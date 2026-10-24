@@ -2,7 +2,8 @@
 //!
 //! Canonical direction: `https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/product/plugin-roadmap.md` owner
 //! direction 2026-09-03 (DEC-0007): management UX is subcommand-first and the
-//! durable state is a managed manifest, never hand-edited Lua. Candidate
+//! durable state is a managed ledger. The ledger is data-only Lua (parsed as
+//! bounded data, never executed or hand-edited for authority). Candidate
 //! layout and semantics from
 //! `https://github.com/bitty-terminal/bitty-plugins-docs/blob/main/extensibility/package-management.md` and
 //! `default-distribution-rfc.md` § "Managed manifest".
@@ -48,12 +49,12 @@
 //!   schemes (`file://`, `http://`, `ssh://`, …) fail closed with a naming
 //!   diagnostic.
 //! - `remove <id> --force` is destructive: bundled records lose their managed
-//!   entry with `bitty-plugins.toml.bak` kept; installed packages delete their
+//!   entry with `bitty-plugins.lua.bak` kept; installed packages delete their
 //!   store record and staged tree. It also deletes an unindexed orphan tree
 //!   when an operator explicitly chooses to discard it; the repair hint shown
 //!   by `list` is the non-destructive `doctor --repair` path.
 //!   `enable`/`disable` are idempotent toggles
-//!   in the managed manifest or the store index respectively; `enable`
+//!   in the managed ledger or the store index respectively; `enable`
 //!   re-checks the hash pin and the grant coverage and fails closed on a
 //!   mismatch. `revoke <id> [--cap <capability>]` drops grants without
 //!   dropping the record: a full revoke clears the granted set and disables,
@@ -130,14 +131,28 @@
 //!
 //! # Durable state
 //!
-//! Exactly one machine-managed manifest lives beside the config file:
-//! `$XDG_CONFIG_HOME/bitty/bitty-plugins.toml` (fallback `~/.config/...`),
-//! or the directory of an explicit `--config`/`BITTY_CONFIG` path. The
-//! format is a strict, bounded TOML **subset** owned by this module: unknown
-//! sections, unknown keys, duplicate keys, malformed values, over-limit
-//! files, and unknown version numbers all fail closed before any mutation.
-//! Only this module writes it; `bitty-config`'s Lua `init.lua` is never
-//! rewritten (package-management.md: arbitrary Lua rewrite is unsafe).
+//! Exactly one machine-managed ledger lives beside the config file:
+//! `$XDG_CONFIG_HOME/bitty/bitty-plugins.lua` (fallback `~/.config/...`),
+//! or the directory of an explicit `--config`/`BITTY_CONFIG` path. The file
+//! is **data-only Lua**: a single `return` of a table literal parsed by
+//! `bitty-config`'s bounded [`bitty_config::plugin_ledger`] parser (no Lua
+//! VM, no host access, no code execution). Unknown keys, duplicate keys or
+//! capability items, malformed values, non-UTF-8 input, over-limit files,
+//! and unknown version numbers all fail closed before any mutation. Only
+//! this module writes it; `bitty-config`'s Lua `init.lua` is never rewritten
+//! (package-management.md: arbitrary Lua rewrite is unsafe).
+//!
+//! The former `bitty-plugins.toml` ledger is read **only** for a one-time
+//! migration: when the Lua ledger is absent and a valid, regular, non-symlink
+//! TOML ledger exists, its records are written to the Lua ledger atomically
+//! (0600 temp + no-clobber commit) and the TOML bytes are retained at
+//! `bitty-plugins.toml.bak`. An existing Lua ledger is never overwritten by
+//! migration, and an unreadable or symlinked TOML source fails closed.
+//!
+//! Authority stays manifest-bound: after parsing, grants for a bundled
+//! record whose hash matches the installed manifest are intersected with
+//! that manifest's requested set. Undeclared grants are dropped and recorded
+//! as a diagnostic; a hand-edited ledger can never widen authority.
 //!
 //! # Authority
 //!
@@ -223,20 +238,22 @@ pub const EXIT_PLUGIN: i32 = 4;
 pub const MAX_PLUGIN_TOKEN_BYTES: usize = 256;
 /// Maximum bytes for a `--format` value.
 pub const MAX_PLUGIN_FORMAT_BYTES: usize = 16;
-/// Managed-manifest file name beside `init.lua`.
-pub const STATE_FILE_NAME: &str = "bitty-plugins.toml";
-/// Suffix appended to the previous managed manifest on every rewrite.
+/// Managed-ledger file name beside `init.lua` (data-only Lua).
+pub const STATE_FILE_NAME: &str = bitty_config::plugin_ledger::LEDGER_FILE_NAME;
+/// Former TOML ledger, read only for one-time migration.
+pub const LEGACY_STATE_FILE_NAME: &str = bitty_config::plugin_ledger::LEGACY_LEDGER_FILE_NAME;
+/// Suffix appended to the previous managed ledger on every rewrite.
 pub const STATE_BACKUP_SUFFIX: &str = ".bak";
-/// Managed-manifest format version (this module owns the codec).
-pub const STATE_VERSION: u32 = 1;
-/// Maximum managed-manifest file size.
-pub const MAX_STATE_FILE_BYTES: usize = 64 * 1024;
-/// Maximum records in one managed manifest.
-pub const MAX_STATE_PLUGINS: usize = 256;
+/// Managed-ledger format version (this module owns the codec).
+pub const STATE_VERSION: u32 = bitty_config::plugin_ledger::LEDGER_STATE_VERSION;
+/// Maximum managed-ledger file size.
+pub const MAX_STATE_FILE_BYTES: usize = bitty_config::plugin_ledger::MAX_LEDGER_FILE_BYTES;
+/// Maximum records in one managed ledger.
+pub const MAX_STATE_PLUGINS: usize = bitty_config::plugin_ledger::MAX_LEDGER_PLUGINS;
 /// Maximum granted capabilities recorded per plugin.
-pub const MAX_STATE_GRANTS: usize = 256;
-/// Maximum managed-manifest lines.
-pub const MAX_STATE_LINES: usize = 4096;
+pub const MAX_STATE_GRANTS: usize = bitty_config::plugin_ledger::MAX_LEDGER_CAPABILITIES;
+/// Maximum managed-ledger lines.
+pub const MAX_STATE_LINES: usize = bitty_config::plugin_ledger::MAX_LEDGER_FILE_LINES;
 /// Hex digest length (`Sha256`, as produced by `PluginManifest::manifest_hash`).
 pub const HEX_HASH_LEN: usize = 64;
 /// Maximum bytes read from one consent answer line.
@@ -836,8 +853,10 @@ pub fn plugin_usage() -> String {
      \x20      profiles (preselect only; review before apply): minimal | editor-like |\n\
      \x20      panel-like | agent-like. Sensitive caps stay explicit per-item consent.\n\
      \n\
-     Bundled plugins are recorded in $XDG_CONFIG_HOME/bitty/bitty-plugins.toml\n\
+     Bundled plugins are recorded in $XDG_CONFIG_HOME/bitty/bitty-plugins.lua\n\
      (fallback ~/.config/bitty/...), or beside an explicit --config path.\n\
+     The ledger is data-only Lua; a legacy bitty-plugins.toml is migrated\n\
+     once and retained as bitty-plugins.toml.bak.\n\
      External packages install into $XDG_DATA_HOME/bitty/plugins (fallback\n\
      ~/.local/share/bitty/plugins). No plugin code runs during any operation.\n\
      Exit codes: 0 success | 1 aborted/io (consent, helper, clone, unpack,\n\
@@ -914,7 +933,7 @@ pub fn plugin_help_text() -> String {
      \x20                             helper or a bad/hostile archive fails\n\
      \x20                             closed with nothing staged.\n\
      \x20 remove <id> --force         Remove a record: bundled records drop from\n\
-     \x20                             the managed manifest (previous copy kept as\n\
+     \x20                             the managed ledger (previous copy kept as\n\
      \x20                             .bak); installed packages delete their store\n\
      \x20                             record and package tree.\n\
      \x20 enable <id>                 Re-enable a recorded plugin. Bundled pins\n\
@@ -968,7 +987,8 @@ pub fn plugin_help_text() -> String {
      \x20                             to overwrite without --force.\n\
      \x20 doctor [--repair] [--no-color]\n\
      \x20                             Diagnose the package store and the\n\
-     \x20                             bitty-plugins.toml ledger. Reports\n\
+     \x20                             bitty-plugins.lua ledger (data only).\n\
+     \x20                             Reports\n\
      \x20                             orphaned/partial version dirs, dangling\n\
      \x20                             index records, a corrupt current.json,\n\
      \x20                             stale staging dirs, and stale ledger\n\
@@ -1056,12 +1076,18 @@ pub fn plugin_help_text() -> String {
      \x20 they are disabled with no grants and must be re-approved.\n\
      \n\
      wiring (where things land, what to edit next):\n\
-     \x20 The managed manifest lives beside the config file:\n\
-     \x20 $XDG_CONFIG_HOME/bitty/bitty-plugins.toml (fallback\n\
+     \x20 The managed ledger lives beside the config file:\n\
+     \x20 $XDG_CONFIG_HOME/bitty/bitty-plugins.lua (fallback\n\
      \x20 ~/.config/bitty/...; an explicit --config path selects its own\n\
-     \x20 directory). Never hand-edit it: it is the grant ledger, and a\n\
-     \x20 malformed file fails closed.\n\
+     \x20 directory). It is data-only Lua, never executed. Never hand-edit\n\
+     \x20 it: it is the grant ledger, and a malformed file fails closed.\n\
+     \x20 A legacy bitty-plugins.toml is migrated once (retained as\n\
+     \x20 bitty-plugins.toml.bak).\n\
      \x20 Per-plugin user files live next to it, under plugins/.\n\
+     \x20 A successful install or first enable of a plugin that declares\n\
+     \x20 [settings] creates a commented defaults file at that path once;\n\
+     \x20 existing files, user edits, and a legacy <id>.toml are never\n\
+     \x20 overwritten (use `config scaffold --force` to replace explicitly).\n\
      \x20 The canonical file is\n\
      \x20 $XDG_CONFIG_HOME/bitty/plugins/<owner>.<name>.lua: it returns a\n\
      \x20 table and runs in a host-free, budgeted configuration VM. A\n\
@@ -1125,7 +1151,7 @@ pub fn plugin_help_text() -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Managed manifest (strict bounded TOML subset, owned by this module)
+// Managed ledger (data-only Lua; legacy TOML for one-time migration)
 // ---------------------------------------------------------------------------
 
 /// One recorded plugin: source, pinned manifest hash, enabled flag, the
@@ -1146,13 +1172,16 @@ pub struct PluginRecord {
     pub denied: BTreeSet<CapabilityId>,
 }
 
-/// Parsed managed manifest (`bitty-plugins.toml`).
+/// Parsed managed ledger (`bitty-plugins.lua`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PluginState {
     records: BTreeMap<String, PluginRecord>,
+    /// Bounded load-time diagnostics (migration notes and authority
+    /// sanitization). Never affects authority; rendered output omits them.
+    diagnostics: Vec<String>,
 }
 
-/// Per-section key accumulators during [`PluginState::parse`].
+/// Per-section key accumulators during [`PluginState::parse_legacy_toml`].
 #[derive(Default)]
 struct SectionAccum {
     source: Option<String>,
@@ -1162,7 +1191,7 @@ struct SectionAccum {
     denied: Option<BTreeSet<CapabilityId>>,
 }
 
-/// Managed-manifest parse/validation failure (owned message incl. line).
+/// Ledger parse/validation failure (owned message incl. line).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateError {
     message: String,
@@ -1172,6 +1201,12 @@ impl StateError {
     fn new(line: usize, message: impl Into<String>) -> Self {
         Self {
             message: format!("line {line}: {}", message.into()),
+        }
+    }
+
+    fn from_message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
         }
     }
 }
@@ -1195,7 +1230,10 @@ impl PluginState {
     #[cfg(test)]
     #[must_use]
     pub fn from_records(records: BTreeMap<String, PluginRecord>) -> Self {
-        Self { records }
+        Self {
+            records,
+            diagnostics: Vec::new(),
+        }
     }
 
     /// Record for `id`, if any.
@@ -1207,6 +1245,34 @@ impl PluginState {
     /// All recorded ids in deterministic (sorted) order.
     pub fn ids(&self) -> impl Iterator<Item = &String> {
         self.records.keys()
+    }
+
+    /// Bounded load-time diagnostics (migration and sanitization notes).
+    ///
+    /// Display-only: they never change authority and are omitted from
+    /// [`PluginState::render`].
+    #[must_use]
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+
+    /// Push one bounded diagnostic (length and count are capped).
+    fn push_diagnostic(&mut self, message: String) {
+        const MAX_DIAGNOSTICS: usize = 8;
+        const MAX_DIAGNOSTIC_BYTES: usize = 320;
+        if self.diagnostics.len() >= MAX_DIAGNOSTICS {
+            return;
+        }
+        let bounded = if message.len() > MAX_DIAGNOSTIC_BYTES {
+            let mut cut = MAX_DIAGNOSTIC_BYTES;
+            while !message.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            format!("{}...", &message[..cut])
+        } else {
+            message
+        };
+        self.diagnostics.push(bounded);
     }
 
     fn get_mut(&mut self, id: &str) -> Option<&mut PluginRecord> {
@@ -1221,19 +1287,21 @@ impl PluginState {
         self.records.remove(id)
     }
 
-    /// Parse a managed manifest, fail-closed on anything outside the strict
-    /// bounded subset this module writes.
+    /// Parse the **legacy** TOML ledger for one-time migration only.
+    ///
+    /// New writes always target the Lua ledger. This parser is not used for
+    /// any file that lives after migration.
     ///
     /// # Errors
     ///
     /// Returns [`StateError`] for over-limit files, unknown/duplicate
     /// sections or keys, malformed values, missing required keys, an
     /// unsupported `state_version`, or invalid plugin/capability identifiers.
-    pub fn parse(text: &str) -> Result<Self, StateError> {
+    pub fn parse_legacy_toml(text: &str) -> Result<Self, StateError> {
         if text.len() > MAX_STATE_FILE_BYTES {
             return Err(StateError::new(
                 1,
-                format!("managed manifest exceeds {MAX_STATE_FILE_BYTES} bytes"),
+                format!("legacy ledger exceeds {MAX_STATE_FILE_BYTES} bytes"),
             ));
         }
         let mut state = Self::new();
@@ -1247,7 +1315,7 @@ impl PluginState {
             if line > MAX_STATE_LINES {
                 return Err(StateError::new(
                     line,
-                    format!("managed manifest exceeds {MAX_STATE_LINES} lines"),
+                    format!("legacy ledger exceeds {MAX_STATE_LINES} lines"),
                 ));
             }
             let trimmed = raw_line.trim();
@@ -1357,16 +1425,124 @@ impl PluginState {
         if state.records.len() > MAX_STATE_PLUGINS {
             return Err(StateError::new(
                 1,
-                format!("managed manifest exceeds {MAX_STATE_PLUGINS} plugins"),
+                format!("legacy ledger exceeds {MAX_STATE_PLUGINS} plugins"),
             ));
         }
         Ok(state)
     }
 
-    /// Render the managed manifest deterministically (sorted records, fixed
-    /// field order, sorted grants, trailing newline).
+    /// Parse the data-only Lua ledger and bind every record to the closed
+    /// identifier grammars.
+    ///
+    /// Structural parsing (no code execution, bounds, duplicate keys) lives
+    /// in [`bitty_config::plugin_ledger`]. This layer validates the closed
+    /// source set, plugin ids, manifest-hash shape, capability identifiers,
+    /// overlap, and record/set limits. Authority is still manifest-bound
+    /// afterwards: [`load_state`] intersects grants with the installed
+    /// manifest for the matching hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StateError`] for any structural or semantic violation.
+    pub fn parse_ledger(bytes: &[u8]) -> Result<Self, StateError> {
+        let ledger = bitty_config::plugin_ledger::parse_ledger(bytes)
+            .map_err(|error| StateError::from_message(error.to_string()))?;
+        if ledger.state_version != STATE_VERSION {
+            return Err(StateError::from_message(format!(
+                "unsupported state_version {} (want {STATE_VERSION})",
+                ledger.state_version
+            )));
+        }
+        if ledger.plugins.len() > MAX_STATE_PLUGINS {
+            return Err(StateError::from_message(format!(
+                "managed ledger exceeds {MAX_STATE_PLUGINS} plugins"
+            )));
+        }
+        let mut state = Self::new();
+        for (id, record) in ledger.plugins {
+            PluginId::new(&id).map_err(|error| {
+                StateError::from_message(format!("invalid plugin id '{id}': {error}"))
+            })?;
+            if record.source != "bundled" {
+                return Err(StateError::from_message(format!(
+                    "unsupported source '{}' for plugin '{id}' (want bundled)",
+                    record.source
+                )));
+            }
+            if !is_lower_hex(&record.manifest_hash, HEX_HASH_LEN) {
+                return Err(StateError::from_message(format!(
+                    "plugin '{id}' manifest_hash must be {HEX_HASH_LEN} lowercase hex characters"
+                )));
+            }
+            let granted = parse_ledger_capabilities(&id, "granted", record.granted)?;
+            let denied = parse_ledger_capabilities(&id, "denied", record.denied)?;
+            if !granted.is_disjoint(&denied) {
+                return Err(StateError::from_message(format!(
+                    "plugin '{id}' lists a capability as both granted and denied"
+                )));
+            }
+            state.insert(
+                id,
+                PluginRecord {
+                    source: record.source,
+                    manifest_hash: record.manifest_hash,
+                    enabled: record.enabled,
+                    granted,
+                    denied,
+                },
+            );
+        }
+        Ok(state)
+    }
+
+    /// Render the managed ledger deterministically as data-only Lua (sorted
+    /// records, fixed field order, sorted grants, trailing newline).
+    ///
+    /// Every identifier is grammar-validated before it reaches this renderer,
+    /// so the only escapes that can appear are the defensive ones below.
     #[must_use]
     pub fn render(&self) -> String {
+        let mut out = String::from(
+            "-- bitty managed plugin ledger — data only, machine-generated by `bitty plugin`.\n\
+             -- Do not edit by hand; use bitty plugin list|install|remove|enable|disable|revoke|grant.\n\
+             -- These records are state, never authority: grants stay bound to the manifest hash.\n\
+             return {\n",
+        );
+        let _ = writeln!(out, "    state_version = {STATE_VERSION},");
+        out.push_str("    plugins = {\n");
+        for (id, record) in &self.records {
+            let _ = writeln!(out, "        [\"{}\"] = {{", ledger_string_literal(id));
+            let _ = writeln!(
+                out,
+                "            source = \"{}\",",
+                ledger_string_literal(&record.source)
+            );
+            let _ = writeln!(
+                out,
+                "            manifest_hash = \"{}\",",
+                ledger_string_literal(&record.manifest_hash)
+            );
+            let _ = writeln!(out, "            enabled = {},", record.enabled);
+            let _ = writeln!(
+                out,
+                "            granted = {},",
+                render_ledger_set(&record.granted)
+            );
+            let _ = writeln!(
+                out,
+                "            denied = {},",
+                render_ledger_set(&record.denied)
+            );
+            out.push_str("        },\n");
+        }
+        out.push_str("    },\n}\n");
+        out
+    }
+
+    /// Render the **legacy** TOML ledger (migration fixtures and tests only).
+    #[cfg(test)]
+    #[must_use]
+    pub fn render_legacy_toml(&self) -> String {
         let mut out = String::from(
             "# bitty managed plugin manifest — machine-generated by `bitty plugin`.\n\
              # Do not edit by hand; use bitty plugin list|install|remove|enable|disable|revoke|grant.\n",
@@ -1396,6 +1572,67 @@ impl PluginState {
             out.push_str("]\n");
         }
         out
+    }
+}
+
+/// Parse one ledger capability list into the closed capability grammar.
+fn parse_ledger_capabilities(
+    id: &str,
+    field: &str,
+    raw: Vec<String>,
+) -> Result<BTreeSet<CapabilityId>, StateError> {
+    if raw.len() > MAX_STATE_GRANTS {
+        return Err(StateError::from_message(format!(
+            "plugin '{id}' exceeds {MAX_STATE_GRANTS} {field} capabilities"
+        )));
+    }
+    let mut out = BTreeSet::new();
+    for text in raw {
+        let capability = CapabilityId::parse(&text).map_err(|error| {
+            StateError::from_message(format!(
+                "plugin '{id}' invalid capability '{text}': {error}"
+            ))
+        })?;
+        if !out.insert(capability) {
+            return Err(StateError::from_message(format!(
+                "plugin '{id}' duplicate capability '{text}'"
+            )));
+        }
+    }
+    Ok(out)
+}
+
+/// Escape one validated ledger string for a Lua double-quoted literal.
+///
+/// Ledger identifiers are ASCII grammar tokens (ids, hex hashes, capability
+/// ids, the closed source label); controls cannot reach this helper, and the
+/// save path re-parses every rendered ledger before writing, so a defensive
+/// escape failure can never produce an unreadable file.
+fn ledger_string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Render one sorted capability set as a Lua array literal.
+fn render_ledger_set(capabilities: &BTreeSet<CapabilityId>) -> String {
+    let items: Vec<String> = capabilities
+        .iter()
+        .map(|capability| format!("\"{}\"", ledger_string_literal(capability.as_str())))
+        .collect();
+    if items.is_empty() {
+        "{}".to_string()
+    } else {
+        format!("{{ {} }}", items.join(", "))
     }
 }
 
@@ -1745,56 +1982,422 @@ fn read_bounded_regular_file(
     Ok(Some(bytes))
 }
 
+/// Load the managed Lua ledger, migrating a legacy TOML ledger once when the
+/// Lua ledger is absent.
+///
+/// An existing Lua ledger is authoritative and is never overwritten by
+/// migration. Legacy TOML is read only when the Lua ledger is missing, from a
+/// bounded regular non-symlink file; after a successful migration the TOML
+/// bytes are retained at `bitty-plugins.toml.bak`. Migration write failures
+/// (for example a read-only config directory) are recorded as a bounded
+/// diagnostic and do not hide the readable legacy state: read-only commands
+/// keep working, while mutations fail at their own save step.
 fn load_state(path: &Path) -> Result<PluginState, PluginFailure> {
-    let bytes = match read_bounded_regular_file(path, MAX_STATE_FILE_BYTES) {
+    match read_bounded_regular_file(path, MAX_STATE_FILE_BYTES) {
+        Ok(Some(bytes)) => {
+            let state = PluginState::parse_ledger(&bytes).map_err(|error| {
+                PluginFailure::plugin(
+                    "StateInvalid",
+                    format!(
+                        "bitty plugin: invalid managed ledger '{}': {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            let mut state = finalize_loaded_state(state)?;
+            // A legacy ledger beside a Lua ledger is inert (the Lua file
+            // wins) and must never be migrated over user content. Surface it
+            // once so `doctor --repair` can retain it as a backup.
+            if std::fs::symlink_metadata(legacy_state_path(path)).is_ok() {
+                state.push_diagnostic(format!(
+                    "legacy ledger '{}' is present but unused; the Lua ledger wins \
+                     (run `bitty plugin doctor --repair` to retain the legacy file as a backup)",
+                    legacy_state_path(path).display()
+                ));
+            }
+            Ok(state)
+        }
+        Ok(None) | Err(BoundedReadError::NotFound) => load_legacy_or_empty(path),
+        Err(BoundedReadError::TooLarge) => Err(PluginFailure::plugin(
+            "StateInvalid",
+            format!(
+                "bitty plugin: '{}' exceeds {MAX_STATE_FILE_BYTES} bytes",
+                path.display()
+            ),
+        )),
+        Err(BoundedReadError::Unsafe(reason)) => Err(PluginFailure::plugin(
+            "UnsafePath",
+            format!(
+                "bitty plugin: refusing managed ledger '{}': {reason}",
+                path.display()
+            ),
+        )),
+        Err(BoundedReadError::Io(reason)) => Err(PluginFailure::generic(
+            "IoError",
+            format!("bitty plugin: cannot read '{}': {reason}", path.display()),
+        )),
+    }
+}
+
+/// Read a legacy TOML ledger (migration only) or return empty state.
+fn load_legacy_or_empty(ledger_path: &Path) -> Result<PluginState, PluginFailure> {
+    let legacy = legacy_state_path(ledger_path);
+    let bytes = match read_bounded_regular_file(&legacy, MAX_STATE_FILE_BYTES) {
         Ok(Some(bytes)) => bytes,
         Ok(None) | Err(BoundedReadError::NotFound) => return Ok(PluginState::new()),
         Err(BoundedReadError::TooLarge) => {
             return Err(PluginFailure::plugin(
                 "StateInvalid",
                 format!(
-                    "bitty plugin: '{}' exceeds {MAX_STATE_FILE_BYTES} bytes",
-                    path.display()
+                    "bitty plugin: legacy ledger '{}' exceeds {MAX_STATE_FILE_BYTES} bytes",
+                    legacy.display()
                 ),
             ));
         }
-        Err(BoundedReadError::Unsafe(reason)) | Err(BoundedReadError::Io(reason)) => {
+        Err(BoundedReadError::Unsafe(reason)) => {
+            return Err(PluginFailure::plugin(
+                "UnsafePath",
+                format!(
+                    "bitty plugin: refusing legacy ledger '{}': {reason}",
+                    legacy.display()
+                ),
+            ));
+        }
+        Err(BoundedReadError::Io(reason)) => {
             return Err(PluginFailure::generic(
                 "IoError",
-                format!("bitty plugin: cannot read '{}': {reason}", path.display()),
+                format!("bitty plugin: cannot read '{}': {reason}", legacy.display()),
             ));
         }
     };
     let text = std::str::from_utf8(&bytes).map_err(|error| {
         PluginFailure::plugin(
             "StateInvalid",
-            format!("bitty plugin: '{}' is not UTF-8: {error}", path.display()),
+            format!("bitty plugin: '{}' is not UTF-8: {error}", legacy.display()),
         )
     })?;
-    PluginState::parse(text).map_err(|error| {
+    let state = PluginState::parse_legacy_toml(text).map_err(|error| {
         PluginFailure::plugin(
             "StateInvalid",
             format!(
-                "bitty plugin: invalid managed manifest '{}': {error}",
-                path.display()
+                "bitty plugin: invalid legacy ledger '{}': {error}",
+                legacy.display()
             ),
         )
-    })
+    })?;
+    let mut state = finalize_loaded_state(state)?;
+    match migrate_legacy_ledger(ledger_path, &legacy, &state) {
+        Ok(Some(backup)) => state.push_diagnostic(format!(
+            "migrated the legacy plugin ledger to '{}' (previous TOML retained at '{}')",
+            ledger_path.display(),
+            backup.display()
+        )),
+        Ok(None) => {}
+        Err(warning) => state.push_diagnostic(warning),
+    }
+    Ok(state)
 }
 
-/// Owner-only mode for the managed manifest and its `.bak` (Unix, CTX-0293).
+/// Sibling legacy ledger path for one canonical ledger path.
+fn legacy_state_path(ledger_path: &Path) -> PathBuf {
+    ledger_path.with_file_name(LEGACY_STATE_FILE_NAME)
+}
+
+/// Drop grants the installed manifest never declared for the matching hash.
+///
+/// Authority is non-delegable: a hand-edited ledger cannot widen it. Only
+/// records whose stored hash equals the current bundled manifest are
+/// sanitized; a stale-hash record keeps its bytes for `info`/`doctor`, and
+/// `enable` still refuses it on the pin mismatch. Undeclared grants are
+/// removed from the in-memory record and recorded as a bounded diagnostic;
+/// they are never persisted as authority.
+fn finalize_loaded_state(mut state: PluginState) -> Result<PluginState, PluginFailure> {
+    let mut diagnostics = Vec::new();
+    for (id, record) in &mut state.records {
+        let Some(manifest) = bundled_manifest_for(id) else {
+            continue;
+        };
+        if record.manifest_hash != manifest.manifest_hash() {
+            continue;
+        }
+        let requested = manifest.capabilities.all_ids().map_err(|error| {
+            PluginFailure::plugin(
+                "StateInvalid",
+                format!("bitty plugin: bundled manifest '{id}' is invalid: {error}"),
+            )
+        })?;
+        let dropped: Vec<String> = record
+            .granted
+            .iter()
+            .filter(|capability| !requested.contains(*capability))
+            .map(|capability| capability.as_str().to_string())
+            .collect();
+        if dropped.is_empty() {
+            continue;
+        }
+        record
+            .granted
+            .retain(|capability| requested.contains(capability));
+        let shown = if dropped.len() > 8 {
+            format!("{} (+{} more)", dropped[..8].join(", "), dropped.len() - 8)
+        } else {
+            dropped.join(", ")
+        };
+        diagnostics.push(format!(
+            "ledger record '{id}' carried grants the manifest does not declare; dropped: {shown}"
+        ));
+    }
+    for diagnostic in diagnostics {
+        state.push_diagnostic(diagnostic);
+    }
+    Ok(state)
+}
+
+/// One-time atomic migration from the legacy TOML ledger to the Lua ledger.
+///
+/// Writes the Lua ledger with a 0600 temp file and a no-clobber hard-link
+/// commit (an existing Lua ledger or symlink fails closed, never overwrites),
+/// then moves the TOML bytes to `<legacy>.bak`. Returns the backup path.
+fn migrate_legacy_ledger(
+    ledger_path: &Path,
+    legacy_path: &Path,
+    state: &PluginState,
+) -> Result<Option<PathBuf>, String> {
+    let rendered = state.render();
+    if rendered.len() > MAX_STATE_FILE_BYTES {
+        return Err(format!(
+            "could not migrate the legacy plugin ledger: rendered ledger exceeds \
+             {MAX_STATE_FILE_BYTES} bytes; legacy TOML left in place"
+        ));
+    }
+    if let Some(parent) = ledger_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                format!(
+                    "could not migrate the legacy plugin ledger to '{}': {error}; \
+                     legacy TOML left in place",
+                    ledger_path.display()
+                )
+            })?;
+            harden_managed_dir(parent).map_err(|failure| failure.message)?;
+        }
+    }
+    write_new_file_atomic(ledger_path, rendered.as_bytes(), LEDGER_TEMP_PREFIX).map_err(
+        |error| {
+            format!(
+                "could not migrate the legacy plugin ledger to '{}': {error}; \
+                 legacy TOML left in place",
+                ledger_path.display()
+            )
+        },
+    )?;
+    // The commit point has passed: the Lua ledger is authoritative. A failure
+    // to retain the backup is reported but cannot un-migrate.
+    let mut backup_name = legacy_path.as_os_str().to_os_string();
+    backup_name.push(STATE_BACKUP_SUFFIX);
+    let backup = PathBuf::from(backup_name);
+    retain_legacy_backup(legacy_path, &backup).map_err(|error| {
+        format!(
+            "migrated the plugin ledger but could not retain the legacy TOML at '{}': {error}",
+            backup.display()
+        )
+    })?;
+    Ok(Some(backup))
+}
+
+/// Move the legacy ledger bytes to the `.bak` path without following links.
+fn retain_legacy_backup(legacy: &Path, backup: &Path) -> std::io::Result<()> {
+    if let Ok(metadata) = std::fs::symlink_metadata(legacy) {
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "legacy ledger is a symlink",
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "legacy ledger is not a regular file",
+            ));
+        }
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(backup) {
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "backup path is a symlink",
+            ));
+        }
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "backup path is not a regular file",
+            ));
+        }
+        std::fs::remove_file(backup)?;
+    }
+    match std::fs::rename(legacy, backup) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            // Cross-device or platform-specific rename failure: copy the
+            // exact bytes first, then drop the legacy file. The bytes are
+            // retained either way (the original is left on a copy failure).
+            let bytes = std::fs::read(legacy)?;
+            write_replace_atomic(backup, &bytes).map_err(|_| rename_error)?;
+            std::fs::remove_file(legacy)
+        }
+    }
+}
+
+/// Owner-only mode for the managed ledger and its `.bak` (Unix, CTX-0293).
 #[cfg(unix)]
 const STATE_FILE_MODE: u32 = 0o600;
 
-/// Owner-only mode for the directory holding the managed manifest (CTX-0293).
+/// Prefix for temporary ledger files created beside the target.
+const LEDGER_TEMP_PREFIX: &str = ".bitty-plugin-ledger-";
+
+/// Monotonic counter so two writes in one process never share a temp name.
+static LEDGER_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Unique temp path in the target's directory (same filesystem for rename).
+fn ledger_temp_path(target: &Path, prefix: &str) -> std::io::Result<PathBuf> {
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let counter = LEDGER_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(parent.join(format!(
+        "{prefix}{}-{nanos}-{counter}.tmp",
+        std::process::id()
+    )))
+}
+
+/// Create, fill, and fsync one 0600 temp file for an atomic ledger write.
+fn fill_private_temp(target: &Path, prefix: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let temp = ledger_temp_path(target, prefix)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(STATE_FILE_MODE);
+    }
+    let mut file = options.open(&temp)?;
+    let result = (|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(std::fs::Permissions::from_mode(STATE_FILE_MODE))?;
+        }
+        std::io::Write::write_all(&mut file, bytes)?;
+        file.sync_all()
+    })();
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(temp)
+}
+
+/// Atomically create `target` only if it does not already exist.
+///
+/// The commit is a hard link from the fsynced temp file, which fails if the
+/// target appeared after the pre-check; an existing ledger is never
+/// overwritten. Symlinks and special files fail closed.
+fn write_new_file_atomic(target: &Path, bytes: &[u8], prefix: &str) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "target is a symlink",
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "target is not a regular file",
+            ));
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "target already exists",
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let temp = fill_private_temp(target, prefix, bytes)?;
+    let commit = std::fs::hard_link(&temp, target);
+    let _ = std::fs::remove_file(&temp);
+    commit
+}
+
+/// Atomic no-clobber write for the auto-generated settings template.
+fn write_new_settings_file_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    write_new_file_atomic(target, bytes, SCAFFOLD_TEMP_PREFIX)
+}
+
+/// Atomically replace `target` with `bytes` (temp + fsync + rename).
+///
+/// Symlinked or special targets are refused even when they appear after the
+/// pre-check the rename itself only replaces the directory entry, never
+/// follows a link.
+fn write_replace_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "target is a symlink",
+            ));
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "target is not a regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let temp = fill_private_temp(target, LEDGER_TEMP_PREFIX, bytes)?;
+    let result = replace_file(&temp, target);
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+/// Rename `temp` over `target`, tolerating Windows' no-replace rename.
+fn replace_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    match std::fs::rename(temp, target) {
+        Ok(()) => Ok(()),
+        #[cfg(windows)]
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Windows `rename` refuses to replace an existing file. The
+            // pre-check above refused symlinks/specials, so removing the
+            // regular file here keeps the write semantics identical; the
+            // gap is bounded to one process-local save.
+            std::fs::remove_file(target)?;
+            std::fs::rename(temp, target)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Owner-only mode for the directory holding the managed ledger (CTX-0293).
 #[cfg(unix)]
 const STATE_DIR_MODE: u32 = 0o700;
 
-/// Force owner-only permissions on the managed manifest or its `.bak`.
+/// Force owner-only permissions on the managed ledger or its `.bak`.
 ///
-/// The manifest is a capability-grant ledger; `std::fs::write` inherits the
-/// process umask, so the mode is set explicitly (P0-AC-026 defense in depth,
-/// CTX-0293). Non-Unix targets have no equivalent mode bits here and no-op.
+/// The ledger is a capability-grant record; temp files are created 0600 and
+/// the mode is set again explicitly (P0-AC-026 defense in depth, CTX-0293).
+/// Non-Unix targets have no equivalent mode bits here and no-op.
 #[cfg(unix)]
 fn harden_managed_file(path: &Path) -> Result<(), PluginFailure> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1838,14 +2441,18 @@ fn harden_managed_dir(_path: &Path) -> Result<(), PluginFailure> {
     Ok(())
 }
 
-/// Write the state, keeping the previous bytes at `<file>.bak` first.
+/// Write the ledger atomically, keeping the previous bytes at `<file>.bak`.
+///
+/// Every write is a 0600 temp file, fsync, then rename; symlinked or special
+/// targets fail closed and are never followed. The new bytes are re-parsed
+/// before writing, so a render regression cannot commit an unreadable ledger.
 fn save_state(path: &Path, state: &PluginState) -> Result<Option<PathBuf>, PluginFailure> {
     let rendered = state.render();
     // Never write bytes this module cannot read back (defense in depth).
-    PluginState::parse(&rendered).map_err(|error| {
+    PluginState::parse_ledger(rendered.as_bytes()).map_err(|error| {
         PluginFailure::generic(
             "Internal",
-            format!("bitty plugin: internal error: rendered manifest invalid: {error}"),
+            format!("bitty plugin: internal error: rendered ledger invalid: {error}"),
         )
     })?;
     if let Some(parent) = path.parent() {
@@ -1863,31 +2470,58 @@ fn save_state(path: &Path, state: &PluginState) -> Result<Option<PathBuf>, Plugi
         }
     }
     let mut backup = None;
-    if path.exists() {
-        let mut backup_name = path.as_os_str().to_os_string();
-        backup_name.push(STATE_BACKUP_SUFFIX);
-        let backup_path = PathBuf::from(backup_name);
-        let previous = std::fs::read(path).map_err(|error| {
-            PluginFailure::generic(
-                "IoError",
-                format!("bitty plugin: cannot read '{}': {error}", path.display()),
-            )
-        })?;
-        std::fs::write(&backup_path, previous).map_err(|error| {
-            PluginFailure::generic(
-                "IoError",
+    match read_bounded_regular_file(path, MAX_STATE_FILE_BYTES) {
+        Ok(Some(previous)) => {
+            let mut backup_name = path.as_os_str().to_os_string();
+            backup_name.push(STATE_BACKUP_SUFFIX);
+            let backup_path = PathBuf::from(backup_name);
+            write_replace_atomic(&backup_path, &previous).map_err(|error| {
+                PluginFailure::generic(
+                    "IoError",
+                    format!(
+                        "bitty plugin: cannot write backup '{}': {error}",
+                        backup_path.display()
+                    ),
+                )
+            })?;
+            harden_managed_file(&backup_path)?;
+            backup = Some(backup_path);
+        }
+        Ok(None) | Err(BoundedReadError::NotFound) => {}
+        Err(BoundedReadError::TooLarge) => {
+            return Err(PluginFailure::plugin(
+                "StateInvalid",
                 format!(
-                    "bitty plugin: cannot write backup '{}': {error}",
-                    backup_path.display()
+                    "bitty plugin: refusing to replace '{}': existing ledger exceeds \
+                     {MAX_STATE_FILE_BYTES} bytes",
+                    path.display()
                 ),
-            )
-        })?;
-        harden_managed_file(&backup_path)?;
-        backup = Some(backup_path);
+            ));
+        }
+        Err(BoundedReadError::Unsafe(reason)) => {
+            return Err(PluginFailure::plugin(
+                "UnsafePath",
+                format!(
+                    "bitty plugin: refusing to replace '{}': {reason}",
+                    path.display()
+                ),
+            ));
+        }
+        Err(BoundedReadError::Io(reason)) => {
+            return Err(PluginFailure::generic(
+                "IoError",
+                format!("bitty plugin: cannot read '{}': {reason}", path.display()),
+            ));
+        }
     }
-    std::fs::write(path, rendered).map_err(|error| {
+    write_replace_atomic(path, rendered.as_bytes()).map_err(|error| {
+        let code = if error.kind() == std::io::ErrorKind::PermissionDenied {
+            "UnsafePath"
+        } else {
+            "IoError"
+        };
         PluginFailure::generic(
-            "IoError",
+            code,
             format!("bitty plugin: cannot write '{}': {error}", path.display()),
         )
     })?;
@@ -1903,9 +2537,9 @@ fn save_state(path: &Path, state: &PluginState) -> Result<Option<PathBuf>, Plugi
 ///
 /// Mirrors [`resolve_state_path`] (explicit `--config`/`BITTY_CONFIG` parent,
 /// else XDG config root): the init wizard records into the same
-/// `bitty-plugins.toml` `plugin install <id>` uses, so a recorded queue is
-/// consumable later by `plugin install`. Returns a plain string error for the
-/// init dispatch (English-only, no secrets).
+/// `bitty-plugins.lua` ledger `plugin install <id>` uses, so a recorded queue
+/// is consumable later by `plugin install`. Returns a plain string error for
+/// the init dispatch (English-only, no secrets).
 pub(crate) fn init_plugin_state_path(
     config_path: Option<&str>,
     bitty_config_env: Option<&str>,
@@ -2009,6 +2643,12 @@ pub(crate) fn init_install_bundled_with_consent(
     if result.changed {
         save_state(state_path, &state).map_err(|failure| failure.message)?;
     }
+    if let Ok(manifest) = bundled_manifest(id.trim()) {
+        report_generated_defaults(
+            output,
+            ensure_generated_plugin_config(state_path.parent(), id.trim(), &manifest),
+        );
+    }
     Ok(summary)
 }
 
@@ -2035,7 +2675,7 @@ pub struct PluginRow {
     pub state: &'static str,
     /// Recorded enabled flag.
     pub enabled: bool,
-    /// Whether the managed `bitty-plugins.toml` ledger records this id.
+    /// Whether the managed `bitty-plugins.lua` ledger records this id.
     ///
     /// Store-index rows are **not** ledger records: `state` describes their
     /// desired store state, not a managed record. Runtime inspection reports
@@ -2714,7 +3354,7 @@ fn format_list_table(rows: &[PluginRow], no_color: bool) -> String {
     out
 }
 
-fn format_info_table(row: &PluginRow, no_color: bool) -> String {
+fn format_info_table(row: &PluginRow, settings_file: Option<&Path>, no_color: bool) -> String {
     let color = color_enabled(no_color);
     let mut out = String::new();
     let _ = writeln!(out, "{}", bold(&format!("plugin {}", row.id), color));
@@ -2729,6 +3369,19 @@ fn format_info_table(row: &PluginRow, no_color: bool) -> String {
     );
     let _ = writeln!(out, "  pin:          {}", pin_label(row.pin_ok));
     let _ = writeln!(out, "  description:  {}", row.description);
+    match settings_file {
+        Some(path) => {
+            let _ = writeln!(
+                out,
+                "  settings:     {} ({})",
+                bounded_display_path(path),
+                presence(exists_no_follow(path))
+            );
+        }
+        None => {
+            let _ = writeln!(out, "  settings:     - (no config root resolved)");
+        }
+    }
     if let Some(repair) = &row.repair {
         let _ = writeln!(out, "  repair:       {repair}");
     }
@@ -2818,7 +3471,12 @@ fn write_capability_array(out: &mut String, capabilities: &[CapabilityRow]) {
     out.push(']');
 }
 
-fn write_plugin_object(out: &mut String, row: &PluginRow, include_manifest: bool) {
+fn write_plugin_object(
+    out: &mut String,
+    row: &PluginRow,
+    include_manifest: bool,
+    settings_file: Option<&Path>,
+) {
     let _ = write!(
         out,
         "{{\"id\":\"{}\",\"name\":\"{}\",\"version\":\"{}\",\"description\":\"{}\",\"bundled\":{},\"source\":\"{}\",\"state\":\"{}\",\"enabled\":{},\"pin_ok\":{}",
@@ -2843,6 +3501,15 @@ fn write_plugin_object(out: &mut String, row: &PluginRow, include_manifest: bool
                 Some(hash) => format!("\"{}\"", json_escape(hash)),
                 None => "null".to_string(),
             }
+        );
+        let _ = write!(
+            out,
+            ",\"settings_file\":{},\"settings_file_exists\":{}",
+            match settings_file {
+                Some(path) => format!("\"{}\"", json_escape(&path.display().to_string())),
+                None => "null".to_string(),
+            },
+            settings_file.is_some_and(exists_no_follow)
         );
     }
     let _ = write!(
@@ -2876,19 +3543,22 @@ pub fn format_list_envelope(rows: &[PluginRow]) -> String {
         if index > 0 {
             out.push(',');
         }
-        write_plugin_object(&mut out, row, false);
+        write_plugin_object(&mut out, row, false, None);
     }
     out.push_str("]}}");
     out
 }
 
 /// Success envelope for `info`.
+///
+/// `settings_file` is the canonical per-plugin Lua path (present or not);
+/// `None` means no config root could be derived.
 #[must_use]
-pub fn format_info_envelope(row: &PluginRow) -> String {
+pub fn format_info_envelope(row: &PluginRow, settings_file: Option<&Path>) -> String {
     let mut out = String::from(
         "{\"v\":1,\"command\":\"plugin\",\"ok\":true,\"result\":{\"verb\":\"info\",\"plugin\":",
     );
-    write_plugin_object(&mut out, row, true);
+    write_plugin_object(&mut out, row, true, settings_file);
     out.push_str("}}");
     out
 }
@@ -3620,7 +4290,7 @@ pub struct ConfigSettingRow {
 pub struct PluginConfigReport {
     /// Plugin id.
     pub id: String,
-    /// Environment-derived config root (parent of `bitty-plugins.toml`).
+    /// Environment-derived config root (parent of `bitty-plugins.lua`).
     pub config_dir: PathBuf,
     /// Candidate user-file paths.
     pub paths: PluginConfigPaths,
@@ -3967,6 +4637,163 @@ fn render_scaffold_default(default: &SettingDefault) -> String {
                 .map(|item| format!("\"{}\"", escape_lua_string(item)))
                 .collect();
             format!("{{ {} }}", quoted.join(", "))
+        }
+    }
+}
+
+/// Render the auto-generated per-plugin defaults file (commented, data only).
+///
+/// Every line is a comment, so the file parses as an empty settings table and
+/// the manifest defaults stay in effect until the user uncomments a line. The
+/// manifest id and hash marker binds the generated content to the manifest
+/// that produced it; the runtime still validates each entry against the
+/// current manifest schema and never treats the file as authority.
+fn render_generated_defaults(id: &str, manifest_hash: &str, settings: &[SettingDecl]) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "-- bitty-plugin-defaults: {id} {manifest_hash}");
+    let _ = writeln!(
+        out,
+        "-- Default settings for {id} (manifest {}).",
+        short_hash(manifest_hash)
+    );
+    out.push_str("-- Generated once by `bitty plugin`; edit values freely.\n");
+    out.push_str(
+        "-- Values are data only: no setting grants capability, authority, or plugin code.\n",
+    );
+    out.push_str("-- Settings load on the next activation of this plugin.\n");
+    out.push_str("--\n");
+    out.push_str("-- Uncomment a line and edit its value to override the shipped default.\n");
+    out.push_str("-- Delete a line to fall back to the manifest default.\n");
+    out.push_str("--\n");
+    out.push_str("-- Declared keys and shipped defaults:\n");
+    for decl in settings {
+        let _ = writeln!(
+            out,
+            "--   {}: {} = {}",
+            decl.key,
+            decl.kind.as_str(),
+            render_scaffold_default(&decl.default)
+        );
+    }
+    out.push_str("--\n");
+    out.push_str("return {\n");
+    for decl in settings {
+        let _ = writeln!(
+            out,
+            "    -- {} = {},",
+            decl.key,
+            render_scaffold_default(&decl.default)
+        );
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// Bounded display path for one-line diagnostics.
+fn bounded_display_path(path: &Path) -> String {
+    const MAX_PATH_DISPLAY_BYTES: usize = 240;
+    let text = path.display().to_string();
+    if text.len() <= MAX_PATH_DISPLAY_BYTES {
+        return text;
+    }
+    let mut cut = MAX_PATH_DISPLAY_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}...", &text[..cut])
+}
+
+/// Create `<config-dir>/plugins/<owner>.<name>.lua` with commented defaults.
+///
+/// Writes only when the canonical file, its short-alias sibling, and the
+/// legacy per-plugin TOML are all absent: an existing file is user content and
+/// is never overwritten (use `config scaffold --force` for an explicit
+/// replace). A manifest with no `[settings]` writes nothing. The manifest id
+/// must match the requested id and the manifest must validate; symlinked
+/// targets or a symlinked `plugins/` directory fail closed. Failures here are
+/// best-effort in the caller: an install/enable that succeeded never fails
+/// because the convenience file could not be created.
+fn ensure_generated_plugin_config(
+    config_dir: Option<&Path>,
+    id: &str,
+    manifest: &PluginManifest,
+) -> Result<Option<PathBuf>, PluginFailure> {
+    let Some(config_dir) = config_dir else {
+        return Ok(None);
+    };
+    if manifest.id().as_str() != id {
+        return Err(PluginFailure::plugin(
+            "ManifestInvalid",
+            format!(
+                "bitty plugin: manifest id '{}' does not match '{id}'",
+                manifest.id()
+            ),
+        ));
+    }
+    if manifest.settings.is_empty() {
+        return Ok(None);
+    }
+    manifest.validate().map_err(|error| {
+        PluginFailure::plugin(
+            "ManifestInvalid",
+            format!("bitty plugin: settings schema for '{id}' is invalid: {error}"),
+        )
+    })?;
+    let paths = plugin_settings::plugin_config_paths(config_dir, id, None).ok_or_else(|| {
+        PluginFailure::plugin(
+            "UnsafePath",
+            format!("bitty plugin: '{id}' cannot name a per-plugin config file"),
+        )
+    })?;
+    // Presence of any candidate (including a symlink) means the user owns the
+    // surface or a legacy file is active: never create the Lua file.
+    if exists_no_follow(&paths.canonical_lua) || exists_no_follow(&paths.legacy_toml) {
+        return Ok(None);
+    }
+    if let Some(alias) = paths.alias_lua.as_deref() {
+        if exists_no_follow(alias) {
+            return Ok(None);
+        }
+    }
+    let _ = ensure_plugins_dir(config_dir)?;
+    let rendered = render_generated_defaults(id, &manifest.manifest_hash(), &manifest.settings);
+    if rendered.len() > MAX_SCAFFOLD_BYTES {
+        return Err(PluginFailure::plugin(
+            "ScaffoldTooLarge",
+            format!("bitty plugin: rendered defaults exceed {MAX_SCAFFOLD_BYTES} bytes"),
+        ));
+    }
+    write_new_settings_file_atomic(&paths.canonical_lua, rendered.as_bytes()).map_err(|error| {
+        PluginFailure::plugin(
+            "IoError",
+            format!(
+                "bitty plugin: cannot create '{}': {error}",
+                paths.canonical_lua.display()
+            ),
+        )
+    })?;
+    Ok(Some(paths.canonical_lua))
+}
+
+/// Report one auto-generated defaults file (or a bounded warning).
+fn report_generated_defaults(
+    output: &mut dyn std::io::Write,
+    result: Result<Option<PathBuf>, PluginFailure>,
+) {
+    match result {
+        Ok(Some(path)) => {
+            let _ = writeln!(
+                output,
+                "bitty plugin: created default settings '{}' (edit to override; never overwritten)",
+                bounded_display_path(&path)
+            );
+        }
+        Ok(None) => {}
+        Err(failure) => {
+            eprintln!(
+                "warning: bitty plugin: default settings not created: {}",
+                failure.message
+            );
         }
     }
 }
@@ -4323,8 +5150,11 @@ pub fn run_plugin_subcommand(
             return failure.exit;
         }
     };
+    for diagnostic in state.diagnostics() {
+        eprintln!("bitty plugin: note: {diagnostic}");
+    }
     // Config dir for next-steps display (CTX-1268): the parent of the
-    // managed manifest, so an explicit `--config`/`BITTY_CONFIG` selects
+    // managed ledger, so an explicit `--config`/`BITTY_CONFIG` selects
     // its own `plugins/` directory for the copy-paste path.
     let config_dir: Option<PathBuf> = path.parent().map(Path::to_path_buf);
 
@@ -4351,12 +5181,20 @@ pub fn run_plugin_subcommand(
             }
             match row_for_id(&state, store_root.as_deref(), id) {
                 Ok(row) => {
+                    let settings_file = plugin_config_file_display(config_dir.as_deref(), id);
                     match request.format {
                         PluginFormat::Table => {
-                            let _ = output.write_all(format_info_table(&row, no_color).as_bytes());
+                            let _ = output.write_all(
+                                format_info_table(&row, settings_file.as_deref(), no_color)
+                                    .as_bytes(),
+                            );
                         }
                         PluginFormat::Json | PluginFormat::Jsonl => {
-                            let _ = writeln!(output, "{}", format_info_envelope(&row));
+                            let _ = writeln!(
+                                output,
+                                "{}",
+                                format_info_envelope(&row, settings_file.as_deref())
+                            );
                         }
                     }
                     EXIT_OK
@@ -4424,6 +5262,16 @@ pub fn run_plugin_subcommand(
                         // (op_install just used it), so a lookup miss falls
                         // back to generic next steps, never to an error.
                         let manifest = bundled_manifest(operand).ok();
+                        if let Some(manifest) = manifest.as_ref() {
+                            report_generated_defaults(
+                                output,
+                                ensure_generated_plugin_config(
+                                    config_dir.as_deref(),
+                                    operand,
+                                    manifest,
+                                ),
+                            );
+                        }
                         write_next_steps(
                             output,
                             operand,
@@ -4448,6 +5296,16 @@ pub fn run_plugin_subcommand(
                         let code = finish_mutation(&path, state, result, output);
                         if code == EXIT_OK {
                             let manifest = bundled_manifest(id).ok();
+                            if let Some(manifest) = manifest.as_ref() {
+                                report_generated_defaults(
+                                    output,
+                                    ensure_generated_plugin_config(
+                                        config_dir.as_deref(),
+                                        id,
+                                        manifest,
+                                    ),
+                                );
+                            }
                             write_next_steps(
                                 output,
                                 id,
@@ -6154,6 +7012,12 @@ fn install_local_path(
             // generic next steps, never to an error.
             let installed_under = store_root.join(&report.root);
             let manifest = read_source_manifest_for_next_steps(source);
+            if let Some(manifest) = manifest.as_ref() {
+                report_generated_defaults(
+                    output,
+                    ensure_generated_plugin_config(config_dir, &report.plugin_id, manifest),
+                );
+            }
             write_next_steps(
                 output,
                 &report.plugin_id,
@@ -6413,6 +7277,12 @@ fn set_store_enabled(
                     ),
                     None => (None, None),
                 };
+                if let Some(manifest) = manifest.as_ref() {
+                    report_generated_defaults(
+                        output,
+                        ensure_generated_plugin_config(config_dir, id, manifest),
+                    );
+                }
                 write_next_steps(
                     output,
                     id,
@@ -6430,7 +7300,8 @@ fn set_store_enabled(
     }
 }
 
-/// Ledger (`bitty-plugins.toml`) health for `bitty plugin doctor`.
+/// Ledger (`bitty-plugins.lua`, or a not-yet-migrated legacy TOML) health for
+/// `bitty plugin doctor`.
 struct LedgerInspection {
     present: bool,
     records: usize,
@@ -6438,9 +7309,20 @@ struct LedgerInspection {
     unknown_ids: Vec<String>,
     stale_pins: Vec<String>,
     state: Option<PluginState>,
+    diagnostics: Vec<String>,
+    /// File the inspection actually read (Lua or legacy TOML).
+    source_path: Option<PathBuf>,
+    /// Whether the source is the legacy TOML ledger (pending migration).
+    legacy: bool,
+    /// Whether a legacy TOML ledger also exists beside a Lua ledger.
+    legacy_beside_lua: bool,
 }
 
 /// Inspect the managed ledger without failing the doctor on a bad file.
+///
+/// The Lua ledger wins when present; otherwise a legacy TOML ledger is read
+/// (and reported as pending migration) without writing anything. Symlinked or
+/// special files are reported as unsafe, never followed.
 fn inspect_ledger(path: &Path) -> LedgerInspection {
     let mut inspection = LedgerInspection {
         present: false,
@@ -6449,35 +7331,77 @@ fn inspect_ledger(path: &Path) -> LedgerInspection {
         unknown_ids: Vec::new(),
         stale_pins: Vec::new(),
         state: None,
+        diagnostics: Vec::new(),
+        source_path: None,
+        legacy: false,
+        legacy_beside_lua: false,
     };
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return inspection,
+    let legacy_path = legacy_state_path(path);
+    let (source, legacy) = match std::fs::symlink_metadata(path) {
+        Ok(_) => (path.to_path_buf(), false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(&legacy_path) {
+                Ok(_) => (legacy_path.clone(), true),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return inspection,
+                Err(error) => {
+                    inspection.error = Some(format!(
+                        "cannot inspect '{}': {error}",
+                        legacy_path.display()
+                    ));
+                    return inspection;
+                }
+            }
+        }
         Err(error) => {
-            inspection.error = Some(format!("cannot read '{}': {error}", path.display()));
+            inspection.error = Some(format!("cannot inspect '{}': {error}", path.display()));
             return inspection;
         }
     };
     inspection.present = true;
-    if bytes.len() > MAX_STATE_FILE_BYTES {
-        inspection.error = Some(format!("exceeds {MAX_STATE_FILE_BYTES} bytes"));
-        return inspection;
+    inspection.source_path = Some(source.clone());
+    inspection.legacy = legacy;
+    if !legacy {
+        inspection.legacy_beside_lua = std::fs::symlink_metadata(&legacy_path).is_ok();
     }
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(text) => text,
-        Err(error) => {
-            inspection.error = Some(format!("not UTF-8: {error}"));
+    let bytes = match read_bounded_regular_file(&source, MAX_STATE_FILE_BYTES) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) | Err(BoundedReadError::NotFound) => {
+            inspection.present = false;
+            return inspection;
+        }
+        Err(BoundedReadError::TooLarge) => {
+            inspection.error = Some(format!("exceeds {MAX_STATE_FILE_BYTES} bytes"));
+            return inspection;
+        }
+        Err(BoundedReadError::Unsafe(reason)) => {
+            inspection.error = Some(reason);
+            return inspection;
+        }
+        Err(BoundedReadError::Io(reason)) => {
+            inspection.error = Some(format!("cannot read '{}': {reason}", source.display()));
             return inspection;
         }
     };
-    let state = match PluginState::parse(text) {
+    let parsed = if legacy {
+        std::str::from_utf8(&bytes)
+            .map_err(|error| format!("not UTF-8: {error}"))
+            .and_then(|text| {
+                PluginState::parse_legacy_toml(text).map_err(|error| error.to_string())
+            })
+    } else {
+        PluginState::parse_ledger(&bytes).map_err(|error| error.to_string())
+    };
+    let state = match parsed
+        .and_then(|state| finalize_loaded_state(state).map_err(|failure| failure.message))
+    {
         Ok(state) => state,
         Err(error) => {
-            inspection.error = Some(error.to_string());
+            inspection.error = Some(error);
             return inspection;
         }
     };
     inspection.records = state.ids().count();
+    inspection.diagnostics = state.diagnostics().to_vec();
     for id in state.ids() {
         match bundled_manifest_for(id) {
             None => inspection.unknown_ids.push(id.clone()),
@@ -6621,9 +7545,28 @@ fn run_plugin_doctor(
              bitty plugin doctor --repair"
         );
     } else if ledger.present {
-        let _ = writeln!(output, "  [ok]   ledger: {} record(s)", ledger.records);
+        if ledger.legacy {
+            let _ = writeln!(
+                output,
+                "  [ok]   ledger: {} record(s) in legacy {} (repair migrates it to {})",
+                ledger.records, LEGACY_STATE_FILE_NAME, STATE_FILE_NAME
+            );
+        } else {
+            let _ = writeln!(output, "  [ok]   ledger: {} record(s)", ledger.records);
+        }
     } else {
         let _ = writeln!(output, "  [ok]   ledger: absent (bundled defaults only)");
+    }
+    if ledger.legacy_beside_lua {
+        warnings += 1;
+        let _ = writeln!(
+            output,
+            "  [warn] ledger: legacy {} is present but unused; repair moves it to {}{}",
+            LEGACY_STATE_FILE_NAME, LEGACY_STATE_FILE_NAME, STATE_BACKUP_SUFFIX
+        );
+    }
+    for diagnostic in &ledger.diagnostics {
+        let _ = writeln!(output, "  [note] ledger: {diagnostic}");
     }
     for id in &ledger.unknown_ids {
         warnings += 1;
@@ -6683,14 +7626,18 @@ fn run_plugin_doctor(
         }
         if ledger.error.is_some() {
             let nonce = doctor_nonce();
-            let quarantined = state_path.with_file_name(format!(
+            let corrupt_source = ledger
+                .source_path
+                .clone()
+                .unwrap_or_else(|| state_path.to_path_buf());
+            let quarantined = corrupt_source.with_file_name(format!(
                 "{}.corrupt-{nonce}",
-                state_path
+                corrupt_source
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "bitty-plugins.toml".to_string())
+                    .unwrap_or_else(|| STATE_FILE_NAME.to_string())
             ));
-            match std::fs::rename(state_path, &quarantined) {
+            match std::fs::rename(&corrupt_source, &quarantined) {
                 Ok(()) => {
                     let _ = writeln!(output, "  quarantined ledger -> {}", quarantined.display());
                     match save_state(state_path, &PluginState::new()) {
@@ -6712,7 +7659,7 @@ fn run_plugin_doctor(
                     let _ = writeln!(
                         output,
                         "  [fail] cannot quarantine '{}': {error} (check ownership/permissions)",
-                        state_path.display()
+                        corrupt_source.display()
                     );
                 }
             }
@@ -6722,30 +7669,52 @@ fn run_plugin_doctor(
                 for id in &unknown {
                     state.remove(id);
                 }
-                match save_state(state_path, &state) {
-                    Ok(backup) => {
+            }
+            // Always write the canonical Lua ledger on repair: a valid legacy
+            // TOML is migrated here, and a Lua ledger with stale records is
+            // rewritten. `save_state` is atomic and 0600.
+            match save_state(state_path, &state) {
+                Ok(backup) => {
+                    if !unknown.is_empty() {
                         let _ = writeln!(
                             output,
                             "  removed {} stale ledger record(s) ({})",
                             unknown.len(),
                             unknown.join(", ")
                         );
-                        if let Some(backup) = backup {
-                            let _ =
-                                writeln!(output, "  previous ledger kept at {}", backup.display());
-                        }
                     }
-                    Err(failure) => {
+                    if let Some(backup) = backup {
+                        let _ = writeln!(output, "  previous ledger kept at {}", backup.display());
+                    }
+                }
+                Err(failure) => {
+                    repair_failures += 1;
+                    let _ = writeln!(
+                        output,
+                        "  [fail] cannot rewrite ledger: {}",
+                        failure.message
+                    );
+                }
+            }
+            let legacy_path = legacy_state_path(state_path);
+            if std::fs::symlink_metadata(&legacy_path).is_ok() {
+                let mut backup_name = legacy_path.as_os_str().to_os_string();
+                backup_name.push(STATE_BACKUP_SUFFIX);
+                let backup = PathBuf::from(backup_name);
+                match retain_legacy_backup(&legacy_path, &backup) {
+                    Ok(()) => {
+                        let _ =
+                            writeln!(output, "  retained legacy ledger at {}", backup.display());
+                    }
+                    Err(error) => {
                         repair_failures += 1;
                         let _ = writeln!(
                             output,
-                            "  [fail] cannot rewrite ledger: {}",
-                            failure.message
+                            "  [fail] cannot retain legacy ledger '{}': {error}",
+                            legacy_path.display()
                         );
                     }
                 }
-            } else {
-                let _ = writeln!(output, "  ledger already consistent");
             }
         }
         let _ = writeln!(
@@ -8107,6 +9076,31 @@ mod tests {
         ]
     }
 
+    /// External-style manifest with declared settings (generation tests).
+    fn config_manifest(id: &str) -> PluginManifest {
+        let text = format!(
+            "[plugin]\n\
+             id = \"{id}\"\n\
+             name = \"Config Fixture\"\n\
+             version = \"1.0.0\"\n\
+             description = \"per-plugin settings fixture\"\n\n\
+             [compat]\n\
+             bitty = \">=0.0.1,<1.0\"\n\
+             plugin-api = \"^1.0\"\n\n\
+             [capabilities]\n\
+             platform.notify = true\n\n\
+             [lazy]\n\
+             commands = []\n\
+             events = []\n\n\
+             [settings]\n\
+             show = {{ type = \"bool\", default = true }}\n\
+             edge = {{ type = \"string\", default = \"bottom\" }}\n\
+             limit = {{ type = \"int\", default = 8 }}\n\
+             modules = {{ type = \"string-array\", default = [\"workspaces\", \"clock\"] }}\n"
+        );
+        manifest_toml::parse_manifest(text.as_bytes()).expect("fixture manifest")
+    }
+
     #[test]
     fn config_scaffold_writes_canonical_lua_and_refuses_overwrite() {
         let dir = scratch_dir("config-scaffold");
@@ -8421,16 +9415,16 @@ mod tests {
     #[test]
     fn state_round_trips_deterministically() {
         let rendered = sample_state().render();
-        let parsed = PluginState::parse(&rendered).expect("parses");
+        let parsed = PluginState::parse_ledger(rendered.as_bytes()).expect("parses");
         assert_eq!(parsed, sample_state());
         assert_eq!(parsed.render(), rendered);
         assert!(rendered.contains("state_version = 1"));
-        assert!(rendered.contains("[plugins.\"bitty-terminal.workspace\"]"));
-        assert!(rendered.contains("granted = [\"terminal.semantic-read\"]"));
+        assert!(rendered.contains("[\"bitty-terminal.workspace\"] = {"));
+        assert!(rendered.contains("granted = { \"terminal.semantic-read\" }"));
         // Empty state renders and parses.
         let empty = PluginState::new().render();
         assert_eq!(
-            PluginState::parse(&empty).expect("empty parses"),
+            PluginState::parse_ledger(empty.as_bytes()).expect("empty parses"),
             PluginState::new()
         );
     }
@@ -8452,7 +9446,7 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        assert_eq!(manifest_mode, 0o600, "managed manifest must be owner-only");
+        assert_eq!(manifest_mode, 0o600, "managed ledger must be owner-only");
         let dir_mode = std::fs::metadata(&dir)
             .expect("directory metadata")
             .permissions()
@@ -8472,7 +9466,7 @@ mod tests {
     }
 
     #[test]
-    fn state_parse_fails_closed_on_tampering() {
+    fn state_parse_ledger_fails_closed_on_tampering() {
         let good = sample_state().render();
         for (bad, needle) in [
             (
@@ -8493,31 +9487,41 @@ mod tests {
             (good.replace("enabled = true", "enabled = yes"), "enabled"),
             (
                 good.replace(
-                    "granted = [\"terminal.semantic-read\"]",
-                    "granted = [\"nope\"]",
+                    "granted = { \"terminal.semantic-read\" }",
+                    "granted = { \"nope\" }",
                 ),
                 "capability",
             ),
-            (good.replace("manifest_hash", "bogus_key"), "unknown key"),
-            (format!("{good}\n[plugins.\"x.y\"]\n"), "missing `source`"),
+            (good.replace("manifest_hash", "bogus_key"), "unknown"),
+            (format!("{good}\nos.execute('id')\n"), "trailing"),
+            (
+                good.replace("enabled = true", "enabled = true, enabled = true"),
+                "duplicate",
+            ),
         ] {
-            assert!(PluginState::parse(&bad).is_err(), "must reject: {needle}");
+            assert!(
+                PluginState::parse_ledger(bad.as_bytes()).is_err(),
+                "must reject: {needle}"
+            );
         }
-        // Unknown top-level key before any section.
-        assert!(PluginState::parse("nope = 1").is_err());
-        // Missing version.
-        assert!(PluginState::parse("# only a comment\n").is_err());
-        // Duplicate plugin section.
-        let dup = format!("{good}{good}");
-        assert!(PluginState::parse(&dup).is_err());
+        // Missing version / plugins.
+        assert!(PluginState::parse_ledger(b"return { plugins = {} }\n").is_err());
+        // Comment-only file.
+        assert!(PluginState::parse_ledger(b"-- only a comment\n").is_err());
         // Oversized file.
-        let oversized = "a".repeat(MAX_STATE_FILE_BYTES + 1);
-        assert!(PluginState::parse(&oversized).is_err());
-        // Quoted value with an escape is not part of the subset.
-        assert!(
-            PluginState::parse("state_version = 1\n[plugins.\"a.b\"]\nsource = \"bun\\\"dled\"\n")
-                .is_err()
-        );
+        let oversized = vec![b'a'; MAX_STATE_FILE_BYTES + 1];
+        assert!(PluginState::parse_ledger(&oversized).is_err());
+        // Non-UTF-8 fails closed.
+        assert!(PluginState::parse_ledger(b"return {\n\xff").is_err());
+    }
+
+    #[test]
+    fn legacy_toml_parser_stays_migration_only() {
+        let text = sample_state().render_legacy_toml();
+        let parsed = PluginState::parse_legacy_toml(&text).expect("legacy parses");
+        assert_eq!(parsed, sample_state());
+        // Lua is not TOML: the legacy parser refuses it.
+        assert!(PluginState::parse_legacy_toml(&sample_state().render()).is_err());
     }
 
     #[test]
@@ -8543,6 +9547,366 @@ mod tests {
         assert!(resolve_state_path(Some("init.lua"), None, None, None).is_err());
     }
 
+    #[test]
+    fn legacy_toml_migrates_atomically_once() {
+        let dir = scratch_dir("state-migrate");
+        let ledger = state_path(&dir);
+        let legacy = dir.join(LEGACY_STATE_FILE_NAME);
+        let original = sample_state().render_legacy_toml();
+        std::fs::write(&legacy, &original).expect("legacy ledger");
+
+        let state = load_state(&ledger).expect("legacy ledger migrates");
+        let record = state
+            .get("bitty-terminal.workspace")
+            .expect("record preserved");
+        assert!(record.enabled, "enabled state preserved");
+        assert_eq!(
+            record
+                .granted
+                .iter()
+                .map(CapabilityId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["terminal.semantic-read"]
+        );
+        assert!(!legacy.exists(), "legacy moved to its backup after commit");
+        let backup = dir.join(format!("{LEGACY_STATE_FILE_NAME}{STATE_BACKUP_SUFFIX}"));
+        assert_eq!(
+            std::fs::read(&backup).expect("backup readable"),
+            original.as_bytes(),
+            "legacy bytes retained verbatim"
+        );
+        let first = std::fs::read(&ledger).expect("lua ledger written");
+        PluginState::parse_ledger(&first).expect("migrated ledger parses");
+        assert!(
+            state
+                .diagnostics()
+                .iter()
+                .any(|line| line.contains("migrated")),
+            "{:?}",
+            state.diagnostics()
+        );
+
+        // Idempotent: the second load reads the Lua ledger and never rewrites
+        // it or re-creates the legacy path.
+        let second = load_state(&ledger).expect("second load");
+        assert!(
+            second.diagnostics().is_empty(),
+            "{:?}",
+            second.diagnostics()
+        );
+        assert_eq!(
+            std::fs::read(&ledger).expect("stable bytes"),
+            first,
+            "second load must not rewrite the ledger"
+        );
+        assert!(!legacy.exists());
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .expect("dir")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(LEDGER_TEMP_PREFIX)
+            })
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_migration_never_overwrites_an_existing_ledger() {
+        let dir = scratch_dir("state-migrate-no-clobber");
+        let ledger = state_path(&dir);
+        let legacy = dir.join(LEGACY_STATE_FILE_NAME);
+        let user_ledger = sample_state()
+            .render()
+            .replace("enabled = true", "enabled = false");
+        std::fs::write(&ledger, &user_ledger).expect("existing lua ledger");
+        let legacy_body = sample_state().render_legacy_toml();
+        std::fs::write(&legacy, &legacy_body).expect("legacy ledger");
+
+        let state = load_state(&ledger).expect("existing ledger wins");
+        assert!(
+            !state
+                .get("bitty-terminal.workspace")
+                .expect("record")
+                .enabled,
+            "migration must not overwrite the existing Lua ledger"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&ledger).expect("unchanged"),
+            user_ledger
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy).expect("legacy untouched"),
+            legacy_body
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undeclared_ledger_grants_are_dropped_and_recorded() {
+        let id = "bitty-terminal.shell-integration";
+        let manifest = bundled_manifest_for(id).expect("bundled manifest");
+        let mut granted = manifest.capabilities.all_ids().expect("capabilities");
+        let extra = CapabilityId::parse("ui.rich").expect("capability");
+        granted.insert(extra.clone());
+        let mut records = BTreeMap::new();
+        records.insert(
+            id.to_string(),
+            PluginRecord {
+                source: "bundled".to_string(),
+                manifest_hash: manifest.manifest_hash(),
+                enabled: true,
+                granted,
+                denied: BTreeSet::new(),
+            },
+        );
+        let dir = scratch_dir("state-escalation");
+        let ledger = state_path(&dir);
+        std::fs::write(&ledger, PluginState::from_records(records).render()).expect("ledger");
+        let state = load_state(&ledger).expect("loads");
+        let record = state.get(id).expect("record");
+        assert!(
+            !record.granted.contains(&extra),
+            "a hand-edited ledger cannot widen authority"
+        );
+        assert!(
+            record
+                .granted
+                .iter()
+                .any(|capability| capability.as_str() == "terminal.semantic-read"),
+            "declared grants survive"
+        );
+        assert!(
+            state
+                .diagnostics()
+                .iter()
+                .any(|line| line.contains("does not declare")),
+            "{:?}",
+            state.diagnostics()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ledger_reader_refuses_symlink_and_special_files() {
+        let dir = scratch_dir("state-symlink");
+        let ledger = state_path(&dir);
+        let outside = dir.join("outside.lua");
+        std::fs::write(&outside, "return { state_version = 1, plugins = {} }\n").expect("outside");
+        std::os::unix::fs::symlink(&outside, &ledger).expect("symlink");
+        let failure = load_state(&ledger).expect_err("symlink refused");
+        assert_eq!(failure.code, "UnsafePath", "{}", failure.message);
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside unchanged"),
+            "return { state_version = 1, plugins = {} }\n"
+        );
+        std::fs::remove_file(&ledger).expect("unlink");
+        std::fs::create_dir(&ledger).expect("directory at ledger path");
+        let failure = load_state(&ledger).expect_err("special file refused");
+        assert_eq!(failure.code, "UnsafePath", "{}", failure.message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_migration_refuses_symlinked_source() {
+        let dir = scratch_dir("state-legacy-symlink");
+        let ledger = state_path(&dir);
+        let outside = dir.join("outside.toml");
+        let body = sample_state().render_legacy_toml();
+        std::fs::write(&outside, &body).expect("outside");
+        let legacy = dir.join(LEGACY_STATE_FILE_NAME);
+        std::os::unix::fs::symlink(&outside, &legacy).expect("symlink");
+        let failure = load_state(&ledger).expect_err("symlinked legacy refused");
+        assert_eq!(failure.code, "UnsafePath", "{}", failure.message);
+        assert!(!ledger.exists(), "no ledger may be written");
+        assert_eq!(std::fs::read_to_string(&outside).expect("unchanged"), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generated_defaults_are_commented_parse_and_never_overwrite() {
+        let dir = scratch_dir("generated-defaults");
+        let manifest = config_manifest("xuepoo.cfg");
+        let target = ensure_generated_plugin_config(Some(&dir), "xuepoo.cfg", &manifest)
+            .expect("generates")
+            .expect("created");
+        assert_eq!(target, dir.join("plugins").join("xuepoo.cfg.lua"));
+        let body = std::fs::read_to_string(&target).expect("generated body");
+        assert!(
+            body.contains("-- bitty-plugin-defaults: xuepoo.cfg "),
+            "{body}"
+        );
+        assert!(body.contains("-- show = true,"), "{body}");
+        assert!(
+            body.contains("--   modules: string-array = { \"workspaces\", \"clock\" }"),
+            "{body}"
+        );
+        assert!(
+            body.contains("    -- modules = { \"workspaces\", \"clock\" },"),
+            "{body}"
+        );
+        assert!(body.contains("return {\n"), "{body}");
+        assert!(body.trim_end().ends_with('}'), "{body}");
+        let mut vm = bitty_lua::ConfigLuaVm::with_limits(
+            "xuepoo.cfg",
+            bitty_lua::PlainConfigLimits::default(),
+        )
+        .expect("vm");
+        let parsed = vm.eval_plain_config(&body).expect("generated file parses");
+        assert_eq!(
+            parsed,
+            bitty_lua::PlainConfigValue::Table(Default::default())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&target)
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "generated defaults must be owner-only");
+        }
+
+        // A user edit is never overwritten, and a second run is a no-op.
+        let edited = "return { show = false }\n";
+        std::fs::write(&target, edited).expect("user edit");
+        assert!(
+            ensure_generated_plugin_config(Some(&dir), "xuepoo.cfg", &manifest)
+                .expect("second run")
+                .is_none()
+        );
+        assert_eq!(std::fs::read_to_string(&target).expect("unchanged"), edited);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn generated_defaults_skip_no_settings_legacy_and_mismatched_id() {
+        let dir = scratch_dir("generated-defaults-skips");
+        let no_settings =
+            bundled_manifest_for("bitty-terminal.shell-integration").expect("bundled");
+        assert!(
+            ensure_generated_plugin_config(
+                Some(&dir),
+                "bitty-terminal.shell-integration",
+                &no_settings
+            )
+            .expect("no settings")
+            .is_none()
+        );
+        assert!(!dir.join("plugins").exists(), "no empty file or directory");
+
+        let manifest = config_manifest("xuepoo.cfg");
+        std::fs::create_dir_all(dir.join("plugins")).expect("plugins dir");
+        let legacy = dir.join("plugins").join("xuepoo.cfg.toml");
+        std::fs::write(&legacy, "show = false\n").expect("legacy toml");
+        assert!(
+            ensure_generated_plugin_config(Some(&dir), "xuepoo.cfg", &manifest)
+                .expect("legacy skip")
+                .is_none()
+        );
+        assert!(!dir.join("plugins").join("xuepoo.cfg.lua").exists());
+        assert_eq!(
+            std::fs::read_to_string(&legacy).expect("unchanged"),
+            "show = false\n"
+        );
+
+        // A special file (directory) at the canonical path is never replaced.
+        std::fs::remove_file(&legacy).expect("remove legacy");
+        std::fs::create_dir(dir.join("plugins").join("xuepoo.cfg.lua")).expect("dir target");
+        assert!(
+            ensure_generated_plugin_config(Some(&dir), "xuepoo.cfg", &manifest)
+                .expect("special target skipped")
+                .is_none()
+        );
+        assert!(
+            dir.join("plugins").join("xuepoo.cfg.lua").is_dir(),
+            "special target untouched"
+        );
+        std::fs::remove_dir(dir.join("plugins").join("xuepoo.cfg.lua")).expect("remove dir");
+
+        let failure = ensure_generated_plugin_config(Some(&dir), "other.cfg", &manifest)
+            .expect_err("manifest id must match");
+        assert_eq!(failure.code, "ManifestInvalid");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_defaults_refuse_symlinked_target_and_dir() {
+        let dir = scratch_dir("generated-defaults-symlink");
+        let manifest = config_manifest("xuepoo.cfg");
+        let plugins = dir.join("plugins");
+        std::fs::create_dir_all(&plugins).expect("plugins dir");
+        let outside = dir.join("outside.lua");
+        std::fs::write(&outside, "return { show = false }\n").expect("outside");
+        std::os::unix::fs::symlink(&outside, plugins.join("xuepoo.cfg.lua")).expect("symlink");
+        assert!(
+            ensure_generated_plugin_config(Some(&dir), "xuepoo.cfg", &manifest)
+                .expect("present symlink is skipped")
+                .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("unchanged"),
+            "return { show = false }\n"
+        );
+
+        std::fs::remove_file(plugins.join("xuepoo.cfg.lua")).expect("unlink");
+        let evil = scratch_dir("generated-defaults-evil");
+        std::fs::remove_dir(&plugins).expect("remove plugins dir");
+        std::os::unix::fs::symlink(&evil, &plugins).expect("symlinked plugins dir");
+        let failure = ensure_generated_plugin_config(Some(&dir), "xuepoo.cfg", &manifest)
+            .expect_err("symlinked dir refused");
+        assert_eq!(failure.code, "SymlinkTarget");
+        assert!(!evil.join("xuepoo.cfg.lua").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&evil);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generated_defaults_absent_or_read_only_dir_are_graceful() {
+        let dir = scratch_dir("generated-defaults-read-only");
+        let manifest = config_manifest("xuepoo.cfg");
+        // Absent root: creation succeeds.
+        let absent = dir.join("fresh");
+        assert!(
+            ensure_generated_plugin_config(Some(&absent), "xuepoo.cfg", &manifest)
+                .expect("absent root creates")
+                .is_some()
+        );
+
+        // Read-only root: no panic, a typed failure; root users bypass mode
+        // bits, so skip when the probe create succeeds.
+        use std::os::unix::fs::PermissionsExt as _;
+        let blocked = dir.join("blocked");
+        std::fs::create_dir_all(&blocked).expect("blocked dir");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        let probe = blocked.join("probe");
+        if std::fs::create_dir(&probe).is_ok() {
+            let _ = std::fs::remove_dir(&probe);
+            let _ = std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700));
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let failure = ensure_generated_plugin_config(Some(&blocked), "xuepoo.cfg", &manifest)
+            .expect_err("read-only root refused");
+        assert!(
+            failure.code == "IoError" || failure.code == "UnsafePath",
+            "{}",
+            failure.code
+        );
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700))
+            .expect("restore");
+        assert!(!blocked.join("plugins").join("xuepoo.cfg.lua").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ── dispatch lifecycle ────────────────────────────────────────────────
 
     #[test]
@@ -8561,8 +9925,8 @@ mod tests {
         assert!(out.contains("installed"), "{out}");
         let file = state_path(&dir);
         let text = std::fs::read_to_string(&file).expect("state written");
-        assert!(text.contains("[plugins.\"bitty-terminal.shell-integration\"]"));
-        assert!(text.contains("granted = [\"terminal.semantic-read\"]"));
+        assert!(text.contains("[\"bitty-terminal.shell-integration\"] = {"));
+        assert!(text.contains("granted = { \"terminal.semantic-read\" }"));
         assert!(text.contains("enabled = true"));
 
         // list shows enabled + pinned.
@@ -8863,7 +10227,7 @@ mod tests {
             .lines()
             .map(|line| {
                 if line.trim_start().starts_with("manifest_hash = ") {
-                    format!("\tmanifest_hash = \"{stale}\"")
+                    format!("\tmanifest_hash = \"{stale}\",")
                 } else {
                     line.to_string()
                 }
@@ -9012,7 +10376,7 @@ mod tests {
             text.lines()
                 .map(|line| {
                     if line.trim_start().starts_with("manifest_hash = ") {
-                        format!("\tmanifest_hash = \"{stale}\"")
+                        format!("\tmanifest_hash = \"{stale}\",")
                     } else {
                         line.to_string()
                     }
@@ -9130,7 +10494,7 @@ mod tests {
         assert_eq!(recorded, 0);
         let after = std::fs::read_to_string(&path).expect("state readable");
         assert_eq!(after, before, "existing record untouched");
-        let state = PluginState::parse(&after).expect("parses");
+        let state = PluginState::parse_ledger(after.as_bytes()).expect("parses");
         let kept = state.get(&id).expect("record kept");
         assert!(kept.enabled, "enabled preserved");
         assert_eq!(kept.granted, granted, "grants preserved");
@@ -9142,8 +10506,8 @@ mod tests {
         let recorded =
             init_record_bundled_offline(&path, std::slice::from_ref(&id)).expect("offline ok");
         assert_eq!(recorded, 1);
-        let state =
-            PluginState::parse(&std::fs::read_to_string(&path).expect("readable")).expect("parses");
+        let state = PluginState::parse_ledger(std::fs::read(&path).expect("readable").as_slice())
+            .expect("parses");
         let fresh = state.get(&id).expect("fresh record");
         assert!(!fresh.enabled, "fresh record disabled");
         assert!(fresh.granted.is_empty() && fresh.denied.is_empty());
@@ -9579,9 +10943,9 @@ mod tests {
         assert_eq!(code, EXIT_OK, "{out}");
         assert!(out.contains("revoked"), "{out}");
         let text = std::fs::read_to_string(&file).expect("state rewritten");
-        assert!(text.contains("granted = []"), "{text}");
+        assert!(text.contains("granted = {}"), "{text}");
         assert!(text.contains("enabled = false"), "{text}");
-        assert!(text.contains("denied = []"), "{text}");
+        assert!(text.contains("denied = {}"), "{text}");
 
         // Second revoke is an idempotent no-op (no rewrite, still success).
         let (code, out, _) = run(
@@ -9629,9 +10993,9 @@ mod tests {
         assert_eq!(code, EXIT_OK, "{out}");
         assert!(out.contains("denial kept"), "{out}");
         let text = std::fs::read_to_string(&file).expect("state rewritten");
-        assert!(text.contains("granted = []"), "{text}");
+        assert!(text.contains("granted = {}"), "{text}");
         assert!(
-            text.contains("denied = [\"terminal.semantic-read\"]"),
+            text.contains("denied = { \"terminal.semantic-read\" }"),
             "{text}"
         );
         assert!(text.contains("enabled = false"), "{text}");
@@ -9737,7 +11101,7 @@ mod tests {
         assert_eq!(code, EXIT_GENERIC);
         let text = std::fs::read_to_string(&file).expect("kept");
         assert!(
-            text.contains("denied = [\"terminal.semantic-read\"]"),
+            text.contains("denied = { \"terminal.semantic-read\" }"),
             "{text}"
         );
 
@@ -9750,10 +11114,10 @@ mod tests {
         assert_eq!(code, EXIT_OK, "{out}");
         let text = std::fs::read_to_string(&file).expect("state rewritten");
         assert!(
-            text.contains("granted = [\"terminal.semantic-read\"]"),
+            text.contains("granted = { \"terminal.semantic-read\" }"),
             "{text}"
         );
-        assert!(text.contains("denied = []"), "{text}");
+        assert!(text.contains("denied = {}"), "{text}");
         assert!(text.contains("enabled = true"), "{text}");
 
         // enable works again after the re-grant.
@@ -9784,20 +11148,23 @@ mod tests {
             },
         );
         let rendered = PluginState::from_records(records).render();
-        assert!(rendered.contains("denied = [\"ui.rich\"]"), "{rendered}");
-        let parsed = PluginState::parse(&rendered).expect("parses");
+        assert!(rendered.contains("denied = { \"ui.rich\" }"), "{rendered}");
+        let parsed = PluginState::parse_ledger(rendered.as_bytes()).expect("parses");
         assert_eq!(parsed.render(), rendered);
 
         // A capability cannot be both granted and denied (hostile edit fails closed).
         let hostile = rendered.replace(
-            "denied = [\"ui.rich\"]",
-            "denied = [\"terminal.semantic-read\"]",
+            "denied = { \"ui.rich\" }",
+            "denied = { \"terminal.semantic-read\" }",
         );
-        assert!(PluginState::parse(&hostile).is_err());
+        assert!(PluginState::parse_ledger(hostile.as_bytes()).is_err());
 
         // Unknown capabilities in `denied` fail closed like `granted`.
-        let hostile = rendered.replace("denied = [\"ui.rich\"]", "denied = [\"nope.everything\"]");
-        assert!(PluginState::parse(&hostile).is_err());
+        let hostile = rendered.replace(
+            "denied = { \"ui.rich\" }",
+            "denied = { \"nope.everything\" }",
+        );
+        assert!(PluginState::parse_ledger(hostile.as_bytes()).is_err());
     }
 
     #[test]
@@ -10243,7 +11610,7 @@ mod tests {
         assert!(out.contains("+ will grant (1)"), "{out}");
         let state = profile_state(&dir).expect("state written");
         assert!(
-            state.contains("granted = [\"terminal.semantic-read\"]"),
+            state.contains("granted = { \"terminal.semantic-read\" }"),
             "{state}"
         );
         assert!(state.contains("enabled = true"), "{state}");
@@ -10266,7 +11633,7 @@ mod tests {
         assert!(out.contains("+ will grant: none"), "{out}");
         assert!(out.contains("stays disabled"), "{out}");
         let state = profile_state(&dir).expect("state written");
-        assert!(state.contains("granted = []"), "{state}");
+        assert!(state.contains("granted = {}"), "{state}");
         assert!(state.contains("enabled = false"), "{state}");
         assert!(
             !state.contains("terminal.semantic-read"),
@@ -10331,7 +11698,7 @@ mod tests {
         assert!(out.contains("granted 'terminal.semantic-read'"), "{out}");
         let state = profile_state(&dir).expect("state written");
         assert!(
-            state.contains("granted = [\"terminal.semantic-read\"]"),
+            state.contains("granted = { \"terminal.semantic-read\" }"),
             "{state}"
         );
         assert!(state.contains("enabled = false"), "{state}");

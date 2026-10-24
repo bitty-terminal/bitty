@@ -489,18 +489,18 @@ fn associated_text_without_report_all_keys_is_inert() {
 fn enter_tab_backspace_keep_legacy_bytes_under_disambiguate() {
     let mut rt = make_runtime();
     send(&mut rt, b"\x1b[=1u");
-    assert_eq!(
-        rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Pressed)),
-        Some(b"\r".to_vec())
-    );
-    assert_eq!(
-        rt.handle_key_event_ref(&named_key(NamedKey::Tab, PressState::Pressed)),
-        Some(b"\t".to_vec())
-    );
-    assert_eq!(
-        rt.handle_key_event_ref(&named_key(NamedKey::Backspace, PressState::Pressed)),
-        Some(b"\x7f".to_vec())
-    );
+    for (key, expected) in [
+        (NamedKey::Enter, b"\r".as_slice()),
+        (NamedKey::Tab, b"\t".as_slice()),
+        (NamedKey::Backspace, b"\x7f".as_slice()),
+        (NamedKey::Delete, b"\x1b[3~".as_slice()),
+    ] {
+        assert_eq!(
+            rt.handle_key_event_ref(&named_key(key, PressState::Pressed)),
+            Some(expected.to_vec()),
+            "unmodified {key:?} must retain its legacy bytes under disambiguation"
+        );
+    }
 }
 
 #[test]

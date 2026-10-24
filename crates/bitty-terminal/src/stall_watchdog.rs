@@ -1556,15 +1556,32 @@ fn normalize_absolute(path: &Path) -> Option<PathBuf> {
     Some(normalized)
 }
 
-/// Create the state directory with owner-only permissions.
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+/// Create or harden the state directory with owner-only permissions.
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
-            .create(dir)
+            .create(dir)?;
+
+        // Open the directory itself without following a final symlink.  Using
+        // fchmod on this handle avoids a path-based permission update race.
+        let mut options = OpenOptions::new();
+        options.read(true);
+        options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+        let directory = options.open(dir)?;
+        let metadata = directory.metadata()?;
+        if !metadata.is_dir() {
+            return Err(invalid_input("state directory is not a directory"));
+        }
+        check_owned_directory_owner(&metadata)?;
+        nix::sys::stat::fchmod(&directory, nix::sys::stat::Mode::from_bits_truncate(0o700))
+            .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
+        check_owned_directory(&directory.metadata()?)
     }
     #[cfg(not(unix))]
     {
@@ -1608,11 +1625,8 @@ fn check_owned_directory(meta: &std::fs::Metadata) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        if meta.uid() != nix::unistd::geteuid().as_raw() {
-            return Err(permission_denied(
-                "state directory is owned by another user",
-            ));
-        }
+
+        check_owned_directory_owner(meta)?;
         if meta.mode() & 0o022 != 0 {
             return Err(permission_denied("state directory is group/world writable"));
         }
@@ -1620,6 +1634,18 @@ fn check_owned_directory(meta: &std::fs::Metadata) -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         let _ = meta;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn check_owned_directory_owner(meta: &std::fs::Metadata) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if meta.uid() != nix::unistd::geteuid().as_raw() {
+        return Err(permission_denied(
+            "state directory is owned by another user",
+        ));
     }
     Ok(())
 }

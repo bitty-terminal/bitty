@@ -477,6 +477,15 @@ nix-lock-check:
 nix-lock-test:
     ./scripts/tests/check-nix-lock.test.sh
 
+# Guard against crane's stubbed dependency cache while the workspace [patch]
+# table points external crates at local ones (#2591). Static; no Nix needed.
+nix-patch-check:
+    ./scripts/check-nix-patch-stub.sh
+
+# Stubbed contract test for the patch/stub guard: no Nix or network needed.
+nix-patch-test:
+    ./scripts/tests/check-nix-patch-stub.test.sh
+
 markdownlint *args:
     bunx --bun markdownlint-cli2@0.23.1 {{args}}
 
@@ -505,7 +514,7 @@ commit-check message:
 # Local CI-equivalent gate. Registry-free by contract: `catalog-test` runs
 # hermetic fixtures; the strict registry drift gate is `check-registry` and
 # needs a bitty-plugins checkout (see CONTRIBUTING.md).
-check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test apt-gpg-import-test release-channels-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test nix-lock-test m1-matrix-test compat-matrix-test compat-freshness-test perf-disk-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-test
+check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test apt-gpg-import-test release-channels-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test nix-lock-test m1-matrix-test compat-matrix-test compat-freshness-test perf-disk-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-test nix-patch-test
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

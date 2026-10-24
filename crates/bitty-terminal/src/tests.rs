@@ -1116,6 +1116,27 @@ return {}
     }
 
     #[test]
+    fn about_to_wait_arms_the_surface_retry_deadline() {
+        let mut fixture = Fixture::new("surface-retry-wake");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        fixture.app.test_surface_retry_deadline = Some(deadline);
+        fixture.operations.borrow_mut().clear();
+        let mut context = EventContext::recording(&fixture.operations);
+        <TerminalApp as AppHandler>::handle_event(
+            &mut fixture.app,
+            &mut context,
+            PlatformEvent::AboutToWait,
+        );
+        let operations = fixture.operations.borrow();
+        assert!(
+            operations.iter().any(
+                |operation| matches!(operation, RecordingOperation::WaitUntil(at) if *at == deadline)
+            ),
+            "AboutToWait must arm the surface-retry wake: {operations:?}"
+        );
+    }
+
+    #[test]
     fn input_vm_boundary_recording_context_refuses_windows() {
         let operations = RefCell::new(Vec::new());
         let mut context = EventContext::recording(&operations);
@@ -7461,6 +7482,7 @@ fn drive_picker_key_loop(
         &mut history,
         false,
         &mut wait,
+        None,
     );
     let printed = String::from_utf8(output).expect("picker output is UTF-8");
     (result, printed, history)
@@ -7619,6 +7641,7 @@ fn init_key_loop_invalid_retries_then_succeeds() {
         &mut history,
         false,
         &mut wait,
+        None,
     );
     // A rejected value reprompts (buffer cleared); empty Enter then takes
     // the cursor default.
@@ -7656,6 +7679,7 @@ fn init_key_loop_too_many_invalid_aborts() {
         &mut history,
         false,
         &mut wait,
+        None,
     );
     assert!(
         result
@@ -7704,6 +7728,7 @@ fn init_ask_option_falls_back_to_line_without_raw_tty() {
         |line: &str| Ok(line.to_string()),
         &mut history,
         true,
+        None,
     );
     assert_eq!(result.expect("line fallback accepted"), "beta");
 }
@@ -7744,6 +7769,7 @@ fn init_key_loop_inplace_repaints_with_cursor_up() {
         &mut history,
         true,
         &mut wait,
+        None,
     );
     assert_eq!(result.expect("inplace pick accepted"), "beta");
     let printed = String::from_utf8(output).expect("picker output is UTF-8");
@@ -8019,6 +8045,21 @@ fn init_preview_never_writes_config_file() {
         "cancel-path preview writes no file"
     );
 
+    // Cursor preview (two theme moves) then Esc still writes nothing: the
+    // preview only mutates the in-memory overlay and the preview session.
+    let (result, _, _) = drive_init_wizard_with_preview(
+        "\nj\nj\n\x1b\n",
+        Some("/bin/bash"),
+        &InitOverrides::default(),
+        bitty_config::fallback_builtin(),
+    );
+    assert!(result.is_err(), "Esc cancels a previewing wizard");
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).expect("sentinel intact"),
+        "-- sentinel\n",
+        "cursor preview writes no file"
+    );
+
     // Subcommand level: a TTY cancel (EOF before any answer) exits 1 and
     // creates neither the target nor a backup.
     let target = dir.join("fresh").join("init.lua");
@@ -8060,6 +8101,346 @@ fn init_preview_never_writes_config_file() {
         "cancel writes no backup"
     );
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// -- `bitty init` theme picker live preview (issue #2435) -----------------
+//
+// Moving the theme cursor previews the highlighted preset through the same
+// palette setter `theme.set`/`ThemeChanged` use, paints the themed strip,
+// never snapshots a step or writes a file, and rolls back on Esc.
+
+/// Deterministic preview session (no PTY, no display) seeded from `baseline`.
+fn preview_session(baseline: &bitty_config::EffectiveConfig) -> Runtime {
+    let cfg = runtime_config_from_effective(baseline).expect("preview cfg");
+    let runtime =
+        Runtime::with_deterministic_rasterizer(cfg).expect("deterministic runtime builds");
+    let _ = crate::config_reload::take_app_adoption();
+    runtime
+}
+
+/// One theme option exactly as the wizard's theme step builds it.
+fn theme_option(theme: &bitty_config::theme::Theme) -> crate::init::InitOptionItem {
+    crate::init::InitOptionItem {
+        label: theme.name.to_string(),
+        value_text: theme.name.to_string(),
+        style_fg: Some(theme.foreground),
+        style_bg: Some(theme.background),
+    }
+}
+
+/// The exact `set_theme_palette` value a resolved preset produces.
+fn expected_palette(theme: &bitty_config::theme::Theme) -> bitty_runtime::ThemePalette {
+    bitty_runtime::ThemePalette::from_theme(theme)
+}
+
+#[test]
+fn init_theme_preview_cursor_move_applies_palette_without_a_step() {
+    let baseline = bitty_config::fallback_builtin();
+    let mut preview = InitPreview::enabled(baseline.clone());
+    let mut live = preview_session(&baseline);
+    let before = live.config().theme;
+    let (candidate, status) = bitty_config::theme::resolve_theme_with_status(Some("github-light"));
+    assert_eq!(status, bitty_config::theme::ThemeResolution::Named);
+
+    let mut driver = crate::init::InitThemePreview::new(&mut preview, Some(&mut live));
+    let strip = driver
+        .frame(&theme_option(candidate), true)
+        .expect("themed strip with color");
+
+    // The install goes through the same `set_theme_palette` sink as
+    // `theme.set`, config reload, and `ThemeChanged`.
+    assert_eq!(
+        live.config().theme,
+        expected_palette(candidate),
+        "cursor move installs the candidate palette"
+    );
+    assert_ne!(live.config().theme, before, "the preview really changed");
+    let [r, g, b] = candidate.background;
+    assert_eq!(live.active_background(), [r, g, b, 0xFF]);
+    // The strip paints the same resolved palette (no second renderer).
+    assert!(strip.contains(&format!("\u{1b}[48;2;{r};{g};{b}m")));
+    let [fr, fg, fb] = candidate.foreground;
+    assert!(strip.contains(&format!("\u{1b}[38;2;{fr};{fg};{fb}m")));
+    for ansi in [candidate.ansi[1], candidate.ansi[4]] {
+        assert!(
+            strip.contains(&format!("\u{1b}[48;2;{};{};{}m", ansi[0], ansi[1], ansi[2])),
+            "ANSI swatch missing from strip: {strip:?}"
+        );
+    }
+    assert!(strip.contains(candidate.name), "strip names the candidate");
+    assert!(
+        strip.ends_with("\u{1b}[0m"),
+        "strip restores the SGR state: {strip:?}"
+    );
+    // Preview is not an answered step: no snapshot, baseline untouched.
+    assert!(
+        preview.snapshots().is_empty(),
+        "cursor preview is not a step"
+    );
+    assert_eq!(
+        preview.current().appearance.theme.as_deref(),
+        Some(candidate.name)
+    );
+    assert_eq!(preview.baseline(), &baseline);
+    assert!(!live.has_pty(), "preview never spawns a shell");
+}
+
+#[test]
+fn init_theme_key_loop_previews_every_cursor_move_before_enter() {
+    let baseline = bitty_config::fallback_builtin();
+    let mut preview = InitPreview::enabled(baseline.clone());
+    let mut live = preview_session(&baseline);
+    let presets = bitty_config::theme::list_presets();
+    let options = vec![
+        theme_option(bitty_config::theme::resolve_theme(Some("dark"))),
+        theme_option(presets[1]),
+        theme_option(presets[2]),
+    ];
+    let mut input = std::io::BufReader::new(b"jj\r".as_slice());
+    let mut output = Vec::new();
+    let mut history: Vec<String> = Vec::new();
+    let mut wait = |inp: &mut dyn std::io::BufRead| -> bool {
+        matches!(inp.fill_buf(), Ok(buf) if !buf.is_empty())
+    };
+    let mut seen: Vec<String> = Vec::new();
+    {
+        let mut driver = crate::init::InitThemePreview::new(&mut preview, Some(&mut live));
+        let mut hook = |item: &crate::init::InitOptionItem| -> Option<String> {
+            seen.push(item.value_text.clone());
+            driver.frame(item, false)
+        };
+        let result = crate::init::init_picker_key_loop(
+            &mut input,
+            &mut output,
+            "Theme [dark]:",
+            &options,
+            0,
+            false,
+            false,
+            crate::init::init_parse_theme_answer,
+            &mut history,
+            false,
+            &mut wait,
+            Some(&mut hook),
+        );
+        assert_eq!(
+            result.expect("Enter selects the previewed theme"),
+            options[2].value_text
+        );
+    }
+    // One preview per frame: the entry frame plus one per cursor move.
+    assert_eq!(
+        seen,
+        vec![
+            options[0].value_text.clone(),
+            options[1].value_text.clone(),
+            options[2].value_text.clone()
+        ],
+        "every cursor position previews before Enter"
+    );
+    assert!(
+        preview.snapshots().is_empty(),
+        "the key loop previews, Enter is the commit"
+    );
+    assert_eq!(
+        live.config().theme,
+        expected_palette(presets[2]),
+        "the palette followed the cursor before Enter"
+    );
+}
+
+#[test]
+fn init_theme_preview_esc_restores_the_previous_theme() {
+    let mut baseline = bitty_config::fallback_builtin();
+    baseline.appearance.theme = Some("github-light".to_string());
+    let mut preview = InitPreview::enabled(baseline.clone());
+    let mut live = preview_session(&baseline);
+    let before = live.config().theme;
+    let third = bitty_config::theme::list_presets()[2];
+
+    let mut input = std::io::BufReader::new("\nj\nj\n\x1b\n".as_bytes());
+    let mut output = Vec::new();
+    let result = run_init_interactive_with_preview(
+        &mut input,
+        &mut output,
+        Some("/bin/bash"),
+        &|p| p == "/bin/bash" || p == "/bin/sh",
+        &InitOverrides::default(),
+        true,
+        Some(&mut preview),
+        Some(&mut live),
+        false,
+    );
+    let err = result.expect_err("Esc cancels");
+    assert!(err.contains("cancelled"), "unexpected: {err}");
+    // The preview ran first: the third preset's strip was painted before Esc.
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    let [r, g, b] = third.background;
+    assert!(
+        printed.contains(&format!("\u{1b}[48;2;{r};{g};{b}m")),
+        "cursor preview painted the candidate strip, got:\n{printed}"
+    );
+    assert!(
+        printed.matches("  preview ").count() >= 3,
+        "one strip per previewed frame, got:\n{printed}"
+    );
+    // Cancel restores the previous theme in memory and in the live session.
+    assert_eq!(preview.current(), &baseline);
+    assert_eq!(
+        preview.snapshots().len(),
+        1,
+        "only the shell step committed"
+    );
+    assert_eq!(live.config().theme, before, "live palette restored");
+    assert!(!live.has_pty(), "cancel spawns nothing");
+}
+
+#[test]
+fn init_theme_preview_enter_commits_the_previewed_theme() {
+    let baseline = bitty_config::fallback_builtin();
+    // Shell, then the theme step: two `j` moves and Enter, then defaults.
+    let stdin = format!("\nj\nj\n{}", "\n".repeat(10));
+    let (result, _, preview) = drive_init_wizard_with_preview(
+        &stdin,
+        Some("/bin/bash"),
+        &InitOverrides::default(),
+        baseline.clone(),
+    );
+    let answers = result.expect("previewed theme committed");
+    let third = bitty_config::theme::list_presets()[2];
+    assert_eq!(answers.theme, third.name);
+    assert_eq!(preview.snapshots().len(), 11, "every prompted step commits");
+    assert_eq!(
+        preview.snapshots()[1].appearance.theme.as_deref(),
+        Some(third.name),
+        "Enter commits the cursor theme as the theme step"
+    );
+    assert_eq!(preview.baseline(), &baseline);
+}
+
+#[test]
+fn init_theme_preview_invalid_candidate_keeps_previous_and_diagnoses() {
+    let mut baseline = bitty_config::fallback_builtin();
+    baseline.appearance.theme = Some("github-light".to_string());
+    let mut preview = InitPreview::enabled(baseline.clone());
+    let mut live = preview_session(&baseline);
+    let before = live.config().theme;
+    let bogus = crate::init::InitOptionItem {
+        label: "bogus".to_string(),
+        value_text: "definitely-not-a-theme".to_string(),
+        style_fg: None,
+        style_bg: None,
+    };
+
+    let strip = {
+        let mut driver = crate::init::InitThemePreview::new(&mut preview, Some(&mut live));
+        driver
+            .frame(&bogus, true)
+            .expect("fallback strip keeps the frame height constant")
+    };
+    // Fail-soft: the previous theme stays in the overlay, the session, and the
+    // strip, and no panic happens.
+    assert_eq!(preview.current(), &baseline);
+    assert_eq!(live.config().theme, before);
+    let [r, g, b] = bitty_config::theme::resolve_theme(Some("github-light")).background;
+    assert!(strip.contains(&format!("\u{1b}[48;2;{r};{g};{b}m")));
+    assert!(strip.contains("github-light"), "strip shows the kept theme");
+    // The existing Enter diagnostic is unchanged.
+    let err = crate::init::init_parse_theme_answer("definitely-not-a-theme")
+        .expect_err("unknown theme still rejects");
+    assert!(err.contains("unknown theme"), "unexpected: {err}");
+
+    // Wizard level: the reprompt shows the same diagnostic, then the default
+    // commits; nothing crashes and the overlay ends on the commit.
+    let stdin = format!("\ndefinitely-not-a-theme\n{}", "\n".repeat(10));
+    let (result, printed, committed) = drive_init_wizard_with_preview(
+        &stdin,
+        Some("/bin/bash"),
+        &InitOverrides::default(),
+        baseline,
+    );
+    let answers = result.expect("retry then default accepted");
+    assert_eq!(answers.theme, "dark");
+    assert!(
+        printed.contains("unknown theme; run 'bitty list themes'"),
+        "existing diagnostic preserved, got:\n{printed}"
+    );
+    assert_eq!(
+        committed.snapshots()[1].appearance.theme.as_deref(),
+        Some("dark")
+    );
+}
+
+#[test]
+fn init_theme_preview_absent_when_stdout_is_not_a_tty() {
+    use std::io::IsTerminal as _;
+    // The harness stdout is the process stdout: skip when a developer runs
+    // `cargo test` from a terminal, since the dispatch would then (correctly)
+    // treat stdout as interactive.
+    if std::io::stdout().is_terminal() {
+        return;
+    }
+    // The harness stdout is piped: even with a TTY stdin the dispatch builds
+    // no preview overlay, so there is no echo, no strip, and no ANSI, while
+    // the selected theme still lands in the file.
+    let dir = init_test_dir("theme-preview-no-tty-out");
+    let target = dir.join("init.lua");
+    let home = dir.display().to_string();
+    let mut args = Args::new();
+    args.init_word = true;
+    args.config_path = Some(target.display().to_string());
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), true);
+    let stdin = format!("\nj\nj\n{}", "\n".repeat(11));
+    let mut input = std::io::BufReader::new(stdin.as_bytes());
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    let printed = String::from_utf8(output).expect("wizard output is UTF-8");
+    assert!(
+        !printed.contains("(preview:"),
+        "no echo without a TTY stdout"
+    );
+    assert!(
+        !printed.contains("  preview "),
+        "no themed strip without a TTY stdout"
+    );
+    assert!(!printed.contains("\u{1b}["), "no ANSI without a TTY stdout");
+    let third = bitty_config::theme::list_presets()[2];
+    let body =
+        std::fs::read_to_string(dir.join("profiles").join("default.lua")).expect("written profile");
+    assert!(
+        body.contains(&format!("theme = \"{}\"", third.name)),
+        "the cursor selection still commits: {body}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_yes_never_previews() {
+    // `--yes` takes the non-interactive path: no prompts, echo, or strip.
+    let dir = init_test_dir("theme-preview-yes");
+    let target = dir.join("init.lua");
+    let home = dir.display().to_string();
+    let mut args = Args::new();
+    args.init_word = true;
+    args.init_yes = true;
+    args.config_path = Some(target.display().to_string());
+    let env = init_env(None, Some("/bin/bash"), None, Some(&home), true);
+    let mut input: &[u8] = b"";
+    let mut output = Vec::new();
+    assert_eq!(
+        run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
+        0
+    );
+    let printed = String::from_utf8(output).expect("output is UTF-8");
+    assert!(!printed.contains("(preview:"));
+    assert!(!printed.contains("  preview "));
+    assert!(!printed.contains("\u{1b}["));
+    let body = std::fs::read_to_string(dir.join("profiles").join("default.lua")).expect("profile");
+    assert!(body.contains("theme = \"dark\""), "defaults still written");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -8205,39 +8586,45 @@ fn init_live_preview_enabled_gate() {
     // preview; every machine flow keeps the in-memory behavior.
     let args = Args::new();
     let env = init_env(None, Some("/bin/bash"), None, Some("/tmp"), true);
-    assert!(crate::init::init_live_preview_enabled(&args, &env));
+    assert!(crate::init::init_live_preview_enabled(&args, &env, true));
 
     let piped = init_env(None, Some("/bin/bash"), None, Some("/tmp"), false);
     assert!(
-        !crate::init::init_live_preview_enabled(&args, &piped),
+        !crate::init::init_live_preview_enabled(&args, &piped, true),
         "piped stdin keeps in-memory preview"
+    );
+
+    let piped_out = init_env(None, Some("/bin/bash"), None, Some("/tmp"), true);
+    assert!(
+        !crate::init::init_live_preview_enabled(&args, &piped_out, false),
+        "piped stdout has no preview surface"
     );
 
     let mut yes = Args::new();
     yes.init_yes = true;
     assert!(
-        !crate::init::init_live_preview_enabled(&yes, &env),
+        !crate::init::init_live_preview_enabled(&yes, &env, true),
         "--yes has no steps to push"
     );
 
     let mut safe = Args::new();
     safe.safe = true;
     assert!(
-        !crate::init::init_live_preview_enabled(&safe, &env),
+        !crate::init::init_live_preview_enabled(&safe, &env, true),
         "--safe keeps in-memory preview"
     );
 
     let mut headless = Args::new();
     headless.headless = true;
     assert!(
-        !crate::init::init_live_preview_enabled(&headless, &env),
+        !crate::init::init_live_preview_enabled(&headless, &env, true),
         "--headless keeps in-memory preview"
     );
 
     let mut testmode = Args::new();
     testmode.test_mode = true;
     assert!(
-        !crate::init::init_live_preview_enabled(&testmode, &env),
+        !crate::init::init_live_preview_enabled(&testmode, &env, true),
         "--test-mode keeps in-memory preview"
     );
 }

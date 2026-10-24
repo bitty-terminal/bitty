@@ -254,6 +254,8 @@ pub const MAX_STATE_PLUGINS: usize = bitty_config::plugin_ledger::MAX_LEDGER_PLU
 pub const MAX_STATE_GRANTS: usize = bitty_config::plugin_ledger::MAX_LEDGER_CAPABILITIES;
 /// Maximum managed-ledger lines.
 pub const MAX_STATE_LINES: usize = bitty_config::plugin_ledger::MAX_LEDGER_FILE_LINES;
+/// Maximum bytes in one managed-ledger line.
+pub const MAX_STATE_LINE_BYTES: usize = bitty_config::plugin_ledger::MAX_LEDGER_LINE_BYTES;
 /// Hex digest length (`Sha256`, as produced by `PluginManifest::manifest_hash`).
 pub const HEX_HASH_LEN: usize = 64;
 /// Maximum bytes read from one consent answer line.
@@ -1523,16 +1525,11 @@ impl PluginState {
                 ledger_string_literal(&record.manifest_hash)
             );
             let _ = writeln!(out, "            enabled = {},", record.enabled);
-            let _ = writeln!(
-                out,
-                "            granted = {},",
-                render_ledger_set(&record.granted)
-            );
-            let _ = writeln!(
-                out,
-                "            denied = {},",
-                render_ledger_set(&record.denied)
-            );
+            out.push_str("            granted = ");
+            render_ledger_set(&mut out, &record.granted, "            ");
+            out.push_str(",\n            denied = ");
+            render_ledger_set(&mut out, &record.denied, "            ");
+            out.push_str(",\n");
             out.push_str("        },\n");
         }
         out.push_str("    },\n}\n");
@@ -1623,17 +1620,55 @@ fn ledger_string_literal(value: &str) -> String {
     out
 }
 
-/// Render one sorted capability set as a Lua array literal.
-fn render_ledger_set(capabilities: &BTreeSet<CapabilityId>) -> String {
+/// Write one sorted capability set as a Lua array literal.
+///
+/// Small sets stay inline. When the inline form would approach the parser's
+/// [`MAX_STATE_LINE_BYTES`] ceiling, entries are wrapped one per line instead:
+/// a capability identifier is capped at 512 bytes by the closed grammar, so a
+/// single indented entry always fits. Writing the whole set inline made a
+/// multi-grant record exceed the parser bound and could make migration commit
+/// an unreadable ledger (issue #2576 review F1).
+fn render_ledger_set(out: &mut String, capabilities: &BTreeSet<CapabilityId>, indent: &str) {
+    if capabilities.is_empty() {
+        out.push_str("{}");
+        return;
+    }
     let items: Vec<String> = capabilities
         .iter()
         .map(|capability| format!("\"{}\"", ledger_string_literal(capability.as_str())))
         .collect();
-    if items.is_empty() {
-        "{}".to_string()
-    } else {
-        format!("{{ {} }}", items.join(", "))
+    let inline = format!("{{ {} }}", items.join(", "));
+    // `granted = ` / `denied = ` plus the trailing comma is at most 11 bytes;
+    // use 12 for headroom.
+    if indent.len() + 12 + inline.len() <= MAX_STATE_LINE_BYTES {
+        out.push_str(&inline);
+        return;
     }
+    out.push_str("{\n");
+    for capability in capabilities {
+        let _ = writeln!(
+            out,
+            "{indent}    \"{}\",",
+            ledger_string_literal(capability.as_str())
+        );
+    }
+    let _ = write!(out, "{indent}}}");
+}
+
+/// Re-parse one rendered ledger and require the same records back.
+///
+/// This is the pre-commit guard shared by normal saves and one-time
+/// migration: a renderer regression must never replace state with bytes the
+/// bounded parser rejects on the next command. Diagnostics are intentionally
+/// not compared (they are load-time, not ledger state).
+fn validate_rendered_ledger(rendered: &str, state: &PluginState) -> Result<(), StateError> {
+    let parsed = PluginState::parse_ledger(rendered.as_bytes())?;
+    if parsed.records != state.records {
+        return Err(StateError::from_message(
+            "rendered ledger does not round-trip to the same records".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn flush_section(
@@ -2093,9 +2128,27 @@ fn load_legacy_or_empty(ledger_path: &Path) -> Result<PluginState, PluginFailure
             backup.display()
         )),
         Ok(None) => {}
-        Err(warning) => state.push_diagnostic(warning),
+        // An unreadable render is an internal invariant failure: fail closed
+        // and leave the legacy ledger in place rather than serve bytes the
+        // next command would reject.
+        Err(MigrationError::InvalidRender(message)) => {
+            return Err(PluginFailure::plugin("StateInvalid", message));
+        }
+        // Filesystem/ownership failures keep the readable legacy state in
+        // service and are retried on the next command.
+        Err(MigrationError::Warning(warning)) => state.push_diagnostic(warning),
     }
     Ok(state)
+}
+
+/// Why one-time migration did not commit.
+#[derive(Debug)]
+enum MigrationError {
+    /// The rendered Lua would be rejected; nothing was written or moved.
+    InvalidRender(String),
+    /// The environment (ownership, permissions, concurrent file) blocked the
+    /// write; the legacy ledger remains authoritative and readable.
+    Warning(String),
 }
 
 /// Sibling legacy ledger path for one canonical ledger path.
@@ -2158,37 +2211,58 @@ fn finalize_loaded_state(mut state: PluginState) -> Result<PluginState, PluginFa
 /// Writes the Lua ledger with a 0600 temp file and a no-clobber hard-link
 /// commit (an existing Lua ledger or symlink fails closed, never overwrites),
 /// then moves the TOML bytes to `<legacy>.bak`. Returns the backup path.
+///
+/// The rendered bytes are re-parsed (and must round-trip to the same records)
+/// before any filesystem mutation. A rejected render is a hard error and
+/// leaves the legacy TOML in place; an I/O failure keeps the legacy ledger
+/// readable and is retried later.
+///
+/// The `.bak` is a byte-for-byte move of the legacy file, so a permissive
+/// legacy mode is preserved when the final rename succeeds; the copy fallback
+/// writes it 0600. Either way it contains only the old machine ledger, never
+/// new authority.
 fn migrate_legacy_ledger(
     ledger_path: &Path,
     legacy_path: &Path,
     state: &PluginState,
-) -> Result<Option<PathBuf>, String> {
+) -> Result<Option<PathBuf>, MigrationError> {
     let rendered = state.render();
     if rendered.len() > MAX_STATE_FILE_BYTES {
-        return Err(format!(
+        return Err(MigrationError::InvalidRender(format!(
             "could not migrate the legacy plugin ledger: rendered ledger exceeds \
-             {MAX_STATE_FILE_BYTES} bytes; legacy TOML left in place"
-        ));
+             {MAX_STATE_FILE_BYTES} bytes; no Lua ledger written and \
+             {LEGACY_STATE_FILE_NAME} left in place"
+        )));
     }
+    // Validate before the commit point: a renderer regression must leave the
+    // legacy ledger authoritative rather than commit bytes the next command
+    // rejects and doctor later quarantines (issue #2576 review F1).
+    validate_rendered_ledger(&rendered, state).map_err(|error| {
+        MigrationError::InvalidRender(format!(
+            "could not migrate the legacy plugin ledger: the rendered Lua ledger would be \
+             rejected ({error}); no Lua ledger written and {LEGACY_STATE_FILE_NAME} left in place"
+        ))
+    })?;
     if let Some(parent) = ledger_path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).map_err(|error| {
-                format!(
+                MigrationError::Warning(format!(
                     "could not migrate the legacy plugin ledger to '{}': {error}; \
                      legacy TOML left in place",
                     ledger_path.display()
-                )
+                ))
             })?;
-            harden_managed_dir(parent).map_err(|failure| failure.message)?;
+            harden_managed_dir(parent)
+                .map_err(|failure| MigrationError::Warning(failure.message))?;
         }
     }
     write_new_file_atomic(ledger_path, rendered.as_bytes(), LEDGER_TEMP_PREFIX).map_err(
         |error| {
-            format!(
+            MigrationError::Warning(format!(
                 "could not migrate the legacy plugin ledger to '{}': {error}; \
                  legacy TOML left in place",
                 ledger_path.display()
-            )
+            ))
         },
     )?;
     // The commit point has passed: the Lua ledger is authoritative. A failure
@@ -2197,10 +2271,10 @@ fn migrate_legacy_ledger(
     backup_name.push(STATE_BACKUP_SUFFIX);
     let backup = PathBuf::from(backup_name);
     retain_legacy_backup(legacy_path, &backup).map_err(|error| {
-        format!(
+        MigrationError::Warning(format!(
             "migrated the plugin ledger but could not retain the legacy TOML at '{}': {error}",
             backup.display()
-        )
+        ))
     })?;
     Ok(Some(backup))
 }
@@ -2449,7 +2523,7 @@ fn harden_managed_dir(_path: &Path) -> Result<(), PluginFailure> {
 fn save_state(path: &Path, state: &PluginState) -> Result<Option<PathBuf>, PluginFailure> {
     let rendered = state.render();
     // Never write bytes this module cannot read back (defense in depth).
-    PluginState::parse_ledger(rendered.as_bytes()).map_err(|error| {
+    validate_rendered_ledger(&rendered, state).map_err(|error| {
         PluginFailure::generic(
             "Internal",
             format!("bitty plugin: internal error: rendered ledger invalid: {error}"),
@@ -4739,12 +4813,19 @@ fn ensure_generated_plugin_config(
             format!("bitty plugin: settings schema for '{id}' is invalid: {error}"),
         )
     })?;
-    let paths = plugin_settings::plugin_config_paths(config_dir, id, None).ok_or_else(|| {
-        PluginFailure::plugin(
-            "UnsafePath",
-            format!("bitty plugin: '{id}' cannot name a per-plugin config file"),
-        )
-    })?;
+    // Alias admission needs a discovered-id set; passing this plugin as its
+    // only claimant makes `plugin_config_paths` resolve its short-name path.
+    // The alias check below must stay live (a `None` discovered set made it
+    // dead code and generated a canonical file that shadowed an existing
+    // `<short>.lua` user file; issue #2576 review F2).
+    let discovered = [id.to_string()];
+    let paths = plugin_settings::plugin_config_paths(config_dir, id, Some(&discovered))
+        .ok_or_else(|| {
+            PluginFailure::plugin(
+                "UnsafePath",
+                format!("bitty plugin: '{id}' cannot name a per-plugin config file"),
+            )
+        })?;
     // Presence of any candidate (including a symlink) means the user owns the
     // surface or a legacy file is active: never create the Lua file.
     if exists_no_follow(&paths.canonical_lua) || exists_no_follow(&paths.legacy_toml) {
@@ -7670,31 +7751,37 @@ fn run_plugin_doctor(
                     state.remove(id);
                 }
             }
-            // Always write the canonical Lua ledger on repair: a valid legacy
-            // TOML is migrated here, and a Lua ledger with stale records is
-            // rewritten. `save_state` is atomic and 0600.
-            match save_state(state_path, &state) {
-                Ok(backup) => {
-                    if !unknown.is_empty() {
+            // Rewrite only when repair has something to change: stale records
+            // or a legacy TOML that needs migration. A healthy, current Lua
+            // ledger is left byte-identical (no `.bak` churn on every run).
+            let needs_write = !unknown.is_empty() || ledger.legacy;
+            if needs_write {
+                match save_state(state_path, &state) {
+                    Ok(backup) => {
+                        if !unknown.is_empty() {
+                            let _ = writeln!(
+                                output,
+                                "  removed {} stale ledger record(s) ({})",
+                                unknown.len(),
+                                unknown.join(", ")
+                            );
+                        }
+                        if let Some(backup) = backup {
+                            let _ =
+                                writeln!(output, "  previous ledger kept at {}", backup.display());
+                        }
+                    }
+                    Err(failure) => {
+                        repair_failures += 1;
                         let _ = writeln!(
                             output,
-                            "  removed {} stale ledger record(s) ({})",
-                            unknown.len(),
-                            unknown.join(", ")
+                            "  [fail] cannot rewrite ledger: {}",
+                            failure.message
                         );
                     }
-                    if let Some(backup) = backup {
-                        let _ = writeln!(output, "  previous ledger kept at {}", backup.display());
-                    }
                 }
-                Err(failure) => {
-                    repair_failures += 1;
-                    let _ = writeln!(
-                        output,
-                        "  [fail] cannot rewrite ledger: {}",
-                        failure.message
-                    );
-                }
+            } else {
+                let _ = writeln!(output, "  ledger already consistent");
             }
             let legacy_path = legacy_state_path(state_path);
             if std::fs::symlink_metadata(&legacy_path).is_ok() {
@@ -9429,6 +9516,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn long_capability_sets_wrap_and_round_trip() {
+        let long_a = format!("fs.read:{}", "a".repeat(500));
+        let long_b = format!("fs.read:{}", "b".repeat(500));
+        let mut granted = BTreeSet::new();
+        granted.insert(CapabilityId::parse(&long_a).expect("long cap a"));
+        granted.insert(CapabilityId::parse(&long_b).expect("long cap b"));
+        granted.insert(CapabilityId::parse("terminal.semantic-read").expect("cap"));
+        let mut records = BTreeMap::new();
+        records.insert(
+            "xuepoo.longcaps".to_string(),
+            PluginRecord {
+                source: "bundled".to_string(),
+                manifest_hash: "00".repeat(32),
+                enabled: true,
+                granted: granted.clone(),
+                denied: BTreeSet::new(),
+            },
+        );
+        let state = PluginState::from_records(records);
+        let rendered = state.render();
+        for line in rendered.lines() {
+            assert!(
+                line.len() <= MAX_STATE_LINE_BYTES,
+                "rendered line exceeds {MAX_STATE_LINE_BYTES}: {}",
+                line.len()
+            );
+        }
+        let parsed = PluginState::parse_ledger(rendered.as_bytes()).expect("long caps parse");
+        assert_eq!(
+            parsed.get("xuepoo.longcaps").expect("record").granted.len(),
+            3
+        );
+        assert_eq!(parsed, state);
+        validate_rendered_ledger(&rendered, &state).expect("guard accepts the render");
+        let tampered = rendered.replace("enabled = true", "enabled = false");
+        assert!(
+            validate_rendered_ledger(&tampered, &state).is_err(),
+            "guard must reject a render whose records drift"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn saved_manifest_is_owner_only_on_unix() {
@@ -9616,6 +9745,47 @@ mod tests {
     }
 
     #[test]
+    fn migration_refuses_an_unreadable_render_without_committing() {
+        let dir = scratch_dir("state-migrate-invalid-render");
+        let ledger = state_path(&dir);
+        let legacy = dir.join(LEGACY_STATE_FILE_NAME);
+        let body = sample_state().render_legacy_toml();
+        std::fs::write(&legacy, &body).expect("legacy ledger");
+        // A record the renderer can stringify but the parser rejects (invalid
+        // plugin id) must stop migration before the commit point.
+        let mut records = BTreeMap::new();
+        records.insert(
+            "../escape".to_string(),
+            PluginRecord {
+                source: "bundled".to_string(),
+                manifest_hash: "00".repeat(32),
+                enabled: true,
+                granted: BTreeSet::new(),
+                denied: BTreeSet::new(),
+            },
+        );
+        let bad = PluginState::from_records(records);
+        let error = migrate_legacy_ledger(&ledger, &legacy, &bad)
+            .expect_err("unreadable render is refused");
+        let MigrationError::InvalidRender(message) = error else {
+            panic!("render rejection must be a hard migration error");
+        };
+        assert!(message.contains("would be rejected"), "{message}");
+        assert!(!ledger.exists(), "nothing committed");
+        assert_eq!(
+            std::fs::read_to_string(&legacy).expect("legacy intact"),
+            body,
+            "legacy TOML must not move"
+        );
+        assert!(
+            !dir.join(format!("{LEGACY_STATE_FILE_NAME}{STATE_BACKUP_SUFFIX}"))
+                .exists(),
+            "no backup may be created before the commit point"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn legacy_migration_never_overwrites_an_existing_ledger() {
         let dir = scratch_dir("state-migrate-no-clobber");
         let ledger = state_path(&dir);
@@ -9726,6 +9896,13 @@ mod tests {
         assert_eq!(failure.code, "UnsafePath", "{}", failure.message);
         assert!(!ledger.exists(), "no ledger may be written");
         assert_eq!(std::fs::read_to_string(&outside).expect("unchanged"), body);
+
+        // A special file (directory) at the legacy path is refused too.
+        std::fs::remove_file(&legacy).expect("unlink");
+        std::fs::create_dir(&legacy).expect("directory at legacy path");
+        let failure = load_state(&ledger).expect_err("special legacy source refused");
+        assert_eq!(failure.code, "UnsafePath", "{}", failure.message);
+        assert!(!ledger.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -9833,6 +10010,15 @@ mod tests {
         let failure = ensure_generated_plugin_config(Some(&dir), "other.cfg", &manifest)
             .expect_err("manifest id must match");
         assert_eq!(failure.code, "ManifestInvalid");
+
+        // A manifest whose settings schema does not validate is refused
+        // before any path is touched.
+        let mut invalid = config_manifest("other.cfg");
+        invalid.settings[0].key = "Not A Valid Key".to_string();
+        let failure = ensure_generated_plugin_config(Some(&dir), "other.cfg", &invalid)
+            .expect_err("invalid settings schema refused");
+        assert_eq!(failure.code, "ManifestInvalid", "{}", failure.message);
+        assert!(!dir.join("plugins").join("other.cfg.lua").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

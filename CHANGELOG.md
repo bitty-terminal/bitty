@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live theme preview in `bitty init` (#2435):** the theme picker now
+  previews the highlighted preset as the cursor moves instead of only moving
+  the highlight. On an interactive terminal each `j`/`k` or arrow-key move
+  installs the candidate through the same palette setter config reload and
+  `ThemeChanged` use (`Runtime::set_theme_palette`) and repaints a themed
+  chrome strip (background, foreground, the 16 ANSI colors, cursor,
+  selection, and the focused/idle border roles), so palettes can be compared
+  before committing. The preview is non-persistent: it writes no config,
+  profile, session, or plugin-state file and records no answered step. Enter
+  commits the highlighted theme; Esc or end-of-input restores the theme that
+  was in effect before the preview. `--yes`, preset `--profile` seeds, a
+  non-TTY stdin, and a piped stdout keep their existing non-interactive
+  behavior, and an unresolvable candidate leaves the previous theme with the
+  existing retry diagnostic.
 - **Ghostty-style `+<action>` helper aliases (#2464):** `bitty +list-themes`,
   `+list-colors`, `+list-fonts`, `+list-keybinds`, `+list-actions`,
   `+list-plugins`, `+list-extensions`, `+show-config`, `+validate-config`, and
@@ -55,6 +69,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Thin rounded Core chrome tokens (#2468):** help/which-key, command
+  palette and presentation/plugin overlays, panel rings, and band chrome now
+  share one `bitty-render::chrome` token layer: one-physical-pixel muted
+  borders, a 6 px radius, 8 px padding, raised/overlay surface tones, and the
+  theme's accepted focused/idle outline pair. Help and overlay cards paint as
+  rounded SDF surfaces with glyph clipping at the corner arc; one-row bands
+  use rounded box-drawing corner glyphs when the corner cell is blank, with a
+  documented light-box/square fallback. Plugin row `fg`/`bg`/`bold` values
+  still win inside the Core card, and a new overlay-card/content/ring layer
+  order keeps row backgrounds visible while the ring stays above content.
+
 - **Default new-panel layout is Spiral (#2571):** `Mod+N` now creates the
   next pane with the 4-way clockwise `Spiral` policy (Right -> Down -> Left
   -> Up around the focused pane) instead of `Balanced` bisect-largest.
@@ -68,9 +93,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Fresh configs keep the gap-aware 10x4 minimum, focus/close ordering, and
   workspace IDs; the spiral phase resets to Right whenever focus lands on a
   pane outside the active creation chain or the fallback runs.
+- **Thin rounded Core chrome tokens (#2468):** help/which-key, command
+  palette and presentation/plugin overlays, panel rings, and band chrome now
+  share one `bitty-render::chrome` token layer: one-physical-pixel muted
+  borders, a 6 px radius, 8 px padding, raised/overlay surface tones, and the
+  theme's accepted focused/idle outline pair. Help and overlay cards paint as
+  rounded SDF surfaces with glyph clipping at the corner arc; one-row bands
+  use rounded box-drawing corner glyphs when the corner cell is blank, with a
+  documented light-box/square fallback. Plugin row `fg`/`bg`/`bold` values
+  still win inside the Core card, and a new overlay-card/content/ring layer
+  order keeps row backgrounds visible while the ring stays above content.
 
 ### Fixed
 
+- **Lua ledger migration and generated defaults hardening (#2576):** migration
+  now renders capability arrays with bounded per-line wrapping and re-parses
+  the rendered bytes (requiring the same records back) before the atomic
+  commit; a rejected render is a hard error that leaves the legacy TOML in
+  place instead of committing a ledger the next command cannot read. Longer
+  parameterized grant sets no longer exceed the 1024-byte parser line bound.
+  Generated per-plugin defaults also inspect the short-name alias path, so an
+  existing `<name>.lua` user file is never shadowed; `plugin doctor --repair`
+  leaves an already-current Lua ledger byte-identical (no `.bak` churn), and
+  the completion-candidate tests read the Lua ledger.
 - **Copy-mode selection spans scrollback pages (#2470):** a visual selection is
   no longer capped at the visible page. Wheel and page keys scroll the
   transcript while a drag is in flight (the selection owns the wheel over PTY
@@ -82,19 +127,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history is gone. The mechanism stays in Core selection/history paging; the
   copy-mode plugin remains a bounded snapshot policy over the same public
   surfaces, and no private API is added.
+- **Panel delete no longer flashes a stale accent ring at the removed slot
+  (#2577):** closing a focused pane kept its last presented decoration ring
+  as RFC-0002 closing chrome, and that stale ring was composited after every
+  live leaf. For the close duration it painted the deleted pane's full accent
+  rounded rectangle over the sibling that had already expanded into the slot;
+  under `catppuccin-mocha`'s teal focused outline the owner saw a green flash.
+  Closing chrome is now ownership-gated against the committed live
+  allocations (the invariant is live ownership wins over stale chrome), so no
+  frame paints retained accent chrome inside the removed rectangle: the
+  surviving owner's surface covers it as its geometry reaches the slot, and
+  the band its `Resize` tween has not covered yet clears to the theme
+  background instead of showing a stale accent border. Applies to tiled,
+  stacked, zoomed, floating, and pinned deletes under any theme. Deterministic
+  headless frame regressions compare each close frame with an instant-delete
+  reference in `catppuccin-mocha` and `github-light`.
 
-### Changed
+### Fixed
 
-- **Thin rounded Core chrome tokens (#2468):** help/which-key, command
-  palette and presentation/plugin overlays, panel rings, and band chrome now
-  share one `bitty-render::chrome` token layer: one-physical-pixel muted
-  borders, a 6 px radius, 8 px padding, raised/overlay surface tones, and the
-  theme's accepted focused/idle outline pair. Help and overlay cards paint as
-  rounded SDF surfaces with glyph clipping at the corner arc; one-row bands
-  use rounded box-drawing corner glyphs when the corner cell is blank, with a
-  documented light-box/square fallback. Plugin row `fg`/`bg`/`bold` values
-  still win inside the Core card, and a new overlay-card/content/ring layer
-  order keeps row backgrounds visible while the ring stays above content.
+- **Nix build with patched workspace crates (#2591):** `nix build .#bitty`
+  failed in the `bitty-deps` derivation because crane's dummy source replaced
+  `crates/bitty-pty`/`crates/bitty-plugin-host` with empty stubs while the
+  external `bitty-execution` dependency resolves those crates through the
+  workspace `[patch]` table. The flake now builds a single real-source
+  derivation (`cargoArtifacts = null`), and `just nix-patch-test` fails if
+  dummy-source caching returns while those patch paths exist.
 
 ## [0.0.27] - 2026-10-23
 

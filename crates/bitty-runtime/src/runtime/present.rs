@@ -233,8 +233,17 @@ const BELL_FLASH_BG: bitty_render::grid::Rgba8 = [0x5A, 0x4A, 0x00, 0xB0];
 /// presented verbatim.
 pub(super) struct PresentedLeaf {
     /// Painted content origin (physical px, before window padding) the list
-    /// was translated against. A mismatch forces a fresh leaf render.
+    /// was translated against. A mismatch forces a fresh leaf render, unless
+    /// the difference is a pure translation of the same content grid (issue
+    /// #2573 drag ghost / sub-cell move): then the window-relative
+    /// primitives are reused shifted by the origin delta instead.
     pub(super) origin: (i32, i32),
+    /// Painted content extent (physical px) the list was rendered for.
+    ///
+    /// A translated reuse requires an identical extent: only then is the
+    /// retained list exactly the render a fresh pass would place at the new
+    /// origin (same grid dims, same clip size). A real resize re-renders.
+    pub(super) content_size: (u32, u32),
     /// Scroll offset the list was rendered at. A mismatch forces a fresh
     /// leaf render (scrollback composites a different cell window).
     pub(super) scroll_offset: usize,
@@ -2336,6 +2345,10 @@ impl Runtime {
         self.reflow_present_layout(&frames);
 
         let mut pending_full = self.pending_full_redraw;
+        // Issue #2573: a paint-only invalidation still owes one frame (the
+        // drag ghost moved) but must not force the full per-leaf pass. A full
+        // invalidation always owns the frame when both flags are armed.
+        let mut paint_only = self.pending_paint_redraw && !pending_full;
         // Collect allocations deterministically BEFORE the idle check so
         // geometry-only changes are visible (CTX-0228). `present_frames`
         // is pure and bounded by the leaf count.
@@ -2457,8 +2470,14 @@ impl Runtime {
         let animations_active = self.animator.is_active(now) || self.fx.is_active(now);
         if animations_active || expired_animations {
             // A live (or just-completed) animation is a presentation-only
-            // change: force the full per-leaf path for this frame.
-            pending_full = true;
+            // change: it owes a frame but never invalidates leaf content.
+            // Issue #2573: forcing the full per-leaf pass here made every
+            // drag frame re-examine every visible cell for the whole 150 ms
+            // ring fade even though only chrome moved. Retained reuse now
+            // decides per leaf: an interpolated origin/grid mismatch or a
+            // changed focus fade re-renders, while ring/shadow/glow alpha is
+            // painted live and safely reuses the retained primitives.
+            paint_only = true;
         }
         // CTX-1335: apply paint-only bounds interpolation. The logical
         // `allocations` below stay final (hit-testing, PTY size, and terminal
@@ -2477,7 +2496,7 @@ impl Runtime {
 
         // Frame-on-demand: no origin advanced and no forced redraw -> idle.
         // `last == u64::MAX` marks the first frame (always present).
-        if !pending_full && !origins_changed && last != u64::MAX {
+        if !pending_full && !paint_only && !origins_changed && last != u64::MAX {
             // bitty#2486 (review): an idle tick still consumed the PTY burst
             // that produced no damage (a terminal query answered with a reply
             // only). Nothing is being held, so close the settle window here;
@@ -2502,13 +2521,16 @@ impl Runtime {
             self.last_presented_allocations = allocations;
             self.last_presented_focus = focused;
             self.pending_full_redraw = false;
+            self.pending_paint_redraw = false;
             return None;
         }
 
         // CTX-0386: genuine full invalidation only. `pending_full` already
         // funnels every window resize, DPI/font change, layout or focus edit,
-        // appearance/animation transition, alt-screen latch, and explicit
-        // `pending_full_redraw`; `last == u64::MAX` marks the first frame.
+        // alt-screen latch, and explicit `pending_full_redraw`; `last ==
+        // u64::MAX` marks the first frame. Issue #2573: presentation-only
+        // animation and drag ticks arm `paint_only` instead, so a frame is
+        // still committed while retained per-leaf reuse stays in effect.
         // Everything else re-renders per origin from its own damage ring, so a
         // split no longer repaints every pane just because sessions exist.
         let full_frame = pending_full || last == u64::MAX;
@@ -2722,17 +2744,32 @@ impl Runtime {
                     .filter(|(index, _)| *index > leaf_index)
                     .map(|(_, rect)| *rect)
                     .collect();
-                let reuse = !full_frame
-                    && !leaf_damaged
-                    && self
-                        .presented_leaf_frames
-                        .get(&view_id)
-                        .is_some_and(|leaf| {
-                            leaf.origin == (frame.content.x, frame.content.y)
-                                && leaf.scroll_offset
-                                    == view.map(|v| v.scroll_offset()).unwrap_or(0)
-                                && leaf.fade_factor == fade
-                        });
+                // Issue #2573: retained reuse now also covers a pure
+                // translation of the same content grid. The drag ghost
+                // (tiled Mod+drag) and Alt+drag sub-cell offset move a frame
+                // without touching its grid, so re-examining every cell
+                // would buy no pixel: the renderer emits window-relative
+                // primitives, so shifting the retained list by the origin
+                // delta is bit-identical to a fresh pass. A size change
+                // (real resize or reflow) still forces a fresh render.
+                let reuse_delta = if full_frame || leaf_damaged {
+                    None
+                } else {
+                    self.presented_leaf_frames.get(&view_id).and_then(|leaf| {
+                        if leaf.scroll_offset != view.map(|v| v.scroll_offset()).unwrap_or(0)
+                            || leaf.fade_factor != fade
+                        {
+                            return None;
+                        }
+                        let dx = frame.content.x.saturating_sub(leaf.origin.0);
+                        let dy = frame.content.y.saturating_sub(leaf.origin.1);
+                        if dx == 0 && dy == 0 {
+                            return Some((0, 0));
+                        }
+                        (leaf.content_size == (frame.content.width, frame.content.height))
+                            .then_some((dx, dy))
+                    })
+                };
 
                 // CTX-1148 (#1978) + CTX-1271 (#2138): detached floats
                 // must paint opaque. The grid fills cover only the content
@@ -2917,28 +2954,48 @@ impl Runtime {
                     }
                 }
 
-                if reuse {
+                if let Some((dx, dy)) = reuse_delta {
                     let leaf = self
                         .presented_leaf_frames
                         .get(&view_id)
                         .expect("reuse requires a retained leaf");
                     built.needs_draw |= !leaf.fills.is_empty() || !leaf.glyphs.is_empty();
-                    built.fills.extend(leaf.fills.iter().cloned());
+                    if dx == 0 && dy == 0 {
+                        built.fills.extend(leaf.fills.iter().cloned());
+                    } else {
+                        // Pure translation: shift every retained primitive
+                        // (and refresh the glyph clip from the live frame,
+                        // which is the same rounded inner arc moved with the
+                        // frame) without re-examining the grid.
+                        built.fills.extend(leaf.fills.iter().map(|fill| {
+                            let mut fill = fill.clone();
+                            fill.rect.x = px_add(fill.rect.x, dx);
+                            fill.rect.y = px_add(fill.rect.y, dy);
+                            fill
+                        }));
+                    }
                     // CTX-1165 (#1993): a retained lower leaf still occludes
                     // under a higher float. The stored list is reused verbatim
                     // except for glyphs sharing area with a higher float
                     // frame, which the upper opaque fill must own alone.
                     // Fills stay: the upper opaque fill already covers them in
                     // paint order.
-                    if higher_floats.is_empty() {
-                        built.glyphs.extend(leaf.glyphs.iter().cloned());
-                    } else {
-                        for glyph in &leaf.glyphs {
-                            if glyph_occluded_by_floats(glyph.dest, glyph.size, &higher_floats) {
-                                continue;
-                            }
-                            built.glyphs.push(glyph.clone());
+                    for glyph in &leaf.glyphs {
+                        let mut glyph = glyph.clone();
+                        if dx != 0 || dy != 0 {
+                            glyph.dest[0] = px_add(glyph.dest[0], dx);
+                            glyph.dest[1] = px_add(glyph.dest[1], dy);
                         }
+                        // The live frame clip is authoritative: a pure
+                        // translation moves the same rounded inner arc, so
+                        // reattaching it can never drift from a fresh pass.
+                        glyph.clip = frame_clip;
+                        if !higher_floats.is_empty()
+                            && glyph_occluded_by_floats(glyph.dest, glyph.size, &higher_floats)
+                        {
+                            continue;
+                        }
+                        built.glyphs.push(glyph);
                     }
                     if is_focused_view && !scrolled {
                         built.cursor = self.reused_cursor_paint(
@@ -3216,6 +3273,7 @@ impl Runtime {
                     view_id,
                     PresentedLeaf {
                         origin: (frame.content.x, frame.content.y),
+                        content_size: (frame.content.width, frame.content.height),
                         scroll_offset: view.map(|v| v.scroll_offset()).unwrap_or(0),
                         fade_factor: fade,
                         fills: fills.clone(),
@@ -5459,6 +5517,7 @@ impl Runtime {
             ..
         } = basis;
         self.pending_full_redraw = false;
+        self.pending_paint_redraw = false;
 
         if !layers.any_needs_draw
             && layers.combined_fills.is_empty()
@@ -7000,6 +7059,219 @@ mod content_padding_tests {
         );
         assert!(rt.set_decoration(Decoration::ZERO).is_ok());
         assert_eq!(rt.decoration(), Decoration::ZERO);
+    }
+}
+
+// Issue #2573 (CTX-1485): a paint-only tiled drag must present the same
+// pixels a full per-leaf pass would, while doing bounded work per motion.
+#[cfg(test)]
+mod tiled_drag_present_tests {
+    //! The drag ghost translates retained primitives instead of re-rendering
+    //! every pane. Two identically driven runtimes prove the fast frame is
+    //! byte-identical to a forced full render on every motion, including the
+    //! live drag-ring animation, and the renderer counters prove the work
+    //! stays bounded instead of scaling with the visible cell area.
+    use super::*;
+    use crate::SplitAxis;
+    use bitty_platform::{KeyEvent, KeyLocation, MouseButton, MouseEvent, NamedKey, PressState};
+
+    fn drag_runtime() -> Runtime {
+        drag_runtime_with(true)
+    }
+
+    fn drag_runtime_with(live_animations: bool) -> Runtime {
+        // Scrollbar chrome is unrelated to the drag path and its auto
+        // show/hide would arm a legitimate one-off full frame mid-drag.
+        let mut config = RuntimeConfig {
+            scrollbar_mode: bitty_ui::ScrollbarMode::Hidden,
+            ..RuntimeConfig::default()
+        };
+        if !live_animations {
+            config.animations.duration_ms = [0; crate::runtime::AnimationKind::COUNT];
+        }
+        let mut rt = Runtime::with_deterministic_rasterizer(config).expect("runtime");
+        let view = ViewId::new(1);
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(view, 80, 24)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+                LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
+            ),
+        ));
+        rt.handle_resize(PhysicalSize::new(1200, 800))
+            .expect("resize applies");
+        for row in 0..22u8 {
+            let line = format!("drag-row-{row:02} ABCDEFGHIJKLMNOP\r\n");
+            rt.handle_pty_bytes(line.as_bytes());
+        }
+        // No caret blink: the drag fixture compares pixels across clocks.
+        rt.handle_pty_bytes(b"\x1b[?25l");
+        rt.tick().expect("settle present");
+        rt
+    }
+
+    fn point(rt: &Runtime, view: ViewId, fx: f64, fy: f64) -> CursorPosition {
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .expect("presented view");
+        let pad = f64::from(rt.window_padding_physical());
+        CursorPosition {
+            x: pad + f64::from(frame.frame.x) + f64::from(frame.frame.width) * fx,
+            y: pad + f64::from(frame.frame.y) + f64::from(frame.frame.height) * fy,
+        }
+    }
+
+    fn alt(state: PressState) -> KeyEvent {
+        KeyEvent {
+            logical_key: bitty_platform::LogicalKey::Named(NamedKey::Alt),
+            text: None,
+            location: KeyLocation::Standard,
+            state,
+            repeat: false,
+            is_synthetic: false,
+        }
+    }
+
+    fn mouse(button: MouseButton, state: PressState) -> MouseEvent {
+        MouseEvent::new(button, state)
+    }
+
+    #[test]
+    fn drag_fast_frames_match_a_forced_full_render_every_motion() {
+        let (mut fast, mut full) = (drag_runtime(), drag_runtime());
+        let t0 = std::time::Instant::now();
+        let grab = point(&fast, ViewId::new(1), 0.5, 0.5);
+        let end = point(&fast, ViewId::new(3), 0.5, 0.5);
+        for rt in [&mut fast, &mut full] {
+            rt.handle_cursor_moved_at(grab, t0);
+            rt.handle_key_event(alt(PressState::Pressed));
+            rt.handle_mouse_input_at(mouse(MouseButton::Left, PressState::Pressed), t0);
+        }
+        let grab_fast = fast.tick_at(t0).expect("grab frame");
+        full.pending_full_redraw = true;
+        full.tick_at(t0).expect("grab reference");
+        assert_eq!(
+            fast.headless_rgba(),
+            full.headless_rgba(),
+            "grab frame must match the forced full render"
+        );
+
+        let steps = 24u64;
+        for step in 1..=steps {
+            let t = t0 + std::time::Duration::from_millis(step * 16);
+            let f = step as f64 / steps as f64;
+            let pos = CursorPosition {
+                x: grab.x + (end.x - grab.x) * f,
+                y: grab.y + (end.y - grab.y) * f,
+            };
+            for rt in [&mut fast, &mut full] {
+                rt.handle_cursor_moved_at(pos, t);
+            }
+            full.pending_full_redraw = true;
+            let fast_stats = fast.tick_at(t).expect("fast drag frame");
+            let full_stats = full.tick_at(t).expect("full drag reference");
+            let (fast_rgba, full_rgba) = (fast.headless_rgba(), full.headless_rgba());
+            if fast_rgba != full_rgba {
+                if let (Some(a), Some(b)) = (fast_rgba.as_ref(), full_rgba.as_ref()) {
+                    let w = fast.present_plan_extent().width as usize;
+                    let first = a
+                        .iter()
+                        .zip(b.iter())
+                        .position(|(x, y)| x != y)
+                        .unwrap_or(usize::MAX);
+                    panic!(
+                        "step {step}: first diff byte {first} (px {},{}); fast cells {} full cells {}; fast={:?} full={:?}",
+                        (first / 4) % w,
+                        (first / 4) / w,
+                        fast_stats.cells_examined,
+                        full_stats.cells_examined,
+                        &a[first..first + 4],
+                        &b[first..first + 4],
+                    );
+                }
+                panic!("step {step}: drag frame mismatch with no rgba on one side");
+            }
+            assert!(
+                fast_stats.cells_examined <= 4,
+                "step {step}: drag motion must reuse retained leaves, got {} cells",
+                fast_stats.cells_examined
+            );
+            assert!(
+                full_stats.cells_examined > 1000,
+                "step {step}: reference must be a full leaf pass, got {}",
+                full_stats.cells_examined
+            );
+            let ghost = fast.tiled_drag_preview_frame().expect("ghost frame");
+            let painted = fast.paint_frames_at(t);
+            let painted_ghost = painted.last().expect("painted frame");
+            assert_eq!(
+                painted_ghost.view,
+                ViewId::new(1),
+                "step {step}: ghost paints last"
+            );
+            assert_eq!(painted_ghost.frame, ghost.frame);
+            assert_eq!(painted_ghost.content, ghost.content);
+        }
+        assert!(
+            grab_fast.cells_examined > 1000,
+            "the grab itself is a full invalidation, got {}",
+            grab_fast.cells_examined
+        );
+
+        // Release commits one swap/insert and the committed frame must again
+        // match a full render.
+        let release_at = t0 + std::time::Duration::from_millis((steps + 1) * 16);
+        for rt in [&mut fast, &mut full] {
+            rt.handle_mouse_input_at(mouse(MouseButton::Left, PressState::Released), release_at);
+            rt.handle_key_event(alt(PressState::Released));
+        }
+        full.pending_full_redraw = true;
+        fast.tick_at(release_at).expect("commit frame");
+        full.tick_at(release_at).expect("commit reference");
+        assert_eq!(
+            fast.headless_rgba(),
+            full.headless_rgba(),
+            "the committed drop must match a full render"
+        );
+        assert!(
+            !fast.tiled_drag_active(),
+            "release must end the drag before the commit frame"
+        );
+    }
+
+    #[test]
+    fn a_paint_only_tick_presents_once_and_then_idles() {
+        let mut rt = drag_runtime_with(false);
+        let t0 = std::time::Instant::now();
+        let grab = point(&rt, ViewId::new(1), 0.5, 0.5);
+        rt.handle_cursor_moved_at(grab, t0);
+        rt.handle_key_event(alt(PressState::Pressed));
+        rt.handle_mouse_input_at(mouse(MouseButton::Left, PressState::Pressed), t0);
+        rt.tick_at(t0).expect("grab presents");
+        rt.handle_cursor_moved_at(
+            CursorPosition {
+                x: grab.x + 120.0,
+                y: grab.y + 60.0,
+            },
+            t0,
+        );
+        let at = t0 + std::time::Duration::from_millis(16);
+        assert!(rt.tick_at(at).is_some(), "motion must present");
+        assert!(
+            rt.tick_at(at).is_none(),
+            "a paint-only frame must not leave a periodic present armed"
+        );
+        assert!(
+            rt.tick_at(at + std::time::Duration::from_millis(8))
+                .is_none(),
+            "no idle drag repaint without motion"
+        );
     }
 }
 

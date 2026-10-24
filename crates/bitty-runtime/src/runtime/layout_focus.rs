@@ -564,7 +564,11 @@ impl Runtime {
         let armed = self.animator.trigger(kind, surface, now);
         if armed {
             // A new animation needs a frame even when no PTY bytes moved.
-            self.pending_full_redraw = true;
+            // Issue #2573: animation state is presentation-only (ring alpha,
+            // bounds interpolation), so it owes a paint frame but never a
+            // full per-leaf rebuild; retained reuse re-renders only leaves
+            // whose origin/size/fade actually changed.
+            self.pending_paint_redraw = true;
         }
         armed
     }

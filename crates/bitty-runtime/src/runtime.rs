@@ -557,6 +557,17 @@ pub struct Runtime {
     /// epoch-consistent frame. See `runtime::present::reject_stale_atlas_frame`.
     stale_atlas_frame_rejects: u8,
     pending_full_redraw: bool,
+    /// Present-only redraw arming (issue #2573): forces one frame without
+    /// invalidating the retained per-leaf primitives.
+    ///
+    /// Drag gestures move a paint-only preview: solver geometry, grids, and
+    /// PTY winsizes are unchanged, so a full leaf re-render would re-examine
+    /// every visible cell for no pixel gain. This flag lets the present path
+    /// emit the moved frame from retained primitives while still committing
+    /// a frame even when no origin advanced. Cleared with the full flag on
+    /// every consumed frame; a full invalidation always wins when both are
+    /// armed.
+    pending_paint_redraw: bool,
     /// Minimum interval between presented frames (CTX-1231, #2093).
     ///
     /// Present-latest coalescing: when dirty ticks arrive faster than this
@@ -1543,6 +1554,7 @@ impl std::fmt::Debug for Runtime {
             .field("pending_input_len", &self.pending_input.len())
             .field("pending_input_dropped", &self.pending_input_dropped)
             .field("pending_full_redraw", &self.pending_full_redraw)
+            .field("pending_paint_redraw", &self.pending_paint_redraw)
             .field("presents_coalesced", &self.presents_coalesced)
             .field("coalesced_pending", &self.coalesced_pending)
             .field("leaf_count", &self.layout.leaf_count())
@@ -1875,6 +1887,7 @@ impl Runtime {
             presented_leaf_frames: std::collections::BTreeMap::new(),
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
+            pending_paint_redraw: false,
             min_present_interval: std::time::Duration::ZERO,
             last_present_at: None,
             presents_coalesced: 0,
@@ -2165,6 +2178,7 @@ impl Runtime {
             presented_leaf_frames: std::collections::BTreeMap::new(),
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
+            pending_paint_redraw: false,
             min_present_interval: std::time::Duration::ZERO,
             last_present_at: None,
             presents_coalesced: 0,

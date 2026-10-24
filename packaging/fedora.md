@@ -36,13 +36,15 @@ Both `bitty` and `bitty-terminal` are recognized package names (via `Provides: b
 The release workflow (`.github/workflows/release.yml`) builds `.rpm` packages
 via `nfpm` for both `x86_64` and `aarch64`. Once built and verified through
 the install smoke gate (`scripts/install-smoke.sh --distro fedora`), the
-`copr` job publishes the artifacts directly to the Copr project using
-`copr-cli uploadrpm` under `environment: release`. `copr-cli` is installed
-into a per-run Python virtual environment (`python3 -m venv`) because Ubuntu
-24.04 does not package it:
+`copr` job builds a source RPM from `packaging/bitty.spec` and the published
+`.tar.zst` bundles, then submits it with `copr-cli build` to every enabled
+x86_64/aarch64 chroot under `environment: release`. Direct RPM upload is not
+used because this Copr instance disables it. `copr-cli` is installed into a
+per-run Python virtual environment (`python3 -m venv`), and `rpmbuild`/`zstd`
+are installed on the runner:
 
 ```sh
-copr-cli uploadrpm -r <chroot> xuepoo/bitty-terminal <path-to-rpm>
+copr-cli build -r <chroot> ... xuepoo/bitty-terminal <path-to-srpm>
 ```
 
 A standalone RPM spec file is also maintained at `packaging/bitty.spec` for

@@ -9,7 +9,7 @@
 //! | Section    | Source (cold path, once)                                      |
 //! |------------|---------------------------------------------------------------|
 //! | diagnostics| `AppConfig` (merged effective config + startup paths)         |
-//! | plugins    | managed `bitty-plugins.toml` + bundled catalog + store index  |
+//! | plugins    | managed `bitty-plugins.lua` + bundled catalog + store index   |
 //! | settings   | manifest `[settings]` declarations + per-plugin user files    |
 //! | extensions | two install tiers + the recorded activation projection        |
 //! | profiles   | `profiles/<name>.lua` names under the config root             |
@@ -782,7 +782,7 @@ mod tests {
     #[test]
     fn unreadable_ledger_marks_the_plugin_section_unavailable() {
         let base = scratch("ledger");
-        let ledger = base.join("bitty-plugins.toml");
+        let ledger = base.join("bitty-plugins.lua");
         std::fs::write(&ledger, "not a ledger").expect("write");
         let mut context =
             RuntimeInspectContext::from_app(&app_config(), &InspectEnv::default(), false);

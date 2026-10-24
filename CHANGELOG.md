@@ -37,6 +37,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   always win, `alt`-bearing suggestions follow `mod_key`, suspend/unload/crash
   and reload remove the generation's chords, and colliding suggestions produce
   bounded warnings naming the deterministic winner and the shadowed command.
+- **Lua plugin ledger and generated per-plugin defaults (#2576):** the
+  machine-managed plugin ledger is now data-only Lua at
+  `$XDG_CONFIG_HOME/bitty/bitty-plugins.lua`; a legacy
+  `bitty-plugins.toml` is migrated once (atomically, 0600, no-clobber) and
+  retained as `bitty-plugins.toml.bak`. The Lua file is parsed without a Lua
+  VM (bounded bytes/lines/keys/strings, UTF-8 only, duplicate keys fail
+  closed), and a hand-edited ledger cannot widen authority: grants for a
+  bundled record are intersected with the manifest declared for its recorded
+  `manifest_hash`, and undeclared grants are dropped with a diagnostic. A
+  successful plugin install or first enable also creates
+  `$XDG_CONFIG_HOME/bitty/plugins/<owner>.<name>.lua` once, containing
+  commented manifest defaults for plugins that declare `[settings]`. Existing
+  files, user edits, legacy `<id>.toml` settings, and settings-less manifests
+  are never touched; `plugin config scaffold --force` remains the explicit
+  overwrite path and `plugin info` points at the canonical file.
 
 ### Fixed
 

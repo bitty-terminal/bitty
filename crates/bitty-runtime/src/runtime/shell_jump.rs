@@ -162,6 +162,7 @@ impl Runtime {
             }
         };
         if changed {
+            self.capture_view_scroll_anchor(focused);
             self.pending_full_redraw = true;
         }
         changed

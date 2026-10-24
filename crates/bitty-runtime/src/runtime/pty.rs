@@ -822,6 +822,29 @@ impl Runtime {
     /// No cache re-attribution here: callers own it at their boundary so the
     /// pane-swap pair never caches the temporarily swapped-in grid.
     pub(super) fn handle_pty_bytes_inner(&mut self, bytes: &[u8]) {
+        // A detached viewport stores its top line identity before Terminal
+        // Truth grows. The numeric offset is relative to the live bottom and
+        // would otherwise move the user's history window down on every line.
+        let anchored_view = self.fed_grid_view();
+        if let Some(view) = anchored_view {
+            let line_id = self.find_view(view).and_then(|leaf| {
+                let offset = leaf.scroll_offset();
+                if offset == 0 {
+                    return None;
+                }
+                let scrollback_len = self.state.scrollback_len();
+                let total = scrollback_len.saturating_add(self.state.height());
+                let start = total
+                    .saturating_sub(usize::from(leaf.rows()))
+                    .saturating_sub(offset);
+                (start < scrollback_len)
+                    .then(|| self.state.scrollback_line(start).map(|line| line.id))
+                    .flatten()
+            });
+            if let Some(line_id) = line_id {
+                self.capture_view_scroll_anchor_line(view, line_id);
+            }
+        }
         // CTX-0904: IMG-4 in-flight bound (256 MiB across all parsers).
         // Check total pending Kitty bytes before advancing; if over budget,
         // drop the input and warn. Fail closed: no partial parse, no buffering
@@ -1708,6 +1731,14 @@ impl Runtime {
             // CTX-0936 (W-143c): output replaced the result set, so prior
             // handles stale even though the binding survives.
             self.bump_search_result_generation();
+        }
+        if let Some(view) = anchored_view {
+            let scrollback_len = self.state.scrollback_len();
+            let state_height = self.state.height();
+            let anchor_id = self.find_view(view).and_then(View::scroll_anchor_line_id);
+            let line_index =
+                anchor_id.and_then(|id| self.state.scrollback().position(|line| line.id == id));
+            self.restore_view_scroll_anchor_values(view, scrollback_len, state_height, line_index);
         }
     }
 

@@ -498,6 +498,19 @@ impl Runtime {
     /// primary PTY resizes stay with the callers.
     pub(super) fn reflow_content_to_chrome(&mut self) {
         self.container = self.band_exclusive_container();
+        // Preserve detached history windows across geometry changes. The
+        // numeric offset is bottom-relative and a resize can move the same
+        // top line by several rows; stable line identities are captured
+        // before the terminal state reflows.
+        let scroll_views: Vec<_> = self
+            .layout
+            .leaf_ids()
+            .into_iter()
+            .filter(|id| self.view_scroll_offset(*id) != 0)
+            .collect();
+        for view in scroll_views {
+            self.capture_view_scroll_anchor(view);
+        }
         let fallback = (
             usize::from(self.container.width).max(1),
             usize::from(self.container.height).max(1),
@@ -544,6 +557,7 @@ impl Runtime {
             if let Some(view) = self.layout.find_leaf_mut(id) {
                 view.clamp_scroll_offset(max_scrollback);
             }
+            self.restore_view_scroll_anchor(id);
         }
         self.layout.reflow_with_gaps(self.container, self.gaps());
         // CTX-0176: the container moved, so every pane session's grid +

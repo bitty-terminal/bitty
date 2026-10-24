@@ -1876,6 +1876,77 @@ impl Runtime {
         None
     }
 
+    /// Captures a detached viewport's top scrollback identity before the
+    /// backing state is mutated. Numeric offsets alone are bottom-relative,
+    /// so live output would otherwise move the visible history downward.
+    pub(super) fn capture_view_scroll_anchor(&mut self, view: ViewId) {
+        let Some(state) = self.live_view_state(view) else {
+            return;
+        };
+        let scrollback_len = state.scrollback_len();
+        let total = scrollback_len.saturating_add(state.height());
+        let Some(leaf) = self.find_view(view) else {
+            return;
+        };
+        let offset = leaf.scroll_offset();
+        if offset == 0 {
+            return;
+        }
+        let start = total
+            .saturating_sub(usize::from(leaf.rows()))
+            .saturating_sub(offset);
+        let Some(line_id) = (start < scrollback_len)
+            .then(|| state.scrollback_line(start).map(|line| line.id))
+            .flatten()
+        else {
+            return;
+        };
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.capture_scroll_anchor_line(line_id);
+        }
+    }
+
+    /// Re-resolves every detached view anchor after terminal output or
+    /// scrollback pruning. Missing identities retain the previous bounded
+    /// offset and are clamped by the view, so eviction never jumps to live.
+    pub(super) fn restore_view_scroll_anchor(&mut self, view: ViewId) {
+        let Some(state) = self.live_view_state(view) else {
+            return;
+        };
+        let scrollback_len = state.scrollback_len();
+        let state_height = state.height();
+        let anchor_id = self.find_view(view).and_then(View::scroll_anchor_line_id);
+        let line_index = anchor_id.and_then(|id| state.scrollback().position(|line| line.id == id));
+        self.restore_view_scroll_anchor_values(view, scrollback_len, state_height, line_index);
+    }
+
+    /// Installs a previously resolved top-line identity while the PTY
+    /// pipeline temporarily swaps a pane's state into `self.state`.
+    pub(super) fn capture_view_scroll_anchor_line(&mut self, view: ViewId, line_id: u64) {
+        let Some(leaf) = self.find_view(view) else {
+            return;
+        };
+        let offset = leaf.scroll_offset();
+        if offset == 0 {
+            return;
+        }
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.capture_scroll_anchor_line(line_id);
+        }
+    }
+
+    pub(super) fn restore_view_scroll_anchor_values(
+        &mut self,
+        view: ViewId,
+        scrollback_len: usize,
+        state_height: usize,
+        line_index: Option<usize>,
+    ) {
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.restore_scroll_anchor_position(scrollback_len, state_height, line_index);
+        }
+    }
+
     /// Scroll offset of leaf `view` in the active layout, detached floats,
     /// or pins (`0` when absent).
     pub(super) fn view_scroll_offset(&self, view: ViewId) -> usize {

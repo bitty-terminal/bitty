@@ -274,3 +274,56 @@ fn whole_layer_drop_denies_profile_history_capture() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn denied_roots_clear_lower_layer_images_and_startup_ticks() {
+    // CTX-1490 review blocker repro: the profile supplies a valid image plus
+    // its approved root, while the user file has an unrelated invalid
+    // geometric decoration. Pre-fix, roots were denied but the image survived,
+    // so Runtime::new rejected the config and startup exited 1.
+    let root = scratch_root("deny-images");
+    let approved = root.join("approved");
+    std::fs::create_dir_all(&approved).expect("approved root");
+    let wall = approved.join("wall.png");
+    // Content is irrelevant post-fix (no image is loaded); keep a PNG header
+    // so the fixture is a plausible file rather than an empty path.
+    std::fs::write(&wall, b"\x89PNG\r\n\x1a\n").expect("write image fixture");
+
+    write_init(
+        &root,
+        "return { font = { family = \"Mono\", size = 13.0 },\n  decoration = { gaps_in = 99 } }\n",
+    );
+    write_profile(
+        &root,
+        "work",
+        &format!(
+            concat!(
+                "return {{ decoration = {{ gaps_in = 2,\n",
+                "  background_image = \"{wall}\",\n",
+                "  background_image_roots = {{ \"{root}\" }} }},\n",
+                " window = {{ background_image = \"{wall}\" }},\n",
+                " views = {{ [\"*\"] = {{ background_image = \"{wall}\" }} }},\n",
+                " font = {{ family = \"Mono\", size = 14.0 }} }}\n"
+            ),
+            wall = wall.display(),
+            root = approved.display()
+        ),
+    );
+
+    let startup = run_bitty(&root, &["--headless", "--profile", "work"]);
+    assert_reached_a_tick(&startup, "startup with denied lower-layer images");
+    let text = stderr(&startup);
+    assert!(
+        text.contains("ignoring 'decoration'"),
+        "the invalid geometric decoration must be salvaged: {text}"
+    );
+    assert!(
+        text.contains("background images disabled"),
+        "the deny summary must cover images: {text}"
+    );
+    assert!(
+        !text.contains("background image path denied"),
+        "startup must not fail on a denied lower-layer image: {text}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

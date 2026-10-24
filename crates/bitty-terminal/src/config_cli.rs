@@ -109,6 +109,9 @@ fn bounded_detail(text: &str) -> &str {
 pub(crate) struct StartupDiagnostics {
     /// Rendered diagnostic lines, at most [`MAX_STARTUP_DIAGNOSTICS`].
     lines: Vec<String>,
+    /// Reserved deny-overlay summary (CTX-1490 review): always rendered, even
+    /// when the element-line cap is full.
+    summary: Option<String>,
     /// Diagnostics dropped by the bound.
     suppressed: usize,
 }
@@ -121,6 +124,19 @@ impl StartupDiagnostics {
         } else {
             self.suppressed += 1;
         }
+    }
+
+    /// Records the deny-overlay summary in a reserved slot.
+    ///
+    /// The summary is always rendered: when the element-line cap is already
+    /// full, the last element line makes room (counted as suppressed), so the
+    /// operator always sees why security-sensitive surfaces were denied.
+    fn set_summary(&mut self, summary: String) {
+        if self.lines.len() >= MAX_STARTUP_DIAGNOSTICS {
+            self.lines.pop();
+            self.suppressed += 1;
+        }
+        self.summary = Some(summary);
     }
 
     /// Records one `(path, field, error)` entry per dropped config element.
@@ -156,10 +172,16 @@ impl StartupDiagnostics {
 
     /// Renders the bounded diagnostic block for stderr.
     fn render(&self) -> Option<String> {
-        if self.lines.is_empty() {
+        if self.lines.is_empty() && self.summary.is_none() {
             return None;
         }
         let mut out = self.lines.join("\n");
+        if let Some(summary) = &self.summary {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(summary);
+        }
         if self.suppressed > 0 {
             out.push_str(&format!(
                 "\nbitty: warning: {} more configuration diagnostics suppressed (run 'bitty config check' for the full list)",
@@ -237,8 +259,9 @@ impl SafeDeny {
     /// lower layer can never re-enable the element for this launch.
     fn apply(&self, effective: &mut bitty_config::EffectiveConfig) {
         if self.plugins {
-            // Deny-all: no configured plugin is enabled or activated, so no
-            // plugin can request a grant through this launch's config.
+            // Deny-all: no configured plugin is enabled. The config layer has
+            // no runtime activation consumer, so this is the configuration
+            // deny surface, not a claim that a plugin process was stopped.
             effective.plugins.clear();
         }
         if self.history {
@@ -253,6 +276,15 @@ impl SafeDeny {
             // No approved root: the decoration loader keeps its
             // deny-by-default posture even if a lower layer granted one.
             effective.decoration.background_image_roots = None;
+            // Every configured image shares that root policy. A surviving
+            // lower-layer path would make `Runtime::new` reject the whole
+            // config and abort startup (CTX-1490 review blocker), so clear
+            // the global, window, and per-view images with the roots.
+            effective.decoration.background_image = None;
+            effective.window.background_image = None;
+            for view in &mut effective.views {
+                view.overrides.background_image = None;
+            }
         }
     }
 
@@ -272,7 +304,7 @@ impl SafeDeny {
             parts.push("mouse buttons none");
         }
         if self.background_image_roots {
-            parts.push("background-image roots empty");
+            parts.push("background images disabled");
         }
         Some(format!(
             "bitty: warning: configuration salvage disabled security-sensitive settings for this launch: {}; lower layers cannot re-enable them",
@@ -613,7 +645,9 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
                         "bitty: warning: ignoring persisted profile selector '{requested}': {err}; ignored; using defaults and remaining layers"
                     ));
                     profile_name = None;
-                    deny.deny_all_sensitive();
+                    // A selector-only miss loads no profile layer, so nothing
+                    // was resurrected from below; keep the other surfaces as
+                    // the remaining layers declare them.
                     None
                 } else {
                     return Err(invalid_selection(&err));
@@ -629,7 +663,8 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
                         path.display()
                     ));
                     profile_name = None;
-                    deny.deny_all_sensitive();
+                    // Nothing was resurrected: the missing profile contributed
+                    // no layer, so do not deny unrelated sensitive surfaces.
                     None
                 } else {
                     return Err(missing_selection(&path));
@@ -820,7 +855,7 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
     if startup {
         deny.apply(&mut merged.effective);
         if let Some(summary) = deny.summary() {
-            diagnostics.push(summary);
+            diagnostics.set_summary(summary);
         }
         merged.effective.validate().map_err(|err| {
             LoadFailure::fatal(format!("bitty: invalid built-in deny overlay: {err}"))
@@ -3608,10 +3643,22 @@ mod startup_tests {
                 ),
                 ..Default::default()
             },
+            window: bitty_config::types::WindowConfig {
+                background_image: Some(String::from("/approved-root/window.png")),
+                ..Default::default()
+            },
             decoration: bitty_config::types::DecorationConfig {
+                background_image: Some(String::from("/approved-root/wall.png")),
                 background_image_roots: Some(vec![String::from("/approved-root")]),
                 ..Default::default()
             },
+            views: vec![bitty_config::types::ViewOverride {
+                selector: bitty_config::types::ViewSelector::Wildcard,
+                overrides: bitty_config::types::ViewAppearanceOverride {
+                    background_image: Some(String::from("/approved-root/view.png")),
+                    ..Default::default()
+                },
+            }],
             ..Default::default()
         };
 
@@ -3635,13 +3682,25 @@ mod startup_tests {
             bitty_config::MouseButtonBinding::None
         );
         assert_eq!(effective.decoration.background_image_roots, None);
+        assert_eq!(
+            effective.decoration.background_image, None,
+            "the global image must be cleared with the roots"
+        );
+        assert_eq!(
+            effective.window.background_image, None,
+            "the window image must be cleared with the roots"
+        );
+        assert_eq!(
+            effective.views[0].overrides.background_image, None,
+            "per-view images must be cleared with the roots"
+        );
         effective.validate().expect("deny overlay stays valid");
         let summary = deny.summary().expect("summary");
         for part in [
             "plugins disabled",
             "history capture off",
             "mouse buttons none",
-            "background-image roots empty",
+            "background images disabled",
         ] {
             assert!(summary.contains(part), "{summary}");
         }
@@ -3774,7 +3833,7 @@ mod startup_tests {
         assert_eq!(app.effective.font.family, "Mono");
         let rendered = diagnostics.render().expect("diagnostics");
         assert!(
-            rendered.contains("background-image roots empty"),
+            rendered.contains("background images disabled"),
             "{rendered}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -3821,10 +3880,21 @@ mod startup_tests {
         assert!(app.profile_name.is_none());
         assert!(app.profile_path.is_none());
         assert_eq!(app.effective.font.family, "Mono");
+        // A selector-only miss loads no profile layer, so it must not deny
+        // unrelated security-sensitive surfaces.
+        assert_eq!(
+            app.effective.mouse.middle,
+            bitty_config::types::default_middle_binding(),
+            "a missing selector must not disable mouse buttons"
+        );
         let rendered = diagnostics.render().expect("diagnostics");
         assert!(
             rendered.contains("ignoring persisted profile selector 'work'"),
             "{rendered}"
+        );
+        assert!(
+            !rendered.contains("configuration salvage disabled"),
+            "a selector-only miss must not trigger the deny overlay: {rendered}"
         );
 
         let strict = resolve_app_config(&args)
@@ -3833,6 +3903,91 @@ mod startup_tests {
         assert!(!strict.fallback_allowed, "{}", strict.message);
         assert!(strict.message.contains("not found"), "{}", strict.message);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_clears_lower_layer_images_when_roots_are_denied() {
+        // CTX-1490 review blocker: denying the root allowlist must also clear
+        // every configured image, otherwise Runtime::new rejects the whole
+        // config and startup exits 1. The profile here is the lower layer and
+        // supplies all three image surfaces; the user layer only has an
+        // invalid geometric decoration.
+        let (dir, args) = selector_args(
+            "deny-images",
+            concat!(
+                "return { format = \"bitty-profile-v1\", profile = \"work\",",
+                " decoration = { gaps_in = 99 },",
+                " font = { family = \"Mono\", size = 13.0 } }"
+            ),
+            Some(concat!(
+                "return { decoration = { gaps_in = 2,",
+                " background_image = \"/approved-root/wall.png\",",
+                " background_image_roots = { \"/approved-root\" } },",
+                " window = { background_image = \"/approved-root/window.png\" },",
+                " views = { [\"*\"] = { background_image = \"/approved-root/view.png\" } },",
+                " font = { family = \"Mono\", size = 14.0 } }"
+            )),
+        );
+        let (app, diagnostics) = resolve_app_config_in(&args, LoadMode::Startup)
+            .expect("startup must not abort on a denied lower-layer image");
+        assert_eq!(app.effective.decoration.background_image_roots, None);
+        assert_eq!(
+            app.effective.decoration.background_image, None,
+            "decoration image must not survive the roots deny"
+        );
+        assert_eq!(
+            app.effective.window.background_image, None,
+            "window image must not survive the roots deny"
+        );
+        assert!(
+            app.effective
+                .views
+                .iter()
+                .all(|view| view.overrides.background_image.is_none()),
+            "per-view images must not survive the roots deny: {:?}",
+            app.effective.views
+        );
+        assert_eq!(
+            app.effective.decoration.gaps_in, 2,
+            "unrelated profile decoration stays effective"
+        );
+        assert_eq!(
+            app.effective.font.family, "Mono",
+            "unrelated valid settings stay effective"
+        );
+        let rendered = diagnostics.render().expect("diagnostics");
+        assert!(
+            rendered.contains("background images disabled"),
+            "{rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_summary_has_a_reserved_slot() {
+        // CTX-1490 review: the deny summary must survive the element-line cap.
+        let mut diagnostics = StartupDiagnostics::default();
+        for index in 0..12 {
+            diagnostics.push(format!("bitty: warning: ignored element {index}"));
+        }
+        diagnostics.set_summary(String::from("bitty: warning: deny summary"));
+        let rendered = diagnostics.render().expect("diagnostics");
+        assert!(
+            rendered.contains("deny summary"),
+            "the reserved summary must be rendered: {rendered}"
+        );
+        assert!(
+            rendered.contains("more configuration diagnostics suppressed"),
+            "{rendered}"
+        );
+        let content_lines = rendered
+            .lines()
+            .filter(|line| !line.contains("diagnostics suppressed"))
+            .count();
+        assert!(
+            content_lines <= MAX_STARTUP_DIAGNOSTICS,
+            "content lines must stay bounded, got {content_lines}: {rendered}"
+        );
     }
 
     #[test]

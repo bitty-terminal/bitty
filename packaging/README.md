@@ -25,12 +25,14 @@ and is labeled as such below.
 | xbps         | `packaging/void/srcpkgs/bitty/template`                  | In-tree template, not in void-packages; best-effort         |
 | ypkg         | `packaging/solus/package.yml`                            | In-tree Solus recipe, not in solus-project; best-effort     |
 | freebsd      | `packaging/freebsd/x11/bitty/` (ports recipe)            | FreeBSD 15.1 amd64 build-only; best-effort, not supported   |
+| openbsd      | `packaging/openbsd/x11/bitty/` (ports recipe)            | OpenBSD amd64 ports recipe; best-effort, not supported      |
+| netbsd       | `packaging/netbsd/x11/bitty/` (pkgsrc recipe)            | NetBSD pkgsrc recipe; best-effort, not supported            |
 | winget       | `packaging/windows/winget/`                              | Windows Package Manager (`BittyTerminal.Bitty`)             |
 
 The upstream distro recipes (Alpine aports, Gentoo overlay, Void `xbps-src`,
-Solus `ypkg`, FreeBSD Ports) are in-tree drafts: nothing is published to
+Solus `ypkg`, FreeBSD Ports, OpenBSD Ports, NetBSD pkgsrc) are in-tree drafts: nothing is published to
 `alpine/aports`, `gentoo/gentoo`, `void-linux/void-packages`, `solus-project`,
-or the FreeBSD ports tree, so none of them is support evidence. Their source
+or the BSD ports/pkgsrc trees, so none of them is support evidence. Their source
 and checksum steps run **at tag time**, because the distfiles are GitHub tag
 archives that do not exist before the release tag is pushed.
 `bash scripts/tests/check-distro-recipes.test.sh` (also

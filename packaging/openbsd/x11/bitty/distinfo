@@ -1,0 +1,13 @@
+# packaging/openbsd/x11/bitty/distinfo
+#
+# Real SHA256 and size entries cannot be computed before the v0.0.27 tag is
+# created, because `make makesum` fetches the released source tarball and
+# every vendored crate from GitHub/crates.io.
+#
+# Tag-time procedure (from a ports tree checkout with bitty copied in):
+#   cd /usr/ports/x11/bitty
+#   make makesum
+#   cp distinfo /path/to/bitty/packaging/openbsd/x11/bitty/distinfo
+#
+# Distfiles required once tagged:
+#   v0.0.27.tar.gz

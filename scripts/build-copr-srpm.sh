@@ -111,7 +111,10 @@ if [[ -f "$SOURCEDIR/SHA256SUMS" ]]; then
     [[ -n "$sum_line" ]] || die "$file is missing from SHA256SUMS"
     printf '%s\n' "$sum_line" >>"$CHECK_FILE"
   done
-  (cd "$SOURCEDIR" && sha256sum -c "$CHECK_FILE") ||
+  # Keep verification output off stdout: callers capture stdout as the SRPM
+  # path (and write it to $GITHUB_OUTPUT), so a checksum "OK" line would
+  # corrupt the single-line contract.
+  (cd "$SOURCEDIR" && sha256sum -c "$CHECK_FILE" >&2) ||
     die "source checksum verification failed"
 fi
 

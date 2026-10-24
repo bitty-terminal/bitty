@@ -16,6 +16,10 @@
 #   --output PATH      AppImage output path (e.g. dist/bitty-x86_64-unknown-linux-gnu.AppImage)
 #   --dry-run          validate and stage AppDir only; do not invoke appimagetool
 #
+# Environment:
+#   APPIMAGETOOL       explicit appimagetool executable path; skips PATH discovery,
+#                      the /tmp cache, and the download fallback
+#
 # Usage:
 #   scripts/make-appimage.sh --version 0.0.27 \
 #     --target x86_64-unknown-linux-gnu \
@@ -44,6 +48,10 @@ Usage: scripts/make-appimage.sh --version VERSION --target TARGET --binary PATH 
   --binary PATH      Linux bitty binary to pack as usr/bin/bitty
   --output PATH      AppImage output path (e.g. dist/bitty-x86_64-unknown-linux-gnu.AppImage)
   --dry-run          validate and stage the AppDir only; do not build the AppImage
+
+Environment:
+  APPIMAGETOOL       explicit appimagetool executable path; skips PATH discovery,
+                     the /tmp cache, and the download fallback
 EOF
 }
 
@@ -179,8 +187,10 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-# Locate or download appimagetool
-APPIMAGETOOL=""
+# Locate or download appimagetool. An explicit APPIMAGETOOL path wins so tests
+# and packagers can pin the tool; an unusable override fails closed instead of
+# silently falling back to discovery, the cache, or the network.
+TOOL_PATH="${APPIMAGETOOL:-}"
 HOST_ARCH="$(uname -m)"
 case "$HOST_ARCH" in
 x86_64 | amd64)
@@ -194,25 +204,28 @@ aarch64 | arm64)
   ;;
 esac
 
-if command -v appimagetool >/dev/null 2>&1; then
-  APPIMAGETOOL="$(command -v appimagetool)"
+if [[ -n "$TOOL_PATH" ]]; then
+  [[ -f "$TOOL_PATH" && -x "$TOOL_PATH" ]] ||
+    die "APPIMAGETOOL must point to an executable file, got: $TOOL_PATH"
+elif command -v appimagetool >/dev/null 2>&1; then
+  TOOL_PATH="$(command -v appimagetool)"
 elif [[ -x "/tmp/bitty/appimagetool" ]]; then
-  APPIMAGETOOL="/tmp/bitty/appimagetool"
+  TOOL_PATH="/tmp/bitty/appimagetool"
 elif [[ -x "/tmp/appimagetool" ]]; then
-  APPIMAGETOOL="/tmp/appimagetool"
+  TOOL_PATH="/tmp/appimagetool"
 else
   echo "make-appimage: downloading appimagetool continuous release for host ${TOOL_ARCH}..."
   mkdir -p "/tmp/bitty"
   TOOL_URL="https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${TOOL_ARCH}.AppImage"
   curl -fsSL -o "/tmp/bitty/appimagetool" "$TOOL_URL" || die "failed to download appimagetool from ${TOOL_URL}"
   chmod +x "/tmp/bitty/appimagetool"
-  APPIMAGETOOL="/tmp/bitty/appimagetool"
+  TOOL_PATH="/tmp/bitty/appimagetool"
 fi
 
 mkdir -p "$(dirname "$OUTPUT")"
 
-echo "make-appimage: generating ${OUTPUT} via ${APPIMAGETOOL}..."
-APPIMAGE_EXTRACT_AND_RUN=1 ARCH="${ARCH}" "$APPIMAGETOOL" "${APPDIR}" "${OUTPUT}"
+echo "make-appimage: generating ${OUTPUT} via ${TOOL_PATH}..."
+APPIMAGE_EXTRACT_AND_RUN=1 ARCH="${ARCH}" "$TOOL_PATH" "${APPDIR}" "${OUTPUT}"
 
 [[ -f "$OUTPUT" ]] || die "output AppImage was not created: ${OUTPUT}"
 [[ -s "$OUTPUT" ]] || die "output AppImage is empty: ${OUTPUT}"

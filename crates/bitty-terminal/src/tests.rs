@@ -10228,7 +10228,7 @@ fn init_dispatch_yes_with_plugins_records_and_grants() {
         0
     );
     assert!(target.exists(), "config written");
-    let state_path = dir.join("bitty-plugins.toml");
+    let state_path = dir.join("bitty-plugins.lua");
     assert!(state_path.exists(), "plugin queue recorded");
     let state_text = std::fs::read_to_string(&state_path).expect("state readable");
     assert!(
@@ -10260,7 +10260,7 @@ fn init_dispatch_yes_with_plugins_unknown_fails_closed() {
     );
     assert!(!target.exists(), "usage error writes no config");
     assert!(
-        !dir.join("bitty-plugins.toml").exists(),
+        !dir.join("bitty-plugins.lua").exists(),
         "usage error writes no plugin queue"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -10284,7 +10284,7 @@ fn init_dispatch_interactive_plugins_and_components() {
         run_init_subcommand_with_io(&args, &env, &mut input, &mut output),
         0
     );
-    let state_path = dir.join("bitty-plugins.toml");
+    let state_path = dir.join("bitty-plugins.lua");
     assert!(state_path.exists(), "interactive selection recorded");
     let printed = String::from_utf8(output).expect("UTF-8");
     assert!(

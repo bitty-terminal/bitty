@@ -1471,6 +1471,16 @@ impl Surface {
                 for fill in &draw_list.overlay_fills {
                     fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
                 }
+                // CTX-1477: card surface, hosted row backgrounds, then ring.
+                for fill in &draw_list.overlay_card_rounded_fills {
+                    fill_rounded_rect_rgba(&mut rgba, width, height, fill);
+                }
+                for fill in &draw_list.overlay_content_fills {
+                    fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
+                }
+                for fill in &draw_list.overlay_rounded_fills {
+                    fill_rounded_rect_rgba(&mut rgba, width, height, fill);
+                }
                 // Glyphs.
                 if let Some((texels, dims)) = atlas {
                     for glyph in &draw_list.glyphs {
@@ -1579,8 +1589,12 @@ impl Surface {
                 state.headless_rgba = Some(rgba);
                 Ok(PresentStats {
                     frame: state.frame,
-                    fills: draw_list.fills.len() + draw_list.overlay_fills.len(),
-                    rounded_fills: draw_list.rounded_fills.len(),
+                    fills: draw_list.fills.len()
+                        + draw_list.overlay_fills.len()
+                        + draw_list.overlay_content_fills.len(),
+                    rounded_fills: draw_list.rounded_fills.len()
+                        + draw_list.overlay_card_rounded_fills.len()
+                        + draw_list.overlay_rounded_fills.len(),
                     glyphs: draw_list.glyphs.len(),
                     headless: true,
                     images: draw_list.images.len(),
@@ -1737,8 +1751,12 @@ impl Surface {
                 state.frame += 1;
                 Ok(PresentStats {
                     frame: state.frame,
-                    fills: draw_list.fills.len() + draw_list.overlay_fills.len(),
-                    rounded_fills: draw_list.rounded_fills.len(),
+                    fills: draw_list.fills.len()
+                        + draw_list.overlay_fills.len()
+                        + draw_list.overlay_content_fills.len(),
+                    rounded_fills: draw_list.rounded_fills.len()
+                        + draw_list.overlay_card_rounded_fills.len()
+                        + draw_list.overlay_rounded_fills.len(),
                     glyphs: draw_list.glyphs.len(),
                     headless: false,
                     images: draw_list.images.len(),
@@ -1844,6 +1862,15 @@ impl Surface {
         // CTX-0347: selection/cursor/chrome overlay fills stay above them.
         for fill in &draw_list.overlay_fills {
             fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
+        }
+        for fill in &draw_list.overlay_card_rounded_fills {
+            fill_rounded_rect_rgba(&mut rgba, width, height, fill);
+        }
+        for fill in &draw_list.overlay_content_fills {
+            fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
+        }
+        for fill in &draw_list.overlay_rounded_fills {
+            fill_rounded_rect_rgba(&mut rgba, width, height, fill);
         }
         if let Some((texels, dims)) = atlas {
             for glyph in &draw_list.glyphs {
@@ -1953,8 +1980,12 @@ impl Surface {
         state.headless_rgba = Some(rgba);
         Ok(PresentStats {
             frame: state.frame,
-            fills: draw_list.fills.len() + draw_list.overlay_fills.len(),
-            rounded_fills: draw_list.rounded_fills.len(),
+            fills: draw_list.fills.len()
+                + draw_list.overlay_fills.len()
+                + draw_list.overlay_content_fills.len(),
+            rounded_fills: draw_list.rounded_fills.len()
+                + draw_list.overlay_card_rounded_fills.len()
+                + draw_list.overlay_rounded_fills.len(),
             glyphs: draw_list.glyphs.len(),
             headless: true,
             images: draw_list.images.len(),
@@ -2740,6 +2771,9 @@ mod tests {
             rounded_fills: vec![],
             backgrounds: vec![],
             overlay_fills: vec![],
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };
@@ -2772,6 +2806,9 @@ mod tests {
             rounded_fills: vec![],
             backgrounds: vec![],
             overlay_fills: vec![],
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };
@@ -2964,6 +3001,9 @@ mod tests {
             rounded_fills: vec![],
             backgrounds: vec![],
             overlay_fills: vec![],
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };
@@ -2992,6 +3032,9 @@ mod tests {
             rounded_fills: vec![],
             backgrounds: vec![],
             overlay_fills: vec![],
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: vec![],
             glyphs: vec![],
             images: vec![],
         }
@@ -3194,6 +3237,9 @@ mod tests {
             rounded_fills: vec![],
             backgrounds: vec![],
             overlay_fills: vec![],
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: vec![],
             glyphs: vec![],
             images: vec![],
         };
@@ -3236,6 +3282,9 @@ mod tests {
             rounded_fills: vec![],
             backgrounds: vec![],
             overlay_fills: vec![],
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: vec![],
             glyphs: vec![],
             images,
         }
@@ -3527,6 +3576,9 @@ mod tests {
             rounded_fills: vec![],
             backgrounds: vec![],
             overlay_fills: vec![],
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: vec![],
             glyphs: vec![],
             images: vec![
                 crate::grid::ImageBlit::try_new(
@@ -3669,6 +3721,9 @@ mod tests {
             rounded_fills: vec![ring.clone()],
             backgrounds: vec![],
             overlay_fills: vec![],
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: vec![],
             glyphs: vec![glyph],
             images: vec![],
         };

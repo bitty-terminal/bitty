@@ -95,9 +95,9 @@
 //! A wrong-typed value at any layer falls back to the next lower layer for
 //! that key only (garbage in, fail-to-default out). Undeclared keys are
 //! never readable through `bitty.settings.get`, whatever layer carries
-//! them. The machine-managed manifest (`bitty-plugins.toml`) is untouched:
-//! it stays machine-only and hand edits there keep today's fail-closed
-//! behavior.
+//! them. The machine-managed ledger (`bitty-plugins.lua`) is untouched: it
+//! stays machine-only, is parsed as bounded data, and a hand edit there
+//! cannot widen authority (grants stay bound to the manifest hash).
 //!
 //! # Responsibility split (quoted from issue #2010, not paraphrased)
 //!

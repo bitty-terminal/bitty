@@ -2163,11 +2163,14 @@ fn renderer_resolves_cells_from_selected_palette() {
 
 /// CTX-1395 (issue #2333): the banner, help, and IME chrome helpers all read
 /// the resolved palette instead of fixed Bitty Dark constants.
+/// CTX-1477 (issue #2468): the help ring now uses the muted idle outline and
+/// the focused chrome border uses the theme's focused outline pair.
 #[test]
 fn chrome_accents_follow_the_resolved_palette() {
     use super::{
-        ThemePalette, banner_fill_in, banner_text_in, help_panel_bg_in, help_panel_border_in,
-        help_panel_fg_in, ime_preedit_bg_in, ime_preedit_underline_in, readable_foreground_on,
+        ThemePalette, banner_fill_in, banner_text_in, chrome_border_in, chrome_focus_border_in,
+        help_panel_bg_in, help_panel_border_in, help_panel_fg_in, ime_preedit_bg_in,
+        ime_preedit_underline_in, readable_foreground_on,
     };
 
     let dark = ThemePalette::bitty_dark();
@@ -2189,44 +2192,42 @@ fn chrome_accents_follow_the_resolved_palette() {
     assert_eq!(help_panel_bg_in(&dark), dark.selection);
     assert_eq!(help_panel_bg_in(&light), light.selection);
     assert_eq!(help_panel_fg_in(&dark), dark.foreground);
-    let dark_ring = dark.ansi[usize::from(super::HELP_PANEL_ACCENT_ANSI_INDEX)];
     assert_eq!(
         help_panel_border_in(&dark),
-        [dark_ring[0], dark_ring[1], dark_ring[2], 0xFF]
+        [0x59, 0x59, 0x59, 0xAA],
+        "help uses the muted idle outline"
+    );
+    assert_eq!(help_panel_border_in(&dark), chrome_border_in(&dark));
+    assert_eq!(
+        chrome_focus_border_in(&dark),
+        [0x33, 0xCC, 0xFF, 0xFF],
+        "focused chrome uses the accepted focused outline"
     );
     assert_ne!(help_panel_border_in(&dark), help_panel_border_in(&light));
 
-    // CTX-1418: the paint helper must agree with the measured policy for
-    // every preset. `contrast_checks` measures `help_ring_source`, so without
-    // this equivalence a broken fallback (or a deleted one) stays green.
+    // CTX-1477: every preset's chrome border pair stays theme-owned and the
+    // focused tone differs from the idle tone.
     for theme in bitty_config::theme::list_presets() {
         let palette = ThemePalette::from_theme(theme);
-        let candidates = [
-            theme.ansi_entry(12),
-            theme.ansi_entry(4),
-            theme.ansi_entry(6),
-            theme.foreground,
-        ];
-        let expected = candidates[bitty_config::theme::help_ring_source(theme)];
         assert_eq!(
-            help_panel_border_in(&palette),
-            [expected[0], expected[1], expected[2], 0xFF],
-            "preset {} ring must be the measured help-ring candidate",
+            chrome_border_in(&palette),
+            theme.border_idle.0,
+            "preset {} idle chrome border",
             theme.name
         );
-        let row = bitty_config::theme::contrast_checks(theme)
-            .into_iter()
-            .find(|row| row.role == bitty_config::theme::ContrastRole::HelpRing)
-            .expect("every preset carries a help-ring row");
-        assert!(row.passed, "preset {} ring row must pass", theme.name);
+        assert_eq!(
+            chrome_focus_border_in(&palette),
+            theme.border_focused.0,
+            "preset {} focused chrome border",
+            theme.name
+        );
+        assert_ne!(
+            chrome_border_in(&palette),
+            chrome_focus_border_in(&palette),
+            "preset {} must distinguish idle and focused chrome",
+            theme.name
+        );
     }
-    // Fallback index pins: Latte's ANSI 12 (2.90:1) cannot clear 3:1 on its
-    // selection, so the ring is the foreground; Mocha's ANSI 4 (3.17:1)
-    // clears it before ANSI 6/foreground are consulted.
-    let latte = bitty_config::theme::resolve_theme(Some("catppuccin-latte"));
-    let mocha = bitty_config::theme::resolve_theme(Some("catppuccin-mocha"));
-    assert_eq!(bitty_config::theme::help_ring_source(latte), 3);
-    assert_eq!(bitty_config::theme::help_ring_source(mocha), 1);
 
     assert_eq!(ime_preedit_bg_in(&dark), dark.selection);
     assert_eq!(ime_preedit_underline_in(&dark), dark.cursor);
@@ -3042,6 +3043,9 @@ fn ascii_fast_path_emission_matches_per_cell_glyphs() {
         rounded_fills: Vec::new(),
         backgrounds: Vec::new(),
         overlay_fills: Vec::new(),
+        overlay_card_rounded_fills: vec![],
+        overlay_content_fills: vec![],
+        overlay_rounded_fills: Vec::new(),
         glyphs: Vec::new(),
         images: Vec::new(),
     };
@@ -3086,6 +3090,9 @@ fn ascii_fast_path_clips_dirty_and_skips_spaces() {
         rounded_fills: Vec::new(),
         backgrounds: Vec::new(),
         overlay_fills: Vec::new(),
+        overlay_card_rounded_fills: vec![],
+        overlay_content_fills: vec![],
+        overlay_rounded_fills: Vec::new(),
         glyphs: Vec::new(),
         images: Vec::new(),
     };
@@ -3114,6 +3121,9 @@ fn ascii_fast_path_clips_dirty_and_skips_spaces() {
         rounded_fills: Vec::new(),
         backgrounds: Vec::new(),
         overlay_fills: Vec::new(),
+        overlay_card_rounded_fills: vec![],
+        overlay_content_fills: vec![],
+        overlay_rounded_fills: Vec::new(),
         glyphs: Vec::new(),
         images: Vec::new(),
     };
@@ -3145,6 +3155,9 @@ fn ascii_fast_path_empty_dirty_emits_nothing() {
         rounded_fills: Vec::new(),
         backgrounds: Vec::new(),
         overlay_fills: Vec::new(),
+        overlay_card_rounded_fills: vec![],
+        overlay_content_fills: vec![],
+        overlay_rounded_fills: Vec::new(),
         glyphs: Vec::new(),
         images: Vec::new(),
     };

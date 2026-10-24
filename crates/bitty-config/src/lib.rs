@@ -90,6 +90,7 @@ pub mod migration;
 pub mod panel_rules;
 pub mod plan;
 pub mod plugin_file;
+pub mod plugin_ledger;
 pub mod project_schema;
 pub mod reload;
 pub mod theme;

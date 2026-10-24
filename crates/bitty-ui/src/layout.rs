@@ -1359,7 +1359,7 @@ impl LayoutNode {
     ) -> Option<SplitHandle> {
         let inner = gaps.inset_outer(bounds);
         let mut hits = Vec::new();
-        self.hit_test_handles_all_inner(inner, gaps.inner, point, Vec::new(), &mut hits);
+        self.hit_test_handles_all_inner(inner, gaps.inner, point, Vec::new(), None, &mut hits);
         let columns = collinear_handle_group(&hits, SplitAxis::Horizontal).ok()?;
         let rows = collinear_handle_group(&hits, SplitAxis::Vertical).ok()?;
         match (columns.is_empty(), rows.is_empty()) {
@@ -1444,6 +1444,7 @@ impl LayoutNode {
         gap_in: u16,
         point: Point,
         prefix: Vec<usize>,
+        endpoint_axis: Option<SplitAxis>,
         result: &mut Vec<SplitHandleHit>,
     ) {
         match self {
@@ -1456,10 +1457,13 @@ impl LayoutNode {
             } => {
                 let (a, b) = split_rect_with_gap(bounds, *axis, *ratio, gap_in);
                 let handle = handle_band_between(a, b, *axis, gap_in);
+                let allow_endpoint = endpoint_axis.is_some_and(|parent| parent != *axis);
+                let boundary_hit =
+                    gap_in == 0 && on_child_boundary(a, b, *axis, point, allow_endpoint);
                 let hit = if let Some(rect) = handle {
                     inflate_handle_band(rect).contains_point(point)
                 } else {
-                    on_child_boundary(a, b, *axis, point)
+                    boundary_hit
                 };
                 if hit {
                     result.push(SplitHandleHit {
@@ -1469,19 +1473,42 @@ impl LayoutNode {
                     });
                 }
                 // Always recurse into both children to find nested handles.
+                let child_endpoint_axis =
+                    (endpoint_axis.is_none() && boundary_hit).then_some(*axis);
                 let mut first_prefix = prefix.clone();
                 first_prefix.push(0);
-                first.hit_test_handles_all_inner(a, gap_in, point, first_prefix, result);
+                first.hit_test_handles_all_inner(
+                    a,
+                    gap_in,
+                    point,
+                    first_prefix,
+                    child_endpoint_axis,
+                    result,
+                );
                 let mut second_prefix = prefix;
                 second_prefix.push(1);
-                second.hit_test_handles_all_inner(b, gap_in, point, second_prefix, result);
+                second.hit_test_handles_all_inner(
+                    b,
+                    gap_in,
+                    point,
+                    second_prefix,
+                    child_endpoint_axis,
+                    result,
+                );
             }
             Self::Stack(children) => {
                 // Only the last (top-most, visible) child owns the pointer.
                 if let Some((i, child)) = children.iter().enumerate().next_back() {
                     let mut child_prefix = prefix.clone();
                     child_prefix.push(i);
-                    child.hit_test_handles_all_inner(bounds, gap_in, point, child_prefix, result);
+                    child.hit_test_handles_all_inner(
+                        bounds,
+                        gap_in,
+                        point,
+                        child_prefix,
+                        endpoint_axis,
+                        result,
+                    );
                 }
             }
             Self::Overlay {
@@ -1501,12 +1528,20 @@ impl LayoutNode {
                         gap_in,
                         point,
                         overlay_prefix,
+                        endpoint_axis,
                         result,
                     );
                 } else {
                     let mut base_prefix = prefix.clone();
                     base_prefix.push(0);
-                    base.hit_test_handles_all_inner(bounds, gap_in, point, base_prefix, result);
+                    base.hit_test_handles_all_inner(
+                        bounds,
+                        gap_in,
+                        point,
+                        base_prefix,
+                        endpoint_axis,
+                        result,
+                    );
                 }
             }
         }
@@ -1780,7 +1815,13 @@ fn handle_band_between(first: Rect, second: Rect, axis: SplitAxis, gap_in: u16) 
 
 /// True when `point` sits on the one-cell boundary between two gapless
 /// siblings (CW-09 helper for zero-gap handle hit testing).
-fn on_child_boundary(first: Rect, second: Rect, axis: SplitAxis, point: Point) -> bool {
+fn on_child_boundary(
+    first: Rect,
+    second: Rect,
+    axis: SplitAxis,
+    point: Point,
+    allow_endpoint: bool,
+) -> bool {
     match axis {
         SplitAxis::Horizontal => {
             // Divider is the last column of `first` / first column of
@@ -1788,21 +1829,49 @@ fn on_child_boundary(first: Rect, second: Rect, axis: SplitAxis, point: Point) -
             second.x == first.x.saturating_add(first.width)
                 && (point.x as u32 == first.right().saturating_sub(1)
                     || point.x as u32 == second.x as u32)
-                && (point.y as u32) >= first.y as u32
-                && (point.y as u32) < first.bottom()
-                && (point.y as u32) >= second.y as u32
-                && (point.y as u32) < second.bottom()
+                && on_split_span(
+                    point.y as u32,
+                    first.y as u32,
+                    first.bottom(),
+                    second.y as u32,
+                    second.bottom(),
+                    allow_endpoint,
+                )
         }
         SplitAxis::Vertical => {
             second.y == first.y.saturating_add(first.height)
                 && (point.y as u32 == first.bottom().saturating_sub(1)
                     || point.y as u32 == second.y as u32)
-                && (point.x as u32) >= first.x as u32
-                && (point.x as u32) < first.right()
-                && (point.x as u32) >= second.x as u32
-                && (point.x as u32) < second.right()
+                && on_split_span(
+                    point.x as u32,
+                    first.x as u32,
+                    first.right(),
+                    second.x as u32,
+                    second.right(),
+                    allow_endpoint,
+                )
         }
     }
+}
+
+/// True when a zero-gap divider point is in both child spans, or in the one
+/// cell immediately beyond their shared endpoint. The adjacent-cell case is
+/// needed for a floored pointer at a T junction: the parent divider owns the
+/// endpoint cell while the nested perpendicular divider starts one cell away.
+fn on_split_span(
+    point: u32,
+    first_start: u32,
+    first_end: u32,
+    second_start: u32,
+    second_end: u32,
+    allow_endpoint: bool,
+) -> bool {
+    let start = first_start.max(second_start);
+    let end = first_end.min(second_end);
+    end > start
+        && (point >= start && point < end
+            || (allow_endpoint && start > 0 && point == start - 1)
+            || (allow_endpoint && point == end))
 }
 
 /// Minimum usable extent of `node` along `axis` (issue #2572).
@@ -3834,6 +3903,141 @@ mod tests {
             Some(vec![1]),
             "nested vertical divider resolves to path [1]"
         );
+    }
+
+    fn t_junction_tree(root_axis: SplitAxis, nested_first: bool) -> LayoutNode {
+        let nested_axis = match root_axis {
+            SplitAxis::Horizontal => SplitAxis::Vertical,
+            SplitAxis::Vertical => SplitAxis::Horizontal,
+        };
+        let nested = LayoutNode::split(
+            nested_axis,
+            0.5,
+            LayoutNode::leaf(view(1, 40, 12)),
+            LayoutNode::leaf(view(2, 40, 12)),
+        );
+        let other = LayoutNode::leaf(view(3, 40, 24));
+        if nested_first {
+            LayoutNode::split(root_axis, 0.5, nested, other)
+        } else {
+            LayoutNode::split(root_axis, 0.5, other, nested)
+        }
+    }
+
+    #[test]
+    fn zero_gap_t_endpoint_neighbors_join_the_perpendicular_stem() {
+        use crate::geometry::{Gaps, Point};
+
+        // The four cells around the geometric endpoint are the cells a
+        // floored headed pointer can report for the same T junction.
+        for (root_axis, nested_first) in [
+            (SplitAxis::Horizontal, false),
+            (SplitAxis::Horizontal, true),
+            (SplitAxis::Vertical, false),
+            (SplitAxis::Vertical, true),
+        ] {
+            let tree = t_junction_tree(root_axis, nested_first);
+            for point in [
+                Point::new(39, 11),
+                Point::new(39, 12),
+                Point::new(40, 11),
+                Point::new(40, 12),
+            ] {
+                let nested_path = vec![if nested_first { 0 } else { 1 }];
+                let nested_axis = match root_axis {
+                    SplitAxis::Horizontal => SplitAxis::Vertical,
+                    SplitAxis::Vertical => SplitAxis::Horizontal,
+                };
+                let expected = if root_axis == SplitAxis::Horizontal {
+                    vec![(Vec::new(), root_axis), (nested_path, nested_axis)]
+                } else {
+                    vec![(nested_path, nested_axis), (Vec::new(), root_axis)]
+                };
+                assert_eq!(
+                    tree.hit_test_split_handles(Rect::new(0, 0, 80, 24), Gaps::ZERO, point),
+                    expected,
+                    "T endpoint {root_axis:?}, nested_first={nested_first}, point={point:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn zero_gap_t_stems_do_not_grab_beyond_their_endpoint() {
+        use crate::geometry::{Gaps, Point};
+
+        let second_horizontal = t_junction_tree(SplitAxis::Horizontal, false);
+        assert_eq!(
+            second_horizontal.hit_test_split_handles(
+                Rect::new(0, 0, 80, 24),
+                Gaps::ZERO,
+                Point::new(39, 6),
+            ),
+            vec![(Vec::new(), SplitAxis::Horizontal)],
+            "root stem remains the only hit away from the nested endpoint"
+        );
+        assert_eq!(
+            second_horizontal.hit_test_split_handles(
+                Rect::new(0, 0, 80, 24),
+                Gaps::ZERO,
+                Point::new(60, 12),
+            ),
+            vec![(vec![1], SplitAxis::Vertical)],
+            "nested stem remains independently draggable"
+        );
+
+        let second_vertical = t_junction_tree(SplitAxis::Vertical, false);
+        assert_eq!(
+            second_vertical.hit_test_split_handles(
+                Rect::new(0, 0, 80, 24),
+                Gaps::ZERO,
+                Point::new(6, 11),
+            ),
+            vec![(Vec::new(), SplitAxis::Vertical)],
+            "root horizontal stem remains the only hit away from the nested endpoint"
+        );
+        assert_eq!(
+            second_vertical.hit_test_split_handles(
+                Rect::new(0, 0, 80, 24),
+                Gaps::ZERO,
+                Point::new(40, 18),
+            ),
+            vec![(vec![1], SplitAxis::Horizontal)],
+            "nested horizontal stem remains independently draggable"
+        );
+    }
+
+    #[test]
+    fn gapped_t_endpoint_uses_existing_inflated_handle_bands() {
+        use crate::geometry::{Gaps, Point};
+
+        for (root_axis, nested_first) in [
+            (SplitAxis::Horizontal, false),
+            (SplitAxis::Horizontal, true),
+            (SplitAxis::Vertical, false),
+            (SplitAxis::Vertical, true),
+        ] {
+            let tree = t_junction_tree(root_axis, nested_first);
+            let nested_path = vec![if nested_first { 0 } else { 1 }];
+            let nested_axis = match root_axis {
+                SplitAxis::Horizontal => SplitAxis::Vertical,
+                SplitAxis::Vertical => SplitAxis::Horizontal,
+            };
+            let hits = tree.hit_test_split_handles(
+                Rect::new(0, 0, 80, 24),
+                Gaps::new(2, 0),
+                Point::new(40, 12),
+            );
+            assert_eq!(
+                hits,
+                if root_axis == SplitAxis::Horizontal {
+                    vec![(Vec::new(), root_axis), (nested_path, nested_axis)]
+                } else {
+                    vec![(nested_path, nested_axis), (Vec::new(), root_axis)]
+                },
+                "gapped T endpoint {root_axis:?}, nested_first={nested_first}"
+            );
+        }
     }
 
     fn four_pane_grid() -> LayoutNode {

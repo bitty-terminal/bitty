@@ -93,8 +93,8 @@ fn first_start_with_broken_config_proceeds_with_builtin_defaults() {
         "the load diagnostic must be reported, stderr={err:?}"
     );
     assert!(
-        err.contains("first start") && err.contains("built-in defaults"),
-        "the fallback must be reported, stderr={err:?}"
+        err.contains("ignored; using defaults and remaining layers"),
+        "the dropped layer must state the fallback, stderr={err:?}"
     );
     let text = stdout(&output);
     assert!(
@@ -209,7 +209,10 @@ fn invalid_theme_with_valid_file_stays_fail_closed() {
 }
 
 #[test]
-fn invalid_profile_with_valid_file_stays_fail_closed() {
+fn invalid_profile_is_ignored_at_startup_with_a_diagnostic() {
+    // CTX-1490 (issue #2580): a present-but-invalid profile no longer aborts
+    // startup. The profile layer is dropped, the valid user file still wins,
+    // and the diagnostic names the profile file and the failing field.
     let root = scratch_root("invalid-profile");
     write_init(&root, "return { appearance = { theme = \"dracula\" } }\n");
     // Passes profile-layer parsing/validation but fails the merged outline
@@ -223,24 +226,28 @@ fn invalid_profile_with_valid_file_stays_fail_closed() {
     let output = run_bitty(&root, &["--profile", "bad", "--headless"]);
     assert_eq!(
         output.status.code(),
-        Some(2),
-        "an invalid profile must stay fail-closed, stderr={:?}",
+        Some(0),
+        "an invalid profile must not block startup, stderr={:?}",
         stderr(&output)
     );
     let err = stderr(&output);
-    assert!(err.contains("invalid profile"), "stderr={err:?}");
+    assert!(
+        err.contains("ignoring profile layers") || err.contains("ignoring invalid profile file"),
+        "the dropped profile must be reported, stderr={err:?}"
+    );
     assert!(err.contains("bad.lua"), "stderr={err:?}");
     assert!(
-        !err.contains("init.lua"),
-        "the valid user file must not be blamed, stderr={err:?}"
+        err.contains("ignored; using defaults and remaining layers"),
+        "the dropped profile must state the fallback, stderr={err:?}"
+    );
+    let text = stdout(&output);
+    assert!(
+        text.contains("tick presented"),
+        "startup must reach a tick, stdout={text:?}"
     );
     assert!(
-        !err.contains("built-in defaults"),
-        "a valid user file must not absorb a profile error, stderr={err:?}"
-    );
-    assert!(
-        !stdout(&output).contains("bitty headless:"),
-        "startup must not proceed with built-ins"
+        text.contains("theme 'dracula'") && text.contains("source=file"),
+        "the valid user file must stay in effect, stdout={text:?}"
     );
 
     let _ = std::fs::remove_dir_all(&root);

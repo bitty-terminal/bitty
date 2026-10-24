@@ -13,24 +13,121 @@ download source).
 
 ## Install
 
-### Arch Linux
+Every supported install channel verifies downloads before installing and fails
+closed on mismatch. Detailed instructions, repository keys, and troubleshooting
+are documented in [`packaging/INSTALL.md`](packaging/INSTALL.md).
 
-Install one of the AUR packages:
+### One-line installer (recommended)
+
+Linux and macOS:
 
 ```sh
-paru -S bitty-bin  # prebuilt release binary
-paru -S bitty      # build from source
+curl -fsSL https://cdn.bitty.run/install/install.sh | bash
 ```
 
-### Release binary
+Windows (PowerShell):
+
+```powershell
+irm https://cdn.bitty.run/install/install.ps1 | iex
+```
+
+### Package managers
+
+#### Linux
+
+- **Arch Linux (AUR)**:
+
+  ```sh
+  paru -S bitty-bin  # prebuilt release binary (recommended)
+  paru -S bitty      # build from source
+  ```
+
+- **Debian / Ubuntu (APT)**:
+
+  ```sh
+  curl -fsSL https://cdn.bitty.run/apt/setup.sh | sudo bash
+  sudo apt install -y bitty
+  ```
+
+  _(See [`packaging/debian.md`](packaging/debian.md))_
+
+- **Fedora / EPEL (Copr)**:
+
+  ```sh
+  sudo dnf copr enable -y xuepoo/bitty-terminal
+  sudo dnf install -y bitty
+  ```
+
+  _(See [`packaging/fedora.md`](packaging/fedora.md))_
+
+- **Nix / NixOS**:
+
+  ```sh
+  nix run github:bitty-terminal/bitty
+  ```
+
+  _(Binary cache on `bitty.cachix.org`, see [`packaging/nix.md`](packaging/nix.md))_
+
+- **AppImage (Universal Portable Linux)**:
+  Download `bitty-<target>.AppImage`, `chmod +x`, and run. _(See [`packaging/appimage.md`](packaging/appimage.md))_
+- **openSUSE (Zypper / OBS)**:
+  _(See [`packaging/opensuse.md`](packaging/opensuse.md))_
+- **Alpine Linux**:
+  _(Native musl `APKBUILD` template in [`packaging/alpine.md`](packaging/alpine.md))_
+- **Gentoo Linux**:
+  _(Portage overlay ebuilds in [`packaging/gentoo.md`](packaging/gentoo.md))_
+- **Void Linux**:
+  _(xbps-src template in [`packaging/void.md`](packaging/void.md))_
+- **Solus Linux**:
+  _(ypkg recipe in [`packaging/solus.md`](packaging/solus.md))_
+
+#### macOS
+
+- **Homebrew**:
+
+  ```sh
+  brew install bitty-terminal/tap/bitty
+  ```
+
+- **Apple Disk Image (DMG)**:
+  Download `Bitty-<version>-universal.dmg` from [GitHub Releases](https://github.com/bitty-terminal/bitty/releases) or the [CDN](https://cdn.bitty.run/releases/v0.0.27/).
+
+#### Windows
+
+- **Windows Package Manager (winget)**:
+
+  ```powershell
+  winget install BittyTerminal.Bitty
+  # or using the moniker
+  winget install bitty
+  ```
+
+  _(See [`packaging/winget.md`](packaging/winget.md))_
+
+- **Scoop**:
+
+  ```powershell
+  scoop bucket add bitty https://github.com/bitty-terminal/scoop-bucket
+  scoop install bitty
+  ```
+
+- **Setup wizard (Inno Setup)**:
+  Download `bitty-<version>-windows-x86_64-setup.exe` from [GitHub Releases](https://github.com/bitty-terminal/bitty/releases) or the [CDN](https://cdn.bitty.run/releases/v0.0.27/). _(See [`packaging/WINDOWS-SMARTSCREEN.md`](packaging/WINDOWS-SMARTSCREEN.md))_
+
+#### BSD
+
+- **FreeBSD Ports**:
+  Ports recipe in `packaging/freebsd/x11/bitty/`. _(See [`packaging/freebsd.md`](packaging/freebsd.md))_
+
+### Release binary (manual download)
 
 Download a platform package or archive from the R2-backed CDN at
 `https://cdn.bitty.run/releases/<tag>/` (preferred) or
 [GitHub Releases](https://github.com/bitty-terminal/bitty/releases) (the same
 bytes, documented fallback). Supported release artifacts include Linux, macOS,
-and Windows binaries, plus selected Linux packages. Every artifact has a
-`.sha256` sidecar, and the install scripts and package-manager channels verify
-it. Packaging details are in [`packaging/README.md`](packaging/README.md).
+and Windows binaries, plus selected Linux packages. Every bare binary and archive
+has a `.sha256` sidecar, and the install scripts and package-manager channels
+verify it. Packaging details are in [`packaging/README.md`](packaging/README.md).
 
 ### Build from source
 

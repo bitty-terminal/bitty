@@ -28,6 +28,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`bitty list colors|fonts` canonical kinds (#2464):** the new catalogs are
   available under the canonical `list` spelling as well; the `+list-*`
   spellings are aliases.
+- **Plugin-suggested keybindings are live (#2407):** `bitty.keymaps.suggest`
+  captures now publish into a generation-fenced Core directory and dispatch at
+  the reserved plugin priority slot — after the user/default keymap table and
+  before terminal encoding. Only a command registered by the same generation
+  can be suggested; unqualified, foreign, unregistered, malformed, and
+  prefix-spelled suggestions fail closed. Explicit user and default bindings
+  always win, `alt`-bearing suggestions follow `mod_key`, suspend/unload/crash
+  and reload remove the generation's chords, and colliding suggestions produce
+  bounded warnings naming the deterministic winner and the shadowed command.
+
+### Fixed
+
+- **Copy-mode selection spans scrollback pages (#2470):** a visual selection is
+  no longer capped at the visible page. Wheel and page keys scroll the
+  transcript while a drag is in flight (the selection owns the wheel over PTY
+  mouse reporting; Shift still escapes capture), a pointer held in the top or
+  bottom painted row auto-scrolls one bounded line per interval, and the press
+  endpoint stays pinned by combined-buffer identity. Pruning is resolved by
+  eviction drift, so a committed multi-page range copies every line exactly and
+  denies (instead of silently copying different lines) once its anchored
+  history is gone. The mechanism stays in Core selection/history paging; the
+  copy-mode plugin remains a bounded snapshot policy over the same public
+  surfaces, and no private API is added.
 
 ### Fixed
 

@@ -1,0 +1,50 @@
+# Solus package recipe for 'bitty'
+name: bitty
+version: 0.0.27
+release: 1
+source:
+  # checksum=SKIP is deliberate for the in-tree draft: the distfile is the
+  # GitHub tag archive, which only exists once the release tag is pushed.
+  # At tag time replace SKIP with the sha256 digest calculated from the
+  # downloaded release tarball (see packaging/solus.md).
+  - https://github.com/bitty-terminal/bitty/archive/refs/tags/v0.0.27.tar.gz: SKIP
+license:
+  - Apache-2.0
+  - MIT
+component: system.utils
+summary: GPU-accelerated terminal emulator with panes and Lua extensions
+description: |
+  Bitty is a fast, keyboard-driven, GPU-accelerated terminal emulator
+  designed for developer ergonomics, featuring native multiplexing (tabs
+  and split panes), smooth rendering, and extensible configuration via Lua.
+networking: yes
+builddeps:
+  - pkgconfig(fontconfig)
+  - pkgconfig(freetype2)
+  - pkgconfig(x11)
+  - pkgconfig(xcb)
+  - pkgconfig(xkbcommon)
+  - cargo
+  - rust
+setup: |
+  %cargo_fetch
+build: |
+  %cargo_build --package bitty-terminal
+install: |
+  %cargo_install bitty-terminal
+
+  # Desktop integration
+  install -Dm00644 packaging/run.bitty.Bitty.desktop $installdir/usr/share/applications/run.bitty.Bitty.desktop
+  install -Dm00644 packaging/run.bitty.Bitty.metainfo.xml $installdir/usr/share/metainfo/run.bitty.Bitty.metainfo.xml
+
+  # Icons
+  for size in 16 32 64 128 256 512; do
+      install -Dm00644 packaging/icons/hicolor/${size}x${size}/apps/bitty.png \
+          $installdir/usr/share/icons/hicolor/${size}x${size}/apps/bitty.png
+  done
+  install -Dm00644 packaging/icons/hicolor/scalable/apps/bitty.svg \
+      $installdir/usr/share/icons/hicolor/scalable/apps/bitty.svg
+
+  # Terminfo database
+  install -dm00755 $installdir/usr/share/terminfo
+  tic -x -o $installdir/usr/share/terminfo terminfo/bitty.ti

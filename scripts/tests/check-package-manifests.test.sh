@@ -317,10 +317,10 @@ for job in homebrew scoop; do
 done
 
 BASE_URL_COUNT="$(grep -cF 'BASE_URL="https://cdn.bitty.run/releases/${TAG}"' "$WORKFLOW" || true)"
-if [[ "$BASE_URL_COUNT" -eq 3 ]]; then
-  pass "release.yml sets the R2/CDN base URL in all three channel jobs"
+if [[ "$BASE_URL_COUNT" -eq 4 ]]; then
+  pass "release.yml sets the R2/CDN base URL in all four channel jobs"
 else
-  fail "release.yml has $BASE_URL_COUNT/3 R2/CDN base URLs"
+  fail "release.yml has $BASE_URL_COUNT/4 R2/CDN base URLs"
 fi
 if grep -qF 'BASE_URL="https://github.com/bitty-terminal/bitty/releases/download/' "$WORKFLOW"; then
   fail "release.yml still downloads channel payloads from GitHub"

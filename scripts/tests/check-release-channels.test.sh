@@ -3,9 +3,10 @@
 # release-channel repairs.
 #
 # Asserts:
-#   1. release.yml no longer apt-installs copr-cli; the Copr job creates a
-#      Python venv, installs copr-cli with pip, puts its bin on PATH, and
-#      prints the version.
+#   1. release.yml and repair-release-channels.yml build an SRPM with
+#      scripts/build-copr-srpm.sh and submit it with `copr-cli build`; direct
+#      `copr-cli uploadrpm` is forbidden. Both install rpm/zstd and use a
+#      Python venv for copr-cli.
 #   2. release.yml imports the APT secret through scripts/import-apt-gpg-key.sh
 #      and verifies the pinned archive fingerprint instead of piping the raw
 #      secret into gpg.
@@ -65,7 +66,7 @@ else
   fail "could not read the fingerprint from $KEYRING"
 fi
 
-# --- 1. Copr CLI installation path -----------------------------------------
+# --- 1. Copr SRPM submission path ------------------------------------------
 COPR_BLOCK="$(
   awk '/^  copr:/{ inside = 1 } inside && /^  apt:/{ exit } inside' "$RELEASE"
 )"
@@ -75,31 +76,81 @@ else
   pass "located the copr job"
 fi
 
-if [[ "$COPR_BLOCK" == *"apt-get install"*"copr-cli"* ]]; then
+for workflow in "$RELEASE" "$REPAIR"; do
+  expect_absent "$workflow" "uploadrpm" \
+    "$(basename "$workflow") does not use direct RPM upload"
+  expect_contains "$workflow" "apt-get install -y --no-install-recommends rpm zstd" \
+    "$(basename "$workflow") installs rpmbuild and zstd"
+  expect_contains "$workflow" "scripts/build-copr-srpm.sh" \
+    "$(basename "$workflow") builds the Copr SRPM through the shared helper"
+  expect_contains "$workflow" 'copr-cli build --timeout 1800 "${ARGS[@]}" "$COPR_PROJECT" "$SRPM"' \
+    "$(basename "$workflow") submits the SRPM to Copr"
+  expect_contains "$workflow" "bitty-\${VERSION}-\${arch}-unknown-linux-gnu.tar.zst" \
+    "$(basename "$workflow") uses the published release source bundles"
+  expect_contains "$workflow" 'python3 -m venv "$RUNNER_TEMP/copr-cli"' \
+    "$(basename "$workflow") creates a venv under RUNNER_TEMP"
+  expect_contains "$workflow" '"$RUNNER_TEMP/copr-cli/bin/pip" install copr-cli' \
+    "$(basename "$workflow") installs copr-cli with pip"
+  expect_contains "$workflow" 'echo "$RUNNER_TEMP/copr-cli/bin" >> "$GITHUB_PATH"' \
+    "$(basename "$workflow") puts the venv bin directory on PATH"
+  expect_contains "$workflow" '"$RUNNER_TEMP/copr-cli/bin/copr-cli" --version' \
+    "$(basename "$workflow") prints copr-cli --version"
+done
+
+if grep -Eq 'apt-get install.*copr-cli' <<<"$COPR_BLOCK"; then
   fail "copr job still apt-installs copr-cli"
 else
-  pass "copr job no longer apt-installs copr-cli"
+  pass "copr job does not apt-install copr-cli"
 fi
-if [[ "$COPR_BLOCK" == *'python3 -m venv "$RUNNER_TEMP/copr-cli"'* ]]; then
-  pass "copr job creates a venv under RUNNER_TEMP"
+expect_contains "$RELEASE" 'BASE_URL="https://cdn.bitty.run/releases/${TAG}"' \
+  "release copr job reads source bundles from the CDN"
+expect_contains "$REPAIR" '--pattern "bitty-${VERSION}-x86_64-unknown-linux-gnu.tar.zst"' \
+  "repair copr job downloads the x86_64 source bundle"
+expect_contains "$REPAIR" '--pattern "bitty-${VERSION}-aarch64-unknown-linux-gnu.tar.zst"' \
+  "repair copr job downloads the aarch64 source bundle"
+expect_contains "$REPAIR" "tooling/scripts/build-copr-srpm.sh" \
+  "repair copr job builds the SRPM from default-branch tooling"
+expect_contains "$REPAIR" "--spec tooling/packaging/bitty.spec" \
+  "repair copr job uses the corrected default-branch spec"
+if [[ "$COPR_BLOCK" == *'copr-cli build --timeout 1800 "${ARGS[@]}" "$COPR_PROJECT" "$SRPM"'* ]]; then
+  pass "release copr job submits one SRPM to all discovered chroots"
 else
-  fail "copr job does not create a venv under RUNNER_TEMP"
+  fail "release copr job does not submit the SRPM to the discovered chroots"
 fi
-if [[ "$COPR_BLOCK" == *'"$RUNNER_TEMP/copr-cli/bin/pip" install copr-cli'* ]]; then
-  pass "copr job installs copr-cli with pip"
+if grep -qF 'CHROOTS="$(printf' <<<"$COPR_BLOCK" &&
+  grep -qF -- 'x86_64|aarch64' <<<"$COPR_BLOCK"; then
+  pass "release copr job discovers x86_64/aarch64 chroots"
 else
-  fail "copr job does not install copr-cli with pip"
+  fail "release copr job does not discover x86_64/aarch64 chroots"
 fi
-if [[ "$COPR_BLOCK" == *'export PATH="$RUNNER_TEMP/copr-cli/bin:$PATH"'* ]]; then
-  pass "copr job puts the venv bin directory on PATH"
-else
-  fail "copr job does not put the venv bin directory on PATH"
-fi
-if [[ "$COPR_BLOCK" == *"copr-cli --version"* ]]; then
-  pass "copr job prints copr-cli --version"
-else
-  fail "copr job does not print copr-cli --version"
-fi
+
+BUILD_SRPM="scripts/build-copr-srpm.sh"
+[[ -x "$BUILD_SRPM" ]] || fail "SRPM helper missing or not executable: $BUILD_SRPM"
+expect_contains "$BUILD_SRPM" 'rpmbuild -bs "$SPEC_COPY"' \
+  "SRPM helper runs rpmbuild -bs"
+expect_contains "$BUILD_SRPM" 'Version:        " version' \
+  "SRPM helper materializes the release version into the spec copy"
+expect_contains "$BUILD_SRPM" '--define "version $VERSION"' \
+  "SRPM helper overrides the spec version"
+expect_contains "$BUILD_SRPM" '--define "_sourcedir $SOURCEDIR"' \
+  "SRPM helper scopes the source directory"
+expect_contains "$BUILD_SRPM" '--define "_srcrpmdir $OUTPUT_DIR"' \
+  "SRPM helper scopes the SRPM output directory"
+expect_contains "$BUILD_SRPM" "zstd -t" \
+  "SRPM helper validates zstd sources"
+expect_contains "$BUILD_SRPM" "sha256sum -c" \
+  "SRPM helper verifies source checksums when SHA256SUMS is present"
+expect_contains "$BUILD_SRPM" 'rpm -qp --qf' \
+  "SRPM helper verifies SRPM metadata"
+
+expect_contains "packaging/bitty.spec" 'Version:        %{version}' \
+  "spec version is overridable"
+expect_contains "packaging/bitty.spec" '%{!?version:%global version 0.0.27}' \
+  "spec keeps a default version"
+expect_contains "packaging/bitty.spec" "BuildRequires:  zstd" \
+  "spec declares zstd for .tar.zst extraction"
+expect_contains "packaging/bitty.spec" "%global debug_package %{nil}" \
+  "spec disables debuginfo for the prebuilt payload"
 
 # --- 2. APT signing key import ---------------------------------------------
 expect_contains "$RELEASE" "scripts/import-apt-gpg-key.sh --fingerprint" \

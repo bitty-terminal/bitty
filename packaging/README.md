@@ -48,13 +48,14 @@ gh workflow run repair-release-channels.yml \
 ```
 
 `channels` is `all`, `apt`, or `copr`. The workflow downloads the published
-`.deb`/`.rpm` assets plus `SHA256SUMS` from the GitHub Release, verifies every
-checksum, republishes only the derived channel state, and reads the APT indices
-back from R2. It never moves a tag, edits a release, or re-uploads an asset.
-The optional Nix leg (`channels=all`) adopts a newer, validated `flake.lock`
-from the default branch only when it is newer than the tag's lock and passes
-`nix flake metadata`; otherwise it skips with a notice, leaving the published
-tag untouched.
+`.deb`/`.tar.zst` assets plus `SHA256SUMS` from the GitHub Release, verifies
+every checksum, republishes only the derived channel state, and reads the APT
+indices back from R2. The Copr leg builds a source RPM from the published
+`.tar.zst` bundles and submits it with `copr-cli build`. The workflow never
+moves a tag, edits a release, or re-uploads an asset. The optional Nix leg
+(`channels=all`) adopts a newer, validated `flake.lock` from the default branch
+only when it is newer than the tag's lock and passes `nix flake metadata`;
+otherwise it skips with a notice, leaving the published tag untouched.
 
 ## Install smoke
 

@@ -70,6 +70,9 @@ What each script installs:
   `autoupdate` point at the R2-backed CDN with the published sha256 hash; its
   `notes` field documents the GitHub Releases fallback. Windows may still show
   a first-run reputation check. See `packaging/README.md`.
+- **Windows Package Manager (winget)**: `winget install BittyTerminal.Bitty` or
+  `winget install bitty`; manifest definition in `packaging/windows/winget/`;
+  see `packaging/winget.md`.
 - **Debian / Ubuntu (APT)**: `curl -fsSL https://cdn.bitty.run/apt/setup.sh | sudo bash && sudo apt install -y bitty`; see `packaging/debian.md`.
 - **Fedora / EPEL (Copr)**: `sudo dnf copr enable -y xuepoo/bitty-terminal && sudo dnf install -y bitty`; see `packaging/fedora.md`.
 - **Nix / NixOS (Flake & Cachix)**: `nix run github:bitty-terminal/bitty` with binary cache `https://bitty.cachix.org`; see `packaging/nix.md`.
@@ -84,6 +87,9 @@ What each script installs:
 - **Void Linux**: `xbps-src` template (in-tree draft, not in void-packages:
   best-effort) in `packaging/void/srcpkgs/bitty/template`; see
   `packaging/void.md`.
+- **Solus Linux**: `ypkg` recipe (in-tree draft, not in solus-project:
+  best-effort) in `packaging/solus/package.yml`; see
+  `packaging/solus.md`.
 - **FreeBSD**: Ports recipe in `packaging/freebsd/x11/bitty/` (`make install`
   from a ports tree); best-effort, not supported (no release job installs it);
   see `packaging/freebsd.md`.

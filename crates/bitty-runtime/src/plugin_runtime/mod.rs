@@ -28,6 +28,7 @@ pub mod device_providers;
 pub mod fs;
 pub mod fs_list;
 pub mod history;
+pub mod keybindings;
 pub mod manifest_toml;
 pub mod overlay;
 pub mod package;
@@ -91,6 +92,10 @@ pub use history::{
     HISTORY_MAX_BYTES_PER_ROW, HISTORY_MAX_BYTES_PER_WINDOW, HISTORY_MAX_QUERIES_PER_WINDOW,
     HISTORY_MAX_ROWS_PER_QUERY, HISTORY_RATE_WINDOW, HISTORY_SNAPSHOT_MAX_ROWS, HistoryProvider,
     TranscriptHistory, history_caps, history_page_value,
+};
+pub use keybindings::{
+    MAX_KEYMAP_SUGGESTION_CONFLICTS, SuggestedBinding, SuggestedBindingDirectory,
+    SuggestedChordConflict,
 };
 pub use overlay::{
     CRASHED_RELEASE_REASON, CapturePoll, DEFAULT_RELEASE_REASON, FOCUS_SWITCHED_RELEASE_REASON,
@@ -694,6 +699,13 @@ pub struct PluginRuntime {
     /// command through the host; activation publishes, suspend parks,
     /// resume restores, dispose/reload/rollback revokes.
     command_directory: Rc<RefCell<CommandDirectory>>,
+    /// Issue #2407 (ADR-0014 stage 3): runtime-shared directory of
+    /// plugin-suggested keybindings consulted by the application at the
+    /// reserved `DispatchPriority::Plugin` slot. Activation publishes only
+    /// same-generation, owner-local command targets, suspend parks, resume
+    /// restores, and dispose/reload/rollback revoke, so a dead generation
+    /// never keeps a chord.
+    suggested_bindings: Rc<RefCell<SuggestedBindingDirectory>>,
     /// CTX-0897: sanitized lifecycle/registration snapshot shared with every
     /// generation's services for `bitty.debug.inspect`; rebuilt by
     /// [`PluginRuntime::sync_debug_view`] after each lifecycle transition.
@@ -964,6 +976,7 @@ impl PluginRuntime {
                 SERVICE_CALL_LEDGER_CAPACITY,
             ))),
             command_directory: Rc::new(RefCell::new(CommandDirectory::new())),
+            suggested_bindings: Rc::new(RefCell::new(SuggestedBindingDirectory::new())),
             debug_view: Rc::new(RefCell::new(debug::DebugView::new())),
             trace_hub: Rc::new(RefCell::new(debug::TraceHub::new())),
             runtime_inspect: None,
@@ -2949,6 +2962,16 @@ impl PluginRuntime {
             let entry = self.entries.get(id).expect("entry exists");
             self.publish_commands(id, generation, &manifest, &entry.registrations, &vm);
         }
+        // Issue #2407 (ADR-0014 stage 3): publish this generation's captured
+        // keymap suggestions into the Core-owned directory the input path
+        // consults at `DispatchPriority::Plugin`. `validate_capture` bounded
+        // their shape; the publish step applies the host-side grammar,
+        // owner-only target, and deterministic-ordering rules, so invalid or
+        // foreign suggestions are dropped instead of reaching dispatch.
+        {
+            let entry = self.entries.get(id).expect("entry exists");
+            self.publish_suggested_bindings(id, generation, &entry.registrations);
+        }
         // CTX-1244 (issue #2107): arm one-shot timers at activation `now +
         // delay_ms` so idle wakes for them. Without this the host pumps
         // zero ticks when idle and armed plugin timers never fire.
@@ -3037,6 +3060,12 @@ impl PluginRuntime {
         self.command_directory
             .borrow_mut()
             .suspend_owner(id.as_str());
+        // Issue #2407: park this generation's suggested bindings with the
+        // same lifecycle, so a disabled plugin's chord stops dispatching and
+        // falls through to the terminal until resume restores it.
+        self.suggested_bindings
+            .borrow_mut()
+            .suspend_owner(id.as_str());
         // CTX-2254: a parked generation may not receive component results it
         // can no longer poll under its authority; every held ticket fails
         // closed with the typed `plugin_not_active` class.
@@ -3078,6 +3107,11 @@ impl PluginRuntime {
         // CTX-1035: restore the parked command publications (same
         // generation, so the catalog and invoke path serve again).
         self.command_directory
+            .borrow_mut()
+            .resume_owner(id.as_str());
+        // Issue #2407: restore the parked suggestions (same generation, so
+        // the previously published chords dispatch again).
+        self.suggested_bindings
             .borrow_mut()
             .resume_owner(id.as_str());
         let _ = self.host.resume(id);
@@ -3143,6 +3177,11 @@ impl PluginRuntime {
         // CTX-1035: revoke this generation's command publications, so no
         // qualified name outlives its owner.
         self.command_directory
+            .borrow_mut()
+            .revoke_owner(id.as_str());
+        // Issue #2407: revoke this generation's suggested bindings, so an
+        // unload, crash, or generation change removes every chord it owned.
+        self.suggested_bindings
             .borrow_mut()
             .revoke_owner(id.as_str());
         let _ = self.host.remove(id);
@@ -3894,6 +3933,65 @@ impl PluginRuntime {
         }
     }
 
+    /// Publish a generation's captured keymap suggestions (issue #2407).
+    ///
+    /// Called after [`validate_capture`] and after [`Self::publish_commands`]
+    /// so every accepted suggestion names a command this same generation
+    /// registered. The host applies the three rules the bridge deliberately
+    /// left for after activation:
+    ///
+    /// - **Grammar**: the chord must parse with the shipped configuration
+    ///   grammar; malformed chords (and the `"leader <second>"` prefix
+    ///   spelling, which has no dispatch router yet) are dropped.
+    /// - **Owner-only target**: `command` must be the qualified
+    ///   `owner:command` form, the owner must be this plugin, and the command
+    ///   must appear in this generation's registration capture. Unqualified,
+    ///   foreign, and unregistered targets are dropped.
+    /// - **Deterministic order**: the directory sorts owners lexicographically
+    ///   and suggestions by canonical chord, keeping the first registered
+    ///   suggestion when one chord repeats.
+    ///
+    /// Dropping is fail-closed, never a fallback: an invalid suggestion binds
+    /// nothing and the chord keeps falling through to terminal encoding.
+    fn publish_suggested_bindings(
+        &self,
+        id: &PluginId,
+        generation: u32,
+        capture: &RegistrationCapture,
+    ) {
+        let registered: BTreeSet<&str> = capture
+            .commands
+            .iter()
+            .map(|registration| registration.id.as_str())
+            .collect();
+        let mut bindings = Vec::new();
+        for suggestion in &capture.keymaps {
+            let Some((owner, command)) = split_qualified_command(&suggestion.command) else {
+                // Unqualified (`foo`) or multi-colon spellings bind nothing.
+                continue;
+            };
+            if owner != id.as_str() || !registered.contains(command) {
+                // Foreign owners and unregistered same-generation commands
+                // are refused before any VM or dispatch path is reachable.
+                continue;
+            }
+            let Ok(chord) = bitty_config::Chord::parse(&suggestion.chord) else {
+                // Grammar failures (including the reserved prefix spelling)
+                // are dropped fail-closed on the cold path.
+                continue;
+            };
+            bindings.push(SuggestedBinding {
+                owner: id.as_str().to_string(),
+                generation,
+                chord,
+                qualified: suggestion.command.clone(),
+            });
+        }
+        self.suggested_bindings
+            .borrow_mut()
+            .publish(id.as_str(), generation, bindings);
+    }
+
     /// Record one delivered event into the trace hub (CTX-0897).
     ///
     /// Runs once per event before fan-out, whether or not any handler is
@@ -4028,6 +4126,11 @@ impl PluginRuntime {
         self.command_directory
             .borrow_mut()
             .revoke_owner(id.as_str());
+        // Issue #2407: a failed activation publishes no suggestions, and a
+        // partially committed generation must not keep any either.
+        self.suggested_bindings
+            .borrow_mut()
+            .revoke_owner(id.as_str());
         self.drop_traces(id);
         // CTX-1244: a failed activation arms nothing; drop any stale timer
         // rows so a dead handle can never fire or wake.
@@ -4064,6 +4167,17 @@ impl PluginRuntime {
     #[must_use]
     pub fn command_directory(&self) -> &Rc<RefCell<CommandDirectory>> {
         &self.command_directory
+    }
+
+    /// Shared live directory of plugin-suggested keybindings (issue #2407).
+    ///
+    /// The application holds no copy: its input path matches against this
+    /// directory at the reserved `DispatchPriority::Plugin` slot, so the
+    /// lifecycle transitions above (publish, suspend, resume, revoke) take
+    /// effect on the next keypress with no app-side refresh window.
+    #[must_use]
+    pub fn suggested_bindings(&self) -> &Rc<RefCell<SuggestedBindingDirectory>> {
+        &self.suggested_bindings
     }
 
     /// Shared native sensor host (CTX-1199; diagnostics, tests).

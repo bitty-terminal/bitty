@@ -534,7 +534,13 @@ impl Runtime {
             view,
             epoch: grid.buffer_epoch(),
             evicted_at: grid.scrollback_evicted_total(),
-            selection: PersistentSelection::from_grid_selection(sel.selection, grid),
+            // Issue #2470 review: a pointer range already carries combined-
+            // buffer rows, so keep it instead of re-expressing a possibly
+            // scrolled viewport range against the live grid (mirrors
+            // `Runtime::persistent_selection`).
+            selection: sel
+                .buffer
+                .unwrap_or_else(|| PersistentSelection::from_grid_selection(sel.selection, grid)),
         })
     }
 

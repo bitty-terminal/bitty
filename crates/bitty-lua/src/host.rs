@@ -2175,9 +2175,10 @@ pub trait HostServices {
     /// `context`, and the optional `title`/`command`). The host must never
     /// add a configuration path, raw user text, argv, environment value, URL,
     /// terminal content, clipboard content, plugin store value, or host
-    /// diagnostic. Plugin-suggested bindings are included only when they are
-    /// actually dispatchable; today the plugin-binding layer is not live, so
-    /// they are omitted instead of advertised.
+    /// diagnostic. Plugin-suggested bindings dispatch through the
+    /// `DispatchPriority::Plugin` slot backed by `SuggestedBindingDirectory`,
+    /// but `bitty.keymaps.list()` intentionally exposes only the resolved
+    /// user/default registry and omits suggestions.
     ///
     /// The default implementation fails closed with `E_NOT_IMPLEMENTED`: a
     /// host without a keymap source grants no ambient registry read.
@@ -4571,9 +4572,11 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     // suggestions: `{ chord = "leader w", command = "my-cmd" }` names the
     // configured Leader (never a hardcoded chord) plus the follow-up chord
     // (bare letters allowed, per `bitty-config` prefix grammar). Capture
-    // accepts the spelling today; dispatch activation rides the Core
-    // pending-window router once the plugin-binding facility lands (the
-    // `match_plugin_binding` slot stays deny-by-default until then).
+    // accepts the spelling, but dispatch understands single chords only:
+    // `SuggestedBindingDirectory` publishes those at the reserved
+    // `DispatchPriority::Plugin` slot, while the prefix-sequence router for
+    // plugin suggestions is intentionally deferred, so the publication layer
+    // drops the spelling fail-closed on the cold path and it binds nothing.
     let keymaps = Table::new(&ctx);
     keymaps
         .set(

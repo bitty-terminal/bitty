@@ -1180,6 +1180,12 @@ mod tests {
             before.first(),
             "PTY growth must not move detached float history"
         );
+        rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, -1.0));
+        assert_eq!(
+            visible_rows(&rt, float).first(),
+            before.get(3),
+            "interactive scrolling after output must use the retained anchor offset"
+        );
     }
 
     #[cfg(unix)]
@@ -1237,6 +1243,12 @@ mod tests {
             visible_rows(&rt, pinned).first(),
             before.first(),
             "PTY growth must not move pinned history"
+        );
+        rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, -1.0));
+        assert_eq!(
+            visible_rows(&rt, pinned).first(),
+            before.get(3),
+            "interactive scrolling after output must use the retained anchor offset"
         );
     }
 }

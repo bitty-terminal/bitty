@@ -827,24 +827,30 @@ impl Runtime {
         // would otherwise move the user's history window down on every line.
         let anchored_view = self.fed_grid_view();
         if let Some(view) = anchored_view {
-            let line_id = self.find_view(view).and_then(|leaf| {
-                let offset = leaf.scroll_offset();
-                if offset == 0 {
-                    return None;
+            let has_anchor = self
+                .find_view(view)
+                .and_then(View::scroll_anchor_line_id)
+                .is_some();
+            if !has_anchor {
+                let line_id = self.find_view(view).and_then(|leaf| {
+                    let offset = leaf.scroll_offset();
+                    if offset == 0 {
+                        return None;
+                    }
+                    let scrollback_len = self.state.scrollback_len();
+                    let total = scrollback_len.saturating_add(self.state.height());
+                    let start = total
+                        .saturating_sub(usize::from(leaf.rows()))
+                        .saturating_sub(offset);
+                    (start < scrollback_len)
+                        .then(|| self.state.scrollback_line(start).map(|line| line.id))
+                        .flatten()
+                });
+                if let Some(line_id) = line_id {
+                    self.capture_view_scroll_anchor_line(view, line_id);
+                } else {
+                    self.clear_view_scroll_anchor(view);
                 }
-                let scrollback_len = self.state.scrollback_len();
-                let total = scrollback_len.saturating_add(self.state.height());
-                let start = total
-                    .saturating_sub(usize::from(leaf.rows()))
-                    .saturating_sub(offset);
-                (start < scrollback_len)
-                    .then(|| self.state.scrollback_line(start).map(|line| line.id))
-                    .flatten()
-            });
-            if let Some(line_id) = line_id {
-                self.capture_view_scroll_anchor_line(view, line_id);
-            } else {
-                self.clear_view_scroll_anchor(view);
             }
         }
         // CTX-0904: IMG-4 in-flight bound (256 MiB across all parsers).

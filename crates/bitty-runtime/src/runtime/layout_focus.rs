@@ -1904,25 +1904,31 @@ impl Runtime {
 
     /// Keeps a detached view's retained top line stable while PTY output
     /// grows, without converting it to a new bottom-relative offset. The
-    /// numeric offset remains the bounded fallback; resize paths use
-    /// [`Self::restore_view_scroll_anchor`] when geometry changes.
+    /// numeric offset is refreshed as well because interactive scrolling
+    /// uses it as the base for its next delta; it remains the bounded
+    /// fallback when the identity is lost.
     pub(super) fn retain_view_scroll_anchor(&mut self, view: ViewId) {
-        let (scrollback_len, state_height, line_index, has_anchor) = {
-            let Some(state) = self.live_view_state(view) else {
-                return;
+        let anchor_id = self.find_view(view).and_then(View::scroll_anchor_line_id);
+        let Some(anchor_id) = anchor_id else {
+            return;
+        };
+        let (scrollback_len, state_height, line_index) = {
+            let state = if self.kitty_origin == Some(view.0) {
+                &self.state
+            } else {
+                let Some(state) = self.live_view_state(view) else {
+                    return;
+                };
+                state
             };
-            let anchor_id = self.find_view(view).and_then(View::scroll_anchor_line_id);
             (
                 state.scrollback_len(),
                 state.height(),
-                anchor_id.and_then(|id| state.scrollback().position(|line| line.id == id)),
-                anchor_id.is_some(),
+                state.scrollback().position(|line| line.id == anchor_id),
             )
         };
-        if !has_anchor || line_index.is_none() {
-            if let Some(leaf) = self.find_view_mut(view) {
-                leaf.restore_scroll_anchor_position(scrollback_len, state_height, line_index);
-            }
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.restore_scroll_anchor_position(scrollback_len, state_height, line_index);
         }
     }
 

@@ -833,6 +833,180 @@ fn t_junction_drag_uses_press_anchor_for_incremental_motion() {
     assert_eq!(rt.layout_allocations(), after_release);
 }
 
+/// T junction with the nested divider in the root's second child:
+/// `H[1,V[2,3]]`.
+fn second_child_horizontal_t() -> LayoutNode {
+    LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 12)),
+            LayoutNode::leaf(View::new(ViewId::new(3), 40, 12)),
+        ),
+    )
+}
+
+/// T junction with the nested divider in the root's second child:
+/// `V[1,H[2,3]]`.
+fn second_child_vertical_t() -> LayoutNode {
+    LayoutNode::split(
+        SplitAxis::Vertical,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+        LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 12)),
+            LayoutNode::leaf(View::new(ViewId::new(3), 40, 12)),
+        ),
+    )
+}
+
+fn assert_second_child_t_state(
+    rt: &Runtime,
+    expected_splits: &[(Vec<usize>, SplitAxis)],
+    expected_leaf_ids: &[ViewId],
+) {
+    assert_eq!(rt.border_drag_splits(), Some(expected_splits.to_vec()));
+    assert_eq!(rt.layout().leaf_ids(), expected_leaf_ids);
+    assert_eq!(rt.leaf_count(), expected_leaf_ids.len());
+    rt.layout()
+        .validate_structure()
+        .expect("dragged T layout must remain structurally valid");
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+    assert!(rt.selection().is_none());
+    assert_partition(rt, UiRect::new(0, 0, 80, 24));
+}
+
+#[test]
+fn second_child_horizontal_t_drag_from_headed_endpoint_moves_both_axes() {
+    let mut rt = make_runtime();
+    rt.set_layout(second_child_horizontal_t());
+    let expected_splits = vec![
+        (Vec::new(), SplitAxis::Horizontal),
+        (vec![1], SplitAxis::Vertical),
+    ];
+    let expected_leaf_ids = vec![ViewId::new(1), ViewId::new(2), ViewId::new(3)];
+
+    // The headed pointer maps to (39,11), one cell adjacent to the nested
+    // divider's span. The layout hit test must still own the T as a cross.
+    rt.handle_cursor_moved(cell_pixels(39, 11));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+    assert_second_child_t_state(&rt, &expected_splits, &expected_leaf_ids);
+
+    // Horizontal-only motion moves the root and leaves the nested split put.
+    rt.handle_cursor_moved(cell_pixels(47, 11));
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 48, 24));
+    assert_eq!(pane(&rt, 2), UiRect::new(48, 0, 32, 12));
+    assert_eq!(pane(&rt, 3), UiRect::new(48, 12, 32, 12));
+    assert_second_child_t_state(&rt, &expected_splits, &expected_leaf_ids);
+
+    // Vertical-only motion returns the root to its press position and moves
+    // only the nested row divider.
+    rt.handle_cursor_moved(cell_pixels(39, 15));
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 40, 24));
+    assert_eq!(pane(&rt, 2), UiRect::new(40, 0, 40, 16));
+    assert_eq!(pane(&rt, 3), UiRect::new(40, 16, 40, 8));
+    assert_second_child_t_state(&rt, &expected_splits, &expected_leaf_ids);
+
+    // Diagonal +8/+4 motion updates both grabbed axes from the same anchor.
+    rt.handle_cursor_moved(cell_pixels(47, 15));
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 48, 24));
+    assert_eq!(pane(&rt, 2), UiRect::new(48, 0, 32, 16));
+    assert_eq!(pane(&rt, 3), UiRect::new(48, 16, 32, 8));
+    assert_second_child_t_state(&rt, &expected_splits, &expected_leaf_ids);
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.border_drag_active());
+}
+
+#[test]
+fn second_child_vertical_t_drag_from_headed_endpoint_moves_both_axes() {
+    let mut rt = make_runtime();
+    rt.set_layout(second_child_vertical_t());
+    let expected_splits = vec![
+        (vec![1], SplitAxis::Horizontal),
+        (Vec::new(), SplitAxis::Vertical),
+    ];
+    let expected_leaf_ids = vec![ViewId::new(1), ViewId::new(2), ViewId::new(3)];
+
+    rt.handle_cursor_moved(cell_pixels(39, 11));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+    assert_second_child_t_state(&rt, &expected_splits, &expected_leaf_ids);
+
+    // Horizontal-only motion moves only the nested divider.
+    rt.handle_cursor_moved(cell_pixels(47, 11));
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 80, 12));
+    assert_eq!(pane(&rt, 2), UiRect::new(0, 12, 48, 12));
+    assert_eq!(pane(&rt, 3), UiRect::new(48, 12, 32, 12));
+    assert_second_child_t_state(&rt, &expected_splits, &expected_leaf_ids);
+
+    // Vertical-only motion returns the nested divider to its press position
+    // and moves only the root split.
+    rt.handle_cursor_moved(cell_pixels(39, 15));
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 80, 16));
+    assert_eq!(pane(&rt, 2), UiRect::new(0, 16, 40, 8));
+    assert_eq!(pane(&rt, 3), UiRect::new(40, 16, 40, 8));
+    assert_second_child_t_state(&rt, &expected_splits, &expected_leaf_ids);
+
+    rt.handle_cursor_moved(cell_pixels(47, 15));
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 80, 16));
+    assert_eq!(pane(&rt, 2), UiRect::new(0, 16, 48, 8));
+    assert_eq!(pane(&rt, 3), UiRect::new(48, 16, 32, 8));
+    assert_second_child_t_state(&rt, &expected_splits, &expected_leaf_ids);
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.border_drag_active());
+}
+
+#[test]
+fn second_child_t_junction_with_gaps_keeps_inflated_cross_ownership() {
+    for (layout, expected_splits) in [
+        (
+            second_child_horizontal_t(),
+            vec![
+                (Vec::new(), SplitAxis::Horizontal),
+                (vec![1], SplitAxis::Vertical),
+            ],
+        ),
+        (
+            second_child_vertical_t(),
+            vec![
+                (vec![1], SplitAxis::Horizontal),
+                (Vec::new(), SplitAxis::Vertical),
+            ],
+        ),
+    ] {
+        let mut rt = Runtime::new(RuntimeConfig {
+            gaps_in: 2,
+            gaps_out: 0,
+            ..RuntimeConfig::default()
+        })
+        .expect("gapped config must build");
+        rt.set_layout(layout);
+        // The center of the two-cell gap intersection is owned by both
+        // inflated perpendicular bands, preserving the existing cross model.
+        rt.handle_cursor_moved(cell_pixels(40, 12));
+        rt.handle_mouse_input(press(MouseButton::Left));
+        assert!(rt.border_drag_active(), "gapped T endpoint must grab");
+        assert_eq!(rt.border_drag_splits(), Some(expected_splits));
+        assert_eq!(
+            rt.layout().leaf_ids(),
+            vec![ViewId::new(1), ViewId::new(2), ViewId::new(3)]
+        );
+        rt.layout()
+            .validate_structure()
+            .expect("gapped T layout must remain structurally valid");
+        assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+        assert!(rt.selection().is_none());
+        rt.handle_mouse_input(release(MouseButton::Left));
+        assert!(!rt.border_drag_active());
+    }
+}
+
 #[test]
 fn junction_drag_grabs_cross_with_both_row_segments() {
     let mut rt = make_runtime();

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use bitty_platform::{CursorPosition, MouseButton, MouseEvent, PressState};
 use bitty_runtime::{
     LayoutNode, PanelLayoutMode, Runtime, SplitAxis, UiRect, View, ViewId, drop_plan_for_point,
-    largest_area_leaf, splittable_axis,
+    largest_splittable_leaf,
 };
 
 const SCALE: u16 = 10;
@@ -448,14 +448,13 @@ fn legacy_eight_panels() -> LayoutNode {
     tree
 }
 
-/// Fixed `Mod+N`: the runtime's balanced plan (largest slot, balanced axis,
-/// after).
+/// Fixed `Mod+N`: the runtime's balanced plan (largest feasible slot, balanced
+/// axis, after).
 fn balanced_eight_panels() -> LayoutNode {
     let mut tree = leaf(1);
     for next in 2..=9u64 {
         let allocations = tree.layout(CONTAINER);
-        let (target, rect) = largest_area_leaf(&allocations).expect("a leaf");
-        let axis = splittable_axis(rect, 0).expect("usable split");
+        let (target, _, axis) = largest_splittable_leaf(&allocations, 0).expect("usable split");
         assert!(split(&mut tree, target, axis, ViewId::new(next), false));
     }
     tree
@@ -507,7 +506,7 @@ fn issue_2521_2528_eight_new_panels_before_after() {
     );
     let after_svg = render_svg(
         "#2521/#2528 eight Mod+N: after (fix)",
-        "balanced bisect-largest keeps every pane usable",
+        "balanced largest-feasible selection keeps every pane usable",
         &after,
         &after_alloc,
         None,
@@ -537,9 +536,9 @@ fn runtime_plan_matches_balanced_evidence_builder() {
         let plan = rt.panel_split_plan().expect("plan");
         assert!(!plan.place_new_first, "balanced always places after");
         let allocations = tree.layout(CONTAINER);
-        let (target, rect) = largest_area_leaf(&allocations).expect("a leaf");
+        let (target, _, axis) = largest_splittable_leaf(&allocations, 0).expect("usable split");
         assert_eq!(plan.target, target);
-        assert_eq!(plan.axis, splittable_axis(rect, 0).expect("usable"));
+        assert_eq!(plan.axis, axis);
         assert!(split(
             &mut tree,
             plan.target,

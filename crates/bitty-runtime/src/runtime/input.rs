@@ -1354,6 +1354,9 @@ impl Runtime {
                 }
             }
             (MouseButton::Left, PressState::Released) => {
+                // Issue #2470: the drag is over, so any armed edge auto-scroll
+                // must not keep scrolling after the selection is committed.
+                self.clear_selection_autoscroll();
                 // CTX-0803 (#1476): the release maps into the *owner's*
                 // content frame, clamped. The mapping is total inside the
                 // owner, so a release over a sibling panel commits at the
@@ -1469,7 +1472,12 @@ impl Runtime {
             let owner = self.selection_owner();
             if boundary_drag {
                 match owner.and_then(|owner| self.cursor_to_owner_cell_and_boundary(owner, pos)) {
-                    Some((cell, boundary)) => self.update_boundary_selection(cell, boundary),
+                    Some((cell, boundary)) => {
+                        self.update_boundary_selection(cell, boundary);
+                        if let Some(owner) = owner {
+                            self.arm_selection_edge_at(owner, pos, now);
+                        }
+                    }
                     // The owner lost its present frame mid-drag: end the drag
                     // and drop the selection rather than extend it against a
                     // frame that is no longer painted (fail closed).
@@ -1478,7 +1486,12 @@ impl Runtime {
                 return;
             }
             match owner.and_then(|owner| self.cursor_to_owner_cell(owner, pos)) {
-                Some(cell) => self.update_selection(cell),
+                Some(cell) => {
+                    self.update_selection(cell);
+                    if let Some(owner) = owner {
+                        self.arm_selection_edge_at(owner, pos, now);
+                    }
+                }
                 None => self.clear_selection(),
             }
             return;
@@ -1676,12 +1689,21 @@ impl Runtime {
                     )
                 };
                 let modal = self.copy_mode.is_some() || self.search_mode;
+                // Issue #2470: an in-flight Core selection drag owns the
+                // wheel. The user is actively extending a selection, so the
+                // transcript must scroll even when the focused app enabled
+                // mouse reporting (capture) or alternate scroll; without a
+                // drag both precedences below are unchanged, and Shift still
+                // forces the viewport path.
+                let selection_drag = self.is_selection_dragging();
                 let alt_scroll_active = !modal
                     && !self.shift_pressed
+                    && !selection_drag
                     && alt_scroll_set
                     && !mouse_tracking
                     && self.focused_alt_screen_active();
-                let capture_scroll = !modal && !self.shift_pressed && mouse_tracking;
+                let capture_scroll =
+                    !modal && !self.shift_pressed && !selection_drag && mouse_tracking;
                 if alt_scroll_active {
                     // Alternate screen has no scrollback: vertical notches
                     // become cursor keys (application-cursor aware), and
@@ -1743,13 +1765,29 @@ impl Runtime {
                     self.wheel_line_accum_x = 0.0;
                     // Viewport scroll
                     if lines_y != 0 {
+                        // Issue #2470: a drag scrolls the *selection owner*
+                        // (Shift+press may own a non-focused pane), and its
+                        // own backing store bounds the scroll. Without a drag
+                        // the focused view (or the single-window fallback)
+                        // stays authoritative.
+                        let scrolled_view = if selection_drag {
+                            self.selection_owner()
+                        } else {
+                            self.focused_view().or(Some(ViewId::new(1)))
+                        };
                         // #1338 fail-closed: the alternate screen owns no
                         // scrollback view, so a wheel that reached this
                         // branch (no alternate scroll, no mouse capture, no
                         // modal) is inert there — never a viewport scroll.
                         // Drain the fraction so it cannot leak into a later
                         // primary-screen session.
-                        if self.focused_alt_screen_active() {
+                        let alt_screen = scrolled_view
+                            .and_then(|id| self.live_view_state(id))
+                            .map_or_else(
+                                || self.focused_alt_screen_active(),
+                                |s| s.alt_screen_active(),
+                            );
+                        if alt_screen {
                             self.wheel_line_accum_y = 0.0;
                         } else {
                             // winit LineDelta y>0 = wheel up; View::scroll_by
@@ -1761,18 +1799,14 @@ impl Runtime {
                             // a wheel that moves the viewport during a drag
                             // shifts the stored viewport anchor so its buffer
                             // line stays pinned (focus stays at the cursor).
-                            let max = self.scrollback_len();
-                            let scrolled_view = self.focused_view().or(Some(ViewId::new(1)));
+                            let max = scrolled_view
+                                .and_then(|id| self.live_view_state(id))
+                                .map_or_else(|| self.scrollback_len(), State::scrollback_len);
                             let old_offset = scrolled_view
                                 .and_then(|id| self.find_view(id))
                                 .map_or(0, |view| view.scroll_offset());
-                            if let Some(view_id) = self.focused_view() {
+                            if let Some(view_id) = scrolled_view {
                                 if let Some(view) = self.find_view_mut(view_id) {
-                                    view.scroll_by(lines_y, max);
-                                }
-                            } else {
-                                // Single-window fallback: find leaf 1
-                                if let Some(view) = self.find_view_mut(ViewId::new(1)) {
                                     view.scroll_by(lines_y, max);
                                 }
                             }
@@ -1826,17 +1860,24 @@ impl Runtime {
     /// scrollback view there), and clamped to the focused pane's own backing
     /// store under splits.
     pub fn scroll_focused_page(&mut self, up: bool) -> bool {
-        // #1338 fail-closed: zero bound on the alternate screen, so paging
-        // is a no-op there; focused-aware bound under splits.
-        let max = if self.focused_alt_screen_active() {
-            0
+        // Issue #2470: while a drag is in flight, page keys page the pane
+        // that owns the selection (a Shift+press can own a non-focused
+        // split/float); the range is re-tracked across the page exactly like
+        // a wheel scroll. Without a drag the focused pane stays authoritative.
+        let target = if self.is_selection_dragging() {
+            self.selection_owner()
         } else {
-            self.scrollback_len()
+            self.focused_view()
         };
-        let target = match self.focused_view() {
-            Some(id) => id,
-            None => return false,
+        let Some(target) = target else {
+            return false;
         };
+        // #1338 fail-closed: zero bound on the alternate screen, so paging
+        // is a no-op there; the bound is the target pane's own store.
+        let max = self
+            .live_view_state(target)
+            .filter(|state| !state.alt_screen_active())
+            .map_or(0, State::scrollback_len);
         let old_offset = self
             .find_view(target)
             .map_or(0, |view| view.scroll_offset());
@@ -1918,6 +1959,11 @@ impl Runtime {
             // present-only ghost clears on the next frame and the layout is
             // still the pre-drag tree.
             self.cancel_tiled_drag();
+            // Issue #2470 review: an armed edge auto-scroll must not keep
+            // scrolling a window the user is no longer interacting with. The
+            // held drag itself stays (the pointer may still be down); the
+            // next pointer move inside the edge row re-arms the wake.
+            self.clear_selection_autoscroll();
         }
         if self.focused == focused {
             return;

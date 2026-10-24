@@ -55,6 +55,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Thin rounded Core chrome tokens (#2468):** help/which-key, command
+  palette and presentation/plugin overlays, panel rings, and band chrome now
+  share one `bitty-render::chrome` token layer: one-physical-pixel muted
+  borders, a 6 px radius, 8 px padding, raised/overlay surface tones, and the
+  theme's accepted focused/idle outline pair. Help and overlay cards paint as
+  rounded SDF surfaces with glyph clipping at the corner arc; one-row bands
+  use rounded box-drawing corner glyphs when the corner cell is blank, with a
+  documented light-box/square fallback. Plugin row `fg`/`bg`/`bold` values
+  still win inside the Core card, and a new overlay-card/content/ring layer
+  order keeps row backgrounds visible while the ring stays above content.
+
 - **Default new-panel layout is Spiral (#2571):** `Mod+N` now creates the
   next pane with the 4-way clockwise `Spiral` policy (Right -> Down -> Left
   -> Up around the focused pane) instead of `Balanced` bisect-largest.
@@ -82,19 +93,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history is gone. The mechanism stays in Core selection/history paging; the
   copy-mode plugin remains a bounded snapshot policy over the same public
   surfaces, and no private API is added.
-
-### Changed
-
-- **Thin rounded Core chrome tokens (#2468):** help/which-key, command
-  palette and presentation/plugin overlays, panel rings, and band chrome now
-  share one `bitty-render::chrome` token layer: one-physical-pixel muted
-  borders, a 6 px radius, 8 px padding, raised/overlay surface tones, and the
-  theme's accepted focused/idle outline pair. Help and overlay cards paint as
-  rounded SDF surfaces with glyph clipping at the corner arc; one-row bands
-  use rounded box-drawing corner glyphs when the corner cell is blank, with a
-  documented light-box/square fallback. Plugin row `fg`/`bg`/`bold` values
-  still win inside the Core card, and a new overlay-card/content/ring layer
-  order keeps row backgrounds visible while the ring stays above content.
 
 ## [0.0.27] - 2026-10-23
 

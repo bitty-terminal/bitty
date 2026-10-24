@@ -3817,7 +3817,7 @@ mod startup_tests {
                 " font = { family = \"Mono\", size = 13.0 } }"
             ),
             Some(
-                "return { decoration = { gaps_in = 2, background_image_roots = { \"/approved-root\" } } }",
+                "return { decoration = { gaps_in = 2, background_image_roots = { \"~/approved-root\" } } }",
             ),
         );
         let (app, diagnostics) =
@@ -3921,10 +3921,10 @@ mod startup_tests {
             ),
             Some(concat!(
                 "return { decoration = { gaps_in = 2,",
-                " background_image = \"/approved-root/wall.png\",",
-                " background_image_roots = { \"/approved-root\" } },",
-                " window = { background_image = \"/approved-root/window.png\" },",
-                " views = { [\"*\"] = { background_image = \"/approved-root/view.png\" } },",
+                " background_image = \"~/approved-root/wall.png\",",
+                " background_image_roots = { \"~/approved-root\" } },",
+                " window = { background_image = \"~/approved-root/window.png\" },",
+                " views = { [\"*\"] = { background_image = \"~/approved-root/view.png\" } },",
                 " font = { family = \"Mono\", size = 14.0 } }"
             )),
         );

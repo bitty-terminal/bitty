@@ -65,6 +65,17 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
+/// Formats a host path for a Lua string literal.
+///
+/// Windows paths use `\`, which Lua reads as an escape (`\U...` is a syntax
+/// error), so normalize separators to `/` and escape quotes. Windows accepts
+/// forward slashes for its file APIs, so the fixture stays valid everywhere.
+fn lua_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "/")
+        .replace('"', "\\\"")
+}
+
 /// Asserts a headless run started and reached a presented tick.
 fn assert_reached_a_tick(output: &Output, context: &str) {
     assert_eq!(
@@ -305,8 +316,8 @@ fn denied_roots_clear_lower_layer_images_and_startup_ticks() {
                 " views = {{ [\"*\"] = {{ background_image = \"{wall}\" }} }},\n",
                 " font = {{ family = \"Mono\", size = 14.0 }} }}\n"
             ),
-            wall = wall.display(),
-            root = approved.display()
+            wall = lua_path(&wall),
+            root = lua_path(&approved)
         ),
     );
 

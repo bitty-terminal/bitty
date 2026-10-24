@@ -23,16 +23,20 @@ and is labeled as such below.
 | apk (aports) | `packaging/alpine/APKBUILD`                              | In-tree aports recipe, not published to aports; best-effort |
 | ebuild       | `packaging/gentoo/` (`bitty-bin`, live `bitty-9999`)     | In-tree overlay, not in the gentoo tree; best-effort        |
 | xbps         | `packaging/void/srcpkgs/bitty/template`                  | In-tree template, not in void-packages; best-effort         |
+| ypkg         | `packaging/solus/package.yml`                            | In-tree Solus recipe, not in solus-project; best-effort     |
 | freebsd      | `packaging/freebsd/x11/bitty/` (ports recipe)            | FreeBSD 15.1 amd64 build-only; best-effort, not supported   |
+| winget       | `packaging/windows/winget/`                              | Windows Package Manager (`BittyTerminal.Bitty`)             |
 
 The upstream distro recipes (Alpine aports, Gentoo overlay, Void `xbps-src`,
-FreeBSD Ports) are in-tree drafts: nothing is published to `alpine/aports`,
-`gentoo/gentoo`, `void-linux/void-packages`, or the FreeBSD ports tree, so
-none of them is support evidence. Their source and checksum steps run **at tag
-time**, because the distfiles are GitHub tag archives that do not exist before
-the release tag is pushed. `bash scripts/tests/check-distro-recipes.test.sh`
-(also `just distro-recipes-test`, run by the CI packaging step) keeps the
-recipes internally consistent and version-agnostic.
+Solus `ypkg`, FreeBSD Ports) are in-tree drafts: nothing is published to
+`alpine/aports`, `gentoo/gentoo`, `void-linux/void-packages`, `solus-project`,
+or the FreeBSD ports tree, so none of them is support evidence. Their source
+and checksum steps run **at tag time**, because the distfiles are GitHub tag
+archives that do not exist before the release tag is pushed.
+`bash scripts/tests/check-distro-recipes.test.sh` (also
+`just distro-recipes-test`, run by the CI packaging step) keeps the recipes
+internally consistent and version-agnostic. Manifests for `winget` are validated
+by `bash scripts/tests/check-package-manifests.test.sh` (`just package-manifests-test`).
 
 Debian and Ubuntu users can install via the R2-backed APT repository (see `packaging/debian.md`). Fedora and Enterprise Linux users can install via Fedora Copr (see `packaging/fedora.md`). OpenSUSE consumes RPMs two ways: the release `nfpm` RPM passes `rpm -qip` and a local `zypper install` check, and `packaging/opensuse/bitty.spec` is the OBS source recipe that publishes a zypper repository (see `packaging/opensuse/README.md` and `packaging/opensuse.md`). No release `verify-install` leg covers OpenSUSE, so both stay best-effort, not supported. Alpine is apk-based; the apk is a native musl build (see `packaging/alpine.md`).
 

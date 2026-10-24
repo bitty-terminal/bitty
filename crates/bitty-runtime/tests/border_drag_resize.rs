@@ -163,6 +163,26 @@ fn drag_right_grows_first_pane_live() {
 }
 
 #[test]
+fn internal_live_drag_commit_preserves_active_drag() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane_horizontal());
+    rt.handle_cursor_moved(cell_pixels(39, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+
+    rt.handle_cursor_moved(cell_pixels(47, 12));
+    assert!(
+        rt.border_drag_active(),
+        "internal commit must keep the drag armed"
+    );
+    assert!((ratio(&rt) - 0.6).abs() < 1e-6);
+
+    rt.handle_cursor_moved(cell_pixels(51, 12));
+    assert!((ratio(&rt) - 0.65).abs() < 1e-6);
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
 fn drag_left_shrinks_first_pane() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane_horizontal());
@@ -174,6 +194,80 @@ fn drag_left_shrinks_first_pane() {
     assert!((ratio(&rt) - expected).abs() < 1e-6);
     rt.handle_mouse_input(release(MouseButton::Left));
     assert!(!rt.border_drag_active());
+}
+
+#[test]
+fn resize_cancels_border_drag_before_reflow() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane_horizontal());
+    rt.handle_cursor_moved(cell_pixels(39, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+
+    rt.handle_resize(bitty_platform::PhysicalSize::new(800, 600))
+        .expect("valid resize");
+    assert!(
+        !rt.border_drag_active(),
+        "resize must cancel the stale drag"
+    );
+
+    let resized = rt.layout().clone();
+    assert!(!rt.update_border_drag_at(cell_pixels(47, 12), std::time::Instant::now()));
+    assert_eq!(
+        rt.layout(),
+        &resized,
+        "motion from the canceled drag must not mutate reflowed geometry"
+    );
+}
+
+#[test]
+fn external_layout_replacement_cancels_border_drag() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane_horizontal());
+    rt.handle_cursor_moved(cell_pixels(39, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+
+    let replacement = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.25,
+        LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(4), 80, 24)),
+    );
+    rt.set_layout(replacement);
+    assert!(
+        !rt.border_drag_active(),
+        "layout replacement must cancel the stale drag"
+    );
+
+    let replaced = rt.layout().clone();
+    assert!((ratio(&rt) - 0.25).abs() < 1e-6);
+    assert!(!rt.update_border_drag_at(cell_pixels(47, 12), std::time::Instant::now()));
+    assert_eq!(
+        rt.layout(),
+        &replaced,
+        "motion from the canceled drag must not mutate replacement geometry"
+    );
+
+    rt.set_layout(two_pane_horizontal());
+    rt.handle_cursor_moved(cell_pixels(39, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+    rt.set_layout_closing(
+        LayoutNode::leaf(View::new(ViewId::new(5), 80, 24)),
+        ViewId::new(1),
+    );
+    assert!(
+        !rt.border_drag_active(),
+        "closing layout replacement must cancel the stale drag"
+    );
+    let replaced = rt.layout().clone();
+    assert!(!rt.update_border_drag_at(cell_pixels(47, 12), std::time::Instant::now()));
+    assert_eq!(
+        rt.layout(),
+        &replaced,
+        "motion after set_layout_closing must not mutate replacement geometry"
+    );
 }
 
 #[test]

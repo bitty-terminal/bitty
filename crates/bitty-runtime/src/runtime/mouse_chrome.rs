@@ -1457,7 +1457,11 @@ impl Runtime {
         }
 
         if any_changed {
-            self.set_layout(next);
+            // This layout is the internal commit of the active gesture, so
+            // preserve its press-time anchor/container while reflowing the
+            // newly committed ratios. Public layout replacements cancel the
+            // drag before replacing the tree.
+            self.commit_border_drag_layout(next);
             // CTX-0967: a live divider move arms the whole-surface resize
             // transition. The ratios commit immediately (terminal content is
             // never interpolated); only Core-owned chrome fades. `None`

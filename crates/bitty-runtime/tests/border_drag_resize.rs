@@ -11,7 +11,9 @@ use bitty_platform::{
     CursorPosition, ModifiersState, MouseButton, PlatformEvent, PressState, WindowEventKind,
     WindowId,
 };
-use bitty_runtime::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId};
+use bitty_runtime::{
+    BandContent, ChromeBands, LayoutNode, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId,
+};
 
 fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("defaults must build")
@@ -217,6 +219,38 @@ fn resize_cancels_border_drag_before_reflow() {
         rt.layout(),
         &resized,
         "motion from the canceled drag must not mutate reflowed geometry"
+    );
+}
+
+#[test]
+fn chrome_band_refresh_cancels_border_drag_before_reflow() {
+    let mut rt = make_runtime();
+    rt.set_layout(two_pane_horizontal());
+    rt.handle_cursor_moved(cell_pixels(39, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+
+    rt.set_chrome_bands(ChromeBands {
+        bottom: vec![BandContent {
+            plugin_id: "test-band".to_string(),
+            slot: bitty_lua::ui::UiSlot::Bottom,
+            root: bitty_lua::ui::UiNode::text("band"),
+            version: 1,
+        }],
+        ..ChromeBands::default()
+    });
+    rt.tick().expect("band refresh must present");
+    assert!(
+        !rt.border_drag_active(),
+        "container refresh must cancel the stale drag"
+    );
+
+    let refreshed = rt.layout().clone();
+    assert!(!rt.update_border_drag_at(cell_pixels(47, 12), std::time::Instant::now()));
+    assert_eq!(
+        rt.layout(),
+        &refreshed,
+        "motion from the canceled drag must not mutate refreshed geometry"
     );
 }
 

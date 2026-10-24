@@ -2902,6 +2902,9 @@ impl Runtime {
         if container == self.container {
             return false;
         }
+        // A changed container invalidates the press-time geometry captured by
+        // any active border drag. Cancel before publishing and reflowing it.
+        self.end_border_drag();
         self.container = container;
         self.layout.reflow_with_gaps(self.container, self.gaps());
         let frames = self.present_frames();

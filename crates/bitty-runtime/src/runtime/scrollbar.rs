@@ -299,6 +299,7 @@ impl Runtime {
         let delta = new_offset as isize - old_offset as isize;
         if delta != 0 {
             self.shift_selection_for_scroll(view, delta);
+            self.capture_view_scroll_anchor(view);
         }
         self.pending_full_redraw = true;
         true

@@ -138,6 +138,35 @@ fn typed_echo_is_painted_on_the_presented_bottom_row_after_overflow() {
 }
 
 #[test]
+fn continuous_output_keeps_detached_history_anchor_in_place() {
+    let mut rt = runtime();
+    overfill(&mut rt, 60);
+
+    rt.handle_wheel(ScrollDelta::Lines(0.0, 2.0));
+    let focused = rt.focused_view().expect("focused leaf");
+    let view = rt.layout().find_leaf(focused).expect("focused leaf exists");
+    let before = view.visible_text_rows(rt.state());
+    let offset_before = view.scroll_offset();
+    assert!(offset_before > 0, "wheel-up must detach from live follow");
+
+    for i in 0..5 {
+        rt.handle_pty_bytes(format!("LIVE-{i}\r\n").as_bytes());
+    }
+    assert!(rt.tick().is_some(), "live output must present");
+
+    let view = rt.layout().find_leaf(focused).expect("focused leaf exists");
+    assert_eq!(
+        view.visible_text_rows(rt.state()),
+        before,
+        "detached history must not move when live output grows"
+    );
+    assert!(
+        view.scroll_offset() >= offset_before,
+        "detached offset must remain historical after output"
+    );
+}
+
+#[test]
 fn scroll_back_suspends_follow_and_typing_reengages_with_visible_echo() {
     let mut rt = runtime();
     overfill(&mut rt, 60);

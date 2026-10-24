@@ -7,8 +7,8 @@ use super::*;
 use crate::PanelLayoutMode;
 use crate::config::decoration_runtime_error;
 use bitty_ui::{
-    SplitAxis, balanced_split_axis, bisect_choice, largest_area_leaf, splittable_axis,
-    splittable_rect,
+    SplitAxis, balanced_split_axis, bisect_choice, largest_area_leaf, largest_splittable_leaf,
+    splittable_axis, splittable_rect,
 };
 use core::ops::{Deref, DerefMut};
 
@@ -205,6 +205,11 @@ impl Deref for LayoutMutGuard<'_> {
 
 impl DerefMut for LayoutMutGuard<'_> {
     fn deref_mut(&mut self) -> &mut LayoutNode {
+        // A caller can replace the live tree through this guard without
+        // passing through the public layout-install funnel. Invalidate the
+        // press-time geometry before exposing mutable access so stale border
+        // motion cannot mutate the caller's replacement tree.
+        self.runtime.cancel_border_drag();
         self.runtime.raise_view_id_high_water();
         &mut self.runtime.layout
     }
@@ -1603,6 +1608,31 @@ impl Runtime {
         }
     }
 
+    /// Reflows only stored overlay Views to their presented content frames.
+    /// Tiled leaves have already been sized by the gap-aware layout solver;
+    /// applying decorated frame dimensions to them here would replace solver
+    /// widths with paint widths and make resize geometry observable incorrectly.
+    pub(super) fn reflow_overlay_present_layout(&mut self, frames: &[PresentFrame]) {
+        let live = self.live_cell_metrics();
+        let cw = u32::from(u16::try_from(live.width).unwrap_or(u16::MAX)).max(1);
+        let ch = u32::from(u16::try_from(live.height).unwrap_or(u16::MAX)).max(1);
+        for frame in frames {
+            let x = (frame.content.x.max(0) as u32) / cw;
+            let y = (frame.content.y.max(0) as u32) / ch;
+            let rect = UiRect::new(
+                x.min(u32::from(u16::MAX)) as u16,
+                y.min(u32::from(u16::MAX)) as u16,
+                frame.cols,
+                frame.rows,
+            );
+            if let Some(stored) = self.pinned.find_mut(frame.view) {
+                stored.reflow_to_rect(rect);
+            } else if let Some(stored) = self.floats.find_mut(frame.view) {
+                stored.reflow_to_rect(rect);
+            }
+        }
+    }
+
     /// Decorated hit-testing: physical cursor position to `(view, local cell)`
     /// over the present frames (frame for hit testing, content for painting).
     ///
@@ -1828,6 +1858,116 @@ impl Runtime {
             return Some(stored);
         }
         None
+    }
+
+    /// Captures a detached viewport's top scrollback identity before the
+    /// backing state is mutated. Numeric offsets alone are bottom-relative,
+    /// so live output would otherwise move the visible history downward.
+    pub(super) fn capture_view_scroll_anchor(&mut self, view: ViewId) {
+        let Some(state) = self.live_view_state(view) else {
+            return;
+        };
+        let scrollback_len = state.scrollback_len();
+        let total = scrollback_len.saturating_add(state.height());
+        let Some(leaf) = self.find_view(view) else {
+            return;
+        };
+        let offset = leaf.scroll_offset();
+        if offset == 0 {
+            return;
+        }
+        let start = total
+            .saturating_sub(usize::from(leaf.rows()))
+            .saturating_sub(offset);
+        let Some(line_id) = (start < scrollback_len)
+            .then(|| state.scrollback_line(start).map(|line| line.id))
+            .flatten()
+        else {
+            if let Some(leaf) = self.find_view_mut(view) {
+                leaf.clear_scroll_anchor();
+            }
+            return;
+        };
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.capture_scroll_anchor_line(line_id);
+        }
+    }
+
+    /// Re-resolves every detached view anchor after terminal output or
+    /// scrollback pruning. Missing identities retain the previous bounded
+    /// offset and are clamped by the view, so eviction never jumps to live.
+    pub(super) fn restore_view_scroll_anchor(&mut self, view: ViewId) {
+        let Some(state) = self.live_view_state(view) else {
+            return;
+        };
+        let scrollback_len = state.scrollback_len();
+        let state_height = state.height();
+        let anchor_id = self.find_view(view).and_then(View::scroll_anchor_line_id);
+        let line_index = anchor_id.and_then(|id| state.scrollback().position(|line| line.id == id));
+        self.restore_view_scroll_anchor_values(view, scrollback_len, state_height, line_index);
+    }
+
+    /// Keeps a detached view's retained top line stable while PTY output
+    /// grows, without converting it to a new bottom-relative offset. The
+    /// numeric offset is refreshed as well because interactive scrolling
+    /// uses it as the base for its next delta; it remains the bounded
+    /// fallback when the identity is lost.
+    pub(super) fn retain_view_scroll_anchor(&mut self, view: ViewId) {
+        let anchor_id = self.find_view(view).and_then(View::scroll_anchor_line_id);
+        let Some(anchor_id) = anchor_id else {
+            return;
+        };
+        let (scrollback_len, state_height, line_index) = {
+            let state = if self.fed_grid_view() == Some(view) {
+                &self.state
+            } else {
+                let Some(state) = self.live_view_state(view) else {
+                    return;
+                };
+                state
+            };
+            (
+                state.scrollback_len(),
+                state.height(),
+                state.scrollback().position(|line| line.id == anchor_id),
+            )
+        };
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.restore_scroll_anchor_position(scrollback_len, state_height, line_index);
+        }
+    }
+
+    /// Installs a previously resolved top-line identity while the PTY
+    /// pipeline temporarily swaps a pane's state into `self.state`.
+    pub(super) fn capture_view_scroll_anchor_line(&mut self, view: ViewId, line_id: u64) {
+        let Some(leaf) = self.find_view(view) else {
+            return;
+        };
+        let offset = leaf.scroll_offset();
+        if offset == 0 || leaf.scroll_anchor_line_id().is_some() {
+            return;
+        }
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.capture_scroll_anchor_line(line_id);
+        }
+    }
+
+    pub(super) fn clear_view_scroll_anchor(&mut self, view: ViewId) {
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.clear_scroll_anchor();
+        }
+    }
+
+    pub(super) fn restore_view_scroll_anchor_values(
+        &mut self,
+        view: ViewId,
+        scrollback_len: usize,
+        state_height: usize,
+        line_index: Option<usize>,
+    ) {
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.restore_scroll_anchor_position(scrollback_len, state_height, line_index);
+        }
     }
 
     /// Scroll offset of leaf `view` in the active layout, detached floats,
@@ -2464,7 +2604,23 @@ impl Runtime {
         self.replace_layout(layout, Some(closed));
     }
 
+    /// Commits a layout produced by the active border drag without
+    /// invalidating that drag's press-time geometry. External callers must
+    /// use [`Self::set_layout`] so a tree replacement cancels the drag.
+    pub(super) fn commit_border_drag_layout(&mut self, layout: LayoutNode) {
+        self.replace_layout_preserving_border_drag(layout, None, true);
+    }
+
     fn replace_layout(&mut self, layout: LayoutNode, closed: Option<ViewId>) {
+        self.replace_layout_preserving_border_drag(layout, closed, false);
+    }
+
+    fn replace_layout_preserving_border_drag(
+        &mut self,
+        layout: LayoutNode,
+        closed: Option<ViewId>,
+        preserve_border_drag: bool,
+    ) {
         // Issue #2337: any layout install abandons an in-flight Mod+drag. A
         // close changes the tree under the drag pointer whether or not it
         // removed the dragged source; the ghost and candidate preview must
@@ -2472,6 +2628,12 @@ impl Runtime {
         // the new tree. The close's own layout change remains; only the drop
         // is abandoned.
         self.cancel_tiled_drag();
+        // A public layout replacement invalidates the press-time container,
+        // gaps, and split paths captured by a border drag. Internal live
+        // border-drag commits explicitly preserve that state.
+        if !preserve_border_drag {
+            self.cancel_border_drag();
+        }
         // Issue #2528 review: any close ends the active creation chain, even
         // when the closed pane was not focused. Otherwise a stale Left/Top
         // spiral phase would still steer the next Mod+N.
@@ -2804,6 +2966,9 @@ impl Runtime {
     /// pre-CTX-0873 `set_container` contract, kept so existing headless
     /// drivers stay deterministic).
     pub fn set_window_cells(&mut self, rect: UiRect) {
+        // Changing the container invalidates any border drag's press-time
+        // geometry. Cancel before publishing the new window bounds.
+        self.cancel_border_drag();
         self.window_cells = rect;
         self.container = self.band_exclusive_container();
         self.pending_full_redraw = true;
@@ -2877,6 +3042,9 @@ impl Runtime {
         if container == self.container {
             return false;
         }
+        // A changed container invalidates the press-time geometry captured by
+        // any active border drag. Cancel before publishing and reflowing it.
+        self.cancel_border_drag();
         self.container = container;
         self.layout.reflow_with_gaps(self.container, self.gaps());
         let frames = self.present_frames();
@@ -2906,11 +3074,12 @@ impl Runtime {
 
     /// Hyprland-dwindle axis for a new panel at `focused` (CTX-0838 #1441).
     ///
-    /// The axis half of [`Self::panel_split_plan`]. [`PanelLayoutMode::Balanced`]
-    /// and [`PanelLayoutMode::BisectLargest`] ignore `focused` and use the
-    /// physically largest slot; `Dwindle` uses the focused leaf. `Spiral` uses
-    /// the focused leaf while it can host two usable children, then falls
-    /// back to the largest-area Balanced target (issue #2571 review).
+    /// The axis half of [`Self::panel_split_plan`]. `Balanced` ignores
+    /// `focused` and uses the largest feasible slot; `BisectLargest` ignores
+    /// `focused` and uses the physically largest slot. `Dwindle` uses the
+    /// focused leaf. `Spiral` uses the focused leaf while it can host two
+    /// usable children, then falls back to the largest feasible Balanced
+    /// target (issue #2571 review).
     /// Falls back to the container when the leaf has no allocation
     /// (fail-closed: never panics, never mutates). Explicit
     /// `new_split:<dir>` keeps its fixed axis; this is only the Mod+N
@@ -2932,12 +3101,11 @@ impl Runtime {
     /// Returns the slot to split, the balanced axis, the insertion side, and
     /// (in `Spiral` mode) the phase used. In `Spiral` mode the focused slot is
     /// used while it can host two usable children; otherwise the plan falls
-    /// back deterministically to the largest-area Balanced target and reports
+    /// back deterministically to the largest feasible Balanced target and reports
     /// `spiral_phase: None` (issue #2571 review). `None` when no live leaf can
     /// host two panes at the minimum usable size (or the layout is empty). The
-    /// app layer commits exactly this plan, so the axis and target can never
-    /// disagree with [`Self::panel_split_axis`] /
-    /// [`Self::panel_bisect_target`].
+    /// app layer commits exactly this plan, so the axis and target stay
+    /// internally consistent for every adaptive mode.
     #[must_use]
     pub fn panel_split_plan(&self) -> Option<PanelSplitPlan> {
         self.panel_split_plan_for(self.focused_view()?)
@@ -2953,8 +3121,8 @@ impl Runtime {
             .unwrap_or(self.container);
         let (target, rect, axis, place_new_first, spiral_phase) = match self.panel_layout_mode {
             PanelLayoutMode::Balanced => {
-                let (target, rect) = largest_area_leaf(&allocations)?;
-                (target, rect, splittable_axis(rect, gap_in)?, false, None)
+                let (target, rect, axis) = largest_splittable_leaf(&allocations, gap_in)?;
+                (target, rect, axis, false, None)
             }
             PanelLayoutMode::BisectLargest => {
                 let (target, rect) = largest_area_leaf(&allocations)?;
@@ -2977,14 +3145,14 @@ impl Runtime {
                         // exhaust on a normal window (80x24 stops after five
                         // presses) long before the tiling is full. Fall back
                         // to the deterministic Balanced target -- the
-                        // largest-area leaf, first in solver order on ties --
+                        // largest feasible leaf, first in solver order on ties --
                         // so `Mod+N` keeps the 0.0.27 capacity instead of
                         // dropping the chord. `spiral_phase: None` marks the
                         // fallback and restarts the chain on the fresh pane;
                         // the app logs one bounded warning for it. `None`
                         // here now means no leaf can host two usable panes.
-                        let (target, rect) = largest_area_leaf(&allocations)?;
-                        (target, rect, splittable_axis(rect, gap_in)?, false, None)
+                        let (target, rect, axis) = largest_splittable_leaf(&allocations, gap_in)?;
+                        (target, rect, axis, false, None)
                     }
                 }
             }
@@ -3030,11 +3198,12 @@ impl Runtime {
     /// Pure, total, headless: returns the leaf with the largest
     /// `width * height` allocation (first in solver order on ties), or
     /// `None` for an empty layout. `NewPanel` callers in
-    /// [`PanelLayoutMode::Balanced`] and [`PanelLayoutMode::BisectLargest`]
-    /// split this target (not the focused leaf); move-to-workspace uses this
-    /// target regardless of [`PanelLayoutMode`]. The axis for the target
-    /// comes from [`bitty_ui::balanced_split_axis`] (balanced) or
-    /// [`bitty_ui::bisect_split_axis`] (raw `width >= height`).
+    /// [`PanelLayoutMode::BisectLargest`] split this target (not the focused
+    /// leaf). Move-to-workspace also uses this largest-area target regardless
+    /// of [`PanelLayoutMode`]. Balanced and Spiral fallback use the separate
+    /// largest-feasible target selected by [`Self::panel_split_plan`].
+    /// The axis for the target comes from [`bitty_ui::bisect_split_axis`]
+    /// (raw `width >= height`).
     #[must_use]
     pub fn panel_bisect_target(&self) -> Option<ViewId> {
         let allocations = self.layout_allocations();
@@ -3183,10 +3352,10 @@ impl Runtime {
     ///   Up) that continues only while the pane created by the previous split
     ///   stays focused; any other active pane restarts at Right (issues
     ///   #2528, #2571). When the focused slot can no longer host two usable
-    ///   panes the plan falls back to the largest-area Balanced target
+    ///   panes the plan falls back to the largest-feasible Balanced target
     ///   (`place_new_first = false`; issue #2571 review).
     /// - `Balanced`: always Right or Down (`place_new_first = false`); the
-    ///   fresh pane goes after the bisected largest slot (explicit opt-in
+    ///   fresh pane goes after the largest feasible slot (explicit opt-in
     ///   since 0.0.28).
     /// - `Dwindle`: Hyprland-style dwindle (always Right or Bottom,
     ///   `place_new_first = false`).
@@ -3220,6 +3389,9 @@ impl Runtime {
     /// CTX-0228: leaf geometry is presentation state — a reflow forces a
     /// full redraw on the next `tick` even when no PTY bytes arrive.
     pub fn reflow_layout(&mut self) -> Vec<(ViewId, UiRect)> {
+        // A caller-requested reflow changes the geometry paired with a
+        // border drag, so stale motion must not reach the current tree.
+        self.cancel_border_drag();
         let gaps = self.gaps();
         self.layout.reflow_with_gaps(self.container, gaps);
         self.pending_full_redraw = true;
@@ -3561,7 +3733,7 @@ mod tests {
     /// `Mod+N` working to the 0.0.27 Balanced capacity. On normal 80x24 and
     /// 120x40 windows the focused Spiral chain exhausts its slot after five
     /// or six presses; the default must then use the deterministic
-    /// largest-area Balanced fallback instead of dropping the chord, match
+    /// largest-feasible Balanced fallback instead of dropping the chord, match
     /// explicit Balanced's pane count, and keep a valid 10x4-minimum tree.
     fn assert_default_spiral_keeps_balanced_capacity(container: UiRect) {
         const PRESSES: usize = 8;
@@ -3627,6 +3799,83 @@ mod tests {
         assert_default_spiral_keeps_balanced_capacity(UiRect::new(0, 0, 120, 40));
     }
 
+    #[test]
+    fn spiral_fallback_selects_largest_feasible_leaf_in_155x42() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        rt.set_container(UiRect::new(0, 0, 155, 42));
+
+        let fallback = loop {
+            let plan = rt.panel_split_plan().expect("fallback remains feasible");
+            if plan.spiral_phase.is_none() {
+                break plan;
+            }
+            apply_new_panel(&mut rt);
+            assert!(
+                rt.leaf_count() < 32,
+                "fallback should precede hard capacity"
+            );
+        };
+        let expected = largest_splittable_leaf(&rt.layout_allocations(), rt.gaps().inner)
+            .expect("a feasible fallback target");
+        assert_eq!(fallback.target, expected.0);
+        assert_eq!(fallback.axis, expected.2);
+        assert!(rt.layout_allocations().iter().all(|(_, rect)| {
+            rect.width >= bitty_ui::MIN_PANE_COLS && rect.height >= bitty_ui::MIN_PANE_ROWS
+        }));
+        apply_new_panel(&mut rt);
+        assert_eq!(rt.leaf_count(), 9);
+        assert_eq!(rt.focused_view(), Some(ViewId::new(9)));
+
+        let continuation = rt.panel_split_plan().expect("fallback-created pane fits");
+        assert_eq!(
+            continuation.target,
+            rt.focused_view().expect("focus after fallback")
+        );
+        assert_eq!(continuation.spiral_phase, Some(0));
+        apply_new_panel(&mut rt);
+        assert_eq!(rt.leaf_count(), 10);
+        assert_eq!(rt.focused_view(), Some(ViewId::new(10)));
+        assert_eq!(rt.layout().validate_structure(), Ok(10));
+        for (id, rect) in rt.layout_allocations() {
+            assert!(
+                rect.width >= bitty_ui::MIN_PANE_COLS && rect.height >= bitty_ui::MIN_PANE_ROWS,
+                "{id:?} fell below the minimum after fallback continuation: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn balanced_and_spiral_fallback_skip_larger_unsplittable_leaf() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        let focused = ViewId::new(1);
+        let feasible = ViewId::new(2);
+        let exhausted = ViewId::new(3);
+        rt.set_container(UiRect::new(0, 0, 39, 7));
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            19.0 / 39.0,
+            LayoutNode::leaf(View::new(focused, 19, 7)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                4.0 / 7.0,
+                LayoutNode::leaf(View::new(feasible, 20, 4)),
+                LayoutNode::leaf(View::new(exhausted, 20, 3)),
+            ),
+        ));
+        assert!(rt.set_focus(focused));
+
+        let spiral = rt.panel_split_plan().expect("smaller feasible leaf exists");
+        assert_eq!(spiral.target, feasible);
+        assert_eq!(spiral.axis, SplitAxis::Horizontal);
+        assert_eq!(spiral.spiral_phase, None);
+
+        rt.set_panel_layout_mode(PanelLayoutMode::Balanced);
+        let balanced = rt.panel_split_plan().expect("balanced fallback exists");
+        assert_eq!(balanced.target, feasible);
+        assert_eq!(balanced.axis, SplitAxis::Horizontal);
+        assert_eq!(balanced.spiral_phase, None);
+    }
+
     /// Issue #2528: the spiral phase continues only along the active
     /// creation chain. Closing a pane hands focus to a survivor, which
     /// resets the next split to Right instead of the stale Left phase.
@@ -3683,7 +3932,7 @@ mod tests {
     }
 
     /// Issue #2521 / #2571 review: a layout where neither the focused Spiral
-    /// target nor the largest-area Balanced fallback can host two usable
+    /// target nor the largest-feasible Balanced fallback can host two usable
     /// panes refuses the adaptive split instead of committing a sliver.
     #[test]
     fn spiral_and_balanced_plans_refuse_below_minimum_pane_size() {
@@ -4063,8 +4312,9 @@ mod tests {
 
     /// Issue #2571 / CTX-0964 (#1698): a fresh runtime defaults to `Spiral`;
     /// `Balanced`, `Dwindle`, and `BisectLargest` stay selectable. `Spiral`
-    /// and `Dwindle` keep focused-leaf semantics; `Balanced` and
-    /// `BisectLargest` target the largest leaf.
+    /// and `Dwindle` keep focused-leaf semantics; `Balanced` targets the
+    /// largest feasible leaf and `BisectLargest` targets the largest-area
+    /// leaf.
     #[test]
     fn default_mode_is_spiral_and_modes_keep_their_targets() {
         let mut rt = Runtime::with_defaults().expect("headless runtime must build");
@@ -4084,10 +4334,14 @@ mod tests {
         assert_eq!(plan.spiral_phase, Some(0), "a fresh chain starts at Right");
         assert!(!plan.place_new_first);
 
-        // Explicit opt-in: Balanced still bisects the largest slot.
+        // Explicit opt-in: Balanced still bisects the largest feasible slot.
         rt.set_panel_layout_mode(PanelLayoutMode::Balanced);
         assert_eq!(rt.panel_layout_mode(), PanelLayoutMode::Balanced);
-        assert_eq!(rt.panel_bisect_target(), Some(focused));
+        assert_eq!(
+            rt.panel_split_plan().expect("balanced plan").target,
+            focused,
+            "balanced selects the largest feasible target"
+        );
         assert_eq!(
             rt.panel_split_plan().expect("balanced plan").spiral_phase,
             None,

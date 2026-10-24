@@ -1026,9 +1026,9 @@ impl LayoutNode {
         }
         // Cell bounds implied by the ratio clamp and the per-pane minima.
         // `split_rect_with_gap` floors `usable * ratio`, so the lower bound
-        // rounds up and the upper bound rounds down to stay inside the
-        // ratio range after the integer allocation.
-        let ratio_lo = (f64::from(LayoutNode::MIN_RATIO) * f64::from(usable)).ceil() as u32;
+        // must use the same allocation-compatible rounding. `min_first`
+        // still raises the bound when the first subtree needs more cells.
+        let ratio_lo = (f64::from(LayoutNode::MIN_RATIO) * f64::from(usable)).floor() as u32;
         let ratio_hi = (f64::from(LayoutNode::MAX_RATIO) * f64::from(usable)).floor() as u32;
         let lo = min_first.max(ratio_lo).max(1);
         let hi = (usable - min_second).min(ratio_hi).min(usable - 1);
@@ -1877,41 +1877,75 @@ fn on_split_span(
 /// Minimum usable extent of `node` along `axis` (issue #2572).
 ///
 /// A leaf needs [`MIN_PANE_COLS`] columns or [`MIN_PANE_ROWS`] rows. A
-/// split along the axis sums both children plus one inner gap; a split on
-/// the perpendicular axis takes the larger child (both share the extent).
+/// split along the axis must be large enough for its *current ratios* to
+/// allocate both child minimums; a split on the perpendicular axis takes the
+/// larger child (both share the extent). This ratio-aware calculation is
+/// important for a nested same-axis split: its structural minimum can fit in
+/// a parent, while its active ratio still leaves one of its leaves too small.
 /// `Stack` takes the largest child so every stacked page stays usable, and
 /// an `Overlay` takes the larger of base and floating layer. Saturating:
 /// deep or oversized trees never wrap.
 fn min_extent(node: &LayoutNode, axis: SplitAxis, gap_in: u16) -> u32 {
+    let max_extent = u32::from(u16::MAX);
+    if !extent_meets_minimum(node, axis, max_extent, gap_in) {
+        return u32::MAX;
+    }
+    let mut lo = 0;
+    let mut hi = max_extent;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if extent_meets_minimum(node, axis, mid, gap_in) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo
+}
+
+/// Returns whether `node` receives at least the pane minimum along `axis` when
+/// allocated `extent` cells. The recursive split arithmetic mirrors
+/// [`split_rect_with_gap`], including its active ratios and gap bands.
+fn extent_meets_minimum(node: &LayoutNode, axis: SplitAxis, extent: u32, gap_in: u16) -> bool {
     let leaf_min = match axis {
         SplitAxis::Horizontal => u32::from(MIN_PANE_COLS),
         SplitAxis::Vertical => u32::from(MIN_PANE_ROWS),
     };
     match node {
-        LayoutNode::Leaf(_) => leaf_min,
+        LayoutNode::Leaf(_) => extent >= leaf_min,
         LayoutNode::Split {
             axis: split_axis,
+            ratio,
             first,
             second,
-            ..
         } => {
-            let first = min_extent(first, axis, gap_in);
-            let second = min_extent(second, axis, gap_in);
-            if *split_axis == axis {
-                first
-                    .saturating_add(u32::from(gap_in))
-                    .saturating_add(second)
-            } else {
-                first.max(second)
+            if *split_axis != axis {
+                return extent_meets_minimum(first, axis, extent, gap_in)
+                    && extent_meets_minimum(second, axis, extent, gap_in);
             }
+            let bounds = match axis {
+                SplitAxis::Horizontal => Rect::new(0, 0, extent as u16, 1),
+                SplitAxis::Vertical => Rect::new(0, 0, 1, extent as u16),
+            };
+            let (first_bounds, second_bounds) =
+                split_rect_with_gap(bounds, *split_axis, *ratio, gap_in);
+            let first_extent = match axis {
+                SplitAxis::Horizontal => u32::from(first_bounds.width),
+                SplitAxis::Vertical => u32::from(first_bounds.height),
+            };
+            let second_extent = match axis {
+                SplitAxis::Horizontal => u32::from(second_bounds.width),
+                SplitAxis::Vertical => u32::from(second_bounds.height),
+            };
+            extent_meets_minimum(first, axis, first_extent, gap_in)
+                && extent_meets_minimum(second, axis, second_extent, gap_in)
         }
         LayoutNode::Stack(children) => children
             .iter()
-            .map(|child| min_extent(child, axis, gap_in))
-            .max()
-            .unwrap_or(0),
+            .all(|child| extent_meets_minimum(child, axis, extent, gap_in)),
         LayoutNode::Overlay { base, overlay, .. } => {
-            min_extent(base, axis, gap_in).max(min_extent(overlay, axis, gap_in))
+            extent_meets_minimum(base, axis, extent, gap_in)
+                && extent_meets_minimum(overlay, axis, extent, gap_in)
         }
     }
 }
@@ -2142,6 +2176,38 @@ pub fn largest_area_leaf(allocations: &[(ViewId, Rect)]) -> Option<(ViewId, Rect
         }
     }
     best.map(|(id, rect, _)| (id, rect))
+}
+
+/// Largest leaf that can be split into two usable children at `gap_in`.
+///
+/// Area is `width as u32 * height as u32`; ties break to the first feasible
+/// entry in allocation order. Unlike [`largest_area_leaf`], this filters
+/// candidates before ranking them, so an oversized but exhausted leaf cannot
+/// hide a smaller usable target. Returns the balanced axis selected by
+/// [`splittable_axis`] together with the target rectangle. Pure and total.
+#[must_use]
+pub fn largest_splittable_leaf(
+    allocations: &[(ViewId, Rect)],
+    gap_in: u16,
+) -> Option<(ViewId, Rect, SplitAxis)> {
+    let mut best: Option<(ViewId, Rect, SplitAxis, u32)> = None;
+    for (id, rect) in allocations {
+        if rect.width < MIN_PANE_COLS || rect.height < MIN_PANE_ROWS {
+            continue;
+        }
+        let Some(axis) = splittable_axis(*rect, gap_in) else {
+            continue;
+        };
+        let area = u32::from(rect.width).saturating_mul(u32::from(rect.height));
+        match best {
+            None => best = Some((*id, *rect, axis, area)),
+            Some((_, _, _, best_area)) if area > best_area => {
+                best = Some((*id, *rect, axis, area));
+            }
+            Some(_) => {}
+        }
+    }
+    best.map(|(id, rect, axis, _)| (id, rect, axis))
 }
 
 /// Combined bisect choice (CTX-0964, #1698): largest-area leaf plus its
@@ -2973,6 +3039,71 @@ mod tests {
         );
         let empty: Vec<(ViewId, Rect)> = Vec::new();
         assert_eq!(largest_area_leaf(&empty), None);
+    }
+
+    #[test]
+    fn largest_splittable_leaf_skips_exhausted_larger_leaves() {
+        let allocs = vec![
+            // Larger by area, but below both minimum split extents.
+            (ViewId::new(1), Rect::new(0, 0, 19, 7)),
+            // Smaller by area, but horizontally splittable at zero gap.
+            (ViewId::new(2), Rect::new(19, 0, 20, 4)),
+        ];
+        assert_eq!(
+            largest_splittable_leaf(&allocs, 0),
+            Some((
+                ViewId::new(2),
+                Rect::new(19, 0, 20, 4),
+                SplitAxis::Horizontal
+            ))
+        );
+
+        let gap_candidates = vec![
+            // 20 - 1 leaves only 19 usable columns, so neither axis fits.
+            (ViewId::new(3), Rect::new(0, 0, 20, 7)),
+            // 21 - 1 leaves exactly 20 usable columns: 10 + gap + 10.
+            (ViewId::new(4), Rect::new(20, 0, 21, 4)),
+        ];
+        assert_eq!(
+            largest_splittable_leaf(&gap_candidates, 1),
+            Some((
+                ViewId::new(4),
+                Rect::new(20, 0, 21, 4),
+                SplitAxis::Horizontal
+            ))
+        );
+
+        assert_eq!(
+            largest_splittable_leaf(&[(ViewId::new(5), Rect::new(0, 0, 19, 7))], 0),
+            None
+        );
+
+        let ranked = vec![
+            (ViewId::new(6), Rect::new(0, 0, 20, 8)),
+            (ViewId::new(7), Rect::new(20, 0, 30, 8)),
+            (ViewId::new(8), Rect::new(50, 0, 20, 8)),
+        ];
+        assert_eq!(
+            largest_splittable_leaf(&ranked, 0).map(|(id, _, axis)| (id, axis)),
+            Some((ViewId::new(7), SplitAxis::Horizontal)),
+            "the largest feasible area wins"
+        );
+        let tied = [
+            (ViewId::new(10), Rect::new(0, 0, 20, 8)),
+            (ViewId::new(11), Rect::new(20, 0, 20, 8)),
+        ];
+        assert_eq!(
+            largest_splittable_leaf(&tied, 0).map(|(id, _, axis)| (id, axis)),
+            Some((ViewId::new(10), SplitAxis::Horizontal)),
+            "equal feasible candidates keep the first allocation"
+        );
+
+        let perpendicular = [(ViewId::new(9), Rect::new(0, 0, 20, 9))];
+        assert_eq!(
+            largest_splittable_leaf(&perpendicular, 1),
+            Some((ViewId::new(9), Rect::new(0, 0, 20, 9), SplitAxis::Vertical)),
+            "a feasible perpendicular axis is selected when the preferred axis misses the gap-aware minimum"
+        );
     }
 
     #[test]
@@ -4209,6 +4340,184 @@ mod tests {
         assert_eq!(rect(&alloc, 3), Rect::new(40, 0, 40, 16));
         assert_eq!(rect(&alloc, 4), Rect::new(40, 16, 40, 4));
         assert_eq!(rect(&alloc, 5), Rect::new(40, 20, 40, 4));
+    }
+
+    #[test]
+    fn root_drag_respects_active_nested_horizontal_ratio() {
+        use crate::geometry::Gaps;
+
+        let bounds = Rect::new(0, 0, 80, 24);
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.6,
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.75,
+                LayoutNode::leaf(view(1, 40, 24)),
+                LayoutNode::leaf(view(2, 40, 24)),
+            ),
+            LayoutNode::leaf(view(3, 40, 24)),
+        );
+        let before = tree.clone();
+        let ratio = tree
+            .drag_split_ratio(bounds, Gaps::ZERO, &[], 0.6, -30)
+            .expect("root drag remains feasible at nested minimum");
+        assert!((ratio - (37.0 / 80.0)).abs() < 1e-6, "ratio {ratio}");
+        let mut next = tree;
+        assert!(next.set_split_ratio_at(&[], ratio));
+        let alloc = rects(&next, bounds, Gaps::ZERO);
+        assert_eq!(rect(&alloc, 1), Rect::new(0, 0, 27, 24));
+        assert_eq!(rect(&alloc, 2), Rect::new(27, 0, 10, 24));
+        assert_eq!(rect(&alloc, 3), Rect::new(37, 0, 43, 24));
+        assert_eq!(next.leaf_ids(), before.leaf_ids());
+    }
+
+    #[test]
+    fn root_drag_respects_active_nested_vertical_ratio() {
+        use crate::geometry::Gaps;
+
+        let bounds = Rect::new(0, 0, 80, 24);
+        let tree = LayoutNode::split(
+            SplitAxis::Vertical,
+            0.75,
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.75,
+                LayoutNode::leaf(view(1, 80, 12)),
+                LayoutNode::leaf(view(2, 80, 12)),
+            ),
+            LayoutNode::leaf(view(3, 80, 12)),
+        );
+        let ratio = tree
+            .drag_split_ratio(bounds, Gaps::ZERO, &[], 0.75, -10)
+            .expect("root drag remains feasible at nested minimum");
+        assert!((ratio - (13.0 / 24.0)).abs() < 1e-6, "ratio {ratio}");
+        let mut next = tree;
+        assert!(next.set_split_ratio_at(&[], ratio));
+        let alloc = rects(&next, bounds, Gaps::ZERO);
+        assert_eq!(rect(&alloc, 1), Rect::new(0, 0, 80, 9));
+        assert_eq!(rect(&alloc, 2), Rect::new(0, 9, 80, 4));
+        assert_eq!(rect(&alloc, 3), Rect::new(0, 13, 80, 11));
+    }
+
+    #[test]
+    fn root_drag_respects_active_nested_ratio_with_gaps() {
+        use crate::geometry::Gaps;
+
+        let bounds = Rect::new(0, 0, 80, 24);
+        let gaps = Gaps::new(2, 0);
+        let horizontal = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.6,
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.75,
+                LayoutNode::leaf(view(1, 40, 24)),
+                LayoutNode::leaf(view(2, 40, 24)),
+            ),
+            LayoutNode::leaf(view(3, 40, 24)),
+        );
+        let ratio = horizontal
+            .drag_split_ratio(bounds, gaps, &[], 0.6, -30)
+            .expect("gapped horizontal root drag remains feasible");
+        assert!((ratio - 0.5).abs() < 1e-6, "ratio {ratio}");
+        let mut horizontal = horizontal;
+        assert!(horizontal.set_split_ratio_at(&[], ratio));
+        let alloc = rects(&horizontal, bounds, gaps);
+        assert_eq!(rect(&alloc, 1), Rect::new(0, 0, 27, 24));
+        assert_eq!(rect(&alloc, 2), Rect::new(29, 0, 10, 24));
+        assert_eq!(rect(&alloc, 3), Rect::new(41, 0, 39, 24));
+
+        let vertical = LayoutNode::split(
+            SplitAxis::Vertical,
+            0.75,
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.75,
+                LayoutNode::leaf(view(1, 80, 12)),
+                LayoutNode::leaf(view(2, 80, 12)),
+            ),
+            LayoutNode::leaf(view(3, 80, 12)),
+        );
+        let ratio = vertical
+            .drag_split_ratio(bounds, gaps, &[], 0.75, -10)
+            .expect("gapped vertical root drag remains feasible");
+        assert!((ratio - (15.0 / 22.0)).abs() < 1e-6);
+        let mut vertical = vertical;
+        assert!(vertical.set_split_ratio_at(&[], ratio));
+        let alloc = rects(&vertical, bounds, gaps);
+        assert_eq!(rect(&alloc, 1), Rect::new(0, 0, 80, 9));
+        assert_eq!(rect(&alloc, 2), Rect::new(0, 11, 80, 4));
+        assert_eq!(rect(&alloc, 3), Rect::new(0, 17, 80, 7));
+    }
+
+    #[test]
+    fn zero_delta_drag_preserves_floor_allocated_nested_minimum() {
+        use crate::geometry::Gaps;
+
+        let bounds = Rect::new(0, 0, 101, 8);
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            LayoutNode::MIN_RATIO,
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(view(1, 10, 4)),
+                LayoutNode::leaf(view(2, 10, 4)),
+            ),
+            LayoutNode::leaf(view(3, 91, 8)),
+        );
+        let before = rects(&tree, bounds, Gaps::ZERO);
+        assert_eq!(rect(&before, 1), Rect::new(0, 0, 10, 4));
+        assert_eq!(rect(&before, 2), Rect::new(0, 4, 10, 4));
+        assert_eq!(rect(&before, 3), Rect::new(10, 0, 91, 8));
+
+        let ratio = tree
+            .drag_split_ratio(bounds, Gaps::ZERO, &[], LayoutNode::MIN_RATIO, 0)
+            .expect("zero-delta drag remains feasible at the nested minimum");
+        assert!((ratio - LayoutNode::MIN_RATIO).abs() < f32::EPSILON);
+
+        let mut next = tree;
+        assert!(next.set_split_ratio_at(&[], ratio));
+        assert_eq!(rects(&next, bounds, Gaps::ZERO), before);
+
+        let clamped = next
+            .drag_split_ratio(bounds, Gaps::ZERO, &[], ratio, -1)
+            .expect("nested minimum remains feasible");
+        assert!(next.set_split_ratio_at(&[], clamped));
+        assert_eq!(rect(&rects(&next, bounds, Gaps::ZERO), 1).width, 10);
+        assert_eq!(rect(&rects(&next, bounds, Gaps::ZERO), 2).width, 10);
+    }
+
+    #[test]
+    fn root_drag_refuses_when_nested_ratio_minimums_do_not_fit() {
+        use crate::geometry::Gaps;
+
+        let bounds = Rect::new(0, 0, 46, 24);
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.6,
+            LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.75,
+                LayoutNode::leaf(view(1, 40, 24)),
+                LayoutNode::leaf(view(2, 40, 24)),
+            ),
+            LayoutNode::leaf(view(3, 40, 24)),
+        );
+        let before = tree.clone();
+        assert_eq!(
+            tree.drag_split_ratio(bounds, Gaps::ZERO, &[], 0.6, -30),
+            None,
+            "the ratio-aware nested minimum must refuse an impossible root"
+        );
+        assert_eq!(tree, before, "refusal must not mutate the tree");
+
+        let boundary = Rect::new(0, 0, 47, 24);
+        let ratio = tree
+            .drag_split_ratio(boundary, Gaps::ZERO, &[], 0.6, -30)
+            .expect("the exact minimum extent must remain draggable");
+        assert!((ratio - (37.0 / 47.0)).abs() < 1e-6);
     }
 
     #[test]

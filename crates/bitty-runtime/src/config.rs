@@ -1090,7 +1090,7 @@ pub struct RuntimeConfig {
     /// created by the previous split stays focused. When the focused Spiral
     /// slot cannot host two usable panes, the plan falls back to the largest
     /// feasible `Balanced` target so `Mod+N` keeps the 0.0.27 capacity
-    /// (issue #2571 review). `Balanced` keeps the bisect-largest policy
+    /// (issue #2571 review). `Balanced` selects the largest feasible slot
     /// (issues #2521, #2528) as an explicit opt-in; `Dwindle` always splits
     /// the focused pane right/down; `BisectLargest` (CTX-0964, #1698) bisects
     /// the largest-area panel with a raw `width >= height` axis (no
@@ -1107,16 +1107,16 @@ pub struct RuntimeConfig {
 /// Left -> Up) while the pane created by the previous split stays focused;
 /// any other focus restarts the chain at Right. When the focused slot can no
 /// longer host two usable panes, `NewPanel` falls back deterministically to
-/// the largest-area Balanced target instead of dropping the chord (issue
-/// #2571 review). `Balanced` keeps the 0.0.27 bisect-largest policy (issues
-/// #2521, #2528) as an explicit opt-in: the fresh pane bisects the physically
-/// largest slot with the cell-aspect-aware axis. `Dwindle` always splits the
+/// the largest-feasible Balanced target instead of dropping the chord (issue
+/// #2571 review). `Balanced` selects the largest feasible slot (issues #2521,
+/// #2528) as an explicit opt-in: the fresh pane bisects it with the
+/// cell-aspect-aware axis. `Dwindle` always splits the
 /// focused pane right/down. `BisectLargest` opts into largest-panel bisection
 /// with the raw cell axis. Move-to-workspace also bisects independently of
 /// this setting (CTX-0964, #1698).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PanelLayoutMode {
-    /// Balanced bisect-largest: split the physically largest slot with
+    /// Balanced: split the largest feasible slot with
     /// [`bitty_ui::balanced_split_axis`] and place the fresh pane after it
     /// (right/down). Keeps pane sizes usable for long creation runs; explicit
     /// opt-in since 0.0.28 (issue #2571).

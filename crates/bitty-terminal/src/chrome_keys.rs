@@ -17,8 +17,8 @@ use std::collections::HashSet;
 use bitty_platform::{KeyEvent, LogicalKey, NamedKey, PressState, WindowEventKind};
 use bitty_runtime::plugin_runtime::OverlayKeyChord;
 use bitty_runtime::{
-    FocusDirection, LayoutNode, PresentationMode, Runtime, SplitAxis, View, ViewCloseRequest,
-    ViewId, WsCloseRequest,
+    FocusDirection, LayoutNode, PanelLayoutMode, PresentationMode, Runtime, SplitAxis, View,
+    ViewCloseRequest, ViewId, WsCloseRequest,
 };
 
 use crate::spawn::spawn_pane_shell_in;
@@ -1601,11 +1601,12 @@ impl TerminalApp {
                     self.apply_new_leaf(target, split_dir_to_axis(dir), place_new_first, &label);
             }
             A::NewPanel => {
-                // Issue #2521/#2528: the default `Balanced` mode bisects the
-                // physically largest slot with the cell-aspect-aware axis, so
-                // eight consecutive presses keep a usable tree. `Spiral`
-                // rotates Right -> Down -> Left -> Up only along the active
-                // creation chain; `Dwindle` follows focus right/down.
+                // Issue #2571: the default `Spiral` mode rotates Right ->
+                // Down -> Left -> Up only along the active creation chain.
+                // `Balanced` (issues #2521/#2528) bisects the physically
+                // largest slot with the cell-aspect-aware axis; `Dwindle`
+                // follows focus right/down. Both are explicit opt-ins via
+                // `RuntimeConfig::panel_layout_mode`.
                 // Explicit `new_split:<dir>` above keeps its fixed axis.
                 //
                 // CTX-0964 (#1698, DEC-0099): `BisectLargest` splits the
@@ -1632,12 +1633,22 @@ impl TerminalApp {
                     self.create_panel_on_empty_base(focused);
                     return false;
                 }
+                let layout_mode = self.runtime.panel_layout_mode();
                 let Some(plan) = self.runtime.panel_split_plan() else {
                     eprintln!(
-                        "warning: keymap new_panel has no usable target at the minimum pane size — ignoring"
+                        "warning: keymap new_panel has no leaf that fits two 10x4 panes — ignoring"
                     );
                     return false;
                 };
+                if layout_mode == PanelLayoutMode::Spiral && plan.spiral_phase.is_none() {
+                    // Issue #2571 review: the focused Spiral slot is
+                    // exhausted; the plan is the deterministic Balanced
+                    // largest-area fallback. Keep the one-line diagnostic
+                    // bounded instead of silently dropping the chord.
+                    eprintln!(
+                        "warning: keymap new_panel spiral target cannot fit two 10x4 panes — falling back to the largest flexible slot"
+                    );
+                }
                 if let Some(created) =
                     self.apply_new_leaf(plan.target, plan.axis, plan.place_new_first, "new_panel")
                 {
@@ -5088,9 +5099,12 @@ mod tests {
         let mut app = workspace_test_app();
         app.runtime
             .set_container(bitty_runtime::UiRect::new(0, 0, 160, 40));
-        // Opt into the 4-way spiral; the default Balanced mode always
-        // places after the bisected slot.
-        app.runtime.set_panel_layout_mode(PanelLayoutMode::Spiral);
+        // Issue #2571: Spiral is the fresh-app default, no opt-in needed.
+        assert_eq!(
+            app.runtime.panel_layout_mode(),
+            PanelLayoutMode::Spiral,
+            "a fresh app defaults to Spiral"
+        );
 
         let v1 = app.runtime.focused_view().expect("seed focus");
 
@@ -5866,13 +5880,16 @@ mod tests {
         assert_eq!(rect_of(largest).width, 60, "largest leaf untouched");
     }
 
-    /// Issues #2521/#2528: eight consecutive default `Mod+N` presses must
-    /// keep a balanced, usable tiling tree (no nested slivers), and closing
-    /// panes must walk the creation tree deterministically.
+    /// Issues #2521/#2528: eight consecutive `Mod+N` presses under the
+    /// explicit `Balanced` opt-in must keep a balanced, usable tiling tree
+    /// (no nested slivers), and closing panes must walk the creation tree
+    /// deterministically. `Balanced` stopped being the default in 0.0.28
+    /// (issue #2571) but remains fully selectable.
     #[test]
     fn chrome_new_panel_eight_times_stays_balanced_and_closes_in_tree_order() {
         use bitty_config::ChromeAction;
         let mut app = workspace_test_app();
+        app.runtime.set_panel_layout_mode(PanelLayoutMode::Balanced);
         for _ in 0..8 {
             app.apply_chrome_action(ChromeAction::NewPanel);
             let allocs = app.runtime.layout_allocations();
@@ -5909,6 +5926,174 @@ mod tests {
             );
         }
         assert_eq!(app.runtime.leaf_count(), 1);
+    }
+
+    /// Issue #2571: a fresh app (no explicit `panel_layout_mode`) presses
+    /// `Mod+N` eight times and must follow the default Spiral chain while
+    /// every pane stays at or above the gap-aware 10x4 minimum. The 160x64
+    /// grid is the smallest cell geometry where the clockwise halving keeps
+    /// all nine panes usable. Closing the created pane or moving focus off
+    /// the chain restarts the phase at Right.
+    #[test]
+    fn chrome_new_panel_default_eight_times_spirals_and_resets_phase() {
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        assert_eq!(
+            app.runtime.panel_layout_mode(),
+            PanelLayoutMode::Spiral,
+            "a fresh app defaults to Spiral (issue #2571)"
+        );
+        app.runtime
+            .set_container(bitty_runtime::UiRect::new(0, 0, 160, 64));
+
+        let mut phases = Vec::new();
+        for press in 1..=8 {
+            let plan = app.runtime.panel_split_plan().expect("feasible plan");
+            phases.push(plan.spiral_phase);
+            app.apply_chrome_action(ChromeAction::NewPanel);
+            assert_eq!(
+                app.runtime.leaf_count(),
+                press + 1,
+                "each Mod+N press must land a pane"
+            );
+            let allocs = app.runtime.layout_allocations();
+            assert_eq!(app.runtime.layout().validate_structure(), Ok(allocs.len()));
+            for (id, rect) in &allocs {
+                assert!(
+                    rect.width >= bitty_runtime::MIN_PANE_COLS
+                        && rect.height >= bitty_runtime::MIN_PANE_ROWS,
+                    "{id:?} fell below the gap-aware minimum after press {press}: {allocs:?}"
+                );
+            }
+        }
+        assert_eq!(app.runtime.leaf_count(), 9);
+        assert_eq!(
+            phases,
+            vec![
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(0),
+                Some(1),
+                Some(2),
+                Some(3)
+            ],
+            "eight presses rotate Right -> Down -> Left -> Up twice"
+        );
+
+        // Close the created pane: the survivor breaks the chain, so the next
+        // press starts again at phase 0 (Right) instead of a stale Left/Top.
+        let closed = app.runtime.focused_view().expect("focus");
+        app.apply_chrome_action(ChromeAction::CloseView);
+        let survivor = app.runtime.focused_view().expect("survivor");
+        assert_ne!(survivor, closed);
+        let plan = app.runtime.panel_split_plan().expect("plan after close");
+        assert_eq!(plan.spiral_phase, Some(0), "a close resets to Right");
+        assert!(!plan.place_new_first);
+
+        // Any focus outside the recorded creation chain resets the phase too.
+        let other = app
+            .runtime
+            .layout()
+            .leaf_ids()
+            .into_iter()
+            .find(|id| *id != survivor)
+            .expect("another leaf survives");
+        assert!(app.runtime.set_focus(survivor));
+        app.runtime.note_panel_split_created(survivor, Some(2));
+        let plan = app.runtime.panel_split_plan().expect("primed plan");
+        assert_eq!(plan.spiral_phase, Some(3));
+        assert!(plan.place_new_first);
+        assert!(app.runtime.set_focus(other));
+        let plan = app
+            .runtime
+            .panel_split_plan()
+            .expect("plan after focus move");
+        assert_eq!(
+            plan.spiral_phase,
+            Some(0),
+            "focus outside the chain resets to Right"
+        );
+        assert!(!plan.place_new_first);
+    }
+
+    /// Issue #2571 review: normal window sizes must keep `Mod+N` working to
+    /// the 0.0.27 Balanced capacity after the focused Spiral slot is
+    /// exhausted. The fallback plan is deterministic (largest-area Balanced),
+    /// every press lands, and the tree stays a valid 10x4-minimum partition.
+    fn assert_default_new_panel_capacity(container: bitty_runtime::UiRect) {
+        use bitty_config::ChromeAction;
+        const PRESSES: usize = 8;
+        let mut app = workspace_test_app();
+        assert_eq!(
+            app.runtime.panel_layout_mode(),
+            PanelLayoutMode::Spiral,
+            "a fresh app defaults to Spiral"
+        );
+        app.runtime.set_container(container);
+        let mut fallbacks = 0;
+        for press in 1..=PRESSES {
+            let plan = app
+                .runtime
+                .panel_split_plan()
+                .unwrap_or_else(|| panic!("press {press} at {container:?} must have a plan"));
+            if plan.spiral_phase.is_none() {
+                fallbacks += 1;
+            }
+            app.apply_chrome_action(ChromeAction::NewPanel);
+            assert_eq!(
+                app.runtime.leaf_count(),
+                press + 1,
+                "press {press} at {container:?} must land a pane"
+            );
+            let allocs = app.runtime.layout_allocations();
+            assert_eq!(
+                app.runtime.layout().validate_structure(),
+                Ok(allocs.len()),
+                "press {press} at {container:?} must keep a valid binary tree"
+            );
+            for (id, rect) in &allocs {
+                assert!(
+                    rect.width >= bitty_runtime::MIN_PANE_COLS
+                        && rect.height >= bitty_runtime::MIN_PANE_ROWS,
+                    "{id:?} fell below 10x4 after press {press} at {container:?}: {allocs:?}"
+                );
+            }
+        }
+        assert!(
+            fallbacks > 0,
+            "the focused Spiral chain must exhaust its slot at {container:?}"
+        );
+
+        let mut balanced = workspace_test_app();
+        balanced
+            .runtime
+            .set_panel_layout_mode(PanelLayoutMode::Balanced);
+        balanced.runtime.set_container(container);
+        for _ in 0..PRESSES {
+            balanced.apply_chrome_action(ChromeAction::NewPanel);
+        }
+        assert_eq!(
+            app.runtime.leaf_count(),
+            balanced.runtime.leaf_count(),
+            "default Spiral with fallback must match explicit Balanced capacity at {container:?}"
+        );
+        assert_eq!(app.runtime.leaf_count(), PRESSES + 1);
+    }
+
+    /// Issue #2571 review: an 80x24 window must not lose `Mod+N` after five
+    /// Spiral presses.
+    #[test]
+    fn chrome_new_panel_default_spiral_keeps_capacity_on_80x24() {
+        assert_default_new_panel_capacity(bitty_runtime::UiRect::new(0, 0, 80, 24));
+    }
+
+    /// Issue #2571 review: a 120x40 window must not lose `Mod+N` after six
+    /// Spiral presses.
+    #[test]
+    fn chrome_new_panel_default_spiral_keeps_capacity_on_120x40() {
+        assert_default_new_panel_capacity(bitty_runtime::UiRect::new(0, 0, 120, 40));
     }
 
     /// Issue #2528: after a close, `Mod+N` in spiral mode follows the active

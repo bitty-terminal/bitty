@@ -459,8 +459,11 @@ jobs:
       # Core embeds a build-time official plugin catalog. The checked-in
       # generated file must match the pinned registry source; a registry pin
       # or entry bump that is not reflected in Core fails here instead of
-      # silently going stale. Read-only, no runtime fetch.
-      - name: Check official plugin catalog freshness
+      # silently going stale. This is the strict registry gate (`just
+      # check-registry`) and stays separate from `just check`, which must pass
+      # without a registry checkout; the invocation is explicit so CI never
+      # falls back to another tree. Read-only, no runtime fetch.
+      - name: Check official plugin catalog freshness (strict registry gate)
         if: matrix.shard == 1
         env:
           BITTY_PLUGINS_REV: ${{ steps.validation-pins.outputs.plugins-rev }}

@@ -17,8 +17,12 @@ Usage:
 
 The registry directory is resolved from ``--registry``, then
 ``BITTY_PLUGINS_DIR``, then ``$BITTY_WORKSPACE/bitty-plugins``, then
-``<repo>/../bitty-plugins``. ``--check`` is read-only and exits non-zero when
-the checked-in file differs from a fresh rendering (CI drift gate).
+``<repo>/../bitty-plugins``, ``<repo>/external/bitty-plugins``, and the
+worktree-relative sibling. An explicit ``--registry`` or ``BITTY_PLUGINS_DIR``
+is authoritative: when it does not name a usable checkout the command fails
+instead of falling back to another tree. ``--check`` is read-only and exits
+non-zero when the checked-in file differs from a fresh rendering (the strict
+``just check-registry`` gate).
 """
 
 from __future__ import annotations
@@ -137,17 +141,45 @@ def resolve_revision(registry: Path, explicit: str | None) -> str:
     return sha
 
 
+def require_registry(candidate: Path, source: str, hint: str) -> Path:
+    """Resolve one requested registry, or fail without trying another tree."""
+    registry = candidate.expanduser().resolve()
+    if not (registry / "registry/official").is_dir():
+        reason = "no registry/official directory"
+    elif not (registry / ".git").exists():
+        reason = "not a Git checkout (missing .git)"
+    else:
+        return registry
+    raise CatalogError(
+        f"requested registry {registry} (via {source}) is not a usable "
+        f"bitty-plugins checkout ({reason}); {hint}"
+    )
+
+
 def resolve_registry(explicit: str | None) -> Path:
-    candidates: list[Path] = []
+    # An explicitly requested registry is authoritative: never fall back to a
+    # different checkout, so a typo or unprovisioned path fails here instead of
+    # silently validating the catalog against an unrelated tree. CI passes
+    # --registry with the pinned checkout.
     if explicit:
-        candidates.append(Path(explicit))
-    if os.environ.get("BITTY_PLUGINS_DIR"):
-        candidates.append(Path(os.environ["BITTY_PLUGINS_DIR"]))
+        return require_registry(
+            Path(explicit),
+            "--registry",
+            "correct the path or choose another checkout",
+        )
+    configured = os.environ.get("BITTY_PLUGINS_DIR")
+    if configured:
+        return require_registry(
+            Path(configured),
+            "BITTY_PLUGINS_DIR",
+            "correct the path or unset BITTY_PLUGINS_DIR",
+        )
+    candidates: list[Path] = []
     if os.environ.get("BITTY_WORKSPACE"):
         candidates.append(Path(os.environ["BITTY_WORKSPACE"]) / "bitty-plugins")
     candidates.append(REPO_ROOT.parent / "bitty-plugins")
-    # CI checks out the pinned registry here for `just check`; a normal
-    # checkout can provision the same sibling path.
+    # CI checks out the pinned registry here for the strict registry gate; a
+    # normal checkout can provision the same in-repository path.
     candidates.append(REPO_ROOT / "external" / "bitty-plugins")
     # Worktrees live at <main-checkout>/.worktrees/<task>; the workspace
     # checkout is three levels up from the worktree root.
@@ -159,7 +191,10 @@ def resolve_registry(explicit: str | None) -> Path:
     tried = ", ".join(str(candidate) for candidate in candidates)
     raise CatalogError(
         "bitty-plugins checkout not found (tried: "
-        f"{tried}); pass --registry DIR or set BITTY_PLUGINS_DIR"
+        f"{tried}); the strict registry gate (`just check-registry`) needs a "
+        "registry: pass --registry DIR, set BITTY_PLUGINS_DIR, or clone "
+        "bitty-plugins beside this checkout (see CONTRIBUTING.md). "
+        "`just check` does not need the registry."
     )
 
 

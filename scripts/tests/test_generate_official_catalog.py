@@ -141,10 +141,19 @@ class GitRepositoryOverrideTest(unittest.TestCase):
         )
         return env
 
+    def run_generator(
+        self, *args: str, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *args],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
     def generate(self, *, check: bool = False, env: dict[str, str] | None = None):
         command = [
-            sys.executable,
-            str(SCRIPT),
             "--registry",
             str(self.registry),
             "--revision",
@@ -154,13 +163,7 @@ class GitRepositoryOverrideTest(unittest.TestCase):
         ]
         if check:
             command.append("--check")
-        return subprocess.run(
-            command,
-            env=env,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+        return self.run_generator(*command, env=env)
 
     def test_git_dir_override_does_not_redirect_generation(self) -> None:
         result = self.generate(env=self.polluted_env())
@@ -191,6 +194,55 @@ class GitRepositoryOverrideTest(unittest.TestCase):
         stale = self.generate(check=True, env=self.polluted_env())
         self.assertEqual(stale.returncode, 1, stale.stdout)
         self.assertIn("is stale", stale.stderr)
+
+    def test_explicit_missing_registry_fails_without_fallback(self) -> None:
+        """A requested --registry is authoritative, even if another tree exists."""
+        missing = self.root / "absent-registry"
+        env = dict(os.environ)
+        env["BITTY_PLUGINS_DIR"] = str(self.registry)
+
+        result = self.run_generator(
+            "--registry",
+            str(missing),
+            "--revision",
+            self.registry_revision,
+            "--output",
+            str(self.output),
+            "--check",
+            env=env,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("requested registry", result.stderr)
+        self.assertIn("via --registry", result.stderr)
+        self.assertIn(str(missing), result.stderr)
+        self.assertIn("no registry/official directory", result.stderr)
+        self.assertFalse(self.output.exists())
+
+    def test_requested_env_registry_fails_without_fallback(self) -> None:
+        """BITTY_PLUGINS_DIR is authoritative over $BITTY_WORKSPACE discovery."""
+        missing = self.root / "absent-env-registry"
+        workspace = self.root / "workspace"
+        workspace.mkdir()
+        shutil.copytree(self.registry, workspace / "bitty-plugins")
+        env = dict(os.environ)
+        env["BITTY_PLUGINS_DIR"] = str(missing)
+        env["BITTY_WORKSPACE"] = str(workspace)
+
+        result = self.run_generator(
+            "--revision",
+            self.registry_revision,
+            "--output",
+            str(self.output),
+            "--check",
+            env=env,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("requested registry", result.stderr)
+        self.assertIn("via BITTY_PLUGINS_DIR", result.stderr)
+        self.assertIn(str(missing), result.stderr)
+        self.assertIn("unset BITTY_PLUGINS_DIR", result.stderr)
 
 
 if __name__ == "__main__":

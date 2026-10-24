@@ -614,6 +614,11 @@ struct PluginEntry {
     services: Option<Rc<PluginServices>>,
     registrations: RegistrationCapture,
     settings_diagnostics: Vec<plugin_settings::PluginSettingsDiagnostic>,
+    /// Effective RC-1/RC-2 budgets applied to this generation (bitty#2304).
+    ///
+    /// `None` until activation resolves them and after teardown; the value is
+    /// host-derived, bounded, and never includes plugin-controlled data.
+    budgets: Option<bitty_plugin_host::budgets::EffectiveBudgets>,
 }
 
 /// One app-dispatched command parked at the RC-1 wall budget (bitty #2314).
@@ -885,6 +890,18 @@ pub struct PluginRuntime {
     /// integration tests (bitty#1744, same treatment as bitty#1727);
     /// production code never sets this.
     vm_wall_budget_ms: Option<u64>,
+    /// User budget tightening (bitty#2304): global default plus per-plugin
+    /// overrides parsed from `<config-dir>/plugin-budgets.lua`.
+    ///
+    /// Empty by default; values can only tighten the manifest/host bounds.
+    /// `--safe` ignores this layer entirely and runs the host defaults.
+    budget_overrides: bitty_plugin_host::budgets::PluginBudgetFile,
+    /// Malformed user budget file diagnostic (bitty#2304).
+    ///
+    /// `Some` means the file was present but rejected. Activation then fails
+    /// closed with [`PluginRuntimeError::Budget`] instead of silently running
+    /// on host defaults; `--safe` stays untouched and runs the defaults.
+    budget_file_error: Option<String>,
     /// Harness override for the per-call host-call deadline (test-only).
     ///
     /// `None` keeps the production deadline ([`DEFAULT_HOST_DEADLINE_MS`], the
@@ -1013,6 +1030,8 @@ impl PluginRuntime {
             device_host,
             audio_host,
             vm_wall_budget_ms: None,
+            budget_overrides: bitty_plugin_host::budgets::PluginBudgetFile::default(),
+            budget_file_error: None,
             host_call_deadline_ms: None,
             parked_commands: BTreeMap::new(),
             timer_deadlines: BTreeMap::new(),
@@ -1130,6 +1149,97 @@ impl PluginRuntime {
     /// issued it runs on a widened slice (bitty#2432).
     pub fn set_vm_wall_budget_ms(&mut self, wall_budget_ms: Option<u64>) {
         self.vm_wall_budget_ms = wall_budget_ms;
+    }
+
+    /// Install the parsed user budget tightening (bitty#2304).
+    ///
+    /// The file is parsed by [`bitty_plugin_host::budgets::parse_budget_file`]
+    /// before this call; values are re-validated against the compiled host
+    /// ceiling at activation. Applies to plugins activated afterwards; an
+    /// already-live generation keeps the budgets it was built with.
+    pub fn set_budget_overrides(
+        &mut self,
+        overrides: bitty_plugin_host::budgets::PluginBudgetFile,
+    ) {
+        self.budget_overrides = overrides;
+        self.budget_file_error = None;
+    }
+
+    /// Mark the user budget file as rejected (bitty#2304).
+    ///
+    /// A present-but-malformed file fails activation closed with a typed
+    /// [`PluginRuntimeError::Budget`]; it is never silently ignored. `--safe`
+    /// still runs the host defaults, so the recovery path is unaffected.
+    pub fn set_budget_file_error(&mut self, error: impl Into<String>) {
+        self.budget_file_error = Some(error.into());
+        self.budget_overrides = bitty_plugin_host::budgets::PluginBudgetFile::default();
+    }
+
+    /// Effective RC-1/RC-2 budgets of the active generation for `id`.
+    ///
+    /// `None` before activation, after teardown, and for a generation that
+    /// never built a VM. The harness-only wall override
+    /// ([`Self::set_vm_wall_budget_ms`]) is not reflected: this is the
+    /// resolved production budget (host ceiling, manifest, user layers).
+    #[must_use]
+    pub fn effective_budgets(
+        &self,
+        id: &PluginId,
+    ) -> Option<&bitty_plugin_host::budgets::EffectiveBudgets> {
+        self.entries
+            .get(id)
+            .and_then(|entry| entry.budgets.as_ref())
+    }
+
+    /// The compiled VM defaults as budget ceilings.
+    ///
+    /// The runtime uses the actual [`VmBudgets::default`] values rather than a
+    /// second copy of the constants, so even a hypothetical drift between
+    /// `bitty-lua` and `bitty-plugin-host` cannot let a declaration exceed the
+    /// ceiling the VM will enforce (a mismatch then fails closed at
+    /// activation).
+    fn budget_ceilings(&self) -> bitty_plugin_host::budgets::BudgetCeilings {
+        let defaults = VmBudgets::default();
+        bitty_plugin_host::budgets::BudgetCeilings {
+            fuel_instructions: defaults.instruction_budget,
+            wall_ms: defaults.wall_budget_ms,
+            warning_ms: defaults.warning_ms,
+            memory_bytes: defaults.memory_limit,
+        }
+    }
+
+    /// Resolve the effective budgets for one activation (bitty#2304).
+    fn resolve_activation_budgets(
+        &self,
+        id: &PluginId,
+        limits: &bitty_plugin_host::manifest::PluginLimits,
+    ) -> Result<bitty_plugin_host::budgets::EffectiveBudgets, PluginRuntimeError> {
+        let ceilings = self.budget_ceilings();
+        // `--safe` is the recovery path: it never consults the manifest
+        // declaration or the user file and always runs host defaults, so a
+        // hostile manifest or a bad local file cannot block it.
+        if self.safe_mode {
+            return Ok(bitty_plugin_host::budgets::EffectiveBudgets::host_defaults(
+                ceilings,
+            ));
+        }
+        if let Some(error) = &self.budget_file_error {
+            return Err(PluginRuntimeError::Budget {
+                plugin: id.to_string(),
+                detail: format!("plugin-budgets.lua rejected: {error}"),
+            });
+        }
+        bitty_plugin_host::budgets::resolve_budgets(
+            id.as_str(),
+            ceilings,
+            limits.budget_values(),
+            self.budget_overrides.default,
+            self.budget_overrides.for_plugin(id.as_str()),
+        )
+        .map_err(|error| PluginRuntimeError::Budget {
+            plugin: id.to_string(),
+            detail: error.to_string(),
+        })
     }
 
     /// Effective per-call host-call deadline (production: 50 ms).
@@ -2349,6 +2459,7 @@ impl PluginRuntime {
                 services: None,
                 registrations: RegistrationCapture::new(),
                 settings_diagnostics: Vec::new(),
+                budgets: None,
             },
         );
         self.order.push(id);
@@ -2833,19 +2944,30 @@ impl PluginRuntime {
                 return Err(error);
             }
         }
+        // bitty#2304: resolve the effective budgets before any VM exists.
+        // Manifest `[limits]` and the user budget file are upper bounds; the
+        // compiled host ceilings remain authoritative and `--safe` ignores
+        // both tightening layers. A rejected user file fails closed here
+        // (except under `--safe`) rather than silently running on defaults.
+        let effective_budgets = match self.resolve_activation_budgets(id, &manifest.limits) {
+            Ok(budgets) => budgets,
+            Err(error) => {
+                self.rollback(id, error.to_string());
+                return Err(error);
+            }
+        };
         // RC-1/RC-2 enter through the fail-closed gate: no VM exists without
         // explicit budgets (the deprecated `LuaVm::new` default path is sealed).
-        // Production uses `VmBudgets::default` (50ms wall). Tests may widen
-        // only the wall dimension via `set_vm_wall_budget_ms` to absorb
-        // scheduler stalls under sharded CI load (bitty#1744, same treatment
-        // as bitty#1727); instruction/memory stay at RC defaults and the
-        // production budget itself is untouched.
-        let vm_budgets = match self.vm_wall_budget_ms {
-            Some(wall_budget_ms) => VmBudgets {
-                wall_budget_ms,
-                ..VmBudgets::default()
-            },
-            None => VmBudgets::default(),
+        // Production applies the resolved budgets above. Tests may widen only
+        // the wall dimension via `set_vm_wall_budget_ms` to absorb scheduler
+        // stalls under sharded CI load (bitty#1744, same treatment as
+        // bitty#1727); instruction/memory stay at the resolved production
+        // budget and the production budget itself is untouched.
+        let vm_budgets = VmBudgets {
+            instruction_budget: effective_budgets.fuel_instructions,
+            wall_budget_ms: self.vm_wall_budget_ms.unwrap_or(effective_budgets.wall_ms),
+            warning_ms: effective_budgets.warning_ms,
+            memory_limit: effective_budgets.memory_bytes,
         };
         let mut vm = match build_plugin_vm(id.as_str(), Some(vm_budgets)) {
             Ok(vm) => vm,
@@ -2940,6 +3062,7 @@ impl PluginRuntime {
             entry.vm = Some(vm.clone());
             entry.registrations = capture;
             entry.settings_diagnostics = settings_diagnostics;
+            entry.budgets = Some(effective_budgets);
             entry.state = LifecycleState::Active;
             (
                 entry.package.source_class,
@@ -3146,6 +3269,7 @@ impl PluginRuntime {
         entry.state = LifecycleState::Disposing;
         entry.vm = None;
         entry.registrations = RegistrationCapture::new();
+        entry.budgets = None;
         // CTX-0428: a disposed generation's handles are dead; clear the host
         // registry so a stale handle cannot be served while the entry lingers.
         if let Some(services) = entry.services.as_ref() {
@@ -4098,6 +4222,7 @@ impl PluginRuntime {
             entry.state = LifecycleState::Failed(message);
             entry.vm = None;
             entry.services = None;
+            entry.budgets = None;
         }
         // CTX-0941: a failed activation is a release. A generation that
         // acquired the transient capture during `init.lua` must never keep it

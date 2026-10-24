@@ -838,6 +838,27 @@ pub struct PluginLimits {
     /// Tighter bound on ports per egress entry (host ceiling
     /// [`MAX_NETWORK_PORTS_PER_HOST`]).
     pub max_network_ports_per_host: Option<usize>,
+    /// Tighter RC-1 instruction fuel (host ceiling
+    /// [`HOST_FUEL_INSTRUCTIONS_CEILING`](crate::budgets::HOST_FUEL_INSTRUCTIONS_CEILING)).
+    ///
+    /// Added by bitty#2304. Absent means the host ceiling applies; a present
+    /// value must be `1..=ceiling` and is applied to the generation's
+    /// `VmBudgets` (it can only tighten, never raise).
+    pub fuel_instructions: Option<u64>,
+    /// Tighter RC-1 wall-clock bound in milliseconds (host ceiling
+    /// [`HOST_WALL_MS_CEILING`](crate::budgets::HOST_WALL_MS_CEILING)).
+    pub wall_ms: Option<u64>,
+    /// Tighter RC-2 accounted-memory ceiling in bytes (host ceiling
+    /// [`HOST_MEMORY_BYTES_CEILING`](crate::budgets::HOST_MEMORY_BYTES_CEILING)).
+    pub memory_bytes: Option<usize>,
+    /// Tighter advisory warning threshold in milliseconds (host ceiling
+    /// [`HOST_WARNING_MS_CEILING`](crate::budgets::HOST_WARNING_MS_CEILING)).
+    ///
+    /// Advisory only: it sets the VM warning flag and never suspends. When
+    /// both keys are present it must be strictly below `wall_ms`; when a
+    /// tighter wall leaves no room, the effective threshold is capped at
+    /// `wall_ms - 1`.
+    pub warning_ms: Option<u64>,
 }
 
 impl PluginLimits {
@@ -900,7 +921,23 @@ impl PluginLimits {
                 }
             }
         }
+        // RC-1/RC-2 tighten-only budgets (bitty#2304): same `1..=ceiling`
+        // rule and a typed budget error, so an escalation attempt is never
+        // reported as a structural-count limit.
+        self.budget_values()
+            .validate("limits", crate::budgets::BudgetCeilings::HOST)?;
         Ok(())
+    }
+
+    /// The `[limits]` execution-budget declarations as a budget layer.
+    #[must_use]
+    pub fn budget_values(&self) -> crate::budgets::BudgetValues {
+        crate::budgets::BudgetValues {
+            fuel_instructions: self.fuel_instructions,
+            wall_ms: self.wall_ms,
+            memory_bytes: self.memory_bytes,
+            warning_ms: self.warning_ms,
+        }
     }
 }
 
@@ -2666,6 +2703,31 @@ impl PluginManifest {
             match value {
                 Some(v) => buf.push_str(&format!("{key}={v},")),
                 None => buf.push_str(&format!("{key}=,")),
+            }
+        }
+        // RC-1/RC-2 budget declarations (bitty#2304) are appended only when
+        // at least one key is present. Manifests that declare no budget keep
+        // the exact pre-existing bytes and therefore the exact same hash;
+        // declaring a budget binds it to consent like every other `[limits]`
+        // key. A tighten-only declaration is safe to add without re-consent in
+        // practice, but hashing it keeps the manifest hash a faithful
+        // description of the approved manifest.
+        let budgets = self.limits.budget_values();
+        if !budgets.is_empty() {
+            buf.push('|');
+            for (key, value) in [
+                (
+                    "fuel_instructions",
+                    budgets.fuel_instructions.map(|v| v.to_string()),
+                ),
+                ("wall_ms", budgets.wall_ms.map(|v| v.to_string())),
+                ("memory_bytes", budgets.memory_bytes.map(|v| v.to_string())),
+                ("warning_ms", budgets.warning_ms.map(|v| v.to_string())),
+            ] {
+                match value {
+                    Some(v) => buf.push_str(&format!("{key}={v},")),
+                    None => buf.push_str(&format!("{key}=,")),
+                }
             }
         }
         buf.into_bytes()
@@ -4528,12 +4590,111 @@ mod tests {
     }
 
     #[test]
+    fn limit_budgets_accept_tightening_and_reject_escalation() {
+        use crate::budgets::{
+            HOST_FUEL_INSTRUCTIONS_CEILING, HOST_MEMORY_BYTES_CEILING, HOST_WALL_MS_CEILING,
+            HOST_WARNING_MS_CEILING,
+        };
+
+        let mut m = minimal_manifest("xuepoo.budget");
+        m.limits.fuel_instructions = Some(1_000_000);
+        m.limits.wall_ms = Some(20);
+        m.limits.memory_bytes = Some(8 * 1024 * 1024);
+        m.limits.warning_ms = Some(4);
+        assert!(m.validate().is_ok(), "tighter budgets are accepted");
+
+        // Zero is meaningless in every dimension.
+        fn reject(limits: PluginLimits) {
+            let mut m = minimal_manifest("xuepoo.budgetbad");
+            m.limits = limits;
+            assert!(m.validate().is_err(), "invalid budget must fail closed");
+        }
+        reject(PluginLimits {
+            fuel_instructions: Some(0),
+            ..PluginLimits::default()
+        });
+        reject(PluginLimits {
+            wall_ms: Some(0),
+            ..PluginLimits::default()
+        });
+        reject(PluginLimits {
+            memory_bytes: Some(0),
+            ..PluginLimits::default()
+        });
+        reject(PluginLimits {
+            warning_ms: Some(0),
+            ..PluginLimits::default()
+        });
+
+        // Above the compiled host ceiling is an escalation attempt.
+        reject(PluginLimits {
+            fuel_instructions: Some(HOST_FUEL_INSTRUCTIONS_CEILING + 1),
+            ..PluginLimits::default()
+        });
+        reject(PluginLimits {
+            wall_ms: Some(HOST_WALL_MS_CEILING + 1),
+            ..PluginLimits::default()
+        });
+        reject(PluginLimits {
+            memory_bytes: Some(HOST_MEMORY_BYTES_CEILING + 1),
+            ..PluginLimits::default()
+        });
+        reject(PluginLimits {
+            warning_ms: Some(HOST_WARNING_MS_CEILING + 1),
+            ..PluginLimits::default()
+        });
+        let above = PluginLimits {
+            fuel_instructions: Some(HOST_FUEL_INSTRUCTIONS_CEILING + 1),
+            ..PluginLimits::default()
+        };
+        let mut m = minimal_manifest("xuepoo.budgetceil");
+        m.limits = above;
+        let error = m
+            .validate()
+            .expect_err("above-ceiling budget must fail closed");
+        assert!(
+            matches!(error, PluginError::Budget { .. }),
+            "typed budget error, got {error:?}"
+        );
+
+        // The advisory warning must stay below a declared wall bound.
+        let mut m = minimal_manifest("xuepoo.budgetwarn");
+        m.limits.wall_ms = Some(5);
+        m.limits.warning_ms = Some(5);
+        assert!(m.validate().is_err());
+        m.limits.warning_ms = Some(4);
+        assert!(m.validate().is_ok());
+
+        // Absent keys keep the host ceilings.
+        let m = minimal_manifest("xuepoo.budgetabsent");
+        assert!(m.limits.budget_values().is_empty());
+    }
+
+    #[test]
     fn manifest_hash_covers_network_and_limits() {
         let m1 = minimal_manifest("xuepoo.nhash");
         let m2 = manifest_with_network("xuepoo.nhash");
         assert_ne!(m1.manifest_hash(), m2.manifest_hash());
         let mut m3 = m2.clone();
         m3.limits.max_commands = Some(4);
+        assert_ne!(m2.manifest_hash(), m3.manifest_hash());
+        assert_eq!(m3.manifest_hash(), m3.clone().manifest_hash());
+    }
+
+    #[test]
+    fn manifest_hash_covers_budgets_only_when_declared() {
+        let m1 = minimal_manifest("xuepoo.bhash");
+        let bytes = String::from_utf8(m1.canonical_bytes()).expect("canonical bytes");
+        assert!(
+            !bytes.contains("fuel_instructions") && !bytes.contains("|memory_bytes"),
+            "absent budgets must not change the pre-existing canonical bytes"
+        );
+
+        let mut m2 = m1.clone();
+        m2.limits.fuel_instructions = Some(1_000_000);
+        assert_ne!(m1.manifest_hash(), m2.manifest_hash());
+        let mut m3 = m2.clone();
+        m3.limits.wall_ms = Some(20);
         assert_ne!(m2.manifest_hash(), m3.manifest_hash());
         assert_eq!(m3.manifest_hash(), m3.clone().manifest_hash());
     }

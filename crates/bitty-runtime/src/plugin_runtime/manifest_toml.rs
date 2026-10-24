@@ -413,6 +413,30 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                     "max_fs_patterns_per_kind" => &mut limits.max_fs_patterns_per_kind,
                     "max_network_egress" => &mut limits.max_network_egress,
                     "max_network_ports_per_host" => &mut limits.max_network_ports_per_host,
+                    "fuel_instructions" => {
+                        let value = parse_limit_u64(&value, &key)
+                            .map_err(|e| format!("invalid [limits] key '{key}': {e}"))?;
+                        limits.fuel_instructions = Some(value);
+                        continue;
+                    }
+                    "wall_ms" => {
+                        let value = parse_limit_u64(&value, &key)
+                            .map_err(|e| format!("invalid [limits] key '{key}': {e}"))?;
+                        limits.wall_ms = Some(value);
+                        continue;
+                    }
+                    "warning_ms" => {
+                        let value = parse_limit_u64(&value, &key)
+                            .map_err(|e| format!("invalid [limits] key '{key}': {e}"))?;
+                        limits.warning_ms = Some(value);
+                        continue;
+                    }
+                    "memory_bytes" => {
+                        let value = parse_limit_uint(&value, &key)
+                            .map_err(|e| format!("invalid [limits] key '{key}': {e}"))?;
+                        limits.memory_bytes = Some(value);
+                        continue;
+                    }
                     other => return Err(format!("unsupported [limits] key '{other}'")),
                 };
                 *slot = Some(
@@ -690,6 +714,22 @@ fn parse_bool(value: &str) -> Option<bool> {
 /// Quoted strings, signs, hex, floats, and empty values are rejected: limits
 /// are integers in real TOML and the subset keeps that shape. Overflow fails
 /// closed. Ceiling/zero checks belong to [`PluginLimits::validate`].
+fn parse_limit_u64(value: &str, key: &str) -> Result<u64, String> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!(
+            "expected a bare non-negative integer for '{key}', found '{value}'"
+        ));
+    }
+    // Bound the digit run before parsing (fail fast on absurd input).
+    if value.len() > 20 {
+        return Err(format!("integer for '{key}' is too large"));
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("integer for '{key}' is too large"))
+}
+
 fn parse_limit_uint(value: &str, key: &str) -> Result<usize, String> {
     let value = value.trim();
     if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
@@ -1617,6 +1657,54 @@ mod tests {
         let body = format!(
             "{}\n[capabilities]\npanel.provider = true\n[limits]\nmax_commands = 0\n",
             minimal_body("xuepoo.limself")
+        );
+        assert!(parse_manifest(body.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn limit_budgets_parse_and_reject_escalation() {
+        let body = format!(
+            "{}\n[capabilities]\npanel.provider = true\n[limits]\nfuel_instructions = 4000000\nwall_ms = 20\nmemory_bytes = 8388608\nwarning_ms = 4\n",
+            minimal_body("xuepoo.budtoml")
+        );
+        let manifest = parse_manifest(body.as_bytes()).expect("budget shape must parse");
+        assert_eq!(manifest.limits.fuel_instructions, Some(4_000_000));
+        assert_eq!(manifest.limits.wall_ms, Some(20));
+        assert_eq!(manifest.limits.memory_bytes, Some(8 * 1024 * 1024));
+        assert_eq!(manifest.limits.warning_ms, Some(4));
+
+        for fragment in [
+            // Above the compiled host ceiling.
+            "fuel_instructions = 10000001\n",
+            "wall_ms = 51\n",
+            "memory_bytes = 33554433\n",
+            "warning_ms = 9\n",
+            // Zero is meaningless.
+            "fuel_instructions = 0\n",
+            "wall_ms = 0\n",
+            // Wrong types, signs, floats, and empty values fail closed.
+            "fuel_instructions = \"4000\"\n",
+            "wall_ms = -1\n",
+            "memory_bytes = 4.0\n",
+            "warning_ms = true\n",
+            "fuel_instructions = \n",
+            // Advisory warning must stay below the declared wall.
+            "wall_ms = 5\nwarning_ms = 5\n",
+        ] {
+            let body = format!(
+                "{}\n[capabilities]\npanel.provider = true\n[limits]\n{fragment}",
+                minimal_body("xuepoo.budbad")
+            );
+            assert!(
+                parse_manifest(body.as_bytes()).is_err(),
+                "fragment must fail closed: {fragment:?}"
+            );
+        }
+
+        // Duplicate keys fail closed.
+        let body = format!(
+            "{}\n[capabilities]\npanel.provider = true\n[limits]\nwall_ms = 20\nwall_ms = 20\n",
+            minimal_body("xuepoo.buddup")
         );
         assert!(parse_manifest(body.as_bytes()).is_err());
     }

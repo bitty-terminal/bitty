@@ -1913,7 +1913,7 @@ impl Runtime {
             return;
         };
         let (scrollback_len, state_height, line_index) = {
-            let state = if self.kitty_origin == Some(view.0) {
+            let state = if self.fed_grid_view() == Some(view) {
                 &self.state
             } else {
                 let Some(state) = self.live_view_state(view) else {

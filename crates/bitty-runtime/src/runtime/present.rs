@@ -6528,8 +6528,10 @@ mod present_origin_tests {
         normalize_cursor_cell, normalize_reused_cursor_cell, px_add, px_offset_cells, px_side,
         px_span, px_span_usize,
     };
+    #[cfg(unix)]
     use crate::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, View, ViewId};
     use bitty_term_state::{State, TerminalAction};
+    #[cfg(unix)]
     use bitty_test_support::require_pty;
 
     #[test]

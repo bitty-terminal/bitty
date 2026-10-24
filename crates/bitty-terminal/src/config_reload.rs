@@ -1166,6 +1166,8 @@ mod tests {
         assert_eq!(runtime.active_background(), expected.background);
         let outline_before_focused = runtime.config().outline_focused;
         let outline_before_idle = runtime.config().outline_idle;
+        let theme_outline_before_focused = runtime.config().theme.border_focused;
+        let theme_outline_before_idle = runtime.config().theme.border_idle;
 
         let mut custom = light.clone();
         let preset = bitty_config::theme::resolve_theme(None);
@@ -1185,10 +1187,23 @@ mod tests {
         };
         custom.appearance.colors = Some(palette);
         apply_live(&mut runtime, &custom).expect("adopt colors");
+        let expected = bitty_runtime::ThemePalette::from_custom(&palette);
+        let live_theme = runtime.config().theme;
         assert_eq!(
-            runtime.config().theme,
-            bitty_runtime::ThemePalette::from_custom(&palette),
-            "every custom role reaches the live renderer palette"
+            live_theme.background, expected.background,
+            "custom background reaches the live renderer palette"
+        );
+        assert_eq!(live_theme.foreground, expected.foreground);
+        assert_eq!(live_theme.cursor, expected.cursor);
+        assert_eq!(live_theme.selection, expected.selection);
+        assert_eq!(live_theme.ansi, expected.ansi);
+        assert_eq!(
+            live_theme.border_focused, theme_outline_before_focused,
+            "custom colors must not rewrite the preset-owned focused outline token"
+        );
+        assert_eq!(
+            live_theme.border_idle, theme_outline_before_idle,
+            "custom colors must not rewrite the preset-owned idle outline token"
         );
         assert_eq!(
             runtime.active_background(),

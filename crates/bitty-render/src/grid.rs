@@ -207,11 +207,12 @@ pub const DEFAULT_SELECTION: Rgba8 = [0x31, 0x32, 0x44, 0xFF];
 /// Resolved terminal palette carried by the renderer.
 ///
 /// A preset is a fixed set of window background, foreground, cursor,
-/// selection, and the 16 ANSI colors (CTX-0355). The [`Default`] value is the
-/// designed Bitty Dark preset, so every existing construction keeps the
-/// previously hardcoded fallback; a selected preset is resolved once in the
-/// app layer and carried here so the clear color, default cell colors, and
-/// ANSI 0–15 all follow `appearance.theme`.
+/// selection, the focused/idle outline pair, and the 16 ANSI colors
+/// (CTX-0355, CTX-1477). The [`Default`] value is the designed Bitty Dark
+/// preset, so every existing construction keeps the previously hardcoded
+/// fallback; a selected preset is resolved once in the app layer and carried
+/// here so the clear color, default cell colors, chrome borders, and ANSI
+/// 0–15 all follow `appearance.theme`.
 ///
 /// CTX-0392 adds the bounded dynamic layer: `dynamic` is the fixed
 /// 256-entry OSC 4 override table (`None` = no override, `Some(rgb)` =
@@ -229,6 +230,10 @@ pub struct ThemePalette {
     pub cursor: Rgba8,
     /// Selection background fill.
     pub selection: Rgba8,
+    /// Focused outline token (`border.focused`), theme-owned (CTX-1477).
+    pub border_focused: Rgba8,
+    /// Idle outline token (`border.idle`), theme-owned (CTX-1477).
+    pub border_idle: Rgba8,
     /// The 16 ANSI colors, indices 0–15 (8 normal + 8 bright).
     pub ansi: [[u8; 3]; 16],
     /// Live OSC 4 overrides, index-addressed `0..=255` (CTX-0392).
@@ -240,9 +245,10 @@ impl ThemePalette {
     /// Resolves a preset from the `bitty-config` theme registry.
     ///
     /// This is the single mapping from the config-side [`Theme`] to the
-    /// render-side palette; RGB channels are copied verbatim and alpha is
-    /// forced opaque for the four chrome colors (the preset has no alpha).
-    /// The dynamic layer starts empty (`[None; 256]`).
+    /// render-side palette; RGB channels are copied verbatim, alpha is forced
+    /// opaque for the four base chrome colors (the preset has no alpha), and
+    /// the outline pair keeps its theme-owned alpha. The dynamic layer starts
+    /// empty (`[None; 256]`).
     ///
     /// [`Theme`]: bitty_config::theme::Theme
     #[must_use]
@@ -267,6 +273,8 @@ impl ThemePalette {
                 theme.selection[2],
                 0xFF,
             ],
+            border_focused: theme.border_focused.0,
+            border_idle: theme.border_idle.0,
             ansi: theme.ansi,
             dynamic: [None; 256],
         }
@@ -275,8 +283,9 @@ impl ThemePalette {
     /// Resolves an inline custom palette (CTX-0392) to the render side.
     ///
     /// Same mapping as [`Self::from_theme`] but from the validated
-    /// [`CustomPalette`](bitty_config::theme::CustomPalette): chrome colors
-    /// become opaque `Rgba8`, ANSI copies verbatim, dynamic starts empty.
+    /// [`CustomPalette`](bitty_config::theme::CustomPalette): base chrome
+    /// colors become opaque `Rgba8`, the optional outline pair falls back to
+    /// the accepted Core defaults, ANSI copies verbatim, dynamic starts empty.
     #[must_use]
     pub fn from_custom(custom: &bitty_config::theme::CustomPalette) -> Self {
         Self {
@@ -299,6 +308,14 @@ impl ThemePalette {
                 custom.selection[2],
                 0xFF,
             ],
+            border_focused: custom.border_focused.map_or(
+                bitty_config::types::DEFAULT_DECORATION_BORDER_FOCUSED.0,
+                |color| color.0,
+            ),
+            border_idle: custom.border_idle.map_or(
+                bitty_config::types::DEFAULT_DECORATION_BORDER_IDLE.0,
+                |color| color.0,
+            ),
             ansi: custom.ansi,
             dynamic: [None; 256],
         }
@@ -336,9 +353,9 @@ pub const PENDING_PASTE_BANNER_FG: Rgba8 = [0xFF, 0xE2, 0x8B, 0xFF];
 /// Bitty Dark reference background for the help popup (CTX-0265); production
 /// uses [`help_panel_bg_in`] (theme selection ground).
 pub const HELP_PANEL_BG: Rgba8 = [0x18, 0x18, 0x28, 0xFF];
-/// Bitty Dark reference accent for the help popup ring (CTX-0265); production
-/// uses [`help_panel_border_in`] (theme ANSI 12 accent, with a theme-owned
-/// fallback when the accent cannot clear the 3:1 non-text floor).
+/// Historical Bitty Dark reference accent for the help popup ring (CTX-0265);
+/// production uses [`help_panel_border_in`], which now resolves the theme's
+/// muted idle outline (CTX-1477) instead of this fixed accent.
 pub const HELP_PANEL_BORDER: Rgba8 = [0xB4, 0xBE, 0xFE, 0xFF];
 /// Bitty Dark reference text for [`HELP_PANEL_BG`]; production uses
 /// [`help_panel_fg_in`] (theme foreground).
@@ -354,11 +371,13 @@ pub const FAINT_ALPHA: u8 = 0x7F;
 /// [`readable_foreground_on`] instead of a second hardcoded role.
 pub const BANNER_ANSI_INDEX: u8 = 3;
 
-/// ANSI index carrying the help-panel accent ring (CTX-1395).
+/// Legacy ANSI index used by the diagnostic accent probe
+/// ([`bitty_config::theme::help_ring_source`]).
 ///
-/// Mirrors the runtime band host's `BAND_ACCENT_ANSI_INDEX` (bright blue): a
-/// theme-owned chrome accent that a custom palette or OSC 4 remap moves with
-/// the rest of the terminal.
+/// Mirrors the runtime band host's `BAND_ACCENT_ANSI_INDEX` (bright blue), but
+/// production help/chrome borders now use the theme outline pair
+/// (`border.idle` / `border.focused`, CTX-1477); this constant is retained for
+/// the contrast report's accent-family probe.
 pub const HELP_PANEL_ACCENT_ANSI_INDEX: u8 = 12;
 
 /// WCAG relative luminance of an sRGB triplet (0.0..=1.0).
@@ -422,39 +441,32 @@ pub const fn help_panel_bg_in(palette: &ThemePalette) -> Rgba8 {
     palette.selection
 }
 
-/// Theme-aware help-panel accent ring (CTX-1395, CTX-1418): ANSI 12.
+/// Theme-aware chrome border (CTX-1477, issue #2468): the accepted idle
+/// outline token.
 ///
-/// The ring is a non-text UI boundary drawn on the selection ground, so it
-/// must clear the 3:1 non-text floor. ANSI 12 is the primary accent, but on
-/// several presets it sits too close to that ground; the helper then falls
-/// back through ANSI 4, ANSI 6, and finally the foreground. Every candidate
-/// is theme-owned (including any live OSC 4 override), so the ring never
-/// invents a color and follows a theme switch.
+/// One shared resolver for normal chrome surfaces (help/which-key, palette,
+/// presentation/plugin overlays). The tone is muted by design; the focused
+/// state uses [`chrome_focus_border_in`] and stays distinguishable through the
+/// theme's accepted outline pair.
 #[must_use]
-pub fn help_panel_border_in(palette: &ThemePalette) -> Rgba8 {
-    let candidates = [
-        palette.active_index(HELP_PANEL_ACCENT_ANSI_INDEX),
-        palette.active_index(4),
-        palette.active_index(6),
-        [
-            palette.foreground[0],
-            palette.foreground[1],
-            palette.foreground[2],
-        ],
-    ];
-    let selection = [
-        palette.selection[0],
-        palette.selection[1],
-        palette.selection[2],
-    ];
-    let winner = bitty_config::theme::readable_accent(
-        &candidates,
-        selection,
-        bitty_config::theme::MIN_UI_CONTRAST,
-    )
-    .unwrap_or(candidates.len() - 1);
-    let rgb = candidates[winner];
-    [rgb[0], rgb[1], rgb[2], 0xFF]
+pub const fn chrome_border_in(palette: &ThemePalette) -> Rgba8 {
+    palette.border_idle
+}
+
+/// Theme-aware focused chrome border (CTX-1477, issue #2468): the accepted
+/// focused outline token.
+#[must_use]
+pub const fn chrome_focus_border_in(palette: &ThemePalette) -> Rgba8 {
+    palette.border_focused
+}
+
+/// Theme-aware help-panel ring (CTX-1395, CTX-1477): the muted chrome border.
+///
+/// Retained as a named helper for the help panel; it now resolves through
+/// [`chrome_border_in`] so every Core overlay shares one border token.
+#[must_use]
+pub const fn help_panel_border_in(palette: &ThemePalette) -> Rgba8 {
+    chrome_border_in(palette)
 }
 
 /// Theme-aware help-panel text (CTX-1395): the default foreground.
@@ -1840,8 +1852,22 @@ pub struct DrawList {
     /// selection/cursor overlays stay visible on top of it.
     pub backgrounds: Vec<ImageBlit>,
     /// Overlay fills painted above the background image and below glyphs
-    /// (CTX-0347: the selection highlight and cursor fill).
+    /// (CTX-0347: the selection highlight and cursor fill; CTX-1477 leaves
+    /// this layer for non-card overlay chrome only).
     pub overlay_fills: Vec<FillRect>,
+    /// Rounded overlay card surfaces (CTX-1477), painted after
+    /// [`Self::overlay_fills`] and before [`Self::overlay_content_fills`].
+    /// The card surface must cover selection/cursor fills but stay behind the
+    /// plugin row backgrounds it hosts.
+    pub overlay_card_rounded_fills: Vec<RoundedFill>,
+    /// Plugin overlay content fills (CTX-1477: styled row `bg` runs and
+    /// fail-open pills), painted after the card surface and before the border
+    /// ring so row backgrounds stay visible inside the card.
+    pub overlay_content_fills: Vec<FillRect>,
+    /// Rounded overlay border rings (CTX-1477: help and plugin card rings),
+    /// painted after [`Self::overlay_content_fills`] and before glyphs so the
+    /// ring stays above hosted content while retaining the SDF corner mask.
+    pub overlay_rounded_fills: Vec<RoundedFill>,
     /// Glyph instances.
     pub glyphs: Vec<GlyphInstance>,
     /// RGBA image blits (CTX-0248 Kitty present layer, topmost).
@@ -1856,6 +1882,9 @@ impl DrawList {
             || !self.rounded_fills.is_empty()
             || !self.backgrounds.is_empty()
             || !self.overlay_fills.is_empty()
+            || !self.overlay_card_rounded_fills.is_empty()
+            || !self.overlay_content_fills.is_empty()
+            || !self.overlay_rounded_fills.is_empty()
             || !self.glyphs.is_empty()
             || !self.images.is_empty()
     }
@@ -2950,6 +2979,9 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             // present path (CTX-0347); grid truth carries neither.
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: Vec::new(),
             glyphs: Vec::new(),
             // Grid truth carries no images; the runtime present path pushes
             // placed Kitty blits onto the combined list (CTX-0248).
@@ -3011,6 +3043,9 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             rounded_fills: Vec::new(),
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: Vec::new(),
             glyphs: Vec::new(),
             images: Vec::new(),
             plan: plan.clone(),
@@ -3747,6 +3782,9 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             rounded_fills: Vec::new(),
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: Vec::new(),
             glyphs: Vec::new(),
             images: Vec::new(),
             plan,
@@ -3790,6 +3828,9 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             rounded_fills: Vec::new(),
             backgrounds: Vec::new(),
             overlay_fills: Vec::new(),
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: Vec::new(),
             glyphs: Vec::new(),
             images: Vec::new(),
             plan: plan.clone(),

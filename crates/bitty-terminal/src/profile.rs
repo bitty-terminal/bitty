@@ -192,14 +192,29 @@ fn scan_names(
         }
         Err(err) => return Err(err),
     };
+    Ok(collect_names(
+        entries.filter_map(Result::ok).map(|entry| entry.path()),
+        entry_limit,
+        name_limit,
+    ))
+}
+
+/// Filter an ordered path stream into validated profile-name candidates.
+///
+/// Split from [`scan_names`] so the entry/name limits are testable with a
+/// deterministic ordering instead of filesystem `read_dir` order.
+fn collect_names(
+    paths: impl Iterator<Item = PathBuf>,
+    entry_limit: usize,
+    name_limit: usize,
+) -> (Vec<String>, bool) {
     let mut names: Vec<String> = Vec::new();
     let mut truncated = false;
-    for (index, entry) in entries.filter_map(Result::ok).enumerate() {
+    for (index, path) in paths.enumerate() {
         if index >= entry_limit || names.len() >= name_limit {
             truncated = true;
             break;
         }
-        let path = entry.path();
         if !path.is_file() {
             continue;
         }
@@ -215,7 +230,7 @@ fn scan_names(
     }
     names.sort();
     names.dedup();
-    Ok((names, truncated))
+    (names, truncated)
 }
 
 /// Bounded profile-name candidates for shell completion.
@@ -233,7 +248,9 @@ pub(crate) fn candidate_names(dir: &Path) -> Vec<String> {
 }
 
 fn run_list(dir: &Path) -> i32 {
-    let (names, truncated) = match scan_names(dir, PROFILE_LIST_CAP, PROFILE_LIST_CAP) {
+    // Inspect up to the scan bound (not the output cap) so unrelated files
+    // cannot exhaust the budget before valid profiles are reached.
+    let (names, truncated) = match scan_names(dir, PROFILE_SCAN_CAP, PROFILE_LIST_CAP) {
         Ok(result) => result,
         Err(err) => {
             eprintln!(
@@ -245,7 +262,8 @@ fn run_list(dir: &Path) -> i32 {
     };
     if truncated {
         eprintln!(
-            "bitty config profile list: stopped at {PROFILE_LIST_CAP} entries; narrow the directory"
+            "bitty config profile list: stopped at {PROFILE_SCAN_CAP} entries / \
+             {PROFILE_LIST_CAP} profiles; narrow the directory"
         );
     }
     for name in names {
@@ -572,6 +590,45 @@ fn rewrite_selector_profile(content: &str, new_profile: &str) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("bitty-profile-{tag}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn entry_budget_does_not_count_unrelated_files() {
+        // 300 non-profile files before the profiles: the old
+        // `PROFILE_LIST_CAP` entry limit stopped at index 256 and printed
+        // nothing, even though the directory held valid profiles.
+        let dir = scratch_dir("entry-budget");
+        let mut ordered: Vec<PathBuf> = Vec::new();
+        for index in 0..300 {
+            let path = dir.join(format!("unrelated-{index:04}.txt"));
+            std::fs::write(&path, "not a profile\n").expect("unrelated file");
+            ordered.push(path);
+        }
+        for name in ["work", "alpha", "zeta"] {
+            let path = dir.join(format!("{name}.lua"));
+            std::fs::write(&path, "return {}\n").expect("profile file");
+            ordered.push(path);
+        }
+        let (names, truncated) =
+            collect_names(ordered.into_iter(), PROFILE_SCAN_CAP, PROFILE_LIST_CAP);
+        assert_eq!(
+            names,
+            vec!["alpha".to_string(), "work".to_string(), "zeta".to_string()]
+        );
+        assert!(
+            !truncated,
+            "a directory below the scan bound is not truncated"
+        );
+    }
 
     #[test]
     fn rewrite_preserves_comments_and_overrides() {

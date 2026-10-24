@@ -600,6 +600,9 @@ if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {{
         if ($tokens.Count -gt 0) {{
             $previous = $tokens[$tokens.Count - 1]
         }}
+        # Operand paths are not grammar nodes (`$paths` only carries grammar
+        # keys), so their dynamic branches must run before the static lookup.
+        $isOperandPath = $path -in @('plugin enable', 'plugin disable', 'config profile show', 'config profile use', 'config profile path')
         $candidates = @()
         if ($wordToComplete -like '--profile=*') {{
             $profilePrefix = '--profile='
@@ -609,15 +612,14 @@ if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {{
                 ForEach-Object {{ "$profilePrefix$_" }})
         }} elseif ($previous -eq '--profile') {{
             $candidates = @(& $global:_BittyProfiles | Where-Object {{ $_ -like "$wordToComplete*" }})
+        }} elseif ($isOperandPath -and $null -ne $wordToComplete -and -not $wordToComplete.StartsWith('-')) {{
+            if ($path -eq 'plugin enable' -or $path -eq 'plugin disable') {{
+                $candidates = @(& $global:_BittyInstalledPlugins | Where-Object {{ $_ -like "$wordToComplete*" }})
+            }} else {{
+                $candidates = @(& $global:_BittyProfiles | Where-Object {{ $_ -like "$wordToComplete*" }})
+            }}
         }} elseif ($paths.Contains($path)) {{
             $candidates = $paths[$path]
-            if ($null -ne $wordToComplete -and -not $wordToComplete.StartsWith('-')) {{
-                if ($path -eq 'plugin enable' -or $path -eq 'plugin disable') {{
-                    $candidates = @(& $global:_BittyInstalledPlugins | Where-Object {{ $_ -like "$wordToComplete*" }})
-                }} elseif ($path -eq 'config profile show' -or $path -eq 'config profile use' -or $path -eq 'config profile path') {{
-                    $candidates = @(& $global:_BittyProfiles | Where-Object {{ $_ -like "$wordToComplete*" }})
-                }}
-            }}
         }}
         $candidates | Where-Object {{ $_ -like "$wordToComplete*" }} | ForEach-Object {{
             [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
@@ -1053,6 +1055,34 @@ mod tests {
             pwsh.contains("catch") && pwsh.contains("LASTEXITCODE"),
             "PowerShell must fail soft when the helper is missing or fails"
         );
+    }
+
+    #[test]
+    fn powershell_operand_branches_run_before_static_path_lookup() {
+        let script = completion_script(CompletionShell::Powershell);
+        let operand = script
+            .find("$isOperandPath = $path -in @(")
+            .unwrap_or_else(|| panic!("powershell defines operand paths: {script}"));
+        let lookup = script
+            .find("elseif ($paths.Contains($path))")
+            .expect("powershell keeps the static lookup");
+        assert!(
+            operand < lookup,
+            "operand paths are not grammar keys; they must be checked first"
+        );
+        assert!(
+            script.contains("elseif ($isOperandPath -and $null -ne $wordToComplete"),
+            "powershell gates operand completion on a non-flag token"
+        );
+        for path in [
+            "plugin enable",
+            "plugin disable",
+            "config profile show",
+            "config profile use",
+            "config profile path",
+        ] {
+            assert!(script.contains(path), "powershell names operand {path}");
+        }
     }
 
     #[test]

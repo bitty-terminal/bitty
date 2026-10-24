@@ -53,16 +53,33 @@ impl CandidateEnv {
         self.config.join("bitty")
     }
 
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(BITTY_BIN)
-            .args(args)
+    /// Command with isolated XDG/HOME roots and the test binary's directory
+    /// first on PATH (`command bitty` in generated completion scripts).
+    fn command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        command
             .env("XDG_CONFIG_HOME", &self.config)
             .env("XDG_DATA_HOME", &self.data)
             .env("HOME", &self.home)
             .env("APPDATA", &self.config)
             .env("LOCALAPPDATA", &self.config)
             .env_remove("BITTY_CONFIG")
-            .env_remove("BITTY_PROFILE")
+            .env_remove("BITTY_PROFILE");
+        if let Some(bin_dir) = std::path::Path::new(BITTY_BIN).parent() {
+            let mut paths = vec![bin_dir.to_path_buf()];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            if let Ok(joined) = std::env::join_paths(paths) {
+                command.env("PATH", joined);
+            }
+        }
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.command(BITTY_BIN)
+            .args(args)
             .output()
             .unwrap_or_else(|err| panic!("spawn {BITTY_BIN:?} {args:?}: {err}"))
     }
@@ -77,6 +94,22 @@ fn write_profile(env: &CandidateEnv, name: &str) {
 fn write_managed_state(env: &CandidateEnv, ids: &[&str]) {
     let root = env.config_root();
     std::fs::create_dir_all(&root).expect("config root");
+    let mut text = String::from("return {\n    state_version = 1,\n    plugins = {\n");
+    for id in ids {
+        text.push_str(&format!(
+            "        [\"{id}\"] = {{ source = \"bundled\", manifest_hash = \"{}\", \
+             enabled = true, granted = {{}}, denied = {{}} }},\n",
+            "a".repeat(64)
+        ));
+    }
+    text.push_str("    },\n}\n");
+    std::fs::write(root.join("bitty-plugins.lua"), text).expect("managed lua ledger");
+}
+
+/// Legacy TOML ledger used only by the pre-migration fallback test.
+fn write_legacy_state(env: &CandidateEnv, ids: &[&str]) {
+    let root = env.config_root();
+    std::fs::create_dir_all(&root).expect("config root");
     let mut text = String::from("state_version = 1\n");
     for id in ids {
         text.push_str(&format!(
@@ -85,7 +118,21 @@ fn write_managed_state(env: &CandidateEnv, ids: &[&str]) {
             "a".repeat(64)
         ));
     }
-    std::fs::write(root.join("bitty-plugins.toml"), text).expect("managed state");
+    std::fs::write(root.join("bitty-plugins.toml"), text).expect("legacy toml ledger");
+}
+
+fn write_completion_script(env: &CandidateEnv, shell: &str) -> std::path::PathBuf {
+    let out = env.run(&["completion", shell]);
+    assert_eq!(out.status.code(), Some(0), "{shell}: {}", stderr(&out));
+    // PowerShell dot-sourcing requires a `.ps1` extension.
+    let file_name = if shell == "powershell" {
+        "completion.ps1".to_string()
+    } else {
+        format!("completion.{shell}")
+    };
+    let path = env.home.join(file_name);
+    std::fs::write(&path, stdout(&out)).expect("write completion script");
+    path
 }
 
 fn stdout(output: &Output) -> String {
@@ -365,11 +412,14 @@ fn candidate_helpers_fail_soft_on_missing_and_malformed_state() {
     assert!(stdout(&out).is_empty());
     assert!(stderr(&out).is_empty());
 
-    // Malformed ledger and a malformed store index stay silent and empty.
+    // Malformed Lua ledger and a malformed store index stay silent and empty.
     let root = env.config_root();
     std::fs::create_dir_all(&root).expect("config root");
-    std::fs::write(root.join("bitty-plugins.toml"), "state_version = 99\n")
-        .expect("malformed state");
+    std::fs::write(
+        root.join("bitty-plugins.lua"),
+        "return { state_version = 99, plugins = {} }\n",
+    )
+    .expect("malformed lua state");
     let store = env.data.join("bitty/plugins");
     std::fs::create_dir_all(&store).expect("store dir");
     std::fs::write(store.join("current.json"), "{not json").expect("malformed index");
@@ -383,6 +433,20 @@ fn candidate_helpers_fail_soft_on_missing_and_malformed_state() {
     assert!(
         stderr(&out).is_empty(),
         "no diagnostics from malformed state"
+    );
+}
+
+#[test]
+fn candidate_helper_reads_the_legacy_toml_ledger_once() {
+    let env = CandidateEnv::new("legacy-ledger");
+    write_legacy_state(&env, &["legacy.bundled"]);
+
+    let out = env.run(&["+list-plugins", "--installed"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "legacy.bundled\n");
+    assert!(
+        env.config_root().join("bitty-plugins.lua").exists(),
+        "the inspect loader migrates the legacy ledger once"
     );
 }
 
@@ -429,4 +493,168 @@ fn candidate_helper_usage_errors_stay_off_stdout() {
             stderr(&out)
         );
     }
+}
+
+/// Bash-level proof that the generated function completes operand slots from
+/// isolated local state (not just that the script contains hook substrings).
+#[test]
+fn bash_completes_plugin_and_profile_operands_from_local_state() {
+    if !script_is_available("bash", "--version") {
+        eprintln!("skipping bash operand completion: bash unavailable");
+        return;
+    }
+    let env = CandidateEnv::new("bash-operands");
+    write_profile(&env, "alpha");
+    write_profile(&env, "work");
+    write_managed_state(&env, &["zeta.plugin", "alpha.plugin"]);
+    let script = write_completion_script(&env, "bash");
+    let script = script.to_string_lossy().into_owned();
+
+    let harness = r#"
+source "$1"
+run() {
+    COMP_WORDS=("$@")
+    COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 ))
+    _bitty_complete
+    printf '%s\n' "${COMPREPLY[@]}"
+}
+run bitty plugin enable ""
+printf -- '--\n'
+run bitty plugin disable a
+printf -- '--\n'
+run bitty config profile show ""
+printf -- '--\n'
+run bitty config profile path w
+"#;
+    let out = env
+        .command("bash")
+        .args(["--noprofile", "--norc", "-c", harness, "_", &script])
+        .output()
+        .expect("spawn bash completion harness");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "bash harness failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout(&out),
+        "alpha.plugin\nzeta.plugin\n--\nalpha.plugin\n--\nalpha\nwork\n--\nwork\n"
+    );
+}
+
+/// PowerShell-level proof for the same operand slots. Windows CI always has
+/// `pwsh`; local Linux hosts without it skip with a visible message.
+#[test]
+fn pwsh_completes_plugin_and_profile_operands_from_local_state() {
+    if !script_is_available("pwsh", "-Version") {
+        eprintln!("skipping pwsh operand completion: pwsh unavailable");
+        return;
+    }
+    let env = CandidateEnv::new("pwsh-operands");
+    write_profile(&env, "alpha");
+    write_profile(&env, "work");
+    write_managed_state(&env, &["zeta.plugin", "alpha.plugin"]);
+    let script = write_completion_script(&env, "powershell");
+    let script = script.to_string_lossy().into_owned();
+
+    let harness_path = env.home.join("complete.ps1");
+    std::fs::write(
+        &harness_path,
+        r#"param([string]$CompletionScript)
+. $CompletionScript
+if (-not (Test-Path variable:global:_BittyCompletionScript)) {
+    Write-Error 'completion scriptblock did not register'
+    exit 3
+}
+
+function Write-Diag([string]$Message) {
+    [Console]::Error.WriteLine($Message)
+}
+
+Write-Diag ("PATH=" + $env:PATH)
+Write-Diag ("bitty=" + [string](Get-Command bitty -ErrorAction SilentlyContinue).Source)
+$rawProfiles = @(& $global:_BittyProfiles 2>&1)
+Write-Diag ("profiles=" + ($rawProfiles -join '|'))
+$rawPlugins = @(& $global:_BittyInstalledPlugins 2>&1)
+Write-Diag ("plugins=" + ($rawPlugins -join '|'))
+
+$cases = @(
+    @('bitty plugin enable ', ''),
+    @('bitty plugin disable a', 'a'),
+    @('bitty config profile show ', ''),
+    @('bitty config profile path w', 'w')
+)
+foreach ($case in $cases) {
+    $line = $case[0]
+    $word = $case[1]
+    $tokens = $null
+    $errors = $null
+    $root = [System.Management.Automation.Language.Parser]::ParseInput($line, [ref]$tokens, [ref]$errors)
+    $command = $root.EndBlock.Statements[0].PipelineElements[0]
+
+    # Diagnostic-only path reconstruction mirrors the generated scriptblock so
+    # a CI failure names the path/token shape instead of just empty output.
+    $diagnosticTokens = New-Object System.Collections.Generic.List[string]
+    foreach ($element in $command.CommandElements) {
+        if ($element.Extent.EndOffset -lt $line.Length) {
+            $diagnosticTokens.Add($element.Extent.Text.Trim([char]39, [char]34))
+        }
+    }
+    if ($diagnosticTokens.Count -gt 0) {
+        $diagnosticTokens.RemoveAt(0)
+    }
+    $pathTokens = New-Object System.Collections.Generic.List[string]
+    for ($i = 0; $i -lt $diagnosticTokens.Count; $i++) {
+        $token = $diagnosticTokens[$i]
+        if ($token.StartsWith('--')) {
+            if (-not $token.Contains('=') -and ($global:_BittyValueFlags -contains $token)) {
+                $i++
+            }
+            continue
+        }
+        if ($token.StartsWith('-')) {
+            continue
+        }
+        $pathTokens.Add($token)
+    }
+    $previous = ''
+    if ($diagnosticTokens.Count -gt 0) {
+        $previous = $diagnosticTokens[$diagnosticTokens.Count - 1]
+    }
+    Write-Diag ("case='" + $line + "' word='" + $word + "' path='" + ($pathTokens -join ' ') + "' previous='" + $previous + "' elements=" + $command.CommandElements.Count + " type=" + $command.GetType().Name)
+
+    Write-Output '--'
+    try {
+        $results = @(& $global:_BittyCompletionScript $word $command $line.Length)
+    } catch {
+        Write-Diag ("completion error: " + $_.Exception.Message)
+        $results = @()
+    }
+    Write-Diag ("results=" + $results.Count)
+    foreach ($result in $results) { Write-Output $result.CompletionText }
+}
+"#,
+    )
+    .expect("write pwsh harness");
+    let harness = harness_path.to_string_lossy().into_owned();
+
+    let out = env
+        .command("pwsh")
+        .args(["-NoProfile", "-NonInteractive", "-File", &harness, &script])
+        .output()
+        .expect("spawn pwsh completion harness");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "pwsh harness failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rendered = stdout(&out).replace("\r\n", "\n");
+    assert_eq!(
+        rendered,
+        "--\nalpha.plugin\nzeta.plugin\n--\nalpha.plugin\n--\nalpha\nwork\n--\nwork\n",
+        "pwsh stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

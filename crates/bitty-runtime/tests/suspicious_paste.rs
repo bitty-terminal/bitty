@@ -677,16 +677,53 @@ fn ctx1372_enter_confirms_with_identical_bytes_to_paste_again() {
         repeat_bytes.as_slice(),
         "Enter and paste-again must deliver identical bytes"
     );
-    // The release produces nothing either.
+    // The confirming press owns its OS repeat and paired release, so neither
+    // can submit an extra CR behind the paste.
+    let mut confirming_repeat = enter_key(PressState::Pressed);
+    confirming_repeat.repeat = true;
+    assert_eq!(
+        rt.handle_key_event(confirming_repeat),
+        None,
+        "confirming Enter repeat is consumed"
+    );
     assert_eq!(rt.handle_key_event(enter_key(PressState::Released)), None);
     assert_eq!(rt.pending_input(), text.as_bytes());
 
-    // Gate consumed: a second Enter is the ordinary CR, exactly once.
+    // Gate consumed: a later Enter is the ordinary CR, exactly once. A
+    // repeat after the confirming release is also a genuine later key event.
     assert_eq!(
         rt.handle_key_event(enter_key(PressState::Pressed)),
         Some(b"\r".to_vec())
     );
     assert_eq!(rt.pending_input(), b"line1\nline2\r");
+    let mut repeat = enter_key(PressState::Pressed);
+    repeat.repeat = true;
+    assert_eq!(rt.handle_key_event(repeat), Some(b"\r".to_vec()));
+    assert_eq!(rt.pending_input(), b"line1\nline2\r\r");
+}
+
+#[test]
+fn modified_enter_does_not_confirm_pending_paste_or_lose_identity() {
+    use bitty_platform::{KeyEvent, KeyLocation, LogicalKey, NamedKey, PressState};
+
+    let mut rt = make_runtime();
+    assert!(rt.paste_text_via_gate("line1\nline2".to_string()));
+    rt.handle_pty_bytes(b"\x1b[>1u");
+    rt.handle_key_event(KeyEvent {
+        logical_key: LogicalKey::Named(NamedKey::Shift),
+        text: None,
+        location: KeyLocation::Standard,
+        state: PressState::Pressed,
+        repeat: false,
+        is_synthetic: false,
+    });
+    let enter = enter_key(PressState::Pressed);
+    assert_eq!(rt.handle_key_event(enter), Some(b"\x1b[13;2u".to_vec()));
+    assert!(
+        rt.has_pending_paste(),
+        "Shift+Enter is not paste confirmation"
+    );
+    assert_eq!(rt.pending_input(), b"\x1b[13;2u");
 }
 
 #[test]

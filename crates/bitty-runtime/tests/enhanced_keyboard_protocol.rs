@@ -17,7 +17,10 @@
 //! (`sw.kovidgoyal.net/kitty/keyboard-protocol`). bitty keeps `?7727` as the
 //! historical alias and implements the real forms here.
 
-use bitty_platform::{KeyEvent, KeyLocation, LogicalKey, NamedKey, PressState};
+use bitty_platform::{
+    KeyEvent, KeyLocation, LogicalKey, ModifiersState, NamedKey, PlatformEvent, PressState,
+    WindowEventKind, WindowId,
+};
 use bitty_runtime::Runtime;
 
 fn make_runtime() -> Runtime {
@@ -95,6 +98,18 @@ fn press_shift(rt: &mut Runtime) {
 
 fn release_super(rt: &mut Runtime) {
     rt.handle_key_event(named_key(NamedKey::Super, PressState::Released));
+}
+
+fn hold_modifiers(rt: &mut Runtime, modifiers: &[NamedKey]) {
+    for &modifier in modifiers {
+        rt.handle_key_event(named_key(modifier, PressState::Pressed));
+    }
+}
+
+fn release_modifiers(rt: &mut Runtime, modifiers: &[NamedKey]) {
+    for &modifier in modifiers.iter().rev() {
+        rt.handle_key_event(named_key(modifier, PressState::Released));
+    }
 }
 
 // ----------------------------------------------------------------------
@@ -474,18 +489,367 @@ fn associated_text_without_report_all_keys_is_inert() {
 fn enter_tab_backspace_keep_legacy_bytes_under_disambiguate() {
     let mut rt = make_runtime();
     send(&mut rt, b"\x1b[=1u");
+    for (key, expected) in [
+        (NamedKey::Enter, b"\r".as_slice()),
+        (NamedKey::Tab, b"\t".as_slice()),
+        (NamedKey::Backspace, b"\x7f".as_slice()),
+        (NamedKey::Delete, b"\x1b[3~".as_slice()),
+    ] {
+        assert_eq!(
+            rt.handle_key_event_ref(&named_key(key, PressState::Pressed)),
+            Some(expected.to_vec()),
+            "unmodified {key:?} must retain its legacy bytes under disambiguation"
+        );
+    }
+}
+
+#[test]
+fn unnegotiated_enter_tab_backspace_keep_legacy_bytes() {
+    let mut rt = make_runtime();
+    for (key, expected) in [
+        (NamedKey::Enter, b"\r".as_slice()),
+        (NamedKey::Tab, b"\t".as_slice()),
+        (NamedKey::Backspace, b"\x7f".as_slice()),
+    ] {
+        assert_eq!(
+            rt.handle_key_event_ref(&named_key(key, PressState::Pressed)),
+            Some(expected.to_vec()),
+            "unnegotiated {key:?} must retain its legacy bytes"
+        );
+    }
+}
+
+#[test]
+fn shift_enter_is_distinct_only_after_kitty_negotiation() {
+    let mut rt = make_runtime();
+
+    // Without an application opt-in, legacy Enter remains CR and Shift+Enter
+    // fails closed to the same legacy byte: no guessed escape sequence is sent
+    // to applications that did not negotiate one.
+    press_shift(&mut rt);
     assert_eq!(
         rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Pressed)),
-        Some(b"\r".to_vec())
+        Some(b"\r".to_vec()),
+        "unnegotiated Shift+Enter must stay legacy CR"
+    );
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
+
+    // Kitty's progressive push form is the protocol an application uses to
+    // opt in. The modifier field 2 means Shift (raw mask 1 plus one), so the
+    // application can bind this key to an inserted newline rather than submit.
+    send(&mut rt, b"\x1b[>1u");
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Pressed)),
+        Some(b"\r".to_vec()),
+        "ordinary Enter must retain its legacy CR"
+    );
+    press_shift(&mut rt);
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Pressed)),
+        Some(b"\x1b[13;2u".to_vec()),
+        "negotiated Shift+Enter must be CSI 13;2u"
+    );
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
+}
+
+#[test]
+fn negotiated_shift_enter_preserves_repeat_and_release_event_types() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[>3u"); // disambiguate + report events
+    press_shift(&mut rt);
+
+    let mut repeat = named_key(NamedKey::Enter, PressState::Pressed);
+    repeat.repeat = true;
+    assert_eq!(
+        rt.handle_key_event_ref(&repeat),
+        Some(b"\x1b[13;2:2u".to_vec())
     );
     assert_eq!(
-        rt.handle_key_event_ref(&named_key(NamedKey::Tab, PressState::Pressed)),
-        Some(b"\t".to_vec())
+        rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Released)),
+        Some(b"\x1b[13;2:3u".to_vec())
     );
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
+}
+
+#[test]
+fn platform_modifier_event_reaches_shift_enter_encoder() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[>1u");
+
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id: WindowId::from_raw_public(1),
+        kind: WindowEventKind::ModifiersChanged(ModifiersState {
+            shift: true,
+            control: false,
+            alt: false,
+            super_pressed: false,
+        }),
+    });
+    assert!(!rt.handle_platform_event(PlatformEvent::Window {
+        window_id: WindowId::from_raw_public(1),
+        kind: WindowEventKind::KeyboardInput(named_key(NamedKey::Enter, PressState::Pressed)),
+    }));
+    assert_eq!(rt.drain_pending_input(), b"\x1b[13;2u");
+}
+
+#[test]
+fn shift_enter_is_not_encoded_by_an_unrelated_alternate_flag() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[>4u"); // alternate-key reporting alone
+    press_shift(&mut rt);
     assert_eq!(
-        rt.handle_key_event_ref(&named_key(NamedKey::Backspace, PressState::Pressed)),
-        Some(b"\x7f".to_vec())
+        rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Pressed)),
+        Some(b"\r".to_vec()),
+        "Shift+Enter must not emit CSI-u without disambiguation or all-keys"
     );
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
+}
+
+#[test]
+fn modified_functional_keys_are_table_driven_csi_u_frames() {
+    struct Case {
+        name: &'static str,
+        key: NamedKey,
+        location: KeyLocation,
+        modifiers: &'static [NamedKey],
+        expected: &'static [u8],
+    }
+
+    const CASES: &[Case] = &[
+        Case {
+            name: "Shift+Enter",
+            key: NamedKey::Enter,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Shift],
+            expected: b"\x1b[13;2u",
+        },
+        Case {
+            name: "Ctrl+Enter",
+            key: NamedKey::Enter,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Control],
+            expected: b"\x1b[13;5u",
+        },
+        Case {
+            name: "Alt+Enter",
+            key: NamedKey::Enter,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Alt],
+            expected: b"\x1b[13;3u",
+        },
+        Case {
+            name: "Ctrl+Shift+Enter",
+            key: NamedKey::Enter,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Control, NamedKey::Shift],
+            expected: b"\x1b[13;6u",
+        },
+        Case {
+            name: "Shift+Tab",
+            key: NamedKey::Tab,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Shift],
+            expected: b"\x1b[9;2u",
+        },
+        Case {
+            name: "Ctrl+Tab",
+            key: NamedKey::Tab,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Control],
+            expected: b"\x1b[9;5u",
+        },
+        Case {
+            name: "Alt+Tab",
+            key: NamedKey::Tab,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Alt],
+            expected: b"\x1b[9;3u",
+        },
+        Case {
+            name: "Ctrl+Shift+Tab",
+            key: NamedKey::Tab,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Control, NamedKey::Shift],
+            expected: b"\x1b[9;6u",
+        },
+        Case {
+            name: "Shift+Backspace",
+            key: NamedKey::Backspace,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Shift],
+            expected: b"\x1b[127;2u",
+        },
+        Case {
+            name: "Ctrl+Backspace",
+            key: NamedKey::Backspace,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Control],
+            expected: b"\x1b[127;5u",
+        },
+        Case {
+            name: "Alt+Backspace",
+            key: NamedKey::Backspace,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Alt],
+            expected: b"\x1b[127;3u",
+        },
+        Case {
+            name: "Ctrl+Shift+Backspace",
+            key: NamedKey::Backspace,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Control, NamedKey::Shift],
+            expected: b"\x1b[127;6u",
+        },
+        Case {
+            name: "Shift+Delete",
+            key: NamedKey::Delete,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Shift],
+            expected: b"\x1b[3;2~",
+        },
+        Case {
+            name: "Ctrl+Delete",
+            key: NamedKey::Delete,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Control],
+            expected: b"\x1b[3;5~",
+        },
+        Case {
+            name: "Alt+Delete",
+            key: NamedKey::Delete,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Alt],
+            expected: b"\x1b[3;3~",
+        },
+        Case {
+            name: "Ctrl+Shift+Delete",
+            key: NamedKey::Delete,
+            location: KeyLocation::Standard,
+            modifiers: &[NamedKey::Control, NamedKey::Shift],
+            expected: b"\x1b[3;6~",
+        },
+        Case {
+            name: "Shift+numpad Enter",
+            key: NamedKey::Enter,
+            location: KeyLocation::Numpad,
+            modifiers: &[NamedKey::Shift],
+            expected: b"\x1b[57414;2u",
+        },
+        Case {
+            name: "Ctrl+numpad Enter",
+            key: NamedKey::Enter,
+            location: KeyLocation::Numpad,
+            modifiers: &[NamedKey::Control],
+            expected: b"\x1b[57414;5u",
+        },
+        Case {
+            name: "Alt+numpad Enter",
+            key: NamedKey::Enter,
+            location: KeyLocation::Numpad,
+            modifiers: &[NamedKey::Alt],
+            expected: b"\x1b[57414;3u",
+        },
+        Case {
+            name: "Ctrl+Shift+numpad Enter",
+            key: NamedKey::Enter,
+            location: KeyLocation::Numpad,
+            modifiers: &[NamedKey::Control, NamedKey::Shift],
+            expected: b"\x1b[57414;6u",
+        },
+    ];
+
+    for case in CASES {
+        let mut rt = make_runtime();
+        send(&mut rt, b"\x1b[>1u");
+        hold_modifiers(&mut rt, case.modifiers);
+        let event = KeyEvent {
+            logical_key: LogicalKey::Named(case.key),
+            text: None,
+            location: case.location,
+            state: PressState::Pressed,
+            repeat: false,
+            is_synthetic: false,
+        };
+        assert_eq!(
+            rt.handle_key_event_ref(&event),
+            Some(case.expected.to_vec()),
+            "{} must use CSI-u and not a duplicate legacy byte",
+            case.name
+        );
+        assert_eq!(
+            rt.drain_pending_input(),
+            case.expected,
+            "{} routed once",
+            case.name
+        );
+        release_modifiers(&mut rt, case.modifiers);
+    }
+}
+
+#[test]
+fn modified_functional_key_repeat_and_release_frames_are_table_driven() {
+    let cases = [
+        (
+            NamedKey::Enter,
+            &[NamedKey::Shift][..],
+            b"\x1b[13;2" as &[u8],
+        ),
+        (NamedKey::Tab, &[NamedKey::Control][..], b"\x1b[9;5"),
+        (NamedKey::Backspace, &[NamedKey::Alt][..], b"\x1b[127;3"),
+        (
+            NamedKey::Delete,
+            &[NamedKey::Control, NamedKey::Shift][..],
+            b"\x1b[3;6",
+        ),
+    ];
+
+    for (key, modifiers, prefix) in cases {
+        let mut rt = make_runtime();
+        send(&mut rt, b"\x1b[>3u");
+        hold_modifiers(&mut rt, modifiers);
+        let mut repeat = named_key(key, PressState::Pressed);
+        repeat.repeat = true;
+        let mut expected = prefix.to_vec();
+        expected.extend_from_slice(if key == NamedKey::Delete {
+            b":2~"
+        } else {
+            b":2u"
+        });
+        assert_eq!(rt.handle_key_event_ref(&repeat), Some(expected.clone()));
+        assert_eq!(rt.drain_pending_input(), expected);
+
+        let mut expected_release = prefix.to_vec();
+        expected_release.extend_from_slice(if key == NamedKey::Delete {
+            b":3~"
+        } else {
+            b":3u"
+        });
+        assert_eq!(
+            rt.handle_key_event_ref(&named_key(key, PressState::Released)),
+            Some(expected_release.clone())
+        );
+        assert_eq!(rt.drain_pending_input(), expected_release);
+        release_modifiers(&mut rt, modifiers);
+    }
+}
+
+#[test]
+fn report_all_encodes_bare_functional_keys_without_legacy_duplicates() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[>9u"); // disambiguate + report all keys
+    for (key, expected) in [
+        (NamedKey::Enter, b"\x1b[13u" as &[u8]),
+        (NamedKey::Tab, b"\x1b[9u"),
+        (NamedKey::Backspace, b"\x1b[127u"),
+        (NamedKey::Delete, b"\x1b[3~"),
+    ] {
+        assert_eq!(
+            rt.handle_key_event_ref(&named_key(key, PressState::Pressed)),
+            Some(expected.to_vec()),
+            "report-all {key:?} must not also emit its legacy byte"
+        );
+        assert_eq!(rt.drain_pending_input(), expected);
+    }
 }
 
 // ----------------------------------------------------------------------

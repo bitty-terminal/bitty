@@ -2662,22 +2662,43 @@ impl Runtime {
     /// Returns `true` when a pending paste was present and the press was
     /// consumed; `false` otherwise.
     pub(super) fn confirm_pending_paste_on_enter(&mut self, event: &KeyEvent) -> bool {
-        if event.state != PressState::Pressed {
-            return false;
-        }
-        if self.pending_paste.is_none() {
-            return false;
-        }
         if !matches!(
             &event.logical_key,
             bitty_platform::LogicalKey::Named(bitty_platform::NamedKey::Enter)
         ) {
             return false;
         }
+        // The confirming press owns its OS repeat and paired release. Without
+        // this one-shot lifecycle, the pending gate is cleared by the first
+        // press and a held Enter can submit an extra CR on its repeat or
+        // release path. Focus loss drops the flag in `set_focused`; a later
+        // physical Enter after release is therefore ordinary input again.
+        if self.pending_paste_enter_swallow {
+            if event.state == PressState::Released {
+                self.pending_paste_enter_swallow = false;
+            }
+            return true;
+        }
+        if event.state != PressState::Pressed || self.pending_paste.is_none() {
+            return false;
+        }
+        // Modified Enter remains application input. In particular, do not
+        // turn Shift+Enter/Ctrl+Enter/Alt+Enter into an unlabelled paste
+        // confirmation; negotiated CSI-u must preserve that identity.
+        if self.shift_pressed
+            || self.control_pressed
+            || self.alt_pressed
+            || self.super_pressed
+            || self.hyper_pressed
+            || self.meta_pressed
+        {
+            return false;
+        }
         // Issue #1438: `confirm_pending_paste` clears an expired gate first,
         // so an expired paste delivers nothing. The press was still the
         // confirm gesture for a visible banner and stays consumed.
         let _ = self.confirm_pending_paste(true);
+        self.pending_paste_enter_swallow = true;
         self.inspect_ring.push_key(
             &key_inspect_label(event),
             self.shift_pressed,

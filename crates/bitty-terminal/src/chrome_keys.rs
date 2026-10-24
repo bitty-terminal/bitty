@@ -3889,6 +3889,17 @@ mod tests {
         })
     }
 
+    fn named_press_repeat(named: NamedKey) -> WindowEventKind {
+        WindowEventKind::KeyboardInput(KeyEvent {
+            logical_key: LogicalKey::Named(named),
+            text: None,
+            location: bitty_platform::KeyLocation::Standard,
+            state: PressState::Pressed,
+            repeat: true,
+            is_synthetic: false,
+        })
+    }
+
     fn named_release(named: NamedKey) -> WindowEventKind {
         WindowEventKind::KeyboardInput(KeyEvent {
             logical_key: LogicalKey::Named(named),
@@ -7742,14 +7753,55 @@ claims = []
 
     #[test]
     fn paste_pending_enter_matches_paste_again_bytes() {
-        // Acceptance pin (CTX-1372): the Enter path and the paste-again
-        // path deliver identical bytes for the same gated clipboard.
+        // Acceptance pin (CTX-1372/CTX-1505): the Enter path and the
+        // paste-again path deliver identical bytes for the same gated
+        // clipboard. The confirming Enter owns exactly one physical
+        // press/repeat/release sequence; a later genuine Enter is ordinary
+        // input again.
         let text = "alpha\nbeta";
         let mut via_enter = paste_test_app(text);
         press_paste_chord(&mut via_enter);
         assert!(via_enter.runtime.has_pending_paste());
-        assert!(!drive_chrome(&mut via_enter, named_press(NamedKey::Enter)));
-        let enter_bytes = via_enter.runtime.drain_pending_input();
+
+        // The modifier latch from Ctrl+Shift+V must be released before this
+        // Enter. Without this physical release sequence Enter is modified
+        // input by contract and correctly produces CR instead of confirming.
+        assert!(!drive_chrome(&mut via_enter, char_release("V")));
+        assert!(!drive_chrome(&mut via_enter, clear_mods_event()));
+
+        let enter_events = [
+            (
+                "confirming press",
+                named_press(NamedKey::Enter),
+                text.as_bytes(),
+            ),
+            (
+                "confirming repeat",
+                named_press_repeat(NamedKey::Enter),
+                b"".as_slice(),
+            ),
+            (
+                "confirming release",
+                named_release(NamedKey::Enter),
+                b"".as_slice(),
+            ),
+            (
+                "later genuine press",
+                named_press(NamedKey::Enter),
+                b"\r".as_slice(),
+            ),
+        ];
+        for (name, event, expected) in enter_events {
+            assert!(
+                !drive_chrome(&mut via_enter, event),
+                "{name} must reach runtime"
+            );
+            assert_eq!(
+                via_enter.runtime.drain_pending_input(),
+                expected,
+                "{name} bytes"
+            );
+        }
 
         let mut via_repeat = paste_test_app(text);
         press_paste_chord(&mut via_repeat);
@@ -7757,8 +7809,80 @@ claims = []
         assert!(!drive_chrome(&mut via_repeat, char_release("V")));
         assert!(drive_chrome(&mut via_repeat, char_press("V", "V", false)));
         let repeat_bytes = via_repeat.runtime.drain_pending_input();
-        assert_eq!(enter_bytes, repeat_bytes);
-        assert_eq!(enter_bytes, text.as_bytes());
+        assert_eq!(repeat_bytes, text.as_bytes());
+
+        // Focus cancellation clears the one-shot ownership even if the
+        // physical release was missed while unfocused.
+        let mut after_focus_loss = paste_test_app(text);
+        press_paste_chord(&mut after_focus_loss);
+        assert!(!drive_chrome(&mut after_focus_loss, char_release("V")));
+        assert!(!drive_chrome(&mut after_focus_loss, clear_mods_event()));
+        assert!(!drive_chrome(
+            &mut after_focus_loss,
+            named_press(NamedKey::Enter)
+        ));
+        assert_eq!(
+            after_focus_loss.runtime.drain_pending_input(),
+            text.as_bytes()
+        );
+        assert!(!drive_chrome(
+            &mut after_focus_loss,
+            WindowEventKind::Focused(false)
+        ));
+        assert!(!drive_chrome(
+            &mut after_focus_loss,
+            WindowEventKind::Focused(true)
+        ));
+        // The confirming release is intentionally missed while unfocused.
+        // The first Enter after refocus must therefore be ordinary input;
+        // without the focus-loss reset it would still be swallowed here.
+        assert!(!drive_chrome(
+            &mut after_focus_loss,
+            named_press(NamedKey::Enter)
+        ));
+        assert_eq!(after_focus_loss.runtime.drain_pending_input(), b"\r");
+        assert!(!drive_chrome(
+            &mut after_focus_loss,
+            named_release(NamedKey::Enter)
+        ));
+
+        // Modified Enter never confirms. The table covers the legacy
+        // fallback and both Kitty disambiguation/report-events paths.
+        for (name, negotiation, expected) in [
+            ("legacy", None, b"\r".as_slice()),
+            (
+                "kitty disambiguation",
+                Some(b"\x1b[>1u".as_slice()),
+                b"\x1b[13;2u".as_slice(),
+            ),
+            (
+                "kitty report-events",
+                Some(b"\x1b[>3u".as_slice()),
+                b"\x1b[13;2u".as_slice(),
+            ),
+        ] {
+            let mut modified = paste_test_app(text);
+            press_paste_chord(&mut modified);
+            assert!(!drive_chrome(&mut modified, char_release("V")));
+            assert!(!drive_chrome(&mut modified, clear_mods_event()));
+            if let Some(negotiation) = negotiation {
+                modified.runtime.handle_pty_bytes(negotiation);
+            }
+            assert!(!drive_chrome(&mut modified, mods_event(true, false)));
+            assert!(!drive_chrome(&mut modified, named_press(NamedKey::Shift)));
+            assert!(!drive_chrome(&mut modified, named_press(NamedKey::Enter)));
+            assert_eq!(
+                modified.runtime.drain_pending_input(),
+                expected,
+                "{name} modified Enter bytes"
+            );
+            assert!(
+                modified.runtime.has_pending_paste(),
+                "{name} must not confirm"
+            );
+            assert!(!drive_chrome(&mut modified, named_release(NamedKey::Enter)));
+            assert!(!drive_chrome(&mut modified, named_release(NamedKey::Shift)));
+        }
     }
 
     #[test]

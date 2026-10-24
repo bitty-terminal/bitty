@@ -1951,6 +1951,10 @@ impl Runtime {
         // with it (a focus change ends the gesture).
         if !focused {
             self.clear_band_press();
+            // CTX-1505: a paste-confirming Enter belongs to the old focused
+            // surface. Do not let its delayed repeat/release swallow a later
+            // Enter after focus returns.
+            self.pending_paste_enter_swallow = false;
             // Issue #2411: a focus loss ends hover ownership too, so a plugin
             // tooltip hides instead of staying anchored to a stale region.
             self.clear_band_hover();

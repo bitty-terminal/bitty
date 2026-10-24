@@ -109,10 +109,10 @@ fn help_overlay_never_touches_grid_truth() {
         "overlay must not mutate grid cells"
     );
     assert!(
-        overlaid.fills > bare.fills,
-        "panel paints fills: {} -> {}",
-        bare.fills,
-        overlaid.fills
+        overlaid.rounded_fills > bare.rounded_fills,
+        "panel paints rounded chrome: {} -> {}",
+        bare.rounded_fills,
+        overlaid.rounded_fills
     );
     assert!(
         overlaid.glyphs > bare.glyphs,
@@ -177,17 +177,16 @@ fn help_panel_occludes_grid_inside_its_frame() {
     let stride = w as usize;
 
     // Bracket the panel frame from the border pixels alone (no layout
-    // internals duplicated here). The border is opaque and unique to the
-    // panel, so its bounding box is exactly the panel rectangle.
-    // CTX-1395: the panel ring is the resolved theme accent (ANSI 12), so
-    // bracket the frame with that palette value rather than a fixed constant.
-    let border =
-        bitty_render::grid::help_panel_border_in(&bitty_render::ThemePalette::bitty_dark());
+    // CTX-1477: locate the panel surface (theme selection) and derive the
+    // one-pixel ring just outside it. Comparing the ring to a fixed raw
+    // colour would be wrong: the 1-px SDF band covers half a pixel centre and
+    // composites at partial coverage, which is exactly the thin-rule effect.
+    let palette = bitty_render::ThemePalette::bitty_dark();
     let (mut x0, mut y0, mut x1, mut y1) = (i64::MAX, i64::MAX, i64::MIN, i64::MIN);
     for y in 0..h as i64 {
         for x in 0..w as i64 {
             let i = (y as usize * stride + x as usize) * 4;
-            if empty[i..i + 4] == border {
+            if empty[i..i + 4] == palette.selection {
                 x0 = x0.min(x);
                 y0 = y0.min(y);
                 x1 = x1.max(x);
@@ -197,7 +196,19 @@ fn help_panel_occludes_grid_inside_its_frame() {
     }
     assert!(
         x1 >= x0 && y1 >= y0 && x1 > x0 && y1 > y0,
-        "panel border must paint a non-degenerate ring"
+        "panel surface must paint a non-degenerate rect"
+    );
+    // Surface bounds are inside the ring; expand by the one-pixel border.
+    let (x0, y0, x1, y1) = (x0 - 1, y0 - 1, x1 + 1, y1 + 1);
+    let chrome = bitty_render::chrome::ChromeTokens::resolve(&palette);
+    let radius = i64::from(chrome.radius_px);
+    // The rounded corner leaves the exact corner pixel as the underlay
+    // ground: that is the grid-safe masking proof (no square corner fill).
+    let corner = (y0 as usize * stride + x0 as usize) * 4;
+    assert_eq!(
+        &empty[corner..corner + 4],
+        &palette.background,
+        "rounded corner must expose the ground, not the panel fill"
     );
 
     let mut diff_inside = 0usize;
@@ -206,7 +217,10 @@ fn help_panel_occludes_grid_inside_its_frame() {
         for x in 0..w as i64 {
             let i = (y as usize * stride + x as usize) * 4;
             if inked[i..i + 4] != empty[i..i + 4] {
-                if (x0..=x1).contains(&x) && (y0..=y1).contains(&y) {
+                let in_frame = (x0..=x1).contains(&x) && (y0..=y1).contains(&y);
+                let in_corner_notch =
+                    (x < x0 + radius || x > x1 - radius) && (y < y0 + radius || y > y1 - radius);
+                if in_frame && !in_corner_notch {
                     diff_inside += 1;
                 } else {
                     diff_outside += 1;
@@ -221,6 +235,35 @@ fn help_panel_occludes_grid_inside_its_frame() {
     assert!(
         diff_outside > 0,
         "grid must be painted outside the panel (test would be vacuous)"
+    );
+
+    // Thin-rule proof: at mid-height the ring is exactly one pixel. The
+    // pixel outside is ground, the ring pixel is a partial composite (neither
+    // ground nor surface), and the next pixel is the panel surface.
+    let mid_y = (y0 + y1) / 2;
+    let at = |x: i64| -> &[u8] {
+        let i = ((mid_y as usize * stride) + x as usize) * 4;
+        &empty[i..i + 4]
+    };
+    assert_eq!(
+        at(x0 - 1),
+        palette.background,
+        "the ring must not paint outside the frame"
+    );
+    assert_ne!(
+        at(x0),
+        palette.selection,
+        "the ring pixel is distinct from the surface"
+    );
+    assert_ne!(
+        at(x0),
+        palette.background,
+        "the ring pixel is visible against the ground"
+    );
+    assert_eq!(
+        at(x0 + 1),
+        palette.selection,
+        "help padding starts one physical pixel inside the ring"
     );
 }
 

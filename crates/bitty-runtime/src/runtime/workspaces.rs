@@ -4015,11 +4015,11 @@ mod tests {
     fn move_bisects_largest_panel_by_default() {
         // CTX-0964 (#1698) + issue #1804: move-to-workspace defaults to
         // balanced bisect-largest regardless of `panel_layout_mode` (here
-        // the default `Balanced`): the moved pane splits the largest-area
+        // the default `Spiral`): the moved pane splits the largest-area
         // target leaf on its physical aspect (here the 60-wide leaf stays
         // side-by-side) instead of the focused leaf or the whole root.
         let mut rt = fresh();
-        assert_eq!(rt.panel_layout_mode(), crate::PanelLayoutMode::Balanced);
+        assert_eq!(rt.panel_layout_mode(), crate::PanelLayoutMode::Spiral);
         let source = rt.focused_view().expect("source focus");
         // Build the target (ws2): 0.25 split gives small 20x24 (id 100) and
         // largest 60x24 (id 101, raw-wide -> Horizontal). Focus the small

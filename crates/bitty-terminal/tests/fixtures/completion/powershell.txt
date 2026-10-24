@@ -1,9 +1,24 @@
 # bitty completion for PowerShell (generated from the CLI grammar; do not edit).
 # Install: bitty completion powershell | Out-String | Invoke-Expression
 #      or save it to a file dot-sourced from $PROFILE.
+# Dynamic values (`--profile`, `plugin enable|disable`, `config profile
+# show|use|path`) come from the hidden local helpers. Helper failures and
+# malformed state produce no candidates and never write diagnostics.
 if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {
     $global:_BittyCompletionRegistered = $true
     $global:_BittyValueFlags = @('--log-level','--split-ratio','--layout','--focus','--config','--profile','--theme','--font-family','--font-size','--opacity','--format','--socket','--instance','--scrollback','--close-confirm','--gaps-in','--gaps-out','--border','--radius','--plugins','--cwd','--env','--title','--scope','--terminal','--family','--cap','--iterations','--rows','--cols','--version','--digest','--distro')
+    $global:_BittyHelper = {
+        param([string[]]$HelperArgs)
+        try {
+            $lines = @(& bitty @HelperArgs 2>$null)
+            if ($LASTEXITCODE -ne 0) { return @() }
+            return @($lines | Where-Object { $null -ne $_ -and "$_".Length -gt 0 })
+        } catch {
+            return @()
+        }
+    }
+    $global:_BittyProfiles = { & $global:_BittyHelper @('+list-profiles') }
+    $global:_BittyInstalledPlugins = { & $global:_BittyHelper @('+list-plugins', '--installed') }
     $global:_BittyCompletionScript = {
         param($wordToComplete, $commandAst, $cursorPosition)
         $paths = [ordered]@{
@@ -77,9 +92,28 @@ if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {
             $pathTokens.Add($token)
         }
         $path = ($pathTokens -join ' ')
+        $previous = ''
+        if ($tokens.Count -gt 0) {
+            $previous = $tokens[$tokens.Count - 1]
+        }
         $candidates = @()
-        if ($paths.Contains($path)) {
+        if ($wordToComplete -like '--profile=*') {
+            $profilePrefix = '--profile='
+            $profileValue = $wordToComplete.Substring($profilePrefix.Length)
+            $candidates = @(& $global:_BittyProfiles |
+                Where-Object { $_ -like "$profileValue*" } |
+                ForEach-Object { "$profilePrefix$_" })
+        } elseif ($previous -eq '--profile') {
+            $candidates = @(& $global:_BittyProfiles | Where-Object { $_ -like "$wordToComplete*" })
+        } elseif ($paths.Contains($path)) {
             $candidates = $paths[$path]
+            if ($null -ne $wordToComplete -and -not $wordToComplete.StartsWith('-')) {
+                if ($path -eq 'plugin enable' -or $path -eq 'plugin disable') {
+                    $candidates = @(& $global:_BittyInstalledPlugins | Where-Object { $_ -like "$wordToComplete*" })
+                } elseif ($path -eq 'config profile show' -or $path -eq 'config profile use' -or $path -eq 'config profile path') {
+                    $candidates = @(& $global:_BittyProfiles | Where-Object { $_ -like "$wordToComplete*" })
+                }
+            }
         }
         $candidates | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
             [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)

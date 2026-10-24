@@ -37,6 +37,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   always win, `alt`-bearing suggestions follow `mod_key`, suspend/unload/crash
   and reload remove the generation's chords, and colliding suggestions produce
   bounded warnings naming the deterministic winner and the shadowed command.
+- **Lua plugin ledger and generated per-plugin defaults (#2576):** the
+  machine-managed plugin ledger is now data-only Lua at
+  `$XDG_CONFIG_HOME/bitty/bitty-plugins.lua`; a legacy
+  `bitty-plugins.toml` is migrated once (atomically, 0600, no-clobber) and
+  retained as `bitty-plugins.toml.bak`. The Lua file is parsed without a Lua
+  VM (bounded bytes/lines/keys/strings, UTF-8 only, duplicate keys fail
+  closed), and a hand-edited ledger cannot widen authority: grants for a
+  bundled record are intersected with the manifest declared for its recorded
+  `manifest_hash`, and undeclared grants are dropped with a diagnostic. A
+  successful plugin install or first enable also creates
+  `$XDG_CONFIG_HOME/bitty/plugins/<owner>.<name>.lua` once, containing
+  commented manifest defaults for plugins that declare `[settings]`. Existing
+  files, user edits, legacy `<id>.toml` settings, and settings-less manifests
+  are never touched; `plugin config scaffold --force` remains the explicit
+  overwrite path and `plugin info` points at the canonical file.
+
+### Changed
+
+- **Default new-panel layout is Spiral (#2571):** `Mod+N` now creates the
+  next pane with the 4-way clockwise `Spiral` policy (Right -> Down -> Left
+  -> Up around the focused pane) instead of `Balanced` bisect-largest.
+  `Balanced` and `Dwindle` remain explicit opt-ins through
+  `RuntimeConfig::panel_layout_mode` / `Runtime::set_panel_layout_mode`, and
+  `BisectLargest` is unchanged. When the focused Spiral slot can no longer
+  host two 10x4 panes, the plan falls back deterministically to the
+  largest-area `Balanced` target (with one bounded warning) instead of
+  dropping `Mod+N`, so normal windows keep the 0.0.27 pane capacity. Only a
+  grid where no leaf can host two usable 10x4 panes still refuses the chord.
+  Fresh configs keep the gap-aware 10x4 minimum, focus/close ordering, and
+  workspace IDs; the spiral phase resets to Right whenever focus lands on a
+  pane outside the active creation chain or the fallback runs.
 
 ### Fixed
 
@@ -66,6 +97,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stacked, zoomed, floating, and pinned deletes under any theme. Deterministic
   headless frame regressions compare each close frame with an instant-delete
   reference in `catppuccin-mocha` and `github-light`.
+
+### Changed
+
+- **Thin rounded Core chrome tokens (#2468):** help/which-key, command
+  palette and presentation/plugin overlays, panel rings, and band chrome now
+  share one `bitty-render::chrome` token layer: one-physical-pixel muted
+  borders, a 6 px radius, 8 px padding, raised/overlay surface tones, and the
+  theme's accepted focused/idle outline pair. Help and overlay cards paint as
+  rounded SDF surfaces with glyph clipping at the corner arc; one-row bands
+  use rounded box-drawing corner glyphs when the corner cell is blank, with a
+  documented light-box/square fallback. Plugin row `fg`/`bg`/`bold` values
+  still win inside the Core card, and a new overlay-card/content/ring layer
+  order keeps row backgrounds visible while the ring stays above content.
 
 ## [0.0.27] - 2026-10-23
 

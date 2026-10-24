@@ -202,6 +202,9 @@ fn headless_image_parity_is_observable_not_silent() {
         rounded_fills: vec![],
         backgrounds: vec![],
         overlay_fills: vec![],
+        overlay_card_rounded_fills: vec![],
+        overlay_content_fills: vec![],
+        overlay_rounded_fills: vec![],
         glyphs: vec![],
         images: vec![blit],
     };
@@ -274,6 +277,9 @@ fn real_wgpu_surface_present_is_env_gated() {
                 rounded_fills: vec![],
                 backgrounds: vec![],
                 overlay_fills: vec![],
+                overlay_card_rounded_fills: vec![],
+                overlay_content_fills: vec![],
+                overlay_rounded_fills: vec![],
                 glyphs: vec![],
                 images: vec![],
             };

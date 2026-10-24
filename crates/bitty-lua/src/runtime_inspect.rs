@@ -1047,7 +1047,7 @@ mod tests {
             app_version: "0.0.26".to_string(),
             config_file: Some("/home/user/.config/bitty/init.lua".to_string()),
             config_dir: Some("/home/user/.config/bitty".to_string()),
-            plugin_ledger: Some("/home/user/.config/bitty/bitty-plugins.toml".to_string()),
+            plugin_ledger: Some("/home/user/.config/bitty/bitty-plugins.lua".to_string()),
             plugin_store: Some("/home/user/.local/share/bitty/plugins".to_string()),
             extension_user_root: Some("/home/user/.local/share/bitty/extensions".to_string()),
             extension_system_root: Some("/usr/lib/bitty/extensions".to_string()),

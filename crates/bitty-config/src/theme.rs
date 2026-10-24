@@ -86,11 +86,13 @@
 //!
 //! Derived chrome uses the same measurements and the same theme-owned
 //! colors: the IME preedit underline (cursor on selection) clears
-//! [`MIN_UI_CONTRAST`], the help-panel ring is the first of ANSI 12/4/6 or
-//! the foreground that clears [`MIN_UI_CONTRAST`] on the selection ground
-//! ([`help_ring_source`]), and the pending-paste banner picks black or white
-//! for [`MIN_TEXT_CONTRAST`] on ANSI 3 ([`banner_text`]). No chrome role
-//! invents a color outside the resolved palette.
+//! [`MIN_UI_CONTRAST`], the help-panel ring is the theme's accepted outline
+//! pair (`border.idle` / `border.focused`, CTX-1477), the legacy accent probe
+//! ([`help_ring_source`]) still measures the first of ANSI 12/4/6 or the
+//! foreground that clears [`MIN_UI_CONTRAST`] on the selection ground, and the
+//! pending-paste banner picks black or white for [`MIN_TEXT_CONTRAST`] on
+//! ANSI 3 ([`banner_text`]). No chrome role invents a color outside the
+//! resolved palette.
 //!
 //! Contrast alone can hide a palette regression: two families may end up at
 //! the same hue and similar lightness after a repair. [`hue_checks`] measures
@@ -440,11 +442,15 @@ pub fn readable_accent(candidates: &[[u8; 3]], background: [u8; 3], floor: f64) 
         .position(|candidate| crate::types::contrast_ratio(*candidate, background) >= floor)
 }
 
-/// Help-panel ring source for `theme`: the first of ANSI 12 (the primary
-/// accent), ANSI 4, ANSI 6, or the foreground that clears [`MIN_UI_CONTRAST`]
-/// against the help-panel ground (the selection fill). Mirrors
-/// `bitty-render`'s `help_panel_border_in`, which applies the same candidate
-/// order to the live palette (including OSC 4 overrides).
+/// Legacy help-panel accent probe for `theme`: the first of ANSI 12 (the
+/// primary accent), ANSI 4, ANSI 6, or the foreground that clears
+/// [`MIN_UI_CONTRAST`] against the help-panel ground (the selection fill).
+///
+/// CTX-1477 moved production chrome to the theme outline pair; this source
+/// remains the measured accent-family probe used by the contrast report, so a
+/// preset's ANSI accent fallback chain stays covered. It mirrors the live
+/// candidate order (including OSC 4 overrides) but is no longer the colour the
+/// help panel paints.
 #[must_use]
 pub fn help_ring_source(theme: &Theme) -> usize {
     let candidates = [

@@ -2230,7 +2230,7 @@ pub(crate) fn help_text() -> String {
                              instance; `bitty dev --help` for detail)\n  \
            plugin <verb>     CLI-first plugin management (local, no VM):\n  \
                              list|install|remove|enable|disable|info over the\n  \
-                             managed manifest (bitty-plugins.toml); install\n  \
+                             managed ledger (bitty-plugins.lua); install\n  \
                              requires capability consent; remove requires\n  \
                              --force; `bitty plugin --help` for detail\n  \
             extension <verb>  Native binary extension management (local, no execution):\n  \

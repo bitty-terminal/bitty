@@ -791,7 +791,8 @@ pub struct Runtime {
     /// chrome action, dismissed by `Esc` or the same chord. Never grid
     /// truth; see `runtime::help`.
     help_visible: bool,
-    /// Adaptive panel creation mode (Balanced vs Spiral vs Dwindle).
+    /// Adaptive panel creation mode (Spiral default, Balanced, Dwindle,
+    /// BisectLargest).
     panel_layout_mode: PanelLayoutMode,
     /// Spiral continuation (`created leaf`, next phase) for
     /// [`PanelLayoutMode::Spiral`] (issue #2528).

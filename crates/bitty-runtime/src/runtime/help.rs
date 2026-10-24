@@ -169,19 +169,21 @@ impl Runtime {
 
     /// Paint the help popup onto the present-layer overlay (CTX-0265).
     ///
-    /// Centered floating panel on the focused view: border fill, inner
-    /// background fill, title glyphs, one glyph run per fitting registry
-    /// row (clipped to the panel), an optional `+N more` tail, and the
-    /// footer. Overlay only — pushes fills/glyphs, never mutates cells,
-    /// scrollback, layout, or focus. Returns `true` when anything was
-    /// pushed (the caller marks the frame dirty); `false` when hidden,
-    /// rowless, or the view is too small (state kept for a later resize).
+    /// Centered floating panel on the focused view: one shared chrome
+    /// surface (rounded, elevated) with a thin muted ring, title glyphs, one
+    /// glyph run per fitting registry row (clipped to the panel), an optional
+    /// `+N more` tail, and the footer. Overlay only — pushes rounded fills and
+    /// glyphs, never mutates cells, scrollback, layout, or focus. Returns
+    /// `true` when anything was pushed (the caller marks the frame dirty);
+    /// `false` when hidden, rowless, or the view is too small (state kept for
+    /// a later resize).
     pub(super) fn paint_help_panel(
         &mut self,
         frames: &[super::layout_focus::PresentFrame],
         view_map: &std::collections::HashMap<ViewId, View>,
         pad_px: i32,
-        fills: &mut Vec<bitty_render::grid::FillRect>,
+        card_rounded: &mut Vec<bitty_render::grid::RoundedFill>,
+        ring_rounded: &mut Vec<bitty_render::grid::RoundedFill>,
         glyphs: &mut Vec<bitty_render::grid::GlyphInstance>,
     ) -> bool {
         if !self.help_visible || self.help_rows.is_empty() {
@@ -216,23 +218,25 @@ impl Runtime {
         let panel_px_y = px_offset_cells(origin_px_y, panel.y, live.height);
         let panel_px_w = px_span(panel.w, live.width);
         let panel_px_h = px_span(panel.h, live.height);
-        // Border: full-bleed fill, then the inset background leaves a
-        // 1-cell outline. Both fills are opaque (`0xFF` alpha).
-        fills.push(bitty_render::grid::FillRect {
-            rect: bitty_render::geometry::RectPx::new(
-                panel_px_x, panel_px_y, panel_px_w, panel_px_h,
-            ),
-            color: bitty_render::grid::help_panel_border_in(&palette),
-        });
-        fills.push(bitty_render::grid::FillRect {
-            rect: bitty_render::geometry::RectPx::new(
-                px_add(panel_px_x, cw),
-                px_add(panel_px_y, ch),
-                panel_px_w.saturating_sub(live.width.saturating_mul(2)),
-                panel_px_h.saturating_sub(live.height.saturating_mul(2)),
-            ),
-            color: bitty_render::grid::help_panel_bg_in(&palette),
-        });
+        // Border: one shared chrome frame (thin muted ring + rounded surface)
+        // instead of a full-cell accent border (CTX-1477, issue #2468). The
+        // surface and ring are rounded SDF fills; `paint.clip` masks glyphs at
+        // the inner arc so no ink leaks into the corner notch.
+        let chrome = bitty_render::chrome::ChromeTokens::resolve(&palette).scaled(self.dpi_scale());
+        let chrome_frame = bitty_render::chrome::ChromeFrame::new(
+            bitty_render::geometry::RectPx::new(panel_px_x, panel_px_y, panel_px_w, panel_px_h),
+            chrome,
+            bitty_render::chrome::ChromeState::Normal,
+            bitty_render::chrome::ChromeElevation::Raised,
+        );
+        let chrome_paint = chrome_frame.paint();
+        if !chrome_paint.is_empty() {
+            card_rounded.push(chrome_paint.surface.clone());
+            if let Some(ring) = &chrome_paint.border {
+                ring_rounded.push(ring.clone());
+            }
+        }
+        let glyph_clip = chrome_paint.clip;
         // CTX-0336: `DrawList` composites every glyph after every fill, so
         // the base grid's glyphs would otherwise draw on top of the opaque
         // panel (the reported "transparent border overlapping content").
@@ -292,18 +296,21 @@ impl Runtime {
         // glyph whose pixel box overlaps the opaque panel frame. `split_off`
         // moves the (small) panel tail aside so `retain` only sees the
         // underlay glyphs, then the tail is restored in paint order.
-        let panel_glyphs = glyphs.split_off(occlude_start);
+        let mut panel_glyphs = glyphs.split_off(occlude_start);
         glyphs.retain(|glyph| !glyph_overlaps_rect(glyph, panel_rect));
+        for glyph in &mut panel_glyphs {
+            glyph.clip = glyph_clip;
+        }
         glyphs.extend(panel_glyphs);
         true
     }
 }
 
 /// True when `glyph`'s pixel bounding box intersects the axis-aligned `rect`
-/// (CTX-0336). Zero-area glyphs never intersect. `i64` throughout so extreme
-/// destinations cannot overflow (matching the present path's saturation
-/// discipline).
-fn glyph_overlaps_rect(
+/// (CTX-0336, shared with the overlay card occlusion in CTX-1477). Zero-area
+/// glyphs never intersect. `i64` throughout so extreme destinations cannot
+/// overflow (matching the present path's saturation discipline).
+pub(super) fn glyph_overlaps_rect(
     glyph: &bitty_render::grid::GlyphInstance,
     rect: bitty_render::geometry::RectPx,
 ) -> bool {
@@ -324,6 +331,51 @@ fn glyph_overlaps_rect(
 #[cfg(test)]
 mod tests {
     use super::help_panel_layout;
+
+    #[test]
+    fn help_panel_uses_thin_rounded_chrome() {
+        // CTX-1477 (issue #2468): the help popup paints one shared chrome
+        // surface and one one-physical-pixel ring, not a full-cell border.
+        let mut rt = crate::Runtime::with_deterministic_rasterizer(crate::RuntimeConfig::default())
+            .expect("deterministic runtime must build");
+        rt.set_help_rows(vec!["alt+x  toggle_zoom".to_string()]);
+        assert!(rt.toggle_help(), "help toggles on");
+        let frames: Vec<super::super::layout_focus::PresentFrame> = rt.present_frames();
+        let frame = frames.first().cloned().expect("one present frame");
+        rt.focus_mut().set(frame.view);
+        let mut card = Vec::new();
+        let mut ring = Vec::new();
+        let mut glyphs = Vec::new();
+        let painted = rt.paint_help_panel(
+            &frames,
+            &std::collections::HashMap::new(),
+            0,
+            &mut card,
+            &mut ring,
+            &mut glyphs,
+        );
+        assert!(painted, "the help panel must paint");
+        assert_eq!(card.len(), 1, "one surface");
+        assert_eq!(ring.len(), 1, "one border ring");
+        let tokens =
+            bitty_render::chrome::ChromeTokens::resolve(&rt.config().theme).scaled(rt.dpi_scale());
+        assert_eq!(card[0].border, 0);
+        assert_eq!(card[0].color, tokens.surface);
+        assert_eq!(card[0].radius, tokens.radius_px);
+        assert_eq!(ring[0].border, tokens.border_px);
+        assert_eq!(ring[0].color, tokens.border_muted);
+        assert_eq!(ring[0].radius, tokens.radius_px);
+        assert_eq!(
+            card[0].frame, ring[0].frame,
+            "ring and surface share one frame"
+        );
+        assert!(!glyphs.is_empty(), "title and rows paint glyphs");
+        let clip = ring[0].inner_clip().expect("radius leaves an inner arc");
+        assert!(
+            glyphs.iter().all(|glyph| glyph.clip == Some(clip)),
+            "help glyphs carry the card's SDF corner mask"
+        );
+    }
 
     #[test]
     fn panel_centers_with_border_title_footer() {

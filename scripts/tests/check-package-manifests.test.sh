@@ -155,6 +155,10 @@ check(arch.get("64bit", {}).get("hash") == sha_x64,
       "Scoop x64 hash is the expected digest")
 check(arch.get("arm64", {}).get("hash") == sha_arm64,
       "Scoop arm64 hash is the expected digest")
+check(arch.get("64bit", {}).get("bin") == [["bitty-x86_64-pc-windows-msvc.exe", "bitty"]],
+      "Scoop x64 executable is exposed as the bitty shim")
+check(arch.get("arm64", {}).get("bin") == [["bitty-aarch64-pc-windows-msvc.exe", "bitty"]],
+      "Scoop arm64 executable is exposed as the bitty shim")
 notes = manifest.get("notes", "")
 check(f"https://github.com/bitty-terminal/bitty/releases/tag/v{version}" in notes,
       "Scoop documents the GitHub Releases fallback")

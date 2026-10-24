@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+
+PackageIdentifier: BittyTerminal.Bitty
+PackageVersion: 0.0.27
+PackageLocale: en-US
+Publisher: Bitty Terminal
+PublisherUrl: https://github.com/bitty-terminal/bitty
+PublisherSupportUrl: https://github.com/bitty-terminal/bitty/issues
+Author: Bitty Developers
+PackageName: Bitty
+PackageUrl: https://bitty.run
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/bitty-terminal/bitty/blob/main/LICENSE
+Copyright: Copyright (c) 2026 Bitty Developers
+ShortDescription: Modern GPU-accelerated terminal emulator with panes and Lua extensions
+Description: |-
+  Bitty is a fast, keyboard-driven, GPU-accelerated terminal emulator designed
+  for developer ergonomics, featuring native multiplexing (tabs and split panes),
+  smooth rendering, and extensible configuration via Lua.
+Moniker: bitty
+Tags:
+  - terminal
+  - terminal-emulator
+  - cli
+  - console
+  - shell
+  - rust
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

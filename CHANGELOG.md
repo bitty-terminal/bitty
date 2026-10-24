@@ -82,6 +82,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Lua ledger migration and generated defaults hardening (#2576):** migration
+  now renders capability arrays with bounded per-line wrapping and re-parses
+  the rendered bytes (requiring the same records back) before the atomic
+  commit; a rejected render is a hard error that leaves the legacy TOML in
+  place instead of committing a ledger the next command cannot read. Longer
+  parameterized grant sets no longer exceed the 1024-byte parser line bound.
+  Generated per-plugin defaults also inspect the short-name alias path, so an
+  existing `<name>.lua` user file is never shadowed; `plugin doctor --repair`
+  leaves an already-current Lua ledger byte-identical (no `.bak` churn), and
+  the completion-candidate tests read the Lua ledger.
 - **Copy-mode selection spans scrollback pages (#2470):** a visual selection is
   no longer capped at the visible page. Wheel and page keys scroll the
   transcript while a drag is in flight (the selection owns the wheel over PTY

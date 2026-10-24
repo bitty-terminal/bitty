@@ -36,9 +36,11 @@
 //! - Capabilities per set `<= MAX_LEDGER_CAPABILITIES` (256).
 //! - Keys `<= MAX_LEDGER_KEY_BYTES` (256); strings
 //!   `<= MAX_LEDGER_STRING_BYTES` (512).
-//! - UTF-8 only, no NUL or other control characters, no duplicate keys, no
-//!   duplicate array items, no `state_version` other than
-//!   [`LEDGER_STATE_VERSION`].
+//! - UTF-8 only. NUL and raw control characters are rejected in strings; the
+//!   `\n`, `\r`, and `\t` escapes decode to their control characters, which
+//!   the caller's identifier/hash grammars then reject, so no such value can
+//!   reach ledger state. No duplicate keys or array items, and no
+//!   `state_version` other than [`LEDGER_STATE_VERSION`].
 //!
 //! # Responsibility split
 //!

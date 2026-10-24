@@ -43,7 +43,8 @@
 //!   this crate's safe API surface): stale leases are reclaimed by a
 //!   single-owner recovery claim plus an atomic quarantine rename, release is
 //!   ownership-checked, and a displaced holder cannot enter the critical
-//!   section.
+//!   section. Ownership is re-verified immediately before the publish rename,
+//!   so a holder displaced while staging cannot overwrite newer evidence.
 //! - **Confined paths.** The slot is derived from `XDG_STATE_HOME`/`HOME`;
 //!   `BITTY_WATCHDOG_STATE_PATH` is only honored when it repeats that derived
 //!   path, and symlinked, hard-linked, foreign-owned, group/world-writable, or
@@ -1346,8 +1347,19 @@ impl StateSlot {
     }
 
     /// Validate the target and atomically rename the staged file over it.
-    fn publish(&self, temp: &Path) -> std::io::Result<()> {
+    ///
+    /// The generation and ownership check immediately before the rename is the
+    /// last fail-closed guard: a holder displaced while staging (for example
+    /// by a stale reclaim after a long `fsync`) must not replace evidence a
+    /// newer helper already published.
+    fn publish(&self, temp: &Path, lock: &SlotLock) -> std::io::Result<()> {
         self.prepare()?;
+        if !lock.verify() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "evidence lock was reclaimed before publish",
+            ));
+        }
         std::fs::rename(temp, &self.path)
     }
 
@@ -1438,10 +1450,12 @@ impl StateSlot {
     /// The generation check, staging, and rename all happen under the lock the
     /// monitor uses to allocate attempts; an attempt older than the current
     /// generation is discarded before it writes anything, so a late helper can
-    /// never replace newer evidence. Temp removal by the supervisor after a
-    /// timeout is a second, independent guard. Concurrent app instances share
-    /// the slot: the newest allocated generation wins and a superseded attempt
-    /// is discarded rather than overwriting it.
+    /// never replace newer evidence. Ownership is verified again immediately
+    /// before the rename, so a holder displaced during staging (for example by
+    /// a stale reclaim after a long `fsync`) fails closed. Temp removal by the
+    /// supervisor after a timeout is a second, independent guard. Concurrent
+    /// app instances share the slot: the newest allocated generation wins and
+    /// a superseded attempt is discarded rather than overwriting it.
     fn commit(&self, attempt: u64, contents: &str) -> std::io::Result<CommitOutcome> {
         self.prepare()?;
         let mut file = self.open_lock()?;
@@ -1479,7 +1493,7 @@ impl StateSlot {
             }
             let temp = self.attempt_temp(attempt);
             self.stage(&temp, contents)?;
-            self.publish(&temp)?;
+            self.publish(&temp, &lock)?;
             Ok(CommitOutcome::Published)
         })();
         if !matches!(result, Ok(CommitOutcome::Published)) {
@@ -1626,6 +1640,10 @@ struct SlotLock {
     /// Portable generation gate held alongside the sequence file (Windows).
     #[cfg(windows)]
     gate: Option<PortableGate>,
+    /// Test-only gate attached to a real Unix lock so the publish-time
+    /// ownership check can be exercised without a Windows host.
+    #[cfg(all(test, unix))]
+    test_gate: Option<PortableGate>,
     #[cfg(not(any(unix, windows)))]
     inner: File,
 }
@@ -1637,18 +1655,29 @@ impl SlotLock {
 
     /// Whether this lock still holds the generation gate.
     ///
-    /// Always true on Unix, where the advisory lock cannot be stolen. On
-    /// Windows a token-checked gate can be reclaimed as stale; a displaced
-    /// holder must not enter (or finish) the critical section.
+    /// Unix advisory locks cannot be stolen, so this is true there (except for
+    /// the test-only attached gate). On Windows a token-checked gate can be
+    /// reclaimed as stale; a displaced holder must not enter (or finish) the
+    /// critical section.
     fn verify(&self) -> bool {
         #[cfg(windows)]
-        {
-            self.gate.as_ref().is_some_and(PortableGate::still_owned)
-        }
-        #[cfg(not(windows))]
-        {
-            true
-        }
+        let owned = self.gate.as_ref().is_some_and(PortableGate::still_owned);
+        #[cfg(all(test, unix))]
+        let owned = self
+            .test_gate
+            .as_ref()
+            .is_none_or(PortableGate::still_owned);
+        #[cfg(all(unix, not(test)))]
+        let owned = true;
+        #[cfg(not(any(unix, windows)))]
+        let owned = true;
+        owned
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_test_gate(mut self, gate: PortableGate) -> Self {
+        self.test_gate = Some(gate);
+        self
     }
 
     /// Release the lock without ever panicking on an unlock error.
@@ -1735,7 +1764,7 @@ impl PortableGate {
         // Serialize stealers: only the single recovery-claim owner may move a
         // stale gate. Without this, two waiters could each rename a gate the
         // other just published, and both would believe they had won.
-        let Some(_claim) = RecoveryClaim::take(self.recovery_path())? else {
+        let Some(claim) = RecoveryClaim::take(self.recovery_path())? else {
             return Ok(false);
         };
         // Re-inspect under the claim: the holder may have released or a new
@@ -1750,6 +1779,11 @@ impl PortableGate {
             Ok(false) => return Ok(false),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
+        }
+        if !claim.still_owned() {
+            // The recovery claim itself was reclaimed while we inspected the
+            // gate; another recoverer owns the steal now.
+            return Ok(false);
         }
         // The rename is the single-winner claim: a unique destination plus an
         // atomic rename means exactly one waiter can move this source entry.
@@ -1813,6 +1847,12 @@ impl PortableGate {
     /// a displaced holder that moves a newer gate restores it instead of
     /// deleting it.
     fn release(&self) {
+        // Cheap pre-check: never touch the path when this holder was already
+        // displaced. The post-move token check below stays authoritative for
+        // the check-to-rename window.
+        if !self.still_owned() {
+            return;
+        }
         let quarantine = self.quarantine_path();
         if std::fs::rename(&self.path, &quarantine).is_err() {
             return;
@@ -1882,6 +1922,13 @@ impl RecoveryClaim {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    /// Whether this claim's token is still the entry at the claim path.
+    fn still_owned(&self) -> bool {
+        read_gate_token(&self.path)
+            .ok()
+            .is_some_and(|token| token == self.token)
     }
 }
 
@@ -1988,7 +2035,11 @@ fn read_gate_token(path: &Path) -> std::io::Result<String> {
 #[cfg(unix)]
 fn try_lock_slot(file: File, _gate: &Path) -> Result<SlotLock, File> {
     match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-        Ok(inner) => Ok(SlotLock { inner }),
+        Ok(inner) => Ok(SlotLock {
+            inner,
+            #[cfg(all(test, unix))]
+            test_gate: None,
+        }),
         Err((file, _errno)) => Err(file),
     }
 }
@@ -3318,6 +3369,12 @@ mod tests {
         assert!(newer.try_acquire().expect("reclaim"), "stale lease");
         assert!(!owner.still_owned(), "the displaced holder lost the gate");
         assert!(newer.still_owned());
+        // A third waiter must see the fresh winner, not the displaced holder.
+        let third = PortableGate::new(path.clone());
+        assert!(
+            !third.try_acquire().expect("third acquire"),
+            "a fresh winner must exclude a third holder"
+        );
         owner.release();
         assert!(path.exists(), "a displaced holder must not delete the gate");
         assert_eq!(
@@ -3395,11 +3452,10 @@ mod tests {
 
     #[test]
     fn displaced_stale_holder_cannot_publish_after_newer_evidence() {
-        // Allocate and publish newer evidence first, then model a holder that
-        // was displaced from the portable gate. Its older attempt must not
-        // overwrite the newer slot: on Unix the generation check rejects it as
-        // `Stale`; on Windows the newer gate keeps it out of the critical
-        // section entirely.
+        // Acquire the old lock, displace its gate, stage stale bytes through
+        // that lock, let a newer helper publish, then attempt the stale
+        // publish. The ownership check at publish time (not just at entry)
+        // must fail closed and leave the newer slot intact.
         let dir = test_dir("displaced-publish");
         let slot = state_slot_in(&dir);
         slot.prepare().expect("state dir");
@@ -3407,40 +3463,48 @@ mod tests {
             .next_attempt(Instant::now() + Duration::from_millis(100))
             .expect("lock")
             .expect("generation");
-        let newer = slot
-            .next_attempt(Instant::now() + Duration::from_millis(100))
-            .expect("lock")
-            .expect("generation");
-        assert!(newer > stale);
-        slot.commit(newer, "newer\n").expect("newer evidence");
 
-        let old_gate = PortableGate::new(slot.gate_path());
-        assert!(old_gate.try_acquire().expect("old gate"));
+        let file = slot.open_lock().expect("sequence file");
+        let lock = try_lock_slot(file, &slot.gate_path()).expect("old lock");
+        #[cfg(unix)]
+        let mut lock = lock;
+        #[cfg(unix)]
+        {
+            // Unix flock cannot be stolen; attach a portable gate to the real
+            // lock so the publish-time token check is exercised there too.
+            let old_gate = PortableGate::new(slot.gate_path());
+            assert!(old_gate.try_acquire().expect("old gate"));
+            lock = lock.with_test_gate(old_gate);
+        }
+        // On Windows `try_lock_slot` already created and owns the gate.
         age_gate(&slot.gate_path());
         let new_gate = PortableGate::new(slot.gate_path());
         assert!(
             new_gate.try_acquire().expect("reclaim"),
             "the stale holder must be displaceable"
         );
-        let late = slot.commit(stale, "stale\n");
-        if cfg!(windows) {
-            assert!(
-                late.is_err(),
-                "a displaced holder must not enter the newer gate"
-            );
-        } else {
-            assert_eq!(
-                late.expect("commit outcome"),
-                CommitOutcome::Stale,
-                "the generation check must reject the older attempt"
-            );
-        }
+        assert!(
+            !lock.verify(),
+            "the reclaim must have displaced the old lock"
+        );
+
+        // The displaced holder stages its older bytes, then a newer helper
+        // publishes while it is about to rename.
+        let temp = slot.attempt_temp(stale);
+        slot.stage(&temp, "stale\n").expect("stage stale bytes");
+        std::fs::write(&slot.path, "newer\n").expect("newer evidence");
+        assert!(
+            slot.publish(&temp, &lock).is_err(),
+            "the pre-publish ownership check must fail closed"
+        );
         assert_eq!(
             std::fs::read_to_string(&slot.path).expect("state slot"),
             "newer\n",
             "a stale holder must never replace newer evidence"
         );
-        old_gate.release();
+        assert!(temp.exists(), "a failed publish must not move the temp");
+
+        lock.release();
         assert!(
             slot.gate_path().exists(),
             "a displaced holder must not delete the newer gate"

@@ -2075,6 +2075,38 @@ pub fn largest_area_leaf(allocations: &[(ViewId, Rect)]) -> Option<(ViewId, Rect
     best.map(|(id, rect, _)| (id, rect))
 }
 
+/// Largest leaf that can be split into two usable children at `gap_in`.
+///
+/// Area is `width as u32 * height as u32`; ties break to the first feasible
+/// entry in allocation order. Unlike [`largest_area_leaf`], this filters
+/// candidates before ranking them, so an oversized but exhausted leaf cannot
+/// hide a smaller usable target. Returns the balanced axis selected by
+/// [`splittable_axis`] together with the target rectangle. Pure and total.
+#[must_use]
+pub fn largest_splittable_leaf(
+    allocations: &[(ViewId, Rect)],
+    gap_in: u16,
+) -> Option<(ViewId, Rect, SplitAxis)> {
+    let mut best: Option<(ViewId, Rect, SplitAxis, u32)> = None;
+    for (id, rect) in allocations {
+        if rect.width < MIN_PANE_COLS || rect.height < MIN_PANE_ROWS {
+            continue;
+        }
+        let Some(axis) = splittable_axis(*rect, gap_in) else {
+            continue;
+        };
+        let area = u32::from(rect.width).saturating_mul(u32::from(rect.height));
+        match best {
+            None => best = Some((*id, *rect, axis, area)),
+            Some((_, _, _, best_area)) if area > best_area => {
+                best = Some((*id, *rect, axis, area));
+            }
+            Some(_) => {}
+        }
+    }
+    best.map(|(id, rect, axis, _)| (id, rect, axis))
+}
+
 /// Combined bisect choice (CTX-0964, #1698): largest-area leaf plus its
 /// raw-aspect axis.
 ///
@@ -2904,6 +2936,71 @@ mod tests {
         );
         let empty: Vec<(ViewId, Rect)> = Vec::new();
         assert_eq!(largest_area_leaf(&empty), None);
+    }
+
+    #[test]
+    fn largest_splittable_leaf_skips_exhausted_larger_leaves() {
+        let allocs = vec![
+            // Larger by area, but below both minimum split extents.
+            (ViewId::new(1), Rect::new(0, 0, 19, 7)),
+            // Smaller by area, but horizontally splittable at zero gap.
+            (ViewId::new(2), Rect::new(19, 0, 20, 4)),
+        ];
+        assert_eq!(
+            largest_splittable_leaf(&allocs, 0),
+            Some((
+                ViewId::new(2),
+                Rect::new(19, 0, 20, 4),
+                SplitAxis::Horizontal
+            ))
+        );
+
+        let gap_candidates = vec![
+            // 20 - 1 leaves only 19 usable columns, so neither axis fits.
+            (ViewId::new(3), Rect::new(0, 0, 20, 7)),
+            // 21 - 1 leaves exactly 20 usable columns: 10 + gap + 10.
+            (ViewId::new(4), Rect::new(20, 0, 21, 4)),
+        ];
+        assert_eq!(
+            largest_splittable_leaf(&gap_candidates, 1),
+            Some((
+                ViewId::new(4),
+                Rect::new(20, 0, 21, 4),
+                SplitAxis::Horizontal
+            ))
+        );
+
+        assert_eq!(
+            largest_splittable_leaf(&[(ViewId::new(5), Rect::new(0, 0, 19, 7))], 0),
+            None
+        );
+
+        let ranked = vec![
+            (ViewId::new(6), Rect::new(0, 0, 20, 8)),
+            (ViewId::new(7), Rect::new(20, 0, 30, 8)),
+            (ViewId::new(8), Rect::new(50, 0, 20, 8)),
+        ];
+        assert_eq!(
+            largest_splittable_leaf(&ranked, 0).map(|(id, _, axis)| (id, axis)),
+            Some((ViewId::new(7), SplitAxis::Horizontal)),
+            "the largest feasible area wins"
+        );
+        let tied = [
+            (ViewId::new(10), Rect::new(0, 0, 20, 8)),
+            (ViewId::new(11), Rect::new(20, 0, 20, 8)),
+        ];
+        assert_eq!(
+            largest_splittable_leaf(&tied, 0).map(|(id, _, axis)| (id, axis)),
+            Some((ViewId::new(10), SplitAxis::Horizontal)),
+            "equal feasible candidates keep the first allocation"
+        );
+
+        let perpendicular = [(ViewId::new(9), Rect::new(0, 0, 20, 9))];
+        assert_eq!(
+            largest_splittable_leaf(&perpendicular, 1),
+            Some((ViewId::new(9), Rect::new(0, 0, 20, 9), SplitAxis::Vertical)),
+            "a feasible perpendicular axis is selected when the preferred axis misses the gap-aware minimum"
+        );
     }
 
     #[test]

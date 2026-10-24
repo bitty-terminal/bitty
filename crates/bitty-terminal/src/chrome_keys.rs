@@ -1230,11 +1230,11 @@ impl TerminalApp {
     /// loud log line.
     ///
     /// `target` is the leaf to split: explicit `new_split:<dir>` passes the
-    /// focused leaf, while `new_panel` in `PanelLayoutMode::BisectLargest`
-    /// (CTX-0964, #1698, DEC-0099) passes `Runtime::panel_bisect_target`
-    /// (the largest-area leaf, not focus). Spawn sizing and cwd inheritance
-    /// still read the focused pane, so the fresh shell matches its
-    /// neighbors.
+    /// focused leaf, while adaptive `new_panel` passes the target selected by
+    /// `Runtime::panel_split_plan` (largest feasible for `Balanced` and
+    /// Spiral fallback; largest-area for `BisectLargest`). Spawn sizing and
+    /// cwd inheritance still read the focused pane, so the fresh shell
+    /// matches its neighbors.
     fn apply_new_leaf(
         &mut self,
         target: ViewId,
@@ -1603,8 +1603,8 @@ impl TerminalApp {
             A::NewPanel => {
                 // Issue #2571: the default `Spiral` mode rotates Right ->
                 // Down -> Left -> Up only along the active creation chain.
-                // `Balanced` (issues #2521/#2528) bisects the physically
-                // largest slot with the cell-aspect-aware axis; `Dwindle`
+                // `Balanced` (issues #2521/#2528) bisects the largest
+                // feasible slot with the cell-aspect-aware axis; `Dwindle`
                 // follows focus right/down. Both are explicit opt-ins via
                 // `RuntimeConfig::panel_layout_mode`.
                 // Explicit `new_split:<dir>` above keeps its fixed axis.
@@ -1643,7 +1643,7 @@ impl TerminalApp {
                 if layout_mode == PanelLayoutMode::Spiral && plan.spiral_phase.is_none() {
                     // Issue #2571 review: the focused Spiral slot is
                     // exhausted; the plan is the deterministic Balanced
-                    // largest-area fallback. Keep the one-line diagnostic
+                    // largest-feasible fallback. Keep the one-line diagnostic
                     // bounded instead of silently dropping the chord.
                     eprintln!(
                         "warning: keymap new_panel spiral target cannot fit two 10x4 panes — falling back to the largest flexible slot"
@@ -6031,7 +6031,8 @@ mod tests {
 
     /// Issue #2571 review: normal window sizes must keep `Mod+N` working to
     /// the 0.0.27 Balanced capacity after the focused Spiral slot is
-    /// exhausted. The fallback plan is deterministic (largest-area Balanced),
+    /// exhausted. The fallback plan is deterministic (largest-feasible
+    /// Balanced),
     /// every press lands, and the tree stays a valid 10x4-minimum partition.
     fn assert_default_new_panel_capacity(container: bitty_runtime::UiRect) {
         use bitty_config::ChromeAction;

@@ -245,8 +245,8 @@ pub use label_allocator::{
 pub use layout::{
     CELL_ASPECT_RATIO, LayoutNode, MIN_PANE_COLS, MIN_PANE_ROWS, OverlayLayer, OverlayTier,
     SplitHandle, TreeViolation, balanced_bisect_choice, balanced_split_axis, bisect_choice,
-    bisect_split_axis, clamp_ratio, largest_area_leaf, smart_split_axis, split_rect,
-    split_rect_with_gap, splittable_axis, splittable_rect, survivor_after_close,
+    bisect_split_axis, clamp_ratio, largest_area_leaf, largest_splittable_leaf, smart_split_axis,
+    split_rect, split_rect_with_gap, splittable_axis, splittable_rect, survivor_after_close,
 };
 pub use motion::{
     MAX_MOTION_DURATION_MS, MotionConfig, MotionCurve, MotionError, MotionScope, MotionSpec,

@@ -7,8 +7,8 @@ use super::*;
 use crate::PanelLayoutMode;
 use crate::config::decoration_runtime_error;
 use bitty_ui::{
-    SplitAxis, balanced_split_axis, bisect_choice, largest_area_leaf, splittable_axis,
-    splittable_rect,
+    SplitAxis, balanced_split_axis, bisect_choice, largest_area_leaf, largest_splittable_leaf,
+    splittable_axis, splittable_rect,
 };
 use core::ops::{Deref, DerefMut};
 
@@ -2906,11 +2906,12 @@ impl Runtime {
 
     /// Hyprland-dwindle axis for a new panel at `focused` (CTX-0838 #1441).
     ///
-    /// The axis half of [`Self::panel_split_plan`]. [`PanelLayoutMode::Balanced`]
-    /// and [`PanelLayoutMode::BisectLargest`] ignore `focused` and use the
-    /// physically largest slot; `Dwindle` uses the focused leaf. `Spiral` uses
-    /// the focused leaf while it can host two usable children, then falls
-    /// back to the largest-area Balanced target (issue #2571 review).
+    /// The axis half of [`Self::panel_split_plan`]. `Balanced` ignores
+    /// `focused` and uses the largest feasible slot; `BisectLargest` ignores
+    /// `focused` and uses the physically largest slot. `Dwindle` uses the
+    /// focused leaf. `Spiral` uses the focused leaf while it can host two
+    /// usable children, then falls back to the largest feasible Balanced
+    /// target (issue #2571 review).
     /// Falls back to the container when the leaf has no allocation
     /// (fail-closed: never panics, never mutates). Explicit
     /// `new_split:<dir>` keeps its fixed axis; this is only the Mod+N
@@ -2932,12 +2933,11 @@ impl Runtime {
     /// Returns the slot to split, the balanced axis, the insertion side, and
     /// (in `Spiral` mode) the phase used. In `Spiral` mode the focused slot is
     /// used while it can host two usable children; otherwise the plan falls
-    /// back deterministically to the largest-area Balanced target and reports
+    /// back deterministically to the largest feasible Balanced target and reports
     /// `spiral_phase: None` (issue #2571 review). `None` when no live leaf can
     /// host two panes at the minimum usable size (or the layout is empty). The
-    /// app layer commits exactly this plan, so the axis and target can never
-    /// disagree with [`Self::panel_split_axis`] /
-    /// [`Self::panel_bisect_target`].
+    /// app layer commits exactly this plan, so the axis and target stay
+    /// internally consistent for every adaptive mode.
     #[must_use]
     pub fn panel_split_plan(&self) -> Option<PanelSplitPlan> {
         self.panel_split_plan_for(self.focused_view()?)
@@ -2953,8 +2953,8 @@ impl Runtime {
             .unwrap_or(self.container);
         let (target, rect, axis, place_new_first, spiral_phase) = match self.panel_layout_mode {
             PanelLayoutMode::Balanced => {
-                let (target, rect) = largest_area_leaf(&allocations)?;
-                (target, rect, splittable_axis(rect, gap_in)?, false, None)
+                let (target, rect, axis) = largest_splittable_leaf(&allocations, gap_in)?;
+                (target, rect, axis, false, None)
             }
             PanelLayoutMode::BisectLargest => {
                 let (target, rect) = largest_area_leaf(&allocations)?;
@@ -2977,14 +2977,14 @@ impl Runtime {
                         // exhaust on a normal window (80x24 stops after five
                         // presses) long before the tiling is full. Fall back
                         // to the deterministic Balanced target -- the
-                        // largest-area leaf, first in solver order on ties --
+                        // largest feasible leaf, first in solver order on ties --
                         // so `Mod+N` keeps the 0.0.27 capacity instead of
                         // dropping the chord. `spiral_phase: None` marks the
                         // fallback and restarts the chain on the fresh pane;
                         // the app logs one bounded warning for it. `None`
                         // here now means no leaf can host two usable panes.
-                        let (target, rect) = largest_area_leaf(&allocations)?;
-                        (target, rect, splittable_axis(rect, gap_in)?, false, None)
+                        let (target, rect, axis) = largest_splittable_leaf(&allocations, gap_in)?;
+                        (target, rect, axis, false, None)
                     }
                 }
             }
@@ -3030,11 +3030,12 @@ impl Runtime {
     /// Pure, total, headless: returns the leaf with the largest
     /// `width * height` allocation (first in solver order on ties), or
     /// `None` for an empty layout. `NewPanel` callers in
-    /// [`PanelLayoutMode::Balanced`] and [`PanelLayoutMode::BisectLargest`]
-    /// split this target (not the focused leaf); move-to-workspace uses this
-    /// target regardless of [`PanelLayoutMode`]. The axis for the target
-    /// comes from [`bitty_ui::balanced_split_axis`] (balanced) or
-    /// [`bitty_ui::bisect_split_axis`] (raw `width >= height`).
+    /// [`PanelLayoutMode::BisectLargest`] split this target (not the focused
+    /// leaf). Move-to-workspace also uses this largest-area target regardless
+    /// of [`PanelLayoutMode`]. Balanced and Spiral fallback use the separate
+    /// largest-feasible target selected by [`Self::panel_split_plan`].
+    /// The axis for the target comes from [`bitty_ui::bisect_split_axis`]
+    /// (raw `width >= height`).
     #[must_use]
     pub fn panel_bisect_target(&self) -> Option<ViewId> {
         let allocations = self.layout_allocations();
@@ -3183,10 +3184,10 @@ impl Runtime {
     ///   Up) that continues only while the pane created by the previous split
     ///   stays focused; any other active pane restarts at Right (issues
     ///   #2528, #2571). When the focused slot can no longer host two usable
-    ///   panes the plan falls back to the largest-area Balanced target
+    ///   panes the plan falls back to the largest-feasible Balanced target
     ///   (`place_new_first = false`; issue #2571 review).
     /// - `Balanced`: always Right or Down (`place_new_first = false`); the
-    ///   fresh pane goes after the bisected largest slot (explicit opt-in
+    ///   fresh pane goes after the largest feasible slot (explicit opt-in
     ///   since 0.0.28).
     /// - `Dwindle`: Hyprland-style dwindle (always Right or Bottom,
     ///   `place_new_first = false`).
@@ -3561,7 +3562,7 @@ mod tests {
     /// `Mod+N` working to the 0.0.27 Balanced capacity. On normal 80x24 and
     /// 120x40 windows the focused Spiral chain exhausts its slot after five
     /// or six presses; the default must then use the deterministic
-    /// largest-area Balanced fallback instead of dropping the chord, match
+    /// largest-feasible Balanced fallback instead of dropping the chord, match
     /// explicit Balanced's pane count, and keep a valid 10x4-minimum tree.
     fn assert_default_spiral_keeps_balanced_capacity(container: UiRect) {
         const PRESSES: usize = 8;
@@ -3627,6 +3628,83 @@ mod tests {
         assert_default_spiral_keeps_balanced_capacity(UiRect::new(0, 0, 120, 40));
     }
 
+    #[test]
+    fn spiral_fallback_selects_largest_feasible_leaf_in_155x42() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        rt.set_container(UiRect::new(0, 0, 155, 42));
+
+        let fallback = loop {
+            let plan = rt.panel_split_plan().expect("fallback remains feasible");
+            if plan.spiral_phase.is_none() {
+                break plan;
+            }
+            apply_new_panel(&mut rt);
+            assert!(
+                rt.leaf_count() < 32,
+                "fallback should precede hard capacity"
+            );
+        };
+        let expected = largest_splittable_leaf(&rt.layout_allocations(), rt.gaps().inner)
+            .expect("a feasible fallback target");
+        assert_eq!(fallback.target, expected.0);
+        assert_eq!(fallback.axis, expected.2);
+        assert!(rt.layout_allocations().iter().all(|(_, rect)| {
+            rect.width >= bitty_ui::MIN_PANE_COLS && rect.height >= bitty_ui::MIN_PANE_ROWS
+        }));
+        apply_new_panel(&mut rt);
+        assert_eq!(rt.leaf_count(), 9);
+        assert_eq!(rt.focused_view(), Some(ViewId::new(9)));
+
+        let continuation = rt.panel_split_plan().expect("fallback-created pane fits");
+        assert_eq!(
+            continuation.target,
+            rt.focused_view().expect("focus after fallback")
+        );
+        assert_eq!(continuation.spiral_phase, Some(0));
+        apply_new_panel(&mut rt);
+        assert_eq!(rt.leaf_count(), 10);
+        assert_eq!(rt.focused_view(), Some(ViewId::new(10)));
+        assert_eq!(rt.layout().validate_structure(), Ok(10));
+        for (id, rect) in rt.layout_allocations() {
+            assert!(
+                rect.width >= bitty_ui::MIN_PANE_COLS && rect.height >= bitty_ui::MIN_PANE_ROWS,
+                "{id:?} fell below the minimum after fallback continuation: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn balanced_and_spiral_fallback_skip_larger_unsplittable_leaf() {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        let focused = ViewId::new(1);
+        let feasible = ViewId::new(2);
+        let exhausted = ViewId::new(3);
+        rt.set_container(UiRect::new(0, 0, 39, 7));
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            19.0 / 39.0,
+            LayoutNode::leaf(View::new(focused, 19, 7)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                4.0 / 7.0,
+                LayoutNode::leaf(View::new(feasible, 20, 4)),
+                LayoutNode::leaf(View::new(exhausted, 20, 3)),
+            ),
+        ));
+        assert!(rt.set_focus(focused));
+
+        let spiral = rt.panel_split_plan().expect("smaller feasible leaf exists");
+        assert_eq!(spiral.target, feasible);
+        assert_eq!(spiral.axis, SplitAxis::Horizontal);
+        assert_eq!(spiral.spiral_phase, None);
+
+        rt.set_panel_layout_mode(PanelLayoutMode::Balanced);
+        let balanced = rt.panel_split_plan().expect("balanced fallback exists");
+        assert_eq!(balanced.target, feasible);
+        assert_eq!(balanced.axis, SplitAxis::Horizontal);
+        assert_eq!(balanced.spiral_phase, None);
+    }
+
     /// Issue #2528: the spiral phase continues only along the active
     /// creation chain. Closing a pane hands focus to a survivor, which
     /// resets the next split to Right instead of the stale Left phase.
@@ -3683,7 +3761,7 @@ mod tests {
     }
 
     /// Issue #2521 / #2571 review: a layout where neither the focused Spiral
-    /// target nor the largest-area Balanced fallback can host two usable
+    /// target nor the largest-feasible Balanced fallback can host two usable
     /// panes refuses the adaptive split instead of committing a sliver.
     #[test]
     fn spiral_and_balanced_plans_refuse_below_minimum_pane_size() {
@@ -4063,8 +4141,9 @@ mod tests {
 
     /// Issue #2571 / CTX-0964 (#1698): a fresh runtime defaults to `Spiral`;
     /// `Balanced`, `Dwindle`, and `BisectLargest` stay selectable. `Spiral`
-    /// and `Dwindle` keep focused-leaf semantics; `Balanced` and
-    /// `BisectLargest` target the largest leaf.
+    /// and `Dwindle` keep focused-leaf semantics; `Balanced` targets the
+    /// largest feasible leaf and `BisectLargest` targets the largest-area
+    /// leaf.
     #[test]
     fn default_mode_is_spiral_and_modes_keep_their_targets() {
         let mut rt = Runtime::with_defaults().expect("headless runtime must build");
@@ -4084,10 +4163,14 @@ mod tests {
         assert_eq!(plan.spiral_phase, Some(0), "a fresh chain starts at Right");
         assert!(!plan.place_new_first);
 
-        // Explicit opt-in: Balanced still bisects the largest slot.
+        // Explicit opt-in: Balanced still bisects the largest feasible slot.
         rt.set_panel_layout_mode(PanelLayoutMode::Balanced);
         assert_eq!(rt.panel_layout_mode(), PanelLayoutMode::Balanced);
-        assert_eq!(rt.panel_bisect_target(), Some(focused));
+        assert_eq!(
+            rt.panel_split_plan().expect("balanced plan").target,
+            focused,
+            "balanced selects the largest feasible target"
+        );
         assert_eq!(
             rt.panel_split_plan().expect("balanced plan").spiral_phase,
             None,

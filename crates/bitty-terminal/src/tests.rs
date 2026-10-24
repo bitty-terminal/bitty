@@ -1116,6 +1116,27 @@ return {}
     }
 
     #[test]
+    fn about_to_wait_arms_the_surface_retry_deadline() {
+        let mut fixture = Fixture::new("surface-retry-wake");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        fixture.app.test_surface_retry_deadline = Some(deadline);
+        fixture.operations.borrow_mut().clear();
+        let mut context = EventContext::recording(&fixture.operations);
+        <TerminalApp as AppHandler>::handle_event(
+            &mut fixture.app,
+            &mut context,
+            PlatformEvent::AboutToWait,
+        );
+        let operations = fixture.operations.borrow();
+        assert!(
+            operations.iter().any(
+                |operation| matches!(operation, RecordingOperation::WaitUntil(at) if *at == deadline)
+            ),
+            "AboutToWait must arm the surface-retry wake: {operations:?}"
+        );
+    }
+
+    #[test]
     fn input_vm_boundary_recording_context_refuses_windows() {
         let operations = RefCell::new(Vec::new());
         let mut context = EventContext::recording(&operations);

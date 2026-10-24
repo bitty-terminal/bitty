@@ -11,6 +11,7 @@ use bitty_render::gpu::{GpuContext, select_instance_backends};
 use bitty_runtime::plugin_runtime::{LuaValue, OverlayKeyChord, PluginRuntime, WorkspaceRequest};
 use bitty_runtime::{Runtime, ViewId, WorkspaceSummary};
 
+use crate::crash_report;
 use crate::ctl;
 use crate::layout_cmd::spawn_demo_pty_pump_with_theme;
 use crate::logging::LogLevel;
@@ -635,6 +636,9 @@ pub(crate) struct TerminalApp {
     /// Phase marks are observability only: they never alter routing, timing,
     /// or runtime state.
     pub(crate) stall_watchdog: Option<StallWatchdog>,
+    /// Test-only override for the surface-retry wake (issue #2570 B1).
+    #[cfg(test)]
+    pub(crate) test_surface_retry_deadline: Option<std::time::Instant>,
     /// Chrome-owned key state (keymaps, modifier mirror, held keys, zoom).
     pub(crate) chrome: crate::chrome_keys::ChromeState,
     /// Frozen startup spawn recipe so `new_split` leaves replay the exact
@@ -808,6 +812,8 @@ impl TerminalApp {
             _pty_thread: None,
             presented_frames: 0,
             stall_watchdog: StallWatchdog::from_env(),
+            #[cfg(test)]
+            test_surface_retry_deadline: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
             log_level: LogLevel::default_level(),
@@ -855,6 +861,8 @@ impl TerminalApp {
             _pty_thread: Some(handle),
             presented_frames: 0,
             stall_watchdog: StallWatchdog::from_env(),
+            #[cfg(test)]
+            test_surface_retry_deadline: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
             log_level: LogLevel::default_level(),
@@ -963,6 +971,9 @@ impl TerminalApp {
     /// One relaxed store plus a timestamp when enabled; a leaked null check
     /// when disabled. Never changes control flow.
     fn watchdog_phase(&self, phase: Phase) {
+        // Issue #2570: the crash report needs the phase even when the opt-in
+        // stall watchdog is disabled. One relaxed atomic store either way.
+        crate::crash_report::set_phase(phase);
         if let Some(watchdog) = self.stall_watchdog.as_ref() {
             watchdog.enter(phase);
         }
@@ -970,6 +981,15 @@ impl TerminalApp {
 
     /// Tell the watchdog the loop is parked in `ControlFlow::Wait`, so a quiet
     /// window is not a stall.
+    /// Surface-retry wake, with a test override for the AboutToWait wiring.
+    fn surface_retry_wake(&self) -> Option<std::time::Instant> {
+        #[cfg(test)]
+        if let Some(deadline) = self.test_surface_retry_deadline {
+            return Some(deadline);
+        }
+        self.runtime.surface_retry_deadline()
+    }
+
     fn watchdog_idle(&self) {
         if let Some(watchdog) = self.stall_watchdog.as_ref() {
             watchdog.idle();
@@ -1023,6 +1043,8 @@ impl TerminalApp {
             band_count,
             band_plugin_ids,
             presented_frames: self.presented_frames,
+            surface: bitty_render::telemetry::snapshot(),
+            lifecycle: crate::crash_report::last_lifecycle_name(),
         });
     }
 
@@ -4014,6 +4036,37 @@ impl AppHandler for TerminalApp {
 impl TerminalApp {
     /// Event-handler body; the `AppHandler` wrapper owns the watchdog mark.
     fn handle_event_inner(&mut self, ctx: &mut EventContext<'_>, event: PlatformEvent) {
+        // Issue #2570: record the last window/surface lifecycle event so a
+        // crash report names what the surface was doing. One relaxed atomic
+        // store per window event when crash capture is enabled.
+        match &event {
+            PlatformEvent::Resumed => crash_report::lifecycle(crash_report::Lifecycle::Resumed),
+            PlatformEvent::Suspended => {
+                crash_report::lifecycle(crash_report::Lifecycle::Suspended);
+            }
+            PlatformEvent::Window { kind, .. } => match kind {
+                WindowEventKind::Resized(_) => {
+                    crash_report::lifecycle(crash_report::Lifecycle::Resized);
+                }
+                WindowEventKind::ScaleFactorChanged(_) => {
+                    crash_report::lifecycle(crash_report::Lifecycle::ScaleChanged);
+                }
+                WindowEventKind::Focused(true) => {
+                    crash_report::lifecycle(crash_report::Lifecycle::Focused);
+                }
+                WindowEventKind::Focused(false) => {
+                    crash_report::lifecycle(crash_report::Lifecycle::Unfocused);
+                }
+                WindowEventKind::CloseRequested => {
+                    crash_report::lifecycle(crash_report::Lifecycle::CloseRequested);
+                }
+                WindowEventKind::Closed => {
+                    crash_report::lifecycle(crash_report::Lifecycle::Closed);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
         // Bounded PTY pump: drain before handling the event so fresh bytes are
         // visible to the state machine before the tick.
         self.watchdog_phase(Phase::PtyPump);
@@ -4032,6 +4085,7 @@ impl TerminalApp {
         if self.reap_exited_shells() == ShellExitOutcome::AppExiting {
             self.save_session_best_effort("shell-exit");
             self.runtime.shutdown();
+            crash_report::record_exit(crash_report::ExitReason::ShellExit);
             ctx.exit();
             return;
         }
@@ -4053,6 +4107,7 @@ impl TerminalApp {
                     });
                     self.save_session_best_effort("close-view");
                     self.runtime.shutdown();
+                    crash_report::record_exit(crash_report::ExitReason::CloseView);
                     ctx.exit();
                 }
                 return;
@@ -4116,6 +4171,14 @@ impl TerminalApp {
             self.watchdog_phase(Phase::Shutdown);
             self.save_session_best_effort("exit");
             self.runtime.shutdown();
+            let reason = match &event {
+                PlatformEvent::Window {
+                    kind: WindowEventKind::CloseRequested | WindowEventKind::Closed,
+                    ..
+                } => crash_report::ExitReason::WindowClose,
+                _ => crash_report::ExitReason::RouteEvent,
+            };
+            crash_report::record_exit(reason);
             ctx.exit();
             return;
         }
@@ -4129,6 +4192,7 @@ impl TerminalApp {
             crate::logging::info(|| "bitty: exit requested (mouse chrome action)".to_string());
             self.save_session_best_effort("mouse-action");
             self.runtime.shutdown();
+            crash_report::record_exit(crash_report::ExitReason::MouseAction);
             ctx.exit();
             return;
         }
@@ -4250,6 +4314,12 @@ impl TerminalApp {
                             // (deterministic fallback, no panic). On a real display we get a wgpu surface
                             // via winit's SurfaceTarget and present via tick.
                             self.try_attach_gpu(&handle_for_gpu);
+                            crash_report::lifecycle(crash_report::Lifecycle::WindowCreated);
+                            if self.runtime.has_gpu() {
+                                crash_report::lifecycle(crash_report::Lifecycle::GpuAttached);
+                            } else {
+                                crash_report::lifecycle(crash_report::Lifecycle::GpuAttachFailed);
+                            }
                             crate::logging::info(|| {
                                 format!(
                                     "bitty: window created id={} gpu={} crossfont={} focused={:?} leafs={} ime=allowed",
@@ -4344,6 +4414,7 @@ impl TerminalApp {
                 if self.reap_exited_shells() == ShellExitOutcome::AppExiting {
                     self.save_session_best_effort("shell-exit");
                     self.runtime.shutdown();
+                    crash_report::record_exit(crash_report::ExitReason::ShellExit);
                     ctx.exit();
                     return;
                 }
@@ -4410,6 +4481,10 @@ impl TerminalApp {
                 // the next bounded one-line auto-scroll step; `None` when no
                 // drag is at an edge, so idle unchanged.
                 let selection_auto = self.runtime.selection_autoscroll_deadline();
+                // Issue #2570: a failed real-GPU present retains damage and
+                // arms a bounded retry; without this wake a quiet window would
+                // never retry and could stay stale after a workspace switch.
+                let surface_retry = self.surface_retry_wake();
                 let wake = [
                     hover,
                     animation,
@@ -4421,6 +4496,7 @@ impl TerminalApp {
                     parked,
                     shell_exit,
                     selection_auto,
+                    surface_retry,
                 ]
                 .into_iter()
                 .flatten()
@@ -4487,6 +4563,7 @@ impl TerminalApp {
             PlatformEvent::Exiting => {
                 self.save_session_best_effort("loop-exiting");
                 self.runtime.shutdown();
+                crash_report::record_exit(crash_report::ExitReason::LoopExiting);
                 ctx.exit();
             }
             _ => {}

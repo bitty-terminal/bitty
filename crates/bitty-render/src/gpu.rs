@@ -141,6 +141,7 @@ use crate::batch;
 use crate::error::RenderError;
 use crate::grid::{DrawList, ThemePalette};
 use crate::pipeline::GpuResources;
+use crate::telemetry;
 
 // ---------------------------------------------------------------------------
 // Adapter description
@@ -1085,6 +1086,32 @@ impl Surface {
 
     /// Configures (or reconfigures) the surface for `extent`.
     ///
+    /// For a real surface this queries `get_capabilities`, picks a format
+    /// (`Srgb` preferred), a present mode (`Fifo` preferred), and an alpha
+    /// mode (premultiplied when the requested opacity is below `1.0` and the
+    /// platform supports it). For the headless fake it validates the extent
+    /// and stores deterministic defaults.
+    ///
+    /// Counts the attempt in [`crate::telemetry`] and delegates to
+    /// [`Self::configure_inner`].
+    ///
+    /// # Errors
+    ///
+    /// - [`RenderError::InvalidInput`] for zero extents.
+    /// - [`RenderError::SurfaceConfigure`] when the upstream configuration
+    ///   cannot be built.
+    pub fn configure(&self, ctx: &GpuContext, extent: PhysicalSize) -> Result<(), RenderError> {
+        let result = self.configure_inner(ctx, extent);
+        if result.is_ok() {
+            telemetry::configure_ok();
+        } else {
+            telemetry::configure_err();
+        }
+        result
+    }
+
+    /// Configures (or reconfigures) the surface for `extent`.
+    ///
     /// For a real surface, this queries `get_capabilities`, picks a format
     /// with `Srgb`→fallback, a present mode with `Fifo` preferred (CTX-1036,
     /// issue #1809 — double-buffered vsync keeps one fewer resident frame
@@ -1109,7 +1136,7 @@ impl Surface {
     /// - [`RenderError::SurfaceConfigure`] when the upstream `configure`
     ///   cannot be built (should be unreachable with the fallback rules, but
     ///   surfaced honestly).
-    pub fn configure(&self, ctx: &GpuContext, extent: PhysicalSize) -> Result<(), RenderError> {
+    fn configure_inner(&self, ctx: &GpuContext, extent: PhysicalSize) -> Result<(), RenderError> {
         if extent.width() == 0 || extent.height() == 0 {
             return Err(RenderError::InvalidInput {
                 reason: "surface extent must be non-zero",
@@ -1162,9 +1189,23 @@ impl Surface {
     /// Propagates [`Self::configure`] failures for non-zero extents only.
     pub fn resize(&self, ctx: &GpuContext, new_extent: PhysicalSize) -> Result<(), RenderError> {
         if map_resize_to_surface_extent(new_extent).is_none() {
+            telemetry::resize_zero_skipped();
             return Ok(());
         }
+        telemetry::resize();
         self.configure(ctx, new_extent)
+    }
+
+    /// Records the acquire error class and returns the telemetry event name.
+    fn note_acquire_error(error: &wgpu::SurfaceError) {
+        match error {
+            wgpu::SurfaceError::Timeout => telemetry::acquire_timeout(),
+            wgpu::SurfaceError::Outdated => telemetry::acquire_outdated(),
+            wgpu::SurfaceError::Lost => telemetry::acquire_lost(),
+            wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other => {
+                telemetry::acquire_other();
+            }
+        }
     }
 
     /// Presents a frame without `DrawList` compositing (minimal clear).
@@ -1185,6 +1226,7 @@ impl Surface {
     pub fn present(&self, ctx: &GpuContext) -> Result<PresentStats, RenderError> {
         match &self.kind {
             SurfaceKind::Headless => {
+                telemetry::headless_present();
                 let mut state = self.state.lock().expect("surface state poisoned");
                 if state.config.is_none() {
                     return Err(RenderError::SurfaceConfigure(
@@ -1234,14 +1276,45 @@ impl Surface {
                 // fatal in different ways — the caller decides whether to retry
                 // the frame. The headless fake never reaches this branch.
                 let frame = match surface.get_current_texture() {
-                    Ok(f) => f,
-                    Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
-                        self.configure(ctx, config.extent)?;
-                        surface
-                            .get_current_texture()
-                            .map_err(|e| RenderError::SurfaceAcquire(e.to_string()))?
+                    Ok(f) => {
+                        telemetry::acquire_ok();
+                        f
                     }
-                    Err(e) => return Err(RenderError::SurfaceAcquire(e.to_string())),
+                    Err(wgpu::SurfaceError::Outdated) => {
+                        telemetry::acquire_outdated();
+                        self.configure(ctx, config.extent)?;
+                        match surface.get_current_texture() {
+                            Ok(f) => {
+                                telemetry::acquire_ok();
+                                f
+                            }
+                            Err(e) => {
+                                Self::note_acquire_error(&e);
+                                telemetry::present_err();
+                                return Err(RenderError::SurfaceAcquire(e.to_string()));
+                            }
+                        }
+                    }
+                    Err(wgpu::SurfaceError::Lost) => {
+                        telemetry::acquire_lost();
+                        self.configure(ctx, config.extent)?;
+                        match surface.get_current_texture() {
+                            Ok(f) => {
+                                telemetry::acquire_ok();
+                                f
+                            }
+                            Err(e) => {
+                                Self::note_acquire_error(&e);
+                                telemetry::present_err();
+                                return Err(RenderError::SurfaceAcquire(e.to_string()));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        Self::note_acquire_error(&e);
+                        telemetry::present_err();
+                        return Err(RenderError::SurfaceAcquire(e.to_string()));
+                    }
                 };
                 let view = frame
                     .texture
@@ -1276,6 +1349,7 @@ impl Surface {
                 }
                 ctx.queue.submit(std::iter::once(encoder.finish()));
                 frame.present();
+                telemetry::present_ok();
                 let mut state = self.state.lock().expect("surface state poisoned");
                 state.frame += 1;
                 Ok(PresentStats {
@@ -1356,6 +1430,7 @@ impl Surface {
 
         match &self.kind {
             SurfaceKind::Headless => {
+                telemetry::headless_present();
                 // Headless composite onto CPU buffer — mirrors
                 // `software::draw_list_onto` but lives here so the sw-fallback
                 // feature is not required for headless tests.
@@ -1533,17 +1608,49 @@ impl Surface {
                 // atlas dimensions change (covers reconfiguration and
                 // device-loss recovery without panicking).
                 let frame = match surface.get_current_texture() {
-                    Ok(f) => f,
-                    Err(wgpu::SurfaceError::Outdated) | Err(wgpu::SurfaceError::Lost) => {
+                    Ok(f) => {
+                        telemetry::acquire_ok();
+                        f
+                    }
+                    Err(wgpu::SurfaceError::Outdated) => {
+                        telemetry::acquire_outdated();
                         self.configure(ctx, config.extent)?;
                         // Reconfiguration may have picked a new format; drop
                         // cached resources so the draw below recreates them.
                         self.state.lock().expect("surface state poisoned").resources = None;
-                        surface
-                            .get_current_texture()
-                            .map_err(|e| RenderError::SurfaceAcquire(e.to_string()))?
+                        match surface.get_current_texture() {
+                            Ok(f) => {
+                                telemetry::acquire_ok();
+                                f
+                            }
+                            Err(e) => {
+                                Self::note_acquire_error(&e);
+                                telemetry::present_err();
+                                return Err(RenderError::SurfaceAcquire(e.to_string()));
+                            }
+                        }
                     }
-                    Err(e) => return Err(RenderError::SurfaceAcquire(e.to_string())),
+                    Err(wgpu::SurfaceError::Lost) => {
+                        telemetry::acquire_lost();
+                        self.configure(ctx, config.extent)?;
+                        self.state.lock().expect("surface state poisoned").resources = None;
+                        match surface.get_current_texture() {
+                            Ok(f) => {
+                                telemetry::acquire_ok();
+                                f
+                            }
+                            Err(e) => {
+                                Self::note_acquire_error(&e);
+                                telemetry::present_err();
+                                return Err(RenderError::SurfaceAcquire(e.to_string()));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        Self::note_acquire_error(&e);
+                        telemetry::present_err();
+                        return Err(RenderError::SurfaceAcquire(e.to_string()));
+                    }
                 };
                 let view = frame
                     .texture
@@ -1639,6 +1746,7 @@ impl Surface {
                     );
                 }
                 frame.present();
+                telemetry::present_ok();
                 let mut state = self.state.lock().expect("surface state poisoned");
                 state.frame += 1;
                 Ok(PresentStats {
@@ -1703,6 +1811,7 @@ impl Surface {
                 "headless_present called on a real surface".into(),
             ));
         }
+        telemetry::headless_present();
         let config = {
             let state = self.state.lock().expect("surface state poisoned");
             state
@@ -1901,8 +2010,10 @@ impl Surface {
             ));
         }
         if map_resize_to_surface_extent(new_extent).is_none() {
+            telemetry::resize_zero_skipped();
             return Ok(());
         }
+        telemetry::resize();
         let config =
             SurfaceConfig::new(new_extent, SurfaceFormat::Bgra8UnormSrgb, PresentMode::Fifo)?;
         let mut state = self.state.lock().expect("surface state poisoned");
@@ -2927,6 +3038,33 @@ mod tests {
             glyphs: vec![],
             images: vec![],
         }
+    }
+
+    #[test]
+    fn headless_surface_survives_120_resize_present_cycles() {
+        // Issue #2570 regression: 120 hide/show-shaped reconfigure + present
+        // cycles must not panic, leak the configuration, or stop presenting.
+        let before = crate::telemetry::snapshot();
+        let surface = Surface::headless(PhysicalSize::new(640, 480)).expect("headless surface");
+        for cycle in 0..120u32 {
+            let width = 640 + (cycle % 5) * 16;
+            let height = 480 + (cycle % 3) * 8;
+            surface
+                .headless_resize(PhysicalSize::new(width, height))
+                .expect("headless resize");
+            let list = empty_draw_list(width, height);
+            assert!(
+                surface.headless_present(&list, None).is_ok(),
+                "cycle {cycle}"
+            );
+        }
+        let after = crate::telemetry::snapshot();
+        assert!(
+            after.headless_present >= before.headless_present + 120,
+            "{after:?}"
+        );
+        assert!(after.resize >= before.resize + 120, "{after:?}");
+        assert_eq!(surface.extent(), Some(PhysicalSize::new(704, 496)));
     }
 
     #[test]

@@ -202,6 +202,7 @@ pub mod grid;
 pub mod hidpi;
 pub(crate) mod pipeline;
 pub mod shaped;
+pub mod telemetry;
 pub mod window;
 
 #[cfg(feature = "sw-fallback")]

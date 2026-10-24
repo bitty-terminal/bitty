@@ -180,7 +180,7 @@ pub(crate) enum Phase {
 
 impl Phase {
     /// Decode a stored phase byte.
-    fn from_u8(raw: u8) -> Self {
+    pub(crate) fn from_u8(raw: u8) -> Self {
         match raw {
             0 => Self::Startup,
             1 => Self::Idle,
@@ -211,7 +211,7 @@ impl Phase {
     }
 
     /// Stable lowercase name used in reports.
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Startup => "startup",
             Self::Idle => "idle",
@@ -266,6 +266,10 @@ pub(crate) struct WatchdogContext {
     pub(crate) band_plugin_ids: Vec<String>,
     /// Presented frames at sample time.
     pub(crate) presented_frames: u64,
+    /// Surface-present counters from [`bitty_render::telemetry`] (issue #2570).
+    pub(crate) surface: bitty_render::telemetry::SurfaceTelemetrySnapshot,
+    /// Last window/surface lifecycle event name (issue #2570).
+    pub(crate) lifecycle: &'static str,
 }
 
 /// Parsed watchdog configuration.
@@ -348,20 +352,20 @@ fn config_from_env() -> Option<WatchdogConfig> {
 
 /// One sampled thread's kernel-visible state.
 #[derive(Clone, Debug)]
-struct ThreadRow {
-    tid: u64,
-    comm: String,
-    state: char,
-    wchan: String,
-    syscall_number: String,
+pub(crate) struct ThreadRow {
+    pub(crate) tid: u64,
+    pub(crate) comm: String,
+    pub(crate) state: char,
+    pub(crate) wchan: String,
+    pub(crate) syscall_number: String,
 }
 
 /// Process totals sampled alongside the thread rows.
 #[derive(Clone, Debug, Default)]
-struct ProcessTotals {
-    thread_count: usize,
-    fd_count: usize,
-    rss_kib: u64,
+pub(crate) struct ProcessTotals {
+    pub(crate) thread_count: usize,
+    pub(crate) fd_count: usize,
+    pub(crate) rss_kib: u64,
 }
 
 /// One rendered stall report, built on the monitor thread only.
@@ -762,7 +766,7 @@ fn monitor_loop(
 }
 
 /// Sample all threads and process totals (Linux); other targets return empty.
-fn sample_process_totals() -> (Vec<ThreadRow>, ProcessTotals) {
+pub(crate) fn sample_process_totals() -> (Vec<ThreadRow>, ProcessTotals) {
     #[cfg(target_os = "linux")]
     {
         linux_thread_snapshot()
@@ -916,6 +920,28 @@ fn render_report(report: &StallReport) -> String {
                 format_ids(&context.plugin_ids),
                 context.band_count,
                 format_ids(&context.band_plugin_ids),
+            );
+            let surface = &context.surface;
+            let _ = writeln!(
+                out,
+                "  surface: last={} configure_err={} acquire_ok={} acquire_timeout={} acquire_outdated={} acquire_lost={} acquire_other={} present_ok={} present_err={} resize={} resize_zero_skipped={} headless_present={} retry_failures={} retry_attempts={} retry_recoveries={} retry_last_delay_ms={} lifecycle={}",
+                surface.last_event,
+                surface.configure_err,
+                surface.acquire_ok,
+                surface.acquire_timeout,
+                surface.acquire_outdated,
+                surface.acquire_lost,
+                surface.acquire_other,
+                surface.present_ok,
+                surface.present_err,
+                surface.resize,
+                surface.resize_zero_skipped,
+                surface.headless_present,
+                surface.retry_failures,
+                surface.retry_attempts,
+                surface.retry_recoveries,
+                surface.retry_last_delay_ms,
+                context.lifecycle,
             );
         }
         None => {
@@ -1308,9 +1334,20 @@ pub(crate) fn handle_state_writer(raw: &[String]) -> bool {
 
 /// Resolve the single-slot state file path from XDG state conventions.
 fn state_file_path() -> Option<PathBuf> {
+    state_file_path_for(STATE_FILE_NAME)
+}
+
+/// Resolve a named state file under the platform state directory.
+///
+/// Order: `XDG_STATE_HOME`, then `HOME/.local/state`, then `LOCALAPPDATA`
+/// (Windows has no XDG/HOME by default, so the crash/exit report would
+/// otherwise have no durable location).
+pub(crate) fn state_file_path_for(name: &str) -> Option<PathBuf> {
     state_file_path_from(
         std::env::var_os("XDG_STATE_HOME").as_deref(),
         std::env::var_os("HOME").as_deref(),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
+        name,
     )
 }
 
@@ -1318,11 +1355,14 @@ fn state_file_path() -> Option<PathBuf> {
 fn state_file_path_from(
     xdg_state: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
+    local_app_data: Option<&std::ffi::OsStr>,
+    name: &str,
 ) -> Option<PathBuf> {
     let base = xdg_state
         .map(PathBuf::from)
-        .or_else(|| home.map(|home| PathBuf::from(home).join(".local").join("state")))?;
-    Some(base.join("bitty").join(STATE_FILE_NAME))
+        .or_else(|| home.map(|home| PathBuf::from(home).join(".local").join("state")))
+        .or_else(|| local_app_data.map(PathBuf::from))?;
+    Some(base.join("bitty").join(name))
 }
 
 #[cfg(test)]
@@ -1566,16 +1606,40 @@ mod tests {
     fn state_path_follows_xdg_then_home() {
         use std::ffi::OsStr;
         assert_eq!(
-            state_file_path_from(Some(OsStr::new("/example/state")), None),
+            state_file_path_from(
+                Some(OsStr::new("/example/state")),
+                None,
+                None,
+                STATE_FILE_NAME
+            ),
             Some(PathBuf::from("/example/state/bitty/stall-watchdog.log"))
         );
         assert_eq!(
-            state_file_path_from(None, Some(OsStr::new("/example/home"))),
+            state_file_path_from(
+                None,
+                Some(OsStr::new("/example/home")),
+                None,
+                STATE_FILE_NAME
+            ),
             Some(PathBuf::from(
                 "/example/home/.local/state/bitty/stall-watchdog.log"
             ))
         );
-        assert_eq!(state_file_path_from(None, None), None);
+        assert_eq!(
+            state_file_path_from(
+                None,
+                None,
+                Some(OsStr::new("/example/localappdata")),
+                STATE_FILE_NAME
+            ),
+            Some(PathBuf::from(
+                "/example/localappdata/bitty/stall-watchdog.log"
+            ))
+        );
+        assert_eq!(
+            state_file_path_from(None, None, None, STATE_FILE_NAME),
+            None
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1626,6 +1690,7 @@ mod tests {
                 band_count: 1,
                 band_plugin_ids: vec![String::from("bitty-terminal.bar")],
                 presented_frames: 41,
+                ..Default::default()
             }),
             threads: rows,
             totals,
@@ -1634,6 +1699,7 @@ mod tests {
         assert!(rendered.contains("phase=runtime-tick"), "{rendered}");
         assert!(rendered.contains("[main]"), "{rendered}");
         assert!(rendered.len() <= MAX_REPORT_BYTES, "{}", rendered.len());
+        assert!(rendered.contains("surface: last=none"), "{rendered}");
         assert!(!rendered.contains("/home/"), "{rendered}");
     }
 

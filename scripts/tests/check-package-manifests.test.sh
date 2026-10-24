@@ -169,6 +169,52 @@ check(all("github.com" not in str(value) for value in arch.values() if isinstanc
 sys.exit(1 if failures else 0)
 PY
 
+# --- winget -----------------------------------------------------------------
+WINGET_GEN=./scripts/generate-winget-manifest.sh
+SETUP_SHA="6de07964fcf79c2b7410c80bbfe0001d920cde256473f8a4f28e980bc8e93ca8"
+WINGET_DIR="$TMP/winget-test"
+
+if [[ -x "$WINGET_GEN" ]]; then
+  if "$WINGET_GEN" --version "$VERSION" \
+    --installer-sha256 "$SETUP_SHA" \
+    --base-url "$BASE_URL" \
+    --output-dir "$WINGET_DIR" >"$TMP/winget.out" 2>"$TMP/winget.err"; then
+    pass "generator produces winget manifests"
+  else
+    fail "generator failed for winget: $(cat "$TMP/winget.err")"
+  fi
+
+  expect_contains "$WINGET_DIR/BittyTerminal.Bitty.yaml" "PackageIdentifier: BittyTerminal.Bitty" \
+    "winget version manifest sets PackageIdentifier"
+  expect_contains "$WINGET_DIR/BittyTerminal.Bitty.yaml" "PackageVersion: ${VERSION}" \
+    "winget version manifest sets PackageVersion"
+  expect_contains "$WINGET_DIR/BittyTerminal.Bitty.installer.yaml" "${BASE_URL}/bitty-${VERSION}-windows-x86_64-setup.exe" \
+    "winget installer URL uses the R2/CDN host"
+  expect_contains "$WINGET_DIR/BittyTerminal.Bitty.installer.yaml" "InstallerSha256: ${SETUP_SHA}" \
+    "winget installer manifest embeds the installer sha256"
+  expect_contains "$WINGET_DIR/BittyTerminal.Bitty.installer.yaml" "ProductCode: '{3E8B4A2C-7F1D-4B6E-9A0C-5D2F8E1B7A40}_is1'" \
+    "winget installer manifest embeds the Inno Setup ProductCode"
+  expect_contains "$WINGET_DIR/BittyTerminal.Bitty.locale.en-US.yaml" "Moniker: bitty" \
+    "winget defaultLocale manifest defines moniker bitty"
+  expect_contains "$WINGET_DIR/BittyTerminal.Bitty.locale.en-US.yaml" "License: MIT OR Apache-2.0" \
+    "winget defaultLocale manifest declares dual license"
+
+  # Error handling assertions
+  if "$WINGET_GEN" --version "$VERSION" --installer-sha256 "$SETUP_SHA" --base-url "https://github.com/foo" >/dev/null 2>&1; then
+    fail "winget generator accepted non-CDN base URL"
+  else
+    pass "winget generator rejects non-CDN base URL"
+  fi
+
+  if "$WINGET_GEN" --version "$VERSION" --installer-sha256 "INVALID" >/dev/null 2>&1; then
+    fail "winget generator accepted invalid sha256"
+  else
+    pass "winget generator rejects invalid sha256"
+  fi
+else
+  fail "generate-winget-manifest.sh missing or not executable"
+fi
+
 # --- Renderer negative cases ------------------------------------------------
 expect_render_fail "a GitHub Releases base URL" homebrew \
   --version "$VERSION" \
@@ -346,8 +392,15 @@ done
 # --- Documentation ----------------------------------------------------------
 expect_contains "$README" 'R2/CDN' "packaging/README.md names the R2/CDN primary source"
 expect_contains "$README" 'GitHub Releases' "packaging/README.md documents the GitHub fallback"
+expect_contains "$README" 'packaging/windows/winget/' "packaging/README.md references winget manifests"
 expect_contains "$INSTALL" 'R2-backed CDN' "packaging/INSTALL.md names the R2-backed CDN"
 expect_contains "$INSTALL" 'GitHub Releases' "packaging/INSTALL.md documents the GitHub fallback"
+expect_contains "$INSTALL" 'winget install' "packaging/INSTALL.md documents winget install"
+if [[ -f "./packaging/winget.md" ]]; then
+  pass "Documentation exists: packaging/winget.md"
+else
+  fail "Documentation missing: packaging/winget.md"
+fi
 expect_contains "$TOP_README" 'https://cdn.bitty.run/releases/' \
   "README.md names the CDN release path"
 

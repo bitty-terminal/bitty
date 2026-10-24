@@ -4359,6 +4359,27 @@ pub struct ConfigSettingRow {
     pub layer: SettingLayer,
 }
 
+/// One effective execution-budget dimension in a `config show` report
+/// (bitty#2304).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigBudgetRow {
+    /// Dimension spelling (`fuel_instructions`, `wall_ms`, `memory_bytes`,
+    /// `warning_ms`).
+    pub dimension: &'static str,
+    /// Compiled host ceiling.
+    pub host_ceiling: u64,
+    /// Manifest `[limits]` declaration, if present.
+    pub manifest: Option<u64>,
+    /// User file global default, if present.
+    pub user_default: Option<u64>,
+    /// User file per-plugin override, if present.
+    pub user_plugin: Option<u64>,
+    /// Effective value, absent when the budget file was rejected.
+    pub effective: Option<u64>,
+    /// Layer that determined `effective`.
+    pub source: Option<&'static str>,
+}
+
 /// Read-only inspection result for one plugin's settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginConfigReport {
@@ -4383,6 +4404,12 @@ pub struct PluginConfigReport {
     pub dropped: Vec<String>,
     /// Whole-file rejection diagnostic, if any.
     pub file_error: Option<String>,
+    /// Effective execution budgets (host / manifest / user layers).
+    pub budgets: Vec<ConfigBudgetRow>,
+    /// Rejected `plugin-budgets.lua` diagnostic, if any.
+    pub budget_error: Option<String>,
+    /// Whether the advisory warning was capped by a tighter wall bound.
+    pub warning_capped_by_wall: bool,
 }
 
 /// Render a resolved/declared plain value as a single bounded token.
@@ -4458,6 +4485,7 @@ fn build_config_report(
         })
         .collect();
     rows.sort_by(|a, b| a.key.cmp(&b.key));
+    let (budgets, budget_error, warning_capped_by_wall) = budget_rows(config_dir, id, manifest);
     PluginConfigReport {
         id: id.to_string(),
         config_dir: config_dir.to_path_buf(),
@@ -4469,7 +4497,106 @@ fn build_config_report(
         rows,
         dropped: loaded.dropped,
         file_error: loaded.file_error,
+        budgets,
+        budget_error,
+        warning_capped_by_wall,
     }
+}
+
+/// Build the effective-budget rows for `config show` (bitty#2304).
+///
+/// Reads the same `plugin-budgets.lua` the runtime loads. A rejected file
+/// yields the host/manifest rows with no effective column plus the bounded
+/// error; the command then exits non-zero after printing the report.
+fn budget_rows(
+    config_dir: &Path,
+    id: &str,
+    manifest: &PluginManifest,
+) -> (Vec<ConfigBudgetRow>, Option<String>, bool) {
+    use bitty_plugin_host::budgets::{
+        BudgetCeilings, EffectiveBudgets, HOST_FUEL_INSTRUCTIONS_CEILING,
+        HOST_MEMORY_BYTES_CEILING, HOST_WALL_MS_CEILING, HOST_WARNING_MS_CEILING, PluginBudgetFile,
+    };
+    let ceilings = BudgetCeilings::HOST;
+    let loaded = crate::plugin_runtime::load_plugin_budget_overrides(Some(config_dir));
+    let (file, budget_error) = match loaded {
+        Ok(file) => (file.unwrap_or_else(PluginBudgetFile::default), None),
+        Err(error) => (PluginBudgetFile::default(), Some(error)),
+    };
+    let manifest_values = manifest.limits.budget_values();
+    let user_default = file.default;
+    let user_plugin = file.for_plugin(id);
+    let resolved: Option<EffectiveBudgets> = if budget_error.is_some() {
+        None
+    } else {
+        bitty_plugin_host::budgets::resolve_budgets(
+            id,
+            ceilings,
+            manifest_values,
+            user_default,
+            user_plugin,
+        )
+        .ok()
+    };
+    let mut rows = Vec::with_capacity(4);
+    for (
+        dimension,
+        host_ceiling,
+        manifest_value,
+        user_default_value,
+        user_plugin_value,
+        effective,
+        source,
+    ) in [
+        (
+            "fuel_instructions",
+            HOST_FUEL_INSTRUCTIONS_CEILING,
+            manifest_values.fuel_instructions,
+            user_default.fuel_instructions,
+            user_plugin.fuel_instructions,
+            resolved.map(|budgets| budgets.fuel_instructions),
+            resolved.map(|budgets| budgets.sources.fuel_instructions.as_str()),
+        ),
+        (
+            "wall_ms",
+            HOST_WALL_MS_CEILING,
+            manifest_values.wall_ms,
+            user_default.wall_ms,
+            user_plugin.wall_ms,
+            resolved.map(|budgets| budgets.wall_ms),
+            resolved.map(|budgets| budgets.sources.wall_ms.as_str()),
+        ),
+        (
+            "memory_bytes",
+            HOST_MEMORY_BYTES_CEILING as u64,
+            manifest_values.memory_bytes.map(|value| value as u64),
+            user_default.memory_bytes.map(|value| value as u64),
+            user_plugin.memory_bytes.map(|value| value as u64),
+            resolved.map(|budgets| budgets.memory_bytes as u64),
+            resolved.map(|budgets| budgets.sources.memory_bytes.as_str()),
+        ),
+        (
+            "warning_ms",
+            HOST_WARNING_MS_CEILING,
+            manifest_values.warning_ms,
+            user_default.warning_ms,
+            user_plugin.warning_ms,
+            resolved.map(|budgets| budgets.warning_ms),
+            resolved.map(|budgets| budgets.sources.warning_ms.as_str()),
+        ),
+    ] {
+        rows.push(ConfigBudgetRow {
+            dimension,
+            host_ceiling,
+            manifest: manifest_value,
+            user_default: user_default_value,
+            user_plugin: user_plugin_value,
+            effective,
+            source,
+        });
+    }
+    let caught = resolved.is_some_and(|budgets| budgets.warning_capped_by_wall);
+    (rows, budget_error, caught)
 }
 
 fn presence(exists: bool) -> &'static str {
@@ -4561,6 +4688,33 @@ fn format_config_table(report: &PluginConfigReport, no_color: bool) -> String {
     if let Some(error) = &report.file_error {
         let _ = writeln!(out, "\n  file error: {error}");
     }
+    out.push('\n');
+    let budget_header = format!(
+        "{:<20} {:<13} {:<10} {:<13} {:<12} {:<12} {}",
+        "BUDGET", "HOST CEILING", "MANIFEST", "USER-DEFAULT", "USER-PLUGIN", "EFFECTIVE", "SOURCE"
+    );
+    let _ = writeln!(out, "{}", bold(&budget_header, color));
+    let render =
+        |value: Option<u64>| value.map_or_else(|| "-".to_string(), |value| value.to_string());
+    for row in &report.budgets {
+        let _ = writeln!(
+            out,
+            "{:<20} {:<13} {:<10} {:<13} {:<12} {:<12} {}",
+            row.dimension,
+            row.host_ceiling,
+            render(row.manifest),
+            render(row.user_default),
+            render(row.user_plugin),
+            render(row.effective),
+            row.source.unwrap_or("-")
+        );
+    }
+    if report.warning_capped_by_wall {
+        out.push_str("  note: warning_ms capped at wall_ms - 1 by the tighter wall bound\n");
+    }
+    if let Some(error) = &report.budget_error {
+        let _ = writeln!(out, "\n  budget file error: {error}");
+    }
     out
 }
 
@@ -4629,6 +4783,42 @@ pub fn format_config_envelope(report: &PluginConfigReport) -> String {
     }
     out.push_str("],\"file_error\":");
     match &report.file_error {
+        Some(error) => {
+            let _ = write!(out, "\"{}\"", json_escape(error));
+        }
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"budgets\":[");
+    for (index, row) in report.budgets.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let optional = |value: Option<u64>| {
+            value.map_or_else(|| "null".to_string(), |value| value.to_string())
+        };
+        let _ = write!(
+            out,
+            "{{\"dimension\":\"{}\",\"host_ceiling\":{},\"manifest\":{},\"user_default\":{},\"user_plugin\":{},\"effective\":{},\"source\":{}}}",
+            row.dimension,
+            row.host_ceiling,
+            optional(row.manifest),
+            optional(row.user_default),
+            optional(row.user_plugin),
+            optional(row.effective),
+            match row.source {
+                Some(source) => format!("\"{}\"", json_escape(source)),
+                None => "null".to_string(),
+            }
+        );
+    }
+    out.push_str("],\"warning_capped_by_wall\":");
+    out.push_str(if report.warning_capped_by_wall {
+        "true"
+    } else {
+        "false"
+    });
+    out.push_str(",\"budget_error\":");
+    match &report.budget_error {
         Some(error) => {
             let _ = write!(out, "\"{}\"", json_escape(error));
         }
@@ -5531,6 +5721,13 @@ pub fn run_plugin_subcommand(
                     if let Some(error) = &report.file_error {
                         eprintln!(
                             "bitty plugin: ConfigRejected: settings file for '{id}' was \
+                             rejected: {error}"
+                        );
+                        return EXIT_PLUGIN;
+                    }
+                    if let Some(error) = &report.budget_error {
+                        eprintln!(
+                            "bitty plugin: BudgetRejected: budget file for '{id}' was \
                              rejected: {error}"
                         );
                         return EXIT_PLUGIN;

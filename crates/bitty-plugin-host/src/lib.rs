@@ -141,6 +141,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audio;
+pub mod budgets;
 pub mod bundled;
 pub mod capability;
 pub mod consent_profile;
@@ -180,6 +181,13 @@ pub use audio::{
     parse_active_port, parse_default_sink, parse_sink_mute, parse_sink_volume,
     read_default_sink_argv, read_mute_argv, read_volume_argv, resample_levels, set_volume_argv,
     spectrum_poll_value_count, spectrum_response_bytes, toggle_mute_argv,
+};
+pub use budgets::{
+    BUDGET_FILE_NAME, BudgetCeilings, BudgetSource, BudgetSources, BudgetValues, EffectiveBudgets,
+    HOST_FUEL_INSTRUCTIONS_CEILING, HOST_MEMORY_BYTES_CEILING, HOST_WALL_MS_CEILING,
+    HOST_WARNING_MS_CEILING, MAX_BUDGET_FILE_BYTES, MAX_BUDGET_FILE_LINE_BYTES,
+    MAX_BUDGET_FILE_LINES, MAX_BUDGET_PLUGINS, PluginBudgetFile, parse_budget_file,
+    resolve_budgets,
 };
 pub use capability::{
     CapabilityCatalog, CapabilityFamily, CapabilityId, effect_statement, effect_statement_with,

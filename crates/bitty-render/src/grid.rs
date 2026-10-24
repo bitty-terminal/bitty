@@ -707,7 +707,7 @@ pub fn cursor_fill(
     cols: usize,
     rows: usize,
 ) -> Option<FillRect> {
-    cursor_fill_in(&ThemePalette::bitty_dark(), cursor, cell, cols, rows)
+    cursor_fill_in_for_width(&ThemePalette::bitty_dark(), cursor, cell, 1, cols, rows)
 }
 
 /// Theme-aware [`cursor_fill`]: the emitted fill carries `palette.cursor`.
@@ -716,6 +716,29 @@ pub fn cursor_fill_in(
     palette: &ThemePalette,
     cursor: &bitty_term_state::Cursor,
     cell: CellMetrics,
+    cols: usize,
+    rows: usize,
+) -> Option<FillRect> {
+    cursor_fill_in_for_width(palette, cursor, cell, 1, cols, rows)
+}
+
+/// Theme-aware cursor fill whose block/underline span follows the owned grid
+/// cell width.
+///
+/// A terminal cursor column is a logical grid column, while a wide grapheme
+/// owns its leading column and the following continuation column.  The
+/// default [`cursor_fill`] API remains one-cell wide for callers that do not
+/// have a snapshot cell; renderers that do have one must pass its `width`
+/// here.  Bar cursors intentionally remain a thin one-cell strip, matching
+/// DEC cursor geometry, while block and underline cursors cover the entire
+/// grapheme.  Invalid widths fail closed to one cell and a wide lead at the
+/// right edge is clipped to the grid.
+#[must_use]
+pub fn cursor_fill_in_for_width(
+    palette: &ThemePalette,
+    cursor: &bitty_term_state::Cursor,
+    cell: CellMetrics,
+    cursor_cell_width: u8,
     cols: usize,
     rows: usize,
 ) -> Option<FillRect> {
@@ -729,12 +752,16 @@ pub fn cursor_fill_in(
     if row >= rows || col >= cols {
         return None;
     }
+    let logical_width = u64::from(cursor_cell_width.clamp(1, 2));
+    let available = cols.saturating_sub(col).max(1) as u64;
+    let span_cells = logical_width.min(available);
+    let span_px = saturating_u32(span_cells.saturating_mul(u64::from(cell.width)));
     let base_x = saturating_i32(u64::from(col as u32).saturating_mul(u64::from(cell.width)));
     let base_y = saturating_i32(u64::from(row as u32).saturating_mul(u64::from(cell.height)));
     let thickness = cursor_thickness(cell);
     let rect = match cursor.cursor_style {
         CursorStyle::Default | CursorStyle::BlinkingBlock | CursorStyle::SteadyBlock => {
-            RectPx::new(base_x, base_y, cell.width, cell.height)
+            RectPx::new(base_x, base_y, span_px, cell.height)
         }
         CursorStyle::BlinkingBar | CursorStyle::SteadyBar => {
             RectPx::new(base_x, base_y, thickness, cell.height)
@@ -742,7 +769,7 @@ pub fn cursor_fill_in(
         CursorStyle::BlinkingUnderline | CursorStyle::SteadyUnderline => RectPx::new(
             base_x,
             base_y.saturating_add(cell.height.saturating_sub(thickness) as i32),
-            cell.width,
+            span_px,
             thickness,
         ),
     };

@@ -208,14 +208,14 @@ impl From<RenderPresentStats> for PresentStats {
 /// `bitty_platform::WindowHandle::set_ime_cursor_area` so the OS
 /// preedit/candidate window anchors at the terminal cursor cell. Coordinates
 /// are window-relative physical pixels, already DPI-scaled through the live
-/// cell metrics; the rect spans one cursor cell.
+/// cell metrics; the rect spans the cursor's owned cell width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImeCursorArea {
     /// Window-relative physical x of the caret cell's left edge.
     pub x: i32,
     /// Window-relative physical y of the caret cell's top edge.
     pub y: i32,
-    /// Caret cell width in physical pixels (>= 1).
+    /// Caret cell width in physical pixels (>= 1; two cells for a wide lead).
     pub width: u32,
     /// Caret cell height in physical pixels (>= 1).
     pub height: u32,
@@ -305,8 +305,43 @@ struct CursorPaint {
     rows: usize,
     /// Cell columns between the caret and the pane's right edge (>= 1).
     cells_available: u16,
-    /// Whether the cursor cell is the trailing half of a wide char.
-    on_spacer: bool,
+    /// Width owned by the cursor's leading cell (one or two terminal cells).
+    /// A cursor position that arrives on a continuation cell is normalized to
+    /// its lead while keeping this width, so block/underline geometry covers
+    /// the complete grapheme without changing Terminal Truth.
+    cell_width: u8,
+}
+
+/// Resolves the visual owner of a snapshot cursor without mutating terminal
+/// state. Terminal Truth normally keeps the cursor off continuation cells,
+/// but replay fixtures and external snapshot producers can still expose a
+/// trailing coordinate. Rendering paints the lead in that case, rather than
+/// leaving a one-cell cursor on the right half of a wide glyph.
+fn normalize_cursor_cell(cursor: &mut bitty_term_state::Cursor, snapshot: &Snapshot) -> u8 {
+    let row = usize::from(cursor.position.row);
+    let col = usize::from(cursor.position.col);
+    let Some(cell) = snapshot
+        .cells
+        .get(row.saturating_mul(snapshot.width).saturating_add(col))
+    else {
+        return 1;
+    };
+    if cell.spacer && col > 0 {
+        cursor.position.col -= 1;
+        return 2;
+    }
+    cell.width.clamp(1, 2)
+}
+
+/// Normalizes a cursor from a retained pane against the grid that owns it.
+/// The primary snapshot is only the fallback for the primary runtime cursor;
+/// split panes can have different glyph ownership at the same coordinate.
+fn normalize_reused_cursor_cell(
+    cursor: &mut bitty_term_state::Cursor,
+    pane_snapshot: Option<&Snapshot>,
+    primary_snapshot: &Snapshot,
+) -> u8 {
+    normalize_cursor_cell(cursor, pane_snapshot.unwrap_or(primary_snapshot))
 }
 
 /// One frame's combined leaf primitives, built in a retryable pass.
@@ -506,7 +541,8 @@ fn cursor_occluded_by_floats(
         px_offset_cells(paint.origin_x, paint.cursor.position.col, cell[0]),
         px_offset_cells(paint.origin_y, paint.cursor.position.row, cell[1]),
     ];
-    glyph_occluded_by_floats(dest, cell, occluders)
+    let width = cell[0].saturating_mul(u32::from(paint.cell_width.clamp(1, 2)));
+    glyph_occluded_by_floats(dest, [width, cell[1]], occluders)
 }
 
 /// CTX-1181 (#2041): upper bound on occlusion pieces per image blit.
@@ -2012,13 +2048,19 @@ impl Runtime {
         origin_x: i32,
         origin_y: i32,
     ) -> Option<CursorPaint> {
-        let (mut cursor, base_height) = match self.pane_sessions.get(&view_id) {
-            Some(sess) => (sess.state.cursor().clone(), sess.state.height()),
-            None => (snapshot.cursor.clone(), snapshot.height),
+        let (mut cursor, base_height, pane_snapshot) = match self.pane_sessions.get(&view_id) {
+            Some(sess) => (
+                sess.state.cursor().clone(),
+                sess.state.height(),
+                Some(sess.state.snapshot()),
+            ),
+            None => (snapshot.cursor.clone(), snapshot.height, None),
         };
         if !cursor.visible {
             return None;
         }
+        let cell_width =
+            normalize_reused_cursor_cell(&mut cursor, pane_snapshot.as_ref(), snapshot);
         let rows = usize::from(frame.rows);
         let cols = usize::from(frame.cols);
         let start = cursor_follow_window_start(usize::from(cursor.position.row), base_height, rows);
@@ -2028,9 +2070,6 @@ impl Runtime {
             return None;
         }
         let cells_available = frame.cols.saturating_sub(cursor.position.col).max(1);
-        // `State` steps the cursor off any spacer half after every action
-        // batch and resize (`enforce_cursor_invariants`), so a reused leaf
-        // needs no cell probe to resolve the spacer flag.
         Some(CursorPaint {
             origin_x,
             origin_y,
@@ -2038,7 +2077,7 @@ impl Runtime {
             cols,
             rows,
             cells_available,
-            on_spacer: false,
+            cell_width,
         })
     }
 
@@ -2063,7 +2102,7 @@ impl Runtime {
             area: ImeCursorArea {
                 x: px_offset_cells(paint.origin_x, paint.cursor.position.col, live.width),
                 y: px_offset_cells(paint.origin_y, paint.cursor.position.row, live.height),
-                width: live.width.max(1),
+                width: px_span(paint.cell_width.clamp(1, 2).into(), live.width).max(1),
                 height: live.height.max(1),
             },
             cells_available: paint.cells_available,
@@ -2081,7 +2120,7 @@ impl Runtime {
     ///
     /// Layer contract (S7): kitty blits keep their 32-blit / 64-MiB
     /// per-frame budget, and the cursor overlay is not counted in it — the
-    /// only cursor cost is the pre-existing 1-cell overlay fill (no new
+    /// only cursor cost is the pre-existing bounded overlay fill (no new
     /// allocation; the punch zeroes owned blit bytes in place). Selection,
     /// banner, scrollbar, and hint fills keep their overlay order under
     /// the kitty layer; only the focused cursor is topmost. The unfocused
@@ -2096,9 +2135,6 @@ impl Runtime {
         if !self.focused {
             return false;
         }
-        if paint.on_spacer {
-            return false;
-        }
         let live = self.live_cell_metrics();
         // DECSCUSR shape comes from the shared render primitive
         // (`bitty_render::grid::cursor_fill`: block = full cell, bar = left
@@ -2106,10 +2142,11 @@ impl Runtime {
         // ghostty/alacritty refs). Geometry is shared; the overlay hue is
         // the resolved theme cursor (CTX-0355) so the live cursor matches
         // the selected preset (CTX-0219: no hardcoded white).
-        if let Some(fill) = bitty_render::grid::cursor_fill_in(
+        if let Some(fill) = bitty_render::grid::cursor_fill_in_for_width(
             &self.config.theme,
             &paint.cursor,
             live,
+            paint.cell_width,
             paint.cols,
             paint.rows,
         ) {
@@ -3333,20 +3370,17 @@ impl Runtime {
                     if (cur.row as usize) < view_snapshot.height
                         && (cur.col as usize) < view_snapshot.width
                     {
-                        let idx = cur.row as usize * view_snapshot.width + cur.col as usize;
-                        let on_spacer = view_snapshot
-                            .cells
-                            .get(idx)
-                            .map(|c| c.spacer)
-                            .unwrap_or(false);
+                        let mut cursor = view_snapshot.cursor.clone();
+                        let cell_width = normalize_cursor_cell(&mut cursor, &view_snapshot);
+                        let cells_available = frame.cols.saturating_sub(cursor.position.col).max(1);
                         let paint = CursorPaint {
                             origin_x: origin_px_x,
                             origin_y: origin_px_y,
-                            cursor: view_snapshot.cursor.clone(),
+                            cursor,
                             cols: view_snapshot.width,
                             rows: view_snapshot.height,
-                            cells_available: frame.cols.saturating_sub(cur.col).max(1),
-                            on_spacer,
+                            cells_available,
+                            cell_width,
                         };
                         // CTX-1173 (#2031): same higher-float occluder as the
                         // reuse path and the CTX-1165 glyph filter. A cursor
@@ -6539,7 +6573,15 @@ mod atlas_epoch_guard_tests {
 
 #[cfg(test)]
 mod present_origin_tests {
-    use super::{px_add, px_offset_cells, px_side, px_span, px_span_usize};
+    use super::{
+        normalize_cursor_cell, normalize_reused_cursor_cell, px_add, px_offset_cells, px_side,
+        px_span, px_span_usize,
+    };
+    #[cfg(unix)]
+    use crate::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, View, ViewId};
+    use bitty_term_state::{State, TerminalAction};
+    #[cfg(unix)]
+    use bitty_test_support::require_pty;
 
     #[test]
     fn origins_are_exact_on_normal_config() {
@@ -6564,6 +6606,120 @@ mod present_origin_tests {
         assert_eq!(px_span(u16::MAX, u32::MAX), u32::MAX);
         assert_eq!(px_span_usize(usize::MAX, u32::MAX), u32::MAX);
         assert_eq!(px_side(u32::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn trailing_wide_cursor_normalizes_to_lead_without_changing_grid_truth() {
+        let mut state = State::new();
+        state.apply(&TerminalAction::Print(bitty_vt::GraphemeCell::from('中')));
+        let mut snapshot = state.snapshot();
+        snapshot.cursor.position.col = 1;
+        let mut cursor = snapshot.cursor.clone();
+        let width = normalize_cursor_cell(&mut cursor, &snapshot);
+        assert_eq!(cursor.position.col, 0);
+        assert_eq!(width, 2);
+        assert!(!snapshot.cells[0].spacer);
+        assert!(snapshot.cells[1].spacer);
+    }
+
+    #[test]
+    fn narrow_cursor_keeps_one_cell_owner() {
+        let mut state = State::new();
+        state.apply(&TerminalAction::Print(bitty_vt::GraphemeCell::from('A')));
+        let snapshot = state.snapshot();
+        let mut cursor = snapshot.cursor.clone();
+        cursor.position.col = 0;
+        assert_eq!(normalize_cursor_cell(&mut cursor, &snapshot), 1);
+        assert_eq!(cursor.position.col, 0);
+    }
+
+    #[test]
+    fn reused_cursor_uses_focused_pane_snapshot_for_cell_ownership() {
+        use bitty_vt::GraphemeCell;
+
+        let mut pane_state = State::new();
+        pane_state.apply(&TerminalAction::Print(GraphemeCell::from('中')));
+        let mut pane_snapshot = pane_state.snapshot();
+        pane_snapshot.cursor.position.col = 0;
+
+        let mut primary_state = State::new();
+        primary_state.apply(&TerminalAction::Print(GraphemeCell::from('A')));
+        let primary_snapshot = primary_state.snapshot();
+
+        let mut cursor = pane_snapshot.cursor.clone();
+        assert_eq!(
+            normalize_reused_cursor_cell(&mut cursor, Some(&pane_snapshot), &primary_snapshot,),
+            2,
+            "a retained pane wide glyph owns both pane cells"
+        );
+        assert_eq!(cursor.position.col, 0);
+
+        let mut narrow_pane_state = State::new();
+        narrow_pane_state.apply(&TerminalAction::Print(GraphemeCell::from('B')));
+        let narrow_pane_snapshot = narrow_pane_state.snapshot();
+        let mut primary_wide_state = State::new();
+        primary_wide_state.apply(&TerminalAction::Print(GraphemeCell::from('中')));
+        let primary_wide_snapshot = primary_wide_state.snapshot();
+        let mut cursor = narrow_pane_snapshot.cursor.clone();
+        cursor.position.col = 0;
+        assert_eq!(
+            normalize_reused_cursor_cell(
+                &mut cursor,
+                Some(&narrow_pane_snapshot),
+                &primary_wide_snapshot,
+            ),
+            1,
+            "a retained pane narrow glyph must not inherit primary width"
+        );
+        assert_eq!(cursor.position.col, 0);
+
+        // A continuation coordinate in the pane must move to that pane's
+        // leading cell even when the primary grid has no continuation there.
+        pane_snapshot.cursor.position.col = 1;
+        let mut cursor = pane_snapshot.cursor.clone();
+        assert_eq!(
+            normalize_reused_cursor_cell(&mut cursor, Some(&pane_snapshot), &primary_snapshot,),
+            2
+        );
+        assert_eq!(cursor.position.col, 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn retained_pane_cursor_repaint_uses_pane_grid_for_wide_cell() {
+        require_pty!();
+        let mut runtime = Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime must build");
+        let pane = ViewId::new(2);
+        runtime.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(pane, 40, 24)),
+        ));
+        runtime
+            .spawn_shell_for_view(pane, "/bin/sh", &[], 40, 24)
+            .expect("pane shell must spawn");
+
+        // Keep the primary grid narrow at the coordinate while the pane owns
+        // a wide glyph there. The first tick establishes the retained pane;
+        // only the subsequent cursor move should use the reuse path.
+        runtime.handle_pty_bytes(b"A\x1b[1;1H");
+        runtime.handle_pane_bytes(pane, "中".as_bytes());
+        runtime.tick().expect("initial split frame must present");
+        runtime.handle_pane_bytes(pane, b"\x1b[1;1H");
+
+        let frame = runtime
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == pane)
+            .expect("pane frame must be retained");
+        let primary_snapshot = runtime.snapshot();
+        let paint = runtime
+            .reused_cursor_paint(&frame, pane, &primary_snapshot, 0, 0)
+            .expect("visible pane cursor must repaint");
+        assert_eq!(paint.cursor.position.col, 0);
+        assert_eq!(paint.cell_width, 2);
     }
 }
 

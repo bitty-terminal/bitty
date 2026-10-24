@@ -1745,6 +1745,104 @@ fn cursor_fill_shapes_per_decscusr() {
 }
 
 #[test]
+fn cursor_fill_wide_lead_covers_both_owned_cells() {
+    use super::{DEFAULT_CURSOR, ThemePalette, cursor_fill_in_for_width};
+    use bitty_term_state::{Cursor, CursorPosition, CursorStyle};
+
+    let cursor = Cursor {
+        position: CursorPosition { row: 0, col: 2 },
+        visible: true,
+        cursor_style: CursorStyle::SteadyBlock,
+        ..Cursor::default()
+    };
+    let fill = cursor_fill_in_for_width(
+        &ThemePalette::bitty_dark(),
+        &cursor,
+        cell_metrics(),
+        2,
+        80,
+        24,
+    )
+    .expect("wide cursor visible");
+    assert_eq!(fill.rect, crate::geometry::RectPx::new(16, 0, 16, 16));
+    assert_eq!(fill.color, DEFAULT_CURSOR);
+
+    // Thin cursor styles keep their one-cell geometry even when the cell
+    // under the logical cursor owns a continuation cell.
+    let bar = cursor_fill_in_for_width(
+        &ThemePalette::bitty_dark(),
+        &Cursor {
+            cursor_style: CursorStyle::SteadyBar,
+            ..cursor.clone()
+        },
+        cell_metrics(),
+        2,
+        80,
+        24,
+    )
+    .expect("wide bar visible");
+    assert_eq!(bar.rect.width, 1);
+
+    let underline = cursor_fill_in_for_width(
+        &ThemePalette::bitty_dark(),
+        &Cursor {
+            cursor_style: CursorStyle::SteadyUnderline,
+            ..cursor
+        },
+        cell_metrics(),
+        2,
+        80,
+        24,
+    )
+    .expect("wide underline visible");
+    assert_eq!(underline.rect.width, 16);
+}
+
+#[test]
+fn cursor_fill_wide_lead_clips_at_right_edge() {
+    use super::{ThemePalette, cursor_fill_in_for_width};
+    use bitty_term_state::{Cursor, CursorPosition};
+
+    let cursor = Cursor {
+        position: CursorPosition { row: 0, col: 3 },
+        visible: true,
+        ..Cursor::default()
+    };
+    let fill = cursor_fill_in_for_width(
+        &ThemePalette::bitty_dark(),
+        &cursor,
+        cell_metrics(),
+        2,
+        4,
+        1,
+    )
+    .expect("edge cursor visible");
+    assert_eq!(fill.rect, crate::geometry::RectPx::new(24, 0, 8, 16));
+}
+
+#[test]
+fn wide_snapshot_cursor_fixture_keeps_continuation_metadata() {
+    let mut state = State::new();
+    state.apply(&TerminalAction::Print(GraphemeCell::from('中')));
+    let mut snapshot = state.snapshot();
+    // The real state invariant keeps the cursor on the next logical column.
+    // The fixture also exercises a replayed snapshot whose cursor points at
+    // the trailing cell; the runtime normalizes that presentation-only case.
+    assert_eq!(snapshot.cursor.position.col, 2);
+    assert_eq!(snapshot.cells[0].width, 2);
+    assert!(!snapshot.cells[0].spacer);
+    assert!(snapshot.cells[1].spacer);
+    snapshot.cursor.position.col = 1;
+    let width = snapshot
+        .cells
+        .get(snapshot.cursor.position.col as usize)
+        .map(|cell| if cell.spacer { 2 } else { cell.width })
+        .unwrap_or(1);
+    assert_eq!(width, 2);
+    assert!(snapshot.cells[1].spacer, "trailing ownership must survive");
+}
+
+#[test]
 fn demo_green_resolves_to_theme_green() {
     // The synthetic demo pump emits `\x1b[32m` (Indexed 2). Render must map
     // it to the preset green, not a hardcoded ad-hoc green.

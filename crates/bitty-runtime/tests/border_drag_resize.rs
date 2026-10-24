@@ -96,6 +96,24 @@ fn assert_partition(rt: &Runtime, bounds: UiRect) {
     }
 }
 
+/// Gapped tiling leaves reserved divider bands uncovered but never overlap or
+/// escape the container.
+fn assert_gapped_partition(rt: &Runtime, bounds: UiRect) {
+    let alloc = rt.layout_allocations();
+    for (i, (id, rect)) in alloc.iter().enumerate() {
+        assert!(
+            rect.right() <= bounds.right() && rect.bottom() <= bounds.bottom(),
+            "p{id:?} escapes the container: {rect:?}"
+        );
+        for (other_id, other) in alloc.iter().skip(i + 1) {
+            assert!(
+                rect.intersection(*other).is_none(),
+                "p{id:?} overlaps p{other_id:?}: {rect:?} vs {other:?}"
+            );
+        }
+    }
+}
+
 fn set_modifiers(rt: &mut Runtime, shift: bool, alt: bool) {
     rt.handle_platform_event(PlatformEvent::Window {
         window_id: WindowId::from_raw_public(1),
@@ -746,6 +764,74 @@ fn second_child_t_junction_with_gaps_keeps_inflated_cross_ownership() {
         assert!(!rt.border_drag_active());
     }
 }
+fn nested_same_axis_horizontal() -> LayoutNode {
+    LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.6,
+        LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.75,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+        ),
+        LayoutNode::leaf(View::new(ViewId::new(3), 40, 24)),
+    )
+}
+
+fn nested_same_axis_vertical() -> LayoutNode {
+    LayoutNode::split(
+        SplitAxis::Vertical,
+        0.75,
+        LayoutNode::split(
+            SplitAxis::Vertical,
+            0.75,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 12)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 12)),
+        ),
+        LayoutNode::leaf(View::new(ViewId::new(3), 80, 12)),
+    )
+}
+
+#[test]
+fn zero_delta_drag_preserves_floor_allocated_nested_minimum() {
+    let mut rt = make_runtime();
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        LayoutNode::MIN_RATIO,
+        LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 10, 4)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 10, 4)),
+        ),
+        LayoutNode::leaf(View::new(ViewId::new(3), 91, 8)),
+    ));
+    rt.set_container(UiRect::new(0, 0, 101, 8));
+    rt.reflow_layout();
+
+    let before = rt.layout_allocations();
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 10, 4));
+    assert_eq!(pane(&rt, 2), UiRect::new(0, 4, 10, 4));
+    assert_eq!(pane(&rt, 3), UiRect::new(10, 0, 91, 8));
+    let ids = rt.layout().leaf_ids();
+    let focus = rt.focused_view();
+
+    rt.handle_cursor_moved(cell_pixels(9, 3));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+
+    // A no-op motion must preserve the press-time allocation exactly. With
+    // usable=101, the floor allocation at MIN_RATIO is 10 cells.
+    rt.handle_cursor_moved(cell_pixels(9, 3));
+    assert_eq!(rt.layout_allocations(), before);
+    assert_eq!(rt.layout().leaf_ids(), ids);
+    assert_eq!(rt.focused_view(), focus);
+    assert!((rt.layout().split_ratio_at(&[]).unwrap() - LayoutNode::MIN_RATIO).abs() < 1e-6);
+    assert!(rt.border_drag_active());
+
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.border_drag_active());
+}
 
 #[test]
 fn junction_drag_grabs_cross_with_both_row_segments() {
@@ -954,6 +1040,108 @@ fn junction_drag_with_gaps_clamps_each_pane_to_10x4() {
     assert_eq!(pane(&rt, 4), UiRect::new(70, 20, 10, 4));
     rt.handle_mouse_input(release(MouseButton::Left));
     assert!(!rt.border_drag_active());
+}
+
+#[test]
+fn nested_root_horizontal_drag_clamps_active_ratio_without_mutating_structure() {
+    let mut rt = make_runtime();
+    rt.set_layout(nested_same_axis_horizontal());
+    let ids = rt.layout().leaf_ids();
+    let focus = rt.focused_view();
+    rt.handle_cursor_moved(cell_pixels(47, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+    rt.handle_cursor_moved(cell_pixels(0, 12));
+    assert_eq!(pane(&rt, 1).width, 27);
+    assert_eq!(pane(&rt, 2).width, 10);
+    assert_eq!(pane(&rt, 3).width, 43);
+    assert_partition(&rt, UiRect::new(0, 0, 80, 24));
+    assert_eq!(rt.layout().leaf_ids(), ids);
+    assert!((rt.layout().split_ratio_at(&[0]).expect("nested split") - 0.75).abs() < 1e-6);
+    assert_eq!(rt.focused_view(), focus);
+    for (_, rect) in rt.layout_allocations() {
+        assert!(rect.width >= bitty_runtime::MIN_PANE_COLS);
+        assert!(rect.height >= bitty_runtime::MIN_PANE_ROWS);
+    }
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn nested_root_vertical_drag_clamps_active_ratio_without_mutating_structure() {
+    let mut rt = make_runtime();
+    rt.set_layout(nested_same_axis_vertical());
+    let ids = rt.layout().leaf_ids();
+    let focus = rt.focused_view();
+    rt.handle_cursor_moved(cell_pixels(39, 17));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+    rt.handle_cursor_moved(cell_pixels(39, 0));
+    assert_eq!(pane(&rt, 1).height, 9);
+    assert_eq!(pane(&rt, 2).height, 4);
+    assert_eq!(pane(&rt, 3).height, 11);
+    assert_partition(&rt, UiRect::new(0, 0, 80, 24));
+    assert_eq!(rt.layout().leaf_ids(), ids);
+    assert!((rt.layout().split_ratio_at(&[0]).expect("nested split") - 0.75).abs() < 1e-6);
+    assert_eq!(rt.focused_view(), focus);
+    for (_, rect) in rt.layout_allocations() {
+        assert!(rect.width >= bitty_runtime::MIN_PANE_COLS);
+        assert!(rect.height >= bitty_runtime::MIN_PANE_ROWS);
+    }
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn nested_root_gapped_drag_clamps_both_axes_to_leaf_minimum() {
+    let mut rt = Runtime::new(RuntimeConfig {
+        gaps_in: 2,
+        gaps_out: 0,
+        ..RuntimeConfig::default()
+    })
+    .expect("gapped config must build");
+    rt.set_layout(nested_same_axis_horizontal());
+    let focus = rt.focused_view();
+    rt.handle_cursor_moved(cell_pixels(47, 12));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+    rt.handle_cursor_moved(cell_pixels(0, 12));
+    assert_eq!(pane(&rt, 1).width, 27);
+    assert_eq!(pane(&rt, 2).width, 10);
+    assert_eq!(pane(&rt, 3).width, 39);
+    assert_gapped_partition(&rt, UiRect::new(0, 0, 80, 24));
+    assert!((rt.layout().split_ratio_at(&[0]).expect("nested split") - 0.75).abs() < 1e-6);
+    assert_eq!(rt.focused_view(), focus);
+    for (_, rect) in rt.layout_allocations() {
+        assert!(rect.width >= bitty_runtime::MIN_PANE_COLS);
+        assert!(rect.height >= bitty_runtime::MIN_PANE_ROWS);
+    }
+    rt.handle_mouse_input(release(MouseButton::Left));
+}
+
+#[test]
+fn nested_root_gapped_vertical_drag_clamps_active_ratio_to_leaf_minimum() {
+    let mut rt = Runtime::new(RuntimeConfig {
+        gaps_in: 2,
+        gaps_out: 0,
+        ..RuntimeConfig::default()
+    })
+    .expect("gapped config must build");
+    rt.set_layout(nested_same_axis_vertical());
+    let focus = rt.focused_view();
+    rt.handle_cursor_moved(cell_pixels(39, 17));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+    rt.handle_cursor_moved(cell_pixels(39, 0));
+    assert_eq!(pane(&rt, 1).height, 9);
+    assert_eq!(pane(&rt, 2).height, 4);
+    assert_eq!(pane(&rt, 3).height, 7);
+    assert_gapped_partition(&rt, UiRect::new(0, 0, 80, 24));
+    assert!((rt.layout().split_ratio_at(&[0]).expect("nested split") - 0.75).abs() < 1e-6);
+    assert_eq!(rt.focused_view(), focus);
+    for (_, rect) in rt.layout_allocations() {
+        assert!(rect.width >= bitty_runtime::MIN_PANE_COLS);
+        assert!(rect.height >= bitty_runtime::MIN_PANE_ROWS);
+    }
+    rt.handle_mouse_input(release(MouseButton::Left));
 }
 
 #[test]

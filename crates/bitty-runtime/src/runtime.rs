@@ -866,6 +866,15 @@ pub struct Runtime {
     /// [`Runtime::selection_owner_state`](crate::Runtime) and fails closed
     /// when the owner is no longer a live leaf of the active layout.
     selection_state: Option<selection::SelectionState>,
+    /// Armed pointer-drag edge auto-scroll (issue #2470).
+    ///
+    /// `Some` only while a selection drag's pointer sits in the top or bottom
+    /// painted row and the owner still has room to scroll in that direction.
+    /// One bounded one-line step runs per
+    /// [`selection::SELECTION_AUTOSCROLL_INTERVAL`], and the embedder arms a
+    /// wake at [`Runtime::selection_autoscroll_deadline`] so a stationary
+    /// pointer keeps extending the selection under `ControlFlow::Wait`.
+    selection_autoscroll: Option<selection::SelectionAutoscroll>,
     /// Bounded multi-click tracker for word/line selection (CTX-0385).
     ///
     /// `O(1)` state (last press time, cell, button, count); the runtime is
@@ -1894,6 +1903,7 @@ impl Runtime {
             container,
             clipboard: make_clipboard(),
             selection_state: None,
+            selection_autoscroll: None,
             click_tracker: ClickTracker::new(),
             last_click_count: crate::runtime::click::CLICK_COUNT_MIN,
             copy_mode: None,
@@ -2184,6 +2194,7 @@ impl Runtime {
             container,
             clipboard: Clipboard::new(),
             selection_state: None,
+            selection_autoscroll: None,
             click_tracker: ClickTracker::new(),
             last_click_count: crate::runtime::click::CLICK_COUNT_MIN,
             copy_mode: None,

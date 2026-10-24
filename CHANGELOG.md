@@ -38,6 +38,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and reload remove the generation's chords, and colliding suggestions produce
   bounded warnings naming the deterministic winner and the shadowed command.
 
+### Fixed
+
+- **Copy-mode selection spans scrollback pages (#2470):** a visual selection is
+  no longer capped at the visible page. Wheel and page keys scroll the
+  transcript while a drag is in flight (the selection owns the wheel over PTY
+  mouse reporting; Shift still escapes capture), a pointer held in the top or
+  bottom painted row auto-scrolls one bounded line per interval, and the press
+  endpoint stays pinned by combined-buffer identity. Pruning is resolved by
+  eviction drift, so a committed multi-page range copies every line exactly and
+  denies (instead of silently copying different lines) once its anchored
+  history is gone. The mechanism stays in Core selection/history paging; the
+  copy-mode plugin remains a bounded snapshot policy over the same public
+  surfaces, and no private API is added.
+
 ## [0.0.27] - 2026-10-23
 
 ### Added

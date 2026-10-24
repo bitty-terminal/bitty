@@ -18,7 +18,9 @@ assert_grep() {
 }
 
 assert_grep "^Name:[[:space:]]+bitty$" "Name must be bitty"
-assert_grep "^Version:[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+" "Version must be semver"
+assert_grep "^%\{!\?version:%global version [0-9]+\.[0-9]+\.[0-9]+\}$" \
+  "spec must define an overridable default version"
+assert_grep "^Version:[[:space:]]+%\{version\}$" "Version must use the overridable version macro"
 assert_grep "^Release:[[:space:]]+1%\{\?dist\}$" "Release must follow standard 1%{?dist}"
 assert_grep "^Summary:[[:space:]]+" "Summary must be present"
 assert_grep "^License:[[:space:]]+MIT OR Apache-2.0$" "License must be MIT OR Apache-2.0"
@@ -32,6 +34,8 @@ assert_grep "^Provides:[[:space:]]+bitty-terminal[[:space:]]*=" "Provides must i
 assert_grep "^Requires:[[:space:]]+fontconfig" "Requires must include fontconfig"
 assert_grep "^Requires:[[:space:]]+freetype" "Requires must include freetype"
 assert_grep "^Requires:[[:space:]]+libgcc" "Requires must include libgcc"
+assert_grep "^BuildRequires:[[:space:]]+zstd$" "BuildRequires must include zstd for .tar.zst sources"
+assert_grep "^%global debug_package %\{nil\}$" "prebuilt payload must disable debuginfo"
 
 # Assert critical sections exist
 for section in "%description" "%prep" "%build" "%install" "%files" "%changelog"; do
@@ -53,6 +57,7 @@ assert_files() {
 
 assert_files "%license %\{_datadir\}/licenses/%\{name\}/LICENSE" "%files must contain %license path"
 assert_files "%doc %\{_docdir\}/%\{name\}/README\.md" "%files must contain %doc README path"
+assert_files "%doc %\{_docdir\}/%\{name\}/CHANGELOG\.md" "%files must contain %doc CHANGELOG path"
 assert_files "%\{_bindir\}/bitty" "%files must contain %{_bindir}/bitty"
 assert_files "%\{_datadir\}/applications/run\.bitty\.Bitty\.desktop" "%files must contain desktop file"
 assert_files "%\{_datadir\}/metainfo/run\.bitty\.Bitty\.metainfo\.xml" "%files must contain metainfo file"

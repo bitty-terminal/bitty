@@ -18,3 +18,7 @@ pub mod component_bridge;
 #[doc(hidden)]
 pub mod component_host;
 mod component_seed;
+#[doc(hidden)]
+pub mod storage_backends;
+#[doc(hidden)]
+pub mod storage_component_host;

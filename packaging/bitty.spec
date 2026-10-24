@@ -1,5 +1,10 @@
+# Release tooling overrides this for historical tags:
+#   rpmbuild -bs ... --define "version X.Y.Z"
+%{!?version:%global version 0.0.27}
+# The payload is a prebuilt release bundle; there is no local compilation.
+%global debug_package %{nil}
 Name:           bitty
-Version:        0.0.26
+Version:        %{version}
 Release:        1%{?dist}
 Summary:        Bitty pre-alpha terminal workspace minimal correct terminal
 License:        MIT OR Apache-2.0
@@ -12,6 +17,8 @@ Requires:       fontconfig
 Requires:       freetype
 Requires:       libgcc
 BuildRequires:  ncurses
+# %setup -a unpacks .tar.zst sources; rpmbuild shells out to zstd.
+BuildRequires:  zstd
 
 %description
 A programmable, microkernel terminal emulator built around a small Rust core
@@ -64,7 +71,8 @@ tic -x -o %{buildroot}%{_datadir}/terminfo terminfo/bitty.ti
 
 %files
 %license %{_datadir}/licenses/%{name}/LICENSE
-%doc %{_docdir}/%{name}/README.md %{_docdir}/%{name}/CHANGELOG.md
+%doc %{_docdir}/%{name}/README.md
+%doc %{_docdir}/%{name}/CHANGELOG.md
 %{_bindir}/bitty
 %{_datadir}/applications/run.bitty.Bitty.desktop
 %{_datadir}/metainfo/run.bitty.Bitty.metainfo.xml
@@ -72,5 +80,7 @@ tic -x -o %{buildroot}%{_datadir}/terminfo terminfo/bitty.ti
 %{_datadir}/terminfo/b/bitty
 
 %changelog
+* Sat Oct 24 2026 Bitty Maintainers <maintainers@bitty-terminal.dev> - 0.0.27-1
+- Release 0.0.27
 * Thu Oct 22 2026 Bitty Maintainers <maintainers@bitty-terminal.dev> - 0.0.26-1
 - Release 0.0.26

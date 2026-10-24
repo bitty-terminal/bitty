@@ -2324,6 +2324,7 @@ fn control_workspace_move_headless_no_elevation() {
     assert_eq!(rt.layout().leaf_count(), 2);
 }
 
+#[cfg(unix)]
 #[test]
 fn control_workspace_move_deleted_stable_id_fails_without_mutation() {
     // CTX-1521 / issue #2654: `ws:N` is a stable identity for ctl, not the
@@ -2333,9 +2334,15 @@ fn control_workspace_move_deleted_stable_id_fails_without_mutation() {
     // pane-session ownership; a later `workspace new` is the only operation
     // that may reuse the freed id.
     use bitty_runtime::{LayoutNode, SplitAxis, View, ViewId};
+    bitty_test_support::require_pty!();
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
     let all = bitty_ipc::ScopeSet::all();
+
+    // Attach the primary so workspace creation replays a real pane-session
+    // recipe, leaving ws3 with a live session after ws2 is deleted.
+    rt.spawn_shell_with_args("/bin/sh", &[])
+        .expect("primary shell must attach headless");
 
     assert!(
         apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli).ok,
@@ -2382,6 +2389,11 @@ fn control_workspace_move_deleted_stable_id_fails_without_mutation() {
     let active_before = rt.active_workspace_index();
     let focus_before = rt.focused_view();
     let sessions_before = rt.pane_session_ids();
+    assert_eq!(
+        sessions_before,
+        vec![ViewId::new(1), ViewId::new(3)],
+        "snapshot must include the surviving pane-session owners"
+    );
     let missing = apply_control_envelope(
         &mut rt,
         ipc_ctl::METHOD_MOVE_WORKSPACE,

@@ -1026,9 +1026,9 @@ impl LayoutNode {
         }
         // Cell bounds implied by the ratio clamp and the per-pane minima.
         // `split_rect_with_gap` floors `usable * ratio`, so the lower bound
-        // rounds up and the upper bound rounds down to stay inside the
-        // ratio range after the integer allocation.
-        let ratio_lo = (f64::from(LayoutNode::MIN_RATIO) * f64::from(usable)).ceil() as u32;
+        // must use the same allocation-compatible rounding. `min_first`
+        // still raises the bound when the first subtree needs more cells.
+        let ratio_lo = (f64::from(LayoutNode::MIN_RATIO) * f64::from(usable)).floor() as u32;
         let ratio_hi = (f64::from(LayoutNode::MAX_RATIO) * f64::from(usable)).floor() as u32;
         let lo = min_first.max(ratio_lo).max(1);
         let hi = (usable - min_second).min(ratio_hi).min(usable - 1);
@@ -4352,6 +4352,44 @@ mod tests {
         assert_eq!(rect(&alloc, 1), Rect::new(0, 0, 80, 9));
         assert_eq!(rect(&alloc, 2), Rect::new(0, 11, 80, 4));
         assert_eq!(rect(&alloc, 3), Rect::new(0, 17, 80, 7));
+    }
+
+    #[test]
+    fn zero_delta_drag_preserves_floor_allocated_nested_minimum() {
+        use crate::geometry::Gaps;
+
+        let bounds = Rect::new(0, 0, 101, 8);
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            LayoutNode::MIN_RATIO,
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(view(1, 10, 4)),
+                LayoutNode::leaf(view(2, 10, 4)),
+            ),
+            LayoutNode::leaf(view(3, 91, 8)),
+        );
+        let before = rects(&tree, bounds, Gaps::ZERO);
+        assert_eq!(rect(&before, 1), Rect::new(0, 0, 10, 4));
+        assert_eq!(rect(&before, 2), Rect::new(0, 4, 10, 4));
+        assert_eq!(rect(&before, 3), Rect::new(10, 0, 91, 8));
+
+        let ratio = tree
+            .drag_split_ratio(bounds, Gaps::ZERO, &[], LayoutNode::MIN_RATIO, 0)
+            .expect("zero-delta drag remains feasible at the nested minimum");
+        assert!((ratio - LayoutNode::MIN_RATIO).abs() < f32::EPSILON);
+
+        let mut next = tree;
+        assert!(next.set_split_ratio_at(&[], ratio));
+        assert_eq!(rects(&next, bounds, Gaps::ZERO), before);
+
+        let clamped = next
+            .drag_split_ratio(bounds, Gaps::ZERO, &[], ratio, -1)
+            .expect("nested minimum remains feasible");
+        assert!(next.set_split_ratio_at(&[], clamped));
+        assert_eq!(rect(&rects(&next, bounds, Gaps::ZERO), 1).width, 10);
+        assert_eq!(rect(&rects(&next, bounds, Gaps::ZERO), 2).width, 10);
     }
 
     #[test]

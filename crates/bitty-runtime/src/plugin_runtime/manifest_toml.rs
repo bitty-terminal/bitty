@@ -1623,6 +1623,16 @@ mod tests {
 
     #[test]
     fn limits_reject_bad_keys_values_and_types() {
+        let body = format!(
+            "{}\n[capabilities]\npanel.provider = true\n[limits]\nmax_everything = 4\n",
+            minimal_body("xuepoo.limbad")
+        );
+        let error = parse_manifest(body.as_bytes()).expect_err("unknown budget key");
+        assert!(
+            error.contains("unsupported limits.max_everything"),
+            "expected a precise budget field path for the unknown key: {error}"
+        );
+
         for fragment in [
             // Unknown key.
             "max_everything = 4\n",

@@ -504,6 +504,22 @@ fn enter_tab_backspace_keep_legacy_bytes_under_disambiguate() {
 }
 
 #[test]
+fn unnegotiated_enter_tab_backspace_keep_legacy_bytes() {
+    let mut rt = make_runtime();
+    for (key, expected) in [
+        (NamedKey::Enter, b"\r".as_slice()),
+        (NamedKey::Tab, b"\t".as_slice()),
+        (NamedKey::Backspace, b"\x7f".as_slice()),
+    ] {
+        assert_eq!(
+            rt.handle_key_event_ref(&named_key(key, PressState::Pressed)),
+            Some(expected.to_vec()),
+            "unnegotiated {key:?} must retain its legacy bytes"
+        );
+    }
+}
+
+#[test]
 fn shift_enter_is_distinct_only_after_kitty_negotiation() {
     let mut rt = make_runtime();
 

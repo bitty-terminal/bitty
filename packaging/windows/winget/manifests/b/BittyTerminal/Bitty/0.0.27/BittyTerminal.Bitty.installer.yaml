@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+
+PackageIdentifier: BittyTerminal.Bitty
+PackageVersion: 0.0.27
+MinimumOSVersion: 10.0.0.0
+InstallerType: inno
+Scope: user
+InstallModes:
+  - interactive
+  - silent
+  - silentWithProgress
+InstallerSwitches:
+  Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+  SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART
+UpgradeBehavior: install
+Commands:
+  - bitty
+ProductCode: "{3E8B4A2C-7F1D-4B6E-9A0C-5D2F8E1B7A40}_is1"
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://cdn.bitty.run/releases/v0.0.27/bitty-0.0.27-windows-x86_64-setup.exe
+    InstallerSha256: 6de07964fcf79c2b7410c80bbfe0001d920cde256473f8a4f28e980bc8e93ca8
+    AppsAndFeaturesEntries:
+      - DisplayName: Bitty
+        Publisher: Bitty Terminal
+        DisplayVersion: 0.0.27
+        ProductCode: "{3E8B4A2C-7F1D-4B6E-9A0C-5D2F8E1B7A40}_is1"
+ManifestType: installer
+ManifestVersion: 1.6.0

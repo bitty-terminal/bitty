@@ -1,6 +1,11 @@
 # bitty completion for Nushell (generated from the CLI grammar; do not edit).
 # Install: bitty completion nushell | save -f ~/.config/nushell/completions-bitty.nu
 #      then add `source ~/.config/nushell/completions-bitty.nu` to config.nu.
+# Limitation (issue #2575): Nushell extern signatures are static, so
+# `--profile` and `plugin enable|disable` complete only flags/words.
+# Dynamic profile/plugin values are available in Bash, Zsh, Fish, and
+# PowerShell; run `bitty +list-profiles` or
+# `bitty +list-plugins --installed` manually for the same local data.
 extern "bitty" [
     --help(-h)
     --version(-V)

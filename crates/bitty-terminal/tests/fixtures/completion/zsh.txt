@@ -2,14 +2,60 @@
 # bitty completion for Zsh (generated from the CLI grammar; do not edit).
 # Install: bitty completion zsh > ~/.zfunc/_bitty  (with ~/.zfunc on $fpath)
 #      or: eval "$(bitty completion zsh)" after the bitty binary is on PATH.
+# Dynamic values (`--profile`, `plugin enable|disable`, `config profile
+# show|use|path`) come from the hidden local helpers; failures are silent.
 _bitty_flag_takes_value() {
     case "$1" in
         --log-level|--split-ratio|--layout|--focus|--config|--profile|--theme|--font-family|--font-size|--opacity|--format|--socket|--instance|--scrollback|--close-confirm|--gaps-in|--gaps-out|--border|--radius|--plugins|--cwd|--env|--title|--scope|--terminal|--family|--cap|--iterations|--rows|--cols|--version|--digest|--distro) return 0 ;;
     esac
     return 1
 }
+_bitty_profiles() {
+    local value="$1"
+    local -a names
+    names=()
+    local line
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            names+=("$line")
+        fi
+    done < <(command bitty +list-profiles 2>/dev/null)
+    local name
+    for name in "${names[@]}"; do
+        if [[ "$name" == "$value"* ]]; then
+            compadd -- "$name"
+        fi
+    done
+}
+_bitty_installed_plugins() {
+    local value="$1"
+    local -a names
+    names=()
+    local line
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            names+=("$line")
+        fi
+    done < <(command bitty +list-plugins --installed 2>/dev/null)
+    local name
+    for name in "${names[@]}"; do
+        if [[ "$name" == "$value"* ]]; then
+            compadd -- "$name"
+        fi
+    done
+}
 _bitty() {
     local cur="${words[CURRENT]}"
+    if [[ "$cur" == --profile=* ]]; then
+        # Strip `--profile=` from the match context, then add bare values.
+        compset -P '*='
+        _bitty_profiles "${cur#--profile=}"
+        return 0
+    fi
+    if (( CURRENT > 1 )) && [[ "${words[CURRENT-1]}" == "--profile" ]]; then
+        _bitty_profiles "$cur"
+        return 0
+    fi
     local path=""
     local word
     local i
@@ -31,6 +77,20 @@ _bitty() {
                 ;;
         esac
     done
+    case "$path" in
+        "plugin enable"|"plugin disable")
+            if [[ "$cur" != -* ]]; then
+                _bitty_installed_plugins "$cur"
+                return 0
+            fi
+            ;;
+        "config profile show"|"config profile use"|"config profile path")
+            if [[ "$cur" != -* ]]; then
+                _bitty_profiles "$cur"
+                return 0
+            fi
+            ;;
+    esac
     local -a candidates
     candidates=()
     case "$path" in

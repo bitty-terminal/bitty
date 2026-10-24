@@ -1,12 +1,21 @@
 # bitty completion for Fish (generated from the CLI grammar; do not edit).
 # Install: bitty completion fish > ~/.config/fish/completions/bitty.fish
 #      or: bitty completion fish | source
+# Dynamic values (`--profile`, `plugin enable|disable`, `config profile
+# show|use|path`) come from the hidden local helpers; helper failures yield no
+# candidates and never print into the completion stream.
 function __bitty_flag_takes_value
     switch $argv[1]
         case --log-level --split-ratio --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --cwd --env --title --scope --terminal --family --cap --iterations --rows --cols --version --digest --distro
             return 0
     end
     return 1
+end
+function __bitty_profiles
+    command bitty +list-profiles 2>/dev/null
+end
+function __bitty_installed_plugins
+    command bitty +list-plugins --installed 2>/dev/null
 end
 function __bitty_path
     set -l tokens (commandline -opc)
@@ -40,6 +49,17 @@ function __bitty_path
     string join ' ' -- $path
 end
 function __bitty_complete
+    set -l cur (commandline -ct)
+    if string match -q -- '--profile=*' "$cur"
+        # Keep the `--profile=` prefix on every candidate.
+        __bitty_profiles | string replace -r -- '^' '--profile='
+        return 0
+    end
+    set -l raw_tokens (commandline -opc)
+    if test (count $raw_tokens) -gt 0; and test "$raw_tokens[-1]" = '--profile'
+        __bitty_profiles
+        return 0
+    end
     set -l path (__bitty_path)
     switch "$path"
         case ''
@@ -132,6 +152,14 @@ function __bitty_complete
             printf '%s\n' themes colors fonts plugins instances actions keymaps services --format --socket --instance --no-color --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
         case 'comp'
             printf '%s\n' bash zsh fish powershell nushell --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'plugin enable' 'plugin disable'
+            if not string match -q -- '-*' "$cur"
+                __bitty_installed_plugins
+            end
+        case 'config profile show' 'config profile use' 'config profile path'
+            if not string match -q -- '-*' "$cur"
+                __bitty_profiles
+            end
         case '*'
             return 0
     end

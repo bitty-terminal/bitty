@@ -1,5 +1,5 @@
 //! `bitty completion`: emit shell completion (CTX-0763, issue #1375;
-//! nested grammar from issue #2372).
+//! nested grammar from issue #2372; dynamic values from issue #2575).
 //!
 //! Canonical: `docs/specifications/cli-contract-rfc.md` (`bitty completion`,
 //! local class, Bash/Zsh/Fish/PowerShell/Nushell) with the stable `comp`
@@ -15,8 +15,15 @@
 //!   words, nested verbs such as `config profile`, `ctl workspace`,
 //!   `plugin config`, `extension`, `dev trace`, and per-command flags). The
 //!   grammar tree lives in [`crate::grammar`] and is built from the parser's
-//!   own tables, so a new verb reaches every shell at once. Dynamic
-//!   plugin-subtree entries derived from installed manifests are a follow-up.
+//!   own tables, so a new verb reaches every shell at once.
+//! - Dynamic values (issue #2575): Bash, Zsh, Fish, and PowerShell call the
+//!   hidden local helpers `bitty +list-profiles` and
+//!   `bitty +list-plugins --installed` for `--profile`/`--profile=`,
+//!   `bitty plugin enable|disable <id>`, and
+//!   `bitty config profile show|use|path <name>`. Handlers are read-only,
+//!   bounded, network-free, VM-free, and silent on failure (see
+//!   [`crate::candidates`]). Nushell extern signatures are static, so its
+//!   generated script documents the static fallback instead.
 //! - `--format` is accepted and ignored: completion emits a script, never the
 //!   output envelope. `--no-color` is accepted and ignored (scripts carry no
 //!   color). `--socket`/`--instance` combined with `completion` fail closed
@@ -213,20 +220,66 @@ fn value_flag_pattern(separator: &str) -> String {
     grammar::value_flags().join(separator)
 }
 
-/// Bash completion script (nested grammar, strict-mode safe, idempotent).
+/// Bash completion script (nested grammar + bounded dynamic values,
+/// strict-mode safe, idempotent).
 fn bash_script() -> String {
     format!(
         r#"# bitty completion for Bash (generated from the CLI grammar; do not edit).
 # Install: bitty completion bash > ~/.local/share/bash-completion/completions/bitty
 #      or: eval "$(bitty completion bash)" after the bitty binary is on PATH.
+# Static words come from the generated grammar. `--profile`, `plugin
+# enable|disable <id>`, and `config profile show|use|path <name>` also offer
+# local candidates from the hidden helpers (`+list-profiles`,
+# `+list-plugins --installed`); helper failures and malformed state yield no
+# candidates and never print into the completion stream.
 _bitty_flag_takes_value() {{
     case "$1" in
         {values}) return 0 ;;
     esac
     return 1
 }}
+_bitty_profiles() {{
+    local value="$1"
+    local out_prefix="$2"
+    local line
+    COMPREPLY=()
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+            "$value"*) COMPREPLY+=("${{out_prefix}}${{line}}") ;;
+        esac
+    done < <(command bitty +list-profiles 2>/dev/null)
+}}
+_bitty_installed_plugins() {{
+    local value="$1"
+    local line
+    COMPREPLY=()
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+            "$value"*) COMPREPLY+=("${{line}}") ;;
+        esac
+    done < <(command bitty +list-plugins --installed 2>/dev/null)
+}}
 _bitty_complete() {{
     local cur="${{COMP_WORDS[COMP_CWORD]:-}}"
+    COMPREPLY=()
+    local prev=""
+    if [ "$COMP_CWORD" -gt 0 ]; then
+        prev="${{COMP_WORDS[COMP_CWORD - 1]:-}}"
+    fi
+    # `--profile=<TAB>` keeps the `--profile=` prefix on each candidate.
+    case "$cur" in
+        --profile=*)
+            _bitty_profiles "${{cur#--profile=}}" "--profile="
+            return 0
+            ;;
+    esac
+    # `--profile <TAB>` completes the value slot, not a subcommand.
+    if [ "$prev" = "--profile" ]; then
+        _bitty_profiles "$cur" ""
+        return 0
+    fi
     local path=""
     local word
     local i
@@ -248,6 +301,27 @@ _bitty_complete() {{
                 ;;
         esac
     done
+    # Operand slots with local state; flags still come from the static arms.
+    case "$path" in
+        "plugin enable"|"plugin disable")
+            case "$cur" in
+                -*) ;;
+                *)
+                    _bitty_installed_plugins "$cur"
+                    return 0
+                    ;;
+            esac
+            ;;
+        "config profile show"|"config profile use"|"config profile path")
+            case "$cur" in
+                -*) ;;
+                *)
+                    _bitty_profiles "$cur" ""
+                    return 0
+                    ;;
+            esac
+            ;;
+    esac
     local candidates=""
     case "$path" in
 {arms}        *) return 0 ;;
@@ -263,21 +337,68 @@ complete -o default -F _bitty_complete bitty
     )
 }
 
-/// Zsh completion script (nested grammar, `no_unset` safe, idempotent).
+/// Zsh completion script (nested grammar + bounded dynamic values,
+/// `no_unset` safe, idempotent).
 fn zsh_script() -> String {
     format!(
         r#"#compdef bitty
 # bitty completion for Zsh (generated from the CLI grammar; do not edit).
 # Install: bitty completion zsh > ~/.zfunc/_bitty  (with ~/.zfunc on $fpath)
 #      or: eval "$(bitty completion zsh)" after the bitty binary is on PATH.
+# Dynamic values (`--profile`, `plugin enable|disable`, `config profile
+# show|use|path`) come from the hidden local helpers; failures are silent.
 _bitty_flag_takes_value() {{
     case "$1" in
         {values}) return 0 ;;
     esac
     return 1
 }}
+_bitty_profiles() {{
+    local value="$1"
+    local -a names
+    names=()
+    local line
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            names+=("$line")
+        fi
+    done < <(command bitty +list-profiles 2>/dev/null)
+    local name
+    for name in "${{names[@]}}"; do
+        if [[ "$name" == "$value"* ]]; then
+            compadd -- "$name"
+        fi
+    done
+}}
+_bitty_installed_plugins() {{
+    local value="$1"
+    local -a names
+    names=()
+    local line
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            names+=("$line")
+        fi
+    done < <(command bitty +list-plugins --installed 2>/dev/null)
+    local name
+    for name in "${{names[@]}}"; do
+        if [[ "$name" == "$value"* ]]; then
+            compadd -- "$name"
+        fi
+    done
+}}
 _bitty() {{
     local cur="${{words[CURRENT]}}"
+    if [[ "$cur" == --profile=* ]]; then
+        # Strip `--profile=` from the match context, then add bare values.
+        compset -P '*='
+        _bitty_profiles "${{cur#--profile=}}"
+        return 0
+    fi
+    if (( CURRENT > 1 )) && [[ "${{words[CURRENT-1]}}" == "--profile" ]]; then
+        _bitty_profiles "$cur"
+        return 0
+    fi
     local path=""
     local word
     local i
@@ -299,6 +420,20 @@ _bitty() {{
                 ;;
         esac
     done
+    case "$path" in
+        "plugin enable"|"plugin disable")
+            if [[ "$cur" != -* ]]; then
+                _bitty_installed_plugins "$cur"
+                return 0
+            fi
+            ;;
+        "config profile show"|"config profile use"|"config profile path")
+            if [[ "$cur" != -* ]]; then
+                _bitty_profiles "$cur"
+                return 0
+            fi
+            ;;
+    esac
     local -a candidates
     candidates=()
     case "$path" in
@@ -318,18 +453,28 @@ fi
     )
 }
 
-/// Fish completion script (nested grammar, non-interactive safe, idempotent).
+/// Fish completion script (nested grammar + bounded dynamic values,
+/// non-interactive safe, idempotent).
 fn fish_script() -> String {
     format!(
         r#"# bitty completion for Fish (generated from the CLI grammar; do not edit).
 # Install: bitty completion fish > ~/.config/fish/completions/bitty.fish
 #      or: bitty completion fish | source
+# Dynamic values (`--profile`, `plugin enable|disable`, `config profile
+# show|use|path`) come from the hidden local helpers; helper failures yield no
+# candidates and never print into the completion stream.
 function __bitty_flag_takes_value
     switch $argv[1]
         case {values}
             return 0
     end
     return 1
+end
+function __bitty_profiles
+    command bitty +list-profiles 2>/dev/null
+end
+function __bitty_installed_plugins
+    command bitty +list-plugins --installed 2>/dev/null
 end
 function __bitty_path
     set -l tokens (commandline -opc)
@@ -363,9 +508,28 @@ function __bitty_path
     string join ' ' -- $path
 end
 function __bitty_complete
+    set -l cur (commandline -ct)
+    if string match -q -- '--profile=*' "$cur"
+        # Keep the `--profile=` prefix on every candidate.
+        __bitty_profiles | string replace -r -- '^' '--profile='
+        return 0
+    end
+    set -l raw_tokens (commandline -opc)
+    if test (count $raw_tokens) -gt 0; and test "$raw_tokens[-1]" = '--profile'
+        __bitty_profiles
+        return 0
+    end
     set -l path (__bitty_path)
     switch "$path"
-{arms}        case '*'
+{arms}        case 'plugin enable' 'plugin disable'
+            if not string match -q -- '-*' "$cur"
+                __bitty_installed_plugins
+            end
+        case 'config profile show' 'config profile use' 'config profile path'
+            if not string match -q -- '-*' "$cur"
+                __bitty_profiles
+            end
+        case '*'
             return 0
     end
 end
@@ -379,16 +543,31 @@ end
     )
 }
 
-/// PowerShell completion script (nested grammar, strict-mode safe,
-/// registration guarded so double-sourcing is a no-op).
+/// PowerShell completion script (nested grammar + bounded dynamic values,
+/// strict-mode safe, registration guarded so double-sourcing is a no-op).
 fn powershell_script() -> String {
     format!(
         r#"# bitty completion for PowerShell (generated from the CLI grammar; do not edit).
 # Install: bitty completion powershell | Out-String | Invoke-Expression
 #      or save it to a file dot-sourced from $PROFILE.
+# Dynamic values (`--profile`, `plugin enable|disable`, `config profile
+# show|use|path`) come from the hidden local helpers. Helper failures and
+# malformed state produce no candidates and never write diagnostics.
 if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {{
     $global:_BittyCompletionRegistered = $true
     $global:_BittyValueFlags = @({values})
+    $global:_BittyHelper = {{
+        param([string[]]$HelperArgs)
+        try {{
+            $lines = @(& bitty @HelperArgs 2>$null)
+            if ($LASTEXITCODE -ne 0) {{ return @() }}
+            return @($lines | Where-Object {{ $null -ne $_ -and "$_".Length -gt 0 }})
+        }} catch {{
+            return @()
+        }}
+    }}
+    $global:_BittyProfiles = {{ & $global:_BittyHelper @('+list-profiles') }}
+    $global:_BittyInstalledPlugins = {{ & $global:_BittyHelper @('+list-plugins', '--installed') }}
     $global:_BittyCompletionScript = {{
         param($wordToComplete, $commandAst, $cursorPosition)
         $paths = [ordered]@{{
@@ -417,9 +596,28 @@ if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {{
             $pathTokens.Add($token)
         }}
         $path = ($pathTokens -join ' ')
+        $previous = ''
+        if ($tokens.Count -gt 0) {{
+            $previous = $tokens[$tokens.Count - 1]
+        }}
         $candidates = @()
-        if ($paths.Contains($path)) {{
+        if ($wordToComplete -like '--profile=*') {{
+            $profilePrefix = '--profile='
+            $profileValue = $wordToComplete.Substring($profilePrefix.Length)
+            $candidates = @(& $global:_BittyProfiles |
+                Where-Object {{ $_ -like "$profileValue*" }} |
+                ForEach-Object {{ "$profilePrefix$_" }})
+        }} elseif ($previous -eq '--profile') {{
+            $candidates = @(& $global:_BittyProfiles | Where-Object {{ $_ -like "$wordToComplete*" }})
+        }} elseif ($paths.Contains($path)) {{
             $candidates = $paths[$path]
+            if ($null -ne $wordToComplete -and -not $wordToComplete.StartsWith('-')) {{
+                if ($path -eq 'plugin enable' -or $path -eq 'plugin disable') {{
+                    $candidates = @(& $global:_BittyInstalledPlugins | Where-Object {{ $_ -like "$wordToComplete*" }})
+                }} elseif ($path -eq 'config profile show' -or $path -eq 'config profile use' -or $path -eq 'config profile path') {{
+                    $candidates = @(& $global:_BittyProfiles | Where-Object {{ $_ -like "$wordToComplete*" }})
+                }}
+            }}
         }}
         $candidates | Where-Object {{ $_ -like "$wordToComplete*" }} | ForEach-Object {{
             [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
@@ -438,11 +636,21 @@ if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {{
 }
 
 /// Nushell completion script (nested grammar via one extern per node).
+///
+/// Dynamic value completion is a documented limitation in Nushell: extern
+/// signatures are static, so `--profile` and `plugin enable|disable` offer no
+/// value candidates here (issue #2575). Bash, Zsh, Fish, and PowerShell carry
+/// the dynamic hooks.
 fn nushell_script() -> String {
     format!(
         "# bitty completion for Nushell (generated from the CLI grammar; do not edit).\n\
          # Install: bitty completion nushell | save -f ~/.config/nushell/completions-bitty.nu\n\
-         #      then add `source ~/.config/nushell/completions-bitty.nu` to config.nu.\n{}",
+         #      then add `source ~/.config/nushell/completions-bitty.nu` to config.nu.\n\
+         # Limitation (issue #2575): Nushell extern signatures are static, so\n\
+         # `--profile` and `plugin enable|disable` complete only flags/words.\n\
+         # Dynamic profile/plugin values are available in Bash, Zsh, Fish, and\n\
+         # PowerShell; run `bitty +list-profiles` or\n\
+         # `bitty +list-plugins --installed` manually for the same local data.\n{}",
         nushell_externs()
     )
 }
@@ -511,7 +719,11 @@ pub fn completion_help_text(invoked_as: &str) -> String {
          Prints a completion script for <shell> (one of {}) to stdout. The script\n\
          completes the full CLI grammar: first-level words, nested verbs\n\
          (config, ctl resources, plugin, extension, dev, inspect, list), and\n\
-         per-command flags. Install it with, for example:\n\
+         per-command flags. Bash, Zsh, Fish, and PowerShell also complete local\n\
+         values for `--profile`/`--profile=`, `plugin enable|disable <id>`, and\n\
+         `config profile show|use|path <name>` from bounded local state (no\n\
+         runtime, plugin VM, or network); Nushell keeps static values. Install\n\
+         it with, for example:\n\
          `bitty completion bash > ~/.local/share/bash-completion/completions/bitty`.\n\
          Alias `comp` behaves identically.\n",
         shell_list()
@@ -785,6 +997,120 @@ mod tests {
         assert_eq!(req.shell, CompletionShell::Fish);
         let req = parse_completion_request(&tokens(&["zsh", "--no-color"]), "completion").unwrap();
         assert_eq!(req.shell, CompletionShell::Zsh);
+    }
+
+    #[test]
+    fn dynamic_value_hooks_present_in_dynamic_shells() {
+        for shell in [
+            CompletionShell::Bash,
+            CompletionShell::Zsh,
+            CompletionShell::Fish,
+            CompletionShell::Powershell,
+        ] {
+            let script = completion_script(shell);
+            assert!(
+                script.contains("+list-profiles"),
+                "{shell:?} missing the profile helper hook"
+            );
+            assert!(
+                script.contains("+list-plugins") && script.contains("--installed"),
+                "{shell:?} missing the installed-plugin helper hook"
+            );
+            assert!(
+                script.contains("plugin enable") && script.contains("plugin disable"),
+                "{shell:?} missing the plugin operand contexts"
+            );
+            assert!(
+                script.contains("config profile show") && script.contains("config profile use"),
+                "{shell:?} missing the profile operand contexts"
+            );
+            assert!(
+                script.contains("--profile"),
+                "{shell:?} missing the --profile hook"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_hooks_keep_helper_diagnostics_out_of_candidates() {
+        for shell in [
+            CompletionShell::Bash,
+            CompletionShell::Zsh,
+            CompletionShell::Fish,
+        ] {
+            let script = completion_script(shell);
+            assert!(
+                script.contains("2>/dev/null"),
+                "{shell:?} must silence helper stderr"
+            );
+        }
+        let pwsh = completion_script(CompletionShell::Powershell);
+        assert!(
+            pwsh.contains("2>$null"),
+            "PowerShell must silence helper stderr"
+        );
+        assert!(
+            pwsh.contains("catch") && pwsh.contains("LASTEXITCODE"),
+            "PowerShell must fail soft when the helper is missing or fails"
+        );
+    }
+
+    #[test]
+    fn bash_and_zsh_keep_the_profile_equals_prefix() {
+        let bash = completion_script(CompletionShell::Bash);
+        assert!(bash.contains("--profile=*"), "bash handles --profile=");
+        assert!(
+            bash.contains("${out_prefix}${line}"),
+            "bash re-adds the --profile= prefix"
+        );
+        let zsh = completion_script(CompletionShell::Zsh);
+        assert!(zsh.contains("--profile=*"), "zsh handles --profile=");
+        assert!(
+            zsh.contains("compset -P"),
+            "zsh strips the --profile= prefix from the match context"
+        );
+    }
+
+    #[test]
+    fn nushell_documents_the_static_fallback() {
+        let script = completion_script(CompletionShell::Nushell);
+        assert!(
+            script.contains("Limitation") && script.contains("+list-profiles"),
+            "Nushell must document its static-value limitation: {script}"
+        );
+        assert!(
+            script.contains("extern \"bitty\""),
+            "Nushell keeps the generated externs"
+        );
+    }
+
+    #[test]
+    fn help_text_names_dynamic_values() {
+        let help = completion_help_text("completion");
+        assert!(help.contains("--profile"), "help names the profile flag");
+        assert!(
+            help.contains("plugin enable|disable"),
+            "help names the plugin operand"
+        );
+        assert!(
+            help.contains("Nushell keeps static values"),
+            "help names the Nushell limitation"
+        );
+    }
+
+    #[test]
+    fn fish_quotes_the_current_token_for_string_match() {
+        // Empty `$cur` must stay one (quoted) argument; an unquoted empty
+        // expansion makes `string match` read stdin and can block Tab.
+        let fish = completion_script(CompletionShell::Fish);
+        assert!(
+            fish.contains(r#"string match -q -- '--profile=*' "$cur""#),
+            "fish quotes the profile token"
+        );
+        assert!(
+            fish.contains(r#"string match -q -- '-*' "$cur""#),
+            "fish quotes the flag guard token"
+        );
     }
 
     #[test]

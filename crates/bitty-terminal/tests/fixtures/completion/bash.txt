@@ -1,14 +1,59 @@
 # bitty completion for Bash (generated from the CLI grammar; do not edit).
 # Install: bitty completion bash > ~/.local/share/bash-completion/completions/bitty
 #      or: eval "$(bitty completion bash)" after the bitty binary is on PATH.
+# Static words come from the generated grammar. `--profile`, `plugin
+# enable|disable <id>`, and `config profile show|use|path <name>` also offer
+# local candidates from the hidden helpers (`+list-profiles`,
+# `+list-plugins --installed`); helper failures and malformed state yield no
+# candidates and never print into the completion stream.
 _bitty_flag_takes_value() {
     case "$1" in
         --log-level|--split-ratio|--layout|--focus|--config|--profile|--theme|--font-family|--font-size|--opacity|--format|--socket|--instance|--scrollback|--close-confirm|--gaps-in|--gaps-out|--border|--radius|--plugins|--cwd|--env|--title|--scope|--terminal|--family|--cap|--iterations|--rows|--cols|--version|--digest|--distro) return 0 ;;
     esac
     return 1
 }
+_bitty_profiles() {
+    local value="$1"
+    local out_prefix="$2"
+    local line
+    COMPREPLY=()
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+            "$value"*) COMPREPLY+=("${out_prefix}${line}") ;;
+        esac
+    done < <(command bitty +list-profiles 2>/dev/null)
+}
+_bitty_installed_plugins() {
+    local value="$1"
+    local line
+    COMPREPLY=()
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case "$line" in
+            "$value"*) COMPREPLY+=("${line}") ;;
+        esac
+    done < <(command bitty +list-plugins --installed 2>/dev/null)
+}
 _bitty_complete() {
     local cur="${COMP_WORDS[COMP_CWORD]:-}"
+    COMPREPLY=()
+    local prev=""
+    if [ "$COMP_CWORD" -gt 0 ]; then
+        prev="${COMP_WORDS[COMP_CWORD - 1]:-}"
+    fi
+    # `--profile=<TAB>` keeps the `--profile=` prefix on each candidate.
+    case "$cur" in
+        --profile=*)
+            _bitty_profiles "${cur#--profile=}" "--profile="
+            return 0
+            ;;
+    esac
+    # `--profile <TAB>` completes the value slot, not a subcommand.
+    if [ "$prev" = "--profile" ]; then
+        _bitty_profiles "$cur" ""
+        return 0
+    fi
     local path=""
     local word
     local i
@@ -30,6 +75,27 @@ _bitty_complete() {
                 ;;
         esac
     done
+    # Operand slots with local state; flags still come from the static arms.
+    case "$path" in
+        "plugin enable"|"plugin disable")
+            case "$cur" in
+                -*) ;;
+                *)
+                    _bitty_installed_plugins "$cur"
+                    return 0
+                    ;;
+            esac
+            ;;
+        "config profile show"|"config profile use"|"config profile path")
+            case "$cur" in
+                -*) ;;
+                *)
+                    _bitty_profiles "$cur" ""
+                    return 0
+                    ;;
+            esac
+            ;;
+    esac
     local candidates=""
     case "$path" in
         "") candidates="run ctl config cfg init doctor list ls inspect dev plugin extension version completion comp cmd x shell-init help +list-themes +list-colors +list-fonts +list-keybinds +list-actions +list-plugins +list-extensions +show-config +validate-config +edit-config --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init" ;;

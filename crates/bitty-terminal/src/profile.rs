@@ -23,6 +23,15 @@ use crate::init::{InitWriteError, render_selector_lua, write_init_config};
 /// Maximum profiles listed by `config profile list` (deterministic bound).
 pub(crate) const PROFILE_LIST_CAP: usize = 256;
 
+/// Maximum directory entries inspected for completion candidates.
+///
+/// Completion sorts the scanned names before truncating to
+/// [`PROFILE_LIST_CAP`], so the emitted prefix stays deterministic for any
+/// directory up to this scan bound; beyond it, scanning stops to keep the
+/// helper bounded. The bound is a small multiple of the output cap so the
+/// sorted prefix is stable in normal profile directories.
+pub(crate) const PROFILE_SCAN_CAP: usize = PROFILE_LIST_CAP * 4;
+
 /// Short usage for `bitty config profile` (stderr, fail-closed exit 2).
 pub(crate) fn profile_usage() -> String {
     "usage: bitty config profile <list|show|use|path> [NAME]\n\
@@ -144,10 +153,16 @@ pub(crate) fn run_profile_subcommand(args: &Args) -> i32 {
 /// `--config` > `BITTY_CONFIG` > XDG probe, then a sibling `profiles/`.
 fn profile_dir(args: &Args) -> Result<PathBuf, String> {
     let bitty_config_env = std::env::var("BITTY_CONFIG").ok();
-    let explicit = bitty_config::file::resolve_config_explicit(
-        args.config_path.as_deref(),
-        bitty_config_env.as_deref(),
-    );
+    profile_dir_from(args.config_path.as_deref(), bitty_config_env.as_deref())
+}
+
+/// Profile directory from explicit config inputs (shared by `config profile`
+/// and the completion candidate helper).
+pub(crate) fn profile_dir_from(
+    config_path: Option<&str>,
+    bitty_config_env: Option<&str>,
+) -> Result<PathBuf, String> {
+    let explicit = bitty_config::file::resolve_config_explicit(config_path, bitty_config_env);
     let probed = bitty_config::file::probe_config_path(explicit.as_deref()).ok_or_else(|| {
         "bitty config profile: no config root ($XDG_CONFIG_HOME or $HOME unset)".to_string()
     })?;
@@ -160,26 +175,28 @@ fn profile_dir(args: &Args) -> Result<PathBuf, String> {
     Ok(parent.join(bitty_config::file::PROFILES_DIR_NAME))
 }
 
-fn run_list(dir: &Path) -> i32 {
+/// Scan `dir` for validated profile names.
+///
+/// Reads at most `entry_limit` directory entries and stops after
+/// `name_limit` validated names. Returns the names sorted and de-duplicated,
+/// plus whether a bound cut the scan short.
+fn scan_names(
+    dir: &Path,
+    entry_limit: usize,
+    name_limit: usize,
+) -> std::io::Result<(Vec<String>, bool)> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return 0;
+            return Ok((Vec::new(), false));
         }
-        Err(err) => {
-            eprintln!(
-                "bitty config profile list: cannot read '{}': {err}",
-                dir.display()
-            );
-            return 1;
-        }
+        Err(err) => return Err(err),
     };
     let mut names: Vec<String> = Vec::new();
-    for entry in entries.filter_map(Result::ok) {
-        if names.len() >= PROFILE_LIST_CAP {
-            eprintln!(
-                "bitty config profile list: stopped at {PROFILE_LIST_CAP} entries; narrow the directory"
-            );
+    let mut truncated = false;
+    for (index, entry) in entries.filter_map(Result::ok).enumerate() {
+        if index >= entry_limit || names.len() >= name_limit {
+            truncated = true;
             break;
         }
         let path = entry.path();
@@ -198,6 +215,39 @@ fn run_list(dir: &Path) -> i32 {
     }
     names.sort();
     names.dedup();
+    Ok((names, truncated))
+}
+
+/// Bounded profile-name candidates for shell completion.
+///
+/// Sorted, de-duplicated, capped at [`PROFILE_LIST_CAP`], and fail-soft: an
+/// unreadable or missing directory yields an empty list (never diagnostics).
+pub(crate) fn candidate_names(dir: &Path) -> Vec<String> {
+    match scan_names(dir, PROFILE_SCAN_CAP, PROFILE_SCAN_CAP) {
+        Ok((mut names, _)) => {
+            names.truncate(PROFILE_LIST_CAP);
+            names
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
+fn run_list(dir: &Path) -> i32 {
+    let (names, truncated) = match scan_names(dir, PROFILE_LIST_CAP, PROFILE_LIST_CAP) {
+        Ok(result) => result,
+        Err(err) => {
+            eprintln!(
+                "bitty config profile list: cannot read '{}': {err}",
+                dir.display()
+            );
+            return 1;
+        }
+    };
+    if truncated {
+        eprintln!(
+            "bitty config profile list: stopped at {PROFILE_LIST_CAP} entries; narrow the directory"
+        );
+    }
     for name in names {
         println!("{name}");
     }

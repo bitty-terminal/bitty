@@ -8350,7 +8350,7 @@ mod scroll_region_copy_tests {
             .expect("deterministic Vim runtime must build");
         let view = ViewId::new(1);
         rt.set_layout(LayoutNode::leaf(View::new(view, 80, 23)));
-        rt.handle_resize(PhysicalSize::new(736, 208))
+        rt.handle_resize(PhysicalSize::new(736, 23 * 7 + 16))
             .expect("Vim resize applies");
         rt
     }

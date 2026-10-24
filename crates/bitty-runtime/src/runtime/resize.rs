@@ -502,15 +502,22 @@ impl Runtime {
         // numeric offset is bottom-relative and a resize can move the same
         // top line by several rows; stable line identities are captured
         // before the terminal state reflows.
-        let scroll_views: Vec<_> = self
-            .layout
-            .leaf_ids()
-            .into_iter()
-            .filter(|id| self.view_scroll_offset(*id) != 0)
-            .collect();
+        let mut scroll_views = self.layout.leaf_ids();
+        scroll_views.extend(self.floats.ids());
+        scroll_views.extend(self.pinned.ids());
+        scroll_views.retain(|id| self.view_scroll_offset(*id) != 0);
         for view in scroll_views {
             self.capture_view_scroll_anchor(view);
         }
+
+        // Establish post-resize View geometry before resizing any backing
+        // state. The primary state dimensions are derived from the presented
+        // owner frame, and pane sessions are derived from the same frames;
+        // anchor restoration must observe both the new View height and the
+        // state geometry that those Views require.
+        self.layout.reflow_with_gaps(self.container, self.gaps());
+        let frames = self.present_frames();
+        self.reflow_present_layout(&frames);
         let fallback = (
             usize::from(self.container.width).max(1),
             usize::from(self.container.height).max(1),
@@ -543,12 +550,25 @@ impl Runtime {
         let (_damage, primary_resize) = self.state.resize_with_report(cols, rows);
         self.cols = cols;
         self.rows = rows;
-        // Clamp any leaf View scroll offsets to its own backing store
+
+        // Reflow every presented View before restoring its anchor. In
+        // particular, detached floats and pinned Views are not layout leaves,
+        // and pane sessions may be rebuilt/resized by the geometry sync below.
+        // Restoring before these steps would resolve against the old View
+        // height and could be invalidated by the later backing-state resize.
+        self.sync_pane_geometry_to(&frames);
+
+        // Clamp any live View scroll offsets to its own backing store
         // (scrollback may have been truncated on shrink, though we preserve
         // ids; clamp keeps offset in-bounds deterministically). #1338: split
         // panes own their shells, so the primary length is the wrong bound
-        // for a focused split leaf.
-        let ids = self.layout.leaf_ids();
+        // for a focused split leaf. Detached floats and pinned Views use the
+        // same state lookup and are deliberately included here.
+        let mut ids = self.layout.leaf_ids();
+        ids.extend(self.floats.ids());
+        ids.extend(self.pinned.ids());
+        ids.sort_unstable();
+        ids.dedup();
         for id in ids {
             let max_scrollback = match self.pane_sessions.get(&id) {
                 Some(sess) => sess.state.scrollback_len(),
@@ -559,13 +579,9 @@ impl Runtime {
             }
             self.restore_view_scroll_anchor(id);
         }
-        self.layout.reflow_with_gaps(self.container, self.gaps());
-        // CTX-0176: the container moved, so every pane session's grid +
-        // PTY winsize follows its leaf (primary state/PTY handled below).
-        self.sync_pane_geometry();
         // #2543: move a held grid-coordinate selection with the primary
         // content before clamping it to the new bounds. Pane owners were
-        // already remapped by `sync_pane_geometry`.
+        // already remapped by `sync_pane_geometry_to`.
         if let Some(owner) = self.primary_view {
             self.remap_selection_for_resize(owner, true, primary_resize);
         }
@@ -1013,6 +1029,25 @@ mod tests {
     use crate::Runtime;
     use crate::config::RuntimeConfig;
     use bitty_render::glyph::FontStyle;
+    use bitty_ui::{LayoutNode, SplitAxis, View, ViewId};
+
+    fn two_pane_layout() -> LayoutNode {
+        LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 80, 24)),
+        )
+    }
+
+    fn visible_rows(rt: &Runtime, view: ViewId) -> Vec<String> {
+        let state = rt
+            .live_view_state(view)
+            .expect("view must have a live backing state");
+        rt.find_view(view)
+            .expect("view must be present")
+            .visible_text_rows(state)
+    }
 
     #[test]
     fn base_font_query_reflects_config() {
@@ -1100,6 +1135,86 @@ mod tests {
         assert!(
             (scale - 1.0).abs() < f32::EPSILON,
             "glyph sampling scale must be exactly 1.0, got {scale}"
+        );
+    }
+
+    #[test]
+    fn detached_float_anchor_restores_after_height_reflow_and_output() {
+        let mut rt = Runtime::with_defaults().expect("runtime builds");
+        rt.set_layout(two_pane_layout());
+        let float = ViewId::new(1);
+        rt.float_detach(float).expect("float detaches");
+        assert!(rt.set_focus(float), "detached float remains focusable");
+
+        for i in 0..60 {
+            rt.handle_pty_bytes(format!("FLOAT-{i:03}\r\n").as_bytes());
+        }
+        rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 4.0));
+        let before = visible_rows(&rt, float);
+        assert!(rt.view_scroll_offset(float) > 0, "float must be detached");
+
+        let width = rt.surface_extent().expect("surface extent").width();
+        rt.handle_resize(bitty_platform::PhysicalSize::new(width, 12 * 19 + 16))
+            .expect("height resize");
+        let after_resize = visible_rows(&rt, float);
+        assert_eq!(
+            after_resize.first(),
+            before.first(),
+            "resize must restore the float's top logical line after View reflow"
+        );
+
+        rt.handle_pty_bytes(b"FLOAT-GROWTH\r\n");
+        assert_eq!(
+            visible_rows(&rt, float).first(),
+            before.first(),
+            "PTY growth must not move detached float history"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_pane_anchor_restores_after_height_reflow_and_output() {
+        let mut rt = Runtime::with_defaults().expect("runtime builds");
+        rt.set_layout(two_pane_layout());
+        let pinned = ViewId::new(1);
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == pinned)
+            .expect("pinned pane frame");
+        rt.spawn_shell_for_view(
+            pinned,
+            "/bin/sh",
+            &["-c", "exec sleep 30"],
+            frame.cols,
+            frame.rows,
+        )
+        .expect("pane shell starts");
+        rt.pin_floating(pinned).expect("pane pins");
+        assert!(rt.set_focus(pinned), "pinned view remains focusable");
+
+        for i in 0..60 {
+            rt.handle_pane_bytes(pinned, format!("PIN-{i:03}\r\n").as_bytes());
+        }
+        rt.handle_wheel(bitty_platform::ScrollDelta::Lines(0.0, 4.0));
+        let before = visible_rows(&rt, pinned);
+        assert!(rt.view_scroll_offset(pinned) > 0, "pinned view must scroll");
+
+        let width = rt.surface_extent().expect("surface extent").width();
+        rt.handle_resize(bitty_platform::PhysicalSize::new(width, 12 * 19 + 16))
+            .expect("height resize");
+        let after_resize = visible_rows(&rt, pinned);
+        assert_eq!(
+            after_resize.first(),
+            before.first(),
+            "resize must restore the pinned pane's top logical line after sync"
+        );
+
+        rt.handle_pane_bytes(pinned, b"PIN-GROWTH\r\n");
+        assert_eq!(
+            visible_rows(&rt, pinned).first(),
+            before.first(),
+            "PTY growth must not move pinned history"
         );
     }
 }

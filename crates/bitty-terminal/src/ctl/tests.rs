@@ -2325,6 +2325,91 @@ fn control_workspace_move_headless_no_elevation() {
 }
 
 #[test]
+fn control_workspace_move_deleted_stable_id_fails_without_mutation() {
+    // CTX-1521 / issue #2654: `ws:N` is a stable identity for ctl, not the
+    // current display position. After ws2 is deleted, moving to stable ws:2
+    // must fail closed even though display position 2 is now occupied by
+    // ws3. The failed request must not alter the source, layout, focus, or
+    // pane-session ownership; a later `workspace new` is the only operation
+    // that may reuse the freed id.
+    use bitty_runtime::{LayoutNode, SplitAxis, View, ViewId};
+    let mut rt = headless_runtime();
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    let all = bitty_ipc::ScopeSet::all();
+
+    assert!(
+        apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli).ok,
+        "setup ws2"
+    );
+    assert!(
+        apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli).ok,
+        "setup ws3"
+    );
+    assert!(rt.workspace_switch(0), "return to ws1 before deleting ws2");
+    assert!(
+        apply_control_envelope(
+            &mut rt,
+            ipc_ctl::METHOD_CLOSE_WORKSPACE,
+            Some(&ipc_ctl::params_workspace("ws:2")),
+            &all,
+        )
+        .ok,
+        "delete ws2"
+    );
+    assert_eq!(
+        rt.workspace_names(),
+        vec![String::from("ws1"), String::from("ws3")]
+    );
+    assert_eq!(rt.workspace_index_by_seq(2), None);
+    assert_eq!(rt.workspace_seq_at(1), Some(3));
+
+    // Give ws1 a second source leaf so the attempted move would be visibly
+    // mutating if the deleted stable id were accidentally treated as a
+    // positional target.
+    let moved_id = ViewId::new(50);
+    let focused = rt.focused_view().expect("ws1 focus");
+    let old = rt.layout().find_leaf(focused).cloned().expect("ws1 leaf");
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(old),
+        LayoutNode::leaf(View::new(moved_id, 40, 24)),
+    ));
+    assert!(rt.set_focus(moved_id));
+
+    let names_before = rt.workspace_names();
+    let layout_before = rt.layout().clone();
+    let active_before = rt.active_workspace_index();
+    let focus_before = rt.focused_view();
+    let sessions_before = rt.pane_session_ids();
+    let missing = apply_control_envelope(
+        &mut rt,
+        ipc_ctl::METHOD_MOVE_WORKSPACE,
+        Some(&ipc_ctl::params_workspace("ws:2")),
+        &cli,
+    );
+    assert!(!missing.ok, "deleted stable target must fail: {missing:?}");
+    assert_eq!(missing.code, "NotFound");
+    assert_eq!(rt.workspace_names(), names_before, "source unchanged");
+    assert_eq!(rt.layout(), &layout_before, "layout unchanged");
+    assert_eq!(
+        rt.active_workspace_index(),
+        active_before,
+        "active unchanged"
+    );
+    assert_eq!(rt.focused_view(), focus_before, "focus unchanged");
+    assert_eq!(rt.pane_session_ids(), sessions_before, "sessions unchanged");
+
+    // Creation, rather than a failed stable move, reuses the lowest free id.
+    let created = apply_control_envelope(&mut rt, ipc_ctl::METHOD_NEW_WORKSPACE, None, &cli);
+    assert!(created.ok, "new workspace must succeed: {created:?}");
+    assert!(
+        created.result_json.contains("\"created\":\"ws:2\""),
+        "new must reuse the deleted id: {created:?}"
+    );
+}
+
+#[test]
 fn control_workspace_new_fails_closed_at_capacity() {
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();

@@ -1,6 +1,6 @@
 # Release tooling overrides this for historical tags:
 #   rpmbuild -bs ... --define "version X.Y.Z"
-%{!?version:%global version 0.0.28}
+%{!?version:%global version 0.0.27}
 # The payload is a prebuilt release bundle; there is no local compilation.
 %global debug_package %{nil}
 Name:           bitty

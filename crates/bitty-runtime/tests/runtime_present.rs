@@ -82,6 +82,60 @@ fn tick_cursor_overlay_uses_theme_cursor_hue() {
 }
 
 #[test]
+fn deterministic_cjk_cursor_paints_two_cells_and_preserves_spacer() {
+    // Reproduce the Vim/Neovim failure through the real headless runtime:
+    // print one CJK lead plus continuation, then move the logical cursor back
+    // onto the lead. The cursor overlay must cover both cells, not just the
+    // lead, while Terminal Truth keeps the continuation metadata unchanged.
+    let mut rt = Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+        .expect("deterministic runtime must build");
+    rt.handle_pty_bytes("中".as_bytes());
+    rt.tick().expect("initial CJK frame must present");
+    rt.handle_pty_bytes(b"\x1b[1;1H");
+    rt.tick().expect("cursor move frame must present");
+    let snapshot = rt.snapshot();
+    assert_eq!(snapshot.cursor.position.col, 0);
+    assert_eq!(snapshot.cells[0].width, 2);
+    assert!(!snapshot.cells[0].spacer);
+    assert!(snapshot.cells[1].spacer);
+
+    assert!(rt.is_headless());
+    let rgba = rt.headless_rgba().expect("headless frame pixels");
+    let width = usize::try_from(rt.surface_extent().expect("surface extent").width())
+        .expect("surface width fits usize");
+    let pad = usize::try_from(rt.window_padding_physical()).expect("pad fits usize");
+    const DECORATION: usize = 14;
+    let origin_x = pad + DECORATION;
+    let origin_y = pad + DECORATION;
+    let pixel = |frame: &[u8], x: usize| {
+        let index = ((origin_y + 9) * width + origin_x + x) * 4;
+        [
+            frame[index],
+            frame[index + 1],
+            frame[index + 2],
+            frame[index + 3],
+        ]
+    };
+    // Default deterministic geometry is 9x19. Probe the same interior row in
+    // each logical cell: both CJK cells carry the translucent cursor color,
+    // while the following untouched cell does not.
+    let cursor_rgba = [153, 140, 138, 160];
+    assert_ne!(pixel(&rgba, 4), [30, 30, 46, 255]);
+    assert_ne!(pixel(&rgba, 13), [30, 30, 46, 255]);
+    assert_ne!(pixel(&rgba, 22), cursor_rgba);
+
+    // Hide only the terminal cursor and repaint. Both owned cells must change
+    // relative to the same glyph frame; a one-cell cursor implementation only
+    // changes the first probe and fails this differential assertion.
+    rt.handle_pty_bytes(b"\x1b[?25l");
+    rt.tick().expect("hidden-cursor frame must present");
+    let hidden = rt.headless_rgba().expect("hidden-cursor pixels");
+    assert_ne!(pixel(&rgba, 4), pixel(&hidden, 4));
+    assert_ne!(pixel(&rgba, 13), pixel(&hidden, 13));
+    assert_eq!(pixel(&rgba, 22), pixel(&hidden, 22));
+}
+
+#[test]
 fn cold_queue_is_bounded_and_observable() {
     let cfg = RuntimeConfig {
         cold_queue_capacity: 2,

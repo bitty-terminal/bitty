@@ -20,6 +20,15 @@ workspace = true
 name = "bitty"
 path = "src/main.rs"
 
+# CTX-1479: the storage-component fixture is this harness-free test binary
+# (invoked with --root by the host). Keeping it a test target leaves exactly
+# one release binary, so packaging recipes need no change.
+[[test]]
+name = "storage_component_host"
+path = "tests/storage_component_host.rs"
+harness = false
+required-features = ["storage-component"]
+
 # CTX-1361: the composition root's component-store/staging implementation is
 # also exposed as a library so integration tests in `bitty-runtime` can drive
 # the real `bitty extension add` code path instead of duplicating it. The
@@ -44,6 +53,12 @@ bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "949367
 # the dependency direction stays one-way (extension mechanics behind the
 # Core gate, never Core importing the extension).
 bitty-storage = { git = "https://github.com/bitty-terminal/bitty-storage", rev = "7bf5177" }
+# CTX-1479 / bitty#2495: the storage component host is deliberately opt-in
+# while the enable/migration task is still open.  The component pin is the
+# merged storage#18 merge commit (`502c7f5`), kept separate from the linked
+# model pin above so default builds link no component code.
+# Re-pin instructions live in `src/storage_component_host.rs`.
+bitty-storage-component = { package = "bitty-storage", git = "https://github.com/bitty-terminal/bitty-storage", rev = "502c7f5", optional = true }
 bitty-package = { version = "0.0.27", path = "../bitty-package" }
 # CTX-0981 (W-110): the composition root owns the extracted observability
 # contract. This is the ONLY crate in the workspace that may depend on
@@ -65,13 +80,20 @@ pollster = { workspace = true }
 # (ICANON/ECHO off, ISIG kept) plus readiness polling for ESC disambiguation.
 # Unix-only; Windows and piped setups keep the line loop (no new crates).
 [target.'cfg(unix)'.dependencies]
-nix = { workspace = true, features = ["fs", "poll", "term"] }
+# `process`/`signal` are the storage component host's process-group isolation
+# and kill path (CTX-1479); no other feature changes behavior.
+nix = { workspace = true, features = ["fs", "poll", "process", "signal", "term"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 [features]
 default = []
+# CTX-1479 / bitty#2495: explicit architecture seam for the storage component
+# host.  This does not change startup wiring, migrate existing XDG state, or
+# remove the linked adapter, and stays default-off until the enable/migration
+# task lands.
+storage-component = ["dep:bitty-storage-component"]
 # Enables `bitty dev capture|synthesize|dump|overlay` (CTX-0922): developer
 # headless captures, dumps, and overlay proofs stay out of release builds.
 dev-tools = []

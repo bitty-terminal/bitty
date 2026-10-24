@@ -120,6 +120,13 @@ pub(crate) struct Args {
     pub(crate) config_word: bool,
     /// Unexpected extra positionals in subcommand mode (dispatch errors).
     pub(crate) config_args: Vec<String>,
+    /// `--format` shape for `bitty config show|validate` (CTX-1467).
+    /// Raw on purpose: validated fail-closed at config dispatch.
+    pub(crate) config_format: Option<String>,
+    /// Ghostty-style `+<action>` alias (CTX-1467, issue #2464). Only the
+    /// parsed identity is stored; dispatch always reuses the canonical
+    /// `list`/`config`/`extension` fields set beside it.
+    pub(crate) plus_action: Option<crate::plus::PlusAction>,
 
     /// `bitty init` opt-in setup wizard (#243, CTX-0149). True once the
     /// first positional `init` word is seen; extra positionals land in
@@ -394,6 +401,11 @@ pub(crate) enum ConfigCommand {
     Path,
     /// Load + validate and print per-key sources (the testing hook).
     Check,
+    /// Load + validate and print the effective config with layer sources
+    /// (`--format json` emits the stable envelope; CTX-1467).
+    Show,
+    /// Load + validate only; nonzero on invalid (CTX-1467).
+    Validate,
     /// Open the file in `$VISUAL`/`$EDITOR` (never overwrites existing).
     Edit,
     /// Named-profile management (`list`, `show`, `use`, `path`). The
@@ -407,6 +419,8 @@ impl ConfigCommand {
     pub(crate) const VERBS: &[(&str, Self)] = &[
         ("path", Self::Path),
         ("check", Self::Check),
+        ("show", Self::Show),
+        ("validate", Self::Validate),
         ("edit", Self::Edit),
         ("profile", Self::Profile),
     ];
@@ -424,6 +438,8 @@ impl ConfigCommand {
         match self {
             Self::Path => "path",
             Self::Check => "check",
+            Self::Show => "show",
+            Self::Validate => "validate",
             Self::Edit => "edit",
             Self::Profile => "profile",
         }
@@ -459,6 +475,8 @@ impl Args {
             config_cmd: None,
             config_word: false,
             config_args: Vec::new(),
+            config_format: None,
+            plus_action: None,
 
             init_word: false,
             init_yes: false,
@@ -713,7 +731,7 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
 /// - `doctor [--format table|json|jsonl] [--no-color]` → installation and
 ///   compatibility diagnosis (CTX-0175, local class, safe mode); a program
 ///   literally named `doctor` needs `bitty -- doctor ...`
-/// - `list <themes|plugins|instances|actions|keymaps|services>` → resource enumeration (CTX-0172, CTX-1127);
+/// - `list <themes|colors|fonts|plugins|instances|actions|keymaps|services>` → resource enumeration (CTX-0172, CTX-1127, CTX-1467);
 ///   a program literally named `list`/`ls` needs `bitty -- list ...`
 /// - `inspect <target> <value>` → state and ownership (CTX-0173, local
 ///   class, safe mode); a program literally named `inspect` needs
@@ -785,6 +803,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             }
             out.doctor_format = Some(val.to_string());
             out.list_format = Some(val.to_string());
+            out.config_format = Some(val.to_string());
             out.inspect_format = Some(val.to_string());
             out.dev_format = Some(val.to_string());
             out.plugin_format = Some(val.to_string());
@@ -1217,6 +1236,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
                     out.doctor_format = Some(raw[i + 1].clone());
                     out.list_format = Some(raw[i + 1].clone());
+                    out.config_format = Some(raw[i + 1].clone());
                     out.inspect_format = Some(raw[i + 1].clone());
                     out.dev_format = Some(raw[i + 1].clone());
                     out.plugin_format = Some(raw[i + 1].clone());
@@ -1225,6 +1245,7 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 } else {
                     eprintln!("warning: --format needs a value (table|json|jsonl) — ignoring");
                     out.list_format = Some(String::new());
+                    out.config_format = Some(String::new());
                     out.inspect_format = Some(String::new());
                     out.dev_format = Some(String::new());
                     out.plugin_format = Some(String::new());
@@ -1655,6 +1676,51 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     out.config_args.push(token.clone());
                     i += 1;
                     continue;
+                }
+
+                // Ghostty-style `+<action>` helper aliases (CTX-1467, issue
+                // #2464). Each alias maps onto the canonical `list`, `config`,
+                // or `extension` fields, so dispatch runs the same code path
+                // (never a parallel implementation). Unknown `+` tokens keep
+                // the historical program-spawn behavior.
+                if !program_set && token.starts_with('+') {
+                    if let Some(action) = crate::plus::PlusAction::parse(token) {
+                        out.plus_action = Some(action);
+                        if let Some(kind) = action.list_kind() {
+                            out.list_word = true;
+                            out.list_spelling = token.clone();
+                            out.list_kind = Some(kind.name().to_string());
+                            i += 1;
+                            continue;
+                        }
+                        if let Some(cmd) = action.config_command() {
+                            out.config_word = true;
+                            out.config_cmd = Some(cmd);
+                            i += 1;
+                            continue;
+                        }
+                        // `+list-extensions` owns its tail exactly like the
+                        // `extension` word. `--help` is lifted so the alias
+                        // help renders (the canonical extension help remains
+                        // available via `bitty extension --help`).
+                        out.component_word = true;
+                        out.component_spelling = String::from("extension");
+                        out.component_raw.push(String::from("list"));
+                        // `--safe` is a global no-op for the static extension
+                        // inventory (listing loads no code); accept it in the
+                        // alias position instead of leaking it to the
+                        // extension parser, which has no such flag.
+                        let tail: Vec<String> = raw[i + 1..]
+                            .iter()
+                            .filter(|token| token.as_str() != "--safe")
+                            .cloned()
+                            .collect();
+                        if tail.iter().any(|t| t == "-h" || t == "--help") {
+                            out.help = true;
+                        }
+                        out.component_raw.extend(tail);
+                        break;
+                    }
                 }
 
                 // `bitty +show-font` resolved-font probe (first positional
@@ -2148,7 +2214,11 @@ pub(crate) fn help_text() -> String {
                               Exit 0 when all pass (warns allowed), 1 on\n  \
                               recoverable failure, else the strongest\n  \
                               category code (3 config, 5 compat, 8 conflict).\n  \
-             list <kind>      Enumerate resources: themes|plugins|instances|actions|keymaps|services\n  \
+            config <verb>     Config path|check|show|validate|edit|profile\n  \
+                             (--format table|json|jsonl for show/validate;\n  \
+                             `bitty config --help` for detail; alias `cfg`)\n  \
+             list <kind>      Enumerate resources:\n  \
+                              themes|colors|fonts|plugins|instances|actions|keymaps|services\n  \
                               (--format table|json|jsonl, --socket/--instance for\n  \
                               instances; alias `ls`; `bitty list --help` for detail)\n  \
              inspect <target> <value>  Explain state and ownership (local, safe mode)\n  \
@@ -2192,6 +2262,20 @@ pub(crate) fn help_text() -> String {
                              `font_family:`/`font_size:`/`font_fallback:`\n  \
                              lines from the merged config and exits (exit 3\n  \
                              when no usable identity; read-only, no runtime)\n  \
+           +<action>         Ghostty-style aliases over canonical commands\n  \
+                             (no parallel logic; bitty list/config stay canonical):\n  \
+                               +list-themes     themes with provenance\n  \
+                               +list-colors     16 ANSI + UI tokens with contrast\n  \
+                               +list-fonts      discovered fonts (family/style/source)\n  \
+                               +list-keybinds   same rows as `list keymaps`\n  \
+                               +list-actions    chrome actions + core commands\n  \
+                               +list-plugins    static bundled plugin catalog\n  \
+                               +list-extensions installed native extension inventory\n  \
+                               +show-config     validated config + layer sources\n  \
+                               +validate-config exit 2 on invalid config\n  \
+                               +edit-config     $VISUAL/$EDITOR, then validate\n  \
+                             Local class: no plugin VM, no network for static\n  \
+                             lists, `--format json` envelope v1, bounded rows.\n  \
              help [cmd]       Show the compact overview, or per-command help\n  \
                               (`bitty help plugin` == `bitty plugin --help`;\n  \
                               unknown names fail closed naming valid commands;\n  \
@@ -2320,10 +2404,10 @@ pub(crate) fn help_text_short(color: bool) -> String {
           {subcommands}\n  \
             run -- COMMAND...       Explicit child launch (local)\n  \
             ctl <resource> <verb>   Control a running instance (runtime)\n  \
-            config <verb>           Config path, check, or edit (alias cfg)\n  \
+            config <verb>           Config path|check|show|validate|edit|profile (alias cfg)\n  \
             init [FLAGS]            Opt-in guided setup wizard (never auto-runs)\n  \
             doctor                  Diagnose installation and compatibility (local)\n  \
-            list <kind>             Enumerate themes|plugins|instances|actions|keymaps|services (alias ls)\n  \
+            list <kind>             Enumerate themes|colors|fonts|plugins|instances|actions|keymaps|services (alias ls)\n  \
             inspect <target> <value> Explain state and ownership (command|key|plugin|config|protocol)\n  \
             dev <verb>              Developer tracing, captures, synthesis, dumps, overlays\n  \
             plugin <verb>           Plugin management: list|install|remove|enable|disable|info\n  \
@@ -2334,6 +2418,9 @@ pub(crate) fn help_text_short(color: bool) -> String {
             shell-init <shell>      Shell integration: prompt hooks + completion wiring\n  \
             version                 Version and build metadata\n  \
             +show-font              Print resolved font family and size (read-only probe)\n  \
+          Actions (aliases over list/config; see `bitty <action> --help`):\n  \
+            +list-themes +list-colors +list-fonts +list-keybinds +list-actions\n  \
+            +list-plugins +list-extensions +show-config +validate-config +edit-config\n  \
             help [cmd]              Show this help, or per-command help (alias for --help)\n\
           \n\
           {arguments}\n  \
@@ -2405,6 +2492,9 @@ pub(crate) fn help_usage() -> String {
          commands:\n\
          \x20 run, ctl, config (cfg), init, doctor, list (ls), inspect, dev,\n\
          \x20 plugin, extension, version, completion (comp), cmd, x, shell-init, help\n\
+         plus actions:\n\
+         \x20 +list-themes, +list-colors, +list-fonts, +list-keybinds, +list-actions,\n\
+         \x20 +list-plugins, +list-extensions, +show-config, +validate-config, +edit-config\n\
          examples:\n\
          \x20 bitty help\n\
          \x20 bitty help plugin\n\

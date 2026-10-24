@@ -172,7 +172,7 @@ pub enum GlyphSource {
 static SYSTEM_DB: OnceLock<Database> = OnceLock::new();
 
 /// Returns the shared system database, scanning on first use.
-fn system_db() -> &'static Database {
+pub(crate) fn system_db() -> &'static Database {
     SYSTEM_DB.get_or_init(|| {
         let mut db = Database::new();
         db.load_system_fonts();

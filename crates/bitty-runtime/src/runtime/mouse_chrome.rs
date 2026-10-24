@@ -214,6 +214,8 @@ pub struct BorderDragState {
     press_container: Rect,
     /// Gaps at the press (cells), paired with `press_layout`.
     press_gaps: Gaps,
+    /// The consumed press still owns its release after external cancellation.
+    canceled: bool,
 }
 
 /// Rounds a cursor position to physical pixels, fail-closed.
@@ -1285,7 +1287,7 @@ impl Runtime {
     /// Whether a border-drag resize is currently active.
     #[must_use]
     pub fn border_drag_active(&self) -> bool {
-        self.border_drag.is_some()
+        self.border_drag.as_ref().is_some_and(|drag| !drag.canceled)
     }
 
     /// Grabbed split divider(s) for the active border drag, if any (issues
@@ -1298,7 +1300,10 @@ impl Runtime {
     /// plus both row segments). Headless-testable without a window.
     #[must_use]
     pub fn border_drag_splits(&self) -> Option<Vec<(Vec<usize>, SplitAxis)>> {
-        self.border_drag.as_ref().map(|drag| drag.splits.clone())
+        self.border_drag
+            .as_ref()
+            .filter(|drag| !drag.canceled)
+            .map(|drag| drag.splits.clone())
     }
 
     /// Attempts to grab the split divider(s) under the last known cursor for
@@ -1358,6 +1363,7 @@ impl Runtime {
             press_layout: self.layout.clone(),
             press_container: self.container,
             press_gaps: gaps,
+            canceled: false,
         });
         // A border owns no leaf, so — unlike click-to-focus — the grab
         // moves no focus. A pending hover dwell is dropped: the pointer is
@@ -1398,6 +1404,9 @@ impl Runtime {
         let Some(drag) = self.border_drag.clone() else {
             return false;
         };
+        if drag.canceled {
+            return false;
+        }
         let Some(point) = self.cursor_to_layout_point(pos) else {
             // Unmappable motion (outside the container origin) keeps the
             // drag armed but changes nothing.
@@ -1457,7 +1466,11 @@ impl Runtime {
         }
 
         if any_changed {
-            self.set_layout(next);
+            // This layout is the internal commit of the active gesture, so
+            // preserve its press-time anchor/container while reflowing the
+            // newly committed ratios. Public layout replacements cancel the
+            // drag before replacing the tree.
+            self.commit_border_drag_layout(next);
             // CTX-0967: a live divider move arms the whole-surface resize
             // transition. The ratios commit immediately (terminal content is
             // never interpolated); only Core-owned chrome fades. `None`
@@ -1473,11 +1486,28 @@ impl Runtime {
     /// active (caller skips the selection-release commit/copy: no selection
     /// was started by the grabbing press).
     pub fn end_border_drag(&mut self) -> bool {
-        if self.border_drag.is_none() {
-            return false;
+        self.border_drag.take().is_some()
+    }
+
+    /// Consumes the left-button release owned by an externally canceled
+    /// border drag. Returns `true` only for the tombstone, leaving a live
+    /// drag untouched so capture routing keeps its existing behavior.
+    pub(super) fn consume_canceled_border_drag_release(&mut self) -> bool {
+        if self.border_drag.as_ref().is_some_and(|drag| drag.canceled) {
+            self.border_drag = None;
+            true
+        } else {
+            false
         }
-        self.border_drag = None;
-        true
+    }
+
+    /// Marks an active border drag canceled by an external geometry change.
+    /// The tombstone is consumed by the matching left-button release through
+    /// normal or capture routing, so selection-release/auto-copy cannot run.
+    pub(super) fn cancel_border_drag(&mut self) {
+        if let Some(drag) = self.border_drag.as_mut() {
+            drag.canceled = true;
+        }
     }
 
     /// Click-to-focus (CTX-0339): a left press focuses the pane under the

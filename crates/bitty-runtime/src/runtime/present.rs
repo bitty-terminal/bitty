@@ -3574,7 +3574,12 @@ impl Runtime {
         now: std::time::Instant,
         layers: &mut FrameLayers,
     ) {
-        self.paint_closing_rings(basis.pad_px, now, layers);
+        // Issue #2577: closing chrome is ownership-gated against the
+        // *committed* allocations, not the interpolated paint bounds: a live
+        // owner owns its final slot from the first frame even while its own
+        // geometry tween is still sliding into it. The uncovered part of the
+        // surface presents the clear color instead of stale accent chrome.
+        self.paint_closing_rings(&basis.allocations, basis.pad_px, now, layers);
         // CTX-1335: overlays anchored to a leaf follow its interpolated paint
         // bounds so content, cursor, and selection never tear apart during a
         // geometry transition. Their logical state and hit-testing remain
@@ -3643,10 +3648,31 @@ impl Runtime {
     }
 
     /// RFC-0002 close transition: fade the retained rings of Views closed
-    /// during the current transition (CTX-0474 extraction; body moved
-    /// verbatim from `tick_at`).
+    /// during the current transition (CTX-0474 extraction).
+    ///
+    /// Issue #2577: the retained ring is *stale chrome*. It is composited in
+    /// the overlay phase, after every live leaf, so without an ownership
+    /// gate it painted the removed View's full accent rounded rectangle over
+    /// the sibling that had already expanded into the vacated slot. Under
+    /// `catppuccin-mocha` the focused outline (`#94E2D5`) reads as green, so
+    /// the owner saw a "green flash" at the deleted panel's position; the
+    /// same defect exists for every theme and only the accent color differs.
+    ///
+    /// Invariant: **live ownership wins over stale chrome.** A closing frame
+    /// may paint only space that no live allocation owns this frame. Every
+    /// close that re-allocates the removed slot (tiled close, zoom restore,
+    /// float/pin teardown over the base, pinned base retirement) therefore
+    /// presents exactly the new layout; the surviving owner's own ring is
+    /// the only accent that can remain inside the old rectangle. The gate
+    /// reads the committed logical allocations, never the interpolated paint
+    /// bounds: the expanding sibling owns the vacated slot from the first
+    /// frame even while its own `Resize` tween is still sliding into it, and
+    /// the not-yet-covered band must clear to the theme background rather
+    /// than show a retained accent ghost. Intersect (not containment) is the
+    /// test: partial overlap is still double ownership.
     fn paint_closing_rings(
         &mut self,
+        allocations: &[layout_focus::PresentFrame],
         pad_px: i32,
         now: std::time::Instant,
         layers: &mut FrameLayers,
@@ -3673,6 +3699,25 @@ impl Runtime {
                 closing.frame.width,
                 closing.frame.height,
             );
+            // Issue #2577: a live allocation owns its decoration rectangle
+            // outright. The closing ring is background-tier stale chrome and
+            // must never composite over it. Frames with no extent own
+            // nothing and do not occlude.
+            let owned_by_live_layout = allocations.iter().any(|live| {
+                if live.frame.width == 0 || live.frame.height == 0 {
+                    return false;
+                }
+                let live_frame = bitty_render::geometry::RectPx::new(
+                    px_add(pad_px, live.frame.x),
+                    px_add(pad_px, live.frame.y),
+                    live.frame.width,
+                    live.frame.height,
+                );
+                ring_frame.intersection(&live_frame).is_some()
+            });
+            if owned_by_live_layout {
+                continue;
+            }
             layers
                 .combined_rounded
                 .push(bitty_render::chrome::outline_ring(

@@ -93,6 +93,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Fresh configs keep the gap-aware 10x4 minimum, focus/close ordering, and
   workspace IDs; the spiral phase resets to Right whenever focus lands on a
   pane outside the active creation chain or the fallback runs.
+- **Thin rounded Core chrome tokens (#2468):** help/which-key, command
+  palette and presentation/plugin overlays, panel rings, and band chrome now
+  share one `bitty-render::chrome` token layer: one-physical-pixel muted
+  borders, a 6 px radius, 8 px padding, raised/overlay surface tones, and the
+  theme's accepted focused/idle outline pair. Help and overlay cards paint as
+  rounded SDF surfaces with glyph clipping at the corner arc; one-row bands
+  use rounded box-drawing corner glyphs when the corner cell is blank, with a
+  documented light-box/square fallback. Plugin row `fg`/`bg`/`bold` values
+  still win inside the Core card, and a new overlay-card/content/ring layer
+  order keeps row backgrounds visible while the ring stays above content.
 
 ### Fixed
 
@@ -117,6 +127,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   history is gone. The mechanism stays in Core selection/history paging; the
   copy-mode plugin remains a bounded snapshot policy over the same public
   surfaces, and no private API is added.
+- **Panel delete no longer flashes a stale accent ring at the removed slot
+  (#2577):** closing a focused pane kept its last presented decoration ring
+  as RFC-0002 closing chrome, and that stale ring was composited after every
+  live leaf. For the close duration it painted the deleted pane's full accent
+  rounded rectangle over the sibling that had already expanded into the slot;
+  under `catppuccin-mocha`'s teal focused outline the owner saw a green flash.
+  Closing chrome is now ownership-gated against the committed live
+  allocations (the invariant is live ownership wins over stale chrome), so no
+  frame paints retained accent chrome inside the removed rectangle: the
+  surviving owner's surface covers it as its geometry reaches the slot, and
+  the band its `Resize` tween has not covered yet clears to the theme
+  background instead of showing a stale accent border. Applies to tiled,
+  stacked, zoomed, floating, and pinned deletes under any theme. Deterministic
+  headless frame regressions compare each close frame with an instant-delete
+  reference in `catppuccin-mocha` and `github-light`.
 
 ### Fixed
 

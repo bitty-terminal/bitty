@@ -501,8 +501,10 @@ fn zoom_engage_and_disengage_envelopes() {
     let settled = start + Duration::from_millis(open_ms);
     harness.rt.tick_at(settled);
 
-    // Zoom engage collapses to one leaf through the layout funnel.
-    // The tree commits at once; the hidden leaf fades its retained ring out.
+    // Zoom engage collapses to one leaf through the layout funnel. The tree
+    // commits at once. Issue #2577: the hidden leaf's retained ring is stale
+    // chrome and must never paint over the zoomed owner, so the old rect
+    // presents the owner from the first close frame.
     let closing_rect = harness
         .rt
         .present_frames()
@@ -510,6 +512,15 @@ fn zoom_engage_and_disengage_envelopes() {
         .find(|f| f.view == ViewId::new(2))
         .expect("split must show the second leaf")
         .frame;
+    let probe_pad = usize::try_from(harness.rt.window_padding_physical()).expect("pad fits");
+    let probe_x = probe_pad + usize::try_from(closing_rect.x).expect("rect x fits");
+    let probe_y = probe_pad + usize::try_from(closing_rect.y).expect("rect y fits") + 50;
+    let stride = usize::try_from(harness.rt.config().window_extent().width()).expect("stride");
+    let pre_rgba = harness
+        .rt
+        .headless_rgba()
+        .expect("pre-close frame must carry raw bytes");
+    let pre_px = rgba_at(&pre_rgba, stride, probe_x, probe_y);
     harness.rt.set_layout(single_leaf());
     assert_eq!(
         harness.rt.layout().leaf_ids(),
@@ -546,13 +557,11 @@ fn zoom_engage_and_disengage_envelopes() {
         "grid content survives zoom engage verbatim"
     );
 
-    // Pixel evidence for the fade-out: the retained ring pixel at the removed
-    // leaf's old rect still shows mid-transition and clears at the end. Both
-    // bytes come from the single forward drive above.
-    let pad = usize::try_from(harness.rt.window_padding_physical()).expect("pad fits");
-    let stride = usize::try_from(harness.rt.config().window_extent().width()).expect("stride");
-    let probe_x = pad + usize::try_from(closing_rect.x).expect("rect x fits");
-    let probe_y = pad + usize::try_from(closing_rect.y).expect("rect y fits") + 50;
+    // Issue #2577 pixel evidence: the hidden leaf's old border probe now sits
+    // inside the zoomed owner. The stale closing ring may not paint there, so
+    // the probe shows the owner's surface from the first close frame instead
+    // of a fading accent border.
+    let background = harness.rt.config().theme.background;
     let mid_rgba = close_series[2]
         .rgba
         .as_deref()
@@ -564,8 +573,16 @@ fn zoom_engage_and_disengage_envelopes() {
         .expect("end frame must carry raw bytes");
     let cleared_px = rgba_at(cleared_rgba, stride, probe_x, probe_y);
     assert_ne!(
+        pre_px, cleared_px,
+        "the probe must see the removed leaf's ring before the zoom commits"
+    );
+    assert_eq!(
         mid_px, cleared_px,
-        "retained ring must still show mid-close and clear at the end"
+        "no retained closing ring may paint over the zoomed owner (#2577)"
+    );
+    assert_eq!(
+        mid_px, background,
+        "the old rect presents the live owner's surface during the close"
     );
 
     // Zoom disengage restores the split; the restored leaf fades its ring in.

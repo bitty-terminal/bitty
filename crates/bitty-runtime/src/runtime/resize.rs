@@ -633,7 +633,12 @@ impl Runtime {
         // not the primary grid — a split pane's selection is reclamped against
         // that pane. A selection whose owner is no longer live is dropped by
         // the fail-closed guard.
-        if let Some(sel) = self.selection_state {
+        if self.selection_state.is_some() && self.resolved_selection().is_none() {
+            // Issue #2470: a range whose history identities were reassigned
+            // by this geometry change must not resolve onto unrelated lines.
+            self.drop_selection();
+        }
+        if let Some(sel) = self.resolved_selection() {
             // Issues #2480/#2470: pointer selections keep their buffer
             // anchors across a reflow/DPI change. Rows are re-projected
             // against the new window; a one-cell selection survives even

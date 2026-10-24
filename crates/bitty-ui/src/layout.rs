@@ -979,6 +979,162 @@ impl LayoutNode {
         self.set_split_ratio_at(path, next)
     }
 
+    /// Computes the gap-aware ratio for dragging the divider at `path`
+    /// (issue #2572).
+    ///
+    /// `base_ratio` is the split ratio captured at press time; `delta_cells`
+    /// is the pointer's signed cell motion along the split axis since the
+    /// press (positive toward the second child). The returned ratio keeps
+    /// both child subtrees at or above their gap-aware minimum extent
+    /// ([`MIN_PANE_COLS`] / [`MIN_PANE_ROWS`] per pane, with one inner gap
+    /// per nested same-axis split) and within
+    /// `[MIN_RATIO, MAX_RATIO]`.
+    ///
+    /// Returns `None` when `path` does not address a split, the split's
+    /// usable extent cannot host both minimum subtrees, or the geometry is
+    /// degenerate. Non-mutating: the caller decides which axis to apply, so
+    /// a refused axis never disturbs the other (cross-drag, issue #2572).
+    /// Total and deterministic.
+    #[must_use]
+    pub fn drag_split_ratio(
+        &self,
+        container: Rect,
+        gaps: Gaps,
+        path: &[usize],
+        base_ratio: f32,
+        delta_cells: i32,
+    ) -> Option<f32> {
+        let (bounds, axis) = self.split_bounds_at(container, gaps, path)?;
+        let (first, second) = self.split_pair_at(path)?;
+        let extent = match axis {
+            SplitAxis::Horizontal => bounds.width,
+            SplitAxis::Vertical => bounds.height,
+        };
+        let total = u32::from(extent);
+        if total < 2 {
+            return None;
+        }
+        let gap = u32::from(gaps.inner).min(total - 1);
+        let usable = total - gap;
+        if usable < 2 {
+            return None;
+        }
+        let min_first = min_extent(first, axis, gaps.inner);
+        let min_second = min_extent(second, axis, gaps.inner);
+        if min_first.saturating_add(min_second) > usable {
+            return None;
+        }
+        // Cell bounds implied by the ratio clamp and the per-pane minima.
+        // `split_rect_with_gap` floors `usable * ratio`, so the lower bound
+        // rounds up and the upper bound rounds down to stay inside the
+        // ratio range after the integer allocation.
+        let ratio_lo = (f64::from(LayoutNode::MIN_RATIO) * f64::from(usable)).ceil() as u32;
+        let ratio_hi = (f64::from(LayoutNode::MAX_RATIO) * f64::from(usable)).floor() as u32;
+        let lo = min_first.max(ratio_lo).max(1);
+        let hi = (usable - min_second).min(ratio_hi).min(usable - 1);
+        if lo > hi {
+            return None;
+        }
+        let base = clamp_ratio(base_ratio);
+        let current = ((usable as f32) * base).floor() as u32;
+        let current = current.clamp(1, usable - 1);
+        let target = (i64::from(current) + i64::from(delta_cells))
+            .clamp(i64::from(lo), i64::from(hi)) as u32;
+        Some(ratio_for_first_cells(target, usable))
+    }
+
+    /// Allocated bounds and axis of the split at `path`.
+    ///
+    /// Walks the solver exactly like [`Self::layout_with_gaps`] (`Stack`
+    /// children share the bounds, overlays use their clipped rect). Returns
+    /// `None` when `path` addresses no split or the container is degenerate.
+    fn split_bounds_at(
+        &self,
+        container: Rect,
+        gaps: Gaps,
+        path: &[usize],
+    ) -> Option<(Rect, SplitAxis)> {
+        self.split_bounds_inner(gaps.inset_outer(container), gaps.inner, path)
+    }
+
+    /// Recursion for [`Self::split_bounds_at`].
+    fn split_bounds_inner(
+        &self,
+        bounds: Rect,
+        gap_in: u16,
+        path: &[usize],
+    ) -> Option<(Rect, SplitAxis)> {
+        match self {
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                if path.is_empty() {
+                    return Some((bounds, *axis));
+                }
+                let (a, b) = split_rect_with_gap(bounds, *axis, *ratio, gap_in);
+                match path[0] {
+                    0 => first.split_bounds_inner(a, gap_in, &path[1..]),
+                    1 => second.split_bounds_inner(b, gap_in, &path[1..]),
+                    _ => None,
+                }
+            }
+            Self::Stack(children) => {
+                if path.is_empty() {
+                    return None;
+                }
+                children
+                    .get(path[0])?
+                    .split_bounds_inner(bounds, gap_in, &path[1..])
+            }
+            Self::Overlay {
+                base,
+                overlay,
+                bounds: overlay_bounds,
+                ..
+            } => {
+                if path.is_empty() {
+                    return None;
+                }
+                match path[0] {
+                    0 => base.split_bounds_inner(bounds, gap_in, &path[1..]),
+                    1 => {
+                        let clipped = overlay_bounds.clip_to(bounds).unwrap_or(Rect::zero());
+                        overlay.split_bounds_inner(clipped, gap_in, &path[1..])
+                    }
+                    _ => None,
+                }
+            }
+            Self::Leaf(_) => None,
+        }
+    }
+
+    /// Children of the split at `path`, in `(first, second)` order.
+    fn split_pair_at(&self, path: &[usize]) -> Option<(&Self, &Self)> {
+        match path.split_first() {
+            None => match self {
+                Self::Split { first, second, .. } => Some((first, second)),
+                _ => None,
+            },
+            Some((&idx, rest)) => match self {
+                Self::Split { first, second, .. } => match idx {
+                    0 => first.split_pair_at(rest),
+                    1 => second.split_pair_at(rest),
+                    _ => None,
+                },
+                Self::Stack(children) => children.get(idx)?.split_pair_at(rest),
+                Self::Overlay { base, overlay, .. } => match idx {
+                    0 => base.split_pair_at(rest),
+                    1 => overlay.split_pair_at(rest),
+                    _ => None,
+                },
+                Self::Leaf(_) => None,
+            },
+        }
+    }
+
     /// Reads the split ratio at `path` (`[]` = this node), or `None` when
     /// `path` addresses no split.
     #[must_use]
@@ -1174,14 +1330,69 @@ impl LayoutNode {
             .map(|(id, _)| id)
     }
 
-    /// Hit-tests `point` against the split-handle bands (CW-09).
+    /// Hit-tests `point` against the split-handle bands and classifies the
+    /// result (CW-09, issue #2572).
     ///
     /// A split handle is the `gaps.inner`-wide band between the two
     /// children of a `Split` (Hyprland-like `gaps_in`); with zero inner
     /// gaps the divider is the one-cell boundary line between the children.
-    /// Returns the path of the split whose handle contains the point
-    /// (outermost first on nesting), or `None`. Paths use the same
-    /// indexing as [`Self::set_split_ratio_at`]. Total and deterministic.
+    ///
+    /// Returns [`SplitHandle::Edge`] when exactly one divider orientation
+    /// is under the pointer (the outermost split on that axis), or
+    /// [`SplitHandle::Intersection`] when a vertical and a horizontal
+    /// divider cross there — the four-pane inner junction. An intersection
+    /// collects every collinear segment of both crossed dividers (for
+    /// example both column halves of `H[V[1,2], V[3,4]]`'s shared
+    /// horizontal line), so dragging moves the whole cross instead of
+    /// snapping to one axis or one quadrant.
+    ///
+    /// Fail-closed when the same axis matches two non-collinear dividers at
+    /// the same minimal depth (ambiguous tolerance overlap: no grab).
+    /// Paths use the same indexing as [`Self::set_split_ratio_at`]. Total
+    /// and deterministic.
+    #[must_use]
+    pub fn hit_test_split_handle_kind(
+        &self,
+        bounds: Rect,
+        gaps: Gaps,
+        point: Point,
+    ) -> Option<SplitHandle> {
+        let inner = gaps.inset_outer(bounds);
+        let mut hits = Vec::new();
+        self.hit_test_handles_all_inner(inner, gaps.inner, point, Vec::new(), &mut hits);
+        let columns = collinear_handle_group(&hits, SplitAxis::Horizontal).ok()?;
+        let rows = collinear_handle_group(&hits, SplitAxis::Vertical).ok()?;
+        match (columns.is_empty(), rows.is_empty()) {
+            (true, true) => None,
+            (false, true) => Some(SplitHandle::Edge {
+                path: columns[0].path.clone(),
+                axis: SplitAxis::Horizontal,
+            }),
+            (true, false) => Some(SplitHandle::Edge {
+                path: rows[0].path.clone(),
+                axis: SplitAxis::Vertical,
+            }),
+            (false, false) => {
+                // A cross extends past the pointer's own subtree: at the
+                // exact center of `H[V[1,2], V[3,4]]` the pointer is on
+                // one row segment plus the root divider, but both row
+                // segments must move. Scan every visible divider and keep
+                // the collinear segments of each anchored line.
+                let mut all = Vec::new();
+                self.collect_visible_dividers_inner(inner, gaps.inner, point, Vec::new(), &mut all);
+                let columns = extend_collinear(&columns[0], &all, SplitAxis::Horizontal);
+                let rows = extend_collinear(&rows[0], &all, SplitAxis::Vertical);
+                Some(SplitHandle::Intersection { columns, rows })
+            }
+        }
+    }
+
+    /// Hit-tests `point` against the split-handle bands (CW-09).
+    ///
+    /// Compatibility shape for callers that only need one divider path:
+    /// returns the edge path, or the vertical divider path of an
+    /// intersection. [`Self::hit_test_split_handle_kind`] is the
+    /// intersection-aware query. Total and deterministic.
     #[must_use]
     pub fn hit_test_split_handle(
         &self,
@@ -1189,20 +1400,23 @@ impl LayoutNode {
         gaps: Gaps,
         point: Point,
     ) -> Option<Vec<usize>> {
-        let inner = gaps.inset_outer(bounds);
-        self.hit_test_handle_inner(inner, gaps.inner, point, Vec::new())
+        match self.hit_test_split_handle_kind(bounds, gaps, point)? {
+            SplitHandle::Edge { path, .. } => Some(path),
+            SplitHandle::Intersection { mut columns, .. } => {
+                (!columns.is_empty()).then(|| columns.remove(0))
+            }
+        }
     }
 
-    /// Hit-tests `point` against all split-handle bands for corner-drag
-    /// resize (issue #1445: Hyprland/Niri 4-way corner model).
+    /// Hit-tests `point` against every segment of the grabbed handle
+    /// (issue #1445 corner-drag, issue #2572 cross-drag).
     ///
-    /// Returns at most one split per axis (outermost on nesting), so a
-    /// corner intersection of perpendicular splits yields at most two
-    /// entries (one per axis) for up to four adjacent panels. Returns an
-    /// empty vec when the point lands on no handle, or fail-closed when
-    /// the same axis matches at the same depth on different paths
-    /// (ambiguous sibling dividers: no grab). Paths use the same indexing
-    /// as [`Self::set_split_ratio_at`]. Total and deterministic.
+    /// Returns one `(path, axis)` per split that the drag must move: one
+    /// entry for an edge divider, and every collinear segment of both
+    /// crossed dividers for an intersection (a 2x2 junction yields three
+    /// entries: the root column split and both row splits). Empty when no
+    /// handle matches. Paths use the same indexing as
+    /// [`Self::set_split_ratio_at`]. Total and deterministic.
     #[must_use]
     pub fn hit_test_split_handles(
         &self,
@@ -1210,99 +1424,27 @@ impl LayoutNode {
         gaps: Gaps,
         point: Point,
     ) -> Vec<(Vec<usize>, SplitAxis)> {
-        let inner = gaps.inset_outer(bounds);
-        let mut result = Vec::new();
-        self.hit_test_handles_all_inner(inner, gaps.inner, point, Vec::new(), &mut result);
-        dedup_handles_to_one_per_axis(result)
+        self.hit_test_split_handle_kind(bounds, gaps, point)
+            .map(|handle| handle.splits())
+            .unwrap_or_default()
     }
 
-    /// Recursion for [`Self::hit_test_split_handle`]: `bounds` is the
-    /// gap-inset region owned by `self`; `prefix` is the path to `self`.
-    fn hit_test_handle_inner(
-        &self,
-        bounds: Rect,
-        gap_in: u16,
-        point: Point,
-        prefix: Vec<usize>,
-    ) -> Option<Vec<usize>> {
-        match self {
-            Self::Leaf(_) => None,
-            Self::Split {
-                axis,
-                ratio,
-                first,
-                second,
-            } => {
-                let (a, b) = split_rect_with_gap(bounds, *axis, *ratio, gap_in);
-                let handle = handle_band_between(a, b, *axis, gap_in);
-                if let Some(rect) = handle {
-                    if rect.contains_point(point) {
-                        return Some(prefix.clone());
-                    }
-                } else if on_child_boundary(a, b, *axis, point) {
-                    return Some(prefix.clone());
-                }
-                // Recurse: first child keeps the prefix, second appends.
-                let mut first_prefix = prefix.clone();
-                first_prefix.push(0);
-                if let Some(hit) = first.hit_test_handle_inner(a, gap_in, point, first_prefix) {
-                    return Some(hit);
-                }
-                let mut second_prefix = prefix;
-                second_prefix.push(1);
-                second.hit_test_handle_inner(b, gap_in, point, second_prefix)
-            }
-            Self::Stack(children) => {
-                // Only the last (top-most, visible) child owns the pointer;
-                // hidden stacked children never own a handle (issue #1445).
-                if let Some((i, child)) = children.iter().enumerate().next_back() {
-                    let mut child_prefix = prefix.clone();
-                    child_prefix.push(i);
-                    if let Some(hit) =
-                        child.hit_test_handle_inner(bounds, gap_in, point, child_prefix)
-                    {
-                        return Some(hit);
-                    }
-                }
-                None
-            }
-            Self::Overlay {
-                base,
-                overlay,
-                bounds: overlay_bounds,
-                ..
-            } => {
-                let clipped = overlay_bounds.clip_to(bounds).unwrap_or(Rect::zero());
-                // Overlay occlusion (issue #1445): when the pointer is over
-                // the floating overlay, base handles beneath are hidden.
-                if clipped.contains_point(point) {
-                    let mut overlay_prefix = prefix;
-                    overlay_prefix.push(1);
-                    overlay.hit_test_handle_inner(clipped, gap_in, point, overlay_prefix)
-                } else {
-                    let mut base_prefix = prefix.clone();
-                    base_prefix.push(0);
-                    base.hit_test_handle_inner(bounds, gap_in, point, base_prefix)
-                }
-            }
-        }
-    }
-
-    /// Recursion for [`Self::hit_test_split_handles`]: collects all split
-    /// handles containing `point` into `result`. Unlike the single-hit
-    /// variant, this continues searching after finding a match to detect
-    /// corner intersections (issue #1445). Only the visible Stack child
-    /// and the occlusion-winning Overlay branch are searched; gapped
-    /// handle bands are inflated by one cell so perpendicular gap bands
-    /// overlap at corners (otherwise the gap-intersection square belongs
-    /// to neither inner band and corner-drag is dead with `gaps_in > 0`).
+    /// Recursion for the handle hit tests: collects every split handle
+    /// containing `point` into `result`, with the divider band geometry
+    /// needed to prove collinearity (issue #2572).
+    ///
+    /// Only the visible Stack child and the occlusion-winning Overlay
+    /// branch are searched; gapped handle bands are inflated by one cell
+    /// so perpendicular gap bands overlap at corners (otherwise the
+    /// gap-intersection square belongs to neither inner band and
+    /// corner-drag is dead with `gaps_in > 0`).
     fn hit_test_handles_all_inner(
         &self,
         bounds: Rect,
         gap_in: u16,
         point: Point,
         prefix: Vec<usize>,
-        result: &mut Vec<(Vec<usize>, SplitAxis)>,
+        result: &mut Vec<SplitHandleHit>,
     ) {
         match self {
             Self::Leaf(_) => {}
@@ -1320,7 +1462,11 @@ impl LayoutNode {
                     on_child_boundary(a, b, *axis, point)
                 };
                 if hit {
-                    result.push((prefix.clone(), *axis));
+                    result.push(SplitHandleHit {
+                        path: prefix.clone(),
+                        axis: *axis,
+                        band: divider_band(a, b, *axis, gap_in),
+                    });
                 }
                 // Always recurse into both children to find nested handles.
                 let mut first_prefix = prefix.clone();
@@ -1365,6 +1511,213 @@ impl LayoutNode {
             }
         }
     }
+
+    /// Collects every visible split divider with its band geometry, with no
+    /// band containment filter (issue #2572 cross extension).
+    ///
+    /// Mirrors the hit test's visibility rules: `Stack` exposes only its
+    /// top-most child, and an `Overlay` exposes the floating branch when
+    /// `point` is inside its clipped rect and the base otherwise. Hidden
+    /// segments of an occluded branch never join a cross.
+    fn collect_visible_dividers_inner(
+        &self,
+        bounds: Rect,
+        gap_in: u16,
+        point: Point,
+        prefix: Vec<usize>,
+        out: &mut Vec<SplitHandleHit>,
+    ) {
+        match self {
+            Self::Leaf(_) => {}
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let (a, b) = split_rect_with_gap(bounds, *axis, *ratio, gap_in);
+                out.push(SplitHandleHit {
+                    path: prefix.clone(),
+                    axis: *axis,
+                    band: divider_band(a, b, *axis, gap_in),
+                });
+                let mut first_prefix = prefix.clone();
+                first_prefix.push(0);
+                first.collect_visible_dividers_inner(a, gap_in, point, first_prefix, out);
+                let mut second_prefix = prefix;
+                second_prefix.push(1);
+                second.collect_visible_dividers_inner(b, gap_in, point, second_prefix, out);
+            }
+            Self::Stack(children) => {
+                if let Some((i, child)) = children.iter().enumerate().next_back() {
+                    let mut child_prefix = prefix.clone();
+                    child_prefix.push(i);
+                    child.collect_visible_dividers_inner(bounds, gap_in, point, child_prefix, out);
+                }
+            }
+            Self::Overlay {
+                base,
+                overlay,
+                bounds: overlay_bounds,
+                ..
+            } => {
+                let clipped = overlay_bounds.clip_to(bounds).unwrap_or(Rect::zero());
+                if clipped.contains_point(point) {
+                    let mut overlay_prefix = prefix;
+                    overlay_prefix.push(1);
+                    overlay.collect_visible_dividers_inner(
+                        clipped,
+                        gap_in,
+                        point,
+                        overlay_prefix,
+                        out,
+                    );
+                } else {
+                    let mut base_prefix = prefix.clone();
+                    base_prefix.push(0);
+                    base.collect_visible_dividers_inner(bounds, gap_in, point, base_prefix, out);
+                }
+            }
+        }
+    }
+}
+
+/// A split-handle grab resolved against a [`LayoutNode`] (issue #2572).
+///
+/// Edge handles own one divider; intersection handles own a crossing of a
+/// vertical and a horizontal divider plus every collinear segment of both
+/// lines, so all panes adjacent to the cross resize together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitHandle {
+    /// A single divider, away from any crossing.
+    Edge {
+        /// Path to the split (same indexing as
+        /// [`LayoutNode::set_split_ratio_at`]).
+        path: Vec<usize>,
+        /// Divider orientation: `Horizontal` is a vertical divider between
+        /// left/right panes, `Vertical` a horizontal divider between
+        /// top/bottom panes.
+        axis: SplitAxis,
+    },
+    /// A vertical and a horizontal divider crossing at the pointer (the
+    /// four-pane inner junction).
+    Intersection {
+        /// Every `Horizontal` split on the shared vertical divider line
+        /// (outermost first), in depth-first order.
+        columns: Vec<Vec<usize>>,
+        /// Every `Vertical` split on the shared horizontal divider line
+        /// (outermost first), in depth-first order.
+        rows: Vec<Vec<usize>>,
+    },
+}
+
+impl SplitHandle {
+    /// Flattens the handle into the splits a drag or resize must move.
+    #[must_use]
+    pub fn splits(&self) -> Vec<(Vec<usize>, SplitAxis)> {
+        match self {
+            Self::Edge { path, axis } => vec![(path.clone(), *axis)],
+            Self::Intersection { columns, rows } => columns
+                .iter()
+                .map(|path| (path.clone(), SplitAxis::Horizontal))
+                .chain(rows.iter().map(|path| (path.clone(), SplitAxis::Vertical)))
+                .collect(),
+        }
+    }
+
+    /// Whether this handle is a cross intersection of both axes.
+    #[must_use]
+    pub const fn is_intersection(&self) -> bool {
+        matches!(self, Self::Intersection { .. })
+    }
+}
+
+/// One raw handle hit with the divider band span (issue #2572).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitHandleHit {
+    /// Path to the split that owns the divider.
+    path: Vec<usize>,
+    /// Divider orientation.
+    axis: SplitAxis,
+    /// Divider band interval along the split axis: columns for a
+    /// `Horizontal` split, rows for a `Vertical` one, half-open
+    /// `[start, end)`.
+    band: (u32, u32),
+}
+
+impl SplitHandleHit {
+    /// True when two handles lie on the same divider line: same axis and
+    /// overlapping (or touching within their own band width) spans.
+    fn is_collinear_with(&self, other: &Self) -> bool {
+        self.axis == other.axis && self.band.0 < other.band.1 && other.band.0 < self.band.1
+    }
+}
+
+/// Collects the collinear segment group on one axis, outermost first
+/// (issue #2572).
+///
+/// The shallowest hit anchors the group. Every hit whose band overlaps the
+/// anchor band belongs to the same divider line (both column halves of a
+/// cross's row divider, deeper nested segments, ...). Returns `Err(())` —
+/// fail closed — when two non-collinear dividers on this axis match at the
+/// same minimal depth: the pointer is only within tolerance of both, so
+/// guessing one would move the wrong divider. Total and deterministic.
+fn collinear_handle_group(
+    hits: &[SplitHandleHit],
+    axis: SplitAxis,
+) -> Result<Vec<SplitHandleHit>, ()> {
+    let axis_hits: Vec<&SplitHandleHit> = hits.iter().filter(|hit| hit.axis == axis).collect();
+    let Some(anchor) = axis_hits.iter().min_by_key(|hit| hit.path.len()).copied() else {
+        return Ok(Vec::new());
+    };
+    let anchor_depth = anchor.path.len();
+    if axis_hits
+        .iter()
+        .any(|hit| hit.path.len() == anchor_depth && !hit.is_collinear_with(anchor))
+    {
+        return Err(());
+    }
+    Ok(axis_hits
+        .into_iter()
+        .filter(|hit| hit.is_collinear_with(anchor))
+        .cloned()
+        .collect())
+}
+
+/// Every visible divider collinear with `anchor` on `axis`, in traversal
+/// order (issue #2572).
+///
+/// Used to extend a cross past the pointer's own subtree: both column
+/// halves of a shared row divider are collinear even though the pointer
+/// sits on only one half (or exactly between them).
+fn extend_collinear(
+    anchor: &SplitHandleHit,
+    all: &[SplitHandleHit],
+    axis: SplitAxis,
+) -> Vec<Vec<usize>> {
+    all.iter()
+        .filter(|hit| hit.axis == axis && hit.is_collinear_with(anchor))
+        .map(|hit| hit.path.clone())
+        .collect()
+}
+
+/// Divider band interval along the split axis (issue #2572).
+///
+/// Mirrors [`handle_band_between`] and [`on_child_boundary`]: gapped
+/// splits report the gap band; gapless splits report the two-cell
+/// boundary line (last column/row of the first child plus the first of
+/// the second).
+fn divider_band(first: Rect, second: Rect, axis: SplitAxis, gap_in: u16) -> (u32, u32) {
+    if let Some(band) = handle_band_between(first, second, axis, gap_in) {
+        return match axis {
+            SplitAxis::Horizontal => (u32::from(band.x), band.right()),
+            SplitAxis::Vertical => (u32::from(band.y), band.bottom()),
+        };
+    }
+    match axis {
+        SplitAxis::Horizontal => (first.right().saturating_sub(1), second.x as u32 + 1),
+        SplitAxis::Vertical => (first.bottom().saturating_sub(1), second.y as u32 + 1),
+    }
 }
 
 /// Inflates a gapped split-handle band by one cell on every side
@@ -1375,8 +1728,8 @@ impl LayoutNode {
 /// split's band (inner bands end at the gap edge, exclusive), and no
 /// pointer position hits both perpendicular splits when `gaps_in > 0`.
 /// The one-cell tolerance creates a small overlap where an offset corner
-/// press grabs both dividers; the [`dedup_handles_to_one_per_axis`]
-/// bound below keeps the grab to at most one split per axis.
+/// press grabs both dividers; [`collinear_handle_group`] keeps the grab
+/// to the collinear segments of each axis.
 fn inflate_handle_band(rect: Rect) -> Rect {
     Rect::new(
         rect.x.saturating_sub(1),
@@ -1384,62 +1737,6 @@ fn inflate_handle_band(rect: Rect) -> Rect {
         rect.width.saturating_add(2),
         rect.height.saturating_add(2),
     )
-}
-
-/// Bounds raw corner hits to at most one split per axis (issue #1445).
-///
-/// Keeps the outermost (shortest-path, first in depth-first order) split
-/// per [`SplitAxis`], so parallel nested splits collapse to the outer
-/// divider and a corner yields at most two entries (one per axis) for up
-/// to four panels. Fail-closed on ambiguity: when the same axis matches
-/// at the same minimal depth on different paths (sibling dividers both
-/// within tolerance, e.g. a dead-center gap press), returns empty (no
-/// grab) instead of guessing a quadrant. Total and deterministic.
-fn dedup_handles_to_one_per_axis(
-    hits: Vec<(Vec<usize>, SplitAxis)>,
-) -> Vec<(Vec<usize>, SplitAxis)> {
-    use SplitAxis::{Horizontal, Vertical};
-    let mut best_h: Option<(Vec<usize>, SplitAxis)> = None;
-    let mut best_v: Option<(Vec<usize>, SplitAxis)> = None;
-    let mut ambiguous_h = false;
-    let mut ambiguous_v = false;
-    for (path, axis) in hits {
-        match axis {
-            Horizontal => match &best_h {
-                None => best_h = Some((path, axis)),
-                Some((best_path, _)) => {
-                    if path.len() < best_path.len() {
-                        best_h = Some((path, axis));
-                        ambiguous_h = false;
-                    } else if path.len() == best_path.len() && path != *best_path {
-                        ambiguous_h = true;
-                    }
-                }
-            },
-            Vertical => match &best_v {
-                None => best_v = Some((path, axis)),
-                Some((best_path, _)) => {
-                    if path.len() < best_path.len() {
-                        best_v = Some((path, axis));
-                        ambiguous_v = false;
-                    } else if path.len() == best_path.len() && path != *best_path {
-                        ambiguous_v = true;
-                    }
-                }
-            },
-        }
-    }
-    if ambiguous_h || ambiguous_v {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(2);
-    if let Some(h) = best_h {
-        out.push(h);
-    }
-    if let Some(v) = best_v {
-        out.push(v);
-    }
-    out
 }
 
 /// Handle band between two gap-split siblings (CW-09 helper for
@@ -1506,6 +1803,66 @@ fn on_child_boundary(first: Rect, second: Rect, axis: SplitAxis, point: Point) -
                 && (point.x as u32) < second.right()
         }
     }
+}
+
+/// Minimum usable extent of `node` along `axis` (issue #2572).
+///
+/// A leaf needs [`MIN_PANE_COLS`] columns or [`MIN_PANE_ROWS`] rows. A
+/// split along the axis sums both children plus one inner gap; a split on
+/// the perpendicular axis takes the larger child (both share the extent).
+/// `Stack` takes the largest child so every stacked page stays usable, and
+/// an `Overlay` takes the larger of base and floating layer. Saturating:
+/// deep or oversized trees never wrap.
+fn min_extent(node: &LayoutNode, axis: SplitAxis, gap_in: u16) -> u32 {
+    let leaf_min = match axis {
+        SplitAxis::Horizontal => u32::from(MIN_PANE_COLS),
+        SplitAxis::Vertical => u32::from(MIN_PANE_ROWS),
+    };
+    match node {
+        LayoutNode::Leaf(_) => leaf_min,
+        LayoutNode::Split {
+            axis: split_axis,
+            first,
+            second,
+            ..
+        } => {
+            let first = min_extent(first, axis, gap_in);
+            let second = min_extent(second, axis, gap_in);
+            if *split_axis == axis {
+                first
+                    .saturating_add(u32::from(gap_in))
+                    .saturating_add(second)
+            } else {
+                first.max(second)
+            }
+        }
+        LayoutNode::Stack(children) => children
+            .iter()
+            .map(|child| min_extent(child, axis, gap_in))
+            .max()
+            .unwrap_or(0),
+        LayoutNode::Overlay { base, overlay, .. } => {
+            min_extent(base, axis, gap_in).max(min_extent(overlay, axis, gap_in))
+        }
+    }
+}
+
+/// Ratio that makes the deterministic solver allocate exactly `target`
+/// cells to the first child of a `usable`-cell split (issue #2572).
+///
+/// [`split_rect_with_gap`] floors `usable * ratio`; rounding the ratio down
+/// can land one cell short, so step to the next representable `f32` until
+/// the floor reaches the requested count (bounded to a few steps).
+fn ratio_for_first_cells(target: u32, usable: u32) -> f32 {
+    debug_assert!(target > 0 && target < usable);
+    let mut ratio = target as f32 / usable as f32;
+    for _ in 0..4 {
+        if ((usable as f32) * ratio).floor() as u32 >= target {
+            break;
+        }
+        ratio = f32::from_bits(ratio.to_bits() + 1);
+    }
+    clamp_ratio(ratio)
 }
 
 /// Clamps a raw ratio to `[MIN_RATIO, MAX_RATIO]`.
@@ -3401,58 +3758,253 @@ mod tests {
         )
     }
 
-    #[test]
-    fn corner_handles_grab_both_perpendicular_zero_gap() {
-        use crate::geometry::{Gaps, Point};
-        // Issue #1445: a corner press on the 2x2 intersection grabs the
-        // outer horizontal split plus the containing column's vertical
-        // split (at most one per axis, outermost).
-        let tree = four_pane_grid();
-        let bounds = Rect::new(0, 0, 80, 24);
-        let hits = tree.hit_test_split_handles(bounds, Gaps::ZERO, Point::new(39, 11));
-        assert_eq!(
-            hits.len(),
-            2,
-            "corner grabs two perpendicular splits: {hits:?}"
-        );
-        assert!(hits.contains(&(Vec::new(), SplitAxis::Horizontal)));
-        assert!(hits.contains(&(vec![0], SplitAxis::Vertical)));
+    /// Flattens an intersection handle into its column/row path groups.
+    fn split_groups(handle: &SplitHandle) -> (Vec<Vec<usize>>, Vec<Vec<usize>>) {
+        match handle {
+            SplitHandle::Intersection { columns, rows } => (columns.clone(), rows.clone()),
+            SplitHandle::Edge { .. } => panic!("expected an intersection handle, got {handle:?}"),
+        }
+    }
+
+    /// Allocations as `(leaf id, rect)` pairs for exact geometry asserts.
+    fn rects(tree: &LayoutNode, bounds: Rect, gaps: Gaps) -> Vec<(u64, Rect)> {
+        tree.layout_with_gaps(bounds, gaps)
+            .into_iter()
+            .map(|(id, rect)| (id.0, rect))
+            .collect()
+    }
+
+    fn rect(alloc: &[(u64, Rect)], id: u64) -> Rect {
+        alloc
+            .iter()
+            .find(|(leaf, _)| *leaf == id)
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| panic!("leaf {id} must be allocated"))
     }
 
     #[test]
-    fn corner_handles_grab_both_perpendicular_with_gaps() {
+    fn junction_handle_reports_both_axes_and_all_collinear_rows() {
         use crate::geometry::{Gaps, Point};
-        // Issue #1445: with gaps_in > 0 the gap-intersection square belongs
-        // only to the outer band, so an offset corner press (inside the
-        // left column's inflated inner band and the inflated outer band)
-        // must still grab both perpendicular splits.
+        // Issue #2572: the 2x2 inner junction is an intersection handle, not
+        // an edge divider. Every pointer cell around the exact crossing
+        // resolves the root column split plus both row segments.
         let tree = four_pane_grid();
         let bounds = Rect::new(0, 0, 80, 24);
-        let gaps = Gaps::new(2, 0);
-        let hits = tree.hit_test_split_handles(bounds, gaps, Point::new(38, 12));
-        assert_eq!(
-            hits.len(),
-            2,
-            "gapped offset corner grabs both splits: {hits:?}"
-        );
-        assert!(hits.contains(&(Vec::new(), SplitAxis::Horizontal)));
-        assert!(hits.contains(&(vec![0], SplitAxis::Vertical)));
+        for point in [
+            Point::new(39, 11),
+            Point::new(39, 12),
+            Point::new(40, 11),
+            Point::new(40, 12),
+        ] {
+            let handle = tree
+                .hit_test_split_handle_kind(bounds, Gaps::ZERO, point)
+                .unwrap_or_else(|| panic!("junction must grab at {point:?}"));
+            assert!(handle.is_intersection(), "{point:?}: {handle:?}");
+            let (columns, rows) = split_groups(&handle);
+            assert_eq!(columns, vec![Vec::new()], "columns at {point:?}");
+            assert_eq!(
+                rows,
+                vec![vec![0], vec![1]],
+                "both row segments move at {point:?}"
+            );
+        }
+        let hits = tree.hit_test_split_handles(bounds, Gaps::ZERO, Point::new(40, 12));
+        assert_eq!(hits.len(), 3, "cross exposes all three splits: {hits:?}");
     }
 
     #[test]
-    fn corner_handles_fail_closed_on_ambiguous_center_gap_press() {
+    fn junction_handle_is_distinct_from_edge_dividers() {
         use crate::geometry::{Gaps, Point};
-        // Issue #1445: a dead-center gap press is within tolerance of both
-        // sibling vertical dividers ([0] and [1]); guessing a quadrant
-        // would surprise, so the hit test fails closed (no grab).
+        // Issue #2572: away from the crossing cell the same dividers stay
+        // single-axis edge handles (no accidental cross grab).
         let tree = four_pane_grid();
         let bounds = Rect::new(0, 0, 80, 24);
-        let gaps = Gaps::new(2, 0);
-        let hits = tree.hit_test_split_handles(bounds, gaps, Point::new(40, 12));
-        assert!(
-            hits.is_empty(),
-            "ambiguous center gap press must not grab: {hits:?}"
+        assert_eq!(
+            tree.hit_test_split_handle_kind(bounds, Gaps::ZERO, Point::new(40, 5)),
+            Some(SplitHandle::Edge {
+                path: Vec::new(),
+                axis: SplitAxis::Horizontal,
+            }),
+            "shared vertical divider away from the junction"
         );
+        assert_eq!(
+            tree.hit_test_split_handle_kind(bounds, Gaps::ZERO, Point::new(10, 12)),
+            Some(SplitHandle::Edge {
+                path: vec![0],
+                axis: SplitAxis::Vertical,
+            }),
+            "row divider away from the junction"
+        );
+    }
+
+    #[test]
+    fn junction_handle_works_with_gaps_and_skips_non_collinear_rows() {
+        use crate::geometry::{Gaps, Point};
+        let bounds = Rect::new(0, 0, 80, 24);
+        let gaps = Gaps::new(2, 0);
+        let tree = four_pane_grid();
+        // The dead-center gap square used to fail closed as an ambiguous
+        // sibling press (issue #1445); with a cross it is the junction.
+        let handle = tree
+            .hit_test_split_handle_kind(bounds, gaps, Point::new(40, 12))
+            .expect("gapped center junction must grab");
+        let (columns, rows) = split_groups(&handle);
+        assert_eq!(columns, vec![Vec::new()]);
+        assert_eq!(rows, vec![vec![0], vec![1]]);
+
+        // Fractional row positions: an offset (non-collinear) sibling row
+        // divider is a T junction, so only the touched segment moves.
+        let offset = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(view(1, 40, 12)),
+                LayoutNode::leaf(view(2, 40, 12)),
+            ),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.6,
+                LayoutNode::leaf(view(3, 40, 13)),
+                LayoutNode::leaf(view(4, 40, 11)),
+            ),
+        );
+        let handle = offset
+            .hit_test_split_handle_kind(bounds, gaps, Point::new(40, 11))
+            .expect("T junction must still cross on the touched row");
+        let (_, rows) = split_groups(&handle);
+        assert_eq!(
+            rows,
+            vec![vec![0]],
+            "only the collinear row segment moves: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn cross_drag_moves_both_rows_and_columns() {
+        use crate::geometry::{Gaps, Point};
+        // Issue #2572 acceptance: a diagonal drag from the exact center of
+        // H[V[1,2], V[3,4]] changes both axes and all four pane extents.
+        let bounds = Rect::new(0, 0, 80, 24);
+        let tree = four_pane_grid();
+        let handle = tree
+            .hit_test_split_handle_kind(bounds, Gaps::ZERO, Point::new(40, 12))
+            .expect("center junction");
+        let mut next = tree.clone();
+        for (path, axis) in handle.splits() {
+            let delta = match axis {
+                SplitAxis::Horizontal => 8,
+                SplitAxis::Vertical => 4,
+            };
+            let base = tree.split_ratio_at(&path).expect("grabbed split");
+            let ratio = tree
+                .drag_split_ratio(bounds, Gaps::ZERO, &path, base, delta)
+                .expect("draggable split");
+            assert!(next.set_split_ratio_at(&path, ratio));
+        }
+        let alloc = rects(&next, bounds, Gaps::ZERO);
+        assert_eq!(rect(&alloc, 1), Rect::new(0, 0, 48, 16));
+        assert_eq!(rect(&alloc, 2), Rect::new(0, 16, 48, 8));
+        assert_eq!(rect(&alloc, 3), Rect::new(48, 0, 32, 16));
+        assert_eq!(
+            rect(&alloc, 4),
+            Rect::new(48, 16, 32, 8),
+            "right row segment must move with the shared cross"
+        );
+    }
+
+    #[test]
+    fn cross_drag_clamps_to_gap_aware_minimum_sizes() {
+        use crate::geometry::{Gaps, Point};
+        // Issue #2572: every adjacent pane keeps its 10x4 minimum with the
+        // configured inner gap reserved before the split.
+        let bounds = Rect::new(0, 0, 80, 24);
+        let gaps = Gaps::new(2, 0);
+        let tree = four_pane_grid();
+        let handle = tree
+            .hit_test_split_handle_kind(bounds, gaps, Point::new(40, 12))
+            .expect("center junction");
+        let mut next = tree.clone();
+        for (path, axis) in handle.splits() {
+            let delta = match axis {
+                SplitAxis::Horizontal => 100,
+                SplitAxis::Vertical => -100,
+            };
+            let base = tree.split_ratio_at(&path).expect("grabbed split");
+            let ratio = tree
+                .drag_split_ratio(bounds, gaps, &path, base, delta)
+                .expect("draggable split");
+            assert!(next.set_split_ratio_at(&path, ratio));
+        }
+        // Width: usable 78 -> first 68, gap 2, second 10. Height: usable
+        // 22 -> first 4, gap 2, second 18.
+        let alloc = rects(&next, bounds, gaps);
+        assert_eq!(rect(&alloc, 1), Rect::new(0, 0, 68, 4));
+        assert_eq!(rect(&alloc, 2), Rect::new(0, 6, 68, 18));
+        assert_eq!(rect(&alloc, 3), Rect::new(70, 0, 10, 4));
+        assert_eq!(rect(&alloc, 4), Rect::new(70, 6, 10, 18));
+        for (id, rect) in &alloc {
+            assert!(
+                rect.width >= MIN_PANE_COLS && rect.height >= MIN_PANE_ROWS,
+                "p{id} below 10x4: {rect:?}"
+            );
+            assert!(!rect.is_empty(), "p{id} collapsed: {rect:?}");
+        }
+    }
+
+    #[test]
+    fn cross_drag_respects_nested_subtree_minimums() {
+        use crate::geometry::{Gaps, Point};
+        // Nested cross: H[V[1,2], V[3,V[4,5]]]. The right row divider can
+        // only grow to 16 rows because its bottom half must still host two
+        // 4-row panes; the left row divider may grow to 20.
+        let bounds = Rect::new(0, 0, 80, 24);
+        let tree = LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(view(1, 40, 12)),
+                LayoutNode::leaf(view(2, 40, 12)),
+            ),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(view(3, 40, 12)),
+                LayoutNode::split(
+                    SplitAxis::Vertical,
+                    0.5,
+                    LayoutNode::leaf(view(4, 40, 6)),
+                    LayoutNode::leaf(view(5, 40, 6)),
+                ),
+            ),
+        );
+        let handle = tree
+            .hit_test_split_handle_kind(bounds, Gaps::ZERO, Point::new(40, 12))
+            .expect("nested center junction");
+        let (_, rows) = split_groups(&handle);
+        assert_eq!(rows, vec![vec![0], vec![1]], "nested row segments");
+
+        let mut next = tree.clone();
+        for (path, axis) in handle.splits() {
+            let delta = match axis {
+                SplitAxis::Horizontal => 0,
+                SplitAxis::Vertical => 20,
+            };
+            let base = tree.split_ratio_at(&path).expect("grabbed split");
+            let ratio = tree
+                .drag_split_ratio(bounds, Gaps::ZERO, &path, base, delta)
+                .expect("draggable split");
+            assert!(next.set_split_ratio_at(&path, ratio));
+        }
+        let alloc = rects(&next, bounds, Gaps::ZERO);
+        assert_eq!(rect(&alloc, 1), Rect::new(0, 0, 40, 20));
+        assert_eq!(rect(&alloc, 2), Rect::new(0, 20, 40, 4));
+        assert_eq!(rect(&alloc, 3), Rect::new(40, 0, 40, 16));
+        assert_eq!(rect(&alloc, 4), Rect::new(40, 16, 40, 4));
+        assert_eq!(rect(&alloc, 5), Rect::new(40, 20, 40, 4));
     }
 
     #[test]

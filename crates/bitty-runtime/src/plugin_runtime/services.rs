@@ -317,11 +317,13 @@ pub fn keymap_row(binding: &ResolvedKeymap) -> Option<KeymapRow> {
 /// Convert the live resolved table into addressable rows, dropping malformed
 /// entries.
 ///
-/// Plugin-suggested bindings are deliberately absent: the plugin-binding
-/// dispatch slot (`DispatchPriority::Plugin` / `match_plugin_binding`) is a
-/// deny-by-default stub, so a suggestion is not dispatchable today and
-/// advertising it would promise a chord that does nothing. They join this
-/// list only when the suggestion layer actually dispatches.
+/// Plugin-suggested bindings are deliberately absent from this table: the
+/// read API serves the resolved user/default registry, while suggestions are
+/// published through the separate generation-fenced dispatch directory
+/// (`bitty-runtime` `SuggestedBindingDirectory`) and dispatch only the
+/// owning generation's registered command. Advertising them here would
+/// misreport them as resolvable user bindings, so they join this page only
+/// if the read contract later defines a distinct suggestion source.
 #[must_use]
 pub fn keymap_rows(bindings: &[ResolvedKeymap]) -> Vec<KeymapRow> {
     bindings.iter().filter_map(keymap_row).collect()

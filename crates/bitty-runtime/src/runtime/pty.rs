@@ -1733,12 +1733,7 @@ impl Runtime {
             self.bump_search_result_generation();
         }
         if let Some(view) = anchored_view {
-            let scrollback_len = self.state.scrollback_len();
-            let state_height = self.state.height();
-            let anchor_id = self.find_view(view).and_then(View::scroll_anchor_line_id);
-            let line_index =
-                anchor_id.and_then(|id| self.state.scrollback().position(|line| line.id == id));
-            self.restore_view_scroll_anchor_values(view, scrollback_len, state_height, line_index);
+            self.retain_view_scroll_anchor(view);
         }
     }
 

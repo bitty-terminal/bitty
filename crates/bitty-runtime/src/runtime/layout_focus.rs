@@ -1649,6 +1649,31 @@ impl Runtime {
         }
     }
 
+    /// Reflows only stored overlay Views to their presented content frames.
+    /// Tiled leaves have already been sized by the gap-aware layout solver;
+    /// applying decorated frame dimensions to them here would replace solver
+    /// widths with paint widths and make resize geometry observable incorrectly.
+    pub(super) fn reflow_overlay_present_layout(&mut self, frames: &[PresentFrame]) {
+        let live = self.live_cell_metrics();
+        let cw = u32::from(u16::try_from(live.width).unwrap_or(u16::MAX)).max(1);
+        let ch = u32::from(u16::try_from(live.height).unwrap_or(u16::MAX)).max(1);
+        for frame in frames {
+            let x = (frame.content.x.max(0) as u32) / cw;
+            let y = (frame.content.y.max(0) as u32) / ch;
+            let rect = UiRect::new(
+                x.min(u32::from(u16::MAX)) as u16,
+                y.min(u32::from(u16::MAX)) as u16,
+                frame.cols,
+                frame.rows,
+            );
+            if let Some(stored) = self.pinned.find_mut(frame.view) {
+                stored.reflow_to_rect(rect);
+            } else if let Some(stored) = self.floats.find_mut(frame.view) {
+                stored.reflow_to_rect(rect);
+            }
+        }
+    }
+
     /// Decorated hit-testing: physical cursor position to `(view, local cell)`
     /// over the present frames (frame for hit testing, content for painting).
     ///
@@ -1920,6 +1945,30 @@ impl Runtime {
         self.restore_view_scroll_anchor_values(view, scrollback_len, state_height, line_index);
     }
 
+    /// Keeps a detached view's retained top line stable while PTY output
+    /// grows, without converting it to a new bottom-relative offset. The
+    /// numeric offset remains the bounded fallback; resize paths use
+    /// [`Self::restore_view_scroll_anchor`] when geometry changes.
+    pub(super) fn retain_view_scroll_anchor(&mut self, view: ViewId) {
+        let (scrollback_len, state_height, line_index, has_anchor) = {
+            let Some(state) = self.live_view_state(view) else {
+                return;
+            };
+            let anchor_id = self.find_view(view).and_then(View::scroll_anchor_line_id);
+            (
+                state.scrollback_len(),
+                state.height(),
+                anchor_id.and_then(|id| state.scrollback().position(|line| line.id == id)),
+                anchor_id.is_some(),
+            )
+        };
+        if !has_anchor || line_index.is_none() {
+            if let Some(leaf) = self.find_view_mut(view) {
+                leaf.restore_scroll_anchor_position(scrollback_len, state_height, line_index);
+            }
+        }
+    }
+
     /// Installs a previously resolved top-line identity while the PTY
     /// pipeline temporarily swaps a pane's state into `self.state`.
     pub(super) fn capture_view_scroll_anchor_line(&mut self, view: ViewId, line_id: u64) {
@@ -1927,7 +1976,7 @@ impl Runtime {
             return;
         };
         let offset = leaf.scroll_offset();
-        if offset == 0 {
+        if offset == 0 || leaf.scroll_anchor_line_id().is_some() {
             return;
         }
         if let Some(leaf) = self.find_view_mut(view) {

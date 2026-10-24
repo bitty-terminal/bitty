@@ -328,9 +328,7 @@ impl View {
     /// `scrollback_len` from `State::scrollback_len()`.
     pub fn set_scroll_offset(&mut self, offset: usize, max_scrollback: usize) {
         self.scroll_offset = offset.min(max_scrollback);
-        if self.scroll_offset == 0 {
-            self.scroll_anchor = None;
-        }
+        self.scroll_anchor = None;
     }
 
     /// Scrolls by `delta` lines (positive = up into history, negative = down
@@ -340,9 +338,7 @@ impl View {
         let next = cur + delta;
         let clamped = next.clamp(0, max_scrollback as isize) as usize;
         self.scroll_offset = clamped;
-        if self.scroll_offset == 0 {
-            self.scroll_anchor = None;
-        }
+        self.scroll_anchor = None;
     }
 
     /// Scrolls to live (bottom).
@@ -476,7 +472,14 @@ impl View {
         // Bottom-aligned window: when live (offset 0) the window ends at the
         // bottom of the combined buffer (the live cursor row). When scrolled,
         // it slides upward by `offset` lines.
-        let start = total.saturating_sub(rows).saturating_sub(offset);
+        let start = self
+            .scroll_anchor
+            .and_then(|anchor| {
+                state
+                    .scrollback()
+                    .position(|line| line.id == anchor.line_id)
+            })
+            .unwrap_or_else(|| total.saturating_sub(rows).saturating_sub(offset));
         let snap = state.snapshot();
         let mut out = Vec::with_capacity(rows * cols);
         let blank = Cell::erased(Style::default());

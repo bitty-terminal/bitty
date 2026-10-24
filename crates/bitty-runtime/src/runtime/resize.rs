@@ -517,7 +517,7 @@ impl Runtime {
         // state geometry that those Views require.
         self.layout.reflow_with_gaps(self.container, self.gaps());
         let frames = self.present_frames();
-        self.reflow_present_layout(&frames);
+        self.reflow_overlay_present_layout(&frames);
         let fallback = (
             usize::from(self.container.width).max(1),
             usize::from(self.container.height).max(1),
@@ -1156,6 +1156,17 @@ mod tests {
         let width = rt.surface_extent().expect("surface extent").width();
         rt.handle_resize(bitty_platform::PhysicalSize::new(width, 12 * 19 + 16))
             .expect("height resize");
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == float)
+            .expect("detached float frame");
+        let float_view = rt.find_view(float).expect("detached float view");
+        assert_eq!(
+            (float_view.cols(), float_view.rows()),
+            (frame.cols, frame.rows),
+            "detached float View must follow its post-resize presented frame"
+        );
         let after_resize = visible_rows(&rt, float);
         assert_eq!(
             after_resize.first(),
@@ -1203,6 +1214,17 @@ mod tests {
         let width = rt.surface_extent().expect("surface extent").width();
         rt.handle_resize(bitty_platform::PhysicalSize::new(width, 12 * 19 + 16))
             .expect("height resize");
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == pinned)
+            .expect("pinned frame");
+        let pinned_view = rt.find_view(pinned).expect("pinned view");
+        assert_eq!(
+            (pinned_view.cols(), pinned_view.rows()),
+            (frame.cols, frame.rows),
+            "pinned View must follow its post-resize presented frame"
+        );
         let after_resize = visible_rows(&rt, pinned);
         assert_eq!(
             after_resize.first(),

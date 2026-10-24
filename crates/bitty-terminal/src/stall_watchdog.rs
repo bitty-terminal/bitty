@@ -45,7 +45,8 @@
 //!   ownership-checked, and a displaced holder cannot enter the critical
 //!   section. Ownership is re-verified immediately before the publish rename,
 //!   so a holder displaced while staging cannot overwrite newer evidence.
-//! - **Confined paths.** The slot is derived from `XDG_STATE_HOME`/`HOME`;
+//! - **Confined paths.** The slot is derived from `XDG_STATE_HOME`,
+//!   `HOME/.local/state`, or `LOCALAPPDATA`;
 //!   `BITTY_WATCHDOG_STATE_PATH` is only honored when it repeats that derived
 //!   path, and symlinked, hard-linked, foreign-owned, group/world-writable, or
 //!   special-file slots are rejected. Temp files are created with `O_EXCL`
@@ -121,7 +122,7 @@ const REPORT_REPEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// on every phase mark; a context at most this stale still names the right
 /// window when a stall is reported.
 const CONTEXT_REFRESH_NANOS: u64 = 500_000_000;
-/// Single-slot state file name under the XDG state directory.
+/// Single-slot state file name under the platform state directory.
 const STATE_FILE_NAME: &str = "stall-watchdog.log";
 /// Companion single-slot file recording delivery outcomes.
 ///
@@ -158,7 +159,7 @@ const REPORT_HELPER_POLL: Duration = Duration::from_millis(5);
 pub(crate) const STATE_WRITER_ARG: &str = "--internal-stall-watchdog-state";
 /// Environment variable carrying the optional state-slot path to the helper.
 ///
-/// The helper only honors a value that repeats the XDG-derived slot path; any
+/// The helper only honors a value that repeats the platform-derived slot path;
 /// other value is rejected, so the variable cannot redirect evidence.
 const STATE_WRITER_PATH_ENV: &str = "BITTY_WATCHDOG_STATE_PATH";
 /// Environment variable carrying the evidence generation to the helper.
@@ -1225,7 +1226,8 @@ impl DeliveryOutcome {
 
 /// Confined single-slot evidence file plus its directory.
 ///
-/// The path is derived from `XDG_STATE_HOME`/`HOME`; the helper additionally
+/// The path is derived from `XDG_STATE_HOME`, `HOME/.local/state`, or
+/// `LOCALAPPDATA`; the helper additionally
 /// requires `BITTY_WATCHDOG_STATE_PATH` to repeat that derived path, so a
 /// hostile or stale value can never redirect evidence. Every write is staged
 /// in a fresh `O_EXCL` temp file and renamed into place, and symlinked,
@@ -3870,12 +3872,23 @@ mod tests {
     struct BrokenStderr {
         state_path: PathBuf,
         saw_state_before_write: Arc<AtomicBool>,
+        /// Set by the first stderr write of the first delivery.
+        first_write_seen: Arc<AtomicBool>,
+        /// Whether the state slot existed at that first write.
+        first_write_saw_state: Arc<AtomicBool>,
     }
 
     impl std::io::Write for BrokenStderr {
         fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
             // Record whether the state evidence already existed when this
-            // write arrived; that is the ordering the helper guarantees.
+            // write arrived; that is the ordering the helper guarantees. The
+            // first write is recorded separately so a later report cannot mask
+            // an ordering violation in the first delivery.
+            let first = !self.first_write_seen.swap(true, Ordering::SeqCst);
+            if first {
+                self.first_write_saw_state
+                    .store(self.state_path.exists(), Ordering::SeqCst);
+            }
             if self.state_path.exists() {
                 self.saw_state_before_write.store(true, Ordering::SeqCst);
             }
@@ -3893,6 +3906,8 @@ mod tests {
     struct OrderingDelivery {
         state_path: PathBuf,
         saw_state_before_write: Arc<AtomicBool>,
+        first_write_seen: Arc<AtomicBool>,
+        first_write_saw_state: Arc<AtomicBool>,
     }
 
     impl ReportDelivery for OrderingDelivery {
@@ -3911,6 +3926,8 @@ mod tests {
                 &mut BrokenStderr {
                     state_path: self.state_path.clone(),
                     saw_state_before_write: Arc::clone(&self.saw_state_before_write),
+                    first_write_seen: Arc::clone(&self.first_write_seen),
+                    first_write_saw_state: Arc::clone(&self.first_write_saw_state),
                 },
             );
             DeliveryResult::single(DeliveryOutcome::Delivered)
@@ -3927,6 +3944,8 @@ mod tests {
             Box::new(OrderingDelivery {
                 state_path: slot.path.clone(),
                 saw_state_before_write: Arc::clone(&saw_state),
+                first_write_seen: Arc::new(AtomicBool::new(false)),
+                first_write_saw_state: Arc::new(AtomicBool::new(false)),
             }),
         );
         let line = concat!(
@@ -3959,11 +3978,15 @@ mod tests {
         let slot = state_slot_in(&dir);
         let writes = Arc::new(AtomicU64::new(0));
         let saw_state = Arc::new(AtomicBool::new(false));
+        let first_write = Arc::new(AtomicBool::new(false));
+        let first_write_state = Arc::new(AtomicBool::new(false));
         let mut sink = ReportSink::new(
             Some(slot.clone()),
             Box::new(OrderingDelivery {
                 state_path: slot.path.clone(),
                 saw_state_before_write: Arc::clone(&saw_state),
+                first_write_seen: Arc::clone(&first_write),
+                first_write_saw_state: Arc::clone(&first_write_state),
             }),
         );
         let sink_writes = Arc::clone(&writes);
@@ -4000,6 +4023,22 @@ mod tests {
             assert!(evidence.contains("[main]"), "{evidence}");
             assert!(evidence.contains("state="), "{evidence}");
         }
+        // Wait for the monitor's first stderr write instead of sampling a
+        // snapshot: the main thread can observe the renamed slot before the
+        // monitor reaches the stderr attempt. The per-first-write probe then
+        // asserts the real contract (evidence exists before that write).
+        let first_write_deadline = Instant::now() + Duration::from_secs(5);
+        while !first_write.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < first_write_deadline,
+                "sink never attempted the failing stderr write"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            first_write_state.load(Ordering::SeqCst),
+            "evidence must be on disk before the first failing stderr write"
+        );
         assert!(
             saw_state.load(Ordering::SeqCst),
             "evidence must be on disk before the failing stderr write"

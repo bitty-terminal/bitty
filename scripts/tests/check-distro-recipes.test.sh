@@ -6,6 +6,8 @@
 #   - Gentoo Linux (live ebuild + prebuilt binary ebuild + overlay config)
 #   - Void Linux (xbps-src template)
 #   - FreeBSD (Ports recipe: Makefile, pkg-plist, pkg-descr, distinfo)
+#   - OpenBSD (Ports recipe: Makefile, pkg/PLIST, pkg/DESCR, distinfo)
+#   - NetBSD (pkgsrc recipe: Makefile, PLIST, DESCR, distinfo)
 #   - Solus Linux (ypkg package.yml)
 #   - openSUSE (OBS spec + source service)
 #
@@ -464,16 +466,218 @@ else
   pass "FreeBSD recipe has no hardcoded host paths"
 fi
 
-# 6. Recipe versions must agree with one another, and never lag the workspace.
+# 6. OpenBSD ports recipe (x11/bitty)
+OPENBSD_PORT_DIR="$REPO_ROOT/packaging/openbsd/x11/bitty"
+OPENBSD_MAKEFILE="$OPENBSD_PORT_DIR/Makefile"
+OPENBSD_PLIST="$OPENBSD_PORT_DIR/pkg/PLIST"
+OPENBSD_DESCR="$OPENBSD_PORT_DIR/pkg/DESCR"
+OPENBSD_DISTINFO="$OPENBSD_PORT_DIR/distinfo"
+openbsd_version=""
+
+if [[ -f "$OPENBSD_MAKEFILE" ]]; then
+  openbsd_makefile_failures=$FAIL
+  grep -Eq '^DISTNAME[[:space:]]*=[[:space:]]*bitty-\$\{V\}[[:space:]]*$' "$OPENBSD_MAKEFILE" ||
+    fail "OpenBSD Makefile missing DISTNAME = bitty-\${V}"
+  openbsd_version="$(sed -n 's/^V[[:space:]]*=[[:space:]]*//p' "$OPENBSD_MAKEFILE")"
+  if is_semver "$openbsd_version"; then
+    pass "OpenBSD version $openbsd_version is X.Y.Z"
+  else
+    fail "OpenBSD Makefile missing a numeric V = X.Y.Z (got '$openbsd_version')"
+  fi
+  grep -Eq '^CATEGORIES[[:space:]]*=[[:space:]]*x11' "$OPENBSD_MAKEFILE" ||
+    fail "OpenBSD Makefile CATEGORIES lacks x11"
+  grep -Eq '^MASTER_SITES[[:space:]]*=[[:space:]]+[^[:space:]]+' "$OPENBSD_MAKEFILE" ||
+    fail "OpenBSD Makefile missing MASTER_SITES"
+  grep -Eq '^PERMIT_PACKAGE[[:space:]]*=[[:space:]]*Yes' "$OPENBSD_MAKEFILE" ||
+    fail "OpenBSD Makefile missing PERMIT_PACKAGE = Yes"
+  grep -Eq '^MODULES[[:space:]]*=[[:space:]]*devel/cargo' "$OPENBSD_MAKEFILE" ||
+    fail "OpenBSD Makefile does not build with MODULES = devel/cargo"
+  grep -Eq '^[[:space:]]*MODCARGO_CRATES[[:space:]]*=' "$OPENBSD_MAKEFILE" ||
+    fail "OpenBSD Makefile has no MODCARGO_CRATES list"
+  grep -Eq '^do-install:' "$OPENBSD_MAKEFILE" ||
+    fail "OpenBSD Makefile has no do-install target"
+  grep -q 'PREFIX}/bin' "$OPENBSD_MAKEFILE" ||
+    fail "OpenBSD do-install does not install bin/bitty"
+  grep -q 'tic -x' "$OPENBSD_MAKEFILE" ||
+    fail "OpenBSD do-install does not compile terminfo with tic -x"
+  if [[ "$FAIL" -eq "$openbsd_makefile_failures" ]]; then
+    pass "OpenBSD ports Makefile integrity"
+  fi
+else
+  fail "OpenBSD ports Makefile not found at $OPENBSD_MAKEFILE"
+fi
+
+if [[ -s "$OPENBSD_DESCR" ]] && grep -q '^WWW:' "$OPENBSD_DESCR"; then
+  pass "OpenBSD pkg/DESCR is non-empty and carries a WWW line"
+else
+  fail "OpenBSD pkg/DESCR missing, empty, or without a WWW line"
+fi
+
+if [[ -f "$OPENBSD_DISTINFO" ]] && grep -q 'make makesum' "$OPENBSD_DISTINFO"; then
+  pass "OpenBSD distinfo defers checksums to make makesum"
+else
+  fail "OpenBSD distinfo missing or does not document make makesum"
+fi
+
+if [[ -s "$OPENBSD_PLIST" ]]; then
+  openbsd_plist_entries=0
+  openbsd_plist_failures=$FAIL
+  while IFS= read -r raw_line; do
+    entry="${raw_line%%[[:space:]]*}"
+    [[ -z "$entry" ]] && continue
+    case "$entry" in
+    \#* | @comment* | @dir*) continue ;;
+    @bin*) entry="${raw_line#@bin }" ;;
+    esac
+    entry="${entry%%[[:space:]]*}"
+    [[ -z "$entry" || "$entry" == */ ]] && continue
+    openbsd_plist_entries=$((openbsd_plist_entries + 1))
+    case "$entry" in
+    bin/bitty) ;;
+    share/terminfo/*) ;;
+    *)
+      source_path="$(plist_source_for "$entry")"
+      [[ -f "$source_path" ]] ||
+        fail "OpenBSD PLIST entry has no in-tree source: $entry (looked for $source_path)"
+      ;;
+    esac
+  done <"$OPENBSD_PLIST"
+  if [[ "$openbsd_plist_entries" -eq 0 ]]; then
+    fail "OpenBSD pkg/PLIST lists no files"
+  fi
+  openbsd_makefile_sizes="$(sed -n 's/^\.for size in //p' "$OPENBSD_MAKEFILE" |
+    tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n -u | tr '\n' ' ')"
+  openbsd_plist_sizes="$(sed -n 's|^share/icons/hicolor/\([0-9]*\)x[0-9]*/apps/bitty\.png$|\1|p' \
+    "$OPENBSD_PLIST" | sort -n -u | tr '\n' ' ')"
+  if [[ "$openbsd_makefile_sizes" != "$openbsd_plist_sizes" ]]; then
+    fail "OpenBSD icon sizes drift: do-install '${openbsd_makefile_sizes}' vs pkg/PLIST '${openbsd_plist_sizes}'"
+  fi
+  if [[ "$FAIL" -eq "$openbsd_plist_failures" ]]; then
+    pass "OpenBSD pkg/PLIST (${openbsd_plist_entries} entries) matches in-tree sources"
+  fi
+else
+  fail "OpenBSD pkg/PLIST missing or empty"
+fi
+
+openbsd_host_paths="$(grep -nE '/(home|Users|Volumes|mnt)/' \
+  "$OPENBSD_MAKEFILE" "$OPENBSD_PLIST" "$OPENBSD_DESCR" "$OPENBSD_DISTINFO" \
+  "$REPO_ROOT/packaging/openbsd.md" 2>/dev/null || true)"
+if [[ -n "$openbsd_host_paths" ]]; then
+  fail "OpenBSD recipe carries a hardcoded host path: ${openbsd_host_paths}"
+else
+  pass "OpenBSD recipe has no hardcoded host paths"
+fi
+
+# 7. NetBSD pkgsrc recipe (x11/bitty)
+NETBSD_PKG_DIR="$REPO_ROOT/packaging/netbsd/x11/bitty"
+NETBSD_MAKEFILE="$NETBSD_PKG_DIR/Makefile"
+NETBSD_PLIST="$NETBSD_PKG_DIR/PLIST"
+NETBSD_DESCR="$NETBSD_PKG_DIR/DESCR"
+NETBSD_DISTINFO="$NETBSD_PKG_DIR/distinfo"
+netbsd_version=""
+
+if [[ -f "$NETBSD_MAKEFILE" ]]; then
+  netbsd_makefile_failures=$FAIL
+  netbsd_distname="$(sed -n 's/^DISTNAME=[[:space:]]*//p' "$NETBSD_MAKEFILE")"
+  netbsd_version="${netbsd_distname#bitty-}"
+  if is_semver "$netbsd_version"; then
+    pass "NetBSD pkgsrc version $netbsd_version is X.Y.Z"
+  else
+    fail "NetBSD Makefile missing a numeric DISTNAME=bitty-X.Y.Z (got '$netbsd_distname')"
+  fi
+  grep -Eq '^CATEGORIES=[[:space:]]*x11' "$NETBSD_MAKEFILE" ||
+    fail "NetBSD Makefile CATEGORIES lacks x11"
+  grep -Eq '^HOMEPAGE=[[:space:]]+https://bitty\.run' "$NETBSD_MAKEFILE" ||
+    fail "NetBSD Makefile missing HOMEPAGE"
+  grep -Eq '^LICENSE=[[:space:]]*mit OR apache-2\.0' "$NETBSD_MAKEFILE" ||
+    fail "NetBSD Makefile LICENSE is not 'mit OR apache-2.0'"
+  grep -q 'lang/rust/cargo.mk' "$NETBSD_MAKEFILE" ||
+    fail "NetBSD Makefile does not include lang/rust/cargo.mk"
+  grep -Eq '^do-install:' "$NETBSD_MAKEFILE" ||
+    fail "NetBSD Makefile has no do-install target"
+  grep -q 'PREFIX}/bin/bitty' "$NETBSD_MAKEFILE" ||
+    fail "NetBSD do-install does not install bin/bitty"
+  grep -q 'tic -x' "$NETBSD_MAKEFILE" ||
+    fail "NetBSD do-install does not compile terminfo with tic -x"
+  if [[ "$FAIL" -eq "$netbsd_makefile_failures" ]]; then
+    pass "NetBSD pkgsrc Makefile integrity"
+  fi
+else
+  fail "NetBSD pkgsrc Makefile not found at $NETBSD_MAKEFILE"
+fi
+
+if [[ -s "$NETBSD_DESCR" ]]; then
+  pass "NetBSD DESCR is non-empty"
+else
+  fail "NetBSD DESCR missing or empty"
+fi
+
+if [[ -f "$NETBSD_DISTINFO" ]] && grep -q 'bmake makesum' "$NETBSD_DISTINFO"; then
+  pass "NetBSD distinfo defers checksums to bmake makesum"
+else
+  fail "NetBSD distinfo missing or does not document bmake makesum"
+fi
+
+if [[ -s "$NETBSD_PLIST" ]]; then
+  netbsd_plist_entries=0
+  netbsd_plist_failures=$FAIL
+  while IFS= read -r raw_line; do
+    entry="${raw_line%%[[:space:]]*}"
+    [[ -z "$entry" ]] && continue
+    case "$entry" in
+    \#* | @comment* | @dir*) continue ;;
+    esac
+    entry="${entry%%[[:space:]]*}"
+    [[ -z "$entry" || "$entry" == */ ]] && continue
+    netbsd_plist_entries=$((netbsd_plist_entries + 1))
+    case "$entry" in
+    bin/bitty) ;;
+    share/terminfo/*) ;;
+    *)
+      source_path="$(plist_source_for "$entry")"
+      [[ -f "$source_path" ]] ||
+        fail "NetBSD PLIST entry has no in-tree source: $entry (looked for $source_path)"
+      ;;
+    esac
+  done <"$NETBSD_PLIST"
+  if [[ "$netbsd_plist_entries" -eq 0 ]]; then
+    fail "NetBSD PLIST lists no files"
+  fi
+  netbsd_makefile_sizes="$(sed -n 's/^\.for size in //p' "$NETBSD_MAKEFILE" |
+    tr ' ' '\n' | grep -E '^[0-9]+$' | sort -n -u | tr '\n' ' ')"
+  netbsd_plist_sizes="$(sed -n 's|^share/icons/hicolor/\([0-9]*\)x[0-9]*/apps/bitty\.png$|\1|p' \
+    "$NETBSD_PLIST" | sort -n -u | tr '\n' ' ')"
+  if [[ "$netbsd_makefile_sizes" != "$netbsd_plist_sizes" ]]; then
+    fail "NetBSD icon sizes drift: do-install '${netbsd_makefile_sizes}' vs PLIST '${netbsd_plist_sizes}'"
+  fi
+  if [[ "$FAIL" -eq "$netbsd_plist_failures" ]]; then
+    pass "NetBSD PLIST (${netbsd_plist_entries} entries) matches in-tree sources"
+  fi
+else
+  fail "NetBSD PLIST missing or empty"
+fi
+
+netbsd_host_paths="$(grep -nE '/(home|Users|Volumes|mnt)/' \
+  "$NETBSD_MAKEFILE" "$NETBSD_PLIST" "$NETBSD_DESCR" "$NETBSD_DISTINFO" \
+  "$REPO_ROOT/packaging/netbsd.md" 2>/dev/null || true)"
+if [[ -n "$netbsd_host_paths" ]]; then
+  fail "NetBSD recipe carries a hardcoded host path: ${netbsd_host_paths}"
+else
+  pass "NetBSD recipe has no hardcoded host paths"
+fi
+
+# 8. Recipe versions must agree with one another, and never lag the workspace.
 #    Recipes may lead Cargo.toml by the pending release bump (draft release PR),
 #    so a lead is reported, not failed.
-if [[ -n "$bin_version" && -n "$void_version" && -n "$alpine_pkgver" && -n "$solus_version" ]] &&
+if [[ -n "$bin_version" && -n "$void_version" && -n "$alpine_pkgver" && -n "$solus_version" && -n "$openbsd_version" && -n "$netbsd_version" ]] &&
   [[ "$alpine_pkgver" == "$bin_version" ]] &&
   [[ "$void_version" == "$bin_version" ]] &&
-  [[ "$solus_version" == "$bin_version" ]]; then
-  pass "Alpine, Gentoo binary, Void, and Solus recipes agree on version $bin_version"
+  [[ "$solus_version" == "$bin_version" ]] &&
+  [[ "$openbsd_version" == "$bin_version" ]] &&
+  [[ "$netbsd_version" == "$bin_version" ]]; then
+  pass "Alpine, Gentoo binary, Void, Solus, OpenBSD, and NetBSD recipes agree on version $bin_version"
 else
-  fail "recipe versions disagree (Alpine '$alpine_pkgver', Gentoo bin '$bin_version', Void '$void_version', Solus '$solus_version')"
+  fail "recipe versions disagree (Alpine '$alpine_pkgver', Gentoo bin '$bin_version', Void '$void_version', Solus '$solus_version', OpenBSD '$openbsd_version', NetBSD '$netbsd_version')"
 fi
 
 if is_semver "$bin_version" && is_semver "$CARGO_VERSION"; then
@@ -489,8 +693,8 @@ if is_semver "$bin_version" && is_semver "$CARGO_VERSION"; then
   fi
 fi
 
-# 7. Documentation coverage
-for doc in packaging/alpine.md packaging/gentoo.md packaging/void.md packaging/freebsd.md packaging/solus.md; do
+# 9. Documentation coverage
+for doc in packaging/alpine.md packaging/gentoo.md packaging/void.md packaging/freebsd.md packaging/solus.md packaging/openbsd.md packaging/netbsd.md; do
   if [[ -f "$REPO_ROOT/$doc" ]]; then
     pass "Documentation exists: $doc"
     expect "$REPO_ROOT/$doc" 'tag time' "Documentation states tag-time steps: $doc"
@@ -499,7 +703,7 @@ for doc in packaging/alpine.md packaging/gentoo.md packaging/void.md packaging/f
   fi
 done
 
-# 8. The Gentoo guide must describe a valid overlay, not the repository root:
+# 10. The Gentoo guide must describe a valid overlay, not the repository root:
 #    profiles/repo_name and metadata/layout.conf live only in packaging/gentoo.
 GENTOO_DOC="$REPO_ROOT/packaging/gentoo.md"
 reject "$GENTOO_DOC" 'eselect repository add bitty git https://github\.com/bitty-terminal/bitty\.git' \
@@ -513,8 +717,10 @@ if grep -q 'packaging/gentoo.md' "$REPO_ROOT/packaging/INSTALL.md" &&
   grep -q 'packaging/void.md' "$REPO_ROOT/packaging/INSTALL.md" &&
   grep -q 'packaging/freebsd.md' "$REPO_ROOT/packaging/INSTALL.md" &&
   grep -q 'packaging/solus.md' "$REPO_ROOT/packaging/INSTALL.md" &&
+  grep -q 'packaging/openbsd.md' "$REPO_ROOT/packaging/INSTALL.md" &&
+  grep -q 'packaging/netbsd.md' "$REPO_ROOT/packaging/INSTALL.md" &&
   grep -q 'packaging/alpine/APKBUILD' "$REPO_ROOT/packaging/INSTALL.md"; then
-  pass "INSTALL.md references the Alpine, Gentoo, Void, Solus, and FreeBSD recipes"
+  pass "INSTALL.md references the Alpine, Gentoo, Void, Solus, FreeBSD, OpenBSD, and NetBSD recipes"
 else
   fail "INSTALL.md missing references to distro recipes"
 fi

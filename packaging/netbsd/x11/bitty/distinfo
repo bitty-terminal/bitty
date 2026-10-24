@@ -1,0 +1,14 @@
+$NetBSD$
+# packaging/netbsd/x11/bitty/distinfo
+#
+# Real SHA512 and size entries cannot be computed before the v0.0.27 tag is
+# created, because `bmake makesum` fetches the released source tarball and
+# every vendored crate from GitHub/crates.io.
+#
+# Tag-time procedure (from a pkgsrc tree checkout with bitty copied in):
+#   cd /usr/pkgsrc/x11/bitty
+#   bmake makesum
+#   cp distinfo /path/to/bitty/packaging/netbsd/x11/bitty/distinfo
+#
+# Distfiles required once tagged:
+#   v0.0.27.tar.gz

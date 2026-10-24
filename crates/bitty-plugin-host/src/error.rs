@@ -66,6 +66,18 @@ pub enum PluginError {
         /// Actual value.
         actual: usize,
     },
+    /// A declared execution budget (RC-1/RC-2) failed validation.
+    ///
+    /// Distinct from [`Self::LimitExceeded`] because budget declarations are
+    /// tighten-only upper bounds: zero, an above-ceiling value, a negative or
+    /// wrong-typed value, or a warning threshold not below its wall bound is
+    /// a fail-closed configuration error, never a silent clamp.
+    Budget {
+        /// Dotted field path (for example `limits.wall_ms`).
+        field: String,
+        /// Bounded reason.
+        message: String,
+    },
     /// Duplicate declaration (e.g. qualified command name).
     Duplicate {
         /// Kind of duplicate.
@@ -155,6 +167,7 @@ impl PluginError {
                 ErrorClass::Manifest
             }
             Self::Capability { .. } => ErrorClass::Capability,
+            Self::Budget { .. } => ErrorClass::Budget,
             Self::Grant { .. } => ErrorClass::Grant,
             Self::Registry { .. }
             | Self::Duplicate { .. }
@@ -178,6 +191,7 @@ impl fmt::Display for PluginError {
             } => {
                 write!(f, "{field}: limit {limit} exceeded (actual {actual})")
             }
+            Self::Budget { field, message } => write!(f, "budget {field}: {message}"),
             Self::Duplicate { kind, value } => write!(f, "duplicate {kind}: '{value}'"),
             Self::Registry { message } => write!(f, "registry: {message}"),
             Self::Grant { message } => write!(f, "grant: {message}"),

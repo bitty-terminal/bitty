@@ -23,6 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-TTY stdin, and a piped stdout keep their existing non-interactive
   behavior, and an unresolvable candidate leaves the previous theme with the
   existing retry diagnostic.
+- **Per-plugin execution budgets (#2304):** `bitty-plugin.toml` accepts
+  optional `[limits]` keys `fuel_instructions`, `wall_ms`, `memory_bytes`,
+  and `warning_ms` in `1..=host ceiling`, and an optional
+  `$XDG_CONFIG_HOME/bitty/plugin-budgets.lua` adds a global default plus
+  per-plugin overrides. Both layers only tighten the compiled RC-1/RC-2
+  ceilings; the effective value is the per-dimension minimum, so no manifest
+  or user file can widen another layer. Zero, above-ceiling, negative,
+  wrong-typed, duplicate, and unknown values fail closed with the field path,
+  a rejected user file fails activation closed, and `--safe` ignores both
+  layers and runs host defaults. Production activation now builds
+  `VmBudgets` from the resolved values instead of always `default()`; absent
+  declarations keep the existing defaults. `bitty plugin config show` prints
+  each dimension's host ceiling, manifest value, user layers, effective value,
+  and source layer. The user file is data-only Lua parsed without a VM
+  (16 KiB, 256 lines, 256 plugin entries, UTF-8 only, symlinks refused).
+
 - **Ghostty-style `+<action>` helper aliases (#2464):** `bitty +list-themes`,
   `+list-colors`, `+list-fonts`, `+list-keybinds`, `+list-actions`,
   `+list-plugins`, `+list-extensions`, `+show-config`, `+validate-config`, and

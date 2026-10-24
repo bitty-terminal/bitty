@@ -897,7 +897,7 @@ impl Runtime {
                     // Issue #1348: leaving the window also ends a
                     // border-drag resize (deterministic teardown like the
                     // Alt+drag move above).
-                    self.end_border_drag();
+                    self.cancel_border_drag();
                     // Issue #1694 (CTX-0966): leaving also cancels a Mod
                     // tiled-drag without committing (no drop target outside
                     // the window; the tree stays untouched).

@@ -927,52 +927,6 @@ impl Runtime {
             self.trigger_bounds_animation(kind, frame.view, from, to, started, now);
         }
 
-        // CTX-1335: a workspace switch slides the newly visible workspace in
-        // from the direction of travel. The outgoing workspace is stashed (no
-        // retained ghost, #2134); only the committed new bounds translate, so
-        // the animation never depends on stale content. The accepted
-        // cross-fade (`AnimationKind::Workspace` on the global surface) still
-        // runs alongside this geometry.
-        if active_workspace != self.last_presented_workspace
-            && policy.animates(AnimationKind::Workspace)
-        {
-            let live = self.live_cell_metrics();
-            let distance =
-                i32::try_from(u32::from(self.container.width).saturating_mul(live.width))
-                    .unwrap_or(i32::MAX);
-            if distance > 0 {
-                let direction: i32 = if active_workspace > self.last_presented_workspace {
-                    1
-                } else {
-                    -1
-                };
-                let dx = direction.saturating_mul(distance);
-                for frame in allocations {
-                    // CTX-1335 F5: pins are window-global chrome, not part of
-                    // the incoming workspace; they stay anchored while the
-                    // workspace slides beneath them.
-                    if self.pinned.contains(frame.view) {
-                        continue;
-                    }
-                    let to = PanelBounds {
-                        frame: frame.frame,
-                        content: frame.content,
-                    };
-                    let from = to.translated(dx, 0);
-                    if !self.trigger_bounds_animation(
-                        AnimationKind::Workspace,
-                        frame.view,
-                        from,
-                        to,
-                        now,
-                        now,
-                    ) {
-                        break;
-                    }
-                }
-            }
-        }
-
         if focused != self.last_presented_focus {
             if let Some(fid) = focused {
                 if policy.animates(AnimationKind::Focus) {

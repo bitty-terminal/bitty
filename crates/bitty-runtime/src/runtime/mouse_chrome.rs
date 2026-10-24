@@ -1405,9 +1405,8 @@ impl Runtime {
         };
         let delta_col = i32::from(point.x) - drag.anchor_col;
         let delta_row = i32::from(point.y) - drag.anchor_row;
-        if delta_col == 0 && delta_row == 0 {
-            return true;
-        }
+        // Recompute even for a zero delta: moving back to the press anchor
+        // must restore the press-time allocation after an earlier motion.
 
         let mut next = self.layout.clone();
         let mut any_changed = false;

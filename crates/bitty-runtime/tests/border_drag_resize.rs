@@ -397,6 +397,182 @@ fn four_pane_grid() -> LayoutNode {
     )
 }
 
+/// T junction: the right row divider is deliberately not collinear with the
+/// left row divider, so a hit at the left T must not grab the right sibling.
+fn t_junction_grid() -> LayoutNode {
+    LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 12)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 12)),
+        ),
+        LayoutNode::split(
+            SplitAxis::Vertical,
+            0.75,
+            LayoutNode::leaf(View::new(ViewId::new(3), 40, 12)),
+            LayoutNode::leaf(View::new(ViewId::new(4), 40, 12)),
+        ),
+    )
+}
+
+fn assert_t_junction_drag_invariants(
+    rt: &Runtime,
+    expected_splits: &[(Vec<usize>, SplitAxis)],
+    expected_leaf_ids: &[ViewId],
+) {
+    assert_eq!(
+        rt.border_drag_splits(),
+        Some(expected_splits.to_vec()),
+        "the grabbed split set must not change during motion"
+    );
+    assert_eq!(rt.layout().leaf_ids(), expected_leaf_ids);
+    assert_eq!(rt.leaf_count(), expected_leaf_ids.len());
+    rt.layout()
+        .validate_structure()
+        .expect("dragged layout must remain structurally valid");
+    assert_eq!(
+        rt.focused_view(),
+        Some(ViewId::new(1)),
+        "a T junction owns no leaf"
+    );
+    assert!(
+        rt.selection().is_none(),
+        "a border drag starts no selection"
+    );
+    assert_partition(rt, UiRect::new(0, 0, 80, 24));
+
+    // The non-collinear right sibling is never a grabbed split. Its row
+    // boundary therefore stays at 18/24 even while the root moves.
+    assert!((rt.layout().split_ratio_at(&[1]).unwrap() - 0.75).abs() < 1e-6);
+    assert_eq!(pane(rt, 3).y, 0);
+    assert_eq!(pane(rt, 3).height, 18);
+    assert_eq!(pane(rt, 4).y, 18);
+    assert_eq!(pane(rt, 4).height, 6);
+}
+
+#[test]
+fn t_junction_drag_grabs_only_collinear_splits() {
+    let mut rt = make_runtime();
+    rt.set_layout(t_junction_grid());
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+
+    // The exact left T is the root horizontal split plus the left child
+    // vertical split. The right child's row divider is lower and is not part
+    // of this collinear line.
+    rt.handle_cursor_moved(cell_pixels(39, 11));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active(), "the left T must grab");
+    assert_eq!(
+        rt.border_drag_splits(),
+        Some(vec![
+            (Vec::new(), SplitAxis::Horizontal),
+            (vec![0], SplitAxis::Vertical),
+        ])
+    );
+    assert_eq!(
+        rt.layout().split_ratio_at(&[1]),
+        Some(0.75),
+        "the non-collinear right row divider remains separate"
+    );
+    assert!(rt.selection().is_none());
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.border_drag_active());
+    assert_eq!(rt.border_drag_splits(), None);
+}
+
+#[test]
+fn t_junction_drag_uses_press_anchor_for_incremental_motion() {
+    let mut rt = make_runtime();
+    rt.set_layout(t_junction_grid());
+    let expected_splits = vec![
+        (Vec::new(), SplitAxis::Horizontal),
+        (vec![0], SplitAxis::Vertical),
+    ];
+    let expected_leaf_ids = vec![
+        ViewId::new(1),
+        ViewId::new(2),
+        ViewId::new(3),
+        ViewId::new(4),
+    ];
+    let press_anchor = cell_pixels(39, 11);
+
+    rt.handle_cursor_moved(press_anchor);
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert_t_junction_drag_invariants(&rt, &expected_splits, &expected_leaf_ids);
+    let at_press = rt.layout_allocations();
+
+    // A no-op motion must preserve the press-time allocation exactly.
+    rt.handle_cursor_moved(press_anchor);
+    assert_eq!(rt.layout_allocations(), at_press);
+    assert_t_junction_drag_invariants(&rt, &expected_splits, &expected_leaf_ids);
+
+    // Each one-cell motion is measured from the original press, not from the
+    // previous motion. A cumulative implementation would produce 43 cells on
+    // the second step instead of 42.
+    rt.handle_cursor_moved(cell_pixels(40, 11));
+    assert!((rt.layout().split_ratio_at(&[]).unwrap() - 41.0 / 80.0).abs() < 1e-6);
+    assert!((rt.layout().split_ratio_at(&[0]).unwrap() - 0.5).abs() < 1e-6);
+    assert_eq!(pane(&rt, 1).width, 41);
+    assert_t_junction_drag_invariants(&rt, &expected_splits, &expected_leaf_ids);
+
+    rt.handle_cursor_moved(cell_pixels(41, 11));
+    assert!((rt.layout().split_ratio_at(&[]).unwrap() - 42.0 / 80.0).abs() < 1e-6);
+    assert_eq!(pane(&rt, 1).width, 42);
+    assert_t_junction_drag_invariants(&rt, &expected_splits, &expected_leaf_ids);
+
+    // A diagonal motion updates both grabbed axes from the same press anchor.
+    rt.handle_cursor_moved(cell_pixels(42, 12));
+    assert!((rt.layout().split_ratio_at(&[]).unwrap() - 43.0 / 80.0).abs() < 1e-6);
+    assert!((rt.layout().split_ratio_at(&[0]).unwrap() - 13.0 / 24.0).abs() < 1e-6);
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 43, 13));
+    assert_t_junction_drag_invariants(&rt, &expected_splits, &expected_leaf_ids);
+
+    // Move backward across the press anchor. The absolute position follows
+    // immediately in both directions rather than accumulating the prior
+    // forward motion.
+    rt.handle_cursor_moved(cell_pixels(38, 10));
+    assert!((rt.layout().split_ratio_at(&[]).unwrap() - 39.0 / 80.0).abs() < 1e-6);
+    assert!((rt.layout().split_ratio_at(&[0]).unwrap() - 11.0 / 24.0).abs() < 1e-6);
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 39, 11));
+    assert_t_junction_drag_invariants(&rt, &expected_splits, &expected_leaf_ids);
+
+    // Returning to the press cell returns both splits to their original
+    // allocations, regardless of the preceding incremental motions.
+    rt.handle_cursor_moved(press_anchor);
+    assert_eq!(rt.layout_allocations(), at_press);
+    assert_t_junction_drag_invariants(&rt, &expected_splits, &expected_leaf_ids);
+
+    // Clamp both grabbed axes, then recover one axis while the other remains
+    // clamped. This also proves that a clamp does not create a dead zone.
+    rt.handle_cursor_moved(cell_pixels(79, 0));
+    assert!((rt.layout().split_ratio_at(&[]).unwrap() - 0.875).abs() < 1e-6);
+    assert!((rt.layout().split_ratio_at(&[0]).unwrap() - 4.0 / 24.0).abs() < 1e-6);
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 70, 4));
+    assert_t_junction_drag_invariants(&rt, &expected_splits, &expected_leaf_ids);
+
+    rt.handle_cursor_moved(cell_pixels(79, 11));
+    assert!((rt.layout().split_ratio_at(&[]).unwrap() - 0.875).abs() < 1e-6);
+    assert!((rt.layout().split_ratio_at(&[0]).unwrap() - 0.5).abs() < 1e-6);
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 70, 12));
+    assert_t_junction_drag_invariants(&rt, &expected_splits, &expected_leaf_ids);
+
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.border_drag_active());
+    assert_eq!(rt.border_drag_splits(), None);
+    assert!(
+        rt.selection().is_none(),
+        "release must not commit a selection"
+    );
+    assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+    let after_release = rt.layout_allocations();
+    rt.handle_cursor_moved(cell_pixels(0, 23));
+    assert_eq!(rt.layout_allocations(), after_release);
+}
+
 #[test]
 fn junction_drag_grabs_cross_with_both_row_segments() {
     let mut rt = make_runtime();

@@ -21,10 +21,9 @@
 //! bitty#1744/#1727 treatment). Production enforcement stays at
 //! `RC1_WALL_CLOCK_BUDGET_MS` and is pinned by `bitty-lua`'s
 //! `measurement_lua` / `load_gate` tests. What proves the #2425 fix here is
-//! not that ceiling but the injected-reader companion below: a read that
-//! takes 1.5 s (30x the production slice, 3x this headroom) must cost the
-//! activation slice nothing at all, so any inline read fails this suite even
-//! on a host where three warm `pactl` spawns would fit 50 ms.
+//! not that ceiling but the injected-reader companion below: the reader
+//! enters and waits for activation to return, so any inline read fails the
+//! suite without depending on a loaded host's wall-clock behavior.
 //!
 //! The production-budget guard for the same regression is
 //! `plugin_device_audio_native::bar_activation_never_blocks_on_a_slow_audio_monitor`
@@ -36,8 +35,9 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use bitty_lua::{BridgeError, LuaValue, RC1_WALL_CLOCK_BUDGET_MS, WorkspaceInfo};
 use bitty_plugin_host::manifest::PluginId;
@@ -48,18 +48,19 @@ use bitty_runtime::plugin_runtime::{
 };
 
 const BAR_ID: &str = "bitty-terminal.bar";
+const AUDIO_READER_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Harness wall budget for the pinned real bar.
+/// Harness wall budget for the pinned real bar's activation-and-mount test.
 ///
 /// RC-1 (50 ms) is calibrated for release builds. This test drives the
 /// pinned 4 000-line bar `init.lua` in a debug test build: ~4 ms on a fast
 /// host but 61-117 ms on a sharded Linux CI runner, measured on the fixed
 /// code (the audio reader is off the executor thread in both numbers).
 /// Widen only the wall dimension for this harness, the bitty#1744/#1727
-/// treatment: production keeps `RC1_WALL_CLOCK_BUDGET_MS`, budget
+/// treatment: production keeps `RC1_WALL_CLOCK_BUDGET_MS`, and budget
 /// enforcement stays pinned by `bitty-lua/tests/measurement_lua.rs` and
-/// `load_gate.rs`, and the reader-latency regression below injects a read
-/// (3 x 500 ms) that exceeds this headroom, so an inline read still fails.
+/// `load_gate.rs`. The reader-latency regression below uses synchronization
+/// instead of a wall-clock threshold.
 const HARNESS_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
 
 #[derive(Default)]
@@ -229,39 +230,119 @@ fn three_group_bar_plan_activates_and_mounts() {
 #[test]
 fn three_group_bar_plan_never_waits_for_the_audio_monitor() {
     // Deterministic companion to the live test above: the injected reader
-    // takes 500 ms per spawn (1.5 s per composed read), three times the
-    // harness headroom and thirty times the production slice. Activation
-    // must not observe that time at all, so this fails on any
-    // implementation that reads providers inline even on a fast host where
-    // the real `pactl` happens to fit 50 ms.
-    let spawn: SampledSpawnFn = std::sync::Arc::new(|argv: &[String]| {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let joined = argv.join(" ");
-        if joined.contains("get-sink-volume") {
-            Ok("Volume: front-left: 32768 / 50% / -18.06 dB\n".to_string())
-        } else if joined.contains("get-sink-mute") {
-            Ok("Mute: no\n".to_string())
-        } else if joined.contains("list") {
-            Ok("Sink #0\n\tState: RUNNING\n\tActive Port: analog-output-headphones\n".to_string())
-        } else {
-            Err(bitty_plugin_host::AudioError::unavailable(
-                "unexpected argv in fixture",
-            ))
-        }
-    });
+    // parks until activation has returned, so this proves the activation path
+    // does not wait synchronously for the audio monitor without relying on a
+    // host wall-clock threshold.
+    let activation_thread = std::thread::current().id();
+    let (reader_entered_tx, reader_entered_rx) = std::sync::mpsc::sync_channel(1);
+    let (reader_finished_tx, reader_finished_rx) = std::sync::mpsc::sync_channel(1);
+    let inline_called = Arc::new(AtomicBool::new(false));
+    let activation_timed_out = Arc::new(AtomicBool::new(false));
+    let reader_calls = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let spawn: SampledSpawnFn = {
+        let inline_called = Arc::clone(&inline_called);
+        let reader_calls = Arc::clone(&reader_calls);
+        let release = Arc::clone(&release);
+        std::sync::Arc::new(move |argv: &[String]| {
+            let call = reader_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 1 {
+                reader_entered_tx
+                    .send(std::thread::current().id())
+                    .expect("activation test is waiting for reader entry");
+            }
+            if std::thread::current().id() == activation_thread {
+                // An inline regression must fail fast rather than deadlock
+                // the test while waiting for the release intended for the
+                // background sampler.
+                inline_called.store(true, Ordering::SeqCst);
+                return Err(bitty_plugin_host::AudioError::unavailable(
+                    "audio reader invoked on activation thread",
+                ));
+            }
+            let (released, wake) = &*release;
+            let mut released = released.lock().expect("reader release lock");
+            while !*released {
+                released = wake.wait(released).expect("reader release wait");
+            }
+
+            let joined = argv.join(" ");
+            let output = if joined.contains("get-sink-volume") {
+                Ok("Volume: front-left: 32768 / 50% / -18.06 dB\n".to_string())
+            } else if joined.contains("get-sink-mute") {
+                Ok("Mute: no\n".to_string())
+            } else if joined.contains("list") {
+                Ok(
+                    "Sink #0\n\tState: RUNNING\n\tActive Port: analog-output-headphones\n"
+                        .to_string(),
+                )
+            } else {
+                Err(bitty_plugin_host::AudioError::unavailable(
+                    "unexpected argv in fixture",
+                ))
+            };
+            drop(released);
+            if call == 3 {
+                reader_finished_tx
+                    .send(())
+                    .expect("activation test is waiting for reader completion");
+            }
+            output
+        })
+    };
     let (mut rt, data_dir) = three_group_runtime_with(Some(spawn));
     let bar = PluginId::new(BAR_ID).expect("id");
     rt.discover();
-    let started = Instant::now();
+    let (activation_done_tx, activation_done_rx) = std::sync::mpsc::sync_channel(1);
+    let watchdog_timed_out = Arc::clone(&activation_timed_out);
+    let watchdog_release = Arc::clone(&release);
+    let watchdog = std::thread::spawn(move || {
+        if activation_done_rx
+            .recv_timeout(AUDIO_READER_WATCHDOG_TIMEOUT)
+            .is_err()
+        {
+            // Safety cleanup only: the activation assertion below reports a
+            // timeout, while this release lets a synchronously waiting
+            // regression unwind so the test cannot hang indefinitely.
+            watchdog_timed_out.store(true, Ordering::SeqCst);
+            let (released, wake) = &*watchdog_release;
+            *released.lock().expect("watchdog release lock") = true;
+            wake.notify_all();
+        }
+    });
     let report = rt
         .activate(&bar)
         .expect("provider latency never enters the activation slice");
-    assert!(
-        started.elapsed().as_millis() < u128::from(HARNESS_WALL_BUDGET_MS),
-        "activation waited on the injected 1.5 s reader: {:?}",
-        started.elapsed()
-    );
+    activation_done_tx
+        .send(())
+        .expect("activation watchdog is still waiting");
+    watchdog.join().expect("activation watchdog thread");
     assert_eq!(report.state, LifecycleState::Active);
+    assert!(
+        !activation_timed_out.load(Ordering::SeqCst),
+        "activation waited synchronously for the audio reader"
+    );
+    assert!(
+        !inline_called.load(Ordering::SeqCst),
+        "audio reader ran inline on the activation thread"
+    );
     assert_eq!(rt.ui_blocks().len(), 1, "band still mounts while warming");
+
+    let reader_thread = reader_entered_rx
+        .recv_timeout(AUDIO_READER_WATCHDOG_TIMEOUT)
+        .expect("audio reader entered before activation returned");
+    assert_ne!(
+        reader_thread, activation_thread,
+        "audio reader ran on the activation thread"
+    );
+    assert!(!inline_called.load(Ordering::SeqCst));
+    if reader_thread != activation_thread {
+        let (released, wake) = &*release;
+        *released.lock().expect("reader release lock") = true;
+        wake.notify_all();
+        reader_finished_rx
+            .recv_timeout(AUDIO_READER_WATCHDOG_TIMEOUT)
+            .expect("background reader completed deterministically");
+    }
     let _ = std::fs::remove_dir_all(&data_dir);
 }

@@ -173,12 +173,12 @@ render_scoop() {
         "64bit": {
             "url": "${BASE_URL}/${ASSET_A}",
             "hash": "${SHA_A}",
-            "bin": "${ASSET_A}"
+            "bin": [["${ASSET_A}", "bitty"]]
         },
         "arm64": {
             "url": "${BASE_URL}/${ASSET_B}",
             "hash": "${SHA_B}",
-            "bin": "${ASSET_B}"
+            "bin": [["${ASSET_B}", "bitty"]]
         }
     },
     "checkver": {

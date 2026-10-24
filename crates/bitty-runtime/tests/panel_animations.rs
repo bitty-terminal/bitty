@@ -11,8 +11,8 @@
 //!   content, and hit-test frames commit immediately (CTX-1335 adds
 //!   paint-only bounds interpolation);
 //! - workspace switches (new/switch/prev/next/last) arm the bounded
-//!   workspace cross-fade and slide the committed incoming bounds in with
-//!   the same virtual-clock seam;
+//!   workspace cross-fade; the committed panel bounds and terminal grid stay
+//!   fixed throughout the chrome-only transition;
 //! - panel move (same-workspace reposition, cross-workspace reparent),
 //!   panel resize (border-drag divider, keyboard step), and panel drag
 //!   (Alt+drag float move) arm their own bounded transitions from the
@@ -671,61 +671,112 @@ fn instant_reduced_and_safe_paths_skip_bounds_interpolation() {
 }
 
 #[test]
-fn workspace_switch_slides_committed_bounds_without_touching_hits() {
-    // A workspace switch stashes the outgoing workspace and slides the
-    // committed incoming bounds in from the direction of travel alongside
-    // the accepted cross-fade.
+fn workspace_switch_keeps_committed_bounds_and_hits() {
+    // Workspace transitions are chrome-only. A lower-index switch must not
+    // translate incoming panels from a negative x origin, and the painted
+    // frames must remain exactly equal to the committed hit-test frames while
+    // the global workspace cross-fade is active.
     let mut rt = runtime_with(AnimationPolicy::default());
     let start = Instant::now();
     rt.set_container(UiRect::new(0, 0, 80, 24));
     let _ = rt.tick_at(start).expect("baseline presents");
     assert!(rt.tick_at(start).is_none());
 
+    // Build and settle the two-panel workspace at index 0, retaining focus on
+    // its second panel so the switch-back also proves workspace focus state.
+    rt.set_layout(two_pane_split());
+    rt.tick_at(start).expect("split presents");
+    let split_end = start + Duration::from_millis(200);
+    rt.tick_at(split_end).expect("split settles");
+    assert!(rt.tick_at(split_end).is_none(), "split is idle");
+    assert!(rt.set_focus(ViewId::new(2)));
+    rt.tick_at(split_end).expect("focus presents");
+    let focus_end = split_end + Duration::from_millis(100);
+    rt.tick_at(focus_end).expect("focus settles");
+    assert!(rt.tick_at(focus_end).is_none(), "focus is idle");
+
+    // Create workspace 1, then give it two different panels and settle that
+    // layout. Switching back to workspace 0 therefore exercises a lower-index
+    // multi-panel transition rather than the single-leaf fast path.
     rt.workspace_new().expect("new workspace");
-    let _ = rt.tick_at(start).expect("switch presents");
-    let logical = rt.present_frames();
-    let target = logical
-        .first()
-        .expect("incoming workspace frame")
-        .to_owned();
+    let workspace_one_start = focus_end + Duration::from_millis(200);
+    rt.tick_at(workspace_one_start)
+        .expect("new workspace presents");
+    let workspace_one_end = workspace_one_start + Duration::from_millis(200);
+    rt.tick_at(workspace_one_end)
+        .expect("new workspace settles");
+    assert!(rt.tick_at(workspace_one_end).is_none());
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        LayoutNode::leaf(View::new(ViewId::new(3), 40, 24)),
+        LayoutNode::leaf(View::new(ViewId::new(4), 40, 24)),
+    ));
+    let workspace_one_split = workspace_one_end + Duration::from_millis(200);
+    rt.tick_at(workspace_one_split)
+        .expect("workspace one split presents");
+    let workspace_one_split_end = workspace_one_split + Duration::from_millis(200);
+    rt.tick_at(workspace_one_split_end)
+        .expect("workspace one split settles");
+    assert!(rt.tick_at(workspace_one_split_end).is_none());
 
-    let painted_start = frame_for(&rt.paint_frames_at(start), target.view);
+    assert!(rt.workspace_switch(0), "switch to lower workspace");
+    let switch_start = workspace_one_split_end + Duration::from_millis(200);
+    rt.tick_at(switch_start)
+        .expect("lower workspace switch presents");
+    assert_eq!(rt.focused_view(), Some(ViewId::new(2)));
     assert!(
-        painted_start.frame.x > target.frame.x,
-        "next workspace slides in from the right: {} must start right of {}",
-        painted_start.frame.x,
-        target.frame.x
-    );
-    assert_eq!(painted_start.frame.width, target.frame.width);
-    assert_eq!(
-        rt.present_frames(),
-        logical,
-        "workspace switch hit-test geometry is final"
+        rt.animation_progress(AnimationKind::Workspace, None, switch_start)
+            .is_some(),
+        "workspace chrome transition remains active"
     );
 
-    let mid = start + Duration::from_millis(100);
-    rt.tick_at(mid).expect("mid frame presents");
-    let painted_mid = frame_for(&rt.paint_frames_at(mid), target.view);
-    assert!(
-        painted_mid.frame.x < painted_start.frame.x && painted_mid.frame.x > target.frame.x,
-        "mid slide {} must lie between {} and {}",
-        painted_mid.frame.x,
-        painted_start.frame.x,
-        target.frame.x
-    );
-    assert_eq!(rt.present_frames(), logical);
+    let assert_committed_paint_and_hits = |rt: &Runtime, now: Instant| {
+        let committed = rt.present_frames();
+        let painted = rt.paint_frames_at(now);
+        assert_eq!(
+            painted, committed,
+            "workspace switch must not animate panels"
+        );
+        let viewport_right = i64::from(rt.config().window_extent().width());
+        for frame in &committed {
+            let right = i64::from(frame.frame.x) + i64::from(frame.frame.width);
+            assert!(
+                frame.frame.x >= 0,
+                "panel {} entered from x<0",
+                frame.view.0
+            );
+            assert!(
+                right <= viewport_right,
+                "panel {} extends outside the viewport",
+                frame.view.0
+            );
+            let hit = rt
+                .cursor_to_present_cell(point_in_frame(rt, frame.view, 0.5, 0.5))
+                .map(|(view, _)| view);
+            assert_eq!(
+                hit,
+                Some(frame.view),
+                "committed hit-test for {}",
+                frame.view.0
+            );
+        }
+    };
+    assert_committed_paint_and_hits(&rt, switch_start);
 
-    let end = start + Duration::from_millis(200);
-    rt.tick_at(end).expect("final frame commits");
-    let painted_end = frame_for(&rt.paint_frames_at(end), target.view);
-    assert_eq!(painted_end.frame, target.frame);
-    assert_eq!(painted_end.content, target.content);
+    let mid = switch_start + Duration::from_millis(100);
+    rt.tick_at(mid).expect("mid workspace frame presents");
+    assert_committed_paint_and_hits(&rt, mid);
+
+    let end = switch_start + Duration::from_millis(200);
+    rt.tick_at(end).expect("final workspace frame commits");
+    assert_committed_paint_and_hits(&rt, end);
     assert!(!rt.animations_active());
     assert!(rt.tick_at(end).is_none());
 }
 
 #[test]
-fn workspace_slide_is_instant_under_reduced_motion() {
+fn workspace_switch_is_instant_under_reduced_motion() {
     for policy in [
         AnimationPolicy {
             reduced_motion: ReducedMotionMode::Always,
@@ -749,7 +800,7 @@ fn workspace_slide_is_instant_under_reduced_motion() {
         assert_eq!(
             rt.paint_frames_at(start),
             rt.present_frames(),
-            "reduced/instant workspace must paint final bounds: {policy:?}"
+            "reduced/instant workspace transition must paint final bounds: {policy:?}"
         );
         assert!(!rt.animations_active(), "{policy:?}");
         assert!(rt.tick_at(start).is_none(), "{policy:?}");
@@ -1130,7 +1181,7 @@ fn consecutive_alt_drag_updates_carry_painted_bounds_forward() {
 #[test]
 fn pinned_overlay_does_not_slide_with_the_workspace() {
     // CTX-1335 F5: pins are window-global chrome; the incoming workspace
-    // slides beneath them instead of dragging them in from off-screen.
+    // transition runs beneath them instead of moving them off-screen.
     let mut rt = runtime_with(AnimationPolicy::default());
     let start = Instant::now();
     rt.set_container(UiRect::new(0, 0, 80, 24));

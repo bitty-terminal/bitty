@@ -1249,6 +1249,16 @@ impl TerminalApp {
         self
     }
 
+    /// Injects the effective `mod_key` slot (issue #2407).
+    ///
+    /// Resolved once at startup from `mod_key`; applied to plugin-suggested
+    /// `alt`-bearing chords at match time, exactly like the shipped defaults,
+    /// and adopted live on reload via [`Self::adopt_live_config`].
+    pub(crate) fn with_mod_key(mut self, mod_key: bitty_config::ModKey) -> Self {
+        self.chrome = self.chrome.with_mod_key(mod_key);
+        self
+    }
+
     /// Adopts the app-owned half of an accepted live reload (CTX-0898, #1522).
     ///
     /// Swaps the resolved keymap table (`keymaps` + `mod_key`), the Leader
@@ -1256,7 +1266,8 @@ impl TerminalApp {
     /// `input.leader` + `input.timeout_len`, CTX-1002), the prefix-sequence
     /// bindings (`"leader <second>"` entries, CTX-1002), the hint kill switch
     /// (`hints_enabled`), the tiled resize step (`layout.resize_step`,
-    /// CTX-0963), and re-applies the platform transparency hint for
+    /// CTX-0963), the `mod_key` slot applied to plugin-suggested chords
+    /// (issue #2407), and re-applies the platform transparency hint for
     /// `window.opacity`. A Leader window or hint session armed under the old
     /// binding is cancelled when the binding changes or hints are disabled,
     /// so no stale chord or armed window outlives the reload. Held-key
@@ -1272,6 +1283,10 @@ impl TerminalApp {
         self.chrome.prefix_bindings = adoption.prefix_bindings;
         self.chrome.hints_enabled = adoption.hints_enabled;
         self.chrome.resize_step = crate::chrome_keys::sanitize_resize_step(adoption.resize_step);
+        // Issue #2407: plugin-suggested `alt`-bearing chords follow the same
+        // Mod slot as the shipped defaults, so a `mod_key` flip re-spells
+        // them on the next keypress without republishing the suggestions.
+        self.chrome.mod_key = adoption.mod_key;
         // Issue #2405: keep the plugin keymap source on the exact table the
         // input path now uses, so the next `bitty.keymaps.list()` observes the
         // reloaded registry. No rows are cached: the source stores the typed
@@ -2802,6 +2817,9 @@ impl TerminalApp {
     /// still-parked work counts as an attempt, while a completed resume counts
     /// as one delivered result. Returns attempts plus completed resumed parks.
     pub(crate) fn pump_cold_commands(&mut self) -> usize {
+        // Issue #2407 (review B3): surface plugin-suggestion chord
+        // collisions once, on the cold path, before other plugin work.
+        self.log_keymap_suggestion_conflicts();
         // bitty #2314: resume commands parked by the previous cold tick
         // before admitting new work. A resume advances at most one RC-1 wall
         // window per plugin; a command that still needs work stays parked for
@@ -2928,6 +2946,46 @@ impl TerminalApp {
             attempted = attempted.saturating_add(1);
         }
         attempted
+    }
+
+    /// Drain and log pending plugin-suggestion chord conflicts (issue #2407
+    /// review B3; LUA-OQ-5 conflict diagnostics).
+    ///
+    /// Publication keeps its deterministic tiebreak (lexicographically first
+    /// owner, first registered suggestion) but never hides the loser: the
+    /// runtime records one bounded row per colliding chord, and this cold-path
+    /// drain logs each row once as a warning. The input path only reads the
+    /// directory and never touches this buffer.
+    fn log_keymap_suggestion_conflicts(&mut self) {
+        let Some(runtime) = self.plugin_runtime.as_ref() else {
+            return;
+        };
+        let directory = runtime.suggested_bindings();
+        let (conflicts, dropped) = {
+            let mut directory = directory.borrow_mut();
+            (directory.drain_conflicts(), directory.conflicts_dropped())
+        };
+        if conflicts.is_empty() {
+            return;
+        }
+        for conflict in &conflicts {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: plugin keybinding conflict: {} is claimed by {}; {} is shadowed",
+                    conflict.chord.canonical(),
+                    conflict.winner,
+                    conflict.loser
+                )
+            });
+        }
+        if dropped > 0 {
+            crate::logging::warn(|| {
+                format!(
+                    "bitty: plugin keybinding conflicts: {dropped} additional row(s) dropped \
+                     (bounded diagnostic buffer)"
+                )
+            });
+        }
     }
 
     /// Empty args value for argument-free host-mediated invocations

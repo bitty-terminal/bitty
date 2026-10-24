@@ -105,6 +105,11 @@ pub(crate) struct ChromeState {
     /// startup and adopted live on reload. Sanitized at use (fail-closed to
     /// the default when non-finite or out of range).
     pub(crate) resize_step: f32,
+    /// Effective `mod_key` slot (issue #2407): applied to plugin-suggested
+    /// `alt`-bearing chords at match time so they follow the same Mod slot as
+    /// the shipped defaults. Fixed (non-`alt`) suggestions pass through
+    /// unchanged. Resolved at startup and adopted live on reload.
+    pub(crate) mod_key: bitty_config::ModKey,
 }
 
 impl ChromeState {
@@ -131,6 +136,7 @@ impl ChromeState {
             editor: crate::editor_host::ExternalEditorHost::new(),
             hints_enabled: true,
             resize_step: bitty_config::types::DEFAULT_LAYOUT_RESIZE_STEP,
+            mod_key: bitty_config::ModKey::default(),
         }
     }
 
@@ -165,6 +171,16 @@ impl ChromeState {
     /// [`bitty_config::types::DEFAULT_LAYOUT_RESIZE_STEP`], never clamp.
     pub(crate) fn with_resize_step(mut self, step: f32) -> Self {
         self.resize_step = sanitize_resize_step(step);
+        self
+    }
+
+    /// Injects the effective `mod_key` slot (issue #2407 startup path).
+    ///
+    /// Plugin-suggested `alt`-bearing chords are re-spelled through this slot
+    /// at match time, exactly like the shipped defaults, so a plugin's
+    /// suggested `alt+?` follows `mod_key = "super"` as `super+?`.
+    pub(crate) fn with_mod_key(mut self, mod_key: bitty_config::ModKey) -> Self {
+        self.mod_key = mod_key;
         self
     }
 
@@ -855,9 +871,13 @@ fn gap_resized_two_pane(ratio: f32) -> LayoutNode {
 ///    defaults plus user overrides via [`bitty_config::match_keymap`]).
 ///    The modal's own confirm gesture (repeat the arming chord) dispatches
 ///    here so confirmation reuses the normal action path.
-/// 4. [`DispatchPriority::Plugin`] — plugin-suggested bindings (future).
-///    No plugin-binding facility exists, so this layer is inert and denies
-///    by default; see [`match_plugin_binding`].
+/// 4. [`DispatchPriority::Plugin`] — plugin-suggested bindings published by
+///    active generations (issue #2407, ADR-0014 stage 3). Consulted exactly
+///    here, after the user table and before terminal encoding; an explicit
+///    user binding always wins because this layer is only reached when
+///    [`bitty_config::match_keymap`] found nothing. The resolved action is
+///    the same host-mediated `command:<owner:command>` invocation a user
+///    binding uses, so no plugin callback runs on the input path.
 /// 5. [`DispatchPriority::Terminal`] — terminal encoding fall-through: the
 ///    event is not consumed and routes to `Runtime` (PTY bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -868,22 +888,10 @@ pub(crate) enum DispatchPriority {
     Modal,
     /// Resolved keymap action runs (single owner, CTX-0153).
     User,
-    /// Plugin-suggested binding (inert: deny-by-default, CTX-0275 slot).
+    /// Plugin-suggested binding runs through the host-mediated command path.
     Plugin,
     /// No layer claimed the key: route to terminal encoding.
     Terminal,
-}
-
-/// Plugin-suggested binding lookup (CTX-0275 future slot).
-///
-/// No plugin-binding facility exists today, so this always returns `None`
-/// (deny-by-default): an explicit user mapping can never lose to a plugin,
-/// and unbound keys keep falling through to terminal encoding. When a
-/// plugin-binding facility lands, its lookup must sit exactly here — after
-/// [`DispatchPriority::User`], before [`DispatchPriority::Terminal`] — and
-/// this stub is the single wiring point.
-fn match_plugin_binding(_keyref: bitty_config::KeyRef) -> Option<bitty_config::ChromeAction> {
-    None
 }
 
 /// Whether a bound chrome action may run under the live modal gates
@@ -930,13 +938,14 @@ fn action_passes_modal_gate(
 ///
 /// Inputs are plain data so the priority table is headless-testable without
 /// a display server or a live `Runtime`: `matched` is the
-/// [`bitty_config::match_keymap`] result for `keyref`, and the pending flags
+/// [`bitty_config::match_keymap`] result for `keyref`, `plugin` is the live
+/// plugin-suggestion lookup result for the same key, and the pending flags
 /// are the app's modal surface (`Runtime::has_pending_paste` /
 /// `Runtime::has_pending_ws_close` / `Runtime::has_pending_close_confirm`
 /// plus the CTX-0482 panel-overlay bit fed by
 /// `OverlayManager::modal_active`).
 /// Returns the winning layer plus the action to run when the layer dispatches
-/// one (`User` only; `Modal` swallows, `Plugin` is inert, `Terminal` routes).
+/// one (`User` and `Plugin`; `Modal` swallows, `Terminal` routes).
 ///
 /// `close_confirm_pending` is any CTX-0370 close arm (view or window);
 /// `close_confirm_view` is only true when the arm targets the currently
@@ -964,6 +973,11 @@ fn action_passes_modal_gate(
 ///   paste-again confirm — dispatches as `(User, action)` through the normal
 ///   path below.
 /// - bound chord, no modal -> `(User, action)`.
+/// - suggestion-bound chord, no user binding, no capturing modal ->
+///   `(Plugin, action)` (issue #2407; the plugin slot is reached only after
+///   the user table produced nothing, so a suggestion never shadows it).
+/// - suggestion-bound chord while a capturing modal pends -> `(Modal, None)`:
+///   the modal captures every bound chrome chord, suggestions included.
 /// - unbound key while a modal pends -> `(Terminal, None)` (fall-through
 ///   unchanged: the dialog captures commands, not typing).
 /// - unbound key, no modal -> `(Terminal, None)` (existing fall-through).
@@ -971,6 +985,7 @@ fn action_passes_modal_gate(
 fn resolve_priority_for(
     keyref: bitty_config::KeyRef,
     matched: Option<bitty_config::ChromeAction>,
+    plugin: Option<bitty_config::ChromeAction>,
     paste_pending: bool,
     ws_close_pending: bool,
     close_confirm_pending: bool,
@@ -1024,11 +1039,11 @@ fn resolve_priority_for(
             }
         }
         Some(action) => (DispatchPriority::User, Some(action)),
-        None => match match_plugin_binding(keyref) {
-            // Future wiring point: plugin suggestions sit after the user
-            // table (an explicit mapping always wins) and before terminal
-            // encoding. Inert today (`match_plugin_binding` denies by
-            // default), so this arm falls through to `Terminal`.
+        None => match plugin {
+            // Issue #2407: plugin suggestions sit exactly after the user
+            // table and before terminal encoding. A capturing modal still
+            // swallows them; only the paste banner is informational.
+            Some(_) if capturing => (DispatchPriority::Modal, None),
             Some(action) => (DispatchPriority::Plugin, Some(action)),
             None => (DispatchPriority::Terminal, None),
         },
@@ -2436,7 +2451,9 @@ impl TerminalApp {
     ///
     /// Thin wrapper over the pure [`resolve_priority_for`] table using live
     /// modal state; see that function for the layer order and the
-    /// confirm-gesture rule.
+    /// confirm-gesture rule. The plugin layer is resolved here, from the
+    /// runtime's live suggestion directory, and only ever after the user
+    /// table produced no match.
     pub(crate) fn resolve_dispatch(
         &self,
         keyref: bitty_config::KeyRef,
@@ -2451,9 +2468,19 @@ impl TerminalApp {
             close_confirm_window,
             is_last_pane,
         ) = self.modal_gates();
+        // Issue #2407: an explicit user binding always wins, so the plugin
+        // directory is not even consulted when the user table matched. This
+        // is also the only place the plugin layer can be reached, keeping
+        // the reserved priority slot structural.
+        let plugin = if matched.is_none() {
+            self.match_plugin_binding(keyref)
+        } else {
+            None
+        };
         resolve_priority_for(
             keyref,
             matched,
+            plugin,
             paste_pending,
             ws_close_pending,
             close_confirm_pending,
@@ -2462,6 +2489,30 @@ impl TerminalApp {
             close_confirm_window,
             is_last_pane,
         )
+    }
+
+    /// Resolve one keypress against the live plugin-suggestion directory
+    /// (issue #2407, ADR-0014 stage 3).
+    ///
+    /// The directory is owned by the plugin runtime and only the cold path
+    /// mutates it, so this reads the exact generation set the lifecycle last
+    /// committed: publish on activation, park on suspend, restore on resume,
+    /// revoke on unload/crash/dispose/reload. A detached runtime, an inactive
+    /// plugin, or a stale generation simply matches nothing and the key keeps
+    /// falling through to terminal encoding.
+    ///
+    /// No plugin code runs here: a match returns the same host-mediated
+    /// [`bitty_config::ChromeAction::InvokeCommand`] a user
+    /// `command:<owner:command>` binding uses, and dispatch then re-checks
+    /// registration, schema, and liveness on the normal command path.
+    pub(crate) fn match_plugin_binding(
+        &self,
+        keyref: bitty_config::KeyRef,
+    ) -> Option<bitty_config::ChromeAction> {
+        let runtime = self.plugin_runtime.as_ref()?;
+        let directory = runtime.suggested_bindings();
+        let directory = directory.borrow();
+        directory.action_for(keyref, self.chrome.mod_key)
     }
 
     /// Live modal gates shared by the keyboard table and the mouse-action
@@ -2891,10 +2942,10 @@ impl TerminalApp {
 
     /// Single-owner chrome intercept (CTX-0153) with explicit dispatch
     /// priority (CTX-0275): emergency/reserved > active overlay-modal >
-    /// user-defined keymap > plugin (inert, deny-by-default) > terminal
-    /// encoding. Returns `true` when the event was consumed (emergency
-    /// cancel ran, a modal captured a bound chord, a bound chord ran, or a
-    /// chrome-owned key repeat/duplicate was swallowed) and must NOT reach
+    /// user-defined keymap > plugin suggestions > terminal encoding. Returns
+    /// `true` when the event was consumed (emergency cancel ran, a modal
+    /// captured a bound chord, a bound chord ran, or a chrome-owned key
+    /// repeat/duplicate was swallowed) and must NOT reach
     /// `Runtime`; `false` means route normally (unbound keys like Tab,
     /// arrows, plain letters fall through to shell input, modal or not).
     /// Modifier tracking stays in sync because modifier-only keys
@@ -3141,13 +3192,28 @@ impl TerminalApp {
                             return true;
                         }
                         DispatchPriority::Plugin => {
-                            // Inert today (`match_plugin_binding` denies by
-                            // default); fail closed to terminal routing.
-                            debug_assert!(
-                                match_plugin_binding(keyref).is_none(),
-                                "plugin layer must stay deny-by-default",
-                            );
-                            return false;
+                            // Issue #2407: a live generation's suggestion
+                            // wins here, after the user table and before
+                            // terminal encoding. Dispatch rides the same
+                            // host-mediated command path a user binding
+                            // uses: no plugin callback on the input path, and
+                            // every registration/schema/liveness gate still
+                            // applies (a target that died since publication
+                            // fails closed with a diagnostic).
+                            let Some(action) = action else {
+                                // Unreachable by construction (`Plugin` always
+                                // carries the matched action); fail closed to
+                                // terminal routing rather than panicking.
+                                return false;
+                            };
+                            self.chrome.held.insert(keyref.key);
+                            if !key.repeat && self.apply_input_chrome_action(action) {
+                                self.chrome_close_exit_requested = true;
+                            }
+                            if let Some(win) = self.window.handle.as_ref() {
+                                win.request_redraw();
+                            }
+                            return true;
                         }
                         DispatchPriority::Terminal => {
                             return false;
@@ -6819,8 +6885,8 @@ claims = []
 
     #[test]
     fn dispatch_priority_table_orders_emergency_modal_user_terminal() {
-        // Pure classifier: emergency > modal > user > plugin (inert) >
-        // terminal, over plain data (no display server, no live Runtime).
+        // Pure classifier: emergency > modal > user > plugin > terminal,
+        // over plain data (no display server, no live Runtime).
         use bitty_config::{ChromeAction as A, KeyName, KeyRef, SplitDir};
         let esc = KeyRef {
             key: KeyName::Escape,
@@ -6862,6 +6928,7 @@ claims = []
             resolve_priority_for(
                 esc,
                 Some(A::CloseView),
+                None,
                 true,
                 false,
                 false,
@@ -6873,7 +6940,9 @@ claims = []
             (DispatchPriority::Emergency, None)
         );
         assert_eq!(
-            resolve_priority_for(esc, None, false, true, false, false, false, false, false,),
+            resolve_priority_for(
+                esc, None, None, false, true, false, false, false, false, false
+            ),
             (DispatchPriority::Emergency, None)
         );
         // No modal: bound -> User, unbound -> Terminal (pre-0275 behavior).
@@ -6881,6 +6950,7 @@ claims = []
             resolve_priority_for(
                 esc,
                 Some(A::CloseView),
+                None,
                 false,
                 false,
                 false,
@@ -6892,17 +6962,23 @@ claims = []
             (DispatchPriority::User, Some(A::CloseView))
         );
         assert_eq!(
-            resolve_priority_for(esc, None, false, false, false, false, false, false, false,),
+            resolve_priority_for(
+                esc, None, None, false, false, false, false, false, false, false
+            ),
             (DispatchPriority::Terminal, None)
         );
         // Unbound keys fall through even with a modal up (the dialog
         // captures commands, not typing).
         assert_eq!(
-            resolve_priority_for(bare_x, None, true, false, false, false, false, false, false,),
+            resolve_priority_for(
+                bare_x, None, None, true, false, false, false, false, false, false
+            ),
             (DispatchPriority::Terminal, None)
         );
         assert_eq!(
-            resolve_priority_for(bare_x, None, true, true, false, false, false, false, false,),
+            resolve_priority_for(
+                bare_x, None, None, true, true, false, false, false, false, false
+            ),
             (DispatchPriority::Terminal, None)
         );
         // A close gate captures a bound non-confirm chord (a pending paste
@@ -6912,6 +6988,7 @@ claims = []
             resolve_priority_for(
                 alt_h,
                 Some(A::GotoSplit(SplitDir::Left)),
+                None,
                 true,
                 false,
                 false,
@@ -6927,6 +7004,7 @@ claims = []
             resolve_priority_for(
                 alt_h,
                 Some(A::GotoSplit(SplitDir::Left)),
+                None,
                 false,
                 true,
                 false,
@@ -6945,6 +7023,7 @@ claims = []
             resolve_priority_for(
                 paste_chord,
                 Some(A::PasteFromClipboard),
+                None,
                 true,
                 false,
                 false,
@@ -6959,6 +7038,7 @@ claims = []
             resolve_priority_for(
                 alt_w,
                 Some(A::WorkspaceClose),
+                None,
                 false,
                 true,
                 false,
@@ -6977,6 +7057,7 @@ claims = []
             resolve_priority_for(
                 alt_w,
                 Some(A::WorkspaceClose),
+                None,
                 true,
                 false,
                 false,
@@ -6992,6 +7073,7 @@ claims = []
             resolve_priority_for(
                 paste_chord,
                 Some(A::PasteFromClipboard),
+                None,
                 false,
                 true,
                 false,
@@ -7008,6 +7090,7 @@ claims = []
             resolve_priority_for(
                 alt_h,
                 Some(A::GotoSplit(SplitDir::Left)),
+                None,
                 false,
                 false,
                 true,
@@ -7022,6 +7105,7 @@ claims = []
             resolve_priority_for(
                 alt_w,
                 Some(A::CloseView),
+                None,
                 false,
                 false,
                 true,
@@ -7037,6 +7121,7 @@ claims = []
             resolve_priority_for(
                 alt_w,
                 Some(A::CloseView),
+                None,
                 false,
                 false,
                 true,
@@ -7054,6 +7139,7 @@ claims = []
             resolve_priority_for(
                 alt_w,
                 Some(A::CloseView),
+                None,
                 false,
                 false,
                 true,
@@ -7066,7 +7152,9 @@ claims = []
             "window arm on the last pane: repeat close confirms the window"
         );
         assert_eq!(
-            resolve_priority_for(esc, None, false, false, true, true, false, false, false),
+            resolve_priority_for(
+                esc, None, None, false, false, true, true, false, false, false
+            ),
             (DispatchPriority::Emergency, None),
             "Esc cancels a close-confirm arm"
         );
@@ -7075,6 +7163,7 @@ claims = []
             resolve_priority_for(
                 alt_h,
                 Some(A::GotoSplit(SplitDir::Left)),
+                None,
                 false,
                 false,
                 false,
@@ -7093,6 +7182,7 @@ claims = []
             resolve_priority_for(
                 esc,
                 Some(A::CloseView),
+                None,
                 false,
                 false,
                 false,
@@ -7106,7 +7196,9 @@ claims = []
         // A pending confirmation still owns `Esc` even with the panel modal
         // up: cancelling the confirmation is the emergency gesture.
         assert_eq!(
-            resolve_priority_for(esc, None, true, false, false, false, true, false, false),
+            resolve_priority_for(
+                esc, None, None, true, false, false, false, true, false, false
+            ),
             (DispatchPriority::Emergency, None)
         );
         // The panel modal's confirm gestures are not exempt: only the
@@ -7116,6 +7208,7 @@ claims = []
             resolve_priority_for(
                 paste_chord,
                 Some(A::PasteFromClipboard),
+                None,
                 false,
                 false,
                 false,
@@ -7126,11 +7219,15 @@ claims = []
             ),
             (DispatchPriority::Modal, None)
         );
-        // Plugin slot denies by default for every key shape.
+        // With no published suggestion for the key, the plugin slot adds
+        // nothing and unbound keys keep their terminal fall-through.
         for keyref in [esc, alt_h, alt_w, paste_chord, bare_x] {
-            assert!(
-                match_plugin_binding(keyref).is_none(),
-                "plugin layer must stay deny-by-default"
+            assert_eq!(
+                resolve_priority_for(
+                    keyref, None, None, false, false, false, false, false, false, false,
+                ),
+                (DispatchPriority::Terminal, None),
+                "no plugin suggestion must fall through to terminal encoding"
             );
         }
     }
@@ -8025,6 +8122,665 @@ claims = []
             app.runtime.notification_banner().as_deref(),
             Some("bitty-featured.devtools:plugins: 2 plugins active"),
             "a refused dispatch must not disturb the banner"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #2407 / ADR-0014 stage 3: live plugin-suggested bindings at the
+    // reserved `DispatchPriority::Plugin` slot.
+    // -----------------------------------------------------------------------
+
+    /// Write one plugin package whose `init.lua` registers `commands` and
+    /// captures `suggestions` (`(chord, command)` pairs).
+    fn write_suggesting_plugin(
+        root: &std::path::Path,
+        id: &str,
+        commands: &[&str],
+        suggestions: &[(&str, &str)],
+        registered: &[&str],
+    ) {
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        let declared = commands
+            .iter()
+            .map(|command| format!("\"{id}:{command}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Suggestion Test\"\nversion = \"0.0.1\"\n\
+                 description = \"plugin suggestion test\"\n\n\
+                 [compat]\nbitty = \">=0.0.1\"\nplugin-api = \"^1.0\"\n\n\
+                 [capabilities]\n\n\
+                 [lazy]\ncommands = [{declared}]\nevents = []\n",
+            ),
+        )
+        .expect("manifest");
+        let mut init = String::new();
+        for command in registered {
+            init.push_str(&format!(
+                "bitty.commands.register({{\n\
+                 \x20 id = \"{command}\",\n\
+                 \x20 title = \"Suggestion {command}\",\n\
+                 \x20 run = function() return \"ran {command}\" end,\n\
+                 }})\n"
+            ));
+        }
+        for (chord, command) in suggestions {
+            init.push_str(&format!(
+                "bitty.keymaps.suggest({{ chord = \"{chord}\", command = \"{command}\" }})\n"
+            ));
+        }
+        init.push_str("return {}\n");
+        std::fs::write(plugin.join("lua/init.lua"), init).expect("init");
+    }
+
+    fn activate_plugin_runtime(
+        root: &std::path::Path,
+        id: &str,
+    ) -> (
+        bitty_runtime::plugin_runtime::PluginRuntime,
+        bitty_plugin_host::manifest::PluginId,
+    ) {
+        use crate::composer_owner::fixture;
+        let mut plugin_runtime = fixture::runtime_for(vec![root.to_path_buf()]);
+        plugin_runtime.discover();
+        let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("id");
+        plugin_runtime.activate(&pid).expect("activate");
+        (plugin_runtime, pid)
+    }
+
+    fn modifier_event(ctrl: bool, alt: bool, shift: bool, super_held: bool) -> WindowEventKind {
+        WindowEventKind::ModifiersChanged(bitty_platform::ModifiersState {
+            shift,
+            control: ctrl,
+            alt,
+            super_pressed: super_held,
+        })
+    }
+
+    const SUGGESTION_OWNER: &str = "bitty-featured.help-fixture";
+    const SUGGESTION_COMMAND: &str = "toggle-help";
+    const SUGGESTION_QUALIFIED: &str = "bitty-featured.help-fixture:toggle-help";
+
+    #[test]
+    fn plugin_suggestion_dispatches_at_the_reserved_slot() {
+        // Issue #2407: an active generation's suggestion dispatches its own
+        // registered command at `DispatchPriority::Plugin` — after the user
+        // table and before terminal encoding — through the same host-mediated
+        // command path a user `command:` binding uses.
+        use crate::chrome_keys::DispatchPriority;
+        use crate::composer_owner::fixture;
+        use bitty_config::{ChromeAction, KeyName, KeyRef};
+        let root = fixture::temp_dir("suggestion-dispatch");
+        write_suggesting_plugin(
+            &root,
+            SUGGESTION_OWNER,
+            &[SUGGESTION_COMMAND],
+            &[("ctrl+alt+k", SUGGESTION_QUALIFIED)],
+            &[SUGGESTION_COMMAND],
+        );
+        let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let chord = KeyRef {
+            key: KeyName::Char('k'),
+            ctrl: true,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        let (priority, action) = app.resolve_dispatch(chord, None);
+        assert_eq!(priority, DispatchPriority::Plugin);
+        assert_eq!(
+            action,
+            Some(ChromeAction::InvokeCommand(
+                SUGGESTION_QUALIFIED.to_string()
+            ))
+        );
+        // The live input path dispatches it and surfaces the command result
+        // on the bounded banner: no plugin callback on the input path, the
+        // normal host-mediated invocation path ran the owner's VM. Command
+        // invocations are deferred to the cold phase (CTX-1324), so the
+        // dispatch lands on the next cold pump.
+        let _ = app.intercept_chrome_key(&modifier_event(true, true, false, false));
+        assert!(app.intercept_chrome_key(&char_press("k", "k", false)));
+        assert_eq!(app.pump_cold_commands(), 1, "one deferred command ran");
+        assert_eq!(
+            app.runtime.notification_banner().as_deref(),
+            Some("bitty-featured.help-fixture:toggle-help: ran toggle-help"),
+            "the suggested chord must dispatch its owner's registered command"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plugin_suggestion_never_shadows_a_user_binding() {
+        // Issue #2407: an explicit user binding always wins. The plugin
+        // directory is not even consulted when the user table matched, so a
+        // suggestion can never shadow — or lose to — the user's action.
+        use crate::chrome_keys::DispatchPriority;
+        use crate::composer_owner::fixture;
+        use bitty_config::{ChromeAction, KeyName, KeyRef, KeymapEntry};
+        let root = fixture::temp_dir("suggestion-user-wins");
+        write_suggesting_plugin(
+            &root,
+            SUGGESTION_OWNER,
+            &[SUGGESTION_COMMAND],
+            &[("ctrl+alt+k", SUGGESTION_QUALIFIED)],
+            &[SUGGESTION_COMMAND],
+        );
+        let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
+        let effective = bitty_config::EffectiveConfig {
+            keymaps: vec![KeymapEntry {
+                chord: "ctrl+alt+k".into(),
+                action: "toggle_zoom".into(),
+                context: "global".into(),
+            }],
+            ..Default::default()
+        };
+        let maps = bitty_config::resolve_keymaps(&effective).expect("resolves");
+        let app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let chord = KeyRef {
+            key: KeyName::Char('k'),
+            ctrl: true,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        let (priority, action) = app.resolve_dispatch(
+            chord,
+            bitty_config::match_keymap(&app.chrome.keymaps, chord),
+        );
+        assert_eq!(
+            priority,
+            DispatchPriority::User,
+            "the user table owns the chord"
+        );
+        assert_eq!(action, Some(ChromeAction::ToggleZoom));
+        // The plugin layer alone still resolves the raw suggestion; only the
+        // priority table decides the user wins.
+        assert_eq!(
+            app.match_plugin_binding(chord),
+            Some(ChromeAction::InvokeCommand(
+                SUGGESTION_QUALIFIED.to_string()
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plugin_suggestion_never_shadows_a_shipped_default() {
+        // Issue #2407 acceptance: the historical case is a help plugin
+        // suggesting the old `toggle_help` chord while Core still ships the
+        // default. The shipped default is part of the user table, so it owns
+        // the chord and the suggestion only becomes live once the default is
+        // retired (stage 6) or the user rebinds it.
+        use crate::chrome_keys::DispatchPriority;
+        use crate::composer_owner::fixture;
+        use bitty_config::{ChromeAction, KeyName, KeyRef};
+        let root = fixture::temp_dir("suggestion-default-wins");
+        write_suggesting_plugin(
+            &root,
+            SUGGESTION_OWNER,
+            &[SUGGESTION_COMMAND],
+            &[("alt+?", SUGGESTION_QUALIFIED)],
+            &[SUGGESTION_COMMAND],
+        );
+        let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let chord = KeyRef {
+            key: KeyName::Char('?'),
+            ctrl: false,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        let matched = bitty_config::match_keymap(&app.chrome.keymaps, chord);
+        assert_eq!(matched, Some(ChromeAction::ToggleHelp));
+        let (priority, action) = app.resolve_dispatch(chord, matched);
+        assert_eq!(
+            priority,
+            DispatchPriority::User,
+            "a shipped default always wins over a plugin suggestion"
+        );
+        assert_eq!(action, Some(ChromeAction::ToggleHelp));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plugin_suggestion_follows_the_configured_mod_slot() {
+        // Issue #2407: `alt`-bearing suggestions follow `mod_key`, matching
+        // the shipped defaults (`super+` under `mod_key = "super"`), while
+        // mod-independent suggestions stay fixed.
+        use crate::composer_owner::fixture;
+        use bitty_config::{ChromeAction, KeyName, KeyRef, ModKey};
+        let root = fixture::temp_dir("suggestion-mod-flip");
+        write_suggesting_plugin(
+            &root,
+            SUGGESTION_OWNER,
+            &[SUGGESTION_COMMAND],
+            &[
+                ("alt+?", SUGGESTION_QUALIFIED),
+                ("ctrl+k", SUGGESTION_QUALIFIED),
+            ],
+            &[SUGGESTION_COMMAND],
+        );
+        let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let app = help_test_app(maps)
+            .with_plugin_runtime(Some(plugin_runtime))
+            .with_mod_key(ModKey::Super);
+        let alt_question = KeyRef {
+            key: KeyName::Char('?'),
+            ctrl: false,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        let super_question = KeyRef {
+            key: KeyName::Char('?'),
+            ctrl: false,
+            alt: false,
+            shift: false,
+            super_held: true,
+        };
+        assert_eq!(app.chrome.mod_key, ModKey::Super);
+        assert_eq!(
+            app.match_plugin_binding(super_question),
+            Some(ChromeAction::InvokeCommand(
+                SUGGESTION_QUALIFIED.to_string()
+            )),
+            "the Mod slot moves the alt gesture to super"
+        );
+        assert_eq!(app.match_plugin_binding(alt_question), None);
+        // Fixed (non-`alt`) chords pass through unchanged under the flip.
+        let fixed = KeyRef {
+            key: KeyName::Char('k'),
+            ctrl: true,
+            alt: false,
+            shift: false,
+            super_held: false,
+        };
+        assert_eq!(
+            app.match_plugin_binding(fixed),
+            Some(ChromeAction::InvokeCommand(
+                SUGGESTION_QUALIFIED.to_string()
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plugin_suggestion_requires_a_same_generation_owner_target() {
+        // Issue #2407: only a command registered by the same generation is a
+        // valid target. Unqualified, foreign, and unregistered names are
+        // dropped on the cold path and bind nothing.
+        use crate::composer_owner::fixture;
+        use bitty_config::{ChromeAction, KeyName, KeyRef};
+        let root = fixture::temp_dir("suggestion-owner-only");
+        write_suggesting_plugin(
+            &root,
+            SUGGESTION_OWNER,
+            &[SUGGESTION_COMMAND],
+            &[
+                ("ctrl+alt+k", SUGGESTION_QUALIFIED),
+                ("ctrl+alt+j", SUGGESTION_COMMAND),
+                ("ctrl+alt+l", "bitty-featured.other:toggle-help"),
+                ("ctrl+alt+m", "bitty-featured.help-fixture:missing"),
+            ],
+            &[SUGGESTION_COMMAND],
+        );
+        let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let key = |c: char| KeyRef {
+            key: KeyName::Char(c),
+            ctrl: true,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        assert_eq!(
+            app.match_plugin_binding(key('k')),
+            Some(ChromeAction::InvokeCommand(
+                SUGGESTION_QUALIFIED.to_string()
+            ))
+        );
+        for (c, tag) in [
+            ('j', "unqualified"),
+            ('l', "foreign"),
+            ('m', "unregistered"),
+        ] {
+            assert_eq!(
+                app.match_plugin_binding(key(c)),
+                None,
+                "{tag} targets must fail closed"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plugin_suggestion_rejects_malformed_and_prefix_chords_at_dispatch() {
+        // Issue #2407 review B1: the grammar gate is exercised in the chord
+        // position with a *valid* qualified target, at the dispatcher level
+        // too. If publication ever fell back to a default chord or kept the
+        // raw spelling, these presses would no longer fall through to the
+        // terminal and `resolve_dispatch` would report the plugin slot.
+        use crate::chrome_keys::DispatchPriority;
+        use crate::composer_owner::fixture;
+        use bitty_config::{ChromeAction, KeyName, KeyRef};
+        let root = fixture::temp_dir("suggestion-grammar");
+        write_suggesting_plugin(
+            &root,
+            SUGGESTION_OWNER,
+            &[SUGGESTION_COMMAND],
+            &[
+                ("leader w", SUGGESTION_QUALIFIED),
+                ("not-a-chord", SUGGESTION_QUALIFIED),
+                ("ctrl+alt+g", SUGGESTION_QUALIFIED),
+            ],
+            &[SUGGESTION_COMMAND],
+        );
+        let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        // Only the valid row published.
+        let directory = app
+            .plugin_runtime
+            .as_ref()
+            .expect("runtime")
+            .suggested_bindings()
+            .borrow();
+        assert_eq!(directory.active().len(), 1);
+        assert_eq!(directory.active()[0].chord.canonical(), "ctrl+alt+g");
+        drop(directory);
+        // A press that could resemble the rejected spellings is unbound.
+        for keyref in [
+            KeyRef {
+                key: KeyName::Char('w'),
+                ctrl: true,
+                alt: true,
+                shift: false,
+                super_held: false,
+            },
+            KeyRef {
+                key: KeyName::Char('n'),
+                ctrl: true,
+                alt: true,
+                shift: false,
+                super_held: false,
+            },
+        ] {
+            assert_eq!(app.match_plugin_binding(keyref), None);
+            assert_eq!(
+                app.resolve_dispatch(keyref, None),
+                (DispatchPriority::Terminal, None),
+                "a rejected suggestion must leave the chord to terminal encoding"
+            );
+        }
+        // The valid row dispatches normally.
+        let valid = KeyRef {
+            key: KeyName::Char('g'),
+            ctrl: true,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        assert_eq!(
+            app.resolve_dispatch(valid, None),
+            (
+                DispatchPriority::Plugin,
+                Some(ChromeAction::InvokeCommand(
+                    SUGGESTION_QUALIFIED.to_string()
+                ))
+            )
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plugin_suggestion_disappears_on_suspend_and_generation_change() {
+        // Issue #2407: disable/suspend parks the suggestions, resume restores
+        // them in place, and dispose/reload (a generation change) removes
+        // them. The same chord reaches the terminal whenever the plugin is
+        // inactive.
+        use crate::chrome_keys::DispatchPriority;
+        use crate::composer_owner::fixture;
+        use bitty_config::{ChromeAction, KeyName, KeyRef};
+        let root = fixture::temp_dir("suggestion-lifecycle");
+        write_suggesting_plugin(
+            &root,
+            SUGGESTION_OWNER,
+            &[SUGGESTION_COMMAND],
+            &[("ctrl+alt+k", SUGGESTION_QUALIFIED)],
+            &[SUGGESTION_COMMAND],
+        );
+        let (plugin_runtime, pid) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let chord = KeyRef {
+            key: KeyName::Char('k'),
+            ctrl: true,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        let suggestion = Some(ChromeAction::InvokeCommand(
+            SUGGESTION_QUALIFIED.to_string(),
+        ));
+        assert_eq!(app.match_plugin_binding(chord), suggestion);
+        // Suspend (disable): the suggestion is parked, not lost.
+        app.plugin_runtime
+            .as_mut()
+            .expect("runtime")
+            .suspend(&pid)
+            .expect("suspend");
+        assert_eq!(app.match_plugin_binding(chord), None);
+        assert_eq!(
+            app.resolve_dispatch(chord, None),
+            (DispatchPriority::Terminal, None),
+            "an inactive plugin's chord reaches the terminal"
+        );
+        // Resume restores the same generation's binding.
+        app.plugin_runtime
+            .as_mut()
+            .expect("runtime")
+            .resume(&pid)
+            .expect("resume");
+        assert_eq!(app.match_plugin_binding(chord), suggestion);
+        // A generation change (reload) republishes under the new generation.
+        app.plugin_runtime
+            .as_mut()
+            .expect("runtime")
+            .reload(&pid)
+            .expect("reload");
+        assert_eq!(
+            app.plugin_runtime
+                .as_ref()
+                .expect("runtime")
+                .suggested_bindings()
+                .borrow()
+                .generation_of(SUGGESTION_OWNER),
+            Some(2),
+            "reload publishes generation 2, never a stale generation 1"
+        );
+        assert_eq!(app.match_plugin_binding(chord), suggestion);
+        // Dispose (unload) drops every suggestion the generation owned.
+        app.plugin_runtime
+            .as_mut()
+            .expect("runtime")
+            .dispose(&pid)
+            .expect("dispose");
+        assert_eq!(app.match_plugin_binding(chord), None);
+        assert!(
+            app.plugin_runtime
+                .as_ref()
+                .expect("runtime")
+                .suggested_bindings()
+                .borrow()
+                .is_empty()
+        );
+        assert_eq!(
+            app.resolve_dispatch(chord, None),
+            (DispatchPriority::Terminal, None)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plugin_suggestion_absent_falls_through_to_terminal() {
+        // Issue #2407: with no active suggestion for the chord (no runtime,
+        // or a plugin that never suggested it), dispatch is unchanged:
+        // terminal encoding, no shadowing of unbound keys.
+        use crate::chrome_keys::DispatchPriority;
+        use bitty_config::{KeyName, KeyRef};
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let app = help_test_app(maps);
+        let chord = KeyRef {
+            key: KeyName::Char('k'),
+            ctrl: true,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        assert_eq!(app.match_plugin_binding(chord), None);
+        assert_eq!(
+            app.resolve_dispatch(chord, None),
+            (DispatchPriority::Terminal, None)
+        );
+    }
+
+    #[test]
+    fn plugin_suggestion_conflicts_are_bounded_diagnostics_on_the_cold_path() {
+        // Issue #2407 review B3 / LUA-OQ-5: a collision still has one
+        // deterministic dispatch owner (lexicographically first owner), but
+        // the loser is reported as a bounded diagnostic and drained by the
+        // cold path instead of silently disappearing.
+        use crate::composer_owner::fixture;
+        use bitty_config::{ChromeAction, KeyName, KeyRef};
+        const OTHER_OWNER: &str = "bitty-featured.alpha-fixture";
+        let root = fixture::temp_dir("suggestion-conflict");
+        for (owner, command) in [
+            (SUGGESTION_OWNER, SUGGESTION_QUALIFIED),
+            (OTHER_OWNER, "bitty-featured.alpha-fixture:toggle-help"),
+        ] {
+            write_suggesting_plugin(
+                &root,
+                owner,
+                &[SUGGESTION_COMMAND],
+                &[("ctrl+alt+g", command)],
+                &[SUGGESTION_COMMAND],
+            );
+        }
+        let mut plugin_runtime = fixture::runtime_for(vec![root.clone()]);
+        plugin_runtime.discover();
+        for owner in [SUGGESTION_OWNER, OTHER_OWNER] {
+            let pid = bitty_plugin_host::manifest::PluginId::new(owner).expect("id");
+            plugin_runtime.activate(&pid).expect("activate");
+        }
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let chord = KeyRef {
+            key: KeyName::Char('g'),
+            ctrl: true,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        // `bitty-featured.alpha-fixture` sorts before `bitty-featured.help-fixture`.
+        assert_eq!(
+            app.match_plugin_binding(chord),
+            Some(ChromeAction::InvokeCommand(
+                "bitty-featured.alpha-fixture:toggle-help".to_string()
+            ))
+        );
+        {
+            let directory = app
+                .plugin_runtime
+                .as_ref()
+                .expect("runtime")
+                .suggested_bindings()
+                .borrow();
+            assert_eq!(directory.active().len(), 2, "both rows stay published");
+            let pending = directory.pending_conflicts();
+            assert_eq!(pending.len(), 1, "one diagnostic per colliding chord");
+            assert_eq!(
+                pending[0].winner,
+                "bitty-featured.alpha-fixture:toggle-help"
+            );
+            assert_eq!(pending[0].loser, SUGGESTION_QUALIFIED);
+        }
+        // The cold path drains the pending diagnostic exactly once.
+        let _ = app.pump_cold_commands();
+        let mut directory = app
+            .plugin_runtime
+            .as_ref()
+            .expect("runtime")
+            .suggested_bindings()
+            .borrow_mut();
+        assert!(directory.drain_conflicts().is_empty(), "drained once");
+        assert_eq!(directory.conflicts_dropped(), 0);
+        drop(directory);
+        // The deterministic winner still dispatches after the drain.
+        assert_eq!(
+            app.match_plugin_binding(chord),
+            Some(ChromeAction::InvokeCommand(
+                "bitty-featured.alpha-fixture:toggle-help".to_string()
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn plugin_suggestion_is_captured_by_a_live_modal() {
+        // Issue #2407: the plugin slot sits below the capturing modals, so a
+        // suggestion-bound chord is swallowed behind a confirm/panel modal
+        // exactly like a user-bound chord — it never mutates state under a
+        // destructive dialog. A pending paste alone stays informational.
+        use crate::chrome_keys::DispatchPriority;
+        use crate::composer_owner::fixture;
+        use bitty_config::{KeyName, KeyRef};
+        let root = fixture::temp_dir("suggestion-modal");
+        write_suggesting_plugin(
+            &root,
+            SUGGESTION_OWNER,
+            &[SUGGESTION_COMMAND],
+            &[("ctrl+alt+k", SUGGESTION_QUALIFIED)],
+            &[SUGGESTION_COMMAND],
+        );
+        let (plugin_runtime, _) = activate_plugin_runtime(&root, SUGGESTION_OWNER);
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        let chord = KeyRef {
+            key: KeyName::Char('k'),
+            ctrl: true,
+            alt: true,
+            shift: false,
+            super_held: false,
+        };
+        app.runtime.set_overlay_modal_active(true);
+        assert_eq!(
+            app.resolve_dispatch(chord, None),
+            (DispatchPriority::Modal, None)
+        );
+        app.runtime.set_overlay_modal_active(false);
+        assert_eq!(
+            app.resolve_dispatch(chord, None).0,
+            DispatchPriority::Plugin
         );
         let _ = std::fs::remove_dir_all(&root);
     }

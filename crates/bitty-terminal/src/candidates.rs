@@ -312,6 +312,18 @@ mod tests {
         std::fs::write(path, state.render()).expect("state file");
     }
 
+    fn write_legacy_state(path: &Path, ids: &[&str]) {
+        let mut text = String::from("state_version = 1\n");
+        for id in ids {
+            text.push_str(&format!(
+                "[plugins.\"{id}\"]\nsource = \"bundled\"\n\
+                 manifest_hash = \"{}\"\nenabled = true\ngranted = []\n",
+                "a".repeat(64)
+            ));
+        }
+        std::fs::write(path, text).expect("legacy toml ledger");
+    }
+
     fn store_record(id: &str) -> bitty_runtime::plugin_runtime::resolution::PluginRecord {
         bitty_runtime::plugin_runtime::resolution::PluginRecord {
             source_class: bitty_runtime::plugin_runtime::SourceClass::LocalPath,
@@ -429,6 +441,73 @@ mod tests {
                 "zeta.bundled".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn plugins_union_is_bounded_sorted_and_deduplicated() {
+        let dir = scratch_dir("plugins-bounded");
+        let state = dir.join("bitty-plugins.lua");
+        let managed: Vec<String> = (0..200)
+            .map(|index| format!("s{index:04}.bundled"))
+            .collect();
+        let managed_refs: Vec<&str> = managed.iter().map(String::as_str).collect();
+        write_state(&state, &managed_refs);
+
+        // One store id duplicates a managed id; the rest are store-only.
+        let mut records = vec![store_record("s0000.bundled")];
+        for index in 0..99 {
+            records.push(store_record(&format!("t{index:04}.installed")));
+        }
+        let store = dir.join("store");
+        std::fs::create_dir_all(&store).expect("store dir");
+        bitty_runtime::plugin_runtime::resolution::write_index(&store, &records)
+            .expect("store index");
+
+        let candidates = plugin_candidates_from(Some(&state), Some(&store));
+        assert_eq!(candidates.len(), MAX_CANDIDATES);
+        assert!(
+            candidates.windows(2).all(|pair| pair[0] < pair[1]),
+            "union stays sorted and de-duplicated"
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|id| id.as_str() == "s0000.bundled")
+                .count(),
+            1,
+            "a managed/store duplicate appears once"
+        );
+    }
+
+    #[test]
+    fn plugins_legacy_toml_fallback_when_lua_absent() {
+        let dir = scratch_dir("plugins-legacy");
+        let lua = dir.join("bitty-plugins.lua");
+        let legacy = dir.join("bitty-plugins.toml");
+        write_legacy_state(&legacy, &["legacy.bundled", "alpha.bundled"]);
+        assert_eq!(
+            plugin_candidates_from(Some(&lua), None),
+            vec!["alpha.bundled".to_string(), "legacy.bundled".to_string()]
+        );
+        assert!(
+            lua.exists(),
+            "the inspect loader migrates the legacy ledger once"
+        );
+    }
+
+    #[test]
+    fn plugins_malformed_lua_does_not_fall_back_to_legacy() {
+        let dir = scratch_dir("plugins-malformed-lua");
+        let lua = dir.join("bitty-plugins.lua");
+        let legacy = dir.join("bitty-plugins.toml");
+        write_legacy_state(&legacy, &["legacy.bundled"]);
+        std::fs::write(&lua, "return { state_version = 1, plugins = 1 }\n")
+            .expect("malformed lua ledger");
+        assert!(
+            plugin_candidates_from(Some(&lua), None).is_empty(),
+            "a present-but-malformed Lua ledger never falls back"
+        );
+        assert!(legacy.exists(), "the legacy file stays untouched");
     }
 
     #[test]

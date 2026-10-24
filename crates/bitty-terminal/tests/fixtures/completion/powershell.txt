@@ -96,6 +96,9 @@ if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {
         if ($tokens.Count -gt 0) {
             $previous = $tokens[$tokens.Count - 1]
         }
+        # Operand paths are not grammar nodes (`$paths` only carries grammar
+        # keys), so their dynamic branches must run before the static lookup.
+        $isOperandPath = $path -in @('plugin enable', 'plugin disable', 'config profile show', 'config profile use', 'config profile path')
         $candidates = @()
         if ($wordToComplete -like '--profile=*') {
             $profilePrefix = '--profile='
@@ -105,15 +108,14 @@ if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {
                 ForEach-Object { "$profilePrefix$_" })
         } elseif ($previous -eq '--profile') {
             $candidates = @(& $global:_BittyProfiles | Where-Object { $_ -like "$wordToComplete*" })
+        } elseif ($isOperandPath -and $null -ne $wordToComplete -and -not $wordToComplete.StartsWith('-')) {
+            if ($path -eq 'plugin enable' -or $path -eq 'plugin disable') {
+                $candidates = @(& $global:_BittyInstalledPlugins | Where-Object { $_ -like "$wordToComplete*" })
+            } else {
+                $candidates = @(& $global:_BittyProfiles | Where-Object { $_ -like "$wordToComplete*" })
+            }
         } elseif ($paths.Contains($path)) {
             $candidates = $paths[$path]
-            if ($null -ne $wordToComplete -and -not $wordToComplete.StartsWith('-')) {
-                if ($path -eq 'plugin enable' -or $path -eq 'plugin disable') {
-                    $candidates = @(& $global:_BittyInstalledPlugins | Where-Object { $_ -like "$wordToComplete*" })
-                } elseif ($path -eq 'config profile show' -or $path -eq 'config profile use' -or $path -eq 'config profile path') {
-                    $candidates = @(& $global:_BittyProfiles | Where-Object { $_ -like "$wordToComplete*" })
-                }
-            }
         }
         $candidates | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
             [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)

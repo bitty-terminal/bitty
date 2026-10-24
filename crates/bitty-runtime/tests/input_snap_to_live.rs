@@ -161,12 +161,23 @@ fn output_does_not_yank_scrolled_viewport() {
     fill_with_scrollback(&mut rt);
     scroll_up(&mut rt, 2.0);
     let before = focused_offset(&rt);
+    let focused = rt.focused_view().expect("focused");
+    let before_rows = rt
+        .layout()
+        .find_leaf(focused)
+        .expect("focused leaf")
+        .visible_text_rows(rt.state());
     rt.handle_pty_bytes(b"new-output-while-scrolled\r\n");
     let _ = rt.tick();
+    let after_view = rt.layout().find_leaf(focused).expect("focused leaf");
     assert_eq!(
-        focused_offset(&rt),
-        before,
+        after_view.visible_text_rows(rt.state()),
+        before_rows,
         "new PTY output must not yank a scrolled viewport"
+    );
+    assert!(
+        after_view.scroll_offset() >= before,
+        "output may increase the bottom-relative offset to retain the same history"
     );
 }
 

@@ -81,6 +81,12 @@ pub struct View {
     rows: u16,
     /// Lines scrolled back from the live bottom (0 = live).
     scroll_offset: usize,
+    /// The retained line at the top of a deliberately detached viewport.
+    ///
+    /// Scroll offset is measured from the live bottom, so retaining only the
+    /// offset makes new output move a historical viewport downward. This
+    /// identity lets the runtime recompute the offset after output grows.
+    scroll_anchor: Option<ScrollAnchor>,
     /// Horizontal column offset; clamped to snapshot width.
     col_offset: u16,
     /// Allocation origin assigned by the layout solver; not part of size.
@@ -128,6 +134,16 @@ pub struct View {
     fixed_size: Option<Size>,
 }
 
+/// Stable identity for a detached scrollback viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrollAnchor {
+    /// Retained scrollback line at the viewport top when it was captured.
+    line_id: u64,
+    /// Fail-closed fallback when the anchored line is evicted or the buffer
+    /// is rebuilt during a resize and receives fresh line identities.
+    fallback_offset: usize,
+}
+
 impl View {
     /// Minimum size in either dimension (prevents zero-sized panes from
     /// collapsing layout arithmetic).
@@ -150,6 +166,7 @@ impl View {
             cols,
             rows,
             scroll_offset: 0,
+            scroll_anchor: None,
             col_offset: 0,
             origin: Point::new(0, 0),
             presentation: PresentationMode::Tiled,
@@ -311,6 +328,7 @@ impl View {
     /// `scrollback_len` from `State::scrollback_len()`.
     pub fn set_scroll_offset(&mut self, offset: usize, max_scrollback: usize) {
         self.scroll_offset = offset.min(max_scrollback);
+        self.scroll_anchor = None;
     }
 
     /// Scrolls by `delta` lines (positive = up into history, negative = down
@@ -320,11 +338,13 @@ impl View {
         let next = cur + delta;
         let clamped = next.clamp(0, max_scrollback as isize) as usize;
         self.scroll_offset = clamped;
+        self.scroll_anchor = None;
     }
 
     /// Scrolls to live (bottom).
     pub fn scroll_to_live(&mut self) {
         self.scroll_offset = 0;
+        self.scroll_anchor = None;
     }
 
     /// True when scrolled to live.
@@ -339,6 +359,101 @@ impl View {
     pub fn clamp_scroll_offset(&mut self, max_scrollback: usize) {
         if self.scroll_offset > max_scrollback {
             self.scroll_offset = max_scrollback;
+        }
+        if self.scroll_offset == 0 {
+            self.scroll_anchor = None;
+        }
+    }
+
+    /// Captures the current top row as a stable scrollback identity.
+    ///
+    /// Call this after a user scrolls a view away from live. The numeric
+    /// offset remains the bounded fallback for a resize/rebuild or pruning
+    /// event that removes the identity.
+    pub fn capture_scroll_anchor(&mut self, state: &State) {
+        if self.scroll_offset == 0 {
+            self.scroll_anchor = None;
+            return;
+        }
+        let scrollback_len = state.scrollback_len();
+        let total = scrollback_len.saturating_add(state.height());
+        let start = total
+            .saturating_sub(usize::from(self.rows))
+            .saturating_sub(self.scroll_offset);
+        let Some(line) = (start < scrollback_len)
+            .then(|| state.scrollback_line(start))
+            .flatten()
+        else {
+            self.scroll_anchor = None;
+            return;
+        };
+        self.scroll_anchor = Some(ScrollAnchor {
+            line_id: line.id,
+            fallback_offset: self.scroll_offset,
+        });
+    }
+
+    /// Records a previously resolved top-line identity. Runtime callers use
+    /// this form when the state and view are stored in separate owners.
+    pub fn capture_scroll_anchor_line(&mut self, line_id: u64) {
+        if self.scroll_offset != 0 {
+            self.scroll_anchor = Some(ScrollAnchor {
+                line_id,
+                fallback_offset: self.scroll_offset,
+            });
+        }
+    }
+
+    /// Drops a stale detached anchor while retaining the bounded scroll offset.
+    pub fn clear_scroll_anchor(&mut self) {
+        self.scroll_anchor = None;
+    }
+
+    /// Returns the stable identity of the detached viewport's top line.
+    #[must_use]
+    pub fn scroll_anchor_line_id(&self) -> Option<u64> {
+        self.scroll_anchor.map(|anchor| anchor.line_id)
+    }
+
+    /// Recomputes a detached offset so the captured top line stays at the
+    /// same viewport row after output has grown. Missing identities fall back
+    /// to the previous bounded offset and are clamped to retained history.
+    pub fn restore_scroll_anchor(&mut self, state: &State) {
+        let index = self.scroll_anchor.and_then(|anchor| {
+            state
+                .scrollback()
+                .position(|line| line.id == anchor.line_id)
+        });
+        self.restore_scroll_anchor_position(state.scrollback_len(), state.height(), index);
+    }
+
+    /// Restores an anchor using a pre-resolved retained-row index.
+    pub fn restore_scroll_anchor_position(
+        &mut self,
+        scrollback_len: usize,
+        state_height: usize,
+        line_index: Option<usize>,
+    ) {
+        let Some(anchor) = self.scroll_anchor else {
+            self.clamp_scroll_offset(scrollback_len);
+            return;
+        };
+        let Some(index) = line_index else {
+            // The identity was pruned or the buffer was rebuilt (width
+            // reflow assigns fresh physical-row ids). Preserve the bounded
+            // numeric position as a deterministic clamp, then clear the
+            // stale identity so later output cannot repeatedly re-center it.
+            self.scroll_offset = anchor.fallback_offset.min(scrollback_len);
+            self.scroll_anchor = None;
+            return;
+        };
+        let total = scrollback_len.saturating_add(state_height);
+        let desired = total
+            .saturating_sub(usize::from(self.rows))
+            .saturating_sub(index);
+        self.scroll_offset = desired.min(scrollback_len);
+        if self.scroll_offset == 0 {
+            self.scroll_anchor = None;
         }
     }
 
@@ -363,7 +478,14 @@ impl View {
         // Bottom-aligned window: when live (offset 0) the window ends at the
         // bottom of the combined buffer (the live cursor row). When scrolled,
         // it slides upward by `offset` lines.
-        let start = total.saturating_sub(rows).saturating_sub(offset);
+        let start = self
+            .scroll_anchor
+            .and_then(|anchor| {
+                state
+                    .scrollback()
+                    .position(|line| line.id == anchor.line_id)
+            })
+            .unwrap_or_else(|| total.saturating_sub(rows).saturating_sub(offset));
         let snap = state.snapshot();
         let mut out = Vec::with_capacity(rows * cols);
         let blank = Cell::erased(Style::default());
@@ -601,6 +723,56 @@ mod tests {
         v.scroll_by(-20, 10);
         assert_eq!(v.scroll_offset(), 0);
         assert!(v.is_live());
+    }
+
+    #[test]
+    fn detached_anchor_keeps_top_line_when_scrollback_grows() {
+        use bitty_vt::{ControlChar, GraphemeCell, TerminalAction};
+
+        let mut state = State::with_scrollback_lines(64);
+        for i in 0..40 {
+            for ch in format!("line-{i:02}").chars() {
+                state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+            }
+            state.apply(&TerminalAction::PrintControl(ControlChar(0x0a)));
+        }
+        let mut view = View::new(ViewId::new(1), 80, 24);
+        view.set_scroll_offset(6, state.scrollback_len());
+        let before = view.visible_text_rows(&state)[0].clone();
+        view.capture_scroll_anchor(&state);
+
+        for ch in "new-output".chars() {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+        }
+        state.apply(&TerminalAction::PrintControl(ControlChar(0x0a)));
+        view.restore_scroll_anchor(&state);
+
+        assert_eq!(view.visible_text_rows(&state)[0], before);
+        assert!(view.scroll_offset() > 0);
+    }
+
+    #[test]
+    fn detached_anchor_falls_back_when_top_line_is_evicted() {
+        use bitty_vt::{ControlChar, GraphemeCell, TerminalAction};
+
+        let mut state = State::with_scrollback_lines(2);
+        for i in 0..40 {
+            for ch in format!("line-{i}").chars() {
+                state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+            }
+            state.apply(&TerminalAction::PrintControl(ControlChar(0x0a)));
+        }
+        let mut view = View::new(ViewId::new(1), 80, 24);
+        view.set_scroll_offset(2, state.scrollback_len());
+        view.capture_scroll_anchor(&state);
+        for ch in "more".chars() {
+            state.apply(&TerminalAction::Print(GraphemeCell::from(ch)));
+        }
+        state.apply(&TerminalAction::PrintControl(ControlChar(0x0a)));
+        view.restore_scroll_anchor(&state);
+
+        assert!(view.scroll_offset() <= state.scrollback_len());
+        assert!(view.scroll_offset() > 0);
     }
 
     #[test]

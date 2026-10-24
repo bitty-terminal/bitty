@@ -384,6 +384,7 @@ impl View {
             .then(|| state.scrollback_line(start))
             .flatten()
         else {
+            self.scroll_anchor = None;
             return;
         };
         self.scroll_anchor = Some(ScrollAnchor {
@@ -401,6 +402,11 @@ impl View {
                 fallback_offset: self.scroll_offset,
             });
         }
+    }
+
+    /// Drops a stale detached anchor while retaining the bounded scroll offset.
+    pub fn clear_scroll_anchor(&mut self) {
+        self.scroll_anchor = None;
     }
 
     /// Returns the stable identity of the detached viewport's top line.

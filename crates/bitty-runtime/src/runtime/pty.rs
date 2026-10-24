@@ -843,6 +843,8 @@ impl Runtime {
             });
             if let Some(line_id) = line_id {
                 self.capture_view_scroll_anchor_line(view, line_id);
+            } else {
+                self.clear_view_scroll_anchor(view);
             }
         }
         // CTX-0904: IMG-4 in-flight bound (256 MiB across all parsers).

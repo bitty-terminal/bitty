@@ -1924,6 +1924,9 @@ impl Runtime {
             .then(|| state.scrollback_line(start).map(|line| line.id))
             .flatten()
         else {
+            if let Some(leaf) = self.find_view_mut(view) {
+                leaf.clear_scroll_anchor();
+            }
             return;
         };
         if let Some(leaf) = self.find_view_mut(view) {
@@ -1981,6 +1984,12 @@ impl Runtime {
         }
         if let Some(leaf) = self.find_view_mut(view) {
             leaf.capture_scroll_anchor_line(line_id);
+        }
+    }
+
+    pub(super) fn clear_view_scroll_anchor(&mut self, view: ViewId) {
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.clear_scroll_anchor();
         }
     }
 

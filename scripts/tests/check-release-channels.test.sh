@@ -140,6 +140,8 @@ expect_contains "$BUILD_SRPM" "zstd -t" \
   "SRPM helper validates zstd sources"
 expect_contains "$BUILD_SRPM" "sha256sum -c" \
   "SRPM helper verifies source checksums when SHA256SUMS is present"
+expect_contains "$BUILD_SRPM" 'sha256sum -c "$CHECK_FILE" >&2' \
+  "SRPM helper keeps checksum verification output off stdout"
 expect_contains "$BUILD_SRPM" 'rpm -qp --qf' \
   "SRPM helper verifies SRPM metadata"
 

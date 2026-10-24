@@ -219,8 +219,12 @@ fn keymaps_suggest_captures_with_global_default() {
 fn keymaps_suggest_captures_prefix_spelling() {
     // CTX-1002 (issue #1650): the `"leader <second>"` spelling captures
     // through the same bridge (bounds-checked here; follow-up grammar is
-    // validated host-side after activation, and dispatch rides the Core
-    // pending-window router once the plugin-binding facility lands).
+    // validated host-side after activation). The implemented dispatcher is
+    // single-chord: `SuggestedBindingDirectory` serves the reserved
+    // `DispatchPriority::Plugin` slot and cannot route a sequence, so the
+    // prefix-sequence router for plugin suggestions stays intentionally
+    // deferred and publication drops this row fail-closed (it binds nothing).
+    // This test pins capture parity only.
     let mut vm = gate_vm("parity-keymaps-prefix");
     install(&mut vm, Rc::new(ParityServices::default()));
     let outcome = vm

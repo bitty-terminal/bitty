@@ -415,29 +415,29 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<PluginManifest, String> {
                     "max_network_ports_per_host" => &mut limits.max_network_ports_per_host,
                     "fuel_instructions" => {
                         let value = parse_limit_u64(&value, &key)
-                            .map_err(|e| format!("invalid [limits] key '{key}': {e}"))?;
+                            .map_err(|e| format!("invalid limits.{key}: {e}"))?;
                         limits.fuel_instructions = Some(value);
                         continue;
                     }
                     "wall_ms" => {
                         let value = parse_limit_u64(&value, &key)
-                            .map_err(|e| format!("invalid [limits] key '{key}': {e}"))?;
+                            .map_err(|e| format!("invalid limits.{key}: {e}"))?;
                         limits.wall_ms = Some(value);
                         continue;
                     }
                     "warning_ms" => {
                         let value = parse_limit_u64(&value, &key)
-                            .map_err(|e| format!("invalid [limits] key '{key}': {e}"))?;
+                            .map_err(|e| format!("invalid limits.{key}: {e}"))?;
                         limits.warning_ms = Some(value);
                         continue;
                     }
                     "memory_bytes" => {
                         let value = parse_limit_uint(&value, &key)
-                            .map_err(|e| format!("invalid [limits] key '{key}': {e}"))?;
+                            .map_err(|e| format!("invalid limits.{key}: {e}"))?;
                         limits.memory_bytes = Some(value);
                         continue;
                     }
-                    other => return Err(format!("unsupported [limits] key '{other}'")),
+                    other => return Err(format!("unsupported limits.{other}")),
                 };
                 *slot = Some(
                     parse_limit_uint(&value, &key)
@@ -1643,6 +1643,23 @@ mod tests {
             assert!(
                 parse_manifest(body.as_bytes()).is_err(),
                 "fragment must fail closed: {fragment:?}"
+            );
+        }
+
+        for (key, value) in [
+            ("fuel_instructions", "\"4000\""),
+            ("wall_ms", "-1"),
+            ("warning_ms", "4.0"),
+            ("memory_bytes", "true"),
+        ] {
+            let body = format!(
+                "{}\n[limits]\n{key} = {value}\n",
+                minimal_body("xuepoo.limpath")
+            );
+            let error = parse_manifest(body.as_bytes()).expect_err("malformed budget value");
+            assert!(
+                error.contains(&format!("invalid limits.{key}")),
+                "expected a precise budget field path for {key}: {error}"
             );
         }
 

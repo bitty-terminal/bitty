@@ -7,30 +7,6 @@ use super::*;
 use bitty_render::gpu::PresentStats as RenderPresentStats;
 use bitty_rich::kitty_seam::KittyRasterBackend as _;
 
-#[cfg(test)]
-thread_local! {
-    static RETAINED_GLYPH_GUARD_CALLS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-    static RETAINED_GLYPH_PARTIAL_HITS: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-fn reset_retained_glyph_guard_calls() {
-    RETAINED_GLYPH_GUARD_CALLS.with(|calls| calls.set(0));
-    RETAINED_GLYPH_PARTIAL_HITS.with(|hits| hits.set(0));
-}
-
-#[cfg(test)]
-fn retained_glyph_guard_calls() -> usize {
-    RETAINED_GLYPH_GUARD_CALLS.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
-fn retained_glyph_partial_hits() -> usize {
-    RETAINED_GLYPH_PARTIAL_HITS.with(std::cell::Cell::get)
-}
-
 /// First retry delay after a failed real-GPU present (issue #2570).
 const SURFACE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(50);
 /// Retry-delay ceiling: a permanently lost surface retries once per second.
@@ -467,9 +443,8 @@ fn retained_glyph_requires_full_redraw(
             && !fullwidth_repaint
                 .iter()
                 .any(|fullwidth| fullwidth.contains_rect(&bounds));
-        #[cfg(test)]
         if partial {
-            RETAINED_GLYPH_PARTIAL_HITS.with(|hits| hits.set(hits.get() + 1));
+            record_retained_glyph_partial_hit();
         }
         partial
     })
@@ -1464,8 +1439,7 @@ impl Runtime {
                 kept.size[0],
                 kept.size[1],
             );
-            #[cfg(test)]
-            RETAINED_GLYPH_GUARD_CALLS.with(|calls| calls.set(calls.get() + 1));
+            record_retained_glyph_guard_call();
             if retained_glyph_requires_full_redraw(&kept, &repaint_regions, &fullwidth_repaint) {
                 // A partial companion repaint can erase a cell while a
                 // retained glyph overhangs outside that cell. The fresh fill
@@ -5984,20 +5958,9 @@ impl Runtime {
         self.surface_retry = SurfaceRetry::default();
     }
 
-    /// Test-only seam: force the real-GPU route and inject `failures`
-    /// consecutive present failures before the next success.
-    #[cfg(test)]
-    pub(crate) fn enable_test_present(&mut self, failures: usize) {
-        self.test_present = Some(TestPresentSeam {
-            failures_left: failures,
-            attempts: 0,
-        });
-    }
-
-    /// Test-only: number of present attempts observed after the backoff gate.
-    #[cfg(test)]
-    pub(crate) fn test_present_attempts(&self) -> usize {
-        self.test_present.as_ref().map_or(0, |seam| seam.attempts)
+    #[cfg(not(test))]
+    fn test_present_attempt(&mut self) -> Option<bool> {
+        None
     }
 
     /// Phase 6 (CTX-0474): synthesize the combined draw list, present it,
@@ -6184,21 +6147,9 @@ impl Runtime {
         if retrying {
             bitty_render::telemetry::retry_attempt();
         }
-        #[cfg(test)]
-        let test_present = self.test_present.as_mut().map(|seam| {
-            seam.attempts = seam.attempts.saturating_add(1);
-            if seam.failures_left > 0 {
-                seam.failures_left -= 1;
-                false
-            } else {
-                true
-            }
-        });
-        let gpu_route = self.gpu.is_some();
-        #[cfg(test)]
-        let gpu_route = gpu_route || test_present.is_some();
+        let test_present = self.test_present_attempt();
+        let gpu_route = self.gpu.is_some() || test_present.is_some();
         let stats = if gpu_route {
-            #[cfg(test)]
             if test_present == Some(false) {
                 // Simulate the real-GPU failure path without an adapter: arm
                 // the retry first (so the log line carries the delay actually
@@ -6483,6 +6434,14 @@ struct FrameLayers {
 /// bumps its placement generation), never by writing a fabricated number, so
 /// the fixture exercises the same mechanism `overlay_text_glyphs` uses when it
 /// exhausts the atlas mid-frame.
+#[cfg(not(test))]
+#[inline]
+fn record_retained_glyph_guard_call() {}
+
+#[cfg(not(test))]
+#[inline]
+fn record_retained_glyph_partial_hit() {}
+
 #[cfg(test)]
 mod atlas_epoch_guard_tests {
     use super::{ATLAS_REBUILD_LIMIT, FrameLayers};
@@ -9523,5 +9482,68 @@ mod surface_retry_tests {
         assert!(!should_log_present_failure(GPU_PRESENT_LOG_EVERY + 1));
         assert!(should_log_present_failure(GPU_PRESENT_LOG_EVERY * 2));
         assert!(!should_log_present_failure(u64::MAX - 1));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RETAINED_GLYPH_GUARD_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static RETAINED_GLYPH_PARTIAL_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_retained_glyph_guard_calls() {
+    RETAINED_GLYPH_GUARD_CALLS.with(|calls| calls.set(0));
+    RETAINED_GLYPH_PARTIAL_HITS.with(|hits| hits.set(0));
+}
+
+#[cfg(test)]
+fn retained_glyph_guard_calls() -> usize {
+    RETAINED_GLYPH_GUARD_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn retained_glyph_partial_hits() -> usize {
+    RETAINED_GLYPH_PARTIAL_HITS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_retained_glyph_guard_call() {
+    RETAINED_GLYPH_GUARD_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+#[cfg(test)]
+fn record_retained_glyph_partial_hit() {
+    RETAINED_GLYPH_PARTIAL_HITS.with(|hits| hits.set(hits.get() + 1));
+}
+
+#[cfg(test)]
+impl Runtime {
+    /// Test-only seam: force the real-GPU route and inject `failures`
+    /// consecutive present failures before the next success.
+    pub(crate) fn enable_test_present(&mut self, failures: usize) {
+        self.test_present = Some(TestPresentSeam {
+            failures_left: failures,
+            attempts: 0,
+        });
+    }
+
+    /// Test-only: number of present attempts observed after the backoff gate.
+    pub(crate) fn test_present_attempts(&self) -> usize {
+        self.test_present.as_ref().map_or(0, |seam| seam.attempts)
+    }
+
+    fn test_present_attempt(&mut self) -> Option<bool> {
+        self.test_present.as_mut().map(|seam| {
+            seam.attempts = seam.attempts.saturating_add(1);
+            if seam.failures_left > 0 {
+                seam.failures_left -= 1;
+                false
+            } else {
+                true
+            }
+        })
     }
 }

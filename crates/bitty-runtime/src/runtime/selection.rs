@@ -1022,6 +1022,7 @@ impl Runtime {
             return false;
         }
         self.shift_selection_for_scroll(owner, new_offset as isize - old_offset as isize);
+        self.capture_view_scroll_anchor(owner);
         self.pending_full_redraw = true;
         true
     }

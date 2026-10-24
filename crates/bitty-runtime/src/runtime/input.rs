@@ -1828,6 +1828,7 @@ impl Runtime {
                                 let delta = new_offset as isize - old_offset as isize;
                                 if delta != 0 {
                                     self.shift_selection_for_scroll(view_id, delta);
+                                    self.capture_view_scroll_anchor(view_id);
                                 }
                             }
                             self.wheel_line_accum_y -= lines_y as f32;
@@ -1916,6 +1917,7 @@ impl Runtime {
             let delta = new_offset as isize - old_offset as isize;
             if delta != 0 {
                 self.shift_selection_for_scroll(target, delta);
+                self.capture_view_scroll_anchor(target);
             }
             self.pending_full_redraw = true;
         }

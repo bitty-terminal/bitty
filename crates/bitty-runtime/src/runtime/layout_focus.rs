@@ -1608,6 +1608,31 @@ impl Runtime {
         }
     }
 
+    /// Reflows only stored overlay Views to their presented content frames.
+    /// Tiled leaves have already been sized by the gap-aware layout solver;
+    /// applying decorated frame dimensions to them here would replace solver
+    /// widths with paint widths and make resize geometry observable incorrectly.
+    pub(super) fn reflow_overlay_present_layout(&mut self, frames: &[PresentFrame]) {
+        let live = self.live_cell_metrics();
+        let cw = u32::from(u16::try_from(live.width).unwrap_or(u16::MAX)).max(1);
+        let ch = u32::from(u16::try_from(live.height).unwrap_or(u16::MAX)).max(1);
+        for frame in frames {
+            let x = (frame.content.x.max(0) as u32) / cw;
+            let y = (frame.content.y.max(0) as u32) / ch;
+            let rect = UiRect::new(
+                x.min(u32::from(u16::MAX)) as u16,
+                y.min(u32::from(u16::MAX)) as u16,
+                frame.cols,
+                frame.rows,
+            );
+            if let Some(stored) = self.pinned.find_mut(frame.view) {
+                stored.reflow_to_rect(rect);
+            } else if let Some(stored) = self.floats.find_mut(frame.view) {
+                stored.reflow_to_rect(rect);
+            }
+        }
+    }
+
     /// Decorated hit-testing: physical cursor position to `(view, local cell)`
     /// over the present frames (frame for hit testing, content for painting).
     ///
@@ -1833,6 +1858,116 @@ impl Runtime {
             return Some(stored);
         }
         None
+    }
+
+    /// Captures a detached viewport's top scrollback identity before the
+    /// backing state is mutated. Numeric offsets alone are bottom-relative,
+    /// so live output would otherwise move the visible history downward.
+    pub(super) fn capture_view_scroll_anchor(&mut self, view: ViewId) {
+        let Some(state) = self.live_view_state(view) else {
+            return;
+        };
+        let scrollback_len = state.scrollback_len();
+        let total = scrollback_len.saturating_add(state.height());
+        let Some(leaf) = self.find_view(view) else {
+            return;
+        };
+        let offset = leaf.scroll_offset();
+        if offset == 0 {
+            return;
+        }
+        let start = total
+            .saturating_sub(usize::from(leaf.rows()))
+            .saturating_sub(offset);
+        let Some(line_id) = (start < scrollback_len)
+            .then(|| state.scrollback_line(start).map(|line| line.id))
+            .flatten()
+        else {
+            if let Some(leaf) = self.find_view_mut(view) {
+                leaf.clear_scroll_anchor();
+            }
+            return;
+        };
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.capture_scroll_anchor_line(line_id);
+        }
+    }
+
+    /// Re-resolves every detached view anchor after terminal output or
+    /// scrollback pruning. Missing identities retain the previous bounded
+    /// offset and are clamped by the view, so eviction never jumps to live.
+    pub(super) fn restore_view_scroll_anchor(&mut self, view: ViewId) {
+        let Some(state) = self.live_view_state(view) else {
+            return;
+        };
+        let scrollback_len = state.scrollback_len();
+        let state_height = state.height();
+        let anchor_id = self.find_view(view).and_then(View::scroll_anchor_line_id);
+        let line_index = anchor_id.and_then(|id| state.scrollback().position(|line| line.id == id));
+        self.restore_view_scroll_anchor_values(view, scrollback_len, state_height, line_index);
+    }
+
+    /// Keeps a detached view's retained top line stable while PTY output
+    /// grows, without converting it to a new bottom-relative offset. The
+    /// numeric offset is refreshed as well because interactive scrolling
+    /// uses it as the base for its next delta; it remains the bounded
+    /// fallback when the identity is lost.
+    pub(super) fn retain_view_scroll_anchor(&mut self, view: ViewId) {
+        let anchor_id = self.find_view(view).and_then(View::scroll_anchor_line_id);
+        let Some(anchor_id) = anchor_id else {
+            return;
+        };
+        let (scrollback_len, state_height, line_index) = {
+            let state = if self.fed_grid_view() == Some(view) {
+                &self.state
+            } else {
+                let Some(state) = self.live_view_state(view) else {
+                    return;
+                };
+                state
+            };
+            (
+                state.scrollback_len(),
+                state.height(),
+                state.scrollback().position(|line| line.id == anchor_id),
+            )
+        };
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.restore_scroll_anchor_position(scrollback_len, state_height, line_index);
+        }
+    }
+
+    /// Installs a previously resolved top-line identity while the PTY
+    /// pipeline temporarily swaps a pane's state into `self.state`.
+    pub(super) fn capture_view_scroll_anchor_line(&mut self, view: ViewId, line_id: u64) {
+        let Some(leaf) = self.find_view(view) else {
+            return;
+        };
+        let offset = leaf.scroll_offset();
+        if offset == 0 || leaf.scroll_anchor_line_id().is_some() {
+            return;
+        }
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.capture_scroll_anchor_line(line_id);
+        }
+    }
+
+    pub(super) fn clear_view_scroll_anchor(&mut self, view: ViewId) {
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.clear_scroll_anchor();
+        }
+    }
+
+    pub(super) fn restore_view_scroll_anchor_values(
+        &mut self,
+        view: ViewId,
+        scrollback_len: usize,
+        state_height: usize,
+        line_index: Option<usize>,
+    ) {
+        if let Some(leaf) = self.find_view_mut(view) {
+            leaf.restore_scroll_anchor_position(scrollback_len, state_height, line_index);
+        }
     }
 
     /// Scroll offset of leaf `view` in the active layout, detached floats,

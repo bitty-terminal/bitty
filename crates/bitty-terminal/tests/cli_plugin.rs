@@ -1471,6 +1471,9 @@ fn write_config_fixture(home: &Path) -> PathBuf {
          [lazy]\n\
          commands = [\"xuepoo.cfg:greet\"]\n\
          events = []\n\n\
+         [limits]\n\
+         fuel_instructions = 5000000\n\
+         wall_ms = 25\n\n\
          [settings]\n\
          show = { type = \"bool\", default = true }\n\
          edge = { type = \"string\", default = \"bottom\" }\n\
@@ -1549,6 +1552,41 @@ fn plugin_config_show_reports_schema_and_source_layers() {
     assert!(json.contains("\"description\":null"), "{json}");
     assert!(json.contains("\"selected\":{\"path\":"), "{json}");
     assert!(json.contains("\"kind\":\"lua-canonical\""), "{json}");
+
+    // bitty#2304: effective execution budgets and their source layers.
+    for needle in [
+        "BUDGET",
+        "fuel_instructions",
+        "5000000",
+        "wall_ms",
+        "25",
+        "manifest",
+    ] {
+        assert!(text.contains(needle), "missing budget {needle:?} in {text}");
+    }
+    assert!(json.contains("\"budgets\":["), "{json}");
+    assert!(
+        json.contains("\"dimension\":\"fuel_instructions\""),
+        "{json}"
+    );
+    assert!(json.contains("\"source\":\"manifest\""), "{json}");
+
+    // The user budget file can only tighten: the global default and the
+    // per-plugin override are later layers, never a widening.
+    std::fs::create_dir_all(home.join("bitty")).expect("config root");
+    std::fs::write(
+        home.join("bitty")
+            .join(bitty_plugin_host::budgets::BUDGET_FILE_NAME),
+        "return { default = { wall_ms = 20 }, plugins = { [\"xuepoo.cfg\"] = { fuel_instructions = 4000000 } } }\n",
+    )
+    .expect("budget file");
+    let output = run_in(&home, &["plugin", "config", "show", "xuepoo.cfg"], None);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("4000000"), "{text}");
+    assert!(text.contains("user-plugin"), "{text}");
+    assert!(text.contains("user-default"), "{text}");
+    assert!(text.contains(" 20 "), "{text}");
 
     // Canonical Lua wins and every overridden key attributes to user-file.
     std::fs::create_dir_all(config_dir(&home)).expect("plugins dir");
@@ -1647,6 +1685,33 @@ fn plugin_config_show_fails_closed_on_unknown_and_undeclared_keys() {
         stderr(&output)
     );
 
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// bitty#2304: a rejected user budget file is reported and fails closed; the
+/// host defaults remain visible in the report instead of a silent fallback.
+#[test]
+fn plugin_config_show_rejects_a_malformed_budget_file() {
+    let home = scratch_dir("config-budget-error");
+    install_config_fixture(&home);
+    std::fs::create_dir_all(home.join("bitty")).expect("config root");
+    std::fs::write(
+        home.join("bitty")
+            .join(bitty_plugin_host::budgets::BUDGET_FILE_NAME),
+        "return { default = { fuel_instructions = 0 } }\n",
+    )
+    .expect("invalid budget file");
+
+    let output = run_in(&home, &["plugin", "config", "show", "xuepoo.cfg"], None);
+    assert_eq!(output.status.code(), Some(4), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("budget file error"), "{text}");
+    assert!(text.contains("fuel_instructions"), "{text}");
+    assert!(
+        stderr(&output).contains("BudgetRejected"),
+        "{}",
+        stderr(&output)
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 

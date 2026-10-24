@@ -610,8 +610,49 @@ pub(crate) fn discover_and_activate(
     )
 }
 
-/// Env-free startup wiring behind [`discover_and_activate`] (CTX-1115 test seam).
+/// Load the optional user budget tightening file (bitty#2304).
 ///
+/// Path: `<config-dir>/plugin-budgets.lua`. Returns `Ok(None)` when the file
+/// is absent or no configuration root resolves. Present-but-unreadable,
+/// symlinked/special, oversized, non-UTF-8, or malformed files return a
+/// bounded error; the caller installs it through
+/// [`PluginRuntime::set_budget_file_error`] so plugin activation fails closed
+/// instead of silently running on host defaults.
+pub(crate) fn load_plugin_budget_overrides(
+    config_dir: Option<&Path>,
+) -> Result<Option<bitty_plugin_host::budgets::PluginBudgetFile>, String> {
+    let Some(config_dir) = config_dir else {
+        return Ok(None);
+    };
+    let path = config_dir.join(bitty_plugin_host::budgets::BUDGET_FILE_NAME);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!("cannot inspect {}: {error}", path.display()));
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{} is not a regular file (symlinks and special files are refused)",
+            path.display()
+        ));
+    }
+    if metadata.len() > bitty_plugin_host::budgets::MAX_BUDGET_FILE_BYTES as u64 {
+        return Err(format!(
+            "{} exceeds {} bytes",
+            path.display(),
+            bitty_plugin_host::budgets::MAX_BUDGET_FILE_BYTES
+        ));
+    }
+    let bytes =
+        std::fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    bitty_plugin_host::budgets::parse_budget_file(&bytes)
+        .map(Some)
+        .map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Env-free startup wiring behind [`discover_and_activate`] (CTX-1115 test seam).///
 /// Production resolves the store, development, and filesystem-home roots from
 /// the environment; tests pass explicit roots so the real backend installation
 /// plus activation path runs without process-global environment mutation
@@ -651,6 +692,17 @@ pub(crate) fn discover_with_roots(
     // `plugins/<owner>.<name>.toml` when its services are built (the first
     // present file wins; absent files serve shipped defaults plus the old
     // home).
+    // bitty#2304: the same config root holds the optional budget tightening
+    // file. A rejected file is installed as a typed activation error (fail
+    // closed); `--safe` ignores it and still runs host defaults.
+    match load_plugin_budget_overrides(settings_dir.as_deref()) {
+        Ok(Some(overrides)) => runtime.set_budget_overrides(overrides),
+        Ok(None) => {}
+        Err(error) => {
+            crate::logging::warn(|| format!("bitty: plugin budget overrides rejected: {error}"));
+            runtime.set_budget_file_error(error);
+        }
+    }
     runtime.set_settings_dir(settings_dir);
     // CTX-1345: install the production `bitty.panel.create` backend before
     // activation so panel-creating generations capture a real allocator.
@@ -2247,5 +2299,78 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             id.parse().expect("numeric panel id"),
             generation.parse().expect("numeric generation"),
         )
+    }
+
+    // ── bitty#2304: user budget file loading ────────────────────────────
+
+    fn budget_file_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-plugin-budget-file-{tag}-{}-{counter}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn budget_file_loader_absent_and_valid() {
+        let dir = budget_file_dir("valid");
+        assert!(
+            load_plugin_budget_overrides(Some(&dir))
+                .expect("absent file is not an error")
+                .is_none()
+        );
+        std::fs::write(
+            dir.join(bitty_plugin_host::budgets::BUDGET_FILE_NAME),
+            "return { default = { wall_ms = 20 }, plugins = { [\"xuepoo.a\"] = { wall_ms = 10 } } }\n",
+        )
+        .expect("budget file");
+        let loaded = load_plugin_budget_overrides(Some(&dir))
+            .expect("valid budget file")
+            .expect("present");
+        assert_eq!(loaded.default.wall_ms, Some(20));
+        assert_eq!(loaded.for_plugin("xuepoo.a").wall_ms, Some(10));
+        assert!(
+            load_plugin_budget_overrides(None)
+                .expect("none root")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn budget_file_loader_rejects_malformed_and_oversized_files() {
+        let dir = budget_file_dir("malformed");
+        let path = dir.join(bitty_plugin_host::budgets::BUDGET_FILE_NAME);
+        std::fs::write(&path, "return { default = { wall_ms = 0 } }\n").expect("file");
+        let error = load_plugin_budget_overrides(Some(&dir)).expect_err("zero must fail");
+        assert!(error.contains("plugin-budgets.lua"), "{error}");
+
+        std::fs::write(
+            &path,
+            vec![b' '; bitty_plugin_host::budgets::MAX_BUDGET_FILE_BYTES + 1],
+        )
+        .expect("oversize file");
+        let error = load_plugin_budget_overrides(Some(&dir)).expect_err("oversize must fail");
+        assert!(error.contains("exceeds"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn budget_file_loader_refuses_symlinks_and_special_files() {
+        use std::os::unix::fs::symlink;
+        let dir = budget_file_dir("symlink");
+        let target = dir.join("target.lua");
+        std::fs::write(&target, "return {}\n").expect("target");
+        symlink(
+            &target,
+            dir.join(bitty_plugin_host::budgets::BUDGET_FILE_NAME),
+        )
+        .expect("symlink");
+        let error = load_plugin_budget_overrides(Some(&dir)).expect_err("symlink must fail");
+        assert!(error.contains("not a regular file"), "{error}");
     }
 }

@@ -792,6 +792,47 @@ fn nested_same_axis_vertical() -> LayoutNode {
 }
 
 #[test]
+fn zero_delta_drag_preserves_floor_allocated_nested_minimum() {
+    let mut rt = make_runtime();
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        LayoutNode::MIN_RATIO,
+        LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 10, 4)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 10, 4)),
+        ),
+        LayoutNode::leaf(View::new(ViewId::new(3), 91, 8)),
+    ));
+    rt.set_container(UiRect::new(0, 0, 101, 8));
+    rt.reflow_layout();
+
+    let before = rt.layout_allocations();
+    assert_eq!(pane(&rt, 1), UiRect::new(0, 0, 10, 4));
+    assert_eq!(pane(&rt, 2), UiRect::new(0, 4, 10, 4));
+    assert_eq!(pane(&rt, 3), UiRect::new(10, 0, 91, 8));
+    let ids = rt.layout().leaf_ids();
+    let focus = rt.focused_view();
+
+    rt.handle_cursor_moved(cell_pixels(9, 3));
+    rt.handle_mouse_input(press(MouseButton::Left));
+    assert!(rt.border_drag_active());
+
+    // A no-op motion must preserve the press-time allocation exactly. With
+    // usable=101, the floor allocation at MIN_RATIO is 10 cells.
+    rt.handle_cursor_moved(cell_pixels(9, 3));
+    assert_eq!(rt.layout_allocations(), before);
+    assert_eq!(rt.layout().leaf_ids(), ids);
+    assert_eq!(rt.focused_view(), focus);
+    assert!((rt.layout().split_ratio_at(&[]).unwrap() - LayoutNode::MIN_RATIO).abs() < 1e-6);
+    assert!(rt.border_drag_active());
+
+    rt.handle_mouse_input(release(MouseButton::Left));
+    assert!(!rt.border_drag_active());
+}
+
+#[test]
 fn junction_drag_grabs_cross_with_both_row_segments() {
     let mut rt = make_runtime();
     rt.set_layout(four_pane_grid());

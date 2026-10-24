@@ -81,8 +81,9 @@ pollster = { workspace = true }
 # Unix-only; Windows and piped setups keep the line loop (no new crates).
 [target.'cfg(unix)'.dependencies]
 # `process`/`signal` are the storage component host's process-group isolation
-# and kill path (CTX-1479); no other feature changes behavior.
-nix = { workspace = true, features = ["fs", "poll", "process", "signal", "term"] }
+# and kill path (CTX-1479); `user` is the watchdog's owner checks (CTX-1472).
+# No other feature changes behavior.
+nix = { workspace = true, features = ["fs", "poll", "process", "signal", "term", "user"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }

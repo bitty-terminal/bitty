@@ -468,7 +468,7 @@ fn write_slot(path: &Path, text: &str, max_bytes: usize) -> std::io::Result<()> 
         max_bytes,
     );
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        stall_watchdog::create_private_dir(parent)?;
     }
     let tmp = path.with_extension("tmp");
     // A stale temp may be a symlink: remove the link (never follow it) before
@@ -596,6 +596,13 @@ mod tests {
             std::thread::current().id()
         ));
         let path = dir.join("crash-report.log");
+        std::fs::create_dir_all(&dir).expect("create report directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770))
+                .expect("make report directory group-writable");
+        }
         write_slot(&path, "bitty: crash report\n", MAX_CRASH_BYTES).expect("write");
         let text = std::fs::read_to_string(&path).expect("read");
         assert!(text.contains("crash report"));
@@ -607,6 +614,15 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+            let directory_mode = std::fs::metadata(&dir)
+                .expect("directory metadata")
+                .permissions()
+                .mode();
+            assert_eq!(
+                directory_mode & 0o777,
+                0o700,
+                "directory mode {directory_mode:o}"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

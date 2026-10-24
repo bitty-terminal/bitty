@@ -7831,17 +7831,20 @@ claims = []
         ));
         assert!(!drive_chrome(
             &mut after_focus_loss,
-            named_release(NamedKey::Enter)
-        ));
-        assert!(!drive_chrome(
-            &mut after_focus_loss,
             WindowEventKind::Focused(true)
         ));
+        // The confirming release is intentionally missed while unfocused.
+        // The first Enter after refocus must therefore be ordinary input;
+        // without the focus-loss reset it would still be swallowed here.
         assert!(!drive_chrome(
             &mut after_focus_loss,
             named_press(NamedKey::Enter)
         ));
         assert_eq!(after_focus_loss.runtime.drain_pending_input(), b"\r");
+        assert!(!drive_chrome(
+            &mut after_focus_loss,
+            named_release(NamedKey::Enter)
+        ));
 
         // Modified Enter never confirms. The table covers the legacy
         // fallback and both Kitty disambiguation/report-events paths.

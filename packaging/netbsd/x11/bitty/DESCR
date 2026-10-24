@@ -1,0 +1,4 @@
+Bitty is a GPU-accelerated terminal emulator with a built-in pane
+multiplexer, session persistence, and Lua-based extensions. It keeps a
+small audited VT parser with a canonical terminfo entry, renders through
+Vulkan or OpenGL, and runs on Linux, macOS, and BSD systems.

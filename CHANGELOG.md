@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Live theme preview in `bitty init` (#2435):** the theme picker now
+  previews the highlighted preset as the cursor moves instead of only moving
+  the highlight. On an interactive terminal each `j`/`k` or arrow-key move
+  installs the candidate through the same palette setter config reload and
+  `ThemeChanged` use (`Runtime::set_theme_palette`) and repaints a themed
+  chrome strip (background, foreground, the 16 ANSI colors, cursor,
+  selection, and the focused/idle border roles), so palettes can be compared
+  before committing. The preview is non-persistent: it writes no config,
+  profile, session, or plugin-state file and records no answered step. Enter
+  commits the highlighted theme; Esc or end-of-input restores the theme that
+  was in effect before the preview. `--yes`, preset `--profile` seeds, a
+  non-TTY stdin, and a piped stdout keep their existing non-interactive
+  behavior, and an unresolvable candidate leaves the previous theme with the
+  existing retry diagnostic.
 - **Ghostty-style `+<action>` helper aliases (#2464):** `bitty +list-themes`,
   `+list-colors`, `+list-fonts`, `+list-keybinds`, `+list-actions`,
   `+list-plugins`, `+list-extensions`, `+show-config`, `+validate-config`, and

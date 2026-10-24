@@ -1224,6 +1224,57 @@ fn profile_list_and_path_do_not_create_or_evaluate() {
 }
 
 #[test]
+fn init_yes_output_carries_no_theme_preview() {
+    // Issue #2435: `--yes` stays non-interactive. No echo, no themed strip,
+    // no ANSI, and the shipped defaults still land in the profile.
+    let root = scratch_root("yes-plain");
+    let output = run_bitty(&root, &["init", "--yes"]);
+    assert_ok(&output, "init --yes");
+    let out = stdout(&output);
+    assert!(
+        !out.contains("(preview:") && !out.contains("  preview "),
+        "no preview text, stdout:\n{out}"
+    );
+    assert!(!out.contains('\u{1b}'), "no ANSI preview, stdout:\n{out:?}");
+    let profile = std::fs::read_to_string(profile_path(&root, "default")).expect("profile");
+    assert!(
+        profile.contains("theme = \"dark\""),
+        "defaults still written:\n{profile}"
+    );
+    let selector = std::fs::read_to_string(init_path(&root)).expect("selector");
+    assert!(selector.contains("format = \"bitty-profile-v1\""));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn init_piped_stdout_or_stdin_never_previews() {
+    // Piped stdin without a preset/`--yes` fails closed before any prompt, so
+    // nothing previews and nothing is written. (Command::output also gives a
+    // non-TTY stdout, which the wizard additionally gates on.)
+    let root = scratch_root("piped-plain");
+    let output = run_bitty(&root, &["init"]);
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "piped stdin is a usage refusal, stdout={:?} stderr={:?}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("stdin is not a terminal"),
+        "existing diagnostic kept, stderr:\n{err}"
+    );
+    assert!(!err.contains("preview"), "no preview diagnostic:\n{err}");
+    assert!(!init_path(&root).exists(), "refusal writes no config");
+    assert!(
+        !profile_path(&root, "default").exists(),
+        "refusal writes no profile"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn init_shell_name_positional_hints_shell_init_and_writes_nothing() {
     // `bitty init fish` is a common shell-init typo (#2367): a targeted hint
     // precedes the usage and nothing is written. The generic unexpected-

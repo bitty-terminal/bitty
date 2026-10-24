@@ -2328,13 +2328,26 @@ fn init_key_read_byte(input: &mut dyn std::io::BufRead) -> Option<u8> {
     }
 }
 
+/// Live picker preview hook (issue #2435).
+///
+/// Called once per rendered picker frame with the entry under the cursor,
+/// before the frame is painted: the theme step applies the candidate as a
+/// non-persistent preview and returns one themed chrome strip for the frame,
+/// so in-place repaints keep a constant height. `None` keeps a step
+/// preview-free (every non-theme step, and every non-interactive run).
+pub(crate) type InitPickerPreviewLine<'a> = &'a mut dyn FnMut(&InitOptionItem) -> Option<String>;
+
 /// Renders one key-loop picker frame: `prompt`, every entry with the cursor
-/// marker, the navigation hint, and the typed line. The typed line is always
-/// present (even empty) so in-place repaints keep a constant frame height.
+/// marker, the navigation hint, the optional live preview line, and the typed
+/// line. The typed line is always present (even empty) so in-place repaints
+/// keep a constant frame height; a step that passes a preview line must pass
+/// one on every frame (`init_theme_preview_strip` falls back to the running
+/// preview theme) for the same reason.
 ///
 /// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
 /// through tests, hence the dead-code allowance there.)
 #[cfg_attr(not(unix), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 fn init_picker_block(
     prompt: &str,
     options: &[InitOptionItem],
@@ -2342,6 +2355,7 @@ fn init_picker_block(
     color: bool,
     numbered: bool,
     typed: &str,
+    preview_line: Option<&str>,
     notice: Option<&str>,
 ) -> Vec<String> {
     let mut block = Vec::with_capacity(options.len() + 4);
@@ -2364,6 +2378,9 @@ fn init_picker_block(
         block.push("  (j/k or arrows move, Enter selects, number picks)".to_string());
     } else {
         block.push("  (j/k or arrows move, Enter selects, or type a value)".to_string());
+    }
+    if let Some(line) = preview_line {
+        block.push(line.to_string());
     }
     if let Some(message) = notice {
         block.push(message.to_string());
@@ -2454,7 +2471,9 @@ fn init_picker_submit<T>(
 /// hidden while looping) for live TTYs; otherwise every frame appends so
 /// piped output stays a plain transcript. `wait_for_more` decides whether an
 /// `ESC`-led prefix has more bytes coming (poll timeout on a TTY,
-/// EOF-terminated headlessly).
+/// EOF-terminated headlessly). `preview` is the optional live preview hook
+/// (issue #2435): it runs once per frame with the entry under the cursor
+/// before painting, and its returned line joins the frame.
 ///
 /// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
 /// through tests, hence the dead-code allowance there.)
@@ -2472,6 +2491,7 @@ pub(crate) fn init_picker_key_loop<T>(
     history: &mut Vec<String>,
     inplace: bool,
     wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
+    mut preview: Option<InitPickerPreviewLine<'_>>,
 ) -> Result<T, String> {
     assert!(!options.is_empty(), "option list must not be empty");
     let mut cursor = default_index.min(options.len() - 1);
@@ -2483,6 +2503,12 @@ pub(crate) fn init_picker_key_loop<T>(
     }
     let mut rendered: usize = 0;
     let result = loop {
+        // Preview the entry under the cursor before painting this frame, so a
+        // cursor move and its visible preview land in the same frame.
+        let preview_line = match preview.as_mut() {
+            Some(hook) => hook(&options[cursor]),
+            None => None,
+        };
         let block = init_picker_block(
             prompt,
             options,
@@ -2490,6 +2516,7 @@ pub(crate) fn init_picker_key_loop<T>(
             color,
             numbered,
             &typed,
+            preview_line.as_deref(),
             notice.as_deref(),
         );
         if inplace && rendered > 0 {
@@ -2841,6 +2868,9 @@ pub(crate) fn init_multiselect_key_loop(
 /// and stdin is a Unix TTY, the step runs [`init_picker_key_loop`] under a
 /// cbreak guard (no Enter needed to move); piped runs, failed raw setup,
 /// and non-Unix setups keep the line loop byte-identical to before.
+/// `preview` is the optional live preview hook (issue #2435), forwarded to
+/// the key loop and also run by the line loop on every frame so headless
+/// tests can prove cursor-driven preview without a TTY.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn init_ask_option<T>(
     input: &mut dyn std::io::BufRead,
@@ -2853,6 +2883,7 @@ pub(crate) fn init_ask_option<T>(
     parse: impl Fn(&str) -> Result<T, String>,
     history: &mut Vec<String>,
     tty_interactive: bool,
+    mut preview: Option<InitPickerPreviewLine<'_>>,
 ) -> Result<T, String> {
     assert!(!options.is_empty(), "option list must not be empty");
     // Single-keypress navigation when both ends are live TTYs (Unix raw
@@ -2874,6 +2905,7 @@ pub(crate) fn init_ask_option<T>(
                 // in `run_init_subcommand_with_io`), so repaint in place.
                 true,
                 &mut |stdin_buf| init_stdin_poll_ready(stdin_buf, INIT_KEY_WAIT_MS.into()),
+                preview,
             );
         }
     }
@@ -2882,6 +2914,12 @@ pub(crate) fn init_ask_option<T>(
     let mut cursor = default_index.min(options.len() - 1);
     let mut failures: usize = 0;
     loop {
+        // Same once-per-frame hook as the key loop (issue #2435): preview the
+        // entry under the cursor before the frame is painted.
+        let preview_line = match preview.as_mut() {
+            Some(hook) => hook(&options[cursor]),
+            None => None,
+        };
         let _ = writeln!(output, "{prompt}");
         for (index, item) in options.iter().enumerate() {
             let selected = index == cursor;
@@ -2907,6 +2945,9 @@ pub(crate) fn init_ask_option<T>(
                 output,
                 "  (j/k or arrows move, Enter selects, or type a value)"
             );
+        }
+        if let Some(line) = preview_line.as_deref() {
+            let _ = writeln!(output, "{line}");
         }
         let _ = output.flush();
         let (raw, line) = match init_read_line_with_history(input, history) {
@@ -2992,7 +3033,10 @@ pub(crate) fn init_ask_option<T>(
 /// ([`init_preview_push_live`]: fail-soft validation and producer state with
 /// no visible effect on its own); the user-visible preview is the per-step
 /// stdout echo from [`init_emit_preview_echo`], which renders the running
-/// overlay appearance in the running preview theme. The restart-required
+/// overlay appearance in the running preview theme, plus the theme step's
+/// per-frame chrome strip ([`InitThemePreview`], issue #2435) that previews the
+/// entry under the cursor before Enter and never commits a snapshot. The
+/// restart-required
 /// remainder (`terminal.shell`, `terminal.scrollback`, `close_confirm`) is
 /// staged in the same overlay and takes effect on confirm/next start. TTY
 /// seeds `baseline` from the loaded effective config via
@@ -3138,6 +3182,27 @@ impl InitPreview {
         self.commit_step();
     }
 
+    /// Overlay one candidate theme as a non-persistent preview (issue #2435).
+    ///
+    /// Unlike [`Self::apply_theme`] this records NO step snapshot: the theme
+    /// step is not answered until Enter, so cursor movement must never look
+    /// like a completed step (the snapshot count has to keep equalling the
+    /// prompted-step count). Nothing is persisted; the overlay is discarded
+    /// by [`Self::rollback`] like every other preview value. Returns whether
+    /// the overlay changed (`false` for a disabled preview or the already
+    /// previewed theme), so callers only push real changes to the live
+    /// session and a held key or a repaint costs no palette work.
+    pub(crate) fn preview_theme(&mut self, theme: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        if self.current.appearance.theme.as_deref() == Some(theme) {
+            return false;
+        }
+        self.current.appearance.theme = Some(theme.to_string());
+        true
+    }
+
     pub(crate) fn apply_font_family(&mut self, family: &str) {
         if !self.enabled {
             return;
@@ -3232,20 +3297,30 @@ impl InitPreview {
 }
 
 /// Whether the wizard maintains a live preview `Runtime` (p4 of #1806,
-/// CTX-1119 DEC-0108).
+/// CTX-1119 DEC-0108; stdout gate for the cursor theme preview, #2435).
 ///
-/// Pure over `args` plus `env`, so headless tests assert the gate without a
-/// TTY or a display. True only for the interactive line-prompt wizard
-/// (`stdin_is_tty` without `--yes`) outside the machine flows: `--safe`
-/// stays on the built-in safe config, `--headless`/`--test-mode` stay on the
-/// headless smoke, and piped/non-TTY keeps the in-memory overlay only. When
-/// false the wizard behaves exactly as p1-p3 (in-memory overlay, file write
-/// on confirm, in-memory rollback); when true the caller builds a
-/// wizard-owned preview `Runtime` and pushes per step (see
-/// [`init_preview_push_live`]), fail-soft on any construction or adoption
-/// error. No new flags, no new env, no new process authority.
-pub(crate) fn init_live_preview_enabled(args: &Args, env: &InitEnv<'_>) -> bool {
-    env.stdin_is_tty && !args.init_yes && !args.safe && !args.headless && !args.test_mode
+/// Pure over `args`, `env`, and the caller's stdout-TTY decision, so headless
+/// tests assert the gate without a TTY or a display. True only for the
+/// interactive line-prompt wizard (`stdin_is_tty` and `stdout_is_tty` without
+/// `--yes`) outside the machine flows: `--safe` stays on the built-in safe
+/// config, `--headless`/`--test-mode` stay on the headless smoke, and
+/// piped/non-TTY keeps the in-memory overlay only. When false the wizard
+/// behaves exactly as p1-p3 (in-memory overlay, file write on confirm,
+/// in-memory rollback); when true the caller builds a wizard-owned preview
+/// `Runtime` and pushes per step (see [`init_preview_push_live`]), fail-soft on
+/// any construction or adoption error. No new flags, no new env, no new
+/// process authority.
+pub(crate) fn init_live_preview_enabled(
+    args: &Args,
+    env: &InitEnv<'_>,
+    stdout_is_tty: bool,
+) -> bool {
+    env.stdin_is_tty
+        && stdout_is_tty
+        && !args.init_yes
+        && !args.safe
+        && !args.headless
+        && !args.test_mode
 }
 
 /// Push the preview overlay through the existing reload path (p4 of #1806,
@@ -3347,6 +3422,137 @@ fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview
     let _ = writeln!(output, "{}", init_style_label(&item, false, color));
 }
 
+/// Push only the theme half of the preview overlay through the live-adopt
+/// setter that `theme.set`, live config reload, and `ThemeChanged` all share
+/// (issue #2435).
+///
+/// [`init_preview_push_live`] drives the full presentation sweep (decoration,
+/// backgrounds, chrome style, font atlas, padding, opacity). A cursor move
+/// only changes the theme, so the theme step instead resolves the same palette
+/// the reload mapping resolves
+/// ([`EffectiveConfig::effective_theme_for`](bitty_config::EffectiveConfig::effective_theme_for)
+/// plus [`bitty_runtime::ThemePalette::from_theme`]) and installs it through
+/// [`bitty_runtime::Runtime::set_theme_palette`] — the one setter every theme
+/// pipeline ends in, including the existing OSC 4/10/11/12 override
+/// preservation and idempotent no-op for an unchanged palette. Per-frame cost
+/// is one preset resolve plus a palette compare, never a font/atlas rebuild,
+/// so a cursor move stays inside one frame budget.
+///
+/// Never writes the user file, never touches the session store, and is a
+/// no-op (`false`) for a disabled preview. Returns whether the installed
+/// palette changed.
+pub(crate) fn init_preview_push_theme_live(
+    runtime: &mut bitty_runtime::Runtime,
+    preview: &InitPreview,
+) -> bool {
+    if !preview.is_enabled() {
+        return false;
+    }
+    let prefer_light = crate::config_cli::startup_prefer_light();
+    let theme = preview.current().effective_theme_for(prefer_light);
+    let before = runtime.config().theme;
+    runtime.set_theme_palette(bitty_runtime::ThemePalette::from_theme(&theme));
+    runtime.config().theme != before
+}
+
+/// Non-persistent live preview for the `bitty init` theme step (issue #2435).
+///
+/// The theme picker calls [`Self::frame`] once per rendered frame with the
+/// entry under the cursor. A valid candidate is overlaid on [`InitPreview`]
+/// without a step snapshot ([`InitPreview::preview_theme`]) and pushed through
+/// [`init_preview_push_theme_live`], so moving the cursor hot-updates the
+/// wizard-owned preview session through the same pipeline as `theme.set` /
+/// `ThemeChanged` before Enter. Nothing is persisted: the config/profile files
+/// are only written by the confirm path after every step, and Esc/cancel rolls
+/// the overlay back to the baseline.
+///
+/// An unresolvable candidate leaves the previous theme in place (no runtime
+/// mutation, no panic); Enter's parser still shows the existing retry
+/// diagnostic. The renderer is the existing option-list truecolor convention
+/// ([`init_theme_preview_strip`]), not a second drawing path.
+pub(crate) struct InitThemePreview<'a> {
+    /// Wizard overlay updated per frame (never snapshotted by a cursor move).
+    preview: &'a mut InitPreview,
+    /// Wizard-owned headless preview session, if the live gate allowed one.
+    live: Option<&'a mut bitty_runtime::Runtime>,
+}
+
+impl<'a> InitThemePreview<'a> {
+    /// Builds the step preview over an enabled wizard overlay.
+    pub(crate) fn new(
+        preview: &'a mut InitPreview,
+        live: Option<&'a mut bitty_runtime::Runtime>,
+    ) -> Self {
+        Self { preview, live }
+    }
+
+    /// Applies the candidate under the cursor and returns one themed chrome
+    /// strip for the frame, or `None` when ANSI styling is disabled
+    /// (piped/`NO_COLOR`/`TERM=dumb`) so plain output stays byte-identical.
+    ///
+    /// The strip always resolves from the overlay (the candidate just
+    /// installed, or the previous theme when the candidate was invalid), so
+    /// the painted colors and the installed palette can never disagree. It is
+    /// also always present when `color` is true, which keeps the frame height
+    /// constant for in-place repaints.
+    pub(crate) fn frame(&mut self, item: &InitOptionItem, color: bool) -> Option<String> {
+        if let Ok(theme) = init_parse_theme_answer(&item.value_text) {
+            let changed = self.preview.preview_theme(&theme);
+            if changed {
+                if let Some(runtime) = self.live.as_deref_mut() {
+                    let _ = init_preview_push_theme_live(runtime, self.preview);
+                }
+            }
+        }
+        let prefer_light = crate::config_cli::startup_prefer_light();
+        let resolved = self.preview.current().effective_theme_for(prefer_light);
+        color.then(|| init_theme_preview_strip(&resolved))
+    }
+}
+
+/// One ANSI chrome strip for the theme picker preview (issue #2435).
+///
+/// Painted entirely from the resolved [`bitty_config::theme::Theme`] the
+/// palette install uses ([`InitThemePreview::frame`]): the theme background
+/// and foreground fill the bar, the 16 ANSI entries are the background swatch
+/// row, and the cursor, selection, focused-border, and idle-border roles lead
+/// with a foreground block, so the user sees the candidate chrome before
+/// committing. Fixed width (no terminal-size query) keeps in-place repaints
+/// aligned and the wizard deterministic. Callers gate on `color`; plain
+/// output never sees it.
+fn init_theme_preview_strip(theme: &bitty_config::theme::Theme) -> String {
+    let [bg_r, bg_g, bg_b] = theme.background;
+    let [fg_r, fg_g, fg_b] = theme.foreground;
+    let mut strip = String::with_capacity(256);
+    strip.push_str(&format!(
+        "\u{1b}[48;2;{bg_r};{bg_g};{bg_b}m\u{1b}[38;2;{fg_r};{fg_g};{fg_b}m  preview "
+    ));
+    for [r, g, b] in theme.ansi {
+        // One background-painted cell per ANSI entry: a 16-swatch row.
+        strip.push_str(&format!("\u{1b}[48;2;{r};{g};{b}m "));
+    }
+    for [r, g, b] in [
+        theme.cursor,
+        theme.selection,
+        [
+            theme.border_focused.0[0],
+            theme.border_focused.0[1],
+            theme.border_focused.0[2],
+        ],
+        [
+            theme.border_idle.0[0],
+            theme.border_idle.0[1],
+            theme.border_idle.0[2],
+        ],
+    ] {
+        // Role blocks stay on the theme background, so each one shows the
+        // exact role color the candidate installs.
+        strip.push_str(&format!("\u{1b}[38;2;{r};{g};{b}m\u{2588}"));
+    }
+    strip.push_str(&format!(" {}\u{1b}[0m", theme.name));
+    strip
+}
+
 /// Runs the interactive wizard: shell / theme / font
 /// (family, size) / decoration (gaps_in, gaps_out, border, radius) /
 /// scrollback / close-confirm / keybinding-preset picks. Pure over injected
@@ -3367,10 +3573,12 @@ fn init_emit_preview_echo(output: &mut dyn std::io::Write, preview: &InitPreview
 /// [`init_preview_push_live`] as headless validation/producer state (no
 /// visible effect on its own); cancel/EOF discards the overlay, restores the
 /// baseline in memory via `rollback`, and pushes the baseline into the
-/// headless session again (see [`InitPreview`]). `None` preview disables
-/// overlay and echo (piped/non-TTY); `None` live keeps the in-memory overlay
-/// plus echo only (headless, safe, piped, or construction failed —
-/// fail-soft).
+/// headless session again (see [`InitPreview`]). The theme step additionally
+/// previews the entry under the cursor on every frame through
+/// [`InitThemePreview`] (issue #2435) — before Enter, without a step snapshot.
+/// `None` preview disables overlay and echo (piped/non-TTY); `None` live keeps
+/// the in-memory overlay plus echo only (headless, safe, piped, or construction
+/// failed — fail-soft).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_init_interactive_with_preview(
     input: &mut dyn std::io::BufRead,
@@ -3511,6 +3719,7 @@ fn run_init_interactive_impl(
         |line| init_parse_shell_answer(line, &candidates),
         &mut history,
         tty_interactive,
+        None,
     )?;
     if let Some(active) = preview.as_mut() {
         active.apply_shell(shell.as_deref());
@@ -3560,19 +3769,36 @@ fn run_init_interactive_impl(
                     }
                 })
                 .collect();
-            init_ask_option(
-                input,
-                output,
-                "Theme [dark]:",
-                &theme_options,
-                0,
-                color,
-                false,
-                init_parse_theme_answer,
-                &mut history,
-                tty_interactive,
-            )
-            .inspect(|theme| {
+            let picked = {
+                // Live theme preview (issue #2435): the step's driver previews
+                // the entry under the cursor on every frame through the same
+                // palette pipeline `theme.set`/`ThemeChanged` use, and paints
+                // the themed strip. No driver (piped/`--yes`) keeps the step
+                // exactly as before.
+                let mut driver = preview
+                    .as_deref_mut()
+                    .map(|active| InitThemePreview::new(active, live.as_deref_mut()));
+                let has_driver = driver.is_some();
+                let mut hook = |item: &InitOptionItem| -> Option<String> {
+                    driver.as_mut().and_then(|driver| driver.frame(item, color))
+                };
+                let hook: Option<InitPickerPreviewLine<'_>> =
+                    if has_driver { Some(&mut hook) } else { None };
+                init_ask_option(
+                    input,
+                    output,
+                    "Theme [dark]:",
+                    &theme_options,
+                    0,
+                    color,
+                    false,
+                    init_parse_theme_answer,
+                    &mut history,
+                    tty_interactive,
+                    hook,
+                )
+            };
+            picked.inspect(|theme| {
                 if let Some(active) = preview.as_mut() {
                     active.apply_theme(theme);
                 }
@@ -3628,6 +3854,7 @@ fn run_init_interactive_impl(
                 init_parse_font_family_answer,
                 &mut history,
                 tty_interactive,
+                None,
             )
             .inspect(|family| {
                 if let Some(active) = preview.as_mut() {
@@ -3690,6 +3917,7 @@ fn run_init_interactive_impl(
                 init_parse_font_size_answer,
                 &mut history,
                 tty_interactive,
+                None,
             )
             .inspect(|size| {
                 if let Some(active) = preview.as_mut() {
@@ -3759,6 +3987,7 @@ fn run_init_interactive_impl(
                 },
                 &mut history,
                 tty_interactive,
+                None,
             )
             .inspect(|value| {
                 if let Some(active) = preview.as_mut() {
@@ -3824,6 +4053,7 @@ fn run_init_interactive_impl(
                 },
                 &mut history,
                 tty_interactive,
+                None,
             )
             .inspect(|value| {
                 if let Some(active) = preview.as_mut() {
@@ -3888,6 +4118,7 @@ fn run_init_interactive_impl(
                 },
                 &mut history,
                 tty_interactive,
+                None,
             )
             .inspect(|value| {
                 if let Some(active) = preview.as_mut() {
@@ -3953,6 +4184,7 @@ fn run_init_interactive_impl(
                 },
                 &mut history,
                 tty_interactive,
+                None,
             )
             .inspect(|value| {
                 if let Some(active) = preview.as_mut() {
@@ -4004,6 +4236,7 @@ fn run_init_interactive_impl(
                 init_parse_scrollback_answer,
                 &mut history,
                 tty_interactive,
+                None,
             )
             .inspect(|value| {
                 if let Some(active) = preview.as_mut() {
@@ -4059,6 +4292,7 @@ fn run_init_interactive_impl(
                 init_parse_close_confirm_answer,
                 &mut history,
                 tty_interactive,
+                None,
             )
             .inspect(|mode| {
                 if let Some(active) = preview.as_mut() {
@@ -4101,6 +4335,7 @@ fn run_init_interactive_impl(
         init_parse_preset_answer,
         &mut history,
         tty_interactive,
+        None,
     )?;
     if let Some(active) = preview.as_mut() {
         active.apply_key_preset(key_preset);
@@ -5116,7 +5351,8 @@ pub(crate) fn run_init_subcommand_with_io(
     // Single-keypress navigation needs both ends live: a TTY stdin for
     // immediate keys plus a TTY stdout for in-place repaints (#2136, reused
     // by the plugin multi-select). Anything else keeps the line loop.
-    let tty_interactive = env.stdin_is_tty && std::io::stdout().is_terminal();
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    let tty_interactive = env.stdin_is_tty && stdout_is_tty;
     // Existing color convention only (no new flag): any shared
     // `--no-color` (set in lockstep for a pre-word flag), `NO_COLOR`,
     // or `TERM=dumb` disables init list colors.
@@ -5156,24 +5392,31 @@ pub(crate) fn run_init_subcommand_with_io(
             return 2;
         }
         // Live preview (phase 2 of #1806, seeded p3 CTX-1071, per-step live p4
-        // CTX-1119, stdout echo DEC-0109): on a TTY the wizard overlays each
-        // answer onto an in-memory preview seeded from the loaded effective
-        // config (`init_preview_baseline`: `CLI > file > profile > defaults`,
-        // else the shipped fallback) and echoes the running appearance
-        // preview to stdout after each step (the user-visible half, styled in
-        // the running preview theme when color allows). The user file is
-        // never written until confirm below; cancel/EOF rolls the overlay
-        // back and returns 1 with nothing written. Piped/non-TTY stays
-        // preview-free (nothing to see). When `init_live_preview_enabled`
-        // holds, the wizard additionally owns a headless preview `Runtime`
-        // built from the baseline and pushes each overlay per step through
-        // the reload `apply_live` path as validation/producer state (no
-        // visible effect on its own, fail-soft without a live display path);
-        // headless, safe, and piped modes keep the in-memory-plus-echo
-        // behavior unchanged.
-        let mut preview = InitPreview::enabled(init_preview_baseline(args, env));
-        let mut live_runtime = if init_live_preview_enabled(args, env) {
-            init_preview_runtime(preview.baseline())
+        // CTX-1119, stdout echo DEC-0109, cursor theme preview #2435): on a
+        // TTY the wizard overlays each answer onto an in-memory preview seeded
+        // from the loaded effective config (`init_preview_baseline`:
+        // `CLI > file > profile > defaults`, else the shipped fallback) and
+        // echoes the running appearance preview to stdout after each step (the
+        // user-visible half, styled in the running preview theme when color
+        // allows). The theme step additionally previews the entry under the
+        // cursor per frame through `InitThemePreview`. Both ends must be live
+        // TTYs (#2435): a piped stdout is not a preview surface, so the
+        // overlay, echoes, and the themed strip are skipped entirely and the
+        // wizard keeps its prompts-only output. The user file is never written
+        // until confirm below; cancel/EOF rolls the overlay back and returns 1
+        // with nothing written. Piped/non-TTY stays preview-free (nothing to
+        // see). When `init_live_preview_enabled` holds, the wizard additionally
+        // owns a headless preview `Runtime` built from the baseline and pushes
+        // each overlay per step through the reload `apply_live` path as
+        // validation/producer state (no visible effect on its own, fail-soft
+        // without a live display path); headless, safe, and piped modes keep
+        // the in-memory-plus-echo behavior unchanged.
+        let mut preview =
+            tty_interactive.then(|| InitPreview::enabled(init_preview_baseline(args, env)));
+        let mut live_runtime = if init_live_preview_enabled(args, env, stdout_is_tty) {
+            preview
+                .as_ref()
+                .and_then(|active| init_preview_runtime(active.baseline()))
         } else {
             None
         };
@@ -5184,7 +5427,7 @@ pub(crate) fn run_init_subcommand_with_io(
             &|path| std::path::Path::new(path).exists(),
             &overrides,
             color,
-            Some(&mut preview),
+            preview.as_mut(),
             live_runtime.as_mut(),
             tty_interactive,
         ) {

@@ -458,6 +458,10 @@ impl Runtime {
         rows: usize,
         surface_extent: PhysicalSize,
     ) -> Result<(), RuntimeError> {
+        // The window geometry invalidates the press-time container captured
+        // by any active border drag. Cancel before changing the container or
+        // reflowing its layout.
+        self.cancel_border_drag();
         // CTX-0375: the primary grid follows the primary owner leaf's
         // *decorated content* frame, not the window grid. The Core-owned
         // decoration (`gaps_out + border + content_inset`, CTX-0294/CTX-0333)
@@ -893,7 +897,7 @@ impl Runtime {
                     // Issue #1348: leaving the window also ends a
                     // border-drag resize (deterministic teardown like the
                     // Alt+drag move above).
-                    self.end_border_drag();
+                    self.cancel_border_drag();
                     // Issue #1694 (CTX-0966): leaving also cancels a Mod
                     // tiled-drag without committing (no drop target outside
                     // the window; the tree stays untouched).

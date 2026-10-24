@@ -205,6 +205,11 @@ impl Deref for LayoutMutGuard<'_> {
 
 impl DerefMut for LayoutMutGuard<'_> {
     fn deref_mut(&mut self) -> &mut LayoutNode {
+        // A caller can replace the live tree through this guard without
+        // passing through the public layout-install funnel. Invalidate the
+        // press-time geometry before exposing mutable access so stale border
+        // motion cannot mutate the caller's replacement tree.
+        self.runtime.cancel_border_drag();
         self.runtime.raise_view_id_high_water();
         &mut self.runtime.layout
     }
@@ -2464,7 +2469,23 @@ impl Runtime {
         self.replace_layout(layout, Some(closed));
     }
 
+    /// Commits a layout produced by the active border drag without
+    /// invalidating that drag's press-time geometry. External callers must
+    /// use [`Self::set_layout`] so a tree replacement cancels the drag.
+    pub(super) fn commit_border_drag_layout(&mut self, layout: LayoutNode) {
+        self.replace_layout_preserving_border_drag(layout, None, true);
+    }
+
     fn replace_layout(&mut self, layout: LayoutNode, closed: Option<ViewId>) {
+        self.replace_layout_preserving_border_drag(layout, closed, false);
+    }
+
+    fn replace_layout_preserving_border_drag(
+        &mut self,
+        layout: LayoutNode,
+        closed: Option<ViewId>,
+        preserve_border_drag: bool,
+    ) {
         // Issue #2337: any layout install abandons an in-flight Mod+drag. A
         // close changes the tree under the drag pointer whether or not it
         // removed the dragged source; the ghost and candidate preview must
@@ -2472,6 +2493,12 @@ impl Runtime {
         // the new tree. The close's own layout change remains; only the drop
         // is abandoned.
         self.cancel_tiled_drag();
+        // A public layout replacement invalidates the press-time container,
+        // gaps, and split paths captured by a border drag. Internal live
+        // border-drag commits explicitly preserve that state.
+        if !preserve_border_drag {
+            self.cancel_border_drag();
+        }
         // Issue #2528 review: any close ends the active creation chain, even
         // when the closed pane was not focused. Otherwise a stale Left/Top
         // spiral phase would still steer the next Mod+N.
@@ -2804,6 +2831,9 @@ impl Runtime {
     /// pre-CTX-0873 `set_container` contract, kept so existing headless
     /// drivers stay deterministic).
     pub fn set_window_cells(&mut self, rect: UiRect) {
+        // Changing the container invalidates any border drag's press-time
+        // geometry. Cancel before publishing the new window bounds.
+        self.cancel_border_drag();
         self.window_cells = rect;
         self.container = self.band_exclusive_container();
         self.pending_full_redraw = true;
@@ -2877,6 +2907,9 @@ impl Runtime {
         if container == self.container {
             return false;
         }
+        // A changed container invalidates the press-time geometry captured by
+        // any active border drag. Cancel before publishing and reflowing it.
+        self.cancel_border_drag();
         self.container = container;
         self.layout.reflow_with_gaps(self.container, self.gaps());
         let frames = self.present_frames();
@@ -3220,6 +3253,9 @@ impl Runtime {
     /// CTX-0228: leaf geometry is presentation state — a reflow forces a
     /// full redraw on the next `tick` even when no PTY bytes arrive.
     pub fn reflow_layout(&mut self) -> Vec<(ViewId, UiRect)> {
+        // A caller-requested reflow changes the geometry paired with a
+        // border drag, so stale motion must not reach the current tree.
+        self.cancel_border_drag();
         let gaps = self.gaps();
         self.layout.reflow_with_gaps(self.container, gaps);
         self.pending_full_redraw = true;

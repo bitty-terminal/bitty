@@ -1131,6 +1131,17 @@ impl Runtime {
         let capture = !shift_override && capture_tracking && self.should_capture_mouse();
 
         if capture {
+            // A border press is host-owned and may be canceled by an
+            // external geometry change before the app enables mouse
+            // tracking. Consume its matching release before capture can
+            // report an orphan event to the app; live border drags keep the
+            // existing capture behavior.
+            if event.button == MouseButton::Left
+                && event.state == PressState::Released
+                && self.consume_canceled_border_drag_release()
+            {
+                return;
+            }
             // Issue #1710 (CTX-0995): an active Mod tiled-drag owns its
             // terminating left release even when the focused app enabled
             // mouse tracking mid-drag. End it here (committing the

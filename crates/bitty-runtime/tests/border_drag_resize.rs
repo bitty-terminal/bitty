@@ -763,6 +763,7 @@ fn second_child_t_junction_with_gaps_keeps_inflated_cross_ownership() {
         rt.handle_mouse_input(release(MouseButton::Left));
         assert!(!rt.border_drag_active());
     }
+}
 fn nested_same_axis_horizontal() -> LayoutNode {
     LayoutNode::split(
         SplitAxis::Horizontal,

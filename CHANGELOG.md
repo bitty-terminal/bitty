@@ -67,6 +67,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are never touched; `plugin config scaffold --force` remains the explicit
   overwrite path and `plugin info` points at the canonical file.
 
+- **Dynamic shell completion (#2575):** generated Bash, Zsh, Fish, and
+  PowerShell completion now offers profile names for `--profile`/`--profile=`
+  and installed plugin ids for `plugin enable|disable` by calling hidden,
+  read-only `+list-profiles` / `+list-plugins --installed` helpers. The helpers
+  are bounded (256 candidates, 128 bytes each), sorted, deduplicated, VM- and
+  network-free, and fail soft to an empty set on missing or malformed local
+  state; Nushell keeps documented static signatures. PowerShell operand
+  completion and the profile scan/output bounds were fixed in the follow-up.
+- **Default-off storage component host (#2574):** Core can spawn the merged
+  `bitty-storage` component behind the `storage-component` feature with
+  descriptor/digest verification, a cleared environment, bounded protocol, and
+  fail-closed crash handling. It is not wired into startup and stays disabled
+  unless explicitly enabled.
+- **Packaging: FreeBSD, winget, and Solus (#2512, #2596, #2597):** a FreeBSD
+  ports recipe plus winget and Solus Linux manifests and an expanded README
+  install matrix. Packaging recipes carry their own verification; no runtime
+  behavior changes.
+
+- **Fail-soft configuration startup (#2580):** a present but invalid user
+  config or profile no longer blocks startup. The invalid top-level element is
+  ignored with a bounded diagnostic, valid sibling tables and layers still
+  apply, and security-sensitive surfaces (`plugins`, `history`, `mouse`,
+  decoration background-image roots and all image paths) fall back to their
+  most restrictive values instead of resurrecting a more permissive lower
+  layer. `config check` and `doctor` remain strict; `--fail-loud` semantics are
+  unchanged; user files are never rewritten. Partial `window` tables default
+  `opacity`/`padding` independently.
+- **Cross-drag the 2x2 junction (#2572):** the center junction resizes all four
+  panes on both axes with gap-aware clamping, without disturbing focus,
+  selection, leaf order, or paint order.
+- **Paint-only tiled drag (#2573):** drag motions reuse translated retained
+  frames, removing ghost ink and the full-repaint cost while keeping the
+  release frame byte-identical.
+
 ### Changed
 
 - **`bitty init` reports the offline plugin inventory honestly (#2436):** the
@@ -104,16 +138,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Fresh configs keep the gap-aware 10x4 minimum, focus/close ordering, and
   workspace IDs; the spiral phase resets to Right whenever focus lands on a
   pane outside the active creation chain or the fallback runs.
-- **Thin rounded Core chrome tokens (#2468):** help/which-key, command
-  palette and presentation/plugin overlays, panel rings, and band chrome now
-  share one `bitty-render::chrome` token layer: one-physical-pixel muted
-  borders, a 6 px radius, 8 px padding, raised/overlay surface tones, and the
-  theme's accepted focused/idle outline pair. Help and overlay cards paint as
-  rounded SDF surfaces with glyph clipping at the corner arc; one-row bands
-  use rounded box-drawing corner glyphs when the corner cell is blank, with a
-  documented light-box/square fallback. Plugin row `fg`/`bg`/`bold` values
-  still win inside the Core card, and a new overlay-card/content/ring layer
-  order keeps row backgrounds visible while the ring stays above content.
 
 ### Fixed
 
@@ -154,15 +178,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   headless frame regressions compare each close frame with an instant-delete
   reference in `catppuccin-mocha` and `github-light`.
 
-### Fixed
-
-- **Nix build with patched workspace crates (#2591):** `nix build .#bitty`
+ **Nix build with patched workspace crates (#2591):** `nix build .#bitty`
   failed in the `bitty-deps` derivation because crane's dummy source replaced
   `crates/bitty-pty`/`crates/bitty-plugin-host` with empty stubs while the
   external `bitty-execution` dependency resolves those crates through the
   workspace `[patch]` table. The flake now builds a single real-source
   derivation (`cargoArtifacts = null`), and `just nix-patch-test` fails if
   dummy-source caching returns while those patch paths exist.
+
+- **Hyprland present retry and crash evidence (#2570):** a failed GPU present
+  now retains damage, backs off, and retries without a tick storm; surface
+  acquire/present/retry counters and lifecycle state are captured in bounded
+  crash/exit reports (`BITTY_CRASH_REPORT`, default on for interactive runs,
+  8 KiB/1 KiB caps, redaction). The documented limitation is that
+  SIGTERM/SIGHUP are not captured (no unsafe signal handlers; #2589).
+- **AppImage test uses its mock (#2566):** `make-appimage.sh` accepts an
+  explicit `APPIMAGETOOL` override and the test injects its mock there, with
+  PATH/download bypass stubs proving a clean host exercises the mock and an
+  unusable override fails closed.
 
 ## [0.0.27] - 2026-10-23
 

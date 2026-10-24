@@ -76,13 +76,21 @@ impl Delete {
         }
     }
 
-    /// Close transitions this path arms (the discard paths only force a
-    /// redraw because the stored view vanished).
+    /// Every delete removes a View from the presented set, so the view-set
+    /// delta in `detect_panel_animations` arms the RFC-0002 close transition
+    /// on all six paths — including the float/pin discards, which vanish
+    /// without an explicit `set_layout_closing`. Asserting this everywhere
+    /// keeps a lost close animation from silently retiring the retained-ring
+    /// probe.
     fn arms_close(self) -> bool {
-        matches!(
-            self,
-            Self::Split | Self::Stacked | Self::Zoomed | Self::PinnedBase
-        )
+        match self {
+            Self::Split
+            | Self::Stacked
+            | Self::Zoomed
+            | Self::Floating
+            | Self::Pinned
+            | Self::PinnedBase => true,
+        }
     }
 
     /// Whether the removed view paints the focused accent before the delete
@@ -460,14 +468,17 @@ fn deleting_a_panel_never_repaints_the_removed_rect_in_the_accent() {
                 "{theme_name}/{}: both runs must remove the same rectangle",
                 delete.label()
             );
-            if delete.arms_close() {
-                assert!(
-                    animated.close_armed,
-                    "{theme_name}/{}: the close transition must arm, or the probe never \
-                     exercises the retained closing frame",
-                    delete.label()
-                );
-            }
+            assert!(
+                delete.arms_close(),
+                "{theme_name}/{}: the scenario must arm the close transition",
+                delete.label()
+            );
+            assert!(
+                animated.close_armed,
+                "{theme_name}/{}: the close transition must arm, or the probe never \
+                 exercises the retained closing frame",
+                delete.label()
+            );
             assert_no_flash(theme_name, delete, &animated, &reference, old_rect);
         }
     }

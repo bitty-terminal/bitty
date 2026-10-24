@@ -55,6 +55,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`bitty init` reports the offline plugin inventory honestly (#2436):** the
+  plugin step no longer implies `bitty-terminal.shell-integration` is the whole
+  official catalog. It groups **Bundled** (installable offline with no payload
+  fetch, the only selectable rows), **Installed** (ids already staged in the
+  local plugin store, shown once when they overlap a bundled id), and a
+  bounded **Needs network** count for the remaining embedded official catalog;
+  nothing is fetched by default. Discovery is read-only: a malformed store
+  index degrades to bundled-only with one bounded warning, a missing data root
+  simply reports nothing installed, and neither blocks the configuration
+  write. `--yes`, explicit `--plugins`/`--no-plugins`, and named-profile writes
+  never read the store, and capability grants still require the existing
+  confirmation.
 - **Thin rounded Core chrome tokens (#2468):** help/which-key, command
   palette and presentation/plugin overlays, panel rings, and band chrome now
   share one `bitty-render::chrome` token layer: one-physical-pixel muted
@@ -65,7 +77,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documented light-box/square fallback. Plugin row `fg`/`bg`/`bold` values
   still win inside the Core card, and a new overlay-card/content/ring layer
   order keeps row backgrounds visible while the ring stays above content.
-
 - **Default new-panel layout is Spiral (#2571):** `Mod+N` now creates the
   next pane with the 4-way clockwise `Spiral` policy (Right -> Down -> Left
   -> Up around the focused pane) instead of `Balanced` bisect-largest.

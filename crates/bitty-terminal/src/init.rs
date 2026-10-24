@@ -1,8 +1,11 @@
 //! `bitty init` opt-in setup wizard (#243, CTX-0149).
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::IsTerminal as _;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use bitty_runtime::plugin_runtime::{PluginRecord, load_index};
 
 use crate::cli::Args;
 use crate::spawn::FALLBACK_SHELL;
@@ -2642,31 +2645,253 @@ pub(crate) fn init_picker_key_loop<T>(
     result
 }
 
-/// Header line for the TTY bundled-plugin multi-select (#1913 follow-up).
+/// One already-installed plugin shown (read-only) by the init plugin step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InitInstalledPlugin {
+    /// Canonical plugin id from the local store index.
+    pub(crate) id: String,
+    /// Installed version from the local store index.
+    pub(crate) version: String,
+    /// Desired load state recorded in the store index.
+    pub(crate) enabled: bool,
+}
+
+/// Offline plugin inventory for the `bitty init` plugin step (#2436).
 ///
-/// The non-TTY line path keeps its own header byte-identical.
-const INIT_PLUGIN_MULTISELECT_PROMPT: &str = "Plugins (official, offline-safe):";
+/// Discovery is read-only and never touches the network: bundled plugins are
+/// compiled into the binary, installed plugins come from the local package
+/// store index, and the remaining official catalog entries are counted only
+/// to state honestly that they need a network install. Only `bundled` ids are
+/// selectable for install, so an installed plugin can never be re-installed
+/// implicitly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InitPluginInventory {
+    /// Bundled ids (sorted, deduplicated); the only selectable rows.
+    pub(crate) bundled: Vec<String>,
+    /// Store-index plugins already present locally, excluding bundled ids.
+    pub(crate) installed: Vec<InitInstalledPlugin>,
+    /// Official catalog ids that need a network install (never fetched here).
+    pub(crate) needs_network: Vec<String>,
+    /// Bounded fail-soft discovery warning; never aborts the wizard.
+    pub(crate) warning: Option<String>,
+}
+
+/// Maximum characters kept from one discovery failure detail.
+pub(crate) const INIT_PLUGIN_WARNING_MAX_CHARS: usize = 160;
+
+/// Prompt for the plugin inventory and multi-select. It must never imply the
+/// bundled set is the complete official catalog (#2436).
+const INIT_PLUGIN_PROMPT: &str =
+    "Plugins (offline-safe; only bundled plugins install without network):";
+
+/// Bundled group header: shipped in the binary, installable with no fetch.
+const INIT_PLUGIN_BUNDLED_HEADER: &str = "  Bundled (install offline, no payload fetch):";
+
+/// Installed group header: already staged in the local package store.
+const INIT_PLUGIN_INSTALLED_HEADER: &str = "  Installed (already present locally):";
+
+/// Network group header: official entries deliberately not offered here.
+const INIT_PLUGIN_NETWORK_HEADER: &str = "  Needs network (not shown, nothing is fetched):";
+
+/// Explicit empty-group line (never leave a group silently blank).
+const INIT_PLUGIN_GROUP_EMPTY: &str = "    none";
+
+/// Maximum installed rows rendered before a counted remainder.
+///
+/// The store index is byte-bounded but can still hold many records; the init
+/// step lists the first few and points at `bitty plugin list` for the rest.
+const INIT_PLUGIN_INSTALLED_ROWS_MAX: usize = 8;
+
+/// Explicit no-selection line when the bundled catalog is empty.
+const INIT_PLUGIN_NO_BUNDLED: &str = "  No bundled plugins to select; skipping.";
 
 /// Key hint under the bundled-plugin multi-select rows.
 const INIT_PLUGIN_MULTISELECT_HINT: &str =
     "  (space toggles, j/k or arrows move, Enter confirms, Esc cancels)";
 
-/// Renders one multi-select frame: the prompt, one `[ ]`/`[x]` row per
-/// bundled id with the `>` cursor marker, then the key hint. Every frame has
-/// the same height (`ids.len() + 2`) so in-place repaints stay aligned.
+/// Bounds one discovery failure detail for display: control characters
+/// become spaces, the text is trimmed, and only the first
+/// [`INIT_PLUGIN_WARNING_MAX_CHARS`] characters survive.
+fn init_bounded_plugin_warning(detail: &str) -> String {
+    let sanitized: String = detail
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = sanitized.trim();
+    let bounded: String = trimmed
+        .chars()
+        .take(INIT_PLUGIN_WARNING_MAX_CHARS)
+        .collect();
+    if bounded.is_empty() {
+        "unreadable plugin store".to_string()
+    } else if trimmed.chars().count() > INIT_PLUGIN_WARNING_MAX_CHARS {
+        format!("{bounded}...")
+    } else {
+        bounded
+    }
+}
+
+/// Builds the offline inventory from already-loaded catalog and store data.
+///
+/// Pure and deterministic so tests can cover bundled-only, installed-only,
+/// overlap, and registry-listed states without a real filesystem. A store
+/// read failure degrades to bundled-only with the bounded warning, never an
+/// abort and never a write.
+pub(crate) fn init_plugin_inventory(
+    bundled: &[String],
+    store: Result<Vec<PluginRecord>, String>,
+    official: &[&str],
+) -> InitPluginInventory {
+    let mut bundled: Vec<String> = bundled.to_vec();
+    bundled.sort();
+    bundled.dedup();
+    let bundled_set: BTreeSet<&str> = bundled.iter().map(String::as_str).collect();
+
+    let (installed, warning) = match store {
+        Ok(records) => {
+            // BTreeMap keeps deterministic id order and collapses a
+            // duplicated record instead of listing the same id twice.
+            let mut by_id: BTreeMap<String, InitInstalledPlugin> = BTreeMap::new();
+            for record in records {
+                if bundled_set.contains(record.plugin_id.as_str()) {
+                    continue;
+                }
+                by_id.insert(
+                    record.plugin_id.clone(),
+                    InitInstalledPlugin {
+                        id: record.plugin_id,
+                        version: record.version,
+                        enabled: record.enabled,
+                    },
+                );
+            }
+            (by_id.into_values().collect::<Vec<_>>(), None)
+        }
+        Err(detail) => (
+            Vec::new(),
+            Some(init_bounded_plugin_warning(detail.as_str())),
+        ),
+    };
+
+    let installed_set: BTreeSet<&str> = installed.iter().map(|row| row.id.as_str()).collect();
+    let mut needs_network: Vec<String> = official
+        .iter()
+        .map(|id| (*id).to_string())
+        .filter(|id| !bundled_set.contains(id.as_str()) && !installed_set.contains(id.as_str()))
+        .collect();
+    needs_network.sort();
+    needs_network.dedup();
+
+    InitPluginInventory {
+        bundled,
+        installed,
+        needs_network,
+        warning,
+    }
+}
+
+/// Discovers the offline plugin inventory from the injected environment.
+///
+/// The only filesystem access is a read of the local store index; no network
+/// request is made and nothing is written. A malformed index and a missing
+/// data root both leave the bundled catalog usable.
+pub(crate) fn init_plugin_inventory_for_env(env: &InitEnv<'_>) -> InitPluginInventory {
+    let bundled = bitty_plugin_host::bundled::bundled_ids_sorted();
+    let store = match crate::plugin_runtime::store_root_for(env.xdg_data_home, env.home) {
+        Some(root) => load_index(&root).map_err(|error| error.to_string()),
+        None => Ok(Vec::new()),
+    };
+    let official: Vec<&str> = bitty_plugin_host::official::official_plugins()
+        .iter()
+        .map(|entry| entry.id)
+        .collect();
+    init_plugin_inventory(&bundled, store, &official)
+}
+
+/// Renders the three inventory groups in display order.
+///
+/// `bundled_row` owns the per-row presentation so the TTY multi-select can
+/// draw a cursor and checkbox while the line fallback stays a plain list.
+fn init_plugin_inventory_groups(
+    inventory: &InitPluginInventory,
+    bundled_row: &dyn Fn(usize, &str) -> String,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    lines.push(INIT_PLUGIN_BUNDLED_HEADER.to_string());
+    if inventory.bundled.is_empty() {
+        lines.push(INIT_PLUGIN_GROUP_EMPTY.to_string());
+    } else {
+        for (index, id) in inventory.bundled.iter().enumerate() {
+            lines.push(bundled_row(index, id));
+        }
+    }
+    lines.push(INIT_PLUGIN_INSTALLED_HEADER.to_string());
+    if inventory.installed.is_empty() {
+        lines.push(INIT_PLUGIN_GROUP_EMPTY.to_string());
+    } else {
+        for plugin in inventory
+            .installed
+            .iter()
+            .take(INIT_PLUGIN_INSTALLED_ROWS_MAX)
+        {
+            lines.push(format!(
+                "    - {} {} ({})",
+                plugin.id,
+                plugin.version,
+                if plugin.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ));
+        }
+        if inventory.installed.len() > INIT_PLUGIN_INSTALLED_ROWS_MAX {
+            let hidden = inventory.installed.len() - INIT_PLUGIN_INSTALLED_ROWS_MAX;
+            lines.push(format!(
+                "    - +{hidden} more installed plugin{} (bitty plugin list)",
+                if hidden == 1 { "" } else { "s" }
+            ));
+        }
+    }
+    lines.push(INIT_PLUGIN_NETWORK_HEADER.to_string());
+    if inventory.needs_network.is_empty() {
+        lines.push(INIT_PLUGIN_GROUP_EMPTY.to_string());
+    } else {
+        let count = inventory.needs_network.len();
+        let verb = if count == 1 {
+            "plugin needs"
+        } else {
+            "plugins need"
+        };
+        lines.push(format!(
+            "    - {count} official {verb} a network install (bitty plugin install <id>)"
+        ));
+    }
+    if let Some(warning) = &inventory.warning {
+        lines.push(format!(
+            "  warning: installed plugin discovery failed: {warning}; showing bundled plugins only"
+        ));
+    }
+    lines
+}
+
+/// Renders one multi-select frame: the prompt, the three inventory groups
+/// (with one `[ ]`/`[x]` row per bundled id and the `>` cursor marker), then
+/// the key hint. The frame height is stable for the whole session, so
+/// in-place repaints stay aligned.
 ///
 /// (Unix-dispatched plus headless-tested: non-Unix binaries only reach this
 /// through tests, hence the dead-code allowance there.)
 #[cfg_attr(not(unix), allow(dead_code))]
 fn init_multiselect_block(
-    ids: &[String],
+    inventory: &InitPluginInventory,
     cursor: usize,
     selected: &[bool],
     color: bool,
 ) -> Vec<String> {
-    let mut block = Vec::with_capacity(ids.len() + 2);
-    block.push(INIT_PLUGIN_MULTISELECT_PROMPT.to_string());
-    for (index, id) in ids.iter().enumerate() {
+    let mut block = Vec::new();
+    block.push(INIT_PLUGIN_PROMPT.to_string());
+    block.extend(init_plugin_inventory_groups(inventory, &|index, id| {
         let is_cursor = index == cursor;
         let marker = if is_cursor {
             if color { "\u{1b}[36m>\u{1b}[0m" } else { ">" }
@@ -2681,10 +2906,10 @@ fn init_multiselect_block(
         let label = if color && is_cursor {
             format!("\u{1b}[1m{id}\u{1b}[0m")
         } else {
-            id.clone()
+            id.to_string()
         };
-        block.push(format!("{marker} {checkbox} {label}"));
-    }
+        format!("{marker} {checkbox} {label}")
+    }));
     block.push(INIT_PLUGIN_MULTISELECT_HINT.to_string());
     block
 }
@@ -2708,6 +2933,8 @@ fn init_multiselect_selection(ids: &[String], selected: &[bool]) -> Vec<String> 
 /// - `Esc` cancels the wizard, `Ctrl-D`/EOF aborts fail-closed; every other
 ///   byte is ignored, so a stray paste never changes the selection.
 ///
+/// The cursor and toggles move only over [`InitPluginInventory::bundled`];
+/// installed and network-only rows are informational and never selectable.
 /// Ids come from the bundled catalog and are never fetched or validated
 /// here (recording happens later in the dispatch), so the step stays
 /// offline-safe. `inplace` repaints the frame in place (cursor-up plus
@@ -2722,11 +2949,12 @@ fn init_multiselect_selection(ids: &[String], selected: &[bool]) -> Vec<String> 
 pub(crate) fn init_multiselect_key_loop(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
-    ids: &[String],
+    inventory: &InitPluginInventory,
     color: bool,
     inplace: bool,
     wait_for_more: &mut dyn FnMut(&mut dyn std::io::BufRead) -> bool,
 ) -> Result<Vec<String>, String> {
+    let ids = &inventory.bundled;
     assert!(!ids.is_empty(), "plugin list must not be empty");
     let mut cursor = 0usize;
     let mut selected = vec![false; ids.len()];
@@ -2735,7 +2963,7 @@ pub(crate) fn init_multiselect_key_loop(
     }
     let mut rendered: usize = 0;
     let result = loop {
-        let block = init_multiselect_block(ids, cursor, &selected, color);
+        let block = init_multiselect_block(inventory, cursor, &selected, color);
         if inplace && rendered > 0 {
             let _ = write!(output, "\x1b[{rendered}A");
         }
@@ -4742,6 +4970,8 @@ pub(crate) struct InitEnv<'a> {
     pub(crate) shell: Option<&'a str>,
     /// Stands in for `XDG_CONFIG_HOME`.
     pub(crate) xdg_config_home: Option<&'a str>,
+    /// Stands in for `XDG_DATA_HOME` (local plugin store root).
+    pub(crate) xdg_data_home: Option<&'a str>,
     /// Stands in for `HOME` (XDG fallback root).
     pub(crate) home: Option<&'a str>,
     /// Whether stdin is a TTY; `false` without `--yes` fails closed.
@@ -4769,6 +4999,7 @@ pub(crate) fn run_init_subcommand_with_env(
     shell_env: Option<&str>,
 ) -> i32 {
     let xdg = std::env::var("XDG_CONFIG_HOME").ok();
+    let data_home = std::env::var("XDG_DATA_HOME").ok();
     let home = std::env::var("HOME").ok();
     let profile = std::env::var("BITTY_PROFILE").ok();
     let env = InitEnv {
@@ -4776,6 +5007,7 @@ pub(crate) fn run_init_subcommand_with_env(
         bitty_profile: profile.as_deref(),
         shell: shell_env,
         xdg_config_home: xdg.as_deref(),
+        xdg_data_home: data_home.as_deref(),
         home: home.as_deref(),
         stdin_is_tty: std::io::stdin().is_terminal(),
     };
@@ -4901,28 +5133,43 @@ pub(crate) fn init_preview_baseline(
     }
 }
 
-/// Prompts the optional first-batch plugin selection (CTX-1132, #1913).
+/// Prompts the optional first-batch plugin selection (CTX-1132, #1913,
+/// #2436).
 ///
-/// Lists bundled ids from the same source `plugin install <id>` uses
-/// ([`bitty_plugin_host::bundled::bundled_ids_sorted`], no duplicate list).
+/// The step lists three honest groups from the offline inventory:
+/// **bundled** ids (the only selectable/installable-offline rows, from the
+/// same source `plugin install <id>` uses), **installed** store-index ids
+/// (already present locally, informational), and a bounded count of other
+/// **official** catalog entries that need a network install (never fetched
+/// here). The header names the limitation instead of implying the bundled
+/// set is the full official catalog. A bundled id that is also installed is
+/// shown once under the stronger bundled group.
+///
 /// On a live TTY the step renders a checkbox multi-select and runs
 /// [`init_multiselect_key_loop`] under a cbreak guard (space toggles,
 /// `j`/`k`/arrows move, Enter confirms, Esc cancels, no Enter needed to
 /// toggle). Every other setup keeps the line loop and comma-separated
-/// parsing byte-identical for scripted input and `--yes` runs (reprompt
-/// fail-closed, EOF aborts, Esc cancels). Empty means none. Offline-safe:
-/// no fetch, no consent, no secrets — recording happens later in the
-/// dispatch. Returns the selected ids in catalog order.
+/// parsing byte-identical for scripted input (reprompt fail-closed, EOF
+/// aborts, Esc cancels); `--yes` never reaches this prompt. Empty means
+/// none. Offline-safe: no fetch, no consent, no secrets, no writes — the
+/// read-only store index is the only filesystem access and a read failure
+/// degrades to bundled-only with a bounded warning. Returns the selected ids
+/// in bundled catalog order.
 pub(crate) fn init_prompt_plugin_selection(
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
     history: &mut Vec<String>,
     color: bool,
     tty_interactive: bool,
+    inventory: &InitPluginInventory,
 ) -> Result<Vec<String>, String> {
-    let ids = bitty_plugin_host::bundled::bundled_ids_sorted();
-    if ids.is_empty() {
-        let _ = writeln!(output, "\nPlugins (none bundled; skipping):");
+    if inventory.bundled.is_empty() {
+        let mut lines = vec![INIT_PLUGIN_PROMPT.to_string()];
+        lines.extend(init_plugin_inventory_groups(inventory, &|_, id| {
+            format!("    - {id}")
+        }));
+        lines.push(INIT_PLUGIN_NO_BUNDLED.to_string());
+        let _ = writeln!(output, "\n{}", lines.join("\n"));
         let _ = output.flush();
         return Ok(Vec::new());
     }
@@ -4936,26 +5183,32 @@ pub(crate) fn init_prompt_plugin_selection(
             // at column 0 so in-place cursor-up repaints stay aligned.
             let _ = writeln!(output);
             let _ = output.flush();
-            return init_multiselect_key_loop(input, output, &ids, color, true, &mut |stdin_buf| {
-                init_stdin_poll_ready(stdin_buf, INIT_KEY_WAIT_MS.into())
-            });
+            return init_multiselect_key_loop(
+                input,
+                output,
+                inventory,
+                color,
+                true,
+                &mut |stdin_buf| init_stdin_poll_ready(stdin_buf, INIT_KEY_WAIT_MS.into()),
+            );
         }
     }
     #[cfg(not(unix))]
     let _ = (tty_interactive, color);
-    let _ = writeln!(output, "\nPlugins (optional first batch, offline-safe):");
-    for id in &ids {
-        let _ = writeln!(output, "  - {id}");
-    }
-    let _ = writeln!(
-        output,
-        "Selections are recorded offline without fetching; fetching needs explicit opt-in."
+    let mut lines = vec![INIT_PLUGIN_PROMPT.to_string()];
+    lines.extend(init_plugin_inventory_groups(inventory, &|_, id| {
+        format!("    - {id}")
+    }));
+    lines.push(
+        "Only bundled ids are selectable here; selections are recorded offline without fetching."
+            .to_string(),
     );
+    let _ = writeln!(output, "\n{}", lines.join("\n"));
     let _ = output.flush();
     init_ask(
         input,
         output,
-        "Plugins [comma-separated ids, empty for none]:",
+        "Plugins [comma-separated bundled ids, empty for none]:",
         init_parse_plugins_answer,
         history,
     )
@@ -5211,12 +5464,17 @@ pub(crate) fn run_init_subcommand_with_io(
     } else if args.init_yes {
         Vec::new()
     } else {
+        // Read-only discovery happens only when the step actually runs:
+        // `--yes`, explicit `--plugins`/`--no-plugins`, and named-profile
+        // writes never touch the local store.
+        let inventory = init_plugin_inventory_for_env(env);
         match init_prompt_plugin_selection(
             input,
             output,
             &mut followup_history,
             color,
             tty_interactive,
+            &inventory,
         ) {
             Ok(ids) => ids,
             Err(message) => {

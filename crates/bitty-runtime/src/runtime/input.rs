@@ -1279,7 +1279,7 @@ impl Runtime {
             && event.button == MouseButton::Left
             && event.state == PressState::Pressed
             && (self.alt_pressed || self.super_pressed)
-            && self.begin_tiled_drag()
+            && self.begin_tiled_drag_at(now)
         {
             return;
         }

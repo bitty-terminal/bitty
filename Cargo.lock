@@ -442,6 +442,14 @@ dependencies = [
 [[package]]
 name = "bitty-storage"
 version = "0.0.1"
+source = "git+https://github.com/bitty-terminal/bitty-storage?rev=502c7f5#502c7f53d652498d1d535f7c76b08ad63c869508"
+dependencies = [
+ "rustix 1.1.5",
+]
+
+[[package]]
+name = "bitty-storage"
+version = "0.0.1"
 source = "git+https://github.com/bitty-terminal/bitty-storage?rev=7bf5177#7bf5177c668fb72ec683c7cb8270049f6400f204"
 
 [[package]]
@@ -466,7 +474,8 @@ dependencies = [
  "bitty-render",
  "bitty-rich",
  "bitty-runtime",
- "bitty-storage",
+ "bitty-storage 0.0.1 (git+https://github.com/bitty-terminal/bitty-storage?rev=502c7f5)",
+ "bitty-storage 0.0.1 (git+https://github.com/bitty-terminal/bitty-storage?rev=7bf5177)",
  "bitty-term-state",
  "bitty-test-support",
  "bitty-vt",

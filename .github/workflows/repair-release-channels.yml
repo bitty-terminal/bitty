@@ -198,7 +198,7 @@ jobs:
     if: inputs.channels == 'all' || inputs.channels == 'copr'
     environment: release
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 45
     env:
       TAG: ${{ needs.validate.outputs.tag }}
     steps:
@@ -207,40 +207,65 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.tag }}
           persist-credentials: false
-      - name: Download published .rpm assets
+      - name: Check out repair tooling from the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: tooling
+          persist-credentials: false
+      - name: Install RPM build tooling
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends rpm zstd
+          rpm --version
+          rpmbuild --version
+          zstd --version
+      - name: Download published source bundles
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p release
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir release \
-            --pattern '*.rpm' --pattern 'SHA256SUMS'
-          test -f release/SHA256SUMS
-          ls -l release
-      - name: Verify published .rpm checksums
+          VERSION="${TAG#v}"
+          SOURCEDIR="$RUNNER_TEMP/copr-sources"
+          mkdir -p "$SOURCEDIR"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$SOURCEDIR" \
+            --pattern "bitty-${VERSION}-x86_64-unknown-linux-gnu.tar.zst" \
+            --pattern "bitty-${VERSION}-aarch64-unknown-linux-gnu.tar.zst" \
+            --pattern 'SHA256SUMS'
+          test -f "$SOURCEDIR/SHA256SUMS"
+          for arch in x86_64 aarch64; do
+            test -s "$SOURCEDIR/bitty-${VERSION}-${arch}-unknown-linux-gnu.tar.zst"
+          done
+          ls -l "$SOURCEDIR"
+      - name: Verify published source checksums
         run: |
           set -euo pipefail
-          cd release
-          mapfile -t RPMS < <(find . -maxdepth 1 -type f -name '*.rpm' -printf '%f\n' | sort)
-          if [ "${#RPMS[@]}" -eq 0 ]; then
-            echo "::error::no .rpm assets found in release ${TAG}" >&2
-            exit 1
-          fi
-          EXPECTED_RPMS="$(awk '$2 ~ /^\*?.*\.rpm$/ { count++ } END { print count + 0 }' SHA256SUMS)"
-          if [ "$EXPECTED_RPMS" -ne "${#RPMS[@]}" ]; then
-            echo "::error::SHA256SUMS lists ${EXPECTED_RPMS} .rpm file(s) but ${#RPMS[@]} were downloaded" >&2
-            exit 1
-          fi
-          : > "$RUNNER_TEMP/rpm.sha256"
-          for rpm in "${RPMS[@]}"; do
-            sum_line="$(awk -v f="$rpm" '$2 == f || $2 == "*" f { print }' SHA256SUMS)"
+          VERSION="${TAG#v}"
+          SOURCEDIR="$RUNNER_TEMP/copr-sources"
+          : > "$RUNNER_TEMP/source.sha256"
+          for arch in x86_64 aarch64; do
+            asset="bitty-${VERSION}-${arch}-unknown-linux-gnu.tar.zst"
+            sum_line="$(awk -v f="$asset" '$2 == f || $2 == "*" f { print }' "$SOURCEDIR/SHA256SUMS")"
             if [ -z "$sum_line" ]; then
-              echo "::error::${rpm} is missing from SHA256SUMS" >&2
+              echo "::error::${asset} is missing from SHA256SUMS" >&2
               exit 1
             fi
-            printf '%s\n' "$sum_line" >> "$RUNNER_TEMP/rpm.sha256"
+            printf '%s\n' "$sum_line" >> "$RUNNER_TEMP/source.sha256"
           done
-          sha256sum -c "$RUNNER_TEMP/rpm.sha256"
+          (cd "$SOURCEDIR" && sha256sum -c "$RUNNER_TEMP/source.sha256")
+      - name: Build Copr SRPM
+        id: srpm
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          SRPM="$(tooling/scripts/build-copr-srpm.sh \
+            --spec tooling/packaging/bitty.spec \
+            --version "$VERSION" \
+            --sourcedir "$RUNNER_TEMP/copr-sources" \
+            --output-dir "$RUNNER_TEMP/copr-srpm")"
+          echo "srpm=$SRPM" >> "$GITHUB_OUTPUT"
+          echo "built ${SRPM}"
       - name: Install copr-cli in a virtual environment
         run: |
           set -euo pipefail
@@ -249,7 +274,7 @@ jobs:
           "$RUNNER_TEMP/copr-cli/bin/pip" install copr-cli
           echo "$RUNNER_TEMP/copr-cli/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/copr-cli/bin/copr-cli" --version
-      - name: Upload RPMs to the configured Copr project
+      - name: Submit SRPM to the configured Copr project
         env:
           COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
           COPR_PROJECT: ${{ vars.COPR_PROJECT || 'xuepoo/bitty-terminal' }}
@@ -259,58 +284,29 @@ jobs:
             echo "::error::Copr repair requires COPR_CONFIG" >&2
             exit 1
           fi
-
+          SRPM="${{ steps.srpm.outputs.srpm }}"
+          if [ -z "$SRPM" ] || [ ! -f "$SRPM" ]; then
+            echo "::error::Copr SRPM was not built" >&2
+            exit 1
+          fi
           mkdir -p ~/.config
           printf '%s\n' "$COPR_CONFIG" > ~/.config/copr
           chmod 600 ~/.config/copr
 
-          RPM_X64="$(find release -maxdepth 1 -name '*.rpm' -print | sort | grep -E 'x86_64|amd64' | head -n1 || true)"
-          RPM_ARM="$(find release -maxdepth 1 -name '*.rpm' -print | sort | grep -E 'aarch64|arm64' | head -n1 || true)"
-
           echo "Querying enabled chroots for ${COPR_PROJECT}..."
           PROJECT_INFO="$(copr-cli get "$COPR_PROJECT")"
-          CHROOTS_X64="$(printf '%s\n' "$PROJECT_INFO" | awk '/^[[:space:]]+.*-x86_64:/{print $1}' | tr -d ':')"
-          CHROOTS_ARM="$(printf '%s\n' "$PROJECT_INFO" | awk '/^[[:space:]]+.*-aarch64:/{print $1}' | tr -d ':')"
-
-          if [ -z "$CHROOTS_X64" ] && [ -z "$CHROOTS_ARM" ]; then
-            echo "::error::No enabled chroots found for project ${COPR_PROJECT}" >&2
+          CHROOTS="$(printf '%s\n' "$PROJECT_INFO" | awk '/^[[:space:]]+.*-(x86_64|aarch64):/{print $1}' | tr -d ':' | sort -u)"
+          if [ -z "$CHROOTS" ]; then
+            echo "::error::No enabled x86_64/aarch64 chroots found for project ${COPR_PROJECT}" >&2
             exit 1
           fi
-
-          UPLOADED=0
-          if [ -n "$CHROOTS_X64" ]; then
-            if [ -z "$RPM_X64" ] || [ ! -f "$RPM_X64" ]; then
-              echo "::error::Missing x86_64 RPM asset for Copr repair" >&2
-              exit 1
-            fi
-            ARGS_X64=()
-            for chroot in $CHROOTS_X64; do
-              ARGS_X64+=(-r "$chroot")
-            done
-            echo "Uploading $RPM_X64 to x86_64 chroots: $CHROOTS_X64"
-            copr-cli uploadrpm "${ARGS_X64[@]}" "$COPR_PROJECT" "$RPM_X64"
-            UPLOADED=$((UPLOADED + 1))
-          fi
-
-          if [ -n "$CHROOTS_ARM" ]; then
-            if [ -z "$RPM_ARM" ] || [ ! -f "$RPM_ARM" ]; then
-              echo "::error::Missing aarch64 RPM asset for Copr repair" >&2
-              exit 1
-            fi
-            ARGS_ARM=()
-            for chroot in $CHROOTS_ARM; do
-              ARGS_ARM+=(-r "$chroot")
-            done
-            echo "Uploading $RPM_ARM to aarch64 chroots: $CHROOTS_ARM"
-            copr-cli uploadrpm "${ARGS_ARM[@]}" "$COPR_PROJECT" "$RPM_ARM"
-            UPLOADED=$((UPLOADED + 1))
-          fi
-
-          if [ "$UPLOADED" -eq 0 ]; then
-            echo "::error::No packages published to Copr" >&2
-            exit 1
-          fi
-
+          ARGS=()
+          while IFS= read -r chroot; do
+            ARGS+=(-r "$chroot")
+            echo "  chroot: ${chroot}"
+          done <<< "$CHROOTS"
+          echo "Submitting ${SRPM} to ${COPR_PROJECT}"
+          copr-cli build --timeout 1800 "${ARGS[@]}" "$COPR_PROJECT" "$SRPM"
   nix:
     name: Repair Nix flake lock (optional)
     needs: validate

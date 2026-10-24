@@ -439,10 +439,14 @@ fn retained_glyph_requires_full_redraw(
         glyph.size[1],
     );
     repaint_regions.iter().any(|region| {
-        region.intersection(&bounds).is_some()
+        let partial = region.intersection(&bounds).is_some()
             && !fullwidth_repaint
                 .iter()
-                .any(|fullwidth| fullwidth.contains_rect(&bounds))
+                .any(|fullwidth| fullwidth.contains_rect(&bounds));
+        if partial {
+            record_retained_glyph_partial_hit();
+        }
+        partial
     })
 }
 
@@ -1435,6 +1439,7 @@ impl Runtime {
                 kept.size[0],
                 kept.size[1],
             );
+            record_retained_glyph_guard_call();
             if retained_glyph_requires_full_redraw(&kept, &repaint_regions, &fullwidth_repaint) {
                 // A partial companion repaint can erase a cell while a
                 // retained glyph overhangs outside that cell. The fresh fill
@@ -5953,20 +5958,9 @@ impl Runtime {
         self.surface_retry = SurfaceRetry::default();
     }
 
-    /// Test-only seam: force the real-GPU route and inject `failures`
-    /// consecutive present failures before the next success.
-    #[cfg(test)]
-    pub(crate) fn enable_test_present(&mut self, failures: usize) {
-        self.test_present = Some(TestPresentSeam {
-            failures_left: failures,
-            attempts: 0,
-        });
-    }
-
-    /// Test-only: number of present attempts observed after the backoff gate.
-    #[cfg(test)]
-    pub(crate) fn test_present_attempts(&self) -> usize {
-        self.test_present.as_ref().map_or(0, |seam| seam.attempts)
+    #[cfg(not(test))]
+    fn test_present_attempt(&mut self) -> Option<bool> {
+        None
     }
 
     /// Phase 6 (CTX-0474): synthesize the combined draw list, present it,
@@ -6153,21 +6147,9 @@ impl Runtime {
         if retrying {
             bitty_render::telemetry::retry_attempt();
         }
-        #[cfg(test)]
-        let test_present = self.test_present.as_mut().map(|seam| {
-            seam.attempts = seam.attempts.saturating_add(1);
-            if seam.failures_left > 0 {
-                seam.failures_left -= 1;
-                false
-            } else {
-                true
-            }
-        });
-        let gpu_route = self.gpu.is_some();
-        #[cfg(test)]
-        let gpu_route = gpu_route || test_present.is_some();
+        let test_present = self.test_present_attempt();
+        let gpu_route = self.gpu.is_some() || test_present.is_some();
         let stats = if gpu_route {
-            #[cfg(test)]
             if test_present == Some(false) {
                 // Simulate the real-GPU failure path without an adapter: arm
                 // the retry first (so the log line carries the delay actually
@@ -6452,6 +6434,14 @@ struct FrameLayers {
 /// bumps its placement generation), never by writing a fabricated number, so
 /// the fixture exercises the same mechanism `overlay_text_glyphs` uses when it
 /// exhausts the atlas mid-frame.
+#[cfg(not(test))]
+#[inline]
+fn record_retained_glyph_guard_call() {}
+
+#[cfg(not(test))]
+#[inline]
+fn record_retained_glyph_partial_hit() {}
+
 #[cfg(test)]
 mod atlas_epoch_guard_tests {
     use super::{ATLAS_REBUILD_LIMIT, FrameLayers};
@@ -8307,6 +8297,23 @@ mod scroll_region_copy_tests {
         rt
     }
 
+    /// Vim fixture with a compact cell height so a retained descender can
+    /// overhang into the newly exposed row without changing production
+    /// geometry or the shared scroll fixtures.
+    fn vim_runtime() -> Runtime {
+        let mut config = RuntimeConfig::default();
+        config.animations.duration_ms = [0; AnimationKind::COUNT];
+        config.cell_height = 7;
+        config.font_size = 14.0;
+        let mut rt = Runtime::with_deterministic_rasterizer(config)
+            .expect("deterministic Vim runtime must build");
+        let view = ViewId::new(1);
+        rt.set_layout(LayoutNode::leaf(View::new(view, 80, 23)));
+        rt.handle_resize(PhysicalSize::new(736, 23 * 7 + 16))
+            .expect("Vim resize applies");
+        rt
+    }
+
     /// Identical workload on both runtimes: fill the grid with distinct
     /// rows, settle the retained leaf, hide the cursor (no blink-phase
     /// overlay divergence), then scroll with trailing prints — the
@@ -8410,27 +8417,42 @@ mod scroll_region_copy_tests {
         rt.handle_pty_bytes(b"\n\n\n");
     }
 
-    /// Vim's redraw shape: scroll the full viewport, then move to a row in
-    /// the retained span and erase only the suffix before writing a shorter
-    /// replacement. The erase damage is a partial companion rectangle; a
-    /// retained glyph from the old suffix must not survive over its fresh
-    /// background.
+    /// Vim's redraw shape: populate every row, then erase a suffix on the
+    /// bottom row before scrolling it into the exposed band. The erase is a
+    /// partial companion repaint, so a retained glyph with a vertical
+    /// overhang can intersect fresh damage without being wholly covered by
+    /// the exposed-row repaint.
     fn drive_with_vim_suffix_erase(rt: &mut Runtime, wide: bool, alt: bool) {
-        for row in 0..24u8 {
+        for row in 0..23u8 {
             let line = if wide {
-                format!("row-{row:02} 中OLD-SUFFIX\x1b[2K")
+                format!("\x1b[2Krow-{row:02} 中gOLD-SUFFIX")
             } else {
-                format!("row-{row:02} OLD-SUFFIX\x1b[2K")
+                format!("\x1b[2Krow-{row:02} gOLD-SUFFIX")
             };
             rt.handle_pty_bytes(format!("\x1b[{};1H{line}", row + 1).as_bytes());
         }
         rt.tick();
         if alt {
             rt.handle_pty_bytes(b"\x1b[?1049h");
-            rt.handle_pty_bytes(b"\x1b[1;1HALT-OLD-SUFFIX");
+            for row in 0..23u8 {
+                let line = if wide {
+                    format!("\x1b[2Krow-{row:02} 中gOLD-SUFFIX")
+                } else {
+                    format!("\x1b[2Krow-{row:02} gOLD-SUFFIX")
+                };
+                rt.handle_pty_bytes(format!("\x1b[{};1H{line}", row + 1).as_bytes());
+            }
+            rt.tick();
         }
-        rt.handle_pty_bytes(b"\x1b[24;1H\n");
-        rt.handle_pty_bytes(b"\x1b[11;1H\x1b[2KNEW");
+        // Scroll the bottom row into the exposed band, then erase a suffix on
+        // that row in the same tick. The partial companion intersects the
+        // retained descender that shifted into the exposed row.
+        rt.handle_pty_bytes(b"\x1b[99;1H\n");
+        if wide {
+            rt.handle_pty_bytes(b"\x1b[23;10H\x1b[KNEW");
+        } else {
+            rt.handle_pty_bytes(b"\x1b[23;8H\x1b[KNEW");
+        }
     }
 
     #[test]
@@ -8475,14 +8497,28 @@ mod scroll_region_copy_tests {
 
     #[test]
     fn scroll_fast_path_repaints_vim_ascii_suffix_erase() {
-        let mut fast = runtime();
+        let mut fast = vim_runtime();
         drive_with_vim_suffix_erase(&mut fast, false, false);
-        let mut full = runtime();
+        let mut full = vim_runtime();
         drive_with_vim_suffix_erase(&mut full, false, false);
         full.pending_full_redraw = true;
+
+        reset_retained_glyph_guard_calls();
         let fast_stats = fast.tick().expect("erase repaint must present");
         let full_stats = full.tick().expect("full repaint must present");
-        assert_eq!(fast.headless_rgba(), full.headless_rgba());
+        assert!(
+            retained_glyph_guard_calls() > 0,
+            "Vim erase must reach the retained-glyph intersection guard, not an earlier fallback"
+        );
+        assert!(
+            retained_glyph_partial_hits() > 0,
+            "Vim erase must reach a partial retained-glyph intersection"
+        );
+        assert_eq!(
+            fast.headless_rgba(),
+            full.headless_rgba(),
+            "partial Vim erase must match a forced full repaint"
+        );
         assert_eq!(
             fast_stats.cells_examined, full_stats.cells_examined,
             "partial erase intersecting a retained glyph must fail closed"
@@ -8492,14 +8528,28 @@ mod scroll_region_copy_tests {
     #[test]
     fn scroll_fast_path_repaints_vim_wide_suffix_erase_and_alt_screen() {
         for alt in [false, true] {
-            let mut fast = runtime();
+            let mut fast = vim_runtime();
             drive_with_vim_suffix_erase(&mut fast, true, alt);
-            let mut full = runtime();
+            let mut full = vim_runtime();
             drive_with_vim_suffix_erase(&mut full, true, alt);
             full.pending_full_redraw = true;
+
+            reset_retained_glyph_guard_calls();
             let fast_stats = fast.tick().expect("wide erase repaint must present");
             let full_stats = full.tick().expect("wide full repaint must present");
-            assert_eq!(fast.headless_rgba(), full.headless_rgba(), "alt={alt}");
+            assert!(
+                retained_glyph_guard_calls() > 0,
+                "wide Vim erase must reach the retained-glyph intersection guard, not an earlier fallback; alt={alt}"
+            );
+            assert!(
+                retained_glyph_partial_hits() > 0,
+                "wide Vim erase must reach a partial retained-glyph intersection; alt={alt}"
+            );
+            assert_eq!(
+                fast.headless_rgba(),
+                full.headless_rgba(),
+                "wide partial Vim erase must match a forced full repaint; alt={alt}"
+            );
             assert_eq!(
                 fast_stats.cells_examined, full_stats.cells_examined,
                 "wide partial erase intersecting a retained glyph must fail closed; alt={alt}"
@@ -9432,5 +9482,68 @@ mod surface_retry_tests {
         assert!(!should_log_present_failure(GPU_PRESENT_LOG_EVERY + 1));
         assert!(should_log_present_failure(GPU_PRESENT_LOG_EVERY * 2));
         assert!(!should_log_present_failure(u64::MAX - 1));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RETAINED_GLYPH_GUARD_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static RETAINED_GLYPH_PARTIAL_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn reset_retained_glyph_guard_calls() {
+    RETAINED_GLYPH_GUARD_CALLS.with(|calls| calls.set(0));
+    RETAINED_GLYPH_PARTIAL_HITS.with(|hits| hits.set(0));
+}
+
+#[cfg(test)]
+fn retained_glyph_guard_calls() -> usize {
+    RETAINED_GLYPH_GUARD_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn retained_glyph_partial_hits() -> usize {
+    RETAINED_GLYPH_PARTIAL_HITS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_retained_glyph_guard_call() {
+    RETAINED_GLYPH_GUARD_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+#[cfg(test)]
+fn record_retained_glyph_partial_hit() {
+    RETAINED_GLYPH_PARTIAL_HITS.with(|hits| hits.set(hits.get() + 1));
+}
+
+#[cfg(test)]
+impl Runtime {
+    /// Test-only seam: force the real-GPU route and inject `failures`
+    /// consecutive present failures before the next success.
+    pub(crate) fn enable_test_present(&mut self, failures: usize) {
+        self.test_present = Some(TestPresentSeam {
+            failures_left: failures,
+            attempts: 0,
+        });
+    }
+
+    /// Test-only: number of present attempts observed after the backoff gate.
+    pub(crate) fn test_present_attempts(&self) -> usize {
+        self.test_present.as_ref().map_or(0, |seam| seam.attempts)
+    }
+
+    fn test_present_attempt(&mut self) -> Option<bool> {
+        self.test_present.as_mut().map(|seam| {
+            seam.attempts = seam.attempts.saturating_add(1);
+            if seam.failures_left > 0 {
+                seam.failures_left -= 1;
+                false
+            } else {
+                true
+            }
+        })
     }
 }

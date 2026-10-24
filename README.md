@@ -119,6 +119,12 @@ irm https://cdn.bitty.run/install/install.ps1 | iex
 - **FreeBSD Ports**:
   Ports recipe in `packaging/freebsd/x11/bitty/`. _(See [`packaging/freebsd.md`](packaging/freebsd.md))_
 
+- **OpenBSD Ports**:
+  Ports recipe in `packaging/openbsd/x11/bitty/`. _(See [`packaging/openbsd.md`](packaging/openbsd.md))_
+
+- **NetBSD pkgsrc**:
+  pkgsrc recipe in `packaging/netbsd/x11/bitty/`. _(See [`packaging/netbsd.md`](packaging/netbsd.md))_
+
 ### Release binary (manual download)
 
 Download a platform package or archive from the R2-backed CDN at

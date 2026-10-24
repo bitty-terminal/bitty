@@ -93,6 +93,10 @@ What each script installs:
 - **FreeBSD**: Ports recipe in `packaging/freebsd/x11/bitty/` (`make install`
   from a ports tree); best-effort, not supported (no release job installs it);
   see `packaging/freebsd.md`.
+- **OpenBSD**: Ports recipe in `packaging/openbsd/x11/bitty/` (`make install`
+  from a ports tree); best-effort, not supported; see `packaging/openbsd.md`.
+- **NetBSD**: pkgsrc recipe in `packaging/netbsd/x11/bitty/` (`bmake install`
+  from a pkgsrc tree); best-effort, not supported; see `packaging/netbsd.md`.
 - **openSUSE (zypper)**: best-effort, not supported (no release
   `verify-install` leg); `zypper addrepo` + `zypper install bitty` from the OBS
   repository, source recipe in `packaging/opensuse/bitty.spec`; see

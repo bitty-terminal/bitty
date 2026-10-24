@@ -26,6 +26,10 @@
 //!   `"\x1b[A"`, `F1` → `"\x1bOP"`, etc.). Modifier-only names (`Shift`,
 //!   `Control`, `Alt`, …) produce no bytes; `Other`/`Unidentified` fall back
 //!   to `text` when available, otherwise nothing.
+//! - In the legacy path, `Shift+Enter` intentionally remains `CR`: without an
+//!   application negotiation there is no compatible byte that distinguishes it
+//!   from ordinary Enter. Under the negotiated Kitty protocol, the enhanced
+//!   path emits `CSI 13;2u` for `Shift+Enter` while bare Enter keeps `CR`.
 //! - Kitty keyboard protocol is M1 opt-in, not M1-required
 //!   (`compatibility-milestone-rfc`): this module owns the legacy baseline
 //!   and the Kitty code tables ([`ext_functional_key`],
@@ -675,8 +679,10 @@ pub const MAX_KITTY_FRAME_BYTES: usize = 64;
 /// must use the legacy encoder instead: `flags == 0`, synthetic events,
 /// releases without report-events, shift-only text keys under disambiguate,
 /// and the bare `Enter`/`Tab`/`Backspace` legacy exception (the spec keeps
-/// their legacy bytes so a crashed program can still `reset`). The encoding
-/// mirrors the reference `serialize`/`encode_key` gates
+/// their legacy bytes so a crashed program can still `reset`). Modified
+/// functional keys, including `Shift+Enter`, use the CSI-u frame so their
+/// modifier is not collapsed into the legacy key byte. The encoding mirrors
+/// the reference `serialize`/`encode_key` gates
 /// (`kitty/key_encoding.c`): the key code is the un-shifted codepoint, the
 /// modifier field (`mods + 1`) is omitted when empty, repeat carries `:2`
 /// and release `:3`, and associated text is embedded only with all-keys.
@@ -831,17 +837,21 @@ pub fn encode_key_event_kitty_protocol(
                 return None;
             }
             // Bare Enter/Tab/Backspace/Delete keep their legacy bytes under
-            // disambiguate/report-events; report-all-keys encodes them. The
-            // exception covers the main keys only, never numpad substitutes.
+            // disambiguate/report-events; report-all-keys encodes them. A
+            // modified key is intentionally outside this exception: the
+            // modifier is the distinction applications need (notably
+            // Shift+Enter for an inserted TUI newline). The exception covers
+            // the main keys only, never numpad substitutes.
             // CTX-1267 (#2142c): Delete joins the exception so a bare
             // release never reports `CSI 3;1:3~` — one tap deletes exactly
             // once (Backspace already behaved this way).
-            let legacy_exception = !is_keypad
+            let bare_legacy_exception = !is_keypad
+                && modifiers == 0
                 && matches!(
                     named,
                     NamedKey::Enter | NamedKey::Tab | NamedKey::Backspace | NamedKey::Delete
                 );
-            if legacy_exception && !report_all && modifiers == 0 {
+            if bare_legacy_exception && !report_all {
                 return None;
             }
             return kitty_key_frame(code, None, modifiers, event_type, None, trailer);

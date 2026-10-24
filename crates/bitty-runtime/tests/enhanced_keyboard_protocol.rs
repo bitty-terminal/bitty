@@ -17,7 +17,10 @@
 //! (`sw.kovidgoyal.net/kitty/keyboard-protocol`). bitty keeps `?7727` as the
 //! historical alias and implements the real forms here.
 
-use bitty_platform::{KeyEvent, KeyLocation, LogicalKey, NamedKey, PressState};
+use bitty_platform::{
+    KeyEvent, KeyLocation, LogicalKey, ModifiersState, NamedKey, PlatformEvent, PressState,
+    WindowEventKind, WindowId,
+};
 use bitty_runtime::Runtime;
 
 fn make_runtime() -> Runtime {
@@ -486,6 +489,92 @@ fn enter_tab_backspace_keep_legacy_bytes_under_disambiguate() {
         rt.handle_key_event_ref(&named_key(NamedKey::Backspace, PressState::Pressed)),
         Some(b"\x7f".to_vec())
     );
+}
+
+#[test]
+fn shift_enter_is_distinct_only_after_kitty_negotiation() {
+    let mut rt = make_runtime();
+
+    // Without an application opt-in, legacy Enter remains CR and Shift+Enter
+    // fails closed to the same legacy byte: no guessed escape sequence is sent
+    // to applications that did not negotiate one.
+    press_shift(&mut rt);
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Pressed)),
+        Some(b"\r".to_vec()),
+        "unnegotiated Shift+Enter must stay legacy CR"
+    );
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
+
+    // Kitty's progressive push form is the protocol an application uses to
+    // opt in. The modifier field 2 means Shift (raw mask 1 plus one), so the
+    // application can bind this key to an inserted newline rather than submit.
+    send(&mut rt, b"\x1b[>1u");
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Pressed)),
+        Some(b"\r".to_vec()),
+        "ordinary Enter must retain its legacy CR"
+    );
+    press_shift(&mut rt);
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Pressed)),
+        Some(b"\x1b[13;2u".to_vec()),
+        "negotiated Shift+Enter must be CSI 13;2u"
+    );
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
+}
+
+#[test]
+fn negotiated_shift_enter_preserves_repeat_and_release_event_types() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[>3u"); // disambiguate + report events
+    press_shift(&mut rt);
+
+    let mut repeat = named_key(NamedKey::Enter, PressState::Pressed);
+    repeat.repeat = true;
+    assert_eq!(
+        rt.handle_key_event_ref(&repeat),
+        Some(b"\x1b[13;2:2u".to_vec())
+    );
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Released)),
+        Some(b"\x1b[13;2:3u".to_vec())
+    );
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
+}
+
+#[test]
+fn platform_modifier_event_reaches_shift_enter_encoder() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[>1u");
+
+    rt.handle_platform_event(PlatformEvent::Window {
+        window_id: WindowId::from_raw_public(1),
+        kind: WindowEventKind::ModifiersChanged(ModifiersState {
+            shift: true,
+            control: false,
+            alt: false,
+            super_pressed: false,
+        }),
+    });
+    assert!(!rt.handle_platform_event(PlatformEvent::Window {
+        window_id: WindowId::from_raw_public(1),
+        kind: WindowEventKind::KeyboardInput(named_key(NamedKey::Enter, PressState::Pressed)),
+    }));
+    assert_eq!(rt.drain_pending_input(), b"\x1b[13;2u");
+}
+
+#[test]
+fn shift_enter_is_not_encoded_by_an_unrelated_alternate_flag() {
+    let mut rt = make_runtime();
+    send(&mut rt, b"\x1b[>4u"); // alternate-key reporting alone
+    press_shift(&mut rt);
+    assert_eq!(
+        rt.handle_key_event_ref(&named_key(NamedKey::Enter, PressState::Pressed)),
+        Some(b"\r".to_vec()),
+        "Shift+Enter must not emit CSI-u without disambiguation or all-keys"
+    );
+    rt.handle_key_event(named_key(NamedKey::Shift, PressState::Released));
 }
 
 // ----------------------------------------------------------------------

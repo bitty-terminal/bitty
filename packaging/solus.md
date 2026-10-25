@@ -32,8 +32,8 @@ the release tag is pushed.
 
 ```sh
 # Calculate sha256 checksum for the release archive
-curl -fsSLO https://github.com/bitty-terminal/bitty/archive/refs/tags/v0.0.28.tar.gz
-sha256sum v0.0.28.tar.gz
+curl -fsSLO https://github.com/bitty-terminal/bitty/archive/refs/tags/v0.0.29.tar.gz
+sha256sum v0.0.29.tar.gz
 
 # Replace SKIP in package.yml with the sha256 digest:
 sed -i 's/SKIP/<computed-sha256>/' package.yml
@@ -48,7 +48,7 @@ sha256 digest, never `SKIP`; the in-tree copy is a draft until then.
 ### 4. Install the package
 
 ```sh
-sudo eopkg install bitty-0.0.28-1-1-x86_64.eopkg
+sudo eopkg install bitty-0.0.29-1-1-x86_64.eopkg
 ```
 
 ## Features

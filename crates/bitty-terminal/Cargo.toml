@@ -44,7 +44,7 @@ test = false
 doctest = false
 
 [dependencies]
-bitty-config = { version = "0.0.28", path = "../bitty-config" }
+bitty-config = { version = "0.0.29", path = "../bitty-config" }
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674" }
 # CTX-0939 (W-146): the composition root owns the extracted storage
 # mechanics. This is the ONLY crate in the workspace that may depend on
@@ -59,7 +59,7 @@ bitty-storage = { git = "https://github.com/bitty-terminal/bitty-storage", rev =
 # model pin above so default builds link no component code.
 # Re-pin instructions live in `src/storage_component_host.rs`.
 bitty-storage-component = { package = "bitty-storage", git = "https://github.com/bitty-terminal/bitty-storage", rev = "502c7f5", optional = true }
-bitty-package = { version = "0.0.28", path = "../bitty-package" }
+bitty-package = { version = "0.0.29", path = "../bitty-package" }
 # CTX-0981 (W-110): the composition root owns the extracted observability
 # contract. This is the ONLY crate in the workspace that may depend on
 # `bitty-observability-api`: Core library crates never link it (Core keeps
@@ -67,13 +67,13 @@ bitty-package = { version = "0.0.28", path = "../bitty-package" }
 # the dependency direction stays one-way and default builds link no
 # exporters, metrics pipeline, or tracing runtime).
 bitty-observability-api = { git = "https://github.com/bitty-terminal/bitty-observability", rev = "f1d08f4" }
-bitty-platform = { version = "0.0.28", path = "../bitty-platform" }
-bitty-plugin-host = { version = "0.0.28", path = "../bitty-plugin-host" }
-bitty-runtime = { version = "0.0.28", path = "../bitty-runtime" }
-bitty-render = { version = "0.0.28", path = "../bitty-render" }
-bitty-rich = { version = "0.0.28", path = "../bitty-rich" }
-bitty-term-state = { version = "0.0.28", path = "../bitty-term-state" }
-bitty-vt = { version = "0.0.28", path = "../bitty-vt" }
+bitty-platform = { version = "0.0.29", path = "../bitty-platform" }
+bitty-plugin-host = { version = "0.0.29", path = "../bitty-plugin-host" }
+bitty-runtime = { version = "0.0.29", path = "../bitty-runtime" }
+bitty-render = { version = "0.0.29", path = "../bitty-render" }
+bitty-rich = { version = "0.0.29", path = "../bitty-rich" }
+bitty-term-state = { version = "0.0.29", path = "../bitty-term-state" }
+bitty-vt = { version = "0.0.29", path = "../bitty-vt" }
 pollster = { workspace = true }
 # CTX-1265 (#2136): Unix TTY single-keypress picker navigation. `nix` (already
 # workspace-pinned) provides the safe termios/poll wrappers: cbreak mode

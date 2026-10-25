@@ -591,6 +591,12 @@ fn reload_fixture(tag: &str) -> ReloadFixture {
         snapshot: std::rc::Rc::new(EmptySnapshot),
     });
     assert_eq!(plugins.discover().len(), 1, "one store plugin discovered");
+    // Harness-only budget widening (same as `production_scratch` above): the
+    // production 50 ms `RC1_WALL_CLOCK_BUDGET_MS` can park `go` on a slow or
+    // contended CI runner before the VM ever settles. These tests assert
+    // lifecycle/denial semantics, not latency, so give the Lua calls the
+    // 100x harness room.
+    plugins.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
     let id = PluginId::new(RELOAD_PLUGIN).expect("plugin id");
     let report = plugins.activate(&id).expect("activate v1");
     assert_eq!(report.state, LifecycleState::Active);

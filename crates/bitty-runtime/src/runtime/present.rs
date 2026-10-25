@@ -1627,6 +1627,86 @@ impl Runtime {
         self.coalesced_deadline
     }
 
+    // -----------------------------------------------------------------------
+    // Surface visibility gate (issue #2589, follow-up of #2570)
+    // -----------------------------------------------------------------------
+
+    /// Whether the surface may be presented to (`true` by default).
+    ///
+    /// `false` from the embedder's `Suspended` delivery (a Hyprland workspace
+    /// switch-away unmaps the Wayland surface) back until the matching
+    /// `Resumed`. See [`Self::set_surface_visibility_at`].
+    #[must_use]
+    pub fn is_surface_visible(&self) -> bool {
+        self.surface_visible
+    }
+
+    /// Sets the surface visibility gate (issue #2589).
+    ///
+    /// Convenience clock: uses the live [`std::time::Instant`]. Deterministic
+    /// callers (tests) use [`Self::set_surface_visibility_at`].
+    pub fn set_surface_visibility(&mut self, visible: bool) {
+        self.set_surface_visibility_at(std::time::Instant::now(), visible);
+    }
+
+    /// Tracks a surface visibility transition and re-schedules presentation
+    /// alongside it (issue #2589).
+    ///
+    /// This is the "move present off the occlusion transition" milestone the
+    /// issue asks for. The runtime never presents to a hidden surface and
+    /// never presents *during* a visibility event: both the hide and the show
+    /// handlers only re-schedule work, and the actual buffer present runs on
+    /// a later, own loop turn — a next-frame queue item at reveal, and the
+    /// existing off-transition bounded retry (`#2570`, PR #2588) when that
+    /// present fails. The event loop therefore cannot deadlock on (or be
+    /// terminated by) the driver's swap-chain wait while hidden, and a
+    /// present failure inside this transition cannot recurse into handlers.
+    ///
+    /// Superfluuous deliveries are no-ops (same visibility, no transition),
+    /// including the startup `Resumed` before the first window exists.
+    ///
+    /// - **Hide** (visible → hidden): the compositor may stop releasing
+    ///   swap-chain buffers, so every future acquire would park the present
+    ///   thread in the driver wait. The pending presentation is cancelled
+    ///   into retained damage instead of attempted: the deferral state is
+    ///   cleared (so no past-due coalesced wake can spin the loop while
+    ///   occluded), and `pending_full_redraw` is armed so the shown surface
+    ///   later repaints from truth in one frame. Nothing is consumed: the
+    ///   grid, generations, and pane rings stay exactly as they were.
+    /// - **Show** (hidden → visible): one full-redraw frame is queued by
+    ///   arming the coalesced wake at `now`, so the embedder's existing
+    ///   `AboutToWait` wake selection presents it on the next loop turn.
+    ///   Late PTY output that arrived while hidden still defers the release
+    ///   through the settle gate (bounded by [`PRESENT_SETTLE_MAX`]) so the
+    ///   occluded span's terminal output lands in one final frame.
+    #[doc(hidden)]
+    pub fn set_surface_visibility_at(&mut self, now: std::time::Instant, visible: bool) {
+        if self.surface_visible == visible {
+            return;
+        }
+        self.surface_visible = visible;
+        if visible {
+            // Reveal: queue one full-redraw presentation as a next-frame
+            // task. The deadline is already open, so the embedder's wake
+            // (`present_coalescing_deadline`) presents it on the very next
+            // loop turn rather than inside this transition handler.
+            self.coalesced_pending = true;
+            self.coalesced_deadline = Some(now);
+        } else {
+            // Hide: cancel the pending presentation without consuming
+            // anything. `mark_frame_presented` is deliberately *not* called:
+            // no frame was presented, so generations and pane rings must
+            // stay. The deferral bookkeeping is released instead, and the
+            // occluded span's output is covered by the full redraw armed
+            // below.
+            self.coalesced_pending = false;
+            self.coalesced_deadline = None;
+            self.settle_input_at = None;
+            self.settle_burst_at = None;
+        }
+        self.pending_full_redraw = true;
+    }
+
     /// Present-latest gate: cadence (CTX-1231, #2093) plus PTY-quiescence
     /// settle (bitty#2486).
     ///
@@ -2316,6 +2396,21 @@ impl Runtime {
         // echo lands) or when its window elapses, whichever comes first.
         self.age_ime_commit_key_claim(now);
         if self.tick_time_gates(now) {
+            return None;
+        }
+        // Issue #2589: while the window is hidden (the Wayland shell surface
+        // is unmapped, e.g. a Hyprland workspace switch-away), the
+        // compositor may stop releasing swap-chain buffers, and every
+        // acquire would park the loop in the driver wait — the main-thread
+        // stall #2570 reports. The gate keeps the whole present path (build,
+        // snapshot-to-DrawList, acquire) off the surface while hidden.
+        // Damage stays retained in `pending_full_redraw` and the per-origin
+        // rings; the reveal re-queues presentation as a next-frame task
+        // (see `set_surface_visibility_at`). Like every early return here,
+        // this skips the only paths that clear a deferred frame, but none
+        // can be pending: the hide transition releases the deferral book-
+        // keeping, and `defer_coalesced_present` only runs below this gate.
+        if !self.surface_visible {
             return None;
         }
         // Issue #2570 review: while the retry backoff is pending, do not
@@ -9482,6 +9577,302 @@ mod surface_retry_tests {
         assert!(!should_log_present_failure(GPU_PRESENT_LOG_EVERY + 1));
         assert!(should_log_present_failure(GPU_PRESENT_LOG_EVERY * 2));
         assert!(!should_log_present_failure(u64::MAX - 1));
+    }
+}
+
+/// Occlusion-transition regressions for issue #2589 (the code-level repro of
+/// the #2570 hide/show freeze class).
+///
+/// The test seam (`enable_test_present`) counts every present attempt the
+/// runtime makes, so these tests can prove the event loop never touches the
+/// swap chain while the window is hidden and never presents inside a
+/// visibility transition:
+///
+/// - the occluded gate must hold frames with damage retained and make zero
+///   present attempts (no driver acquire — the `get_current_texture` wait
+///   that #2570 suspects);
+/// - the reveal must not present inline in the transition but arm a
+///   next-frame queue item the embedder's wake presents on its own turn;
+/// - repeated hide/show cycles with failing presents must stay bounded on
+///   every step (no past-due wake, no spin, no termination) and recover.
+#[cfg(test)]
+mod surface_visibility_tests {
+    use super::*;
+    use crate::runtime::RuntimeConfig;
+
+    fn runtime() -> Runtime {
+        Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime must build")
+    }
+
+    /// The wake the app's `AboutToWait` would arm from the runtime-owned
+    /// session deadlines (same definition as `surface_retry_tests::wake_min`).
+    fn wake_min(rt: &Runtime) -> Option<std::time::Instant> {
+        [
+            rt.present_coalescing_deadline(),
+            rt.surface_retry_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    #[test]
+    fn occlusion_gate_never_attempts_a_present_while_hidden() {
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        // An always-failing injected present: any accidental acquire would
+        // both attempt (counter) and arm a retry, so the test can see it.
+        rt.enable_test_present(usize::MAX);
+        rt.pending_full_redraw = true;
+        assert!(rt.is_surface_visible(), "default is visible");
+        assert!(
+            rt.tick_at(t0).is_none(),
+            "the injected failure must not present"
+        );
+        let visible_attempts = rt.test_present_attempts();
+        assert!(visible_attempts > 0, "sanity: attempts are observable");
+
+        // Workspace switch-away: winit delivers `Suspended`.
+        let t_hidden = t0 + std::time::Duration::from_millis(10);
+        rt.set_surface_visibility_at(t_hidden, false);
+        assert!(!rt.is_surface_visible());
+        // The hidden surface keeps receiving shell output (a progress bar in
+        // a pane the compositor hid): every tick must be a no-op against the
+        // swap chain.
+        for step in 1..=30u64 {
+            let now = t_hidden + std::time::Duration::from_millis(step);
+            rt.note_present_input_at(now);
+            assert!(
+                rt.tick_at(now).is_none(),
+                "no frame while the surface is hidden (step {step})"
+            );
+            let wake = wake_min(&rt);
+            assert!(
+                wake >= Some(now),
+                "wake {wake:?} must never be in the past at {now:?}"
+            );
+        }
+        assert_eq!(
+            rt.test_present_attempts(),
+            visible_attempts,
+            "zero present attempts while the surface is hidden"
+        );
+        // Damaged-but-unpresented state survives: the full redraw is armed so
+        // the reveal repaints from truth.
+        assert!(rt.pending_full_redraw);
+        assert!(!rt.coalesced_pending);
+    }
+
+    #[test]
+    fn reveal_queues_the_present_instead_of_presenting_inline() {
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        rt.enable_test_present(usize::MAX);
+        rt.pending_full_redraw = true;
+        let _ = rt.tick_at(t0);
+        // Drop the baseline failure's retry so the reveal alone schedules the
+        // next present: this isolates the transition behaviour.
+        rt.surface_retry.failures = 0;
+        rt.surface_retry.deadline = None;
+        rt.set_surface_visibility_at(t0 + std::time::Duration::from_millis(5), false);
+
+        // Switch-back: the transition only re-queues work. Nothing presents
+        // inside the handler (the attempt counter is untouched by the reveal
+        // itself) and a next-frame queue item is placed with its wake open.
+        let t_show = t0 + std::time::Duration::from_millis(20);
+        let attempts_before_reveal = rt.test_present_attempts();
+        rt.set_surface_visibility_at(t_show, true);
+        assert!(rt.is_surface_visible());
+        assert_eq!(
+            rt.test_present_attempts(),
+            attempts_before_reveal,
+            "the reveal transition must not present inline"
+        );
+        assert_eq!(
+            rt.present_coalescing_deadline(),
+            Some(t_show),
+            "the reveal arms one next-frame present on its own wake"
+        );
+        assert!(rt.pending_full_redraw, "the reveal repaints from truth");
+
+        // The queued frame presents on the next loop turn — the injected
+        // failure then re-arms the bounded retry off the transition.
+        assert!(rt.tick_at(t_show).is_none(), "the injected failure fires");
+        assert_eq!(rt.test_present_attempts(), attempts_before_reveal + 1);
+        let retry = rt
+            .surface_retry_deadline()
+            .expect("a failed present re-arms the bounded retry");
+        assert!(retry > t_show);
+        // The wake handed to the event loop during the backoff is bounded.
+        for step in 1..=40u64 {
+            let now = t_show + std::time::Duration::from_millis(step);
+            assert!(rt.tick_at(now).is_none(), "the backoff gates the present");
+            let wake = wake_min(&rt);
+            assert!(
+                wake >= Some(now),
+                "wake {wake:?} must never be in the past at {now:?}"
+            );
+        }
+        assert!(rt.pending_full_redraw, "damage survives for the retry");
+    }
+
+    #[test]
+    fn reveal_presents_the_queued_frame_and_clears_the_queue() {
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        rt.enable_test_present(0); // every attempt succeeds
+        rt.pending_full_redraw = true;
+        let _ = rt.tick_at(t0);
+        rt.set_surface_visibility_at(t0 + std::time::Duration::from_millis(5), false);
+        rt.set_surface_visibility_at(t0 + std::time::Duration::from_millis(20), true);
+
+        let stats = rt
+            .tick_at(t0 + std::time::Duration::from_millis(20))
+            .expect("the queued next-frame present must run on its own wake");
+        assert!(rt.present_coalescing_deadline().is_none());
+        assert_eq!(stats.generation, rt.last_presented_generation);
+        // The full redraw consumed the occluded span's output in one frame.
+        assert!(!rt.pending_full_redraw);
+        assert_eq!(rt.surface_retry_deadline(), None);
+    }
+
+    /// The #2570 mirror: 100+ Hyprland-shaped workspace switch-away/back
+    /// cycles with a deteriorating compositor that fails the first present
+    /// after every reveal. Proves the event loop stays alive and bounded on
+    /// every step: hidden ticks make no attempts, reveal re-queues, the
+    /// failing present re-arms a bounded off-transition retry, and the
+    /// cycle ends in one recovery present.
+    #[test]
+    fn hide_show_cycles_with_failing_presents_stay_bounded_and_recover() {
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        let mut now = t0;
+        let mut recoveries = 0usize;
+        for cycle in 0..=120u32 {
+            rt.enable_test_present(1);
+            // Switch away: hidden ticks with continuous shell output.
+            rt.set_surface_visibility_at(now, false);
+            let hidden_attempts = rt.test_present_attempts();
+            for _ in 0..3 {
+                now += std::time::Duration::from_millis(3);
+                rt.note_present_input_at(now);
+                assert!(rt.tick_at(now).is_none(), "cycle {cycle}");
+            }
+            assert_eq!(
+                rt.test_present_attempts(),
+                hidden_attempts,
+                "cycle {cycle}: zero present attempts while hidden"
+            );
+            // Hidden with no pending work: the loop waits on input
+            // (`wake_min == None`); any armed wake must never be in the past.
+            let wake = wake_min(&rt);
+            assert!(
+                wake.is_none_or(|w| w >= now),
+                "cycle {cycle}: wake {wake:?} must never be in the past"
+            );
+
+            // Switch back: reveal queues the frame, the compositor is still
+            // catching up and the first present fails. The failure is
+            // handled off the transition: a bounded backoff re-arms it.
+            now += std::time::Duration::from_millis(15);
+            rt.set_surface_visibility_at(now, true);
+            assert!(
+                rt.tick_at(now).is_none(),
+                "cycle {cycle}: the injected present failure is not fatal"
+            );
+            assert_eq!(rt.test_present_attempts(), hidden_attempts + 1);
+
+            // Bounded wake loop (the backoff ceiling is 1 s; 5 ms steps).
+            let mut steps = 0usize;
+            while rt.tick_at(now).is_none() {
+                now += std::time::Duration::from_millis(5);
+                steps += 1;
+                assert!(steps < 300, "cycle {cycle}: the retry never fired");
+                let wake = wake_min(&rt);
+                assert!(
+                    wake.is_none_or(|w| w >= now),
+                    "cycle {cycle}: wake {wake:?} must never be in the past"
+                );
+            }
+            // Recovery: the retained frame presented, the queue is clear.
+            assert_eq!(rt.test_present_attempts(), hidden_attempts + 2);
+            assert_eq!(rt.surface_retry_deadline(), None);
+            assert!(!rt.pending_full_redraw);
+            assert_eq!(rt.present_coalescing_deadline(), None);
+            recoveries += 1;
+        }
+        assert_eq!(recoveries, 121);
+    }
+
+    #[test]
+    fn repeated_same_visibility_deliveries_are_no_ops() {
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        rt.set_surface_visibility_at(t0, true); // startup Resumed: visible already
+        assert!(rt.is_surface_visible());
+        assert_eq!(rt.present_coalescing_deadline(), None);
+        rt.set_surface_visibility_at(t0, false);
+        assert!(!rt.is_surface_visible());
+        assert!(rt.pending_full_redraw, "the hide arms one full redraw");
+        // A second Suspended with no transition must not re-arm the queue /
+        // redraw or otherwise move presentation state.
+        rt.pending_full_redraw = false;
+        rt.set_surface_visibility_at(t0, false);
+        assert!(!rt.is_surface_visible());
+        assert!(!rt.pending_full_redraw);
+        // And a second Resumed before reality (still hidden in between) is a
+        // no-op too.
+        rt.set_surface_visibility_at(t0, false);
+        assert!(!rt.is_surface_visible());
+        rt.set_surface_visibility_at(t0 + std::time::Duration::from_millis(1), true);
+        assert_eq!(
+            rt.present_coalescing_deadline(),
+            Some(t0 + std::time::Duration::from_millis(1))
+        );
+        rt.set_surface_visibility_at(t0 + std::time::Duration::from_millis(1), true);
+        assert_eq!(
+            rt.present_coalescing_deadline(),
+            Some(t0 + std::time::Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn hidden_settle_output_presents_in_one_frame_after_reveal() {
+        // Terminal Truth: bytes consumed while hidden (a settle window was
+        // started for them) are released by the settle gate after the reveal,
+        // bounded by PRESENT_SETTLE_MAX, not by the reveal wake.
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        rt.set_present_settle(std::time::Duration::from_millis(40));
+        rt.pending_full_redraw = true;
+        rt.set_surface_visibility_at(t0, false);
+        rt.note_present_input_at(t0 + std::time::Duration::from_millis(5));
+        assert!(
+            rt.tick_at(t0 + std::time::Duration::from_millis(10))
+                .is_none()
+        );
+        // Reveal re-queues the frame with an open wake...
+        let t_show = t0 + std::time::Duration::from_millis(10);
+        rt.set_surface_visibility_at(t_show, true);
+        // ...but the settle gate opened (input + the capped hold) later than
+        // the reveal; the frame is held (damage retained) until then.
+        assert!(rt.tick_at(t_show).is_none(), "settle holds the frame");
+        let open_at = rt
+            .present_coalescing_deadline()
+            .expect("the reveal frame is deferred to the settle open");
+        assert!(open_at >= t_show);
+        // The settle cap keeps the hold bounded.
+        assert!(
+            open_at <= t0 + std::time::Duration::from_millis(5) + super::PRESENT_SETTLE_MAX,
+            "the settle gate caps at PRESENT_SETTLE_MAX"
+        );
+        let stats = rt.tick_at(open_at).expect("the frame presents at the open");
+        assert!(
+            rt.present_coalescing_deadline().is_none(),
+            "the reveal queue is consumed with the frame"
+        );
+        assert_eq!(stats.generation, rt.last_presented_generation);
     }
 }
 

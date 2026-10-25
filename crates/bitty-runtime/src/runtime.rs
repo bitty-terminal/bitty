@@ -1216,6 +1216,18 @@ pub struct Runtime {
     gpu_present_failures: u64,
     /// Bounded retry state after a failed GPU present (issue #2570).
     surface_retry: SurfaceRetry,
+    /// Surface visibility gate (issue #2589, follow-up of #2570).
+    ///
+    /// `false` while the window is hidden: winit delivers `Suspended` when a
+    /// Wayland shell surface unmaps (a Hyprland workspace switch-away), and
+    /// `Resumed` when it re-maps. While hidden, the compositor may stop
+    /// releasing swap-chain buffers, so every acquire would either park the
+    /// main thread in the driver wait (the #2570 freeze suspect) or fail.
+    /// The gate keeps every present off the occluded surface with damage
+    /// retained; setting visibility back to `true` re-queues the presentation
+    /// as a next-frame task on its own wake instead of presenting inline in
+    /// the visibility transition. See `runtime::present`.
+    surface_visible: bool,
     /// Test-only present-failure seam (issue #2570 B1).
     ///
     /// Forces the real-GPU branch and injects a bounded number of failures so
@@ -1600,6 +1612,7 @@ impl std::fmt::Debug for Runtime {
             .field("pending_paint_redraw", &self.pending_paint_redraw)
             .field("presents_coalesced", &self.presents_coalesced)
             .field("coalesced_pending", &self.coalesced_pending)
+            .field("surface_visible", &self.surface_visible)
             .field("leaf_count", &self.layout.leaf_count())
             .field("focused", &self.focus.focused())
             .field("workspace_count", &self.workspaces.len())
@@ -2015,6 +2028,9 @@ impl Runtime {
             ),
             gpu_present_failures: 0,
             surface_retry: SurfaceRetry::default(),
+            // Issue #2589: the gate starts visible so the startup path and
+            // every existing present schedule keep their pre-change behavior.
+            surface_visible: true,
             #[cfg(test)]
             test_present: None,
             pending_activation_gesture: None,
@@ -2311,6 +2327,9 @@ impl Runtime {
             ),
             gpu_present_failures: 0,
             surface_retry: SurfaceRetry::default(),
+            // Issue #2589: the gate starts visible so the startup path and
+            // every existing present schedule keep their pre-change behavior.
+            surface_visible: true,
             #[cfg(test)]
             test_present: None,
             pending_activation_gesture: None,

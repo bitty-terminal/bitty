@@ -318,6 +318,32 @@ fn legacy_timeout_auto_cancel_enter_consumes_without_delivery() {
     assert_eq!(rt.pending_input(), b"\r");
 }
 
+#[test]
+fn legacy_gate_visible_release_without_confirm_routes_ordinarily() {
+    // A release reaching a visible-but-never-confirmed gate (the gate armed
+    // while the physical key was already down) is NOT a confirm gesture and
+    // routes ordinarily: legacy emits no bytes, nothing is delivered, the
+    // pending paste survives, and the later press of that key still
+    // confirms.
+    let mut rt = make_runtime();
+    gate_pending_paste(&mut rt, "line1\nline2");
+    assert_eq!(
+        rt.handle_key_event(enter(PressState::Released, false)),
+        None,
+        "unconfirmed gate never consumes a release or delivers"
+    );
+    assert!(rt.has_pending_paste(), "release must not disturb the gate");
+    assert_eq!(rt.pending_input(), b"");
+    // The held key's press is still the confirm gesture once it arrives.
+    assert_eq!(rt.handle_key_event(enter(PressState::Pressed, false)), None);
+    assert!(!rt.has_pending_paste());
+    assert_eq!(
+        rt.pending_input(),
+        b"line1\nline2",
+        "paste delivered exactly once"
+    );
+}
+
 // ── Path B: Kitty negotiated, no report-events (flags 1) ───────────────
 
 #[test]

@@ -3085,6 +3085,10 @@ impl Runtime {
     /// `new_split:<dir>` keeps its fixed axis; this is only the Mod+N
     /// `new_panel` path.
     ///
+    /// In [`PanelLayoutMode::Spiral`] the axis follows the clockwise phase
+    /// rotation from the container's balanced axis; the other adaptive modes
+    /// keep their documented target rules.
+    ///
     /// CTX-0964 (#1698): in [`PanelLayoutMode::BisectLargest`] this returns
     /// the raw-aspect axis ([`bitty_ui::bisect_split_axis`], no 2.0
     /// cell-aspect correction) of the largest-area panel (see
@@ -3138,7 +3142,7 @@ impl Runtime {
             ),
             PanelLayoutMode::Spiral => {
                 let phase = self.panel_spiral_phase(focused);
-                match splittable_axis(focused_rect, gap_in) {
+                match Self::spiral_axis(self.container, focused_rect, phase, gap_in) {
                     Some(axis) => (focused, focused_rect, axis, phase >= 2, Some(phase)),
                     None => {
                         // Issue #2571 review: the focused Spiral slot can
@@ -3166,6 +3170,40 @@ impl Runtime {
             place_new_first,
             spiral_phase,
         })
+    }
+
+    /// Axis half of the clockwise Spiral rotation.
+    ///
+    /// The rotation starts from the container's balanced axis rather than
+    /// always opening horizontally: a wide window opens Right, a tall one
+    /// opens Down, and each following press turns 90 degrees. The sequence is
+    /// clockwise from that base, so a tall window reads Down -> Right -> Up ->
+    /// Left rather than the literal Right -> Down -> Left -> Up of a wide
+    /// window. Phases 0/2 use the base axis and phases
+    /// 1/3 the perpendicular one; phases 2/3 place the new pane first
+    /// (left/top). Deriving the axis from the cell aspect alone collapsed the
+    /// rotation into Right -> Right -> Left -> Left on ordinary windows. When
+    /// the phase axis cannot host two gap-aware panes, the perpendicular axis
+    /// keeps the chord working; `None` means neither fits and the caller takes
+    /// the Balanced fallback.
+    fn spiral_axis(container: UiRect, rect: UiRect, phase: u8, gap_in: u16) -> Option<SplitAxis> {
+        let base = balanced_split_axis(container);
+        let preferred = if phase % 2 == 0 {
+            base
+        } else {
+            match base {
+                SplitAxis::Horizontal => SplitAxis::Vertical,
+                SplitAxis::Vertical => SplitAxis::Horizontal,
+            }
+        };
+        if splittable_rect(rect, preferred, gap_in) {
+            return Some(preferred);
+        }
+        let fallback = match preferred {
+            SplitAxis::Horizontal => SplitAxis::Vertical,
+            SplitAxis::Vertical => SplitAxis::Horizontal,
+        };
+        splittable_rect(rect, fallback, gap_in).then_some(fallback)
     }
 
     /// Spiral phase for the next split when `focused` continues the creation

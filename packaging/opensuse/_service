@@ -20,7 +20,7 @@
   <service name="tar_scm" mode="disabled">
     <param name="url">https://github.com/bitty-terminal/bitty.git</param>
     <param name="scm">git</param>
-    <param name="revision">v0.0.28</param>
+    <param name="revision">v0.0.29</param>
     <param name="filename">bitty</param>
     <param name="versionformat">@PARENT_TAG@</param>
     <param name="versionrewrite-pattern">v(.*)</param>

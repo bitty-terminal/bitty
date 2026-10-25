@@ -25,7 +25,7 @@ it means adding an openSUSE leg to the release `verify-install` matrix first.
 | `_service` | OBS source service: checks out the release tag, produces `bitty-<version>.tar.gz`, keeps `Version` aligned. Every service is `mode="disabled"`. |
 | `README.md` | This file: project layout, submission, repository publication. |
 
-The recipe pins the `0.0.28` line like the sibling recipes (`packaging/alpine/APKBUILD`,
+The recipe pins the `0.0.29` line like the sibling recipes (`packaging/alpine/APKBUILD`,
 `packaging/gentoo/`, `packaging/void/`). `Version`, the `_service` revision,
 and the `%changelog` entry move together at release time.
 

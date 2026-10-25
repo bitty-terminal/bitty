@@ -58,8 +58,8 @@ manifests/b/BittyTerminal/Bitty/<version>/
 Manifests can be generated automatically via `scripts/generate-winget-manifest.sh`:
 
 ```sh
-VERSION=0.0.28
-INSTALLER_SHA256="${INSTALLER_SHA256:?set to the published 0.0.28 installer SHA-256}"
+VERSION=0.0.29
+INSTALLER_SHA256="${INSTALLER_SHA256:?set to the published 0.0.29 installer SHA-256}"
 scripts/generate-winget-manifest.sh --version "$VERSION" \
   --installer-sha256 "$INSTALLER_SHA256"
 ```
@@ -68,7 +68,7 @@ Alternatively, upstream pull requests to `microsoft/winget-pkgs` can be submitte
 using Microsoft's `wingetcreate` CLI tool:
 
 ```powershell
-$version = '0.0.28'
+$version = '0.0.29'
 wingetcreate update BittyTerminal.Bitty `
   --urls "https://cdn.bitty.run/releases/v$version/bitty-$version-windows-x86_64-setup.exe" `
   --version $version

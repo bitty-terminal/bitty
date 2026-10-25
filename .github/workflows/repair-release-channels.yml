@@ -22,6 +22,11 @@ on:
           - all
           - apt
           - copr
+      copr-build-timeout:
+        description: "Copr build timeout in seconds (600-10800; Copr caps at 10800)"
+        required: false
+        default: "10800"
+        type: string
 
 permissions:
   contents: read
@@ -198,9 +203,15 @@ jobs:
     if: inputs.channels == 'all' || inputs.channels == 'copr'
     environment: release
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Allow a full 10800 s Copr timeout plus check-out/SRPM overhead; the job
+    # waits synchronously for the slowest enabled chroot (ctx-1584).
+    timeout-minutes: 200
     env:
       TAG: ${{ needs.validate.outputs.tag }}
+      # Slow mirrors (e.g. openeuler-24.03-aarch64, bitty#2693) need more than
+      # the Copr default 1800 s to install the mock buildroot. Override with
+      # the copr-build-timeout input; Copr hard-caps builds at 10800 s.
+      COPR_BUILD_TIMEOUT: ${{ inputs.copr-build-timeout || '10800' }}
     steps:
       - name: Check out release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -284,6 +295,15 @@ jobs:
             echo "::error::Copr repair requires COPR_CONFIG" >&2
             exit 1
           fi
+          if ! [[ "$COPR_BUILD_TIMEOUT" =~ ^[0-9]+$ ]]; then
+            echo "::error::COPR_BUILD_TIMEOUT must be an integer number of seconds, got: $COPR_BUILD_TIMEOUT" >&2
+            exit 1
+          fi
+          if [ "$COPR_BUILD_TIMEOUT" -lt 600 ] || [ "$COPR_BUILD_TIMEOUT" -gt 10800 ]; then
+            echo "::error::COPR_BUILD_TIMEOUT must be within 600-10800 seconds (Copr hard-caps builds at 10800), got: $COPR_BUILD_TIMEOUT" >&2
+            exit 1
+          fi
+          echo "Copr build timeout: ${COPR_BUILD_TIMEOUT}s"
           SRPM="${{ steps.srpm.outputs.srpm }}"
           if [ -z "$SRPM" ] || [ ! -f "$SRPM" ]; then
             echo "::error::Copr SRPM was not built" >&2
@@ -306,7 +326,7 @@ jobs:
             echo "  chroot: ${chroot}"
           done <<< "$CHROOTS"
           echo "Submitting ${SRPM} to ${COPR_PROJECT}"
-          copr-cli build --timeout 1800 "${ARGS[@]}" "$COPR_PROJECT" "$SRPM"
+          copr-cli build --timeout "$COPR_BUILD_TIMEOUT" "${ARGS[@]}" "$COPR_PROJECT" "$SRPM"
   nix:
     name: Repair Nix flake lock (optional)
     needs: validate

@@ -83,8 +83,10 @@ for workflow in "$RELEASE" "$REPAIR"; do
     "$(basename "$workflow") installs rpmbuild and zstd"
   expect_contains "$workflow" "scripts/build-copr-srpm.sh" \
     "$(basename "$workflow") builds the Copr SRPM through the shared helper"
-  expect_contains "$workflow" 'copr-cli build --timeout 1800 "${ARGS[@]}" "$COPR_PROJECT" "$SRPM"' \
+  expect_contains "$workflow" 'copr-cli build --timeout "$COPR_BUILD_TIMEOUT" "${ARGS[@]}" "$COPR_PROJECT" "$SRPM"' \
     "$(basename "$workflow") submits the SRPM to Copr"
+  expect_contains "$workflow" 'if [ "$COPR_BUILD_TIMEOUT" -lt 600 ] || [ "$COPR_BUILD_TIMEOUT" -gt 10800 ]; then' \
+    "$(basename "$workflow") bounds the Copr build timeout"
   expect_contains "$workflow" "bitty-\${VERSION}-\${arch}-unknown-linux-gnu.tar.zst" \
     "$(basename "$workflow") uses the published release source bundles"
   expect_contains "$workflow" 'python3 -m venv "$RUNNER_TEMP/copr-cli"' \
@@ -102,6 +104,12 @@ if grep -Eq 'apt-get install.*copr-cli' <<<"$COPR_BLOCK"; then
 else
   pass "copr job does not apt-install copr-cli"
 fi
+expect_contains "$RELEASE" "COPR_BUILD_TIMEOUT: \${{ vars.COPR_BUILD_TIMEOUT || '10800' }}" \
+  "release copr job defaults the Copr timeout to 10800 seconds (repovar overridable)"
+expect_contains "$REPAIR" "COPR_BUILD_TIMEOUT: \${{ inputs.copr-build-timeout || '10800' }}" \
+  "repair copr job defaults the Copr timeout to 10800 seconds (input overridable)"
+expect_contains "$REPAIR" 'default: "10800"' \
+  "repair workflow defaults the copr-build-timeout input to 10800"
 expect_contains "$RELEASE" 'BASE_URL="https://cdn.bitty.run/releases/${TAG}"' \
   "release copr job reads source bundles from the CDN"
 expect_contains "$REPAIR" '--pattern "bitty-${VERSION}-x86_64-unknown-linux-gnu.tar.zst"' \
@@ -112,7 +120,7 @@ expect_contains "$REPAIR" "tooling/scripts/build-copr-srpm.sh" \
   "repair copr job builds the SRPM from default-branch tooling"
 expect_contains "$REPAIR" "--spec tooling/packaging/bitty.spec" \
   "repair copr job uses the corrected default-branch spec"
-if [[ "$COPR_BLOCK" == *'copr-cli build --timeout 1800 "${ARGS[@]}" "$COPR_PROJECT" "$SRPM"'* ]]; then
+if [[ "$COPR_BLOCK" == *'copr-cli build --timeout "$COPR_BUILD_TIMEOUT" "${ARGS[@]}" "$COPR_PROJECT" "$SRPM"'* ]]; then
   pass "release copr job submits one SRPM to all discovered chroots"
 else
   fail "release copr job does not submit the SRPM to the discovered chroots"

@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.0.29] - 2026-10-26
 
+### Fixed
+
+- **Occluded-window presentation (#2662):** the runtime tracks surface
+  visibility and skips presentation while the platform reports the surface
+  unmapped. `Suspended` (a Wayland surface unmap, such as a Hyprland workspace
+  switch-away) cancels the pending frame into retained damage and stops every
+  present attempt, so the event loop cannot park in the compositor's
+  swap-chain wait. `Resumed` queues one full-redraw frame on its own wake; the
+  occluded span's output lands in that frame.
+- **Hidden-window wakeups and paste expiry (#2668):** hidden ticks no
+  longer arm time-gate deadlines that immediately come due (the 100 ms
+  synchronized-update wake caused repeated `AboutToWait` deliveries), and the
+  failed-present retry is suspended, so a stale deadline cannot outrank the
+  reveal or be re-armed by hidden ticks. Paste-confirmation expiry still
+  advances while hidden — an expired prompt auto-cancels — without acquiring
+  or presenting.
+- **Detached scrollback viewport holds its place (#2633):** a scrolled-back
+  pane anchors the top scrollback line, not just a bottom-relative offset, so
+  new output no longer drags the history window toward live. Wheel, page,
+  scrollbar, and shell-jump scrolling capture the anchor, and resize restores
+  it after the View and backing state have their new geometry. Tiled,
+  detached-float, and pinned panes keep the same rows; if the anchored line is
+  pruned or a width reflow rebuilds identities, the previous bounded offset is
+  kept and clamped.
+- **Border drag returns to its press anchor (#2640):** zero-delta pointer
+  motion used to return early, so dragging a divider away and back left the
+  previous ratio in place. The drag now recomputes from the press-time layout,
+  container, and gaps even at zero delta, so returning the pointer to the grab
+  point restores the exact pre-drag allocation — including cross and
+  T-junction drags — instead of keeping the last moved size.
+- **Nested pane minimums during border drags (#2657):** a split's minimum
+  extent now follows its live ratios and gap bands rather than the sum of its
+  children's structural minimums, so a parent divider stops before a nested
+  pane drops below 10x4 instead of allocating a sliver. The `MIN_RATIO` cell
+  bound uses the allocator's floor rounding, so dragging at the floor no
+  longer shifts the allocation by a cell. Horizontal and vertical nests are
+  covered.
+- **T-junction drags move both dividers (#2641):** with zero gaps, the cell
+  at a T-junction and the adjacent cell that pointer rounding can produce now
+  belong to the perpendicular divider as well as the parent. Pressing there
+  grabs both handles, so the junction follows the pointer on both axes and all
+  three panes resize together; before, only the parent moved and the junction
+  came apart. Away from the endpoint each stem stays independently draggable.
+- **Stale border drags are canceled (#2659):** a window resize, container or
+  window-cell change, layout replacement (including through the mutable layout
+  guard), explicit reflow, or pointer leave now ends an in-flight divider drag
+  instead of letting stale deltas mutate the new tree. The matching left
+  release is consumed in normal and mouse-capture routing, so it cannot
+  trigger a selection commit or copy or reach the app as an orphan event.
+  Live drag commits keep their press anchor.
+- **Workspace switches no longer slide panels (#2639):** workspace
+  transitions no longer slide incoming panels horizontally. The old slide
+  moved them by a full container width — to negative x on a lower-index
+  switch — so panes were painted outside the viewport while hit-testing
+  already read the committed frames. Every tick now paints exactly those
+  frames, with the terminal grid fixed and pins anchored; the cross-fade still
+  runs, and focus and workspace state still switch immediately.
+- **Adaptive splits find a usable pane (#2658):** `Balanced` and the
+  default Spiral fallback now choose the largest leaf that can still host two
+  10x4 panes at the configured gap, instead of the largest-area leaf and then
+  refusing when it cannot split. An exhausted oversized pane no longer hides
+  a smaller usable target, so `Mod+N` keeps working and is refused only when no
+  leaf is feasible. The plan's axis and target always agree.
+- **Scoop manifests expose `bitty` (#2637):** the generated manifests map both
+  the x86_64 and aarch64 executables to the shim name `bitty` instead of
+  exposing the release asset filename as the command. The package-manifest
+  check asserts the alias for both architectures.
+
 ## [0.0.28] - 2026-10-24
 
 ### Added

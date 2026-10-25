@@ -1137,7 +1137,7 @@ return {}
     }
 
     #[test]
-    fn suspend_and_resumed_move_presentation_off_the_transition() {
+    fn app_handler_visibility_events_update_surface_gate() {
         // Issue #2589 / #2570: a Hyprland workspace switch-away delivers
         // `Suspended` (the Wayland shell surface unmaps); switch-back delivers
         // `Resumed`. The embedder must gate presentation on the visibility
@@ -1159,9 +1159,9 @@ return {}
             "the hide transition must not leave a wake behind"
         );
 
-        // The reveal transition only re-queues work (the headless fallback
-        // consumes its queued smoke frame in the same delivery on a fake
-        // surface; a real window goes through `request_redraw`).
+        // The AppHandler delivery ungates the runtime. This headless fixture
+        // cannot observe a window-capable inline Resumed presentation, so the
+        // queue/present-on-a-later-turn contract is covered by runtime tests.
         let mut context = EventContext::recording(&fixture.operations);
         <TerminalApp as AppHandler>::handle_event(
             &mut fixture.app,
@@ -1172,35 +1172,6 @@ return {}
         assert!(
             fixture.app.runtime.is_surface_visible(),
             "Resumed must ungate presentation"
-        );
-
-        // The runtime-owned reveal queue item is consumed only by a later
-        // tick at its own wake — never inside the visibility delivery. On a
-        // real window the service path is `request_redraw` → `AboutToWait`;
-        // the headless fixture surfaces the same queue through the runtime
-        // seam the production `Resumed` delivery drives. (The fixture's own
-        // `Resumed` delivery is exempt from the off-transition claim: its
-        // headless fallback drives one smoke tick on a fake surface that
-        // cannot block.)
-        fixture.app.runtime.set_surface_visibility(false);
-        let before_present = fixture.app.runtime.present_coalescing_deadline().is_none();
-        let _ = fixture.app.runtime.tick_at(std::time::Instant::now());
-        assert!(before_present, "a hidden tick presents nothing");
-        let queue_wake = {
-            fixture.app.runtime.set_surface_visibility(true);
-            fixture
-                .app
-                .runtime
-                .present_coalescing_deadline()
-                .expect("the reveal must queue one next-frame present")
-        };
-        assert!(
-            fixture.app.runtime.tick_at(queue_wake).is_some(),
-            "the queued next-frame present runs at its own wake"
-        );
-        assert!(
-            fixture.app.runtime.present_coalescing_deadline().is_none(),
-            "the queue is consumed with the frame"
         );
     }
 

@@ -2410,6 +2410,10 @@ impl Runtime {
         // work to perform and would cause repeated immediate AboutToWait
         // deliveries once it becomes due. Damage and Terminal Truth remain
         // retained for the reveal.
+        // Paste confirmation expiry is independent of presentation and must
+        // still advance while hidden; unlike the other time gates, it does
+        // not arm a wake or touch the surface.
+        self.check_and_auto_cancel_paste_at(now);
         if !self.surface_visible {
             self.coalesced_pending = false;
             self.coalesced_deadline = None;
@@ -9719,6 +9723,42 @@ mod surface_visibility_tests {
         rt.set_surface_visibility_at(shown, true);
         assert_eq!(rt.present_coalescing_deadline(), Some(shown));
         assert!(rt.pending_full_redraw);
+    }
+
+    #[test]
+    fn hidden_paste_expiry_does_not_present_and_reveal_still_presents() {
+        let mut rt = Runtime::with_deterministic_rasterizer(RuntimeConfig {
+            paste_confirm_timeout: std::time::Duration::from_secs(1),
+            ..RuntimeConfig::default()
+        })
+        .expect("deterministic runtime must build");
+        rt.enable_test_present(0);
+        assert!(rt.paste_text_via_gate(String::from("visible\npaste")));
+        assert!(rt.has_pending_paste());
+        let visible_at = std::time::Instant::now() + std::time::Duration::from_millis(1);
+        assert!(
+            rt.tick_at(visible_at).is_some(),
+            "visible paste must present"
+        );
+        assert!(rt.has_pending_paste());
+        let visible_attempts = rt.test_present_attempts();
+
+        let hidden_at = visible_at + std::time::Duration::from_millis(1);
+        rt.set_surface_visibility_at(hidden_at, false);
+
+        let expired = hidden_at + std::time::Duration::from_secs(2);
+        assert!(rt.tick_at(expired).is_none());
+        assert!(!rt.has_pending_paste(), "hidden time must expire the paste");
+        assert_eq!(
+            rt.test_present_attempts(),
+            visible_attempts,
+            "paste expiry must not acquire or present while hidden"
+        );
+
+        let shown = expired + std::time::Duration::from_millis(1);
+        rt.set_surface_visibility_at(shown, true);
+        assert!(rt.tick_at(shown).is_some(), "reveal must still present");
+        assert_eq!(rt.test_present_attempts(), visible_attempts + 1);
     }
 
     #[test]

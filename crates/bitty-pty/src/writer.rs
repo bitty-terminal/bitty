@@ -420,50 +420,130 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
+    #[cfg(target_os = "linux")]
+    use std::sync::Condvar;
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Environment marker that switches this test into its child role: the
+    /// measurement runs in a process this test spawns, never in the shared
+    /// test binary.
+    #[cfg(target_os = "linux")]
+    const STACK_PROBE_CHILD_ENV: &str = "BITTY_PTY_WRITER_STACK_PROBE_CHILD";
+
+    /// Exact libtest path of this test, used to select only it in the child.
+    #[cfg(target_os = "linux")]
+    const STACK_PROBE_TEST_PATH: &str = "writer::tests::writer_thread_stack_stays_bounded";
+
+    /// Printed by the child once its assertions pass. The parent requires it
+    /// so a stale test path (the child runs nothing) cannot pass silently.
+    #[cfg(target_os = "linux")]
+    const STACK_PROBE_PASSED: &str = "writer stack probe passed";
+
+    /// Lower bound the negative control must clear for the measurement to
+    /// resolve a full default (2 MiB) stack reservation.
+    #[cfg(target_os = "linux")]
+    const DEFAULT_STACK_FLOOR_KIB: usize = 1536;
+
+    /// Minimum gap between the default and bounded stack reservations; the
+    /// observed gap is ~1.9 MiB.
+    #[cfg(target_os = "linux")]
+    const MIN_STACK_GAP_KIB: usize = 1024;
+
+    /// Slack the writer thread's delta may add above the requested reservation
+    /// for its guard page, thread descriptor, and the probe's own bookkeeping.
+    /// The child observes 144 KiB for the 128 KiB reservation.
+    #[cfg(target_os = "linux")]
+    const STACK_DELTA_SLACK_KIB: usize = 64;
+
+    /// Bound on how long a probe worker may take to reach its parked state.
+    #[cfg(target_os = "linux")]
+    const PROBE_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
     #[test]
     #[cfg(target_os = "linux")]
     fn writer_thread_stack_stays_bounded() {
-        // Measure process VmSize while a live worker is parked. The same
-        // closure and channel allocations are used for both cases; only the
-        // stack reservation differs. A default Builder is the negative
-        // control. Removing `.stack_size(...)` makes the deltas equal and
-        // fails the test.
-        let control_release = std::sync::mpsc::channel();
-        let bounded_release = std::sync::mpsc::channel();
-        let control_ready = std::sync::mpsc::channel();
-        let bounded_ready = std::sync::mpsc::channel();
-        let baseline = process_vsize_kib();
-        let control = spawn_parked_thread(
-            std::thread::Builder::new(),
-            control_ready.0,
-            control_release.1,
-        );
-        control_ready
-            .1
-            .recv_timeout(Duration::from_secs(5))
-            .expect("default-stack control ready");
-        let with_control = process_vsize_kib();
-        let bounded =
-            spawn_parked_thread(writer_thread_builder(), bounded_ready.0, bounded_release.1);
-        bounded_ready
-            .1
-            .recv_timeout(Duration::from_secs(5))
-            .expect("bounded writer thread ready");
-        let with_both = process_vsize_kib();
-        let control_kib = with_control.saturating_sub(baseline);
-        let bounded_kib = with_both.saturating_sub(with_control);
-        control_release.0.send(()).expect("release control");
-        bounded_release.0.send(()).expect("release bounded");
-        control.join().expect("join control");
-        bounded.join().expect("join bounded");
+        if std::env::var_os(STACK_PROBE_CHILD_ENV).is_none() {
+            run_writer_stack_probe_in_child_process();
+            return;
+        }
+        measure_writer_stack_in_child_process();
+    }
+
+    /// Re-runs this test in a freshly spawned process of the same binary.
+    ///
+    /// `VmSize` only reflects a thread's stack while the runtime maps that
+    /// stack fresh, and a long-lived test process does not: glibc caches the
+    /// stack of every thread that exits and hands it back to the next spawn of
+    /// the same size (exact-size match), so a default-stack thread can add
+    /// 0-12 KiB instead of 2 MiB depending on which tests ran first. The child
+    /// starts with an empty stack cache, `MALLOC_ARENA_MAX=1` keeps every
+    /// thread on the single main arena instead of reserving its own 64 MiB
+    /// glibc arena, and `RUST_MIN_STACK` is cleared so "default" is always
+    /// std's built-in reservation. Both measured deltas then depend only on
+    /// the requested stack size, independent of test order and scheduling.
+    #[cfg(target_os = "linux")]
+    fn run_writer_stack_probe_in_child_process() {
+        let executable = std::env::current_exe().expect("test binary path");
+        let output = std::process::Command::new(executable)
+            .args([
+                "--exact",
+                STACK_PROBE_TEST_PATH,
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(STACK_PROBE_CHILD_ENV, "1")
+            .env("MALLOC_ARENA_MAX", "1")
+            .env_remove("RUST_MIN_STACK")
+            .output()
+            .expect("spawn writer stack probe");
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            control_kib >= 1536,
+            output.status.success() && stdout.contains(STACK_PROBE_PASSED),
+            "child writer stack probe did not pass ({}):\nstdout:\n{stdout}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Measures both reservations and asserts the bound (child role).
+    ///
+    /// The same worker code and sync state are used for both cases; only the
+    /// stack reservation differs. A default Builder is the negative control:
+    /// removing `.stack_size(...)` from `writer_thread_builder` gives the
+    /// writer thread a default-stack reservation too, which fails both the
+    /// relative and the absolute assertion.
+    #[cfg(target_os = "linux")]
+    fn measure_writer_stack_in_child_process() {
+        // The sync allocations happen before the baseline sample so they
+        // cannot land in either delta.
+        let mut control = ParkedThread::new();
+        let mut writer = ParkedThread::new();
+        let baseline = process_vsize_kib();
+        control.start(std::thread::Builder::new());
+        control.wait_ready();
+        let with_control = process_vsize_kib();
+        writer.start(writer_thread_builder());
+        writer.wait_ready();
+        let with_writer = process_vsize_kib();
+        let control_kib = with_control.saturating_sub(baseline);
+        let bounded_kib = with_writer.saturating_sub(with_control);
+        control.release();
+        writer.release();
+        assert!(
+            control_kib >= DEFAULT_STACK_FLOOR_KIB,
             "negative-control VmSize delta {control_kib} KiB is unexpectedly small"
         );
         assert!(
-            bounded_kib + 1024 <= control_kib,
-            "writer-thread VmSize delta {bounded_kib} KiB is not at least 1 MiB below default {control_kib} KiB"
+            bounded_kib + MIN_STACK_GAP_KIB <= control_kib,
+            "writer-thread VmSize delta {bounded_kib} KiB is not at least {MIN_STACK_GAP_KIB} KiB below default {control_kib} KiB"
         );
+        assert!(
+            bounded_kib <= WRITER_THREAD_STACK_BYTES / 1024 + STACK_DELTA_SLACK_KIB,
+            "writer-thread VmSize delta {bounded_kib} KiB exceeds the {} KiB reservation plus {STACK_DELTA_SLACK_KIB} KiB of slack",
+            WRITER_THREAD_STACK_BYTES / 1024
+        );
+        println!("{STACK_PROBE_PASSED}: control {control_kib} KiB, writer {bounded_kib} KiB");
     }
 
     /// Reads process virtual size from procfs on Linux.
@@ -479,21 +559,67 @@ mod tests {
             .expect("VmSize present")
     }
 
-    /// Spawns an otherwise identical parked worker so VmSize deltas isolate
-    /// the requested Builder stack reservation.
+    /// Worker parked on a condition variable while the test samples `VmSize`.
+    ///
+    /// The shared state is allocated before the baseline sample, and the
+    /// worker allocates nothing while parked: a heap allocation there would
+    /// reserve this thread's own allocator arena on glibc and swamp the stack
+    /// delta being measured.
     #[cfg(target_os = "linux")]
-    fn spawn_parked_thread(
-        builder: std::thread::Builder,
-        ready: std::sync::mpsc::Sender<()>,
-        release: std::sync::mpsc::Receiver<()>,
-    ) -> std::thread::JoinHandle<()> {
-        builder
-            .spawn(move || {
-                let _marker = 0u8;
-                let _ = ready.send(());
-                let _ = release.recv();
-            })
-            .expect("measured thread spawn")
+    struct ParkedThread {
+        ready: Arc<AtomicBool>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ParkedThread {
+        fn new() -> Self {
+            Self {
+                ready: Arc::new(AtomicBool::new(false)),
+                release: Arc::new((Mutex::new(false), Condvar::new())),
+                handle: None,
+            }
+        }
+
+        /// Starts the worker on `builder`, which owns the stack reservation.
+        fn start(&mut self, builder: std::thread::Builder) {
+            let ready = Arc::clone(&self.ready);
+            let release = Arc::clone(&self.release);
+            self.handle = Some(
+                builder
+                    .spawn(move || {
+                        ready.store(true, Ordering::Release);
+                        let (lock, condition) = &*release;
+                        let mut released = lock.lock().expect("probe release mutex");
+                        while !*released {
+                            released = condition.wait(released).expect("probe release wait");
+                        }
+                    })
+                    .expect("measured thread spawn"),
+            );
+        }
+
+        /// Blocks until the worker reached its parked state.
+        fn wait_ready(&self) {
+            let deadline = Instant::now() + PROBE_READY_TIMEOUT;
+            while !self.ready.load(Ordering::Acquire) {
+                assert!(Instant::now() < deadline, "probe thread did not park");
+                std::thread::yield_now();
+            }
+        }
+
+        /// Releases and joins the worker.
+        fn release(mut self) {
+            let (lock, condition) = &*self.release;
+            *lock.lock().expect("probe release mutex") = true;
+            condition.notify_all();
+            self.handle
+                .take()
+                .expect("started probe thread")
+                .join()
+                .expect("join measured thread");
+        }
     }
 
     /// `io::Write` sink that records every byte written into shared state.

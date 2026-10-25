@@ -14,6 +14,13 @@
 //! Bracketed paste (`?2004`) is defense-in-depth only — it wraps confirmed
 //! delivery but never bypasses confirmation.
 //!
+//! The input-ownership contract for `Enter` frames (press/repeat/release,
+//! legacy vs negotiated Kitty paths) while the paste gate is visible is
+//! normatively documented on
+//! `Runtime::confirm_pending_paste_on_enter` and proven executable in
+//! `crates/bitty-runtime/tests/paste_confirm_enter_ownership.rs` (issue
+//! #2632; confirmation-gate history: issue #2265, issue #1438, PR #2269).
+//!
 //! Two trigger groups require confirmation (`needs_confirmation`):
 //!
 //! 1. **Multi-line paste** — LF `\n` (`has_newline`). This is the kitty/ghostty

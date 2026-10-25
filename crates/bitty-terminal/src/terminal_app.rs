@@ -4040,9 +4040,23 @@ impl TerminalApp {
         // crash report names what the surface was doing. One relaxed atomic
         // store per window event when crash capture is enabled.
         match &event {
-            PlatformEvent::Resumed => crash_report::lifecycle(crash_report::Lifecycle::Resumed),
+            PlatformEvent::Resumed => {
+                crash_report::lifecycle(crash_report::Lifecycle::Resumed);
+                // Issue #2589: a Wayland shell surface re-maps (a Hyprland
+                // workspace switch-back). The reveal never presents here:
+                // the runtime re-queues one full-redraw next-frame task, so
+                // the buffer present (and any failure retry) runs on its own
+                // later loop turn, off this transition.
+                self.runtime.set_surface_visibility(true);
+            }
             PlatformEvent::Suspended => {
                 crash_report::lifecycle(crash_report::Lifecycle::Suspended);
+                // Issue #2589 / #2570: the workspace switch-away unmaps the
+                // Wayland surface; the compositor may stop releasing swap-
+                // chain buffers, so presentation must not touch the surface
+                // until it re-maps. Cancels the queued frame into retained
+                // damage instead of acquiring.
+                self.runtime.set_surface_visibility(false);
             }
             PlatformEvent::Window { kind, .. } => match kind {
                 WindowEventKind::Resized(_) => {

@@ -196,7 +196,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   headless frame regressions compare each close frame with an instant-delete
   reference in `catppuccin-mocha` and `github-light`.
 
-- **Nix build with patched workspace crates (#2591):** `nix build .#bitty`
+ **Nix build with patched workspace crates (#2591):** `nix build .#bitty`
   failed in the `bitty-deps` derivation because crane's dummy source replaced
   `crates/bitty-pty`/`crates/bitty-plugin-host` with empty stubs while the
   external `bitty-execution` dependency resolves those crates through the

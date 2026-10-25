@@ -1703,6 +1703,10 @@ impl Runtime {
             self.coalesced_deadline = None;
             self.settle_input_at = None;
             self.settle_burst_at = None;
+            // A retry belongs to the surface incarnation that failed. Do not
+            // let its old deadline win over the reveal's next-frame queue;
+            // hidden ticks also must not re-arm it.
+            self.suspend_surface_retry();
         }
         self.pending_full_redraw = true;
     }
@@ -2332,12 +2336,16 @@ impl Runtime {
         // attempt out on the bounded backoff. A failed present already armed
         // a future deadline, and a successful one cleared it.
         if stats.is_none() {
-            if let Some(deadline) = self.surface_retry.deadline {
-                if now >= deadline {
-                    // No present ran: this is a backoff re-arm, not a failed
-                    // present, so it must not count as `retry_failures`.
-                    let delay = self.arm_surface_retry(now);
-                    bitty_render::telemetry::retry_rearmed(delay.as_millis() as u64);
+            if self.surface_visible {
+                if let Some(deadline) = self.surface_retry.deadline {
+                    if now >= deadline {
+                        // No present ran: this is a backoff re-arm, not a
+                        // failed present, so it must not count as a retry
+                        // failure. Hidden ticks return before the retry gate
+                        // and must never re-arm a suspended retry.
+                        let delay = self.arm_surface_retry(now);
+                        bitty_render::telemetry::retry_rearmed(delay.as_millis() as u64);
+                    }
                 }
             }
             // Review (PR #2588): every `None` return above skipped the only
@@ -2395,6 +2403,22 @@ impl Runtime {
         // issue #1449 straight back. The claim goes when it is observed (the
         // echo lands) or when its window elapses, whichever comes first.
         self.age_ime_commit_key_claim(now);
+        // A hidden surface must not retain a deadline that the embedder will
+        // immediately hand back to the event loop. In particular,
+        // `tick_time_gates` can arm the synchronized-update 100 ms wake before
+        // the visibility gate below; while hidden that wake has no useful
+        // work to perform and would cause repeated immediate AboutToWait
+        // deliveries once it becomes due. Damage and Terminal Truth remain
+        // retained for the reveal.
+        // Paste confirmation expiry is independent of presentation and must
+        // still advance while hidden; unlike the other time gates, it does
+        // not arm a wake or touch the surface.
+        self.check_and_auto_cancel_paste_at(now);
+        if !self.surface_visible {
+            self.coalesced_pending = false;
+            self.coalesced_deadline = None;
+            return None;
+        }
         if self.tick_time_gates(now) {
             return None;
         }
@@ -2410,9 +2434,7 @@ impl Runtime {
         // this skips the only paths that clear a deferred frame, but none
         // can be pending: the hide transition releases the deferral book-
         // keeping, and `defer_coalesced_present` only runs below this gate.
-        if !self.surface_visible {
-            return None;
-        }
+        debug_assert!(self.surface_visible);
         // Issue #2570 review: while the retry backoff is pending, do not
         // rebuild the retained frame on every tick. Damage stays in
         // `pending_full_redraw` and the per-origin rings; the deadline wake
@@ -6053,6 +6075,16 @@ impl Runtime {
         self.surface_retry = SurfaceRetry::default();
     }
 
+    /// Suspends retry state while the surface is hidden.
+    ///
+    /// This is not a successful recovery: the failed surface is unavailable,
+    /// so do not publish retry-recovered telemetry. A reveal queues a fresh
+    /// next-frame present and starts a new bounded retry sequence if that
+    /// surface also fails.
+    fn suspend_surface_retry(&mut self) {
+        self.surface_retry = SurfaceRetry::default();
+    }
+
     #[cfg(not(test))]
     fn test_present_attempt(&mut self) -> Option<bool> {
         None
@@ -9507,7 +9539,7 @@ mod surface_retry_tests {
             assert!(rt.tick_at(now).is_none(), "the backoff gates the present");
             let wake = wake_min(&rt);
             assert!(
-                wake >= Some(now),
+                wake.is_none_or(|wake| wake >= now),
                 "wake {wake:?} must never be in the past at {now:?}"
             );
             assert_eq!(
@@ -9649,7 +9681,7 @@ mod surface_visibility_tests {
             );
             let wake = wake_min(&rt);
             assert!(
-                wake >= Some(now),
+                wake.is_none_or(|wake| wake >= now),
                 "wake {wake:?} must never be in the past at {now:?}"
             );
         }
@@ -9665,17 +9697,94 @@ mod surface_visibility_tests {
     }
 
     #[test]
+    fn hidden_synchronized_updates_do_not_leave_a_past_due_wake() {
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        rt.set_surface_visibility_at(t0, false);
+        rt.handle_pty_bytes(b"\x1b[?2026hhidden-sync");
+        assert!(rt.synchronized_update_active());
+
+        // The synchronized-update gate must not run for an occluded surface:
+        // it has no present to defer and must not arm a wake that eventually
+        // becomes past due while hidden. Terminal Truth remains live.
+        for offset in [0, 50, 100, 101] {
+            let now = t0 + std::time::Duration::from_millis(offset);
+            assert!(rt.tick_at(now).is_none());
+            assert_eq!(
+                rt.present_coalescing_deadline(),
+                None,
+                "hidden synchronized tick at {offset} ms must not arm a wake"
+            );
+        }
+
+        // Reveal still owns the first wake; the hidden synchronized batch is
+        // not lost or presented by a hidden tick.
+        let shown = t0 + std::time::Duration::from_millis(120);
+        rt.set_surface_visibility_at(shown, true);
+        assert_eq!(rt.present_coalescing_deadline(), Some(shown));
+        assert!(rt.pending_full_redraw);
+    }
+
+    #[test]
+    fn hidden_paste_expiry_does_not_present_and_reveal_still_presents() {
+        let mut rt = Runtime::with_deterministic_rasterizer(RuntimeConfig {
+            paste_confirm_timeout: std::time::Duration::from_secs(1),
+            ..RuntimeConfig::default()
+        })
+        .expect("deterministic runtime must build");
+        rt.enable_test_present(0);
+        assert!(rt.paste_text_via_gate(String::from("visible\npaste")));
+        assert!(rt.has_pending_paste());
+        let visible_at = std::time::Instant::now() + std::time::Duration::from_millis(1);
+        assert!(
+            rt.tick_at(visible_at).is_some(),
+            "visible paste must present"
+        );
+        assert!(rt.has_pending_paste());
+        let visible_attempts = rt.test_present_attempts();
+
+        let hidden_at = visible_at + std::time::Duration::from_millis(1);
+        rt.set_surface_visibility_at(hidden_at, false);
+
+        let expired = hidden_at + std::time::Duration::from_secs(2);
+        assert!(rt.tick_at(expired).is_none());
+        assert!(!rt.has_pending_paste(), "hidden time must expire the paste");
+        assert_eq!(
+            rt.test_present_attempts(),
+            visible_attempts,
+            "paste expiry must not acquire or present while hidden"
+        );
+
+        let shown = expired + std::time::Duration::from_millis(1);
+        rt.set_surface_visibility_at(shown, true);
+        assert!(rt.tick_at(shown).is_some(), "reveal must still present");
+        assert_eq!(rt.test_present_attempts(), visible_attempts + 1);
+    }
+
+    #[test]
     fn reveal_queues_the_present_instead_of_presenting_inline() {
         let t0 = std::time::Instant::now();
         let mut rt = runtime();
         rt.enable_test_present(usize::MAX);
         rt.pending_full_redraw = true;
         let _ = rt.tick_at(t0);
-        // Drop the baseline failure's retry so the reveal alone schedules the
-        // next present: this isolates the transition behaviour.
-        rt.surface_retry.failures = 0;
-        rt.surface_retry.deadline = None;
+        let stale_retry = rt
+            .surface_retry_deadline()
+            .expect("the baseline failure arms a retry");
         rt.set_surface_visibility_at(t0 + std::time::Duration::from_millis(5), false);
+        assert_eq!(
+            rt.surface_retry_deadline(),
+            None,
+            "hide suspends the stale retry instead of carrying it across the reveal"
+        );
+        assert!(stale_retry > t0);
+        let hidden_late = stale_retry + std::time::Duration::from_millis(1);
+        assert!(rt.tick_at(hidden_late).is_none());
+        assert_eq!(
+            rt.surface_retry_deadline(),
+            None,
+            "a hidden tick must not re-arm the suspended retry"
+        );
 
         // Switch-back: the transition only re-queues work. Nothing presents
         // inside the handler (the attempt counter is untouched by the reveal
@@ -9710,7 +9819,7 @@ mod surface_visibility_tests {
             assert!(rt.tick_at(now).is_none(), "the backoff gates the present");
             let wake = wake_min(&rt);
             assert!(
-                wake >= Some(now),
+                wake.is_none_or(|wake| wake >= now),
                 "wake {wake:?} must never be in the past at {now:?}"
             );
         }

@@ -271,6 +271,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   workspace `[patch]` table. The flake now builds a single real-source
   derivation (`cargoArtifacts = null`), and `just nix-patch-test` fails if
   dummy-source caching returns while those patch paths exist.
+
 - **Stall-watchdog delivery hardening (#2560):** report delivery now records
   every outcome (`delivered`, `helper-failed`, `timed-out`, `spawn-failed`,
   `evidence-failed`) in a bounded companion slot

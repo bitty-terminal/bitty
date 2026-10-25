@@ -5171,6 +5171,104 @@ mod tests {
         );
     }
 
+    /// The clockwise rotation is an axis rotation, not just a side flip:
+    /// Right (horizontal), Down (vertical), Left (horizontal), Up (vertical).
+    /// The cell-aspect heuristic alone collapses this to Right, Right, Left,
+    /// Left on a normal wide window, which is the observed Mod+N defect.
+    #[test]
+    fn chrome_new_panel_spiral_rotates_the_split_axis() {
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime
+            .set_container(bitty_runtime::UiRect::new(0, 0, 160, 40));
+        let expected = [
+            SplitAxis::Horizontal,
+            SplitAxis::Vertical,
+            SplitAxis::Horizontal,
+            SplitAxis::Vertical,
+        ];
+        for (index, axis) in expected.into_iter().enumerate() {
+            let plan = app
+                .runtime
+                .panel_split_plan()
+                .expect("the spiral target must stay feasible");
+            assert_eq!(
+                plan.axis,
+                axis,
+                "split {} must follow the clockwise Right/Down/Left/Up rotation",
+                index + 1
+            );
+            app.apply_chrome_action(ChromeAction::NewPanel);
+        }
+    }
+
+    /// When the phase axis cannot host two usable panes the perpendicular
+    /// axis keeps the chord working instead of dropping it, and the spiral
+    /// continues from the pane it created.
+    #[test]
+    fn chrome_new_panel_spiral_degrades_to_the_perpendicular_axis() {
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        // 40x6: a horizontal 20+20 split fits, a vertical split cannot fit
+        // two 4-row panes.
+        app.runtime
+            .set_container(bitty_runtime::UiRect::new(0, 0, 40, 6));
+        app.apply_chrome_action(ChromeAction::NewPanel);
+        assert_eq!(app.runtime.leaf_count(), 2);
+        let plan = app
+            .runtime
+            .panel_split_plan()
+            .expect("the perpendicular axis must stay available");
+        assert_eq!(
+            plan.axis,
+            SplitAxis::Horizontal,
+            "a 6-row pane cannot split vertically, so the spiral degrades"
+        );
+        assert!(
+            !plan.place_new_first,
+            "phase 1 keeps the new pane right/bottom"
+        );
+        assert_eq!(plan.spiral_phase, Some(1), "the chain keeps its phase");
+        app.apply_chrome_action(ChromeAction::NewPanel);
+        assert_eq!(app.runtime.leaf_count(), 3);
+    }
+
+    /// A tall container starts from the vertical base axis: Down, Right, Up,
+    /// Left, with the fresh pane placed after the first two presses and
+    /// before the last two.
+    #[test]
+    fn chrome_new_panel_spiral_rotates_from_the_vertical_base() {
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        app.runtime
+            .set_container(bitty_runtime::UiRect::new(0, 0, 40, 80));
+        let expected = [
+            (SplitAxis::Vertical, false),
+            (SplitAxis::Horizontal, false),
+            (SplitAxis::Vertical, true),
+            (SplitAxis::Horizontal, true),
+        ];
+        for (index, (axis, place_first)) in expected.into_iter().enumerate() {
+            let plan = app
+                .runtime
+                .panel_split_plan()
+                .expect("the tall spiral target must stay feasible");
+            assert_eq!(
+                plan.axis,
+                axis,
+                "split {} must turn 90 degrees from the vertical base",
+                index + 1
+            );
+            assert_eq!(
+                plan.place_new_first,
+                place_first,
+                "split {} side must follow the phase",
+                index + 1
+            );
+            app.apply_chrome_action(ChromeAction::NewPanel);
+        }
+    }
+
     #[test]
     fn chrome_floating_toggle_default_mod_a_resolves() {
         // CTX-0962 (#1695): Mod+a toggles floating. Both alt+a/alt+v were

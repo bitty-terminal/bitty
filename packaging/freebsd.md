@@ -91,7 +91,7 @@ Useful knobs:
 ## Regenerating `distinfo` at tag time
 
 `packaging/freebsd/x11/bitty/distinfo` carries only a comment. It cannot hold
-real checksums before the `v0.0.28` tag exists, because `make makesum` hashes
+real checksums before the `v0.0.29` tag exists, because `make makesum` hashes
 the published tarball and every vendored crate. Run it as part of the release:
 
 ```sh

@@ -1,6 +1,6 @@
 # Maintainer: Xuepo <xuepo@bitty.run>
 pkgname=bitty
-pkgver=0.0.28
+pkgver=0.0.29
 pkgrel=0
 pkgdesc="GPU-accelerated terminal emulator with built-in pane multiplexer and Lua extensions"
 url="https://bitty.run"

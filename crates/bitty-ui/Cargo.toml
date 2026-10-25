@@ -14,7 +14,7 @@ publish = true
 workspace = true
 
 [dependencies]
-bitty-term-state = { version = "0.0.28", path = "../bitty-term-state" }
+bitty-term-state = { version = "0.0.29", path = "../bitty-term-state" }
 # CTX-1362 / #2257: the accepted W-134 snapshot-model seam. The extension
 # owns `Role`/`SceneKind`/`SnapshotBuilder`/`Adapter` and the bounded host
 # contract; Core implements `SnapshotHost` over its terminal projection and
@@ -34,6 +34,6 @@ bitty-a11y-component = { package = "bitty-a11y", version = "0.0.1", git = "https
 
 
 [dev-dependencies]
-bitty-rich = { version = "0.0.28", path = "../bitty-rich" }
-bitty-term-state = { version = "0.0.28", path = "../bitty-term-state" }
-bitty-vt = { version = "0.0.28", path = "../bitty-vt" }
+bitty-rich = { version = "0.0.29", path = "../bitty-rich" }
+bitty-term-state = { version = "0.0.29", path = "../bitty-term-state" }
+bitty-vt = { version = "0.0.29", path = "../bitty-vt" }

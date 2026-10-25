@@ -147,7 +147,7 @@ expect_contains "$BUILD_SRPM" 'rpm -qp --qf' \
 
 expect_contains "packaging/bitty.spec" 'Version:        %{version}' \
   "spec version is overridable"
-expect_contains "packaging/bitty.spec" '%{!?version:%global version 0.0.27}' \
+expect_contains "packaging/bitty.spec" '%{!?version:%global version 0.0.29}' \
   "spec keeps a default version"
 expect_contains "packaging/bitty.spec" "BuildRequires:  zstd" \
   "spec declares zstd for .tar.zst extraction"

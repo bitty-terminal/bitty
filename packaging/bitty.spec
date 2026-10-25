@@ -1,6 +1,6 @@
 # Release tooling overrides this for historical tags:
 #   rpmbuild -bs ... --define "version X.Y.Z"
-%{!?version:%global version 0.0.27}
+%{!?version:%global version 0.0.29}
 # The payload is a prebuilt release bundle; there is no local compilation.
 %global debug_package %{nil}
 Name:           bitty
@@ -9,6 +9,8 @@ Release:        1%{?dist}
 Summary:        Bitty pre-alpha terminal workspace minimal correct terminal
 License:        MIT OR Apache-2.0
 URL:            https://github.com/bitty-terminal/bitty
+# Only x86_64 and aarch64 bundles are published; any other arch has no Source.
+ExclusiveArch:  x86_64 aarch64
 Source0:        https://cdn.bitty.run/releases/v%{version}/bitty-%{version}-x86_64-unknown-linux-gnu.tar.zst
 Source1:        https://cdn.bitty.run/releases/v%{version}/bitty-%{version}-aarch64-unknown-linux-gnu.tar.zst
 

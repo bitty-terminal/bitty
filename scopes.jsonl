@@ -1618,3 +1618,5 @@
 {"created_at":"2026-10-24T04:31:34.279420779+00:00","id":"01M5P2VAC7WNE8Y0CRGPC4VJ57","kind":"include","pattern":"CHANGELOG.md","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M5P1KFKCNMQEH1SWJYPTYSW3"}
 {"created_at":"2026-10-24T05:12:27.826501142+00:00","id":"01M5P566DJNKWWYM83PFED9FPM","kind":"include","pattern":"bitty/scripts/make-appimage.sh","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M5P55SACKWND9BM0X6K6HWBS"}
 {"created_at":"2026-10-24T05:12:27.880772545+00:00","id":"01M5P566F8X9BGYX5ADJTC63WD","kind":"include","pattern":"bitty/scripts/tests/make-appimage.test.sh","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M5P55SACKWND9BM0X6K6HWBS"}
+{"created_at":"2026-10-25T04:35:42.975010289+00:00","id":"01M5RNFM7ZEHKSCVH66N835CBB","kind":"include","pattern":"crates/bitty-runtime/src/runtime/present.rs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M5RNFM64EQ4GTC1SQVVGTK8Q"}
+{"created_at":"2026-10-25T04:35:43.026519079+00:00","id":"01M5RNFM9J1DSRQSTGHGFFSZ6P","kind":"include","pattern":"crates/bitty-terminal/src/tests.rs","project_id":"01M0WAMWPGZ2YDGM6M88AT3YGT","task_id":"01M5RNFM64EQ4GTC1SQVVGTK8Q"}

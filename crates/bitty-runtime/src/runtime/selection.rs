@@ -2654,11 +2654,38 @@ impl Runtime {
     /// consumed either way, so its CR can never reach the PTY behind the
     /// gate (that would submit the line the confirmation was guarding).
     /// With no paste pending the key keeps its normal binding/encoding.
-    ///
     /// Only the paste gate is affected: workspace-close and view/window-close
     /// arms keep their repeat-the-chord gesture (`Esc` remains their cancel).
     /// Copy/search modes and IME preedit own the keyboard above the caller,
     /// so this never fires there.
+    ///
+    /// # Input-ownership contract for `Enter` while a paste pends
+    ///
+    /// Normative ownership for every `Enter` frame the gate is visible for;
+    /// `paste_confirm_enter_ownership.rs` is the executable form of this
+    /// table (issue #2632, history: issue #2265, issue #1438, PR #2269).
+    /// "Encoding path" is the negotiated Kitty flag set of the focused pane:
+    /// *legacy* = flags `0` or an emitted frame's legacy fallback, *report
+    /// events* = flags with `report-events` (bit 2), *all keys* = flags with
+    /// `report-all-keys` (bit 8) on top. The confirm lifecycle flag is
+    /// `pending_paste_enter_swallow`.
+    ///
+    /// | Event | Gate visible, no modifiers | Gate visible, any modifier held | While confirm-lifecycle live (`swallow`) | Gate absent / cancelled / confirmed |
+    /// |---|---|---|---|---|
+    /// | Press | Confirms and is consumed. Delivers the pending paste exactly once (bracketed when `?2004`), never its own `CR`/legacy Enter bytes, never a `CSI u` frame. An expired gate auto-cancels first (issue #1438): consumed, delivers nothing. | Never confirms (ordinary key routing; negotiated `Shift+Enter` `CSI 13;2u` identity is preserved per the separately scoped decision). Forwarded exactly once per its own path. | Consumed before any encoding; no bytes either way. | Ordinary key routing, exactly once per its own path. |
+    /// | Repeat | Consumed with the lifecycle below: no bytes, no delivery. (Before a confirm exists, a repeated press is an ordinary press.) | Ordinary key routing, exactly once per its own path. | Consumed, no bytes, no delivery; does not clear the lifecycle. | Ordinary key routing, exactly once per its own path. |
+    /// | Release | Consumed; legacy/report-events paths had emitted nothing for it anyway and the lifecycle below is armed. | Ordinary key routing (legacy: no bytes; report-events: the `:3` frame when the event-type form is negotiated). | Consumed, no bytes; clears the confirm lifecycle below. | Ordinary key routing (legacy: no bytes; report-events: `:3` frame). |
+    ///
+    /// Confirm lifecycle (`pending_paste_enter_swallow`): armed by the
+    /// confirming press, released by its paired `Enter` release. A held
+    /// `Enter` can therefore leak neither a repeat `CR` nor a release frame
+    /// behind the delivered paste. Focus loss disarms it (`set_focused`
+    /// CTX-1505) so a delayed frame can never swallow a later `Enter` after
+    /// focus returns; the pending paste itself is not cancelled by focus
+    /// loss. Bare `Enter` stays on the spec's legacy exception under Kitty
+    /// (press/repeat `CR`, release no frame) unless
+    /// `report-all-keys` negotiates the full `CSI 13;1:2u`/`13;1:3u` forms;
+    /// modified `Enter` always keeps its `CSI u` identity under negotiation.
     ///
     /// Returns `true` when a pending paste was present and the press was
     /// consumed; `false` otherwise.

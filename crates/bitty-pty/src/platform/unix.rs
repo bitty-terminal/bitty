@@ -96,6 +96,27 @@ fn is_transient_spawn_errno(errno: Option<i32>) -> bool {
     )
 }
 
+/// Serializes FreeBSD pair creation (CTX-1561).
+///
+/// libutil's `openpty()` resolves the slave path with `ptsname(3)`, which
+/// returns a pointer into a process-wide `static` buffer (only `ptsname_r(3)`
+/// is reentrant) and hands it to `open(2)` a few instructions later. Two
+/// threads that create PTYs at the same time can interleave between those two
+/// calls, so one pair opens the other pair's slave: its `TIOCSWINSZ` lands on
+/// the sibling's tty, its own master keeps the kernel's zero-initialized
+/// winsize forever (`(0, 0)` in release run 40211911571), and its child gets
+/// stdio on a terminal another session may already own (the `TIOCSCTTY`
+/// `EPERM`/`ENOTTY` family CTX-1020 retries).
+///
+/// Holding this lock across the upstream `openpty` call keeps each pair bound
+/// to its own slave. Only pair creation is serialized: fork/exec, resize, and
+/// I/O stay concurrent, so the cost is one uncontended lock per PTY. Every
+/// `bitty-pty` spawn in the process goes through this call site. FreeBSD-only:
+/// this is the platform where the failure was observed, and the other Unix
+/// paths keep their existing behavior.
+#[cfg(target_os = "freebsd")]
+static OPENPTY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub(crate) fn open_pty_and_spawn(
     config: &SpawnConfig,
 ) -> Result<(Master, Child, Option<crate::tree::OwnedTree>), PtyError> {
@@ -119,14 +140,25 @@ pub(crate) fn open_pty_and_spawn(
 fn open_pty_and_spawn_once(
     config: &SpawnConfig,
 ) -> Result<(Master, Child, Option<crate::tree::OwnedTree>), (PtyError, bool)> {
-    let pair = native_pty_system()
-        .openpty(to_size(
-            config.cols,
-            config.rows,
-            config.pixel_width,
-            config.pixel_height,
-        ))
-        .map_err(|err| (PtyError::flatten_upstream(err), false))?;
+    // CTX-1561: hold the FreeBSD pair-creation lock only for `openpty`
+    // itself; the spawn below may stay concurrent. A poisoned lock means a
+    // previous holder panicked inside upstream code, which is unrelated to
+    // the pair being created now, so recover the guard instead of wedging
+    // every later spawn.
+    let pair = {
+        #[cfg(target_os = "freebsd")]
+        let _openpty_guard = OPENPTY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        native_pty_system()
+            .openpty(to_size(
+                config.cols,
+                config.rows,
+                config.pixel_width,
+                config.pixel_height,
+            ))
+            .map_err(|err| (PtyError::flatten_upstream(err), false))?
+    };
 
     let mut argv: Vec<OsString> = Vec::with_capacity(config.args.len() + 1);
     argv.push(config.program.clone());

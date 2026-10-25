@@ -111,17 +111,96 @@ fn spawn_gated(
     panic!("gated child never produced the marker after a fresh respawn: {diagnosis}");
 }
 
+/// Fresh-PTY respawns allowed for an unapplied initial winsize (CTX-1561).
+///
+/// The FreeBSD failure is per pair: a process-wide `ptsname()` static buffer
+/// raced by a sibling spawn cross-wires the slave descriptor, so that pair's
+/// master keeps the kernel's zero-initialized winsize forever (closing the
+/// slave never clears `t_winsize`). One fresh pair is enough to escape it; a
+/// second failure is a genuine "initial size never applied" regression and
+/// must panic. Zero elsewhere: Linux and macOS keep their single-attempt
+/// behavior, which the FreeBSD libutil race cannot affect.
+#[cfg(target_os = "freebsd")]
+const MAX_INITIAL_SIZE_RESPAWNS: usize = 1;
+#[cfg(not(target_os = "freebsd"))]
+const MAX_INITIAL_SIZE_RESPAWNS: usize = 0;
+
+/// Spawns a PTY and replaces the pair once when FreeBSD's `openpty()` loses
+/// the parallel-spawn race (CTX-1561, release run 40211911571: `(0, 0)`
+/// against `(80, 24)`).
+///
+/// FreeBSD libutil's `openpty()` builds the slave path with `ptsname()`, whose
+/// result points into a process-wide `static` buffer (`ptsname_r()` is the
+/// reentrant form), and then opens it. Two test threads can interleave between
+/// those calls: pair A opens pair B's slave, A's `TIOCSWINSZ` lands on B's tty,
+/// and A's own master keeps the zero-initialized winsize forever — the kernel
+/// keeps `t_winsize` on the tty and a closed slave never clears it. Re-reading
+/// the same pair therefore cannot repair it, so the only recovery is a fresh
+/// pair; child liveness is recorded for diagnosis only.
+///
+/// `openpty(3)` applies the requested winsize before it returns, so a healthy
+/// pair answers the single probe. Only the documented zero-geometry signature
+/// is respawned (`is_known_transient`); any other mismatch, or a failed probe,
+/// panics at once because it has no known transient signature. The caller's
+/// exact assertion still runs on the accepted pair, so a regression that never
+/// applies the size fails loudly after the bounded attempts instead of being
+/// retried away.
+fn spawn_with_initial_geometry<T>(
+    expected: T,
+    spawn: impl Fn() -> bitty_pty::Pty,
+    probe: impl Fn(&bitty_pty::Pty) -> Result<T, PtyError>,
+    is_known_transient: impl Fn(&T) -> bool,
+) -> bitty_pty::Pty
+where
+    T: PartialEq + std::fmt::Debug,
+{
+    let attempts = MAX_INITIAL_SIZE_RESPAWNS + 1;
+    let mut diagnosis = String::from("no attempts ran");
+    for attempt in 1..=attempts {
+        let mut pty = spawn();
+        let measured = probe(&pty);
+        if measured
+            .as_ref()
+            .is_ok_and(|geometry| *geometry == expected)
+        {
+            return pty;
+        }
+        let transient = measured.as_ref().is_ok_and(&is_known_transient);
+        let child_exit = pty.try_wait().ok().flatten();
+        diagnosis = format!(
+            "attempt {attempt}/{attempts}: measured={measured:?} \
+             requested={expected:?} tty={:?} child_exit={child_exit:?}",
+            pty.tty_name(),
+        );
+        // The dud's `Drop` kills and reaps a still-running child, or reaps
+        // nothing when the liveness probe already consumed the status, so a
+        // cross-wired pair cannot leak into the respawn.
+        drop(pty);
+        if !transient {
+            break;
+        }
+    }
+    panic!("initial PTY geometry was never applied after bounded respawns: {diagnosis}");
+}
+
 /// `TIOCGWINSZ` pixel geometry is what `kitty +kitten icat` reads
 /// (`tools/tty.GetSize`); zero on either axis makes it report "Terminal
 /// does not support reporting screen sizes in pixels" (#2442). The spawn
 /// size and every resize must carry the pixel axes.
 #[test]
 fn pty_reports_pixel_geometry_through_winsize() {
-    let pty = PtyBuilder::new("/bin/cat")
-        .size(80, 24)
-        .pixel_size(720, 456)
-        .spawn()
-        .expect("spawn /bin/cat");
+    let pty = spawn_with_initial_geometry(
+        (80, 24, 720, 456),
+        || {
+            PtyBuilder::new("/bin/cat")
+                .size(80, 24)
+                .pixel_size(720, 456)
+                .spawn()
+                .expect("spawn /bin/cat")
+        },
+        bitty_pty::Pty::size_pixels,
+        |(cols, rows, _, _)| *cols == 0 && *rows == 0,
+    );
     assert_eq!(
         pty.size_pixels().expect("initial pixel size"),
         (80, 24, 720, 456)
@@ -139,10 +218,22 @@ fn pty_reports_pixel_geometry_through_winsize() {
 
 #[test]
 fn cat_echo_resize_and_graceful_shutdown() {
-    let mut pty = PtyBuilder::new("/bin/cat")
-        .size(80, 24)
-        .spawn()
-        .expect("spawn /bin/cat");
+    // CTX-1561: FreeBSD's libutil `openpty()` can cross-wire two pairs spawned
+    // by parallel test threads (process-wide `ptsname()` static buffer); the
+    // victim's master then reports `(0, 0)` forever. The helper probes once and
+    // respawns once on FreeBSD, while the exact assertion below still guards a
+    // genuine "initial size never applied" regression on every platform.
+    let mut pty = spawn_with_initial_geometry(
+        (80, 24),
+        || {
+            PtyBuilder::new("/bin/cat")
+                .size(80, 24)
+                .spawn()
+                .expect("spawn /bin/cat")
+        },
+        bitty_pty::Pty::size,
+        |(cols, rows)| *cols == 0 && *rows == 0,
+    );
 
     assert_eq!(pty.size().expect("initial size"), (80, 24));
     pty.resize(120, 40).expect("resize up");

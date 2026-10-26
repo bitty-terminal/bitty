@@ -315,6 +315,122 @@ fn alternating_refused_strings_and_text_stay_bounded() {
     assert_recovers(&actions, "alternating refused strings");
 }
 
+/// Checked-in generator for the `control_string_cap` fuzz target's seed
+/// corpus (CTX-1603).
+///
+/// The cap is ~4 MiB, so these seeds cannot live in the retained corpora:
+/// every `fuzz/` target truncates input to 32 KiB and would never reach the
+/// cap. This ignored test writes them into the gitignored
+/// `fuzz/corpus/control_string_cap/` instead, and derives every boundary from
+/// [`CAP`] (itself the crate's public constants) rather than duplicating the
+/// number:
+///
+/// ```sh
+/// cargo test -p bitty-vt --test control_string_cap -- --ignored --nocapture generate_cap_seeds
+/// cargo +nightly fuzz run control_string_cap fuzz/corpus/control_string_cap -- -runs=64
+/// ```
+///
+/// It self-checks the seeds while writing them: the at-cap strings are
+/// admitted (still open at end of input), the just-past-cap strings are
+/// refused exactly once, and the resync seeds deliver their title and text.
+#[test]
+#[ignore = "generator: run explicitly to materialize the over-cap fuzz corpus"]
+fn generate_cap_seeds() {
+    fn write(dir: &std::path::Path, name: &str, wire: &[u8]) {
+        let path = dir.join(name);
+        std::fs::write(&path, wire).expect("write fuzz seed");
+        eprintln!("wrote {} ({} bytes)", path.display(), wire.len());
+    }
+
+    fn parse_wire(wire: &[u8]) -> Vec<TerminalAction> {
+        let mut parser = Parser::new();
+        let mut actions = Vec::new();
+        parser.advance(wire, |action| actions.push(action));
+        actions
+    }
+
+    fn has_title(actions: &[TerminalAction], title: &str) -> bool {
+        actions.iter().any(
+            |action| matches!(action, TerminalAction::OscTitle { text } if text.as_str() == title),
+        )
+    }
+
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fuzz/corpus/control_string_cap");
+    std::fs::create_dir_all(&dir).expect("create fuzz corpus dir");
+
+    let filler = vec![b'A'; CAP];
+    let over = vec![b'A'; CAP + 1];
+
+    // `vte`-owned families: at the cap the string is still open at end of
+    // input (no refusal); one byte past it is refused exactly once.
+    for (label, introducer) in [
+        ("osc", b"\x1b]".as_slice()),
+        ("dcs", b"\x1bP".as_slice()),
+        ("sos", b"\x1bX".as_slice()),
+        ("pm", b"\x1b^".as_slice()),
+    ] {
+        let mut at_cap = introducer.to_vec();
+        at_cap.extend_from_slice(&filler);
+        assert!(
+            refusal_kinds(&parse_wire(&at_cap)).is_empty(),
+            "{label} at cap must be admitted"
+        );
+        write(&dir, &format!("{label}-at-cap.bin"), &at_cap);
+
+        let mut past_cap = introducer.to_vec();
+        past_cap.extend_from_slice(&over);
+        assert_eq!(
+            refusal_kinds(&parse_wire(&past_cap)).len(),
+            1,
+            "{label} past cap must be refused once"
+        );
+        write(&dir, &format!("{label}-past-cap.bin"), &past_cap);
+    }
+
+    // Parser-handled APC: the header `z;` is charged too, so the at-cap body
+    // is two bytes shorter than the other families.
+    let mut at_cap = b"\x1b_z;".to_vec();
+    at_cap.extend_from_slice(&filler[2..]);
+    assert!(
+        refusal_kinds(&parse_wire(&at_cap)).is_empty(),
+        "apc at cap must be admitted"
+    );
+    write(&dir, "apc-at-cap.bin", &at_cap);
+    let mut past_cap = b"\x1b_z;".to_vec();
+    past_cap.extend_from_slice(&over[2..]);
+    assert_eq!(
+        refusal_kinds(&parse_wire(&past_cap)).len(),
+        1,
+        "apc past cap must be refused once"
+    );
+    write(&dir, "apc-past-cap.bin", &past_cap);
+
+    // Discard resync after a refusal (bitty#2712): the `ESC ]0;t` tail must
+    // still deliver the title, and the trailing text must still print.
+    let mut osc_resync = b"\x1b]".to_vec();
+    osc_resync.extend_from_slice(&over);
+    osc_resync.extend_from_slice(b"\x1b]0;t\x07ok");
+    let actions = parse_wire(&osc_resync);
+    assert_eq!(refusal_kinds(&actions), vec![ControlStringKind::Osc]);
+    assert!(has_title(&actions, "t"), "osc resync title: {actions:?}");
+    write(&dir, "osc-past-cap-esc-title.bin", &osc_resync);
+
+    let mut apc_resync = b"\x1b_z;".to_vec();
+    apc_resync.extend_from_slice(&over[2..]);
+    apc_resync.extend_from_slice(b"\x1b]0;t\x07ok");
+    let actions = parse_wire(&apc_resync);
+    assert_eq!(refusal_kinds(&actions), vec![ControlStringKind::Apc]);
+    assert!(has_title(&actions, "t"), "apc resync title: {actions:?}");
+    write(&dir, "apc-past-cap-esc-title.bin", &apc_resync);
+
+    eprintln!(
+        "cap seeds ready in {}: run `cargo +nightly fuzz run control_string_cap \
+         fuzz/corpus/control_string_cap -- -runs=64`",
+        dir.display()
+    );
+}
+
 #[test]
 fn the_iterm2_diversion_shares_the_cap_without_being_refused() {
     // A candidate body exactly at the iTerm2 body cap consumes the whole

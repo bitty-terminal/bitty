@@ -39,6 +39,17 @@ test = false
 doc = false
 bench = false
 
+# Over-cap control strings (CTX-1603). This target does *not* truncate input:
+# the parser cap is ~4 MiB, so the seed corpus is generated into the
+# gitignored fuzz/corpus/control_string_cap/ by the ignored
+# `generate_cap_seeds` test in crates/bitty-vt/tests/control_string_cap.rs.
+[[bin]]
+name = "control_string_cap"
+path = "fuzz_targets/control_string_cap.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 
 [dependencies.bitty-term-state]

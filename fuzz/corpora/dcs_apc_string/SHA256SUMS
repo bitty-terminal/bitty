@@ -9,6 +9,8 @@ ff6b648bdfdc2b7dfce0814c20c2930d7044637615b68d94f65a5daed60a086c  fuzz/corpora/d
 6f323dad04cc75a17ae64d3ccaec36878100d1adc1e23d466f953a7a307ff05f  fuzz/corpora/dcs_apc_string/78-kitty-unknown-action.bin
 bc0faec729a2819bd42cd6a3cb2cb1b25a0b07f6cf404c1f3be678aab11b177e  fuzz/corpora/dcs_apc_string/79-kitty-no-payload.bin
 844c1a4248b7f29a0b831c2567e53db3f563c4267abadab378961f8d3b94df07  fuzz/corpora/dcs_apc_string/80-kitty-oversize-raw.bin
+481e8a845c08fc9cf930d5c77c969c7574799d007da1fd23800592f0d9d299f1  fuzz/corpora/dcs_apc_string/81-dcs-st-osc1337-image.bin
+6ee7bc16c328659c025a02d1865cf14b2a57e16a28c158442fdc54f6c1664d7a  fuzz/corpora/dcs_apc_string/82-kitty-interleaved-text.bin
 8c45a5bc18365ef95b7e21d2d6b28b3d511b6b7a1d79c3b67d61e44bbef0b2f9  fuzz/corpora/dcs_apc_string/from-12-dcs-and-status-P-1.bin
 62df934512fcaded7418ae9dea52ef5b4192d4f8817a98b8e81f1ea688acce12  fuzz/corpora/dcs_apc_string/from-12-dcs-and-status-P.bin
 3d503a3c4aecc41c1cd8d51e50cecdcdf981ca38b578022755396c6d4c9ca8c7  fuzz/corpora/dcs_apc_string/from-17-unterminated-dcs-P.bin

@@ -96,6 +96,23 @@ pub fn assert_small_ledger_invariants(data: &[u8]) {
     );
 }
 
+/// Asserts fresh-run determinism on the input **without** truncation and
+/// without the byte-wise replay.
+///
+/// Only the `control_string_cap` target uses this: it feeds multi-megabyte
+/// strings on purpose (the parser cap is ~4 MiB, so [`MAX_INPUT_BYTES`]
+/// would hide the path), and parsing 4 MiB one byte per call is far too slow
+/// to fuzz. Chunking identity is covered for the same families by the
+/// bounded targets and by `crates/bitty-vt/tests/control_string_cap.rs`.
+pub fn assert_whole_run_invariants(data: &[u8]) {
+    let first = collect_whole(data);
+    let second = collect_whole(data);
+    assert_eq!(
+        first, second,
+        "parser replay diverged between identical runs"
+    );
+}
+
 /// Wraps a raw payload as terminal string sequences for every introducer the
 /// parser distinguishes: DCS (`ESC P`), APC (`ESC _`), SOS (`ESC X`), and PM
 /// (`ESC ^`), each with both `ST` and `BEL` terminators.

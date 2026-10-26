@@ -38,3 +38,5 @@ d05a1f7c7b08910cf675adead728d917c0ea3579002b51fa12c3c38b10e216a4  fuzz/corpora/o
 ca613a8e00da75700a04b30303214682f263454a4bf951ecd13d547da8b80619  fuzz/corpora/osc_string/66-overlong-payload.bin
 a3c941de11d0cd50d1536dd133f762c2638b091942cfb07f6cc99dd6be0cbaf1  fuzz/corpora/osc_string/67-invalid-utf8.bin
 9d67234d367fb3dba3d4c101869810c142c013798b153ed2a2febca53ec01524  fuzz/corpora/osc_string/68-colon-subparams.bin
+943abf254e694ff699f3a4692fc88c758f0d120bcaa00e4f9a33a78f6e84ca7e  fuzz/corpora/osc_string/69-osc1337-file-image.bin
+2ea98c4c59cb78e20392ec177626e188a701a504ad588fa8f0e82fdff98d819c  fuzz/corpora/osc_string/70-osc1337-file-image-truncated.bin

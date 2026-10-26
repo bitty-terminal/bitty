@@ -5,7 +5,7 @@
 `fuzz/` holds the cargo-fuzz target crate for the VT parser family plus the
 content-addressed seed corpora cited by the R-001 evidence.
 
-- `fuzz/Cargo.toml` — `bitty-fuzz` package, `cargo-fuzz = true`, three
+- `fuzz/Cargo.toml` — `bitty-fuzz` package, `cargo-fuzz = true`, four
   `[[bin]]` targets, path dependency on `crates/bitty-vt`.
 - `fuzz/fuzz_targets/` — target sources (`common.rs` shared helpers).
 - `fuzz/corpora/` — retained seed corpora (this file documents them).
@@ -14,11 +14,12 @@ content-addressed seed corpora cited by the R-001 evidence.
 
 ## Target crate
 
-| Target           | Surface                                                                                   |
-| ---------------- | ----------------------------------------------------------------------------------------- |
-| `vt_parser`      | arbitrary bytes into `bitty_vt::Parser` (whole + byte-wise replay)                        |
-| `osc_string`     | OSC payload bodies (`ESC ] ...` BEL / `ST`)                                               |
-| `dcs_apc_string` | DCS/APC/SOS/PM bodies plus kitty `APC G` single-shot and `m=1`/`m=1`/`m=0` chunked shapes |
+| Target               | Surface                                                                                   |
+| -------------------- | ----------------------------------------------------------------------------------------- |
+| `vt_parser`          | arbitrary bytes into `bitty_vt::Parser` (whole + byte-wise replay)                        |
+| `osc_string`         | OSC payload bodies (`ESC ] ...` BEL / `ST`)                                               |
+| `dcs_apc_string`     | DCS/APC/SOS/PM bodies plus kitty `APC G` single-shot and `m=1`/`m=1`/`m=0` chunked shapes |
+| `control_string_cap` | whole control strings at and past `CONTROL_STRING_MAX_BYTES` (generated corpus, below)    |
 
 Every target feeds bytes through the real public `bitty_vt::Parser::advance`
 API and drives it to completion. Each input asserts two contract invariants:
@@ -32,7 +33,9 @@ without allocating the production 320 MB ledger.
 Bounds (enforced in `fuzz/fuzz_targets/common.rs`, not by the harness):
 
 - Input is truncated to `MAX_INPUT_BYTES` (32 KiB); every retained seed is
-  ≤ 8 KiB, so seeds are never truncated.
+  ≤ 8 KiB, so seeds are never truncated. `control_string_cap` is the one
+  exception: it feeds its input whole (no truncation, no byte-wise replay),
+  because the parser cap is ~4 MiB and a 32 KiB bound would hide it.
 - Retained actions are capped at `MAX_ACTIONS` (65536); every byte is still
   parsed, only the comparison vector stops growing.
 - No wall-clock, sleeps, randomness, filesystem, or network access exists in a
@@ -65,6 +68,22 @@ nightly, a compile-only check is
 `cargo check --manifest-path fuzz/Cargo.toml` (stable can type-check the
 target crate).
 
+`control_string_cap` has no committed seeds: its inputs are at and just past
+the ~4 MiB parser cap, which is larger than every other target's 32 KiB input
+bound (they would be truncated before reaching the cap). A checked-in
+generator — the ignored `generate_cap_seeds` test — writes them into the
+gitignored scratch corpus, self-checks the boundary, and prints the command:
+
+```sh
+cargo test -p bitty-vt --test control_string_cap -- --ignored --nocapture generate_cap_seeds
+# libFuzzer's default mutation cap is 1 MiB, so pass -max_len for this target:
+cargo +nightly fuzz run control_string_cap fuzz/corpus/control_string_cap -- -max_len=4198432 -runs=64
+```
+
+The exact at-cap/just-past-cap boundary (all five string families) is also
+pinned deterministically by `crates/bitty-vt/tests/control_string_cap.rs`,
+which the stable workspace gates run.
+
 ## Corpus retention policy on new findings
 
 - A crash/hang is a finding: fix it, then commit the **minimized** artifact
@@ -74,7 +93,8 @@ target crate).
 - New coverage discovered by long runs (`fuzz/corpus/<target>/` is
   gitignored): promote the interesting cases into `fuzz/corpora/<target>/`
   deliberately — never commit the scratch corpus wholesale. Bound any added
-  seed to the target's `MAX_INPUT_BYTES`.
+  seed to the target's `MAX_INPUT_BYTES`, except for `control_string_cap`,
+  whose seeds are generated on demand and never committed (see above).
 - Regenerate the manifest after any edit (from the repo root, so the
   committed `fuzz/corpora/<target>/` path prefix stays stable):
   `(cd fuzz/corpora/<target> && sha256sum *.bin | sed 's#  #  fuzz/corpora/<target>/#') > fuzz/corpora/<target>/SHA256SUMS`
@@ -85,17 +105,21 @@ target crate).
 
 ## Retained corpora
 
-| Directory                     | Target           | Seeds | Source                                         |
-| ----------------------------- | ---------------- | ----- | ---------------------------------------------- |
-| `fuzz/corpora/vt_parser`      | `vt_parser`      | 30    | byte-identical copy of `fuzz/corpora/vt/*.bin` |
-| `fuzz/corpora/osc_string`     | `osc_string`     | 40    | OSC bodies extracted from `vt/` + hand-curated |
-| `fuzz/corpora/dcs_apc_string` | `dcs_apc_string` | 19    | DCS/APC/SOS/PM bodies + kitty `G` shapes       |
-| `fuzz/corpora/vt`             | (source corpus)  | 30    | R-001 retained corpus (below)                  |
-| `fuzz/corpora/rich`           | (ImageStore)     | 20    | R-002 corpus, own README                       |
+| Directory                        | Target               | Seeds          | Source                                         |
+| -------------------------------- | -------------------- | -------------- | ---------------------------------------------- |
+| `fuzz/corpora/vt_parser`         | `vt_parser`          | 30             | byte-identical copy of `fuzz/corpora/vt/*.bin` |
+| `fuzz/corpora/osc_string`        | `osc_string`         | 42             | OSC bodies extracted from `vt/` + hand-curated |
+| `fuzz/corpora/dcs_apc_string`    | `dcs_apc_string`     | 21             | DCS/APC/SOS/PM bodies + kitty `G` shapes       |
+| `fuzz/corpora/vt`                | (source corpus)      | 30             | R-001 retained corpus (below)                  |
+| `fuzz/corpora/rich`              | (ImageStore)         | 20             | R-002 corpus, own README                       |
+| `fuzz/corpus/control_string_cap` | `control_string_cap` | 12 (generated) | `generate_cap_seeds` test, never committed     |
 
 The `vt_parser` seeds are byte-identical copies of the R-001 corpus, so the
 fuzz target and the in-repo evidence share one corpus. The derived target
 corpora are additive; the `vt/` corpus remains the canonical R-001 artifact.
+The `control_string_cap` seeds are >4 MiB each (about 50 MiB total), so they
+live in the gitignored scratch corpus and are regenerated from the parser
+cap instead of being versioned.
 
 ## Coverage (adversarial dimensions per P0-AC-002, R-001)
 
@@ -126,6 +150,19 @@ corpora are additive; the `vt/` corpus remains the canonical R-001 artifact.
 | `24-osc-payload-*.bin` (×6)              | `52;c;` payload 1024/1025/2048/4095/4096/5000 B | 001/002 | vte MAX_OSC_RAW=1024 + Bounded 4096          |
 | `25-chunk-split-esc.bin`                 | ESC at chunk boundary + OSC/DCS interleaved     | 002     | incremental chunking identity                |
 | `SHA256SUMS`                             | manifest                                        | —       | `sha256sum *.bin` sorted                     |
+
+### Derived-corpus additions (CTX-1603)
+
+These live in the per-target corpora (not in `vt/`), so the R-001 table above
+stays the canonical corpus record.
+
+| Seed                                       | Target               | Dimension                                                          |
+| ------------------------------------------ | -------------------- | ------------------------------------------------------------------ |
+| `69-osc1337-file-image.bin`                | `osc_string`         | valid `OSC 1337;File=` image body                                  |
+| `70-osc1337-file-image-truncated.bin`      | `osc_string`         | truncated image body (invalid base64 refusal)                      |
+| `81-dcs-st-osc1337-image.bin`              | `dcs_apc_string`     | `ESC P 0x9C` + diverted image + text across the DCS abort          |
+| `82-kitty-interleaved-text.bin`            | `dcs_apc_string`     | chunked kitty `APC G` interleaved with non-base64 text             |
+| generated `{osc,dcs,sos,pm,apc}-*-cap.bin` | `control_string_cap` | at / just past `CONTROL_STRING_MAX_BYTES`, plus `ESC`-resync tails |
 
 ## Gates
 

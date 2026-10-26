@@ -1369,6 +1369,11 @@ fn profile_commands_refuse_a_cross_layer_keymap_duplicate() {
         "set diagnostic: {}",
         stderr(&set)
     );
+    assert!(
+        stderr(&set).contains(&init_path(&root).display().to_string()),
+        "the set refusal names the selector: {}",
+        stderr(&set)
+    );
     assert_eq!(
         std::fs::read_to_string(profile_path(&root, "keys")).expect("keys profile"),
         profile,
@@ -1387,6 +1392,23 @@ fn profile_commands_refuse_a_cross_layer_keymap_duplicate() {
         std::fs::read_to_string(init_path(&root)).expect("selector"),
         selector,
         "a refused use writes nothing"
+    );
+
+    let clone = run_bitty(&root, &["config", "profile", "clone", "keys", "copy"]);
+    assert_exit(&clone, 2, "clone with a cross-layer duplicate");
+    assert!(
+        stderr(&clone).contains("duplicate keymap id") && stderr(&clone).contains("global::alt+j"),
+        "clone diagnostic: {}",
+        stderr(&clone)
+    );
+    assert!(
+        stderr(&clone).contains(&init_path(&root).display().to_string()),
+        "the clone refusal names the selector: {}",
+        stderr(&clone)
+    );
+    assert!(
+        !profile_path(&root, "copy").exists(),
+        "a refused clone creates no destination"
     );
     assert_no_temp_files(&root, "cross-layer keymap");
     let _ = std::fs::remove_dir_all(&root);
@@ -1429,7 +1451,135 @@ fn profile_commands_refuse_a_selector_whose_own_theme_is_missing() {
         selector,
         "a refused use writes nothing"
     );
+
+    let clone = run_bitty(&root, &["config", "profile", "clone", "th", "copy"]);
+    assert_exit(&clone, 2, "clone under a missing selector theme");
+    assert!(
+        stderr(&clone).contains("unknown local theme 'missing-theme'"),
+        "clone resolves the selector theme: {}",
+        stderr(&clone)
+    );
+    assert!(
+        stderr(&clone).contains(&init_path(&root).display().to_string()),
+        "the clone refusal names the selector: {}",
+        stderr(&clone)
+    );
+    assert!(
+        !profile_path(&root, "copy").exists(),
+        "a refused clone creates no destination"
+    );
     assert_no_temp_files(&root, "cross-layer theme");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_commands_gate_on_the_selector_overridden_outline() {
+    let root = scratch_root("cross-layer-outline");
+    // #333333 fails the focused-outline contrast gate on its own; the
+    // selector's #FFFFFF overrides it, so `config check --profile beta` is
+    // green. Profile-only effective validation used to refuse all three verbs.
+    write_profile(
+        &root,
+        "beta",
+        "return {\n    decoration = { border_color_focused = \"#333333\" },\n}\n",
+    );
+    write_profile(&root, "alpha", "return {}\n");
+    std::fs::write(
+        init_path(&root),
+        "return {\n    format = \"bitty-profile-v1\",\n    profile = \"alpha\",\n    \
+         decoration = { border_color_focused = \"#FFFFFF\" },\n}\n",
+    )
+    .expect("selector");
+
+    assert_ok(
+        &run_bitty(&root, &["config", "check", "--profile", "beta"]),
+        "check beta under the selector outline",
+    );
+    assert_ok(
+        &run_bitty(&root, &["config", "profile", "use", "beta"]),
+        "use beta under the selector outline",
+    );
+    assert!(
+        std::fs::read_to_string(init_path(&root))
+            .expect("selector")
+            .contains("profile = \"beta\""),
+        "use rewrites the selector"
+    );
+    assert_ok(
+        &run_bitty(&root, &["config", "check"]),
+        "post-switch check resolves the selector outline",
+    );
+    assert_ok(
+        &run_bitty(
+            &root,
+            &["config", "profile", "set", "beta", "font.size", "13"],
+        ),
+        "set beta under the selector outline",
+    );
+    assert_ok(
+        &run_bitty(&root, &["config", "profile", "clone", "beta", "copy"]),
+        "clone beta under the selector outline",
+    );
+    assert!(
+        profile_path(&root, "copy").is_file(),
+        "clone created the destination profile"
+    );
+    assert_ok(
+        &run_bitty(&root, &["config", "check"]),
+        "check after set and clone",
+    );
+    assert_no_temp_files(&root, "cross-layer outline");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_commands_refuse_a_missing_explicit_config_path() {
+    let root = scratch_root("explicit-missing");
+    write_profile(&root, "kid", "return {}\n");
+    let missing = root.join("bitty").join("missing.lua");
+    let missing_str = missing.to_string_lossy().into_owned();
+
+    let set = run_bitty(
+        &root,
+        &[
+            "--config",
+            &missing_str,
+            "config",
+            "profile",
+            "set",
+            "kid",
+            "font.size",
+            "13",
+        ],
+    );
+    assert_exit(&set, 2, "set with a missing --config");
+    assert!(
+        stderr(&set).contains("--config") && stderr(&set).contains("not found"),
+        "the --config refusal matches config check: {}",
+        stderr(&set)
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "kid")).expect("kid profile"),
+        "return {}\n",
+        "a refused set writes nothing"
+    );
+
+    let env_set = Command::new(BITTY_BIN)
+        .args(["config", "profile", "set", "kid", "font.size", "13"])
+        .env("XDG_CONFIG_HOME", &root)
+        .env("HOME", &root)
+        .env("NO_COLOR", "1")
+        .env("BITTY_CONFIG", &missing)
+        .env_remove("BITTY_PROFILE")
+        .output()
+        .expect("spawn bitty with BITTY_CONFIG");
+    assert_exit(&env_set, 2, "set with a missing BITTY_CONFIG");
+    assert!(
+        stderr(&env_set).contains("BITTY_CONFIG") && stderr(&env_set).contains("not found"),
+        "the BITTY_CONFIG refusal matches config check: {}",
+        stderr(&env_set)
+    );
+    assert_no_temp_files(&root, "explicit missing config");
     let _ = std::fs::remove_dir_all(&root);
 }
 

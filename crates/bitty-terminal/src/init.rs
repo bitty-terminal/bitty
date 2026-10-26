@@ -4797,6 +4797,10 @@ fn create_new_exclusively(target: &std::path::Path, content: &str) -> Result<(),
             target.display()
         )));
     }
+    // A brand-new file's directory entry needs the same durability as an
+    // atomic replace: a crash right after the first activation must not lose
+    // the selector while its bytes are already synced.
+    sync_parent_dir(target);
     Ok(())
 }
 

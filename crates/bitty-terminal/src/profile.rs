@@ -566,12 +566,14 @@ fn run_use(args: &Args, dir: &Path, raw_name: &str) -> Result<Reply, Failure> {
     let name = valid_name("use", raw_name)?;
     let profile_path = profile_path(dir, &name);
     ensure_present("use", &name, &profile_path)?;
-    // Reject a chain that is invalid on its own (syntax, shape, schema) before
-    // any mutation. The strict post-merge gates are deliberately NOT run here:
-    // they decide on the cross-layer merge below, where the selector's own
-    // approved roots, theme, and keymaps participate. Running them on the
-    // profile alone refused configurations `config check` accepts.
-    let _ = merged_profile(dir, "use", &name)?;
+    // Reject a chain that is invalid on its own (syntax, shape, schema,
+    // cycle) before any mutation. The strict post-merge gates are deliberately
+    // NOT run here: they decide on the cross-layer merge below, where the
+    // selector's own approved roots, theme, keymaps, and outline overrides
+    // participate. Validating the profile alone refused configurations
+    // `config check` accepts.
+    bitty_config::file::load_profile_chain_in_dir(&name, dir)
+        .map_err(|err| invalid_profile("use", &name, &err))?;
     let bitty_config_env = std::env::var("BITTY_CONFIG").ok();
     let explicit = bitty_config::file::resolve_config_explicit(
         args.config_path.as_deref(),
@@ -834,28 +836,18 @@ fn run_clone(args: &Args, dir: &Path, raw_src: &str, raw_dst: &str) -> Result<Re
     let dst_path = profile_path(dir, &dst);
     ensure_present("clone", &src, &src_path)?;
     ensure_absent("clone", &dst, &dst_path)?;
+    // The chain loader parses, migrates, and validates the source file and its
+    // ancestors; the copied bytes are exactly this chain's last link. The
+    // cross-layer merge below is the gate, because the copied profile is only
+    // ever loaded under the user selector — a leaf that is invalid in
+    // isolation may be overridden there.
     let chain = match bitty_config::file::load_profile_chain_in_dir(&src, dir) {
         Ok(chain) => chain,
         Err(err) => return Err(invalid_profile("clone", &src, &err)),
     };
-    // Profile-only merge first: a chain that is invalid on its own keeps the
-    // source-profile attribution. The cross-layer merge below is what decides,
-    // because the copied profile is only ever loaded under the user selector.
-    bitty_config::file::resolve_effective_with_profiles(
-        None,
-        chain.clone(),
-        &bitty_config::file::CliOverrides::default(),
-    )
-    .map_err(|err| invalid_profile("clone", &src, &err))?;
-    let merged = merge_with_current_user("clone", &src, args, chain)?;
-    strict_post_merge_checks(
-        "clone",
-        &format!("invalid profile '{src}'"),
-        &merged.effective,
-    )?;
+    let cross = merge_with_current_user("clone", &src, args, chain)?;
+    strict_post_merge_checks("clone", &cross.subject(&src), &cross.merged.effective)?;
     let content = read_profile("clone", &src, &src_path)?;
-    validate_new_profile(&content, &dst_path)
-        .map_err(|err| invalid_profile("clone", &src, &err))?;
     create_exclusive(&dst_path, &content).map_err(|err| {
         if err.kind() == std::io::ErrorKind::AlreadyExists {
             exists_failure("clone", &dst, &dst_path)
@@ -1012,7 +1004,11 @@ fn run_set(
     let path = profile_path(dir, &name);
     ensure_present("set", &name, &path)?;
     let content = read_profile("set", &name, &path)?;
-    let current = merged_profile(dir, "set", &name)?;
+    // Seed-only view: the profile chain restricted to its own layers. A leaf
+    // that is invalid in isolation (for example an outline color the selector
+    // overrides) must still be pinnable, so this merge does not validate; the
+    // cross-layer merge decides before any write.
+    let current = merged_profile_unvalidated(dir, "set", &name)?;
     let segments: Vec<&str> = field.path.split('.').collect();
     let table = segments[0];
     let mut updated = content;
@@ -1349,8 +1345,9 @@ fn validate_new_profile(content: &str, path: &Path) -> Result<(), bitty_config::
 ///
 /// The merge the gates see is the one `config check --profile NAME` sees
 /// (user layer + candidate chain). The returned value is the profile-only
-/// merge: pin seeding and `set`'s attribution stay on the profile the command
-/// targets, exactly as before.
+/// merge, unvalidated: pin seeding, the round-trip re-read, and `set`'s
+/// attribution stay on the profile the command targets, and a leaf that is
+/// invalid in isolation must still be repairable by the cross-layer result.
 fn merge_candidate(
     args: &Args,
     dir: &Path,
@@ -1367,25 +1364,20 @@ fn merge_candidate(
     } else {
         chain.push(candidate);
     }
-    // A chain that is invalid on its own is rejected with profile attribution
-    // before the user layer can be blamed for it.
-    let merged = bitty_config::file::resolve_effective_with_profiles(
+    let merged = bitty_config::file::resolve_effective_with_profiles_unvalidated(
         None,
         chain.clone(),
         &bitty_config::file::CliOverrides::default(),
     )
     .map_err(|err| invalid_profile("set", name, &err))?;
-    // The selector is a user layer too: its theme, approved roots, and keymaps
-    // participate in what the next launch loads, so the gates must see the
-    // cross-layer result. Checking the profile alone both refused valid configs
-    // (selector-approved image roots) and accepted invalid ones (a keymap
+    // The selector is a user layer too: its theme, approved roots, keymaps,
+    // and outline overrides participate in what the next launch loads, so the
+    // gates must see the cross-layer result. Checking the profile alone both
+    // refused valid configurations (selector-approved image roots, a focused
+    // outline the selector replaces) and accepted invalid ones (a keymap
     // duplicate or `local:missing` theme only the selector introduced).
-    let cross_layer = merge_with_current_user("set", name, args, chain)?;
-    strict_post_merge_checks(
-        "set",
-        &format!("invalid profile '{name}'"),
-        &cross_layer.effective,
-    )?;
+    let cross = merge_with_current_user("set", name, args, chain)?;
+    strict_post_merge_checks("set", &cross.subject(name), &cross.merged.effective)?;
     Ok(merged)
 }
 
@@ -1401,9 +1393,11 @@ struct CurrentUserLayer {
 /// Loads the user file `config check` merges above the profile chain.
 ///
 /// Resolution matches startup: `--config` > `BITTY_CONFIG` > the XDG probe
-/// (`init.lua`, then the `config.lua` alias). A missing file means the profile
-/// chain is the whole configuration; a present but invalid file fails closed,
-/// because the strict loader would reject the next launch too.
+/// (`init.lua`, then the `config.lua` alias). A missing default probe means the
+/// profile chain is the whole configuration; a missing **explicit**
+/// `--config`/`BITTY_CONFIG` path fails closed exactly like `config check`,
+/// and a present but invalid file fails closed because the strict loader would
+/// reject the next launch too.
 fn current_user_layer(verb: &str, args: &Args) -> Result<Option<CurrentUserLayer>, Failure> {
     let bitty_config_env = std::env::var("BITTY_CONFIG").ok();
     let explicit = bitty_config::file::resolve_config_explicit(
@@ -1414,7 +1408,27 @@ fn current_user_layer(verb: &str, args: &Args) -> Result<Option<CurrentUserLayer
         return Ok(None);
     };
     if !probed.path.exists() {
-        return Ok(None);
+        if !probed.explicit {
+            return Ok(None);
+        }
+        // An explicit path is a user input, not the default probe: the strict
+        // loader fails closed here, so a profile command must not silently
+        // validate a configuration `config check` cannot load.
+        let explicit_from_cli = args
+            .config_path
+            .as_deref()
+            .is_some_and(|path| !path.trim().is_empty());
+        return Err(Failure::usage(if explicit_from_cli {
+            format!(
+                "bitty config profile {verb}: --config '{}' not found",
+                probed.path.display()
+            )
+        } else {
+            format!(
+                "bitty config profile {verb}: BITTY_CONFIG '{}' not found",
+                probed.path.display()
+            )
+        }));
     }
     let layer = bitty_config::file::load_user_layer(&probed.path).map_err(|err| {
         Failure::invalid(format!(
@@ -1428,6 +1442,27 @@ fn current_user_layer(verb: &str, args: &Args) -> Result<Option<CurrentUserLayer
     }))
 }
 
+/// A cross-layer merge and the user file that participated in it.
+struct CrossLayerMerge {
+    /// Validated merge of the user layer above the profile chain.
+    merged: bitty_config::MergedConfig,
+    /// Selector/`init.lua` path when a user layer participated.
+    user_path: Option<PathBuf>,
+}
+
+impl CrossLayerMerge {
+    /// Attribution clause for a strict post-merge gate failure.
+    fn subject(&self, name: &str) -> String {
+        match &self.user_path {
+            Some(path) => format!(
+                "profile '{name}' merged with '{}' is invalid",
+                path.display()
+            ),
+            None => format!("invalid profile '{name}'"),
+        }
+    }
+}
+
 /// Merges `chain` under the current user layer exactly as
 /// `config check --profile NAME` does, so a profile command never validates a
 /// configuration the next launch would not load.
@@ -1436,35 +1471,44 @@ fn merge_with_current_user(
     name: &str,
     args: &Args,
     chain: Vec<bitty_config::LayeredPlan>,
-) -> Result<bitty_config::MergedConfig, Failure> {
+) -> Result<CrossLayerMerge, Failure> {
     let user = current_user_layer(verb, args)?;
     let (file, path) = match user {
         Some(user) => (Some(user.layer), Some(user.path)),
         None => (None, None),
     };
-    bitty_config::file::resolve_effective_with_profiles(
+    let merged = bitty_config::file::resolve_effective_with_profiles(
         file,
         chain,
         &bitty_config::file::CliOverrides::default(),
     )
-    .map_err(|err| match path {
+    .map_err(|err| match &path {
         Some(path) => Failure::invalid(format!(
             "bitty config profile {verb}: profile '{name}' merged with '{}' is invalid: {err}",
             path.display()
         )),
         None => invalid_profile(verb, name, &err),
+    })?;
+    Ok(CrossLayerMerge {
+        merged,
+        user_path: path,
     })
 }
 
-/// Loads and merges one profile's current `extends` chain.
-fn merged_profile(
+/// Loads and merges one profile's current `extends` chain **for seeding only**.
+///
+/// Merge only, never a gate: the returned effective config may be invalid in
+/// isolation because the current user layer overrides the offending leaf.
+/// Callers that decide whether a write is valid must use
+/// [`merge_with_current_user`] instead.
+fn merged_profile_unvalidated(
     dir: &Path,
     verb: &str,
     name: &str,
 ) -> Result<bitty_config::MergedConfig, Failure> {
     let chain = bitty_config::file::load_profile_chain_in_dir(name, dir)
         .map_err(|err| invalid_profile(verb, name, &err))?;
-    bitty_config::file::resolve_effective_with_profiles(
+    bitty_config::file::resolve_effective_with_profiles_unvalidated(
         None,
         chain,
         &bitty_config::file::CliOverrides::default(),

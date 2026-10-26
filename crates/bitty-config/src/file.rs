@@ -1080,6 +1080,49 @@ pub fn resolve_effective_with_profiles(
     profiles: Vec<LayeredPlan>,
     cli: &CliOverrides,
 ) -> Result<crate::merge::MergedConfig, ConfigError> {
+    resolve_effective_with_profiles_inner(file, profiles, cli, true)
+}
+
+/// [`resolve_effective_with_profiles`] without the final effective-config
+/// validation.
+///
+/// Merge only: the caller must validate the merged
+/// [`EffectiveConfig`](crate::types::EffectiveConfig) on the configuration it
+/// ultimately acts on. Use this for intermediate values (a profile's
+/// inherited-table seed, source attribution) where a leaf is invalid in
+/// isolation but a higher-precedence user layer overrides it; the validating
+/// form remains the only gate.
+///
+/// Layer loading/plan validation and the precedence merge are identical to
+/// [`resolve_effective_with_profiles`].
+///
+/// # Errors
+///
+/// Same as [`resolve_effective_with_profiles`], except an effective config
+/// that only fails
+/// [`EffectiveConfig::validate`](crate::types::EffectiveConfig::validate) is
+/// returned successfully.
+pub fn resolve_effective_with_profiles_unvalidated(
+    file: Option<LayeredPlan>,
+    profiles: Vec<LayeredPlan>,
+    cli: &CliOverrides,
+) -> Result<crate::merge::MergedConfig, ConfigError> {
+    resolve_effective_with_profiles_inner(file, profiles, cli, false)
+}
+
+fn resolve_effective_with_profiles_inner(
+    file: Option<LayeredPlan>,
+    profiles: Vec<LayeredPlan>,
+    cli: &CliOverrides,
+    validate: bool,
+) -> Result<crate::merge::MergedConfig, ConfigError> {
+    let merge = |layers| {
+        if validate {
+            crate::merge::merge_layers(layers)
+        } else {
+            crate::merge::merge_layers_unvalidated(layers)
+        }
+    };
     let mut lower = Vec::new();
     for p in profiles {
         debug_assert_eq!(
@@ -1094,10 +1137,10 @@ pub fn resolve_effective_with_profiles(
     }
     // Fast path: no CLI override stays a single merge (pre-0180 behavior).
     if cli.is_empty() {
-        return crate::merge::merge_layers(lower);
+        return merge(lower);
     }
     // Base merge first so profile/file failures surface before CLI enters.
-    let base = crate::merge::merge_layers(lower.clone())?;
+    let base = merge(lower.clone())?;
     // Base-aware CLI layer: validates CLI raws fail-closed and inherits
     // non-overridden font/window siblings from the base.
     let cli_layer = cli.to_layer_with_base(&base.effective)?;
@@ -1105,7 +1148,7 @@ pub fn resolve_effective_with_profiles(
     if let Some(c) = cli_layer {
         layers.push(c);
     }
-    let mut merged = crate::merge::merge_layers(layers)?;
+    let mut merged = merge(layers)?;
     // The CLI tables are atomic at merge, so inherited siblings were
     // re-attributed to `Cli` with identical values: restore the base source
     // per non-overridden field and prune the spurious CLI conflicts so

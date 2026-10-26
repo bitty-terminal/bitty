@@ -14,12 +14,34 @@
 //!   is an implementation detail; no `vte` type appears in the public
 //!   surface.
 //! - **Bounded, panic-free parsing.** Parameter count/magnitude, sequence
-//!   length, and OSC payload size are bounded; exceeding a limit yields a
+//!   length, and string payload size are bounded; exceeding a limit yields a
 //!   well-defined truncated or inert action, never unbounded growth.
 //! - **Deterministic UTF-8 policy.** Invalid bytes decode to U+FFFD (one
 //!   cell), identically offline and live, delegated to `vte`'s collector.
 //! - **Zero unsafe.** The workspace denies `unsafe_code`; this crate adds no
 //!   exception to that rule.
+//!
+//! # Parser bounds
+//!
+//! | Bound | Value | Enforcement |
+//! | --- | --- | --- |
+//! | CSI parameter count | `vte`'s 32-parameter cap | extra parameters dropped and flagged `ignore` |
+//! | CSI numeric magnitude | `u16` saturation | saturating parse in the dispatcher |
+//! | Control string (OSC/DCS/SOS/PM/APC) | [`CONTROL_STRING_MAX_BYTES`] (4 MiB iTerm2 body cap + its introducer; the introducer is not charged for a `vte`-owned string) | `CAN` injection for `vte` strings, local abort for a parser-handled APC |
+//! | Materialized string/bytes | [`BoundedString`]/[`BoundedBytes`] 4096 bytes | truncation at action construction |
+//! | Kitty graphics | IMG-1 [`KITTY_APC_LEDGER_CAP`], IMG-3 [`KITTY_APC_DECODE_MAX_BYTES`] | streamed decode before allocation |
+//! | iTerm2 inline image | [`ITERM2_OSC_MAX_WIRE_BYTES`], [`ITERM2_OSC_MAX_ATTRIBUTE_BYTES`] | pre-scan body cap before dispatch |
+//!
+//! The control-string cap is the one bound `vte` does not provide (its `std`
+//! OSC collector is an uncapped growable `Vec`), so it is enforced here:
+//! `vte`-owned strings are aborted with an injected `CAN` and the diverted
+//! iTerm2 candidate is charged against the same budget (for the diversion the
+//! counter only accounts; the scanner's own body cap refuses first). Over-cap
+//! strings emit [`TerminalAction::ControlStringRejected`] and are counted in
+//! terminal-state telemetry (`TelemetryCounters::control_string_refused`).
+//! The action is inert, but the refusal is not: the bounded prefix forwarded
+//! before the abort is dispatched first, so one truncated mapped action may
+//! already have applied (see [`ControlStringReject::Overflow`]).
 //!
 //! Kitty `APC G` wiring (CTX-0256) pre-scans `APC` (which `vte` 0.15 leaves
 //! inert), base64-decodes with a fail-closed alphabet check, and reassembles
@@ -68,12 +90,13 @@ mod parser;
 
 pub use action::{
     Attribute, AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, ClipboardOp, Col, Color,
-    ControlChar, Count, CursorStyle, Direction, DynamicColorOp, DynamicColorTarget,
-    EnhancedKeyboardOp, EnhancedKeyboardSetMode, EraseDisplayMode, EraseLineMode, GraphemeCell,
-    Hyperlink, KittyNotificationChunk, KittyPayloadType, MAX_OSC4_OPS, MAX_OSC22_SHAPES, Mode,
-    MouseCoordinateEncoding, MouseTrackingMode, Notification, NotificationSource, PaletteColorOp,
-    PaletteOp, PointerShape, PointerShapeOp, Rgb, Row, SequenceKind, StatusKind, TabTargets,
-    TerminalAction, UnderlineStyle, UnrecognizedSequence, ZoneKind,
+    ControlChar, ControlStringKind, ControlStringReject, Count, CursorStyle, Direction,
+    DynamicColorOp, DynamicColorTarget, EnhancedKeyboardOp, EnhancedKeyboardSetMode,
+    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, KittyNotificationChunk,
+    KittyPayloadType, MAX_OSC4_OPS, MAX_OSC22_SHAPES, Mode, MouseCoordinateEncoding,
+    MouseTrackingMode, Notification, NotificationSource, PaletteColorOp, PaletteOp, PointerShape,
+    PointerShapeOp, Rgb, Row, SequenceKind, StatusKind, TabTargets, TerminalAction, UnderlineStyle,
+    UnrecognizedSequence, ZoneKind,
 };
 pub use bounded::{BoundedBytes, BoundedString};
 pub use iterm2_osc::{
@@ -89,4 +112,4 @@ pub use kitty_apc::{
     KittyApcReject, KittyCompleted, KittyControlKeys, KittyFeedOutcome, KittyMedium,
 };
 pub use kitty_font_query::{KittyFontQuery, parse_kitty_font_query};
-pub use parser::Parser;
+pub use parser::{CONTROL_STRING_MAX_BYTES, Parser};

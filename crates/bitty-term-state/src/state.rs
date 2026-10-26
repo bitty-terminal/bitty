@@ -207,6 +207,15 @@ pub struct TelemetryCounters {
     /// decode, store, or placement quota then refused. Counts only requests
     /// recognized as images, never ordinary OSC 1337 commands.
     pub iterm2_refused: u64,
+    /// Control strings (`OSC`/`DCS`/`SOS`/`PM`/`APC`) the parser aborted
+    /// because one string exceeded its byte cap
+    /// (`bitty_vt::CONTROL_STRING_MAX_BYTES`, CTX-1592). The body past the
+    /// cap was dropped, but the prefix already forwarded to `vte` was
+    /// dispatched first, so one truncated mapped action may have applied
+    /// before the refusal (see
+    /// `bitty_vt::ControlStringReject::Overflow`). Distinct from
+    /// `iterm2_refused`, which counts image-request refusals.
+    pub control_string_refused: u64,
 }
 
 /// Content displacement produced by one [`State::resize`] call.
@@ -1791,6 +1800,14 @@ impl State {
             // counted (the parser already dropped that request).
             TerminalAction::Iterm2Image { .. } => {}
             TerminalAction::Iterm2ImageRejected { .. } => self.telemetry.iterm2_refused += 1,
+            // CTX-1592: an over-cap control string (OSC/DCS/SOS/PM/APC) was
+            // truncated by the parser; the tail past the cap never parsed.
+            // This arm only counts it — but the bounded prefix was dispatched
+            // first, so a truncated title/zone/cwd may already have applied.
+            // Counted separately from image refusals.
+            TerminalAction::ControlStringRejected { .. } => {
+                self.telemetry.control_string_refused += 1;
+            }
             // Kitty graphics (CTX-0256 base, CTX-0950 advanced): pixel
             // decode and paint live downstream (`KittyImageLayer` routes
             // to `kitty_display_image`), but placement, deletion,

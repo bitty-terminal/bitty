@@ -2764,3 +2764,102 @@ fn iterm2_inline_image_is_inert_and_refusals_are_counted() {
     assert_eq!(s.telemetry().iterm2_refused, 4);
     assert!(s.check_invariants().is_ok());
 }
+
+#[test]
+fn control_string_refusals_are_counted_separately() {
+    // CTX-1592: an over-cap control string is truncated by the parser (the
+    // bounded prefix may still have dispatched one mapped action, see
+    // `truncated_control_string_prefix_still_applies`). Terminal state only
+    // counts the refusal itself, with no grid, cursor, or damage change, and
+    // the counters stay distinct.
+    let mut s = State::new();
+    prints(&mut s, "x");
+    let cursor_before = s.cursor().position;
+    let (row, col) = (cursor_before.row, cursor_before.col);
+    for kind in [
+        bitty_vt::ControlStringKind::Osc,
+        bitty_vt::ControlStringKind::Dcs,
+        bitty_vt::ControlStringKind::Sos,
+        bitty_vt::ControlStringKind::Pm,
+        bitty_vt::ControlStringKind::Apc,
+    ] {
+        let damage = s.apply(&TerminalAction::ControlStringRejected {
+            kind,
+            reason: bitty_vt::ControlStringReject::Overflow,
+        });
+        assert!(
+            damage.regions.is_empty(),
+            "control-string refusals never damage the grid"
+        );
+    }
+    assert_eq!(s.telemetry().control_string_refused, 5);
+    assert_eq!(
+        s.telemetry().iterm2_refused,
+        0,
+        "iTerm2 refusals stay a separate counter"
+    );
+    assert_eq!(
+        s.telemetry().unknown_osc,
+        0,
+        "a refused string is not an unmapped-OSC report"
+    );
+    assert_eq!(
+        (s.cursor().position.row, s.cursor().position.col),
+        (row, col)
+    );
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
+fn truncated_control_string_prefix_still_applies_and_is_counted() {
+    // CTX-1592 review MF-2: an over-cap control string is not inert. The
+    // bounded prefix is dispatched before the abort, so its truncated title
+    // lands in terminal truth and the refusal is counted; the tail past the
+    // cap never parses, and the grid/cursor are untouched.
+    let mut stream = b"\x1b]0;".to_vec();
+    stream.extend(std::iter::repeat_n(
+        b'T',
+        bitty_vt::CONTROL_STRING_MAX_BYTES + 8,
+    ));
+    stream.extend_from_slice(b"\x07");
+
+    let mut parser = bitty_vt::Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(&stream, |action| actions.push(action));
+
+    // The prefix dispatch precedes the injected `CAN` and the refusal.
+    assert!(
+        matches!(
+            actions.first(),
+            Some(TerminalAction::OscTitle { text })
+                if text.len() == bitty_vt::BoundedString::MAX_LEN
+        ),
+        "the bounded prefix must dispatch as a title: {:?}",
+        actions.first()
+    );
+    assert_eq!(
+        actions.last(),
+        Some(&TerminalAction::ControlStringRejected {
+            kind: bitty_vt::ControlStringKind::Osc,
+            reason: bitty_vt::ControlStringReject::Overflow,
+        }),
+        "the refusal is the last action of the string"
+    );
+
+    let mut s = State::new();
+    prints(&mut s, "x");
+    let cursor_before = s.cursor().position;
+    for action in &actions {
+        let damage = s.apply(action);
+        assert!(
+            damage.regions.is_empty(),
+            "a truncated control string never damages the grid"
+        );
+    }
+    assert_eq!(s.title(), "T".repeat(bitty_vt::BoundedString::MAX_LEN));
+    assert_eq!(s.telemetry().control_string_refused, 1);
+    assert_eq!(s.telemetry().iterm2_refused, 0);
+    assert_eq!(s.telemetry().unknown_osc, 0);
+    assert_eq!(s.cursor().position, cursor_before);
+    assert!(s.check_invariants().is_ok());
+}

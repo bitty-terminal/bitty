@@ -7,11 +7,11 @@
 use super::*;
 use crate::action::{
     Attribute, AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, ClipboardOp, Col, Color,
-    ControlChar, Count, CursorStyle, Direction, DynamicColorOp, DynamicColorTarget,
-    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, KittyPayloadType, MAX_OSC4_OPS,
-    MAX_OSC22_SHAPES, Mode, MouseTrackingMode, Notification, NotificationSource, PaletteColorOp,
-    PaletteOp, PointerShape, PointerShapeOp, Rgb, Row, SequenceKind, StatusKind, TabTargets,
-    UnderlineStyle, UnrecognizedSequence, ZoneKind,
+    ControlChar, ControlStringKind, ControlStringReject, Count, CursorStyle, Direction,
+    DynamicColorOp, DynamicColorTarget, EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink,
+    KittyPayloadType, MAX_OSC4_OPS, MAX_OSC22_SHAPES, Mode, MouseTrackingMode, Notification,
+    NotificationSource, PaletteColorOp, PaletteOp, PointerShape, PointerShapeOp, Rgb, Row,
+    SequenceKind, StatusKind, TabTargets, UnderlineStyle, UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 
@@ -3314,4 +3314,680 @@ fn osc1337_body_cap_bounds_the_parser_body_behind_an_aborted_apc() {
             reason: crate::Iterm2Reject::OversizePayload
         }]
     );
+}
+
+// — CTX-1592 (bitty#2704): parser-wide control-string cap.
+
+const CAP: usize = crate::CONTROL_STRING_MAX_BYTES;
+
+/// One counted refusal action.
+fn control_refusal(kind: ControlStringKind) -> TerminalAction {
+    TerminalAction::ControlStringRejected {
+        kind,
+        reason: ControlStringReject::Overflow,
+    }
+}
+
+/// Number of `ControlStringRejected` actions with `kind`.
+fn count_refusals(actions: &[TerminalAction], kind: ControlStringKind) -> usize {
+    actions
+        .iter()
+        .filter(|action| **action == control_refusal(kind))
+        .count()
+}
+
+/// Asserts the stream ends with the `ok` print pair (recovery).
+fn assert_recovers_with_ok(actions: &[TerminalAction]) {
+    assert_eq!(
+        &actions[actions.len().saturating_sub(2)..],
+        &[
+            TerminalAction::Print(GraphemeCell::from('o')),
+            TerminalAction::Print(GraphemeCell::from('k')),
+        ],
+        "output after the refused string must still arrive: {actions:?}"
+    );
+}
+
+#[test]
+fn control_string_cap_covers_the_iterm2_maximum() {
+    // One cap, sized by the largest legitimate control string: the diverted
+    // iTerm2 body plus its introducer and prefix.
+    assert_eq!(
+        CAP,
+        crate::ITERM2_OSC_MAX_BODY_BYTES + crate::ITERM2_OSC_PREFIX.len() + 2
+    );
+    assert!(
+        CAP >= crate::ITERM2_OSC_MAX_ATTRIBUTE_BYTES
+            + 1
+            + crate::ITERM2_OSC_MAX_WIRE_BYTES
+            + crate::ITERM2_OSC_PREFIX.len()
+            + 2,
+        "the cap must admit a maximum-size iTerm2 request"
+    );
+}
+
+#[test]
+fn bare_osc_at_the_cap_is_admitted_and_one_over_is_refused() {
+    // Exactly at the cap: terminated normally, no refusal injected.
+    let mut at_cap = b"\x1b]0;".to_vec();
+    at_cap.extend(std::iter::repeat_n(b'A', CAP - 2));
+    at_cap.extend_from_slice(b"\x07ok");
+    let actions = parse(&at_cap);
+    assert_eq!(count_refusals(&actions, ControlStringKind::Osc), 0);
+    assert_recovers_with_ok(&actions);
+
+    // One byte over: `CAN` aborts the string, the tail is dropped, the
+    // refusal is counted, and the following output still parses.
+    let mut over = b"\x1b]0;".to_vec();
+    over.extend(std::iter::repeat_n(b'A', CAP - 1));
+    over.extend_from_slice(b"\x07ok");
+    let actions = parse(&over);
+    assert_eq!(count_refusals(&actions, ControlStringKind::Osc), 1);
+    assert_recovers_with_ok(&actions);
+}
+
+#[test]
+fn bare_unterminated_osc_ids_are_capped() {
+    for (id, kind) in [
+        (b"0".as_slice(), ControlStringKind::Osc),
+        (b"8".as_slice(), ControlStringKind::Osc),
+        (b"52".as_slice(), ControlStringKind::Osc),
+    ] {
+        let mut stream = b"\x1b]".to_vec();
+        stream.extend_from_slice(id);
+        stream.push(b';');
+        stream.extend(std::iter::repeat_n(b'A', CAP + 4096));
+        stream.extend_from_slice(b"\x07ok");
+        let actions = parse(&stream);
+        assert_eq!(count_refusals(&actions, kind), 1, "OSC {id:?}");
+        assert_recovers_with_ok(&actions);
+    }
+}
+
+#[test]
+fn dcs_sos_pm_strings_are_capped_and_recover() {
+    // DCS: `CAN` runs `unhook` (one mapped `Unknown(Dcs)`) before aborting.
+    let mut dcs = b"\x1bP".to_vec();
+    dcs.extend(std::iter::repeat_n(b'A', CAP + 4096));
+    dcs.extend_from_slice(b"\x1b\\ok");
+    let actions = parse(&dcs);
+    assert_eq!(count_refusals(&actions, ControlStringKind::Dcs), 1);
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, TerminalAction::Unknown(report) if report.kind == SequenceKind::Dcs)),
+        "the aborted DCS still reports its mapped family: {actions:?}"
+    );
+    assert_recovers_with_ok(&actions);
+
+    // SOS and PM stay inert; only the refusal and recovery are visible.
+    for (introducer, kind) in [
+        (b'X', ControlStringKind::Sos),
+        (b'^', ControlStringKind::Pm),
+    ] {
+        let mut stream = b"\x1b".to_vec();
+        stream.push(introducer);
+        stream.extend(std::iter::repeat_n(b'A', CAP + 4096));
+        stream.extend_from_slice(b"\x1b\\ok");
+        let actions = parse(&stream);
+        assert_eq!(count_refusals(&actions, kind), 1, "{kind} refusal");
+        assert_recovers_with_ok(&actions);
+    }
+}
+
+#[test]
+fn apc_inside_an_osc_shares_the_cap_and_recovers() {
+    // Shape 2: `ESC _` is consumed by the parser, so the OSC `vte` owns
+    // stays open; when the APC ends, the tail lands in that OSC and the cap
+    // aborts it. Before CTX-1592 this grew `vte`'s collector without bound.
+    let mut stream = b"\x1b]0;t\x1b_Gm=0;\x1b\\".to_vec();
+    stream.extend(std::iter::repeat_n(b'A', CAP + 4096));
+    stream.extend_from_slice(b"\x07ok");
+    let actions = parse(&stream);
+    assert_eq!(count_refusals(&actions, ControlStringKind::Osc), 1);
+    assert_recovers_with_ok(&actions);
+}
+
+#[test]
+fn kitty_apc_interleaved_with_text_is_capped_and_recovers() {
+    // Shape 3: a chunked kitty stream whose payload is interleaved with
+    // non-base64 text. The text aborts the pending stream; the remaining
+    // APC bytes are charged to the shared cap and then discarded.
+    let mut stream = b"\x1b_Ga=T,f=32,s=1,v=1,m=1;AAAA".to_vec();
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(&stream, |action| actions.push(action));
+    assert!(parser.has_pending_kitty(), "the chunked stream stays open");
+
+    let text = b"!!!! text !!!! ";
+    let mut feed = Vec::new();
+    while feed.len() <= CAP {
+        feed.extend_from_slice(text);
+    }
+    parser.advance(&feed, |action| actions.push(action));
+    parser.advance(b"\x07ok", |action| actions.push(action));
+    assert_eq!(count_refusals(&actions, ControlStringKind::Apc), 1);
+    assert!(!parser.has_pending_kitty(), "the stream is dropped");
+    assert_recovers_with_ok(&actions);
+
+    // The same stream parsed whole (prefix included) matches.
+    stream.extend_from_slice(&feed);
+    stream.extend_from_slice(b"\x07ok");
+    assert_eq!(parse_split(&stream, 7), actions);
+}
+
+#[test]
+fn image_diversion_after_a_capped_string_is_admitted() {
+    // A valid iTerm2 image after an over-cap unterminated OSC must still be
+    // diverted and admitted; the refusal does not poison the next sequence.
+    let mut stream = b"\x1b]0;".to_vec();
+    stream.extend(std::iter::repeat_n(b'A', CAP + 4096));
+    stream.extend_from_slice(iterm2_wire("inline=1", &ITERM2_PNG_1X1).as_bytes());
+    stream.extend_from_slice(b"ok");
+    let actions = parse(&stream);
+    assert_eq!(count_refusals(&actions, ControlStringKind::Osc), 1);
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            TerminalAction::Iterm2Image {
+                cols: 0,
+                rows: 0,
+                ..
+            }
+        )),
+        "the image after the capped string must be admitted: {actions:?}"
+    );
+    assert_recovers_with_ok(&actions);
+}
+
+#[test]
+fn control_string_cap_is_chunk_split_invariant() {
+    let prefix = b"\x1b]0;";
+    let mut stream = prefix.to_vec();
+    stream.extend(std::iter::repeat_n(b'A', CAP + 4096));
+    stream.extend_from_slice(b"\x07ok");
+    let whole = parse(&stream);
+    assert_eq!(count_refusals(&whole, ControlStringKind::Osc), 1);
+
+    // Boundary offsets around the overflow point plus chunk sizes; every
+    // split must produce the identical action stream and accounting.
+    let mut cuts = vec![
+        0,
+        1,
+        2,
+        prefix.len(),
+        prefix.len() + 1,
+        prefix.len() + CAP - 1,
+        prefix.len() + CAP,
+        prefix.len() + CAP + 1,
+        prefix.len() + CAP + 2,
+        stream.len() - 4,
+        stream.len() - 1,
+        stream.len(),
+    ];
+    cuts.retain(|cut| *cut <= stream.len());
+    for cut in cuts {
+        let mut parser = Parser::new();
+        let mut actions = Vec::new();
+        parser.advance(&stream[..cut], |action| actions.push(action));
+        parser.advance(&stream[cut..], |action| actions.push(action));
+        assert_eq!(actions, whole, "split at offset {cut}");
+    }
+    for chunk_size in [7, 4096, 64 * 1024] {
+        assert_eq!(
+            parse_split(&stream, chunk_size),
+            whole,
+            "chunk size {chunk_size}"
+        );
+    }
+}
+
+#[test]
+fn well_formed_control_strings_never_trip_the_cap() {
+    // Every mapped family at representative sizes: the cap must be invisible
+    // for terminated sequences — no refusal, and the same action stream
+    // however the input is split.
+    let stream = concat!(
+        "\x1b]0;title\x07",
+        "\x1b]2;title\x07",
+        "\x1b]4;1;rgb:00/00/00\x07",
+        "\x1b]7;file:///tmp\x07",
+        "\x1b]8;;https://example.com\x07link\x1b]8;;\x07",
+        "\x1b]9;notice\x07",
+        "\x1b]52;c;aGk=\x07",
+        "\x1b]99;i=1:d=0;hi\x07",
+        "\x1b]133;A\x07",
+        "\x1b]22;pointer\x07",
+        "\x1bP+q544e\x1b\\",
+        "\x1bP1$r0m\x1b\\",
+        "\x1bXinert\x1b\\",
+        "\x1b^inert\x1b\\",
+        "\x1b_Ga=T,f=32,s=1,v=1;AAAA\x1b\\",
+        "\x1b]1337;File=inline=1;width=1:",
+    )
+    .as_bytes()
+    .to_vec();
+    let mut stream = stream;
+    stream.extend_from_slice(kitty_base64(&ITERM2_PNG_1X1).as_bytes());
+    stream.extend_from_slice(b"\x07ok");
+    let actions = parse(&stream);
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, TerminalAction::ControlStringRejected { .. })),
+        "well-formed sequences must never be refused: {actions:?}"
+    );
+    assert_recovers_with_ok(&actions);
+    assert_eq!(parse_split(&stream, 1), actions);
+}
+
+// — CTX-1592 review MF-1/MF-2/MF-4: the DCS substate that decides C1 `ST`,
+// the recovery tails, the per-family cap boundary, and the truncated-prefix
+// dispatch that the refusal documentation must state.
+
+/// Builds `introducer + body + terminator` for one `vte`-owned family.
+fn vte_control_string(kind: ControlStringKind, body: &[u8], terminator: &[u8]) -> Vec<u8> {
+    let mut wire = Vec::with_capacity(body.len() + terminator.len() + 2);
+    wire.extend_from_slice(match kind {
+        ControlStringKind::Osc => b"\x1b]".as_slice(),
+        ControlStringKind::Dcs => b"\x1bP".as_slice(),
+        ControlStringKind::Sos => b"\x1bX".as_slice(),
+        ControlStringKind::Pm => b"\x1b^".as_slice(),
+        ControlStringKind::Apc => b"\x1b_".as_slice(),
+    });
+    wire.extend_from_slice(body);
+    wire.extend_from_slice(terminator);
+    wire
+}
+
+/// Compares two action streams without dumping multi-megabyte `Debug`
+/// output on failure: reports the first differing index instead.
+fn assert_actions_eq(actual: &[TerminalAction], expected: &[TerminalAction], context: &str) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{context}: action count differs"
+    );
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(actual, expected, "{context}: action {index} differs");
+    }
+}
+
+/// Asserts a multi-megabyte stream parses to `expected` whole, byte-wise
+/// (every offset is then a chunk boundary), two-way split at `cuts`, and in
+/// fixed chunks. The exhaustive two-way loop of
+/// [`assert_split_invariant`] is quadratic and is not affordable at the cap
+/// size; byte-wise feeding covers the same property linearly.
+fn assert_capped_stream_invariant(stream: &[u8], expected: &[TerminalAction], cuts: &[usize]) {
+    assert_actions_eq(&parse(stream), expected, "whole-buffer parse");
+    assert_actions_eq(&parse_split(stream, 1), expected, "byte-wise parse");
+    for &cut in cuts {
+        assert!(cut <= stream.len(), "cut {cut} beyond the stream");
+        let mut parser = Parser::new();
+        let mut actions = Vec::new();
+        parser.advance(&stream[..cut], |action| actions.push(action));
+        parser.advance(&stream[cut..], |action| actions.push(action));
+        assert_actions_eq(&actions, expected, &format!("split at offset {cut}"));
+    }
+    for chunk_size in [7, 4096, 64 * 1024] {
+        assert_actions_eq(
+            &parse_split(stream, chunk_size),
+            expected,
+            &format!("chunk size {chunk_size}"),
+        );
+    }
+}
+
+/// Compact fold over an action stream with a multi-megabyte text tail.
+///
+/// `TerminalAction` is 128 bytes, so the ~4.2M `Print` actions of the F-A
+/// stream cost ~0.5 GiB per copy; the chunking checks below would need two
+/// copies each. Counting and keeping only the edges pins the same behaviour
+/// without that allocation.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StreamSummary {
+    actions: usize,
+    prints: usize,
+    refusals: Vec<ControlStringKind>,
+    first: Option<TerminalAction>,
+    last: Vec<TerminalAction>,
+}
+
+impl StreamSummary {
+    fn push(&mut self, action: TerminalAction) {
+        self.actions += 1;
+        match &action {
+            TerminalAction::Print(_) => self.prints += 1,
+            TerminalAction::ControlStringRejected { kind, .. } => self.refusals.push(*kind),
+            _ => {}
+        }
+        if self.first.is_none() {
+            self.first = Some(action.clone());
+        }
+        self.last.push(action);
+        if self.last.len() > 4 {
+            self.last.remove(0);
+        }
+    }
+}
+
+/// Summarizes `bytes` fed in `chunk_size` slices (`1` = byte-wise).
+fn summarize_chunked(bytes: &[u8], chunk_size: usize) -> StreamSummary {
+    let mut parser = Parser::new();
+    let mut summary = StreamSummary::default();
+    for chunk in bytes.chunks(chunk_size.max(1)) {
+        parser.advance(chunk, |action| summary.push(action));
+    }
+    summary
+}
+
+/// Summarizes `bytes` fed as two slices split at `cut`.
+fn summarize_split(bytes: &[u8], cut: usize) -> StreamSummary {
+    let mut parser = Parser::new();
+    let mut summary = StreamSummary::default();
+    parser.advance(&bytes[..cut], |action| summary.push(action));
+    parser.advance(&bytes[cut..], |action| summary.push(action));
+    summary
+}
+
+#[test]
+fn c1_st_returns_to_ground_after_a_hooked_dcs() {
+    // C1 `ST` unhooks a hooked DCS and `vte` returns to `Ground`; the
+    // tracker must follow. Otherwise the next `CAP` bytes are counted as an
+    // unterminated DCS, faked into a refusal at the cap, and the rest of the
+    // text is swallowed (CTX-1592 re-review F-A). The tail is deliberately
+    // longer than the cap: the desync only surfaces after `CAP` bytes.
+    let mut stream = b"\x1bPqpayload\x9c".to_vec();
+    stream.extend(std::iter::repeat_n(b'B', CAP + 16));
+    stream.extend_from_slice(b"ok");
+
+    let whole = summarize_chunked(&stream, stream.len());
+    assert!(
+        whole.refusals.is_empty(),
+        "a terminated DCS must not be refused: {:?}",
+        whole.refusals
+    );
+    assert_eq!(
+        whole.actions,
+        1 + CAP + 16 + 2,
+        "every byte after `ST` dispatches"
+    );
+    assert_eq!(whole.prints, CAP + 18, "the whole text run prints");
+    assert_eq!(
+        whole.first,
+        Some(unknown(SequenceKind::Dcs, b'q', [0, 0])),
+        "the unmapped DCS is still reported once at `ST`"
+    );
+    assert_eq!(
+        whole.last,
+        vec![
+            TerminalAction::Print(GraphemeCell::from('B')),
+            TerminalAction::Print(GraphemeCell::from('B')),
+            TerminalAction::Print(GraphemeCell::from('o')),
+            TerminalAction::Print(GraphemeCell::from('k')),
+        ],
+        "the tail is text, not a swallowed string"
+    );
+
+    // `\x1bPqpayload` is 10 bytes, so the `0x9C` is at offset 10 and the
+    // text starts at 11; the cuts bracket the terminator and the offset the
+    // stale `Other` state used to overflow at.
+    let cuts = [
+        0,
+        1,
+        2,
+        3,
+        10,
+        11,
+        11 + CAP - 1,
+        11 + CAP,
+        11 + CAP + 1,
+        stream.len() - 2,
+    ];
+    for cut in cuts {
+        assert_eq!(
+            summarize_split(&stream, cut),
+            whole,
+            "split at offset {cut}"
+        );
+    }
+    for chunk_size in [1, 7, 4096, 64 * 1024] {
+        assert_eq!(
+            summarize_chunked(&stream, chunk_size),
+            whole,
+            "chunk size {chunk_size}"
+        );
+    }
+}
+
+#[test]
+fn c1_st_terminates_a_hooked_dcs() {
+    // `ESC P q` calls `hook` (final `q`), so `vte` is in `DcsPassthrough`,
+    // where C1 `ST` (`0x9C`) unhooks: the unmapped string is reported once
+    // and the following text prints.
+    let stream = b"\x1bPqpayload\x9cok";
+    let expected = vec![
+        unknown(SequenceKind::Dcs, b'q', [0, 0]),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    assert_split_invariant(stream, &expected);
+}
+
+#[test]
+fn dcs_header_c1_st_does_not_close_the_header_before_a_diverted_image() {
+    // Regression (CTX-1592 review MF-1): `vte` ignores C1 `ST` in
+    // `DcsEntry` (`anywhere`) and stays in the header. The tracker must not
+    // report the string closed while the machine still holds it, or the
+    // diversion skips its `ESC \` close and `ok` is hooked into the header
+    // as payload. The header ends on the close, so the image and the text
+    // parse normally.
+    let mut stream = b"\x1bP\x9c".to_vec();
+    stream.extend_from_slice(iterm2_wire("inline=1", &ITERM2_PNG_1X1).as_bytes());
+    stream.extend_from_slice(b"ok");
+    let expected = vec![
+        iterm2_image(0, 0),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    assert_split_invariant(&stream, &expected);
+}
+
+#[test]
+fn c1_st_does_not_end_a_refused_dcs_header_tail() {
+    // Over-cap DCS that overflowed while still in its header: `vte` never
+    // hooked, so on the wire `0x9C` is inert and cannot resynchronize the
+    // wire either. The discard tail swallows it and the text after it up to
+    // the real `ESC \`.
+    let mut stream = b"\x1bP".to_vec();
+    stream.extend(std::iter::repeat_n(b'1', CAP + 8));
+    stream.extend_from_slice(b"\x9cok\x1b\\kl");
+    let expected = vec![
+        // The injected `CAN` is executed by `vte` in the DCS header
+        // (`anywhere`) before the refusal is emitted.
+        TerminalAction::PrintControl(ControlChar(0x18)),
+        control_refusal(ControlStringKind::Dcs),
+        TerminalAction::Print(GraphemeCell::from('k')),
+        TerminalAction::Print(GraphemeCell::from('l')),
+    ];
+    let cuts = [2, 2 + CAP - 1, 2 + CAP, 2 + CAP + 1, stream.len() - 5];
+    assert_capped_stream_invariant(&stream, &expected, &cuts);
+}
+
+#[test]
+fn c1_st_ends_a_refused_dcs_passthrough_tail() {
+    // Over-cap DCS that had hooked: `vte` ends it on `0x9C` on the wire, so
+    // the discard tail ends there too and the following text prints.
+    let mut stream = b"\x1bPq".to_vec();
+    stream.extend(std::iter::repeat_n(b'A', CAP + 8));
+    stream.extend_from_slice(b"\x9cok");
+    let expected = vec![
+        // `CAN` unhooks (one unmapped-DCS report) and then executes.
+        unknown(SequenceKind::Dcs, b'q', [0, 0]),
+        TerminalAction::PrintControl(ControlChar(0x18)),
+        control_refusal(ControlStringKind::Dcs),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    let cuts = [3, 3 + CAP - 1, 3 + CAP, 3 + CAP + 1, stream.len() - 2];
+    assert_capped_stream_invariant(&stream, &expected, &cuts);
+}
+
+#[test]
+fn osc_overflow_ends_at_esc_backslash_and_recovers() {
+    // `ESC \` is a real OSC terminator (`Some(true)`: the `ESC` is
+    // forwarded), so the refused tail ends there and the text prints.
+    let mut stream = b"\x1b]0;".to_vec();
+    stream.extend(std::iter::repeat_n(b'A', CAP + 8));
+    stream.extend_from_slice(b"\x1b\\ok");
+    let expected = vec![
+        // The bounded prefix dispatches as the title, then `CAN` executes.
+        TerminalAction::OscTitle {
+            text: BoundedString::new("A".repeat(BoundedString::MAX_LEN)),
+        },
+        TerminalAction::PrintControl(ControlChar(0x18)),
+        control_refusal(ControlStringKind::Osc),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    let cuts = [4, 4 + CAP - 1, 4 + CAP, 4 + CAP + 1, stream.len() - 2];
+    assert_capped_stream_invariant(&stream, &expected, &cuts);
+}
+
+#[test]
+fn apc_overflow_ends_at_bel_and_recovers() {
+    // A parser-handled APC that is not accepted kitty payload: the header
+    // never parses, so the bytes after it are charged to the shared budget
+    // and refused once it crosses the cap. `BEL` ends the APC and `ok`
+    // prints.
+    let mut stream = b"\x1b_z;".to_vec();
+    stream.extend(std::iter::repeat_n(b'A', CAP + 8));
+    stream.extend_from_slice(b"\x07ok");
+    let expected = vec![
+        control_refusal(ControlStringKind::Apc),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    let cuts = [4, 4 + CAP - 1, 4 + CAP, 4 + CAP + 1, stream.len() - 2];
+    assert_capped_stream_invariant(&stream, &expected, &cuts);
+}
+
+#[test]
+fn control_string_cap_boundary_is_per_family() {
+    // The cap counts body bytes only (the introducer is not charged): a body
+    // of `CAP - 1` and `CAP` bytes is admitted, `CAP + 1` is refused once.
+    // Every family is restarted at zero between strings.
+    for (kind, terminator) in [
+        (ControlStringKind::Osc, b"\x07".as_slice()),
+        (ControlStringKind::Dcs, b"\x1b\\".as_slice()),
+        (ControlStringKind::Sos, b"\x1b\\".as_slice()),
+        (ControlStringKind::Pm, b"\x1b\\".as_slice()),
+    ] {
+        for (body_len, refused) in [(CAP - 1, 0), (CAP, 0), (CAP + 1, 1)] {
+            let mut stream = vte_control_string(kind, &vec![b'A'; body_len], terminator);
+            stream.extend_from_slice(b"ok");
+            let actions = parse(&stream);
+            assert_eq!(
+                count_refusals(&actions, kind),
+                refused,
+                "{kind} with a {body_len}-byte body"
+            );
+            assert_recovers_with_ok(&actions);
+        }
+
+        // Chunk-boundary invariance around the exact overflow offset.
+        let mut stream = vte_control_string(kind, &vec![b'A'; CAP + 1], terminator);
+        stream.extend_from_slice(b"ok");
+        let whole = parse(&stream);
+        assert_eq!(count_refusals(&whole, kind), 1, "{kind} over the cap");
+        for cut in [2 + CAP - 1, 2 + CAP, 2 + CAP + 1] {
+            let mut parser = Parser::new();
+            let mut actions = Vec::new();
+            parser.advance(&stream[..cut], |action| actions.push(action));
+            parser.advance(&stream[cut..], |action| actions.push(action));
+            assert_eq!(actions, whole, "{kind} split at offset {cut}");
+        }
+        assert_eq!(parse_split(&stream, 7), whole, "{kind} chunked");
+    }
+
+    // APC is parser-handled and its own header cap binds first: an over-long
+    // header is discarded without crossing the shared budget (which is why
+    // no `ControlStringRejected` appears), and the stream recovers.
+    let mut apc = b"\x1b_".to_vec();
+    apc.extend(std::iter::repeat_n(
+        b'z',
+        crate::kitty_apc::KITTY_APC_MAX_CONTROL_BYTES + 8,
+    ));
+    apc.extend_from_slice(b"\x1b\\ok");
+    let actions = parse(&apc);
+    assert_eq!(count_refusals(&actions, ControlStringKind::Apc), 0);
+    assert_recovers_with_ok(&actions);
+
+    // APC shared-budget boundary: the parser-handled APC charges every
+    // non-payload byte it sees (`ESC _;` charges the `;`, which fails
+    // `begin_control` and starts the discard tail), so the tail brings the
+    // total to `CAP - 1`, `CAP`, and `CAP + 1`.
+    const PREAMBLE: usize = 1;
+    for (tail_len, refused) in [(CAP - 2, 0), (CAP - 1, 0), (CAP, 1)] {
+        let mut apc = b"\x1b_;".to_vec();
+        apc.extend(std::iter::repeat_n(b'A', tail_len));
+        apc.extend_from_slice(b"\x07ok");
+        let actions = parse(&apc);
+        assert_eq!(
+            count_refusals(&actions, ControlStringKind::Apc),
+            refused,
+            "APC tail of {tail_len} bytes (shared total {})",
+            PREAMBLE + tail_len
+        );
+        assert_recovers_with_ok(&actions);
+    }
+}
+
+#[test]
+fn a_second_over_cap_string_is_refused_and_counted_again() {
+    // The per-string budget restarts after the terminator: a short string in
+    // between is admitted, and the next over-cap string is refused again.
+    let mut stream = b"\x1b]0;".to_vec();
+    stream.extend(std::iter::repeat_n(b'A', CAP + 8));
+    stream.extend_from_slice(b"\x07ok\x1b]2;short\x07");
+    stream.extend_from_slice(b"\x1b]0;");
+    stream.extend(std::iter::repeat_n(b'B', CAP + 8));
+    stream.extend_from_slice(b"\x07ok");
+    let actions = parse(&stream);
+    assert_eq!(count_refusals(&actions, ControlStringKind::Osc), 2);
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            TerminalAction::OscTitle { text } if text.as_str() == "short"
+        )),
+        "the admitted string between the refusals must dispatch: {actions:?}"
+    );
+    assert_recovers_with_ok(&actions);
+    assert_eq!(parse_split(&stream, 4096), actions);
+}
+
+#[test]
+fn truncated_osc52_write_is_dispatched_before_the_refusal() {
+    // MF-2: the prefix forwarded before the abort is dispatched first, so a
+    // gated clipboard write can still reach the policy seam with a bounded
+    // payload. "Refused" is not inert; only the tail past the cap is lost.
+    let mut stream = b"\x1b]52;c;".to_vec();
+    stream.extend(std::iter::repeat_n(b'A', CAP + 8));
+    stream.extend_from_slice(b"\x07ok");
+    let expected = vec![
+        TerminalAction::OscClipboard {
+            op: ClipboardOp::Write,
+            data: BoundedBytes::new(vec![b'A'; BoundedBytes::MAX_LEN]),
+        },
+        TerminalAction::PrintControl(ControlChar(0x18)),
+        control_refusal(ControlStringKind::Osc),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    let actions = parse(&stream);
+    assert_eq!(actions, expected);
+    // Same stream, fed around the abort: `CAN` is dispatched at the same
+    // point and the clipboard action stays byte-identical.
+    let cuts = [5 + CAP - 1, 5 + CAP, 5 + CAP + 1];
+    assert_capped_stream_invariant(&stream, &expected, &cuts);
 }

@@ -35,6 +35,10 @@
 //! - [`ITERM2_OSC_MAX_NAME_BYTES`]: decoded `name=` cap (the value is
 //!   validated and then dropped: Bitty writes no files).
 //! - [`ITERM2_OSC_MAX_CELL_SPAN`]: requested `width`/`height` cell span cap.
+//! - [`crate::CONTROL_STRING_MAX_BYTES`]: the parser-wide control-string cap
+//!   (CTX-1592) is sized from [`ITERM2_OSC_MAX_BODY_BYTES`] plus the `ESC ]`
+//!   introducer and [`ITERM2_OSC_PREFIX`], so the diverted candidate shares
+//!   one budget with every string `vte` collects.
 //!
 //! The body buffer is released (not just cleared) once an OSC terminates,
 //! so a parser does not retain image-sized capacity between images. An
@@ -245,6 +249,12 @@ impl Iterm2OscScanner {
     /// Whether a candidate OSC is open (bytes must keep flowing here).
     pub(crate) const fn is_active(&self) -> bool {
         !matches!(self.state, ScanState::Idle)
+    }
+
+    /// Whether the prefix matched and the scanner is collecting the body
+    /// (the only diversion bytes that count against the shared budget).
+    pub(crate) const fn is_collecting(&self) -> bool {
+        matches!(self.state, ScanState::Collect | ScanState::AwaitSt)
     }
 
     /// Bytes currently collected in the body buffer (cap-boundary tests).

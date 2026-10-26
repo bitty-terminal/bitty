@@ -832,6 +832,79 @@ pub enum PointerShapeOp {
 /// payload bounded; longer pushes fail closed as inert.
 pub const MAX_OSC22_SHAPES: usize = 16;
 
+/// Kind of control string a parser-level bound aborted (CTX-1592).
+///
+/// Carried by [`TerminalAction::ControlStringRejected`] so telemetry and
+/// diagnostics can name the family without keeping the refused bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ControlStringKind {
+    /// Operating system command (`ESC ]`).
+    Osc,
+    /// Device control string (`ESC P`).
+    Dcs,
+    /// Start of string (`ESC X`).
+    Sos,
+    /// Privacy message (`ESC ^`).
+    Pm,
+    /// Application program command (`ESC _`, the kitty graphics envelope).
+    Apc,
+}
+
+impl ControlStringKind {
+    /// Stable short label used in diagnostics and telemetry.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Osc => "OSC",
+            Self::Dcs => "DCS",
+            Self::Sos => "SOS",
+            Self::Pm => "PM",
+            Self::Apc => "APC",
+        }
+    }
+}
+
+impl std::fmt::Display for ControlStringKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Why a control string was refused before its terminator (CTX-1592).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ControlStringReject {
+    /// One string exceeded the parser-wide control-string byte cap
+    /// ([`crate::CONTROL_STRING_MAX_BYTES`]).
+    ///
+    /// The body past the cap is dropped. This is *not* an inert refusal: the
+    /// prefix already forwarded to `vte` is dispatched before the abort (an
+    /// `OSC` dispatch or a DCS `unhook` runs on the injected `CAN`), so one
+    /// truncated, bounded mapped action may still apply — a shortened title,
+    /// hyperlink, zone mark, cwd, or palette entry, or a truncated `OSC 52`
+    /// clipboard write that remains subject to the existing clipboard gate.
+    /// Only a prefix action already bounded by the action's own caps
+    /// ([`crate::BoundedString`]/[`crate::BoundedBytes`],
+    /// [`crate::MAX_OSC4_OPS`], fixed enums) and by the consuming policy
+    /// gates can be observed.
+    Overflow,
+}
+
+impl ControlStringReject {
+    /// Stable reason label used in diagnostics and telemetry.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Overflow => "control string exceeds parser budget",
+        }
+    }
+}
+
+impl std::fmt::Display for ControlStringReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// Kind of sequence reported by [`TerminalAction::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SequenceKind {
@@ -1240,6 +1313,23 @@ pub enum TerminalAction {
     Iterm2ImageRejected {
         /// Why the request was refused.
         reason: Iterm2Reject,
+    },
+    /// A control string refused by the parser-wide byte cap (CTX-1592).
+    ///
+    /// This action itself is inert telemetry: it stores, places, and paints
+    /// nothing, and terminal state only counts it. It does **not** mean the
+    /// whole string was discarded. The prefix already forwarded to `vte` is
+    /// dispatched before the abort, so one truncated but bounded mapped
+    /// action can have been applied just before this variant — a shortened
+    /// title, hyperlink, zone mark, cwd, or palette entry, or a truncated
+    /// `OSC 52` write that the existing clipboard gate still governs. Only
+    /// the tail past the cap was dropped, and the parser-handled `APC` path
+    /// (which never reaches `vte`) drops its accumulated header instead.
+    ControlStringRejected {
+        /// Family of the aborted string.
+        kind: ControlStringKind,
+        /// Why it was refused.
+        reason: ControlStringReject,
     },
 
     // Unknown escape families

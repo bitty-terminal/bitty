@@ -36,7 +36,7 @@
 #   build/tool scratch, never durable evidence), so only `/tmp/bitty` (end of
 #   line or before a non-path character) and `/tmp/bitty/...` are allowed;
 #   `/tmp/bitty-*`, `/tmp/bitty.*`, `/tmp/bitty2`, `/tmp/bitty/../...`, and
-#   `/var/tmp/bitty` stay flagged.
+#   `/var/tmp/bitty` stay flagged, as do drive-qualified `X:/tmp/...` paths.
 #   The rule covers `/var/tmp/` too (the alternate system temp dir; the
 #   inner `/tmp/` of `/var/tmp/` is lookbehind-excluded, so it needs its
 #   own alternative). The match requires the leading slash NOT to follow `[A-Za-z0-9_/-]`.
@@ -197,7 +197,7 @@ for file in "${SRC_FILES[@]}"; do
     echo "scratch-paths[tmp-write]: $file:$hit"
     FAIL=1
   done < <(
-    rg -n -P --no-heading '(?<![A-Za-z0-9_/\-])(/var/tmp/|/tmp/(?!bitty(?=$|[^[:alnum:]_.-])(?!/\.\.(?:/|$))))' "$file" 2>/dev/null || true
+    rg -n -P --no-heading '(?<![A-Za-z0-9_/\-])([A-Za-z]:/tmp/|/var/tmp/|/tmp/(?!bitty(?=$|[^[:alnum:]_.-])(?!/\.\.(?:/|$))))' "$file" 2>/dev/null || true
   )
 done
 

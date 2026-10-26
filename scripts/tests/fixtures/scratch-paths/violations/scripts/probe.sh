@@ -10,4 +10,5 @@ log=/tmp/bitty.log
 root2=/tmp/bitty2/q
 trav=/tmp/bitty/../x
 vartmp=/var/tmp/bitty/appimagetool
-printf '%s %s %s %s %s\n' "$backup" "$log" "$root2" "$trav" "$vartmp" >/dev/null
+drive=C:/tmp/bitty/x
+printf '%s %s %s %s %s %s\n' "$backup" "$log" "$root2" "$trav" "$vartmp" "$drive" >/dev/null

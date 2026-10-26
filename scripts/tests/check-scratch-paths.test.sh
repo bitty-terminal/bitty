@@ -48,7 +48,8 @@ for path in \
   '/tmp/bitty.log' \
   '/tmp/bitty2/q' \
   '/tmp/bitty/../x' \
-  '/var/tmp/bitty/appimagetool'; do
+  '/var/tmp/bitty/appimagetool' \
+  'C:/tmp/bitty/x'; do
   if ! rg -qF "$path" <<<"$violations_out"; then
     echo "FAIL: over-broad /tmp/bitty allowlist let $path pass:" >&2
     printf '%s\n' "$violations_out" >&2

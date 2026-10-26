@@ -12,9 +12,11 @@
 //! 2. **Place**: every cell covered by a planned dirty rectangle is
 //!    examined. Backgrounds merge into maximal horizontal same-color runs
 //!    per row (CTX-0471) and, with text decorations, become [`FillRect`]s;
-//!    a printable base scalar, plus each visible combining mark in the
-//!    cell's bounded `zerowidth` buffer (CR-TERM-01), becomes a
-//!    [`GlyphInstance`].
+//!    a printable base scalar, plus each visible zero-width mark in the
+//!    cell's bounded `zerowidth` cluster-tail buffer (CR-TERM-01,
+//!    CTX-1609), becomes a [`GlyphInstance`]. Printable continuation
+//!    scalars of a multi-base cluster stay in Terminal Truth and paint
+//!    through the shaped path; the unshaped fallback paints the lead.
 //!    Underline paint is style-faithful (CTX-0583, refined CTX-1007):
 //!    `Single`/`Double` are full-width bars, while `Curly`/`Dotted`/`Dashed`
 //!    decompose into bounded, deterministic rectangle patterns anchored to
@@ -3448,16 +3450,18 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
 
     /// Emits a cell's zero-width scalars over their base glyph (CR-TERM-01).
     ///
-    /// `Cell::zerowidth` carries combining marks, joiners, and selectors
-    /// attached to the base cell. The unshaped paint path used to drop the
-    /// whole buffer, so a base + mark cell — for example the `e` + U+0301
-    /// corpus line in the #2264 report — painted as a bare `e`. Painting
-    /// each visible mark at the pen position the font expects restores the
-    /// diacritic without touching Terminal Truth: the cell keeps its base
-    /// scalar and mark buffer, so selection, copy, search, and accessibility
-    /// text stay byte-identical. (A genuinely precomposed U+00E9 cell was
-    /// already painted correctly; this closes the equivalent decomposed
-    /// encoding, which is what the reported corpus stores.)
+    /// `Cell::zerowidth` carries the cluster tail: combining marks, joiners,
+    /// selectors, and (CTX-1609) printable continuation scalars. Only
+    /// zero-width mark shapes paint here; printable continuations need the
+    /// shaped path. The unshaped paint path used to drop the whole buffer,
+    /// so a base + mark cell — for example the `e` + U+0301 corpus line in
+    /// the #2264 report — painted as a bare `e`. Painting each visible mark
+    /// at the pen position the font expects restores the diacritic without
+    /// touching Terminal Truth: the cell keeps its base scalar and mark
+    /// buffer, so selection, copy, search, and accessibility text stay
+    /// byte-identical. (A genuinely precomposed U+00E9 cell was already
+    /// painted correctly; this closes the equivalent decomposed encoding,
+    /// which is what the reported corpus stores.)
     ///
     /// Join controls (ZWNJ/ZWJ), variation selectors, and tag scalars carry
     /// no glyph of their own; they are skipped rather than rasterized (a
@@ -4201,6 +4205,17 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
             let group = &clusters_ref[idx..group_end];
             let byte_end = cluster_group_end(clusters_ref, idx, run.text.len());
             let slice = run.text.get(group_offset..byte_end).unwrap_or("");
+            // CTX-1609: the grid committed one cell per grapheme cluster, so
+            // a shaper cluster whose run-relative start lies past the run's
+            // committed columns belongs to the same stored cell (a font
+            // without the ZWJ/flag ligature returns one cluster per base).
+            // Only the leading base paints; the rest of the text stays in
+            // Terminal Truth for the shaped path with a ligating font and for
+            // copy/search/accessibility.
+            if first.cells.0 >= run.col_count {
+                idx = group_end;
+                continue;
+            }
             // Group span from grid truth (the empty-slice member's stored
             // count is a 1-cell placeholder, never authoritative).
             let count = cells_for_range(slice).max(1);
@@ -4430,17 +4445,21 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
         Ok(())
     }
 
-    /// Emits one cluster's text per cell through the unshaped path
-    /// (CJK-epsilon fallback; every visible scalar keeps grid-true
+    /// Emits one cluster's text per grid cell through the unshaped path
+    /// (CJK-epsilon fallback; every committed cluster keeps grid-true
     /// placement).
     ///
-    /// Zero-width scalars own no cell. Join controls, variation selectors,
-    /// and tags are skipped: advancing them would shift a ZWJ sequence into
+    /// CTX-1609: the slice is split into extended grapheme clusters and each
+    /// cluster paints its leading scalar at the column span the print path
+    /// committed (one or two cells). Join controls, variation selectors, and
+    /// tags are skipped: advancing them would shift a ZWJ sequence into
     /// spacer columns and paint a stray glyph over the following cell.
-    /// Visible combining marks paint at the preceding base's pen origin,
-    /// mirroring the #2279 cell path, so a per-base fallback never drops a
-    /// diacritic. All bytes stay in Terminal Truth for selection, copy,
-    /// search, and accessibility.
+    /// Visible combining marks paint at the base's pen origin, mirroring the
+    /// #2279 cell path, so a per-cluster fallback never drops a diacritic.
+    /// Additional printable scalars of a multi-base cluster (ZWJ partners,
+    /// regional indicators, skin-tone modifiers) stay in Terminal Truth for
+    /// selection, copy, search, accessibility, and the shaped path; the
+    /// unshaped fallback paints the leading glyph only.
     fn emit_unshaped_slice(
         &mut self,
         slice: &str,
@@ -4450,26 +4469,31 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
         list: &mut DrawList,
     ) {
         let mut col = abs_col;
-        let mut last_base: Option<(usize, i32)> = None;
-        for ch in slice.chars() {
-            let width = usize::from(bitty_term_state::char_cell_width(ch));
+        for cluster in bitty_term_state::Graphemes::new(slice) {
+            let width = usize::from(bitty_term_state::cluster_cell_width(
+                cluster,
+                bitty_term_state::AmbiguousWidth::Narrow,
+            ));
+            let mut chars = cluster.chars();
+            let Some(base) = chars.next() else {
+                continue;
+            };
             if width == 0 {
-                if is_paintable_zerowidth(ch) {
-                    if let Some((base_col, pen_advance)) = last_base {
-                        if let Some(advance) =
-                            self.emit_mark(ch, row, base_col, pen_advance, fg, list)
-                        {
-                            last_base = Some((base_col, pen_advance.saturating_add(advance)));
-                        }
-                    }
-                }
                 continue;
             }
-            let (emitted, advance) = self.emit_glyph(ch, row, col, width, fg, list);
+            let (emitted, advance) = self.emit_glyph(base, row, col, width, fg, list);
             if !emitted {
                 self.counters.blank_cells_skipped += 1;
             }
-            last_base = Some((col, advance.max(0)));
+            let mut pen_advance = advance.max(0);
+            for mark in chars {
+                if !is_paintable_zerowidth(mark) {
+                    continue;
+                }
+                if let Some(advance) = self.emit_mark(mark, row, col, pen_advance, fg, list) {
+                    pen_advance = pen_advance.saturating_add(advance);
+                }
+            }
             col += width;
         }
     }
@@ -4532,11 +4556,13 @@ fn push_cached_glyph(
 
 /// Whether a zero-width scalar attached to a cell has a visible mark shape.
 ///
-/// `Grapheme_Extend` covers combining marks (and emoji modifiers, which are
-/// wide scalars stored in their own cells, so they never reach the mark
-/// buffer in practice). Join controls and selectors/tags carry no mark shape;
-/// they are skipped so a missing-glyph tofu box can never be painted over
-/// their base.
+/// `Grapheme_Extend` covers combining marks. CTX-1609 stores the whole
+/// cluster tail in this buffer, including printable scalars (regional
+/// indicators, emoji modifiers, spacing marks); those are not overlay marks
+/// and the unshaped path must not paint them at the base's pen position, so
+/// only zero-cell-width scalars qualify. Join controls and selectors/tags
+/// carry no mark shape and are skipped so a missing-glyph tofu box can never
+/// be painted over their base.
 #[must_use]
 fn is_paintable_zerowidth(ch: char) -> bool {
     let cp = ch as u32;
@@ -4549,7 +4575,7 @@ fn is_paintable_zerowidth(ch: char) -> bool {
     ) {
         return false;
     }
-    bitty_term_state::is_grapheme_extend(cp)
+    bitty_term_state::char_cell_width(ch) == 0 && bitty_term_state::is_grapheme_extend(cp)
 }
 
 /// Destination x for one shaped glyph instance (Phase C hardening).

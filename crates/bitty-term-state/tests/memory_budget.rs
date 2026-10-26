@@ -4,8 +4,8 @@
 //! bloat (a wider [`Cell`], a raised scrollback default, a bigger grid,
 //! an over-allocating container) fails CI instead of regressing silently:
 //!
-//! - [`Cell`] stays at most 64 bytes (measured 60: 4 glyph + 20 style +
-//!   width/spacer/hyperlink + 24 inline combining buffer);
+//! - [`Cell`] stays at most 64 bytes (measured 64: 4 glyph + 20 style +
+//!   width/spacer/hyperlink + 28 inline cluster-tail buffer);
 //! - an idle 80x24 state (primary + alt grids, empty scrollback) measures
 //!   its retained heap via [`State::retained_heap_bytes`] and stays under
 //!   1 MiB of owned heap;

@@ -5,9 +5,12 @@
 //! this scalar occupy", this module answers "which scalars travel together".
 //! The segmenter is dependency-free, deterministic, and total over any
 //! `&str`: no I/O, no allocation beyond the returned slices, no platform
-//! variance. Lookup tables are curated M1 subsets of the Unicode Character
-//! Database, documented below; unlisted scalars resolve to the fail-open
-//! `GB999 Any ÷ Any` break, never to a panic or an over-join.
+//! variance. The East_Asian_Width and Extended_Pictographic lookup tables are
+//! generated from pinned UCD 18.0.0 snapshots (`crate::width_tables`); the
+//! remaining segmentation property subsets are curated and documented below,
+//! and the full official `GraphemeBreakTest.txt` passes. Unlisted scalars
+//! resolve to the fail-open `GB999 Any ÷ Any` break, never to a panic or an
+//! over-join.
 //!
 //! Rule coverage (UAX #29, grapheme-cluster boundary rules):
 //!
@@ -15,21 +18,20 @@
 //! - `GB6`–`GB8` (Hangul syllables): Jamo `1100..11FF`, extended Jamo
 //!   `A960..A97C`/`D7B0..D7FB`, and precomposed syllables `AC00..D7A3`.
 //! - `GB9` (`× Extend | ZWJ`): [`is_grapheme_extend`] over the crate
-//!   zero-width tables plus emoji modifiers `1F3FB..1F3FF`; format controls
-//!   (bidi marks, Arabic format controls, `FEFF`, tags `E0000..E0001`)
-//!   break instead of joining, matching their `Control` grapheme property.
+//!   zero-width tables plus emoji modifiers `1F3FB..1F3FF`; ZWNJ `200C`
+//!   joins as Extend. Other format controls (bidi marks, Arabic format
+//!   controls, `FEFF`, tags `E0000..E0001`) break, matching their `Control`
+//!   grapheme property.
 //! - `GB9a` (`× SpacingMark`): curated Indic, Thai/Lao, Myanmar, and Khmer
 //!   spacing-mark ranges. Unlisted spacing marks break (table gap).
-//! - `GB9b` (`× Prepend`): not implemented; prepend format controls break.
-//!   Prepend scalars are vanishingly rare in terminal text, and joining
-//!   them forward would mis-measure cursor runs for every other consumer.
-//! - `GB11` (extended-pictographic ZWJ sequences): full over the curated
-//!   [`is_extended_pictographic`] set (the width emoji-presentation ranges
-//!   plus `1F300..1F64F`/`1F680..1F6FF`/`1F900..1F9FF`).
+//! - `GB9b` (`Prepend × Any`): the Unicode 18.0.0 `Prepend` class.
+//! - `GB11` (extended-pictographic ZWJ sequences): the authoritative UTS #51
+//!   `Extended_Pictographic` set generated from the pinned `emoji-data.txt`.
 //! - `GB12`/`GB13` (regional-indicator pairing): full, with run parity.
-//! - Indic conjuncts (post-15.0 `GB9c`, virama linkers): M1-lite rule — no
-//!   break between a virama linker and a following Indic/Tibetan/Myanmar/
-//!   Khmer letter. The full `InCB` property table follows the text RFC.
+//! - Indic conjuncts (`GB9c`, virama linkers): linker state tracked across
+//!   `InCB=Extend` scalars, closing on a following Indic/Tibetan/Myanmar/
+//!   Khmer/Balinese/Vedic letter. The `InCB` consonant requirement before
+//!   the linker is not tracked (documented M1-lite approximation).
 //!
 //! Tibetan subjoining beyond the combining vowel-sign range `0F72..0F84`
 //! segments conservatively (breaks where a full `InCB` table would join);
@@ -37,16 +39,31 @@
 //!
 //! [`Graphemes`] yields the clusters of a string in order; [`split_clusters`]
 //! collects them. [`cluster_cell_width`] measures one cluster for grid work:
-//! the maximum scalar width under the given [`AmbiguousWidth`] policy (`0`
-//! for the empty cluster). Regional-indicator pairs therefore measure `1`
-//! per cluster while occupying two grid cells as two width-1 scalars —
-//! consistent with how the state print path stores them.
+//! Wide/Fullwidth scalars and emoji presentation make the cluster occupy two
+//! cells, regional-indicator pairs occupy two, and every other cluster one
+//! (`0` for a zero-width-only cluster). The state print path stores a
+//! cluster on one leading cell plus, for a two-cell cluster, one wide
+//! spacer, and [`cluster_continues`] decides whether the next scalar joins
+//! that cell (CTX-1609).
 
 use super::cell::{AmbiguousWidth, char_cell_width_in, is_zero_width};
+use super::width_tables::is_extended_pictographic_scalar;
 
 /// Zero-width joiner: joins backward (`GB9`), and forward only across an
 /// extended-pictographic run (`GB11`).
 const ZWJ: u32 = 0x200D;
+
+/// Zero-width non-joiner: joins as `Extend` backward (`GB9`) but suppresses
+/// the `GB9c` conjunct continuation.
+const ZWNJ: u32 = 0x200C;
+
+/// Variation selector-16: requests emoji presentation for the preceding
+/// base, widening a text-default pictograph or keycap cluster to two cells.
+const VARIATION_SELECTOR_16: char = '\u{FE0F}';
+
+/// Combining enclosing keycap: the third scalar of a keycap sequence
+/// (`#` + VS16 + U+20E3), which renders as one two-cell emoji.
+const COMBINING_KEYCAP: char = '\u{20E3}';
 
 /// Carriage return / line feed (`GB3`).
 const CR: u32 = 0x000D;
@@ -61,11 +78,7 @@ fn is_break_control(cp: u32) -> bool {
     matches!(cp,
         0x0000..=0x001F
         | 0x007F..=0x009F
-        | 0x0600..=0x0605
         | 0x061C
-        | 0x06DD
-        | 0x070F
-        | 0x0890..=0x0891
         | 0x200B
         | 0x200E..=0x200F
         | 0x2028..=0x202E
@@ -75,14 +88,42 @@ fn is_break_control(cp: u32) -> bool {
     )
 }
 
-/// Whether `cp` is `Grapheme_Extend` in the M1 curated table (`GB9`).
+/// Whether `cp` is `Prepend` in the UAX #29 table (`GB9b`).
+///
+/// Prepend format controls join forward to the following scalar. The set is
+/// the Unicode 18.0.0 `GraphemeBreakProperty.txt` `Prepend` class; these
+/// scalars are zero-width in the cell tables, so the grid drops a leading
+/// one but never breaks a following cluster.
+fn is_prepend(cp: u32) -> bool {
+    matches!(cp,
+        0x0600..=0x0605
+        | 0x06DD
+        | 0x070F
+        | 0x0890..=0x0891
+        | 0x08E2
+        | 0x0D4E
+        | 0x110BD
+        | 0x110CD
+        | 0x111C2..=0x111C3
+        | 0x113D1
+        | 0x1193F
+        | 0x11941
+        | 0x11A84..=0x11A89
+        | 0x11D46
+        | 0x11F02
+    )
+}
+
+/// Whether `cp` is `Grapheme_Extend` in the crate table (`GB9`).
 ///
 /// The crate zero-width tables minus the format controls (which break, see
-/// `is_break_control`) and minus ZWJ (own class), plus emoji modifiers
-/// `1F3FB..1F3FF` (wide scalars that still join forward).
+/// `is_break_control`), minus `Prepend` scalars (own forward rule, `GB9b`),
+/// and minus ZWJ (own class), plus emoji modifiers `1F3FB..1F3FF` (wide
+/// scalars that still join forward). ZWNJ `U+200C` joins as `Extend`, per
+/// UAX #29.
 #[must_use]
 pub fn is_grapheme_extend(cp: u32) -> bool {
-    if cp == ZWJ || is_break_control(cp) {
+    if cp == ZWJ || is_break_control(cp) || is_prepend(cp) {
         return false;
     }
     if matches!(cp, 0x1F3FB..=0x1F3FF) {
@@ -95,8 +136,10 @@ pub fn is_grapheme_extend(cp: u32) -> bool {
 ///
 /// Curated `SpacingMark` subset: Devanagari, Bengali, Gurmukhi, Gujarati,
 /// Oriya, Tamil, Telugu, Kannada, Malayalam, Sinhala vowel signs, Thai
-/// `0E33`, Lao `0EB3`/`0EBD`, Myanmar `102B..1032`/`1036..1038`, Khmer
-/// `17B6`/`17BE..17C5`/`17C7..17C8`. Unlisted spacing marks break.
+/// `0E33`, Lao `0EB3`/`0EBD`, Myanmar `1031`/`103B..103C`/`1056..1057`/
+/// `1084`, Balinese `1B04`, Khmer `17B6`/`17BE..17C5`/`17C7..17C8`. Unlisted
+/// spacing marks break; the official UCD fixture does not exercise the
+/// remaining gap.
 fn is_spacing_mark(cp: u32) -> bool {
     matches!(cp,
         0x0903
@@ -138,58 +181,26 @@ fn is_spacing_mark(cp: u32) -> bool {
         | 0x0E33
         | 0x0EB3
         | 0x0EBD
-        | 0x102B..=0x1032
-        | 0x1036..=0x1038
+        | 0x1031
+        | 0x103B..=0x103C
+        | 0x1056..=0x1057
+        | 0x1084
         | 0x17B6
         | 0x17BE..=0x17C5
         | 0x17C7..=0x17C8
+        | 0x1B04
     )
 }
 
 /// Whether `cp` may form an emoji ZWJ sequence (`GB11`).
 ///
-/// The width emoji-presentation ranges plus the pictographic blocks
-/// `1F300..1F64F`, `1F680..1F6FF`, and `1F900..1F9FF`.
+/// The authoritative UTS #51 `Extended_Pictographic` set from the pinned
+/// `emoji-data.txt` snapshot (UCD 18.0.0, generated into
+/// [`crate::width_tables`]). The earlier curated subset omitted text-default
+/// pictographs such as U+2764, so sequences like heart-on-fire split.
 #[must_use]
 pub fn is_extended_pictographic(cp: u32) -> bool {
-    matches!(cp,
-        0x231A..=0x231B
-        | 0x23E9..=0x23EC
-        | 0x23F0
-        | 0x23F3
-        | 0x25FD..=0x25FE
-        | 0x2614..=0x2615
-        | 0x2648..=0x2653
-        | 0x267F
-        | 0x2693
-        | 0x26A1
-        | 0x26AA..=0x26AB
-        | 0x26BD..=0x26BE
-        | 0x26C4..=0x26C5
-        | 0x26CE
-        | 0x26D4
-        | 0x26EA
-        | 0x26F2..=0x26F3
-        | 0x26F5
-        | 0x26FA
-        | 0x26FD
-        | 0x2705
-        | 0x270A..=0x270B
-        | 0x2728
-        | 0x274C
-        | 0x274E
-        | 0x2753..=0x2755
-        | 0x2757
-        | 0x2795..=0x2797
-        | 0x27B0
-        | 0x27BF
-        | 0x2B1B..=0x2B1C
-        | 0x2B50
-        | 0x2B55
-        | 0x1F300..=0x1F64F
-        | 0x1F680..=0x1F6FF
-        | 0x1F900..=0x1F9FF
-    )
+    is_extended_pictographic_scalar(cp)
 }
 
 /// Whether `cp` is a regional indicator (`GB12`/`GB13`).
@@ -198,44 +209,64 @@ pub fn is_regional_indicator(cp: u32) -> bool {
     matches!(cp, 0x1F1E6..=0x1F1FF)
 }
 
-/// Virama-style linkers for the M1-lite conjunct rule (`GB9c` approximation).
+/// `InCB=Linker` scalars for the conjunct rule (`GB9c`).
 ///
-/// Devanagari `094D`, Bengali `09CD`, Gurmukhi `0A4D`, Gujarati `0ACD`,
-/// Oriya `0B4D`, Tamil `0BCD`, Telugu `0C4D`, Kannada `0CCD`, Malayalam
-/// `0D4D`, Sinhala `0DCA`, Myanmar `1039`, Khmer `17D2`. A linker never
-/// ends a cluster before a following Indic-block letter.
+/// The Unicode 18.0.0 `DerivedCoreProperties.txt` `InCB; Linker` set:
+/// Devanagari, Bengali, Gujarati, Oriya, Telugu, Malayalam, Myanmar, Khmer,
+/// Tai Tham, Balinese, Zanabazar Square, Vedic, Javanese, Cham, Tai Viet,
+/// and the Kaithi/Sharada/Khojki/Tirhuta/Modi/Soyombo/Bhaiksuki linkers.
+/// A linker opens a conjunct run that a following consonant closes, with
+/// `InCB=Extend` scalars allowed in between.
 fn is_linker(cp: u32) -> bool {
     matches!(
         cp,
         0x094D
             | 0x09CD
-            | 0x0A4D
             | 0x0ACD
             | 0x0B4D
-            | 0x0BCD
             | 0x0C4D
-            | 0x0CCD
             | 0x0D4D
-            | 0x0DCA
             | 0x1039
             | 0x17D2
+            | 0x1A60
+            | 0x1B44
+            | 0x1BAB
+            | 0x1CF5
+            ..=0x1CF6
+                | 0xA9C0
+                | 0xAAF6
+                | 0x10A3F
+                | 0x11133
+                | 0x113D0
+                | 0x1193E
+                | 0x11A3A
+                | 0x11A47
+                | 0x11A99
+                | 0x11F42
     )
 }
 
 /// Letters the linker rule may join onto (Indic blocks, Tibetan, Myanmar,
-/// Khmer): any scalar in these ranges that is not itself a joiner,
-/// control, or indicator.
+/// Khmer, Tai Tham, Balinese, Vedic, and the Brahmic supplement blocks):
+/// any scalar in these ranges that is not itself a joiner, control, or
+/// indicator.
 fn is_linker_target(cp: u32) -> bool {
     if is_grapheme_extend(cp)
         || is_spacing_mark(cp)
         || is_break_control(cp)
         || is_regional_indicator(cp)
+        || is_linker(cp)
         || cp == ZWJ
     {
         return false;
     }
-    matches!(cp,
-        0x0900..=0x0DFF | 0x0F00..=0x0FFF | 0x1000..=0x109F | 0x1780..=0x17FF
+    matches!(
+        cp,
+        0x0900..=0x0DFF
+            | 0x0F00..=0x0FFF
+            | 0x1000..=0x109F
+            | 0x1700..=0x1CFF
+            | 0x11000..=0x11FFF
     )
 }
 
@@ -274,6 +305,9 @@ struct RunState {
     pictographic_open: bool,
     /// Whether the previous scalar is ZWJ (second half of `GB11`).
     prev_is_zwj: bool,
+    /// Whether an `InCB=Linker` was seen in this run with only
+    /// `InCB=Extend` scalars since (`GB9c`).
+    linker_open: bool,
     /// Regional indicators already in this run (`GB12`/`GB13` parity).
     ri_run: u32,
 }
@@ -285,7 +319,43 @@ impl RunState {
             prev_hangul: hangul_class(prev),
             pictographic_open: is_extended_pictographic(prev),
             prev_is_zwj: prev == ZWJ,
+            linker_open: is_linker(prev),
             ri_run: u32::from(is_regional_indicator(prev)),
+        }
+    }
+
+    /// Advances the run state over one scalar that does not break.
+    fn advance(self, cp: u32) -> Self {
+        // ZWJ keeps a pictographic run open (`GB11` spans ExtPict
+        // (Extend | spacing-mark)* ZWJ); anything else closes it unless it
+        // is itself pictographic or a joiner.
+        let extend_like = cp == ZWJ || is_grapheme_extend(cp) || is_spacing_mark(cp);
+        Self {
+            prev: cp,
+            prev_hangul: hangul_class(cp),
+            pictographic_open: if is_extended_pictographic(cp) {
+                true
+            } else {
+                self.pictographic_open && extend_like
+            },
+            prev_is_zwj: cp == ZWJ,
+            linker_open: if cp == ZWNJ {
+                // ZWNJ is InCB=Extend but explicitly suppresses a
+                // conjunct, so it closes the linker run without breaking
+                // the grapheme itself.
+                false
+            } else if is_linker(cp) {
+                true
+            } else if extend_like {
+                self.linker_open
+            } else {
+                false
+            },
+            ri_run: if is_regional_indicator(cp) {
+                self.ri_run + 1
+            } else {
+                0
+            },
         }
     }
 }
@@ -332,6 +402,10 @@ fn breaks_before(state: &RunState, current: u32) -> bool {
     if is_spacing_mark(current) {
         return false;
     }
+    // GB9b: Prepend × Any.
+    if is_prepend(prev) {
+        return false;
+    }
     // GB11: ExtPict Extend* ZWJ × ExtPict.
     if state.prev_is_zwj && state.pictographic_open && is_extended_pictographic(current) {
         return false;
@@ -340,8 +414,8 @@ fn breaks_before(state: &RunState, current: u32) -> bool {
     if is_regional_indicator(prev) && is_regional_indicator(current) {
         return state.ri_run % 2 == 0;
     }
-    // M1-lite GB9c: linker × Indic-block letter.
-    if is_linker(prev) && is_linker_target(current) {
+    // GB9c (M1-lite): a linker run closes on an Indic-block letter.
+    if state.linker_open && is_linker_target(current) {
         return false;
     }
     // GB999: Any ÷ Any.
@@ -382,26 +456,7 @@ impl<'a> Iterator for Graphemes<'a> {
                 break;
             }
             end = self.byte + offset + current.len_utf8();
-            let hangul = hangul_class(cp);
-            // ZWJ keeps a pictographic run open (`GB11` spans ExtPict
-            // (Extend | spacing-mark)* ZWJ); anything else closes it unless
-            // it is itself pictographic or a joiner.
-            let extend_like = cp == ZWJ || is_grapheme_extend(cp) || is_spacing_mark(cp);
-            state = RunState {
-                prev: cp,
-                prev_hangul: hangul,
-                pictographic_open: if is_extended_pictographic(cp) {
-                    true
-                } else {
-                    state.pictographic_open && extend_like
-                },
-                prev_is_zwj: cp == ZWJ,
-                ri_run: if is_regional_indicator(cp) {
-                    state.ri_run + 1
-                } else {
-                    0
-                },
-            };
+            state = state.advance(cp);
         }
         let cluster = self.text.get(self.byte..end)?;
         self.byte = end;
@@ -417,17 +472,82 @@ pub fn split_clusters(text: &str) -> Vec<&str> {
 
 /// Cell width of one grapheme cluster under `ambiguous`.
 ///
-/// The maximum scalar width in the cluster (`0` for the empty cluster), so
-/// a base plus its combining marks measures as the base, and a ZWJ emoji
-/// sequence measures as its wide lead. Regional-indicator pairs measure `1`
-/// per cluster while occupying two width-1 grid cells; see the module docs.
+/// A cluster occupies two cells when it contains a Wide/Fullwidth scalar
+/// (which includes emoji-presentation scalars), when it is a
+/// regional-indicator pair, or when a variation selector-16 turns an
+/// extended-pictographic base or keycap sequence into emoji presentation;
+/// every other non-empty cluster occupies one cell. An all-zero-width
+/// cluster (a lone combining mark or lone ZWJ) occupies none.
 #[must_use]
 pub fn cluster_cell_width(cluster: &str, ambiguous: AmbiguousWidth) -> u8 {
-    cluster
-        .chars()
-        .map(|c| char_cell_width_in(c, ambiguous))
-        .max()
-        .unwrap_or(0)
+    cluster_width(cluster.chars(), ambiguous)
+}
+
+/// [`cluster_cell_width`] over a leading glyph plus its stored tail.
+///
+/// The state print path keeps the base scalar in `Cell::glyph` and the
+/// remaining cluster scalars in the bounded continuation buffer; this
+/// measures that pair without rebuilding a `String`.
+#[must_use]
+pub(crate) fn cluster_cell_width_parts(
+    glyph: char,
+    tail: &[char],
+    ambiguous: AmbiguousWidth,
+) -> u8 {
+    cluster_width(
+        std::iter::once(glyph).chain(tail.iter().copied()),
+        ambiguous,
+    )
+}
+
+fn cluster_width(chars: impl Iterator<Item = char>, ambiguous: AmbiguousWidth) -> u8 {
+    let mut max_width = 0u8;
+    let mut regional = 0u8;
+    let mut emoji_base = false;
+    let mut variation_16 = false;
+    let mut keycap = false;
+    for scalar in chars {
+        max_width = max_width.max(char_cell_width_in(scalar, ambiguous));
+        if is_regional_indicator(scalar as u32) {
+            regional = regional.saturating_add(1);
+        }
+        if scalar == VARIATION_SELECTOR_16 {
+            variation_16 = true;
+        }
+        if scalar == COMBINING_KEYCAP {
+            keycap = true;
+        }
+        if is_extended_pictographic(scalar as u32) {
+            emoji_base = true;
+        }
+    }
+    if max_width == 0 {
+        return 0;
+    }
+    if max_width == 2 || regional >= 2 || (variation_16 && (emoji_base || keycap)) {
+        return 2;
+    }
+    1
+}
+
+/// Whether `next` extends the stored cluster (`glyph` plus `tail`) instead
+/// of starting a new one under the UAX #29 rules this module implements.
+///
+/// Used by the state print path: a scalar that does not break joins the
+/// preceding cell's cluster and therefore does not consume a new layout
+/// unit. The tail is one cluster by construction; a malformed buffer that
+/// already contains a break refuses the join (fail-open to per-scalar
+/// layout, never an over-join).
+#[must_use]
+pub(crate) fn cluster_continues(glyph: char, tail: &[char], next: char) -> bool {
+    let mut state = RunState::start(glyph as u32);
+    for &scalar in tail {
+        if breaks_before(&state, scalar as u32) {
+            return false;
+        }
+        state = state.advance(scalar as u32);
+    }
+    !breaks_before(&state, next as u32)
 }
 
 #[cfg(test)]
@@ -527,5 +647,69 @@ mod tests {
         assert!(!is_extended_pictographic(0x0041));
         assert!(is_regional_indicator(0x1F1EB));
         assert!(!is_regional_indicator(0x1F600));
+    }
+
+    /// Parses one line of the UCD `GraphemeBreakTest.txt` fixture into the
+    /// full input string and the expected cluster strings.
+    fn parse_break_test(line: &str) -> Option<(String, Vec<String>)> {
+        let data = line.split('#').next()?.trim();
+        if data.is_empty() {
+            return None;
+        }
+        let mut text = String::new();
+        let mut expected = Vec::new();
+        let mut current = String::new();
+        for token in data.split_whitespace() {
+            match token {
+                "÷" => {
+                    if !current.is_empty() {
+                        expected.push(std::mem::take(&mut current));
+                    }
+                }
+                "×" => {}
+                hex => {
+                    let cp = u32::from_str_radix(hex, 16).ok()?;
+                    let scalar = char::from_u32(cp)?;
+                    text.push(scalar);
+                    current.push(scalar);
+                }
+            }
+        }
+        Some((text, expected))
+    }
+
+    /// UCD 18.0.0 `GraphemeBreakTest.txt` conformance.
+    ///
+    /// The full official file is checked in and every sample must match
+    /// exactly. Rule coverage is the module's documented set: GB3-GB9c,
+    /// GB11-GB13, GB999. The `InCB=Consonant` requirement before a linker is
+    /// not tracked (the linker state is forward-only), but no official sample
+    /// distinguishes that approximation; regenerating the fixture for a
+    /// newer UCD requires re-running this test before accepting the bump.
+    #[test]
+    fn ucd_grapheme_break_test_conformance() {
+        const FIXTURE: &str = include_str!("../tests/data/GraphemeBreakTest-18.0.0.txt");
+        let mut failures = Vec::new();
+        for (index, line) in FIXTURE.lines().enumerate() {
+            let Some((text, expected)) = parse_break_test(line) else {
+                continue;
+            };
+            let actual: Vec<String> = split_clusters(&text)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            if actual != expected {
+                failures.push((index as u32 + 1, text, expected, actual));
+            }
+        }
+        if !failures.is_empty() {
+            for (line, text, expected, actual) in failures.iter().take(20) {
+                eprintln!("line {line}: {text:?}\n  expected {expected:?}\n  actual   {actual:?}");
+            }
+            panic!(
+                "{} of the UCD samples diverge from the M1 segmenter",
+                failures.len()
+            );
+        }
     }
 }

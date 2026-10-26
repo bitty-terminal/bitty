@@ -948,12 +948,12 @@ impl SwashSingle {
 
 /// Collects run text from grid cells (design 2.2).
 ///
-/// Concatenates `Cell::glyph` + its `zerowidth` buffer contents per cell
-/// (combining marks stay attached to their base — matches
-/// `bitty-term-state` storage). Spacers contribute nothing (they are the
-/// trailing half of a wide char, background-only by construction).
-/// Grid truth stays authoritative: this only reads `Cell`s, never shaped
-/// output.
+/// Concatenates `Cell::glyph` + its `zerowidth` cluster-tail contents per
+/// cell (CTX-1609: combining marks, joiners, selectors, regional indicators,
+/// and modifiers stay attached to their base — matches `bitty-term-state`
+/// storage). Spacers contribute nothing (they are the trailing half of a
+/// wide char, background-only by construction). Grid truth stays
+/// authoritative: this only reads `Cell`s, never shaped output.
 #[must_use]
 pub fn collect_run_text(cells: &[bitty_term_state::Cell]) -> String {
     let mut out = String::new();
@@ -1665,10 +1665,22 @@ pub fn harfrust_features(
 
 /// Sums grid cell widths over a text range (zero-width marks contribute 0,
 /// CJK/emoji contribute 2 — grid truth stays authoritative).
+///
+/// CTX-1609: the sum is per extended grapheme cluster, not per scalar, so a
+/// ZWJ family, regional-indicator flag, skin-tone sequence, or keycap counts
+/// the same two columns the print path committed. The renderer's grid
+/// geometry still comes from `Cell::width`; this helper only estimates text
+/// spans for the shaped path (which is constructed before the runtime
+/// ambiguous-width policy is known and therefore uses the narrow policy).
 #[must_use]
 pub fn cells_for_range(text: &str) -> usize {
-    text.chars()
-        .map(|c| usize::from(bitty_term_state::char_cell_width(c)))
+    bitty_term_state::Graphemes::new(text)
+        .map(|cluster| {
+            usize::from(bitty_term_state::cluster_cell_width(
+                cluster,
+                bitty_term_state::AmbiguousWidth::Narrow,
+            ))
+        })
         .sum()
 }
 
@@ -2161,6 +2173,22 @@ mod tests {
         // Combining mark attaches without advancing.
         assert_eq!(cells_for_range("é"), 1);
         assert_eq!(cells_for_range(""), 0);
+        // CTX-1609: one layout unit per extended grapheme cluster.
+        assert_eq!(
+            cells_for_range("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"),
+            2,
+            "ZWJ family is one wide cluster"
+        );
+        assert_eq!(
+            cells_for_range("\u{1F1EF}\u{1F1F5}"),
+            2,
+            "flag pair is one wide cluster"
+        );
+        assert_eq!(
+            cells_for_range("\u{1F44D}\u{1F3FD}"),
+            2,
+            "skin-tone sequence is one wide cluster"
+        );
     }
 
     #[test]
@@ -2403,26 +2431,26 @@ mod tests {
     }
 
     #[test]
-    fn run_formation_spans_wide_spacers_for_zwj_clusters() {
-        // Issue #2262: a ZWJ family sequence is stored as four wide leads
-        // (each carrying the following join control) plus four trailing
-        // spacers. Run formation must keep every spacer inside the same run
-        // so HarfBuzz sees the full cluster; before this fix each spacer
-        // broke the run and the family painted as four separate glyphs.
+    fn run_formation_keeps_one_cell_for_zwj_clusters() {
+        // CTX-1609: a ZWJ family is stored as one wide lead carrying the
+        // whole cluster tail plus one trailing spacer. Run formation must
+        // keep the spacer inside the run and hand HarfBuzz the full cluster.
         use bitty_term_state::{Cell, Style};
         let style = Style::default();
-        let bases = ['\u{1F468}', '\u{1F469}', '\u{1F467}', '\u{1F466}'];
-        let mut row = Vec::with_capacity(bases.len() * 2);
-        for (index, base) in bases.into_iter().enumerate() {
-            let mut lead = Cell::erased(style);
-            lead.glyph = base;
-            lead.width = 2;
-            if index + 1 < bases.len() {
-                assert!(lead.push_zerowidth('\u{200D}'));
-            }
-            row.push(lead);
-            row.push(Cell::wide_spacer(style));
+        let mut lead = Cell::erased(style);
+        lead.glyph = '\u{1F468}';
+        lead.width = 2;
+        for scalar in [
+            '\u{200D}',
+            '\u{1F469}',
+            '\u{200D}',
+            '\u{1F467}',
+            '\u{200D}',
+            '\u{1F466}',
+        ] {
+            assert!(lead.push_zerowidth(scalar));
         }
+        let row = vec![lead, Cell::wide_spacer(style)];
         let runs = form_runs_for_row(&row, 0);
         assert_eq!(runs.len(), 1, "ZWJ family must form one run: {runs:?}");
         assert_eq!(
@@ -2430,13 +2458,13 @@ mod tests {
             "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}"
         );
         assert_eq!(runs[0].start_col, 0);
-        assert_eq!(runs[0].col_count, 8, "spacers are counted by their lead");
+        assert_eq!(runs[0].col_count, 2, "one cluster, one lead and one spacer");
         // A viewport slice starting mid-row shifts the run origin without
         // changing the text or the span.
         let offset = form_runs_for_row(&row, 3);
         assert_eq!(offset.len(), 1, "offset row keeps one run: {offset:?}");
         assert_eq!(offset[0].start_col, 3);
-        assert_eq!(offset[0].col_count, 8);
+        assert_eq!(offset[0].col_count, 2);
     }
 
     #[test]

@@ -3520,9 +3520,10 @@ fn four_line_paste_state_keeps_the_diacritic() {
     ]);
     let (frame, counters, glyphs) = render_script(&script);
     let stride = 80 * 8;
-    // 3 ASCII + 2 CJK leaders + 1 é + 4 ZWJ-family people = 10 instances;
-    // ZWJ never rasterizes.
-    assert_eq!(glyphs, 10);
+    // 3 ASCII + 2 CJK leaders + 1 é + 1 ZWJ-family lead = 7 instances;
+    // the cluster tail (joiners and the other family members) never
+    // rasterizes in the unshaped path (CTX-1609).
+    assert_eq!(glyphs, 7);
     assert_eq!(counters.missing_glyphs, 0);
 
     let single = render_script(&[print('\u{00E9}')]);
@@ -3559,8 +3560,10 @@ fn four_line_paste_state_combining_eacute_matches_precomposed() {
         "decomposed row 3 must paint the precomposed é frame"
     );
     assert_eq!(counters.missing_glyphs, 0);
-    // 3 ASCII + 2 CJK + base e + mark + 2 people = 9 instances.
-    assert_eq!(glyphs, 9);
+    // 3 ASCII + 2 CJK + base e + mark + 1 family lead = 8 instances
+    // (CTX-1609: the family occupies one cell; the rest of the cluster is
+    // text truth, not a separate glyph).
+    assert_eq!(glyphs, 8);
 }
 
 #[test]

@@ -30,6 +30,10 @@ impl State {
         h.boolean(self.cursor.pending_wrap);
         h.boolean(self.cursor.visible);
         h.u8(cursor_style_discriminant(self.cursor.cursor_style));
+        // CTX-1609: the ambiguous-width policy decides how every later
+        // Ambiguous scalar is laid out, so two states that differ only in
+        // the policy are not behaviorally identical.
+        h.u8(ambiguous_width_discriminant(self.ambiguous_width));
         write_style(&mut h, &self.cursor.style);
 
         h.boolean(self.modes.insert);
@@ -190,6 +194,13 @@ fn cursor_style_discriminant(style: CursorStyle) -> u8 {
         CursorStyle::SteadyUnderline => 4,
         CursorStyle::BlinkingBar => 5,
         CursorStyle::SteadyBar => 6,
+    }
+}
+
+fn ambiguous_width_discriminant(policy: crate::cell::AmbiguousWidth) -> u8 {
+    match policy {
+        crate::cell::AmbiguousWidth::Narrow => 0,
+        crate::cell::AmbiguousWidth::Wide => 1,
     }
 }
 

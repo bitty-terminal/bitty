@@ -1,9 +1,10 @@
-//! Grapheme clusters across wide-char spacers (issue #2262).
+//! Grapheme clusters as one layout unit (issues #2262, #1767).
 //!
-//! The grid stores a wide lead plus its trailing spacer per base, so a ZWJ
-//! family sequence is eight columns of cells with four logical bases. Run
-//! formation must keep those spacer halves inside one run; otherwise HarfBuzz
-//! never sees the full cluster and paints four separate glyphs.
+//! CTX-1609 stores an extended grapheme cluster on one wide lead cell
+//! (`Cell::glyph` plus the bounded `zerowidth` continuation buffer) with a
+//! trailing spacer for the second column. Run formation must keep that
+//! spacer inside one run and feed the full cluster text to HarfBuzz;
+//! otherwise a ZWJ family or flag pair never shapes as one cluster.
 //!
 //! Deterministic tests run everywhere. Font-dependent cluster checks carry
 //! the usual live-font gate:
@@ -124,25 +125,30 @@ fn shape(
 }
 
 #[test]
-fn run_formation_spans_zwj_family_spacers() {
+fn run_formation_keeps_zwj_family_in_one_cell() {
     let state = state_with_text(ZWJ_FAMILY);
     let snapshot = state.snapshot();
     let cells = row(&snapshot, 0);
-    // Grid truth: four wide leads carrying the joins, four spacers.
-    for (index, base) in ['\u{1F468}', '\u{1F469}', '\u{1F467}', '\u{1F466}']
-        .into_iter()
-        .enumerate()
-    {
-        let lead = cells[index * 2];
-        assert_eq!(lead.glyph, base);
-        assert_eq!(lead.width, 2);
-        assert!(!lead.spacer);
-        if index < 3 {
-            assert_eq!(lead.zerowidth.as_slice(), &['\u{200D}']);
-        }
-        assert!(cells[index * 2 + 1].spacer, "trailing half is a spacer");
-    }
-    assert_eq!(collect_run_text(&cells[..8]), ZWJ_FAMILY);
+    // CTX-1609: grid truth is one wide lead carrying the whole cluster plus
+    // one spacer, not one lead per family member.
+    let lead = cells[0];
+    assert_eq!(lead.glyph, '\u{1F468}');
+    assert_eq!(lead.width, 2);
+    assert!(!lead.spacer);
+    assert_eq!(
+        lead.zerowidth.as_slice(),
+        &[
+            '\u{200D}',
+            '\u{1F469}',
+            '\u{200D}',
+            '\u{1F467}',
+            '\u{200D}',
+            '\u{1F466}'
+        ]
+    );
+    assert!(cells[1].spacer, "trailing half is a spacer");
+    assert!(!cells[2].spacer);
+    assert_eq!(collect_run_text(&cells[..2]), ZWJ_FAMILY);
     let runs = form_runs_for_row(cells, 0);
     assert_eq!(
         runs.len(),
@@ -151,10 +157,10 @@ fn run_formation_spans_zwj_family_spacers() {
     );
     assert_eq!(runs[0].text, ZWJ_FAMILY);
     assert_eq!(runs[0].start_col, 0);
-    assert_eq!(runs[0].col_count, 8);
+    assert_eq!(runs[0].col_count, 2, "one layout unit, two columns");
     assert_eq!(
         cells_for_range(&runs[0].text),
-        8,
+        2,
         "column accounting stays exact"
     );
 }
@@ -164,10 +170,11 @@ fn run_formation_keeps_regional_pair_and_variation_selector_clusters() {
     let flag_state = state_with_text(REGIONAL_PAIR);
     let flag_snapshot = flag_state.snapshot();
     let flag = row(&flag_snapshot, 0);
-    // Regional indicators are width-1 cells, so no spacers are involved.
+    // CTX-1609: a regional-indicator pair grows its lead to two cells.
     assert_eq!(flag[0].glyph, '\u{1F1EF}');
-    assert_eq!(flag[1].glyph, '\u{1F1F5}');
-    assert!(!flag[0].spacer && !flag[1].spacer);
+    assert_eq!(flag[0].width, 2);
+    assert_eq!(flag[0].zerowidth.as_slice(), &['\u{1F1F5}']);
+    assert!(flag[1].spacer);
     let flag_runs = form_runs_for_row(flag, 0);
     assert_eq!(flag_runs.len(), 1);
     assert_eq!(flag_runs[0].text, REGIONAL_PAIR);
@@ -178,10 +185,13 @@ fn run_formation_keeps_regional_pair_and_variation_selector_clusters() {
     let heart = row(&heart_snapshot, 0);
     assert_eq!(heart[0].glyph, '\u{2764}');
     assert_eq!(heart[0].zerowidth.as_slice(), &['\u{FE0F}']);
+    // Selector-16 emoji presentation widens the text-default base.
+    assert_eq!(heart[0].width, 2);
+    assert!(heart[1].spacer);
     let heart_runs = form_runs_for_row(heart, 0);
     assert_eq!(heart_runs.len(), 1);
     assert_eq!(heart_runs[0].text, VARIATION_SELECTOR);
-    assert_eq!(heart_runs[0].col_count, 1);
+    assert_eq!(heart_runs[0].col_count, 2);
 }
 
 #[test]
@@ -198,35 +208,19 @@ fn shaped_zwj_family_cluster_when_font_supports_it() {
         eprintln!("skipped: host has no emoji coverage for the family sequence");
         return;
     }
-    // A font with the ZWJ ligature returns one glyph over the whole eight
-    // columns; a font without it returns per-base glyphs that still start on
-    // wide leads (never on a spacer or joiner column). Multi-glyph clusters
-    // share one byte offset, so per-member cell counts are placeholders; only
-    // the fully-covered distinct-offset case sums to the eight columns.
-    if clusters.iter().all(|cluster| !cluster.uncovered) {
-        if clusters.iter().all(|cluster| cluster.byte_offset == 0) {
-            assert_eq!(cells_for_range(ZWJ_FAMILY), 8);
-        } else {
-            let covered_cells: usize = clusters.iter().map(|cluster| cluster.cells.1).sum();
-            assert_eq!(
-                covered_cells, 8,
-                "covered clusters must span every grid column: {clusters:?}"
-            );
-        }
-    }
+    // CTX-1609: the grid commits one two-column cell for the whole family.
+    // A font with the ZWJ ligature returns one glyph over those two columns;
+    // a font without it returns one cluster per base, which the shaped
+    // emitter only paints for the leading committed column.
+    assert_eq!(cells_for_range(ZWJ_FAMILY), 2);
     if clusters.len() == 1 {
         assert_eq!(
             clusters[0].cells,
-            (0, 8),
-            "full family cluster spans eight columns"
+            (0, 2),
+            "full family cluster spans two columns"
         );
     } else {
-        for cluster in &clusters {
-            assert!(
-                cluster.cells.0 % 2 == 0,
-                "per-base fallback starts on wide leads, never spacers: {clusters:?}"
-            );
-        }
+        assert_eq!(clusters[0].cells.0, 0, "the lead starts at column zero");
     }
     // The shaped frame emits no glyph at a spacer-only column: every glyph
     // starts on an even (lead) column for this all-wide row. The unshaped
@@ -262,7 +256,7 @@ fn shaped_zwj_family_cluster_when_font_supports_it() {
 }
 
 #[test]
-fn shaped_zwj_family_without_ligature_falls_back_per_cell() {
+fn shaped_zwj_family_without_ligature_paints_one_cell() {
     let Some(mut raster) = live_chain_for("Noto Sans") else {
         eprintln!("skipped: no host font stack or Noto Sans");
         return;
@@ -298,43 +292,46 @@ fn shaped_zwj_family_without_ligature_falls_back_per_cell() {
     let list = renderer
         .render_shaped(&snapshot, &damage, LigaturePolicy::Never, &features)
         .expect("per-base fallback renders");
-    // Four bases, one glyph each, on their own grid columns; join controls
-    // and spacers never emit. No stacking at the cluster origin.
-    assert_eq!(list.glyphs.len(), 4, "one glyph per emoji base: {list:?}");
+    // CTX-1609: the cluster owns one two-column cell, so a per-base shaper
+    // result paints only the leading base; the remaining bases stay in
+    // Terminal Truth (copy/search/shaping with a ligating font).
+    assert_eq!(
+        list.glyphs.len(),
+        1,
+        "one glyph for the committed cell: {list:?}"
+    );
     let cell_width = f64::from(renderer.cell_metrics().width);
-    let mut columns: Vec<i64> = list
-        .glyphs
-        .iter()
-        .map(|glyph| (f64::from(glyph.dest[0]) / cell_width).round() as i64)
-        .collect();
-    columns.sort_unstable();
-    assert_eq!(columns, vec![0, 2, 4, 6], "bases keep their lead columns");
+    let column = (f64::from(list.glyphs[0].dest[0]) / cell_width).round() as i64;
+    assert_eq!(column, 0, "the lead keeps its lead column");
     assert_eq!(
         renderer.counters().spacer_cells_skipped,
-        before.spacer_cells_skipped + 4,
-        "four spacers paint background only"
+        before.spacer_cells_skipped + 1,
+        "one spacer paints background only"
     );
     assert_eq!(snapshot.cells[0].glyph, '\u{1F468}', "grid truth untouched");
 }
 
 #[test]
-fn shaped_fallback_keeps_combining_mark_on_wide_base() {
+fn shaped_fallback_keeps_combining_mark_in_grid_truth() {
     let Some(mut raster) = live_chain_for("Noto Sans") else {
         eprintln!("skipped: no host font stack or Noto Sans");
         return;
     };
     warm_chain(&mut raster, '\u{1F468}');
-    // A combining mark on the final wide base must survive the per-cell
-    // fallback, matching the #2279 base-pen mark path.
-    let text = format!("{ZWJ_FAMILY}\u{0301}");
-    let state = state_with_text(&text);
+    // CTX-1609: use a three-person family (five tail scalars) so the
+    // combining mark fits the six-scalar cluster cap. A full four-person
+    // family plus a mark is the documented over-cap degradation.
+    let text = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}\u{0301}";
+    let state = state_with_text(text);
     let snapshot = state.snapshot();
-    assert_eq!(snapshot.cells[6].glyph, '\u{1F466}');
+    assert_eq!(snapshot.cells[0].glyph, '\u{1F468}');
+    assert_eq!(snapshot.cells[0].width, 2);
     assert_eq!(
-        snapshot.cells[6].zerowidth.as_slice(),
-        &['\u{0301}'],
-        "grid truth keeps the mark on the final base"
+        snapshot.cells[0].zerowidth.as_slice(),
+        &['\u{200D}', '\u{1F469}', '\u{200D}', '\u{1F466}', '\u{0301}'],
+        "grid truth keeps the mark on the cluster cell"
     );
+    assert!(snapshot.cells[1].spacer);
     let features = vec![bitty_config::types::OpenTypeFeature::parse("ccmp=0").unwrap()];
     let damage = full_damage(&state);
     let mut renderer = renderer_for(raster, "Noto Sans");
@@ -344,23 +341,16 @@ fn shaped_fallback_keeps_combining_mark_on_wide_base() {
     let list = renderer
         .render_shaped(&snapshot, &damage, LigaturePolicy::Never, &features)
         .expect("per-base fallback renders");
-    assert_eq!(
-        list.glyphs.len(),
-        5,
-        "four bases plus the combining mark: {list:?}"
+    // Only the leading committed column paints; the family members and the
+    // mark remain in Terminal Truth for the shaped path with a ligating
+    // font and for copy/search/accessibility.
+    assert!(
+        !list.glyphs.is_empty(),
+        "the lead base must paint: {list:?}"
     );
     let cell_width = f64::from(renderer.cell_metrics().width);
-    let mut columns: Vec<i64> = list
-        .glyphs
-        .iter()
-        .map(|glyph| (f64::from(glyph.dest[0]) / cell_width).round() as i64)
-        .collect();
-    columns.sort_unstable();
-    // The mark follows the final base's advance; it may cross into the last
-    // spacer column but must never precede its base or land on columns 1/3/5.
-    assert_eq!(columns[..4], [0, 2, 4, 6], "bases keep lead columns");
-    assert!(columns[4] >= 6, "mark never precedes its base: {columns:?}");
-    assert_eq!(snapshot.cells[6].glyph, '\u{1F466}', "grid truth untouched");
+    let column = (f64::from(list.glyphs[0].dest[0]) / cell_width).round() as i64;
+    assert_eq!(column, 0, "the lead base keeps column zero");
 }
 
 #[test]

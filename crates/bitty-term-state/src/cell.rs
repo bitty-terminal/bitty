@@ -6,25 +6,38 @@
 //! leading cell carries the glyph and `width == 2`; the trailing half is a
 //! [`Cell::wide_spacer`]. No orphan spacers may exist.
 //!
-//! Cell-width resolution uses the M1 UAX #11 tables in
-//! [`char_cell_width`] (Wide/Fullwidth plus the emoji-presentation set,
-//! zero-width combining and format ranges, and an explicit
-//! [`AmbiguousWidth`] policy defaulting to narrow). Zero-width scalars
-//! (combining marks, ZWJ, variation selectors) are stored on the preceding
-//! cell's bounded [`Cell::zerowidth`] buffer (Alacritty zerowidth pattern);
-//! cluster segmentation (UAX #29) lives in [`crate::grapheme`]. Shaping,
-//! fallback fonts, and the CJK-wide deployment switch follow the text RFC
-//! named by ADR-0004 and are still open.
+//! Cell-width resolution uses the generated UAX #11 tables in
+//! [`crate::width_tables`] (Unicode 18.0.0 `EastAsianWidth.txt`, W/F wide,
+//! A resolved by the configured [`AmbiguousWidth`] policy, N/Na/H narrow),
+//! the crate zero-width tables, and the UAX #29 cluster rules in
+//! [`crate::grapheme`]. The remainder of an extended grapheme cluster
+//! (combining marks, ZWJ, regional-indicator pairs, emoji modifiers,
+//! spacing marks) is stored on the leading cell's bounded
+//! [`Cell::zerowidth`] buffer, so one cluster is one layout unit. Shaping,
+//! fallback fonts, and cluster paint for the unshaped path follow the text
+//! RFC named by ADR-0004 and are still open.
 
 use bitty_vt::{Attribute, Color, UnderlineStyle};
 
-/// Maximum combining scalars retained on one cell (Alacritty zerowidth
-/// parity; CR-TERM-01 remediation).
+use crate::width_tables::{EawClass, eaw_class};
+
+/// Maximum cluster-continuation scalars retained on one cell.
 ///
-/// The cap bounds untrusted-input memory per threat T-01: excess marks are
-/// dropped without advancing the cursor or growing the heap. Five covers
-/// decomposed accents plus ZWJ/variation-selector chains seen in practice.
-pub const MAX_ZEROWIDTH_CHARS: usize = 5;
+/// The cap bounds untrusted-input memory per threat T-01: the scalars after
+/// the base glyph of an extended grapheme cluster are stored inline and the
+/// excess degrades deterministically (see [`Cell::push_zerowidth`]). Six
+/// covers decomposed accents, keycaps, variant selectors, skin tones, and the
+/// canonical four-person ZWJ family without a heap allocation while keeping
+/// [`Cell`] inside the 64-byte scrollback budget.
+pub const MAX_CLUSTER_SCALARS: usize = 6;
+
+/// Historical name for [`MAX_CLUSTER_SCALARS`] kept on the public surface.
+///
+/// The buffer originally held only zero-width combining marks
+/// (Alacritty zerowidth parity); it now holds every scalar of the cluster
+/// tail, including regional indicators and emoji modifiers. Both names
+/// describe the same bound.
+pub const MAX_ZEROWIDTH_CHARS: usize = MAX_CLUSTER_SCALARS;
 
 /// A unique reference from cells into the state's hyperlink table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -132,19 +145,24 @@ pub struct Style {
     pub attributes: Attributes,
 }
 
-/// Bounded inline combining-mark buffer replacing the heap `Vec<char>`.
+/// Bounded inline cluster-tail buffer replacing the heap `Vec<char>`.
 ///
-/// Stores up to [`MAX_ZEROWIDTH_CHARS`] scalars inline as `[char; 5] + len`
+/// Stores up to [`MAX_CLUSTER_SCALARS`] scalars inline as `[char; 6] + len`
 /// (CTX-0389, issue #645): no heap allocation per cell, so cloning a
 /// scrollback snapshot is a `memcpy` instead of per-cell `malloc` + cache
 /// thrash. `Copy` so [`Cell`] can be `Copy` and snapshots clone fast.
+///
+/// The historical name reflects the original zero-width-only payload; the
+/// buffer now holds every scalar of the extended grapheme cluster that
+/// follows [`Cell::glyph`] — combining marks, ZWJ, variation selectors,
+/// regional indicators, emoji modifiers, and spacing marks (CTX-1609).
 ///
 /// Fail-closed on overflow: [`Zerowidth::push`] returns `false` without
 /// mutating when full, never panics. Unused tail slots stay `'\0'` and are
 /// excluded from equality and hashing.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Zerowidth {
-    chars: [char; MAX_ZEROWIDTH_CHARS],
+    chars: [char; MAX_CLUSTER_SCALARS],
     len: u8,
 }
 
@@ -153,7 +171,7 @@ impl Zerowidth {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            chars: ['\0'; MAX_ZEROWIDTH_CHARS],
+            chars: ['\0'; MAX_CLUSTER_SCALARS],
             len: 0,
         }
     }
@@ -187,12 +205,14 @@ impl Zerowidth {
         self.as_slice().contains(mark)
     }
 
-    /// Append one mark, fail-closed when full.
+    /// Append one cluster-tail scalar, fail-closed when full.
     ///
     /// Returns `false` without mutating when already holding
-    /// [`MAX_ZEROWIDTH_CHARS`] scalars; the caller drops the excess.
+    /// [`MAX_CLUSTER_SCALARS`] scalars; the caller decides the documented
+    /// degradation (a zero-width mark is dropped, a printable continuation
+    /// starts a fresh cell).
     pub fn push(&mut self, mark: char) -> bool {
-        if self.len as usize >= MAX_ZEROWIDTH_CHARS {
+        if self.len as usize >= MAX_CLUSTER_SCALARS {
             return false;
         }
         self.chars[self.len as usize] = mark;
@@ -248,10 +268,12 @@ pub struct Cell {
     pub padding: bool,
     /// Hyperlink span reference, if any.
     pub hyperlink: Option<HyperlinkId>,
-    /// Combining scalars attached to [`Cell::glyph`], in arrival order.
+    /// Continuation scalars of this cell's extended grapheme cluster, in
+    /// arrival order: combining marks, ZWJ, regional indicators, emoji
+    /// modifiers, spacing marks, variation selectors, and keycap marks.
     ///
-    /// Bounded by [`MAX_ZEROWIDTH_CHARS`] (threat T-01); spacers never
-    /// carry combining marks. Empty for erased and spacer cells.
+    /// Bounded by [`MAX_CLUSTER_SCALARS`] (threat T-01); spacers never
+    /// carry continuation scalars. Empty for erased and spacer cells.
     pub zerowidth: Zerowidth,
 }
 
@@ -291,13 +313,14 @@ impl Cell {
     }
 
     /// Appends this cell's textual content to `out`: the leading
-    /// [`Cell::glyph`] followed by every retained zero-width scalar, in
-    /// arrival order (CTX-1367).
+    /// [`Cell::glyph`] followed by every retained cluster-tail scalar, in
+    /// arrival order (CTX-1367, CTX-1609).
     ///
     /// Text extraction (selection copy, accessibility runs, inspection,
-    /// URL detection) uses this so combining marks, ZWJ, and variation
-    /// selectors survive. Paint does not call it. Callers iterate a row and
-    /// skip [`Cell::spacer`] trailing halves before invoking this.
+    /// URL detection) uses this so combining marks, ZWJ, variation
+    /// selectors, regional indicators, and emoji modifiers survive. Paint
+    /// does not call it. Callers iterate a row and skip [`Cell::spacer`]
+    /// trailing halves before invoking this.
     pub fn push_text_into(&self, out: &mut String) {
         out.push(self.glyph);
         for mark in &self.zerowidth {
@@ -305,13 +328,14 @@ impl Cell {
         }
     }
 
-    /// Appends a zero-width scalar to this cell's combining buffer.
+    /// Appends a cluster-continuation scalar to this cell's inline buffer.
     ///
     /// Returns `false` without mutating when the buffer already holds
-    /// [`MAX_ZEROWIDTH_CHARS`] scalars, so untrusted combining runs cannot
-    /// grow memory (threat T-01). The caller drops the excess scalar.
-    /// Spacers reject every mark (`false`) because marks belong to the
-    /// leading half.
+    /// [`MAX_CLUSTER_SCALARS`] scalars, so untrusted cluster runs cannot
+    /// grow memory (threat T-01). The caller drops a zero-width excess or
+    /// places a printable excess as its own layout unit. Spacers reject
+    /// every scalar (`false`) because the cluster belongs to the leading
+    /// half.
     pub fn push_zerowidth(&mut self, mark: char) -> bool {
         if self.spacer {
             return false;
@@ -323,15 +347,15 @@ impl Cell {
 /// Ambiguous-width policy for East Asian Ambiguous (`A`) scalars (UAX #11).
 ///
 /// Ambiguous scalars (Greek and Cyrillic letters, CJK-adjacent
-/// punctuation, arrows, math symbols) render wide
+/// punctuation, arrows, math symbols, box drawing) render wide
 /// in East Asian legacy contexts and narrow elsewhere, so the grid must pick
 /// one policy per deployment. [`AmbiguousWidth::Narrow`] (default; matches
 /// `unicode-width::width`) resolves every ambiguous scalar to one cell;
 /// [`AmbiguousWidth::Wide`] resolves them to two cells (matches
-/// `unicode-width::width_cjk`). The M1 slice takes no runtime configuration,
-/// so every grid call site uses [`char_cell_width`] (narrow); call sites
-/// that measure text for a CJK-wide deployment use [`char_cell_width_in`]
-/// explicitly once the text RFC accepts the switch.
+/// `unicode-width::width_cjk`). The policy is configuration
+/// (`terminal.ambiguous_width`) carried by [`crate::State`]; call sites that
+/// measure text outside a state use [`char_cell_width`] (narrow) or
+/// [`char_cell_width_in`] explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum AmbiguousWidth {
     /// Ambiguous scalars occupy one cell (default).
@@ -341,15 +365,44 @@ pub enum AmbiguousWidth {
     Wide,
 }
 
-/// Display-width resolution for one Unicode scalar (M1 UAX #11 tables,
-/// issues #1146).
+impl AmbiguousWidth {
+    /// Parses a config spelling (exact lowercase; fail-closed).
+    ///
+    /// Returns `None` for anything but `"narrow"` and `"wide"`; the
+    /// integration layer maps the configuration enum by value.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "narrow" => Some(Self::Narrow),
+            "wide" => Some(Self::Wide),
+            _ => None,
+        }
+    }
+
+    /// Canonical config spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Narrow => "narrow",
+            Self::Wide => "wide",
+        }
+    }
+}
+
+impl std::fmt::Display for AmbiguousWidth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Display-width resolution for one Unicode scalar (UAX #11, UCD 18.0.0).
 ///
 /// Returns `0` for zero-width scalars (combining marks, ZWJ, variation
 /// selectors, bidi controls, tags), `2` for East Asian Wide/Fullwidth
-/// ranges and the emoji-presentation set, else `1`. Ambiguous (`A`)
-/// scalars resolve narrow. C0/C1 controls resolve to `1`: control
-/// interpretation belongs to the action stream (`PrintControl`), never to
-/// width, and changing that here would silently reflow every caller.
+/// scalars, else `1`. Ambiguous (`A`) scalars resolve narrow. C0/C1 controls
+/// resolve to `1`: control interpretation belongs to the action stream
+/// (`PrintControl`), never to width, and changing that here would silently
+/// reflow every caller.
 #[must_use]
 pub fn char_cell_width(c: char) -> u8 {
     char_cell_width_in(c, AmbiguousWidth::Narrow)
@@ -358,7 +411,10 @@ pub fn char_cell_width(c: char) -> u8 {
 /// [`char_cell_width`] with an explicit [`AmbiguousWidth`] policy.
 ///
 /// Only East Asian Ambiguous scalars observe the policy; every other scalar
-/// resolves identically under both policies.
+/// resolves identically under both policies. The authoritative
+/// `East_Asian_Width` table lives in [`crate::width_tables`] (generated from
+/// the pinned UCD snapshot); the crate zero-width table takes precedence so
+/// combining marks in wide blocks still occupy no cell.
 #[must_use]
 pub fn char_cell_width_in(c: char, ambiguous: AmbiguousWidth) -> u8 {
     let cp = c as u32;
@@ -371,145 +427,25 @@ pub fn char_cell_width_in(c: char, ambiguous: AmbiguousWidth) -> u8 {
     if is_zero_width(cp) {
         return 0;
     }
-    if is_wide(cp) {
-        return 2;
-    }
-    if is_ambiguous(cp) {
-        return match ambiguous {
+    match eaw_class(cp) {
+        EawClass::W | EawClass::F => 2,
+        EawClass::A => match ambiguous {
             AmbiguousWidth::Narrow => 1,
             AmbiguousWidth::Wide => 2,
-        };
+        },
+        EawClass::N | EawClass::Na | EawClass::H => 1,
     }
-    1
 }
 
-/// Whether `cp` is an East Asian Ambiguous scalar in the M1 curated table.
+/// Whether `cp` is a zero-width combining or format scalar in the crate
+/// tables.
 ///
-/// Curated UAX #11 `A` subset (Latin-1 symbols, Latin Extended, Greek,
-/// Cyrillic, CJK-adjacent punctuation and currency, letter-like symbols,
-/// arrows, math operators): every listed scalar is `A` in EastAsianWidth.
-/// Box-drawing, block, and geometric ranges are deliberately unlisted and
-/// resolve narrow until the text RFC tables them; unlisted `A` scalars are
-/// a table gap, never a policy disagreement.
-fn is_ambiguous(cp: u32) -> bool {
-    matches!(cp,
-        0x00A1
-        | 0x00A4
-        | 0x00A7..=0x00A8
-        | 0x00AA
-        | 0x00AD..=0x00AE
-        | 0x00B0..=0x00B4
-        | 0x00B6..=0x00BA
-        | 0x00BC..=0x00BF
-        | 0x00C6
-        | 0x00D0
-        | 0x00D7..=0x00D8
-        | 0x00DE..=0x00E1
-        | 0x00E6
-        | 0x00E8..=0x00EA
-        | 0x00EC..=0x00ED
-        | 0x00F0
-        | 0x00F2..=0x00F3
-        | 0x00F7..=0x00FA
-        | 0x00FC
-        | 0x00FE
-        | 0x0101
-        | 0x0111
-        | 0x0113
-        | 0x011B
-        | 0x0126..=0x0127
-        | 0x012B
-        | 0x0131..=0x0133
-        | 0x0138
-        | 0x013F..=0x0142
-        | 0x0144
-        | 0x0148..=0x014B
-        | 0x014D
-        | 0x0152..=0x0153
-        | 0x0166..=0x0167
-        | 0x016B
-        | 0x01CE
-        | 0x01D0
-        | 0x01D2
-        | 0x01D4
-        | 0x01D6
-        | 0x01D8
-        | 0x01DA
-        | 0x01DC
-        | 0x0251
-        | 0x0261
-        | 0x02C4
-        | 0x02C7
-        | 0x02C9..=0x02CB
-        | 0x02CD
-        | 0x02D0
-        | 0x02D8..=0x02DB
-        | 0x02DD
-        | 0x02DF
-        | 0x0391..=0x03A1
-        | 0x03A3..=0x03A9
-        | 0x03B1..=0x03C1
-        | 0x03C3..=0x03C9
-        | 0x0401
-        | 0x0410..=0x044F
-        | 0x0451
-        | 0x2010
-        | 0x2013..=0x2016
-        | 0x2018..=0x2019
-        | 0x201C..=0x201D
-        | 0x2020..=0x2021
-        | 0x2025..=0x2026
-        | 0x2030..=0x2033
-        | 0x2035
-        | 0x203B
-        | 0x203E
-        | 0x2074
-        | 0x207F
-        | 0x2081..=0x2084
-        | 0x20AC
-        | 0x2103
-        | 0x2105
-        | 0x2113
-        | 0x2116
-        | 0x2121..=0x2122
-        | 0x2126
-        | 0x212B
-        | 0x2153..=0x2154
-        | 0x215B..=0x215E
-        | 0x2160..=0x216B
-        | 0x2170..=0x2179
-        | 0x2190..=0x2194
-        | 0x2199
-        | 0x21B8..=0x21B9
-        | 0x21D2
-        | 0x21D4
-        | 0x21E7
-        | 0x2200..=0x2201
-        | 0x2206
-        | 0x2209
-        | 0x2211
-        | 0x2215
-        | 0x221A
-        | 0x221D..=0x2220
-        | 0x2222..=0x2223
-        | 0x2225
-        | 0x2227..=0x222C
-        | 0x222E
-        | 0x2234..=0x2237
-        | 0x223C..=0x223D
-        | 0x2248
-        | 0x2260..=0x2261
-        | 0x2264..=0x2267
-        | 0x226E..=0x226F
-        | 0x2282..=0x2283
-        | 0x2295..=0x2296
-        | 0x2299
-        | 0x22A5
-        | 0x22BF
-        | 0x2312
-    )
-}
-
+/// The tables cover the combining-mark blocks, implicit marks, variation
+/// selectors, and the format controls the terminal must not advance over
+/// (CTX-1609 leaves this curated slice unchanged; the authoritative
+/// `Grapheme_Extend` set is a separate follow-up). Width resolution orders
+/// this check before the East_Asian_Width table so a mark stays zero-width
+/// even when its block is Wide or Ambiguous.
 pub(crate) fn is_zero_width(cp: u32) -> bool {
     matches!(cp,
         0x0300..=0x036F
@@ -545,13 +481,29 @@ pub(crate) fn is_zero_width(cp: u32) -> bool {
         | 0x094D
         | 0x0951..=0x0957
         | 0x0962..=0x0963
+        | 0x09CD
+        | 0x0ACD
+        | 0x0AFB
+        | 0x0B4D
+        | 0x0C4D
+        | 0x0D4D
         | 0x0E31
         | 0x0E34..=0x0E3A
         | 0x0E47..=0x0E4E
         | 0x0F72..=0x0F84
+        | 0x1036..=0x1037
+        | 0x1039..=0x103A
         | 0x135D..=0x135F
+        | 0x17B7..=0x17BD
+        | 0x17D0
+        | 0x17D2
         | 0x180B..=0x180D
+        | 0x1A60
         | 0x1AB0..=0x1AFF
+        | 0x1B00..=0x1B03
+        | 0x1B34..=0x1B38
+        | 0x1B44
+        | 0x1BAB
         | 0x1D165..=0x1D169
         | 0x1DC0..=0x1DFF
         | 0x200B..=0x200F
@@ -563,68 +515,20 @@ pub(crate) fn is_zero_width(cp: u32) -> bool {
         | 0xA66F
         | 0xA674..=0xA67D
         | 0xA8E0..=0xA8F1
+        | 0xA9C0
+        | 0xAAF6
         | 0xFE00..=0xFE0F
         | 0xFE20..=0xFE2F
         | 0xFEFF
+        | 0x10A3F
+        | 0x11133
+        | 0x113D0
+        | 0x1193E
+        | 0x11A47
+        | 0x11A99
+        | 0x11F42
         | 0xE0000..=0xE007F
         | 0xE0100..=0xE01EF
-    )
-}
-
-fn is_wide(cp: u32) -> bool {
-    matches!(cp,
-        0x1100..=0x115F
-        | 0x231A..=0x231B
-        | 0x23E9..=0x23EC
-        | 0x23F0
-        | 0x23F3
-        | 0x25FD..=0x25FE
-        | 0x2614..=0x2615
-        | 0x2648..=0x2653
-        | 0x267F
-        | 0x2693
-        | 0x26A1
-        | 0x26AA..=0x26AB
-        | 0x26BD..=0x26BE
-        | 0x26C4..=0x26C5
-        | 0x26CE
-        | 0x26D4
-        | 0x26EA
-        | 0x26F2..=0x26F3
-        | 0x26F5
-        | 0x26FA
-        | 0x26FD
-        | 0x2705
-        | 0x270A..=0x270B
-        | 0x2728
-        | 0x274C
-        | 0x274E
-        | 0x2753..=0x2755
-        | 0x2757
-        | 0x2795..=0x2797
-        | 0x27B0
-        | 0x27BF
-        | 0x2B1B..=0x2B1C
-        | 0x2B50
-        | 0x2B55
-        | 0x2E80..=0x303E
-        | 0x3041..=0x33FF
-        | 0x3400..=0x4DBF
-        | 0x4E00..=0x9FFF
-        | 0xA000..=0xA4CF
-        | 0xA960..=0xA97F
-        | 0xAC00..=0xD7A3
-        | 0xF900..=0xFAFF
-        | 0xFE10..=0xFE19
-        | 0xFE30..=0xFE6F
-        | 0xFF00..=0xFF60
-        | 0xFFE0..=0xFFE6
-        | 0x1B000..=0x1B001
-        | 0x1F300..=0x1F64F
-        | 0x1F680..=0x1F6FF
-        | 0x1F900..=0x1F9FF
-        | 0x20000..=0x2FFFD
-        | 0x30000..=0x3FFFD
     )
 }
 
@@ -685,7 +589,7 @@ mod tests {
     fn ambiguous_defaults_narrow_with_explicit_wide_policy() {
         for scalar in [
             '\u{00A1}', '\u{0391}', '\u{0410}', '\u{2014}', '\u{20AC}', '\u{2192}', '\u{2200}',
-            '\u{2260}',
+            '\u{2260}', '\u{2500}',
         ] {
             assert_eq!(char_cell_width(scalar), 1, "{scalar:?} defaults narrow");
             assert_eq!(
@@ -704,14 +608,16 @@ mod tests {
     #[test]
     fn policy_only_moves_ambiguous_scalars() {
         // Non-ambiguous scalars resolve identically under both policies
-        // (U+00DF sharp-s is Ambiguous per UAX #11, so it is absent here).
+        // (U+00DF sharp-s and U+2500 box drawing are Ambiguous per UAX #11,
+        // so they are absent here; the authoritative table moved box
+        // drawing from the old curated narrow gap into the policy).
         for scalar in [
             'a',
             '\u{4E2D}',
             '\u{1F600}',
             '\u{0301}',
-            '\u{2500}',
             '\u{00E7}',
+            '\u{FF61}',
         ] {
             assert_eq!(
                 char_cell_width_in(scalar, AmbiguousWidth::Narrow),
@@ -811,12 +717,13 @@ mod tests {
 
     #[test]
     fn zerowidth_is_inline_bounded_and_copy() {
-        // CTX-0389 (#645): no heap Vec per cell; inline [char; 5] + len.
-        // 5 chars (20 bytes) + len byte padded to char alignment = 24 bytes,
-        // same stack size as a Vec header but with no heap allocation and
-        // Copy memcpy clone for snapshots.
-        assert_eq!(std::mem::size_of::<Zerowidth>(), 24);
-        assert!(std::mem::size_of::<Zerowidth>() <= 24);
+        // CTX-0389 (#645): no heap Vec per cell; inline [char; 6] + len.
+        // 6 chars (24 bytes) + len byte padded to char alignment = 28 bytes,
+        // same stack size class as a Vec header but with no heap allocation
+        // and Copy memcpy clone for snapshots (CTX-1609 widened the payload
+        // from 5 to 6 cluster-tail scalars).
+        assert_eq!(std::mem::size_of::<Zerowidth>(), 28);
+        assert!(std::mem::size_of::<Zerowidth>() <= 28);
         // Cell stays sane for a 10k x 100 scrollback (1M cells); the win is
         // no per-cell heap, not a smaller header.
         assert!(std::mem::size_of::<Cell>() <= 96);

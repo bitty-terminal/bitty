@@ -1582,6 +1582,10 @@ impl Runtime {
                     0,
                     0,
                 ) {
+                    // Every refusal counts, including one the parser admitted
+                    // and the decode/store/placement seam then refused
+                    // (CTX-1590 review follow-up).
+                    self.state.note_iterm2_refused();
                     if let Some(suppressed) = self.kitty_log.admit_now() {
                         eprintln!(
                             "bitty: rejecting iTerm2 inline image ({err}): stored nothing{}",

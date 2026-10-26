@@ -105,6 +105,11 @@ const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 /// (`ESC ]` plus the longest matched prefix).
 const MAX_REPLAY_BYTES: usize = ITERM2_OSC_PREFIX.len() + 2;
 
+/// Smallest body-buffer growth step. Larger bodies grow geometrically from
+/// here, so the retained capacity stays at the cap instead of the `2x` a bare
+/// `Vec::push` doubling reaches (CTX-1590 review follow-up).
+const BODY_RESERVE_MIN: usize = 4 * 1024;
+
 /// Why one `OSC 1337 ; File=` request was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Iterm2Reject {
@@ -232,6 +237,18 @@ impl Iterm2OscScanner {
         !matches!(self.state, ScanState::Idle)
     }
 
+    /// Bytes currently collected in the body buffer (cap-boundary tests).
+    #[cfg(test)]
+    pub(crate) fn buffered_body_len(&self) -> usize {
+        self.body.len()
+    }
+
+    /// Capacity currently retained by the body buffer (cap-boundary tests).
+    #[cfg(test)]
+    pub(crate) fn buffered_body_capacity(&self) -> usize {
+        self.body.capacity()
+    }
+
     /// Opens a candidate after the caller consumed `ESC ]`.
     pub(crate) fn begin(&mut self) {
         self.state = ScanState::Probe;
@@ -320,6 +337,11 @@ impl Iterm2OscScanner {
     }
 
     /// Collects one body byte under the body cap.
+    ///
+    /// Capacity grows in bounded steps (`max(len, BODY_RESERVE_MIN)`, capped
+    /// by the remaining budget), so the *retained* capacity never exceeds the
+    /// cap (a realloc can transiently hold the old and new blocks side by
+    /// side) instead of the ~`2x` cap a plain `Vec::push` doubling retains.
     fn push_body(&mut self, byte: u8) {
         if self.rejecting.is_some() {
             return;
@@ -327,9 +349,17 @@ impl Iterm2OscScanner {
         if self.body.len() >= ITERM2_OSC_MAX_BODY_BYTES {
             self.rejecting = Some(Iterm2Reject::OversizePayload);
             // Release the accumulated body now: the remaining bytes are
-            // discarded without buffering, so the cap is also the peak.
+            // discarded without buffering.
             self.body = Vec::new();
             return;
+        }
+        if self.body.len() == self.body.capacity() {
+            let step = self
+                .body
+                .len()
+                .max(BODY_RESERVE_MIN)
+                .min(ITERM2_OSC_MAX_BODY_BYTES - self.body.len());
+            self.body.reserve_exact(step);
         }
         self.body.push(byte);
     }
@@ -535,6 +565,12 @@ fn validate_png(payload: &[u8]) -> Result<(), Iterm2Reject> {
     // Magic (8) + length (4) + `IHDR` (4) + width/height (8) + depth/color
     // (2) + compression/filter/interlace (3) + CRC (4) = 33 bytes.
     if payload.len() < 33 || payload[..8] != PNG_MAGIC || &payload[12..16] != b"IHDR" {
+        return Err(Iterm2Reject::UnsupportedFormat);
+    }
+    // `IHDR` is the first chunk and its payload is exactly 13 bytes; a
+    // mismatched declared length means the dimensions below are not the ones
+    // the decoder will read (`bitty-rich::kitty_decode::sniff_png_ihdr`).
+    if u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]) != 13 {
         return Err(Iterm2Reject::UnsupportedFormat);
     }
     let width = u32::from_be_bytes([payload[16], payload[17], payload[18], payload[19]]);
@@ -766,6 +802,29 @@ mod tests {
     }
 
     #[test]
+    fn body_growth_stays_within_the_cap() {
+        let mut scanner = Iterm2OscScanner::default();
+        scanner.begin();
+        for _ in 0..ITERM2_OSC_PREFIX.len() {
+            assert_eq!(
+                scanner.push(ITERM2_OSC_PREFIX[scanner.matched]),
+                OscOutcome::Consumed
+            );
+        }
+        for _ in 0..ITERM2_OSC_MAX_BODY_BYTES {
+            assert_eq!(scanner.push(b'A'), OscOutcome::Consumed);
+        }
+        assert_eq!(scanner.buffered_body_len(), ITERM2_OSC_MAX_BODY_BYTES);
+        // `Vec::push` doubling alone would reach ~2x the cap here.
+        assert!(
+            scanner.buffered_body_capacity() <= ITERM2_OSC_MAX_BODY_BYTES,
+            "body capacity {} must not exceed the {}-byte cap",
+            scanner.buffered_body_capacity(),
+            ITERM2_OSC_MAX_BODY_BYTES
+        );
+    }
+
+    #[test]
     fn malformed_and_unknown_attributes_are_refused() {
         expect_reject(&body("width"), Iterm2Reject::MalformedAttribute);
         expect_reject(&body("=2"), Iterm2Reject::UnknownAttribute);
@@ -813,6 +872,18 @@ mod tests {
         let mut raw = b"inline=1:".to_vec();
         raw.extend_from_slice(base64_encode(&payload).as_bytes());
         expect_reject(&raw, Iterm2Reject::OversizePixels);
+    }
+
+    #[test]
+    fn ihdr_chunk_length_must_be_thirteen() {
+        // Same valid PNG bytes, but the first chunk's declared length is not
+        // `IHDR`'s 13: the dimensions read here would not be the ones the
+        // decoder reads, so the request is refused before either allocates.
+        let mut payload = PNG_1X1.to_vec();
+        payload[8..12].copy_from_slice(&16u32.to_be_bytes());
+        let mut raw = b"inline=1:".to_vec();
+        raw.extend_from_slice(base64_encode(&payload).as_bytes());
+        expect_reject(&raw, Iterm2Reject::UnsupportedFormat);
     }
 
     #[test]

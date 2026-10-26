@@ -139,6 +139,23 @@ fn transmit_only_form_fails_closed_and_is_counted() {
 }
 
 #[test]
+fn downstream_decode_failure_is_counted_as_a_refusal() {
+    let mut rt = make_runtime();
+    // `IHDR` only: the parser admits it (valid PNG signature, `IHDR` chunk,
+    // in-cap extents) and the decoder refuses it (no image data), so the
+    // refusal happens after parsing and must still be counted.
+    rt.handle_pty_bytes(&osc1337("inline=1", &PNG_1X1[..33]));
+    assert_eq!(rt.kitty_image_count(), 0, "nothing may be stored");
+    assert_eq!(rt.kitty_placement_count(), 0, "nothing may be placed");
+    assert_eq!(rt.kitty_last_frame_images(), 0, "nothing may be painted");
+    assert_eq!(
+        rt.state().telemetry().iterm2_refused,
+        1,
+        "a downstream decode refusal is still an iTerm2 refusal"
+    );
+}
+
+#[test]
 fn kitty_graphics_still_works_alongside_osc_1337() {
     let mut rt = make_runtime();
     // 2x2 opaque red RGBA (`f=32`).

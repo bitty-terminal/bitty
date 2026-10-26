@@ -2757,4 +2757,10 @@ fn iterm2_inline_image_is_inert_and_refusals_are_counted() {
         "kitty counters stay separate"
     );
     assert_eq!(s.cursor().position, cursor_before);
+
+    // A refusal the runtime takes downstream (decode, store, or placement
+    // quota) lands in the same counter, so "every refusal is counted" holds.
+    s.note_iterm2_refused();
+    assert_eq!(s.telemetry().iterm2_refused, 4);
+    assert!(s.check_invariants().is_ok());
 }

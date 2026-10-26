@@ -200,11 +200,12 @@ pub struct TelemetryCounters {
     /// unresolvable animation target, over-cap frames). The wire bytes
     /// were well-formed; the request itself could not be honored.
     pub kitty_refused: u64,
-    /// iTerm2 inline-image requests (`OSC 1337 ; File=`) refused by the
-    /// bounded parser and dropped before any store, placement, or paint
-    /// (oversize payload, malformed attributes, unsupported form, bad
-    /// base64, non-PNG format, over-cap pixels). Counts only requests the
-    /// parser recognized as images, never ordinary OSC 1337 commands.
+    /// iTerm2 inline-image requests (`OSC 1337 ; File=`) refused and dropped
+    /// before any paint. Counts both parser refusals (oversize payload,
+    /// malformed attributes, unsupported form, bad base64, non-PNG format,
+    /// over-cap pixels) and images the parser admitted that the downstream
+    /// decode, store, or placement quota then refused. Counts only requests
+    /// recognized as images, never ordinary OSC 1337 commands.
     pub iterm2_refused: u64,
 }
 
@@ -1476,6 +1477,16 @@ impl State {
     #[must_use]
     pub fn telemetry(&self) -> TelemetryCounters {
         self.telemetry
+    }
+
+    /// Counts one iTerm2 inline-image request that was admitted by the parser
+    /// but refused downstream, before it painted anything (CTX-1590 review).
+    ///
+    /// Decode, store, and placement-quota refusals happen in the runtime's
+    /// image seam, not in [`Self::apply`], so the runtime reports them here.
+    /// Telemetry only: no terminal state and no canonical hash changes.
+    pub fn note_iterm2_refused(&mut self) {
+        self.telemetry.iterm2_refused += 1;
     }
 
     /// Current damage generation; increments once per applied batch.

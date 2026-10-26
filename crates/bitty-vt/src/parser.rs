@@ -44,6 +44,12 @@ mod tests;
 /// parser budget; completed transmissions emit
 /// [`TerminalAction::KittyGraphics`]. All other `APC` (and `PM`/`SOS`,
 /// which stay with `vte`) remain inert.
+///
+/// `OSC 1337 ; File=` is likewise pre-scanned (see [`crate::iterm2_osc`]).
+/// Because that diversion removes the sequence's `ESC` from `vte`'s input,
+/// a private `VteString` tracker records whether a string `vte` owns is
+/// still open, and the diversion feeds a terminating `ESC \` first
+/// (CTX-1590 review MF-1).
 pub struct Parser {
     state_machine: vte::Parser,
     dcs: PendingDcs,
@@ -55,6 +61,7 @@ pub struct Parser {
     apc_discarding: bool,
     held_esc: bool,
     held_in_apc: bool,
+    vte_string: VteString,
     reject_log: RejectLog,
 }
 
@@ -65,6 +72,7 @@ impl std::fmt::Debug for Parser {
             .field("in_apc", &self.in_apc)
             .field("kitty_pending", &self.kitty.has_pending())
             .field("iterm2_pending", &self.iterm2.is_active())
+            .field("vte_string", &self.vte_string)
             .finish_non_exhaustive()
     }
 }
@@ -101,6 +109,79 @@ impl Default for PendingDcs {
     }
 }
 
+/// Tracks the reachable string state of the wrapped `vte` machine so a
+/// diversion can close it before taking bytes off the wire (CTX-1590 review
+/// MF-1/MF-2).
+///
+/// `vte` ends an `OSC` on `BEL`, `CAN`, `SUB`, or `ESC`, but a
+/// `DCS`/`SOS`/`PM` only on `CAN`, `SUB`, or `ESC`; the kind is kept so a
+/// forwarded `BEL` never clears a string that is still open. The tracked
+/// state only has to answer "would the next forwarded byte land inside a
+/// string?", so non-string sequence states collapse into [`Self::Ground`]
+/// (nothing to close) and every string state into [`Self::Other`] (only
+/// terminators can leave it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum VteString {
+    /// Not inside a string (`vte` Ground, or mid-CSI/mid-dispatch).
+    #[default]
+    Ground,
+    /// A bare `ESC` was forwarded; the next forwarded byte decides.
+    Escape,
+    /// An `OSC` string, collected in `vte`'s uncapped buffer.
+    Osc,
+    /// A `DCS`, `SOS`, or `PM` string, whose payload stays with `vte`.
+    Other,
+}
+
+impl VteString {
+    /// Tracked state after `byte` is forwarded to `vte`.
+    fn after(self, byte: u8) -> Self {
+        match self {
+            // `vte` Ground prints until `ESC` enters the sequence layer.
+            Self::Ground => {
+                if byte == 0x1B {
+                    Self::Escape
+                } else {
+                    Self::Ground
+                }
+            }
+            // `advance_esc`: `ESC` stays, C0/CAN/SUB behave as anywhere,
+            // `]` opens an OSC, `P`/`X`/`^`/`_` open a string, and every
+            // other byte dispatches, starts a CSI/charset, or collects an
+            // intermediate, none of which a string can start from.
+            Self::Escape => match byte {
+                0x1B => Self::Escape,
+                0x18 | 0x1A => Self::Ground,
+                b']' => Self::Osc,
+                b'P' | b'X' | b'^' | b'_' => Self::Other,
+                0x00..=0x17 | 0x19 | 0x1C..=0x2F => Self::Escape,
+                _ => Self::Ground,
+            },
+            // `advance_osc_string`: collected until `BEL`/`CAN`/`SUB`/`ESC`.
+            Self::Osc => match byte {
+                0x07 | 0x18 | 0x1A => Self::Ground,
+                0x1B => Self::Escape,
+                _ => Self::Osc,
+            },
+            // `advance_dcs_passthrough` / `anywhere`: `CAN`/`SUB`/`ESC` end
+            // it. C1 `ST` (0x9C) is left open on purpose: it only unhooks an
+            // already-hooked DCS, so a stale flag can only add one inert
+            // `ESC \` later.
+            Self::Other => match byte {
+                0x18 | 0x1A => Self::Ground,
+                0x1B => Self::Escape,
+                _ => Self::Other,
+            },
+        }
+    }
+
+    /// Whether `vte` holds state that `ESC \` closes without an action:
+    /// an open string, or the pending `ESC` of an abandoned sequence.
+    const fn needs_close(self) -> bool {
+        !matches!(self, Self::Ground)
+    }
+}
+
 impl Parser {
     /// Creates a fresh parser.
     #[must_use]
@@ -116,6 +197,7 @@ impl Parser {
             apc_discarding: false,
             held_esc: false,
             held_in_apc: false,
+            vte_string: VteString::default(),
             reject_log: RejectLog::default(),
         }
     }
@@ -138,6 +220,7 @@ impl Parser {
             apc_discarding: false,
             held_esc: false,
             held_in_apc: false,
+            vte_string: VteString::default(),
             reject_log: RejectLog::default(),
         }
     }
@@ -200,6 +283,7 @@ impl Parser {
             apc_discarding,
             held_esc,
             held_in_apc,
+            vte_string,
             reject_log,
         } = self;
         let mut bridge = Bridge { emit, dcs };
@@ -228,7 +312,7 @@ impl Parser {
                     *apc_payload = false;
                     *apc_discarding = false;
                     kitty.abort();
-                    state_machine.advance(&mut bridge, &[next]);
+                    feed_vte(state_machine, &mut bridge, vte_string, &[next]);
                     i = 1;
                 } else if *apc_discarding {
                     // Held ESC is discarded. A following ESC is re-examined
@@ -248,12 +332,25 @@ impl Parser {
                     kitty.abort();
                     begin_apc(kitty, apc_buf, apc_payload, in_apc, apc_discarding);
                     i = 1;
+                } else if next == b']' {
+                    // Aborted APC followed by `OSC 1337 ; File=` (CTX-1590
+                    // review MF-2): the aborting `ESC` must not hand the body
+                    // to `vte`'s uncapped OSC collector. Route into the same
+                    // diversion the ground path uses.
+                    clear_apc_header(kitty, apc_buf);
+                    *in_apc = false;
+                    *apc_payload = false;
+                    kitty.abort();
+                    close_vte_string(state_machine, &mut bridge, vte_string);
+                    kitty.note_interleaved(1);
+                    iterm2.begin();
+                    i = 1;
                 } else {
                     clear_apc_header(kitty, apc_buf);
                     *in_apc = false;
                     *apc_payload = false;
                     kitty.abort();
-                    state_machine.advance(&mut bridge, &[0x1B]);
+                    feed_vte(state_machine, &mut bridge, vte_string, &[0x1B]);
                     i = 0;
                 }
             } else {
@@ -265,11 +362,12 @@ impl Parser {
                     // Possible `OSC 1337 ; File=` (CTX-1590): the introducer
                     // is consumed here and the scanner decides whether the
                     // prefix matches or must be replayed into `vte`.
+                    close_vte_string(state_machine, &mut bridge, vte_string);
                     kitty.note_interleaved(1);
                     iterm2.begin();
                     i = 1;
                 } else {
-                    state_machine.advance(&mut bridge, &[0x1B]);
+                    feed_vte(state_machine, &mut bridge, vte_string, &[0x1B]);
                     i = 0;
                 }
             }
@@ -285,9 +383,7 @@ impl Parser {
                         continue;
                     }
                     OscOutcome::PassThrough => {
-                        for replayed in iterm2.replay() {
-                            state_machine.advance(&mut bridge, &[*replayed]);
-                        }
+                        feed_vte(state_machine, &mut bridge, vte_string, iterm2.replay());
                         iterm2.clear_replay();
                         // Fall through: the current byte takes the normal
                         // path now that `vte` has the whole OSC prefix.
@@ -299,9 +395,7 @@ impl Parser {
                     }
                     OscOutcome::FinishedThenPassThrough => {
                         finish_iterm2(&mut bridge, iterm2, reject_log);
-                        for replayed in iterm2.replay() {
-                            state_machine.advance(&mut bridge, &[*replayed]);
-                        }
+                        feed_vte(state_machine, &mut bridge, vte_string, iterm2.replay());
                         iterm2.clear_replay();
                     }
                 }
@@ -338,8 +432,16 @@ impl Parser {
                         if nxt == b'_' {
                             begin_apc(kitty, apc_buf, apc_payload, in_apc, apc_discarding);
                             i += 2;
+                        } else if nxt == b']' {
+                            // Aborted APC followed by `OSC 1337 ; File=`
+                            // (CTX-1590 review MF-2): divert the body before
+                            // `vte` can collect it as an OSC.
+                            close_vte_string(state_machine, &mut bridge, vte_string);
+                            kitty.note_interleaved(1);
+                            iterm2.begin();
+                            i += 2;
                         } else {
-                            state_machine.advance(&mut bridge, &[0x1B]);
+                            feed_vte(state_machine, &mut bridge, vte_string, &[0x1B]);
                             i += 1;
                         }
                     }
@@ -360,7 +462,7 @@ impl Parser {
                     *apc_payload = false;
                     *apc_discarding = false;
                     kitty.abort();
-                    state_machine.advance(&mut bridge, &[b]);
+                    feed_vte(state_machine, &mut bridge, vte_string, &[b]);
                 } else if *apc_discarding {
                     // Discarded APC bytes (non-`G` commands, rejected
                     // headers) count toward an open stream's stall bound.
@@ -414,12 +516,13 @@ impl Parser {
                         i += 2;
                     } else if bytes[i + 1] == b']' {
                         // Possible `OSC 1337 ; File=`: see the held-ESC arm.
+                        close_vte_string(state_machine, &mut bridge, vte_string);
                         kitty.note_interleaved(1);
                         iterm2.begin();
                         i += 2;
                     } else {
                         kitty.note_interleaved(1);
-                        state_machine.advance(&mut bridge, &[0x1B]);
+                        feed_vte(state_machine, &mut bridge, vte_string, &[0x1B]);
                         i += 1;
                     }
                 } else {
@@ -429,7 +532,7 @@ impl Parser {
                     // Text interleaved with an open chunked kitty stream
                     // counts toward its stall bound (no-op when idle).
                     kitty.note_interleaved(1);
-                    state_machine.advance(&mut bridge, &[b]);
+                    feed_vte(state_machine, &mut bridge, vte_string, &[b]);
                     i += 1;
                 }
             }
@@ -448,6 +551,42 @@ fn begin_apc(
     *apc_payload = false;
     *in_apc = true;
     *apc_discarding = false;
+}
+
+/// Feeds bytes to `vte` and keeps [`VteString`] in step with them.
+///
+/// Every byte the parser hands to `vte` must go through here (or the state
+/// tracker diverges and a later diversion stops closing a string `vte` still
+/// owns). Feeding the same bytes one call at a time is equivalent to feeding
+/// them in one call: `vte` carries its state across calls.
+fn feed_vte<F: FnMut(TerminalAction)>(
+    state_machine: &mut vte::Parser,
+    bridge: &mut Bridge<'_, F>,
+    vte_string: &mut VteString,
+    bytes: &[u8],
+) {
+    for &byte in bytes {
+        *vte_string = vte_string.after(byte);
+    }
+    state_machine.advance(bridge, bytes);
+}
+
+/// Closes whatever `vte` still holds before an `ESC ]` is diverted away from
+/// it (CTX-1590 review MF-1).
+///
+/// The diversion consumes the `ESC` that `vte` would have used to end an open
+/// string, so without this an OSC it received through the replay path keeps
+/// collecting the rest of the stream in its uncapped buffer. `ESC \` is
+/// action-free in Ground and Escape, ends an `OSC`/`DCS` and dispatches the
+/// pending OSC first: exactly the effect that `ESC` had before the diversion.
+fn close_vte_string<F: FnMut(TerminalAction)>(
+    state_machine: &mut vte::Parser,
+    bridge: &mut Bridge<'_, F>,
+    vte_string: &mut VteString,
+) {
+    if vte_string.needs_close() {
+        feed_vte(state_machine, bridge, vte_string, b"\x1b\\");
+    }
 }
 
 fn clear_apc_header(kitty: &mut KittyApcAssembler, apc_buf: &mut Vec<u8>) {

@@ -4033,6 +4033,28 @@ impl AppHandler for TerminalApp {
     }
 }
 
+/// Issue #2570 instrumented triage: the Wayland occlusion-signal deficit.
+///
+/// winit 0.30.13 never maps the xdg `suspended` toplevel state to the
+/// `Suspended` lifecycle or an `Occluded` window event, so the surface
+/// visibility gate has no native signal source on the platform #2570
+/// reproduces on. Logged once per process so a dogfood log records what the
+/// gate is fed on that session.
+static OCCLUSION_AWARENESS_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn log_occlusion_awareness_once() {
+    if OCCLUSION_AWARENESS_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+        return;
+    }
+    eprintln!(
+        "bitty: [issue #2570 triage] Wayland session: winit 0.30.13 delivers neither `Suspended` nor `Occluded` for the xdg shell 'suspended' state; the surface-visibility gate only consumes platform `Occluded` edges (native on iOS/X11, or the synthetic redraw-starvation probe, which stays silent when a compositor keeps serving frame callbacks to a suspended surface)"
+    );
+}
+
 impl TerminalApp {
     /// Event-handler body; the `AppHandler` wrapper owns the watchdog mark.
     fn handle_event_inner(&mut self, ctx: &mut EventContext<'_>, event: PlatformEvent) {
@@ -4076,6 +4098,22 @@ impl TerminalApp {
                 }
                 WindowEventKind::Closed => {
                     crash_report::lifecycle(crash_report::Lifecycle::Closed);
+                }
+                WindowEventKind::Occluded(true) => {
+                    // Issue #2570 follow-up: occlusion detected (the Wayland
+                    // synthetic starve edge or native X11/iOS delivery).
+                    log_occlusion_awareness_once();
+                    crash_report::lifecycle(crash_report::Lifecycle::Occluded);
+                    // Same contract as `Suspended`: presentation must not
+                    // touch the surface while occluded; the cancel + retain
+                    // behavior lives in `set_surface_visibility_at`.
+                    self.runtime.set_surface_visibility(false);
+                }
+                WindowEventKind::Occluded(false) => {
+                    crash_report::lifecycle(crash_report::Lifecycle::Revealed);
+                    // Same contract as `Resumed`: re-queue on full redraw
+                    // off this transition; the runtime does the requeue.
+                    self.runtime.set_surface_visibility(true);
                 }
                 _ => {}
             },

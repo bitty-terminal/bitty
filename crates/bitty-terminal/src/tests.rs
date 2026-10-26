@@ -1176,6 +1176,48 @@ return {}
     }
 
     #[test]
+    fn app_handler_occluded_events_update_surface_gate() {
+        // Issue #2570 follow-up: the synthetic Wayland occlusion edge (probed
+        // from redraw starvation) and the native X11/iOS delivery reach the
+        // same surface-visibility gate the `Suspended` lifecycle drives, with
+        // the same off-transition contract (no wake left behind).
+        let mut fixture = Fixture::new("occlusion-gate");
+        let mut context = EventContext::recording(&fixture.operations);
+        <TerminalApp as AppHandler>::handle_event(
+            &mut fixture.app,
+            &mut context,
+            PlatformEvent::Window {
+                window_id: WindowId::from_raw_public(1),
+                kind: WindowEventKind::Occluded(true),
+            },
+        );
+        drop(context);
+        assert!(
+            !fixture.app.runtime.is_surface_visible(),
+            "Occluded(true) must gate presentation until the reveal edge"
+        );
+        assert!(
+            fixture.app.runtime.present_coalescing_deadline().is_none(),
+            "the occlusion transition must not leave a wake behind"
+        );
+
+        let mut context = EventContext::recording(&fixture.operations);
+        <TerminalApp as AppHandler>::handle_event(
+            &mut fixture.app,
+            &mut context,
+            PlatformEvent::Window {
+                window_id: WindowId::from_raw_public(1),
+                kind: WindowEventKind::Occluded(false),
+            },
+        );
+        drop(context);
+        assert!(
+            fixture.app.runtime.is_surface_visible(),
+            "Occluded(false) must ungate presentation"
+        );
+    }
+
+    #[test]
     fn input_vm_boundary_recording_context_refuses_windows() {
         let operations = RefCell::new(Vec::new());
         let mut context = EventContext::recording(&operations);

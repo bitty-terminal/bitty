@@ -2,7 +2,7 @@
 //! management exposed through owned types only.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize as WinitLogicalSize;
@@ -12,7 +12,9 @@ use winit::window::{Window as WinitWindow, WindowAttributes, WindowId as WinitWi
 
 use crate::dpi::{LogicalSize, PhysicalSize, ScaleFactor};
 use crate::error::PlatformError;
-use crate::event::{PlatformEvent, WindowId, translate_window_event};
+use crate::event::{
+    PlatformEvent, WindowEventKind, WindowId, map_occluded, translate_window_event,
+};
 use crate::surface::SurfaceTarget;
 
 /// User-event payload carried by the winit event loop.
@@ -200,9 +202,12 @@ impl EventContext<'_> {
         }
 
         let id = registry.register(&window.id());
+        let occlusion_probe = Arc::new(Mutex::new(OcclusionProbe::default()));
+        registry.register_probe(&window.id(), Arc::clone(&occlusion_probe));
         Ok(WindowHandle {
             id,
             window: Arc::new(window),
+            occlusion_probe,
         })
     }
 
@@ -262,6 +267,10 @@ impl EventContext<'_> {
 pub struct WindowHandle {
     id: WindowId,
     window: Arc<WinitWindow>,
+    /// Redraw-starvation probe shared with the loop adapter: `request_redraw`
+    /// marks it, the adapter resolves the starved pending request into the
+    /// synthetic Wayland `Occluded` edge (issue #2570 follow-up).
+    occlusion_probe: Arc<Mutex<OcclusionProbe>>,
 }
 
 impl WindowHandle {
@@ -295,7 +304,15 @@ impl WindowHandle {
     ///
     /// The application observes it as
     /// [`PlatformEvent::Window`]` with `[`WindowEventKind::RedrawRequested`].
+    ///
+    /// Issue #2570 follow-up: the call also marks the occlusion probe's
+    /// pending request; the adapter resolves it into the synthetic Wayland
+    /// `Occluded` edge when the frame callback never comes (a compositor
+    /// stops serving frame callbacks for a suspended xdg surface).
     pub fn request_redraw(&self) {
+        if let Ok(mut probe) = self.occlusion_probe.lock() {
+            probe.note_redraw_request(std::time::Instant::now());
+        }
         self.window.request_redraw();
     }
 
@@ -597,10 +614,106 @@ fn apply_optional_size(
     attributes
 }
 
+/// Redraw-starvation probe for the synthetic Wayland occlusion edge
+/// (issue #2570 follow-up for the `#2589` surface-visibility gate).
+///
+/// winit 0.30.13 delivers no `WindowEvent::Occluded` on Wayland and no
+/// `Suspended` lifecycle either, so the embedder's visibility gate cannot
+/// engage on the platform #2570 reproduces on. The probe exploits what the
+/// Wayland backend *does* guarantee: a `RedrawRequested` dispatch is gated on
+/// the compositor's frame callback (`refresh_frame` /
+/// `frame_callback_state`), and a compositor stops serving frame callbacks
+/// for a suspended xdg surface (a Hyprland workspace switch-away). A pending
+/// `request_redraw` that is unanswered for [`OCCLUSION_STARVE`] therefore
+/// names an occluded surface without any protocol-level introspection.
+#[derive(Debug, Clone, Copy, Default)]
+struct OcclusionProbe {
+    /// The last unanswered `request_redraw`.
+    last_request: Option<std::time::Instant>,
+    /// Whether a `RedrawRequested` was ever observed: the surface proved it
+    /// can serve frame callbacks. The probe never fires before the first
+    /// observation, so a surface that has not yet completed one frame cannot
+    /// starve into a false occlusion.
+    redraw_seen: bool,
+    /// Whether the occluded edge is the currently delivered state.
+    occluded: bool,
+}
+
+/// Redraw starvation beyond this span names an occluded surface.
+///
+/// A live Wayland surface serves its frame callback within one repaint cycle
+/// (16 ms at 60 Hz); 300 ms tolerates dropped frames, compositor stalls, and
+/// scheduling jitter with a large margin while staying far below the
+/// seconds-long spans a Hyprland workspace switch-away suspends for.
+const OCCLUSION_STARVE: std::time::Duration = std::time::Duration::from_millis(300);
+
+impl OcclusionProbe {
+    /// Records a new unanswered `request_redraw` (issue #2570 probe).
+    fn note_redraw_request(&mut self, now: std::time::Instant) {
+        self.last_request = Some(now);
+    }
+
+    /// Records a `RedrawRequested` delivery: the frame callback was served,
+    /// so the surface can accept redraws again.
+    fn note_redraw_delivered(&mut self) {
+        self.last_request = None;
+        self.redraw_seen = true;
+    }
+
+    /// Records a delivered occlusion edge (native delivery, e.g. iOS or X11
+    /// `VisibilityFullyObscured`, or a synthetic starve edge from
+    /// [`Self::starvation_edge`]).
+    fn note_occluded_state(&mut self, occluded: bool) {
+        self.occluded = occluded;
+    }
+
+    /// The synthetic occlusion edge when the pending redraw request starved
+    /// long enough to name a suspended surface — at most one discovery.
+    fn starvation_edge(&mut self, now: std::time::Instant) -> Option<bool> {
+        if self.occluded || !self.redraw_seen {
+            return None;
+        }
+        let requested_at = self.last_request?;
+        if now.duration_since(requested_at) < OCCLUSION_STARVE {
+            return None;
+        }
+        self.occluded = true;
+        Some(true)
+    }
+
+    /// The reveal edge for a qualifying event, at most one discovery.
+    ///
+    /// Reveal events are the ones a re-shown surface delivers: a served frame
+    /// callback (`RedrawRequested` — the same event also clears the pending
+    /// request), keyboard focus regain, or a real size change.
+    fn reveal_edge(&mut self, event: &winit::event::WindowEvent) -> Option<bool> {
+        if !self.occluded {
+            return None;
+        }
+        let reveals = match event {
+            winit::event::WindowEvent::RedrawRequested => {
+                self.note_redraw_delivered();
+                true
+            }
+            winit::event::WindowEvent::Focused(true)
+            | winit::event::WindowEvent::Resized(_)
+            | winit::event::WindowEvent::ScaleFactorChanged { .. } => true,
+            _ => false,
+        };
+        if reveals {
+            self.occluded = false;
+            Some(false)
+        } else {
+            None
+        }
+    }
+}
+
 /// Bidirectional mapping between upstream window ids and owned ids.
 #[derive(Debug, Default)]
 struct Registry {
     ids: HashMap<WinitWindowId, WindowId>,
+    probes: HashMap<WinitWindowId, Arc<Mutex<OcclusionProbe>>>,
     next_raw_id: u64,
 }
 
@@ -612,8 +725,13 @@ impl Registry {
         owned
     }
 
+    fn register_probe(&mut self, upstream: &WinitWindowId, probe: Arc<Mutex<OcclusionProbe>>) {
+        self.probes.insert(*upstream, probe);
+    }
+
     fn unregister(&mut self, upstream: &WinitWindowId) {
         self.ids.remove(upstream);
+        self.probes.remove(upstream);
     }
 
     fn lookup(&self, upstream: &WinitWindowId) -> Option<WindowId> {
@@ -646,6 +764,39 @@ impl<H: AppHandler> Adapter<H> {
         };
         handler.handle_event(&mut ctx, event);
     }
+
+    /// Delivers the synthetic Wayland occlusion edges for every window whose
+    /// pending redraw request starved past [`OCCLUSION_STARVE`].
+    ///
+    /// Native `Occluded` deliveries (iOS, X11) are translated straight to the
+    /// same [`WindowEventKind::Occluded`] event, so the embedder sees one
+    /// edge vocabulary on every platform. Wayland gets the synthetic delivery
+    /// here; the probe state keeps the two from ever double-delivering.
+    fn synthesize_occlusion(&mut self, event_loop: &ActiveEventLoop) {
+        // Collect first: the probes and the id lookup are separate registry
+        // maps, and `dispatch` borrows the registry mutably again.
+        let mut edges: Vec<(WindowId, bool)> = Vec::new();
+        for (upstream, probe) in self.registry.probes.iter() {
+            let edge = match probe.lock() {
+                Ok(mut state) => state.starvation_edge(std::time::Instant::now()),
+                Err(_) => None,
+            };
+            if edge == Some(true) {
+                if let Some(owned) = self.registry.lookup(upstream) {
+                    edges.push((owned, true));
+                }
+            }
+        }
+        for (window_id, occluded) in edges {
+            self.dispatch(
+                event_loop,
+                PlatformEvent::Window {
+                    window_id,
+                    kind: map_occluded(occluded),
+                },
+            );
+        }
+    }
 }
 
 impl<H: AppHandler> ApplicationHandler<WakeEvent> for Adapter<H> {
@@ -666,6 +817,10 @@ impl<H: AppHandler> ApplicationHandler<WakeEvent> for Adapter<H> {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // Issue #2570 follow-up: resolve starved redraw requests into the
+        // synthetic Wayland occlusion edge before the handler runs, so its
+        // `Occluded` handling sits ahead of any present path this turn.
+        self.synthesize_occlusion(event_loop);
         self.dispatch(event_loop, PlatformEvent::AboutToWait);
     }
 
@@ -685,6 +840,34 @@ impl<H: AppHandler> ApplicationHandler<WakeEvent> for Adapter<H> {
             // below is filtered out for some reason.
             self.registry.unregister(&window_id);
         }
+        // Issue #2570 follow-up: run the occlusion probe before the event
+        // moves into translation. A frame callback served while occluded
+        // clears the pending request and yields the reveal edge; reveal
+        // events (focus regain, size change) yield it without a callback.
+        let reveal_edge = {
+            let probe = self.registry.probes.get(&window_id).cloned();
+            probe.and_then(|probe| {
+                let mut state = probe.lock().ok()?;
+                // Every served frame callback proves the surface can accept
+                // redraws and clears the pending request — the probe's arm
+                // point and its un-mark, regardless of occlusion state.
+                if matches!(event, winit::event::WindowEvent::RedrawRequested) {
+                    state.note_redraw_delivered();
+                }
+                state.reveal_edge(&event)
+            })
+        };
+        if reveal_edge == Some(false) {
+            if let Some(owned_id) = self.registry.lookup(&window_id) {
+                self.dispatch(
+                    event_loop,
+                    PlatformEvent::Window {
+                        window_id: owned_id,
+                        kind: map_occluded(false),
+                    },
+                );
+            }
+        }
         // CTX-0951: OS appearance is app-global, not window-scoped.
         // `translate_window_event` filters `ThemeChanged`; re-dispatch it
         // here as one app-level event per reporting window (downstream
@@ -703,6 +886,16 @@ impl<H: AppHandler> ApplicationHandler<WakeEvent> for Adapter<H> {
         let Some(kind) = translate_window_event(event) else {
             return;
         };
+        // Issue #2570 follow-up: the probe tracks the delivered occlusion
+        // state exactly, so a native edge (iOS, X11) and the synthetic
+        // starve edge never double-deliver.
+        if let WindowEventKind::Occluded(occluded) = &kind {
+            if let Some(probe) = self.registry.probes.get(&window_id) {
+                if let Ok(mut state) = probe.lock() {
+                    state.note_occluded_state(*occluded);
+                }
+            }
+        }
         let Some(owned_id) = self.registry.lookup(&window_id) else {
             // Events for windows this crate did not create are dropped; there
             // is no stable way to name them for the application.
@@ -777,5 +970,127 @@ mod tests {
         assert_eq!(WindowConfig::new().with_opacity(f32::NAN).opacity(), 1.0);
         assert!(!WindowConfig::new().with_opacity(2.0).is_transparent());
         assert!(WindowConfig::new().with_opacity(0.5).is_transparent());
+    }
+
+    /// Installs a probe through the live `request_redraw` path in memento
+    /// form: `window.request_redraw + time passed` is the only way a real
+    /// starvation develops.
+    #[test]
+    fn probe_never_fires_before_first_delivered_redraw() {
+        let mut probe = OcclusionProbe::default();
+        let t0 = std::time::Instant::now();
+        probe.note_redraw_request(t0);
+        assert_eq!(
+            probe.starvation_edge(t0 + OCCLUSION_STARVE * 10),
+            None,
+            "a surface that has not yet served one redraw cannot starve into occlusion"
+        );
+        probe.note_redraw_delivered();
+        assert_eq!(
+            probe.starvation_edge(t0 + OCCLUSION_STARVE * 10),
+            None,
+            "with no pending request the probe stays quiet"
+        );
+    }
+
+    #[test]
+    fn probe_starve_edge_and_single_fire() {
+        let mut probe = OcclusionProbe::default();
+        let t0 = std::time::Instant::now();
+        probe.note_redraw_request(t0);
+        probe.note_redraw_delivered();
+        let pending = t0 + std::time::Duration::from_millis(1);
+        probe.note_redraw_request(pending);
+        assert_eq!(
+            probe.starvation_edge(pending),
+            None,
+            "a fresh request inside the starve span is healthy"
+        );
+        assert_eq!(
+            probe.starvation_edge(pending + OCCLUSION_STARVE),
+            Some(true),
+            "one repaint cycle cannot reach the span; starvation past it names occlusion"
+        );
+        assert_eq!(
+            probe.starvation_edge(pending + OCCLUSION_STARVE * 2),
+            None,
+            "the edge is discovered once"
+        );
+    }
+
+    #[test]
+    fn probe_reveal_edges() {
+        let mut probe = OcclusionProbe::default();
+        probe.note_redraw_delivered();
+        probe.note_redraw_request(std::time::Instant::now());
+        assert!(
+            probe
+                .starvation_edge(std::time::Instant::now() + OCCLUSION_STARVE)
+                .unwrap_or(false)
+        );
+        assert!(
+            probe.occluded,
+            "starvation must arm the probe before reveal edges apply"
+        );
+
+        // A served frame callback clears the pending request and reveals.
+        assert_eq!(
+            probe.reveal_edge(&winit::event::WindowEvent::RedrawRequested),
+            Some(false)
+        );
+        assert!(!probe.occluded);
+        assert_eq!(
+            probe.last_request, None,
+            "the served callback must clear the pending request"
+        );
+
+        // Focus regain reveals without a callback.
+        probe.occluded = true;
+        assert_eq!(
+            probe.reveal_edge(&winit::event::WindowEvent::Focused(true)),
+            Some(false)
+        );
+        assert!(!probe.occluded);
+
+        // A size change reveals without a callback.
+        probe.occluded = true;
+        assert_eq!(
+            probe.reveal_edge(&winit::event::WindowEvent::Resized(
+                winit::dpi::PhysicalSize::new(1280, 800)
+            )),
+            Some(false)
+        );
+        assert!(!probe.occluded);
+
+        // Non-reveal events keep the occluded state.
+        probe.occluded = true;
+        assert_eq!(
+            probe.reveal_edge(&winit::event::WindowEvent::Focused(false)),
+            None
+        );
+        assert_eq!(
+            probe.reveal_edge(&winit::event::WindowEvent::CursorLeft {
+                device_id: winit::event::DeviceId::dummy(),
+            }),
+            None
+        );
+        assert!(probe.occluded);
+    }
+
+    #[test]
+    fn probe_native_occluded_state_syncs_the_starve_edge() {
+        let mut probe = OcclusionProbe::default();
+        probe.note_occluded_state(true);
+        assert_eq!(
+            probe.starvation_edge(std::time::Instant::now() + OCCLUSION_STARVE),
+            None,
+            "a natively delivered occlusion must not double-deliver via the starve edge"
+        );
+        probe.note_occluded_state(false);
+        assert_eq!(
+            probe.reveal_edge(&winit::event::WindowEvent::Focused(true)),
+            None,
+            "an un-occluded probe has no reveal edge to deliver"
+        );
     }
 }

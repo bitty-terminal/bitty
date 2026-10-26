@@ -846,6 +846,13 @@ impl Runtime {
                     self.window_close_request()
                 }
                 WindowEventKind::Closed => true,
+                WindowEventKind::Occluded(_) => {
+                    // Issue #2570 follow-up: the visibility gate edges are
+                    // embedder-owned (`set_surface_visibility`), so the
+                    // runtime does not re-deliver occlusion here; the embedder
+                    // routes native and synthetic occlusion into the gate.
+                    false
+                }
                 WindowEventKind::RedrawRequested => {
                     // The embedder will call `tick` on `AboutToWait`; we do
                     // not present eagerly here so frame-on-demand stays

@@ -65,10 +65,17 @@ fn classic_preference_forces_the_crossfont_fallback() {
         "classic preference resolves crossfont (or headless on a bare host): {:?}",
         rt.text_stack()
     );
-    assert!(
-        rt.text_stack_note().is_none(),
-        "an explicit classic preference is not a fallback"
-    );
+    match rt.text_stack() {
+        TextStack::Crossfont => assert!(
+            rt.text_stack_note().is_none(),
+            "an explicit classic preference is not a fallback"
+        ),
+        TextStack::Headless => assert!(
+            rt.text_stack_note().is_some(),
+            "a headless resolution must explain the missing crossfont font"
+        ),
+        TextStack::Shaped => panic!("classic preference selected the shaped stack"),
+    }
 }
 
 #[test]
@@ -107,8 +114,8 @@ fn first_two_cells_pixels(rt: &Runtime) -> Vec<u8> {
 fn shaped_default_disables_ligatures_when_configured() {
     // The CI macOS image resolves the default family to a system monospace
     // without programming ligatures, so there is nothing to disable there.
-    if cfg!(target_os = "macos") {
-        eprintln!("skipped: the macOS CI font stack has no programming ligatures");
+    if cfg!(target_os = "macos") || cfg!(windows) {
+        eprintln!("skipped: the CI font stack has no programming ligatures on this platform");
         return;
     }
     if !host_fonts_available(DEFAULT_FAMILY) {

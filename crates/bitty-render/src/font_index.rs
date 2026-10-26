@@ -1910,6 +1910,18 @@ mod tests {
         assert_eq!(discovery_calls.get(), 1);
 
         let future = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        #[cfg(windows)]
+        {
+            // Copied font fixtures can carry the read-only attribute, which
+            // makes `set_modified` fail with PermissionDenied on Windows.
+            let mut permissions = std::fs::metadata(&changed)
+                .expect("stat changed")
+                .permissions();
+            if permissions.readonly() {
+                permissions.set_readonly(false);
+                std::fs::set_permissions(&changed, permissions).expect("clear read-only");
+            }
+        }
         std::fs::File::open(&changed)
             .expect("open changed")
             .set_modified(future)

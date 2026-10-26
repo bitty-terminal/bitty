@@ -55,7 +55,10 @@ find . -type f ! -name PATCHES.md ! -path './patches/*' \
 
 `scripts/check-vendored-winit.sh` (recipe `just vendored-winit`) recomputes the
 same value and fails on any mismatch, so a stray edit inside the vendored tree
-cannot pass `just check` unnoticed. The trust model is deliberately simple: the
+cannot pass `just check` unnoticed. Because the tree digest excludes
+`patches/`, the same gate also hashes the recorded diff file named by the
+`Patch` row and compares it with `Patch SHA-256`, so editing the patch alone
+fails too. The trust model is deliberately simple: the
 digest proves the tree is the one reviewed with this file, not that upstream is
 trustworthy. Upstream trust comes from the recorded base/head commits and the
 diff review, not from the digest.
@@ -158,8 +161,9 @@ source in the graph:
   afterwards.
 - Path dependencies have no registry or git source, so `[sources]` needs no
   exception; the existing `allow-registry`/`allow-git` lists are unchanged.
-- No `deny.toml` edit is part of this patch. A future move to a git source
-  instead of a path source would need an `allow-git` entry.
+- No policy change: the CTX-1605 comment in `deny.toml` only points at this
+  section (advisory coverage gap and the dated re-audit bound). A future move to
+  a git source instead of a path source would need an `allow-git` entry.
 - Markdown gates: upstream winit ships Markdown (crate README, `FEATURES.md`,
   `docs/`, `src/changelog/`) that does not follow this repository's
   markdownlint configuration. Those exact paths are listed in
@@ -209,7 +213,10 @@ Compensating controls, until the patch is dropped:
   The checksum is the published `winit 0.30.13` checksum (the value the lock
   carried before the patch). The same snippet works for any future vendored
   release: take the fresh checksum from `cargo search`/the crates.io API and
-  bump the `version` line.
+  bump the `version` line. `--no-fetch` keeps the run read-only, so it needs a
+  populated advisory database (the `cargo deny` step of `just supply-chain`, or
+  `cargo audit --db <dir>` after a fetch, seeds `~/.cargo/advisory-db`); drop
+  the flag to let `cargo audit` fetch its own copy.
 
 ## Update procedure
 
@@ -255,8 +262,19 @@ Drop this patch when either lands in a release Bitty can adopt:
 
 As of 2026-10-26 the newest published 0.30 release is `0.30.13`
 (2026-03-02), the newest published 0.31 release is `0.31.0-beta.4`
-(2026-10-24), and both #4709 and #4710 are open. On removal: bump
-`[workspace.dependencies] winit`, delete `[patch.crates-io] winit`, delete the
-`exclude` entry and this directory, regenerate `Cargo.lock`, then re-run the
-gates. The application-side `Occluded` handling needs no change either way,
-since it consumes the platform event that upstream would then emit natively.
+(2026-10-24), and both #4709 and #4710 are open. On removal:
+
+- bump `[workspace.dependencies] winit`, delete `[patch.crates-io] winit`,
+  delete the `exclude` entry and this directory, and regenerate `Cargo.lock`;
+- remove the gate wiring that exists only for this patch: the
+  `vendored-winit`/`vendored-winit-test` recipes and their entry in the
+  `justfile` `check` recipe, the shard-1 `Check the vendored winit resolution`
+  step in `.github/workflows/ci.yml`, `scripts/check-vendored-winit.sh` with
+  `scripts/tests/check-vendored-winit.test.sh` and
+  `scripts/tests/fixtures/vendored-winit/`, the `-whitespace` line for
+  `vendor/winit/patches/*.diff` in `.gitattributes`, and the
+  `dependency-name: "winit"` ignore in `.github/dependabot.yml`;
+- re-run the gates.
+
+The application-side `Occluded` handling needs no change either way, since it
+consumes the platform event that upstream would then emit natively.

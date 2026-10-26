@@ -242,7 +242,7 @@ jobs:
       # CTX-1605: `winit` is a patched path dependency (vendor/winit). A
       # requirement bump otherwise resolves to crates.io with only a "patch was
       # not used" warning, dropping the Wayland Occluded edge while staying
-      # green. Offline, no build.
+      # green. No build; needs the local cargo index/cache.
       - name: Check the vendored winit resolution
         if: matrix.shard == 1
         run: ./scripts/check-vendored-winit.sh

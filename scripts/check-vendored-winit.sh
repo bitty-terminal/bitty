@@ -11,7 +11,7 @@
 # This gate fails closed on that state and on any drift of the vendored tree
 # from the digest recorded in `vendor/winit/PATCHES.md`.
 #
-# Checks (offline, no build):
+# Checks (no build; needs the local cargo index/cache):
 #   1. `Cargo.lock` records no `source` or `checksum` for `winit`.
 #   2. `cargo metadata --locked` resolves `winit` with a null `source` and a
 #      manifest at `<tree>/Cargo.toml`.
@@ -19,11 +19,14 @@
 #      `PATCHES.md` (files are hashed as `sha256sum` prints them, sorted under
 #      `LC_ALL=C`; `PATCHES.md` and `patches/` are metadata, not vendored
 #      source, and are excluded).
+#   4. The recorded patch file (`Patch` row) hashes to the `Patch SHA-256`
+#      pinned in `PATCHES.md`. The tree digest deliberately excludes
+#      `patches/`, so this row is what protects the recorded diff itself.
 #
 # Options (fixture tests use them; the defaults are the repository state):
 #   --tree DIR       vendored crate directory (default: vendor/winit)
 #   --lock FILE      lockfile to inspect (default: Cargo.lock)
-#   --patches FILE   PATCHES.md carrying the tree digest
+#   --patches FILE   PATCHES.md carrying the tree digest and patch hash
 #   --metadata FILE  pre-generated `cargo metadata --format-version 1` JSON
 #                    (default: run `cargo metadata --locked` in this checkout)
 #   -h, --help       print this usage
@@ -37,7 +40,7 @@ patches="$tree/PATCHES.md"
 metadata=""
 
 usage() {
-  sed -n '4,29p' "$0" | sed 's/^# \{0,1\}//'
+  awk 'NR > 3 && /^set -euo pipefail$/ { exit } NR > 3 { sub(/^# ?/, ""); print }' "$0"
 }
 
 while (($#)); do
@@ -186,6 +189,30 @@ else:
             "recompute it after an intentional vendor change (procedure in PATCHES.md)"
         )
 
+# 4. The recorded patch file itself: the tree digest above excludes `patches/`.
+patch_row = re.search(r"\|\s*Patch\s*\|\s*`([^`]+)`\s*\|", patches_text)
+patch_hash_row = re.search(
+    r"\|\s*Patch SHA-256\s*\|\s*`?([0-9a-f]{64})`?\s*\|", patches_text
+)
+if patch_row is None:
+    fail(f"{patches_path} has no `Patch` row naming the recorded diff")
+elif patch_hash_row is None:
+    fail(f"{patches_path} has no `Patch SHA-256` row with a 64-hex value")
+else:
+    patch_relative = patch_row.group(1)
+    patch_file = pathlib.Path(tree_path, patch_relative)
+    if not patch_file.is_file():
+        fail(f"recorded patch {patch_relative} is missing under {tree_path}")
+    else:
+        computed_patch = hashlib.sha256(patch_file.read_bytes()).hexdigest()
+        recorded_patch = patch_hash_row.group(1)
+        if computed_patch != recorded_patch:
+            fail(
+                f"recorded patch {patch_relative} is {computed_patch}, "
+                f"{patches_path} records {recorded_patch}; restore the fetched diff "
+                "or update the `Patch SHA-256` row"
+            )
+
 if failures:
     for message in failures:
         print(f"check-vendored-winit: {message}", file=sys.stderr)
@@ -194,6 +221,6 @@ if failures:
 version = packages[0].get("version", "unknown") if metadata is not None else "unknown"
 print(
     f"check-vendored-winit: winit {version} resolves to {tree_path}/Cargo.toml; "
-    "lock is path-resolved; tree digest matches"
+    "lock is path-resolved; tree digest and patch hash match"
 )
 PY

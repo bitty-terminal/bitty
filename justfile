@@ -197,7 +197,8 @@ test-support-gate:
 # the patch "was not used in the crate graph": the build stays green and the
 # Wayland `Occluded` edge the surface-visibility gate needs disappears. This
 # gate fails closed on that state and on drift from the tree digest pinned in
-# `vendor/winit/PATCHES.md`. Offline, no build; part of `just check`.
+# `vendor/winit/PATCHES.md`. No build; needs the local cargo index/cache.
+# Part of `just check`.
 vendored-winit:
     ./scripts/check-vendored-winit.sh
 

@@ -82,7 +82,8 @@ fail_case "lock with a checksum but no source" "records a \`checksum\`" \
 
 # Digest drift: every upstream file edit must update PATCHES.md in the same
 # commit, so an old digest fails.
-sed 's/`c0c4343e576b91e6c1e88f7f1f2ba3c1d0cd9519533d0b554492385ee0510a47`/`0000000000000000000000000000000000000000000000000000000000000000`/' \
+recorded_digest="$(sed -n 's/.*Tree digest.*`\([0-9a-f]\{64\}\)`.*/\1/p' "$PATCHES")"
+sed "s/\`$recorded_digest\`/\`0000000000000000000000000000000000000000000000000000000000000000\`/" \
   "$PATCHES" >"$TMP/PATCHES.bad-digest.md"
 if cmp -s "$PATCHES" "$TMP/PATCHES.bad-digest.md"; then
   echo "FAIL: digest substitution did not change PATCHES.md (row reworded?)" >&2
@@ -96,6 +97,29 @@ grep -v 'Tree digest' "$PATCHES" >"$TMP/PATCHES.no-digest.md"
 fail_case "PATCHES.md without a digest row" "no \`Tree digest\` row" \
   "$GATE" --metadata "$TMP/metadata-path.json" --lock "$FIXTURES/Cargo.lock.path" \
   --patches "$TMP/PATCHES.no-digest.md"
+
+# The tree digest excludes `patches/`, so the recorded diff itself is covered
+# by the `Patch SHA-256` row: mutating the diff must fail even though the tree
+# digest still matches. The fixture tree carries only a manifest and the patch,
+# so its digest is recomputed into a PATCHES.md copy and stays stable across
+# the mutation.
+mkdir -p "$TMP/tree/patches"
+printf '[package]\nname = "winit"\nversion = "0.30.13"\n' >"$TMP/tree/Cargo.toml"
+cp "$TREE"/patches/*.diff "$TMP/tree/patches/"
+sed "s|@TREE@|$TMP/tree|" "$FIXTURES/metadata-path.json" >"$TMP/metadata-fixed.json"
+fixture_digest="$(
+  cd "$TMP/tree" &&
+    find . -type f ! -name PATCHES.md ! -path './patches/*' -print0 |
+    LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
+)"
+sed "s/$recorded_digest/$fixture_digest/" "$PATCHES" >"$TMP/PATCHES.fixture.md"
+pass_case "intact recorded patch" \
+  "$GATE" --metadata "$TMP/metadata-fixed.json" --lock "$FIXTURES/Cargo.lock.path" \
+  --tree "$TMP/tree" --patches "$TMP/PATCHES.fixture.md"
+printf '\n# mutated\n' >>"$TMP/tree/patches/0001-wayland-xdg-suspended-occluded.diff"
+fail_case "mutated recorded patch" "recorded patch" \
+  "$GATE" --metadata "$TMP/metadata-fixed.json" --lock "$FIXTURES/Cargo.lock.path" \
+  --tree "$TMP/tree" --patches "$TMP/PATCHES.fixture.md"
 
 fail_case "missing vendored manifest" "missing vendored manifest" \
   "$GATE" --metadata "$TMP/metadata-path.json" --lock "$FIXTURES/Cargo.lock.path" \

@@ -84,9 +84,11 @@
 //! `$XDG_CACHE_HOME/bitty/font-index-v1` (see `font_index`; the upstream
 //! `fontdb` scan remains the fallback): a cold process walks the font
 //! directories once and reads only the `name`/`OS/2`/`post` tables of each
-//! face in parallel, then writes a versioned index atomically; a warm process
-//! reads the cached metadata, stats each path, reparses only changed files,
-//! and builds a metadata-only `fontdb` database. Face bytes still load lazily
+//! face in parallel, then writes a versioned index atomically; every start
+//! runs discovery again and reconciles the cache against the current path
+//! set (new/removed/changed fonts, fontconfig changes, foreign entries),
+//! reparsing only changed/new paths before building a metadata-only `fontdb`
+//! database. Face bytes still load lazily
 //! for the faces a frame needs, and missing-glyph fallback loads a covering
 //! face on demand. `BITTY_FONT_INDEX=0` restores the upstream full scan for
 //! diagnosis. A stale, corrupt, or unwritable cache never fails startup.

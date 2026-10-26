@@ -38,12 +38,13 @@ observable in startup logs, the verbose tick line, and `bitty doctor`'s
 The shaped stack keeps a versioned face index at
 `$XDG_CACHE_HOME/bitty/font-index-v1`. A cold process discovers the font
 files once and parses only each face's `name`/`OS/2`/`post` tables in
-bounded parallel workers, then writes the index atomically; a warm process
-reads the cached metadata, stats each path, and reparses only changed files.
-Faces load lazily, so startup reads no font outlines. The index is ignored
-(and the upstream full scan runs) when `BITTY_FONT_INDEX=0` is set, when the
-cache root is unavailable, or when a corrupt/version-mismatched index must be
-rebuilt.
+bounded parallel workers, then writes the index atomically. Every start
+runs discovery again and reconciles the cache: new/removed/changed fonts and
+fontconfig changes are picked up, foreign/missing entries are dropped, and
+only changed/new paths are reparsed. Faces load lazily, so startup reads no
+font outlines. The index is ignored (and the upstream full scan runs) when
+`BITTY_FONT_INDEX=0` is set, when the cache root is unavailable, or when a
+corrupt/truncated/version-mismatched index must be rebuilt.
 
 ## Boundaries
 

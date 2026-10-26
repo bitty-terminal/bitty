@@ -377,9 +377,11 @@ dependencies = [
  "bitty-term-state",
  "bitty-vt",
  "crossfont",
+ "fontconfig-parser",
  "fontdb",
  "harfrust",
  "swash",
+ "ttf-parser",
  "wgpu",
 ]
 

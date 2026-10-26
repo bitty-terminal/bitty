@@ -11,12 +11,15 @@ features = ["publication-control"]
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-# ttf-parser (remaining node: winit/sctk-adwaita/ab_glyph decoration path)
-# and paste are unmaintained upstream; the advisories are tracked here and
-# ignored until the replacement lands, matching the cargo-audit step in CI
-# (ADR-0004 maintenance policy). fontdb 0.24 (bitty#1692) vendors its
-# query-time parser subset, so fontdb no longer contributes a ttf-parser
-# node; only the winit path keeps RUSTSEC-2026-0192 live.
+# ttf-parser (direct font-index metadata edge plus the
+# winit/sctk-adwaita/ab_glyph decoration path) and paste are unmaintained
+# upstream; the advisories are tracked here and ignored until the replacement
+# lands, matching the cargo-audit step in CI (ADR-0004 maintenance policy).
+# fontdb 0.24 (bitty#1692) vendors its query-time parser subset, so fontdb no
+# longer contributes a ttf-parser node; the winit decoration path and the
+# CTX-1607 font index now keep RUSTSEC-2026-0192 live. The ADR revision for
+# the new hot-path edge is tracked separately (do not edit the docs repo
+# here).
 # Time bound (CTX-0634, P0-AC-034 exception policy): re-check both upstream
 # replacements no later than 2027-03-31 and drop each ignore when its
 # replacement lands; any extension needs a dated ADR-0004 revision.

@@ -3050,6 +3050,31 @@ pub(crate) fn runtime_config_from_effective_for_with_warnings(
         // Without this the production rasterizer chain always saw the
         // default empty tier.
         cfg.font_fallback = effective.font.fallback.clone();
+        // CTX-1607: carry the effective OpenType feature overrides and the
+        // programming-ligature policy to the shaped default path. The
+        // effective config is already validated (tag shape, value, entry
+        // bound); a malformed entry here would be upstream drift, so it is
+        // dropped rather than aborting startup (`RuntimeConfig::validate`
+        // still enforces the entry bound).
+        cfg.font_features = effective
+            .font
+            .features
+            .iter()
+            .filter_map(|raw| bitty_config::types::OpenTypeFeature::parse(raw).ok())
+            .collect();
+        cfg.disable_ligatures = effective.font.disable_ligatures;
+        // CTX-1607: startup-only text-stack escape hatch. An invalid value
+        // stays on `auto` and is reported through the warning channel.
+        let (text_stack, stack_warning) = bitty_runtime::TextStackPreference::from_env_value(
+            std::env::var(bitty_runtime::TEXT_STACK_ENV).ok().as_deref(),
+        );
+        cfg.text_stack = text_stack;
+        if let Some(reason) = stack_warning {
+            warnings.push(format!(
+                "bitty: {}: {reason} — using auto",
+                bitty_runtime::TEXT_STACK_ENV
+            ));
+        }
         // CTX-0756 (issue #1359): `terminal.cursor_style` flows file ->
         // effective -> runtime by value (`bitty-runtime` owns no
         // `bitty-config` dependency); the match is total with a fail-closed

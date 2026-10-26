@@ -1876,13 +1876,22 @@ fn tick_line_format_carries_frame_stats() {
         backgrounds: 0,
         images_skipped: 0,
     };
-    let line = TerminalApp::format_tick_line(&present, 1, None, 1, false, false, 1234);
+    let line = TerminalApp::format_tick_line(
+        &present,
+        1,
+        None,
+        1,
+        false,
+        bitty_runtime::TextStack::Headless,
+        1234,
+    );
     assert!(line.starts_with("bitty tick:"));
     assert!(line.contains("t_ms=1234"));
     assert!(line.contains("frame=2"));
     assert!(line.contains("fills=1921"));
     assert!(line.contains("glyphs=21"));
     assert!(line.contains("headless=true"));
+    assert!(line.contains("text_stack=headless"));
     assert!(line.contains("gen=30"));
     // CTX-0253 F3: the image gate counters ride the verbose tick line
     // so a real-GPU skip is user-visible in logs, never silent.
@@ -4487,7 +4496,7 @@ fn runtime_config_carries_effective_font_fallback() {
     use bitty_config::plan::{ConfigSource, LayerKind};
     let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
     let plan = parse_lua_config(
-        r#"return { font = { family = "Mono", size = 12.0, fallback = { "Noto Sans Symbols 2", "Noto Color Emoji" } } }"#,
+        r#"return { font = { family = "Mono", size = 12.0, fallback = { "Noto Sans Symbols 2", "Noto Color Emoji" }, features = { "calt=0", "ss01=2" }, disable_ligatures = "cursor" } }"#,
         &src,
     )
     .expect("fallback parses");
@@ -4502,6 +4511,19 @@ fn runtime_config_carries_effective_font_fallback() {
     );
     let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
     assert_eq!(cfg.font_fallback, merged.effective.font.fallback);
+    // CTX-1607: the shaped default consumes the typed feature overrides and
+    // the ligature policy directly, not just through `FontConfig`.
+    assert_eq!(
+        cfg.font_features,
+        vec![
+            bitty_config::types::OpenTypeFeature::parse("calt=0").unwrap(),
+            bitty_config::types::OpenTypeFeature::parse("ss01=2").unwrap()
+        ]
+    );
+    assert_eq!(
+        cfg.disable_ligatures,
+        bitty_config::types::LigaturePolicy::Cursor
+    );
     let font = cfg.font_config();
     assert_eq!(font.family, cfg.font_family);
     assert_eq!(
@@ -4515,6 +4537,11 @@ fn runtime_config_carries_effective_font_fallback() {
     let cfg_default = runtime_config_from_effective(&bitty_config::EffectiveConfig::default())
         .expect("defaults build");
     assert!(cfg_default.font_fallback.is_empty());
+    assert!(cfg_default.font_features.is_empty());
+    assert_eq!(
+        cfg_default.disable_ligatures,
+        bitty_config::types::LigaturePolicy::Never
+    );
 }
 
 #[test]

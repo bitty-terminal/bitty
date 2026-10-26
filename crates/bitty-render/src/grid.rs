@@ -103,7 +103,8 @@ use crate::glyph::{
     RasterKey,
 };
 use crate::shaped::{
-    RunAttrs, ShapedCluster, SwashSingle, cells_for_range, features_for_policy, form_runs_for_row,
+    RunAttrs, ShapedCluster, ShapedRunSource, cells_for_range, features_for_policy,
+    form_runs_for_row,
 };
 
 /// Straight-alpha RGBA color, `[r, g, b, a]` bytes.
@@ -1971,6 +1972,11 @@ pub struct RenderCounters {
     /// skipped its `shape_run` call entirely (runs missing the dirty range
     /// also skip shaping but are not counted).
     pub ascii_fast_path_runs: u64,
+    /// Runs whose `shape_run` call failed and were degraded to per-cell
+    /// unshaped rendering (CTX-1607). Bounded monotone counter: the frame
+    /// never errors on a single bad run, and the fallback stays observable
+    /// alongside `shaping_misaligned`.
+    pub shaping_fallback_runs: u64,
 }
 
 /// Occupancy fraction at which an exhausted atlas earns growth (CTX-1206,
@@ -3755,23 +3761,33 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     }
 }
 
-impl GridRenderer<FallbackRasterizer<SwashSingle>> {
+impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
     /// Shaped run-cache `(hits, misses)` totals from the inner shaper.
     #[must_use]
     pub fn shape_stats(&self) -> (u64, u64) {
         self.cache.rasterizer().inner().shape_stats()
     }
 
-    /// Renders one frame through the shaped run path (Phase B, opt-in).
+    /// Renders one frame through the shaped run path (production default,
+    /// CTX-1607).
     ///
     /// Dirty-row run formation groups contiguous cells with identical
-    /// style into LTR runs; each run shapes via the inner `SwashSingle`
+    /// style into LTR runs; each run shapes via the inner shaper
     /// (run/shape-plan caches, tail fallback), then clusters emit as
     /// N-cell ligature spans, CJK double-width singles, or tofu. The
     /// cursor policy (`Never`/`Cursor`/`Always`) selects the feature set:
     /// `Always` forces programming ligatures off (bit-for-bit unshaped),
     /// `Cursor` re-shapes the cursor row from cache with ligatures zeroed
     /// when the cursor intersects a ligature span, `Never` shapes verbatim.
+    /// Configured `font.features` reach the shaper through the same
+    /// effective list.
+    ///
+    /// A source that reports
+    /// [`ShapedRunSource::shaping_supported`] `== false` (the classic
+    /// crossfont fallback or the deterministic headless rasterizer) is
+    /// served by [`Self::render`] instead, so callers always use this one
+    /// entry point and the fallback is a property of the rasterizer, not a
+    /// separate call site.
     ///
     /// Grid truth is never read from shaped output: backgrounds,
     /// decorations, selection, and copy all keep reading `Snapshot`
@@ -3786,6 +3802,17 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
     /// glyph destinations; invisible-attribute runs emit no glyph, tofu,
     /// or fallback — backgrounds only.
     ///
+    /// Grid-tiling gate (CTX-1607): every emitted group must start at the
+    /// run's running pen column, stay inside the run's cell span, and
+    /// advance at the run's per-cell advance (median single-cell shaped
+    /// advance, or the configured cell width when the run has no single
+    /// cluster). A group that violates any of those invariants degrades
+    /// that group to per-cell unshaped rendering and bumps
+    /// [`RenderCounters::shaping_misaligned`]; a shaper failure degrades
+    /// the whole run and bumps [`RenderCounters::shaping_fallback_runs`].
+    /// Misaligned glyphs are never painted, so the grid never stretches,
+    /// overlaps, or clips a cluster to make malformed output fit.
+    ///
     /// # Errors
     ///
     /// Propagates rasterizer failures; a single bad run degrades that
@@ -3797,6 +3824,13 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
         policy: bitty_config::types::LigaturePolicy,
         features: &[bitty_config::types::OpenTypeFeature],
     ) -> Result<DrawList, RenderError> {
+        // Fallback contract (CTX-1607): the classic crossfont stack and the
+        // deterministic headless rasterizer cannot shape, so they are served
+        // by the per-cell path unchanged. The check is one virtual call per
+        // frame; `render` owns its own frame counter.
+        if !self.cache.rasterizer().inner().shaping_supported() {
+            return self.render(snapshot, damage);
+        }
         self.counters.frames_planned += 1;
 
         let descriptor = SnapshotDamage::new(snapshot, damage, self.cell);
@@ -4017,6 +4051,15 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
         list: &mut DrawList,
     ) -> Result<Vec<(usize, usize)>, RenderError> {
         use bitty_config::types::LigaturePolicy;
+        // The shaped shaper reshapes uncovered clusters against the chain
+        // tails it is handed. Tails load lazily on the first per-glyph miss
+        // (CTX-1026), so a multi-script run shaped before any such miss
+        // would fall through to the slower dynamic scan instead of the
+        // pinned tail order. Warm the tails once on the first non-ASCII run
+        // (ASCII-only sessions keep the lazy startup).
+        if !crate::shaped::is_printable_ascii_str(&run.text) {
+            self.cache.rasterizer_mut().warm_tails();
+        }
         // Chain + size from the live renderer (single font, single size).
         let chain: Vec<FontId> = self.cache.rasterizer().fonts().to_vec();
         if chain.is_empty() {
@@ -4055,6 +4098,9 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
         {
             Ok(clusters) => clusters,
             Err(_) => {
+                // Observable fallback: the run keeps grid-true per-cell
+                // placement and the counter names the degradation.
+                self.counters.shaping_fallback_runs += 1;
                 let fg = self.shaped_run_fg(snapshot, row, snapshot.width, run);
                 self.emit_unshaped_slice(&run.text, row, run.start_col, fg, list);
                 return Ok(vec![(run.start_col, run.col_count)]);
@@ -4078,7 +4124,7 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
                     let run_cursor_col =
                         cursor_col.checked_sub(run.start_col).unwrap_or(usize::MAX);
                     if cursor_row == row
-                        && SwashSingle::cursor_intersects_ligature(&clusters, run_cursor_col)
+                        && crate::shaped::cursor_intersects_ligature(&clusters, run_cursor_col)
                             .is_some()
                     {
                         let mut zeroed = effective.to_vec();
@@ -4139,6 +4185,10 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
         // whole text (a later gate failure then emits only part of the
         // cluster) — grouping keeps the gate and the fallback whole.
         let mut idx = 0usize;
+        // Running pen column (run-relative). Every group must start where
+        // the previous one ended; a shaper that overlaps, reorders, or
+        // overruns the run breaks grid tiling and degrades that group.
+        let mut pen_col = 0usize;
         while idx < clusters_ref.len() {
             let first = &clusters_ref[idx];
             let group_offset = first.byte_offset;
@@ -4154,11 +4204,35 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             // Group span from grid truth (the empty-slice member's stored
             // count is a 1-cell placeholder, never authoritative).
             let count = cells_for_range(slice).max(1);
-            let abs_start = run.start_col + first.cells.0;
-            let abs_end = abs_start + count;
+            // Grid-true placement: the running pen column, never the
+            // shaper's claimed origin. The two agree for well-formed
+            // output; on corruption only the grid-true column is painted.
+            let abs_start = run.start_col.saturating_add(pen_col);
+            let abs_end = abs_start.saturating_add(count);
+            let tiling_ok = first.cells.0 == pen_col
+                && count <= run.col_count.saturating_sub(pen_col)
+                && abs_end <= snapshot.width;
+            pen_col = pen_col.saturating_add(count);
             let dirty_start = dirty_cols.start.max(run.start_col);
             let dirty_end = dirty_cols.end.min(run.start_col + run.col_count);
             if abs_end <= dirty_start || abs_start >= dirty_end {
+                idx = group_end;
+                continue;
+            }
+            if !tiling_ok {
+                // Broken tiling: never paint the malformed span. Every
+                // scalar keeps its grid-true per-cell position instead.
+                self.counters.shaping_misaligned += 1;
+                self.cache.rasterizer_mut().inner_mut().note_misaligned();
+                if abs_start < snapshot.width {
+                    self.emit_unshaped_slice(
+                        slice,
+                        row,
+                        abs_start,
+                        self.shaped_run_fg(snapshot, row, cols, run),
+                        list,
+                    );
+                }
                 idx = group_end;
                 continue;
             }
@@ -4168,7 +4242,7 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             let fg = self.shaped_run_fg(snapshot, row, cols, run);
             // Issue #2307/#2315: a cluster whose only spacing scalar is a
             // block element never needs the shaped font outline. Emit the
-            // shared cell-box mask so the opt-in shaped path tiles exactly
+            // shared cell-box mask so the shaped path tiles exactly
             // like the default unshaped path. A block base with trailing
             // zero-width scalars keeps the same box and paints the marks
             // through the per-cell path: the font's block edge must never
@@ -4215,8 +4289,38 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
                 idx = group_end;
                 continue;
             }
+            // Grid-advance gate (CTX-1607): the group's advance must
+            // reconcile with the run's per-cell advance — the median
+            // single-cell shaped advance, or the configured cell width when
+            // the run has no single cluster to sample. Cost per cell (not
+            // the absolute span) makes the test independent of ligature
+            // length, CJK width, and sub-pixel cell rounding. Mark-only
+            // groups carry no spacing scalar and are positioned by GPOS,
+            // so they are exempt.
             let group_advance: f32 = group.iter().map(|c| c.x_advance_px).sum();
-            if !SwashSingle::is_cjk_advance_aligned(slice, count, group_advance, single_advance) {
+            let reference_advance = if single_advance > 0.0 {
+                single_advance
+            } else {
+                self.cell.width as f32
+            };
+            let per_cell_advance = group_advance / count as f32;
+            // Multi-cell spans are only held to the monospace cell lattice
+            // on faces that declare monospaced metrics: a proportional
+            // face's ligature advance is unrelated to the terminal cell
+            // width, while a terminal face's must tile its N cells exactly.
+            let monospaced = self
+                .cache
+                .rasterizer()
+                .inner()
+                .face_is_monospaced(first.face);
+            let enforce_advance = count == 1 || monospaced;
+            let advance_ok = cluster_base_scalar_count(slice) == 0
+                || !enforce_advance
+                || (per_cell_advance.is_finite()
+                    && per_cell_advance > 0.0
+                    && (per_cell_advance - reference_advance).abs()
+                        <= crate::shaped::GRID_ADVANCE_EPSILON_PX);
+            if !advance_ok {
                 self.counters.shaping_misaligned += 1;
                 self.cache.rasterizer_mut().inner_mut().note_misaligned();
                 // Degrade to per-cell unshaped rendering for this group.
@@ -4285,7 +4389,7 @@ impl GridRenderer<FallbackRasterizer<SwashSingle>> {
             self.point_size,
             features,
         );
-        let source = self.atlas.ensure_shaped_cached(shaped_key, bitmap);
+        let source = self.atlas.ensure_shaped_cached(shaped_key, bitmap.inner);
         // Grid origin plus bearing plus the shaper's GPOS horizontal
         // offset (Phase C): combining marks shaped as separate glyphs
         // carry their mark shift in `x_offset_px`, previously dropped.

@@ -18,25 +18,45 @@ never mutates terminal state, per `src/lib.rs`.
 ## Status
 
 Render row of the Core Workspace Topology (ADR-0003), with `wgpu` adopted and
-`crossfont` wrapped per the accepted rows of ADR-0004, as stated in
-`src/lib.rs`.
+the `harfrust`/`swash`/`fontdb` shaped stack wrapped as the production default
+plus `crossfont` wrapped as the explicit fallback, per the accepted rows of
+ADR-0004 and CTX-1607, as stated in `src/lib.rs`.
 
-## Backend selection (CTX-0957 additive landing, DEC-0095)
+## Backend selection (CTX-1607)
 
-Production default stays `crossfont` (zero behavior change). The
-`harfrust`/`swash`/`fontdb` stack in `src/shaped.rs` is an explicit opt-in
-(construct `SwashSingle` directly, as `tests/shaped_parity.rs` does — no
-flag, no env var, no silent default flip). Full removal of the crossfont
-wrap is deferred to CTX-0961 (CJK/script chain policy + dynamic fallback +
-per-OS evidence). See the `Backend selection` section in `src/lib.rs`.
+Production default is the `harfrust`/`swash`/`fontdb` stack in
+`src/shaped.rs` (programming ligatures, `font.features`, and
+`font.disable_ligatures` are live). `crossfont` is the explicit fallback:
+the runtime selects it when the shaped stack cannot initialize or when
+`BITTY_TEXT_STACK=classic` is set. Non-shaping rasterizers are served by the
+per-cell path through `ShapedRunSource::shaping_supported`. The fallback is
+observable in startup logs, the verbose tick line, and `bitty doctor`'s
+`text-stack` row. See the `Backend selection` section in `src/lib.rs`.
+
+## Font discovery (CTX-1607)
+
+The shaped stack keeps a versioned face index at
+`$XDG_CACHE_HOME/bitty/font-index-v2`. A cold process discovers the font
+files once and parses only each face's `name`/`OS/2`/`post` tables in
+bounded parallel workers, then writes the index atomically. Every start
+runs discovery again and reconciles the cache: new/removed/changed fonts and
+fontconfig changes are picked up, foreign/missing entries are dropped, and
+only changed/new paths are reparsed. The index reads no face bytes; the
+runtime still loads the primary face at startup to build its grid renderer,
+and other faces load lazily. The v2 index carries a content hash so a
+syntactically valid line mutation is rejected and rebuilt. The index is ignored (and the upstream full scan runs) when
+`BITTY_FONT_INDEX=0` is set, when the cache root is unavailable, or when a
+corrupt/truncated/version-mismatched index must be rebuilt.
 
 ## Boundaries
 
 - Workspace-internal dependencies, per `Cargo.toml`: `bitty-term-state`,
   `bitty-platform`, and `bitty-config`.
-- Third-party dependencies, per `Cargo.toml`: `wgpu`, `crossfont`, and the
-  opt-in `harfrust`/`swash`/`fontdb` stack, plus a dev-dependency on
-  `bitty-vt` for tests; no network-facing dependency is declared.
+- Third-party dependencies, per `Cargo.toml`: `wgpu`, the shaped
+  `harfrust`/`swash`/`fontdb` stack, the `crossfont` fallback, and
+  `ttf-parser`/`fontconfig-parser` for the persistent discovery index, plus
+  a dev-dependency on `bitty-vt` for tests; no network-facing dependency is
+  declared.
 - No upstream type appears in the public API; every upstream failure flattens
   into the owned error type.
 - `skia-safe` is rejected and must not be introduced; cursor visuals,
@@ -65,11 +85,13 @@ coverage is absent.
 - `src/frame.rs` — frame planning from pixel-domain damage.
 - `src/grid.rs` and `src/grid/` — snapshot and damage to draw-record pipeline.
 - `src/atlas.rs` and `src/cache.rs` — atlas layout math and glyph cache.
+- `src/font_index.rs` — persistent versioned discovery index (cold parallel
+  metadata scan, lazy per-path rebuild, atomic write).
 - `src/glyph.rs`, `src/fallback.rs`, `src/crossfont_backend.rs` — rasterizer
-  contract, font-chain fallback, and the crossfont wrapper (production
-  default).
-- `src/shaped.rs` — explicit opt-in backend (`fontdb` + `harfrust` + `swash`)
-  plus the Phase B run-shaping skeleton.
+  contract, font-chain fallback, and the crossfont wrapper (explicit
+  fallback).
+- `src/shaped.rs` — production shaped backend (`fontdb` + `harfrust` +
+  `swash`) plus the run-shaping surface.
 - `src/gpu.rs`, `src/pipeline.rs`, `src/batch.rs` — GPU context, WGSL
   pipelines, and CPU batch translation.
 - `src/software.rs` — opt-in CPU compositor behind `sw-fallback`.

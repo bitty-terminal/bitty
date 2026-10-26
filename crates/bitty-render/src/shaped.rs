@@ -27,17 +27,19 @@
 //! Bounds: faces load as owned bytes capped at [`MAX_FACE_BYTES`] each,
 //! at most [`MAX_LOADED_FACES`] faces per session; every bitmap crosses
 //! [`GlyphBitmap::try_new`], so malformed upstream output is rejected
-//! instead of trusted. Font discovery uses `fontdb` defaults (system font
-//! directories plus fontconfig XML on Linux); this crate adds no search
-//! path of its own.
+//! instead of trusted. Face discovery uses the same platform directories
+//! as `fontdb` (fontconfig XML on Linux, platform font dirs on
+//! macOS/Windows) through the persistent index in `crate::font_index`;
+//! only face metadata is read at startup, and face bytes load lazily.
 //!
-//! Backend selection: this module is the explicit opt-in stack, not the
-//! production default (CTX-0957 additive landing, DEC-0095 — see the
-//! `Backend selection` section in [crate docs](crate)). Production
-//! construction sites build `crossfont_backend::CrossFontRasterizer`;
-//! opt in here by constructing [`SwashSingle::new`] directly (as
-//! `tests/shaped_parity.rs` does). Full removal of the crossfont wrap is
-//! deferred to CTX-0961.
+//! Backend selection (CTX-1607): this module is the **production default**
+//! stack. Runtimes construct [`SwashSingle::new`] and call
+//! [`GridRenderer::render_shaped`](crate::grid::GridRenderer::render_shaped);
+//! `crossfont_backend::CrossFontRasterizer` remains the explicit fallback
+//! (forced with `BITTY_TEXT_STACK=classic` or selected when shaped
+//! initialization fails) and is served by the per-cell path through
+//! [`ShapedRunSource::shaping_supported`]. See the `Backend selection`
+//! section in [crate docs](crate).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock};
@@ -47,7 +49,7 @@ use fontdb::{Database, Family, Query, Source, Style, Weight};
 use crate::error::RenderError;
 use crate::glyph::{
     BitmapFormat, CachedBitmap, FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap,
-    GlyphMetrics, GlyphRasterizer, RasterKey,
+    GlyphMetrics, GlyphRasterizer, RasterKey, ShapedBitmap,
 };
 
 /// Maximum bytes retained per loaded face (design 1.4).
@@ -119,6 +121,16 @@ pub const MAX_DYNAMIC_CACHE_ENTRIES: usize = 4096;
 /// `shaping_misaligned` — cells are never stretched or clipped.
 pub const CJK_ADVANCE_EPSILON_PX: f32 = 1.5;
 
+/// Per-cell advance tolerance for the general grid-tiling gate (CTX-1607).
+///
+/// Every shaped group's `advance / cell_count` must stay within this
+/// distance of the run's reference per-cell advance (the median single-cell
+/// shaped advance, or the configured cell width when the run has no single
+/// cluster). Groups outside it degrade to per-cell unshaped rendering, so a
+/// shaper that stretches, overlaps, or under-advances a cluster never paints
+/// a misaligned glyph. Shares the CJK sub-pixel rounding tolerance.
+pub const GRID_ADVANCE_EPSILON_PX: f32 = CJK_ADVANCE_EPSILON_PX;
+
 /// Programming-ligature OpenType tags covered by the cursor policy.
 ///
 /// `Always` forces these four to zero regardless of `features`
@@ -139,6 +151,14 @@ struct StoredFace {
     data: Arc<Vec<u8>>,
     /// Face index inside the collection (`fontdb` source index).
     face_index: u32,
+    /// `fontdb`'s monospace flag for the face.
+    ///
+    /// The grid-tiling gate only enforces `ligature advance == cells ×
+    /// per-cell advance` on monospaced faces: a proportional face's
+    /// legitimate ligature advance is unrelated to the monospace cell
+    /// lattice, while a terminal face's is. Set at load time from the
+    /// discovery metadata (no per-frame parsing).
+    monospaced: bool,
 }
 
 /// Kind of font data a drawable glyph comes from (owned vocabulary).
@@ -159,25 +179,25 @@ pub enum GlyphSource {
     ColorBitmap,
 }
 
-/// Process-wide system font database, scanned once.
+/// Process-wide system font database, built once.
 ///
 /// A full `load_system_fonts` pass costs hundreds of milliseconds on
 /// font-rich hosts (453ms release / ~1s+ debug for 1583 faces on the
-/// reference seat) — paying it per rasterizer would blow the PB-1 startup
-/// budget once and per test runtime after that. Discovery is read-only host
-/// state, so every [`SwashSingle`] shares one scan. Caveat: a process that
-/// mutates font configuration mid-run (fontconfig env) keeps the first
-/// scan; no such use exists (production reads the host stack once, tests
-/// share the host stack).
-static SYSTEM_DB: OnceLock<Database> = OnceLock::new();
+/// reference seat). CTX-1607 replaces that per-process scan with the
+/// persistent index in `crate::font_index`: a warm process reads the
+/// cached face metadata (no font bytes), and a cold process parses the font
+/// files once in parallel and writes the index. `BITTY_FONT_INDEX=0`
+/// restores the upstream full scan for diagnosis. Discovery is read-only
+/// host state, so every [`SwashSingle`] shares one database. Caveat: a
+/// process that mutates the font configuration mid-run (fontconfig env)
+/// keeps the first snapshot; production reads the host stack once.
+static SYSTEM_DB: OnceLock<Arc<Database>> = OnceLock::new();
 
-/// Returns the shared system database, scanning on first use.
-pub(crate) fn system_db() -> &'static Database {
-    SYSTEM_DB.get_or_init(|| {
-        let mut db = Database::new();
-        db.load_system_fonts();
-        db
-    })
+/// Returns the shared system database, loading the index on first use.
+pub(crate) fn system_db() -> Arc<Database> {
+    SYSTEM_DB
+        .get_or_init(|| Arc::new(crate::font_index::system_database()))
+        .clone()
 }
 
 /// [`GlyphRasterizer`] over `fontdb` discovery + `swash` rasterization.
@@ -188,10 +208,11 @@ pub(crate) fn system_db() -> &'static Database {
 /// first, then platform tails) exactly as the crossfont backend was
 /// wrapped, so per-glyph fallback needs no second implementation.
 ///
-/// Face discovery reads the process-wide `system_db` scan; per-face bytes
-/// stay session-owned under [`MAX_FACE_BYTES`].
+/// Face discovery reads the process-wide [`system_db`] metadata; per-face
+/// bytes stay session-owned under [`MAX_FACE_BYTES`] and load lazily on
+/// [`GlyphRasterizer::load_font`]/dynamic fallback (CTX-1607).
 pub struct SwashSingle {
-    db: &'static Database,
+    db: Arc<Database>,
     faces: HashMap<FontId, StoredFace>,
     /// `fontdb` face ID to session handle: reloads (for example a font-size
     /// change) re-query the same faces, and without this map every reload
@@ -278,41 +299,11 @@ impl SwashSingle {
                 "no system fonts discovered".to_string(),
             ));
         }
-        Ok(Self {
-            db,
-            faces: HashMap::new(),
-            by_db_id: HashMap::new(),
-            dynamic_cache: HashMap::new(),
-            dynamic_faces: HashSet::new(),
-            scale_ctx: swash::scale::ScaleContext::new(),
-            next_font_id: 0,
-            shape_plans: HashMap::new(),
-            shape_plan_lru: VecDeque::new(),
-            run_cache: HashMap::new(),
-            run_lru: VecDeque::new(),
-            run_cache_bytes: 0,
-            shaped_glyphs: HashMap::new(),
-            shaped_lru: VecDeque::new(),
-            shaped_glyph_bytes: 0,
-            transient_shaped_key: None,
-            transient_shaped_glyph: None,
-            shape_hits: 0,
-            shape_misses: 0,
-            shaping_misaligned: 0,
-        })
+        Ok(Self::empty_with_database(db))
     }
 
-    /// Deterministic test constructor without a host font scan (CTX-1026).
-    ///
-    /// The outcome-cache bound test only needs `dynamic_cache` /
-    /// `dynamic_faces` bookkeeping, never real system fonts:
-    /// [`SwashSingle::new`] scans the host filesystem (seconds on
-    /// font-rich seats) and silently early-returns on bare hosts, making
-    /// the gate host-dependent. This builds the same empty session over
-    /// an empty database, so the test is hermetic and never skips.
-    #[cfg(test)]
-    fn empty_for_cache_test() -> Self {
-        let db: &'static Database = Box::leak(Box::new(Database::new()));
+    /// Builds an empty session over `db` (shared metadata, lazy face bytes).
+    fn empty_with_database(db: Arc<Database>) -> Self {
         Self {
             db,
             faces: HashMap::new(),
@@ -337,9 +328,43 @@ impl SwashSingle {
         }
     }
 
+    /// Deterministic test constructor without a host font scan (CTX-1026).
+    ///
+    /// The outcome-cache bound test only needs `dynamic_cache` /
+    /// `dynamic_faces` bookkeeping, never real system fonts:
+    /// [`SwashSingle::new`] reads the host index/filesystem and silently
+    /// early-returns on bare hosts, making the gate host-dependent. This
+    /// builds the same empty session over an empty database, so the test is
+    /// hermetic and never skips.
+    #[cfg(test)]
+    fn empty_for_cache_test() -> Self {
+        Self::empty_with_database(Arc::new(Database::new()))
+    }
+
+    /// Test-only constructor over an explicit metadata database (CTX-1607).
+    ///
+    /// Lets the font-index tests exercise lazy loading and fallback without
+    /// touching the process-wide cache.
+    #[cfg(test)]
+    pub(crate) fn with_database(db: Arc<Database>) -> Self {
+        Self::empty_with_database(db)
+    }
+
+    /// Test-only loaded-face count (lazy-loading assertions).
+    #[cfg(test)]
+    pub(crate) fn loaded_face_count(&self) -> usize {
+        self.faces.len()
+    }
+
     /// Resolves a session handle back to its stored face.
     fn stored(&self, font: FontId) -> Result<&StoredFace, RenderError> {
         self.faces.get(&font).ok_or(RenderError::UnknownFontHandle)
+    }
+
+    /// `fontdb`'s monospace flag for a discovered face (false when the
+    /// database no longer holds it; the face still loads under its bounds).
+    fn face_monospaced(&self, id: fontdb::ID) -> bool {
+        self.db.face(id).is_some_and(|face| face.monospaced)
     }
 
     /// Raster size in pixels for a query, mirroring the crossfont scale.
@@ -519,19 +544,26 @@ impl SwashSingle {
     /// (outline, bitmap strike, color bitmap strike), so the probe and the
     /// render agree by construction (verified: space probes `Outline` on
     /// both, matching the empty-mask render).
-    fn probe_source(scaler: &mut swash::scale::Scaler<'_>, glyph_id: u16) -> Option<GlyphSource> {
+    fn probe_source(
+        scaler: &mut swash::scale::Scaler<'_>,
+        glyph_id: u16,
+    ) -> Option<(GlyphSource, bool)> {
         use swash::scale::StrikeWith;
-        if scaler.scale_outline(glyph_id).is_some() {
-            return Some(GlyphSource::Outline);
+        if let Some(outline) = scaler.scale_outline(glyph_id) {
+            // Blank-outline reporting powers the ligature-scaffold detector:
+            // JetBrains Mono / Cascadia / Fira Code substitute the first
+            // scalar of a programming ligature to an empty glyph, then draw
+            // the wide outline from the following cell (CTX-1607).
+            return Some((GlyphSource::Outline, outline.points().is_empty()));
         }
         if scaler.scale_bitmap(glyph_id, StrikeWith::BestFit).is_some() {
-            return Some(GlyphSource::Bitmap);
+            return Some((GlyphSource::Bitmap, false));
         }
         if scaler
             .scale_color_bitmap(glyph_id, StrikeWith::BestFit)
             .is_some()
         {
-            return Some(GlyphSource::ColorBitmap);
+            return Some((GlyphSource::ColorBitmap, false));
         }
         None
     }
@@ -571,7 +603,7 @@ impl SwashSingle {
             .size(Self::px(point_size))
             .hint(true)
             .build();
-        Ok(Self::probe_source(&mut scaler, glyph_id))
+        Ok(Self::probe_source(&mut scaler, glyph_id).map(|(source, _)| source))
     }
 
     /// Cumulative run-cache hits (served without shaping).
@@ -710,7 +742,11 @@ impl SwashSingle {
                 Ok(pair) => pair,
                 Err(_) => continue,
             };
-            let stored = StoredFace { data, face_index };
+            let stored = StoredFace {
+                data,
+                face_index,
+                monospaced: self.face_monospaced(id),
+            };
             let font_ref = match Self::font_ref(&stored) {
                 Ok(font) => font,
                 Err(_) => continue,
@@ -878,12 +914,7 @@ impl SwashSingle {
         clusters: &[ShapedCluster],
         cursor_col: usize,
     ) -> Option<usize> {
-        clusters.iter().position(|c| {
-            !c.uncovered
-                && c.cells.1 > 1
-                && cursor_col >= c.cells.0
-                && cursor_col < c.cells.0 + c.cells.1
-        })
+        cursor_intersects_ligature(clusters, cursor_col)
     }
 
     /// True when a single wide-char cluster's advance reconciles with grid
@@ -1135,10 +1166,23 @@ impl GlyphRasterizer for SwashSingle {
             style: style_attr,
             ..Default::default()
         };
-        let id = self
-            .db
-            .query(&request)
-            .ok_or_else(|| RenderError::FontNotFound(query.family.clone()))?;
+        // Exact family first, then the generic monospace face. The crossfont
+        // fallback reached the generic face through fontconfig substitution
+        // when the configured family was absent; the shaped stack must not
+        // regress to "primary not found" on a bare host that only ships a
+        // system monospace, so the same substitution happens here (CTX-1607).
+        // `load_system_fonts` resolves the generic family's concrete name.
+        let id = self.db.query(&request).or_else(|| {
+            let generic = [Family::Monospace];
+            let substitute = Query {
+                families: &generic,
+                weight,
+                style: style_attr,
+                ..Default::default()
+            };
+            self.db.query(&substitute)
+        });
+        let id = id.ok_or_else(|| RenderError::FontNotFound(query.family.clone()))?;
         // Reloads re-query already-loaded faces: reuse the handle instead
         // of appending a duplicate entry (the bound below guards genuinely
         // new faces only).
@@ -1151,7 +1195,11 @@ impl GlyphRasterizer for SwashSingle {
             });
         }
         let (data, face_index) = self.load_bytes(id)?;
-        let stored = StoredFace { data, face_index };
+        let stored = StoredFace {
+            data,
+            face_index,
+            monospaced: self.face_monospaced(id),
+        };
         // Reject bytes the parser cannot use now (fail-closed at load, not
         // at first rasterize, so a corrupt face never enters the chain).
         Self::font_ref(&stored)?;
@@ -1191,17 +1239,29 @@ impl GlyphRasterizer for SwashSingle {
                 reason: "raster size must be finite and positive",
             });
         }
-        self.stored(font)?;
-        // Phase A answers "no measurement" (always valid per the trait).
-        // Rationale: the crossfont FreeType backend this replaces reported
-        // degenerate metrics on Linux (unrounded `average_advance`,
-        // zero `line_height`/`descent` — see the CTX-0957 baseline fixture),
-        // so the grid always took the legacy fixed-baseline rule there;
-        // answering `None` keeps that path bit-identical. Wiring real
-        // swash metrics plus the baseline policy they imply is Phase B work
-        // with per-OS evidence (macOS/Windows crossfont backends did report
-        // usable metrics, so this is a known Phase C verification point).
-        Ok(None)
+        let face = self.stored(font)?;
+        let font_ref = Self::font_ref(face)?;
+        let metrics = font_ref.metrics(&[]).scale(Self::px(point_size));
+        // FreeType parity (CTX-1607): the crossfont fallback serves
+        // `FT_Size_Metrics` on Linux, which rounds the ascender up, the
+        // descender down, and the line height to whole pixels. Rasterizing
+        // the same face through both stacks must keep the same pen baseline
+        // (`resolve_baseline_offset` reads `line_height + descent`), so the
+        // shaped stack reproduces that rounding here instead of exposing
+        // swash's unrounded design-unit values. `FontMetrics::is_usable`
+        // still gate-keeps hostile metrics; anything unusable falls back to
+        // the legacy fixed rule on both stacks.
+        let ascent = metrics.ascent.max(0.0).ceil();
+        let descent = metrics.descent.max(0.0).ceil();
+        let line_height = (metrics.ascent + metrics.descent + metrics.leading)
+            .max(0.0)
+            .round()
+            .max(ascent + descent);
+        Ok(Some(FontMetrics {
+            average_advance_px: metrics.average_width.max(0.0).round(),
+            line_height_px: line_height,
+            descent_px: -descent,
+        }))
     }
 
     fn dynamic_face_for(&mut self, c: char, point_size: f32) -> Option<FontId> {
@@ -1215,6 +1275,63 @@ impl GlyphRasterizer for SwashSingle {
         self.note_dynamic_outcome(c, found);
         found
     }
+}
+
+impl ShapedRunSource for SwashSingle {
+    fn shaping_supported(&self) -> bool {
+        true
+    }
+
+    fn shape_run(
+        &mut self,
+        text: &str,
+        chain: &[FontId],
+        attrs: &RunAttrs,
+    ) -> Result<Vec<ShapedCluster>, RenderError> {
+        SwashSingle::shape_run(self, text, chain, attrs)
+    }
+
+    fn rasterize_shaped_cached_ref(
+        &mut self,
+        face: FontId,
+        glyph_id: u16,
+        point_size: f32,
+        features: &[bitty_config::types::OpenTypeFeature],
+    ) -> Result<Option<ShapedBitmap<'_>>, RenderError> {
+        SwashSingle::rasterize_shaped_cached_ref(self, face, glyph_id, point_size, features)
+            .map(|bitmap| bitmap.map(|inner| ShapedBitmap { inner }))
+    }
+
+    fn note_misaligned(&mut self) {
+        SwashSingle::note_misaligned(self);
+    }
+
+    fn shape_stats(&self) -> (u64, u64) {
+        SwashSingle::shape_stats(self)
+    }
+
+    fn face_is_monospaced(&self, face: FontId) -> bool {
+        self.faces
+            .get(&face)
+            .is_some_and(|stored| stored.monospaced)
+    }
+}
+
+/// True when `cursor_col` intersects a multi-cell (ligature) cluster.
+///
+/// Free-function form of [`SwashSingle::cursor_intersects_ligature`] used by
+/// the generic grid emitter (CTX-1607): the shaped path no longer names
+/// [`SwashSingle`] directly, so the pure grid-column overlap test lives
+/// outside the backend type. Pure integer range overlap — no shaped
+/// coordinate hit testing; single-cell clusters never trigger un-shaping.
+#[must_use]
+pub fn cursor_intersects_ligature(clusters: &[ShapedCluster], cursor_col: usize) -> Option<usize> {
+    clusters.iter().position(|c| {
+        !c.uncovered
+            && (c.cells.1 > 1 || c.ligature_part)
+            && cursor_col >= c.cells.0
+            && cursor_col < c.cells.0 + c.cells.1
+    })
 }
 
 impl SwashSingle {
@@ -1257,6 +1374,63 @@ pub struct RunAttrs {
     pub point_size: f32,
 }
 
+/// Run-shaping extension of [`GlyphRasterizer`] (CTX-1607).
+///
+/// [`GridRenderer::render_shaped`](crate::grid::GridRenderer::render_shaped)
+/// is generic over this trait instead of naming [`SwashSingle`] directly, so
+/// a caller can carry either backend behind one rasterizer value: the shaped
+/// stack reports [`shaping_supported`](Self::shaping_supported) `== true`,
+/// while the classic crossfont fallback and the deterministic headless
+/// rasterizer report `false` and are served by the per-cell
+/// [`render`](crate::grid::GridRenderer::render) path unchanged.
+///
+/// Implementors must delegate the shaped operations to a real shaper
+/// ([`SwashSingle`] is the only in-tree one); the grid emitter never calls
+/// [`shape_run`](Self::shape_run) on a source that reports no support.
+pub trait ShapedRunSource: GlyphRasterizer {
+    /// True when this rasterizer can shape runs and rasterize shaped glyphs.
+    fn shaping_supported(&self) -> bool;
+
+    /// Shapes one LTR run over `chain` (see [`SwashSingle::shape_run`]).
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`SwashSingle::shape_run`].
+    fn shape_run(
+        &mut self,
+        text: &str,
+        chain: &[FontId],
+        attrs: &RunAttrs,
+    ) -> Result<Vec<ShapedCluster>, RenderError>;
+
+    /// Rasterizes one shaped glyph by face/glyph id, borrowing the packed
+    /// cache form (see [`SwashSingle::rasterize_shaped`]).
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`SwashSingle::rasterize_shaped`].
+    fn rasterize_shaped_cached_ref(
+        &mut self,
+        face: FontId,
+        glyph_id: u16,
+        point_size: f32,
+        features: &[bitty_config::types::OpenTypeFeature],
+    ) -> Result<Option<ShapedBitmap<'_>>, RenderError>;
+
+    /// Records one grid-advance misalignment that degraded to unshaped.
+    fn note_misaligned(&mut self);
+
+    /// Shaped run-cache `(hits, misses)` totals.
+    fn shape_stats(&self) -> (u64, u64);
+
+    /// True when `face` declares monospaced metrics (the grid-tiling gate's
+    /// multi-cell advance rule applies only there; CTX-1607).
+    ///
+    /// Unknown handles answer `false`: a stale face cannot claim the strict
+    /// mono invariant, and the per-cell placement still keeps the grid.
+    fn face_is_monospaced(&self, face: FontId) -> bool;
+}
+
 /// One shaped cluster: the glyph(s) covering a grid cell range.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShapedCluster {
@@ -1272,6 +1446,18 @@ pub struct ShapedCluster {
     pub x_offset_px: f32,
     /// True when no loaded face covered this cluster (caller paints tofu).
     pub uncovered: bool,
+    /// True when this cluster participates in a multi-scalar ligature
+    /// substitution (CTX-1607).
+    ///
+    /// Set for a cluster that itself spans more than one grid cell, and for
+    /// both halves of the *scaffold* encoding used by JetBrains Mono,
+    /// Cascadia, and Fira Code: the first scalar maps to the font's space
+    /// glyph (a blank left half) and the following cluster carries the
+    /// ligature outline with a negative left bearing over the scaffold
+    /// cell. Cursor un-shaping reads this flag, so `Cursor` mode disables
+    /// ligatures whose glyph spans the cursor even when the shaped output
+    /// is two one-cell clusters.
+    pub ligature_part: bool,
     /// Byte offset of this cluster's text start in the outer run (splice
     /// bookkeeping for tail reshapes; grid emission reads `cells` only).
     pub byte_offset: usize,
@@ -1288,24 +1474,46 @@ fn retained_run_bytes(run: &Vec<ShapedCluster>) -> usize {
 /// features); hashing the validated feature list keeps the key owned while
 /// the plan itself borrows face bytes. Phase A constructs plans per call;
 /// Phase B stores at most [`MAX_SHAPE_PLANS_PER_FACE`] plans per face under
-/// this key (cosmic-text `NUM_SHAPE_PLANS` sizing).
+/// this key (cosmic-text `NUM_SHAPE_PLANS` sizing). Script and language are
+/// upstream types, so they enter the key as opaque hashes (CTX-1607: a
+/// single face legitimately needs a Latin plan and a Han plan at once).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ShapePlanKey {
     /// Face the plan was built for.
     pub face: FontId,
     /// Hash of the run feature list.
     pub features_hash: u64,
+    /// Hash of the plan's script/language segment properties.
+    segment_hash: u64,
 }
 
 impl ShapePlanKey {
-    /// Derives the key for `face` + `features` (FNV-1a over tag bytes and
-    /// values; deterministic across processes, no DoS surface — shaping
-    /// plans are never keyed by untrusted input lengths).
+    /// Derives the key for `face` + `features` with no explicit segment
+    /// properties (FNV-1a over tag bytes and values; deterministic across
+    /// processes, no DoS surface — shaping plans are never keyed by
+    /// untrusted input lengths).
     #[must_use]
     pub fn new(face: FontId, features: &[bitty_config::types::OpenTypeFeature]) -> Self {
+        Self::for_segment(face, features, None, None)
+    }
+
+    /// Derives the key for `face` + `features` + the buffer's guessed
+    /// script/language (CTX-1607).
+    #[must_use]
+    fn for_segment(
+        face: FontId,
+        features: &[bitty_config::types::OpenTypeFeature],
+        script: Option<harfrust::Script>,
+        language: Option<&harfrust::Language>,
+    ) -> Self {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        script.hash(&mut hasher);
+        language.hash(&mut hasher);
         Self {
             face,
             features_hash: features_hash(features),
+            segment_hash: hasher.finish(),
         }
     }
 }
@@ -1727,18 +1935,33 @@ impl SwashSingle {
         let blob: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> = face.data.clone();
         let font = harfrust::Font::new(blob, face.face_index)
             .ok_or_else(|| RenderError::flatten_rasterizer("face rejected by harfrust"))?;
+        // Segment properties (CTX-1607 fix): HarfBuzz applies `calt`/`liga`
+        // through the plan's script table. Leaving the script unset made
+        // the planner take the `DFLT`/unknown path, where a Latin
+        // programming-ligature `calt` lookup never matches — so `->`, `!=`,
+        // and `fi` stayed per-scalar even with the features enabled. Guess
+        // the script/language from the run text first, then pin the
+        // direction to LTR (the terminal grid pins logical order).
+        let mut buffer = harfrust::Buffer::new();
+        buffer.push_str(text);
+        buffer.guess_segment_properties();
+        buffer.set_direction(harfrust::Direction::LeftToRight);
+        let script = buffer.script();
+        let language = buffer.language();
         // Retained plan LRU (design 5): at most MAX_SHAPE_PLANS_PER_FACE
-        // per face. Disjoint field borrows keep this `unsafe`-free: the
-        // plan owns its maps and never borrows `font`, so an immutable
-        // borrow of `shape_plans` coexists with the mutable `scale_ctx`
-        // borrow below.
-        let plan_key = ShapePlanKey::new(id, validated);
+        // per face. Plans are a pure function of (face, direction, script,
+        // language, features); the key hashes the script/language pair so
+        // one face can hold a Latin and a Han plan side by side. Disjoint
+        // field borrows keep this `unsafe`-free: the plan owns its maps and
+        // never borrows `font`, so an immutable borrow of `shape_plans`
+        // coexists with the mutable `scale_ctx` borrow below.
+        let plan_key = ShapePlanKey::for_segment(id, validated, script, language);
         if !self.shape_plans.contains_key(&plan_key) {
             let fresh = harfrust::ShapePlan::new(
                 &font,
                 harfrust::Direction::LeftToRight,
-                None,
-                None,
+                script,
+                language,
                 features,
             );
             self.evict_plans_for_face_if_full(id);
@@ -1762,9 +1985,6 @@ impl SwashSingle {
             });
         }
         shaper.set_scale(scale as i32);
-        let mut buffer = harfrust::Buffer::new();
-        buffer.push_str(text);
-        buffer.set_direction(harfrust::Direction::LeftToRight);
         harfrust::shape(
             &shaper,
             &mut buffer,
@@ -1786,6 +2006,10 @@ impl SwashSingle {
             .size(px)
             .hint(true)
             .build();
+        // Draft flags for the scaffold pass below: a visible scalar shaped
+        // to a blank outline is the first half of a programming ligature
+        // (the font draws the wide outline from the following cell).
+        let mut scaffolds = Vec::with_capacity(infos.len());
         for (i, (info, pos)) in infos.iter().zip(positions.iter()).enumerate() {
             let start = info.cluster as usize;
             let end = if i + 1 < infos.len() {
@@ -1812,8 +2036,12 @@ impl SwashSingle {
             let glyph_id = info.glyph_id;
             // Drawable, not merely mapped: probe the same source order the
             // rasterizer serves (see `probe_source`).
-            let covered =
-                glyph_id != 0 && Self::probe_source(&mut scaler, glyph_id as u16).is_some();
+            let probe = (glyph_id != 0)
+                .then(|| Self::probe_source(&mut scaler, glyph_id as u16))
+                .flatten();
+            let covered = probe.is_some();
+            let blank_outline = probe.is_some_and(|(_, blank)| blank);
+            scaffolds.push(blank_outline && slice.chars().any(|ch| !ch.is_whitespace()));
             clusters.push(ShapedCluster {
                 cells: (col, cells),
                 glyph_id: glyph_id as u16,
@@ -1821,8 +2049,21 @@ impl SwashSingle {
                 x_advance_px: pos.x_advance as f32 / UNITS_PER_PX,
                 x_offset_px: pos.x_offset as f32 / UNITS_PER_PX,
                 uncovered: !covered,
+                ligature_part: cells > 1,
                 byte_offset: base_offset + start,
             });
+        }
+        // Scaffold pass (CTX-1607): a blank left half owns its own one-cell
+        // cluster, so mark it and the following body cluster as one
+        // ligature span. Cursor un-shaping then sees the whole visual
+        // extent even though no single cluster spans two cells.
+        for (index, scaffold) in scaffolds.into_iter().enumerate() {
+            if scaffold {
+                clusters[index].ligature_part = true;
+                if let Some(next) = clusters.get_mut(index + 1) {
+                    next.ligature_part = true;
+                }
+            }
         }
         Ok(clusters)
     }
@@ -1853,6 +2094,7 @@ mod tests {
             StoredFace {
                 data: Arc::new(demo_ttf()),
                 face_index: 0,
+                monospaced: true,
             },
         );
         (shaper, face)

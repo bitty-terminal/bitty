@@ -4,11 +4,11 @@
 //! The baseline (`fixtures/crossfont_baseline.json`) was captured from
 //! `CrossFontRasterizer` + `FallbackRasterizer::with_default_chain` on the
 //! reference host (JetBrainsMono Nerd Font 12pt) by a since-removed one-shot
-//! `tests/capture_baseline.rs`. The crossfont backend itself stays in-tree
-//! as the production default (CTX-0957 additive landing, DEC-0095 — see the
-//! `Backend selection` section in the crate docs); these tests exercise the
-//! explicit shaped opt-in (`SwashSingle::new` + default chain, now with the
-//! CTX-0961 CJK tail plus dynamic fallback).
+//! `tests/capture_baseline.rs`. CTX-1607 flipped the shaped stack
+//! (`SwashSingle::new` + default chain, CTX-0961 CJK tail plus dynamic
+//! fallback) to the production default; crossfont stays in-tree as the
+//! explicit fallback (see the `Backend selection` section in the crate
+//! docs). These tests keep the two stacks differential.
 //! They are gated behind `BITTY_RENDER_FONT_TESTS=1` like the other
 //! live-font tests and additionally skip when the primary face is missing,
 //! so default CI stays deterministic.
@@ -37,9 +37,10 @@
 //! The live `shape_run` checks below cover the Phase B skeleton over the
 //! same chain: ASCII clusters, tofu flagging, and tail-face fallback.
 
+use bitty_render::grid::resolve_baseline_offset;
 use bitty_render::{
-    CellMetrics, FallbackRasterizer, FontId, FontMetrics, FontQuery, FontStyle, GlyphRasterizer,
-    GlyphSource, GridRenderer, RasterKey, RunAttrs, SwashSingle,
+    CellMetrics, CrossFontRasterizer, FallbackRasterizer, FontId, FontMetrics, FontQuery,
+    FontStyle, GlyphRasterizer, GlyphSource, GridRenderer, RasterKey, RunAttrs, SwashSingle,
 };
 
 const ENABLE_ENV: &str = "BITTY_RENDER_FONT_TESTS";
@@ -273,16 +274,50 @@ fn swash_matches_crossfont_coverage_and_dimensions() {
 }
 
 #[test]
-fn swash_metrics_keep_the_legacy_baseline_path() {
+fn swash_metrics_match_the_crossfont_baseline() {
+    // CTX-1607: the shaped stack is the production default, so its face
+    // measurement must resolve the same pen baseline as the crossfont
+    // fallback for the same face/size. Byte-identical glyph bitmaps are not
+    // expected (hinting differs), but a baseline shift would move every
+    // glyph in every frame.
     let Some(mut raster) = live_chain() else {
         eprintln!("skipped: no host font stack or primary family");
         return;
     };
+    let mut crossfont = CrossFontRasterizer::new().expect("host crossfont stack");
+    let crossfont_font = crossfont.load_font(&query()).expect("crossfont loads");
+    let crossfont_metrics = crossfont
+        .font_metrics(crossfont_font, POINT_SIZE)
+        .expect("crossfont metrics")
+        .expect("crossfont measures the face");
+    let primary = raster.fonts()[0];
+    let shaped = raster
+        .inner_mut()
+        .font_metrics(primary, POINT_SIZE)
+        .expect("shaped metrics must not error")
+        .expect("shaped stack measures the face");
+    assert!(
+        shaped.is_usable(),
+        "shaped metrics must be usable: {shaped:?}"
+    );
+    assert!(
+        (shaped.line_height_px - crossfont_metrics.line_height_px).abs() <= 1.0,
+        "line height {shaped:?} vs crossfont {crossfont_metrics:?}"
+    );
+    assert!(
+        (shaped.descent_px - crossfont_metrics.descent_px).abs() <= 1.0,
+        "descent {shaped:?} vs crossfont {crossfont_metrics:?}"
+    );
+    for cell_height in [16, 19, 22, 32] {
+        assert_eq!(
+            resolve_baseline_offset(cell_height, Some(shaped)),
+            resolve_baseline_offset(cell_height, Some(crossfont_metrics)),
+            "pen baseline must match crossfont at cell height {cell_height}"
+        );
+    }
+    // The historical fixture triple stays evidence for why the old
+    // `Ok(None)` answer was safe, not a claim about the current stack.
     let fixture = load_fixture();
-    // The baseline was captured from crossfont 0.9 before the face was
-    // sized ahead of `metrics()` (see the crossfont backend's
-    // `font_metrics`); its recorded triple is degenerate, so the grid
-    // demonstrably took the legacy fixed-baseline rule at capture time.
     let recorded = FontMetrics {
         average_advance_px: fixture.metrics.0,
         line_height_px: fixture.metrics.1,
@@ -290,16 +325,8 @@ fn swash_metrics_keep_the_legacy_baseline_path() {
     };
     assert!(
         !recorded.is_usable(),
-        "baseline metrics must be unusable (legacy path): {recorded:?}"
+        "recorded baseline must stay degenerate (legacy-path evidence): {recorded:?}"
     );
-    // ... and the new backend answers no measurement, so the grid takes the
-    // same legacy path (placement unchanged by construction).
-    let primary = raster.fonts()[0];
-    let answered = raster
-        .inner_mut()
-        .font_metrics(primary, POINT_SIZE)
-        .expect("metrics must not error");
-    assert_eq!(answered, None, "Phase A reports no face measurement");
 }
 
 #[test]

@@ -350,6 +350,95 @@ pub fn check_fonts(tool_available: bool, families: &[(&str, bool)]) -> DoctorChe
     }
 }
 
+/// Text-stack preference and optional shaped-stack probe (CTX-1607).
+///
+/// `probe` is `None` when the shaped stack is intentionally not exercised
+/// (`BITTY_TEXT_STACK=classic`) or the effective config could not be loaded;
+/// otherwise it records whether `SwashSingle` could load the configured
+/// family on this host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextStackInput {
+    /// Effective `BITTY_TEXT_STACK` preference.
+    pub preference: bitty_runtime::TextStackPreference,
+    /// True when the environment value was present but invalid (ignored).
+    pub invalid_env: bool,
+    /// Shaped-stack probe outcome (`None` = not probed).
+    pub probe: Option<Result<(), String>>,
+}
+
+impl Default for TextStackInput {
+    fn default() -> Self {
+        Self {
+            preference: bitty_runtime::TextStackPreference::Auto,
+            invalid_env: false,
+            probe: None,
+        }
+    }
+}
+
+/// Text stack the terminal will actually use (CTX-1607).
+///
+/// The shaped `harfrust`/`swash` stack is the production default; the
+/// crossfont fallback is expected and correct when forced
+/// (`BITTY_TEXT_STACK=classic`) or when the shaped probe cannot load the
+/// configured family. A failed shaped probe is a warn, never a failure:
+/// the runtime falls back with a diagnostic, so the terminal still renders.
+#[must_use]
+pub fn check_text_stack(input: &TextStackInput) -> DoctorCheck {
+    let env_note = if input.invalid_env {
+        " (invalid BITTY_TEXT_STACK value ignored)"
+    } else {
+        ""
+    };
+    if input.preference == bitty_runtime::TextStackPreference::Classic {
+        return DoctorCheck::pass(
+            "text-stack",
+            "Text stack",
+            format!("crossfont classic (forced by BITTY_TEXT_STACK){env_note}"),
+        );
+    }
+    match &input.probe {
+        Some(Ok(())) => DoctorCheck::pass(
+            "text-stack",
+            "Text stack",
+            format!("shaped harfrust/swash default (ligatures + font.features active){env_note}"),
+        ),
+        Some(Err(reason)) => DoctorCheck::warn(
+            "text-stack",
+            "Text stack",
+            "install a monospace font so the shaped stack can load; crossfont fallback keeps rendering"
+                .to_string(),
+            format!("shaped unavailable: {reason}; crossfont fallback active{env_note}"),
+        ),
+        None => DoctorCheck::warn(
+            "text-stack",
+            "Text stack",
+            "run `bitty doctor` with a readable config so the shaped probe can run".to_string(),
+            format!("shaped stack not probed{env_note}"),
+        ),
+    }
+}
+
+/// Probes the shaped stack for `family` at `size` points (CTX-1607).
+///
+/// Doctor-only: this loads the process-wide font database (the same scan a
+/// shaped runtime pays once at startup) and loads the primary face, so a
+/// font-rich host pays a one-time discovery cost during diagnosis. Errors
+/// are stringified for the doctor envelope and never panic.
+fn probe_shaped_stack(family: &str, size: f32) -> Result<(), String> {
+    use bitty_render::GlyphRasterizer as _;
+    let mut shaped = bitty_render::SwashSingle::new().map_err(|err| err.to_string())?;
+    let query = bitty_render::FontQuery {
+        family: family.to_string(),
+        style: bitty_render::FontStyle::Normal,
+        point_size: size,
+    };
+    shaped
+        .load_font(&query)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
 /// Display presence: Wayland (`WAYLAND_DISPLAY`) or X11 (`DISPLAY`).
 /// Neither present is a warn (headless smoke is the supported fallback).
 #[must_use]
@@ -575,6 +664,8 @@ pub struct DoctorInputs {
     pub font_tool_available: bool,
     /// Ordered `(family, present)` probe results.
     pub families: Vec<(String, bool)>,
+    /// Text-stack preference plus the shaped-stack probe (CTX-1607).
+    pub text_stack: TextStackInput,
     /// `WAYLAND_DISPLAY` value.
     pub wayland: Option<String>,
     /// `DISPLAY` value.
@@ -689,6 +780,7 @@ pub fn assemble_report(inputs: &DoctorInputs) -> DoctorReport {
             check_config(&inputs.config),
             check_keymaps(&inputs.keymaps),
             check_fonts(inputs.font_tool_available, &family_refs),
+            check_text_stack(&inputs.text_stack),
             check_display(
                 inputs.wayland.as_deref(),
                 inputs.x11.as_deref(),
@@ -1095,7 +1187,7 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
         Ok(path) => (true, path.display().to_string()),
         Err(_) => (false, String::new()),
     };
-    let (config, keymaps, font_chain) = match load_merged_config(args) {
+    let (config, keymaps, font_chain, font_probe) = match load_merged_config(args) {
         Ok(loaded) => {
             let file_path = loaded
                 .probed
@@ -1118,14 +1210,23 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
                 Err(err) => KeymapInput::Err(err.to_string()),
             };
             let chain = loaded.merged.effective.font.fallback_chain();
-            (config, keymaps, chain)
+            let probe = (
+                loaded.merged.effective.font.family.clone(),
+                loaded.merged.effective.font.size,
+            );
+            (config, keymaps, chain, Some(probe))
         }
         Err(message) => {
             let chain: Vec<String> = bitty_config::types::FONT_FALLBACK_CHAIN
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect();
-            (ConfigInput::Invalid(message), KeymapInput::Skipped, chain)
+            (
+                ConfigInput::Invalid(message),
+                KeymapInput::Skipped,
+                chain,
+                None,
+            )
         }
     };
     let font_tool_available = find_on_path("fc-match").is_some();
@@ -1136,6 +1237,23 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
             (family, present)
         })
         .collect();
+    // CTX-1607: report the resolved text stack and, unless the user forced
+    // the classic fallback, whether the shaped default can load the
+    // configured family on this host. A failed probe is diagnostic only:
+    // the runtime falls back and keeps rendering.
+    let (preference, invalid_env) = bitty_runtime::TextStackPreference::from_env_value(
+        std::env::var(bitty_runtime::TEXT_STACK_ENV).ok().as_deref(),
+    );
+    let probe = match (preference, font_probe) {
+        (bitty_runtime::TextStackPreference::Classic, _) => None,
+        (_, Some((family, size))) => Some(probe_shaped_stack(&family, size)),
+        (_, None) => None,
+    };
+    let text_stack = TextStackInput {
+        preference,
+        invalid_env: invalid_env.is_some(),
+        probe,
+    };
     let wayland = std::env::var("WAYLAND_DISPLAY").ok();
     let x11 = std::env::var("DISPLAY").ok();
     let session_type = std::env::var("XDG_SESSION_TYPE").ok();
@@ -1188,6 +1306,7 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
         keymaps,
         font_tool_available,
         families,
+        text_stack,
         wayland,
         x11,
         session_type,
@@ -1263,6 +1382,11 @@ mod tests {
                 ("DejaVu Sans Mono".to_string(), true),
                 ("Noto Sans Symbols 2".to_string(), true),
             ],
+            text_stack: TextStackInput {
+                preference: bitty_runtime::TextStackPreference::Auto,
+                invalid_env: false,
+                probe: Some(Ok(())),
+            },
             wayland: Some("wayland-0".to_string()),
             x11: None,
             session_type: Some("wayland".to_string()),
@@ -1283,7 +1407,7 @@ mod tests {
         let report = assemble_report(&healthy_inputs());
         assert_eq!(report.exit_code(), EXIT_OK);
         assert!(report.ok());
-        assert_eq!(report.checks.len(), 12);
+        assert_eq!(report.checks.len(), 13);
         assert!(report.checks.iter().all(|c| c.status == DoctorStatus::Pass
             || c.id == "images"
             || c.id == "config"
@@ -1291,7 +1415,47 @@ mod tests {
         // images is informational-warn by design; everything else passes.
         let summary = report.summary();
         assert_eq!(summary.fail, 0);
-        assert_eq!(summary.pass + summary.warn, 12);
+        assert_eq!(summary.pass + summary.warn, 13);
+    }
+
+    #[test]
+    fn text_stack_reports_shaped_default_and_forced_classic() {
+        // CTX-1607: the doctor row names the resolved production stack, and
+        // a shaped-probe failure is an advisory warn (the runtime falls
+        // back), never a hard failure.
+        let shaped = check_text_stack(&TextStackInput {
+            preference: bitty_runtime::TextStackPreference::Auto,
+            invalid_env: false,
+            probe: Some(Ok(())),
+        });
+        assert_eq!(shaped.id, "text-stack");
+        assert_eq!(shaped.status, DoctorStatus::Pass);
+        assert!(shaped.detail.contains("shaped"), "{}", shaped.detail);
+
+        let forced = check_text_stack(&TextStackInput {
+            preference: bitty_runtime::TextStackPreference::Classic,
+            invalid_env: false,
+            probe: None,
+        });
+        assert_eq!(forced.status, DoctorStatus::Pass);
+        assert!(forced.detail.contains("classic"), "{}", forced.detail);
+
+        let fallback = check_text_stack(&TextStackInput {
+            preference: bitty_runtime::TextStackPreference::Auto,
+            invalid_env: true,
+            probe: Some(Err("no system fonts discovered".to_string())),
+        });
+        assert_eq!(fallback.status, DoctorStatus::Warn);
+        assert!(
+            fallback.detail.contains("crossfont fallback"),
+            "{}",
+            fallback.detail
+        );
+        assert!(
+            fallback.detail.contains("invalid BITTY_TEXT_STACK"),
+            "{}",
+            fallback.detail
+        );
     }
 
     #[test]
@@ -1521,6 +1685,7 @@ mod tests {
             "config",
             "keymaps",
             "fonts",
+            "text-stack",
             "display",
             "gpu",
             "clipboard",

@@ -356,6 +356,32 @@ impl CachedBitmap {
     }
 }
 
+/// Borrowed packed bitmap for one shaped glyph (CTX-1607).
+///
+/// The shaped grid path keeps coverage in the rasterizer's bounded
+/// glyph-id cache and borrows it through this view, so emitting a frame
+/// never expands the packed bitmap into public RGB data. Only the grid
+/// emitter reads it (metrics plus atlas upload); the wrapper stays opaque
+/// to the runtime text-stack enum that forwards it.
+#[derive(Debug, Clone, Copy)]
+pub struct ShapedBitmap<'a> {
+    pub(crate) inner: &'a CachedBitmap,
+}
+
+impl ShapedBitmap<'_> {
+    /// Placement metrics for the borrowed bitmap.
+    #[must_use]
+    pub const fn metrics(&self) -> GlyphMetrics {
+        self.inner.metrics()
+    }
+
+    /// True when the bitmap carries no coverage.
+    #[must_use]
+    pub fn is_blank(&self) -> bool {
+        self.inner.as_glyph_bitmap().is_blank()
+    }
+}
+
 /// Returns the exact source byte count for a bitmap format.
 fn expected_data_len(metrics: GlyphMetrics, format: BitmapFormat) -> Result<usize, RenderError> {
     let width = usize::try_from(metrics.width).map_err(|_| RenderError::InvalidInput {
@@ -447,9 +473,9 @@ pub trait GlyphRasterizer {
 
     /// Reports font-wide metrics at `point_size`, when the backend can
     /// measure the face (CTX-0237: the crossfont backend answers from
-    /// upstream face metrics; the shaped backend answers `Ok(None)` in
-    /// Phase A, keeping the legacy fixed-baseline rule there;
-    /// deterministic fakes keep the default).
+    /// upstream face metrics; CTX-1607: the shaped backend answers swash
+    /// metrics rounded to FreeType parity so both stacks resolve the same
+    /// pen baseline; deterministic fakes keep the default).
     ///
     /// The default returns `Ok(None)` — "no measurement" — so existing
     /// implementors keep compiling and the renderer falls back to the

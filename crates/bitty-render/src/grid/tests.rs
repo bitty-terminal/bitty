@@ -2544,9 +2544,10 @@ fn phase_c_cluster(byte_offset: usize, col: usize, count: usize) -> ShapedCluste
         cells: (col, count),
         glyph_id: 7,
         face: FontId::next(&mut 0),
-        x_advance_px: 10.0,
+        x_advance_px: 8.0,
         x_offset_px: 0.0,
         uncovered: false,
+        ligature_part: count > 1,
         byte_offset,
     }
 }
@@ -3842,5 +3843,396 @@ fn block_atlas_hits_are_counted_in_atlas_stats() {
         hits_after,
         hits_before + 1,
         "second frame must count one block atlas hit"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CTX-1607: shaped default path, grid-tiling gate, fallback contract.
+// ---------------------------------------------------------------------------
+
+/// Deterministic shaped source for the default-path tests.
+///
+/// `shape_run` models a programming-ligature font: `->`, `!=`, and `=>`
+/// collapse into one two-cell cluster unless the four programming-ligature
+/// features are zeroed. Every other scalar shapes 1:1 at the grid pen
+/// position. `supports == false` models the classic/headless fallback,
+/// `fail` models a shaper error, `ligature_advance` overrides the cluster
+/// advance (misalignment), and `overlap` reuses the same cluster column
+/// (broken tiling).
+struct FakeShaper {
+    next_id: u64,
+    supports: bool,
+    fail: bool,
+    overlap: bool,
+    ligature_advance: Option<f32>,
+    calls: Vec<Vec<bitty_config::types::OpenTypeFeature>>,
+    scratch: Option<crate::glyph::CachedBitmap>,
+}
+
+impl FakeShaper {
+    fn shaped() -> Self {
+        Self {
+            next_id: 0,
+            supports: true,
+            fail: false,
+            overlap: false,
+            ligature_advance: None,
+            calls: Vec::new(),
+            scratch: None,
+        }
+    }
+
+    fn unsupported() -> Self {
+        Self {
+            supports: false,
+            ..Self::shaped()
+        }
+    }
+
+    fn bitmap(seed: u32) -> GlyphBitmap {
+        let width = i32::try_from(seed % 3 + 6).expect("small width");
+        let height = 6;
+        let data = vec![0x80; (width as usize) * (height as usize) * 3];
+        GlyphBitmap::try_new(
+            GlyphMetrics {
+                left: 0,
+                top: 1,
+                width,
+                height,
+                advance: [8, 0],
+            },
+            BitmapFormat::Rgb,
+            data,
+        )
+        .expect("valid fake bitmap")
+    }
+
+    fn ligature_features_zeroed(features: &[bitty_config::types::OpenTypeFeature]) -> bool {
+        crate::shaped::PROGRAMMING_LIGATURE_TAGS.iter().all(|tag| {
+            features
+                .iter()
+                .any(|feature| feature.tag == *tag && feature.value == 0)
+        })
+    }
+}
+
+impl GlyphRasterizer for FakeShaper {
+    fn load_font(&mut self, _query: &FontQuery) -> Result<FontId, RenderError> {
+        Ok(FontId::next(&mut self.next_id))
+    }
+
+    fn rasterize(&mut self, key: RasterKey) -> Result<Option<GlyphBitmap>, RenderError> {
+        Ok(Some(Self::bitmap(u32::from(key.character))))
+    }
+}
+
+impl crate::shaped::ShapedRunSource for FakeShaper {
+    fn shaping_supported(&self) -> bool {
+        self.supports
+    }
+
+    fn shape_run(
+        &mut self,
+        text: &str,
+        chain: &[FontId],
+        attrs: &crate::shaped::RunAttrs,
+    ) -> Result<Vec<crate::shaped::ShapedCluster>, RenderError> {
+        self.calls.push(attrs.features.clone());
+        if self.fail {
+            return Err(RenderError::UpstreamRasterizer(
+                "fake shaper failure".into(),
+            ));
+        }
+        let face = chain[0];
+        let ligates =
+            matches!(text, "->" | "!=" | "=>") && !Self::ligature_features_zeroed(&attrs.features);
+        if ligates {
+            return Ok(vec![crate::shaped::ShapedCluster {
+                cells: (0, 2),
+                glyph_id: 900,
+                face,
+                x_advance_px: self.ligature_advance.unwrap_or(16.0),
+                x_offset_px: 0.0,
+                uncovered: false,
+                ligature_part: true,
+                byte_offset: 0,
+            }]);
+        }
+        let mut offset = 0usize;
+        Ok(text
+            .chars()
+            .enumerate()
+            .map(|(col, ch)| {
+                let cluster = crate::shaped::ShapedCluster {
+                    cells: (if self.overlap { 0 } else { col }, 1),
+                    glyph_id: ch as u16,
+                    face,
+                    x_advance_px: 8.0,
+                    x_offset_px: 0.0,
+                    uncovered: false,
+                    ligature_part: false,
+                    byte_offset: offset,
+                };
+                offset += ch.len_utf8();
+                cluster
+            })
+            .collect())
+    }
+
+    fn rasterize_shaped_cached_ref(
+        &mut self,
+        _face: FontId,
+        glyph_id: u16,
+        _point_size: f32,
+        _features: &[bitty_config::types::OpenTypeFeature],
+    ) -> Result<Option<crate::glyph::ShapedBitmap<'_>>, RenderError> {
+        self.scratch = Some(
+            crate::glyph::CachedBitmap::source(Self::bitmap(u32::from(glyph_id)))
+                .expect("valid fake bitmap"),
+        );
+        Ok(self
+            .scratch
+            .as_ref()
+            .map(|inner| crate::glyph::ShapedBitmap { inner }))
+    }
+
+    fn note_misaligned(&mut self) {}
+
+    fn shape_stats(&self) -> (u64, u64) {
+        (0, self.calls.len() as u64)
+    }
+
+    fn face_is_monospaced(&self, _face: FontId) -> bool {
+        // The fake models a terminal face; the strict multi-cell advance
+        // rule applies to it.
+        true
+    }
+}
+
+fn shaped_renderer(shaper: FakeShaper) -> GridRenderer<super::FallbackRasterizer<FakeShaper>> {
+    GridRenderer::new(
+        super::FallbackRasterizer::new(shaper, Vec::new()),
+        &font_query(),
+        cell_metrics(),
+    )
+    .expect("renderer builds")
+}
+
+fn shaped_state(text: &str) -> State {
+    let mut script = Vec::new();
+    for ch in text.chars() {
+        script.push(print(ch));
+    }
+    state_from(&script)
+}
+
+/// Plain ASCII through the shaped default must keep the exact per-cell box
+/// of the classic path: same destination, size, and color for every glyph
+/// (atlas keys legitimately differ).
+#[test]
+fn shaped_default_preserves_plain_ascii_cell_metrics() {
+    let mut renderer = shaped_renderer(FakeShaper::shaped());
+    let state = shaped_state("Hello");
+    let damage = full_damage(&state);
+    let plain = renderer.render(&state.snapshot(), &damage).unwrap();
+    let shaped = renderer
+        .render_shaped(
+            &state.snapshot(),
+            &damage,
+            bitty_config::types::LigaturePolicy::Never,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(plain.fills, shaped.fills, "backgrounds stay grid-true");
+    assert_eq!(plain.glyphs.len(), shaped.glyphs.len());
+    for (plain, shaped) in plain.glyphs.iter().zip(&shaped.glyphs) {
+        assert_eq!(plain.dest, shaped.dest, "cell origin must not move");
+        assert_eq!(plain.size, shaped.size, "cell box must not move");
+        assert_eq!(plain.color, shaped.color);
+    }
+}
+
+/// `->`, `!=`, `=>` paint one N-cell run; a cursor inside the span under the
+/// `Cursor` policy re-shapes it into per-cell glyphs.
+#[test]
+fn shaped_ligature_paints_one_run_with_cursor_inside() {
+    for text in ["->", "!=", "=>"] {
+        let mut renderer = shaped_renderer(FakeShaper::shaped());
+        let state = shaped_state(text);
+        let mut snapshot = state.snapshot();
+        snapshot.cursor.position.row = 0;
+        snapshot.cursor.position.col = 0;
+        snapshot.cursor.visible = true;
+        let damage = full_damage(&state);
+        let never = renderer
+            .render_shaped(
+                &snapshot,
+                &damage,
+                bitty_config::types::LigaturePolicy::Never,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(never.glyphs.len(), 1, "{text}: one ligature run");
+        let cursor = renderer
+            .render_shaped(
+                &snapshot,
+                &damage,
+                bitty_config::types::LigaturePolicy::Cursor,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            cursor.glyphs.len(),
+            2,
+            "{text}: cursor inside the span un-shapes it"
+        );
+        let calls = &renderer.cache.rasterizer().inner().calls;
+        let last = calls.last().expect("cursor policy shaped twice");
+        assert!(
+            FakeShaper::ligature_features_zeroed(last),
+            "{text}: cursor re-shape must zero calt/liga/clig/dlig: {last:?}"
+        );
+    }
+}
+
+/// `Always` reaches the shaped path as the four zeroed features and bypasses
+/// shaping entirely through the ASCII fast path.
+#[test]
+fn shaped_always_policy_disables_ligatures_without_shaping() {
+    let mut renderer = shaped_renderer(FakeShaper::shaped());
+    let state = shaped_state("->");
+    let damage = full_damage(&state);
+    let list = renderer
+        .render_shaped(
+            &state.snapshot(),
+            &damage,
+            bitty_config::types::LigaturePolicy::Always,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(list.glyphs.len(), 2, "Always emits per cell");
+    assert_eq!(
+        renderer.cache.rasterizer().inner().calls.len(),
+        0,
+        "Always must take the unshaped fast path"
+    );
+    assert_eq!(renderer.counters().ascii_fast_path_runs, 1);
+}
+
+/// Configured `font.features` reach the shaper verbatim on the default path.
+#[test]
+fn shaped_feature_overrides_reach_the_shaper() {
+    let mut renderer = shaped_renderer(FakeShaper::shaped());
+    let state = shaped_state("ab");
+    let damage = full_damage(&state);
+    let features = vec![bitty_config::types::OpenTypeFeature::parse("ss01=2").unwrap()];
+    let _ = renderer
+        .render_shaped(
+            &state.snapshot(),
+            &damage,
+            bitty_config::types::LigaturePolicy::Never,
+            &features,
+        )
+        .unwrap();
+    assert_eq!(
+        renderer
+            .cache
+            .rasterizer()
+            .inner()
+            .calls
+            .last()
+            .expect("shaped once"),
+        &features
+    );
+}
+
+/// A shaper error degrades the run to per-cell glyphs, never a frame error,
+/// and stays observable through the fallback counter.
+#[test]
+fn shaped_failure_degrades_the_run_to_unshaped() {
+    let mut renderer = shaped_renderer(FakeShaper {
+        fail: true,
+        ..FakeShaper::shaped()
+    });
+    let state = shaped_state("ab");
+    let damage = full_damage(&state);
+    let list = renderer
+        .render_shaped(
+            &state.snapshot(),
+            &damage,
+            bitty_config::types::LigaturePolicy::Never,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(list.glyphs.len(), 2);
+    assert_eq!(renderer.counters().shaping_fallback_runs, 1);
+}
+
+/// A ligature whose advance does not reconcile with the cell grid falls back
+/// to per-cell placement instead of painting a stretched glyph.
+#[test]
+fn shaped_advance_misalignment_degrades_to_unshaped() {
+    let mut renderer = shaped_renderer(FakeShaper {
+        ligature_advance: Some(8.0),
+        ..FakeShaper::shaped()
+    });
+    let state = shaped_state("->");
+    let damage = full_damage(&state);
+    let list = renderer
+        .render_shaped(
+            &state.snapshot(),
+            &damage,
+            bitty_config::types::LigaturePolicy::Never,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(list.glyphs.len(), 2, "misaligned ligature is not painted");
+    assert_eq!(renderer.counters().shaping_misaligned, 1);
+}
+
+/// Clusters that reuse a pen column break grid tiling; only the offending
+/// group degrades (earlier groups keep their shaped output).
+#[test]
+fn shaped_tiling_break_degrades_the_offending_group() {
+    let mut renderer = shaped_renderer(FakeShaper {
+        overlap: true,
+        ..FakeShaper::shaped()
+    });
+    let state = shaped_state("ab");
+    let damage = full_damage(&state);
+    let list = renderer
+        .render_shaped(
+            &state.snapshot(),
+            &damage,
+            bitty_config::types::LigaturePolicy::Never,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(list.glyphs.len(), 2);
+    assert_eq!(renderer.counters().shaping_misaligned, 1);
+}
+
+/// A non-shaping source (classic crossfont / deterministic headless) is
+/// served by the classic per-cell path through the same entry point.
+#[test]
+fn unshaped_source_falls_back_to_the_classic_path() {
+    let mut renderer = shaped_renderer(FakeShaper::unsupported());
+    let state = shaped_state("a->b");
+    let damage = full_damage(&state);
+    let plain = renderer.render(&state.snapshot(), &damage).unwrap();
+    let through_default = renderer
+        .render_shaped(
+            &state.snapshot(),
+            &damage,
+            bitty_config::types::LigaturePolicy::Never,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(plain.glyphs, through_default.glyphs);
+    assert_eq!(plain.fills, through_default.fills);
+    assert_eq!(
+        renderer.cache.rasterizer().inner().calls.len(),
+        0,
+        "the fallback source must never be asked to shape"
     );
 }

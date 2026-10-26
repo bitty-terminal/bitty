@@ -121,7 +121,7 @@ use bitty_plugin_host::{
     PluginHost, PluginId, PluginManifest, QualifiedName,
 };
 
-use crate::config::RuntimeConfig;
+use crate::config::{RuntimeConfig, TextStack};
 use crate::error::RuntimeError;
 use crate::queue::{ColdEvent, ColdQueue};
 
@@ -192,7 +192,7 @@ use self::mouse_chrome::{
     AltDragState, BorderDragState, FloatResizeState, HoverPending, TiledDragState,
 };
 use self::panes::PaneSession;
-use self::present::{AnyRasterizer, HeadlessRasterizer, ImeCaret};
+use self::present::{AnyRasterizer, ImeCaret, select_renderer};
 use self::scrollbar::ScrollbarDrag;
 use self::workspaces::{PendingWsClose, WorkspaceSlot};
 
@@ -1414,7 +1414,12 @@ pub struct Runtime {
     wheel_line_accum_x: f32,
     // DPI scale
     scale_factor: ScaleFactor,
-    is_crossfont: bool,
+    /// Text stack serving this runtime (CTX-1607: shaped default, crossfont
+    /// fallback, headless for deterministic tests).
+    text_stack: TextStack,
+    /// Diagnostic recorded when the preferred text stack lost to a fallback
+    /// (surfaced by [`Runtime::text_stack_note`], startup logs, and doctor).
+    text_stack_note: Option<String>,
     /// Startup font size in points (CTX-0263 font zoom reset baseline).
     ///
     /// Per-window: cloned from the validated config at construction, never
@@ -1820,7 +1825,7 @@ impl Runtime {
 
     /// Test-only constructor: as [`Self::with_plugin_host_capacity`] but the
     /// glyph rasterizer is the deterministic [`HeadlessRasterizer`] instead of
-    /// the platform font stack (crossfont).
+    /// the shaped (or crossfont fallback) host font stack.
     ///
     /// The headless rasterizer derives every bitmap from the scalar and point
     /// size alone — no font file, no font metrics, no host state — and the
@@ -1828,9 +1833,9 @@ impl Runtime {
     /// math, so a tick's [`PresentStats`] and `headless_rgba` are
     /// byte-identical on every host. Golden tests use this seam to pin
     /// presented frames with hardcoded digests across Linux/macOS/Windows CI;
-    /// production constructors keep the crossfont preference, so this changes
-    /// no production behavior. Hidden from rustdoc: not part of the product
-    /// surface.
+    /// production constructors keep `TextStackPreference::Auto` (shaped
+    /// default, crossfont fallback), so this changes no production
+    /// behavior. Hidden from rustdoc: not part of the product surface.
     ///
     /// # Errors
     ///
@@ -1892,41 +1897,22 @@ impl Runtime {
             style: FontStyle::Normal,
             point_size: config.font_size,
         };
-        // Vertical slice: prefer crossfont when available, fallback to headless
-        // for CI determinism. Both are bounded and headless-testable. The
-        // crossfont backend is wrapped in the per-glyph fallback chain
-        // (CTX-0163: braille `U+2800-U+28FF` + blocks `U+2580-U+259F`;
-        // CTX-0368: symbols/emoji through the pinned platform tail, with the
-        // RFC tofu box painted when no loaded face covers the scalar). On
-        // Windows the monospace family may be absent, so a FontNotFound from
-        // GridRenderer re-tries deterministically with HeadlessRasterizer
-        // instead of failing with_defaults on headless CI.
-        let (renderer, is_crossfont) = {
-            let base = if deterministic_rasterizer {
-                AnyRasterizer::Headless(HeadlessRasterizer::new())
-            } else {
-                AnyRasterizer::try_crossfont()
-            };
-            let is_cf = base.is_crossfont();
-            // CTX-0953: the production chain carries the effective
-            // `font.fallback` tier ahead of the platform tail (empty by
-            // default, identical to the bare chain).
-            let font_config = config.font_config();
-            let raster = FallbackRasterizer::with_config(base, &font_config);
-            match GridRenderer::new(raster, &query, cell) {
-                Ok(r) => (r, is_cf),
-                Err(err) if is_cf && matches!(&err, RenderError::FontNotFound(_)) => {
-                    let fallback = FallbackRasterizer::with_config(
-                        AnyRasterizer::Headless(HeadlessRasterizer::new()),
-                        &font_config,
-                    );
-                    let r =
-                        GridRenderer::new(fallback, &query, cell).map_err(RuntimeError::from)?;
-                    (r, false)
-                }
-                Err(err) => return Err(RuntimeError::from(err)),
-            }
-        };
+        // CTX-1607: the shaped `harfrust`/`swash` stack is the production
+        // default; crossfont stays as the explicit fallback and headless
+        // remains the deterministic CI/golden rasterizer. Every stack is
+        // wrapped in the per-glyph fallback chain (CTX-0163 braille +
+        // blocks; CTX-0368 symbols/emoji through the pinned platform tail,
+        // with the RFC tofu box when no face covers the scalar). A font
+        // stack that cannot load the configured family falls through to the
+        // deterministic headless rasterizer with a diagnostic instead of
+        // failing construction on a bare CI host.
+        let selected = select_renderer(&config, &query, cell, deterministic_rasterizer)?;
+        if let Some(note) = &selected.note {
+            eprintln!("bitty: text stack fallback: {note}");
+        }
+        let renderer = selected.renderer;
+        let text_stack = selected.stack;
+        let text_stack_note = selected.note;
         let cols = config.cols;
         let rows = config.rows;
         let layout = default_layout(cols, rows);
@@ -2103,7 +2089,8 @@ impl Runtime {
             wheel_line_accum_y: 0.0,
             wheel_line_accum_x: 0.0,
             scale_factor: ScaleFactor::ONE,
-            is_crossfont,
+            text_stack,
+            text_stack_note,
             base_font_size: config.font_size,
             query_overlap: Vec::new(),
             inspect_ring: crate::inspect::InputRing::new(),
@@ -2205,28 +2192,15 @@ impl Runtime {
             style: FontStyle::Normal,
             point_size: config.font_size,
         };
-        let (renderer, is_crossfont) = {
-            let base = AnyRasterizer::try_crossfont();
-            let is_cf = base.is_crossfont();
-            // CTX-0953: the production chain carries the effective
-            // `font.fallback` tier ahead of the platform tail (empty by
-            // default, identical to the bare chain).
-            let font_config = config.font_config();
-            let raster = FallbackRasterizer::with_config(base, &font_config);
-            match GridRenderer::new(raster, &query, cell) {
-                Ok(r) => (r, is_cf),
-                Err(err) if is_cf && matches!(&err, RenderError::FontNotFound(_)) => {
-                    let fallback = FallbackRasterizer::with_config(
-                        AnyRasterizer::Headless(HeadlessRasterizer::new()),
-                        &font_config,
-                    );
-                    let r =
-                        GridRenderer::new(fallback, &query, cell).map_err(RuntimeError::from)?;
-                    (r, false)
-                }
-                Err(err) => return Err(RuntimeError::from(err)),
-            }
-        };
+        // CTX-1607: same text-stack selection as the capacity constructor
+        // (shaped default, crossfont fallback, headless last resort).
+        let selected = select_renderer(&config, &query, cell, false)?;
+        if let Some(note) = &selected.note {
+            eprintln!("bitty: text stack fallback: {note}");
+        }
+        let renderer = selected.renderer;
+        let text_stack = selected.stack;
+        let text_stack_note = selected.note;
         let cols = config.cols;
         let rows = config.rows;
         let layout = default_layout(cols, rows);
@@ -2402,7 +2376,8 @@ impl Runtime {
             wheel_line_accum_y: 0.0,
             wheel_line_accum_x: 0.0,
             scale_factor: ScaleFactor::ONE,
-            is_crossfont,
+            text_stack,
+            text_stack_note,
             base_font_size: config.font_size,
             query_overlap: Vec::new(),
             inspect_ring: crate::inspect::InputRing::new(),
@@ -2502,9 +2477,10 @@ impl Runtime {
     /// GPU context so `tick` can present via `Surface::present_draw_list` with
     /// the real swapchain. When no GPU is available the headless seam remains.
     pub fn attach_gpu(&mut self, gpu: GpuContext, surface: Surface) {
-        // Keep renderer as is (AnyRasterizer may be crossfont already); surface
-        // and gpu are swapped wholesale. Headless fallback remains if gpu later
-        // fails present (caller may detach).
+        // Keep renderer as is (AnyRasterizer is the shaped default or its
+        // crossfont fallback); surface and gpu are swapped wholesale.
+        // Headless fallback remains if gpu later fails present (caller may
+        // detach).
         // CTX-0355: the app constructs the real-GPU surface; install the
         // resolved palette so its clear color matches the renderer.
         surface.set_theme_palette(self.config.theme);
@@ -2652,10 +2628,40 @@ impl Runtime {
         });
     }
 
-    /// Whether crossfont rasterizer is active.
+    /// Text stack actually serving this runtime (CTX-1607).
+    ///
+    /// [`TextStack::Shaped`] is the production default; `Crossfont` means
+    /// the fallback was selected (see [`Self::text_stack_note`]) and
+    /// `Headless` is the deterministic test rasterizer.
     #[must_use]
-    pub fn is_crossfont(&self) -> bool {
-        self.is_crossfont
+    pub const fn text_stack(&self) -> TextStack {
+        self.text_stack
+    }
+
+    /// Diagnostic naming why the preferred text stack was not used.
+    ///
+    /// `None` when the preferred stack won (including an explicit
+    /// `BITTY_TEXT_STACK=classic`); `Some` carries the fallback reason for
+    /// startup logs and `bitty doctor`.
+    #[must_use]
+    pub fn text_stack_note(&self) -> Option<&str> {
+        self.text_stack_note.as_deref()
+    }
+
+    /// True when the shaped stack serves this runtime.
+    #[must_use]
+    pub const fn is_shaped(&self) -> bool {
+        self.text_stack.is_shaped()
+    }
+
+    /// Whether a real host font stack is active (shaped or crossfont).
+    ///
+    /// Compatibility accessor for the pre-CTX-1607 call sites that used this
+    /// to distinguish a real font stack from the deterministic headless
+    /// rasterizer; the stack itself is named by [`Self::text_stack`].
+    #[must_use]
+    pub const fn is_crossfont(&self) -> bool {
+        self.text_stack.is_host()
     }
 
     /// Owned config view.

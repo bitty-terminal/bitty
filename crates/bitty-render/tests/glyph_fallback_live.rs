@@ -15,12 +15,12 @@
 //! tofu, bounded walk/cache) are unit-tested headlessly in `src/fallback.rs`
 //! and `src/grid/tests.rs`; this file is the live-font evidence layer.
 //!
-//! CTX-0957 additive landing (DEC-0095): this crossfont chain IS the
-//! production default path, so the CJK test below is the no-regression
-//! proof for the flagged codepoints (U+6F22/U+5B57). The shaped opt-in
-//! covers the same corpus in `tests/shaped_parity.rs` with exact equality
-//! (CTX-0961 closed the former allowlist via the pinned CJK tail plus
-//! dynamic fallback).
+//! CTX-1607: this crossfont chain is the explicit fallback stack, so the
+//! CJK test below is the no-regression proof for the flagged codepoints
+//! (U+6F22/U+5B57) when the shaped default cannot initialize. The shaped
+//! default covers the same corpus in `tests/shaped_parity.rs` with exact
+//! equality (CTX-0961 closed the former allowlist via the pinned CJK tail
+//! plus dynamic fallback).
 
 use bitty_render::{
     CellMetrics, CrossFontRasterizer, FallbackRasterizer, FontQuery, FontStyle, GlyphRasterizer,
@@ -234,10 +234,10 @@ fn host_chain_is_bounded_and_deterministic() {
 
 #[test]
 fn default_path_covers_cjk_flagged_codepoints() {
-    // CTX-0957 additive landing (DEC-0095): the crossfont chain is the
-    // production default, so U+6F22/U+5B57 must render covered here — no
-    // tofu on the default path. (The shaped opt-in covers the same two via
-    // its pinned CJK tail plus dynamic fallback; see
+    // CTX-1607: the crossfont chain is the explicit fallback, so
+    // U+6F22/U+5B57 must still render covered here — no tofu when the
+    // shaped default cannot initialize. (The shaped default covers the same
+    // two via its pinned CJK tail plus dynamic fallback; see
     // `tests/shaped_parity.rs`, CTX-0961.)
     let Some(mut raster) = live_chain() else {
         eprintln!("skipped: no host font stack or primary family");

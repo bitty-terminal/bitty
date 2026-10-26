@@ -22,12 +22,10 @@
 //!   presenting tick is wall-clock independent. See issue #1711 for why
 //!   BEL-corpus tests must instead drain through the virtual-clock seam
 //!   (`bell_notification_deadline` + `tick_at`).
-//! - The shaped stack itself (`SwashSingle`) stays an explicit opt-in the
-//!   runtime does not wire yet (see `Backend selection` in
-//!   `bitty-render`'s crate docs); grid truth is shared (`Snapshot` by
-//!   shared ref), so the idle contract asserted here is
-//!   rasterizer-independent and becomes the landing pad for shaped-wiring
-//!   idle assertions when the runtime adopts the shaped stack.
+//! - The runtime now wires the shaped stack by default (CTX-1607); grid
+//!   truth is shared (`Snapshot` by shared ref), so the idle contract
+//!   asserted here is rasterizer-independent and stays valid on the shaped
+//!   path.
 //!
 //! ```text
 //! cargo test -p bitty-runtime --test shaped_idle

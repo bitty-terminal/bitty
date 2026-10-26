@@ -554,7 +554,7 @@ mod tests {
         assert!(handled.contains("secret://db-password"), "{handled}");
         // Legit diagnostics pass through byte-identical (no behavior change).
         for line in [
-            "bitty tick: frame=1 fills=7 glyphs=3 headless=true gen=9 presented_frames=1 focused=None leafs=1 gpu=false crossfont=false images=0 images_skipped=0",
+            "bitty tick: frame=1 fills=7 glyphs=3 headless=true gen=9 presented_frames=1 focused=None leafs=1 gpu=false text_stack=headless images=0 images_skipped=0",
             "bitty: theme 'default' via default",
             "bitty: keymaps resolved (3 entries)",
             "bitty: layout installed — leafs=1",

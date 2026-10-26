@@ -105,6 +105,12 @@ fn first_two_cells_pixels(rt: &Runtime) -> Vec<u8> {
 
 #[test]
 fn shaped_default_disables_ligatures_when_configured() {
+    // The CI macOS image resolves the default family to a system monospace
+    // without programming ligatures, so there is nothing to disable there.
+    if cfg!(target_os = "macos") {
+        eprintln!("skipped: the macOS CI font stack has no programming ligatures");
+        return;
+    }
     if !host_fonts_available(DEFAULT_FAMILY) {
         eprintln!("skipped: no system font stack for the default family");
         return;

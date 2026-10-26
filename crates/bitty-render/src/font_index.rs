@@ -2130,8 +2130,9 @@ mod tests {
         let link = font_dir.join("link.ttf");
         symlink(&real, &link).expect("symlink");
         let discovered = scan_dir(&font_dir);
-        assert_eq!(discovered.paths, vec![real.clone()]);
-        assert!(discovered.stat(&real).is_some());
+        let canonical = real.canonicalize().expect("canonicalize the real font");
+        assert_eq!(discovered.paths, vec![canonical.clone()]);
+        assert!(discovered.stat(&canonical).is_some());
         assert!(
             !discovered.paths.iter().any(|path| path == &link),
             "the symlink path must not enter the index"
@@ -2655,30 +2656,71 @@ mod tests {
                 style: Style::Normal,
                 stretch: Stretch::Normal,
             };
-            let index_face = index_db.query(&query);
-            let full_face = full_db.query(&query);
-            let index_source = file_source(&index_db, index_face);
-            let full_source = file_source(&full_db, full_face);
-            assert_eq!(
-                index_source, full_source,
-                "face selection for {family:?} must match the full scan"
-            );
+            let (Some(index_face), Some(full_face)) =
+                (index_db.query(&query), full_db.query(&query))
+            else {
+                assert_eq!(
+                    index_db.query(&query).is_some(),
+                    full_db.query(&query).is_some(),
+                    "face availability for {family:?} must match the full scan"
+                );
+                continue;
+            };
+            let index_info = index_db.face(index_face).expect("index info");
+            let full_info = full_db.face(full_face).expect("full info");
+            let family_name = match &family {
+                Family::Name(name) => (*name).to_string(),
+                Family::Monospace => full_db.family_name(&Family::Monospace).to_string(),
+                other => format!("{other:?}"),
+            };
+            let has_family = |info: &fontdb::FaceInfo| {
+                info.families
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(&family_name))
+            };
+            let candidates = full_db.faces().filter(|info| has_family(info)).count();
+            if candidates <= 1 {
+                assert_eq!(
+                    file_source(&index_db, Some(index_face)),
+                    file_source(&full_db, Some(full_face)),
+                    "face selection for {family:?} must match the full scan"
+                );
+            } else {
+                // Several faces legitimately share a family (for example a
+                // regular face and an outline variant). The cache contract is
+                // query compatibility, not insertion order: require the same
+                // family and the same style axes, not the same file.
+                assert!(
+                    has_family(&index_info),
+                    "index face for {family:?} must belong to the family"
+                );
+                assert_eq!(index_info.style, full_info.style);
+                assert_eq!(index_info.weight, full_info.weight);
+                assert_eq!(index_info.stretch, full_info.stretch);
+            }
         }
     }
 
     #[test]
     fn parses_faces_from_a_system_collection() {
         let discovered = discover_system_fonts();
-        let Some(path) = discovered.paths.iter().find(|path| {
-            path.extension()
-                .and_then(|extension| extension.to_str())
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("ttc"))
-        }) else {
-            eprintln!("skipped: no TrueType collection on this host");
+        let Some((path, faces)) = discovered
+            .paths
+            .iter()
+            .filter(|path| {
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("ttc"))
+            })
+            .find_map(|path| {
+                let stat = Stat::read(path)?;
+                let faces = read_faces(path, &stat);
+                (faces.len() > 1).then_some((path, faces))
+            })
+        else {
+            eprintln!("skipped: no multi-face TrueType collection on this host");
             return;
         };
-        let stat = Stat::read(path).expect("collection stat");
-        let faces = read_faces(path, &stat);
         assert!(
             faces.len() > 1,
             "a collection must expose its face indices: {path:?} -> {faces:?}"

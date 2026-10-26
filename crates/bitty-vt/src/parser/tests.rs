@@ -7,11 +7,11 @@
 use super::*;
 use crate::action::{
     Attribute, AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, ClipboardOp, Col, Color,
-    ControlChar, Count, CursorStyle, Direction, DynamicColorOp, DynamicColorTarget,
-    EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, KittyPayloadType, MAX_OSC4_OPS,
-    MAX_OSC22_SHAPES, Mode, MouseTrackingMode, Notification, NotificationSource, PaletteColorOp,
-    PaletteOp, PointerShape, PointerShapeOp, Rgb, Row, SequenceKind, StatusKind, TabTargets,
-    UnderlineStyle, UnrecognizedSequence, ZoneKind,
+    ControlChar, ControlStringKind, ControlStringReject, Count, CursorStyle, Direction,
+    DynamicColorOp, DynamicColorTarget, EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink,
+    KittyPayloadType, MAX_OSC4_OPS, MAX_OSC22_SHAPES, Mode, MouseTrackingMode, Notification,
+    NotificationSource, PaletteColorOp, PaletteOp, PointerShape, PointerShapeOp, Rgb, Row,
+    SequenceKind, StatusKind, TabTargets, UnderlineStyle, UnrecognizedSequence, ZoneKind,
 };
 use crate::bounded::{BoundedBytes, BoundedString};
 
@@ -3314,4 +3314,268 @@ fn osc1337_body_cap_bounds_the_parser_body_behind_an_aborted_apc() {
             reason: crate::Iterm2Reject::OversizePayload
         }]
     );
+}
+
+// — CTX-1592 (bitty#2704): parser-wide control-string cap.
+
+const CAP: usize = crate::CONTROL_STRING_MAX_BYTES;
+
+/// One counted refusal action.
+fn control_refusal(kind: ControlStringKind) -> TerminalAction {
+    TerminalAction::ControlStringRejected {
+        kind,
+        reason: ControlStringReject::Overflow,
+    }
+}
+
+/// Number of `ControlStringRejected` actions with `kind`.
+fn count_refusals(actions: &[TerminalAction], kind: ControlStringKind) -> usize {
+    actions
+        .iter()
+        .filter(|action| **action == control_refusal(kind))
+        .count()
+}
+
+/// Asserts the stream ends with the `ok` print pair (recovery).
+fn assert_recovers_with_ok(actions: &[TerminalAction]) {
+    assert_eq!(
+        &actions[actions.len().saturating_sub(2)..],
+        &[
+            TerminalAction::Print(GraphemeCell::from('o')),
+            TerminalAction::Print(GraphemeCell::from('k')),
+        ],
+        "output after the refused string must still arrive: {actions:?}"
+    );
+}
+
+#[test]
+fn control_string_cap_covers_the_iterm2_maximum() {
+    // One cap, sized by the largest legitimate control string: the diverted
+    // iTerm2 body plus its introducer and prefix.
+    assert_eq!(
+        CAP,
+        crate::ITERM2_OSC_MAX_BODY_BYTES + crate::ITERM2_OSC_PREFIX.len() + 2
+    );
+    assert!(
+        CAP >= crate::ITERM2_OSC_MAX_ATTRIBUTE_BYTES
+            + 1
+            + crate::ITERM2_OSC_MAX_WIRE_BYTES
+            + crate::ITERM2_OSC_PREFIX.len()
+            + 2,
+        "the cap must admit a maximum-size iTerm2 request"
+    );
+}
+
+#[test]
+fn bare_osc_at_the_cap_is_admitted_and_one_over_is_refused() {
+    // Exactly at the cap: terminated normally, no refusal injected.
+    let mut at_cap = b"\x1b]0;".to_vec();
+    at_cap.extend(std::iter::repeat_n(b'A', CAP - 2));
+    at_cap.extend_from_slice(b"\x07ok");
+    let actions = parse(&at_cap);
+    assert_eq!(count_refusals(&actions, ControlStringKind::Osc), 0);
+    assert_recovers_with_ok(&actions);
+
+    // One byte over: `CAN` aborts the string, the tail is dropped, the
+    // refusal is counted, and the following output still parses.
+    let mut over = b"\x1b]0;".to_vec();
+    over.extend(std::iter::repeat_n(b'A', CAP - 1));
+    over.extend_from_slice(b"\x07ok");
+    let actions = parse(&over);
+    assert_eq!(count_refusals(&actions, ControlStringKind::Osc), 1);
+    assert_recovers_with_ok(&actions);
+}
+
+#[test]
+fn bare_unterminated_osc_ids_are_capped() {
+    for (id, kind) in [
+        (b"0".as_slice(), ControlStringKind::Osc),
+        (b"8".as_slice(), ControlStringKind::Osc),
+        (b"52".as_slice(), ControlStringKind::Osc),
+    ] {
+        let mut stream = b"\x1b]".to_vec();
+        stream.extend_from_slice(id);
+        stream.push(b';');
+        stream.extend(std::iter::repeat_n(b'A', CAP + 4096));
+        stream.extend_from_slice(b"\x07ok");
+        let actions = parse(&stream);
+        assert_eq!(count_refusals(&actions, kind), 1, "OSC {id:?}");
+        assert_recovers_with_ok(&actions);
+    }
+}
+
+#[test]
+fn dcs_sos_pm_strings_are_capped_and_recover() {
+    // DCS: `CAN` runs `unhook` (one mapped `Unknown(Dcs)`) before aborting.
+    let mut dcs = b"\x1bP".to_vec();
+    dcs.extend(std::iter::repeat_n(b'A', CAP + 4096));
+    dcs.extend_from_slice(b"\x1b\\ok");
+    let actions = parse(&dcs);
+    assert_eq!(count_refusals(&actions, ControlStringKind::Dcs), 1);
+    assert!(
+        actions
+            .iter()
+            .any(|action| matches!(action, TerminalAction::Unknown(report) if report.kind == SequenceKind::Dcs)),
+        "the aborted DCS still reports its mapped family: {actions:?}"
+    );
+    assert_recovers_with_ok(&actions);
+
+    // SOS and PM stay inert; only the refusal and recovery are visible.
+    for (introducer, kind) in [
+        (b'X', ControlStringKind::Sos),
+        (b'^', ControlStringKind::Pm),
+    ] {
+        let mut stream = b"\x1b".to_vec();
+        stream.push(introducer);
+        stream.extend(std::iter::repeat_n(b'A', CAP + 4096));
+        stream.extend_from_slice(b"\x1b\\ok");
+        let actions = parse(&stream);
+        assert_eq!(count_refusals(&actions, kind), 1, "{kind} refusal");
+        assert_recovers_with_ok(&actions);
+    }
+}
+
+#[test]
+fn apc_inside_an_osc_shares_the_cap_and_recovers() {
+    // Shape 2: `ESC _` is consumed by the parser, so the OSC `vte` owns
+    // stays open; when the APC ends, the tail lands in that OSC and the cap
+    // aborts it. Before CTX-1592 this grew `vte`'s collector without bound.
+    let mut stream = b"\x1b]0;t\x1b_Gm=0;\x1b\\".to_vec();
+    stream.extend(std::iter::repeat_n(b'A', CAP + 4096));
+    stream.extend_from_slice(b"\x07ok");
+    let actions = parse(&stream);
+    assert_eq!(count_refusals(&actions, ControlStringKind::Osc), 1);
+    assert_recovers_with_ok(&actions);
+}
+
+#[test]
+fn kitty_apc_interleaved_with_text_is_capped_and_recovers() {
+    // Shape 3: a chunked kitty stream whose payload is interleaved with
+    // non-base64 text. The text aborts the pending stream; the remaining
+    // APC bytes are charged to the shared cap and then discarded.
+    let mut stream = b"\x1b_Ga=T,f=32,s=1,v=1,m=1;AAAA".to_vec();
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(&stream, |action| actions.push(action));
+    assert!(parser.has_pending_kitty(), "the chunked stream stays open");
+
+    let text = b"!!!! text !!!! ";
+    let mut feed = Vec::new();
+    while feed.len() <= CAP {
+        feed.extend_from_slice(text);
+    }
+    parser.advance(&feed, |action| actions.push(action));
+    parser.advance(b"\x07ok", |action| actions.push(action));
+    assert_eq!(count_refusals(&actions, ControlStringKind::Apc), 1);
+    assert!(!parser.has_pending_kitty(), "the stream is dropped");
+    assert_recovers_with_ok(&actions);
+
+    // The same stream parsed whole (prefix included) matches.
+    stream.extend_from_slice(&feed);
+    stream.extend_from_slice(b"\x07ok");
+    assert_eq!(parse_split(&stream, 7), actions);
+}
+
+#[test]
+fn image_diversion_after_a_capped_string_is_admitted() {
+    // A valid iTerm2 image after an over-cap unterminated OSC must still be
+    // diverted and admitted; the refusal does not poison the next sequence.
+    let mut stream = b"\x1b]0;".to_vec();
+    stream.extend(std::iter::repeat_n(b'A', CAP + 4096));
+    stream.extend_from_slice(iterm2_wire("inline=1", &ITERM2_PNG_1X1).as_bytes());
+    stream.extend_from_slice(b"ok");
+    let actions = parse(&stream);
+    assert_eq!(count_refusals(&actions, ControlStringKind::Osc), 1);
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            TerminalAction::Iterm2Image {
+                cols: 0,
+                rows: 0,
+                ..
+            }
+        )),
+        "the image after the capped string must be admitted: {actions:?}"
+    );
+    assert_recovers_with_ok(&actions);
+}
+
+#[test]
+fn control_string_cap_is_chunk_split_invariant() {
+    let prefix = b"\x1b]0;";
+    let mut stream = prefix.to_vec();
+    stream.extend(std::iter::repeat_n(b'A', CAP + 4096));
+    stream.extend_from_slice(b"\x07ok");
+    let whole = parse(&stream);
+    assert_eq!(count_refusals(&whole, ControlStringKind::Osc), 1);
+
+    // Boundary offsets around the overflow point plus chunk sizes; every
+    // split must produce the identical action stream and accounting.
+    let mut cuts = vec![
+        0,
+        1,
+        2,
+        prefix.len(),
+        prefix.len() + 1,
+        prefix.len() + CAP - 1,
+        prefix.len() + CAP,
+        prefix.len() + CAP + 1,
+        prefix.len() + CAP + 2,
+        stream.len() - 4,
+        stream.len() - 1,
+        stream.len(),
+    ];
+    cuts.retain(|cut| *cut <= stream.len());
+    for cut in cuts {
+        let mut parser = Parser::new();
+        let mut actions = Vec::new();
+        parser.advance(&stream[..cut], |action| actions.push(action));
+        parser.advance(&stream[cut..], |action| actions.push(action));
+        assert_eq!(actions, whole, "split at offset {cut}");
+    }
+    for chunk_size in [7, 4096, 64 * 1024] {
+        assert_eq!(
+            parse_split(&stream, chunk_size),
+            whole,
+            "chunk size {chunk_size}"
+        );
+    }
+}
+
+#[test]
+fn well_formed_control_strings_never_trip_the_cap() {
+    // Every mapped family at representative sizes: the cap must be invisible
+    // for terminated sequences (byte-identical action stream, no refusals).
+    let stream = concat!(
+        "\x1b]0;title\x07",
+        "\x1b]2;title\x07",
+        "\x1b]4;1;rgb:00/00/00\x07",
+        "\x1b]7;file:///tmp\x07",
+        "\x1b]8;;https://example.com\x07link\x1b]8;;\x07",
+        "\x1b]9;notice\x07",
+        "\x1b]52;c;aGk=\x07",
+        "\x1b]99;i=1:d=0;hi\x07",
+        "\x1b]133;A\x07",
+        "\x1b]22;pointer\x07",
+        "\x1bP+q544e\x1b\\",
+        "\x1bP1$r0m\x1b\\",
+        "\x1bXinert\x1b\\",
+        "\x1b^inert\x1b\\",
+        "\x1b_Ga=T,f=32,s=1,v=1;AAAA\x1b\\",
+        "\x1b]1337;File=inline=1;width=1:",
+    )
+    .as_bytes()
+    .to_vec();
+    let mut stream = stream;
+    stream.extend_from_slice(kitty_base64(&ITERM2_PNG_1X1).as_bytes());
+    stream.extend_from_slice(b"\x07ok");
+    let actions = parse(&stream);
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, TerminalAction::ControlStringRejected { .. })),
+        "well-formed sequences must never be refused: {actions:?}"
+    );
+    assert_recovers_with_ok(&actions);
+    assert_eq!(parse_split(&stream, 1), actions);
 }

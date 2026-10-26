@@ -11,17 +11,30 @@
 //! count (extra parameters are dropped and flagged via `ignore`),
 //! parameter magnitude (`u16` saturation), and OSC payload size (fixed
 //! buffer); this module additionally bounds every materialized string or
-//! byte payload through the [`crate::bounded`] types. Exceeding any limit
-//! therefore yields a well-defined truncated action rather than unbounded
-//! growth (threat T-01).
+//! byte payload through the [`crate::bounded`] types and enforces one
+//! parser-wide control-string byte cap ([`CONTROL_STRING_MAX_BYTES`]) over
+//! every string `vte` collects and over the diverted iTerm2 candidate.
+//! Exceeding any limit therefore yields a well-defined truncated action
+//! rather than unbounded growth (threat T-01).
+//!
+//! The control-string cap is the bound `vte` itself does not provide: its
+//! `std` OSC collector is a growable `Vec` (`MAX_OSC_RAW` exists only in the
+//! `no_std` build), so an unterminated `OSC`/`DCS`/`SOS`/`PM` grows memory
+//! 1:1 with input. An over-cap string is aborted with an injected `CAN`,
+//! its tail is dropped up to the real terminator, and the refusal is emitted
+//! as [`TerminalAction::ControlStringRejected`] for telemetry. Every
+//! terminated sequence that stays under the cap is dispatched exactly as
+//! before (CTX-1592, bitty#2704).
 //!
 //! The crate holds no terminal state: the only memory retained across input
 //! chunks is the `vte` machine itself plus a pending device-control-string
 //! marker needed to report terminated-but-unmapped string sequences.
 
-use crate::action::TerminalAction;
+use crate::action::{ControlStringKind, ControlStringReject, TerminalAction};
 use crate::diag::{RejectLog, warn_rejection};
-use crate::iterm2_osc::{Iterm2OscScanner, OscOutcome};
+use crate::iterm2_osc::{
+    ITERM2_OSC_MAX_BODY_BYTES, ITERM2_OSC_PREFIX, Iterm2OscScanner, OscOutcome,
+};
 use crate::kitty_apc::{KITTY_APC_MAX_CONTROL_BYTES, KittyApcAssembler, KittyFeedOutcome};
 use crate::kitty_font_query::{KITTY_FONT_QUERY_WIRE_MAX_BYTES, parse_kitty_font_query};
 use vte::Params;
@@ -31,6 +44,43 @@ mod sgr;
 
 #[cfg(test)]
 mod tests;
+
+/// Parser-wide byte cap for one control string (CTX-1592, bitty#2704).
+///
+/// A control string is an `OSC`, `DCS`, `SOS`, `PM`, or `APC` sequence, or
+/// the diverted iTerm2 `OSC 1337;File=` candidate. The cap counts introducer
+/// bytes too, and is sized so the largest legitimate control string the
+/// parser accepts fits exactly: the iTerm2 body cap
+/// ([`ITERM2_OSC_MAX_BODY_BYTES`], the 4 MiB wire payload plus its attribute
+/// header) plus the `ESC ]` introducer and `1337;File=` prefix, i.e.
+/// 4 MiB + 4 KiB + 13 = 4,198,413 bytes.
+///
+/// This is the bound `vte` does not provide: its `std` OSC collector is a
+/// growable `Vec` (`MAX_OSC_RAW` exists only in the `no_std` build), so an
+/// unterminated string grows memory 1:1 with input. On overflow the parser
+/// injects `CAN` (`0x18`), which makes `vte` dispatch/abort the string and
+/// clear the collected body, then swallows the rest of the string up to its
+/// real terminator and emits [`TerminalAction::ControlStringRejected`].
+/// `vte` keeps the collector's capacity after the body is cleared, so one
+/// parser retains at most one doubling above the cap (8 MiB) once it has
+/// refused a string; that is the steady-state memory bound.
+///
+/// The kitty graphics payload is deliberately outside this budget: it is
+/// streamed into [`crate::kitty_apc`] and bounded by the IMG-1
+/// ([`crate::kitty_apc::KITTY_APC_LEDGER_CAP`]) and IMG-3
+/// ([`crate::kitty_apc::KITTY_APC_DECODE_MAX_BYTES`]) caps instead of being
+/// buffered by the parser. Only the parser-handled `APC` bytes that are *not*
+/// accepted kitty payload (header, discarded text, rejected payload) count
+/// toward this cap.
+///
+/// Documented beside the other parser bounds in the `bitty-vt` crate-level
+/// documentation; the memory and action bounds it implies are pinned by
+/// `tests/control_string_cap.rs`.
+pub const CONTROL_STRING_MAX_BYTES: usize = ITERM2_OSC_MAX_BODY_BYTES + ITERM2_OSC_PREFIX.len() + 2;
+
+/// `vte` ends a control string on the byte the caller injected to abort an
+/// over-cap string.
+const CAN: u8 = 0x18;
 
 /// Stateful byte-stream parser: wraps a `vte::Parser` and translates its
 /// callbacks into semantic [`TerminalAction`] values via the `emit` sink.
@@ -50,6 +100,13 @@ mod tests;
 /// a private `VteString` tracker records whether a string `vte` owns is
 /// still open, and the diversion feeds a terminating `ESC \` first
 /// (CTX-1590 review MF-1).
+///
+/// The same tracker carries the parser-wide control-string budget: every
+/// byte of a string `vte` owns, of the diverted iTerm2 candidate, and of a
+/// parser-handled `APC` that is not accepted kitty payload is charged
+/// against [`CONTROL_STRING_MAX_BYTES`] (CTX-1592). An over-cap `vte` string
+/// is aborted with an injected `CAN`; an over-cap `APC` is aborted locally
+/// because it never reached `vte`.
 pub struct Parser {
     state_machine: vte::Parser,
     dcs: PendingDcs,
@@ -61,7 +118,7 @@ pub struct Parser {
     apc_discarding: bool,
     held_esc: bool,
     held_in_apc: bool,
-    vte_string: VteString,
+    control_string: ControlString,
     reject_log: RejectLog,
 }
 
@@ -72,7 +129,7 @@ impl std::fmt::Debug for Parser {
             .field("in_apc", &self.in_apc)
             .field("kitty_pending", &self.kitty.has_pending())
             .field("iterm2_pending", &self.iterm2.is_active())
-            .field("vte_string", &self.vte_string)
+            .field("control_string", &self.control_string)
             .finish_non_exhaustive()
     }
 }
@@ -166,9 +223,10 @@ impl VteString {
                 _ => Self::Osc,
             },
             // `advance_dcs_passthrough` / `anywhere`: `CAN`/`SUB`/`ESC` end
-            // it. C1 `ST` (0x9C) is left open on purpose: it only unhooks an
-            // already-hooked DCS, so a stale flag can only add one inert
-            // `ESC \` later.
+            // it. C1 `ST` (0x9C) unhooks only a DCS passthrough, never a
+            // SOS/PM string, so the collapsed state stays `Other` for it;
+            // `feed_vte` applies the family-specific rule from the recorded
+            // introducer (CTX-1592 byte accounting).
             Self::Other => match byte {
                 0x18 | 0x1A => Self::Ground,
                 0x1B => Self::Escape,
@@ -181,6 +239,139 @@ impl VteString {
     /// an open string, or the pending `ESC` of an abandoned sequence.
     const fn needs_close(self) -> bool {
         !matches!(self, Self::Ground)
+    }
+
+    /// Whether this state is inside a control string (the only states that
+    /// grow a `vte` collector).
+    const fn is_string(self) -> bool {
+        matches!(self, Self::Osc | Self::Other)
+    }
+
+    /// Whether `byte` ends a string of this family while its overflow tail
+    /// is being discarded (CTX-1592).
+    ///
+    /// `Some(true)` means "the string ends and `byte` must still be
+    /// forwarded" (`ESC` opens whatever sequence follows); `Some(false)`
+    /// means the byte is the terminator and is swallowed with the tail.
+    /// `Other` needs the recorded family: C1 `ST` (`0x9C`) unhooks a DCS but
+    /// does not end a SOS/PM string.
+    const fn discard_ends_at(self, kind: ControlStringKind, byte: u8) -> Option<bool> {
+        match self {
+            Self::Osc => match byte {
+                0x07 | CAN | 0x1A => Some(false),
+                0x1B => Some(true),
+                _ => None,
+            },
+            Self::Other => match byte {
+                CAN | 0x1A => Some(false),
+                0x1B => Some(true),
+                0x9C if matches!(kind, ControlStringKind::Dcs) => Some(false),
+                _ => None,
+            },
+            Self::Ground | Self::Escape => None,
+        }
+    }
+}
+
+/// Control-string state and the parser-wide byte budget (CTX-1592).
+///
+/// Wraps the [`VteString`] tracker so the "would the next forwarded byte
+/// land inside a string?" answer and the per-string byte count move
+/// together: the count can only advance on bytes [`VteString::after`] maps
+/// into a string, and it resets exactly when that string ends.
+#[derive(Debug)]
+struct ControlString {
+    /// Reachable string state of the wrapped `vte` machine.
+    state: VteString,
+    /// Body bytes forwarded to `vte` for the string [`Self::state`] names.
+    bytes: usize,
+    /// Family of the open `vte` string, captured at its introducer.
+    kind: ControlStringKind,
+    /// Set after an overflow: the rest of the string is swallowed until its
+    /// real terminator resynchronizes the wire.
+    discard: Option<VteString>,
+    /// Bytes of the parser-handled `APC` currently open (header and
+    /// discarded text; accepted kitty payload uses the IMG ledger instead).
+    apc_bytes: usize,
+    /// The open `APC` was already refused by the cap; stop charging it.
+    apc_refused: bool,
+}
+
+impl Default for ControlString {
+    fn default() -> Self {
+        Self {
+            state: VteString::default(),
+            bytes: 0,
+            kind: ControlStringKind::Osc,
+            discard: None,
+            apc_bytes: 0,
+            apc_refused: false,
+        }
+    }
+}
+
+impl ControlString {
+    /// Whether `vte` holds state that `ESC \` closes without an action.
+    const fn needs_close(&self) -> bool {
+        self.state.needs_close()
+    }
+
+    /// Opens the diverted iTerm2 candidate (`ESC ]` already consumed).
+    ///
+    /// The diversion replaces any open string (`vte` was closed first), so
+    /// the shared budget restarts with the two introducer bytes.
+    fn begin_diversion(&mut self) {
+        self.state = VteString::Ground;
+        self.bytes = 2;
+        self.kind = ControlStringKind::Osc;
+        self.discard = None;
+    }
+
+    /// Charges one byte consumed by the diverted iTerm2 candidate.
+    ///
+    /// The scanner's body cap plus the introducer and prefix sum to
+    /// [`CONTROL_STRING_MAX_BYTES`], so the shared budget saturates exactly
+    /// at the cap instead of overflowing; the scanner refuses an oversize
+    /// body itself (`Iterm2Reject::OversizePayload`).
+    fn charge_diversion(&mut self) {
+        self.bytes = self.bytes.saturating_add(1).min(CONTROL_STRING_MAX_BYTES);
+    }
+
+    /// Leaves the diversion: `vte` owns no string and the budget restarts.
+    fn end_diversion(&mut self) {
+        self.state = VteString::Ground;
+        self.bytes = 0;
+    }
+
+    /// Opens a parser-handled `APC` (`ESC _` already consumed).
+    ///
+    /// An `APC` introducer ends an overflowing `vte` string on the wire even
+    /// though the parser consumes it itself, so the discard tail ends here.
+    fn begin_apc(&mut self) {
+        self.discard = None;
+        self.apc_bytes = 0;
+        self.apc_refused = false;
+    }
+
+    /// Closes the parser-handled `APC`.
+    fn end_apc(&mut self) {
+        self.apc_bytes = 0;
+        self.apc_refused = false;
+    }
+
+    /// Charges one parser-handled `APC` byte that is not accepted kitty
+    /// payload; `true` means the byte crossed the cap and the caller must
+    /// abort the `APC`.
+    fn charge_apc(&mut self) -> bool {
+        if self.apc_refused {
+            return false;
+        }
+        self.apc_bytes += 1;
+        if self.apc_bytes > CONTROL_STRING_MAX_BYTES {
+            self.apc_refused = true;
+            return true;
+        }
+        false
     }
 }
 
@@ -199,7 +390,7 @@ impl Parser {
             apc_discarding: false,
             held_esc: false,
             held_in_apc: false,
-            vte_string: VteString::default(),
+            control_string: ControlString::default(),
             reject_log: RejectLog::default(),
         }
     }
@@ -222,7 +413,7 @@ impl Parser {
             apc_discarding: false,
             held_esc: false,
             held_in_apc: false,
-            vte_string: VteString::default(),
+            control_string: ControlString::default(),
             reject_log: RejectLog::default(),
         }
     }
@@ -270,6 +461,10 @@ impl Parser {
     /// transmissions emit [`TerminalAction::KittyGraphics`] in stream order.
     /// Unterminated `APC` and held trailing `ESC` are buffered for the next
     /// call.
+    ///
+    /// One control string may hold at most [`CONTROL_STRING_MAX_BYTES`]
+    /// bytes; an over-cap string emits
+    /// [`TerminalAction::ControlStringRejected`] and drops its body.
     pub fn advance<F>(&mut self, bytes: &[u8], emit: F)
     where
         F: FnMut(TerminalAction),
@@ -285,7 +480,7 @@ impl Parser {
             apc_discarding,
             held_esc,
             held_in_apc,
-            vte_string,
+            control_string,
             reject_log,
         } = self;
         let mut bridge = Bridge { emit, dcs };
@@ -307,19 +502,37 @@ impl Parser {
                         apc_payload,
                         in_apc,
                         apc_discarding,
+                        control_string,
                     );
                 } else if next == 0x18 || next == 0x1A {
+                    control_string.end_apc();
                     clear_apc_header(kitty, apc_buf);
                     *in_apc = false;
                     *apc_payload = false;
                     *apc_discarding = false;
                     kitty.abort();
-                    feed_vte(state_machine, &mut bridge, vte_string, &[next]);
+                    feed_vte(
+                        state_machine,
+                        &mut bridge,
+                        control_string,
+                        reject_log,
+                        &[next],
+                    );
                     i = 1;
                 } else if *apc_discarding {
                     // Held ESC is discarded. A following ESC is re-examined
                     // by the main loop (it may start `ESC \`), matching the
                     // in-buffer path; any other byte is discarded with it.
+                    if control_string.charge_apc() {
+                        refuse_apc(
+                            &mut bridge,
+                            kitty,
+                            apc_buf,
+                            apc_payload,
+                            apc_discarding,
+                            reject_log,
+                        );
+                    }
                     if next == 0x1B {
                         kitty.note_interleaved(1);
                         i = 0;
@@ -332,44 +545,74 @@ impl Parser {
                     *in_apc = false;
                     *apc_payload = false;
                     kitty.abort();
-                    begin_apc(kitty, apc_buf, apc_payload, in_apc, apc_discarding);
+                    begin_apc(
+                        kitty,
+                        apc_buf,
+                        apc_payload,
+                        in_apc,
+                        apc_discarding,
+                        control_string,
+                    );
                     i = 1;
                 } else if next == b']' {
                     // Aborted APC followed by `OSC 1337 ; File=` (CTX-1590
                     // review MF-2): the aborting `ESC` must not hand the body
                     // to `vte`'s uncapped OSC collector. Route into the same
                     // diversion the ground path uses.
+                    control_string.end_apc();
                     clear_apc_header(kitty, apc_buf);
                     *in_apc = false;
                     *apc_payload = false;
                     kitty.abort();
-                    close_vte_string(state_machine, &mut bridge, vte_string);
+                    close_vte_string(state_machine, &mut bridge, control_string, reject_log);
                     kitty.note_interleaved(1);
+                    control_string.begin_diversion();
                     iterm2.begin();
                     i = 1;
                 } else {
+                    control_string.end_apc();
                     clear_apc_header(kitty, apc_buf);
                     *in_apc = false;
                     *apc_payload = false;
                     kitty.abort();
-                    feed_vte(state_machine, &mut bridge, vte_string, &[0x1B]);
+                    feed_vte(
+                        state_machine,
+                        &mut bridge,
+                        control_string,
+                        reject_log,
+                        &[0x1B],
+                    );
                     i = 0;
                 }
             } else {
                 *held_esc = false;
                 if next == b'_' {
-                    begin_apc(kitty, apc_buf, apc_payload, in_apc, apc_discarding);
+                    begin_apc(
+                        kitty,
+                        apc_buf,
+                        apc_payload,
+                        in_apc,
+                        apc_discarding,
+                        control_string,
+                    );
                     i = 1;
                 } else if next == b']' {
                     // Possible `OSC 1337 ; File=` (CTX-1590): the introducer
                     // is consumed here and the scanner decides whether the
                     // prefix matches or must be replayed into `vte`.
-                    close_vte_string(state_machine, &mut bridge, vte_string);
+                    close_vte_string(state_machine, &mut bridge, control_string, reject_log);
                     kitty.note_interleaved(1);
+                    control_string.begin_diversion();
                     iterm2.begin();
                     i = 1;
                 } else {
-                    feed_vte(state_machine, &mut bridge, vte_string, &[0x1B]);
+                    feed_vte(
+                        state_machine,
+                        &mut bridge,
+                        control_string,
+                        reject_log,
+                        &[0x1B],
+                    );
                     i = 0;
                 }
             }
@@ -380,24 +623,40 @@ impl Parser {
                 let byte = bytes[i];
                 match iterm2.push(byte) {
                     OscOutcome::Consumed => {
+                        control_string.charge_diversion();
                         kitty.note_interleaved(1);
                         i += 1;
                         continue;
                     }
                     OscOutcome::PassThrough => {
-                        feed_vte(state_machine, &mut bridge, vte_string, iterm2.replay());
+                        control_string.end_diversion();
+                        feed_vte(
+                            state_machine,
+                            &mut bridge,
+                            control_string,
+                            reject_log,
+                            iterm2.replay(),
+                        );
                         iterm2.clear_replay();
                         // Fall through: the current byte takes the normal
                         // path now that `vte` has the whole OSC prefix.
                     }
                     OscOutcome::Finished => {
+                        control_string.end_diversion();
                         finish_iterm2(&mut bridge, iterm2, reject_log);
                         i += 1;
                         continue;
                     }
                     OscOutcome::FinishedThenPassThrough => {
+                        control_string.end_diversion();
                         finish_iterm2(&mut bridge, iterm2, reject_log);
-                        feed_vte(state_machine, &mut bridge, vte_string, iterm2.replay());
+                        feed_vte(
+                            state_machine,
+                            &mut bridge,
+                            control_string,
+                            reject_log,
+                            iterm2.replay(),
+                        );
                         iterm2.clear_replay();
                     }
                 }
@@ -420,30 +679,62 @@ impl Parser {
                             apc_payload,
                             in_apc,
                             apc_discarding,
+                            control_string,
                         );
                     } else if *apc_discarding {
                         // A discarded ESC still counts toward the stall
-                        // bound, so an ESC flood cannot evade it.
+                        // bound and the control-string budget, so an ESC
+                        // flood cannot evade either.
+                        if control_string.charge_apc() {
+                            refuse_apc(
+                                &mut bridge,
+                                kitty,
+                                apc_buf,
+                                apc_payload,
+                                apc_discarding,
+                                reject_log,
+                            );
+                        }
                         kitty.note_interleaved(1);
                         i += 1;
                     } else {
+                        control_string.end_apc();
                         clear_apc_header(kitty, apc_buf);
                         *in_apc = false;
                         *apc_payload = false;
                         kitty.abort();
                         if nxt == b'_' {
-                            begin_apc(kitty, apc_buf, apc_payload, in_apc, apc_discarding);
+                            begin_apc(
+                                kitty,
+                                apc_buf,
+                                apc_payload,
+                                in_apc,
+                                apc_discarding,
+                                control_string,
+                            );
                             i += 2;
                         } else if nxt == b']' {
                             // Aborted APC followed by `OSC 1337 ; File=`
                             // (CTX-1590 review MF-2): divert the body before
                             // `vte` can collect it as an OSC.
-                            close_vte_string(state_machine, &mut bridge, vte_string);
+                            close_vte_string(
+                                state_machine,
+                                &mut bridge,
+                                control_string,
+                                reject_log,
+                            );
                             kitty.note_interleaved(1);
+                            control_string.begin_diversion();
                             iterm2.begin();
                             i += 2;
                         } else {
-                            feed_vte(state_machine, &mut bridge, vte_string, &[0x1B]);
+                            feed_vte(
+                                state_machine,
+                                &mut bridge,
+                                control_string,
+                                reject_log,
+                                &[0x1B],
+                            );
                             i += 1;
                         }
                     }
@@ -456,54 +747,73 @@ impl Parser {
                         apc_payload,
                         in_apc,
                         apc_discarding,
+                        control_string,
                     );
                 } else if b == 0x18 || b == 0x1A {
                     i += 1;
+                    control_string.end_apc();
                     clear_apc_header(kitty, apc_buf);
                     *in_apc = false;
                     *apc_payload = false;
                     *apc_discarding = false;
                     kitty.abort();
-                    feed_vte(state_machine, &mut bridge, vte_string, &[b]);
-                } else if *apc_discarding {
-                    // Discarded APC bytes (non-`G` commands, rejected
-                    // headers) count toward an open stream's stall bound.
-                    kitty.note_interleaved(1);
-                    i += 1;
+                    feed_vte(state_machine, &mut bridge, control_string, reject_log, &[b]);
                 } else if *apc_payload {
+                    // Accepted payload bytes are charged to the kitty ledger,
+                    // not the control-string budget (see
+                    // [`CONTROL_STRING_MAX_BYTES`]).
                     if kitty.push_payload(std::slice::from_ref(&b)).is_err() {
                         *apc_payload = false;
                         *apc_discarding = true;
                     }
                     i += 1;
-                } else if b == b';' && !apc_buf.starts_with(b"+q") {
-                    match kitty.begin_control(apc_buf) {
-                        Ok(()) => {
-                            *apc_payload = true;
-                            clear_apc_header(kitty, apc_buf);
-                        }
-                        Err(_) => {
-                            *apc_discarding = true;
-                            clear_apc_header(kitty, apc_buf);
-                        }
-                    }
-                    i += 1;
-                } else if apc_buf.len() >= KITTY_APC_MAX_CONTROL_BYTES
-                    || !kitty.reserve_header_byte()
-                {
-                    clear_apc_header(kitty, apc_buf);
-                    *apc_discarding = true;
-                    kitty.abort();
-                    if let Some(occurrence) = reject_log.record() {
-                        warn_rejection(
-                            occurrence,
-                            "bitty: rejecting kitty APC: control exceeds parser budget: stored nothing",
-                        );
-                    }
-                    i += 1;
                 } else {
-                    apc_buf.push(b);
-                    i += 1;
+                    if control_string.charge_apc() {
+                        refuse_apc(
+                            &mut bridge,
+                            kitty,
+                            apc_buf,
+                            apc_payload,
+                            apc_discarding,
+                            reject_log,
+                        );
+                        i += 1;
+                        continue;
+                    }
+                    if *apc_discarding {
+                        // Discarded APC bytes (non-`G` commands, rejected
+                        // headers) count toward an open stream's stall bound.
+                        kitty.note_interleaved(1);
+                        i += 1;
+                    } else if b == b';' && !apc_buf.starts_with(b"+q") {
+                        match kitty.begin_control(apc_buf) {
+                            Ok(()) => {
+                                *apc_payload = true;
+                                clear_apc_header(kitty, apc_buf);
+                            }
+                            Err(_) => {
+                                *apc_discarding = true;
+                                clear_apc_header(kitty, apc_buf);
+                            }
+                        }
+                        i += 1;
+                    } else if apc_buf.len() >= KITTY_APC_MAX_CONTROL_BYTES
+                        || !kitty.reserve_header_byte()
+                    {
+                        clear_apc_header(kitty, apc_buf);
+                        *apc_discarding = true;
+                        kitty.abort();
+                        if let Some(occurrence) = reject_log.record() {
+                            warn_rejection(
+                                occurrence,
+                                "bitty: rejecting kitty APC: control exceeds parser budget: stored nothing",
+                            );
+                        }
+                        i += 1;
+                    } else {
+                        apc_buf.push(b);
+                        i += 1;
+                    }
                 }
             } else {
                 let b = bytes[i];
@@ -514,17 +824,31 @@ impl Parser {
                         break;
                     }
                     if bytes[i + 1] == b'_' {
-                        begin_apc(kitty, apc_buf, apc_payload, in_apc, apc_discarding);
+                        begin_apc(
+                            kitty,
+                            apc_buf,
+                            apc_payload,
+                            in_apc,
+                            apc_discarding,
+                            control_string,
+                        );
                         i += 2;
                     } else if bytes[i + 1] == b']' {
                         // Possible `OSC 1337 ; File=`: see the held-ESC arm.
-                        close_vte_string(state_machine, &mut bridge, vte_string);
+                        close_vte_string(state_machine, &mut bridge, control_string, reject_log);
                         kitty.note_interleaved(1);
+                        control_string.begin_diversion();
                         iterm2.begin();
                         i += 2;
                     } else {
                         kitty.note_interleaved(1);
-                        feed_vte(state_machine, &mut bridge, vte_string, &[0x1B]);
+                        feed_vte(
+                            state_machine,
+                            &mut bridge,
+                            control_string,
+                            reject_log,
+                            &[0x1B],
+                        );
                         i += 1;
                     }
                 } else {
@@ -534,7 +858,7 @@ impl Parser {
                     // Text interleaved with an open chunked kitty stream
                     // counts toward its stall bound (no-op when idle).
                     kitty.note_interleaved(1);
-                    feed_vte(state_machine, &mut bridge, vte_string, &[b]);
+                    feed_vte(state_machine, &mut bridge, control_string, reject_log, &[b]);
                     i += 1;
                 }
             }
@@ -548,29 +872,161 @@ fn begin_apc(
     apc_payload: &mut bool,
     in_apc: &mut bool,
     apc_discarding: &mut bool,
+    control_string: &mut ControlString,
 ) {
     clear_apc_header(kitty, apc_buf);
     *apc_payload = false;
     *in_apc = true;
     *apc_discarding = false;
+    control_string.begin_apc();
 }
 
-/// Feeds bytes to `vte` and keeps [`VteString`] in step with them.
+/// Feeds bytes to `vte`, keeps [`ControlString`] in step with them, and
+/// enforces [`CONTROL_STRING_MAX_BYTES`] (CTX-1592).
 ///
 /// Every byte the parser hands to `vte` must go through here (or the state
 /// tracker diverges and a later diversion stops closing a string `vte` still
 /// owns). Feeding the same bytes one call at a time is equivalent to feeding
-/// them in one call: `vte` carries its state across calls.
+/// them in one call: `vte` and the tracker carry state across calls.
+///
+/// The cap is a byte count, so overflow lands at the same offset however the
+/// stream is chunked. On overflow the bytes forwarded so far are flushed, a
+/// `CAN` is injected (which makes `vte` dispatch/abort the string and clear
+/// its collector), and the rest of the string is swallowed until the byte
+/// that would have ended it on the wire — except `ESC`, which is forwarded
+/// so the sequence after the string parses normally.
 fn feed_vte<F: FnMut(TerminalAction)>(
     state_machine: &mut vte::Parser,
     bridge: &mut Bridge<'_, F>,
-    vte_string: &mut VteString,
+    control_string: &mut ControlString,
+    reject_log: &mut RejectLog,
     bytes: &[u8],
 ) {
-    for &byte in bytes {
-        *vte_string = vte_string.after(byte);
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(family) = control_string.discard {
+            match family.discard_ends_at(control_string.kind, byte) {
+                Some(forward) => {
+                    control_string.discard = None;
+                    if forward {
+                        // `ESC` ends the string and opens what follows it.
+                        control_string.state = control_string.state.after(byte);
+                        start = i;
+                        i += 1;
+                    } else {
+                        i += 1;
+                        start = i;
+                    }
+                }
+                None => {
+                    i += 1;
+                    start = i;
+                }
+            }
+            continue;
+        }
+        let previous = control_string.state;
+        // `advance_dcs_passthrough` ends a DCS at C1 `ST` (`0x9C`) as well
+        // as at CAN/SUB/ESC, but a SOS/PM string ignores `0x9C`. The
+        // collapsed `Other` state cannot tell them apart, so the family
+        // recorded at the introducer decides (CTX-1592).
+        if previous == VteString::Other
+            && byte == 0x9C
+            && matches!(control_string.kind, ControlStringKind::Dcs)
+        {
+            control_string.state = VteString::Ground;
+            control_string.bytes = 0;
+            i += 1;
+            continue;
+        }
+        let next = previous.after(byte);
+        if next.is_string() && !previous.is_string() {
+            control_string.kind = kind_of_introducer(byte);
+            control_string.bytes = 0;
+        } else if next.is_string() {
+            if control_string.bytes == CONTROL_STRING_MAX_BYTES {
+                // Flush what `vte` has not seen yet, then abort the string
+                // with `CAN`: `vte` runs its dispatch/unhook/hook-end path
+                // and clears the collected body. The refused byte and the
+                // rest of the string never reach it.
+                state_machine.advance(bridge, &bytes[start..i]);
+                state_machine.advance(bridge, &[CAN]);
+                let kind = control_string.kind;
+                control_string.state = previous.after(CAN);
+                control_string.bytes = 0;
+                control_string.discard = Some(next);
+                emit_control_string_refusal(bridge, reject_log, kind);
+                start = i + 1;
+                i += 1;
+                continue;
+            }
+            control_string.bytes += 1;
+        } else if previous.is_string() {
+            // The terminator itself is not retained; the next string starts
+            // from zero.
+            control_string.bytes = 0;
+        }
+        control_string.state = next;
+        i += 1;
     }
-    state_machine.advance(bridge, bytes);
+    state_machine.advance(bridge, &bytes[start..]);
+}
+
+/// Family of a control string from the byte that opens it in `vte`'s
+/// `advance_esc` arm.
+const fn kind_of_introducer(byte: u8) -> ControlStringKind {
+    match byte {
+        b'P' => ControlStringKind::Dcs,
+        b'X' => ControlStringKind::Sos,
+        b'^' => ControlStringKind::Pm,
+        b'_' => ControlStringKind::Apc,
+        // `]` (the only remaining introducer) opens an OSC.
+        _ => ControlStringKind::Osc,
+    }
+}
+
+/// Emits one counted control-string refusal and its rate-limited diagnostic.
+fn emit_control_string_refusal<F: FnMut(TerminalAction)>(
+    bridge: &mut Bridge<'_, F>,
+    reject_log: &mut RejectLog,
+    kind: ControlStringKind,
+) {
+    if let Some(occurrence) = reject_log.record() {
+        warn_rejection(
+            occurrence,
+            &format!(
+                "bitty: rejecting {kind} control string ({}): stored nothing",
+                ControlStringReject::Overflow.label()
+            ),
+        );
+    }
+    bridge.emit(TerminalAction::ControlStringRejected {
+        kind,
+        reason: ControlStringReject::Overflow,
+    });
+}
+
+/// Aborts an open parser-handled `APC` that crossed the cap (CTX-1592).
+///
+/// The `APC` never reaches `vte`, so there is no string to abort there: the
+/// accumulated header/payload is dropped, the tail is discarded until the
+/// real terminator, and one refusal is counted. `in_apc` stays set so the
+/// discard path owns the remaining bytes.
+fn refuse_apc<F: FnMut(TerminalAction)>(
+    bridge: &mut Bridge<'_, F>,
+    kitty: &mut KittyApcAssembler,
+    apc_buf: &mut Vec<u8>,
+    apc_payload: &mut bool,
+    apc_discarding: &mut bool,
+    reject_log: &mut RejectLog,
+) {
+    clear_apc_header(kitty, apc_buf);
+    kitty.abort();
+    *apc_payload = false;
+    *apc_discarding = true;
+    emit_control_string_refusal(bridge, reject_log, ControlStringKind::Apc);
 }
 
 /// Closes whatever `vte` still holds before an `ESC ]` is diverted away from
@@ -584,10 +1040,11 @@ fn feed_vte<F: FnMut(TerminalAction)>(
 fn close_vte_string<F: FnMut(TerminalAction)>(
     state_machine: &mut vte::Parser,
     bridge: &mut Bridge<'_, F>,
-    vte_string: &mut VteString,
+    control_string: &mut ControlString,
+    reject_log: &mut RejectLog,
 ) {
-    if vte_string.needs_close() {
-        feed_vte(state_machine, bridge, vte_string, b"\x1b\\");
+    if control_string.needs_close() {
+        feed_vte(state_machine, bridge, control_string, reject_log, b"\x1b\\");
     }
 }
 
@@ -603,7 +1060,9 @@ fn terminate_apc<F: FnMut(TerminalAction)>(
     apc_payload: &mut bool,
     in_apc: &mut bool,
     apc_discarding: &mut bool,
+    control_string: &mut ControlString,
 ) {
+    control_string.end_apc();
     if *apc_discarding {
         *in_apc = false;
         *apc_discarding = false;

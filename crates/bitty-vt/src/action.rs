@@ -832,6 +832,69 @@ pub enum PointerShapeOp {
 /// payload bounded; longer pushes fail closed as inert.
 pub const MAX_OSC22_SHAPES: usize = 16;
 
+/// Kind of control string a parser-level bound aborted (CTX-1592).
+///
+/// Carried by [`TerminalAction::ControlStringRejected`] so telemetry and
+/// diagnostics can name the family without keeping the refused bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ControlStringKind {
+    /// Operating system command (`ESC ]`).
+    Osc,
+    /// Device control string (`ESC P`).
+    Dcs,
+    /// Start of string (`ESC X`).
+    Sos,
+    /// Privacy message (`ESC ^`).
+    Pm,
+    /// Application program command (`ESC _`, the kitty graphics envelope).
+    Apc,
+}
+
+impl ControlStringKind {
+    /// Stable short label used in diagnostics and telemetry.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Osc => "OSC",
+            Self::Dcs => "DCS",
+            Self::Sos => "SOS",
+            Self::Pm => "PM",
+            Self::Apc => "APC",
+        }
+    }
+}
+
+impl std::fmt::Display for ControlStringKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Why a control string was refused before dispatch (CTX-1592).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ControlStringReject {
+    /// One string exceeded the parser-wide control-string byte cap
+    /// ([`crate::CONTROL_STRING_MAX_BYTES`]). The accumulated body was
+    /// dropped; only a bounded prefix ever reached the dispatcher.
+    Overflow,
+}
+
+impl ControlStringReject {
+    /// Stable reason label used in diagnostics and telemetry.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Overflow => "control string exceeds parser budget",
+        }
+    }
+}
+
+impl std::fmt::Display for ControlStringReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
 /// Kind of sequence reported by [`TerminalAction::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SequenceKind {
@@ -1240,6 +1303,18 @@ pub enum TerminalAction {
     Iterm2ImageRejected {
         /// Why the request was refused.
         reason: Iterm2Reject,
+    },
+    /// A control string refused by the parser-wide byte cap (CTX-1592).
+    ///
+    /// Semantically inert and carried for telemetry only: the parser already
+    /// dropped the body (or aborted the parser-handled `APC`), so this
+    /// variant never stores, places, or paints anything. Terminal state counts
+    /// it separately from the iTerm2 refusal counter.
+    ControlStringRejected {
+        /// Family of the aborted string.
+        kind: ControlStringKind,
+        /// Why it was refused.
+        reason: ControlStringReject,
     },
 
     // Unknown escape families

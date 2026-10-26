@@ -2764,3 +2764,46 @@ fn iterm2_inline_image_is_inert_and_refusals_are_counted() {
     assert_eq!(s.telemetry().iterm2_refused, 4);
     assert!(s.check_invariants().is_ok());
 }
+
+#[test]
+fn control_string_refusals_are_counted_separately() {
+    // CTX-1592: an over-cap control string is dropped by the parser before
+    // dispatch. Terminal state only counts it, with no grid, cursor, or
+    // damage change, and the counters stay distinct.
+    let mut s = State::new();
+    prints(&mut s, "x");
+    let cursor_before = s.cursor().position;
+    let (row, col) = (cursor_before.row, cursor_before.col);
+    for kind in [
+        bitty_vt::ControlStringKind::Osc,
+        bitty_vt::ControlStringKind::Dcs,
+        bitty_vt::ControlStringKind::Sos,
+        bitty_vt::ControlStringKind::Pm,
+        bitty_vt::ControlStringKind::Apc,
+    ] {
+        let damage = s.apply(&TerminalAction::ControlStringRejected {
+            kind,
+            reason: bitty_vt::ControlStringReject::Overflow,
+        });
+        assert!(
+            damage.regions.is_empty(),
+            "control-string refusals never damage the grid"
+        );
+    }
+    assert_eq!(s.telemetry().control_string_refused, 5);
+    assert_eq!(
+        s.telemetry().iterm2_refused,
+        0,
+        "iTerm2 refusals stay a separate counter"
+    );
+    assert_eq!(
+        s.telemetry().unknown_osc,
+        0,
+        "a refused string is not an unmapped-OSC report"
+    );
+    assert_eq!(
+        (s.cursor().position.row, s.cursor().position.col),
+        (row, col)
+    );
+    assert!(s.check_invariants().is_ok());
+}

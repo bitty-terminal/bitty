@@ -1160,6 +1160,7 @@ mod tests {
 
     #[test]
     fn automation_grant_mints_session_bound_bearer() {
+        let _automation = crate::test_globals::automation_guard();
         bitty_ipc::devtools::clear_automation_for_tests();
         let authority = test_authority();
         let grant = open_test_session(&authority);
@@ -1191,6 +1192,7 @@ mod tests {
 
     #[test]
     fn automation_grant_rejects_bad_terminal() {
+        let _automation = crate::test_globals::automation_guard();
         bitty_ipc::devtools::clear_automation_for_tests();
         let authority = test_authority();
         let grant = open_test_session(&authority);
@@ -1285,6 +1287,7 @@ mod tests {
 
     #[test]
     fn revoke_session_ends_authorization_and_tracked_bearers() {
+        let _automation = crate::test_globals::automation_guard();
         bitty_ipc::devtools::clear_automation_for_tests();
         let authority = test_authority();
         let grant = open_test_session(&authority);
@@ -1416,6 +1419,7 @@ mod tests {
 
     #[test]
     fn grant_handler_mints_family_bearer_on_exact_phrase() {
+        let _automation = crate::test_globals::automation_guard();
         bitty_ipc::devtools::clear_automation_for_tests();
         let server = test_server();
         let authority = test_authority();

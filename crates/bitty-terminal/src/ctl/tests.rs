@@ -3360,6 +3360,8 @@ fn wm_automation_surface_tracks_split_layout() {
     };
 
     let _guard = hold_wm_lock();
+    // The automation registry is process-global; consent tests touch it too.
+    let _automation = crate::test_globals::automation_guard();
     clear_introspection_for_tests();
     clear_automation_for_tests();
     publish_grid_text(

@@ -81,14 +81,17 @@
 //! path.
 //!
 //! Font discovery is cached for the shaped stack in
-//! `$XDG_CACHE_HOME/bitty/font-index-v1` (see `font_index`; the upstream
+//! `$XDG_CACHE_HOME/bitty/font-index-v2` (see `font_index`; the upstream
 //! `fontdb` scan remains the fallback): a cold process walks the font
 //! directories once and reads only the `name`/`OS/2`/`post` tables of each
 //! face in parallel, then writes a versioned index atomically; every start
 //! runs discovery again and reconciles the cache against the current path
 //! set (new/removed/changed fonts, fontconfig changes, foreign entries),
 //! reparsing only changed/new paths before building a metadata-only `fontdb`
-//! database. Face bytes still load lazily
+//! database. The index reads no face bytes; the runtime's
+//! `GridRenderer::new` still loads the primary face at startup to build its
+//! glyph cache. The v2 cache carries an FNV-1a content hash over its
+//! generic/face lines, so valid-line corruption is rejected and rebuilt. Face bytes still load lazily
 //! for the faces a frame needs, and missing-glyph fallback loads a covering
 //! face on demand. `BITTY_FONT_INDEX=0` restores the upstream full scan for
 //! diagnosis. A stale, corrupt, or unwritable cache never fails startup.

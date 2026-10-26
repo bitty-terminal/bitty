@@ -5,7 +5,7 @@
 //! pass parses every face on every process launch (hundreds of milliseconds
 //! on a font-rich seat), which blows the accepted PB-1 startup budget
 //! (`p50 <= 100 ms`). This module keeps the parsed face metadata in a small
-//! persistent index under `$XDG_CACHE_HOME/bitty/font-index-v1` and
+//! persistent index under `$XDG_CACHE_HOME/bitty/font-index-v2` and
 //! reconciles it against a fresh discovery pass on every start.
 //!
 //! # Design
@@ -19,19 +19,21 @@
 //!   atomically (unique temp file + `rename`). The cold build is a one-time
 //!   cost; the next process reads the index in a few milliseconds.
 //! - **Warm start:** discover the current path set + stats, read the
-//!   versioned index (`v1`), keep only cached faces discovery still produces
+//!   versioned index (`v2`, with a content hash), keep only cached faces discovery still produces
 //!   with an unchanged stat, reparse changed/new paths (and drop foreign,
 //!   missing, or stale entries), take generic aliases from the fresh
 //!   discovery, and build a metadata-only [`fontdb::Database`]. Face bytes
-//!   are not read at startup; [`super::shaped::SwashSingle`] loads only the
-//!   faces the first frames need and keeps dynamic (missing-glyph) fallback
-//!   on demand.
+//!   are not read by the index at startup. The runtime still loads the
+//!   primary face to construct its grid renderer; [`super::shaped::SwashSingle`]
+//!   loads only the faces the first frames need and keeps dynamic
+//!   (missing-glyph) fallback on demand.
 //! - **Correctness:** entries carry path, face index, family names, style,
 //!   weight, stretch, monospace flag, and the file size/mtime they were
-//!   parsed from. Selection metadata is byte-compatible with fontdb's own
-//!   `FaceInfo` (the query only reads the family name string, style, weight,
-//!   stretch, and monospace flag), so a query over the index resolves the
-//!   same face as a full scan. A corrupt/truncated/version-mismatched index
+//!   parsed from. Selection metadata is **query-compatible** with fontdb's
+//!   own `FaceInfo` for the fields queries read (family name strings, style,
+//!   weight, stretch, monospace); it is not byte-identical: PostScript names
+//!   and MacRoman-only/localized family entries are reduced, and duplicate
+//!   family names are dropped. A corrupt/truncated/version-mismatched index
 //!   is discarded and rebuilt; a single changed font only reparses that file.
 //! - **Concurrency:** builds run in-process only; writers use a unique temp
 //!   file plus an atomic rename, so a reader sees either the previous or the
@@ -48,9 +50,13 @@
 //! (so a foreign or `/etc/passwd` entry can never reach the shaper). Newly
 //! installed and remove/re-added fonts appear on the next start; changed
 //! files are detected by size + mtime, the same staleness rule the cache
-//! format records. The cache file is treated as untrusted input: version,
-//! end marker/count, line caps, field caps, and a bounded read all gate it,
-//! and any failure falls back to discovery + rebuild.
+//! format records. The cache is untrusted for **robustness**, not
+//! authenticity: the v2 version, FNV-1a content hash, end marker/count,
+//! line/field caps, and bounded read reject accidental or partial
+//! corruption (including syntactically valid line mutations), and any
+//! failure rebuilds from discovery. It is not a MAC: a same-user attacker
+//! who can rewrite both the cache and the discovered font files is outside
+//! this check.
 //!
 //! # PATCHES: `BITTY_FONT_INDEX=0`
 //!
@@ -66,7 +72,7 @@
 //! macOS/Windows. The fallback for an empty discovery result or an all-reject
 //! parse is the upstream full scan, so a cache miss never reduces coverage.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -82,10 +88,10 @@ use fontdb::{Database, FaceInfo, Family, ID, Language, Source, Stretch, Style, W
 pub(crate) const INDEX_ENV: &str = "BITTY_FONT_INDEX";
 
 /// Cache file name; the version is repeated in the header.
-const INDEX_FILE_NAME: &str = "font-index-v1";
+const INDEX_FILE_NAME: &str = "font-index-v2";
 
 /// On-disk format version.
-const INDEX_VERSION: &str = "v1";
+const INDEX_VERSION: &str = "v2";
 
 /// Refuse to read an index larger than this (hostile/truncated files).
 const MAX_INDEX_BYTES: u64 = 32 * 1024 * 1024;
@@ -95,6 +101,15 @@ const MAX_INDEX_LINE_BYTES: usize = 64 * 1024;
 
 /// Bound on retained faces (the reference host has ~1.8k).
 const MAX_INDEX_FACES: usize = 16_384;
+
+/// Space reserved for the trailing `end\t<count>\t<hash>` marker.
+const END_MARKER_RESERVE: usize = 64;
+
+/// FNV-1a 64-bit offset basis (index integrity hash).
+const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+
+/// FNV-1a 64-bit prime.
+const FNV_PRIME: u64 = 0x100000001b3;
 
 /// Reader/writer bound on one stored font path.
 const MAX_INDEX_PATH_BYTES: usize = 4096;
@@ -202,6 +217,19 @@ impl GenericFamilies {
         db.set_cursive_family(self.cursive.clone());
         db.set_fantasy_family(self.fantasy.clone());
         db.set_monospace_family(self.monospace.clone());
+    }
+
+    /// Truncates each alias to the reader/writer family cap.
+    fn sanitize(&mut self) {
+        for name in [
+            &mut self.serif,
+            &mut self.sans_serif,
+            &mut self.cursive,
+            &mut self.fantasy,
+            &mut self.monospace,
+        ] {
+            truncate_utf8(name, MAX_INDEX_FAMILY_BYTES);
+        }
     }
 
     /// Iterates `(kind, name)` pairs in a stable order.
@@ -423,6 +451,11 @@ where
             }
         }
     };
+    let generic_before = index.generic.clone();
+    index.generic.sanitize();
+    if index.generic != generic_before {
+        changed = true;
+    }
     if index.faces.is_empty() {
         // Every candidate was rejected by the metadata parser; the upstream
         // scan is the coverage backstop.
@@ -445,33 +478,40 @@ where
 /// Reconciles a cached index with the current discovery set.
 ///
 /// - Faces whose path discovery no longer produces are dropped (this is the
-///   untrusted-cache boundary: a foreign path can never survive).
+///   foreign-cache boundary: a path the host does not advertise can never
+///   survive).
 /// - Faces whose stat changed, or whose file disappeared, are dropped and
 ///   the path is reparsed (when it still exists).
 /// - Paths present in discovery but absent from the cache are parsed.
 /// - Generic aliases always come from the fresh discovery.
 fn reconcile(cached: FontIndex, discovered: &DiscoveredFonts) -> (FontIndex, usize, bool) {
     let discovered_paths: HashSet<&Path> = discovered.paths.iter().map(PathBuf::as_path).collect();
+    // Group cached faces by file so a stat mismatch drops the whole file's
+    // faces (a TTC reparses as one unit) instead of leaving a partial set.
+    let mut by_path: BTreeMap<PathBuf, Vec<IndexFace>> = BTreeMap::new();
+    for face in cached.faces {
+        by_path.entry(face.path.clone()).or_default().push(face);
+    }
     let mut faces = Vec::new();
     let mut kept_paths: HashSet<PathBuf> = HashSet::new();
     let mut changed = false;
-    for face in cached.faces {
-        if !discovered_paths.contains(face.path.as_path()) {
+    for (path, group) in by_path {
+        if !discovered_paths.contains(path.as_path()) {
             changed = true;
             continue;
         }
-        let Some(stat) = discovered.stat(&face.path) else {
+        let Some(stat) = discovered.stat(&path) else {
             // Discovered but unreadable/missing right now: drop the stale
             // entry; the next start reparses it once the file is back.
             changed = true;
             continue;
         };
-        if !stat.matches(&face) {
+        if !group.iter().all(|face| stat.matches(face)) {
             changed = true;
             continue;
         }
-        kept_paths.insert(face.path.clone());
-        faces.push(face);
+        kept_paths.insert(path);
+        faces.extend(group);
     }
     let parse_paths: Vec<PathBuf> = discovered
         .paths
@@ -480,18 +520,16 @@ fn reconcile(cached: FontIndex, discovered: &DiscoveredFonts) -> (FontIndex, usi
         .cloned()
         .collect();
     let (new_faces, parsed_paths) = build_index_counted(&parse_paths, &discovered.stats);
-    if parsed_paths > 0 {
-        changed = true;
-    }
     if !new_faces.is_empty() {
+        changed = true;
         faces.extend(new_faces);
-        // Cached faces came from a validated (sorted) index and new faces
-        // from `build_index_counted`; merge them in deterministic order.
-        sort_and_dedup(&mut faces);
     }
     if cached.generic != discovered.generic {
         changed = true;
     }
+    // Path order from the BTreeMap and face order from the validated index
+    // are already deterministic; sort/dedup defensively after appends.
+    sort_and_dedup(&mut faces);
     (
         FontIndex {
             faces,
@@ -508,6 +546,13 @@ fn reconcile(cached: FontIndex, discovered: &DiscoveredFonts) -> (FontIndex, usi
 /// wrong version, is boundary-truncated (no `end` marker), or is malformed.
 fn read_index(path: &Path) -> Option<FontIndex> {
     use std::io::Read as _;
+    // Check regular-file status before opening: `File::open` on a FIFO blocks
+    // until a writer appears (a hanging startup). `metadata` never opens the
+    // node. The bounded read below still guards a racing/size-changing file.
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_INDEX_BYTES {
+        return None;
+    }
     let file = std::fs::File::open(path).ok()?;
     let mut text = String::new();
     // Bounded read: one byte over the limit detects an oversized file without
@@ -561,17 +606,19 @@ fn serialize_index(index: &FontIndex) -> String {
     let mut out = String::new();
     out.push_str(INDEX_VERSION);
     out.push('\n');
-    for (kind, name) in index.generic.entries() {
-        out.push_str("generic\t");
-        out.push_str(kind);
-        out.push('\t');
-        out.push_str(&escape_field(name));
+    let mut hash = FNV_OFFSET;
+    // The writer applies the same caps as the reader, including generic
+    // aliases, so a valid discovered name cannot produce a rejected line.
+    let mut generic = index.generic.clone();
+    generic.sanitize();
+    for (kind, name) in generic.entries() {
+        let line = format!("generic\t{kind}\t{}", escape_field(name));
+        out.push_str(&line);
         out.push('\n');
+        hash = fnv_line(hash, &line);
     }
     let mut face_count = 0usize;
     for face in index.faces.iter().take(MAX_INDEX_FACES) {
-        // The writer enforces the reader's caps so a valid font can never
-        // produce an index the reader always rejects.
         let mut face = face.clone();
         if !sanitize_face(&mut face) {
             continue;
@@ -580,16 +627,37 @@ fn serialize_index(index: &FontIndex) -> String {
         if line.len() > MAX_INDEX_LINE_BYTES {
             continue;
         }
+        // Keep the whole file under the reader's byte bound, reserving room
+        // for the trailing end marker. A truncated-at-the-limit index still
+        // carries a valid end marker and is accepted/read as-is.
+        let projected = out
+            .len()
+            .saturating_add(line.len())
+            .saturating_add(1)
+            .saturating_add(END_MARKER_RESERVE);
+        if projected as u64 > MAX_INDEX_BYTES {
+            break;
+        }
         out.push_str(&line);
         out.push('\n');
+        hash = fnv_line(hash, &line);
         face_count += 1;
     }
-    // Trailing end marker: a cache truncated at any line boundary (including
-    // after the last face) is rejected instead of silently losing faces.
-    out.push_str("end\t");
-    out.push_str(&face_count.to_string());
+    // Trailing end marker: count + content hash. A cache truncated at any
+    // line boundary, or mutated on a syntactically valid line, is rejected.
+    out.push_str(&format!("end\t{face_count}\t{hash}"));
     out.push('\n');
     out
+}
+
+/// FNV-1a update over one line plus its newline separator.
+fn fnv_line(mut hash: u64, line: &str) -> u64 {
+    for byte in line.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash ^= u64::from(b'\n');
+    hash.wrapping_mul(FNV_PRIME)
 }
 
 /// Serializes one already-sanitized face line (no trailing newline).
@@ -672,10 +740,9 @@ fn truncate_utf8(value: &mut String, max: usize) {
 
 /// Parses the versioned line format.
 ///
-/// Strict on v1: any malformed line rejects the whole file so the caller
-/// rebuilds from discovery rather than trusting a partially corrupted cache.
-/// The trailing `end` marker makes boundary truncation detectable even when
-/// every remaining line is syntactically complete.
+/// Strict on v2: any malformed line, missing end marker, count mismatch, or
+/// content-hash mismatch rejects the whole file so the caller rebuilds from
+/// discovery rather than trusting a partially corrupted cache.
 fn parse_index(text: &str) -> Option<FontIndex> {
     let mut lines = text.lines();
     if lines.next()? != INDEX_VERSION {
@@ -684,6 +751,7 @@ fn parse_index(text: &str) -> Option<FontIndex> {
     let mut generic = GenericFamilies::default();
     let mut faces = Vec::new();
     let mut ended = false;
+    let mut hash = FNV_OFFSET;
     for line in lines {
         if line.is_empty() || ended {
             return None;
@@ -696,7 +764,7 @@ fn parse_index(text: &str) -> Option<FontIndex> {
             "generic" => {
                 let kind = fields.next()?;
                 let name = unescape_field(fields.next()?)?;
-                if fields.next().is_some() {
+                if fields.next().is_some() || name.len() > MAX_INDEX_FAMILY_BYTES {
                     return None;
                 }
                 match kind {
@@ -716,13 +784,20 @@ fn parse_index(text: &str) -> Option<FontIndex> {
             }
             "end" => {
                 let count = fields.next()?.parse::<usize>().ok()?;
-                if fields.next().is_some() || count != faces.len() || count > MAX_INDEX_FACES {
+                let expected = fields.next()?.parse::<u64>().ok()?;
+                if fields.next().is_some()
+                    || count != faces.len()
+                    || count > MAX_INDEX_FACES
+                    || expected != hash
+                {
                     return None;
                 }
                 ended = true;
+                continue;
             }
             _ => return None,
         }
+        hash = fnv_line(hash, line);
     }
     if !ended {
         return None;
@@ -1697,8 +1772,8 @@ mod tests {
             },
         };
         let text = serialize_index(&index);
-        assert!(text.starts_with("v1\n"));
-        assert!(text.contains("end\t1\n"), "end marker: {text}");
+        assert!(text.starts_with("v2\n"));
+        assert!(text.contains("end\t1\t"), "end marker: {text}");
         let parsed = parse_index(&text).expect("round trip");
         assert_eq!(parsed, index);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1760,6 +1835,10 @@ mod tests {
     #[test]
     fn corrupt_or_version_mismatched_index_is_rejected() {
         assert!(parse_index("garbage\n").is_none());
+        assert!(
+            parse_index("v1\nend\t0\t0\n").is_none(),
+            "old format rejects"
+        );
         assert!(parse_index("v2\n").is_none());
         let good = serialize_index(&FontIndex {
             faces: Vec::new(),
@@ -1767,15 +1846,15 @@ mod tests {
         });
         assert!(parse_index(&good).is_some());
         assert!(
-            parse_index("v1\nface\tbroken\n").is_none(),
+            parse_index("v2\nface\tbroken\n").is_none(),
             "truncated face line must reject the cache"
         );
         assert!(
-            parse_index("v1\nend\t1\n").is_none(),
+            parse_index("v2\nend\t1\t0\n").is_none(),
             "end count must match the face count"
         );
         assert!(
-            parse_index("v1\nend\t0\nextra\n").is_none(),
+            parse_index("v2\nend\t0\t0\nextra\n").is_none(),
             "lines after the end marker must reject the cache"
         );
     }
@@ -2129,7 +2208,7 @@ mod tests {
         assert_eq!(outcome.index.faces.len(), 1);
         assert_eq!(outcome.parsed_paths, 1);
         let text = std::fs::read_to_string(root.join(INDEX_FILE_NAME)).expect("rewritten");
-        assert!(text.ends_with("end\t1\n"));
+        assert!(text.contains("end\t1\t"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2190,8 +2269,8 @@ mod tests {
         assert_eq!(outcome.index.faces.len(), 1);
         assert_eq!(outcome.parsed_paths, 1);
         let text = std::fs::read_to_string(root.join(INDEX_FILE_NAME)).expect("rewritten index");
-        assert!(text.starts_with("v1\n"));
-        assert!(text.ends_with("end\t1\n"));
+        assert!(text.starts_with("v2\n"));
+        assert!(text.contains("end\t1\t"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2340,6 +2419,201 @@ mod tests {
                 .expect("config b parses");
         assert_eq!(dirs_b, vec![fonts_b]);
         assert_eq!(generic_b.monospace, "Second Mono");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn mutate_first_face_field(text: &str, field: usize, value: &str) -> String {
+        let mut out = String::new();
+        let mut changed = false;
+        for line in text.lines() {
+            if !changed && line.starts_with("face\t") {
+                let mut fields: Vec<&str> = line.split('\t').collect();
+                if field < fields.len() {
+                    fields[field] = value;
+                    out.push_str(&fields.join("\t"));
+                    out.push('\n');
+                    changed = true;
+                    continue;
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        assert!(changed, "test mutation must find a face line");
+        out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_cache_path_is_rejected_without_blocking() {
+        use std::process::Command;
+        let dir = temp_dir("fifo");
+        let path = dir.join(INDEX_FILE_NAME);
+        let status = Command::new("mkfifo").arg(&path).status();
+        if !matches!(status, Ok(status) if status.success()) {
+            eprintln!("skipped: mkfifo unavailable");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        // A metadata check must reject the FIFO before `File::open` blocks.
+        assert!(read_index(&path).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_face_discovered_file_does_not_rewrite_the_warm_index() {
+        let dir = temp_dir("junk");
+        let good = write_font(&dir, "good.ttf");
+        // AppleDouble/resource-fork style junk with a font extension: it is
+        // discovered but parses to zero faces.
+        std::fs::write(dir.join("._junk.ttf"), b"not a font").expect("junk file");
+        let root = dir.join("cache");
+        let first = load_or_build_with(&root, || scan_dir(&dir)).expect("cold build");
+        assert_eq!(face_paths(&first), vec![good.clone()]);
+        assert!(first.changed);
+        let index_path = root.join(INDEX_FILE_NAME);
+        let before = std::fs::metadata(&index_path).expect("index stat");
+        let second = load_or_build_with(&root, || scan_dir(&dir)).expect("warm read");
+        assert_eq!(second.index.faces.len(), 1);
+        assert_eq!(second.parsed_paths, 1, "junk is still parsed for reporting");
+        assert!(
+            !second.changed,
+            "zero-face files must not force a cache rewrite"
+        );
+        let after = std::fs::metadata(&index_path).expect("index stat");
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().ok(), after.modified().ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn over_cap_generic_alias_is_truncated() {
+        let dir = temp_dir("generic-cap");
+        let path = write_font(&dir, "a.ttf");
+        let index = FontIndex {
+            faces: fixture_faces(&[path]),
+            generic: GenericFamilies {
+                monospace: "x".repeat(70_000),
+                ..GenericFamilies::default()
+            },
+        };
+        let text = serialize_index(&index);
+        assert!(
+            text.lines().all(|line| line.len() <= MAX_INDEX_LINE_BYTES),
+            "generic line must stay under the reader's line cap"
+        );
+        let parsed = parse_index(&text).expect("capped generic must parse");
+        assert_eq!(parsed.generic.monospace.len(), MAX_INDEX_FAMILY_BYTES);
+        assert!(parsed.generic.monospace.bytes().all(|byte| byte == b'x'));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serialized_size_stays_under_the_read_bound() {
+        let family = |face: usize, name: usize| {
+            let prefix = format!("{face:04}-{name:02}-");
+            let mut value = prefix;
+            value.push_str(&"x".repeat(MAX_INDEX_FAMILY_BYTES - value.len()));
+            value
+        };
+        let faces: Vec<IndexFace> = (0..4_200)
+            .map(|face| IndexFace {
+                path: PathBuf::from(format!("/tmp/bitty-size-{face}.ttf")),
+                face_index: 0,
+                families: (0..MAX_INDEX_FAMILIES)
+                    .map(|name| family(face, name))
+                    .collect(),
+                post_script_name: "PS".to_string(),
+                style: 0,
+                weight: 400,
+                stretch: 5,
+                monospaced: true,
+                file_size: 1,
+                mtime_secs: 0,
+                mtime_nanos: 0,
+            })
+            .collect();
+        let text = serialize_index(&FontIndex {
+            faces,
+            generic: GenericFamilies::default(),
+        });
+        assert!(
+            text.len() as u64 <= MAX_INDEX_BYTES,
+            "writer must stop before the reader's byte bound"
+        );
+        assert!(text.starts_with("v2\n"));
+        let parsed = parse_index(&text).expect("bounded index must parse");
+        assert!(!parsed.faces.is_empty());
+        assert!(
+            parsed.faces.len() < 4_200,
+            "the size cap must truncate the face set"
+        );
+    }
+
+    #[test]
+    fn valid_line_mutation_is_rejected_by_the_hash() {
+        let dir = temp_dir("mutation");
+        let path = write_font(&dir, "a.ttf");
+        let index = FontIndex {
+            faces: fixture_faces(std::slice::from_ref(&path)),
+            generic: GenericFamilies::default(),
+        };
+        let text = serialize_index(&index);
+        let mutated = mutate_first_face_field(&text, 10, "Hacked Family");
+        assert!(
+            parse_index(&mutated).is_none(),
+            "a syntactically valid family mutation must fail the content hash"
+        );
+        let root = dir.join("cache");
+        std::fs::create_dir_all(&root).expect("cache dir");
+        std::fs::write(root.join(INDEX_FILE_NAME), &mutated).expect("mutated cache");
+        let outcome =
+            load_or_build_with(&root, || discovered(vec![path])).expect("mutated cache rebuilds");
+        assert_eq!(outcome.index.faces.len(), 1);
+        assert_eq!(outcome.index.faces[0].families[0], "Bitty Index Test");
+        assert_eq!(outcome.parsed_paths, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ttc_face_mutation_reparses_the_whole_collection() {
+        let host = discover_system_fonts();
+        let Some(ttc) = host.paths.iter().find(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("ttc"))
+        }) else {
+            eprintln!("skipped: no TrueType collection on this host");
+            return;
+        };
+        let faces = build_index(std::slice::from_ref(ttc));
+        if faces.len() < 2 {
+            eprintln!("skipped: collection has fewer than two parsable faces");
+            return;
+        }
+        let original_count = faces.len();
+        let text = serialize_index(&FontIndex {
+            faces,
+            generic: GenericFamilies::default(),
+        });
+        // Mutate one face's mtime on a syntactically valid line.
+        let mutated = mutate_first_face_field(&text, 4, "0");
+        assert!(
+            parse_index(&mutated).is_none(),
+            "hash must reject the mutation"
+        );
+        let dir = temp_dir("ttc-mutation");
+        let root = dir.join("cache");
+        std::fs::create_dir_all(&root).expect("cache dir");
+        std::fs::write(root.join(INDEX_FILE_NAME), &mutated).expect("mutated cache");
+        let outcome = load_or_build_with(&root, || discovered(vec![ttc.clone()]))
+            .expect("TTC cache rebuilds");
+        assert_eq!(
+            outcome.index.faces.len(),
+            original_count,
+            "a rejected TTC cache must reparse every face, not lose one"
+        );
+        assert_eq!(outcome.parsed_paths, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

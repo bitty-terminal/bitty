@@ -36,13 +36,15 @@ observable in startup logs, the verbose tick line, and `bitty doctor`'s
 ## Font discovery (CTX-1607)
 
 The shaped stack keeps a versioned face index at
-`$XDG_CACHE_HOME/bitty/font-index-v1`. A cold process discovers the font
+`$XDG_CACHE_HOME/bitty/font-index-v2`. A cold process discovers the font
 files once and parses only each face's `name`/`OS/2`/`post` tables in
 bounded parallel workers, then writes the index atomically. Every start
 runs discovery again and reconciles the cache: new/removed/changed fonts and
 fontconfig changes are picked up, foreign/missing entries are dropped, and
-only changed/new paths are reparsed. Faces load lazily, so startup reads no
-font outlines. The index is ignored (and the upstream full scan runs) when
+only changed/new paths are reparsed. The index reads no face bytes; the
+runtime still loads the primary face at startup to build its grid renderer,
+and other faces load lazily. The v2 index carries a content hash so a
+syntactically valid line mutation is rejected and rebuilt. The index is ignored (and the upstream full scan runs) when
 `BITTY_FONT_INDEX=0` is set, when the cache root is unavailable, or when a
 corrupt/truncated/version-mismatched index must be rebuilt.
 

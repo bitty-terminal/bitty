@@ -77,6 +77,7 @@ What each script installs:
 - **Fedora / EPEL (Copr)**: `sudo dnf copr enable -y xuepoo/bitty-terminal && sudo dnf install -y bitty`; see `packaging/fedora.md`.
 - **Nix / NixOS (Flake & Cachix)**: `nix run github:bitty-terminal/bitty` with binary cache `https://bitty.cachix.org`; see `packaging/nix.md`.
 - **AppImage (Universal Portable Linux)**: download `bitty-<target>.AppImage`, `chmod +x`, and execute; see `packaging/appimage.md`.
+- **Flatpak (Flathub)**: manifest in `packaging/flathub/run.bitty.Bitty.yaml`; not submitted to Flathub yet (owner action), so install with `flatpak-builder --user --install --force-clean build run.bitty.Bitty.yaml` from a copy of that manifest; see `packaging/flathub/README.md`.
 - **Alpine**: verified via the release `verify-install` Alpine leg; see
   `packaging/alpine.md`. In-tree aports draft (not submitted to aports,
   best-effort) in `packaging/alpine/APKBUILD`.

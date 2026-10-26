@@ -2168,6 +2168,9 @@ impl Runtime {
         // (effective `terminal.cursor_style`) so new panes start on it and
         // app `DECSCUSR 0` resets resolve back to it.
         runtime.state.set_default_cursor_style(config.cursor_style);
+        // CTX-1609: seed the East Asian Ambiguous width policy for every
+        // later print on this terminal.
+        runtime.state.set_ambiguous_width(config.ambiguous_width);
         runtime.init_workspaces();
         runtime.reload_backgrounds()?;
         Ok(runtime)
@@ -2455,6 +2458,9 @@ impl Runtime {
         // (effective `terminal.cursor_style`) so new panes start on it and
         // app `DECSCUSR 0` resets resolve back to it.
         runtime.state.set_default_cursor_style(config.cursor_style);
+        // CTX-1609: seed the East Asian Ambiguous width policy for every
+        // later print on this terminal.
+        runtime.state.set_ambiguous_width(config.ambiguous_width);
         runtime.init_workspaces();
         runtime.reload_backgrounds()?;
         Ok(runtime)

@@ -556,6 +556,9 @@ impl Runtime {
         // default cursor shape (effective `terminal.cursor_style`), like the
         // primary terminal at construction.
         state.set_default_cursor_style(self.config.cursor_style);
+        // CTX-1609: panes obey the same ambiguous-width policy as the
+        // primary terminal.
+        state.set_ambiguous_width(self.config.ambiguous_width);
         state.resize(cols as usize, rows as usize);
         let old_session = self.pane_sessions.remove(&view);
         let old_handle = old_session.and_then(|mut old| {

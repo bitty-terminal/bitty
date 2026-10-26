@@ -2488,6 +2488,9 @@ pub const DEFAULT_CURSOR_STYLE: CursorStyle = CursorStyle::Default;
 /// Default `terminal.bell` (CTX-0756, issue #1359): `visual`.
 pub const DEFAULT_BELL_MODE: BellMode = BellMode::Visual;
 
+/// Default `terminal.ambiguous_width` (CTX-1609): `narrow`.
+pub const DEFAULT_AMBIGUOUS_WIDTH: AmbiguousWidth = AmbiguousWidth::Narrow;
+
 /// Default cursor rendering shape (CTX-0756, issue #1359
 /// `terminal.cursor_style`).
 ///
@@ -2637,6 +2640,64 @@ impl std::fmt::Display for BellMode {
     }
 }
 
+/// East Asian Ambiguous (`A`) cell-width policy (CTX-1609
+/// `terminal.ambiguous_width`; UAX #11).
+///
+/// Mirrors `bitty_term_state::AmbiguousWidth` by value (`bitty-config` owns
+/// no workspace-crate dependency; `bitty-terminal` maps the effective value
+/// across at startup and the two defaults must stay equal). Ambiguous scalars
+/// (Greek and Cyrillic letters, CJK-adjacent punctuation, arrows, math
+/// symbols, box drawing) render wide in East Asian legacy contexts:
+/// `narrow` (default) charges one cell, `wide` charges two. Changing the
+/// policy never re-measures cells already on the grid, so it is
+/// restart-required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AmbiguousWidth {
+    /// Ambiguous scalars occupy one cell (default).
+    #[default]
+    Narrow,
+    /// Ambiguous scalars occupy two cells (East Asian legacy context).
+    Wide,
+}
+
+impl AmbiguousWidth {
+    /// Parses a config string (exact lowercase; fail-closed).
+    ///
+    /// Returns `None` for anything but `"narrow"` and `"wide"`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "narrow" => Some(Self::Narrow),
+            "wide" => Some(Self::Wide),
+            _ => None,
+        }
+    }
+
+    /// Validate a parsed value (total: the type can only hold accepted
+    /// variants; the exhaustive match keeps coverage explicit so a future
+    /// variant forces a review of the runtime mapping).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        match self {
+            Self::Narrow | Self::Wide => Ok(()),
+        }
+    }
+
+    /// Canonical config spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Narrow => "narrow",
+            Self::Wide => "wide",
+        }
+    }
+}
+
+impl std::fmt::Display for AmbiguousWidth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Terminal behavior configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalConfig {
@@ -2662,6 +2723,11 @@ pub struct TerminalConfig {
     /// default `visual`). `audible`/`both` count without sounding until the
     /// owner-pending OS primitive lands (OQ-076, CTX-0754/#1361).
     pub bell: BellMode,
+    /// East Asian Ambiguous width policy (CTX-1609
+    /// `terminal.ambiguous_width`; default `narrow`). Seeded into terminal
+    /// state at creation; restart-required because it never re-measures
+    /// already committed cells.
+    pub ambiguous_width: AmbiguousWidth,
 }
 
 impl Default for TerminalConfig {
@@ -2674,6 +2740,7 @@ impl Default for TerminalConfig {
             page_scroll_percent: DEFAULT_PAGE_SCROLL_PERCENT,
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell: DEFAULT_BELL_MODE,
+            ambiguous_width: DEFAULT_AMBIGUOUS_WIDTH,
         }
     }
 }
@@ -2714,6 +2781,9 @@ impl TerminalConfig {
         self.bell
             .validate()
             .map_err(|e| ConfigError::validation("terminal.bell", e.to_string()))?;
+        self.ambiguous_width
+            .validate()
+            .map_err(|e| ConfigError::validation("terminal.ambiguous_width", e.to_string()))?;
         if let Some(s) = &self.shell {
             let t = s.trim();
             if t.is_empty() {
@@ -5418,6 +5488,40 @@ mod tests {
         EffectiveConfig::default()
             .validate()
             .expect("default effective valid");
+    }
+
+    #[test]
+    fn ambiguous_width_parses_round_trips_and_defaults_narrow() {
+        // CTX-1609: only the two lowercase policy spellings are accepted;
+        // the default is narrow under both the constant and the effective
+        // config, and an unknown value fails closed with the field path.
+        assert_eq!(DEFAULT_AMBIGUOUS_WIDTH, AmbiguousWidth::Narrow);
+        assert_eq!(AmbiguousWidth::default(), AmbiguousWidth::Narrow);
+        assert_eq!(
+            EffectiveConfig::default().terminal.ambiguous_width,
+            AmbiguousWidth::Narrow
+        );
+        for (raw, expected) in [
+            ("narrow", AmbiguousWidth::Narrow),
+            ("wide", AmbiguousWidth::Wide),
+        ] {
+            let parsed = AmbiguousWidth::parse(raw).expect("accepted spelling");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.as_str(), raw);
+            assert_eq!(parsed.to_string(), raw);
+            parsed.validate().expect("parsed value valid");
+        }
+        for bad in ["", "Narrow", "WIDE", "cjk", "2", "narrow "] {
+            assert!(
+                AmbiguousWidth::parse(bad).is_none(),
+                "ambiguous_width rejects {bad:?}"
+            );
+        }
+        let wide = TerminalConfig {
+            ambiguous_width: AmbiguousWidth::Wide,
+            ..Default::default()
+        };
+        wide.validate().expect("wide policy valid");
     }
 
     #[test]

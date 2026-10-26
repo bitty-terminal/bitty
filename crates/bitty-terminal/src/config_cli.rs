@@ -1552,6 +1552,14 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 println!(
                     "{}",
                     check_row(
+                        "terminal.ambiguous_width",
+                        e.terminal.ambiguous_width.as_str().to_string(),
+                        &src("terminal.ambiguous_width")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
                         "selection.auto_copy",
                         format!("{}", e.selection.auto_copy),
                         &src("selection.auto_copy")
@@ -2342,6 +2350,10 @@ fn config_rows(loaded: &LoadedConfig) -> (Vec<ConfigRow>, bool) {
         ConfigValue::Text(effective.terminal.bell.as_str().to_string()),
     );
     push(
+        "terminal.ambiguous_width",
+        ConfigValue::Text(effective.terminal.ambiguous_width.as_str().to_string()),
+    );
+    push(
         "terminal.page_scroll_percent",
         ConfigValue::Number(format!("{}", effective.terminal.page_scroll_percent)),
     );
@@ -3101,6 +3113,13 @@ pub(crate) fn runtime_config_from_effective_for_with_warnings(
             bitty_config::BellMode::Audible => bitty_runtime::BellMode::Audible,
             bitty_config::BellMode::Both => bitty_runtime::BellMode::Both,
             bitty_config::BellMode::Visual => bitty_runtime::BellMode::Visual,
+        };
+        // CTX-1609: the East Asian Ambiguous width policy crosses the same
+        // boundary by value; the total match fails closed to the narrow
+        // default if a future variant drifts upstream.
+        cfg.ambiguous_width = match effective.terminal.ambiguous_width {
+            bitty_config::AmbiguousWidth::Narrow => bitty_term_state::AmbiguousWidth::Narrow,
+            bitty_config::AmbiguousWidth::Wide => bitty_term_state::AmbiguousWidth::Wide,
         };
         (cfg, warnings)
     })

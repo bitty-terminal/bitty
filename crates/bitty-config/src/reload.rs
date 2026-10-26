@@ -150,6 +150,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `terminal.page_scroll_percent` | RestartRequired |
 /// | `terminal.cursor_style`         | RestartRequired    |
 /// | `terminal.bell`                 | RestartRequired    |
+/// | `terminal.ambiguous_width`      | RestartRequired    |
 /// | `selection.auto_copy`     | RestartRequired    |
 /// | `history.capture.transcript` | RestartRequired |
 /// | `history.capture.commands`   | RestartRequired |
@@ -303,6 +304,7 @@ pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "terminal.page_scroll_percent",
     "terminal.cursor_style",
     "terminal.bell",
+    "terminal.ambiguous_width",
     "selection.auto_copy",
     "history.capture.transcript",
     "history.capture.commands",
@@ -639,6 +641,13 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "terminal.bell",
         old.terminal.bell.as_str().to_string(),
         new.terminal.bell.as_str().to_string(),
+    );
+    // CTX-1609: the ambiguous-width policy is seeded at terminal creation and
+    // never re-measures committed cells, so changes are restart-required.
+    push_if_changed(
+        "terminal.ambiguous_width",
+        old.terminal.ambiguous_width.as_str().to_string(),
+        new.terminal.ambiguous_width.as_str().to_string(),
     );
     // CTX-0191: auto-copy is adopted at startup (RuntimeConfig is built once
     // from the effective config), so changes are restart-required, not live.

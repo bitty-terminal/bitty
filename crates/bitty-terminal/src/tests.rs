@@ -4643,6 +4643,54 @@ fn runtime_config_inherits_file_close_confirm() {
 }
 
 #[test]
+fn runtime_config_inherits_file_ambiguous_width() {
+    // CTX-1609: `terminal.ambiguous_width` flows file -> effective ->
+    // runtime with the narrow default preserved end to end.
+    assert_eq!(
+        bitty_runtime::config::DEFAULT_AMBIGUOUS_WIDTH,
+        bitty_term_state::AmbiguousWidth::Narrow
+    );
+    assert_eq!(
+        bitty_config::types::DEFAULT_AMBIGUOUS_WIDTH.as_str(),
+        "narrow"
+    );
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(
+        r#"return { terminal = { scrollback = 10000, ambiguous_width = "wide" } }"#,
+        &src,
+    )
+    .expect("ambiguous width parses");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    assert_eq!(
+        merged.effective.terminal.ambiguous_width,
+        bitty_config::AmbiguousWidth::Wide
+    );
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert_eq!(cfg.ambiguous_width, bitty_term_state::AmbiguousWidth::Wide);
+    assert_eq!(
+        merged.source_of("terminal.ambiguous_width").unwrap().layer,
+        bitty_config::plan::LayerKind::User
+    );
+    // Absent key keeps the default.
+    let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
+        .expect("minimal terminal parses");
+    let merged2 = resolve_effective(
+        Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+        None,
+    )
+    .expect("merge");
+    let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+    assert_eq!(
+        cfg2.ambiguous_width,
+        bitty_term_state::AmbiguousWidth::Narrow
+    );
+}
+
+#[test]
 fn runtime_config_inherits_file_cursor_style_and_bell() {
     // CTX-0756 (issue #1359): `terminal.cursor_style` / `terminal.bell`
     // flow file -> effective -> runtime; crate defaults stay equal

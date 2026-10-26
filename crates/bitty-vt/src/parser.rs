@@ -119,6 +119,12 @@ const CAN: u8 = 0x18;
 /// against [`CONTROL_STRING_MAX_BYTES`] (CTX-1592). An over-cap `vte` string
 /// is aborted with an injected `CAN`; an over-cap `APC` is aborted locally
 /// because it never reached `vte`.
+///
+/// A discarded `APC` also ends at `ESC`, exactly as `vte` ends an APC
+/// (`SosPmApcString` → `Escape`, without consuming the byte after it): the
+/// `ESC` is forwarded and the next byte is parsed normally, so a rejected
+/// APC followed by `ESC ]0;title` still delivers the title (CTX-1603,
+/// bitty#2712).
 pub struct Parser {
     state_machine: vte::Parser,
     dcs: PendingDcs,
@@ -340,6 +346,17 @@ struct ControlString {
     apc_bytes: usize,
     /// The open `APC` was already refused by the cap; stop charging it.
     apc_refused: bool,
+    /// Test-only cost counters backing the deterministic linear-cost
+    /// assertion in `parser::tests` (CTX-1603); absent from real builds.
+    ///
+    /// `examined` counts loop iterations in `Parser::advance` and
+    /// `feed_vte` (one per byte visit, including discarded tail bytes);
+    /// `forwarded` counts the bytes handed to `vte`, injected `CAN`
+    /// included.
+    #[cfg(test)]
+    examined: usize,
+    #[cfg(test)]
+    forwarded: usize,
 }
 
 impl Default for ControlString {
@@ -353,6 +370,10 @@ impl Default for ControlString {
             discard: None,
             apc_bytes: 0,
             apc_refused: false,
+            #[cfg(test)]
+            examined: 0,
+            #[cfg(test)]
+            forwarded: 0,
         }
     }
 }
@@ -500,6 +521,19 @@ impl ControlString {
         self.apc_refused = false;
     }
 
+    /// Records one byte visit by a parser loop (test builds only).
+    #[cfg(test)]
+    fn count_examined(&mut self) {
+        self.examined = self.examined.saturating_add(1);
+    }
+
+    /// Records `n` bytes handed to `vte`, injected `CAN` included (test
+    /// builds only).
+    #[cfg(test)]
+    fn count_forwarded(&mut self, n: usize) {
+        self.forwarded = self.forwarded.saturating_add(n);
+    }
+
     /// Charges one parser-handled `APC` byte that is not accepted kitty
     /// payload; `true` means the byte crossed the cap and the caller must
     /// abort the `APC`.
@@ -611,6 +645,9 @@ impl Parser {
     /// whether the write is honoured), and the tail past the cap is dropped
     /// up to the real terminator with one
     /// [`TerminalAction::ControlStringRejected`] emitted for telemetry.
+    /// A refused `APC` drops its tail up to `BEL`/C1 `ST` or `ESC`; an
+    /// `ESC` ends the APC and is forwarded, so the sequence after it parses
+    /// normally (CTX-1603).
     pub fn advance<F>(&mut self, bytes: &[u8], emit: F)
     where
         F: FnMut(TerminalAction),
@@ -637,9 +674,26 @@ impl Parser {
                 return;
             }
             let next = bytes[0];
+            if *held_in_apc && *apc_discarding && next != b'\\' {
+                // `vte` ends an APC on `ESC` and leaves that `ESC` pending as
+                // the start of the next sequence, so a discarded APC resyncs
+                // at the held `ESC` instead of swallowing the byte after it
+                // (bitty#2712). The held `ESC` then takes the normal
+                // outside-an-APC path below (`ESC \`, `ESC ]` diversion,
+                // `ESC _`, or a forwarded `ESC`).
+                abort_apc(
+                    kitty,
+                    apc_buf,
+                    apc_payload,
+                    in_apc,
+                    apc_discarding,
+                    control_string,
+                );
+                *held_in_apc = false;
+            }
             if *held_in_apc {
                 *held_esc = false;
-                if next == b'\\' || (*apc_discarding && (next == 0x07 || next == 0x9C)) {
+                if next == b'\\' {
                     i = 1;
                     terminate_apc(
                         &mut bridge,
@@ -651,12 +705,14 @@ impl Parser {
                         control_string,
                     );
                 } else if next == 0x18 || next == 0x1A {
-                    control_string.end_apc();
-                    clear_apc_header(kitty, apc_buf);
-                    *in_apc = false;
-                    *apc_payload = false;
-                    *apc_discarding = false;
-                    kitty.abort();
+                    abort_apc(
+                        kitty,
+                        apc_buf,
+                        apc_payload,
+                        in_apc,
+                        apc_discarding,
+                        control_string,
+                    );
                     feed_vte(
                         state_machine,
                         &mut bridge,
@@ -665,32 +721,15 @@ impl Parser {
                         &[next],
                     );
                     i = 1;
-                } else if *apc_discarding {
-                    // Held ESC is discarded. A following ESC is re-examined
-                    // by the main loop (it may start `ESC \`), matching the
-                    // in-buffer path; any other byte is discarded with it.
-                    if control_string.charge_apc() {
-                        refuse_apc(
-                            &mut bridge,
-                            kitty,
-                            apc_buf,
-                            apc_payload,
-                            apc_discarding,
-                            reject_log,
-                        );
-                    }
-                    if next == 0x1B {
-                        kitty.note_interleaved(1);
-                        i = 0;
-                    } else {
-                        kitty.note_interleaved(2);
-                        i = 1;
-                    }
                 } else if next == b'_' {
-                    clear_apc_header(kitty, apc_buf);
-                    *in_apc = false;
-                    *apc_payload = false;
-                    kitty.abort();
+                    abort_apc(
+                        kitty,
+                        apc_buf,
+                        apc_payload,
+                        in_apc,
+                        apc_discarding,
+                        control_string,
+                    );
                     begin_apc(
                         kitty,
                         apc_buf,
@@ -705,22 +744,28 @@ impl Parser {
                     // review MF-2): the aborting `ESC` must not hand the body
                     // to `vte`'s uncapped OSC collector. Route into the same
                     // diversion the ground path uses.
-                    control_string.end_apc();
-                    clear_apc_header(kitty, apc_buf);
-                    *in_apc = false;
-                    *apc_payload = false;
-                    kitty.abort();
+                    abort_apc(
+                        kitty,
+                        apc_buf,
+                        apc_payload,
+                        in_apc,
+                        apc_discarding,
+                        control_string,
+                    );
                     close_vte_string(state_machine, &mut bridge, control_string, reject_log);
                     kitty.note_interleaved(1);
                     control_string.begin_diversion();
                     iterm2.begin();
                     i = 1;
                 } else {
-                    control_string.end_apc();
-                    clear_apc_header(kitty, apc_buf);
-                    *in_apc = false;
-                    *apc_payload = false;
-                    kitty.abort();
+                    abort_apc(
+                        kitty,
+                        apc_buf,
+                        apc_payload,
+                        in_apc,
+                        apc_discarding,
+                        control_string,
+                    );
                     feed_vte(
                         state_machine,
                         &mut bridge,
@@ -765,6 +810,8 @@ impl Parser {
         }
 
         while i < bytes.len() {
+            #[cfg(test)]
+            control_string.count_examined();
             if iterm2.is_active() {
                 let byte = bytes[i];
                 match iterm2.push(byte) {
@@ -828,27 +875,33 @@ impl Parser {
                             control_string,
                         );
                     } else if *apc_discarding {
-                        // A discarded ESC still counts toward the stall
-                        // bound and the control-string budget, so an ESC
-                        // flood cannot evade either.
-                        if control_string.charge_apc() {
-                            refuse_apc(
-                                &mut bridge,
-                                kitty,
-                                apc_buf,
-                                apc_payload,
-                                apc_discarding,
-                                reject_log,
-                            );
-                        }
-                        kitty.note_interleaved(1);
-                        i += 1;
+                        // `vte` ends an APC on `ESC` and leaves that `ESC`
+                        // pending as the start of the next sequence, so the
+                        // discarded APC resyncs here instead of swallowing
+                        // the byte after `ESC`: a rejected APC followed by
+                        // `ESC ]0;title` still delivers the title, and
+                        // `ESC [31m` still selects attributes (bitty#2712).
+                        abort_apc(
+                            kitty,
+                            apc_buf,
+                            apc_payload,
+                            in_apc,
+                            apc_discarding,
+                            control_string,
+                        );
+                        // Do not advance: the `ESC` is re-examined outside
+                        // the APC on the next iteration, so `ESC \`, `ESC ]`,
+                        // `ESC _`, and `ESC [` all take their normal paths.
+                        continue;
                     } else {
-                        control_string.end_apc();
-                        clear_apc_header(kitty, apc_buf);
-                        *in_apc = false;
-                        *apc_payload = false;
-                        kitty.abort();
+                        abort_apc(
+                            kitty,
+                            apc_buf,
+                            apc_payload,
+                            in_apc,
+                            apc_discarding,
+                            control_string,
+                        );
                         if nxt == b'_' {
                             begin_apc(
                                 kitty,
@@ -897,12 +950,14 @@ impl Parser {
                     );
                 } else if b == 0x18 || b == 0x1A {
                     i += 1;
-                    control_string.end_apc();
-                    clear_apc_header(kitty, apc_buf);
-                    *in_apc = false;
-                    *apc_payload = false;
-                    *apc_discarding = false;
-                    kitty.abort();
+                    abort_apc(
+                        kitty,
+                        apc_buf,
+                        apc_payload,
+                        in_apc,
+                        apc_discarding,
+                        control_string,
+                    );
                     feed_vte(state_machine, &mut bridge, control_string, reject_log, &[b]);
                 } else if *apc_payload {
                     // Accepted payload bytes are charged to the kitty ledger,
@@ -1027,6 +1082,28 @@ fn begin_apc(
     control_string.begin_apc();
 }
 
+/// Abandons the open parser-handled `APC` without a terminator.
+///
+/// The parser owns every `APC`, so aborting one never involves `vte`; the
+/// header/payload is released, any pending kitty stream is dropped, and the
+/// shared budget restarts with the next string. Used by `ESC`/`CAN`/`SUB`
+/// (the bytes `vte` ends an APC on) and by the abort-and-restart paths.
+fn abort_apc(
+    kitty: &mut KittyApcAssembler,
+    apc_buf: &mut Vec<u8>,
+    apc_payload: &mut bool,
+    in_apc: &mut bool,
+    apc_discarding: &mut bool,
+    control_string: &mut ControlString,
+) {
+    control_string.end_apc();
+    clear_apc_header(kitty, apc_buf);
+    *in_apc = false;
+    *apc_payload = false;
+    *apc_discarding = false;
+    kitty.abort();
+}
+
 /// Feeds bytes to `vte`, keeps [`ControlString`] in step with them, and
 /// enforces [`CONTROL_STRING_MAX_BYTES`] (CTX-1592).
 ///
@@ -1051,6 +1128,8 @@ fn feed_vte<F: FnMut(TerminalAction)>(
     let mut start = 0;
     let mut i = 0;
     while i < bytes.len() {
+        #[cfg(test)]
+        control_string.count_examined();
         let byte = bytes[i];
         if let Some(family) = control_string.discard {
             match family.discard_ends_at(control_string.dcs_hooked, byte) {
@@ -1096,6 +1175,8 @@ fn feed_vte<F: FnMut(TerminalAction)>(
                 // rest of the string never reach it.
                 state_machine.advance(bridge, &bytes[start..i]);
                 state_machine.advance(bridge, &[CAN]);
+                #[cfg(test)]
+                control_string.count_forwarded(i - start + 1);
                 let kind = control_string.kind;
                 control_string.state = previous.after(CAN);
                 control_string.bytes = 0;
@@ -1115,6 +1196,8 @@ fn feed_vte<F: FnMut(TerminalAction)>(
         control_string.state = next;
         i += 1;
     }
+    #[cfg(test)]
+    control_string.count_forwarded(bytes.len() - start);
     state_machine.advance(bridge, &bytes[start..]);
 }
 

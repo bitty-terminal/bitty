@@ -25,7 +25,7 @@
 //!   here and stay deny-by-default (`NotFound`).
 //! - Execution: live process path, allowlist-gated. [`authorized_execution_provider`]
 //!   is the [`ExecutionService`](bitty_ipc::ExecutionService) provider that
-//!   routes through the CTX-0444 [`HostToolsAuthorizer`](super::spawn::HostToolsAuthorizer)
+//!   routes through the CTX-0444 `HostToolsAuthorizer`
 //!   (real process spawn only where a `[tools.*]` declaration exists) and
 //!   then the extracted `bitty-execution` registry (#2249: argv-direct,
 //!   closed env, owned-tree cancel, bounded output, `Unknown` reconcile). No

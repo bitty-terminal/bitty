@@ -4,13 +4,13 @@
 //! via [`LayoutNode::remove_leaf`](crate::layout::LayoutNode::remove_leaf)
 //! (the vacated slot collapses and siblings refill, exactly like the
 //! `close_view` tiling-first close) and waits in a workspace-local store,
-//! stamped [`PresentationMode::Floating`](crate::presentation::PresentationMode::Floating)
+//! stamped [`PresentationMode::Floating`]
 //! through the CW-08 gate. Untoggling re-inserts it as a fresh split via the
 //! accepted #1804 balanced placement policy
-//! ([`balanced_bisect_choice`](crate::layout::balanced_bisect_choice):
+//! ([`balanced_bisect_choice`]:
 //! largest-area live leaf, physical-aspect
-//! [`balanced_split_axis`](crate::layout::balanced_split_axis), `0.5`,
-//! after) and stamps it back to `Tiled`. The same [`ViewId`](crate::view::ViewId)
+//! [`balanced_split_axis`], `0.5`,
+//! after) and stamps it back to `Tiled`. The same [`ViewId`]
 //! is preserved across the round trip, so pane sessions stay keyed
 //! uninterrupted. Ghost outlines are structurally impossible: no slot
 //! remains while detached, so no slot chrome can paint.
@@ -258,7 +258,7 @@ impl FloatStore {
     /// `allocations` (solver order, usually
     /// `tree.layout_with_gaps(container, gaps)`): the largest-area leaf is
     /// split on its physical-aspect
-    /// [`balanced_split_axis`](crate::layout::balanced_split_axis) at
+    /// [`balanced_split_axis`] at
     /// [`FLOAT_RESTORE_RATIO`] with the restored leaf after it (right or
     /// down). `container` is the fallback axis source when `allocations`
     /// is empty. An empty tree becomes the restored leaf. A stale target

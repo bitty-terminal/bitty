@@ -23,23 +23,23 @@
 //! named constant so behavior stays deterministic and replayable, except
 //! scrollback retention, whose per-buffer capacity is chosen at construction
 //! (`State::with_scrollback_lines`) within the hard
-//! [`SCROLLBACK_MAX_LINES`](scrollback::SCROLLBACK_MAX_LINES) bound and
-//! defaulting to [`SCROLLBACK_DEFAULT_LINES`](scrollback::SCROLLBACK_DEFAULT_LINES).
+//! [`SCROLLBACK_MAX_LINES`] bound and
+//! defaulting to [`SCROLLBACK_DEFAULT_LINES`].
 //! Each cites its RFC clause:
 //!
 //! | Constant | Value | Contract |
 //! |---|---|---|
 //! | [`GRID_COLUMNS`] / [`GRID_ROWS`] | 80 x 24 | Initial geometry; width resizes reflow primary logical lines via soft-wrap flags (CTX-0266), alt screen truncates (xterm) |
 //! | [`DEFAULT_TAB_INTERVAL`] | 8 | RFC invariant 6: default tab lattice; `FullReset` restores it |
-//! | [`SCROLLBACK_DEFAULT_LINES`](scrollback::SCROLLBACK_DEFAULT_LINES) | 10 000 | Default scrollback retention (`terminal.scrollback` default) |
-//! | [`SCROLLBACK_MAX_LINES`](scrollback::SCROLLBACK_MAX_LINES) | 100 000 | Hard retention bound (RFC invariant 4: bounded pruning, oldest first; mirrors the accepted `terminal.scrollback` maximum) |
-//! | [`REPLY_CAP_BYTES`](replies::REPLY_CAP_BYTES) | 4096 | RFC invariant 7: reply bounds, drop-and-flag |
+//! | [`SCROLLBACK_DEFAULT_LINES`] | 10 000 | Default scrollback retention (`terminal.scrollback` default) |
+//! | [`SCROLLBACK_MAX_LINES`] | 100 000 | Hard retention bound (RFC invariant 4: bounded pruning, oldest first; mirrors the accepted `terminal.scrollback` maximum) |
+//! | [`REPLY_CAP_BYTES`] | 4096 | RFC invariant 7: reply bounds, drop-and-flag |
 //! | [`DAMAGE_HISTORY_BATCHES`](damage::DAMAGE_HISTORY_BATCHES) | 64 | Bounded `damage_since` window |
 //! | [`DAMAGE_MAX_REGIONS_PER_BATCH`](damage::DAMAGE_MAX_REGIONS_PER_BATCH) | 256 | Coarse fallback beyond the cap |
-//! | [`HYPERLINK_TABLE_MAX`](state::HYPERLINK_TABLE_MAX) | 1024 | Bounded link table (threat T-01) |
-//! | [`MAX_ZEROWIDTH_CHARS`](cell::MAX_ZEROWIDTH_CHARS) | 5 | Per-cell combining-mark cap (threat T-01; Alacritty zerowidth parity) |
+//! | [`HYPERLINK_TABLE_MAX`] | 1024 | Bounded link table (threat T-01) |
+//! | [`MAX_ZEROWIDTH_CHARS`] | 5 | Per-cell combining-mark cap (threat T-01; Alacritty zerowidth parity) |
 //! | [`MAX_BIDI_PARAGRAPH_CELLS`](bidi::MAX_BIDI_PARAGRAPH_CELLS) | 4096 | Candidate BiDi paragraph bound: longer logical paragraphs split at cell boundaries (M1-21 scope-deferred reorder; `OQ-091` open) |
-//! | [`ZONE_RECORDS_MAX`](state::ZONE_RECORDS_MAX) | 1024 | Bounded `OSC 133` zone log |
+//! | [`ZONE_RECORDS_MAX`] | 1024 | Bounded `OSC 133` zone log |
 //! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 12 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds saved cursor style/visibility, v3 combining buffers, v4 soft-wrap flags, v5 synchronized-update mode, v6 hyperlink id-space position, v7 alternate-scroll mode, v8 Kitty keyboard stack, v9 inactive-screen Kitty register, v10 zone anchors, v11 OSC 133 output tracking, v12 cell layout-padding marker) |
 //!
 //! # Determinism

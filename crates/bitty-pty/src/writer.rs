@@ -34,7 +34,7 @@ const MAX_PRODUCER_FRAME_BYTES: usize = 64 * 1024 + 13;
 /// when the child stops reading its input (a previewing TUI, a stopped job,
 /// a shell blocked on its own output backpressure).
 ///
-/// The bound must exceed [`MAX_PRODUCER_FRAME_BYTES`] (65,549 bytes), because
+/// The bound must exceed `MAX_PRODUCER_FRAME_BYTES` (65,549 bytes), because
 /// a max-size composer submit is offered as one write while the child may be
 /// idle: bounding at the composer cap alone rejected that legitimate frame
 /// after `terminal_submit` reported `Accepted`, silently losing the input

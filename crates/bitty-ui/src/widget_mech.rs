@@ -18,10 +18,10 @@
 //!   color, font, glyph, pixel buffer, or raster handle.
 //!
 //! Each mechanism binds the canonical
-//! [`UiNodeId`](crate::uitree::UiNodeId) of its tree node (never redefined
+//! [`UiNodeId`] of its tree node (never redefined
 //! here): mechanism state reconciles by the same stable identity the
 //! retained tree diffs by. Text payloads reuse the canonical
-//! [`MAX_UI_TEXT_LEN`](crate::uitree::MAX_UI_TEXT_LEN) cap so one bound
+//! [`MAX_UI_TEXT_LEN`] cap so one bound
 //! governs every text surface.
 //!
 //! No render, platform, PTY, exec, or plugin coupling: nothing here draws,

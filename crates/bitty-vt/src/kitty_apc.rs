@@ -129,7 +129,7 @@ pub const KITTY_APC_SHM_NAME_MAX: usize = 255;
 /// reading it only when the path sits in a known temporary directory and
 /// carries this marker; the parse-time half of that rule (marker presence)
 /// is enforced here, the directory half where the file is opened
-/// downstream (see [`validate_kitty_path`]).
+/// downstream (see `validate_kitty_path`).
 pub const KITTY_APC_TMP_NAME_MARKER: &str = "tty-graphics-protocol";
 
 /// Kitty graphics transmission medium (wire `t=` key).

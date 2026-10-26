@@ -4,7 +4,7 @@
 //! byte-identical logic, only module wiring changed.
 //!
 //! CTX-0803 (DEC-0078 D1, issues #1476/#1433): the selection is View-owned.
-//! [`SelectionState`] binds the range, the drag pin, and the drag flag to the
+//! `SelectionState` binds the range, the drag pin, and the drag flag to the
 //! one [`ViewId`] whose grid they address, and every reader resolves that
 //! owner's live grid before touching a snapshot. There is at most one live
 //! selection; pressing in another `View` replaces it.
@@ -1398,7 +1398,7 @@ impl Runtime {
     ///
     /// CTX-0803: the primary-grid entry point, kept for its existing
     /// callers and single-pane semantics. The pointer path uses
-    /// [`Self::start_selection_in`] with the hit-tested owner.
+    /// `Self::start_selection_in` with the hit-tested owner.
     pub fn start_selection(&mut self, pos: CellPos) {
         self.start_selection_in(SelectionKind::Simple, pos);
     }

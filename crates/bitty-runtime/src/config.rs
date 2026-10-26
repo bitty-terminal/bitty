@@ -3,7 +3,7 @@
 //! Configuration is declarative, total, and validated eagerly. No file I/O,
 //! Lua, or style inference occurs here; the values are already resolved
 //! Rust primitives. The grid dimensions remain logical (columns x rows);
-//! pixel dimensions are derived from [`cell_width`]/[`cell_height`] when
+//! pixel dimensions are derived from `cell_width`/`cell_height` when
 //! mapping to [`bitty_platform::PhysicalSize`] and surface extents.
 //!
 //! The initial grid size defaults to [`bitty_term_state::GRID_COLUMNS`] x
@@ -435,7 +435,7 @@ pub struct RuntimeViewBackground {
 /// them.
 ///
 /// Consumed by the S3 present path (CTX-1162): resolved, carried on
-/// [`PresentFrame`](crate::runtime::PresentFrame), and painted as
+/// `PresentFrame`, and painted as
 /// glow/shadow/tint/fade. Presentation-only: never participates in cell
 /// geometry, hit testing, selection, or Terminal Truth.
 ///
@@ -825,7 +825,7 @@ pub struct RuntimeConfig {
     pub cold_queue_capacity: usize,
     /// Font family used by the renderer; whitespace-trimmed on validation.
     ///
-    /// Default [`crate::font_default_family`] (`JetBrainsMono Nerd Font`):
+    /// Default `crate::font_default_family` (`JetBrainsMono Nerd Font`):
     /// Nerd-patched for starship/opencode glyphs, matching the CTX-0157
     /// ghostty side-by-side acceptance at 12pt. System `monospace` remains
     /// the ultimate fallback (see `bitty-config` `FONT_FALLBACK_CHAIN`).
@@ -890,7 +890,7 @@ pub struct RuntimeConfig {
     /// Right-button host action (issue #2474 `mouse.right`; default `None`).
     ///
     /// A non-captured right press queues this action through
-    /// [`Runtime::take_pending_mouse_action`]; the embedder runs it through
+    /// `Runtime::take_pending_mouse_action`; the embedder runs it through
     /// the same chrome-action dispatcher as a bound chord. `None` is an inert
     /// right-click: no clipboard read, no paste dialog, no PTY bytes. A pane
     /// that enables mouse reporting receives protocol bytes first and never
@@ -1662,7 +1662,7 @@ impl RuntimeConfig {
     /// (shadow, fade) pass through unchanged: no selector can supply them.
     ///
     /// Consumed by the S3 present path (CTX-1162): the returned value is
-    /// stored on [`PresentFrame`](crate::runtime::PresentFrame) and painted
+    /// stored on `PresentFrame` and painted
     /// as glow/shadow/tint/fade.
     #[must_use]
     pub fn resolve_view_style(&self, target: &RuntimeViewTarget) -> RuntimeViewStyle {

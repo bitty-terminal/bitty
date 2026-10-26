@@ -194,7 +194,7 @@ impl Pty {
     /// Takes exclusive ownership of the output side.
     ///
     /// The returned [`PtyReader`] pumps kernel reads into a bounded channel
-    /// on a dedicated thread; see the [`reader`](crate::reader) module docs
+    /// on a dedicated thread; see the `reader` module docs
     /// for the backpressure contract. May be called only once per PTY. The
     /// reader stays unclaimed when the pump thread cannot be spawned
     /// (surfaced as [`PtyError::Io`]), so a later retry is possible.

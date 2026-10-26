@@ -24,7 +24,7 @@
 //!   reports every pending notice once and clears it, so a reused host never
 //!   re-delivers a transition (#2352).
 //! - [`A11ySettings`] — core-owned reduced-motion plus high-contrast
-//!   composition over [`MotionSpec`](crate::motion::MotionSpec) and theme
+//!   composition over [`MotionSpec`] and theme
 //!   tokens. The extension crate is dependency-free and cannot own these; they
 //!   stay here by construction and never take plugin input.
 //!
@@ -32,13 +32,13 @@
 //! announcement queue's documented drop-oldest overflow):
 //!
 //! - Names, labels, chrome state: at most 256 characters
-//!   ([`MAX_ACCESSIBLE_NAME_LEN`](bitty_a11y::MAX_ACCESSIBLE_NAME_LEN)).
+//!   ([`MAX_ACCESSIBLE_NAME_LEN`]).
 //! - Nodes per snapshot: at most 4096
 //!   ([`MAX_SNAPSHOT_NODES`](bitty_a11y::MAX_SNAPSHOT_NODES)).
 //! - Announcement text: at most 256 characters
-//!   ([`MAX_ANNOUNCEMENT_TEXT_LEN`](bitty_a11y::MAX_ANNOUNCEMENT_TEXT_LEN)).
+//!   ([`MAX_ANNOUNCEMENT_TEXT_LEN`]).
 //! - Pending announcements: at most 8
-//!   ([`MAX_PENDING_ANNOUNCEMENTS`](bitty_a11y::MAX_PENDING_ANNOUNCEMENTS)).
+//!   ([`MAX_PENDING_ANNOUNCEMENTS`]).
 //!   A full queue drops the oldest notice so the newest state wins (W-134);
 //!   overflow does not fail the ingest. The host-side queue is bounded on
 //!   [`UiSnapshotHost::push_notice`], so an untouched host never grows past

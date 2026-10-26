@@ -295,7 +295,7 @@ pub(crate) struct WindowState {
     pub(crate) theme_source: String,
     /// Window opacity from the effective config (CTX-0223
     /// `window.opacity`; default `1.0` = opaque). Applied to the platform
-    /// [`WindowConfig`](bitty_platform::WindowConfig) at creation and to the
+    /// [`WindowConfig`] at creation and to the
     /// renderer at GPU attach (CTX-0290): the platform requests compositor
     /// blending where supported, and the renderer scales its premultiplied
     /// output so the value has a visible effect. Platforms without
@@ -863,7 +863,7 @@ pub(crate) struct TerminalApp {
 pub(crate) struct PendingExit {
     /// `ViewId.0` of the exited terminal.
     pub(crate) terminal_id: u64,
-    /// Raw exit code from [`bitty_pty::ExitStatus::code`].
+    /// Raw exit code from `bitty_pty::ExitStatus::code`.
     pub(crate) exit_code: u32,
 }
 
@@ -1183,7 +1183,7 @@ impl TerminalApp {
     /// Sets the window opacity applied at creation and GPU attach
     /// (CTX-0223/CTX-0290). Call once at startup from the effective config;
     /// the value is sanitized by the platform
-    /// [`WindowConfig`](bitty_platform::WindowConfig) and the renderer
+    /// [`WindowConfig`] and the renderer
     /// surface, so out-of-range inputs degrade instead of failing creation.
     pub(crate) fn with_window_opacity(mut self, opacity: f32) -> Self {
         self.window.opacity = opacity;
@@ -2425,7 +2425,7 @@ impl TerminalApp {
     /// removes the surface per the contract. CTX-1431 adds the independent
     /// presentation-only session: its owner's retained block is painted
     /// below the modal (if any) and disappears when the session ends or the
-    /// generation unloads. The [`Runtime`](bitty_runtime::Runtime) setters
+    /// generation unloads. The [`Runtime`] setters
     /// only mark redraw on actual change, so overlay-less ticks stay idle.
     fn update_plugin_overlay(&mut self) {
         let Some(plugin_runtime) = self.plugin_runtime.as_ref() else {
@@ -2666,7 +2666,7 @@ impl TerminalApp {
     /// `enter`/`leave` phase, never pointer coordinates, and it neither takes
     /// the overlay capture nor sets `modal_active`. An `enter` uses the same
     /// presented-frame origin fence as clicks
-    /// ([`bitty_runtime::PluginRuntime::dispatch_ui_command`]), so a band that
+    /// (`bitty_runtime::PluginRuntime::dispatch_ui_command`), so a band that
     /// was replaced, moved, or reflowed after the transition was queued is
     /// refused instead of retargeted. A `leave` is deliberately unfenced: it
     /// only hides/cleans up, so the plugin still hears about the transition

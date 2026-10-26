@@ -19,7 +19,7 @@ use bitty_ipc::ctl as ipc_ctl;
 // authority-less entries, and the live callers pass an empty set so such an
 // entry can never borrow process-wide scopes.
 
-/// [`drain_global_control_queue`] with a pre-mutation hook (CTX-0481, #762).
+/// `drain_global_control_queue` with a pre-mutation hook (CTX-0481, #762).
 ///
 /// `before_mutation(runtime, method)` runs for an authorized
 /// layout-mutating verb before it applies; the app uses it to restore an

@@ -45,7 +45,7 @@
 //!   frames and transports bytes; envelope validation, scopes, consent, and
 //!   the six-gate dispatcher live helper-side (out of scope for #2123).
 //! - **Residency.** There is no idle stop. The process is spawned once and
-//!   kept alive across requests; only an exit (crash) or [`Self::shutdown`]
+//!   kept alive across requests; only an exit (crash) or `Self::shutdown`
 //!   ends it.
 //! - **Single fenced writer.** Exactly one writer thread owns the child's
 //!   stdin for one process generation; a generation fence drops stale reader

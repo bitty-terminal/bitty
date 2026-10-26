@@ -1606,9 +1606,9 @@ pub(crate) fn render_selector_lua(profile: &str) -> String {
 
 /// Wizard line-editing escape outcome: one parsed `ESC`-led sequence mapped
 /// to an editing action. The tables mirror the terminal input encoder
-/// (`bitty-platform::keyboard`: [`encode_named_key`] legacy sequences plus
-/// the kitty [`ext_functional_key`] codes framed by
-/// [`encode_key_event_kitty_protocol`]) so every byte pattern the terminal
+/// (`bitty-platform::keyboard`: `encode_named_key` legacy sequences plus
+/// the kitty `ext_functional_key` codes framed by
+/// `encode_key_event_kitty_protocol`) so every byte pattern the terminal
 /// can emit for the listed keys decodes here instead of landing in answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitEscapeAction {

@@ -1,7 +1,7 @@
 //! Host capability probes for the VM tier.
 //!
 //! Probing is split from decision logic: [`find_on_path`] and
-//! [`probe_with`] take their inputs as arguments and are unit-testable
+//! [`Capabilities::probe_with`] take their inputs as arguments and are unit-testable
 //! without touching the process environment, while [`Capabilities::probe`]
 //! wires in the real `PATH` and filesystem. The VM tier is a Linux-host
 //! capability; off Linux the probes report "unavailable" instead of

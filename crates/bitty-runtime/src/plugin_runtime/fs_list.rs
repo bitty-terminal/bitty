@@ -27,10 +27,10 @@
 //!   leaves the grant, and non-file/non-directory entries are silently
 //!   skipped, matching the RFC-0005 silent-skip listing default.
 //! - **Bounded result.** At most `max_entries` (bridge cap
-//!   [`FS_LIST_MAX_ENTRIES`]) entries are returned, deterministically sorted
+//!   `FS_LIST_MAX_ENTRIES`) entries are returned, deterministically sorted
 //!   by name, and the returned name bytes never exceed [`FS_LIST_MAX_BYTES`].
 //! - **Bounded time.** The walk checks its deadline every
-//!   [`SCAN_DEADLINE_CHECK_INTERVAL`] entries and aborts with `E_TIMEOUT`
+//!   `SCAN_DEADLINE_CHECK_INTERVAL` entries and aborts with `E_TIMEOUT`
 //!   instead of finishing an over-budget scan. Bridge calls pass the
 //!   enclosing callback expiry; direct calls use the accepted RC-1 wall
 //!   budget.
@@ -113,7 +113,7 @@ impl FsListBackend {
     /// `granted` is the calling generation's full activation grant snapshot;
     /// only `fs.read:` entries are considered. Results are deterministic
     /// (lexicographic name order), carry logical `~/...` names, and are
-    /// bounded by [`FS_LIST_MAX_ENTRIES`] and [`FS_LIST_MAX_BYTES`]. The
+    /// bounded by `FS_LIST_MAX_ENTRIES` and [`FS_LIST_MAX_BYTES`]. The
     /// walk is bounded by the accepted RC-1 wall budget; use
     /// [`Self::list_with_expiry`] to pass the enclosing callback deadline.
     ///
@@ -144,7 +144,7 @@ impl FsListBackend {
     /// Expiry-aware [`Self::list`] for the bridge callback deadline.
     ///
     /// Same contract as [`Self::list`], except that the directory walk checks
-    /// `expiry` every [`SCAN_DEADLINE_CHECK_INTERVAL`] entries and aborts
+    /// `expiry` every `SCAN_DEADLINE_CHECK_INTERVAL` entries and aborts
     /// with `E_TIMEOUT`. The deadline is checked before any per-entry
     /// symlink resolution, so one escaping link cannot extend the scan past
     /// the budget.

@@ -21,7 +21,7 @@
 //!   [`CloseResolution`] naming exactly what happened.
 //! - [`WorkspaceGuard::reconcile_focus`] — zero-focus reconciliation: a
 //!   workspace whose focus names a departed panel falls back to the
-//!   smallest surviving [`PanelId`](crate::panel::PanelId), and reports
+//!   smallest surviving [`PanelId`], and reports
 //!   [`FocusResolution::Cleared`] only when truly panel-less (parked).
 //!
 //! A workspace is identified by a plain `u32` index. These are UI-side

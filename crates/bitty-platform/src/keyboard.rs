@@ -101,7 +101,7 @@ pub fn encode_key_event(event: &KeyEvent) -> Option<Vec<u8>> {
 /// Modifier semantics (xterm legacy):
 ///
 /// - `control` synthesizes C0 bytes from the logical character via
-///   [`ctrl_control_byte`] without consulting `text`: `Ctrl+A-Z` →
+///   `ctrl_control_byte` without consulting `text`: `Ctrl+A-Z` →
 ///   `0x01-0x1A` (case-insensitive), plus the `Space`/`[`/`\`/`]`/`^`/`_`/`?`
 ///   equivalents. A control chord with no C0 mapping (digits, other
 ///   punctuation) falls through to the text path so the key still produces

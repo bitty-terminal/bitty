@@ -5,7 +5,7 @@
 //! minimum 16). The parser classifies set/push/pop ops; this module owns the
 //! stack transitions plus the `PointerShape` → [`bitty_platform::CursorIcon`]
 //! map so `bitty-platform` keeps its no-workspace-dependency rule. The app
-//! queries [`Runtime::cursor_icon_for_focused`] each tick and applies it
+//! queries `Runtime::cursor_icon_for_focused` each tick and applies it
 //! through `WindowHandle::set_cursor_icon`; an empty stack (or unknown view)
 //! fails open to [`bitty_platform::CursorIcon::Default`].
 

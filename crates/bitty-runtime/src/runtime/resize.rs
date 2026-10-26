@@ -179,7 +179,7 @@ impl Runtime {
     ///
     /// The configured logical padding scaled by the sanitized live factor,
     /// rounded half away from zero. Tick translates grid content by this
-    /// offset and [`Self::grid_from_physical`] removes twice it before
+    /// offset and `Self::grid_from_physical` removes twice it before
     /// dividing, so render placement and grid derivation share one source.
     #[must_use]
     pub fn window_padding_physical(&self) -> u32 {

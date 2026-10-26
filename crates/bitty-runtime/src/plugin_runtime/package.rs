@@ -1278,7 +1278,7 @@ pub struct StoreInspection {
 
 /// Inspect the store without mutating it.
 ///
-/// Unlike [`load_index`], a malformed index is reported as a
+/// Unlike `load_index`, a malformed index is reported as a
 /// [`StoreIssueKind::CorruptIndex`] issue instead of aborting the inspection,
 /// so the doctor can name the exact repair command. Package directories are
 /// still inspected in that case because they are the rebuild source.

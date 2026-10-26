@@ -8,7 +8,7 @@
 //!   [`PresentationMode::Fullscreen`] full-bleed base. The existing
 //!   backup/restore mechanics are reused as-is; this crate adds no second
 //!   zoom path.
-//! - [`OverlayTier`](crate::layout::OverlayTier) paint order
+//! - [`OverlayTier`] paint order
 //!   (`Editor < Float < Popup < Messages`): overlay-like modes map onto it
 //!   via [`PresentationMode::overlay_tier`].
 //! - 4+1 overlay manager (`OverlayManager` in [`crate::panel`]): unchanged,

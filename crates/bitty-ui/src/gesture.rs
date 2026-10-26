@@ -23,12 +23,12 @@
 //!   deterministic depth-first order for the drop-target UI.
 //! - **Rollback** ([`GestureTransaction::cancel`]) is the Esc path: the
 //!   transaction settles as [`GestureOutcome::Cancelled`] with the tree and
-//!   the [`DragHistory`](crate::drag::DragHistory) untouched. Preview
+//!   the [`DragHistory`] untouched. Preview
 //!   records hover state only, so there is nothing to rewind beyond
 //!   discarding the transaction.
 //! - **Atomic commit** ([`GestureTransaction::commit`]) validates the bound
-//!   command against the workspace [`CommandRegistry`](crate::panel::CommandRegistry),
-//!   records a [`DragHistory`](crate::drag::DragHistory) snapshot, and
+//!   command against the workspace [`CommandRegistry`],
+//!   records a [`DragHistory`] snapshot, and
 //!   re-parents the source leaf. Validation order (tree untouched on every
 //!   failure): registry ownership, self-drop, source lookup, target lookup.
 //!
@@ -37,8 +37,8 @@
 //! [`CommandOrigin`] names the six invocation surfaces (gesture, keyboard,
 //! palette, CLI, IPC, agent). [`resolve_invocation`] maps any
 //! [`CommandInvocation`] to the owning
-//! [`PanelId`](crate::panel::PanelId) through the single workspace
-//! [`CommandRegistry`](crate::panel::CommandRegistry): the origin selects
+//! [`PanelId`] through the single workspace
+//! [`CommandRegistry`]: the origin selects
 //! *how* the command string arrives, never *what* it resolves to. That is
 //! the 1:1 equivalence claim, and [`verify_origin_equivalence`] is the
 //! conformance check for it: it resolves one command from every origin and
@@ -397,7 +397,7 @@ impl std::fmt::Display for EquivalenceError {
 impl std::error::Error for EquivalenceError {}
 
 /// Resolves one invocation to the owning
-/// [`PanelId`](crate::panel::PanelId) through the single workspace
+/// [`PanelId`] through the single workspace
 /// [`CommandRegistry`].
 ///
 /// Grammar first, then registry ownership; the origin takes no branch in

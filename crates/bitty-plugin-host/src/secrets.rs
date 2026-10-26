@@ -114,7 +114,7 @@ pub const SECRET_REDACTED_MARKER: &str = "[redacted]";
 /// The handle names a secret without carrying its value: `Display`, `Debug`,
 /// and serde-free snapshots quote the `secret://<name>` reference only. The
 /// value lives in the host [`SecretStore`] and is injected into the child
-/// process environment at spawn time by [`resolve_env_for_spawn`].
+/// process environment at spawn time by [`SecretStore::resolve_env_for_spawn`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SecretHandle {
     name: String,
@@ -1013,7 +1013,7 @@ impl SecretAuditLedger {
 
     /// Record a successful resolution (names only).
     ///
-    /// The payload is names-only by construction (see [`Self::push`] and the
+    /// The payload is names-only by construction (see `Self::push` and the
     /// `*_names_never_values` tests), ensuring secrets never enter audit logs.
     pub fn push_allow(&mut self, handles: &[String], detail: impl Into<String>) {
         self.push(SecretAuditDecision::Allow, handles, None, detail.into());

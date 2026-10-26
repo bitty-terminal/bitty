@@ -4,7 +4,7 @@
 //! This module is the only place where `fontdb`, `swash`, or `harfrust`
 //! types are named (ADR-0004 "Wrap" row). Every value crossing back out is
 //! converted into the owned vocabulary of [`crate::glyph`], and every
-//! upstream failure is flattened through [`RenderError::flatten_rasterizer`]
+//! upstream failure is flattened through `RenderError::flatten_rasterizer`
 //! or mapped onto a semantic variant. No upstream type appears in this
 //! crate's public API.
 //!
@@ -188,7 +188,7 @@ pub(crate) fn system_db() -> &'static Database {
 /// first, then platform tails) exactly as the crossfont backend was
 /// wrapped, so per-glyph fallback needs no second implementation.
 ///
-/// Face discovery reads the process-wide [`system_db`] scan; per-face bytes
+/// Face discovery reads the process-wide `system_db` scan; per-face bytes
 /// stay session-owned under [`MAX_FACE_BYTES`].
 pub struct SwashSingle {
     db: &'static Database,
@@ -628,7 +628,7 @@ impl SwashSingle {
     /// Number of distinct dynamic-fallback faces loaded so far.
     ///
     /// Lifetime quota, independent of the evictable
-    /// [`SwashSingle::dynamic_cache`] warmth: wholesale-clear on overflow
+    /// `SwashSingle::dynamic_cache` warmth: wholesale-clear on overflow
     /// clears the scalar map but never this set, so the
     /// [`MAX_DYNAMIC_FALLBACK_FACES`] bound holds for the session.
     #[must_use]

@@ -148,7 +148,7 @@ pub const IDLE_CONTROL_BROKER_HEAD: &str = "platform.idle.control";
 /// Version and heads come from this definition, never from Lua; the broker
 /// records them at publication (dynapi gating, bitty#2005). Method names
 /// (`get`, `set_power`, `set_step`, `set`) are fixed per interface in the
-/// table above and recorded on the broker [`ServiceRecord`] at publication.
+/// table above and recorded on the broker `ServiceRecord` at publication.
 #[must_use]
 pub fn device_descriptor(iface: &str) -> ProvidedService {
     let head = match iface {

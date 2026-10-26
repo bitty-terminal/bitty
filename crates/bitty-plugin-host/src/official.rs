@@ -2,7 +2,7 @@
 //!
 //! Core never fetches registry metadata at runtime. The official plugin set
 //! (`registry/official/*.toml` plus each entry's pinned `plugins/<name>`
-//! gitlink) is rendered into [`crate::official_catalog`] by
+//! gitlink) is rendered into `crate::official_catalog` by
 //! `just catalog-generate` and compiled into the binary. `bitty plugin
 //! install <official-id>` resolves an exact id against this catalog, refuses
 //! incompatible entries before any network access, then installs the pinned

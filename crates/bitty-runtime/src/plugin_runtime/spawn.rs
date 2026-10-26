@@ -5,7 +5,7 @@
 //! closed with `E_SPAWN_UNAVAILABLE` until a host surface executes them.
 //! This module is that execution surface: it turns a [`SpawnRequest`]
 //! (`tool` + argv + closed env + timeout + output budget) into a bounded,
-//! attributed [`ExecutionResult`](bitty_ipc::ExecutionResult) whose bytes are
+//! attributed [`ExecutionResult`] whose bytes are
 //! always labeled `is_untrusted_surface`.
 //!
 //! # Seam with CTX-0444 (do not duplicate the allowlist)

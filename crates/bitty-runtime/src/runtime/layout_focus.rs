@@ -146,7 +146,7 @@ fn boundary_frame_axis(offset_px: f64, cell_px: f64, max: u16) -> u16 {
 /// inset.
 ///
 /// CTX-1161 S2: `style` carries the resolved per-`View` chrome style
-/// (populated at present build via [`Runtime::view_style_for`]).
+/// (populated at present build via `Runtime::view_style_for`).
 /// Consumed by the S3 present path (CTX-1162): glow/shadow/tint/fade paint
 /// from this value, so styled configs diverge from unstyled ones exactly by
 /// their style contribution.
@@ -2562,7 +2562,7 @@ impl Runtime {
     /// The new tree's leaf `View`s are reflowed into the current container
     /// immediately (tick repeats this every frame; idempotent), and every
     /// grid follows its leaf: pane sessions via
-    /// [`Self::sync_pane_geometry`](super::Runtime::sync_pane_geometry), and
+    /// `Self::sync_pane_geometry`, and
     /// the shared primary grid (+ primary PTY winsize) via the primary
     /// owner leaf's allocation ([`Self::primary_view`]). Focus is retained
     /// when the focused `ViewId` still exists, otherwise it moves to the

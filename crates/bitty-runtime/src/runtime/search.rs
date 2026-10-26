@@ -8,7 +8,7 @@
 //! and every refresh, reveal, highlight, and live selection it drives
 //! addresses that grid, never the primary grid by assumption. The
 //! persistent-selection API addresses the same keyboard View
-//! ([`Runtime::keyboard_view`]).
+//! (`Runtime::keyboard_view`).
 use super::selection::grid_of;
 use super::*;
 

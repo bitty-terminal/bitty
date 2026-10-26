@@ -21,14 +21,14 @@
 //! authority:
 //!
 //! - [`grant_consent_scope`] / [`grant_automation_consent`] are the only
-//!   non-test callers of [`ControlAuthority::grant_scope`] in this
+//!   non-test callers of `ControlAuthority::grant_scope` in this
 //!   repository. Both require an [`ExplicitConsent`] token, which production
 //!   code can only obtain from [`ExplicitConsent::confirm_interactive`] (a
 //!   local-TTY prompt; never flags, environment, configuration, or an
-//!   inherited descriptor). Tests use [`ExplicitConsent::for_tests`].
+//!   inherited descriptor). Tests use `ExplicitConsent::for_tests`.
 //! - [`revoke_consent_scope`] / [`revoke_consent_session`] call
-//!   [`ControlAuthority::revoke_scope`] / [`ControlAuthority::revoke_session`]
-//!   (plus per-token [`revoke_automation_bearer`](bitty_ipc::devtools::revoke_automation_bearer)
+//!   `ControlAuthority::revoke_scope` / `ControlAuthority::revoke_session`
+//!   (plus per-token [`revoke_automation_bearer`]
 //!   for ledger-tracked bearers) and return an auditable [`RevokeReceipt`].
 //!   Revocation advances the consent generation (scope revoke) or ends the
 //!   session, so queued controls deny at the next drain recheck
@@ -36,7 +36,7 @@
 //!   effect.
 //! - The [`METHOD_GRANT_CONSENT_SCOPE`], [`METHOD_REVOKE_CONSENT_SCOPE`],
 //!   and [`METHOD_REVOKE_CONSENT_SESSION`] IPC methods (registered by
-//!   [`register_consent_methods`] on the bitty-owned [`Dispatcher`](bitty_ipc::devtools::Dispatcher))
+//!   [`register_consent_methods`] on the bitty-owned [`Dispatcher`])
 //!   expose the same gesture to DevTools UI clients: the grant method
 //!   requires the exact `ALLOW <what>` confirmation phrase for the requested
 //!   grant, so the UI dialog is the gesture and the phrase is its evidence.
@@ -44,7 +44,7 @@
 //!
 //! Bearer binding note: the pinned `bitty-ipc` revision exposes the
 //! session-bound minter
-//! ([`issue_automation_bearer_with_ttl`](bitty_ipc::devtools::issue_automation_bearer_with_ttl))
+//! ([`issue_automation_bearer_with_ttl`])
 //! and keeps its connection-bound (principal plus consent-generation)
 //! issuer test-only. Bearers minted here are therefore bound to one session,
 //! one terminal, and one method family with a capped TTL; principal and
@@ -175,7 +175,7 @@ impl ConsentError {
 /// `ALLOW <what>` phrase. There is deliberately no constructor from flags,
 /// environment variables, configuration values, or inherited descriptors:
 /// adding one would reopen the issuance path the accepted contract forbids.
-/// Hermetic tests use [`ExplicitConsent::for_tests`].
+/// Hermetic tests use `ExplicitConsent::for_tests`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExplicitConsent {
     _sealed: (),

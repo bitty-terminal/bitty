@@ -64,6 +64,7 @@ just check              # fmt-check + clippy + test + scratch-path/PTY/status-dr
 just check-registry     # strict official-catalog drift gate (needs a bitty-plugins checkout)
 just fmt-check          # cargo fmt --all -- --check
 just clippy             # cargo clippy --workspace --all-targets --locked -- -D warnings
+just doc-check          # rustdoc intra-doc links with warnings denied (`cargo doc --workspace --no-deps`)
 just test               # cargo nextest (workspace) + doctests + harness=false platform entry points
 just status-drift       # scripts/check-status-drift.sh (OQ/RFC/crate-count/submodule gate)
 just status-drift-test  # scripts/tests/check-status-drift.test.sh (gate fixture tests)

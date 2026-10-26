@@ -14,6 +14,12 @@
 //! a byte bound, not a duration. They also assert the counted refusal and
 //! that output after the refused string still arrives.
 //!
+//! CTX-1603 adds the alternating-string shape: many over-cap APCs, each
+//! followed by an OSC title and text, through one parser. It pins one refusal
+//! per string, the resync delivery after each refusal, and the same peak
+//! bound, so a per-string re-scan of the swallowed tail would fail on cost or
+//! memory rather than on wall clock.
+//!
 //! # Pre-fix evidence method
 //!
 //! This file does not compile against `main`'s pre-fix tree as-is:
@@ -147,6 +153,14 @@ const CHUNK: usize = 64 * 1024;
 /// `parser::tests` pins the two values equal.
 const CAP: usize = bitty_vt::ITERM2_OSC_MAX_BODY_BYTES + bitty_vt::ITERM2_OSC_PREFIX.len() + 2;
 
+/// libFuzzer mutation cap for the generated over-cap corpus.
+///
+/// libFuzzer clamps mutated inputs to 1 MiB unless `-max_len` is passed, which
+/// would hide the parser cap from every mutation. The largest generated seed
+/// is [`CAP`] + 11 bytes (introducer, cap, one byte past, 8-byte resync tail);
+/// this value adds a little mutation headroom on top.
+const FUZZ_MAX_LEN: usize = CAP + 19;
+
 /// Hard heap bound for one 256 MiB shape. Post-fix the peak is the cap plus
 /// `vte`'s one capacity doubling and one bounded dispatch copy (~16 MiB for
 /// an OSC) — or the existing kitty/iTerm2 budgets, whichever applies. The
@@ -263,6 +277,168 @@ fn image_diversion_after_a_capped_string_is_admitted() {
         "the image after the capped string must be admitted"
     );
     assert_recovers(&out.actions, "image after capped OSC");
+}
+
+#[test]
+fn alternating_refused_strings_and_text_stay_bounded() {
+    // CTX-1603: many over-cap strings alternating with text through one
+    // parser. Each refused string yields exactly one refusal, the text after
+    // every string arrives, and the peak heap stays at the cap plus `vte`'s
+    // one capacity doubling — the swallowed tail is never re-scanned.
+    const ROUNDS: usize = 8;
+    let mut round = b"\x1b_z;".to_vec();
+    round.extend(std::iter::repeat_n(b'A', CAP + 8));
+    round.extend_from_slice(b"\x1b]0;t\x07ok");
+    let (actions, peak) = peak_alloc::measure(|| {
+        let mut parser = Parser::new();
+        let mut actions = Vec::new();
+        for _ in 0..ROUNDS {
+            for chunk in round.chunks(CHUNK) {
+                parser.advance(chunk, |action| actions.push(action));
+            }
+        }
+        actions
+    });
+    eprintln!("alternating refused strings: peak {peak} bytes");
+    assert!(
+        peak <= PEAK_BOUND,
+        "alternating refused strings: peak heap {peak} bytes exceeds the {PEAK_BOUND}-byte bound"
+    );
+    assert_eq!(
+        refusal_kinds(&actions).len(),
+        ROUNDS,
+        "exactly one refusal per refused string"
+    );
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| matches!(
+                action,
+                TerminalAction::OscTitle { text } if text.as_str() == "t"
+            ))
+            .count(),
+        ROUNDS,
+        "the title after every refused string must arrive"
+    );
+    assert_recovers(&actions, "alternating refused strings");
+}
+
+/// Checked-in generator for the `control_string_cap` fuzz target's seed
+/// corpus (CTX-1603).
+///
+/// The cap is ~4 MiB, so these seeds cannot live in the retained corpora:
+/// every other `fuzz/` target truncates input to 32 KiB and would never reach
+/// the cap. This ignored test writes them into the gitignored
+/// `fuzz/corpus/control_string_cap/` instead, and derives every boundary from
+/// [`CAP`] (itself the crate's public constants) rather than duplicating the
+/// number:
+///
+/// ```sh
+/// cargo test -p bitty-vt --test control_string_cap -- --ignored --nocapture generate_cap_seeds
+/// # -max_len is required: libFuzzer clamps mutated inputs to 1 MiB otherwise.
+/// cargo +nightly fuzz run control_string_cap fuzz/corpus/control_string_cap \
+///     -- -max_len=4198432 -runs=64
+/// ```
+///
+/// It self-checks the seeds while writing them: the at-cap strings are
+/// admitted (still open at end of input), the just-past-cap strings are
+/// refused exactly once, and the resync seeds deliver their title and text.
+#[test]
+#[ignore = "generator: run explicitly to materialize the over-cap fuzz corpus"]
+fn generate_cap_seeds() {
+    fn write(dir: &std::path::Path, name: &str, wire: &[u8]) {
+        let path = dir.join(name);
+        std::fs::write(&path, wire).expect("write fuzz seed");
+        eprintln!("wrote {} ({} bytes)", path.display(), wire.len());
+    }
+
+    fn parse_wire(wire: &[u8]) -> Vec<TerminalAction> {
+        let mut parser = Parser::new();
+        let mut actions = Vec::new();
+        parser.advance(wire, |action| actions.push(action));
+        actions
+    }
+
+    fn has_title(actions: &[TerminalAction], title: &str) -> bool {
+        actions.iter().any(
+            |action| matches!(action, TerminalAction::OscTitle { text } if text.as_str() == title),
+        )
+    }
+
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fuzz/corpus/control_string_cap");
+    std::fs::create_dir_all(&dir).expect("create fuzz corpus dir");
+
+    let filler = vec![b'A'; CAP];
+    let over = vec![b'A'; CAP + 1];
+
+    // `vte`-owned families: at the cap the string is still open at end of
+    // input (no refusal); one byte past it is refused exactly once.
+    for (label, introducer) in [
+        ("osc", b"\x1b]".as_slice()),
+        ("dcs", b"\x1bP".as_slice()),
+        ("sos", b"\x1bX".as_slice()),
+        ("pm", b"\x1b^".as_slice()),
+    ] {
+        let mut at_cap = introducer.to_vec();
+        at_cap.extend_from_slice(&filler);
+        assert!(
+            refusal_kinds(&parse_wire(&at_cap)).is_empty(),
+            "{label} at cap must be admitted"
+        );
+        write(&dir, &format!("{label}-at-cap.bin"), &at_cap);
+
+        let mut past_cap = introducer.to_vec();
+        past_cap.extend_from_slice(&over);
+        assert_eq!(
+            refusal_kinds(&parse_wire(&past_cap)).len(),
+            1,
+            "{label} past cap must be refused once"
+        );
+        write(&dir, &format!("{label}-past-cap.bin"), &past_cap);
+    }
+
+    // Parser-handled APC: the header `z;` is charged too, so the at-cap body
+    // is two bytes shorter than the other families.
+    let mut at_cap = b"\x1b_z;".to_vec();
+    at_cap.extend_from_slice(&filler[2..]);
+    assert!(
+        refusal_kinds(&parse_wire(&at_cap)).is_empty(),
+        "apc at cap must be admitted"
+    );
+    write(&dir, "apc-at-cap.bin", &at_cap);
+    let mut past_cap = b"\x1b_z;".to_vec();
+    past_cap.extend_from_slice(&over[2..]);
+    assert_eq!(
+        refusal_kinds(&parse_wire(&past_cap)).len(),
+        1,
+        "apc past cap must be refused once"
+    );
+    write(&dir, "apc-past-cap.bin", &past_cap);
+
+    // Discard resync after a refusal (bitty#2712): the `ESC ]0;t` tail must
+    // still deliver the title, and the trailing text must still print.
+    let mut osc_resync = b"\x1b]".to_vec();
+    osc_resync.extend_from_slice(&over);
+    osc_resync.extend_from_slice(b"\x1b]0;t\x07ok");
+    let actions = parse_wire(&osc_resync);
+    assert_eq!(refusal_kinds(&actions), vec![ControlStringKind::Osc]);
+    assert!(has_title(&actions, "t"), "osc resync title: {actions:?}");
+    write(&dir, "osc-past-cap-esc-title.bin", &osc_resync);
+
+    let mut apc_resync = b"\x1b_z;".to_vec();
+    apc_resync.extend_from_slice(&over[2..]);
+    apc_resync.extend_from_slice(b"\x1b]0;t\x07ok");
+    let actions = parse_wire(&apc_resync);
+    assert_eq!(refusal_kinds(&actions), vec![ControlStringKind::Apc]);
+    assert!(has_title(&actions, "t"), "apc resync title: {actions:?}");
+    write(&dir, "apc-past-cap-esc-title.bin", &apc_resync);
+
+    eprintln!(
+        "cap seeds ready in {}: run `cargo +nightly fuzz run control_string_cap \
+         fuzz/corpus/control_string_cap -- -max_len={FUZZ_MAX_LEN} -runs=64`",
+        dir.display()
+    );
 }
 
 #[test]

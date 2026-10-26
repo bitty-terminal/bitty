@@ -117,7 +117,7 @@
 //! - `--version`: 1..=[`MAX_COMPONENT_VERSION_BYTES`] bytes.
 //! - `--digest`: 1..=[`MAX_COMPONENT_DIGEST_BYTES`] bytes, no NUL, plus 64 hex shape.
 //! - Source path: 1..=[`MAX_COMPONENT_PATH_BYTES`] bytes, no NUL.
-//! - Descriptor: [`COMPONENT_DESCRIPTOR_MAX_BYTES`] bytes (via runtime).
+//! - Descriptor: [`COMPONENT_DESCRIPTOR_MAX_BYTES`](bitty_runtime::component::COMPONENT_DESCRIPTOR_MAX_BYTES) bytes (via runtime).
 //! - Executable: [`COMPONENT_EXECUTABLE_MAX_BYTES`] bytes (via runtime).
 //! - TOFU pin file: [`MAX_PIN_FILE_BYTES`] bytes (`tarball.sha256`).
 
@@ -1544,7 +1544,7 @@ pub fn run_component_subcommand(
 /// broker last recorded for that extension name (#2254).
 ///
 /// `activation` is read through the runtime's single reader
-/// ([`read_component_activation`]); `list` never derives a state of its own.
+/// ([`read_component_activation`](bitty_runtime::component::read_component_activation)); `list` never derives a state of its own.
 #[derive(Debug, Clone)]
 pub struct ListedComponent {
     /// Discovered inventory for the component name.

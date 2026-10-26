@@ -1,6 +1,6 @@
 //! Read-only introspection snapshots for input debugging (CTX-0159, Issue #258).
 //!
-//! This module owns the bounded, read-only helpers that turn live [`Runtime`]
+//! This module owns the bounded, read-only helpers that turn live `Runtime`
 //! state into screenshots-free observation data: grid text (bounded rows/cols
 //! plus cursor), the last input events (bounded ring of keys, modifiers, and
 //! mouse buttons with coordinates), the modifier/latch state, and the
@@ -43,7 +43,7 @@
 //!
 //! Input injection (synthetic input) is a separate next slice after
 //! introspection lands (DEC-0018). Nothing here writes to the PTY, mutates
-//! [`Runtime`], or widens authority.
+//! `Runtime`, or widens authority.
 
 #![forbid(unsafe_code)]
 

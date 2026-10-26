@@ -395,7 +395,7 @@ fn matches_cmd_exact(pattern: &str, cmd_line: &str) -> bool {
 ///
 /// Unanchored patterns match anywhere; `^`-prefixed patterns match only at
 /// the start; `$`-suffixed patterns must reach the end. Invalid patterns
-/// return false. Execution is bounded by [`REGEX_STEP_BUDGET`].
+/// return false. Execution is bounded by `REGEX_STEP_BUDGET`.
 #[must_use]
 pub fn matches_regex(pattern: &str, text: &str) -> bool {
     if check_regex_syntax(pattern).is_err() {

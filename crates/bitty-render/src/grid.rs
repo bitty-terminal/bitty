@@ -6,7 +6,7 @@
 //!
 //! 1. **Plan**: grid-coordinate damage is converted to pixel rectangles
 //!    against the configured [`CellMetrics`] and fed to
-//!    [`frame::plan_frame`] through [`SnapshotDamage`], preserving the
+//!    `frame::plan_frame` through [`SnapshotDamage`], preserving the
 //!    damage-driven partial-redraw semantics of the terminal-state-rfc
 //!    damage model.
 //! 2. **Place**: every cell covered by a planned dirty rectangle is
@@ -65,7 +65,7 @@
 //!   a metric-aware baseline with a fixed-rule fallback (see
 //!   [`BASELINE_NUMERATOR`] and [`resolve_baseline_offset`]).
 //! - **Subpixel RGB antialiasing policy**: upstream coverage is averaged to
-//!   luminance exactly like [`crate::software::SurfaceRgba::blend_glyph`]
+//!   luminance exactly like `crate::software::SurfaceRgba::blend_glyph`
 //!   (the grayscale application of
 //!   [`crate::atlas::coverage_policy_for`], which earns subpixel only on
 //!   LCD + non-HiDPI outputs).
@@ -685,7 +685,7 @@ pub fn active_theme(appearance_theme: Option<&str>) -> &'static bitty_config::th
 /// Cursor fill for a live cursor, or `None` when the cursor is hidden
 /// or outside the `cols` x `rows` grid.
 ///
-/// Honors `DECSCUSR` (`CSI Ps SP q`) via the snapshot [`Cursor::cursor_style`]:
+/// Honors `DECSCUSR` (`CSI Ps SP q`) via the snapshot `Cursor::cursor_style`:
 /// `Default`/block paints a full cell, bar paints a left vertical strip,
 /// underline paints a bottom horizontal strip. Blink variants (`Blinking*`)
 /// share their steady shape here; blink timing stays with the embedder's
@@ -1850,7 +1850,7 @@ impl ImageBlit {
 ///
 /// Produced by [`GridRenderer::render`]; consumed by a GPU backend seam or,
 /// under the `sw-fallback` feature, by
-/// [`crate::software::draw_list_onto`]. Paint order is fills first, then
+/// `crate::software::draw_list_onto`. Paint order is fills first, then
 /// rounded fills, then background images, then overlay fills, then glyphs,
 /// then Kitty images; each vector preserves cell scan order so identical
 /// inputs give byte-identical records.
@@ -2028,7 +2028,7 @@ impl BlockMaskKey {
 /// [`GlyphAtlas::ensure`] never resets between two placements of one pass.
 /// When an allocation no longer fits it records exhaustion and returns
 /// [`GlyphSource::Inline`]; the caller rebuilds the whole pass against a
-/// wholesale-reset atlas ([`GlyphAtlas::evict_now`], one counted eviction).
+/// wholesale-reset atlas (`GlyphAtlas::evict_now`, one counted eviction).
 /// Growth is earned, not automatic (CTX-1206): exhaustion below
 /// [`ATLAS_GROW_OCCUPANCY_THRESHOLD`] skips the grow-then-retry and goes
 /// straight to exhaustion (fragmentation or stale working set repacks on
@@ -2264,7 +2264,7 @@ impl GlyphAtlas {
     /// Attempts to grow the atlas to the next power-of-two dimension.
     /// Returns `true` if growth succeeded, `false` if already at max.
     ///
-    /// Called only through [`Self::place_or_grow`] (the CTX-1206 occupancy
+    /// Called only through `Self::place_or_grow` (the CTX-1206 occupancy
     /// gate): direct callers would bypass the evict-first policy and
     /// ratchet the texture on fragmentation. Growth preserves existing
     /// placements by reallocating the texture buffer and copying slot data

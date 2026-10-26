@@ -225,7 +225,7 @@ pub struct PanelRuleData {
 /// `Option` on [`ConfigData::font`]) from "key absent inside a present
 /// table" (inner `Option`); partial tables are rejected downstream rather
 /// than silently defaulted — except `line_height`/`letter_spacing`, which
-/// default to [`DEFAULT_LINE_HEIGHT`]/[`DEFAULT_LETTER_SPACING`] when a
+/// default to `DEFAULT_LINE_HEIGHT`/`DEFAULT_LETTER_SPACING` when a
 /// `font` table is present but omits them (backwards compatible with
 /// existing `{ family, size }` tables).
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -851,7 +851,7 @@ pub enum ConfigOutcome {
 /// Evaluate one config chunk and extract [`ConfigData`].
 ///
 /// Implemented on [`LuaVm`] (same crate, so private budget state is shared
-/// with [`crate::LuaVm::drive_chunk`]): identical fuel, wall-clock, and
+/// with `LuaVm::drive_chunk`): identical fuel, wall-clock, and
 /// memory enforcement as plugin execution, identical fail-closed suspension.
 pub trait ConfigEval {
     /// Evaluate `code` as a config chunk.

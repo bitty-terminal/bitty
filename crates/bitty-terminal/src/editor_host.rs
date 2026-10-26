@@ -16,7 +16,7 @@
 //! `bitty-terminal-docs/specifications/composer-architecture.md`, W-82):
 //!
 //! - the environment-driven program always resolves through
-//!   [`resolve_editor`](bitty_rich::host::resolve_editor): only the bare
+//!   [`resolve_editor`]: only the bare
 //!   `nvim`/`vim`/`vi` names run, a hostile `$VISUAL`/`$EDITOR` is denied
 //!   before any side effect, and denied values are never echoed;
 //! - `program_override` bypasses that allowlist so tests can host
@@ -24,14 +24,14 @@
 //!   passes `None` (the single `EditorRequested` arm), so the bypass never
 //!   reaches real sessions;
 //! - the draft travels through the Bitty-owned `0700` root
-//!   ([`owned_temp_root`](bitty_rich::host::owned_temp_root)) via
-//!   [`write_composer_temp`](bitty_rich::host::write_composer_temp)
+//!   ([`owned_temp_root`]) via
+//!   [`write_composer_temp`]
 //!   (`0600`, bounded) and
-//!   [`read_composer_back`](bitty_rich::host::read_composer_back)
-//!   (bounded, UTF-8); the [`TempComposerFile`](bitty_rich::host::TempComposerFile)
+//!   [`read_composer_back`]
+//!   (bounded, UTF-8); the [`TempComposerFile`]
 //!   guard deletes it on every path, including panic past the frame;
 //! - the editor leaf spawns with the minimized environment
-//!   ([`minimized_env_removals`](bitty_rich::host::minimized_env_removals)):
+//!   ([`minimized_env_removals`]):
 //!   ambient credentials never reach the child. Leaf stdio is the PTY
 //!   itself (the execution boundary's explicit interactive exception);
 //! - the hosted wait is bounded (120 s default, 300 s ceiling, carried
@@ -39,7 +39,7 @@
 //!   ([`Runtime::kill_pane_tree`](bitty_runtime::Runtime::kill_pane_tree)),
 //!   not just the direct child, and reports a typed timeout;
 //! - every open/poll step reports a typed outcome
-//!   ([`EditorOpenOutcome`]/[`EditorOutcome`](bitty_rich::host::EditorOutcome))
+//!   ([`EditorOpenOutcome`]/[`EditorOutcome`])
 //!   at the API boundary; the loud-warning wrappers preserve the existing
 //!   messages for current callers;
 //! - the editor child runs with the temp path as its only argv element

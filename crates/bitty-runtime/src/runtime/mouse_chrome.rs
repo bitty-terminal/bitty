@@ -9,10 +9,10 @@
 //! Issue #1694 (CTX-0966): Mod+Left-drag (Alt by default, the working Mod
 //! per OQ-052; Super also accepted for Hyprland muscle memory) on a tiled
 //! leaf grabs it for a tiled move via the headless
-//! [`DragMoveSession`](bitty_ui::DragMoveSession) primitive: motion tracks
+//! [`DragMoveSession`] primitive: motion tracks
 //! a live preview (advisory hovered target), release commits one
-//! [`DropPlan`](bitty_ui::DropPlan) mutation
-//! ([`drop_plan_for_point`](bitty_ui::drop_plan_for_point): center targets
+//! [`DropPlan`] mutation
+//! ([`drop_plan_for_point`]: center targets
 //! swap in place, edge targets insert at a balanced split).
 //!
 //! Issue #2337: the press immediately paints a bounded, present-only ghost
@@ -42,14 +42,14 @@
 //!
 //! CTX-0334 (Hyprland-like mouse-enter activation): when
 //! `RuntimeConfig::focus_follows_mouse_delay` is non-zero, pointer entry on
-//! a non-focused pane arms a pending candidate ([`HoverPending`]) that
-//! [`Runtime::apply_hover_deadline`] commits once the dwell deadline
+//! a non-focused pane arms a pending candidate (`HoverPending`) that
+//! `Runtime::apply_hover_deadline` commits once the dwell deadline
 //! elapses; `0` activates immediately on entry. Any explicit focus change
 //! cancels the pending dwell so hover can never override a deliberate
 //! choice.
 //!
 //! CTX-0339 (click-to-focus): a left press routes through
-//! [`Runtime::click_focus_at`], which focuses the hit-tested leaf even when
+//! `Runtime::click_focus_at`, which focuses the hit-tested leaf even when
 //! `focus_follows_mouse` is off (the default). It shares the present-frames
 //! hit-test ([`Runtime::cursor_to_present_cell`]) with hover, selection,
 //! and hyperlink resolution plus Shift suppression, so a click, a hover, a
@@ -1079,7 +1079,7 @@ impl Runtime {
     /// Ends the active Mod+drag, committing exactly one move when it lands
     /// on another leaf (issue #1694; issue #2337 reflow).
     ///
-    /// Computes the bounded Hyprland-style [`DropPlan`](bitty_ui::DropPlan)
+    /// Computes the bounded Hyprland-style [`DropPlan`]
     /// at the drag's own recorded pointer: a center target swaps the two
     /// panels in place, an edge target inserts beside it at a balanced split.
     /// The chosen mutation runs once through [`Runtime::set_layout`], so leaf

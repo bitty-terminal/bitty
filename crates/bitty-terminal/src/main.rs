@@ -1,3 +1,4 @@
+//! ```text
 //!            _. ..- ._.                                           ,.-'^j=,.
 //!          .,>=?-_``"^=_._                                     _-"   ."^` ``,
 //!         .*_=..`>>,   ``*,         ... .,.>:?,:L..,.       .>`    ."'  '   1_
@@ -30,6 +31,7 @@
 //!             |  ,  ,  _   `!'                           ^.{   _  _  _  \
 //!            ,^ !|  ]  |  ! ``                            `    H  3  / .?,,
 //!            ``^!!_!!_.|s_` `                              `"_>/.u!.!!.^ `
+//! ```
 //!
 //! `bitty-terminal`: Correct Terminal thin composition root.
 //!
@@ -63,7 +65,7 @@
 //!    with precedence `CLI (appearance flags) > file > profile > defaults`. Invalid files
 //!    fail closed (clear stderr, exit 2, no panic, no silent ignore); a
 //!    missing default-path file simply yields defaults.
-//! 3. **Create [`Runtime`](bitty_runtime::Runtime)** via
+//! 3. **Create [`Runtime`]** via
 //!    [`Runtime::new`](bitty_runtime::Runtime::new) with a [`RuntimeConfig`](bitty_runtime::RuntimeConfig)
 //!    derived from the effective config (font family/size; grid/cell/queue
 //!    stay at defaults). This immediately

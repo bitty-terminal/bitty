@@ -74,15 +74,15 @@ fn spawn_rule_dim(dim: Option<u16>) -> Option<u16> {
 
 impl Runtime {
     /// Spawns `program` inside a PTY sized to the current grid, storing the
-    /// child handle. The program is taken as a direct argv[0] without shell
+    /// child handle. The program is taken as a direct `argv[0]` without shell
     /// interpolation (P0 security posture).
     ///
     /// Replaces any previously spawned child: the old `Pty` is dropped, which
     /// kills and reaps its child without leaking a zombie. The output side
     /// is pumped into a bounded channel (`READ_CHUNK_SIZE` ×
     /// `CHANNEL_CAPACITY_CHUNKS` = 128 KiB) so backpressure is end-to-end;
-    /// see [`poll_pty`] for the non-blocking drain that feeds
-    /// [`handle_pty_bytes`].
+    /// see `poll_pty` for the non-blocking drain that feeds
+    /// `handle_pty_bytes`.
     ///
     /// # Errors
     ///
@@ -100,7 +100,7 @@ impl Runtime {
     /// Direct argv exec, no shell interpolation: `program` plus `args` are
     /// passed verbatim to the platform exec path. For a shell echo, pass
     /// `program = "/bin/sh"` and `args = &["-c", "echo hello"]`. Bounded
-    /// backpressure and lifecycle are identical to [`spawn_shell`].
+    /// backpressure and lifecycle are identical to `spawn_shell`.
     pub fn spawn_shell_with_args(
         &mut self,
         program: &str,
@@ -833,7 +833,7 @@ impl Runtime {
     /// Current kernel winsize of the leaf's PTY, when the session exists.
     ///
     /// Introspection for split/resize verification (CTX-0269):
-    /// [`sync_pane_geometry`](Self::sync_pane_geometry) resizes the winsize
+    /// `sync_pane_geometry` resizes the winsize
     /// alongside the grid, so this must track the leaf allocation after any
     /// layout change. Best-effort (`None` without a session or when the
     /// kernel query fails).

@@ -4,14 +4,14 @@
 //! [`AppHandler`](crate::AppHandler). Translation from `winit` events happens
 //! in this module behind two layers:
 //!
-//! 1. Field-level mapping functions ([`map_keyboard_input`],
-//!    [`map_mouse_input`], [`map_cursor_moved`], [`map_mouse_wheel`],
-//!    [`map_scale_factor_changed`], ...) that take **plain data** extracted
+//! 1. Field-level mapping functions (`translate_key_parts`,
+//!    `map_mouse_input`, `map_cursor_moved`, `map_mouse_wheel`,
+//!    `map_scale_factor_changed`, ...) that take **plain data** extracted
 //!    from upstream payloads. This is the headless seam: payloads such as
 //!    `DeviceId` or `InnerSizeWriter` wrap OS handles that cannot be
 //!    constructed without a display server, so tests exercise the mapping on
 //!    their constructible fields directly.
-//! 2. [`translate_window_event`], which destructures the upstream enum and
+//! 2. `translate_window_event`, which destructures the upstream enum and
 //!    delegates to (1). Variants that carry no non-constructible fields are
 //!    additionally covered end-to-end by unit tests; the remainder are covered
 //!    by the display-gated integration tests.
@@ -515,8 +515,8 @@ pub enum WindowEventKind {
     /// The cursor left the window.
     CursorLeft,
     /// The user or system asked to close the window; the handler decides
-    /// whether to tear down and call [`EventContext::exit`]
-    /// (crate::app::EventContext::exit).
+    /// whether to tear down and call
+    /// [`EventContext::exit`](crate::app::EventContext::exit).
     CloseRequested,
     /// The window was destroyed by the platform; no further events arrive for
     /// it regardless of any pending close request.
@@ -559,8 +559,8 @@ pub enum ImeEvent {
     Disabled,
 }
 
-/// Every event the platform layer delivers to an [`AppHandler`]
-/// (crate::AppHandler), fully owned.
+/// Every event the platform layer delivers to an
+/// [`AppHandler`](crate::AppHandler), fully owned.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlatformEvent {
     /// An event scoped to one window.
@@ -587,8 +587,8 @@ pub enum PlatformEvent {
     /// delivery may cover many queued chunks, and the handler must drain
     /// all immediately available chunks without blocking.
     PtyReadable,
-    /// The loop is about to exit after an [`EventContext::exit`]
-    /// (crate::app::EventContext::exit) request.
+    /// The loop is about to exit after an
+    /// [`EventContext::exit`](crate::app::EventContext::exit) request.
     Exiting,
     /// The OS light/dark appearance changed (CTX-0951, issue #1669).
     ///

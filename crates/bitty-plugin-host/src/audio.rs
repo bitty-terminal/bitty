@@ -853,7 +853,7 @@ impl VolumeTarget {
     }
 }
 
-/// Scoped monitor binary (the only spawned program; argv[0] is fixed).
+/// Scoped monitor binary (the only spawned program; `argv[0]` is fixed).
 pub const MONITOR_PROGRAM: &str = "pactl";
 
 /// Logical default-sink selector (PulseAudio/PipeWire name, never a path).

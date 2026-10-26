@@ -24,7 +24,7 @@
 //!   bumps only on structural change, and the report carries the
 //!   invalidation set ([`UiChange`]) for layout, hit-test, and paint.
 //! - [`a11y_role_of`] — the accessibility mapping for every primitive,
-//!   returning the extension [`Role`](crate::a11y_host::Role) vocabulary so
+//!   returning the extension [`Role`] vocabulary so
 //!   no second role table is introduced.
 //!
 //! Relationship to the accepted Rich `Scene`/`SceneNode` model: this tree

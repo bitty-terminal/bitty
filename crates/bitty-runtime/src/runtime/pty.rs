@@ -427,7 +427,7 @@ impl Runtime {
     /// this point: it blocks in `recv` (zero wakeups when quiet), forwards
     /// each batch into a second bounded channel
     /// ([`PTY_FORWARD_CAPACITY_CHUNKS`]), and invokes `waker` once per batch
-    /// plus once on EOF (CTX-0476 waker merge). [`poll_pty`] drains the
+    /// plus once on EOF (CTX-0476 waker merge). `poll_pty` drains the
     /// forwarding channel, so the existing bounded-drain contract is
     /// preserved end to end.
     ///
@@ -455,7 +455,7 @@ impl Runtime {
         self.pty_waker.is_some()
     }
 
-    /// Whether the wakeup forwarder pump is active (implies [`has_pty_reader`]).
+    /// Whether the wakeup forwarder pump is active (implies `has_pty_reader`).
     #[must_use]
     pub fn has_pty_forwarder(&self) -> bool {
         self.pty_forward_rx.is_some()
@@ -544,7 +544,7 @@ impl Runtime {
         true
     }
 
-    /// Whether a PTY reader channel is currently owned (implies [`has_pty`]).
+    /// Whether a PTY reader channel is currently owned (implies `has_pty`).
     ///
     /// True while either the direct pump reader or the wakeup-forwarder
     /// channel is owned.
@@ -617,12 +617,12 @@ impl Runtime {
     ///
     /// Only available before [`set_pty_waker`](Self::set_pty_waker) promotes
     /// the reader into the wakeup forwarder: afterwards the forwarder thread
-    /// owns the reader and this returns `None` (drain via [`poll_pty`]
+    /// owns the reader and this returns `None` (drain via `poll_pty`
     /// instead). When no forwarder is active the caller becomes responsible
     /// for draining the channel without blocking the runtime thread and for
-    /// joining the pump on EOF. After this call [`poll_pty`] will return `0`
+    /// joining the pump on EOF. After this call `poll_pty` will return `0`
     /// because the channel no longer belongs to the runtime; most embedders
-    /// should prefer [`poll_pty`] instead.
+    /// should prefer `poll_pty` instead.
     pub fn take_pty_reader(&mut self) -> Option<PtyReader> {
         if self.pty_forward_rx.is_some() {
             return None;
@@ -631,7 +631,7 @@ impl Runtime {
     }
 
     /// Non-blocking drain of the bounded PTY output channel into
-    /// [`handle_pty_bytes`].
+    /// `handle_pty_bytes`.
     ///
     /// Drains the wakeup-forwarder channel when [`set_pty_waker`](Self::set_pty_waker)
     /// promoted the pump, otherwise the direct pump channel. Either way the
@@ -652,7 +652,7 @@ impl Runtime {
     /// available yet, or EOF has been reached and the queue drained (the
     /// budgets stop a *busy* poll early, never before the first available
     /// chunk). Headless
-    /// tests that never called [`spawn_shell`] get `0` without error, so the
+    /// tests that never called `spawn_shell` get `0` without error, so the
     /// same binary works headlessly (synthetic `handle_pty_bytes`) and with a
     /// real PTY (live `poll_pty`).
     pub fn poll_pty(&mut self) -> usize {

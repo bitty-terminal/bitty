@@ -54,7 +54,7 @@ pub const MAX_LEASE_TERM_TICKS: u64 = 1 << 20;
 /// Opaque holder tag for the current lease occupant.
 ///
 /// The host assigns tags (one agent holds many panels; the mapping lives
-/// outside this module). A human takeover is a release back to [`Idle`],
+/// outside this module). A human takeover is a release back to `Idle`,
 /// never a holder value: the human path acts outside the lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LeaseHolder(pub u64);

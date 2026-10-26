@@ -5,7 +5,7 @@
 //! [`build_plugin_vm`]) take budgets as a required input and refuse
 //! fail-closed with [`VmError::Budget`](crate::VmError) when budgets are
 //! missing or any enforced dimension is zero. There is no unguarded public
-//! constructor here: the only way to obtain a [`LuaVm`](crate::LuaVm)
+//! constructor here: the only way to obtain a [`LuaVm`]
 //! through this module is to supply valid budgets first.
 //!
 //! [`LoadPolicy`] additionally models `--safe`: under the safe policy no

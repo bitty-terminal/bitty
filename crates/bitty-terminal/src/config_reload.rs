@@ -1,6 +1,6 @@
 //! Live configuration reload (CTX-0814, issue #1397).
 //!
-//! `bitty-config` owns the *policy* of a reload: [`ReloadClass`] and
+//! `bitty-config` owns the *policy* of a reload: `ReloadClass` and
 //! [`bitty_config::diff`] classify a field diff as live / restart-required /
 //! rejected. This module is the *activation path* that policy feeds — it holds
 //! the last-applied [`EffectiveConfig`], re-reads the sources, and pushes the

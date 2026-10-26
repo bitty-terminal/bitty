@@ -1,6 +1,6 @@
 //! Production wiring for installed native components (CTX-1361, bitty#2254).
 //!
-//! [`Runtime`] owns at most one [`ComponentHost`](crate::component::ComponentHost).
+//! [`Runtime`] owns at most one [`ComponentHost`].
 //! The composition root installs it during startup; `None` is fail-closed.
 //! Requests are authorized against the accepted plugin capability model
 //! (`PluginHost` registry + grant store + manifest `[[network.egress]]`) and

@@ -36,7 +36,7 @@
 //!   cell when colors match; a cell with only a row mark copies the column
 //!   and high byte; a cell with row+column marks copies only the high byte.
 //!   In this headless API the caller performs the chaining via
-//!   [`KittyUnicodeRun::push`]; per-cell decode without context is
+//!   [`KittyRunBuilder::push`]; per-cell decode without context is
 //!   [`decode_cell`].
 //!
 //! # Bounds (threat T-01/T-02)

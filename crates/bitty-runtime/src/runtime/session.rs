@@ -34,7 +34,7 @@
 //! ```
 //!
 //! The v3 file appends one window-global `pinned` block after the workspace
-//! blocks: every leaf parked in the [`PinnedStore`](bitty_ui::PinnedStore)
+//! blocks: every leaf parked in the [`PinnedStore`]
 //! at capture, in pin order (present-time paint order). A `pin` record
 //! mirrors the v2 `pane` record minus the `<route>`/`<mode>` tokens — pinned
 //! leaves are floating terminal panels by construction, so the mode is
@@ -55,7 +55,7 @@
 //! private pane session, `detached` = session-less leaf with no state);
 //! `<route>` is the content route (only `terminal` is live — the reserved
 //! extension point for panel/rich activities); `<mode>` is the requested
-//! per-leaf [`PresentationMode`](bitty_ui::PresentationMode)
+//! per-leaf [`PresentationMode`]
 //! (`tiled`/`floating`/`fullscreen`/`scratchpad`). The layout S-expression
 //! still carries identity plus geometry only; the mode token stamps the
 //! restored leaf at decode so the live tree keeps it.
@@ -222,7 +222,7 @@ pub const SESSION_FORMAT_VERSION: u32 = 3;
 /// Earliest format version the decoder still migrates. v1 files carry the
 /// short pane record (`pane <id> <cols> <rows> <k> <cwd:0|1>`); migration
 /// leaves the attachment unspecified (resolved through
-/// [`derive_startup_owner`] exactly like the pre-v2 restore), defaults the
+/// `derive_startup_owner` exactly like the pre-v2 restore), defaults the
 /// route to [`PaneRoute::Terminal`], and defaults the mode to
 /// [`PresentationMode::Tiled`]. v1 and v2 files carry no pinned block, so
 /// migration yields an empty pinned store.
@@ -338,7 +338,7 @@ impl std::error::Error for SessionError {}
 /// (live PTYs), and which were session-less.
 ///
 /// `None` in memory marks a v1-legacy pane whose attachment was never
-/// recorded. Apply and encode resolve it through [`derive_startup_owner`]
+/// recorded. Apply and encode resolve it through `derive_startup_owner`
 /// (the active workspace's focused leaf, else its first leaf),
 /// reproducing the pre-v2 restore exactly: the derived owner hydrates the
 /// primary grid, every other pane waits pending for its respawn.
@@ -434,7 +434,7 @@ pub struct PaneSnapshot {
     /// Scrollback lines oldest-first, trimmed, bounded per pane.
     pub scrollback: Vec<String>,
     /// Live attachment at capture; `None` for v1-legacy panes (resolved
-    /// through [`derive_startup_owner`] on apply and encode).
+    /// through `derive_startup_owner` on apply and encode).
     pub attach: Option<PaneAttachment>,
     /// Content route serving the leaf (always [`PaneRoute::Terminal`]).
     pub route: PaneRoute,
@@ -448,11 +448,11 @@ pub struct PaneSnapshot {
 /// A pinned leaf is detached from every workspace layout, so unlike
 /// [`PaneSnapshot`] this carries the full stripped [`View`] (identity,
 /// geometry, `Floating` mode — origin dropped as presentation-only, exactly
-/// like [`strip_overlays`]) instead of referencing a layout leaf. The mode
+/// like `strip_overlays`) instead of referencing a layout leaf. The mode
 /// is always [`PresentationMode::Floating`] (pinning stamps it through the
 /// CW-08 gate); the route is always terminal, so neither travels as a file
 /// token. `anchor`/`after` are the unpin restore hint recorded at pin time
-/// (see [`PinnedStore`](bitty_ui::PinnedStore)); a stale anchor falls back
+/// (see [`PinnedStore`]); a stale anchor falls back
 /// to docking beside the first live leaf at unpin.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PinnedSnapshot {

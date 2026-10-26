@@ -24,7 +24,7 @@
 //! `plugin/runtime overlay` RFC and is not part of the v1 contract.
 //!
 //! Per DEC-0011 the user config file is Lua evaluated in the `bitty-lua`
-//! sandbox (same budgets as plugins): the [`file`] module loads
+//! sandbox (same budgets as plugins): the [`file`](mod@crate::file) module loads
 //! `init.lua`/`config.lua` through that sandbox into a [`ConfigPlan`]. The
 //! core pipeline stays **pure data + validation** past that point, with no
 //! `unsafe` — the crate stays headlessly testable on both Linux CI and the
@@ -36,7 +36,7 @@
 //! `init.lua` (sandboxed) -> ConfigPlan -> typed validation -> migration -> merge -> diff -> reconcile
 //! ```
 //!
-//! - Lua evaluation runs in the `bitty-lua` sandbox ([`file`]) with plugin
+//! - Lua evaluation runs in the `bitty-lua` sandbox ([`file`](mod@crate::file)) with plugin
 //!   budgets and no `io`/`os`; it yields plain data as [`plan::ConfigPlan`].
 //! - Typed validation (`validation`, `types`) checks every present field.
 //! - Migration (`migration`) bumps older `schema_version`s to the current

@@ -11,7 +11,7 @@
 //! per hint-session entry into an immutable [`TargetSnapshot`]. The
 //! compositor never polls providers per frame; a new session entry collects
 //! a new snapshot. Each collection is a new epoch: inserting an id issues a
-//! fresh [`TargetRegistry`](crate::targeting::TargetRegistry)
+//! fresh [`TargetRegistry`]
 //! generation, so handles captured by an older snapshot resolve
 //! [`ProviderError::StaleSnapshot`] — fail closed, never refreshed in place.
 //! There is deliberately no `refresh`/`poll` API on [`TargetSnapshot`].

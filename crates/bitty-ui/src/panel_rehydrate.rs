@@ -10,7 +10,7 @@
 //! What this module provides:
 //!
 //! - [`PanelRecord`] — the declarative snapshot of one panel's seven
-//!   axes ([`SevenPanelState`](crate::panel_state::SevenPanelState)) as
+//!   axes ([`SevenPanelState`]) as
 //!   plain values, with a `k=v;...` text encoding that uses no serializer
 //!   and no heap image.
 //! - [`encode_snapshot`] / [`rehydrate_snapshot`] — a snapshot document
@@ -28,7 +28,7 @@
 //!
 //! All types are bounded and `#![forbid(unsafe_code)]`. No wall-clock time,
 //! randomness, render, platform, PTY, or plugin handle participates.
-//! Rehydration output is sorted by [`PanelId`](crate::panel::PanelId), so
+//! Rehydration output is sorted by [`PanelId`], so
 //! reports are deterministic.
 
 #![forbid(unsafe_code)]
@@ -543,7 +543,7 @@ fn decode_record(line: &str, line_no: usize) -> Result<PanelRecord, RehydrateErr
 /// Outcome of [`rehydrate_snapshot`]: fresh states plus what was applied.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RehydrateReport {
-    /// Fresh states, sorted by [`PanelId`](crate::panel::PanelId).
+    /// Fresh states, sorted by [`PanelId`].
     pub states: Vec<SevenPanelState>,
     /// Raw panel ids applied, in ascending order.
     pub applied: Vec<u64>,

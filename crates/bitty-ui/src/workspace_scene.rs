@@ -15,12 +15,12 @@
 //!   (`tiled`, `floating`, `pinned`, `popover`, `overlay`) with an explicit
 //!   z-order contract ([`SceneLayer::z_rank`]).
 //! - [`WorkspaceScene`] — headless scene state: the tiled layer reuses the
-//!   accepted [`LayoutNode`](crate::layout::LayoutNode) composition, the
+//!   accepted [`LayoutNode`] composition, the
 //!   other layers hold bounded [`LayerEntry`] placements, and panel
 //!   attachments join panel identity to presentation.
 //! - [`PanelAttachment`] — the `Panel`-at-`View` binding. The accepted
 //!   inequality `PanelId != ViewId != TerminalId` holds by construction:
-//!   [`PanelId`](crate::panel::PanelId), [`ViewId`](crate::view::ViewId),
+//!   [`PanelId`], [`ViewId`],
 //!   and [`TerminalBinding`] are pairwise distinct newtypes with no `From`
 //!   bridge, and no function accepts one where another is expected.
 //!   [`WorkspaceScene::move_panel`] re-parents the presentation attachment
@@ -285,7 +285,7 @@ impl SceneLayer {
     }
 
     /// Whether this layer is the tiled composition (backed by
-    /// [`LayoutNode`](crate::layout::LayoutNode), not [`LayerEntry`]).
+    /// [`LayoutNode`], not [`LayerEntry`]).
     #[must_use]
     pub const fn is_tiled(self) -> bool {
         matches!(self, Self::Tiled)
@@ -346,12 +346,12 @@ pub struct PanelAttachment {
 /// Headless four-layer scene: tiled composition, layered placements, and
 /// panel attachments.
 ///
-/// The tiled layer owns a [`LayoutNode`](crate::layout::LayoutNode); the
+/// The tiled layer owns a [`LayoutNode`]; the
 /// floating, pinned, popover, and overlay layers hold bounded
 /// [`LayerEntry`] placements. Panel attachments join [`PanelId`] to
 /// [`ViewId`] with the [`TerminalBinding`] preserved across moves.
 ///
-/// [`LayoutNode`](crate::layout::LayoutNode) carries an `f32` split ratio
+/// [`LayoutNode`] carries an `f32` split ratio
 /// and implements `PartialEq` only, so scene equality is `PartialEq` too.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkspaceScene {
@@ -423,7 +423,7 @@ impl WorkspaceScene {
     /// # Errors
     ///
     /// Returns [`SceneError::LayerFull`] at capacity. The tiled layer is
-    /// rejected (it is owned by the [`LayoutNode`](crate::layout::LayoutNode)
+    /// rejected (it is owned by the [`LayoutNode`]
     /// composition, edited through its own API).
     pub fn place(&mut self, layer: SceneLayer, entry: LayerEntry) -> Result<(), SceneError> {
         let entries = match layer {
@@ -443,7 +443,7 @@ impl WorkspaceScene {
     /// Removes a view from its non-tiled layer.
     ///
     /// Returns whether an entry was removed. Tiled leaves are owned by
-    /// the [`LayoutNode`](crate::layout::LayoutNode) composition and are
+    /// the [`LayoutNode`] composition and are
     /// never removed here.
     #[must_use]
     pub fn unplace(&mut self, view: ViewId) -> bool {

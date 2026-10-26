@@ -78,7 +78,7 @@ fn is_break_control(cp: u32) -> bool {
 /// Whether `cp` is `Grapheme_Extend` in the M1 curated table (`GB9`).
 ///
 /// The crate zero-width tables minus the format controls (which break, see
-/// [`is_break_control`]) and minus ZWJ (own class), plus emoji modifiers
+/// `is_break_control`) and minus ZWJ (own class), plus emoji modifiers
 /// `1F3FB..1F3FF` (wide scalars that still join forward).
 #[must_use]
 pub fn is_grapheme_extend(cp: u32) -> bool {

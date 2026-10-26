@@ -3,7 +3,7 @@
 //! This module is the only place where `crossfont` types are named (ADR-0004
 //! "Wrap" row). Every value crossing back out is converted into the owned
 //! vocabulary of [`crate::glyph`], and every upstream failure is flattened
-//! through [`RenderError::flatten_rasterizer`] or mapped onto a semantic
+//! through `RenderError::flatten_rasterizer` or mapped onto a semantic
 //! variant:
 //!
 //! | Upstream condition                | Owned result                                   |

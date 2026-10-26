@@ -15,7 +15,7 @@
 //!   (`bitty.panel:*` / `bitty.workspace:*`) with the capability and
 //!   [`ApiScope`] each spelling needs. Spellings satisfy the
 //!   `owner.name:command` grammar (see
-//!   [`QualifiedCommand`](crate::panel::QualifiedCommand)) and are
+//!   [`QualifiedCommand`]) and are
 //!   validated by [`validate_spellings`].
 //! - [`PANEL_LUA_QUERIES`] / [`PANEL_LUA_EVENTS`] — the candidate query
 //!   and event name tables. Queries read; events notify; neither mutates.

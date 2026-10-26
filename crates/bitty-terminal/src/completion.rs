@@ -523,16 +523,23 @@ function __bitty_complete
         return 0
     end
     set -l path (__bitty_path)
+    # Operand slots are not grammar keys, so their dynamic candidates run
+    # first; a flag-prefixed token falls through to the static node below so
+    # `config profile show --json` still completes.
     switch "$path"
-{arms}        case 'plugin enable' 'plugin disable'
+        case 'plugin enable' 'plugin disable'
             if not string match -q -- '-*' "$cur"
                 __bitty_installed_plugins
+                return 0
             end
         case 'config profile show' 'config profile use' 'config profile path' 'config profile get' 'config profile clone' 'config profile delete' 'config profile rename'
             if not string match -q -- '-*' "$cur"
                 __bitty_profiles
+                return 0
             end
-        case '*'
+    end
+    switch "$path"
+{arms}        case '*'
             return 0
     end
 end
@@ -1139,12 +1146,17 @@ mod tests {
                 );
             }
             // A local-name branch for `create` would offer profiles the verb
-            // then rejects. Nushell only carries the static grammar extern.
+            // then rejects. Every verb now has a static grammar node, so check
+            // the dynamic operand branch only (its first line names `show`);
+            // Nushell has no dynamic branch at all.
             if shell != CompletionShell::Nushell {
-                let create = "\"config profile create\"";
+                let context = code
+                    .lines()
+                    .find(|line| line.contains("config profile show"))
+                    .unwrap_or_else(|| panic!("{shell:?} has no profile operand branch"));
                 assert!(
-                    !code.contains(create) && !code.contains("'config profile create'"),
-                    "{shell:?} must not complete existing profiles for `create`"
+                    !context.contains("config profile create"),
+                    "{shell:?} must not complete existing profiles for `create`: {context}"
                 );
             }
         }

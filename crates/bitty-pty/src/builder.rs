@@ -154,7 +154,8 @@ pub const GRAPHICS_FINGERPRINT_PREFIXES: &[&str] = &["GHOSTTY_", "WEZTERM_", "KI
 ///   versions; bitty implements bounded Kitty-graphics and no SIXEL, so an
 ///   inherited marker would misreport the child's graphics.
 /// - `ITERM_SESSION_ID`, `ITERM_PROFILE`: iTerm2 session markers (iTerm2
-///   announces inline images bitty does not implement).
+///   announces its full inline-image surface; bitty implements only the
+///   bounded `OSC 1337 File=` subset, so the marker stays stripped).
 /// - `LC_TERMINAL`, `LC_TERMINAL_VERSION`: iTerm2 announces itself here;
 ///   not locale data (`LANG`/`LC_ALL`/`LC_CTYPE` stay untouched).
 /// - `TERM_PROGRAM_VERSION`: companion to `TERM_PROGRAM`; the parent

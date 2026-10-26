@@ -200,6 +200,13 @@ pub struct TelemetryCounters {
     /// unresolvable animation target, over-cap frames). The wire bytes
     /// were well-formed; the request itself could not be honored.
     pub kitty_refused: u64,
+    /// iTerm2 inline-image requests (`OSC 1337 ; File=`) refused and dropped
+    /// before any paint. Counts both parser refusals (oversize payload,
+    /// malformed attributes, unsupported form, bad base64, non-PNG format,
+    /// over-cap pixels) and images the parser admitted that the downstream
+    /// decode, store, or placement quota then refused. Counts only requests
+    /// recognized as images, never ordinary OSC 1337 commands.
+    pub iterm2_refused: u64,
 }
 
 /// Content displacement produced by one [`State::resize`] call.
@@ -1472,6 +1479,16 @@ impl State {
         self.telemetry
     }
 
+    /// Counts one iTerm2 inline-image request that was admitted by the parser
+    /// but refused downstream, before it painted anything (CTX-1590 review).
+    ///
+    /// Decode, store, and placement-quota refusals happen in the runtime's
+    /// image seam, not in [`Self::apply`], so the runtime reports them here.
+    /// Telemetry only: no terminal state and no canonical hash changes.
+    pub fn note_iterm2_refused(&mut self) {
+        self.telemetry.iterm2_refused += 1;
+    }
+
     /// Current damage generation; increments once per applied batch.
     #[must_use]
     pub fn generation(&self) -> u64 {
@@ -1768,6 +1785,12 @@ impl State {
             // stays inert by contract (like OSC 10/11/4 and notifications).
             TerminalAction::OscPointerShape { .. } => {}
             TerminalAction::OscUnknown { .. } => self.telemetry.unknown_osc += 1,
+            // iTerm2 inline images (CTX-1590): pixels, decode, placement,
+            // and paint live downstream exactly like kitty graphics, so the
+            // action is inert here; the refusal variant exists only to be
+            // counted (the parser already dropped that request).
+            TerminalAction::Iterm2Image { .. } => {}
+            TerminalAction::Iterm2ImageRejected { .. } => self.telemetry.iterm2_refused += 1,
             // Kitty graphics (CTX-0256 base, CTX-0950 advanced): pixel
             // decode and paint live downstream (`KittyImageLayer` routes
             // to `kitty_display_image`), but placement, deletion,

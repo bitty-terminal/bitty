@@ -1553,6 +1553,50 @@ impl Runtime {
                 // the action, so continue to the next one.
                 continue;
             }
+            // iTerm2 inline images (CTX-1590, issue #2217): the parser
+            // already bounded the OSC, decoded the base64, and validated the
+            // PNG `IHDR`, so the payload is store-ready. Route through the
+            // same transmit-and-display seam the kitty path uses (`f=100`
+            // PNG, `a=` absent), with `C=0` so the cursor advances past the
+            // image exactly like native iTerm2/imgcat (only the WezTerm-only
+            // `doNotMoveCursor=1` extension holds it, which the native path
+            // deliberately does not admit). `cols`/`rows` are the requested cell
+            // span (`0` derives from pixels); the seam letterboxes a
+            // two-axis box, which is exactly the admitted
+            // `preserveAspectRatio=1` form. Refusals store nothing and paint
+            // nothing, with the same rate-limited diagnostic posture.
+            if let TerminalAction::Iterm2Image {
+                cols,
+                rows,
+                payload,
+            } = action
+            {
+                if let Err(err) = self.kitty_display_image_owned_with_wire(
+                    bitty_rich::KITTY_FORMAT_PNG,
+                    None,
+                    None,
+                    None,
+                    cols,
+                    rows,
+                    0,
+                    payload,
+                    0,
+                    0,
+                    0,
+                ) {
+                    // Every refusal counts, including one the parser admitted
+                    // and the decode/store/placement seam then refused
+                    // (CTX-1590 review follow-up).
+                    self.state.note_iterm2_refused();
+                    if let Some(suppressed) = self.kitty_log.admit_now() {
+                        eprintln!(
+                            "bitty: rejecting iTerm2 inline image ({err}): stored nothing{}",
+                            log_throttle::suppressed_suffix(suppressed)
+                        );
+                    }
+                }
+                continue;
+            }
             let damage = self.state.apply(&action);
             // #2442: swap the origin's image plane at the mode transition
             // itself (not only on the next tick), so a `?1049h`/`a=T` pair

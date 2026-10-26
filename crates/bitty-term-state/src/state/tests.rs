@@ -2716,3 +2716,51 @@ fn kitty_spanless_transmit_records_nothing_headless() {
     assert_eq!((s.cursor().position.row, s.cursor().position.col), (0, 0));
     assert!(s.check_invariants().is_ok());
 }
+
+#[test]
+fn iterm2_inline_image_is_inert_and_refusals_are_counted() {
+    // CTX-1590: pixels/placement live downstream exactly like kitty
+    // graphics, so the admitted action must not move the cursor, damage the
+    // grid, or enter Terminal Truth.
+    let mut s = State::new();
+    prints(&mut s, "x");
+    let cursor_before = s.cursor().position;
+    let damage = s.apply(&TerminalAction::Iterm2Image {
+        cols: 2,
+        rows: 1,
+        payload: Box::default(),
+    });
+    assert!(
+        damage.regions.is_empty(),
+        "image actions never damage the grid"
+    );
+    assert_eq!(
+        s.cursor().position,
+        cursor_before,
+        "the cursor must not advance"
+    );
+    assert_eq!(s.telemetry().iterm2_refused, 0);
+
+    // Every refusal is counted; nothing else changes.
+    for reason in [
+        bitty_vt::Iterm2Reject::OversizePayload,
+        bitty_vt::Iterm2Reject::BadBase64,
+        bitty_vt::Iterm2Reject::TransmitOnly,
+    ] {
+        let damage = s.apply(&TerminalAction::Iterm2ImageRejected { reason });
+        assert!(damage.regions.is_empty(), "refusals never damage the grid");
+    }
+    assert_eq!(s.telemetry().iterm2_refused, 3);
+    assert_eq!(
+        s.telemetry().kitty_refused,
+        0,
+        "kitty counters stay separate"
+    );
+    assert_eq!(s.cursor().position, cursor_before);
+
+    // A refusal the runtime takes downstream (decode, store, or placement
+    // quota) lands in the same counter, so "every refusal is counted" holds.
+    s.note_iterm2_refused();
+    assert_eq!(s.telemetry().iterm2_refused, 4);
+    assert!(s.check_invariants().is_ok());
+}

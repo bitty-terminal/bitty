@@ -2928,3 +2928,390 @@ fn kitty_font_query_apc_bel_terminator_is_accepted() {
         }]
     );
 }
+
+// — CTX-1590 / issue #2217 OSC 1337 `File=` inline images: admitted images,
+// counted refusals, chunking invariance, and untouched non-image OSC paths.
+
+/// 1x1 opaque red PNG (same fixture as the runtime suite).
+const ITERM2_PNG_1X1: [u8; 70] = [
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
+    0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 218, 99, 248, 207, 192, 240, 31, 0,
+    5, 0, 1, 255, 86, 199, 47, 13, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
+fn iterm2_wire(header: &str, payload: &[u8]) -> String {
+    format!("\x1b]1337;File={header}:{}\x07", kitty_base64(payload))
+}
+
+#[test]
+fn osc1337_inline_image_emits_one_bounded_action() {
+    let wire = iterm2_wire("inline=1;width=2;height=auto", &ITERM2_PNG_1X1);
+    let actions = parse(wire.as_bytes());
+    assert_eq!(actions.len(), 1, "expected one action, got {actions:?}");
+    match &actions[0] {
+        TerminalAction::Iterm2Image {
+            cols,
+            rows,
+            payload,
+        } => {
+            assert_eq!((*cols, *rows), (2, 0));
+            assert_eq!(&**payload, ITERM2_PNG_1X1.as_slice());
+        }
+        other => panic!("expected an admitted iTerm2 image, got {other:?}"),
+    }
+}
+
+#[test]
+fn osc1337_is_chunking_invariant() {
+    let wire = iterm2_wire("inline=1;width=3;height=2", &ITERM2_PNG_1X1);
+    let whole = parse(wire.as_bytes());
+    assert_eq!(whole.len(), 1);
+    for chunk_size in [1, 2, 3, 5, 7, 16, 32] {
+        assert_eq!(
+            parse_split(wire.as_bytes(), chunk_size),
+            whole,
+            "chunk size {chunk_size} changed the OSC 1337 action stream"
+        );
+    }
+}
+
+#[test]
+fn osc1337_esc_backslash_terminator_is_accepted() {
+    let mut wire = iterm2_wire("inline=1", &ITERM2_PNG_1X1);
+    wire.pop(); // drop BEL
+    wire.push_str("\x1b\\");
+    let actions = parse(wire.as_bytes());
+    assert_eq!(actions.len(), 1, "expected one action, got {actions:?}");
+    assert!(matches!(actions[0], TerminalAction::Iterm2Image { .. }));
+    // The terminating `ESC \` is consumed, not reported as an unknown ESC.
+    assert!(
+        actions
+            .iter()
+            .all(|action| !matches!(action, TerminalAction::Unknown(_)))
+    );
+}
+
+#[test]
+fn osc1337_refusals_are_counted_inert_actions() {
+    // Oversize wire payload: the body cap drops it without buffering.
+    let mut oversize = String::from("\x1b]1337;File=inline=1:");
+    oversize.push_str(&"A".repeat(crate::ITERM2_OSC_MAX_BODY_BYTES + 8));
+    oversize.push('\x07');
+    assert_eq!(
+        parse(oversize.as_bytes()),
+        vec![TerminalAction::Iterm2ImageRejected {
+            reason: crate::Iterm2Reject::OversizePayload
+        }]
+    );
+
+    // Transmit-only (`inline=0`) is refused: no unreachable stored image.
+    assert_eq!(
+        parse(iterm2_wire("inline=0", &ITERM2_PNG_1X1).as_bytes()),
+        vec![TerminalAction::Iterm2ImageRejected {
+            reason: crate::Iterm2Reject::TransmitOnly
+        }]
+    );
+
+    // Truncated base64 never reaches the store.
+    let mut truncated = String::from("\x1b]1337;File=inline=1:");
+    let encoded = kitty_base64(&ITERM2_PNG_1X1);
+    truncated.push_str(&encoded[..encoded.len() - 3]);
+    truncated.push('\x07');
+    assert_eq!(
+        parse(truncated.as_bytes()),
+        vec![TerminalAction::Iterm2ImageRejected {
+            reason: crate::Iterm2Reject::BadBase64
+        }]
+    );
+}
+
+#[test]
+fn osc1337_oversize_body_recovers_for_the_next_image() {
+    let mut stream = String::from("\x1b]1337;File=inline=1:");
+    stream.push_str(&"B".repeat(crate::ITERM2_OSC_MAX_BODY_BYTES + 8));
+    stream.push('\x07');
+    stream.push_str(&iterm2_wire("inline=1", &ITERM2_PNG_1X1));
+    let actions = parse(stream.as_bytes());
+    assert_eq!(actions.len(), 2, "got {actions:?}");
+    assert!(matches!(
+        actions[0],
+        TerminalAction::Iterm2ImageRejected { .. }
+    ));
+    assert!(matches!(actions[1], TerminalAction::Iterm2Image { .. }));
+}
+
+#[test]
+fn osc1337_other_commands_stay_inert_unknown_osc() {
+    // `Copy=` is not an admitted command: the probe replays the prefix and
+    // `vte` reports the sequence exactly as it did before CTX-1590.
+    assert_eq!(
+        parse(b"\x1b]1337;Copy=:YWJj\x07"),
+        vec![TerminalAction::OscUnknown {
+            id: 1337,
+            data: BoundedBytes::new(b"Copy=:YWJj".to_vec()),
+        }]
+    );
+}
+
+#[test]
+fn osc1337_probe_leaves_other_osc_paths_unchanged() {
+    // Titles, prompt marks, and clipboard still dispatch through `vte`.
+    assert_eq!(
+        parse(b"\x1b]0;title\x07"),
+        vec![TerminalAction::OscTitle {
+            text: BoundedString::new("title"),
+        }]
+    );
+    assert_eq!(
+        parse(b"\x1b]133;A\x07"),
+        vec![TerminalAction::OscPromptMark {
+            kind: ZoneKind::PromptStart,
+            exit_code: None,
+        }]
+    );
+    assert!(matches!(
+        parse(b"\x1b]52;c;aGk=\x07").as_slice(),
+        [TerminalAction::OscClipboard {
+            op: ClipboardOp::Write,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn osc1337_image_keeps_stream_order_with_text() {
+    let mut stream = iterm2_wire("inline=1", &ITERM2_PNG_1X1);
+    stream.push_str("ok");
+    let actions = parse(stream.as_bytes());
+    assert!(matches!(actions[0], TerminalAction::Iterm2Image { .. }));
+    assert_eq!(
+        &actions[1..],
+        &[
+            TerminalAction::Print(GraphemeCell::from('o')),
+            TerminalAction::Print(GraphemeCell::from('k')),
+        ]
+    );
+}
+
+// — CTX-1590 review MF-1/MF-2: a diverted `ESC ]` must not leave `vte` inside
+// a string it owns, and an APC-aborted image must reach the same diversion.
+
+/// The action one admitted 1x1 PNG request produces.
+fn iterm2_image(cols: u16, rows: u16) -> TerminalAction {
+    TerminalAction::Iterm2Image {
+        cols,
+        rows,
+        payload: ITERM2_PNG_1X1.to_vec().into_boxed_slice(),
+    }
+}
+
+/// Asserts a stream parses to `expected` whole, byte-wise, and split at
+/// every offset (chunk-boundary invariance for the new state tracking).
+fn assert_split_invariant(bytes: &[u8], expected: &[TerminalAction]) {
+    assert_eq!(parse(bytes), expected, "whole-buffer parse");
+    assert_eq!(parse_split(bytes, 1), expected, "byte-wise parse");
+    for split in 0..=bytes.len() {
+        let mut parser = Parser::new();
+        let mut actions = Vec::new();
+        parser.advance(&bytes[..split], |action| actions.push(action));
+        parser.advance(&bytes[split..], |action| actions.push(action));
+        assert_eq!(actions, expected, "split at offset {split}");
+    }
+}
+
+/// Appends one admitted image and trailing text to `prefix`.
+fn image_then_text(prefix: &[u8]) -> Vec<u8> {
+    let mut stream = prefix.to_vec();
+    stream.extend_from_slice(iterm2_wire("inline=1;width=1", &ITERM2_PNG_1X1).as_bytes());
+    stream.extend_from_slice(b"ok");
+    stream
+}
+
+/// The `Iterm2Image` + `ok` tail every MF-1 stream must end with.
+fn image_then_print_actions() -> Vec<TerminalAction> {
+    vec![
+        iterm2_image(1, 0),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ]
+}
+
+#[test]
+fn unterminated_osc_title_is_closed_before_a_diverted_image() {
+    // MF-1: `vte` ends the title OSC on the `ESC` of the next `ESC ]`. The
+    // diversion takes that `ESC` off the wire, so the parser must close the
+    // string itself or `ok` is swallowed by `vte`'s uncapped OSC buffer.
+    let stream = image_then_text(b"\x1b]0;title");
+    let mut expected = vec![TerminalAction::OscTitle {
+        text: BoundedString::new("title"),
+    }];
+    expected.extend(image_then_print_actions());
+    assert_split_invariant(&stream, &expected);
+}
+
+#[test]
+fn unterminated_osc_title_is_closed_before_a_refused_image() {
+    // The refusal path must close the string too: the diversion happens
+    // before the body is parsed, so a refused image cannot leak either.
+    let mut stream = b"\x1b]0;title".to_vec();
+    stream.extend_from_slice(iterm2_wire("inline=0", &ITERM2_PNG_1X1).as_bytes());
+    stream.extend_from_slice(b"ok");
+    let expected = vec![
+        TerminalAction::OscTitle {
+            text: BoundedString::new("title"),
+        },
+        TerminalAction::Iterm2ImageRejected {
+            reason: crate::Iterm2Reject::TransmitOnly,
+        },
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    assert_split_invariant(&stream, &expected);
+}
+
+#[test]
+fn unterminated_non_image_osc_1337_is_closed_before_a_diverted_image() {
+    // A non-matching `1337` command is replayed into `vte`, which then owns
+    // the string; the next image must still close it.
+    let stream = image_then_text(b"\x1b]1337;Copy=:YWJj");
+    let mut expected = vec![TerminalAction::OscUnknown {
+        id: 1337,
+        data: BoundedBytes::new(b"Copy=:YWJj".to_vec()),
+    }];
+    expected.extend(image_then_print_actions());
+    assert_split_invariant(&stream, &expected);
+}
+
+#[test]
+fn unterminated_osc_52_is_closed_before_a_diverted_image() {
+    // Clipboard writes take the plain replay path (no prefix match at all).
+    let stream = image_then_text(b"\x1b]52;c;aGk=");
+    let mut expected = vec![TerminalAction::OscClipboard {
+        op: ClipboardOp::Write,
+        data: BoundedBytes::new(b"aGk=".to_vec()),
+    }];
+    expected.extend(image_then_print_actions());
+    assert_split_invariant(&stream, &expected);
+}
+
+#[test]
+fn unterminated_dcs_is_closed_before_a_diverted_image() {
+    // DCS payloads stay with `vte`; `ESC \` must unhook them and report the
+    // unmapped sequence exactly as the pre-change stream did.
+    let stream = image_then_text(b"\x1bPabc");
+    let mut expected = vec![unknown(SequenceKind::Dcs, b'a', [0, 0])];
+    expected.extend(image_then_print_actions());
+    assert_split_invariant(&stream, &expected);
+}
+
+#[test]
+fn escape_del_before_a_diverted_image_keeps_the_escape_state() {
+    // `vte` does not dispatch `0x7F` from `Escape` (`advance_esc`'s `_ => ()`
+    // arm), so the tracker must stay in `Escape`: the diversion has to close
+    // it with `ESC \` instead of letting the image's own `ESC` be swallowed
+    // and mis-parsing the following text as an ESC dispatch.
+    let mut stream = b"\x1b\x7f".to_vec();
+    stream.extend_from_slice(iterm2_wire("inline=1", &ITERM2_PNG_1X1).as_bytes());
+    stream.extend_from_slice(b"ok");
+    let expected = vec![
+        iterm2_image(0, 0),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    assert_split_invariant(&stream, &expected);
+}
+
+#[test]
+fn escape_non_printing_prefix_bracket_before_a_diverted_image_dispatches_the_osc() {
+    // `ESC` + a non-dispatchable byte leaves `vte` in `Escape`; a raw `]`
+    // then opens a real (empty) OSC. The next image must dispatch it, not
+    // swallow it, and the trailing text must print. `0x7F` and a non-ASCII
+    // `é` (`0xC3 0xA9`) both take that path.
+    let expected = vec![
+        TerminalAction::OscUnknown {
+            id: u32::MAX,
+            data: BoundedBytes::new(Vec::new()),
+        },
+        iterm2_image(0, 0),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    for prefix in [&b"\x1b\x7f]"[..], &b"\x1b\xc3\xa9]"[..]] {
+        let mut stream = prefix.to_vec();
+        stream.extend_from_slice(iterm2_wire("inline=1", &ITERM2_PNG_1X1).as_bytes());
+        stream.extend_from_slice(b"ok");
+        assert_split_invariant(&stream, &expected);
+    }
+}
+
+#[test]
+fn image_after_aborted_apc_is_admitted() {
+    // MF-2: `ESC _ G x` is an APC with junk control bytes. Its aborting
+    // `ESC` must not hand `]1337;File=` to `vte` as an OSC.
+    let mut stream = b"\x1b_Gx".to_vec();
+    stream.extend_from_slice(iterm2_wire("inline=1", &ITERM2_PNG_1X1).as_bytes());
+    assert_split_invariant(&stream, &[iterm2_image(0, 0)]);
+}
+
+#[test]
+fn image_after_aborted_apc_split_across_reads_is_admitted() {
+    // Same as above with the aborting `ESC` at the end of one `advance` and
+    // the `]` at the start of the next (the held-ESC + APC arm).
+    let mut stream = b"\x1b_Gx".to_vec();
+    stream.extend_from_slice(iterm2_wire("inline=1", &ITERM2_PNG_1X1).as_bytes());
+    // `ESC _ G x` and the image's `ESC` form the first read (`len = 5`), so
+    // the aborting `ESC` is held and the next read starts with `]`.
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(&stream[..5], |action| actions.push(action));
+    assert!(actions.is_empty(), "nothing may emit before the image ends");
+    parser.advance(&stream[5..], |action| actions.push(action));
+    assert_eq!(actions, vec![iterm2_image(0, 0)]);
+    assert_eq!(parse_split(&stream, 5), vec![iterm2_image(0, 0)]);
+}
+
+#[test]
+fn osc1337_body_cap_bounds_the_parser_body_behind_an_aborted_apc() {
+    // MF-2 cap boundary: the diverted body is still collected under the
+    // parser's body cap, and the retained capacity never exceeds it.
+    const HEADER: &[u8] = b"inline=1:";
+    let cap = crate::ITERM2_OSC_MAX_BODY_BYTES;
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(b"\x1b_Gx\x1b]1337;File=inline=1:", |action| {
+        actions.push(action);
+    });
+    assert!(actions.is_empty(), "the APC must abort silently");
+    // Fill the body to exactly the cap: everything is retained, nothing is
+    // refused yet.
+    let filler = vec![b'A'; cap - HEADER.len()];
+    parser.advance(&filler, |action| actions.push(action));
+    assert!(actions.is_empty());
+    assert_eq!(parser.iterm2.buffered_body_len(), cap);
+    // `reserve_exact` promises only *at least* the requested capacity; the
+    // tighter cap bound is a std `RawVec::grow_exact` implementation property,
+    // so the assertion allows one documented growth step of slack
+    // (`BODY_CAPACITY_SLACK`) and still rejects a bare `Vec::push` doubling.
+    let bound = cap + crate::iterm2_osc::BODY_CAPACITY_SLACK;
+    assert!(
+        parser.iterm2.buffered_body_capacity() <= bound,
+        "body capacity {} must stay within the {bound}-byte bound",
+        parser.iterm2.buffered_body_capacity()
+    );
+    // One byte past the cap trips the bound and releases the buffer.
+    parser.advance(b"A", |action| actions.push(action));
+    assert!(actions.is_empty());
+    assert_eq!(parser.iterm2.buffered_body_len(), 0);
+    assert_eq!(parser.iterm2.buffered_body_capacity(), 0);
+    // The rest of the hostile body is discarded, and the terminator still
+    // reports exactly one counted refusal.
+    let tail = vec![b'A'; 4096];
+    parser.advance(&tail, |action| actions.push(action));
+    parser.advance(b"\x07", |action| actions.push(action));
+    assert_eq!(
+        actions,
+        vec![TerminalAction::Iterm2ImageRejected {
+            reason: crate::Iterm2Reject::OversizePayload
+        }]
+    );
+}

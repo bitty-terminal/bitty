@@ -527,18 +527,19 @@ pub fn check_shell(shell: Option<&str>, exists: bool, executable: bool) -> Docto
     }
 }
 
-/// Image protocols, reported honestly: kitty graphics is supported as a
-/// bounded subset (inline images paint; transmit-only and unknown actions
-/// store without painting) and sixel is unsupported, so this check stays an
-/// informational capability report (warn) rather than an installation gate.
+/// Image protocols, reported honestly: kitty graphics and iTerm2 inline
+/// images are supported as bounded subsets (paint-capable images paint;
+/// kitty transmit-only and unknown actions store without painting) and sixel
+/// is unsupported, so this check stays an informational capability report
+/// (warn) rather than an installation gate.
 #[must_use]
 pub fn check_image_protocols() -> DoctorCheck {
     DoctorCheck::warn(
         "images",
         "Image protocols",
-        "no action needed: text, braille/block fallbacks, hyperlinks, and bounded kitty inline images work; sixel is unsupported"
+        "no action needed: text, braille/block fallbacks, hyperlinks, and bounded kitty plus iTerm2 inline images work; sixel is unsupported"
             .to_string(),
-        "kitty-graphics: supported (bounded); sixel: unsupported".to_string(),
+        "kitty-graphics: supported (bounded); iterm2-inline-images: supported (bounded, PNG); sixel: unsupported".to_string(),
     )
 }
 
@@ -1314,7 +1315,7 @@ mod tests {
         assert_eq!(check.id, "images");
         assert_eq!(check.status, DoctorStatus::Warn);
         let text = format!("{} {}", check.hint, check.detail);
-        for marker in ["bounded", "sixel", "unsupported"] {
+        for marker in ["bounded", "iterm2", "sixel", "unsupported"] {
             assert!(
                 text.contains(marker),
                 "images row must name {marker:?}, got {text:?}"

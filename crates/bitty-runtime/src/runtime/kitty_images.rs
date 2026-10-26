@@ -209,6 +209,28 @@ impl Runtime {
         self.kitty_last_frame_images
     }
 
+    /// Cell spans of the live plane's retained placements, in insertion
+    /// order (headless-observable test seam: proves the protocol anchor and
+    /// requested span reach the placement layer as `(anchor_col,
+    /// anchor_row, cols, rows)` for the currently active screen plane).
+    ///
+    /// Dormant alternate/main-plane entries stashed across a screen swap are
+    /// not included; the plane the next present paints is the live one.
+    #[must_use]
+    pub fn kitty_placement_spans(&self) -> Vec<(u16, u16, u16, u16)> {
+        self.kitty_images
+            .placements()
+            .map(|placement| {
+                (
+                    placement.anchor_col,
+                    placement.anchor_row,
+                    placement.cols,
+                    placement.rows,
+                )
+            })
+            .collect()
+    }
+
     /// Raster-cache hits since construction (S6, #1849, headless-observable
     /// test seam: proves reuse across present ticks).
     #[must_use]

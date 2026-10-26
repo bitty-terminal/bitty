@@ -55,7 +55,8 @@
 //!   defaults only; precedence documented, file layers owned by
 //!   `bitty config check`).
 //! - Protocols reuse the honest support states reported by `bitty doctor`
-//!   (kitty-graphics supported as a bounded subset, sixel unsupported) plus
+//!   (kitty-graphics and iterm2-inline-images supported as bounded subsets,
+//!   sixel unsupported) plus
 //!   the `bitty-rich` OSC surfaces (hyperlink OSC 8, shell integration
 //!   OSC 133) and the OSC 52 clipboard policy gate.
 //!
@@ -297,7 +298,7 @@ fn example_for(target: InspectTarget) -> &'static str {
 /// Short usage for stderr (fail-closed exit 2 trailer).
 #[must_use]
 pub fn inspect_usage() -> String {
-    "usage: bitty inspect <command|key|plugin|config|protocol> <value> [--format table|json|jsonl] [--no-color]\n\ntargets:\n  command <id>    registry entry: core.terminal.text (workspace verbs: bitty ctl workspace)\n  key <chord>     keymap owner: ctrl+shift+m (unbound chords reach the shell)\n  plugin <id>     static catalog entry: bitty-terminal.shell-integration (no VM loaded)\n  config <key>    built-in default: font.size (effective file values: bitty config check)\n  protocol <name> core support state: kitty-graphics".to_string()
+    "usage: bitty inspect <command|key|plugin|config|protocol> <value> [--format table|json|jsonl] [--no-color]\n\ntargets:\n  command <id>    registry entry: core.terminal.text (workspace verbs: bitty ctl workspace)\n  key <chord>     keymap owner: ctrl+shift+m (unbound chords reach the shell)\n  plugin <id>     static catalog entry: bitty-terminal.shell-integration (no VM loaded)\n  config <key>    built-in default: font.size (effective file values: bitty config check)\n  protocol <name> core support state: kitty-graphics, iterm2-inline-images".to_string()
 }
 
 /// Full help for `bitty inspect --help` (stdout, exit 0).
@@ -871,6 +872,11 @@ const PROTOCOLS: &[(&str, &str, &str)] = &[
         "Bounded inline images ship end-to-end: APC intake, decode (f=100 PNG, f=24 RGB, f=32 RGBA), cursor-anchored placement, present-layer blit. Transmit-only and unknown a= actions store without painting; animation is deferred.",
     ),
     (
+        "iterm2-inline-images",
+        "supported",
+        "Bounded OSC 1337 File= inline images: PNG payloads only, with base64, decoded-byte, IHDR pixel, and cell-span caps enforced before any store. An explicit inline=1 paints at the cursor through the same seam as kitty graphics; an absent or inline=0 form, non-PNG payloads, px/% sizing, and stretch requests are refused and counted.",
+    ),
+    (
         "sixel",
         "unsupported",
         "Sixel is unsupported: sequences are ignored, text and fallbacks keep working.",
@@ -898,6 +904,12 @@ pub fn inspect_protocol(query: &str) -> Option<ProtocolInfo> {
     let want = query.trim().to_ascii_lowercase();
     let canonical = match want.as_str() {
         "kitty" | "kitty_graphics" | "kitty-graphics" | "kittygraphics" => "kitty-graphics",
+        "iterm2"
+        | "iterm"
+        | "iterm2-inline-images"
+        | "iterm2_inline_images"
+        | "osc-1337"
+        | "osc1337" => "iterm2-inline-images",
         "sixel" => "sixel",
         "hyperlink" | "hyperlinks" | "osc-8" | "osc8" => "hyperlink",
         "shell-integration" | "shell_integration" | "shell" | "osc-133" | "osc133" => {
@@ -1321,7 +1333,7 @@ pub fn run_inspect(request: &InspectRequest) -> i32 {
             }
             None => {
                 let message = format!(
-                    "bitty inspect: unknown protocol {:?} (try kitty-graphics, sixel, hyperlink, shell-integration, clipboard)",
+                    "bitty inspect: unknown protocol {:?} (try kitty-graphics, iterm2-inline-images, sixel, hyperlink, shell-integration, clipboard)",
                     request.value,
                 );
                 if emit_json {
@@ -1614,6 +1626,13 @@ mod tests {
             "unsupported"
         );
         assert_eq!(inspect_protocol("osc-8").expect("osc-8").name, "hyperlink");
+        for alias in ["iterm2", "iterm", "osc-1337"] {
+            assert_eq!(
+                inspect_protocol(alias).expect(alias).name,
+                "iterm2-inline-images",
+                "alias {alias:?} must resolve"
+            );
+        }
         assert!(inspect_protocol("nope").is_none());
     }
 
@@ -1640,6 +1659,18 @@ mod tests {
                 !lowered.contains(stale),
                 "kitty detail must not repeat the pre-present-path stub wording ({stale:?}), got {:?}",
                 kitty.detail
+            );
+        }
+        // CTX-1590: the iTerm2 entry names the admitted wire shape, the
+        // PNG-only allowlist, and the refused forms. It must never claim
+        // the full protocol.
+        let iterm2 = inspect_protocol("iterm2-inline-images").expect("iterm2");
+        assert_eq!(iterm2.status, "supported");
+        for marker in ["OSC 1337", "PNG", "inline=1", "inline=0", "caps"] {
+            assert!(
+                iterm2.detail.contains(marker),
+                "iterm2 detail must name {marker:?}, got {:?}",
+                iterm2.detail
             );
         }
         // The rest of the catalog stays honest too: sixel sequences are

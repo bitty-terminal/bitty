@@ -547,6 +547,7 @@ extern "bitty config" [
     --no-shell-init
 ]
 extern "bitty config profile" [
+    --json
     --help(-h)
     --version(-V)
     --verbose

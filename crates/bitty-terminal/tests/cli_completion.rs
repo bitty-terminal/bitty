@@ -525,6 +525,16 @@ printf -- '--\n'
 run bitty config profile show ""
 printf -- '--\n'
 run bitty config profile path w
+printf -- '--\n'
+run bitty config profile clone ""
+printf -- '--\n'
+run bitty config profile delete ""
+printf -- '--\n'
+run bitty config profile rename ""
+printf -- '--\n'
+run bitty config profile get ""
+printf -- '--\n'
+run bitty config profile --j
 "#;
     let out = env
         .command("bash")
@@ -539,7 +549,8 @@ run bitty config profile path w
     );
     assert_eq!(
         stdout(&out),
-        "alpha.plugin\nzeta.plugin\n--\nalpha.plugin\n--\nalpha\nwork\n--\nwork\n"
+        "alpha.plugin\nzeta.plugin\n--\nalpha.plugin\n--\nalpha\nwork\n--\nwork\n--\n\
+         alpha\nwork\n--\nalpha\nwork\n--\nalpha\nwork\n--\nalpha\nwork\n--\n--json\n"
     );
 }
 
@@ -583,7 +594,12 @@ $cases = @(
     @('bitty plugin enable ', ''),
     @('bitty plugin disable a', 'a'),
     @('bitty config profile show ', ''),
-    @('bitty config profile path w', 'w')
+    @('bitty config profile path w', 'w'),
+    @('bitty config profile clone ', ''),
+    @('bitty config profile delete w', 'w'),
+    @('bitty config profile rename ', ''),
+    @('bitty config profile get ', ''),
+    @('bitty config profile --j', '--j')
 )
 foreach ($case in $cases) {
     $line = $case[0]
@@ -653,7 +669,8 @@ foreach ($case in $cases) {
     let rendered = stdout(&out).replace("\r\n", "\n");
     assert_eq!(
         rendered,
-        "--\nalpha.plugin\nzeta.plugin\n--\nalpha.plugin\n--\nalpha\nwork\n--\nwork\n",
+        "--\nalpha.plugin\nzeta.plugin\n--\nalpha.plugin\n--\nalpha\nwork\n--\nwork\n--\n\
+         alpha\nwork\n--\nwork\n--\nalpha\nwork\n--\nalpha\nwork\n--\n--json\n",
         "pwsh stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );

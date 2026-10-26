@@ -817,6 +817,15 @@ fn json_envelopes_have_a_stable_shape() {
     let text = stdout(&missing);
     assert!(text.contains("\"ok\":false"), "{text}");
     assert!(text.contains("\"code\":\"E_PROFILE_NOT_FOUND\""), "{text}");
+    // Same envelope family as `config` errors: a typed `error` object plus a
+    // `result` object describing the outcome.
+    assert!(
+        text.contains(
+            "\"result\":{\"kind\":\"profile\",\"action\":\"delete\",\"valid\":false,\
+             \"name\":null,\"diagnostics\":[{\"severity\":\"error\",\"message\":"
+        ),
+        "error envelope carries a result object: {text}"
+    );
 
     // `--json` composes before the `config` word too.
     let before = run_bitty(&root, &["--json", "config", "profile", "list"]);
@@ -1075,6 +1084,169 @@ fn outside_config_json_stays_an_unknown_flag() {
         stderr(&output).contains("unknown flag '--json'"),
         "json stays scoped to config: {}",
         stderr(&output)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn set_pins_control_bearing_values_and_the_result_parses() {
+    // A valid parent: a long-bracket family with a real newline and a
+    // short-quoted fallback entry carrying a `\r` escape. The loader accepts
+    // both; the pin must re-encode them, because a raw newline inside a
+    // double-quoted Lua string is a syntax error (the pre-fix failure blamed
+    // the child profile for the parent's value).
+    let root = scratch_root("pin-control");
+    let parent = "return {\n    font = {\n        family = [[A\nB]],\n        size = 12,\n        \
+                  fallback = { \"C\\rD\" },\n    },\n}\n";
+    write_profile(&root, "parent", parent);
+    write_profile(&root, "kid", "return { extends = \"parent\" }\n");
+
+    let set = run_bitty(
+        &root,
+        &["config", "profile", "set", "kid", "font.size", "14"],
+    );
+    assert_ok(&set, "pin a control-bearing family");
+    let content = std::fs::read_to_string(profile_path(&root, "kid")).expect("kid profile");
+    assert!(
+        content.contains("family = \"A\\nB\""),
+        "newline escaped in the pin: {content:?}"
+    );
+    assert!(
+        !content.contains("family = \"A\nB\""),
+        "no raw newline inside the Lua literal: {content:?}"
+    );
+    assert!(
+        content.contains("fallback = { \"C\\rD\" }"),
+        "carriage return escaped in the pin: {content:?}"
+    );
+
+    let check = run_bitty(&root, &["config", "check", "--profile", "kid"]);
+    assert_ok(&check, "the pinned profile parses and validates");
+    assert!(
+        row(&stdout(&check), "font.size").starts_with("14 ("),
+        "the edited value wins: {}",
+        stdout(&check)
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "parent")).expect("parent"),
+        parent,
+        "the parent keeps its own bytes"
+    );
+    assert_no_temp_files(&root, "control-bearing pin");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn set_refuses_a_denied_inherited_background_image() {
+    let root = scratch_root("bg-denied");
+    let image = root.join("wall.png");
+    std::fs::write(&image, b"\x89PNG\r\n\x1a\nnot-a-real-png").expect("image candidate");
+    let image_lua = image
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let parent = format!("return {{\n    window = {{ background_image = \"{image_lua}\" }},\n}}\n");
+    write_profile(&root, "parent", &parent);
+    write_profile(&root, "kid", "return { extends = \"parent\" }\n");
+    let before = std::fs::read_to_string(profile_path(&root, "kid")).expect("kid profile");
+
+    // No approved roots is deny-by-default, so the inherited window image is
+    // rejected by the startup pipeline. `set` must run that pipeline: it
+    // previously wrote for a profile `config check` rejects.
+    let plain = run_bitty(
+        &root,
+        &["config", "profile", "set", "kid", "font.size", "13"],
+    );
+    assert_exit(&plain, 2, "set with a denied inherited image");
+    let errors = stderr(&plain);
+    assert!(
+        errors.contains("background image") && errors.contains("window.background_image"),
+        "the refusal names the owning key: {errors}"
+    );
+    assert!(
+        errors.contains("decoration.background_image_roots"),
+        "the refusal points at the approved-root list: {errors}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "kid")).expect("kid profile"),
+        before,
+        "a refused set leaves the bytes intact"
+    );
+
+    // Pinning `window` would copy the denied path into the child; the same
+    // strict gate refuses it before any splice is committed.
+    let pinned = run_bitty(
+        &root,
+        &["config", "profile", "set", "kid", "window.opacity", "0.9"],
+    );
+    assert_exit(&pinned, 2, "pin a denied image");
+    assert!(
+        !std::fs::read_to_string(profile_path(&root, "kid"))
+            .expect("kid profile")
+            .contains("background_image"),
+        "the denied path never reaches the child"
+    );
+
+    // `config check` rejects the same state, proving the two paths agree.
+    let check = run_bitty(&root, &["config", "check", "--profile", "kid"]);
+    assert_exit(&check, 2, "check the denied image");
+    assert!(
+        stderr(&check).contains("window.background_image"),
+        "{}",
+        stderr(&check)
+    );
+    assert_no_temp_files(&root, "denied image");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn use_refuses_a_selector_whose_own_theme_is_missing() {
+    let root = scratch_root("use-selector-theme");
+    write_profile(&root, "alpha", "return {}\n");
+    write_profile(&root, "beta", "return {}\n");
+    let selector = "return {\n    format = \"bitty-profile-v1\",\n    profile = \"alpha\",\n    \
+                    appearance = { theme = \"local:missing-theme\" },\n}\n";
+    std::fs::write(init_path(&root), selector).expect("selector");
+
+    // The target chain (beta) is valid, but the selector is a user layer too:
+    // switching to beta would leave `theme = local:missing-theme` active.
+    let refused = run_bitty(&root, &["config", "profile", "use", "beta"]);
+    assert_exit(&refused, 2, "use with a broken selector theme");
+    assert!(
+        stderr(&refused).contains("unknown local theme 'missing-theme'"),
+        "the selector theme is resolved: {}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("switching to 'beta' would leave"),
+        "the refusal names the switch and the selector: {}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        std::fs::read_to_string(init_path(&root)).expect("selector"),
+        selector,
+        "a refused use writes nothing"
+    );
+
+    // The checker already rejected that merge, so `use` now agrees with it.
+    let check = run_bitty(&root, &["config", "check"]);
+    assert_exit(&check, 2, "check the broken selector");
+    assert!(
+        stderr(&check).contains("unknown local theme"),
+        "{}",
+        stderr(&check)
+    );
+
+    // A clean selector still switches (the gate is not a blanket refusal).
+    write_selector(&root, "alpha");
+    assert_ok(
+        &run_bitty(&root, &["config", "profile", "use", "beta"]),
+        "clean switch",
+    );
+    assert!(
+        std::fs::read_to_string(init_path(&root))
+            .expect("selector")
+            .contains("profile = \"beta\"")
     );
     let _ = std::fs::remove_dir_all(&root);
 }

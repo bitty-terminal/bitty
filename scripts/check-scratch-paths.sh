@@ -32,6 +32,9 @@
 #   `scratch-paths-exempt: <reason>`, or the line mentions `temp_dir`,
 #   `mktemp`, or `sock` (socket paths), or — for `.rs` files — the hit sits
 #   at/after the file's first `#[cfg(test)]` line (unit-test-only region).
+#   `/tmp/bitty` itself is the workspace-sanctioned ephemeral scratch root
+#   (throwaway build/tool scratch, never durable evidence), so `/tmp/bitty`
+#   and `/tmp/bitty/...` are allowed. This does not cover `/var/tmp/bitty`.
 #   The rule covers `/var/tmp/` too (the alternate system temp dir; the
 #   inner `/tmp/` of `/var/tmp/` is lookbehind-excluded, so it needs its
 #   own alternative). The match requires the leading slash NOT to follow `[A-Za-z0-9_/-]`.
@@ -86,26 +89,26 @@ set -euo pipefail
 
 ROOT=""
 while (($# > 0)); do
-	case "$1" in
-	--root)
-		ROOT="${2:?--root requires a directory}"
-		shift 2
-		;;
-	-h | --help)
-		echo "usage: $0 [--root <dir>]"
-		exit 0
-		;;
-	*)
-		echo "usage: $0 [--root <dir>]" >&2
-		exit 2
-		;;
-	esac
+  case "$1" in
+  --root)
+    ROOT="${2:?--root requires a directory}"
+    shift 2
+    ;;
+  -h | --help)
+    echo "usage: $0 [--root <dir>]"
+    exit 0
+    ;;
+  *)
+    echo "usage: $0 [--root <dir>]" >&2
+    exit 2
+    ;;
+  esac
 done
 
 if [[ -n "$ROOT" ]]; then
-	cd "$ROOT"
+  cd "$ROOT"
 else
-	cd "$(dirname "$0")/.."
+  cd "$(dirname "$0")/.."
 fi
 
 FAIL=0
@@ -113,158 +116,158 @@ SELF=scripts/check-scratch-paths.sh
 
 # --- Rule 1: recordings/ (plural) allowlist ---
 while IFS= read -r hit; do
-	file="${hit%%:*}"
-	file="${file#./}"
-	rest="${hit#*:}"
-	line="${rest%%:*}"
-	text="${rest#*:}"
-	# (W-105: the former crates/bitty-compat-lab/src/compare.rs file entry left
-	# with that crate; no in-tree legacy-plural file remains, so only the text
-	# allowlist below applies.)
-	case "$text" in
-	*recordings/compat-matrix-2026-09-01.json* | *scratch-paths-exempt:*)
-		continue
-		;;
-	esac
-	if ((line > 1)); then
-		from=$((line > 3 ? line - 3 : 1))
-		if sed -n "${from},$((line - 1))p" "$file" | rg -q 'scratch-paths-exempt:' 2>/dev/null; then
-			continue
-		fi
-	fi
-	echo "scratch-paths[recordings]: $hit"
-	FAIL=1
+  file="${hit%%:*}"
+  file="${file#./}"
+  rest="${hit#*:}"
+  line="${rest%%:*}"
+  text="${rest#*:}"
+  # (W-105: the former crates/bitty-compat-lab/src/compare.rs file entry left
+  # with that crate; no in-tree legacy-plural file remains, so only the text
+  # allowlist below applies.)
+  case "$text" in
+  *recordings/compat-matrix-2026-09-01.json* | *scratch-paths-exempt:*)
+    continue
+    ;;
+  esac
+  if ((line > 1)); then
+    from=$((line > 3 ? line - 3 : 1))
+    if sed -n "${from},$((line - 1))p" "$file" | rg -q 'scratch-paths-exempt:' 2>/dev/null; then
+      continue
+    fi
+  fi
+  echo "scratch-paths[recordings]: $hit"
+  FAIL=1
 done < <(
-	rg -n --no-heading -g '!target/**' -g '!.git' -g '!.git/**' -g '!.worktrees/**' -g '!*.bin' -g '!docs/**' \
-		-g '!scripts/check-scratch-paths.sh' -g '!scripts/tests/fixtures/**' 'recordings/' . 2>/dev/null || true
+  rg -n --no-heading -g '!target/**' -g '!.git' -g '!.git/**' -g '!.worktrees/**' -g '!*.bin' -g '!docs/**' \
+    -g '!scripts/check-scratch-paths.sh' -g '!scripts/tests/fixtures/**' 'recordings/' . 2>/dev/null || true
 )
 
 # --- Rule 2: hardcoded /tmp/ writes in code + scripts ---
 mapfile -d '' SRC_FILES < <(
-	find crates scripts tools -type f \
-		\( -path 'crates/*/src/*.rs' -o -path 'crates/*/src/**/*.rs' \
-		-o -path 'scripts/*' -o -path 'tools/*' \) \
-		! -path 'scripts/tests/fixtures/*' -print0 2>/dev/null | sort -z
+  find crates scripts tools -type f \
+    \( -path 'crates/*/src/*.rs' -o -path 'crates/*/src/**/*.rs' \
+    -o -path 'scripts/*' -o -path 'tools/*' \) \
+    ! -path 'scripts/tests/fixtures/*' -print0 2>/dev/null | sort -z
 )
 
 for file in "${SRC_FILES[@]}"; do
-	[[ "$file" == "$SELF" ]] && continue
-	test_from=0
-	if [[ "$file" == *.rs ]]; then
-		if [[ "$(basename "$file")" == "tests.rs" ]]; then
-			# Extracted unit-test module (CTX-0304): the `#[cfg(test)]`
-			# attribute lives on the parent's `mod tests;` declaration, so
-			# the whole file is a test-only region.
-			test_from=1
-		else
-			test_from="$(rg -n --max-count 1 '^[[:space:]]*#\[cfg\(test\)\]' "$file" 2>/dev/null | cut -d: -f1 || true)"
-			test_from="${test_from:-0}"
-		fi
-	fi
-	while IFS= read -r hit; do
-		lineno="${hit%%:*}"
-		text="${hit#*:}"
-		if [[ "$text" =~ ^[[:space:]]*(//|#) ]]; then
-			continue
-		fi
-		case "$text" in
-		*scratch-paths-exempt:* | *temp_dir* | *mktemp* | *sock*)
-			continue
-			;;
-		esac
-		if [[ "$file" == *.rs ]] && ((test_from > 0)) && ((lineno >= test_from)); then
-			continue
-		fi
-		if ((lineno > 1)); then
-			from=$((lineno > 3 ? lineno - 3 : 1))
-			if sed -n "${from},$((lineno - 1))p" "$file" | rg -q 'scratch-paths-exempt:' 2>/dev/null; then
-				continue
-			fi
-		fi
-		echo "scratch-paths[tmp-write]: $file:$hit"
-		FAIL=1
-	done < <(
-		rg -n -P --no-heading '(?<![A-Za-z0-9_/\-])(/tmp/|/var/tmp/)' "$file" 2>/dev/null || true
-	)
+  [[ "$file" == "$SELF" ]] && continue
+  test_from=0
+  if [[ "$file" == *.rs ]]; then
+    if [[ "$(basename "$file")" == "tests.rs" ]]; then
+      # Extracted unit-test module (CTX-0304): the `#[cfg(test)]`
+      # attribute lives on the parent's `mod tests;` declaration, so
+      # the whole file is a test-only region.
+      test_from=1
+    else
+      test_from="$(rg -n --max-count 1 '^[[:space:]]*#\[cfg\(test\)\]' "$file" 2>/dev/null | cut -d: -f1 || true)"
+      test_from="${test_from:-0}"
+    fi
+  fi
+  while IFS= read -r hit; do
+    lineno="${hit%%:*}"
+    text="${hit#*:}"
+    if [[ "$text" =~ ^[[:space:]]*(//|#) ]]; then
+      continue
+    fi
+    case "$text" in
+    *scratch-paths-exempt:* | *temp_dir* | *mktemp* | *sock*)
+      continue
+      ;;
+    esac
+    if [[ "$file" == *.rs ]] && ((test_from > 0)) && ((lineno >= test_from)); then
+      continue
+    fi
+    if ((lineno > 1)); then
+      from=$((lineno > 3 ? lineno - 3 : 1))
+      if sed -n "${from},$((lineno - 1))p" "$file" | rg -q 'scratch-paths-exempt:' 2>/dev/null; then
+        continue
+      fi
+    fi
+    echo "scratch-paths[tmp-write]: $file:$hit"
+    FAIL=1
+  done < <(
+    rg -n -P --no-heading '(?<![A-Za-z0-9_/\-])(/var/tmp/|/tmp/(?!bitty\b))' "$file" 2>/dev/null || true
+  )
 done
 
 # --- Rule 3: hardcoded host-absolute paths in production code (CTX-0296) ---
 for file in "${SRC_FILES[@]}"; do
-	[[ "$file" == "$SELF" ]] && continue
-	test_from=0
-	if [[ "$file" == *.rs ]]; then
-		if [[ "$(basename "$file")" == "tests.rs" ]]; then
-			# Extracted unit-test module (CTX-0304): the `#[cfg(test)]`
-			# attribute lives on the parent's `mod tests;` declaration, so
-			# the whole file is a test-only region.
-			test_from=1
-		else
-			test_from="$(rg -n --max-count 1 '^[[:space:]]*#\[cfg\(test\)\]' "$file" 2>/dev/null | cut -d: -f1 || true)"
-			test_from="${test_from:-0}"
-		fi
-	fi
-	while IFS= read -r hit; do
-		lineno="${hit%%:*}"
-		text="${hit#*:}"
-		if [[ "$text" =~ ^[[:space:]]*(//|#) ]]; then
-			continue
-		fi
-		case "$text" in
-		*scratch-paths-exempt:*)
-			continue
-			;;
-		esac
-		if [[ "$file" == *.rs ]] && ((test_from > 0)) && ((lineno >= test_from)); then
-			continue
-		fi
-		if ((lineno > 1)); then
-			from=$((lineno > 3 ? lineno - 3 : 1))
-			if sed -n "${from},$((lineno - 1))p" "$file" | rg -q 'scratch-paths-exempt:' 2>/dev/null; then
-				continue
-			fi
-		fi
-		echo "scratch-paths[abs-path]: $file:$hit"
-		FAIL=1
-	done < <(
-		rg -n -e '/mnt/' -e '/home/[A-Za-z0-9]' -e '/Users/[A-Za-z0-9]' \
-			-e 'C:\\Users' -e 'C:\\\\Users' "$file" 2>/dev/null || true
-	)
+  [[ "$file" == "$SELF" ]] && continue
+  test_from=0
+  if [[ "$file" == *.rs ]]; then
+    if [[ "$(basename "$file")" == "tests.rs" ]]; then
+      # Extracted unit-test module (CTX-0304): the `#[cfg(test)]`
+      # attribute lives on the parent's `mod tests;` declaration, so
+      # the whole file is a test-only region.
+      test_from=1
+    else
+      test_from="$(rg -n --max-count 1 '^[[:space:]]*#\[cfg\(test\)\]' "$file" 2>/dev/null | cut -d: -f1 || true)"
+      test_from="${test_from:-0}"
+    fi
+  fi
+  while IFS= read -r hit; do
+    lineno="${hit%%:*}"
+    text="${hit#*:}"
+    if [[ "$text" =~ ^[[:space:]]*(//|#) ]]; then
+      continue
+    fi
+    case "$text" in
+    *scratch-paths-exempt:*)
+      continue
+      ;;
+    esac
+    if [[ "$file" == *.rs ]] && ((test_from > 0)) && ((lineno >= test_from)); then
+      continue
+    fi
+    if ((lineno > 1)); then
+      from=$((lineno > 3 ? lineno - 3 : 1))
+      if sed -n "${from},$((lineno - 1))p" "$file" | rg -q 'scratch-paths-exempt:' 2>/dev/null; then
+        continue
+      fi
+    fi
+    echo "scratch-paths[abs-path]: $file:$hit"
+    FAIL=1
+  done < <(
+    rg -n -e '/mnt/' -e '/home/[A-Za-z0-9]' -e '/Users/[A-Za-z0-9]' \
+      -e 'C:\\Users' -e 'C:\\\\Users' "$file" 2>/dev/null || true
+  )
 done
 
 # --- Rule 4: hardcoded host-absolute paths in tracked docs/metadata (CTX-0379) ---
 mapfile -d '' DOC_FILES < <(
-	rg --files -0 --hidden \
-		-g '!crates/**' -g '!tests/**' -g '!scripts/**' -g '!tools/**' -g '!docs/**' \
-		-g '!target/**' -g '!.git' -g '!.git/**' -g '!.worktrees/**' -g '!*.bin' \
-		. 2>/dev/null || true
+  rg --files -0 --hidden \
+    -g '!crates/**' -g '!tests/**' -g '!scripts/**' -g '!tools/**' -g '!docs/**' \
+    -g '!target/**' -g '!.git' -g '!.git/**' -g '!.worktrees/**' -g '!*.bin' \
+    . 2>/dev/null || true
 )
 
 for file in "${DOC_FILES[@]}"; do
-	file="${file#./}"
-	while IFS= read -r hit; do
-		lineno="${hit%%:*}"
-		text="${hit#*:}"
-		case "$text" in
-		*scratch-paths-exempt:*)
-			continue
-			;;
-		esac
-		if ((lineno > 1)); then
-			from=$((lineno > 3 ? lineno - 3 : 1))
-			if sed -n "${from},$((lineno - 1))p" "$file" | rg -q 'scratch-paths-exempt:' 2>/dev/null; then
-				continue
-			fi
-		fi
-		echo "scratch-paths[doc-abs-path]: $file:$hit"
-		FAIL=1
-	done < <(
-		rg -n -e '/mnt/' -e '/home/[A-Za-z0-9]' -e '/Users/[A-Za-z0-9]' \
-			-e 'C:\\Users' -e 'C:\\\\Users' "$file" 2>/dev/null || true
-	)
+  file="${file#./}"
+  while IFS= read -r hit; do
+    lineno="${hit%%:*}"
+    text="${hit#*:}"
+    case "$text" in
+    *scratch-paths-exempt:*)
+      continue
+      ;;
+    esac
+    if ((lineno > 1)); then
+      from=$((lineno > 3 ? lineno - 3 : 1))
+      if sed -n "${from},$((lineno - 1))p" "$file" | rg -q 'scratch-paths-exempt:' 2>/dev/null; then
+        continue
+      fi
+    fi
+    echo "scratch-paths[doc-abs-path]: $file:$hit"
+    FAIL=1
+  done < <(
+    rg -n -e '/mnt/' -e '/home/[A-Za-z0-9]' -e '/Users/[A-Za-z0-9]' \
+      -e 'C:\\Users' -e 'C:\\\\Users' "$file" 2>/dev/null || true
+  )
 done
 
 if ((FAIL)); then
-	echo "scratch-paths: FAIL — new stale scratch refs; fix to recording/ or extend the explicit allowlist with a reason" >&2
-	exit 1
+  echo "scratch-paths: FAIL — new stale scratch refs; fix to recording/ or extend the explicit allowlist with a reason" >&2
+  exit 1
 fi
 echo "scratch-paths: OK"

@@ -26,7 +26,12 @@
 //!   path inside the profile's returned Lua table, and commits atomically
 //!   (unique sibling temporary file, `sync_all`, rename over the target,
 //!   parent-directory sync). A failed validation or write leaves the previous
-//!   bytes intact.
+//!   bytes intact. The read captures the file's identity (device, inode,
+//!   length, mtime) through the open handle and re-checks it immediately
+//!   before the rename, so a concurrent edit is refused with the conflict
+//!   class (exit 2) instead of being silently overwritten. The check narrows
+//!   the lost-update window rather than eliminating it (see
+//!   [`ProfileIdentity`]).
 //!   Because the typed plan merges `font`,
 //!   `window`, `terminal`, `layout`, `decoration`, `scrollbar`, and
 //!   `appearance` as complete tables, creating one of them in a profile pins
@@ -44,7 +49,7 @@
 //! state, spawn a shell, or edit shell rc files. `BITTY_PROFILE` is a
 //! one-launch input and is never an output target.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -240,6 +245,7 @@ impl Failure {
 }
 
 /// Successful command output: human text plus the JSON `result` object.
+#[derive(Debug)]
 struct Reply {
     text: String,
     result: String,
@@ -890,7 +896,7 @@ fn run_rename(args: &Args, dir: &Path, raw_old: &str, raw_new: &str) -> Result<R
     // only a check: a destination created between it and the rename would be
     // silently overwritten by POSIX `rename`. Use the no-replace form where
     // the platform has one, and re-report the race as the same conflict.
-    match rename_no_replace(&old_path, &new_path) {
+    match commit_profile_rename(&old_path, &new_path) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
             return Err(exists_failure("rename", &new, &new_path));
@@ -1001,7 +1007,7 @@ fn run_set(
     })?;
     let path = profile_path(dir, &name);
     ensure_present("set", &name, &path)?;
-    let content = read_profile("set", &name, &path)?;
+    let (content, identity) = read_profile("set", &name, &path)?;
     // Seed-only view: the profile chain restricted to its own layers. A leaf
     // that is invalid in isolation (for example an outline color the selector
     // overrides) must still be pinnable, so this merge does not validate; the
@@ -1077,8 +1083,12 @@ fn run_set(
             expected.json()
         )));
     }
-    write_profile_atomic(&path, &updated)
-        .map_err(|err| io_failure("set", &format!("replace '{}'", path.display()), &err))?;
+    write_profile_atomic(&path, &updated, Some(&identity)).map_err(|err| match err {
+        ProfileWriteError::Changed => changed_failure("set", &path),
+        ProfileWriteError::Io(err) => {
+            io_failure("set", &format!("replace '{}'", path.display()), &err)
+        }
+    })?;
     let value = (field.get)(&merged.effective);
     let source = profile_source_label(&merged, field.path);
     let mut text = format!(
@@ -1149,6 +1159,15 @@ fn reject_reserved(verb: &str, name: &str) -> Result<(), Failure> {
 fn exists_failure(verb: &str, name: &str, path: &Path) -> Failure {
     Failure::conflict(format!(
         "bitty config profile {verb}: profile '{name}' already exists ('{}'); refusing to overwrite",
+        path.display()
+    ))
+}
+
+/// Preimage-changed conflict: the file moved under the command's feet.
+fn changed_failure(verb: &str, path: &Path) -> Failure {
+    Failure::conflict(format!(
+        "bitty config profile {verb}: '{}' changed while editing; refusing to overwrite the \
+         concurrent edit (re-run the command on the current file)",
         path.display()
     ))
 }
@@ -1292,9 +1311,70 @@ fn selector_profile_name(args: &Args) -> Option<String> {
     layer.plan.selector.map(|selector| selector.profile)
 }
 
+/// Identity of the profile bytes one command read, captured from the **open
+/// handle** (`fstat`), never from a later path re-stat.
+///
+/// [`run_set`] hands this to the atomic replace, which re-reads the current
+/// file immediately before the rename and refuses the commit when the
+/// identity moved. That closes the common lost-update window (an editor or a
+/// second `set` replacing the file between the read and the write), but it is
+/// a check, not a compare-and-swap: a writer that lands after the re-check
+/// and before `rename` is still overwritten. POSIX offers no way to make
+/// "replace only if this exact file is still there" atomic without holding a
+/// lock (which would exclude every other writer, including the user's
+/// editor), so the residual window is documented rather than claimed closed.
+///
+/// Identity is also only as precise as the metadata: a same-length in-place
+/// edit on a filesystem whose mtime granularity is coarser than the edit
+/// interval is not detected. Replacing the file (a new inode, as every
+/// editor's atomic save does) is always detected on Unix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProfileIdentity {
+    /// Byte length at read time.
+    len: u64,
+    /// Modification time at read time (best effort; `None` when the platform
+    /// cannot report it).
+    modified: Option<std::time::SystemTime>,
+    /// Owning device (Unix).
+    #[cfg(unix)]
+    dev: u64,
+    /// Inode number (Unix).
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl ProfileIdentity {
+    /// Captures identity from the metadata of an already-open handle.
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            dev: {
+                use std::os::unix::fs::MetadataExt;
+                metadata.dev()
+            },
+            #[cfg(unix)]
+            ino: {
+                use std::os::unix::fs::MetadataExt;
+                metadata.ino()
+            },
+        }
+    }
+}
+
 /// Reads one profile with the loader's size bound.
-fn read_profile(verb: &str, name: &str, path: &Path) -> Result<String, Failure> {
-    let meta = std::fs::metadata(path)
+///
+/// One open handle supplies both the bound check and the bytes, and its
+/// metadata is the identity the caller compares before replacing the file.
+/// A path re-stat after the read could observe a different file than the one
+/// actually read (a replacement between `stat` and `read`), which is exactly
+/// the lost-update this identity exists to detect.
+fn read_profile(verb: &str, name: &str, path: &Path) -> Result<(String, ProfileIdentity), Failure> {
+    let file = std::fs::File::open(path)
+        .map_err(|err| io_failure(verb, &format!("read '{}'", path.display()), &err))?;
+    let meta = file
+        .metadata()
         .map_err(|err| io_failure(verb, &format!("inspect '{}'", path.display()), &err))?;
     if meta.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
         return Err(Failure::invalid(format!(
@@ -1302,8 +1382,22 @@ fn read_profile(verb: &str, name: &str, path: &Path) -> Result<String, Failure> 
             bitty_config::file::MAX_CONFIG_FILE_BYTES
         )));
     }
-    std::fs::read_to_string(path)
-        .map_err(|err| io_failure(verb, &format!("read '{}'", path.display()), &err))
+    let identity = ProfileIdentity::from_metadata(&meta);
+    // Bound the read itself, not only the pre-read size: a file that grows
+    // while it is being read must not turn one command into an unbounded
+    // allocation.
+    let limit = bitty_config::file::MAX_CONFIG_FILE_BYTES as u64;
+    let mut content = String::new();
+    file.take(limit + 1)
+        .read_to_string(&mut content)
+        .map_err(|err| io_failure(verb, &format!("read '{}'", path.display()), &err))?;
+    if content.len() as u64 > limit {
+        return Err(Failure::invalid(format!(
+            "bitty config profile {verb}: profile '{name}' exceeds {} bytes; refusing to edit it",
+            bitty_config::file::MAX_CONFIG_FILE_BYTES
+        )));
+    }
+    Ok((content, identity))
 }
 
 /// Parses one candidate profile body as a `Profile` layer.
@@ -1337,7 +1431,9 @@ struct CloneSource {
 /// re-checks the file and line bounds on the actual string, so a file that
 /// grows after the metadata check still fails before any copy.
 fn read_clone_source(dir: &Path, src: &str, src_path: &Path) -> Result<CloneSource, Failure> {
-    let content = read_profile("clone", src, src_path)?;
+    // Clone creates a new destination exclusively, so the source identity is
+    // not used: a source edit only changes the bytes being copied.
+    let (content, _identity) = read_profile("clone", src, src_path)?;
     clone_source_from_content(dir, src, src_path, content)
 }
 
@@ -2088,13 +2184,36 @@ fn create_exclusive(path: &Path, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Failure from one atomic profile replacement.
+#[derive(Debug)]
+enum ProfileWriteError {
+    /// The target no longer matches the identity the edit was computed from;
+    /// nothing was replaced and the concurrent bytes survive.
+    Changed,
+    /// Filesystem failure; the temporary file has been removed.
+    Io(std::io::Error),
+}
+
 /// Replaces a profile atomically: unique sibling temporary file, `sync_all`,
-/// rename over the target, then a parent-directory sync. Any failure removes
-/// the temporary file and leaves the previous bytes intact.
-fn write_profile_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+/// a pre-commit identity re-check, rename over the target, then a
+/// parent-directory sync. Any failure removes the temporary file and leaves
+/// the previous bytes intact.
+///
+/// `expected` is the identity captured when the caller read the bytes the
+/// replacement was computed from. `None` skips the check (callers that did
+/// not read an existing preimage). The re-check runs after the replacement is
+/// staged and immediately before `rename`, so it observes a concurrent
+/// replace or in-place edit that landed during validation. It narrows the
+/// lost-update window but cannot close it: a writer landing between the check
+/// and the rename is still overwritten (see [`ProfileIdentity`]).
+fn write_profile_atomic(
+    path: &Path,
+    content: &str,
+    expected: Option<&ProfileIdentity>,
+) -> Result<(), ProfileWriteError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if !parent.as_os_str().is_empty() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent).map_err(ProfileWriteError::Io)?;
     }
     let name = path.file_name().map_or_else(
         || String::from("profile.lua"),
@@ -2115,14 +2234,14 @@ fn write_profile_atomic(path: &Path, content: &str) -> std::io::Result<()> {
                 break;
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err),
+            Err(err) => return Err(ProfileWriteError::Io(err)),
         }
     }
     let Some((temp_path, mut file)) = temp else {
-        return Err(std::io::Error::new(
+        return Err(ProfileWriteError::Io(std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
             "exhausted temporary profile names",
-        ));
+        )));
     };
     let write_result = file
         .write_all(content.as_bytes())
@@ -2130,14 +2249,22 @@ fn write_profile_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     drop(file);
     if let Err(err) = write_result {
         let _ = std::fs::remove_file(&temp_path);
-        return Err(err);
+        return Err(ProfileWriteError::Io(err));
     }
     if let Some(permissions) = permissions {
         let _ = std::fs::set_permissions(&temp_path, permissions);
     }
+    #[cfg(test)]
+    run_commit_hook(path);
+    if let Some(expected) = expected {
+        if let Err(err) = verify_profile_unchanged(path, expected) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(err);
+        }
+    }
     if let Err(err) = std::fs::rename(&temp_path, path) {
         let _ = std::fs::remove_file(&temp_path);
-        return Err(err);
+        return Err(ProfileWriteError::Io(err));
     }
     // The file bytes are synced above; the directory entry that now names
     // them must be synced too, or a crash can lose the replace while the
@@ -2146,27 +2273,157 @@ fn write_profile_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Re-checks the preimage identity immediately before the replace commits.
+///
+/// The current file is opened and measured through that handle, so a
+/// replacement (new inode) and an in-place edit (same inode, new mtime or
+/// length) are both detected. A file that disappeared is reported as a
+/// concurrent change: the bytes the edit was computed from no longer exist.
+fn verify_profile_unchanged(
+    path: &Path,
+    expected: &ProfileIdentity,
+) -> Result<(), ProfileWriteError> {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ProfileWriteError::Changed);
+        }
+        Err(err) => return Err(ProfileWriteError::Io(err)),
+    };
+    let metadata = file.metadata().map_err(ProfileWriteError::Io)?;
+    if ProfileIdentity::from_metadata(&metadata) == *expected {
+        Ok(())
+    } else {
+        Err(ProfileWriteError::Changed)
+    }
+}
+
+#[cfg(test)]
+type ProfileCommitHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// One-shot test seam: runs after the replacement is staged and synced
+    /// but before the preimage re-check, emulating a concurrent writer that
+    /// lands between `set`'s read and its commit.
+    static PROFILE_COMMIT_HOOK: std::cell::RefCell<Option<ProfileCommitHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the one-shot commit hook for the current test thread.
+#[cfg(test)]
+fn with_commit_hook(hook: impl FnOnce(&Path) + 'static) {
+    PROFILE_COMMIT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Runs and clears the one-shot commit hook (test builds only).
+#[cfg(test)]
+fn run_commit_hook(path: &Path) {
+    let hook = PROFILE_COMMIT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(path);
+    }
+}
+
+/// Commits one profile rename, mapping a raced destination onto the conflict
+/// class in [`run_rename`].
+///
+/// Production is [`rename_no_replace`]; unit tests replace the platform call
+/// through [`PROFILE_RENAME_OVERRIDE`] so the `AlreadyExists` mapping is
+/// exercised on every host, not only where `RENAME_NOREPLACE` exists.
+fn commit_profile_rename(old: &Path, new: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(rename) = PROFILE_RENAME_OVERRIDE.with(|slot| slot.borrow_mut().take()) {
+        return rename(old, new);
+    }
+    rename_no_replace(old, new)
+}
+
+#[cfg(test)]
+type ProfileRenameOverride = Box<dyn FnOnce(&Path, &Path) -> std::io::Result<()>>;
+
+#[cfg(test)]
+thread_local! {
+    /// One-shot test seam replacing the platform rename. The closure owns the
+    /// simulated race (for example creating the destination and returning
+    /// `AlreadyExists`) so the CLI mapping is deterministic.
+    static PROFILE_RENAME_OVERRIDE: std::cell::RefCell<Option<ProfileRenameOverride>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arms the one-shot rename override for the current test thread.
+#[cfg(test)]
+fn with_rename_override(rename: impl FnOnce(&Path, &Path) -> std::io::Result<()> + 'static) {
+    PROFILE_RENAME_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(Box::new(rename)));
+}
+
 /// Renames `old` to `new` without replacing an existing destination.
 ///
 /// POSIX `rename` silently overwrites, so the caller's pre-check is only a
 /// courtesy: a file created between the check and the call would be lost.
 /// Linux `RENAME_NOREPLACE` closes that window; a filesystem or kernel
-/// without the flag (or a non-Linux platform) falls back to the pre-checked
-/// rename that this command always used.
+/// without the flag (or a platform without a safe no-replace wrapper) falls
+/// back to the pre-checked rename that this command always used.
+///
+/// Platform coverage and the recorded gaps:
+/// - **Linux (glibc):** `nix::fcntl::renameat2(..., RENAME_NOREPLACE)` below,
+///   with `EINVAL`/`ENOSYS`/`EOPNOTSUPP` falling back to the pre-checked
+///   rename (old kernel, or a filesystem such as NFS that lacks the flag).
+/// - **Linux (musl):** the kernel and `libc` both support `renameat2`, but
+///   the pinned `nix` 0.31.3 gates its safe wrapper to `target_env = "gnu"`.
+///   Calling `libc::renameat2` directly needs `unsafe`, which this binary
+///   forbids crate-wide, so musl keeps the pre-checked fallback. This is a
+///   documented coverage gap (bitty#2707 / CTX-1602); a safe wrapper
+///   (`rustix` or a narrow reviewed exception) can close it without changing
+///   this command's contract.
+/// - **macOS:** `renamex_np(RENAME_EXCL)` is declared by `libc`, but it is
+///   likewise an `unsafe` FFI call, so it is not reachable under
+///   `#![forbid(unsafe_code)]`. Same documented gap.
+/// - **Windows:** no std no-replace rename; the pre-checked rename remains.
 fn rename_no_replace(old: &Path, new: &Path) -> std::io::Result<()> {
+    rename_with_attempt(old, new, try_rename_no_replace)
+}
+
+/// Runs the platform no-replace attempt when the build has one, otherwise the
+/// pre-checked [`std::fs::rename`] fallback.
+///
+/// Split from [`rename_no_replace`] so the unsupported-platform routing is
+/// testable on every host: `attempt` returning `None` means "this build has
+/// no safe no-replace primitive", which is exactly the fallback contract.
+fn rename_with_attempt(
+    old: &Path,
+    new: &Path,
+    attempt: impl FnOnce(&Path, &Path) -> Option<std::io::Result<()>>,
+) -> std::io::Result<()> {
+    if let Some(result) = attempt(old, new) {
+        return result;
+    }
+    std::fs::rename(old, new)
+}
+
+/// One platform no-replace attempt.
+///
+/// `None` means this build has no safe no-replace primitive and the caller
+/// must fall back; `Some(Err)` is a real failure (for example a raced
+/// destination returning `AlreadyExists`) that must not be retried as a
+/// clobbering rename.
+fn try_rename_no_replace(old: &Path, new: &Path) -> Option<std::io::Result<()>> {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
         use nix::errno::Errno;
         use nix::fcntl::{AT_FDCWD, RenameFlags, renameat2};
         match renameat2(AT_FDCWD, old, AT_FDCWD, new, RenameFlags::RENAME_NOREPLACE) {
-            Ok(()) => return Ok(()),
-            Err(Errno::EINVAL | Errno::ENOSYS | Errno::EOPNOTSUPP) => {
-                // Unsupported flag: keep the legacy pre-checked rename.
-            }
-            Err(err) => return Err(std::io::Error::from(err)),
+            Ok(()) => Some(Ok(())),
+            // Unsupported flag: keep the legacy pre-checked rename.
+            Err(Errno::EINVAL | Errno::ENOSYS | Errno::EOPNOTSUPP) => None,
+            Err(err) => Some(Err(std::io::Error::from(err))),
         }
     }
-    std::fs::rename(old, new)
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    {
+        let _ = (old, new);
+        None
+    }
 }
 
 /// Flushes the directory entry for `path` after a rename or atomic replace.
@@ -3287,6 +3544,33 @@ mod tests {
         dir
     }
 
+    /// `(profiles dir, args)` rooted at a scratch tree with a valid selector.
+    ///
+    /// The explicit `--config` keeps the merge/gate path hermetic: no test
+    /// reads the host's `$XDG_CONFIG_HOME` or `$BITTY_CONFIG` layer.
+    fn scratch_profile_root(tag: &str) -> (PathBuf, Args) {
+        let root = scratch_dir(tag);
+        let profiles = root.join("profiles");
+        std::fs::create_dir_all(&profiles).expect("profiles dir");
+        let selector = root.join("init.lua");
+        // A plain user layer (no selector envelope): valid, and it carries no
+        // `profile` key, so no test depends on the host's active profile.
+        std::fs::write(&selector, "return {}\n").expect("selector");
+        let mut args = Args::new();
+        args.config_path = Some(selector.display().to_string());
+        (profiles, args)
+    }
+
+    /// Temporary siblings left behind by an atomic replacement.
+    fn temp_leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .expect("dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp-"))
+            .collect()
+    }
+
     #[test]
     fn entry_budget_does_not_count_unrelated_files() {
         // 300 non-profile files before the profiles: the old
@@ -3564,8 +3848,11 @@ mod tests {
         let dir = scratch_dir("atomic-cleanup");
         let target = dir.join("work.lua");
         std::fs::create_dir(&target).expect("target dir");
-        let err = write_profile_atomic(&target, "return {}\n").expect_err("rename over dir");
-        assert!(err.kind() != std::io::ErrorKind::NotFound, "{err}");
+        let err = write_profile_atomic(&target, "return {}\n", None).expect_err("rename over dir");
+        assert!(
+            matches!(&err, ProfileWriteError::Io(err) if err.kind() != std::io::ErrorKind::NotFound),
+            "{err:?}"
+        );
         assert!(target.is_dir(), "target directory preserved");
         let leftovers: Vec<_> = std::fs::read_dir(&dir)
             .expect("dir")
@@ -3576,6 +3863,80 @@ mod tests {
             leftovers.is_empty(),
             "temporary file removed: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn set_refuses_a_concurrent_edit_and_keeps_its_bytes() {
+        // A writer landing between `set`'s read and its commit must win: the
+        // command refuses with the conflict class (exit 2), the concurrent
+        // bytes survive, and no staged temporary file is left behind.
+        let (dir, args) = scratch_profile_root("set-lost-update");
+        let path = dir.join("work.lua");
+        std::fs::write(&path, "return {}\n").expect("profile");
+        let concurrent = "return { window = { padding = 99 } }\n";
+        with_commit_hook(move |path| {
+            std::fs::write(path, concurrent).expect("concurrent edit");
+        });
+
+        let failure = run_set(&args, &dir, "work", "window.padding", "8")
+            .expect_err("a concurrent edit must refuse the write");
+        assert_eq!(failure.code, "E_PROFILE_CONFLICT");
+        assert_eq!(failure.exit, 2);
+        assert!(
+            failure.message.contains("changed while editing"),
+            "names the race: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains(&path.display().to_string()),
+            "names the file: {}",
+            failure.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("profile"),
+            concurrent,
+            "the concurrent bytes are never overwritten"
+        );
+        assert!(
+            temp_leftovers(&dir).is_empty(),
+            "no temporary file remains: {:?}",
+            temp_leftovers(&dir)
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().expect("scratch root"));
+    }
+
+    #[test]
+    fn profile_identity_detects_edits_replacement_and_removal() {
+        let dir = scratch_dir("profile-identity");
+        let path = dir.join("work.lua");
+        std::fs::write(&path, "return {}\n").expect("profile");
+        let (_, identity) = read_profile("set", "work", &path).expect("read");
+        verify_profile_unchanged(&path, &identity).expect("unchanged bytes are accepted");
+
+        // In-place edit: same handle target, different bytes.
+        std::fs::write(&path, "return { font = { size = 14 } }\n").expect("edit");
+        assert!(matches!(
+            verify_profile_unchanged(&path, &identity),
+            Err(ProfileWriteError::Changed)
+        ));
+
+        // Replacement: the path now names a different file.
+        let (_, replaced) = read_profile("set", "work", &path).expect("read");
+        let other = dir.join("other.lua");
+        std::fs::write(&other, "return { terminal = { scrollback = 500 } }\n").expect("other");
+        std::fs::rename(&other, &path).expect("replace");
+        assert!(matches!(
+            verify_profile_unchanged(&path, &replaced),
+            Err(ProfileWriteError::Changed)
+        ));
+
+        // Removal is a change too, not a filesystem failure.
+        std::fs::remove_file(&path).expect("remove");
+        assert!(matches!(
+            verify_profile_unchanged(&path, &replaced),
+            Err(ProfileWriteError::Changed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3718,6 +4079,92 @@ mod tests {
         assert!(!old.exists());
         assert!(new.is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_falls_back_when_no_no_replace_primitive_exists() {
+        // Unsupported platform (no safe `RENAME_NOREPLACE`/`RENAME_EXCL`
+        // wrapper): `rename_with_attempt(None)` must take the pre-checked
+        // fallback and still perform the move.
+        let dir = scratch_dir("rename-fallback");
+        let old = dir.join("old.lua");
+        let new = dir.join("new.lua");
+        std::fs::write(&old, "return { fallback = true }\n").expect("old profile");
+        rename_with_attempt(&old, &new, |_, _| None).expect("fallback rename");
+        assert!(!old.exists(), "fallback removed the source name");
+        assert_eq!(
+            std::fs::read_to_string(&new).expect("destination"),
+            "return { fallback = true }\n"
+        );
+
+        // A real no-replace failure is surfaced, never retried as a clobbering
+        // rename that would destroy the raced destination.
+        let source = dir.join("source.lua");
+        let raced = dir.join("raced.lua");
+        std::fs::write(&source, "return { source = true }\n").expect("source profile");
+        std::fs::write(&raced, "return { raced = true }\n").expect("raced destination");
+        let err = rename_with_attempt(&source, &raced, |_, _| {
+            Some(Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists)))
+        })
+        .expect_err("attempt failure is surfaced");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&raced).expect("destination"),
+            "return { raced = true }\n",
+            "the raced destination is preserved"
+        );
+        assert!(source.is_file(), "the source stays in place");
+
+        // A successful attempt is authoritative too: the fallback never runs
+        // a second rename behind it.
+        let untouched = dir.join("untouched.lua");
+        rename_with_attempt(&source, &untouched, |_, _| Some(Ok(()))).expect("attempt succeeded");
+        assert!(source.is_file(), "the attempt owns the move");
+        assert!(!untouched.exists(), "no fallback rename after the attempt");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_maps_a_raced_destination_to_the_conflict_class() {
+        // The pre-check (`ensure_absent`) passed, then a concurrent creator
+        // landed. The no-replace commit reports `AlreadyExists`, and
+        // `run_rename` must turn that into the same conflict/exit-2 class as
+        // the pre-check, leaving both files byte-identical to the race state.
+        let (dir, args) = scratch_profile_root("rename-race");
+        let old_path = dir.join("race-old.lua");
+        let new_path = dir.join("race-new.lua");
+        std::fs::write(&old_path, "return {}\n").expect("source profile");
+        let concurrent = "return { concurrent = true }\n";
+        with_rename_override(move |_, new| {
+            std::fs::write(new, concurrent).expect("concurrent creator");
+            Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
+        });
+
+        let failure = run_rename(&args, &dir, "race-old", "race-new")
+            .expect_err("a destination created after the pre-check must conflict");
+        assert_eq!(failure.code, "E_PROFILE_CONFLICT");
+        assert_eq!(failure.exit, 2);
+        assert!(
+            failure.message.contains("already exists"),
+            "conflict message: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains(&new_path.display().to_string()),
+            "names the destination: {}",
+            failure.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(&new_path).expect("destination"),
+            concurrent,
+            "the raced destination is unchanged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&old_path).expect("source"),
+            "return {}\n",
+            "the source stays intact"
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().expect("scratch root"));
     }
 
     #[test]

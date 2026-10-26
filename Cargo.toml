@@ -18,6 +18,12 @@ members = [
   "crates/bitty-ui",
   "crates/bitty-winjob",
 ]
+# CTX-1605: `vendor/winit` is a patched upstream source tree, not a workspace
+# crate. Excluding it keeps cargo from treating the path dependency as an
+# implicit member, so workspace lint inheritance, `cargo fmt --all`, and
+# `clippy --workspace` never rewrite or re-lint upstream code. The vendored
+# tree is formatted and linted as upstream ships it.
+exclude = ["vendor/winit"]
 resolver = "3"
 
 [workspace.package]
@@ -39,6 +45,10 @@ categories = ["command-line-utilities", "emulators"]
 [workspace.dependencies]
 # Window/event-loop baseline (ADR-0004: adopted inside bitty-platform, used
 # again by the bitty-perf real-window trials). Lock resolves this to 0.30.13.
+# CTX-1605: that exact 0.30.13 release is patched from `vendor/winit` (see the
+# `[patch.crates-io]` entry below and `vendor/winit/PATCHES.md`); the version
+# requirement stays on the released line so dropping the patch is a one-line
+# revert, not a version bump.
 winit = "0.30.13"
 # Minimal one-shot executor for the composition root and perf trials.
 pollster = "1.0"
@@ -60,6 +70,18 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # adapter only (MIT OR Apache-2.0, rust-version 1.71 <= MSRV 1.85). Reuses
 # the 0.61.2 line already in the lockfile; no new crate version.
 windows-sys = { version = "0.61", default-features = false }
+
+# CTX-1605: winit 0.30.13 does not deliver `WindowEvent::Occluded` on Wayland,
+# so a compositor that suspends an xdg-shell surface (v6 `suspended`, e.g. a
+# workspace switch-away on Hyprland) is invisible to the surface-visibility
+# gate. `vendor/winit` is the pristine 0.30.13 crate plus the upstream
+# backport of rust-windowing/winit#4710 (base e9809ef5, head e2cb6c08): the
+# Wayland backend emits `Occluded(true)` when `suspended` is set and
+# `Occluded(false)` when it clears. Remove this patch (and the `vendor/winit`
+# exclusion) once a released winit carries #4709/#4710; see
+# `vendor/winit/PATCHES.md` for provenance, hunks, and the update procedure.
+[patch.crates-io]
+winit = { path = "vendor/winit" }
 
 # bitty#2249: the execution extension is compiled against the workspace's
 # current Core mechanism crates instead of its own older `bitty` git pin.

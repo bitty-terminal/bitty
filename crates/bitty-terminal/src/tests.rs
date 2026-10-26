@@ -1218,6 +1218,47 @@ return {}
     }
 
     #[test]
+    fn reveal_lifecycle_is_recorded_once_per_transition() {
+        // CTX-1605 review F8: the crash report records `Revealed` on the gate
+        // transition, not on every `Occluded(false)`. A `Resized`-driven
+        // synthetic reveal can arrive ahead of the native edge for the same
+        // re-shown surface, so the duplicate must neither record a second
+        // `Revealed` nor overwrite an unrelated lifecycle mark.
+        let mut fixture = Fixture::new("reveal-lifecycle-dedupe");
+        assert!(
+            fixture.app.runtime.is_surface_visible(),
+            "the fixture starts with an open gate"
+        );
+
+        fixture.event(WindowEventKind::Resized(PhysicalSize::new(800, 600)));
+        assert_eq!(
+            crate::crash_report::last_lifecycle_name(),
+            "resized",
+            "the sentinel must be the last recorded lifecycle event"
+        );
+
+        fixture.event(WindowEventKind::Occluded(false));
+        assert_eq!(
+            crate::crash_report::last_lifecycle_name(),
+            "resized",
+            "a reveal edge on an already-open gate must not record another `Revealed`"
+        );
+
+        fixture.event(WindowEventKind::Occluded(true));
+        assert_eq!(
+            crate::crash_report::last_lifecycle_name(),
+            "occluded",
+            "the closing edge records `Occluded`"
+        );
+        fixture.event(WindowEventKind::Occluded(false));
+        assert_eq!(
+            crate::crash_report::last_lifecycle_name(),
+            "revealed",
+            "the real transition still records `Revealed`"
+        );
+    }
+
+    #[test]
     fn input_vm_boundary_recording_context_refuses_windows() {
         let operations = RefCell::new(Vec::new());
         let mut context = EventContext::recording(&operations);

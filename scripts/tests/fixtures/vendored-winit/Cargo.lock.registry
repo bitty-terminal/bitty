@@ -1,0 +1,14 @@
+version = 4
+
+[[package]]
+name = "bitty-platform"
+version = "0.0.29"
+dependencies = [
+ "winit",
+]
+
+[[package]]
+name = "winit"
+version = "0.30.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d"

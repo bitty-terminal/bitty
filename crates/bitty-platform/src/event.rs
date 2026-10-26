@@ -525,13 +525,13 @@ pub enum WindowEventKind {
     /// surface is not ordinarily being re-painted (a Hyprland workspace
     /// switch-away, a fully covering window, a locked output).
     ///
-    /// Delivered natively where winit maps it (iOS, X11
-    /// `VisibilityFullyObscured`); on Wayland supplied synthetically by this
-    /// crate's redraw-starvation probe (winit 0.30.13 does not map the xdg
-    /// `suspended` toplevel state, so the `Suspended` lifecycle and native
-    /// `Occluded` never fire there — the probe closes that gap so the
-    /// surface-visibility gate engages on the platform issue #2570
-    /// reproduces on).
+    /// Delivered natively where winit maps it: iOS, X11
+    /// (`VisibilityFullyObscured`), and Wayland when the compositor sets the
+    /// xdg-shell v6 `suspended` toplevel state (this workspace vendors winit
+    /// 0.30.13 with the upstream #4710 backport that maps it). Otherwise this
+    /// crate's redraw-starvation probe supplies the edge, so the
+    /// surface-visibility gate still engages when a compositor never sends
+    /// `suspended` (issue #2570).
     Occluded(bool),
     /// Modifier state changed (shift/ctrl/alt/super).
     ModifiersChanged(ModifiersState),
@@ -839,8 +839,10 @@ mod tests {
 
     #[test]
     fn occlusion_translate() {
-        // Delivered natively where winit maps it (iOS, X11); on Wayland the
-        // crate's redraw-starvation probe synthesizes it.
+        // Delivered natively where winit maps it (iOS, X11, and Wayland when
+        // the compositor sets xdg-shell v6 `suspended`, which the vendored
+        // winit #4710 backport maps); otherwise the crate's redraw-starvation
+        // probe synthesizes it.
         assert_eq!(
             translate_window_event(WindowEvent::Occluded(true)),
             Some(WindowEventKind::Occluded(true))

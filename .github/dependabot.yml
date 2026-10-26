@@ -1,7 +1,17 @@
 version: 2
 updates:
+  # CTX-1605: `winit` is a patched path dependency here, not a registry
+  # dependency. The workspace patches it to the vendored 0.30.13 tree
+  # (`vendor/winit`) carrying the upstream #4710 Wayland `Occluded` backport.
+  # Bumping the requirement would re-resolve to crates.io, print only
+  # "patch for winit was not used in the crate graph", and silently drop the
+  # edge, so Dependabot is told to leave it alone; `just vendored-winit` fails
+  # if the graph ever resolves away from the tree anyway. To move the pin,
+  # follow the update procedure in `vendor/winit/PATCHES.md`.
   - package-ecosystem: "cargo"
     directory: "/"
+    ignore:
+      - dependency-name: "winit"
     schedule:
       interval: "monthly"
     commit-message:

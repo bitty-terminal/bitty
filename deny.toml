@@ -31,6 +31,12 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # is out of scope for CTX-1373. Time bound (P0-AC-034): review by 2027-03-31 or
 # earlier when the MSRV moves to 1.88; then remove this ignore and raise `time`
 # to >= 0.3.47. Any extension needs a dated ADR-0004 revision.
+# CTX-1605: `winit` is vendored under `vendor/winit` (a path source) with the
+# upstream #4710 Wayland patch. Path packages carry no registry source, so
+# neither this check nor `cargo audit` matches RustSec ranges against the
+# vendored tree. The compensating controls (a synthetic-lock audit snippet and
+# the same 2027-03-31 re-audit bound) are recorded in
+# `vendor/winit/PATCHES.md`.
 ignore = ["RUSTSEC-2026-0192", "RUSTSEC-2024-0436", "RUSTSEC-2026-0009"]
 
 [bans]

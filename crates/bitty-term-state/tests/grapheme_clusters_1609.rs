@@ -244,3 +244,131 @@ fn spacing_mark_joins_without_advancing() {
     assert_eq!(cells[0].width, 1);
     assert_eq!(cursor_col(&state), 1);
 }
+
+#[test]
+fn prepend_takes_no_cell_and_never_hides_its_base() {
+    // CTX-1609: prepends are zero-width (the generated `Prepend` table feeds
+    // both GB9b and `is_zero_width`). Mid-line a prepend attaches to the
+    // preceding cell's tail exactly like a combining mark — copy order stays
+    // byte-exact — and the base it precedes still owns its own lead cell.
+    // Before the width fix the prepend consumed a cell, became the cell
+    // glyph, and pushed its base into the hidden tail.
+    for (prepend, base) in [
+        ('\u{0600}', '1'),         // Arabic number sign + digit
+        ('\u{08E2}', '1'),         // Arabic disputed end of ayah + digit
+        ('\u{0D4E}', 'a'),         // Malayalam letter dot reph + letter
+        ('\u{110BD}', '1'),        // Kaithi number sign + digit
+        ('\u{111C2}', 'a'),        // Sharada sign jihvamuliya
+        ('\u{11A84}', '\u{0915}'), // Soyombo sign jihvamuliya + Devanagari KA
+        ('\u{11F02}', 'a'),        // Kawi sign starting stroke
+    ] {
+        let mut state = State::new();
+        print_text(&mut state, "x");
+        print_text(&mut state, &format!("{prepend}{base}"));
+        let snapshot = state.snapshot();
+        let cells = row(&snapshot, 0);
+        assert_eq!(cells[0].glyph, 'x');
+        assert_eq!(
+            cells[0].zerowidth.as_slice(),
+            &[prepend],
+            "U+{:04X} attaches without a cell of its own",
+            prepend as u32
+        );
+        assert_eq!(
+            cells[1].glyph, base,
+            "U+{:04X} must not hide its base",
+            prepend as u32
+        );
+        assert_eq!(cells[1].width, 1, "the base keeps one cell");
+        assert!(!cells[2].spacer, "no spacer for a one-cell cluster");
+        assert_eq!(cursor_col(&state), 2);
+        assert_eq!(collect(&cells[..2]), format!("x{prepend}{base}"));
+
+        // At the line start there is no preceding cell: the prepend is
+        // dropped under the same documented rule as a lone combining mark,
+        // and the base still owns the lead cell.
+        let state = state_with_text(&format!("{prepend}{base}"));
+        let snapshot = state.snapshot();
+        let cells = row(&snapshot, 0);
+        assert_eq!(cells[0].glyph, base);
+        assert_eq!(cells[0].width, 1);
+        assert_eq!(cursor_col(&state), 1);
+    }
+}
+
+#[test]
+fn lone_regional_indicator_is_one_cell_and_pairs_resume() {
+    // A single RI is its own cluster and one cell: no phantom spacer, and a
+    // following pair still pairs from parity zero.
+    let lone = state_with_text("\u{1F1EB}");
+    let lone_snapshot = lone.snapshot();
+    let lone_cells = row(&lone_snapshot, 0);
+    assert_eq!(lone_cells[0].glyph, '\u{1F1EB}');
+    assert_eq!(lone_cells[0].width, 1);
+    assert!(!lone_cells[1].spacer);
+    assert_eq!(cursor_col(&lone), 1);
+
+    let text = "\u{1F1EB}\u{1F1F7}\u{1F1EB}\u{1F1EE}";
+    let state = state_with_text(text);
+    let snapshot = state.snapshot();
+    let cells = row(&snapshot, 0);
+    assert_eq!(cells[0].glyph, '\u{1F1EB}');
+    assert_eq!(cells[0].width, 2);
+    assert!(cells[1].spacer);
+    assert_eq!(cells[2].glyph, '\u{1F1EB}');
+    assert_eq!(cells[2].width, 2);
+    assert!(cells[3].spacer);
+    assert_eq!(cursor_col(&state), 4);
+}
+
+#[test]
+fn wide_ambiguous_cluster_widens_with_its_marks() {
+    // Under `ambiguous_width = wide` a cluster led by an ambiguous scalar
+    // owns two columns and keeps its mark on the lead cell.
+    let mut state = State::new();
+    state.set_ambiguous_width(AmbiguousWidth::Wide);
+    print_text(&mut state, "\u{03B1}\u{0301}");
+    let snapshot = state.snapshot();
+    let cells = row(&snapshot, 0);
+    assert_eq!(cells[0].glyph, '\u{03B1}');
+    assert_eq!(cells[0].width, 2);
+    assert_eq!(cells[0].zerowidth.as_slice(), &['\u{0301}']);
+    assert!(cells[1].spacer);
+    assert_eq!(cursor_col(&state), 2);
+}
+
+#[test]
+fn cluster_at_the_last_column_wraps_as_one_unit() {
+    // A cluster starting in the final column must not split: the state
+    // layer places the lead in the last column, keeps the continuation on
+    // that cell, and latches the wrap for the next printable scalar.
+    let mut state = State::new();
+    print_text(&mut state, &"a".repeat(79));
+    print_text(&mut state, "\u{0915}\u{093F}");
+    let snapshot = state.snapshot();
+    let last = row(&snapshot, 0)[79];
+    assert_eq!(last.glyph, '\u{0915}');
+    assert_eq!(last.zerowidth.as_slice(), &['\u{093F}']);
+    assert_eq!(last.width, 1);
+    assert!(!last.spacer);
+    assert_eq!(
+        cursor_col(&state),
+        79,
+        "the deferred wrap keeps the cursor on the last column"
+    );
+
+    // The next printable scalar consumes the latched wrap and starts the
+    // next row on column 0.
+    print_text(&mut state, "b");
+    let snapshot = state.snapshot();
+    assert_eq!(row(&snapshot, 1)[0].glyph, 'b');
+    assert_eq!(cursor_col(&state), 1);
+}
+
+fn collect(cells: &[Cell]) -> String {
+    let mut out = String::new();
+    for cell in cells {
+        cell.push_text_into(&mut out);
+    }
+    out
+}

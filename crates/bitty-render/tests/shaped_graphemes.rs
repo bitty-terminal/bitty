@@ -210,8 +210,8 @@ fn shaped_zwj_family_cluster_when_font_supports_it() {
     }
     // CTX-1609: the grid commits one two-column cell for the whole family.
     // A font with the ZWJ ligature returns one glyph over those two columns;
-    // a font without it returns one cluster per base, which the shaped
-    // emitter only paints for the leading committed column.
+    // a font without it splits the cluster into per-base glyphs, which the
+    // shaped emitter paints in one group (issue #1767).
     assert_eq!(cells_for_range(ZWJ_FAMILY), 2);
     if clusters.len() == 1 {
         assert_eq!(
@@ -256,7 +256,7 @@ fn shaped_zwj_family_cluster_when_font_supports_it() {
 }
 
 #[test]
-fn shaped_zwj_family_without_ligature_paints_one_cell() {
+fn shaped_zwj_family_without_ligature_paints_every_base() {
     let Some(mut raster) = live_chain_for("Noto Sans") else {
         eprintln!("skipped: no host font stack or Noto Sans");
         return;
@@ -292,17 +292,19 @@ fn shaped_zwj_family_without_ligature_paints_one_cell() {
     let list = renderer
         .render_shaped(&snapshot, &damage, LigaturePolicy::Never, &features)
         .expect("per-base fallback renders");
-    // CTX-1609: the cluster owns one two-column cell, so a per-base shaper
-    // result paints only the leading base; the remaining bases stay in
-    // Terminal Truth (copy/search/shaping with a ligating font).
+    // CTX-1609 (issue #1767): the whole cluster is one paint group, so a
+    // per-base shaper result paints every base at its shaped pen instead of
+    // hiding three quarters of the family in Terminal Truth.
+    let drawable = clusters.iter().filter(|c| !c.uncovered).count();
     assert_eq!(
         list.glyphs.len(),
-        1,
-        "one glyph for the committed cell: {list:?}"
+        drawable,
+        "every drawable shaper glyph of the one cell paints: {list:?}"
     );
+    assert!(drawable >= 4, "the family has four bases: {clusters:?}");
     let cell_width = f64::from(renderer.cell_metrics().width);
-    let column = (f64::from(list.glyphs[0].dest[0]) / cell_width).round() as i64;
-    assert_eq!(column, 0, "the lead keeps its lead column");
+    let lead_column = (f64::from(list.glyphs[0].dest[0]) / cell_width).round() as i64;
+    assert_eq!(lead_column, 0, "the lead keeps its lead column");
     assert_eq!(
         renderer.counters().spacer_cells_skipped,
         before.spacer_cells_skipped + 1,
@@ -341,16 +343,20 @@ fn shaped_fallback_keeps_combining_mark_in_grid_truth() {
     let list = renderer
         .render_shaped(&snapshot, &damage, LigaturePolicy::Never, &features)
         .expect("per-base fallback renders");
-    // Only the leading committed column paints; the family members and the
-    // mark remain in Terminal Truth for the shaped path with a ligating
-    // font and for copy/search/accessibility.
+    // Every drawable member of the one paint group paints, and the mark stays
+    // in Terminal Truth for copy/search/accessibility.
     assert!(
-        !list.glyphs.is_empty(),
-        "the lead base must paint: {list:?}"
+        list.glyphs.len() > 1,
+        "the family bases and the mark paint: {list:?}"
     );
     let cell_width = f64::from(renderer.cell_metrics().width);
-    let column = (f64::from(list.glyphs[0].dest[0]) / cell_width).round() as i64;
-    assert_eq!(column, 0, "the lead base keeps column zero");
+    for glyph in &list.glyphs {
+        let column = (f64::from(glyph.dest[0]) / cell_width).round() as i64;
+        assert!(
+            (0..=3).contains(&column),
+            "a family member escapes the cluster span: {glyph:?}"
+        );
+    }
 }
 
 #[test]

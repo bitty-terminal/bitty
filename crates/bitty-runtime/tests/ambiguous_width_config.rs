@@ -46,3 +46,29 @@ fn narrow_policy_keeps_ambiguous_scalar_narrow() {
     assert!(!snapshot.cells[1].spacer);
     assert_eq!(snapshot.cursor.position.col, 1);
 }
+
+#[test]
+fn config_reload_classifies_the_policy_as_restart_required() {
+    // Committed `Cell::width` values cannot be re-measured under a running
+    // terminal, so `terminal.ambiguous_width` is restart-required: a reload
+    // reports it, the live policy stays, and the next construction applies
+    // the new value to both the state layer and the renderer's span math.
+    assert_eq!(
+        bitty_config::reload::classify_field("terminal.ambiguous_width"),
+        bitty_config::reload::ReloadClass::RestartRequired
+    );
+    let live = Runtime::new(RuntimeConfig::default()).expect("headless runtime builds");
+    assert_eq!(live.state().ambiguous_width(), AmbiguousWidth::Narrow);
+
+    let restarted_cfg = RuntimeConfig {
+        ambiguous_width: AmbiguousWidth::Wide,
+        ..RuntimeConfig::default()
+    };
+    let mut restarted = Runtime::new(restarted_cfg).expect("headless runtime builds");
+    assert_eq!(restarted.state().ambiguous_width(), AmbiguousWidth::Wide);
+    restarted.handle_pty_bytes("\u{03B1}".as_bytes());
+    let snapshot = restarted.state().snapshot();
+    assert_eq!(snapshot.cells[0].width, 2, "restart adopts the new policy");
+    assert!(snapshot.cells[1].spacer);
+    assert_eq!(snapshot.cursor.position.col, 2);
+}

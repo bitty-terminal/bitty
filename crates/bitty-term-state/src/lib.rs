@@ -79,7 +79,7 @@ pub mod scrollback;
 pub mod search;
 mod state;
 mod tabs;
-mod width_tables;
+mod unicode_tables;
 
 /// Re-exported canonical-hash serialization version; see the crate-level
 /// constant register.

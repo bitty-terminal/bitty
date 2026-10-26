@@ -7,10 +7,10 @@
 //! [`Cell::wide_spacer`]. No orphan spacers may exist.
 //!
 //! Cell-width resolution uses the generated UAX #11 tables in
-//! [`crate::width_tables`] (Unicode 18.0.0 `EastAsianWidth.txt`, W/F wide,
+//! `crate::unicode_tables` (Unicode 18.0.0 `EastAsianWidth.txt`, W/F wide,
 //! A resolved by the configured [`AmbiguousWidth`] policy, N/Na/H narrow),
-//! the crate zero-width tables, and the UAX #29 cluster rules in
-//! [`crate::grapheme`]. The remainder of an extended grapheme cluster
+//! the crate zero-width tables (which read the generated UAX #29 `Prepend`
+//! class), and the UAX #29 cluster rules in [`crate::grapheme`]. The remainder of an extended grapheme cluster
 //! (combining marks, ZWJ, regional-indicator pairs, emoji modifiers,
 //! spacing marks) is stored on the leading cell's bounded
 //! [`Cell::zerowidth`] buffer, so one cluster is one layout unit. Shaping,
@@ -19,7 +19,7 @@
 
 use bitty_vt::{Attribute, Color, UnderlineStyle};
 
-use crate::width_tables::{EawClass, eaw_class};
+use crate::unicode_tables::{EawClass, eaw_class};
 
 /// Maximum cluster-continuation scalars retained on one cell.
 ///
@@ -412,7 +412,7 @@ pub fn char_cell_width(c: char) -> u8 {
 ///
 /// Only East Asian Ambiguous scalars observe the policy; every other scalar
 /// resolves identically under both policies. The authoritative
-/// `East_Asian_Width` table lives in [`crate::width_tables`] (generated from
+/// `East_Asian_Width` table lives in `crate::unicode_tables` (generated from
 /// the pinned UCD snapshot); the crate zero-width table takes precedence so
 /// combining marks in wide blocks still occupy no cell.
 #[must_use]
@@ -440,13 +440,18 @@ pub fn char_cell_width_in(c: char, ambiguous: AmbiguousWidth) -> u8 {
 /// Whether `cp` is a zero-width combining or format scalar in the crate
 /// tables.
 ///
-/// The tables cover the combining-mark blocks, implicit marks, variation
-/// selectors, and the format controls the terminal must not advance over
-/// (CTX-1609 leaves this curated slice unchanged; the authoritative
-/// `Grapheme_Extend` set is a separate follow-up). Width resolution orders
-/// this check before the East_Asian_Width table so a mark stays zero-width
-/// even when its block is Wide or Ambiguous.
+/// The curated table covers the combining-mark blocks, implicit marks,
+/// variation selectors, and the format controls the terminal must not
+/// advance over. UAX #29 `Prepend` scalars (GB9b) are zero-width by
+/// construction and read the generated
+/// `crate::unicode_tables::prepend` class: a prepend that consumed a cell
+/// would hide the base it joins forward to. Width resolution orders this
+/// check before the East_Asian_Width table so a mark stays zero-width even
+/// when its block is Wide or Ambiguous.
 pub(crate) fn is_zero_width(cp: u32) -> bool {
+    if crate::unicode_tables::prepend(cp) {
+        return true;
+    }
     matches!(cp,
         0x0300..=0x036F
         | 0x0483..=0x0489
@@ -455,17 +460,14 @@ pub(crate) fn is_zero_width(cp: u32) -> bool {
         | 0x05C1..=0x05C2
         | 0x05C4..=0x05C5
         | 0x05C7
-        | 0x0600..=0x0605
         | 0x0610..=0x061A
         | 0x061C
         | 0x064B..=0x065F
         | 0x0670
         | 0x06D6..=0x06DC
-        | 0x06DD
         | 0x06DF..=0x06E4
         | 0x06E7..=0x06E8
         | 0x06EA..=0x06ED
-        | 0x070F
         | 0x0711
         | 0x0730..=0x074A
         | 0x07A6..=0x07B0
@@ -473,7 +475,6 @@ pub(crate) fn is_zero_width(cp: u32) -> bool {
         | 0x081B..=0x0823
         | 0x0825..=0x0827
         | 0x0829..=0x082D
-        | 0x0890..=0x0891
         | 0x0900..=0x0902
         | 0x093A
         | 0x093C
@@ -761,6 +762,35 @@ mod tests {
         }
         assert!(!cell.push_zerowidth('\u{0302}'));
         assert_eq!(cell.zerowidth.len(), MAX_ZEROWIDTH_CHARS);
+    }
+
+    /// Every UAX #29 `Prepend` scalar is zero-width (CTX-1609).
+    ///
+    /// `GB9b` stores the prepend in the cluster with the base it joins
+    /// forward to; a prepend that occupied a cell would push the base into
+    /// the next column (or hide it behind a wide spacer). The width table
+    /// reads the same generated class, so this is an equality assertion over
+    /// the whole table, not a spot check.
+    #[test]
+    fn every_prepend_scalar_is_zero_width() {
+        let mut count = 0usize;
+        for &(start, end) in crate::unicode_tables::PREPEND_RANGES {
+            for cp in start..=end {
+                let scalar = char::from_u32(cp).expect("UCD ranges hold valid scalars");
+                assert_eq!(
+                    char_cell_width(scalar),
+                    0,
+                    "U+{cp:04X} is Prepend but resolves to a non-zero cell width"
+                );
+                assert_eq!(
+                    char_cell_width_in(scalar, AmbiguousWidth::Wide),
+                    0,
+                    "U+{cp:04X} is Prepend but widens under the wide policy"
+                );
+                count += 1;
+            }
+        }
+        assert_eq!(count, 27, "the UCD 18.0.0 Prepend class has 27 scalars");
     }
 
     #[test]

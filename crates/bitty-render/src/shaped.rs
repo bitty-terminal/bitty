@@ -1668,19 +1668,24 @@ pub fn harfrust_features(
 ///
 /// CTX-1609: the sum is per extended grapheme cluster, not per scalar, so a
 /// ZWJ family, regional-indicator flag, skin-tone sequence, or keycap counts
-/// the same two columns the print path committed. The renderer's grid
-/// geometry still comes from `Cell::width`; this helper only estimates text
-/// spans for the shaped path (which is constructed before the runtime
-/// ambiguous-width policy is known and therefore uses the narrow policy).
+/// the same two columns the print path committed. Callers that know the
+/// runtime width policy use [`cells_for_range_in`]; this wrapper is the
+/// historical narrow-policy form.
 #[must_use]
 pub fn cells_for_range(text: &str) -> usize {
+    cells_for_range_in(text, bitty_term_state::AmbiguousWidth::Narrow)
+}
+
+/// [`cells_for_range`] under an explicit ambiguous-width policy.
+///
+/// The renderer's measured spans must agree with the committed `Cell::width`
+/// values, which the state layer resolved under `terminal.ambiguous_width`;
+/// measuring with the wrong policy shifts every group after an ambiguous
+/// scalar by one column.
+#[must_use]
+pub fn cells_for_range_in(text: &str, ambiguous: bitty_term_state::AmbiguousWidth) -> usize {
     bitty_term_state::Graphemes::new(text)
-        .map(|cluster| {
-            usize::from(bitty_term_state::cluster_cell_width(
-                cluster,
-                bitty_term_state::AmbiguousWidth::Narrow,
-            ))
-        })
+        .map(|cluster| usize::from(bitty_term_state::cluster_cell_width(cluster, ambiguous)))
         .sum()
 }
 

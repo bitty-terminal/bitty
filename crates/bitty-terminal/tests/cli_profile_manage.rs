@@ -103,6 +103,84 @@ fn row(text: &str, key: &str) -> String {
         .to_string()
 }
 
+/// Every `key = value (source)` row of `config check`, keyed by `key` with the
+/// source suffix stripped (so two profiles can be compared value by value).
+fn check_rows(text: &str) -> std::collections::BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| {
+            let (key, rest) = line.split_once(" = ")?;
+            if key.ends_with(".advisory") {
+                return None;
+            }
+            let value = rest
+                .rsplit_once(" (")
+                .map_or(rest, |(value, _source)| value);
+            Some((key.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+/// A base profile that declares every leaf of the tables `set` pins when it
+/// creates them.
+const PIN_BASE: &str = r##"return {
+    font = {
+        family = "PinMono",
+        size = 15,
+        line_height = 1.3,
+        letter_spacing = 0.5,
+        fallback = { "PinFallback", "Sans" },
+        features = { "ss01", "-liga" },
+        disable_ligatures = "cursor",
+    },
+    window = {
+        opacity = 0.85,
+        padding = 7,
+        radius_px = 5,
+        blur_radius = 0,
+        background_fit = "fit",
+        background_opacity = 0.5,
+        background_position = "top",
+    },
+    terminal = {
+        scrollback = 4321,
+        shell = "/bin/sh",
+        scroll_lines_per_notch = 5,
+        scroll_pixels_per_notch = 40,
+        page_scroll_percent = 60,
+        cursor_style = "steady_bar",
+        bell = "both",
+    },
+    layout = { gaps_in = 2, gaps_out = 3, resize_step = 0.07 },
+    decoration = {
+        gaps_in = 7,
+        gaps_out = 11,
+        border = 3,
+        radius = 8,
+        content_inset = 4,
+        border_color = "#CCCCCC",
+        border_color_focused = "#FFFFFF",
+        border_color_idle = "#888888",
+        border_width = 2,
+        border_width_focused = 3,
+        border_width_idle = 1,
+        background_fit = "tile",
+        background_tint = "#0A0B0C",
+        background_tint_strength = 0.25,
+    },
+    scrollbar = { mode = "always", width = 12 },
+    appearance = {
+        theme = "dark",
+        animations = {
+            enabled = false,
+            reduced_motion = "always",
+            duration_ms = { open = 180 },
+            easing = { open = "linear" },
+        },
+        style = { glow_color = "#ABCDEF", glow_width = 2, fade_unfocused = 0.75 },
+    },
+}
+"##;
+
 /// Leaves no `.*.tmp-*` staging files behind.
 fn assert_no_temp_files(root: &Path, what: &str) {
     let leftovers: Vec<String> = std::fs::read_dir(root.join("bitty").join("profiles"))
@@ -437,6 +515,36 @@ fn set_writes_a_schema_value_get_reads_it_and_config_check_passes() {
     let check = run_bitty(&root, &["config", "check", "--profile", "child"]);
     assert_ok(&check, "check child");
     assert!(row(&stdout(&check), "font.size").starts_with("14 (profile: "));
+
+    // Canonicalizing text fields (mod-key and chrome-action aliases) still
+    // pass the post-write re-read check and report the canonical value.
+    let canonical_key = run_bitty(
+        &root,
+        &["config", "profile", "set", "work", "mod_key", "Super"],
+    );
+    assert_ok(&canonical_key, "set mod_key alias");
+    assert!(
+        stdout(&canonical_key).contains("'mod_key' = \"super\""),
+        "canonical mod_key: {}",
+        stdout(&canonical_key)
+    );
+    let canonical_mouse = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "set",
+            "work",
+            "mouse.middle",
+            "Paste_From_Primary",
+        ],
+    );
+    assert_ok(&canonical_mouse, "set mouse binding alias");
+    assert!(
+        stdout(&canonical_mouse).contains("'mouse.middle' = \"paste_from_primary\""),
+        "canonical mouse binding: {}",
+        stdout(&canonical_mouse)
+    );
     assert_no_temp_files(&root, "set");
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -613,6 +721,247 @@ fn json_envelopes_have_a_stable_shape() {
     let before = run_bitty(&root, &["--json", "config", "profile", "list"]);
     assert_ok(&before, "--json before config");
     assert!(stdout(&before).contains("\"ok\":true"));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn set_pins_every_inherited_leaf_of_the_table_it_creates() {
+    let root = scratch_root("pin-inherited");
+    write_profile(&root, "base", PIN_BASE);
+    write_profile(&root, "kid", "return { extends = \"base\" }\n");
+    write_profile(&root, "kid-json", "return { extends = \"base\" }\n");
+
+    let base_check = run_bitty(&root, &["config", "check", "--profile", "base"]);
+    assert_ok(&base_check, "base config check");
+    let base_rows = check_rows(&stdout(&base_check));
+
+    let edited = [
+        ("font.size", "16"),
+        ("window.padding", "3"),
+        ("terminal.scrollback", "999"),
+        ("layout.gaps_in", "1"),
+        ("decoration.gaps_in", "2"),
+        ("scrollbar.width", "9"),
+        ("appearance.animations.enabled", "true"),
+    ];
+    for (path, value) in edited {
+        let output = run_bitty(&root, &["config", "profile", "set", "kid", path, value]);
+        assert_ok(&output, &format!("set kid {path}"));
+        let table = path.split('.').next().expect("table segment");
+        assert!(
+            stdout(&output).contains(&format!("pinned inherited '{table}' values into 'kid'")),
+            "human pin report for {path}: {}",
+            stdout(&output)
+        );
+    }
+
+    let json = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "set",
+            "kid-json",
+            "decoration.gaps_in",
+            "2",
+            "--json",
+        ],
+    );
+    assert_ok(&json, "set --json");
+    assert!(
+        stdout(&json).contains("\"inherited_pinned\":[\"decoration\"]"),
+        "json pin report: {}",
+        stdout(&json)
+    );
+    // A table the profile already declares locally is not pinned again.
+    let local = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "set",
+            "kid-json",
+            "decoration.gaps_out",
+            "12",
+            "--json",
+        ],
+    );
+    assert_ok(&local, "second set --json");
+    assert!(
+        stdout(&local).contains("\"inherited_pinned\":[]"),
+        "no pin report for a local table: {}",
+        stdout(&local)
+    );
+
+    let kid_check = run_bitty(&root, &["config", "check", "--profile", "kid"]);
+    assert_ok(&kid_check, "kid config check");
+    let kid_rows = check_rows(&stdout(&kid_check));
+    for (key, base_value) in &base_rows {
+        if key == "profile" || edited.iter().any(|(path, _)| path == key) {
+            continue;
+        }
+        assert_eq!(
+            kid_rows.get(key),
+            Some(base_value),
+            "inherited sibling '{key}' changed after a one-leaf edit:\n{}",
+            stdout(&kid_check)
+        );
+    }
+    for (path, value) in edited {
+        assert_eq!(
+            kid_rows.get(path).map(String::as_str),
+            Some(value),
+            "edited leaf '{path}'"
+        );
+    }
+
+    // Leaves `config check` does not print are still pinned byte-for-byte.
+    let content = std::fs::read_to_string(profile_path(&root, "kid")).expect("kid profile");
+    for needle in [
+        "features = { \"ss01\", \"-liga\" }",
+        "disable_ligatures = \"cursor\"",
+        "blur_radius = 0",
+        "background_opacity = 0.5",
+        "border_color = \"#CCCCCC\"",
+        "border_color_focused = \"#FFFFFF\"",
+        "border_color_idle = \"#888888\"",
+        "background_tint = \"#0A0B0C\"",
+        "background_tint_strength = 0.25",
+        "duration_ms = { open = 180",
+        "easing = { open = \"linear\"",
+        "style = { glow_color = \"#ABCDEF\", glow_width = 2, fade_unfocused = 0.75 }",
+    ] {
+        assert!(
+            content.contains(needle),
+            "missing pinned non-advertised leaf {needle}:\n{content}"
+        );
+    }
+    assert_no_temp_files(&root, "pin inherited");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn set_on_a_fresh_profile_pins_the_required_terminal_keys() {
+    let root = scratch_root("pin-terminal");
+    write_profile(&root, "fresh", "return {\n}\n");
+    let set = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "set",
+            "fresh",
+            "terminal.shell",
+            "/bin/true",
+        ],
+    );
+    assert_ok(&set, "set terminal.shell");
+    assert!(
+        stdout(&set).contains("pinned inherited 'terminal' values into 'fresh'"),
+        "pin report: {}",
+        stdout(&set)
+    );
+    let content = std::fs::read_to_string(profile_path(&root, "fresh")).expect("fresh");
+    assert!(content.contains("scrollback = 10000"), "{content}");
+    assert!(content.contains("shell = \"/bin/true\""), "{content}");
+    let check = run_bitty(&root, &["config", "check", "--profile", "fresh"]);
+    assert_ok(&check, "check fresh");
+    assert!(
+        row(&stdout(&check), "terminal.scrollback").starts_with("10000 ("),
+        "seeded scrollback: {}",
+        stdout(&check)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn set_and_clone_refuse_a_local_theme_the_strict_loader_rejects() {
+    let root = scratch_root("local-theme");
+    let original = "return {\n    appearance = { theme = \"dark\" },\n}\n";
+    write_profile(&root, "th", original);
+    let set = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "set",
+            "th",
+            "appearance.theme",
+            "local:missing-theme",
+        ],
+    );
+    assert_exit(&set, 2, "set a missing local theme");
+    assert!(
+        stderr(&set).contains("unknown local theme 'missing-theme'"),
+        "local theme diagnostic: {}",
+        stderr(&set)
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "th")).expect("profile"),
+        original,
+        "a rejected local theme never rewrites the profile"
+    );
+    assert_ok(
+        &run_bitty(&root, &["config", "check", "--profile", "th"]),
+        "config check after the refused set",
+    );
+
+    write_profile(
+        &root,
+        "src",
+        "return {\n    appearance = { theme = \"local:missing-theme\" },\n}\n",
+    );
+    let clone = run_bitty(&root, &["config", "profile", "clone", "src", "dst"]);
+    assert_exit(&clone, 2, "clone a missing local theme");
+    assert!(
+        stderr(&clone).contains("unknown local theme 'missing-theme'"),
+        "clone local theme diagnostic: {}",
+        stderr(&clone)
+    );
+    assert!(!profile_path(&root, "dst").exists());
+    assert_no_temp_files(&root, "local theme");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn use_never_reports_success_without_switching_the_selector() {
+    let root = scratch_root("use-rewrite");
+    write_profile(&root, "alpha", "return {}\n");
+    write_profile(&root, "beta", "return {}\n");
+
+    // Long-bracket live value plus a commented historical selector: the
+    // byte-preserving editor cannot rewrite the live value, so `use` refuses
+    // and leaves the selector untouched instead of editing the comment.
+    let long_selector = "return {\n    format = \"bitty-profile-v1\",\n    --[[ historical \
+                         selector:\n    profile = \"default\"\n    ]]\n    profile = \
+                         [[alpha]],\n}\n";
+    std::fs::write(init_path(&root), long_selector).expect("long selector");
+    let refused = run_bitty(&root, &["config", "profile", "use", "beta"]);
+    assert_exit(&refused, 2, "use a long-bracket selector");
+    assert!(
+        stderr(&refused).contains("cannot locate exactly one"),
+        "refusal diagnostic: {}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        std::fs::read_to_string(init_path(&root)).expect("selector"),
+        long_selector,
+        "a refused use writes nothing"
+    );
+
+    // Short-quoted live value plus the same commented history: only the live
+    // assignment changes (the comment no longer causes a false refusal).
+    let short_selector = "return {\n    format = \"bitty-profile-v1\",\n    --[[ historical \
+                          selector:\n    profile = \"default\"\n    ]]\n    profile = \
+                          \"alpha\",\n}\n";
+    std::fs::write(init_path(&root), short_selector).expect("short selector");
+    let switched = run_bitty(&root, &["config", "profile", "use", "beta"]);
+    assert_ok(&switched, "use a short-quoted selector");
+    let selector = std::fs::read_to_string(init_path(&root)).expect("selector");
+    assert!(selector.contains("profile = \"beta\""), "{selector}");
+    assert!(selector.contains("--[[ historical selector:"), "{selector}");
+    assert!(selector.contains("profile = \"default\""), "{selector}");
+    assert!(!selector.contains("profile = \"alpha\""), "{selector}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

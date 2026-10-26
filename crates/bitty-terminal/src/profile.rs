@@ -17,10 +17,15 @@
 //!   `init.lua` files require the explicit `bitty init --migrate` path.
 //! - `get NAME PATH`: effective value at one documented dotted schema path.
 //! - `set NAME PATH VALUE`: validates the value through the same strict
-//!   loader `bitty config check` uses, edits exactly that path inside the
-//!   profile's returned Lua table, and commits atomically (unique sibling
-//!   temporary file, `sync_all`, rename over the target). A failed
-//!   validation or write leaves the previous bytes intact.
+//!   loader `bitty config check` uses (including `local:<name>` theme
+//!   resolution), edits exactly that path inside the profile's returned Lua
+//!   table, and commits atomically (unique sibling temporary file,
+//!   `sync_all`, rename over the target). A failed validation or write leaves
+//!   the previous bytes intact. Because the typed plan merges `font`,
+//!   `window`, `terminal`, `layout`, `decoration`, `scrollbar`, and
+//!   `appearance` as complete tables, creating one of them in a profile pins
+//!   every inherited leaf first: a one-leaf edit never silently resets the
+//!   other inherited values to core defaults.
 //! - `path NAME`: validates the name grammar and prints the resolved path.
 //!
 //! `create|clone|rename|delete|list|show|use|get|set|path` all report state;
@@ -91,8 +96,12 @@ pub(crate) fn profile_usage() -> String {
      --json (or --format json) prints one versioned envelope per command.\n\
      Writes are validated before any file change and committed atomically;\n\
      `default` is reserved for `bitty init`. Quote values that contain spaces;\n\
-     font.fallback takes a comma-separated list. `set font.*` on a profile with\n\
-     no font table seeds the required family/size pair from current values.\n\
+     font.fallback takes a comma-separated list. `set` on a profile that only\n\
+     inherits `font`, `window`, `terminal`, `layout`, `decoration`, `scrollbar`,\n\
+     or `appearance` pins every inherited leaf of that table into the profile\n\
+     first (reported as inherited-pinned), so one edited leaf never resets its\n\
+     siblings; required keys (font family/size, terminal scrollback) are always\n\
+     included.\n\
      \n\
      use is explicit activation; it never reloads a running instance and\n\
      never installs, enables, or grants plugin/component state."
@@ -211,6 +220,12 @@ impl Failure {
 
     fn io(message: String) -> Self {
         Self::new("E_PROFILE_IO", message, 1)
+    }
+
+    /// The profile tool observed an internal inconsistency after its own
+    /// validated edit; fail closed rather than report a false success.
+    fn internal(message: String) -> Self {
+        Self::new("E_PROFILE_INTERNAL", message, 2)
     }
 }
 
@@ -542,10 +557,10 @@ fn run_use(args: &Args, dir: &Path, raw_name: &str) -> Result<Reply, Failure> {
     let name = valid_name("use", raw_name)?;
     let profile_path = profile_path(dir, &name);
     ensure_present("use", &name, &profile_path)?;
-    // Validate the whole chain before any mutation.
-    if let Err(err) = bitty_config::file::load_profile_chain_in_dir(&name, dir) {
-        return Err(invalid_profile("use", &name, &err));
-    }
+    // Validate the whole chain (and the same `local:<name>` theme selection
+    // the strict loader resolves) before any mutation.
+    let current = merged_profile(dir, "use", &name)?;
+    check_local_theme("use", &name, &current.effective)?;
     let bitty_config_env = std::env::var("BITTY_CONFIG").ok();
     let explicit = bitty_config::file::resolve_config_explicit(
         args.config_path.as_deref(),
@@ -645,14 +660,37 @@ fn run_use(args: &Args, dir: &Path, raw_name: &str) -> Result<Reply, Failure> {
     }
     let Some(rewritten) = rewrite_selector_profile(&content, &name) else {
         return Err(Failure::invalid(format!(
-            "bitty config profile use: cannot locate exactly one top-level `profile = \"...\"` assignment in '{}'",
+            "bitty config profile use: cannot locate exactly one top-level short-quoted \
+             `profile = \"...\"` assignment in '{}'; edit a long-bracket value manually",
             selector.display()
         )));
     };
-    if let Err(err) = bitty_config::file::parse_lua_config(&rewritten, &source) {
-        return Err(Failure::invalid(format!(
-            "bitty config profile use: rewritten selector is invalid ({err}); refusing to write"
-        )));
+    // Re-parse the exact bytes about to be written and require the selector
+    // to name the requested profile: a rewrite that matched the wrong
+    // occurrence must never report success.
+    let rewritten_plan = match bitty_config::file::parse_lua_config(&rewritten, &source) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return Err(Failure::invalid(format!(
+                "bitty config profile use: rewritten selector is invalid ({err}); refusing to write"
+            )));
+        }
+    };
+    match rewritten_plan.selector {
+        Some(found) if found.profile == name => {}
+        Some(found) => {
+            return Err(Failure::invalid(format!(
+                "bitty config profile use: rewritten selector still names '{}' instead of \
+                 '{name}'; refusing to write",
+                found.profile
+            )));
+        }
+        None => {
+            return Err(Failure::invalid(
+                "bitty config profile use: rewritten selector lost its profile field; refusing to write"
+                    .to_string(),
+            ));
+        }
     }
     match write_init_config(&selector, &rewritten, true) {
         Ok(outcome) => {
@@ -722,9 +760,19 @@ fn run_clone(dir: &Path, raw_src: &str, raw_dst: &str) -> Result<Reply, Failure>
     let dst_path = profile_path(dir, &dst);
     ensure_present("clone", &src, &src_path)?;
     ensure_absent("clone", &dst, &dst_path)?;
-    if let Err(err) = bitty_config::file::load_profile_chain_in_dir(&src, dir) {
-        return Err(invalid_profile("clone", &src, &err));
-    }
+    let chain = match bitty_config::file::load_profile_chain_in_dir(&src, dir) {
+        Ok(chain) => chain,
+        Err(err) => return Err(invalid_profile("clone", &src, &err)),
+    };
+    let merged = match bitty_config::file::resolve_effective_with_profiles(
+        None,
+        chain,
+        &bitty_config::file::CliOverrides::default(),
+    ) {
+        Ok(merged) => merged,
+        Err(err) => return Err(invalid_profile("clone", &src, &err)),
+    };
+    check_local_theme("clone", &src, &merged.effective)?;
     let content = read_profile("clone", &src, &src_path)?;
     validate_new_profile(&content, &dst_path)
         .map_err(|err| invalid_profile("clone", &src, &err))?;
@@ -869,21 +917,24 @@ fn run_set(dir: &Path, raw_name: &str, raw_key: &str, raw_value: &str) -> Result
     let content = read_profile("set", &name, &path)?;
     let current = merged_profile(dir, "set", &name)?;
     let segments: Vec<&str> = field.path.split('.').collect();
+    let table = segments[0];
     let mut updated = content;
-    // The schema requires `font` to declare both `family` and `size` when the
-    // table is present. Seeding a missing table from the values this profile
-    // already inherits keeps `set font.size` usable on a fresh profile
-    // without inventing a partial table the strict loader rejects.
-    if segments.first() == Some(&"font") {
+    let mut pinned: Vec<&str> = Vec::new();
+    // The typed plan merges these tables as complete structs: creating one
+    // without its inherited leaves would reset every omitted sibling to the
+    // core default. Pin the resolved inherited table first, then edit.
+    if PINNED_TABLES.contains(&table) {
         let entry = parse_profile_plan(&updated, &path)
             .map_err(|err| invalid_profile("set", &name, &err))?;
-        if entry.plan.font.is_none() {
-            let seed = font_table_seed(&current.effective);
-            updated = set_lua_path(&updated, &["font"], &seed).map_err(|message| {
+        if !declares_table(&entry.plan, table) {
+            let seed = inherited_table_literal(table, &current.effective);
+            updated = set_lua_path(&updated, &[table], &seed).map_err(|message| {
                 Failure::invalid(format!(
-                    "bitty config profile set: cannot add a font table to profile '{name}': {message}"
+                    "bitty config profile set: cannot pin inherited '{table}' values into profile \
+                     '{name}': {message}"
                 ))
             })?;
+            pinned.push(table);
         }
     }
     let updated = set_lua_path(&updated, &segments, &literal).map_err(|message| {
@@ -893,18 +944,49 @@ fn run_set(dir: &Path, raw_name: &str, raw_key: &str, raw_value: &str) -> Result
         ))
     })?;
     let merged = merge_candidate(dir, &name, &path, &updated)?;
+    // Defense in depth: the bytes just spliced must read back as the requested
+    // value. A mismatch means the editor wrote somewhere the merge does not
+    // read (an alias, a duplicate key the parser resolved differently, or an
+    // unexpected `extends` interaction); never report success for that.
+    let actual = (field.get)(&merged.effective);
+    let expected = requested_value(field, raw_value);
+    if actual != expected {
+        return Err(Failure::internal(format!(
+            "bitty config profile set: internal error: '{}' re-reads as {} instead of {}; \
+             refusing to write profile '{name}'",
+            field.path,
+            actual.json(),
+            expected.json()
+        )));
+    }
     write_profile_atomic(&path, &updated)
         .map_err(|err| io_failure("set", &format!("replace '{}'", path.display()), &err))?;
     let value = (field.get)(&merged.effective);
     let source = profile_source_label(&merged, field.path);
-    let text = format!(
+    let mut text = format!(
         "bitty config profile set: set '{}' = {} in '{name}' ('{}')\n",
         field.path,
         display_value(&value, false),
         path.display()
     );
+    if !pinned.is_empty() {
+        let names = pinned
+            .iter()
+            .map(|table| format!("'{table}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        text.push_str(&format!(
+            "bitty config profile set: pinned inherited {names} values into '{name}' so the \
+             edited leaf keeps every inherited sibling\n"
+        ));
+    }
+    let pinned_json = pinned
+        .iter()
+        .map(|table| json_string(table))
+        .collect::<Vec<_>>()
+        .join(",");
     let result = format!(
-        "{{\"kind\":\"profile\",\"action\":\"set\",\"name\":{},\"path\":{},\"key\":{},\"value\":{},\"type\":{},\"layer\":{},\"source\":{},\"changed\":true}}",
+        "{{\"kind\":\"profile\",\"action\":\"set\",\"name\":{},\"path\":{},\"key\":{},\"value\":{},\"type\":{},\"layer\":{},\"source\":{},\"changed\":true,\"inherited_pinned\":[{}]}}",
         json_string(&name),
         json_path(&path),
         json_string(field.path),
@@ -914,7 +996,8 @@ fn run_set(dir: &Path, raw_name: &str, raw_key: &str, raw_value: &str) -> Result
             || String::from("core-defaults"),
             |found| found.layer.label().to_string()
         )),
-        json_string(&source)
+        json_string(&source),
+        pinned_json
     );
     Ok(Reply::new(text, result))
 }
@@ -1044,12 +1127,18 @@ fn referencing_profiles(dir: &Path, target: &str) -> Vec<String> {
             continue;
         }
         let path = profile_path(dir, &name);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            continue;
+        }
+        if metadata.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
+            continue;
+        }
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        if content.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES {
-            continue;
-        }
         let source = bitty_config::plan::ConfigSource::new(
             bitty_config::plan::LayerKind::Profile,
             Some(path.display().to_string()),
@@ -1114,20 +1203,25 @@ fn parse_profile_plan(
     Ok(bitty_config::LayeredPlan::new(source, plan))
 }
 
-/// Validates a brand-new profile body (parse + migrate + strict merge).
+/// Validates a brand-new profile body (parse + migrate + strict merge) and
+/// resolves the same `local:<name>` theme selection `config check` does.
 fn validate_new_profile(content: &str, path: &Path) -> Result<(), bitty_config::ConfigError> {
     let layer = parse_profile_plan(content, path)?;
-    bitty_config::file::resolve_effective_with_profiles(
+    let merged = bitty_config::file::resolve_effective_with_profiles(
         None,
         vec![layer],
         &bitty_config::file::CliOverrides::default(),
-    )
-    .map(|_| ())
+    )?;
+    let mut effective = merged.effective;
+    bitty_config::local_theme::apply_selection(&mut effective)
+        .map_err(|err| bitty_config::ConfigError::validation("appearance.theme", err))?;
+    Ok(())
 }
 
 /// Validates a candidate edit through the exact strict loader `config check`
 /// uses: parse the new body, resolve the current `extends` chain, substitute
-/// the edited entry, and merge/validate the whole chain.
+/// the edited entry, and merge/validate the whole chain (including the
+/// `local:<name>` theme selection the strict loader resolves).
 fn merge_candidate(
     dir: &Path,
     name: &str,
@@ -1143,12 +1237,14 @@ fn merge_candidate(
     } else {
         chain.push(candidate);
     }
-    bitty_config::file::resolve_effective_with_profiles(
+    let merged = bitty_config::file::resolve_effective_with_profiles(
         None,
         chain,
         &bitty_config::file::CliOverrides::default(),
     )
-    .map_err(|err| invalid_profile("set", name, &err))
+    .map_err(|err| invalid_profile("set", name, &err))?;
+    check_local_theme("set", name, &merged.effective)?;
+    Ok(merged)
 }
 
 /// Loads and merges one profile's current `extends` chain.
@@ -1167,16 +1263,427 @@ fn merged_profile(
     .map_err(|err| invalid_profile(verb, name, &err))
 }
 
-/// Complete `font` table literal for a profile that has no `font` table yet.
+/// Tables whose Lua declaration the typed plan merges as one complete struct.
 ///
-/// `font` is the one schema table that rejects a partial declaration, so the
-/// inherited family/size are made explicit beside the edited leaf.
-fn font_table_seed(effective: &bitty_config::EffectiveConfig) -> String {
+/// A layer that declares one of these tables replaces the whole inherited
+/// table: `bitty-config` builds a complete typed struct for every present
+/// table (`crate::file::build_plan_from_data`), so leaves omitted inside the
+/// table fall back to the core defaults instead of keeping the inherited
+/// value. `set` therefore pins the complete resolved table into a profile
+/// before creating it, and a one-leaf edit never drops a sibling.
+///
+/// `appearance` is included because its table-level `theme`/`colors` scalars
+/// reset as soon as the table appears; its `animations`/`style` sub-tables are
+/// pinned as well so the created table is complete.
+const PINNED_TABLES: &[&str] = &[
+    "font",
+    "window",
+    "terminal",
+    "layout",
+    "decoration",
+    "scrollbar",
+    "appearance",
+];
+
+/// Whether one profile body declares `key` itself.
+fn declares_table(plan: &bitty_config::ConfigPlan, key: &str) -> bool {
+    match key {
+        "font" => plan.font.is_some(),
+        "window" => plan.window.is_some(),
+        "terminal" => plan.terminal.is_some(),
+        "layout" => plan.layout.is_some(),
+        "decoration" => plan.decoration.is_some(),
+        "scrollbar" => plan.scrollbar.is_some(),
+        "appearance" => plan.appearance.is_some(),
+        // Not a pinned table: treat it as declared so no caller seeds it.
+        _ => true,
+    }
+}
+
+/// Complete Lua literal pinning every inherited leaf of `key`.
+fn inherited_table_literal(key: &str, effective: &bitty_config::EffectiveConfig) -> String {
+    match key {
+        "font" => font_table_literal(&effective.font),
+        "window" => window_table_literal(&effective.window),
+        "terminal" => terminal_table_literal(&effective.terminal),
+        "layout" => layout_table_literal(&effective.layout),
+        "decoration" => decoration_table_literal(&effective.decoration),
+        "scrollbar" => scrollbar_table_literal(&effective.scrollbar),
+        "appearance" => appearance_table_literal(&effective.appearance, &effective.animations),
+        // Guarded by `PINNED_TABLES`; an empty table keeps the caller honest
+        // instead of inventing an unknown key.
+        _ => String::from("{}"),
+    }
+}
+
+/// One double-quoted Lua string.
+fn lua_string_literal(raw: &str) -> String {
+    format!("\"{}\"", crate::init::init_lua_escape(raw))
+}
+
+/// One Lua string-list literal (`{ "a", "b" }`, `{}` when empty).
+fn lua_list_literal(items: &[String]) -> String {
+    if items.is_empty() {
+        return String::from("{}");
+    }
     format!(
-        "{{ family = \"{}\", size = {} }}",
-        crate::init::init_lua_escape(&effective.font.family),
-        effective.font.size
+        "{{ {} }}",
+        items
+            .iter()
+            .map(|item| lua_string_literal(item))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
+}
+
+/// One single-line Lua table literal from ordered `key = value` entries.
+fn lua_table_literal(entries: &[(&str, String)]) -> String {
+    if entries.is_empty() {
+        return String::from("{}");
+    }
+    format!(
+        "{{ {} }}",
+        entries
+            .iter()
+            .map(|(key, value)| format!("{key} = {value}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// `font`'s Lua spelling of a ligature policy.
+fn ligature_policy_literal(policy: bitty_config::types::LigaturePolicy) -> &'static str {
+    match policy {
+        bitty_config::types::LigaturePolicy::Never => "never",
+        bitty_config::types::LigaturePolicy::Cursor => "cursor",
+        bitty_config::types::LigaturePolicy::Always => "always",
+    }
+}
+
+/// Canonical `#RRGGBB` spelling for one palette role.
+fn hex_rgb(rgb: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+}
+
+/// Complete `font` table literal (family/size are required by the schema).
+fn font_table_literal(font: &bitty_config::FontConfig) -> String {
+    lua_table_literal(&[
+        ("family", lua_string_literal(&font.family)),
+        ("size", format!("{}", font.size)),
+        ("line_height", format!("{}", font.line_height)),
+        ("letter_spacing", format!("{}", font.letter_spacing)),
+        ("fallback", lua_list_literal(&font.fallback)),
+        ("features", lua_list_literal(&font.features)),
+        (
+            "disable_ligatures",
+            lua_string_literal(ligature_policy_literal(font.disable_ligatures)),
+        ),
+    ])
+}
+
+/// Complete `window` table literal, including keys `config check` does not
+/// print (blur radius and the background image leaves).
+fn window_table_literal(window: &bitty_config::WindowConfig) -> String {
+    let mut entries = vec![
+        ("opacity", format!("{}", window.opacity)),
+        ("padding", window.padding.to_string()),
+        ("radius_px", window.radius_px.to_string()),
+        ("blur_radius", window.blur_radius.to_string()),
+    ];
+    if let Some(image) = &window.background_image {
+        entries.push(("background_image", lua_string_literal(image)));
+    }
+    if let Some(fit) = window.background_fit {
+        entries.push(("background_fit", lua_string_literal(fit.as_str())));
+    }
+    if let Some(opacity) = window.background_opacity {
+        entries.push(("background_opacity", format!("{opacity}")));
+    }
+    if let Some(position) = window.background_position {
+        entries.push(("background_position", lua_string_literal(position.as_str())));
+    }
+    lua_table_literal(&entries)
+}
+
+/// Complete `terminal` table literal (scrollback is required by the schema and
+/// is always included).
+fn terminal_table_literal(terminal: &bitty_config::TerminalConfig) -> String {
+    let mut entries = vec![("scrollback", terminal.scrollback.to_string())];
+    if let Some(shell) = &terminal.shell {
+        entries.push(("shell", lua_string_literal(shell)));
+    }
+    entries.push((
+        "scroll_lines_per_notch",
+        terminal.scroll_lines_per_notch.to_string(),
+    ));
+    entries.push((
+        "scroll_pixels_per_notch",
+        terminal.scroll_pixels_per_notch.to_string(),
+    ));
+    entries.push((
+        "page_scroll_percent",
+        terminal.page_scroll_percent.to_string(),
+    ));
+    entries.push((
+        "cursor_style",
+        lua_string_literal(terminal.cursor_style.as_str()),
+    ));
+    entries.push(("bell", lua_string_literal(terminal.bell.as_str())));
+    lua_table_literal(&entries)
+}
+
+/// Complete `layout` table literal.
+fn layout_table_literal(layout: &bitty_config::LayoutConfig) -> String {
+    lua_table_literal(&[
+        ("gaps_in", layout.gaps_in.to_string()),
+        ("gaps_out", layout.gaps_out.to_string()),
+        ("resize_step", format!("{}", layout.resize_step)),
+    ])
+}
+
+/// Complete `decoration` table literal, including the optional color, width,
+/// background-image, and tint leaves.
+fn decoration_table_literal(decoration: &bitty_config::DecorationConfig) -> String {
+    let mut entries = vec![
+        ("gaps_in", decoration.gaps_in.to_string()),
+        ("gaps_out", decoration.gaps_out.to_string()),
+        ("border", decoration.border.to_string()),
+        ("radius", decoration.radius.to_string()),
+        ("content_inset", decoration.content_inset.to_string()),
+    ];
+    for (key, color) in [
+        ("border_color", decoration.border_color),
+        ("border_color_focused", decoration.border_color_focused),
+        ("border_color_idle", decoration.border_color_idle),
+    ] {
+        if let Some(color) = color {
+            entries.push((key, lua_string_literal(&color.to_hex())));
+        }
+    }
+    for (key, width) in [
+        ("border_width", decoration.border_width),
+        ("border_width_focused", decoration.border_width_focused),
+        ("border_width_idle", decoration.border_width_idle),
+    ] {
+        if let Some(width) = width {
+            entries.push((key, width.to_string()));
+        }
+    }
+    if let Some(image) = &decoration.background_image {
+        entries.push(("background_image", lua_string_literal(image)));
+    }
+    if let Some(fit) = decoration.background_fit {
+        entries.push(("background_fit", lua_string_literal(fit.as_str())));
+    }
+    if let Some(roots) = &decoration.background_image_roots {
+        entries.push(("background_image_roots", lua_list_literal(roots)));
+    }
+    if let Some(tint) = decoration.background_tint {
+        entries.push(("background_tint", lua_string_literal(&tint.to_hex())));
+    }
+    if let Some(strength) = decoration.background_tint_strength {
+        entries.push(("background_tint_strength", format!("{strength}")));
+    }
+    lua_table_literal(&entries)
+}
+
+/// Complete `scrollbar` table literal.
+fn scrollbar_table_literal(scrollbar: &bitty_config::ScrollbarConfig) -> String {
+    lua_table_literal(&[
+        ("mode", lua_string_literal(scrollbar.mode.as_str())),
+        ("width", scrollbar.width.to_string()),
+    ])
+}
+
+/// Complete `appearance` table literal.
+///
+/// `theme` and `colors` scalar-replace whenever the `appearance` table is
+/// present, so both are pinned; `animations`/`style` deep-merge per leaf but
+/// are pinned as well so the created table is complete and later edits cannot
+/// depend on which sub-table happened to be present. An inline palette has no
+/// outline-token or category fields (those exist only on local theme files,
+/// which this merge path never applies), so the five data leaves are complete
+/// here.
+fn appearance_table_literal(
+    appearance: &bitty_config::AppearanceConfig,
+    animations: &bitty_config::AnimationsConfig,
+) -> String {
+    let mut entries = Vec::new();
+    if let Some(theme) = &appearance.theme {
+        entries.push(("theme", lua_string_literal(theme)));
+    }
+    if let Some(colors) = &appearance.colors {
+        entries.push(("colors", palette_table_literal(colors)));
+    }
+    entries.push(("animations", animations_table_literal(animations)));
+    if let Some(style) = &appearance.style {
+        entries.push(("style", style_table_literal(style)));
+    }
+    lua_table_literal(&entries)
+}
+
+/// Complete `appearance.animations` table literal (resolved values).
+fn animations_table_literal(animations: &bitty_config::AnimationsConfig) -> String {
+    let durations = [
+        ("open", animations.duration_ms.open),
+        ("close", animations.duration_ms.close),
+        ("focus", animations.duration_ms.focus),
+        ("workspace", animations.duration_ms.workspace),
+        ("move", animations.duration_ms.r#move),
+        ("resize", animations.duration_ms.resize),
+        ("drag", animations.duration_ms.drag),
+    ];
+    let easings = [
+        ("open", animations.easing.open.as_str()),
+        ("close", animations.easing.close.as_str()),
+        ("focus", animations.easing.focus.as_str()),
+        ("workspace", animations.easing.workspace.as_str()),
+        ("move", animations.easing.r#move.as_str()),
+        ("resize", animations.easing.resize.as_str()),
+        ("drag", animations.easing.drag.as_str()),
+    ];
+    lua_table_literal(&[
+        ("enabled", animations.enabled.to_string()),
+        (
+            "reduced_motion",
+            lua_string_literal(animations.reduced_motion.as_str()),
+        ),
+        (
+            "duration_ms",
+            lua_table_literal(
+                &durations
+                    .iter()
+                    .map(|(key, value)| (*key, value.to_string()))
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+        (
+            "easing",
+            lua_table_literal(
+                &easings
+                    .iter()
+                    .map(|(key, value)| (*key, lua_string_literal(value)))
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+    ])
+}
+
+/// Complete `appearance.style` table literal (only declared leaves; an
+/// unset leaf says nothing and keeps inheriting).
+fn style_table_literal(style: &bitty_config::StyleConfig) -> String {
+    let mut entries = Vec::new();
+    for (key, color) in [
+        ("glow_color", style.glow_color),
+        ("shadow_color", style.shadow_color),
+    ] {
+        if let Some(color) = color {
+            entries.push((key, lua_string_literal(&color.to_hex())));
+        }
+    }
+    if let Some(width) = style.glow_width {
+        entries.push(("glow_width", width.to_string()));
+    }
+    for (key, offset) in [
+        ("shadow_offset_x", style.shadow_offset_x),
+        ("shadow_offset_y", style.shadow_offset_y),
+    ] {
+        if let Some(offset) = offset {
+            entries.push((key, offset.to_string()));
+        }
+    }
+    if let Some(fade) = style.fade_unfocused {
+        entries.push(("fade_unfocused", format!("{fade}")));
+    }
+    lua_table_literal(&entries)
+}
+
+/// One inline `appearance.colors` palette literal (`#RRGGBB`, 16 ANSI roles).
+fn palette_table_literal(palette: &bitty_config::CustomPalette) -> String {
+    let ansi = palette
+        .ansi
+        .iter()
+        .map(|rgb| lua_string_literal(&hex_rgb(*rgb)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    lua_table_literal(&[
+        (
+            "background",
+            lua_string_literal(&hex_rgb(palette.background)),
+        ),
+        (
+            "foreground",
+            lua_string_literal(&hex_rgb(palette.foreground)),
+        ),
+        ("cursor", lua_string_literal(&hex_rgb(palette.cursor))),
+        ("selection", lua_string_literal(&hex_rgb(palette.selection))),
+        ("ansi", format!("{{ {ansi} }}")),
+    ])
+}
+
+/// Runs the strict loader's `local:<name>` theme resolution over a candidate
+/// merge, so `set`/`clone`/`use` never accept a body `config check` rejects.
+fn check_local_theme(
+    verb: &str,
+    name: &str,
+    effective: &bitty_config::EffectiveConfig,
+) -> Result<(), Failure> {
+    let mut effective = effective.clone();
+    bitty_config::local_theme::apply_selection(&mut effective).map_err(|err| {
+        Failure::invalid(format!(
+            "bitty config profile {verb}: invalid profile '{name}': {err}"
+        ))
+    })?;
+    Ok(())
+}
+
+/// The typed value one `set` value string must read back as.
+///
+/// `render_literal` already accepted the raw value, so these conversions
+/// cannot fail in normal operation; a conversion that still fails falls back
+/// to an unmatched value, which the caller turns into a refused write instead
+/// of a panic.
+///
+/// Text fields whose typed form canonicalizes an accepted spelling (the mod
+/// key and the chrome mouse-button aliases) must compare in canonical form:
+/// the user may write `Super` or `Paste_From_Primary`, while the re-read
+/// effective value is `super`/`paste_from_primary`.
+fn requested_value(field: &SchemaField, raw: &str) -> ConfigValue {
+    match field.path {
+        "mod_key" => {
+            if let Ok(key) = bitty_config::keymap::ModKey::parse(raw) {
+                return ConfigValue::Text(key.canonical().to_string());
+            }
+        }
+        "mouse.right" | "mouse.middle" => {
+            if let Ok(binding) = bitty_config::keymap::MouseButtonBinding::parse(raw, field.path) {
+                return ConfigValue::Text(binding.canonical());
+            }
+        }
+        _ => {}
+    }
+    match field.kind {
+        FieldKind::Text => ConfigValue::Text(strip_matching_quotes(raw).to_string()),
+        FieldKind::Integer => ConfigValue::Number(
+            raw.trim()
+                .parse::<u32>()
+                .map_or_else(|_| raw.trim().to_string(), |value| value.to_string()),
+        ),
+        FieldKind::Number => ConfigValue::Number(
+            raw.trim()
+                .parse::<f32>()
+                .map_or_else(|_| raw.trim().to_string(), |value| format!("{value}")),
+        ),
+        FieldKind::Bool => ConfigValue::Bool(raw.trim().eq_ignore_ascii_case("true")),
+        FieldKind::List => ConfigValue::List(if raw.trim().is_empty() {
+            Vec::new()
+        } else {
+            raw.trim()
+                .split(',')
+                .map(|item| item.trim().to_string())
+                .collect()
+        }),
+    }
 }
 
 /// Creates a brand-new profile file exclusively, writes it, and syncs it.
@@ -2119,10 +2626,10 @@ fn insert_field(
     let mut stage = content.to_string();
     let mut close_at = close;
     if let Some(last) = fields.last() {
-        let mut cursor = last.value_end;
-        while cursor < close && bytes[cursor].is_ascii_whitespace() {
-            cursor += 1;
-        }
+        // Look past whitespace *and* comments: a separator after a trailing
+        // comment is already present, and adding a second one (`value, -- c`
+        // plus the existing `,` line) would make the table a Lua syntax error.
+        let cursor = skip_ignorable(bytes, last.value_end, close).unwrap_or(close);
         if cursor >= close || (bytes[cursor] != b',' && bytes[cursor] != b';') {
             stage.insert(last.value_end, ',');
             close_at += 1;
@@ -2248,41 +2755,67 @@ fn is_ident(byte: u8) -> bool {
 
 /// Rewrites exactly one top-level `profile = "..."` assignment, preserving
 /// every other byte (comments, formatting, and user overrides).
+///
+/// The scanner skips short strings, comments (line and long-bracket), and
+/// long-bracket strings, so a historical selector kept in a comment can never
+/// be mistaken for the live assignment. The value must be a short-quoted
+/// string: a long-bracket value is valid Lua but not editable by this
+/// byte-preserving rewrite, so the function refuses (`None`) instead of
+/// reporting a switch it did not make.
 fn rewrite_selector_profile(content: &str, new_profile: &str) -> Option<String> {
-    let mut out = String::with_capacity(content.len() + new_profile.len());
-    let mut rewrites = 0usize;
-    for line in content.split_inclusive('\n') {
-        let (body, ending) = match line.strip_suffix('\n') {
-            Some(body) => (body, "\n"),
-            None => (line, ""),
-        };
-        let trimmed = body.trim_start();
-        let is_assignment = trimmed.strip_prefix("profile").is_some_and(|rest| {
-            rest.chars()
-                .next()
-                .is_some_and(|c| c.is_whitespace() || c == '=')
-        });
-        if is_assignment {
-            if let Some(eq) = trimmed.find('=') {
-                let after_eq = &trimmed[eq + 1..];
-                if let Some(open) = after_eq.find('"') {
-                    let rest = &after_eq[open + 1..];
-                    if let Some(close) = rest.find('"') {
-                        let prefix_len = body.len() - after_eq.len() + open + 1;
-                        out.push_str(&body[..prefix_len]);
-                        out.push_str(new_profile);
-                        out.push_str(&rest[close..]);
-                        out.push_str(ending);
-                        rewrites += 1;
-                        continue;
+    let bytes = content.as_bytes();
+    let mut assignments = 0usize;
+    let mut rewritable: Option<(usize, usize)> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => i = skip_short_string(bytes, i, bytes.len()).ok()?,
+            b'-' if i + 1 < bytes.len() && bytes[i + 1] == b'-' => {
+                i = skip_comment(bytes, i, bytes.len()).ok()?;
+            }
+            b'[' if long_bracket_opener(bytes, i).is_some() => {
+                let opener = long_bracket_opener(bytes, i)?;
+                i = skip_long_bracket(bytes, i, opener, bytes.len()).ok()?;
+            }
+            byte if is_ident_start(byte) => {
+                let start = i;
+                let mut end = i + 1;
+                while end < bytes.len() && is_ident(bytes[end]) {
+                    end += 1;
+                }
+                i = end;
+                if bytes[start..end] != *b"profile" {
+                    continue;
+                }
+                let Ok(eq) = skip_ignorable(bytes, end, bytes.len()) else {
+                    continue;
+                };
+                if bytes.get(eq) != Some(&b'=') {
+                    continue;
+                }
+                assignments += 1;
+                let Ok(value_start) = skip_ignorable(bytes, eq + 1, bytes.len()) else {
+                    continue;
+                };
+                if bytes.get(value_start) == Some(&b'"') {
+                    let string_end = skip_short_string(bytes, value_start, bytes.len()).ok()?;
+                    if assignments == 1 {
+                        rewritable = Some((value_start + 1, string_end - 1));
                     }
                 }
             }
+            _ => i += 1,
         }
-        out.push_str(body);
-        out.push_str(ending);
     }
-    if rewrites == 1 { Some(out) } else { None }
+    if assignments != 1 {
+        return None;
+    }
+    let (start, end) = rewritable?;
+    let mut out = String::with_capacity(content.len() + new_profile.len());
+    out.push_str(&content[..start]);
+    out.push_str(new_profile);
+    out.push_str(&content[end..]);
+    Some(out)
 }
 
 #[cfg(test)]
@@ -2420,6 +2953,70 @@ mod tests {
             updated,
             "return { font = { family = \"M\", size = 12, line_height = 1.2 } }\n"
         );
+    }
+
+    #[test]
+    fn set_keeps_a_separator_that_follows_a_trailing_comment() {
+        // The separator already present on the next line must be seen through
+        // the comment; inserting a second one would be a Lua syntax error and
+        // `set` would blame the user's file for it.
+        let content = "return {\n    font = { family = \"M\", size = 12 } -- note\n    ,\n}\n";
+        let updated = set_lua_path(content, &["mod_key"], "\"super\"").expect("splice");
+        assert_eq!(
+            updated,
+            "return {\n    font = { family = \"M\", size = 12 } -- note\n    ,\n    \
+             mod_key = \"super\",\n}\n"
+        );
+        assert!(!updated.contains(",,"), "no doubled separator: {updated}");
+        bitty_config::file::parse_lua_config(
+            &updated,
+            &bitty_config::ConfigSource::new(bitty_config::LayerKind::Profile, Some("p.lua")),
+        )
+        .expect("spliced profile parses");
+    }
+
+    #[test]
+    fn rewrite_skips_comments_and_long_bracket_values() {
+        // Live value is a long-bracket string: the byte-preserving editor
+        // cannot rewrite it, so `use` must refuse instead of editing the
+        // historical selector kept in the comment.
+        let long_value = "return {\n    format = \"bitty-profile-v1\",\n    --[[ historical \
+                          selector:\n    profile = \"default\"\n    ]]\n    profile = \
+                          [[alpha]],\n}\n";
+        assert!(rewrite_selector_profile(long_value, "beta").is_none());
+
+        // Live value is short-quoted: only that assignment changes. The old
+        // line scanner also matched the comment and refused with a misleading
+        // "exactly one" error.
+        let short_value = "return {\n    format = \"bitty-profile-v1\",\n    --[[ historical \
+                           selector:\n    profile = \"default\"\n    ]]\n    profile = \
+                           \"alpha\",\n}\n";
+        let rewritten = rewrite_selector_profile(short_value, "beta").expect("one live assignment");
+        assert!(rewritten.contains("--[[ historical selector:"));
+        assert!(rewritten.contains("profile = \"default\""));
+        assert!(rewritten.contains("profile = \"beta\""));
+        assert!(!rewritten.contains("profile = \"alpha\""));
+        // Offsets outside the rewritten value are byte-identical.
+        let (before, after) = short_value.split_once("alpha").expect("live value present");
+        assert!(rewritten.starts_with(before), "{rewritten}");
+        assert!(rewritten.ends_with(after), "{rewritten}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn referencing_profiles_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch_dir("referencing-symlink");
+        std::fs::write(dir.join("base.lua"), "return {}\n").expect("base");
+        std::fs::write(dir.join("real.lua"), "return { extends = \"base\" }\n").expect("real");
+        symlink(dir.join("real.lua"), dir.join("linked.lua")).expect("symlink");
+        assert_eq!(
+            referencing_profiles(&dir, "base"),
+            vec![String::from("real")],
+            "a symlinked profile never counts as a dependent"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

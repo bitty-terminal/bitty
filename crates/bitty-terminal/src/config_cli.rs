@@ -2173,6 +2173,7 @@ pub(crate) fn bounded_message(raw: &str) -> String {
 }
 
 /// One typed value in the bounded key projection.
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ConfigValue {
     /// String value.
     Text(String),

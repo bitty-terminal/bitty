@@ -3729,19 +3729,19 @@ fn c1_st_returns_to_ground_after_a_hooked_dcs() {
         "the tail is text, not a swallowed string"
     );
 
-    // `ESC P q payload` is 11 bytes, so the `0x9C` is at offset 11 and the
-    // text starts at 12; the cuts bracket the terminator and the offset the
+    // `\x1bPqpayload` is 10 bytes, so the `0x9C` is at offset 10 and the
+    // text starts at 11; the cuts bracket the terminator and the offset the
     // stale `Other` state used to overflow at.
     let cuts = [
         0,
         1,
         2,
         3,
+        10,
         11,
-        12,
-        12 + CAP - 1,
-        12 + CAP,
-        12 + CAP + 1,
+        11 + CAP - 1,
+        11 + CAP,
+        11 + CAP + 1,
         stream.len() - 2,
     ];
     for cut in cuts {

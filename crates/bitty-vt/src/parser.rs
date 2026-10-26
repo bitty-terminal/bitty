@@ -380,10 +380,10 @@ impl ControlString {
     /// Ends the open `vte` string at its terminator, returning the tracker to
     /// `Ground` with it.
     ///
-    /// Every byte that ends a control string leaves `vte` in `Ground` (C1
-    /// `ST` unhooks a DCS, `BEL`/`CAN`/`SUB`/`ESC`-then-`\` end the others),
-    /// so the state must move too: a stale `Other` would count the following
-    /// text as an unterminated string and fake a refusal at the cap
+    /// C1 `ST` unhooks a DCS, and `BEL`/`CAN`/`SUB` end the others; a
+    /// forwarded `ESC` instead leaves `vte` in `Escape`, which the caller
+    /// tracks by advancing with `after`. A stale `Other` would count the
+    /// following text as an unterminated string and fake a refusal at the cap
     /// (CTX-1592 re-review F-A). The other callers either overwrite `state`
     /// immediately (the `ESC` forwarded out of the discard tail) or leave it
     /// in `Ground` (a swallowed terminator), so the reset is their answer too.

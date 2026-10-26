@@ -19,12 +19,14 @@
 //!   `init.lua` files require the explicit `bitty init --migrate` path.
 //! - `get NAME PATH`: effective value at one documented dotted schema path.
 //! - `set NAME PATH VALUE`: validates the value through the same strict
-//!   loader `bitty config check` uses (including `local:<name>` theme
-//!   resolution, keymap resolution, runtime bounds, and the background-image
-//!   root/header/decode pipeline), edits exactly that path inside the
-//!   profile's returned Lua table, and commits atomically (unique sibling
-//!   temporary file, `sync_all`, rename over the target, parent-directory
-//!   sync). A failed validation or write leaves the previous bytes intact.
+//!   loader `bitty config check --profile NAME` uses — the profile chain
+//!   merged under the current selector/`init.lua` user layer, including
+//!   `local:<name>` theme resolution, keymap resolution, runtime bounds, and
+//!   the background-image root/header/decode pipeline — edits exactly that
+//!   path inside the profile's returned Lua table, and commits atomically
+//!   (unique sibling temporary file, `sync_all`, rename over the target,
+//!   parent-directory sync). A failed validation or write leaves the previous
+//!   bytes intact.
 //!   Because the typed plan merges `font`,
 //!   `window`, `terminal`, `layout`, `decoration`, `scrollbar`, and
 //!   `appearance` as complete tables, creating one of them in a profile pins
@@ -151,7 +153,10 @@ impl ProfileVerb {
     }
 
     /// `(label, description)` for every operand this verb takes, in order.
-    fn operands(self) -> &'static [(&'static str, &'static str)] {
+    ///
+    /// `pub(crate)` so shell completion can derive its dynamic operand slots
+    /// from the verb list instead of duplicating the arity by hand.
+    pub(crate) fn operands(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::Create | Self::Delete | Self::Show | Self::Use | Self::Path => {
                 &[("NAME", "profile name")]
@@ -279,14 +284,14 @@ pub(crate) fn run_profile_subcommand(args: &Args) -> i32 {
     };
     let outcome = match verb {
         ProfileVerb::Create => run_create(&dir, operands[0]),
-        ProfileVerb::Clone => run_clone(&dir, operands[0], operands[1]),
+        ProfileVerb::Clone => run_clone(args, &dir, operands[0], operands[1]),
         ProfileVerb::Rename => run_rename(args, &dir, operands[0], operands[1]),
         ProfileVerb::Delete => run_delete(args, &dir, operands[0]),
         ProfileVerb::List => run_list(args, &dir),
         ProfileVerb::Show => run_show(&dir, operands[0]),
         ProfileVerb::Use => run_use(args, &dir, operands[0]),
         ProfileVerb::Get => run_get(&dir, operands[0], operands[1]),
-        ProfileVerb::Set => run_set(&dir, operands[0], operands[1], operands[2]),
+        ProfileVerb::Set => run_set(args, &dir, operands[0], operands[1], operands[2]),
         ProfileVerb::Path => run_path(&dir, operands[0]),
     };
     match outcome {
@@ -561,14 +566,12 @@ fn run_use(args: &Args, dir: &Path, raw_name: &str) -> Result<Reply, Failure> {
     let name = valid_name("use", raw_name)?;
     let profile_path = profile_path(dir, &name);
     ensure_present("use", &name, &profile_path)?;
-    // Validate the whole chain (and the same `local:<name>` theme selection
-    // the strict loader resolves) before any mutation.
-    let current = merged_profile(dir, "use", &name)?;
-    strict_post_merge_checks(
-        "use",
-        &format!("invalid profile '{name}'"),
-        &current.effective,
-    )?;
+    // Reject a chain that is invalid on its own (syntax, shape, schema) before
+    // any mutation. The strict post-merge gates are deliberately NOT run here:
+    // they decide on the cross-layer merge below, where the selector's own
+    // approved roots, theme, and keymaps participate. Running them on the
+    // profile alone refused configurations `config check` accepts.
+    let _ = merged_profile(dir, "use", &name)?;
     let bitty_config_env = std::env::var("BITTY_CONFIG").ok();
     let explicit = bitty_config::file::resolve_config_explicit(
         args.config_path.as_deref(),
@@ -823,7 +826,7 @@ fn run_create(dir: &Path, raw_name: &str) -> Result<Reply, Failure> {
 }
 
 /// `bitty config profile clone SRC DST`.
-fn run_clone(dir: &Path, raw_src: &str, raw_dst: &str) -> Result<Reply, Failure> {
+fn run_clone(args: &Args, dir: &Path, raw_src: &str, raw_dst: &str) -> Result<Reply, Failure> {
     let src = valid_name("clone", raw_src)?;
     let dst = valid_name("clone", raw_dst)?;
     reject_reserved("clone", &dst)?;
@@ -835,14 +838,16 @@ fn run_clone(dir: &Path, raw_src: &str, raw_dst: &str) -> Result<Reply, Failure>
         Ok(chain) => chain,
         Err(err) => return Err(invalid_profile("clone", &src, &err)),
     };
-    let merged = match bitty_config::file::resolve_effective_with_profiles(
+    // Profile-only merge first: a chain that is invalid on its own keeps the
+    // source-profile attribution. The cross-layer merge below is what decides,
+    // because the copied profile is only ever loaded under the user selector.
+    bitty_config::file::resolve_effective_with_profiles(
         None,
-        chain,
+        chain.clone(),
         &bitty_config::file::CliOverrides::default(),
-    ) {
-        Ok(merged) => merged,
-        Err(err) => return Err(invalid_profile("clone", &src, &err)),
-    };
+    )
+    .map_err(|err| invalid_profile("clone", &src, &err))?;
+    let merged = merge_with_current_user("clone", &src, args, chain)?;
     strict_post_merge_checks(
         "clone",
         &format!("invalid profile '{src}'"),
@@ -989,7 +994,13 @@ fn run_get(dir: &Path, raw_name: &str, raw_key: &str) -> Result<Reply, Failure> 
 }
 
 /// `bitty config profile set NAME PATH VALUE`.
-fn run_set(dir: &Path, raw_name: &str, raw_key: &str, raw_value: &str) -> Result<Reply, Failure> {
+fn run_set(
+    args: &Args,
+    dir: &Path,
+    raw_name: &str,
+    raw_key: &str,
+    raw_value: &str,
+) -> Result<Reply, Failure> {
     let name = valid_name("set", raw_name)?;
     let field = schema_field("set", raw_key)?;
     let literal = render_literal(field, raw_value).map_err(|message| {
@@ -1020,7 +1031,7 @@ fn run_set(dir: &Path, raw_name: &str, raw_key: &str, raw_value: &str) -> Result
                      '{name}': {message}"
                 ))
             })?;
-            if let Some(violation) = pin_bound_violation(&pinned_body) {
+            if let Some(violation) = profile_bound_violation(&pinned_body) {
                 return Err(Failure::invalid(format!(
                     "bitty config profile set: cannot pin inherited '{table}' into '{name}': \
                      {violation}; edit the profile manually"
@@ -1036,7 +1047,27 @@ fn run_set(dir: &Path, raw_name: &str, raw_key: &str, raw_value: &str) -> Result
             field.path
         ))
     })?;
-    let merged = merge_candidate(dir, &name, &path, &updated)?;
+    // Recheck the final body, not just the seeded table: an escaping literal or
+    // a leaf appended beside a near-bound pin expands the same line past the
+    // loader limit. Naming the pin and the bound here keeps the diagnostic
+    // actionable instead of surfacing a generic parse error for bytes the user
+    // never wrote.
+    if let Some(violation) = profile_bound_violation(&updated) {
+        let message = if let Some(table) = pinned.last() {
+            format!(
+                "bitty config profile set: cannot pin inherited '{table}' into '{name}': \
+                 {violation}; edit the profile manually"
+            )
+        } else {
+            format!(
+                "bitty config profile set: cannot set '{}' in profile '{name}': {violation}; \
+                 edit the profile manually",
+                field.path
+            )
+        };
+        return Err(Failure::invalid(message));
+    }
+    let merged = merge_candidate(args, dir, &name, &path, &updated)?;
     // Defense in depth: the bytes just spliced must read back as the requested
     // value. A mismatch means the editor wrote somewhere the merge does not
     // read (an alias, a duplicate key the parser resolved differently, or an
@@ -1312,9 +1343,16 @@ fn validate_new_profile(content: &str, path: &Path) -> Result<(), bitty_config::
 
 /// Validates a candidate edit through the exact strict loader `config check`
 /// uses: parse the new body, resolve the current `extends` chain, substitute
-/// the edited entry, and merge/validate the whole chain (including the
-/// `local:<name>` theme selection the strict loader resolves).
+/// the edited entry, and merge/validate the chain — including the current user
+/// selector above it and the `local:<name>` theme selection the strict loader
+/// resolves.
+///
+/// The merge the gates see is the one `config check --profile NAME` sees
+/// (user layer + candidate chain). The returned value is the profile-only
+/// merge: pin seeding and `set`'s attribution stay on the profile the command
+/// targets, exactly as before.
 fn merge_candidate(
+    args: &Args,
     dir: &Path,
     name: &str,
     path: &Path,
@@ -1329,18 +1367,93 @@ fn merge_candidate(
     } else {
         chain.push(candidate);
     }
+    // A chain that is invalid on its own is rejected with profile attribution
+    // before the user layer can be blamed for it.
     let merged = bitty_config::file::resolve_effective_with_profiles(
         None,
-        chain,
+        chain.clone(),
         &bitty_config::file::CliOverrides::default(),
     )
     .map_err(|err| invalid_profile("set", name, &err))?;
+    // The selector is a user layer too: its theme, approved roots, and keymaps
+    // participate in what the next launch loads, so the gates must see the
+    // cross-layer result. Checking the profile alone both refused valid configs
+    // (selector-approved image roots) and accepted invalid ones (a keymap
+    // duplicate or `local:missing` theme only the selector introduced).
+    let cross_layer = merge_with_current_user("set", name, args, chain)?;
     strict_post_merge_checks(
         "set",
         &format!("invalid profile '{name}'"),
-        &merged.effective,
+        &cross_layer.effective,
     )?;
     Ok(merged)
+}
+
+/// The current user file (versioned selector or legacy `init.lua`) loaded as a
+/// [`bitty_config::LayerKind::User`] layer.
+struct CurrentUserLayer {
+    /// Path the layer was read from, for diagnostics.
+    path: PathBuf,
+    /// Parsed, validated, migrated layer.
+    layer: bitty_config::LayeredPlan,
+}
+
+/// Loads the user file `config check` merges above the profile chain.
+///
+/// Resolution matches startup: `--config` > `BITTY_CONFIG` > the XDG probe
+/// (`init.lua`, then the `config.lua` alias). A missing file means the profile
+/// chain is the whole configuration; a present but invalid file fails closed,
+/// because the strict loader would reject the next launch too.
+fn current_user_layer(verb: &str, args: &Args) -> Result<Option<CurrentUserLayer>, Failure> {
+    let bitty_config_env = std::env::var("BITTY_CONFIG").ok();
+    let explicit = bitty_config::file::resolve_config_explicit(
+        args.config_path.as_deref(),
+        bitty_config_env.as_deref(),
+    );
+    let Some(probed) = bitty_config::file::probe_config_path(explicit.as_deref()) else {
+        return Ok(None);
+    };
+    if !probed.path.exists() {
+        return Ok(None);
+    }
+    let layer = bitty_config::file::load_user_layer(&probed.path).map_err(|err| {
+        Failure::invalid(format!(
+            "bitty config profile {verb}: invalid config file '{}': {err}",
+            probed.path.display()
+        ))
+    })?;
+    Ok(Some(CurrentUserLayer {
+        path: probed.path,
+        layer,
+    }))
+}
+
+/// Merges `chain` under the current user layer exactly as
+/// `config check --profile NAME` does, so a profile command never validates a
+/// configuration the next launch would not load.
+fn merge_with_current_user(
+    verb: &str,
+    name: &str,
+    args: &Args,
+    chain: Vec<bitty_config::LayeredPlan>,
+) -> Result<bitty_config::MergedConfig, Failure> {
+    let user = current_user_layer(verb, args)?;
+    let (file, path) = match user {
+        Some(user) => (Some(user.layer), Some(user.path)),
+        None => (None, None),
+    };
+    bitty_config::file::resolve_effective_with_profiles(
+        file,
+        chain,
+        &bitty_config::file::CliOverrides::default(),
+    )
+    .map_err(|err| match path {
+        Some(path) => Failure::invalid(format!(
+            "bitty config profile {verb}: profile '{name}' merged with '{}' is invalid: {err}",
+            path.display()
+        )),
+        None => invalid_profile(verb, name, &err),
+    })
 }
 
 /// Loads and merges one profile's current `extends` chain.
@@ -2467,26 +2580,27 @@ fn strip_matching_quotes(raw: &str) -> &str {
     trimmed
 }
 
-/// Returns the loader bound a rendered pin would breach, if any.
+/// Returns the loader bound a rendered profile body would breach, if any.
 ///
-/// A pin is one Lua table literal on one line. The loader rejects a line over
+/// A pin is one Lua table literal on one line, and the final edit can append
+/// to that same line. The loader rejects a line over
 /// [`bitty_config::file::MAX_LINE_BYTES`] and a file over
-/// [`bitty_config::file::MAX_CONFIG_FILE_BYTES`]; checking the spliced body
-/// before committing lets `set` name the pin and the bound instead of
+/// [`bitty_config::file::MAX_CONFIG_FILE_BYTES`]; checking the final spliced
+/// body before merging lets `set` name the pin and the bound instead of
 /// reporting a generic `invalid profile` for a file the user did not write.
-fn pin_bound_violation(content: &str) -> Option<String> {
+fn profile_bound_violation(content: &str) -> Option<String> {
     if content
         .lines()
         .any(|line| line.len() > bitty_config::file::MAX_LINE_BYTES)
     {
         return Some(format!(
-            "the pinned table would exceed the {}-byte line bound",
+            "the rendered line would exceed the {}-byte line bound",
             bitty_config::file::MAX_LINE_BYTES
         ));
     }
     if content.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES {
         return Some(format!(
-            "the pinned table would exceed the {} KiB profile bound",
+            "the rendered profile would exceed the {} KiB profile bound",
             bitty_config::file::MAX_CONFIG_FILE_BYTES / 1024
         ));
     }
@@ -3375,13 +3489,19 @@ mod tests {
         assert_eq!(lua_string_literal("plain"), "\"plain\"");
         assert_eq!(lua_string_literal("a\\b\"c"), "\"a\\\\b\\\"c\"");
         assert_eq!(lua_string_literal("A\nB\rC\tD"), "\"A\\nB\\rC\\tD\"");
+        assert_eq!(lua_string_literal("a\0b"), "\"a\\x00b\"");
+        assert_eq!(lua_string_literal("ends\\"), "\"ends\\\\\"");
+        assert_eq!(lua_string_literal("lit\\n"), "\"lit\\\\n\"");
         assert_eq!(lua_string_literal("\u{1b}"), "\"\\x1b\"");
         assert_eq!(lua_string_literal("\u{7f}"), "\"\\x7f\"");
+        assert_eq!(lua_string_literal("\u{80}"), "\"\\u{80}\"");
         assert_eq!(lua_string_literal("\u{85}"), "\"\\u{85}\"");
 
         // The encoded literal must read back as the same value through the
         // strict parser: an escaped pin is only useful if it round-trips.
-        let raw = "A\nB\rC\tD\u{1b}\u{85}";
+        // Covers NUL, a lone trailing backslash, the literal text `\n`
+        // (backslash + n), CRLF, C1 controls, and the last scalar.
+        let raw = "A\0B\\C\\nD\r\nE\tF\u{1b}\u{85}\u{80}\u{10ffff}G";
         let literal = lua_string_literal(raw);
         assert!(
             !literal.contains('\n') && !literal.contains('\r') && !literal.contains('\t'),

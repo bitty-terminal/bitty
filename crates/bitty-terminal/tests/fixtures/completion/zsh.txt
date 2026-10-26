@@ -3,7 +3,7 @@
 # Install: bitty completion zsh > ~/.zfunc/_bitty  (with ~/.zfunc on $fpath)
 #      or: eval "$(bitty completion zsh)" after the bitty binary is on PATH.
 # Dynamic values (`--profile`, `plugin enable|disable`, and the first operand
-# of `config profile show|use|path|get|clone|delete|rename`) come from the
+# of `config profile create|show|use|path|get|clone|delete|rename`) come from the
 # hidden local helpers; failures are silent.
 _bitty_flag_takes_value() {
     case "$1" in
@@ -85,7 +85,7 @@ _bitty() {
                 return 0
             fi
             ;;
-        "config profile show"|"config profile use"|"config profile path"|"config profile get"|"config profile clone"|"config profile delete"|"config profile rename")
+        "config profile create"|"config profile show"|"config profile use"|"config profile path"|"config profile get"|"config profile clone"|"config profile delete"|"config profile rename")
             if [[ "$cur" != -* ]]; then
                 _bitty_profiles "$cur"
                 return 0

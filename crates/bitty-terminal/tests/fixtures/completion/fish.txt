@@ -2,7 +2,7 @@
 # Install: bitty completion fish > ~/.config/fish/completions/bitty.fish
 #      or: bitty completion fish | source
 # Dynamic values (`--profile`, `plugin enable|disable`, and the first operand
-# of `config profile show|use|path|get|clone|delete|rename`) come from the
+# of `config profile create|show|use|path|get|clone|delete|rename`) come from the
 # hidden local helpers; helper failures yield no candidates and never print
 # into the completion stream.
 function __bitty_flag_takes_value
@@ -157,7 +157,7 @@ function __bitty_complete
             if not string match -q -- '-*' "$cur"
                 __bitty_installed_plugins
             end
-        case 'config profile show' 'config profile use' 'config profile path' 'config profile get' 'config profile clone' 'config profile delete' 'config profile rename'
+        case 'config profile create' 'config profile show' 'config profile use' 'config profile path' 'config profile get' 'config profile clone' 'config profile delete' 'config profile rename'
             if not string match -q -- '-*' "$cur"
                 __bitty_profiles
             end

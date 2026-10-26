@@ -87,7 +87,7 @@ _bitty_complete() {
                     ;;
             esac
             ;;
-        "config profile show"|"config profile use"|"config profile path"|"config profile get"|"config profile clone"|"config profile delete"|"config profile rename")
+        "config profile create"|"config profile show"|"config profile use"|"config profile path"|"config profile get"|"config profile clone"|"config profile delete"|"config profile rename")
             case "$cur" in
                 -*) ;;
                 *)

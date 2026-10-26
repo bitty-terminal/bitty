@@ -2,7 +2,7 @@
 # Install: bitty completion powershell | Out-String | Invoke-Expression
 #      or save it to a file dot-sourced from $PROFILE.
 # Dynamic values (`--profile`, `plugin enable|disable`, and the first operand
-# of `config profile show|use|path|get|clone|delete|rename`) come from the
+# of `config profile create|show|use|path|get|clone|delete|rename`) come from the
 # hidden local helpers. Helper failures and malformed state produce no
 # candidates and never write diagnostics.
 if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {
@@ -99,7 +99,7 @@ if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {
         }
         # Operand paths are not grammar nodes (`$paths` only carries grammar
         # keys), so their dynamic branches must run before the static lookup.
-        $isOperandPath = $path -in @('plugin enable', 'plugin disable', 'config profile show', 'config profile use', 'config profile path', 'config profile get', 'config profile clone', 'config profile delete', 'config profile rename')
+        $isOperandPath = $path -in @('plugin enable', 'plugin disable', 'config profile create', 'config profile show', 'config profile use', 'config profile path', 'config profile get', 'config profile clone', 'config profile delete', 'config profile rename')
         $candidates = @()
         if ($wordToComplete -like '--profile=*') {
             $profilePrefix = '--profile='

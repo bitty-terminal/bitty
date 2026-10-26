@@ -33,3 +33,8 @@
 *.gz binary
 *.tar binary
 *.mp4 binary
+
+# Vendored patch data must stay byte-identical to upstream (its SHA-256 is
+# pinned in vendor/winit/PATCHES.md); empty context lines legitimately carry
+# the diff's leading space, so whitespace checks and cleanup must skip it.
+vendor/winit/patches/*.diff -whitespace

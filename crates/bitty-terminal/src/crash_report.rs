@@ -71,10 +71,12 @@ pub(crate) enum Lifecycle {
     CloseRequested = 10,
     Closed = 11,
     Exit = 12,
+    Occluded = 13,
+    Revealed = 14,
 }
 
 impl Lifecycle {
-    const COUNT: usize = 13;
+    const COUNT: usize = 15;
 
     fn from_u8(raw: u8) -> Self {
         match raw {
@@ -90,6 +92,8 @@ impl Lifecycle {
             10 => Self::CloseRequested,
             11 => Self::Closed,
             12 => Self::Exit,
+            13 => Self::Occluded,
+            14 => Self::Revealed,
             _ => Self::Startup,
         }
     }
@@ -109,6 +113,8 @@ impl Lifecycle {
             Self::CloseRequested => "close-requested",
             Self::Closed => "closed",
             Self::Exit => "exit",
+            Self::Occluded => "occluded",
+            Self::Revealed => "revealed",
         }
     }
 }

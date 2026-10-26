@@ -521,6 +521,18 @@ pub enum WindowEventKind {
     /// The window was destroyed by the platform; no further events arrive for
     /// it regardless of any pending close request.
     Closed,
+    /// The window's content is (`true`) or is not (`false`) occluded: the
+    /// surface is not ordinarily being re-painted (a Hyprland workspace
+    /// switch-away, a fully covering window, a locked output).
+    ///
+    /// Delivered natively where winit maps it (iOS, X11
+    /// `VisibilityFullyObscured`); on Wayland supplied synthetically by this
+    /// crate's redraw-starvation probe (winit 0.30.13 does not map the xdg
+    /// `suspended` toplevel state, so the `Suspended` lifecycle and native
+    /// `Occluded` never fire there — the probe closes that gap so the
+    /// surface-visibility gate engages on the platform issue #2570
+    /// reproduces on).
+    Occluded(bool),
     /// Modifier state changed (shift/ctrl/alt/super).
     ModifiersChanged(ModifiersState),
     /// IME composition event (preedit/commit).
@@ -618,6 +630,7 @@ pub(crate) fn translate_window_event(event: WindowEvent) -> Option<WindowEventKi
         WindowEvent::CloseRequested => Some(WindowEventKind::CloseRequested),
         WindowEvent::Destroyed => Some(WindowEventKind::Closed),
         WindowEvent::RedrawRequested => Some(WindowEventKind::RedrawRequested),
+        WindowEvent::Occluded(occluded) => Some(map_occluded(occluded)),
         WindowEvent::Focused(focused) => Some(map_focused(focused)),
         WindowEvent::KeyboardInput {
             event: key_event,
@@ -662,6 +675,10 @@ pub(crate) fn map_scale_factor_changed(scale_factor: f64) -> WindowEventKind {
 
 pub(crate) const fn map_focused(focused: bool) -> WindowEventKind {
     WindowEventKind::Focused(focused)
+}
+
+pub(crate) const fn map_occluded(occluded: bool) -> WindowEventKind {
+    WindowEventKind::Occluded(occluded)
 }
 
 /// Translates keyboard event fields into an owned [`KeyEvent`].
@@ -821,14 +838,24 @@ mod tests {
     }
 
     #[test]
+    fn occlusion_translate() {
+        // Delivered natively where winit maps it (iOS, X11); on Wayland the
+        // crate's redraw-starvation probe synthesizes it.
+        assert_eq!(
+            translate_window_event(WindowEvent::Occluded(true)),
+            Some(WindowEventKind::Occluded(true))
+        );
+        assert_eq!(map_occluded(false), WindowEventKind::Occluded(false));
+    }
+
+    #[test]
     fn filtered_events_yield_none() {
-        // Constructible representatives of the filtered families: window move
+        // Constructible representative of the filtered families: window moves
         // and occlusion are not part of the skeleton surface.
         assert_eq!(
             translate_window_event(WindowEvent::Moved(PhysicalPosition::new(10, 20))),
             None
         );
-        assert_eq!(translate_window_event(WindowEvent::Occluded(true)), None);
     }
 
     #[test]

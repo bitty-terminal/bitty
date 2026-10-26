@@ -3827,6 +3827,7 @@ mod tests {
                 }
                 WindowEventKind::ModifiersChanged(_)
                 | WindowEventKind::Focused(_)
+                | WindowEventKind::Occluded(_)
                 | WindowEventKind::Resized(_)
                 | WindowEventKind::ScaleFactorChanged(_)
                 | WindowEventKind::CloseRequested

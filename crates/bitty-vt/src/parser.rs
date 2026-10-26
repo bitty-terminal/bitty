@@ -124,7 +124,8 @@ const CAN: u8 = 0x18;
 /// (`SosPmApcString` → `Escape`, without consuming the byte after it): the
 /// `ESC` is forwarded and the next byte is parsed normally, so a rejected
 /// APC followed by `ESC ]0;title` still delivers the title (CTX-1603,
-/// bitty#2712).
+/// bitty#2712). The one exception is `ESC \` (ST), which is consumed as the
+/// APC's terminator instead of being forwarded.
 pub struct Parser {
     state_machine: vte::Parser,
     dcs: PendingDcs,
@@ -647,7 +648,8 @@ impl Parser {
     /// [`TerminalAction::ControlStringRejected`] emitted for telemetry.
     /// A refused `APC` drops its tail up to `BEL`/C1 `ST` or `ESC`; an
     /// `ESC` ends the APC and is forwarded, so the sequence after it parses
-    /// normally (CTX-1603).
+    /// normally (CTX-1603). `ESC \` (ST) is the exception: it is consumed as
+    /// the APC terminator, not forwarded.
     pub fn advance<F>(&mut self, bytes: &[u8], emit: F)
     where
         F: FnMut(TerminalAction),

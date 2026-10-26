@@ -3908,6 +3908,50 @@ fn refused_apc_prefix() -> Vec<u8> {
     prefix
 }
 
+/// Bytes before the first charged APC body byte: the `ESC _` introducer plus
+/// the header bytes `z;` that fail `begin_control` and start the discard tail.
+const REFUSED_APC_INTRO: usize = 4;
+
+/// Absolute stream offset of the byte that crosses [`CAP`]: the
+/// `(CAP - 1)`th body byte, after the two charged header bytes.
+const REFUSED_APC_AT: usize = REFUSED_APC_INTRO + CAP - 2;
+
+/// Bare `vte` 0.15 callbacks for one byte stream.
+///
+/// `vte` is the adopted state machine (ADR-0004), so the resync tests pin the
+/// bytes after the aborting `ESC` against it instead of a hand-written
+/// reading of its Escape state (CTX-1603 review).
+#[derive(Debug, Default)]
+struct VteTrace {
+    executed: Vec<u8>,
+    printed: String,
+    esc: Vec<(Vec<u8>, bool, u8)>,
+}
+
+struct VteTraceRecorder(VteTrace);
+
+impl vte::Perform for VteTraceRecorder {
+    fn print(&mut self, c: char) {
+        self.0.printed.push(c);
+    }
+
+    fn execute(&mut self, byte: u8) {
+        self.0.executed.push(byte);
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        self.0.esc.push((intermediates.to_vec(), ignore, byte));
+    }
+}
+
+/// Runs `wire` through a bare `vte::Parser` and returns its callbacks.
+fn vte_trace(wire: &[u8]) -> VteTrace {
+    let mut parser = vte::Parser::new();
+    let mut recorder = VteTraceRecorder(VteTrace::default());
+    parser.advance(&mut recorder, wire);
+    recorder.0
+}
+
 /// Asserts the capped-stream invariants and, on top of them, a two-call
 /// split at every offset from `tail_start` to the end of the stream.
 ///
@@ -3946,7 +3990,13 @@ fn rejected_apc_resyncs_at_esc_into_an_osc_title() {
         TerminalAction::Print(GraphemeCell::from('o')),
         TerminalAction::Print(GraphemeCell::from('k')),
     ];
-    let cuts = [CAP - 1, CAP, CAP + 1, tail_start, stream.len() - 2];
+    let cuts = [
+        REFUSED_APC_AT - 1,
+        REFUSED_APC_AT,
+        REFUSED_APC_AT + 1,
+        tail_start,
+        stream.len() - 2,
+    ];
     assert_capped_tail_split_invariant(&stream, &expected, &cuts, tail_start);
 }
 
@@ -3963,7 +4013,13 @@ fn rejected_apc_resyncs_at_esc_into_a_csi_sgr() {
         TerminalAction::Print(GraphemeCell::from('o')),
         TerminalAction::Print(GraphemeCell::from('k')),
     ];
-    let cuts = [CAP - 1, CAP, CAP + 1, tail_start, stream.len() - 2];
+    let cuts = [
+        REFUSED_APC_AT - 1,
+        REFUSED_APC_AT,
+        REFUSED_APC_AT + 1,
+        tail_start,
+        stream.len() - 2,
+    ];
     assert_capped_tail_split_invariant(&stream, &expected, &cuts, tail_start);
 }
 
@@ -3978,34 +4034,199 @@ fn rejected_apc_tail_without_esc_stays_discarded_until_bel() {
         TerminalAction::Print(GraphemeCell::from('o')),
         TerminalAction::Print(GraphemeCell::from('k')),
     ];
-    let cuts = [CAP - 1, CAP, CAP + 1, stream.len() - 2];
+    let cuts = [
+        REFUSED_APC_AT - 1,
+        REFUSED_APC_AT,
+        REFUSED_APC_AT + 1,
+        stream.len() - 2,
+    ];
     assert_capped_stream_invariant(&stream, &expected, &cuts);
+}
+
+#[test]
+fn rejected_apc_esc_bel_resyncs_like_bare_vte() {
+    // `ESC BEL` after the refused APC: `vte` executes the BEL in its Escape
+    // state and stays there, so the next printable byte is that escape's
+    // final, never printed. The parser is pinned against the adopted machine
+    // (ADR-0004) rather than a hand-written reading of this state.
+    let mut stream = refused_apc_prefix();
+    let tail_start = stream.len();
+    stream.extend_from_slice(b"\x1b\x07xok");
+    let expected = vec![
+        control_refusal(ControlStringKind::Apc),
+        TerminalAction::PrintControl(ControlChar(0x07)),
+        unknown(SequenceKind::Esc, b'x', [0, 0]),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    let cuts = [
+        REFUSED_APC_AT - 1,
+        REFUSED_APC_AT,
+        REFUSED_APC_AT + 1,
+        tail_start,
+        stream.len() - 2,
+    ];
+    assert_capped_tail_split_invariant(&stream, &expected, &cuts, tail_start);
+
+    let trace = vte_trace(b"\x1b\x07xok");
+    assert_eq!(trace.executed, vec![0x07], "bare vte executes the BEL");
+    assert_eq!(
+        trace.esc,
+        vec![(Vec::new(), false, b'x')],
+        "bare vte dispatches the next printable as the escape final"
+    );
+    assert_eq!(trace.printed, "ok", "bare vte never prints `x`");
+}
+
+#[test]
+fn rejected_apc_esc_c1_st_resyncs_like_bare_vte() {
+    // C1 `ST` is ignored in `vte`'s Escape state (it only ends a hooked DCS
+    // or an APC passthrough), so it must neither terminate nor emit: the
+    // following printable is still the escape's final.
+    let mut stream = refused_apc_prefix();
+    let tail_start = stream.len();
+    stream.extend_from_slice(&[0x1B, 0x9C, b'x', b'o', b'k']);
+    let expected = vec![
+        control_refusal(ControlStringKind::Apc),
+        unknown(SequenceKind::Esc, b'x', [0, 0]),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    let cuts = [
+        REFUSED_APC_AT - 1,
+        REFUSED_APC_AT,
+        REFUSED_APC_AT + 1,
+        tail_start,
+        stream.len() - 2,
+    ];
+    assert_capped_tail_split_invariant(&stream, &expected, &cuts, tail_start);
+
+    let trace = vte_trace(&[0x1B, 0x9C, b'x', b'o', b'k']);
+    assert!(trace.executed.is_empty(), "bare vte does not execute ST");
+    assert_eq!(
+        trace.esc,
+        vec![(Vec::new(), false, b'x')],
+        "bare vte ignores ST in Escape and ends the escape on `x`"
+    );
+    assert_eq!(trace.printed, "ok", "bare vte never prints `x` or ST");
+}
+
+#[test]
+fn rejected_apc_esc_backslash_terminates_silently() {
+    // `ESC \` is the APC terminator: `terminate_apc` consumes it, so the
+    // refusal is the only event and nothing is forwarded to `vte`.
+    let mut stream = refused_apc_prefix();
+    let tail_start = stream.len();
+    stream.extend_from_slice(b"\x1b\\ok");
+    let expected = vec![
+        control_refusal(ControlStringKind::Apc),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    let cuts = [
+        REFUSED_APC_AT - 1,
+        REFUSED_APC_AT,
+        REFUSED_APC_AT + 1,
+        tail_start,
+        stream.len() - 2,
+    ];
+    assert_capped_tail_split_invariant(&stream, &expected, &cuts, tail_start);
+}
+
+#[test]
+fn rejected_apc_esc_underscore_restarts_a_kitty_apc() {
+    // `ESC _` after a refused APC opens a fresh APC: the complete kitty
+    // transmission after it must parse and emit, and the abort must not add a
+    // stray escape action.
+    let mut stream = refused_apc_prefix();
+    let tail_start = stream.len();
+    stream
+        .extend_from_slice(b"\x1b_Gf=32,s=2,v=2,a=T,c=2,r=2,m=0;/wAA//8AAP//AAD//wAA/w==\x1b\\ok");
+    let whole = parse(&stream);
+    assert_eq!(count_refusals(&whole, ControlStringKind::Apc), 1);
+    assert_eq!(
+        whole
+            .iter()
+            .filter(|action| matches!(action, TerminalAction::KittyGraphics { .. }))
+            .count(),
+        1,
+        "the restarted APC must emit its transmission: {whole:?}"
+    );
+    assert!(
+        !whole
+            .iter()
+            .any(|action| matches!(action, TerminalAction::Unknown(_))),
+        "the resync must not leave an escape action behind: {whole:?}"
+    );
+    assert_recovers_with_ok(&whole);
+    let cuts = [
+        REFUSED_APC_AT - 1,
+        REFUSED_APC_AT,
+        REFUSED_APC_AT + 1,
+        tail_start,
+        stream.len() - 2,
+    ];
+    assert_capped_tail_split_invariant(&stream, &whole, &cuts, tail_start);
+}
+
+#[test]
+fn refused_apc_esc_as_the_last_byte_is_held_across_calls() {
+    // The aborting `ESC` can be the final byte of a read. It must be held (no
+    // event) and resumed by the next call instead of being dropped or
+    // delivered as a bare escape.
+    let mut stream = refused_apc_prefix();
+    stream.push(0x1B);
+    let refusal = control_refusal(ControlStringKind::Apc);
+
+    let mut parser = Parser::new();
+    let mut actions = Vec::new();
+    parser.advance(&stream, |action| actions.push(action));
+    assert_eq!(
+        actions,
+        vec![refusal.clone()],
+        "a trailing ESC is held, not dropped and not dispatched"
+    );
+    parser.advance(b"]0;t\x07ok", |action| actions.push(action));
+    let expected = vec![
+        refusal.clone(),
+        TerminalAction::OscTitle {
+            text: BoundedString::new("t"),
+        },
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    assert_eq!(
+        actions, expected,
+        "resuming the held ESC delivers the title"
+    );
+
+    // Byte-wise feeding leaves the same single held ESC at the end.
+    let mut parser = Parser::new();
+    let mut bytewise = Vec::new();
+    for byte in &stream {
+        parser.advance(std::slice::from_ref(byte), |action| bytewise.push(action));
+    }
+    assert_eq!(bytewise, vec![refusal]);
+    parser.advance(b"]0;t\x07ok", |action| bytewise.push(action));
+    assert_eq!(bytewise, actions, "byte-wise resume matches the held path");
 }
 
 #[test]
 fn discarded_apc_header_resyncs_at_esc_whole_and_split_at_every_offset() {
     // A discarded APC that never crossed the cap (its header exceeded the
     // kitty control cap, so no refusal is counted) must still resync at
-    // `ESC`. The stream is small enough for the exhaustive split loop.
-    for (tail, expected_tail) in [
-        (
-            b"\x1b]0;title\x07ok".as_slice(),
-            vec![
-                TerminalAction::OscTitle {
-                    text: BoundedString::new("title"),
-                },
-                TerminalAction::Print(GraphemeCell::from('o')),
-                TerminalAction::Print(GraphemeCell::from('k')),
-            ],
-        ),
-        (
-            b"\x1b[31mok".as_slice(),
-            vec![
-                attrs(&[AttributeChange::Foreground(Color::Indexed(1))]),
-                TerminalAction::Print(GraphemeCell::from('o')),
-                TerminalAction::Print(GraphemeCell::from('k')),
-            ],
-        ),
+    // `ESC`. The stream is small enough for the exhaustive split loop; the
+    // exact post-`ESC` semantics of each tail are pinned on the multi-megabyte
+    // refused-APC tests above, so this loop is the chunking oracle for every
+    // resync branch (`ESC ]`, `ESC [`, `ESC BEL`, `ESC` + C1 `ST`, `ESC \`,
+    // and a restarted `ESC _` kitty APC).
+    for tail in [
+        b"\x1b]0;title\x07ok".as_slice(),
+        b"\x1b[31mok".as_slice(),
+        b"\x1b\x07xok".as_slice(),
+        b"\x1b\x9cxok".as_slice(),
+        b"\x1b\\ok".as_slice(),
+        b"\x1b_Gf=32,s=2,v=2,a=T,c=2,r=2,m=0;/wAA//8AAP//AAD//wAA/w==\x1b\\ok".as_slice(),
     ] {
         let mut stream = b"\x1b_".to_vec();
         stream.extend(std::iter::repeat_n(
@@ -4013,7 +4234,7 @@ fn discarded_apc_header_resyncs_at_esc_whole_and_split_at_every_offset() {
             crate::kitty_apc::KITTY_APC_MAX_CONTROL_BYTES + 8,
         ));
         stream.extend_from_slice(tail);
-        let expected = expected_tail;
+        let expected = parse(&stream);
         assert_split_invariant(&stream, &expected);
     }
 }
@@ -4041,43 +4262,55 @@ fn refused_round_cost(stream: &[u8], rounds: usize) -> (usize, usize, usize, usi
 
 #[test]
 fn refused_string_cost_is_one_pass_per_byte_and_does_not_grow() {
-    // CTX-1603 item 3: deterministic cost counter instead of a wall-clock
+    // CTX-1603 item 3: deterministic cost counters instead of a wall-clock
     // bound. One round is a refused APC (`CAP + 8` charged bytes) followed by
-    // the OSC title and text the resync must deliver. Every byte is visited a
-    // bounded number of times by the parser loops, the swallowed tail is
-    // never re-scanned, and the per-round cost does not grow with the number
-    // of refused strings.
+    // the OSC title and text the resync must deliver.
+    //
+    // The per-round bound is the actual one-pass assertion: a visit per byte
+    // (plus the handful of bytes the resync re-examines) leaves no room for
+    // re-scanning the swallowed tail. The 1x/2x/3x/4x rows below are the
+    // no-growth check; a single 2x ratio would be tautological, a re-scan of
+    // earlier rounds would add a quadratic term that only shows up over more
+    // than two rounds.
     let mut round = refused_apc_prefix();
     round.extend_from_slice(b"\x1b]0;title\x07ok");
-
-    let (examined_one, forwarded_one, refusals_one, _) = refused_round_cost(&round, 1);
-    let (examined_two, forwarded_two, refusals_two, prints_two) = refused_round_cost(&round, 2);
-
-    // One refused string: at most one visit per byte plus the handful of
-    // bytes the APC resync re-examines (`ESC`, terminators).
     let per_round_bound = round.len() + 64;
-    assert!(
-        examined_one <= per_round_bound,
-        "one refused string examined {examined_one} bytes, bound {per_round_bound}"
-    );
-    // Linear: two rounds examine exactly twice one round (nothing is
-    // re-scanned across strings), it does not grow per string.
-    assert_eq!(
-        examined_two,
-        2 * examined_one,
-        "cost grew non-linearly: {examined_one} then {examined_two} for two rounds"
-    );
-    // The refused tail never reaches `vte`: only the bounded prefix, the
-    // injected `CAN`, and the resync tail after the refusal are forwarded.
-    assert!(
-        forwarded_one <= CAP + 64,
-        "one refused string forwarded {forwarded_one} bytes to vte, bound {}",
-        CAP + 64
-    );
-    assert_eq!(forwarded_two, 2 * forwarded_one, "forwarded cost is linear");
-    assert_eq!(refusals_one, 1, "one refusal per refused string");
-    assert_eq!(refusals_two, 2, "one refusal per refused string");
-    assert_eq!(prints_two, 4, "each round prints `ok` after the title");
+
+    let mut examined = Vec::new();
+    let mut forwarded = Vec::new();
+    for rounds in 1..=4 {
+        let (round_examined, round_forwarded, refusals, prints) =
+            refused_round_cost(&round, rounds);
+        assert!(
+            round_examined <= rounds * per_round_bound,
+            "{rounds} refused strings examined {round_examined} bytes, bound {}",
+            rounds * per_round_bound
+        );
+        // The refused tail never reaches `vte`: only the bounded prefix, an
+        // injected `CAN` for `vte`-owned strings, and the resync tail after
+        // the refusal are forwarded.
+        assert!(
+            round_forwarded <= rounds * (CAP + 64),
+            "{rounds} refused strings forwarded {round_forwarded} bytes to vte, bound {}",
+            rounds * (CAP + 64)
+        );
+        assert_eq!(refusals, rounds, "one refusal per refused string");
+        assert_eq!(prints, 2 * rounds, "each round prints `ok` after the title");
+        examined.push(round_examined);
+        forwarded.push(round_forwarded);
+    }
+    for rounds in 1..=4 {
+        assert_eq!(
+            examined[rounds - 1],
+            rounds * examined[0],
+            "examined cost grew non-linearly across {rounds} rounds: {examined:?}"
+        );
+        assert_eq!(
+            forwarded[rounds - 1],
+            rounds * forwarded[0],
+            "forwarded cost grew non-linearly across {rounds} rounds: {forwarded:?}"
+        );
+    }
 }
 
 #[test]

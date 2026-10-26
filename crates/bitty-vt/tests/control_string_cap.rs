@@ -153,6 +153,14 @@ const CHUNK: usize = 64 * 1024;
 /// `parser::tests` pins the two values equal.
 const CAP: usize = bitty_vt::ITERM2_OSC_MAX_BODY_BYTES + bitty_vt::ITERM2_OSC_PREFIX.len() + 2;
 
+/// libFuzzer mutation cap for the generated over-cap corpus.
+///
+/// libFuzzer clamps mutated inputs to 1 MiB unless `-max_len` is passed, which
+/// would hide the parser cap from every mutation. The largest generated seed
+/// is [`CAP`] + 11 bytes (introducer, cap, one byte past, 8-byte resync tail);
+/// this value adds a little mutation headroom on top.
+const FUZZ_MAX_LEN: usize = CAP + 19;
+
 /// Hard heap bound for one 256 MiB shape. Post-fix the peak is the cap plus
 /// `vte`'s one capacity doubling and one bounded dispatch copy (~16 MiB for
 /// an OSC) — or the existing kitty/iTerm2 budgets, whichever applies. The
@@ -319,15 +327,17 @@ fn alternating_refused_strings_and_text_stay_bounded() {
 /// corpus (CTX-1603).
 ///
 /// The cap is ~4 MiB, so these seeds cannot live in the retained corpora:
-/// every `fuzz/` target truncates input to 32 KiB and would never reach the
-/// cap. This ignored test writes them into the gitignored
+/// every other `fuzz/` target truncates input to 32 KiB and would never reach
+/// the cap. This ignored test writes them into the gitignored
 /// `fuzz/corpus/control_string_cap/` instead, and derives every boundary from
 /// [`CAP`] (itself the crate's public constants) rather than duplicating the
 /// number:
 ///
 /// ```sh
 /// cargo test -p bitty-vt --test control_string_cap -- --ignored --nocapture generate_cap_seeds
-/// cargo +nightly fuzz run control_string_cap fuzz/corpus/control_string_cap -- -runs=64
+/// # -max_len is required: libFuzzer clamps mutated inputs to 1 MiB otherwise.
+/// cargo +nightly fuzz run control_string_cap fuzz/corpus/control_string_cap \
+///     -- -max_len=4198432 -runs=64
 /// ```
 ///
 /// It self-checks the seeds while writing them: the at-cap strings are
@@ -426,7 +436,7 @@ fn generate_cap_seeds() {
 
     eprintln!(
         "cap seeds ready in {}: run `cargo +nightly fuzz run control_string_cap \
-         fuzz/corpus/control_string_cap -- -runs=64`",
+         fuzz/corpus/control_string_cap -- -max_len={FUZZ_MAX_LEN} -runs=64`",
         dir.display()
     );
 }

@@ -307,7 +307,7 @@ impl Runtime {
         // a workspace-local detached float passes the same way (CTX-1147);
         // its motion accumulates a present-time re-anchor offset instead.
         // Tiled leaves fail soft here and the Mod
-        // tiled-drag path (`begin_tiled_drag`) owns them instead
+        // tiled-drag path (`begin_tiled_drag_at`) owns them instead
         // (issue #1694, CTX-0966).
         if !self
             .layout
@@ -862,12 +862,12 @@ impl Runtime {
     /// grab focuses the dragged pane (Hyprland-like). Returns `true` when
     /// the drag started (caller consumes the press and skips selection);
     /// `false` leaves all state untouched so the press falls through.
-    pub fn begin_tiled_drag(&mut self) -> bool {
-        self.begin_tiled_drag_at(Instant::now())
-    }
-
-    /// [`Self::begin_tiled_drag`] with an explicit wall clock (CTX-0967
-    /// virtual-clock seam: tests arm the drag transition deterministically).
+    ///
+    /// Takes the caller's event clock (CTX-0967 virtual-clock seam: tests arm
+    /// the drag transition deterministically). There is deliberately no
+    /// wall-clock default: the live path already runs through
+    /// `handle_mouse_input_at`, and an `Instant::now()` convenience here is
+    /// exactly the #2703 bug (a drag that settles off the event clock).
     pub fn begin_tiled_drag_at(&mut self, now: Instant) -> bool {
         if self.shift_pressed || !(self.alt_pressed || self.super_pressed) {
             return false;
@@ -980,12 +980,10 @@ impl Runtime {
     /// unmappable position keeps the drag armed with no preview change.
     /// When the layout no longer owns the source (closed mid-drag) the drag
     /// ends fail-soft and `false` is returned so the motion falls through.
-    pub fn update_tiled_drag(&mut self, pos: CursorPosition) -> bool {
-        self.update_tiled_drag_at(pos, Instant::now())
-    }
-
-    /// [`Self::update_tiled_drag`] with an explicit wall clock (CTX-0967
-    /// virtual-clock seam: tests arm the drag transition deterministically).
+    ///
+    /// Takes the caller's event clock (CTX-0967 virtual-clock seam: tests arm
+    /// the drag transition deterministically). No wall-clock default exists
+    /// by design — see [`Self::begin_tiled_drag_at`].
     pub fn update_tiled_drag_at(&mut self, pos: CursorPosition, now: Instant) -> bool {
         let point = self.cursor_to_layout_point(pos);
         let (container, gaps) = (self.container, self.gaps());
@@ -1093,12 +1091,12 @@ impl Runtime {
     /// selection-release commit/copy: the grabbing press never started a
     /// selection, so there is nothing to commit and stale highlights must
     /// not auto-copy); `false` when no drag was active.
-    pub fn end_tiled_drag(&mut self) -> bool {
-        self.end_tiled_drag_at(Instant::now())
-    }
-
-    /// [`Self::end_tiled_drag`] with an explicit wall clock (CTX-0967
-    /// virtual-clock seam: tests arm the drop transition deterministically).
+    ///
+    /// Takes the caller's event clock so the committed drop's `Move`
+    /// transition starts at the release instant (CTX-0967 virtual-clock seam,
+    /// CTX-1594 issue #2703). No wall-clock default exists by design: every
+    /// release arm in `handle_mouse_input_at` passes the event's `now`, and a
+    /// convenience wrapper would silently reintroduce the off-clock start.
     pub fn end_tiled_drag_at(&mut self, now: Instant) -> bool {
         let Some(drag) = self.tiled_drag.as_ref() else {
             return false;

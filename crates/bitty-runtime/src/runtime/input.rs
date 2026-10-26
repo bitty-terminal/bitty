@@ -1086,7 +1086,7 @@ impl Runtime {
                         self.end_alt_drag();
                         self.end_float_resize();
                         self.end_border_drag();
-                        self.end_tiled_drag();
+                        self.end_tiled_drag_at(now);
                         if self.selection_state.is_some() {
                             self.clear_selection();
                         }
@@ -1098,7 +1098,7 @@ impl Runtime {
                         self.end_alt_drag();
                         self.end_float_resize();
                         self.end_border_drag();
-                        self.end_tiled_drag();
+                        self.end_tiled_drag_at(now);
                         if self.selection_state.is_some() {
                             self.clear_selection();
                         }
@@ -1150,7 +1150,7 @@ impl Runtime {
             // saw the grabbing press, so the release is not its event.
             if event.button == MouseButton::Left
                 && event.state == PressState::Released
-                && self.end_tiled_drag()
+                && self.end_tiled_drag_at(now)
             {
                 return;
             }
@@ -1247,7 +1247,7 @@ impl Runtime {
             // desync into a selection commit/copy on release
             // (terminal_app routes releases here; no separate release path
             // may commit selection while a drag was active).
-            if self.end_tiled_drag() {
+            if self.end_tiled_drag_at(now) {
                 return;
             }
         }

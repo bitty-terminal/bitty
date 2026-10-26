@@ -1497,3 +1497,243 @@ fn issue_2521_bottom_left_drop_splits_the_left_column() {
     assert_eq!(rect(2), UiRect::new(40, 0, 40, 24));
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
 }
+
+// -- CTX-1594 (issue #2703) virtual-clock seam on the release path --------
+
+/// Every tiled-drag release arm must end the gesture on the caller's clock.
+///
+/// `handle_mouse_input_at` is the virtual-clock seam: every transition it
+/// arms has to start at the supplied instant, exactly like the press and
+/// motion paths (`begin_tiled_drag_at`/`update_tiled_drag_at`). The release
+/// arms used to run through wall-clock wrappers (`end_tiled_drag()`), so the
+/// committed drop's `Move` transition started at `Instant::now()` instead of
+/// the tick clock. Under parallel-suite load the two clocks interleaved and
+/// the next frame painted a *mid-transition* drop whose offsets depended on
+/// real elapsed time (the `runtime::present::tiled_drag_present_tests`
+/// flake). The epoch below is one minute ahead of the wall clock, so a
+/// wall-clock start cannot alias with the expected value: the transition
+/// reads back as already finished (`None`) instead of landing half-way.
+///
+/// The pre-fix reproduction is load-sensitive, so this deterministic pin is
+/// the proof and a rerun is not: the reviewer measured 8/8 green with the old
+/// fixture at 24 threads and 3/3 failures at 64 threads (12842 differing px,
+/// 131 LSB worst channel). The flake needs enough parallel load for the
+/// wall-clock tween to still be in flight at the commit frame.
+///
+/// The table covers every arm class that can terminate the gesture, so a
+/// regression of one arm cannot hide behind the others:
+///
+/// | arm | how the release is routed |
+/// | --- | --- |
+/// | [`ReleaseArm::Plain`] | ordinary left release |
+/// | [`ReleaseArm::Capture`] | app enabled tracking mid-drag (capture owns it) |
+/// | [`ReleaseArm::Osc8`] | matched `OSC 8` pairing, activation modifier held |
+/// | [`ReleaseArm::PlaintextUrl`] | matched plaintext-URL pairing, modifier held |
+#[test]
+fn release_commits_the_drop_on_the_supplied_clock() {
+    for arm in ReleaseArm::ALL {
+        check_release_arm(arm);
+    }
+}
+
+/// Arm classes that can end a Mod+drag in `handle_mouse_input_at`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReleaseArm {
+    /// Ordinary left release: no capture, nothing clickable under the pointer.
+    Plain,
+    /// The focused app enabled mouse tracking mid-drag, so the capture arm
+    /// owns the terminating release instead of reporting it to the app.
+    Capture,
+    /// Matched `OSC 8` press/release pairing with the activation modifier held.
+    Osc8,
+    /// Matched plaintext-URL press/release pairing with the modifier held.
+    PlaintextUrl,
+}
+
+impl ReleaseArm {
+    const ALL: [Self; 4] = [Self::Plain, Self::Capture, Self::Osc8, Self::PlaintextUrl];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Plain => "plain release",
+            Self::Capture => "capture release",
+            Self::Osc8 => "OSC 8 matched release",
+            Self::PlaintextUrl => "plaintext matched release",
+        }
+    }
+
+    /// Link arms arm a press/release URI pairing and need clickable glyphs
+    /// under the release, which only a view with a live grid can resolve.
+    fn uses_link(self) -> bool {
+        matches!(self, Self::Osc8 | Self::PlaintextUrl)
+    }
+}
+
+/// Centre cell of `view`'s painted content grid, from public geometry only.
+fn frame_centre_cell(rt: &Runtime, view: ViewId) -> (u16, u16) {
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == view)
+        .unwrap_or_else(|| panic!("{view:?} must be presented"));
+    (frame.cols / 2, frame.rows / 2)
+}
+
+/// True painted centre of grid cell (col, row) inside `view`'s content frame,
+/// derived from public geometry only.
+fn frame_cell_point(rt: &Runtime, view: ViewId, col: u16, row: u16) -> CursorPosition {
+    let frame = rt
+        .present_frames()
+        .into_iter()
+        .find(|frame| frame.view == view)
+        .unwrap_or_else(|| panic!("{view:?} must be presented"));
+    let (cw, ch) = rt.live_cell_size();
+    let pad = f64::from(rt.window_padding_physical());
+    CursorPosition {
+        x: pad + f64::from(frame.content.x.max(0)) + (f64::from(col) + 0.5) * f64::from(cw),
+        y: pad + f64::from(frame.content.y.max(0)) + (f64::from(row) + 0.5) * f64::from(ch),
+    }
+}
+
+/// Drives one release arm with a virtual epoch and asserts the committed
+/// drop's `Move` transition starts at the release instant.
+fn check_release_arm(arm: ReleaseArm) {
+    use std::time::{Duration, Instant};
+    let label = arm.label();
+    let primary = ViewId::new(1);
+    let tiled = ViewId::new(3);
+    // A drag needs two leaves. The link arms drag the tiled pane onto the
+    // primary shell view: `handle_pty_bytes` feeds the primary grid and only
+    // a session-bearing view resolves hyperlinks, so the clickable glyphs
+    // must live there. The plain arms keep the historical source/target.
+    let (source, target) = if arm.uses_link() {
+        (tiled, primary)
+    } else {
+        (primary, tiled)
+    };
+    let mut rt = make_runtime();
+    rt.set_layout(three_pane());
+    // Virtual epoch: one minute ahead of the wall clock, so a transition
+    // started off the wall clock cannot alias with the expected value.
+    let base = Instant::now() + Duration::from_secs(60);
+    let (centre_col, centre_row) = frame_centre_cell(&rt, target);
+    if arm.uses_link() {
+        assert!(
+            rt.is_primary_view(&target),
+            "{label}: the link target must carry the live grid"
+        );
+        const URL: &[u8] = b"https://example.test/link";
+        // Centre the glyph run on the release cell so the whole link stays
+        // inside the pane row (a clipped URL would resolve truncated).
+        let link_col = match arm {
+            ReleaseArm::PlaintextUrl => centre_col.saturating_sub((URL.len() / 2) as u16),
+            _ => centre_col,
+        };
+        let mut bytes = format!("\x1b[{};{}H", centre_row + 1, link_col + 1).into_bytes();
+        match arm {
+            ReleaseArm::Osc8 => {
+                bytes.extend_from_slice(b"\x1b]8;;https://example.test\x07link\x1b]8;;\x07");
+            }
+            ReleaseArm::PlaintextUrl => bytes.extend_from_slice(URL),
+            ReleaseArm::Plain | ReleaseArm::Capture => unreachable!("checked by uses_link"),
+        }
+        rt.handle_pty_bytes(&bytes);
+        rt.drain_pending_input();
+    }
+    let drop_point = if arm.uses_link() {
+        frame_cell_point(&rt, target, centre_col, centre_row)
+    } else {
+        frame_point(&rt, target, 0.5, 0.5)
+    };
+    // Precondition guard: the clickable glyphs must resolve under the
+    // release point, otherwise the matched arm silently degrades into the
+    // plain one and this row would pin the wrong call site.
+    if arm.uses_link() {
+        rt.handle_cursor_moved_at(drop_point, base);
+        match arm {
+            ReleaseArm::Osc8 => assert_eq!(
+                rt.hovered_hyperlink_uri(),
+                Some("https://example.test"),
+                "{label}: the OSC 8 glyphs must sit under the release point"
+            ),
+            ReleaseArm::PlaintextUrl => assert_eq!(
+                rt.plaintext_hover_at_cursor(drop_point)
+                    .map(|hover| hover.uri)
+                    .as_deref(),
+                Some("https://example.test/link"),
+                "{label}: the URL glyphs must sit under the release point"
+            ),
+            ReleaseArm::Plain | ReleaseArm::Capture => unreachable!("checked by uses_link"),
+        }
+    }
+    rt.handle_cursor_moved_at(frame_point(&rt, source, 0.5, 0.5), base);
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
+    rt.handle_mouse_input_at(press(MouseButton::Left), base);
+    assert!(
+        rt.tiled_drag_active(),
+        "{label}: the press must grab the pane"
+    );
+    // Capture arm: the app enables tracking mid-drag, so the terminating
+    // release is routed through the capture block, never reported to the app.
+    // Link rows enable it too: with capture live, a pairing press that the
+    // hyperlink interception did not consume would be reported as an app
+    // press below, so the assertion pins the pairing half of the gesture.
+    if arm != ReleaseArm::Plain {
+        rt.handle_pty_bytes(b"\x1b[?1000h");
+        rt.drain_pending_input();
+        assert!(
+            rt.mouse_capture_active(),
+            "{label}: tracking must own the release"
+        );
+    }
+    rt.handle_cursor_moved_at(drop_point, base + Duration::from_millis(16));
+    assert_eq!(
+        rt.tiled_drag_preview(),
+        Some(target),
+        "{label}: motion must track the target pane live"
+    );
+    // Link arms need a stored press pairing to mint the matched release. A
+    // grabbing press clears both pairings, so the pairing press is the
+    // second half of the link gesture and must leave the drag running
+    // (fail-closed teardown happens on the release).
+    if arm.uses_link() {
+        rt.handle_key_event(named_key(NamedKey::Control, PressState::Pressed));
+        rt.handle_mouse_input_at(press(MouseButton::Left), base + Duration::from_millis(24));
+        assert!(
+            rt.tiled_drag_active(),
+            "{label}: the pairing press must not end the drag"
+        );
+        assert!(
+            rt.pending_input().is_empty(),
+            "{label}: the pairing press must be intercepted, not reported"
+        );
+    }
+    let released_at = base + Duration::from_millis(32);
+    rt.handle_mouse_input_at(release(MouseButton::Left), released_at);
+    rt.handle_key_event(named_key(NamedKey::Control, PressState::Released));
+    rt.handle_key_event(named_key(NamedKey::Alt, PressState::Released));
+    assert!(
+        !rt.tiled_drag_active(),
+        "{label}: the release must end the drag"
+    );
+    assert!(
+        rt.pending_input().is_empty(),
+        "{label}: the release must never reach the app"
+    );
+    assert_eq!(
+        rt.layout().leaf_ids(),
+        vec![tiled, ViewId::new(2), primary],
+        "{label}: a centre drop must commit the swap"
+    );
+    // Move is 150 ms with the EaseInOut curve, so half its duration reads
+    // exactly 0.5 when the transition started at `released_at`.
+    assert_eq!(
+        rt.animation_progress(
+            AnimationKind::Move,
+            Some(source),
+            released_at + Duration::from_millis(75)
+        ),
+        Some(0.5),
+        "{label}: the committed drop must settle on the release clock, not the wall clock"
+    );
+}

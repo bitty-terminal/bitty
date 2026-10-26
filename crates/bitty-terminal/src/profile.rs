@@ -1085,6 +1085,7 @@ fn run_set(
     }
     write_profile_atomic(&path, &updated, Some(&identity)).map_err(|err| match err {
         ProfileWriteError::Changed => changed_failure("set", &path),
+        ProfileWriteError::NotRegular => not_regular_failure("set", &path),
         ProfileWriteError::Io(err) => {
             io_failure("set", &format!("replace '{}'", path.display()), &err)
         }
@@ -1168,6 +1169,14 @@ fn changed_failure(verb: &str, path: &Path) -> Failure {
     Failure::conflict(format!(
         "bitty config profile {verb}: '{}' changed while editing; refusing to overwrite the \
          concurrent edit (re-run the command on the current file)",
+        path.display()
+    ))
+}
+
+/// A raced entry that is no longer a regular file (FIFO, device, directory).
+fn not_regular_failure(verb: &str, path: &Path) -> Failure {
+    Failure::conflict(format!(
+        "bitty config profile {verb}: '{}' is not a regular file; refusing to edit it",
         path.display()
     ))
 }
@@ -1363,6 +1372,53 @@ impl ProfileIdentity {
     }
 }
 
+/// Opens one profile path for reading without following a final-component
+/// symlink and without blocking on a FIFO.
+///
+/// `ensure_present` rejects links and non-regular files before the read, but
+/// that check has a race window; `O_NOFOLLOW` closes the symlink half at the
+/// open itself, and `O_NONBLOCK` keeps a swapped FIFO from blocking the
+/// command before [`is_regular_profile_file`] can refuse it.
+#[cfg(unix)]
+fn open_profile_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+}
+
+/// Non-Unix fallback: no `O_NOFOLLOW`/`O_NONBLOCK`; the caller still checks
+/// the opened handle's type before reading.
+#[cfg(not(unix))]
+fn open_profile_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+/// Whether an open failure is `O_NOFOLLOW` refusing a final-component symlink.
+///
+/// Rust maps `ELOOP` to `ErrorKind::FilesystemLoop` only on recent toolchains
+/// and not through every layer, so compare the raw errno the flag defines.
+#[cfg(unix)]
+fn is_symlink_refusal(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(nix::libc::ELOOP)
+}
+
+/// Non-Unix open path performs no `O_NOFOLLOW` check.
+#[cfg(not(unix))]
+fn is_symlink_refusal(_err: &std::io::Error) -> bool {
+    false
+}
+
+/// Refuses a handle whose entry is not a regular file.
+///
+/// The identity fields of a FIFO or device are not a profile preimage, and
+/// reading one can return unbounded or blocking bytes; refuse before any
+/// comparison.
+fn is_regular_profile_file(metadata: &std::fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
 /// Reads one profile with the loader's size bound.
 ///
 /// One open handle supplies both the bound check and the bytes, and its
@@ -1371,11 +1427,26 @@ impl ProfileIdentity {
 /// actually read (a replacement between `stat` and `read`), which is exactly
 /// the lost-update this identity exists to detect.
 fn read_profile(verb: &str, name: &str, path: &Path) -> Result<(String, ProfileIdentity), Failure> {
-    let file = std::fs::File::open(path)
-        .map_err(|err| io_failure(verb, &format!("read '{}'", path.display()), &err))?;
+    let file = match open_profile_no_follow(path) {
+        Ok(file) => file,
+        // The entry became a symlink after `ensure_present` checked it: the
+        // file the caller is editing is gone, so this is the conflict class,
+        // not a generic read failure.
+        Err(err) if is_symlink_refusal(&err) => return Err(changed_failure(verb, path)),
+        Err(err) => {
+            return Err(io_failure(
+                verb,
+                &format!("read '{}'", path.display()),
+                &err,
+            ));
+        }
+    };
     let meta = file
         .metadata()
         .map_err(|err| io_failure(verb, &format!("inspect '{}'", path.display()), &err))?;
+    if !is_regular_profile_file(&meta) {
+        return Err(not_regular_failure(verb, path));
+    }
     if meta.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
         return Err(Failure::invalid(format!(
             "bitty config profile {verb}: profile '{name}' exceeds {} bytes; refusing to edit it",
@@ -2190,6 +2261,9 @@ enum ProfileWriteError {
     /// The target no longer matches the identity the edit was computed from;
     /// nothing was replaced and the concurrent bytes survive.
     Changed,
+    /// The target is no longer a regular file (a raced FIFO, device, or
+    /// directory); nothing was replaced.
+    NotRegular,
     /// Filesystem failure; the temporary file has been removed.
     Io(std::io::Error),
 }
@@ -2275,22 +2349,28 @@ fn write_profile_atomic(
 
 /// Re-checks the preimage identity immediately before the replace commits.
 ///
-/// The current file is opened and measured through that handle, so a
-/// replacement (new inode) and an in-place edit (same inode, new mtime or
-/// length) are both detected. A file that disappeared is reported as a
-/// concurrent change: the bytes the edit was computed from no longer exist.
+/// The current file is opened (without following a final-component symlink
+/// or blocking on a FIFO) and measured through that handle, so a replacement
+/// (new inode) and an in-place edit (same inode, new mtime or length) are
+/// both detected. A file that disappeared or became a symlink is reported as
+/// a concurrent change; a non-regular entry (FIFO, device, directory) gets
+/// its own refusal. Non-Unix open failures (for example a replaced directory
+/// on Windows) surface as the I/O class instead.
 fn verify_profile_unchanged(
     path: &Path,
     expected: &ProfileIdentity,
 ) -> Result<(), ProfileWriteError> {
-    let file = match std::fs::File::open(path) {
+    let file = match open_profile_no_follow(path) {
         Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+        Err(err) if is_symlink_refusal(&err) || err.kind() == std::io::ErrorKind::NotFound => {
             return Err(ProfileWriteError::Changed);
         }
         Err(err) => return Err(ProfileWriteError::Io(err)),
     };
     let metadata = file.metadata().map_err(ProfileWriteError::Io)?;
+    if !is_regular_profile_file(&metadata) {
+        return Err(ProfileWriteError::NotRegular);
+    }
     if ProfileIdentity::from_metadata(&metadata) == *expected {
         Ok(())
     } else {
@@ -2311,9 +2391,31 @@ thread_local! {
 }
 
 /// Arms the one-shot commit hook for the current test thread.
+///
+/// The returned guard clears an unused hook on drop, so a test that fails
+/// before the commit cannot leak the closure into the next test that runs on
+/// the same thread (the serial gate reuses one thread for every test).
 #[cfg(test)]
-fn with_commit_hook(hook: impl FnOnce(&Path) + 'static) {
-    PROFILE_COMMIT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+fn arm_commit_hook(hook: impl FnOnce(&Path) + 'static) -> CommitHookGuard {
+    PROFILE_COMMIT_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        assert!(slot.is_none(), "a profile commit hook is already armed");
+        *slot = Some(Box::new(hook));
+    });
+    CommitHookGuard
+}
+
+/// RAII holder for the armed commit hook (clears on drop).
+#[cfg(test)]
+struct CommitHookGuard;
+
+#[cfg(test)]
+impl Drop for CommitHookGuard {
+    fn drop(&mut self) {
+        PROFILE_COMMIT_HOOK.with(|slot| {
+            let _ = slot.borrow_mut().take();
+        });
+    }
 }
 
 /// Runs and clears the one-shot commit hook (test builds only).
@@ -2352,9 +2454,33 @@ thread_local! {
 }
 
 /// Arms the one-shot rename override for the current test thread.
+///
+/// The returned guard clears an unused override on drop, so a test that fails
+/// before the rename cannot leak the closure into the next test that runs on
+/// the same thread.
 #[cfg(test)]
-fn with_rename_override(rename: impl FnOnce(&Path, &Path) -> std::io::Result<()> + 'static) {
-    PROFILE_RENAME_OVERRIDE.with(|slot| *slot.borrow_mut() = Some(Box::new(rename)));
+fn arm_rename_override(
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()> + 'static,
+) -> RenameOverrideGuard {
+    PROFILE_RENAME_OVERRIDE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        assert!(slot.is_none(), "a profile rename override is already armed");
+        *slot = Some(Box::new(rename));
+    });
+    RenameOverrideGuard
+}
+
+/// RAII holder for the armed rename override (clears on drop).
+#[cfg(test)]
+struct RenameOverrideGuard;
+
+#[cfg(test)]
+impl Drop for RenameOverrideGuard {
+    fn drop(&mut self) {
+        PROFILE_RENAME_OVERRIDE.with(|slot| {
+            let _ = slot.borrow_mut().take();
+        });
+    }
 }
 
 /// Renames `old` to `new` without replacing an existing destination.
@@ -2384,12 +2510,16 @@ fn rename_no_replace(old: &Path, new: &Path) -> std::io::Result<()> {
     rename_with_attempt(old, new, try_rename_no_replace)
 }
 
-/// Runs the platform no-replace attempt when the build has one, otherwise the
-/// pre-checked [`std::fs::rename`] fallback.
+/// Runs the platform no-replace attempt when the build has one; otherwise
+/// falls back to a plain [`std::fs::rename`].
+///
+/// The attempt's result is authoritative: `Some(Err(..))` is returned as-is
+/// and never retried. `None` means "this build has no safe no-replace
+/// primitive", and the plain rename is only safe because the **caller** has
+/// already pre-checked that the destination is absent.
 ///
 /// Split from [`rename_no_replace`] so the unsupported-platform routing is
-/// testable on every host: `attempt` returning `None` means "this build has
-/// no safe no-replace primitive", which is exactly the fallback contract.
+/// testable on every host.
 fn rename_with_attempt(
     old: &Path,
     new: &Path,
@@ -3874,7 +4004,7 @@ mod tests {
         let path = dir.join("work.lua");
         std::fs::write(&path, "return {}\n").expect("profile");
         let concurrent = "return { window = { padding = 99 } }\n";
-        with_commit_hook(move |path| {
+        let _commit_hook = arm_commit_hook(move |path| {
             std::fs::write(path, concurrent).expect("concurrent edit");
         });
 
@@ -3902,6 +4032,101 @@ mod tests {
             "no temporary file remains: {:?}",
             temp_leftovers(&dir)
         );
+        let _ = std::fs::remove_dir_all(dir.parent().expect("scratch root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_refuses_a_swapped_symlink_and_fifo_at_commit() {
+        use std::os::unix::fs::{FileTypeExt, symlink};
+
+        // Symlink swap: `O_NOFOLLOW` refuses the final component with `ELOOP`
+        // before the identity comparison, and the link target is never read
+        // or written.
+        let (dir, args) = scratch_profile_root("set-symlink-swap");
+        let path = dir.join("work.lua");
+        let target = dir.join("target.lua");
+        std::fs::write(&path, "return {}\n").expect("profile");
+        let target_bytes = "return { font = { size = 42 } }\n";
+        std::fs::write(&target, target_bytes).expect("link target");
+        let linked_target = target.clone();
+        let _commit_hook = arm_commit_hook(move |path| {
+            std::fs::remove_file(path).expect("remove profile");
+            symlink(&linked_target, path).expect("symlink swap");
+        });
+        let failure = run_set(&args, &dir, "work", "window.padding", "8")
+            .expect_err("a symlink swap must refuse the write");
+        assert_eq!(failure.code, "E_PROFILE_CONFLICT");
+        assert_eq!(failure.exit, 2);
+        assert!(
+            failure.message.contains("changed while editing"),
+            "symlink swap is a conflict: {}",
+            failure.message
+        );
+        assert!(
+            failure.message.contains(&path.display().to_string()),
+            "names the file: {}",
+            failure.message
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("link target"),
+            target_bytes,
+            "the link target is never written"
+        );
+        assert!(
+            temp_leftovers(&dir).is_empty(),
+            "no temporary file remains: {:?}",
+            temp_leftovers(&dir)
+        );
+        let err = open_profile_no_follow(&path).expect_err("O_NOFOLLOW refuses the link");
+        assert_eq!(err.raw_os_error(), Some(nix::libc::ELOOP));
+        let _ = std::fs::remove_dir_all(dir.parent().expect("scratch root"));
+
+        // FIFO swap: `O_NONBLOCK` opens it without a writer and the
+        // non-regular check refuses before any read. The worker plus timeout
+        // makes a regression fail instead of hanging the serial gate.
+        let (dir, args) = scratch_profile_root("set-fifo-swap");
+        let path = dir.join("work.lua");
+        std::fs::write(&path, "return {}\n").expect("profile");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_dir = dir.clone();
+        let worker = std::thread::spawn(move || {
+            let _commit_hook = arm_commit_hook(|path| {
+                std::fs::remove_file(path).expect("remove profile");
+                nix::unistd::mkfifo(
+                    path,
+                    nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+                )
+                .expect("fifo swap");
+            });
+            let sent = match run_set(&args, &worker_dir, "work", "window.padding", "8") {
+                Err(failure) => (failure.code, failure.exit, failure.message),
+                Ok(_) => ("UNEXPECTED_OK", 0, String::new()),
+            };
+            let _ = tx.send(sent);
+        });
+        let (code, exit, message) = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("a FIFO swap must not block the commit check");
+        worker.join().expect("fifo worker");
+        assert_eq!(code, "E_PROFILE_CONFLICT");
+        assert_eq!(exit, 2);
+        assert!(
+            message.contains("not a regular file"),
+            "non-regular refusal: {message}"
+        );
+        let entry = std::fs::symlink_metadata(&path).expect("fifo entry");
+        assert!(
+            entry.file_type().is_fifo(),
+            "the raced FIFO entry is preserved"
+        );
+        assert!(
+            temp_leftovers(&dir).is_empty(),
+            "no temporary file remains: {:?}",
+            temp_leftovers(&dir)
+        );
+        let fifo = open_profile_no_follow(&path).expect("O_NONBLOCK opens the FIFO");
+        assert!(!fifo.metadata().expect("fifo metadata").is_file());
         let _ = std::fs::remove_dir_all(dir.parent().expect("scratch root"));
     }
 
@@ -4135,7 +4360,7 @@ mod tests {
         let new_path = dir.join("race-new.lua");
         std::fs::write(&old_path, "return {}\n").expect("source profile");
         let concurrent = "return { concurrent = true }\n";
-        with_rename_override(move |_, new| {
+        let _rename_override = arm_rename_override(move |_, new| {
             std::fs::write(new, concurrent).expect("concurrent creator");
             Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
         });

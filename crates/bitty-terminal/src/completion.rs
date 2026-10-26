@@ -1163,6 +1163,27 @@ mod tests {
     }
 
     #[test]
+    fn fish_dynamic_profile_operands_precede_the_static_arms() {
+        // Fish switches on the first matching case, and the verb paths are
+        // grammar keys now. A static arm placed before the dynamic operand
+        // case would silently stop profile-name completion while the dynamic
+        // case is still present, so pin the order explicitly.
+        let script = completion_script(CompletionShell::Fish);
+        for verb in ["show", "clone"] {
+            let dynamic = script
+                .find(&format!("'config profile {verb}'"))
+                .unwrap_or_else(|| panic!("fish: missing the dynamic operand {verb}"));
+            let static_arm = script
+                .find(&format!("case 'config profile {verb}'\n"))
+                .unwrap_or_else(|| panic!("fish: missing the static arm {verb}"));
+            assert!(
+                dynamic < static_arm,
+                "fish: dynamic operand for {verb} must precede its static arm"
+            );
+        }
+    }
+
+    #[test]
     fn bash_and_zsh_keep_the_profile_equals_prefix() {
         let bash = completion_script(CompletionShell::Bash);
         assert!(bash.contains("--profile=*"), "bash handles --profile=");

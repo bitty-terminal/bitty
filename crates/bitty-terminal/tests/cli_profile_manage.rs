@@ -41,6 +41,15 @@ fn write_profile(root: &Path, name: &str, body: &str) {
     std::fs::write(profile_path(root, name), body).expect("write profile");
 }
 
+/// Escapes one string for a short-quoted Lua literal (paths, test values).
+fn lua_quote(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Valid 8x8 PNG (the runtime background-image fixture), copied into each
+/// scratch root so the approved-root policy has a decodable file to admit.
+const WALL_PNG: &[u8] = include_bytes!("../../bitty-runtime/tests/fixtures/kitty-red-8x8.png");
+
 /// Writes the versioned selector naming `profile`.
 fn write_selector(root: &Path, profile: &str) {
     std::fs::write(
@@ -277,6 +286,37 @@ fn clone_copies_bytes_verbatim_and_refuses_existing_destination() {
     );
     assert!(!profile_path(&root, "copy2").exists());
     assert_no_temp_files(&root, "clone");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn clone_refuses_source_bytes_that_do_not_parse() {
+    let root = scratch_root("clone-invalid-source");
+    // The parent chain is valid; only the source's own bytes are broken. The
+    // refusal must be the candidate parse (attributed to `src`), never a
+    // parent-chain error, and no destination may be created.
+    write_profile(&root, "parent", "return {}\n");
+    write_profile(&root, "src", "return { extends = \"parent\", font = ");
+    let clone = run_bitty(&root, &["config", "profile", "clone", "src", "dst"]);
+    assert_exit(&clone, 2, "clone a syntactically invalid source");
+    let errors = stderr(&clone);
+    assert!(
+        errors.contains("invalid profile 'src'"),
+        "the error is attributed to the source: {errors}"
+    );
+    assert!(
+        errors.contains("parse error") || errors.contains("validation error at 'config'"),
+        "the error comes from parsing the source bytes: {errors}"
+    );
+    assert!(
+        !errors.contains("profile 'parent'"),
+        "the valid parent chain is not blamed: {errors}"
+    );
+    assert!(
+        !profile_path(&root, "dst").exists(),
+        "a refused clone creates no destination"
+    );
+    assert_no_temp_files(&root, "clone invalid source");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -817,6 +857,15 @@ fn json_envelopes_have_a_stable_shape() {
     let text = stdout(&missing);
     assert!(text.contains("\"ok\":false"), "{text}");
     assert!(text.contains("\"code\":\"E_PROFILE_NOT_FOUND\""), "{text}");
+    // Same envelope family as `config` errors: a typed `error` object plus a
+    // `result` object describing the outcome.
+    assert!(
+        text.contains(
+            "\"result\":{\"kind\":\"profile\",\"action\":\"delete\",\"valid\":false,\
+             \"name\":null,\"diagnostics\":[{\"severity\":\"error\",\"message\":"
+        ),
+        "error envelope carries a result object: {text}"
+    );
 
     // `--json` composes before the `config` word too.
     let before = run_bitty(&root, &["--json", "config", "profile", "list"]);
@@ -1076,5 +1125,586 @@ fn outside_config_json_stays_an_unknown_flag() {
         "json stays scoped to config: {}",
         stderr(&output)
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn set_pins_control_bearing_values_and_the_result_parses() {
+    // A valid parent: a long-bracket family with a real newline and a
+    // short-quoted fallback entry carrying a `\r` escape. The loader accepts
+    // both; the pin must re-encode them, because a raw newline inside a
+    // double-quoted Lua string is a syntax error (the pre-fix failure blamed
+    // the child profile for the parent's value).
+    let root = scratch_root("pin-control");
+    let parent = "return {\n    font = {\n        family = [[A\nB]],\n        size = 12,\n        \
+                  fallback = { \"C\\rD\" },\n    },\n}\n";
+    write_profile(&root, "parent", parent);
+    write_profile(&root, "kid", "return { extends = \"parent\" }\n");
+
+    let set = run_bitty(
+        &root,
+        &["config", "profile", "set", "kid", "font.size", "14"],
+    );
+    assert_ok(&set, "pin a control-bearing family");
+    let content = std::fs::read_to_string(profile_path(&root, "kid")).expect("kid profile");
+    assert!(
+        content.contains("family = \"A\\nB\""),
+        "newline escaped in the pin: {content:?}"
+    );
+    assert!(
+        !content.contains("family = \"A\nB\""),
+        "no raw newline inside the Lua literal: {content:?}"
+    );
+    assert!(
+        content.contains("fallback = { \"C\\rD\" }"),
+        "carriage return escaped in the pin: {content:?}"
+    );
+
+    let check = run_bitty(&root, &["config", "check", "--profile", "kid"]);
+    assert_ok(&check, "the pinned profile parses and validates");
+    assert!(
+        row(&stdout(&check), "font.size").starts_with("14 ("),
+        "the edited value wins: {}",
+        stdout(&check)
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "parent")).expect("parent"),
+        parent,
+        "the parent keeps its own bytes"
+    );
+    assert_no_temp_files(&root, "control-bearing pin");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn set_refuses_a_denied_inherited_background_image() {
+    let root = scratch_root("bg-denied");
+    // Profile-local: no selector (user layer) supplies an approved root here,
+    // so the deny-by-default gate itself must reject the image. The
+    // cross-layer counterpart below proves a selector root is honored.
+    assert!(
+        !init_path(&root).exists(),
+        "the denied-root case stays profile-local"
+    );
+    let image = root.join("wall.png");
+    std::fs::write(&image, b"\x89PNG\r\n\x1a\nnot-a-real-png").expect("image candidate");
+    let image_lua = image
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let parent = format!("return {{\n    window = {{ background_image = \"{image_lua}\" }},\n}}\n");
+    write_profile(&root, "parent", &parent);
+    write_profile(&root, "kid", "return { extends = \"parent\" }\n");
+    let before = std::fs::read_to_string(profile_path(&root, "kid")).expect("kid profile");
+
+    // No approved roots is deny-by-default, so the inherited window image is
+    // rejected by the startup pipeline. `set` must run that pipeline: it
+    // previously wrote for a profile `config check` rejects.
+    let plain = run_bitty(
+        &root,
+        &["config", "profile", "set", "kid", "font.size", "13"],
+    );
+    assert_exit(&plain, 2, "set with a denied inherited image");
+    let errors = stderr(&plain);
+    assert!(
+        errors.contains("background image") && errors.contains("window.background_image"),
+        "the refusal names the owning key: {errors}"
+    );
+    assert!(
+        errors.contains("decoration.background_image_roots"),
+        "the refusal points at the approved-root list: {errors}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "kid")).expect("kid profile"),
+        before,
+        "a refused set leaves the bytes intact"
+    );
+
+    // Pinning `window` would copy the denied path into the child; the same
+    // strict gate refuses it before any splice is committed.
+    let pinned = run_bitty(
+        &root,
+        &["config", "profile", "set", "kid", "window.opacity", "0.9"],
+    );
+    assert_exit(&pinned, 2, "pin a denied image");
+    assert!(
+        !std::fs::read_to_string(profile_path(&root, "kid"))
+            .expect("kid profile")
+            .contains("background_image"),
+        "the denied path never reaches the child"
+    );
+
+    // `config check` rejects the same state, proving the two paths agree.
+    let check = run_bitty(&root, &["config", "check", "--profile", "kid"]);
+    assert_exit(&check, 2, "check the denied image");
+    assert!(
+        stderr(&check).contains("window.background_image"),
+        "{}",
+        stderr(&check)
+    );
+    assert_no_temp_files(&root, "denied image");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn use_refuses_a_selector_whose_own_theme_is_missing() {
+    let root = scratch_root("use-selector-theme");
+    write_profile(&root, "alpha", "return {}\n");
+    write_profile(&root, "beta", "return {}\n");
+    let selector = "return {\n    format = \"bitty-profile-v1\",\n    profile = \"alpha\",\n    \
+                    appearance = { theme = \"local:missing-theme\" },\n}\n";
+    std::fs::write(init_path(&root), selector).expect("selector");
+
+    // The target chain (beta) is valid, but the selector is a user layer too:
+    // switching to beta would leave `theme = local:missing-theme` active.
+    let refused = run_bitty(&root, &["config", "profile", "use", "beta"]);
+    assert_exit(&refused, 2, "use with a broken selector theme");
+    assert!(
+        stderr(&refused).contains("unknown local theme 'missing-theme'"),
+        "the selector theme is resolved: {}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("switching to 'beta' would leave"),
+        "the refusal names the switch and the selector: {}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        std::fs::read_to_string(init_path(&root)).expect("selector"),
+        selector,
+        "a refused use writes nothing"
+    );
+
+    // The checker already rejected that merge, so `use` now agrees with it.
+    let check = run_bitty(&root, &["config", "check"]);
+    assert_exit(&check, 2, "check the broken selector");
+    assert!(
+        stderr(&check).contains("unknown local theme"),
+        "{}",
+        stderr(&check)
+    );
+
+    // A clean selector still switches (the gate is not a blanket refusal).
+    write_selector(&root, "alpha");
+    assert_ok(
+        &run_bitty(&root, &["config", "profile", "use", "beta"]),
+        "clean switch",
+    );
+    assert!(
+        std::fs::read_to_string(init_path(&root))
+            .expect("selector")
+            .contains("profile = \"beta\"")
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_commands_accept_a_root_supplied_by_the_current_selector() {
+    let root = scratch_root("cross-layer-roots");
+    let image = root.join("wall.png");
+    std::fs::write(&image, WALL_PNG).expect("valid PNG fixture");
+    let image_lua = lua_quote(&image.to_string_lossy());
+    let root_lua = lua_quote(&root.to_string_lossy());
+    write_profile(
+        &root,
+        "beta",
+        &format!("return {{\n    window = {{ background_image = \"{image_lua}\" }},\n}}\n"),
+    );
+    write_profile(&root, "alpha", "return {}\n");
+    // The approved root lives in the selector (the user layer), not in the
+    // profile. `config check --profile beta` loads both, so every profile
+    // command must validate the same cross-layer merge instead of refusing
+    // the profile-only chain for a root the selector already provides.
+    let selector = format!(
+        "return {{\n    format = \"bitty-profile-v1\",\n    profile = \"alpha\",\n    \
+         decoration = {{ background_image_roots = {{ \"{root_lua}\" }} }},\n}}\n"
+    );
+    std::fs::write(init_path(&root), &selector).expect("selector");
+
+    assert_ok(
+        &run_bitty(&root, &["config", "check", "--profile", "beta"]),
+        "check beta with a selector root",
+    );
+    assert_ok(
+        &run_bitty(&root, &["config", "profile", "use", "beta"]),
+        "use beta with a selector root",
+    );
+    let switched = std::fs::read_to_string(init_path(&root)).expect("selector");
+    assert!(
+        switched.contains("profile = \"beta\""),
+        "use rewrites the selector: {switched}"
+    );
+    assert!(
+        switched.contains("background_image_roots"),
+        "use preserves the selector's own root list: {switched}"
+    );
+    assert_ok(
+        &run_bitty(&root, &["config", "check"]),
+        "post-switch check resolves the selector root",
+    );
+
+    assert_ok(
+        &run_bitty(
+            &root,
+            &["config", "profile", "set", "beta", "font.size", "14"],
+        ),
+        "set beta with a selector root",
+    );
+    let get = run_bitty(&root, &["config", "profile", "get", "beta", "font.size"]);
+    assert_ok(&get, "get the edited size");
+    assert!(
+        stdout(&get).starts_with("font.size = 14"),
+        "the edit landed: {}",
+        stdout(&get)
+    );
+    assert_ok(
+        &run_bitty(&root, &["config", "profile", "clone", "beta", "copy"]),
+        "clone beta with a selector root",
+    );
+    assert!(
+        profile_path(&root, "copy").is_file(),
+        "clone created the destination profile"
+    );
+    assert_no_temp_files(&root, "cross-layer roots");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_commands_refuse_a_cross_layer_keymap_duplicate() {
+    let root = scratch_root("cross-layer-keymap");
+    // `alt+J` and `alt+j` are distinct set-by-id keys (the raw chord spelling),
+    // but the resolved keymap table normalizes them to the same duplicate.
+    let profile = "return {\n    keymaps = { { chord = \"alt+j\", action = \"focus_next\", \
+                   context = \"global\" } },\n}\n";
+    write_profile(&root, "keys", profile);
+    write_profile(&root, "alpha", "return {}\n");
+    let selector = "return {\n    format = \"bitty-profile-v1\",\n    profile = \"alpha\",\n    \
+                    keymaps = { { chord = \"alt+J\", action = \"focus_prev\", context = \"global\" } },\n}\n";
+    std::fs::write(init_path(&root), selector).expect("selector");
+
+    let check = run_bitty(&root, &["config", "check", "--profile", "keys"]);
+    assert_exit(&check, 2, "check the cross-layer duplicate");
+    assert!(
+        stderr(&check).contains("duplicate keymap id") && stderr(&check).contains("global::alt+j"),
+        "checker diagnostic: {}",
+        stderr(&check)
+    );
+
+    let set = run_bitty(
+        &root,
+        &["config", "profile", "set", "keys", "font.size", "13"],
+    );
+    assert_exit(&set, 2, "set with a cross-layer duplicate");
+    assert!(
+        stderr(&set).contains("duplicate keymap id") && stderr(&set).contains("global::alt+j"),
+        "set diagnostic: {}",
+        stderr(&set)
+    );
+    assert!(
+        stderr(&set).contains(&init_path(&root).display().to_string()),
+        "the set refusal names the selector: {}",
+        stderr(&set)
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "keys")).expect("keys profile"),
+        profile,
+        "a refused set writes nothing"
+    );
+
+    let use_output = run_bitty(&root, &["config", "profile", "use", "keys"]);
+    assert_exit(&use_output, 2, "use with a cross-layer duplicate");
+    assert!(
+        stderr(&use_output).contains("duplicate keymap id")
+            && stderr(&use_output).contains("global::alt+j"),
+        "use diagnostic: {}",
+        stderr(&use_output)
+    );
+    assert_eq!(
+        std::fs::read_to_string(init_path(&root)).expect("selector"),
+        selector,
+        "a refused use writes nothing"
+    );
+
+    let clone = run_bitty(&root, &["config", "profile", "clone", "keys", "copy"]);
+    assert_exit(&clone, 2, "clone with a cross-layer duplicate");
+    assert!(
+        stderr(&clone).contains("duplicate keymap id") && stderr(&clone).contains("global::alt+j"),
+        "clone diagnostic: {}",
+        stderr(&clone)
+    );
+    assert!(
+        stderr(&clone).contains(&init_path(&root).display().to_string()),
+        "the clone refusal names the selector: {}",
+        stderr(&clone)
+    );
+    assert!(
+        !profile_path(&root, "copy").exists(),
+        "a refused clone creates no destination"
+    );
+    assert_no_temp_files(&root, "cross-layer keymap");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_commands_refuse_a_selector_whose_own_theme_is_missing() {
+    let root = scratch_root("cross-layer-theme");
+    write_profile(&root, "th", "return {}\n");
+    write_profile(&root, "alpha", "return {}\n");
+    let selector = "return {\n    format = \"bitty-profile-v1\",\n    profile = \"alpha\",\n    \
+                    appearance = { theme = \"local:missing-theme\" },\n}\n";
+    std::fs::write(init_path(&root), selector).expect("selector");
+
+    let set = run_bitty(
+        &root,
+        &["config", "profile", "set", "th", "font.size", "13"],
+    );
+    assert_exit(&set, 2, "set under a missing selector theme");
+    assert!(
+        stderr(&set).contains("unknown local theme 'missing-theme'"),
+        "set resolves the selector theme: {}",
+        stderr(&set)
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "th")).expect("th profile"),
+        "return {}\n",
+        "a refused set writes nothing"
+    );
+
+    let use_output = run_bitty(&root, &["config", "profile", "use", "th"]);
+    assert_exit(&use_output, 2, "use under a missing selector theme");
+    assert!(
+        stderr(&use_output).contains("unknown local theme 'missing-theme'"),
+        "use resolves the selector theme: {}",
+        stderr(&use_output)
+    );
+    assert_eq!(
+        std::fs::read_to_string(init_path(&root)).expect("selector"),
+        selector,
+        "a refused use writes nothing"
+    );
+
+    let clone = run_bitty(&root, &["config", "profile", "clone", "th", "copy"]);
+    assert_exit(&clone, 2, "clone under a missing selector theme");
+    assert!(
+        stderr(&clone).contains("unknown local theme 'missing-theme'"),
+        "clone resolves the selector theme: {}",
+        stderr(&clone)
+    );
+    assert!(
+        stderr(&clone).contains(&init_path(&root).display().to_string()),
+        "the clone refusal names the selector: {}",
+        stderr(&clone)
+    );
+    assert!(
+        !profile_path(&root, "copy").exists(),
+        "a refused clone creates no destination"
+    );
+    assert_no_temp_files(&root, "cross-layer theme");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_commands_gate_on_the_selector_overridden_outline() {
+    let root = scratch_root("cross-layer-outline");
+    // #333333 fails the focused-outline contrast gate on its own; the
+    // selector's #FFFFFF overrides it, so `config check --profile beta` is
+    // green. Profile-only effective validation used to refuse all three verbs.
+    write_profile(
+        &root,
+        "beta",
+        "return {\n    decoration = { border_color_focused = \"#333333\" },\n}\n",
+    );
+    write_profile(&root, "alpha", "return {}\n");
+    std::fs::write(
+        init_path(&root),
+        "return {\n    format = \"bitty-profile-v1\",\n    profile = \"alpha\",\n    \
+         decoration = { border_color_focused = \"#FFFFFF\" },\n}\n",
+    )
+    .expect("selector");
+
+    assert_ok(
+        &run_bitty(&root, &["config", "check", "--profile", "beta"]),
+        "check beta under the selector outline",
+    );
+    assert_ok(
+        &run_bitty(&root, &["config", "profile", "use", "beta"]),
+        "use beta under the selector outline",
+    );
+    assert!(
+        std::fs::read_to_string(init_path(&root))
+            .expect("selector")
+            .contains("profile = \"beta\""),
+        "use rewrites the selector"
+    );
+    assert_ok(
+        &run_bitty(&root, &["config", "check"]),
+        "post-switch check resolves the selector outline",
+    );
+    assert_ok(
+        &run_bitty(
+            &root,
+            &["config", "profile", "set", "beta", "font.size", "13"],
+        ),
+        "set beta under the selector outline",
+    );
+    assert_ok(
+        &run_bitty(&root, &["config", "profile", "clone", "beta", "copy"]),
+        "clone beta under the selector outline",
+    );
+    assert!(
+        profile_path(&root, "copy").is_file(),
+        "clone created the destination profile"
+    );
+    assert_ok(
+        &run_bitty(&root, &["config", "check"]),
+        "check after set and clone",
+    );
+    assert_no_temp_files(&root, "cross-layer outline");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn profile_commands_refuse_a_missing_explicit_config_path() {
+    let root = scratch_root("explicit-missing");
+    write_profile(&root, "kid", "return {}\n");
+    let missing = root.join("bitty").join("missing.lua");
+    let missing_str = missing.to_string_lossy().into_owned();
+
+    let set = run_bitty(
+        &root,
+        &[
+            "--config",
+            &missing_str,
+            "config",
+            "profile",
+            "set",
+            "kid",
+            "font.size",
+            "13",
+        ],
+    );
+    assert_exit(&set, 2, "set with a missing --config");
+    assert!(
+        stderr(&set).contains("--config") && stderr(&set).contains("not found"),
+        "the --config refusal matches config check: {}",
+        stderr(&set)
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "kid")).expect("kid profile"),
+        "return {}\n",
+        "a refused set writes nothing"
+    );
+
+    let env_set = Command::new(BITTY_BIN)
+        .args(["config", "profile", "set", "kid", "font.size", "13"])
+        .env("XDG_CONFIG_HOME", &root)
+        .env("HOME", &root)
+        .env("NO_COLOR", "1")
+        .env("BITTY_CONFIG", &missing)
+        .env_remove("BITTY_PROFILE")
+        .output()
+        .expect("spawn bitty with BITTY_CONFIG");
+    assert_exit(&env_set, 2, "set with a missing BITTY_CONFIG");
+    assert!(
+        stderr(&env_set).contains("BITTY_CONFIG") && stderr(&env_set).contains("not found"),
+        "the BITTY_CONFIG refusal matches config check: {}",
+        stderr(&env_set)
+    );
+    assert_no_temp_files(&root, "explicit missing config");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn set_round_trips_every_pin_encoder_gap_through_get() {
+    let root = scratch_root("pin-encoder-gaps");
+    // Parent Lua spelling -> exact decoded family. These are the encoder gaps
+    // the pin must cover: NUL, a lone trailing backslash, the literal text
+    // `\n` (backslash + n, not a newline), CRLF, a C1 control, and the last
+    // Unicode scalar.
+    let cases: [(&str, &str); 6] = [
+        ("A\\0B", "A\u{0}B"),
+        ("ends\\\\", "ends\\"),
+        ("lit\\\\n", "lit\\n"),
+        ("a\\r\\nb", "a\r\nb"),
+        ("x\\u{80}y", "x\u{80}y"),
+        ("x\u{10FFFF}y", "x\u{10FFFF}y"),
+    ];
+    let kid = profile_path(&root, "kid");
+    for (index, (lua_family, expected)) in cases.iter().enumerate() {
+        let parent =
+            format!("return {{\n    font = {{ family = \"{lua_family}\", size = 12 }},\n}}\n");
+        write_profile(&root, "parent", &parent);
+        write_profile(&root, "kid", "return { extends = \"parent\" }\n");
+        let set = run_bitty(
+            &root,
+            &["config", "profile", "set", "kid", "font.size", "13"],
+        );
+        assert_ok(&set, &format!("pin encoder case {index}"));
+        let get = run_bitty(&root, &["config", "profile", "get", "kid", "font.family"]);
+        assert_ok(&get, &format!("get encoder case {index}"));
+        assert_eq!(
+            stdout(&get),
+            format!(
+                "font.family = \"{expected}\" (profile: {})\n",
+                kid.display()
+            ),
+            "case {index} must return the parent's exact value"
+        );
+    }
+    assert_no_temp_files(&root, "pin encoder gaps");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn set_refuses_a_final_body_that_crosses_the_profile_bound() {
+    let root = scratch_root("pin-final-bound");
+    // The padding leaves enough room for the seeded `font` table but not for
+    // the expanding fallback list the edit appends. The seed-only check passes,
+    // so the final-body recheck must catch the file bound with the actionable
+    // pin message instead of a generic parse error.
+    let filler = "a".repeat(4052);
+    let mut padded = String::new();
+    for _ in 0..16 {
+        padded.push_str("-- ");
+        padded.push_str(&filler);
+        padded.push('\n');
+    }
+    padded.push_str("return { extends = \"parent\" }\n");
+    write_profile(&root, "parent", "return {}\n");
+    write_profile(&root, "child", &padded);
+    let before = std::fs::read_to_string(profile_path(&root, "child")).expect("child profile");
+
+    let fallback = vec!["f".repeat(100); 8].join(",");
+    let set = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "set",
+            "child",
+            "font.fallback",
+            &fallback,
+        ],
+    );
+    assert_exit(&set, 2, "final body over the profile bound");
+    let errors = stderr(&set);
+    assert!(
+        errors.contains("cannot pin inherited 'font' into 'child'"),
+        "pin failure names the pin: {errors}"
+    );
+    assert!(
+        errors.contains("profile bound") && errors.contains("edit the profile manually"),
+        "actionable bound message: {errors}"
+    );
+    assert!(
+        !errors.contains("invalid profile 'child'"),
+        "must not report a parse error for the final body: {errors}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "child")).expect("child profile"),
+        before,
+        "a refused final body leaves the profile bytes intact"
+    );
+    assert_no_temp_files(&root, "final body profile bound");
     let _ = std::fs::remove_dir_all(&root);
 }

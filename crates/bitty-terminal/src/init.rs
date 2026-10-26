@@ -4797,6 +4797,10 @@ fn create_new_exclusively(target: &std::path::Path, content: &str) -> Result<(),
             target.display()
         )));
     }
+    // A brand-new file's directory entry needs the same durability as an
+    // atomic replace: a crash right after the first activation must not lose
+    // the selector while its bytes are already synced.
+    sync_parent_dir(target);
     Ok(())
 }
 
@@ -4860,7 +4864,26 @@ fn replace_atomically(target: &std::path::Path, content: &str) -> Result<(), Ini
             target.display()
         )));
     }
+    // The file bytes are synced above; the directory entry that now names
+    // them must be synced too, or a crash can lose the replace while the
+    // selector still reads as the previous bytes.
+    sync_parent_dir(target);
     Ok(())
+}
+
+/// Flushes the directory entry for `path` after an atomic replace.
+///
+/// Best-effort: platforms that cannot fsync a directory (Windows) keep the
+/// historical behavior, and a directory that cannot be opened adds no second
+/// failure to an already successful write.
+fn sync_parent_dir(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+    }
 }
 
 /// Explicit legacy migration (`bitty init --migrate`, CTX-1404).

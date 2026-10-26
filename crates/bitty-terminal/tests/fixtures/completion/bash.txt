@@ -2,10 +2,11 @@
 # Install: bitty completion bash > ~/.local/share/bash-completion/completions/bitty
 #      or: eval "$(bitty completion bash)" after the bitty binary is on PATH.
 # Static words come from the generated grammar. `--profile`, `plugin
-# enable|disable <id>`, and `config profile show|use|path <name>` also offer
-# local candidates from the hidden helpers (`+list-profiles`,
-# `+list-plugins --installed`); helper failures and malformed state yield no
-# candidates and never print into the completion stream.
+# enable|disable <id>`, and the first operand of `config profile
+# show|use|path|get|clone|delete|rename <name>` also offer local candidates
+# from the hidden helpers (`+list-profiles`, `+list-plugins --installed`);
+# helper failures and malformed state yield no candidates and never print
+# into the completion stream.
 _bitty_flag_takes_value() {
     case "$1" in
         --log-level|--split-ratio|--layout|--focus|--config|--profile|--theme|--font-family|--font-size|--opacity|--format|--socket|--instance|--scrollback|--close-confirm|--gaps-in|--gaps-out|--border|--radius|--plugins|--cwd|--env|--title|--scope|--terminal|--family|--cap|--iterations|--rows|--cols|--version|--digest|--distro) return 0 ;;
@@ -86,7 +87,7 @@ _bitty_complete() {
                     ;;
             esac
             ;;
-        "config profile show"|"config profile use"|"config profile path")
+        "config profile show"|"config profile use"|"config profile path"|"config profile get"|"config profile clone"|"config profile delete"|"config profile rename")
             case "$cur" in
                 -*) ;;
                 *)
@@ -110,7 +111,7 @@ _bitty_complete() {
         "ctl config") candidates="reload --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init" ;;
         "ctl consent") candidates="grant revoke revoke-session --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init" ;;
         "config") candidates="path check show validate edit profile --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init" ;;
-        "config profile") candidates="create clone rename delete list show use get set path --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init" ;;
+        "config profile") candidates="create clone rename delete list show use get set path --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init" ;;
         "+list-themes") candidates="--format --safe --no-color --help --version --verbose --log-level --headless --test-mode --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --socket --instance --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init" ;;
         "+list-colors") candidates="--format --config --profile --safe --no-color --help --version --verbose --log-level --headless --test-mode --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --theme --font-family --font-size --opacity --socket --instance --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init" ;;
         "+list-fonts") candidates="--format --no-color --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --socket --instance --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init" ;;

@@ -1080,6 +1080,49 @@ pub fn resolve_effective_with_profiles(
     profiles: Vec<LayeredPlan>,
     cli: &CliOverrides,
 ) -> Result<crate::merge::MergedConfig, ConfigError> {
+    resolve_effective_with_profiles_inner(file, profiles, cli, true)
+}
+
+/// [`resolve_effective_with_profiles`] without the final effective-config
+/// validation.
+///
+/// Merge only: the caller must validate the merged
+/// [`EffectiveConfig`](crate::types::EffectiveConfig) on the configuration it
+/// ultimately acts on. Use this for intermediate values (a profile's
+/// inherited-table seed, source attribution) where a leaf is invalid in
+/// isolation but a higher-precedence user layer overrides it; the validating
+/// form remains the only gate.
+///
+/// Layer loading/plan validation and the precedence merge are identical to
+/// [`resolve_effective_with_profiles`].
+///
+/// # Errors
+///
+/// Same as [`resolve_effective_with_profiles`], except an effective config
+/// that only fails
+/// [`EffectiveConfig::validate`](crate::types::EffectiveConfig::validate) is
+/// returned successfully.
+pub fn resolve_effective_with_profiles_unvalidated(
+    file: Option<LayeredPlan>,
+    profiles: Vec<LayeredPlan>,
+    cli: &CliOverrides,
+) -> Result<crate::merge::MergedConfig, ConfigError> {
+    resolve_effective_with_profiles_inner(file, profiles, cli, false)
+}
+
+fn resolve_effective_with_profiles_inner(
+    file: Option<LayeredPlan>,
+    profiles: Vec<LayeredPlan>,
+    cli: &CliOverrides,
+    validate: bool,
+) -> Result<crate::merge::MergedConfig, ConfigError> {
+    let merge = |layers| {
+        if validate {
+            crate::merge::merge_layers(layers)
+        } else {
+            crate::merge::merge_layers_unvalidated(layers)
+        }
+    };
     let mut lower = Vec::new();
     for p in profiles {
         debug_assert_eq!(
@@ -1094,10 +1137,10 @@ pub fn resolve_effective_with_profiles(
     }
     // Fast path: no CLI override stays a single merge (pre-0180 behavior).
     if cli.is_empty() {
-        return crate::merge::merge_layers(lower);
+        return merge(lower);
     }
     // Base merge first so profile/file failures surface before CLI enters.
-    let base = crate::merge::merge_layers(lower.clone())?;
+    let base = merge(lower.clone())?;
     // Base-aware CLI layer: validates CLI raws fail-closed and inherits
     // non-overridden font/window siblings from the base.
     let cli_layer = cli.to_layer_with_base(&base.effective)?;
@@ -1105,7 +1148,7 @@ pub fn resolve_effective_with_profiles(
     if let Some(c) = cli_layer {
         layers.push(c);
     }
-    let mut merged = crate::merge::merge_layers(layers)?;
+    let mut merged = merge(layers)?;
     // The CLI tables are atomic at merge, so inherited siblings were
     // re-attributed to `Cli` with identical values: restore the base source
     // per non-overridden field and prune the spurious CLI conflicts so
@@ -3200,6 +3243,32 @@ pub fn load_profile_chain_in_dir(name: &str, dir: &Path) -> Result<Vec<LayeredPl
     })
 }
 
+/// Loads a profile's parents while treating `ancestors` as already visited.
+///
+/// Same strict loader as [`load_profile_chain_in_dir`], for callers that
+/// already hold one chain link in memory. A parent chain that names an
+/// ancestor fails with [`ConfigError::CycleDetected`] **before that file is
+/// read**, so the caller never re-reads the link it already validated. The
+/// returned chain stays base-first and contains only the parents.
+///
+/// # Errors
+///
+/// Same as [`load_profile_chain_in_dir`].
+pub fn load_profile_chain_in_dir_with_ancestors(
+    name: &str,
+    dir: &Path,
+    ancestors: &[String],
+) -> Result<Vec<LayeredPlan>, ConfigError> {
+    load_profile_chain_in_dir_with_visited(name, dir, ancestors, SalvagePolicy::Strict).map(
+        |chain| {
+            chain
+                .into_iter()
+                .map(|salvaged| salvaged.layer)
+                .collect::<Vec<_>>()
+        },
+    )
+}
+
 /// Startup variant of [`load_profile_chain`] (CTX-1490, issue #2580).
 ///
 /// Every chain link may drop its own invalid top-level elements; the returned
@@ -3242,8 +3311,17 @@ fn load_profile_chain_in_dir_with(
     dir: &Path,
     policy: SalvagePolicy,
 ) -> Result<Vec<SalvagedLayer>, ConfigError> {
+    load_profile_chain_in_dir_with_visited(name, dir, &[], policy)
+}
+
+fn load_profile_chain_in_dir_with_visited(
+    name: &str,
+    dir: &Path,
+    ancestors: &[String],
+    policy: SalvagePolicy,
+) -> Result<Vec<SalvagedLayer>, ConfigError> {
     let mut chain: Vec<SalvagedLayer> = Vec::new();
-    let mut visited: Vec<String> = Vec::new();
+    let mut visited: Vec<String> = ancestors.to_vec();
     let mut current = validate_profile_name(name)?;
     loop {
         if visited.iter().any(|seen| seen == &current) {
@@ -5553,6 +5631,23 @@ mod tests {
     fn load_missing_profile_fails_closed() {
         let path = Path::new("/nonexistent-bitty-ctx0169/profiles/ghost.lua");
         assert!(load_profile_layer(path).is_err());
+    }
+
+    #[test]
+    fn profile_chain_ancestors_fail_a_cycle_before_reading() {
+        let dir =
+            std::env::temp_dir().join(format!("bitty-ctx1597-ancestors-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        // `src.lua` is deliberately absent: the ancestor marker must win
+        // before the loader opens the file.
+        let err = load_profile_chain_in_dir_with_ancestors("src", &dir, &["src".to_string()])
+            .expect_err("ancestor cycle");
+        assert!(
+            matches!(err, ConfigError::CycleDetected { .. }),
+            "ancestor cycle before read: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // CTX-0759 (#1366): `extends` is a profile-layer-only key. Profile

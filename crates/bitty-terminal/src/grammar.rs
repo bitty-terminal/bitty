@@ -236,7 +236,15 @@ pub(crate) fn nodes() -> Vec<Node> {
     push_node(&mut nodes, "config", config_verbs, &[], false);
     let profile_verbs: Vec<&'static str> =
         ProfileVerb::VERBS.iter().map(|(name, _)| *name).collect();
-    push_node(&mut nodes, "config profile", profile_verbs, &[], false);
+    // `--json` is the profile-local machine-output alias (CTX-1589); every
+    // other global flag still rides `merged_flags`.
+    push_node(
+        &mut nodes,
+        "config profile",
+        profile_verbs,
+        &["--json"],
+        false,
+    );
     for (name, action) in PlusAction::ALL {
         push_node(&mut nodes, name, Vec::new(), action.flags(), false);
     }
@@ -483,6 +491,12 @@ mod tests {
         for (name, _) in ProfileVerb::VERBS {
             assert!(candidates_for("config profile").unwrap().contains(name));
         }
+        assert!(
+            candidates_for("config profile")
+                .unwrap()
+                .contains(&"--json"),
+            "config profile offers its --json alias"
+        );
         for (name, verbs) in CTL_RESOURCES {
             let parent = candidates_for("ctl").expect("ctl node");
             assert!(parent.contains(name), "ctl missing resource {name}");

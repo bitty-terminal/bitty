@@ -941,7 +941,31 @@ pub fn safe_merged() -> Result<MergedConfig, ConfigError> {
 /// (`SystemPolicy`) that declare non-overridable fields cause later
 /// overrides to be recorded as `NonOverridable` policy violations and the
 /// policy value is retained.
-pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, ConfigError> {
+///
+/// The merged [`EffectiveConfig`] is validated before it is returned.
+pub fn merge_layers(layers: Vec<LayeredPlan>) -> Result<MergedConfig, ConfigError> {
+    merge_layers_inner(layers, true)
+}
+
+/// Merge a stack of layered plans **without** the final effective-config
+/// validation step.
+///
+/// Merge only: the caller must validate the merged [`EffectiveConfig`] on the
+/// configuration it ultimately acts on. This exists for intermediate views
+/// (for example a profile's inherited-table seed) where a leaf is invalid in
+/// isolation but a higher-precedence layer overrides it.
+///
+/// Layer-local plan validation (schema version, undeclared keys, per-element
+/// shape) and the precedence sort are identical to [`merge_layers`], so a
+/// malformed layer still fails here.
+pub fn merge_layers_unvalidated(layers: Vec<LayeredPlan>) -> Result<MergedConfig, ConfigError> {
+    merge_layers_inner(layers, false)
+}
+
+fn merge_layers_inner(
+    mut layers: Vec<LayeredPlan>,
+    validate: bool,
+) -> Result<MergedConfig, ConfigError> {
     for lp in &layers {
         lp.plan.validate()?;
     }
@@ -2716,7 +2740,9 @@ pub fn merge_layers(mut layers: Vec<LayeredPlan>) -> Result<MergedConfig, Config
             .or_insert_with(|| core_src.clone());
     }
 
-    effective.validate()?;
+    if validate {
+        effective.validate()?;
+    }
     if let Some(first) = policy_violations.first().cloned() {
         return Err(first);
     }
@@ -6937,6 +6963,65 @@ mod tests {
                 .policy_violations
                 .iter()
                 .any(|e| e.field() == Some("views[*].glow_width"))
+        );
+    }
+
+    #[test]
+    fn merge_layers_unvalidated_keeps_a_cross_layer_invalid_leaf() {
+        let outline =
+            |hex: &str| crate::types::OutlineColor::parse(hex).expect("canonical outline color");
+        let profile = LayeredPlan::new(
+            ConfigSource::new(LayerKind::Profile, Some("beta.lua")),
+            ConfigPlan {
+                decoration: Some(crate::types::DecorationConfig {
+                    border_color_focused: Some(outline("#333333")),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+        let user = LayeredPlan::new(
+            ConfigSource::new(LayerKind::User, Some("init.lua")),
+            ConfigPlan {
+                decoration: Some(crate::types::DecorationConfig {
+                    border_color_focused: Some(outline("#FFFFFF")),
+                    ..Default::default()
+                }),
+                schema_version: Some(crate::migration::CURRENT_SCHEMA_VERSION),
+                ..Default::default()
+            },
+        );
+
+        // Alone the profile fails the focused-outline contrast gate.
+        assert!(
+            merge_layers(vec![profile.clone()]).is_err(),
+            "the validating merge must reject the profile-only outline"
+        );
+        let seed = merge_layers_unvalidated(vec![profile.clone()]).expect("unvalidated merge");
+        assert_eq!(
+            seed.effective.decoration.border_color_focused,
+            Some(outline("#333333"))
+        );
+        assert_eq!(
+            seed.source_of("decoration.border_color_focused")
+                .expect("attributed")
+                .layer,
+            LayerKind::Profile
+        );
+
+        // The user layer overrides the leaf, so the validated merge succeeds.
+        let merged = merge_layers(vec![profile, user]).expect("cross-layer merge");
+        assert_eq!(
+            merged.effective.decoration.border_color_focused,
+            Some(outline("#FFFFFF"))
+        );
+        assert_eq!(
+            merged
+                .source_of("decoration.border_color_focused")
+                .expect("attributed")
+                .layer,
+            LayerKind::User
         );
     }
 }

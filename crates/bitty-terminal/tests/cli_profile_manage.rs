@@ -550,6 +550,105 @@ fn set_writes_a_schema_value_get_reads_it_and_config_check_passes() {
 }
 
 #[test]
+fn set_accepts_quoted_canonical_aliases() {
+    let root = scratch_root("quoted-aliases");
+    write_profile(&root, "work", "return {\n}\n");
+
+    // `render_literal` strips one matching quote pair, so the on-disk value is
+    // the inner spelling; the post-write re-read must canonicalise that same
+    // spelling instead of comparing the quoted string literally.
+    let quoted_key = run_bitty(
+        &root,
+        &["config", "profile", "set", "work", "mod_key", "\"Super\""],
+    );
+    assert_ok(&quoted_key, "quoted set mod_key alias");
+    assert!(
+        stdout(&quoted_key).contains("'mod_key' = \"super\""),
+        "quoted mod_key report: {}",
+        stdout(&quoted_key)
+    );
+    let content = std::fs::read_to_string(profile_path(&root, "work")).expect("edited profile");
+    assert!(
+        content.contains("mod_key = \"Super\""),
+        "on-disk spelling stays the user's: {content}"
+    );
+
+    let quoted_mouse = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "set",
+            "work",
+            "mouse.right",
+            "\"Paste_From_Primary\"",
+        ],
+    );
+    assert_ok(&quoted_mouse, "quoted set mouse.right alias");
+    assert!(
+        stdout(&quoted_mouse).contains("'mouse.right' = \"paste_from_primary\""),
+        "quoted mouse report: {}",
+        stdout(&quoted_mouse)
+    );
+    let content = std::fs::read_to_string(profile_path(&root, "work")).expect("edited profile");
+    assert!(
+        content.contains("right = \"Paste_From_Primary\""),
+        "on-disk mouse spelling stays the user's: {content}"
+    );
+    assert_no_temp_files(&root, "quoted aliases");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn set_refuses_a_pin_that_would_exceed_the_line_bound() {
+    let root = scratch_root("pin-line-bound");
+    // The parent's roots line fits the 4096-byte bound; pinning the complete
+    // decoration table adds every other inherited leaf and does not.
+    let long = "a".repeat(1330);
+    let parent = format!(
+        "return {{\n    decoration = {{ background_image_roots = {{ \"/{long}\", \
+         \"/{long}b\", \"/{long}c\" }} }},\n}}\n"
+    );
+    write_profile(&root, "parent", &parent);
+    write_profile(&root, "child", "return { extends = \"parent\" }\n");
+    let child_before =
+        std::fs::read_to_string(profile_path(&root, "child")).expect("child profile");
+
+    let set = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "set",
+            "child",
+            "decoration.gaps_in",
+            "2",
+        ],
+    );
+    assert_exit(&set, 2, "pin over the line bound");
+    let errors = stderr(&set);
+    assert!(
+        errors.contains("cannot pin inherited 'decoration' into 'child'"),
+        "pin failure names the pin: {errors}"
+    );
+    assert!(
+        errors.contains("line bound") && errors.contains("edit the profile manually"),
+        "actionable bound message: {errors}"
+    );
+    assert!(
+        !errors.contains("invalid profile 'child'"),
+        "must not blame the profile for the pin: {errors}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "child")).expect("child profile"),
+        child_before,
+        "a refused pin leaves the profile bytes intact"
+    );
+    assert_no_temp_files(&root, "pin line bound");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn set_rejects_schema_invalid_values_and_keeps_the_previous_bytes() {
     let root = scratch_root("invalid-value");
     let original = "return {\n    font = { family = \"Mono\", size = 12 },\n}\n";
@@ -749,7 +848,7 @@ fn set_pins_every_inherited_leaf_of_the_table_it_creates() {
         assert_ok(&output, &format!("set kid {path}"));
         let table = path.split('.').next().expect("table segment");
         assert!(
-            stdout(&output).contains(&format!("pinned inherited '{table}' values into 'kid'")),
+            stdout(&output).contains(&format!("pinned '{table}' into 'kid'")),
             "human pin report for {path}: {}",
             stdout(&output)
         );
@@ -769,7 +868,7 @@ fn set_pins_every_inherited_leaf_of_the_table_it_creates() {
     );
     assert_ok(&json, "set --json");
     assert!(
-        stdout(&json).contains("\"inherited_pinned\":[\"decoration\"]"),
+        stdout(&json).contains("\"pinned\":[\"decoration\"]"),
         "json pin report: {}",
         stdout(&json)
     );
@@ -788,7 +887,7 @@ fn set_pins_every_inherited_leaf_of_the_table_it_creates() {
     );
     assert_ok(&local, "second set --json");
     assert!(
-        stdout(&local).contains("\"inherited_pinned\":[]"),
+        stdout(&local).contains("\"pinned\":[]"),
         "no pin report for a local table: {}",
         stdout(&local)
     );
@@ -857,7 +956,7 @@ fn set_on_a_fresh_profile_pins_the_required_terminal_keys() {
     );
     assert_ok(&set, "set terminal.shell");
     assert!(
-        stdout(&set).contains("pinned inherited 'terminal' values into 'fresh'"),
+        stdout(&set).contains("pinned 'terminal' into 'fresh'"),
         "pin report: {}",
         stdout(&set)
     );

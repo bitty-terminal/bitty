@@ -99,7 +99,7 @@ pub(crate) fn profile_usage() -> String {
      font.fallback takes a comma-separated list. `set` on a profile that only\n\
      inherits `font`, `window`, `terminal`, `layout`, `decoration`, `scrollbar`,\n\
      or `appearance` pins every inherited leaf of that table into the profile\n\
-     first (reported as inherited-pinned), so one edited leaf never resets its\n\
+     first (reported as pinned), so one edited leaf never resets its\n\
      siblings; required keys (font family/size, terminal scrollback) are always\n\
      included.\n\
      \n\
@@ -928,12 +928,19 @@ fn run_set(dir: &Path, raw_name: &str, raw_key: &str, raw_value: &str) -> Result
             .map_err(|err| invalid_profile("set", &name, &err))?;
         if !declares_table(&entry.plan, table) {
             let seed = inherited_table_literal(table, &current.effective);
-            updated = set_lua_path(&updated, &[table], &seed).map_err(|message| {
+            let pinned_body = set_lua_path(&updated, &[table], &seed).map_err(|message| {
                 Failure::invalid(format!(
                     "bitty config profile set: cannot pin inherited '{table}' values into profile \
                      '{name}': {message}"
                 ))
             })?;
+            if let Some(violation) = pin_bound_violation(&pinned_body) {
+                return Err(Failure::invalid(format!(
+                    "bitty config profile set: cannot pin inherited '{table}' into '{name}': \
+                     {violation}; edit the profile manually"
+                )));
+            }
+            updated = pinned_body;
             pinned.push(table);
         }
     }
@@ -976,8 +983,7 @@ fn run_set(dir: &Path, raw_name: &str, raw_key: &str, raw_value: &str) -> Result
             .collect::<Vec<_>>()
             .join(", ");
         text.push_str(&format!(
-            "bitty config profile set: pinned inherited {names} values into '{name}' so the \
-             edited leaf keeps every inherited sibling\n"
+            "bitty config profile set: pinned {names} into '{name}'\n"
         ));
     }
     let pinned_json = pinned
@@ -986,7 +992,7 @@ fn run_set(dir: &Path, raw_name: &str, raw_key: &str, raw_value: &str) -> Result
         .collect::<Vec<_>>()
         .join(",");
     let result = format!(
-        "{{\"kind\":\"profile\",\"action\":\"set\",\"name\":{},\"path\":{},\"key\":{},\"value\":{},\"type\":{},\"layer\":{},\"source\":{},\"changed\":true,\"inherited_pinned\":[{}]}}",
+        "{{\"kind\":\"profile\",\"action\":\"set\",\"name\":{},\"path\":{},\"key\":{},\"value\":{},\"type\":{},\"layer\":{},\"source\":{},\"changed\":true,\"pinned\":[{}]}}",
         json_string(&name),
         json_path(&path),
         json_string(field.path),
@@ -1646,17 +1652,24 @@ fn check_local_theme(
 ///
 /// Text fields whose typed form canonicalizes an accepted spelling (the mod
 /// key and the chrome mouse-button aliases) must compare in canonical form:
-/// the user may write `Super` or `Paste_From_Primary`, while the re-read
-/// effective value is `super`/`paste_from_primary`.
+/// the user may write `Super`, `"Super"`, or `Paste_From_Primary`, while the
+/// re-read effective value is `super`/`paste_from_primary`.
 fn requested_value(field: &SchemaField, raw: &str) -> ConfigValue {
+    // Quoted CLI values are supported (`render_literal` strips one matching
+    // pair), so canonicalize the same stripped spelling here. Otherwise a
+    // quoted alias such as `"Super"` would compare as the literal string
+    // `Super` and the round-trip check would refuse the write.
+    let canonical = strip_matching_quotes(raw);
     match field.path {
         "mod_key" => {
-            if let Ok(key) = bitty_config::keymap::ModKey::parse(raw) {
+            if let Ok(key) = bitty_config::keymap::ModKey::parse(canonical) {
                 return ConfigValue::Text(key.canonical().to_string());
             }
         }
         "mouse.right" | "mouse.middle" => {
-            if let Ok(binding) = bitty_config::keymap::MouseButtonBinding::parse(raw, field.path) {
+            if let Ok(binding) =
+                bitty_config::keymap::MouseButtonBinding::parse(canonical, field.path)
+            {
                 return ConfigValue::Text(binding.canonical());
             }
         }
@@ -2262,6 +2275,32 @@ fn strip_matching_quotes(raw: &str) -> &str {
         }
     }
     trimmed
+}
+
+/// Returns the loader bound a rendered pin would breach, if any.
+///
+/// A pin is one Lua table literal on one line. The loader rejects a line over
+/// [`bitty_config::file::MAX_LINE_BYTES`] and a file over
+/// [`bitty_config::file::MAX_CONFIG_FILE_BYTES`]; checking the spliced body
+/// before committing lets `set` name the pin and the bound instead of
+/// reporting a generic `invalid profile` for a file the user did not write.
+fn pin_bound_violation(content: &str) -> Option<String> {
+    if content
+        .lines()
+        .any(|line| line.len() > bitty_config::file::MAX_LINE_BYTES)
+    {
+        return Some(format!(
+            "the pinned table would exceed the {}-byte line bound",
+            bitty_config::file::MAX_LINE_BYTES
+        ));
+    }
+    if content.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES {
+        return Some(format!(
+            "the pinned table would exceed the {} KiB profile bound",
+            bitty_config::file::MAX_CONFIG_FILE_BYTES / 1024
+        ));
+    }
+    None
 }
 
 /// Human rendering of one typed value (`config check` row style).

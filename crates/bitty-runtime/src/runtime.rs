@@ -322,6 +322,13 @@ pub(super) fn join_forwarder_with_timeout(
     // Timeout: detach rather than hang teardown. The thread exits on
     // EOF/disconnect; its waker clone may fire once post-detach, so wakers
     // must stay idempotent and Runtime-independent (see `PtyWaker` docs).
+    // Issue #2570 telemetry: callers discard the boolean, so a detached
+    // forwarder used to be silent. Name it once per teardown with the bound
+    // so a lingering process's thread table has a matching log line.
+    eprintln!(
+        "bitty: PTY forwarder join timed out after {} ms; detached (EOF/disconnect still closes it)",
+        timeout.as_millis()
+    );
     false
 }
 

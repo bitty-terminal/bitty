@@ -349,6 +349,19 @@ pub(crate) struct WatchdogContext {
     pub(crate) surface: bitty_render::telemetry::SurfaceTelemetrySnapshot,
     /// Last window/surface lifecycle event name (issue #2570).
     pub(crate) lifecycle: &'static str,
+    /// Whether the embedder's surface-visibility gate currently allows
+    /// presentation (issues #2589/#2570). A stall with `true` names the
+    /// commit-while-occluded path the gate exists to close; `false` names a
+    /// stall behind the gate, where the reveal edge never arrived.
+    pub(crate) surface_visible: bool,
+    /// Age of the oldest unanswered `request_redraw` at sample time (issue
+    /// #2570). Large spans name a compositor that stopped answering the
+    /// redraw probe; `None` means no request was outstanding.
+    pub(crate) redraw_pending_ms: Option<u64>,
+    /// Whether the redraw probe has ever observed a served frame callback.
+    pub(crate) probe_redraw_seen: bool,
+    /// Whether the synthetic/native occlusion edge is currently delivered.
+    pub(crate) probe_occluded: bool,
 }
 
 /// Parsed watchdog configuration.
@@ -1036,10 +1049,17 @@ fn render_report(report: &StallReport) -> String {
                 format_ids(&context.band_plugin_ids),
             );
             let surface = &context.surface;
+            let redraw_pending = context
+                .redraw_pending_ms
+                .map_or_else(|| String::from("none"), |ms| ms.to_string());
             let _ = writeln!(
                 out,
-                "  surface: last={} configure_err={} acquire_ok={} acquire_timeout={} acquire_outdated={} acquire_lost={} acquire_other={} present_ok={} present_err={} resize={} resize_zero_skipped={} headless_present={} retry_failures={} retry_attempts={} retry_recoveries={} retry_last_delay_ms={} lifecycle={}",
+                "  surface: last={} visible={} redraw_pending_ms={} probe_seen={} probe_occluded={} configure_err={} acquire_ok={} acquire_timeout={} acquire_outdated={} acquire_lost={} acquire_other={} present_ok={} present_err={} resize={} resize_zero_skipped={} headless_present={} retry_failures={} retry_attempts={} retry_recoveries={} retry_last_delay_ms={} lifecycle={}",
                 surface.last_event,
+                context.surface_visible,
+                redraw_pending,
+                context.probe_redraw_seen,
+                context.probe_occluded,
                 surface.configure_err,
                 surface.acquire_ok,
                 surface.acquire_timeout,
@@ -3797,6 +3817,9 @@ mod tests {
                 band_count: 1,
                 band_plugin_ids: vec![String::from("bitty-terminal.bar")],
                 presented_frames: 41,
+                surface_visible: true,
+                redraw_pending_ms: Some(750),
+                probe_redraw_seen: true,
                 ..Default::default()
             }),
             threads: rows,
@@ -3816,6 +3839,12 @@ mod tests {
         );
         assert!(rendered.len() <= MAX_REPORT_BYTES, "{}", rendered.len());
         assert!(rendered.contains("surface: last=none"), "{rendered}");
+        assert!(
+            rendered.contains(
+                "visible=true redraw_pending_ms=750 probe_seen=true probe_occluded=false"
+            ),
+            "{rendered}"
+        );
         assert!(!rendered.contains("/home/"), "{rendered}");
     }
 

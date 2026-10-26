@@ -22,3 +22,5 @@ mod component_seed;
 pub mod storage_backends;
 #[doc(hidden)]
 pub mod storage_component_host;
+#[cfg(test)]
+mod test_globals;

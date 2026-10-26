@@ -27,9 +27,10 @@
 //! Bounds: faces load as owned bytes capped at [`MAX_FACE_BYTES`] each,
 //! at most [`MAX_LOADED_FACES`] faces per session; every bitmap crosses
 //! [`GlyphBitmap::try_new`], so malformed upstream output is rejected
-//! instead of trusted. Font discovery uses `fontdb` defaults (system font
-//! directories plus fontconfig XML on Linux); this crate adds no search
-//! path of its own.
+//! instead of trusted. Face discovery uses the same platform directories
+//! as `fontdb` (fontconfig XML on Linux, platform font dirs on
+//! macOS/Windows) through the persistent index in `crate::font_index`;
+//! only face metadata is read at startup, and face bytes load lazily.
 //!
 //! Backend selection (CTX-1607): this module is the **production default**
 //! stack. Runtimes construct [`SwashSingle::new`] and call
@@ -178,25 +179,25 @@ pub enum GlyphSource {
     ColorBitmap,
 }
 
-/// Process-wide system font database, scanned once.
+/// Process-wide system font database, built once.
 ///
 /// A full `load_system_fonts` pass costs hundreds of milliseconds on
 /// font-rich hosts (453ms release / ~1s+ debug for 1583 faces on the
-/// reference seat) — paying it per rasterizer would blow the PB-1 startup
-/// budget once and per test runtime after that. Discovery is read-only host
-/// state, so every [`SwashSingle`] shares one scan. Caveat: a process that
-/// mutates font configuration mid-run (fontconfig env) keeps the first
-/// scan; no such use exists (production reads the host stack once, tests
-/// share the host stack).
-static SYSTEM_DB: OnceLock<Database> = OnceLock::new();
+/// reference seat). CTX-1607 replaces that per-process scan with the
+/// persistent index in `crate::font_index`: a warm process reads the
+/// cached face metadata (no font bytes), and a cold process parses the font
+/// files once in parallel and writes the index. `BITTY_FONT_INDEX=0`
+/// restores the upstream full scan for diagnosis. Discovery is read-only
+/// host state, so every [`SwashSingle`] shares one database. Caveat: a
+/// process that mutates the font configuration mid-run (fontconfig env)
+/// keeps the first snapshot; production reads the host stack once.
+static SYSTEM_DB: OnceLock<Arc<Database>> = OnceLock::new();
 
-/// Returns the shared system database, scanning on first use.
-pub(crate) fn system_db() -> &'static Database {
-    SYSTEM_DB.get_or_init(|| {
-        let mut db = Database::new();
-        db.load_system_fonts();
-        db
-    })
+/// Returns the shared system database, loading the index on first use.
+pub(crate) fn system_db() -> Arc<Database> {
+    SYSTEM_DB
+        .get_or_init(|| Arc::new(crate::font_index::system_database()))
+        .clone()
 }
 
 /// [`GlyphRasterizer`] over `fontdb` discovery + `swash` rasterization.
@@ -207,10 +208,11 @@ pub(crate) fn system_db() -> &'static Database {
 /// first, then platform tails) exactly as the crossfont backend was
 /// wrapped, so per-glyph fallback needs no second implementation.
 ///
-/// Face discovery reads the process-wide `system_db` scan; per-face bytes
-/// stay session-owned under [`MAX_FACE_BYTES`].
+/// Face discovery reads the process-wide [`system_db`] metadata; per-face
+/// bytes stay session-owned under [`MAX_FACE_BYTES`] and load lazily on
+/// [`GlyphRasterizer::load_font`]/dynamic fallback (CTX-1607).
 pub struct SwashSingle {
-    db: &'static Database,
+    db: Arc<Database>,
     faces: HashMap<FontId, StoredFace>,
     /// `fontdb` face ID to session handle: reloads (for example a font-size
     /// change) re-query the same faces, and without this map every reload
@@ -297,41 +299,11 @@ impl SwashSingle {
                 "no system fonts discovered".to_string(),
             ));
         }
-        Ok(Self {
-            db,
-            faces: HashMap::new(),
-            by_db_id: HashMap::new(),
-            dynamic_cache: HashMap::new(),
-            dynamic_faces: HashSet::new(),
-            scale_ctx: swash::scale::ScaleContext::new(),
-            next_font_id: 0,
-            shape_plans: HashMap::new(),
-            shape_plan_lru: VecDeque::new(),
-            run_cache: HashMap::new(),
-            run_lru: VecDeque::new(),
-            run_cache_bytes: 0,
-            shaped_glyphs: HashMap::new(),
-            shaped_lru: VecDeque::new(),
-            shaped_glyph_bytes: 0,
-            transient_shaped_key: None,
-            transient_shaped_glyph: None,
-            shape_hits: 0,
-            shape_misses: 0,
-            shaping_misaligned: 0,
-        })
+        Ok(Self::empty_with_database(db))
     }
 
-    /// Deterministic test constructor without a host font scan (CTX-1026).
-    ///
-    /// The outcome-cache bound test only needs `dynamic_cache` /
-    /// `dynamic_faces` bookkeeping, never real system fonts:
-    /// [`SwashSingle::new`] scans the host filesystem (seconds on
-    /// font-rich seats) and silently early-returns on bare hosts, making
-    /// the gate host-dependent. This builds the same empty session over
-    /// an empty database, so the test is hermetic and never skips.
-    #[cfg(test)]
-    fn empty_for_cache_test() -> Self {
-        let db: &'static Database = Box::leak(Box::new(Database::new()));
+    /// Builds an empty session over `db` (shared metadata, lazy face bytes).
+    fn empty_with_database(db: Arc<Database>) -> Self {
         Self {
             db,
             faces: HashMap::new(),
@@ -354,6 +326,34 @@ impl SwashSingle {
             shape_misses: 0,
             shaping_misaligned: 0,
         }
+    }
+
+    /// Deterministic test constructor without a host font scan (CTX-1026).
+    ///
+    /// The outcome-cache bound test only needs `dynamic_cache` /
+    /// `dynamic_faces` bookkeeping, never real system fonts:
+    /// [`SwashSingle::new`] reads the host index/filesystem and silently
+    /// early-returns on bare hosts, making the gate host-dependent. This
+    /// builds the same empty session over an empty database, so the test is
+    /// hermetic and never skips.
+    #[cfg(test)]
+    fn empty_for_cache_test() -> Self {
+        Self::empty_with_database(Arc::new(Database::new()))
+    }
+
+    /// Test-only constructor over an explicit metadata database (CTX-1607).
+    ///
+    /// Lets the font-index tests exercise lazy loading and fallback without
+    /// touching the process-wide cache.
+    #[cfg(test)]
+    pub(crate) fn with_database(db: Arc<Database>) -> Self {
+        Self::empty_with_database(db)
+    }
+
+    /// Test-only loaded-face count (lazy-loading assertions).
+    #[cfg(test)]
+    pub(crate) fn loaded_face_count(&self) -> usize {
+        self.faces.len()
     }
 
     /// Resolves a session handle back to its stored face.

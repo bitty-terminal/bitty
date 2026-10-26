@@ -33,13 +33,26 @@ per-cell path through `ShapedRunSource::shaping_supported`. The fallback is
 observable in startup logs, the verbose tick line, and `bitty doctor`'s
 `text-stack` row. See the `Backend selection` section in `src/lib.rs`.
 
+## Font discovery (CTX-1607)
+
+The shaped stack keeps a versioned face index at
+`$XDG_CACHE_HOME/bitty/font-index-v1`. A cold process discovers the font
+files once and parses only each face's `name`/`OS/2`/`post` tables in
+bounded parallel workers, then writes the index atomically; a warm process
+reads the cached metadata, stats each path, and reparses only changed files.
+Faces load lazily, so startup reads no font outlines. The index is ignored
+(and the upstream full scan runs) when `BITTY_FONT_INDEX=0` is set, when the
+cache root is unavailable, or when a corrupt/version-mismatched index must be
+rebuilt.
+
 ## Boundaries
 
 - Workspace-internal dependencies, per `Cargo.toml`: `bitty-term-state`,
   `bitty-platform`, and `bitty-config`.
 - Third-party dependencies, per `Cargo.toml`: `wgpu`, the shaped
-  `harfrust`/`swash`/`fontdb` stack, and the `crossfont` fallback, plus a
-  dev-dependency on `bitty-vt` for tests; no network-facing dependency is
+  `harfrust`/`swash`/`fontdb` stack, the `crossfont` fallback, and
+  `ttf-parser`/`fontconfig-parser` for the persistent discovery index, plus
+  a dev-dependency on `bitty-vt` for tests; no network-facing dependency is
   declared.
 - No upstream type appears in the public API; every upstream failure flattens
   into the owned error type.
@@ -69,6 +82,8 @@ coverage is absent.
 - `src/frame.rs` — frame planning from pixel-domain damage.
 - `src/grid.rs` and `src/grid/` — snapshot and damage to draw-record pipeline.
 - `src/atlas.rs` and `src/cache.rs` — atlas layout math and glyph cache.
+- `src/font_index.rs` — persistent versioned discovery index (cold parallel
+  metadata scan, lazy per-path rebuild, atomic write).
 - `src/glyph.rs`, `src/fallback.rs`, `src/crossfont_backend.rs` — rasterizer
   contract, font-chain fallback, and the crossfont wrapper (explicit
   fallback).

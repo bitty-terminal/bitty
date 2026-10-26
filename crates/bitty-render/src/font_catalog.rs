@@ -1,11 +1,12 @@
 //! Bounded system font discovery for `bitty list fonts` / `bitty +list-fonts`
 //! (CTX-1467, issue #2464).
 //!
-//! The catalog reuses the process-wide `fontdb` scan the shaped rasterizer
-//! already owns ([`crate::shaped`]) instead of introducing a second discovery
-//! mechanism: platform font directories plus fontconfig XML on Linux, the
-//! same faces the renderer would resolve. Nothing here opens a network
-//! connection, spawns a process, or loads a plugin VM.
+//! The catalog reuses the process-wide font-index database the shaped
+//! rasterizer already owns ([`crate::shaped`]) instead of introducing a
+//! second discovery mechanism: the same cached face metadata (platform font
+//! directories plus fontconfig XML on Linux) the renderer resolves. Nothing
+//! here opens a network connection, spawns a process, or loads a plugin VM;
+//! face bytes are not read for the catalog.
 //!
 //! # Contract
 //!
@@ -99,7 +100,8 @@ pub fn system_face_catalog(max_faces: usize, user_font_dirs: &[PathBuf]) -> Face
     }
     let cap = max_faces.min(MAX_CATALOG_FACES);
     let mut unique: BTreeSet<CatalogFace> = BTreeSet::new();
-    for face in crate::shaped::system_db().faces() {
+    let db = crate::shaped::system_db();
+    for face in db.faces() {
         let Some(family) = face.families.first().map(|(name, _)| name.as_str()) else {
             continue;
         };

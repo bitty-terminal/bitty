@@ -41,6 +41,13 @@
 //!   [`shaped::MAX_FACE_BYTES`]; discovery uses system font directories
 //!   plus fontconfig XML on Linux. 0.24 vendors its query-time parser
 //!   subset, so the fontdb path carries no external `ttf-parser` edge.
+//! - **`ttf-parser` (0.25.x) is wrapped, never adopted**, inside the
+//!   private `font_index` module: the persistent discovery index reads only
+//!   `name`/`OS/2`/`post` table metadata per face. `fontconfig-parser`
+//!   (0.5.x) supplies the Linux/BSD directory and generic-alias list. Both
+//!   crates were already in the workspace graph (through the winit
+//!   decoration and `fontdb` paths); the index adds direct pinned edges but
+//!   no upstream type appears in this crate's public API.
 //! - **`skia-safe` is rejected** per ADR-0004 and must not be introduced.
 //! - Per ADR-0004's fallback rule, if any upstream becomes unmaintained
 //!   for more than twelve months while on this hot path it must be replaced
@@ -72,6 +79,17 @@
 //! reports it in the `text-stack` row. The deterministic headless
 //! rasterizer used by golden tests is a test stack, not a production font
 //! path.
+//!
+//! Font discovery is cached for the shaped stack in
+//! `$XDG_CACHE_HOME/bitty/font-index-v1` (see `font_index`; the upstream
+//! `fontdb` scan remains the fallback): a cold process walks the font
+//! directories once and reads only the `name`/`OS/2`/`post` tables of each
+//! face in parallel, then writes a versioned index atomically; a warm process
+//! reads the cached metadata, stats each path, reparses only changed files,
+//! and builds a metadata-only `fontdb` database. Face bytes still load lazily
+//! for the faces a frame needs, and missing-glyph fallback loads a covering
+//! face on demand. `BITTY_FONT_INDEX=0` restores the upstream full scan for
+//! diagnosis. A stale, corrupt, or unwritable cache never fails startup.
 //!
 //! Both stacks must keep identical **plain-ASCII cell metrics**: glyph
 //! origins and the cell box come from the grid, and the shaped stack
@@ -208,6 +226,7 @@ pub mod crossfont_backend;
 pub mod error;
 pub mod fallback;
 pub mod font_catalog;
+mod font_index;
 pub mod frame;
 pub mod geometry;
 pub mod glyph;

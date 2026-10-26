@@ -54,6 +54,18 @@ swash = { version = "=0.2.10", default-features = false, features = ["std", "sca
 # on the fontdb path (bitty#1692; ttf-parser remains only via the
 # winit/sctk-adwaita/ab_glyph decoration path until CTX-0961).
 fontdb = { version = "=0.24.0", default-features = false, features = ["std", "fs", "fontconfig"] }
+# Persistent font-index metadata parser (CTX-1607). ttf-parser is already
+# in the dependency graph through the winit/ab_glyph decoration path; this
+# direct edge is the pinned version the index is built against. The index
+# fills fontdb `FaceInfo`s from it (fontdb itself is the authority for the
+# full-scan fallback and for the final query).
+ttf-parser = "=0.25.1"
+# Font directory + generic-alias discovery for the font index on Linux/BSD.
+# Already in the graph through fontdb's `fontconfig` feature; pinned here so
+# the index sees the same directory list as `fontdb::Database::load_system_fonts`.
+# PATCHES (CTX-1607): the persistent index is additive; setting
+# `BITTY_FONT_INDEX=0` restores the upstream full scan for diagnosis.
+fontconfig-parser = "=0.5.8"
 
 
 [dev-dependencies]

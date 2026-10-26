@@ -33,10 +33,14 @@ modules:
   - name: bitty
     buildsystem: simple
     build-commands:
-      # The tar.zst bundle layout is `bin/bitty`, `share/...`, LICENSE, README.md,
-      # CHANGELOG.md, built by `scripts/make-unix-bundle.sh`.
+      # The `share/` tree carries the desktop entry, hicolor icons, and
+      # AppStream metainfo. Terminfo ships as the raw source `terminfo/bitty.ti`
+      # at the bundle ROOT (not inside share/), so it is compiled here with
+      # `tic -x`, mirroring PKGBUILD/PKGBUILD.bin/bitty.spec — ncurses cannot
+      # read a raw source entry from TERMINFO_DIRS without compilation.
       - install -Dm755 -t /app/bin bin/bitty
       - cp -a share/. /app/share/
+      - tic -x -o /app/share/terminfo terminfo/bitty.ti
     sources:
       - type: archive
         archive-type: tar-zst

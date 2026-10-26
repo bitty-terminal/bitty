@@ -26,9 +26,12 @@ comments (and this file) already document.
   `--filesystem=host-os:ro` so the terminal can see and launch host shells.
   The same pattern is used by WezTerm and GNOME Console on Flathub.
 - Module: extracts the release `.tar.zst` bundle with
-  `strip-components: 1` (bundle layout: `bin/bitty`, `share/...`), installs
-  `bin/bitty` into `/app/bin`, and copies `share/` into `/app/share`, which
-  carries the desktop entry, hicolor icons, AppStream metainfo, and terminfo.
+  `strip-components: 1` (bundle layout: `bin/bitty`, `share/...`,
+  root-level `terminfo/bitty.ti`), installs
+  `bin/bitty` into `/app/bin`, copies `share/` (desktop entry, hicolor
+  icons, AppStream metainfo) into `/app/share`, and compiles the terminfo
+  entry with `ncurses` `tic -x -o /app/share/terminfo terminfo/bitty.ti`
+  (the same pattern PKGBUILD/bitty.spec use).
 
 ## Submission checklist (owner)
 

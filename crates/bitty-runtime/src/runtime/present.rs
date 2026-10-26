@@ -8159,6 +8159,13 @@ mod tiled_drag_present_tests {
     //! byte-identical to a forced full render on every motion, including the
     //! live drag-ring animation, and the renderer counters prove the work
     //! stays bounded instead of scaling with the visible cell area.
+    //!
+    //! Exact equality is sound because every event here rides the
+    //! virtual-clock seams (`tick_at`, `handle_cursor_moved_at`,
+    //! `handle_mouse_input_at`): the drop's geometry transition starts at the
+    //! release instant, never at the wall clock (CTX-1594, issue #2703). The
+    //! seam itself is pinned by
+    //! `tiled_drag_move::release_commits_the_drop_on_the_supplied_clock`.
     use super::*;
     use crate::SplitAxis;
     use bitty_platform::{KeyEvent, KeyLocation, MouseButton, MouseEvent, NamedKey, PressState};
@@ -8230,6 +8237,125 @@ mod tiled_drag_present_tests {
         MouseEvent::new(button, state)
     }
 
+    /// Painted frame origins for one runtime, flagging every pane whose
+    /// painted rectangle differs from its committed one (an in-flight
+    /// geometry transition).
+    fn painted_frames(rt: &Runtime, now: std::time::Instant) -> String {
+        let committed = rt.present_frames();
+        let painted = rt.paint_frames_at(now);
+        let frames: Vec<String> = painted
+            .iter()
+            .map(|frame| {
+                let base = committed
+                    .iter()
+                    .find(|base| base.view == frame.view)
+                    .map(|base| base.frame);
+                match base {
+                    Some(base) if base == frame.frame => format!(
+                        "{:?} committed ({},{})",
+                        frame.view, frame.frame.x, frame.frame.y
+                    ),
+                    Some(base) => format!(
+                        "{:?} painted ({},{}) != committed ({},{})",
+                        frame.view, frame.frame.x, frame.frame.y, base.x, base.y
+                    ),
+                    None => format!(
+                        "{:?} painted ({},{}) with no committed frame",
+                        frame.view, frame.frame.x, frame.frame.y
+                    ),
+                }
+            })
+            .collect();
+        format!("[{}]", frames.join("; "))
+    }
+
+    /// Compares the two runtimes' presented frames without dumping
+    /// multi-megabyte buffers.
+    ///
+    /// A mismatch reports the differing pixel count, the worst per-channel
+    /// delta, the first differing pixel with both colors, the bounding box,
+    /// and the per-pane distribution, so a CI failure names the divergent
+    /// region. The painted geometry is included because CTX-1594 (issue
+    /// #2703) was a wall-clock leak in the drop seam: both runtimes painted a
+    /// *mid-transition* commit frame whose offsets depended on real elapsed
+    /// time, which the pixel numbers alone cannot distinguish from a stale
+    /// retained leaf.
+    fn assert_frames_match(
+        label: &str,
+        fast: &Runtime,
+        full: &Runtime,
+        now: std::time::Instant,
+        context: &str,
+    ) {
+        let (fast_rgba, full_rgba) = (fast.headless_rgba(), full.headless_rgba());
+        if fast_rgba == full_rgba {
+            return;
+        }
+        let (Some(a), Some(b)) = (fast_rgba.as_ref(), full_rgba.as_ref()) else {
+            panic!("{label}: frame mismatch with no rgba on one side");
+        };
+        assert_eq!(a.len(), b.len(), "{label}: frame byte lengths differ");
+        let w = fast.present_plan_extent().width as usize;
+        let panes: Vec<_> = fast
+            .present_frames()
+            .into_iter()
+            .map(|frame| (frame.view, frame.content))
+            .collect();
+        let (mut differing, mut worst) = (0usize, 0u8);
+        let (mut first, mut bbox) = (None, (usize::MAX, usize::MAX, 0usize, 0usize));
+        let mut per_pane = vec![0usize; panes.len()];
+        for (index, (l, r)) in a.chunks_exact(4).zip(b.chunks_exact(4)).enumerate() {
+            let delta = l
+                .iter()
+                .zip(r.iter())
+                .map(|(x, y)| x.abs_diff(*y))
+                .max()
+                .unwrap_or(0);
+            if delta == 0 {
+                continue;
+            }
+            differing += 1;
+            worst = worst.max(delta);
+            first.get_or_insert(index);
+            let (px, py) = (index % w, index / w);
+            bbox = (
+                bbox.0.min(px),
+                bbox.1.min(py),
+                bbox.2.max(px),
+                bbox.3.max(py),
+            );
+            let hit = per_pane
+                .iter_mut()
+                .zip(panes.iter())
+                .find(|(_, (_, rect))| {
+                    (px as i32) >= rect.x
+                        && (py as i32) >= rect.y
+                        && (px as i32) < rect.x + rect.width as i32
+                        && (py as i32) < rect.y + rect.height as i32
+                });
+            if let Some((slot, _)) = hit {
+                *slot += 1;
+            }
+        }
+        let first = first.unwrap_or(0);
+        let (fx, fy) = (first % w, first / w);
+        panic!(
+            "{label}: {differing} px differ (worst {worst} LSB), first at ({fx},{fy}) = {:?} vs {:?}, \
+             bbox x {}..={} y {}..={}, pane diffs {per_pane:?} for {panes:?};\n\
+             painted now: fast {}, full {}; drag active: fast {} full {};\n{context}",
+            &a[first * 4..first * 4 + 4],
+            &b[first * 4..first * 4 + 4],
+            bbox.0,
+            bbox.2,
+            bbox.1,
+            bbox.3,
+            painted_frames(fast, now),
+            painted_frames(full, now),
+            fast.tiled_drag_active(),
+            full.tiled_drag_active(),
+        );
+    }
+
     #[test]
     fn drag_fast_frames_match_a_forced_full_render_every_motion() {
         let (mut fast, mut full) = (drag_runtime(), drag_runtime());
@@ -8244,11 +8370,7 @@ mod tiled_drag_present_tests {
         let grab_fast = fast.tick_at(t0).expect("grab frame");
         full.pending_full_redraw = true;
         full.tick_at(t0).expect("grab reference");
-        assert_eq!(
-            fast.headless_rgba(),
-            full.headless_rgba(),
-            "grab frame must match the forced full render"
-        );
+        assert_frames_match("grab frame", &fast, &full, t0, "");
 
         let steps = 24u64;
         for step in 1..=steps {
@@ -8264,27 +8386,7 @@ mod tiled_drag_present_tests {
             full.pending_full_redraw = true;
             let fast_stats = fast.tick_at(t).expect("fast drag frame");
             let full_stats = full.tick_at(t).expect("full drag reference");
-            let (fast_rgba, full_rgba) = (fast.headless_rgba(), full.headless_rgba());
-            if fast_rgba != full_rgba {
-                if let (Some(a), Some(b)) = (fast_rgba.as_ref(), full_rgba.as_ref()) {
-                    let w = fast.present_plan_extent().width as usize;
-                    let first = a
-                        .iter()
-                        .zip(b.iter())
-                        .position(|(x, y)| x != y)
-                        .unwrap_or(usize::MAX);
-                    panic!(
-                        "step {step}: first diff byte {first} (px {},{}); fast cells {} full cells {}; fast={:?} full={:?}",
-                        (first / 4) % w,
-                        (first / 4) / w,
-                        fast_stats.cells_examined,
-                        full_stats.cells_examined,
-                        &a[first..first + 4],
-                        &b[first..first + 4],
-                    );
-                }
-                panic!("step {step}: drag frame mismatch with no rgba on one side");
-            }
+            assert_frames_match(&format!("drag step {step}"), &fast, &full, t, "");
             assert!(
                 fast_stats.cells_examined <= 4,
                 "step {step}: drag motion must reuse retained leaves, got {} cells",
@@ -8313,20 +8415,28 @@ mod tiled_drag_present_tests {
         );
 
         // Release commits one swap/insert and the committed frame must again
-        // match a full render.
+        // match a full render. The drop arms its geometry transition at the
+        // release instant (not the wall clock), so both runtimes paint the
+        // same start-of-transition bounds and exact equality is expected.
+        let last_drag_fast = fast.headless_rgba();
+        let last_drag_full = full.headless_rgba();
         let release_at = t0 + std::time::Duration::from_millis((steps + 1) * 16);
         for rt in [&mut fast, &mut full] {
             rt.handle_mouse_input_at(mouse(MouseButton::Left, PressState::Released), release_at);
             rt.handle_key_event(alt(PressState::Released));
         }
         full.pending_full_redraw = true;
-        fast.tick_at(release_at).expect("commit frame");
-        full.tick_at(release_at).expect("commit reference");
-        assert_eq!(
-            fast.headless_rgba(),
-            full.headless_rgba(),
-            "the committed drop must match a full render"
+        let commit_fast = fast.tick_at(release_at).expect("commit frame");
+        let commit_full = full.tick_at(release_at).expect("commit reference");
+        let context = format!(
+            "commit frame work: fast {} cells, full {} cells; commit frame equals the last drag \
+             frame: fast {}, full {}",
+            commit_fast.cells_examined,
+            commit_full.cells_examined,
+            fast.headless_rgba() == last_drag_fast,
+            full.headless_rgba() == last_drag_full,
         );
+        assert_frames_match("committed drop", &fast, &full, release_at, &context);
         assert!(
             !fast.tiled_drag_active(),
             "release must end the drag before the commit frame"

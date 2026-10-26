@@ -2691,7 +2691,7 @@ mod tests {
                 // query compatibility, not insertion order: require the same
                 // family and the same style axes, not the same file.
                 assert!(
-                    has_family(&index_info),
+                    has_family(index_info),
                     "index face for {family:?} must belong to the family"
                 );
                 assert_eq!(index_info.style, full_info.style);

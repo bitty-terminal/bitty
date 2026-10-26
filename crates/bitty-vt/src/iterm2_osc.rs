@@ -110,6 +110,16 @@ const MAX_REPLAY_BYTES: usize = ITERM2_OSC_PREFIX.len() + 2;
 /// `Vec::push` doubling reaches (CTX-1590 review follow-up).
 const BODY_RESERVE_MIN: usize = 4 * 1024;
 
+/// Slack the capacity assertions allow above [`ITERM2_OSC_MAX_BODY_BYTES`].
+///
+/// `Vec::reserve_exact` documents only *at least* the requested capacity; the
+/// tighter "never above the cap" bound is an implementation property of std's
+/// `RawVec::grow_exact`, which records the request as the exact capacity. One
+/// growth step of slack keeps the tests honest about the documented contract
+/// while still failing a bare `Vec::push` doubling (~2x the cap).
+#[cfg(test)]
+pub(crate) const BODY_CAPACITY_SLACK: usize = BODY_RESERVE_MIN;
+
 /// Why one `OSC 1337 ; File=` request was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Iterm2Reject {
@@ -815,12 +825,14 @@ mod tests {
             assert_eq!(scanner.push(b'A'), OscOutcome::Consumed);
         }
         assert_eq!(scanner.buffered_body_len(), ITERM2_OSC_MAX_BODY_BYTES);
-        // `Vec::push` doubling alone would reach ~2x the cap here.
+        // `Vec::push` doubling alone would reach ~2x the cap here; the bound
+        // checked is the cap plus the documented slack (see
+        // `BODY_CAPACITY_SLACK`).
+        let bound = ITERM2_OSC_MAX_BODY_BYTES + BODY_CAPACITY_SLACK;
         assert!(
-            scanner.buffered_body_capacity() <= ITERM2_OSC_MAX_BODY_BYTES,
-            "body capacity {} must not exceed the {}-byte cap",
-            scanner.buffered_body_capacity(),
-            ITERM2_OSC_MAX_BODY_BYTES
+            scanner.buffered_body_capacity() <= bound,
+            "body capacity {} must stay within the {bound}-byte bound",
+            scanner.buffered_body_capacity()
         );
     }
 

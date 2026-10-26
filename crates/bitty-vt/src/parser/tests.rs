@@ -3205,6 +3205,46 @@ fn unterminated_dcs_is_closed_before_a_diverted_image() {
 }
 
 #[test]
+fn escape_del_before_a_diverted_image_keeps_the_escape_state() {
+    // `vte` does not dispatch `0x7F` from `Escape` (`advance_esc`'s `_ => ()`
+    // arm), so the tracker must stay in `Escape`: the diversion has to close
+    // it with `ESC \` instead of letting the image's own `ESC` be swallowed
+    // and mis-parsing the following text as an ESC dispatch.
+    let mut stream = b"\x1b\x7f".to_vec();
+    stream.extend_from_slice(iterm2_wire("inline=1", &ITERM2_PNG_1X1).as_bytes());
+    stream.extend_from_slice(b"ok");
+    let expected = vec![
+        iterm2_image(0, 0),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    assert_split_invariant(&stream, &expected);
+}
+
+#[test]
+fn escape_non_printing_prefix_bracket_before_a_diverted_image_dispatches_the_osc() {
+    // `ESC` + a non-dispatchable byte leaves `vte` in `Escape`; a raw `]`
+    // then opens a real (empty) OSC. The next image must dispatch it, not
+    // swallow it, and the trailing text must print. `0x7F` and a non-ASCII
+    // `é` (`0xC3 0xA9`) both take that path.
+    let expected = vec![
+        TerminalAction::OscUnknown {
+            id: u32::MAX,
+            data: BoundedBytes::new(Vec::new()),
+        },
+        iterm2_image(0, 0),
+        TerminalAction::Print(GraphemeCell::from('o')),
+        TerminalAction::Print(GraphemeCell::from('k')),
+    ];
+    for prefix in [&b"\x1b\x7f]"[..], &b"\x1b\xc3\xa9]"[..]] {
+        let mut stream = prefix.to_vec();
+        stream.extend_from_slice(iterm2_wire("inline=1", &ITERM2_PNG_1X1).as_bytes());
+        stream.extend_from_slice(b"ok");
+        assert_split_invariant(&stream, &expected);
+    }
+}
+
+#[test]
 fn image_after_aborted_apc_is_admitted() {
     // MF-2: `ESC _ G x` is an APC with junk control bytes. Its aborting
     // `ESC` must not hand `]1337;File=` to `vte` as an OSC.
@@ -3248,9 +3288,14 @@ fn osc1337_body_cap_bounds_the_parser_body_behind_an_aborted_apc() {
     parser.advance(&filler, |action| actions.push(action));
     assert!(actions.is_empty());
     assert_eq!(parser.iterm2.buffered_body_len(), cap);
+    // `reserve_exact` promises only *at least* the requested capacity; the
+    // tighter cap bound is a std `RawVec::grow_exact` implementation property,
+    // so the assertion allows one documented growth step of slack
+    // (`BODY_CAPACITY_SLACK`) and still rejects a bare `Vec::push` doubling.
+    let bound = cap + crate::iterm2_osc::BODY_CAPACITY_SLACK;
     assert!(
-        parser.iterm2.buffered_body_capacity() <= cap,
-        "body capacity {} must stay within the {cap}-byte cap",
+        parser.iterm2.buffered_body_capacity() <= bound,
+        "body capacity {} must stay within the {bound}-byte bound",
         parser.iterm2.buffered_body_capacity()
     );
     // One byte past the cap trips the bound and releases the buffer.

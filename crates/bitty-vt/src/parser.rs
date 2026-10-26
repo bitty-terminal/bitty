@@ -145,16 +145,18 @@ impl VteString {
                     Self::Ground
                 }
             }
-            // `advance_esc`: `ESC` stays, C0/CAN/SUB behave as anywhere,
-            // `]` opens an OSC, `P`/`X`/`^`/`_` open a string, and every
-            // other byte dispatches, starts a CSI/charset, or collects an
-            // intermediate, none of which a string can start from.
+            // `advance_esc`: `ESC` stays, `CAN`/`SUB` execute and return to
+            // Ground, `]` opens an OSC, `P`/`X`/`^`/`_` open a string, and
+            // every other dispatchable or collectable byte lands outside a
+            // string. `0x7F`/`0x80..=0xFF` are *not* dispatchable: `vte`'s
+            // `_ => ()` arm keeps them in `Escape`, so the tracker must too,
+            // or a following raw `]` opens an unobserved OSC string.
             Self::Escape => match byte {
                 0x1B => Self::Escape,
                 0x18 | 0x1A => Self::Ground,
                 b']' => Self::Osc,
                 b'P' | b'X' | b'^' | b'_' => Self::Other,
-                0x00..=0x17 | 0x19 | 0x1C..=0x2F => Self::Escape,
+                0x00..=0x17 | 0x19 | 0x1C..=0x2F | 0x7F..=0xFF => Self::Escape,
                 _ => Self::Ground,
             },
             // `advance_osc_string`: collected until `BEL`/`CAN`/`SUB`/`ESC`.

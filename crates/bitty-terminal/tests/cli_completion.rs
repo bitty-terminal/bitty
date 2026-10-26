@@ -352,6 +352,52 @@ fn every_subcommand_is_completed_per_shell() {
 }
 
 #[test]
+fn profile_verbs_offer_json_after_the_verb() {
+    // `config profile list --json` is valid, but the alias used to be offered
+    // only at the `config profile` group node. Every state-reporting verb now
+    // carries its own grammar node with `--json`; operand slots stay unknown,
+    // so the alias is never suggested after a NAME/PATH/VALUE operand.
+    let verbs = [
+        "create", "clone", "rename", "delete", "list", "show", "use", "get", "set", "path",
+    ];
+    for shell in SHELLS {
+        let script = stdout(&run_bitty(&["completion", shell]));
+        for verb in verbs {
+            let path = format!("config profile {verb}");
+            let (marker, nushell) = match shell {
+                "bash" | "zsh" => (format!("\"{path}\")"), false),
+                "fish" => (format!("case '{path}'"), false),
+                "powershell" => (format!("'{path}' = @("), false),
+                "nushell" => (format!("extern \"bitty {path}\" ["), true),
+                other => panic!("unexpected shell {other}"),
+            };
+            let start = script
+                .rfind(&marker)
+                .unwrap_or_else(|| panic!("{shell}: no grammar node for {path}"));
+            let rest = &script[start..];
+            let block = if nushell {
+                let end = rest.find("\n]\n").map_or(rest.len(), |index| index + 2);
+                &rest[..end]
+            } else if shell == "fish" {
+                // Fish puts the case label and its candidate list on
+                // consecutive lines.
+                let end = rest
+                    .match_indices('\n')
+                    .nth(1)
+                    .map_or(rest.len(), |(index, _)| index);
+                &rest[..end]
+            } else {
+                rest.lines().next().expect("node line")
+            };
+            assert!(
+                block.contains("--json"),
+                "{shell}: {path} must offer --json after the verb: {block}"
+            );
+        }
+    }
+}
+
+#[test]
 fn completion_rejects_usage_errors() {
     for args in [
         vec!["completion"],

@@ -591,6 +591,456 @@ extern "bitty config profile" [
     --no-print-shell-init
     --no-shell-init
 ]
+extern "bitty config profile create" [
+    --json
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty config profile clone" [
+    --json
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty config profile rename" [
+    --json
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty config profile delete" [
+    --json
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty config profile list" [
+    --json
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty config profile show" [
+    --json
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty config profile use" [
+    --json
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty config profile get" [
+    --json
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty config profile set" [
+    --json
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
+extern "bitty config profile path" [
+    --json
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
 extern "bitty +list-themes" [
     --format: string
     --safe
@@ -2037,16 +2487,6 @@ extern "bitty config check" []
 extern "bitty config show" []
 extern "bitty config validate" []
 extern "bitty config edit" []
-extern "bitty config profile create" []
-extern "bitty config profile clone" []
-extern "bitty config profile rename" []
-extern "bitty config profile delete" []
-extern "bitty config profile list" []
-extern "bitty config profile show" []
-extern "bitty config profile use" []
-extern "bitty config profile get" []
-extern "bitty config profile set" []
-extern "bitty config profile path" []
 extern "bitty list themes" []
 extern "bitty list colors" []
 extern "bitty list fonts" []

@@ -245,6 +245,21 @@ pub(crate) fn nodes() -> Vec<Node> {
         &["--json"],
         false,
     );
+    // Every profile verb reports state and accepts `--json`, so the alias is
+    // offered after the verb as well as at the group node: `config profile
+    // list --json` is valid but got no completion when only the group knew
+    // the flag. Operand slots have no grammar node, so `config profile set
+    // font.size <TAB>` still offers nothing (the alias never appears after an
+    // operand).
+    for (name, _) in ProfileVerb::VERBS {
+        push_node(
+            &mut nodes,
+            &child("config profile", name),
+            Vec::new(),
+            &["--json"],
+            false,
+        );
+    }
     for (name, action) in PlusAction::ALL {
         push_node(&mut nodes, name, Vec::new(), action.flags(), false);
     }
@@ -497,6 +512,26 @@ mod tests {
                 .contains(&"--json"),
             "config profile offers its --json alias"
         );
+        for (name, _) in ProfileVerb::VERBS {
+            let path = child("config profile", name);
+            let node = candidates_for(&path).unwrap_or_else(|| panic!("missing {path}"));
+            assert!(
+                node.contains(&"--json"),
+                "{path} must offer its --json alias after the verb"
+            );
+        }
+        // Operand slots are not grammar nodes, so `--json` is never suggested
+        // once a NAME/PATH/VALUE operand has been typed.
+        for path in [
+            "config profile set font.size",
+            "config profile show work",
+            "config profile rename old new",
+        ] {
+            assert!(
+                candidates_for(path).is_none(),
+                "{path} must not be a completion node"
+            );
+        }
         for (name, verbs) in CTL_RESOURCES {
             let parent = candidates_for("ctl").expect("ctl node");
             assert!(parent.contains(name), "ctl missing resource {name}");

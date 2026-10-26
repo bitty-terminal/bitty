@@ -62,6 +62,21 @@ function __bitty_complete
         return 0
     end
     set -l path (__bitty_path)
+    # Operand slots are not grammar keys, so their dynamic candidates run
+    # first; a flag-prefixed token falls through to the static node below so
+    # `config profile show --json` still completes.
+    switch "$path"
+        case 'plugin enable' 'plugin disable'
+            if not string match -q -- '-*' "$cur"
+                __bitty_installed_plugins
+                return 0
+            end
+        case 'config profile show' 'config profile use' 'config profile path' 'config profile get' 'config profile clone' 'config profile delete' 'config profile rename'
+            if not string match -q -- '-*' "$cur"
+                __bitty_profiles
+                return 0
+            end
+    end
     switch "$path"
         case ''
             printf '%s\n' run ctl config cfg init doctor list ls inspect dev plugin extension version completion comp cmd x shell-init help +list-themes +list-colors +list-fonts +list-keybinds +list-actions +list-plugins +list-extensions +show-config +validate-config +edit-config --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
@@ -89,6 +104,26 @@ function __bitty_complete
             printf '%s\n' path check show validate edit profile --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
         case 'config profile'
             printf '%s\n' create clone rename delete list show use get set path --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'config profile create'
+            printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'config profile clone'
+            printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'config profile rename'
+            printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'config profile delete'
+            printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'config profile list'
+            printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'config profile show'
+            printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'config profile use'
+            printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'config profile get'
+            printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'config profile set'
+            printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'config profile path'
+            printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
         case '+list-themes'
             printf '%s\n' --format --safe --no-color --help --version --verbose --log-level --headless --test-mode --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --socket --instance --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
         case '+list-colors'
@@ -153,14 +188,6 @@ function __bitty_complete
             printf '%s\n' themes colors fonts plugins instances actions keymaps services --format --socket --instance --no-color --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
         case 'comp'
             printf '%s\n' bash zsh fish powershell nushell --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
-        case 'plugin enable' 'plugin disable'
-            if not string match -q -- '-*' "$cur"
-                __bitty_installed_plugins
-            end
-        case 'config profile show' 'config profile use' 'config profile path' 'config profile get' 'config profile clone' 'config profile delete' 'config profile rename'
-            if not string match -q -- '-*' "$cur"
-                __bitty_profiles
-            end
         case '*'
             return 0
     end

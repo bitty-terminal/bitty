@@ -1922,10 +1922,14 @@ mod tests {
                 std::fs::set_permissions(&changed, permissions).expect("clear read-only");
             }
         }
-        std::fs::File::open(&changed)
-            .expect("open changed")
-            .set_modified(future)
-            .expect("set mtime");
+        #[cfg(windows)]
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&changed)
+            .expect("open changed for write");
+        #[cfg(not(windows))]
+        let file = std::fs::File::open(&changed).expect("open changed");
+        file.set_modified(future).expect("set mtime");
         let second = load_or_build_with(&root, || {
             discovery_calls.set(discovery_calls.get() + 1);
             discovered(vec![changed.clone(), stable.clone()])

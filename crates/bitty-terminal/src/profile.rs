@@ -1007,7 +1007,7 @@ fn run_set(
     })?;
     let path = profile_path(dir, &name);
     ensure_present("set", &name, &path)?;
-    let (content, identity) = read_profile("set", &name, &path)?;
+    let (content, identity) = read_profile(ReadIntent::Edit, &name, &path)?;
     // Seed-only view: the profile chain restricted to its own layers. A leaf
     // that is invalid in isolation (for example an outline color the selector
     // overrides) must still be pinnable, so this merge does not validate; the
@@ -1084,8 +1084,8 @@ fn run_set(
         )));
     }
     write_profile_atomic(&path, &updated, Some(&identity)).map_err(|err| match err {
-        ProfileWriteError::Changed => changed_failure("set", &path),
-        ProfileWriteError::NotRegular => not_regular_failure("set", &path),
+        ProfileWriteError::Changed => changed_failure(ReadIntent::Edit, &path),
+        ProfileWriteError::NotRegular => not_regular_failure(ReadIntent::Edit, &path),
         ProfileWriteError::Io(err) => {
             io_failure("set", &format!("replace '{}'", path.display()), &err)
         }
@@ -1164,20 +1164,79 @@ fn exists_failure(verb: &str, name: &str, path: &Path) -> Failure {
     ))
 }
 
+/// What a caller read a profile for, which selects the refusal wording.
+///
+/// [`read_profile`] is shared by `set` (which replaces the bytes it read) and
+/// `clone` (which only copies them into a new profile). A read-only copy that
+/// reported "refusing to overwrite the concurrent edit" would describe an
+/// action the command never takes, so the intent supplies the sub-verb and the
+/// refusal clauses.
+#[derive(Debug, Clone, Copy)]
+enum ReadIntent {
+    /// Read to rewrite the same file (`set`); the preimage is compared before
+    /// the replace commits.
+    Edit,
+    /// Read to copy the bytes elsewhere (`clone`); the source is never written.
+    Copy,
+}
+
+impl ReadIntent {
+    /// Sub-verb of the command that performs the read.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Edit => "set",
+            Self::Copy => "clone",
+        }
+    }
+
+    /// Clause after the path when the preimage moved under the command.
+    fn changed_clause(self) -> &'static str {
+        match self {
+            Self::Edit => {
+                "changed while editing; refusing to overwrite the concurrent edit (re-run the \
+                 command on the current file)"
+            }
+            Self::Copy => {
+                "changed while copying; refusing to copy the concurrent change (re-run the \
+                 command on the current source)"
+            }
+        }
+    }
+
+    /// Clause after the path when the entry is not a regular file.
+    fn not_regular_clause(self) -> &'static str {
+        match self {
+            Self::Edit => "is not a regular file; refusing to edit it",
+            Self::Copy => "is not a regular file; refusing to copy it",
+        }
+    }
+
+    /// Size-bound refusal tail (that message already names the profile).
+    fn oversized_clause(self) -> &'static str {
+        match self {
+            Self::Edit => "refusing to edit it",
+            Self::Copy => "refusing to copy it",
+        }
+    }
+}
+
 /// Preimage-changed conflict: the file moved under the command's feet.
-fn changed_failure(verb: &str, path: &Path) -> Failure {
+fn changed_failure(intent: ReadIntent, path: &Path) -> Failure {
     Failure::conflict(format!(
-        "bitty config profile {verb}: '{}' changed while editing; refusing to overwrite the \
-         concurrent edit (re-run the command on the current file)",
-        path.display()
+        "bitty config profile {}: '{}' {}",
+        intent.verb(),
+        path.display(),
+        intent.changed_clause()
     ))
 }
 
 /// A raced entry that is no longer a regular file (FIFO, device, directory).
-fn not_regular_failure(verb: &str, path: &Path) -> Failure {
+fn not_regular_failure(intent: ReadIntent, path: &Path) -> Failure {
     Failure::conflict(format!(
-        "bitty config profile {verb}: '{}' is not a regular file; refusing to edit it",
-        path.display()
+        "bitty config profile {}: '{}' {}",
+        intent.verb(),
+        path.display(),
+        intent.not_regular_clause()
     ))
 }
 
@@ -1397,11 +1456,23 @@ fn open_profile_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Whether an open failure is `O_NOFOLLOW` refusing a final-component symlink.
 ///
-/// Rust maps `ELOOP` to `ErrorKind::FilesystemLoop` only on recent toolchains
-/// and not through every layer, so compare the raw errno the flag defines.
+/// The errno is not portable: Linux, macOS, and OpenBSD report `ELOOP`, while
+/// FreeBSD and DragonFly report `EMLINK` and NetBSD reports `EFTYPE` for the
+/// same refusal. Rust maps `ELOOP` to `ErrorKind::FilesystemLoop` only on
+/// recent toolchains and not through every layer, so compare the raw errno
+/// each platform's `O_NOFOLLOW` actually defines.
 #[cfg(unix)]
 fn is_symlink_refusal(err: &std::io::Error) -> bool {
-    err.raw_os_error() == Some(nix::libc::ELOOP)
+    /// Every errno this platform's `O_NOFOLLOW` open reports for a symlink
+    /// final component.
+    #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+    const NOFOLLOW_REFUSALS: &[std::os::raw::c_int] = &[nix::libc::ELOOP, nix::libc::EMLINK];
+    #[cfg(target_os = "netbsd")]
+    const NOFOLLOW_REFUSALS: &[std::os::raw::c_int] = &[nix::libc::ELOOP, nix::libc::EFTYPE];
+    #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly", target_os = "netbsd")))]
+    const NOFOLLOW_REFUSALS: &[std::os::raw::c_int] = &[nix::libc::ELOOP];
+    err.raw_os_error()
+        .is_some_and(|errno| NOFOLLOW_REFUSALS.contains(&errno))
 }
 
 /// Non-Unix open path performs no `O_NOFOLLOW` check.
@@ -1426,13 +1497,21 @@ fn is_regular_profile_file(metadata: &std::fs::Metadata) -> bool {
 /// A path re-stat after the read could observe a different file than the one
 /// actually read (a replacement between `stat` and `read`), which is exactly
 /// the lost-update this identity exists to detect.
-fn read_profile(verb: &str, name: &str, path: &Path) -> Result<(String, ProfileIdentity), Failure> {
+///
+/// `intent` only selects the refusal wording: `clone` never writes the source
+/// it reads, so none of its refusals may claim an edit is being abandoned.
+fn read_profile(
+    intent: ReadIntent,
+    name: &str,
+    path: &Path,
+) -> Result<(String, ProfileIdentity), Failure> {
+    let verb = intent.verb();
     let file = match open_profile_no_follow(path) {
         Ok(file) => file,
         // The entry became a symlink after `ensure_present` checked it: the
-        // file the caller is editing is gone, so this is the conflict class,
-        // not a generic read failure.
-        Err(err) if is_symlink_refusal(&err) => return Err(changed_failure(verb, path)),
+        // exact file the caller meant to read is gone, so this is the conflict
+        // class, not a generic read failure.
+        Err(err) if is_symlink_refusal(&err) => return Err(changed_failure(intent, path)),
         Err(err) => {
             return Err(io_failure(
                 verb,
@@ -1445,12 +1524,13 @@ fn read_profile(verb: &str, name: &str, path: &Path) -> Result<(String, ProfileI
         .metadata()
         .map_err(|err| io_failure(verb, &format!("inspect '{}'", path.display()), &err))?;
     if !is_regular_profile_file(&meta) {
-        return Err(not_regular_failure(verb, path));
+        return Err(not_regular_failure(intent, path));
     }
     if meta.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
         return Err(Failure::invalid(format!(
-            "bitty config profile {verb}: profile '{name}' exceeds {} bytes; refusing to edit it",
-            bitty_config::file::MAX_CONFIG_FILE_BYTES
+            "bitty config profile {verb}: profile '{name}' exceeds {} bytes; {}",
+            bitty_config::file::MAX_CONFIG_FILE_BYTES,
+            intent.oversized_clause()
         )));
     }
     let identity = ProfileIdentity::from_metadata(&meta);
@@ -1464,8 +1544,9 @@ fn read_profile(verb: &str, name: &str, path: &Path) -> Result<(String, ProfileI
         .map_err(|err| io_failure(verb, &format!("read '{}'", path.display()), &err))?;
     if content.len() as u64 > limit {
         return Err(Failure::invalid(format!(
-            "bitty config profile {verb}: profile '{name}' exceeds {} bytes; refusing to edit it",
-            bitty_config::file::MAX_CONFIG_FILE_BYTES
+            "bitty config profile {verb}: profile '{name}' exceeds {} bytes; {}",
+            bitty_config::file::MAX_CONFIG_FILE_BYTES,
+            intent.oversized_clause()
         )));
     }
     Ok((content, identity))
@@ -1504,7 +1585,7 @@ struct CloneSource {
 fn read_clone_source(dir: &Path, src: &str, src_path: &Path) -> Result<CloneSource, Failure> {
     // Clone creates a new destination exclusively, so the source identity is
     // not used: a source edit only changes the bytes being copied.
-    let (content, _identity) = read_profile("clone", src, src_path)?;
+    let (content, _identity) = read_profile(ReadIntent::Copy, src, src_path)?;
     clone_source_from_content(dir, src, src_path, content)
 }
 
@@ -2349,13 +2430,21 @@ fn write_profile_atomic(
 
 /// Re-checks the preimage identity immediately before the replace commits.
 ///
-/// The current file is opened (without following a final-component symlink
-/// or blocking on a FIFO) and measured through that handle, so a replacement
-/// (new inode) and an in-place edit (same inode, new mtime or length) are
-/// both detected. A file that disappeared or became a symlink is reported as
-/// a concurrent change; a non-regular entry (FIFO, device, directory) gets
-/// its own refusal. Non-Unix open failures (for example a replaced directory
-/// on Windows) surface as the I/O class instead.
+/// The current file is measured through a fresh handle, so a replacement (new
+/// inode) and an in-place edit (same inode, new mtime or length) are both
+/// detected. A file that disappeared or became a symlink is reported as a
+/// concurrent change; a non-regular entry (FIFO, device, directory) gets its
+/// own refusal.
+///
+/// The protections differ by platform. On Unix [`open_profile_no_follow`] opens
+/// with `O_NOFOLLOW | O_NONBLOCK`, so the final component is never followed and
+/// a swapped FIFO cannot block the check; a symlink is therefore classified as
+/// [`ProfileWriteError::Changed`] and a FIFO, device, or directory as
+/// [`ProfileWriteError::NotRegular`]. The non-Unix fallback has neither flag:
+/// it follows a final-component symlink and can block on a FIFO, so only the
+/// post-open regular-file check applies there, and an entry the platform
+/// refuses to open at all (a replaced directory on Windows) surfaces as
+/// [`ProfileWriteError::Io`] instead.
 fn verify_profile_unchanged(
     path: &Path,
     expected: &ProfileIdentity,
@@ -2396,6 +2485,7 @@ thread_local! {
 /// before the commit cannot leak the closure into the next test that runs on
 /// the same thread (the serial gate reuses one thread for every test).
 #[cfg(test)]
+#[must_use = "the hook is cleared as soon as the returned guard drops"]
 fn arm_commit_hook(hook: impl FnOnce(&Path) + 'static) -> CommitHookGuard {
     PROFILE_COMMIT_HOOK.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -2407,6 +2497,7 @@ fn arm_commit_hook(hook: impl FnOnce(&Path) + 'static) -> CommitHookGuard {
 
 /// RAII holder for the armed commit hook (clears on drop).
 #[cfg(test)]
+#[must_use = "the armed hook is cleared when the guard drops"]
 struct CommitHookGuard;
 
 #[cfg(test)]
@@ -2459,6 +2550,7 @@ thread_local! {
 /// before the rename cannot leak the closure into the next test that runs on
 /// the same thread.
 #[cfg(test)]
+#[must_use = "the override is cleared as soon as the returned guard drops"]
 fn arm_rename_override(
     rename: impl FnOnce(&Path, &Path) -> std::io::Result<()> + 'static,
 ) -> RenameOverrideGuard {
@@ -2472,6 +2564,7 @@ fn arm_rename_override(
 
 /// RAII holder for the armed rename override (clears on drop).
 #[cfg(test)]
+#[must_use = "the armed override is cleared when the guard drops"]
 struct RenameOverrideGuard;
 
 #[cfg(test)]
@@ -4040,9 +4133,8 @@ mod tests {
     fn set_refuses_a_swapped_symlink_and_fifo_at_commit() {
         use std::os::unix::fs::{FileTypeExt, symlink};
 
-        // Symlink swap: `O_NOFOLLOW` refuses the final component with `ELOOP`
-        // before the identity comparison, and the link target is never read
-        // or written.
+        // Symlink swap: `O_NOFOLLOW` refuses the final component before the
+        // identity comparison, and the link target is never read or written.
         let (dir, args) = scratch_profile_root("set-symlink-swap");
         let path = dir.join("work.lua");
         let target = dir.join("target.lua");
@@ -4079,6 +4171,15 @@ mod tests {
             temp_leftovers(&dir)
         );
         let err = open_profile_no_follow(&path).expect_err("O_NOFOLLOW refuses the link");
+        // The refusal errno is platform-specific (`ELOOP` on Linux/macOS,
+        // `EMLINK` on FreeBSD/DragonFly, `EFTYPE` on NetBSD), so the portable
+        // assertion is the classification; the exact errno is pinned only
+        // where it is known.
+        assert!(
+            is_symlink_refusal(&err),
+            "the open failure is classified as a symlink refusal: {err:?}"
+        );
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert_eq!(err.raw_os_error(), Some(nix::libc::ELOOP));
         let _ = std::fs::remove_dir_all(dir.parent().expect("scratch root"));
 
@@ -4130,12 +4231,195 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().expect("scratch root"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn set_refuses_a_swapped_directory_and_keeps_it() {
+        // Directory swap: the entry stops being a regular file, so the
+        // pre-commit re-check refuses with the non-regular class (conflict,
+        // exit 2). The staged temporary file is removed and the directory the
+        // concurrent writer created is left in place.
+
+        // The internal class first, so the variant behind the CLI mapping is
+        // pinned directly.
+        let direct = scratch_dir("set-directory-swap-internal");
+        let direct_path = direct.join("work.lua");
+        std::fs::write(&direct_path, "return {}\n").expect("profile");
+        let (_, identity) = read_profile(ReadIntent::Edit, "work", &direct_path).expect("read");
+        {
+            let _commit_hook = arm_commit_hook(|path| {
+                std::fs::remove_file(path).expect("remove profile");
+                std::fs::create_dir(path).expect("directory swap");
+            });
+            let err = write_profile_atomic(&direct_path, "return {}\n", Some(&identity))
+                .expect_err("a directory at the target must refuse the replace");
+            assert!(
+                matches!(err, ProfileWriteError::NotRegular),
+                "a swapped directory is not a regular file: {err:?}"
+            );
+        }
+        assert!(direct_path.is_dir(), "the raced directory is preserved");
+        assert!(
+            temp_leftovers(&direct).is_empty(),
+            "no temporary file remains: {:?}",
+            temp_leftovers(&direct)
+        );
+        let _ = std::fs::remove_dir_all(&direct);
+
+        // Then the user-visible contract: conflict class and exit 2.
+        let (dir, args) = scratch_profile_root("set-directory-swap");
+        let path = dir.join("work.lua");
+        std::fs::write(&path, "return {}\n").expect("profile");
+        {
+            let _commit_hook = arm_commit_hook(|path| {
+                std::fs::remove_file(path).expect("remove profile");
+                std::fs::create_dir(path).expect("directory swap");
+            });
+            let failure = run_set(&args, &dir, "work", "window.padding", "8")
+                .expect_err("a directory swap must refuse the write");
+            assert_eq!(failure.code, "E_PROFILE_CONFLICT");
+            assert_eq!(failure.exit, 2);
+            assert!(
+                failure.message.contains("not a regular file"),
+                "non-regular refusal: {}",
+                failure.message
+            );
+            assert!(
+                failure.message.contains(&path.display().to_string()),
+                "names the file: {}",
+                failure.message
+            );
+        }
+        assert!(path.is_dir(), "the raced directory is preserved");
+        assert!(
+            temp_leftovers(&dir).is_empty(),
+            "no temporary file remains: {:?}",
+            temp_leftovers(&dir)
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().expect("scratch root"));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn set_refuses_a_swapped_directory_as_an_io_failure() {
+        // Non-Unix fallback: `File::open` cannot open a directory at all, so
+        // the same swap surfaces as the I/O class (exit 1) instead of
+        // `NotRegular`. The refusal still removes the staged temporary file
+        // and leaves the raced directory untouched.
+        let (dir, args) = scratch_profile_root("set-directory-swap");
+        let path = dir.join("work.lua");
+        std::fs::write(&path, "return {}\n").expect("profile");
+        {
+            let _commit_hook = arm_commit_hook(|path| {
+                std::fs::remove_file(path).expect("remove profile");
+                std::fs::create_dir(path).expect("directory swap");
+            });
+            let failure = run_set(&args, &dir, "work", "window.padding", "8")
+                .expect_err("a directory swap must refuse the write");
+            assert_eq!(failure.code, "E_PROFILE_IO");
+            assert_eq!(failure.exit, 1);
+        }
+        assert!(path.is_dir(), "the raced directory is preserved");
+        assert!(
+            temp_leftovers(&dir).is_empty(),
+            "no temporary file remains: {:?}",
+            temp_leftovers(&dir)
+        );
+        let _ = std::fs::remove_dir_all(dir.parent().expect("scratch root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clone_source_refusals_say_copy_not_edit() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch_dir("clone-refusal-wording");
+        let target = dir.join("target.lua");
+        std::fs::write(&target, "return {}\n").expect("target");
+        let link = dir.join("link.lua");
+        symlink(&target, &link).expect("symlink");
+
+        // The read-only copy path must never claim it was about to edit the
+        // source; `set` keeps the edit wording for the same entry.
+        let copy = read_profile(ReadIntent::Copy, "link", &link).expect_err("symlink source");
+        assert_eq!(copy.code, "E_PROFILE_CONFLICT");
+        assert_eq!(copy.exit, 2);
+        assert!(
+            copy.message.contains("changed while copying"),
+            "clone wording: {}",
+            copy.message
+        );
+        assert!(
+            copy.message
+                .contains("refusing to copy the concurrent change"),
+            "clone wording: {}",
+            copy.message
+        );
+        assert!(
+            !copy.message.contains("edit"),
+            "no edit wording on the copy path: {}",
+            copy.message
+        );
+        let edit = read_profile(ReadIntent::Edit, "link", &link).expect_err("symlink source");
+        assert!(
+            edit.message.contains("changed while editing"),
+            "set wording: {}",
+            edit.message
+        );
+
+        // Same split for the non-regular class: a FIFO source is refused as a
+        // copy, never as an edit.
+        let fifo = dir.join("fifo.lua");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("fifo");
+        let copy = read_profile(ReadIntent::Copy, "fifo", &fifo).expect_err("fifo source");
+        assert_eq!(copy.code, "E_PROFILE_CONFLICT");
+        assert!(
+            copy.message.contains("refusing to copy it"),
+            "clone wording: {}",
+            copy.message
+        );
+        assert!(
+            !copy.message.contains("edit"),
+            "no edit wording on the copy path: {}",
+            copy.message
+        );
+        let edit = read_profile(ReadIntent::Edit, "fifo", &fifo).expect_err("fifo source");
+        assert!(
+            edit.message.contains("refusing to edit it"),
+            "set wording: {}",
+            edit.message
+        );
+
+        // The size-bound refusal follows the same intent.
+        let oversized = dir.join("oversized.lua");
+        std::fs::write(
+            &oversized,
+            format!(
+                "-- {}\nreturn {{}}\n",
+                "x".repeat(bitty_config::file::MAX_CONFIG_FILE_BYTES)
+            ),
+        )
+        .expect("oversized profile");
+        let copy =
+            read_profile(ReadIntent::Copy, "oversized", &oversized).expect_err("oversized source");
+        assert_eq!(copy.code, "E_PROFILE_INVALID");
+        assert!(
+            copy.message.contains("refusing to copy it"),
+            "clone wording: {}",
+            copy.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn profile_identity_detects_edits_replacement_and_removal() {
         let dir = scratch_dir("profile-identity");
         let path = dir.join("work.lua");
         std::fs::write(&path, "return {}\n").expect("profile");
-        let (_, identity) = read_profile("set", "work", &path).expect("read");
+        let (_, identity) = read_profile(ReadIntent::Edit, "work", &path).expect("read");
         verify_profile_unchanged(&path, &identity).expect("unchanged bytes are accepted");
 
         // In-place edit: same handle target, different bytes.
@@ -4146,7 +4430,7 @@ mod tests {
         ));
 
         // Replacement: the path now names a different file.
-        let (_, replaced) = read_profile("set", "work", &path).expect("read");
+        let (_, replaced) = read_profile(ReadIntent::Edit, "work", &path).expect("read");
         let other = dir.join("other.lua");
         std::fs::write(&other, "return { terminal = { scrollback = 500 } }\n").expect("other");
         std::fs::rename(&other, &path).expect("replace");

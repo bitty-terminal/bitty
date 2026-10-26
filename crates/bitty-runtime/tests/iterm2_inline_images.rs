@@ -5,7 +5,7 @@
 //! a cap), bounds and decodes the payload, validates the PNG `IHDR`, and
 //! emits `Iterm2Image`; the runtime routes it to the same
 //! store/placement/present seam as kitty graphics. These tests prove the
-//! anchor cell rect, the cursor-hold rule, the counted fail-closed refusals,
+//! anchor cell rect, the cursor-advance rule, the counted fail-closed refusals,
 //! chunk-boundary robustness, and that kitty graphics does not regress.
 
 use bitty_runtime::Runtime;
@@ -67,9 +67,14 @@ fn inline_image_lands_on_the_cursor_cell_rect() {
     );
     assert!(rt.tick().is_some(), "a new placement forces a present");
     assert_eq!(rt.kitty_last_frame_images(), 1);
-    // iTerm2 inline images never advance the cursor (`C=1` on the seam).
+    // `C=0` on the seam: the cursor advances past the image like native
+    // iTerm2/imgcat (the WezTerm-only `doNotMoveCursor=1` is not admitted).
     let cursor = rt.state().cursor().position;
-    assert_eq!((cursor.col, cursor.row), (4, 2));
+    assert_eq!(
+        (cursor.col, cursor.row),
+        (6, 4),
+        "the cursor must advance past the 2x2 image (row and col past its bounds)"
+    );
 }
 
 #[test]

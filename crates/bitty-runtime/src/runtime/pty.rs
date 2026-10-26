@@ -1557,8 +1557,10 @@ impl Runtime {
             // already bounded the OSC, decoded the base64, and validated the
             // PNG `IHDR`, so the payload is store-ready. Route through the
             // same transmit-and-display seam the kitty path uses (`f=100`
-            // PNG, `a=` absent), with `C=1` so the cursor stays put as the
-            // iTerm2 protocol specifies. `cols`/`rows` are the requested cell
+            // PNG, `a=` absent), with `C=0` so the cursor advances past the
+            // image exactly like native iTerm2/imgcat (only the WezTerm-only
+            // `doNotMoveCursor=1` extension holds it, which the native path
+            // deliberately does not admit). `cols`/`rows` are the requested cell
             // span (`0` derives from pixels); the seam letterboxes a
             // two-axis box, which is exactly the admitted
             // `preserveAspectRatio=1` form. Refusals store nothing and paint
@@ -1576,7 +1578,7 @@ impl Runtime {
                     None,
                     cols,
                     rows,
-                    1,
+                    0,
                     payload,
                     0,
                     0,

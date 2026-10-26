@@ -1219,7 +1219,8 @@ pub enum TerminalAction {
     /// PNG allowlist, and emits this variant only for a fully validated
     /// image. Terminal state treats it as inert; the runtime routes it to
     /// the same store/placement/present seam as `KittyGraphics`, with the
-    /// cursor held (iTerm2 inline images never advance it).
+    /// cursor advanced past the image (`C=0`), matching native
+    /// iTerm2/imgcat behavior.
     ///
     /// `inline=1` is the only admitted form, so every emitted image paints;
     /// transmit-only (`inline=0`) requests are refused before this variant.

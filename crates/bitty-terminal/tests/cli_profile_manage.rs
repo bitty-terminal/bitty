@@ -603,11 +603,13 @@ fn set_accepts_quoted_canonical_aliases() {
 fn set_refuses_a_pin_that_would_exceed_the_line_bound() {
     let root = scratch_root("pin-line-bound");
     // The parent's roots line fits the 4096-byte bound; pinning the complete
-    // decoration table adds every other inherited leaf and does not.
-    let long = "a".repeat(1330);
+    // decoration table adds every other inherited leaf and does not. The
+    // roots are '~'-anchored so every entry parses as a valid root on both
+    // Windows and Unix while keeping the line lengths unchanged.
+    let long = "a".repeat(1329);
     let parent = format!(
-        "return {{\n    decoration = {{ background_image_roots = {{ \"/{long}\", \
-         \"/{long}b\", \"/{long}c\" }} }},\n}}\n"
+        "return {{\n    decoration = {{ background_image_roots = {{ \"~/{long}\", \
+         \"~/{long}b\", \"~/{long}c\" }} }},\n}}\n"
     );
     write_profile(&root, "parent", &parent);
     write_profile(&root, "child", "return { extends = \"parent\" }\n");

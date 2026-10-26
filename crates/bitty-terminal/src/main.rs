@@ -981,6 +981,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // CTX-1607: name the resolved text stack once at startup. The shaped
+    // stack is the default; a fallback note (crossfont/headless) is already
+    // on stderr from the runtime and is repeated here in the startup log.
+    logging::info(|| format!("bitty: text stack={}", runtime.text_stack()));
     // bitty#2486: real-GUI runs present only after PTY output has been quiet
     // for one settle window. A full-screen TUI repaint can arrive as several
     // PTY reads (the tty delivers well under one screen per read); presenting
@@ -1404,6 +1408,7 @@ fn main() {
                 std::process::exit(1);
             }
         };
+        logging::info(|| format!("bitty: text stack={}", rt.text_stack()));
         // CTX-1080: same panel-rule install as the primary path so headless
         // smoke evaluates the same spawn rules.
         rt.set_panel_spawn_rules(app_config.effective.panel_rules.clone());

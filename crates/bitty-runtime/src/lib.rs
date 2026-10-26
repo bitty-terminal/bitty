@@ -241,7 +241,8 @@ pub use config::{
     DEFAULT_STYLE_TINT_STRENGTH, MAX_BACKGROUND_IMAGE_PATH_BYTES, MAX_BACKGROUND_IMAGE_ROOTS,
     MAX_PASTE_CONFIRM_TIMEOUT_SECS, MAX_STYLE_GLOW_WIDTH_PX, MAX_STYLE_SHADOW_OFFSET_PX,
     MIN_PASTE_CONFIRM_TIMEOUT_SECS, PanelLayoutMode, RuntimeConfig, RuntimeViewBackground,
-    RuntimeViewOutline, RuntimeViewStyle, RuntimeViewTarget, ViewAppearanceRule,
+    RuntimeViewOutline, RuntimeViewStyle, RuntimeViewTarget, TEXT_STACK_ENV, TextStack,
+    TextStackPreference, ViewAppearanceRule,
 };
 pub use error::RuntimeError;
 pub use queue::{ColdEvent, ColdQueue};

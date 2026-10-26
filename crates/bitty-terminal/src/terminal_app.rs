@@ -1518,11 +1518,11 @@ impl TerminalApp {
         focused: Option<bitty_runtime::ViewId>,
         leafs: usize,
         gpu: bool,
-        crossfont: bool,
+        text_stack: bitty_runtime::TextStack,
         uptime_ms: u64,
     ) -> String {
         format!(
-            "bitty tick: t_ms={} frame={} fills={} glyphs={} headless={} gen={} presented_frames={} focused={:?} leafs={} gpu={} crossfont={} images={} images_skipped={}",
+            "bitty tick: t_ms={} frame={} fills={} glyphs={} headless={} gen={} presented_frames={} focused={:?} leafs={} gpu={} text_stack={} images={} images_skipped={}",
             uptime_ms,
             present.frame,
             present.fills,
@@ -1533,7 +1533,7 @@ impl TerminalApp {
             focused,
             leafs,
             gpu,
-            crossfont,
+            text_stack,
             present.images,
             present.images_skipped
         )
@@ -1572,7 +1572,7 @@ impl TerminalApp {
             self.runtime.focused_view(),
             self.runtime.leaf_count(),
             self.runtime.has_gpu(),
-            self.runtime.is_crossfont(),
+            self.runtime.text_stack(),
             Self::tick_uptime_ms(),
         ))
     }
@@ -4088,13 +4088,13 @@ impl TerminalApp {
                             self.runtime.attach_gpu(gpu, surface);
                             crate::logging::info(|| {
                                 format!(
-                                    "bitty: gpu attached (extent={}x{} scale={scale} dpi={} grid={}x{} crossfont={})",
+                                    "bitty: gpu attached (extent={}x{} scale={scale} dpi={} grid={}x{} text_stack={})",
                                     extent.width(),
                                     extent.height(),
                                     self.runtime.dpi_scale(),
                                     snap.width,
                                     snap.height,
-                                    self.runtime.is_crossfont()
+                                    self.runtime.text_stack()
                                 )
                             });
                         }
@@ -4512,7 +4512,8 @@ impl TerminalApp {
                             // observe with a recording double.
                             self.window.os_cursor_sink = Some(Box::new(handle.clone()));
                             self.window.handle = Some(handle);
-                            // Single-window vertical slice: try real GPU attach with crossfont atlas.
+                            // Single-window vertical slice: try real GPU attach with the
+                            // host text stack's atlas (shaped default, crossfont fallback).
                             // On headless CI this fails with NoCompatibleAdapter and we stay headless
                             // (deterministic fallback, no panic). On a real display we get a wgpu surface
                             // via winit's SurfaceTarget and present via tick.
@@ -4525,10 +4526,10 @@ impl TerminalApp {
                             }
                             crate::logging::info(|| {
                                 format!(
-                                    "bitty: window created id={} gpu={} crossfont={} focused={:?} leafs={} ime=allowed",
+                                    "bitty: window created id={} gpu={} text_stack={} focused={:?} leafs={} ime=allowed",
                                     id.get(),
                                     self.runtime.has_gpu(),
-                                    self.runtime.is_crossfont(),
+                                    self.runtime.text_stack(),
                                     self.runtime.focused_view(),
                                     self.runtime.leaf_count()
                                 )

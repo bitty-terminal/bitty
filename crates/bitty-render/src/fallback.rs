@@ -209,6 +209,19 @@ impl<R: GlyphRasterizer> FallbackRasterizer<R> {
         &self.pending_tails
     }
 
+    /// Warms every pending chain tail at the last loaded style/size.
+    ///
+    /// The shaped run path needs the tail faces *before* shaping a
+    /// non-ASCII run ([`crate::shaped::SwashSingle::shape_run`] reshapes
+    /// uncovered clusters against the supplied chain), while the per-glyph
+    /// path stays lazy (CTX-1026). Calling this from the shaped emitter on
+    /// the first non-ASCII run preserves lazy startup for ASCII sessions and
+    /// gives multi-script rows the pinned tail order instead of the dynamic
+    /// scan. Best-effort and idempotent, exactly like the internal warm path.
+    pub fn warm_tails(&mut self) {
+        self.ensure_tails_loaded();
+    }
+
     /// Loads every pending tail at the chain's style/size, best-effort.
     ///
     /// Runs once per [`load_font`](GlyphRasterizer::load_font): the first

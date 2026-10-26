@@ -4,7 +4,11 @@
 //! byte-identical logic, only module wiring changed.
 use super::band_slots::BandEdge;
 use super::*;
-use bitty_render::gpu::PresentStats as RenderPresentStats;
+use crate::config::{TextStack, TextStackPreference};
+use bitty_render::{
+    RunAttrs, ShapedBitmap, ShapedCluster, ShapedRunSource, SwashSingle,
+    gpu::PresentStats as RenderPresentStats,
+};
 use bitty_rich::kitty_seam::KittyRasterBackend as _;
 
 /// First retry delay after a failed real-GPU present (issue #2570).
@@ -98,42 +102,221 @@ impl GlyphRasterizer for HeadlessRasterizer {
     }
 }
 
-/// Owned rasterizer that can be either deterministic headless or real crossfont.
+/// Owned rasterizer for the three text stacks.
 ///
-/// Headless is the CI baseline (no font file, bit-identical everywhere).
-/// Crossfont is the vertical-slice real path (platform font stack).
-/// Both implement `GlyphRasterizer` so `GridRenderer` stays generic.
+/// Shaped (`harfrust` + `swash` + `fontdb`) is the production default
+/// (CTX-1607); crossfont is the explicit fallback and headless is the
+/// deterministic CI/golden rasterizer. All three implement
+/// [`GlyphRasterizer`] so `GridRenderer` stays generic, and the shaped
+/// variant additionally implements [`ShapedRunSource`]; the other two
+/// report `shaping_supported() == false`, which routes the grid to the
+/// per-cell path.
 #[derive(Debug)]
 pub(super) enum AnyRasterizer {
     Headless(HeadlessRasterizer),
+    Shaped(Box<SwashSingle>),
     CrossFont(Box<CrossFontRasterizer>),
-}
-
-impl AnyRasterizer {
-    pub(super) fn try_crossfont() -> Self {
-        match CrossFontRasterizer::new() {
-            Ok(cf) => Self::CrossFont(Box::new(cf)),
-            Err(_) => Self::Headless(HeadlessRasterizer::new()),
-        }
-    }
-    pub(super) fn is_crossfont(&self) -> bool {
-        matches!(self, Self::CrossFont(_))
-    }
 }
 
 impl GlyphRasterizer for AnyRasterizer {
     fn load_font(&mut self, query: &FontQuery) -> Result<FontId, RenderError> {
         match self {
             Self::Headless(r) => r.load_font(query),
+            Self::Shaped(r) => r.load_font(query),
             Self::CrossFont(r) => r.load_font(query),
         }
     }
     fn rasterize(&mut self, key: RasterKey) -> Result<Option<GlyphBitmap>, RenderError> {
         match self {
             Self::Headless(r) => r.rasterize(key),
+            Self::Shaped(r) => r.rasterize(key),
             Self::CrossFont(r) => r.rasterize(key),
         }
     }
+    fn font_metrics(
+        &mut self,
+        font: FontId,
+        point_size: f32,
+    ) -> Result<Option<bitty_render::FontMetrics>, RenderError> {
+        match self {
+            Self::Headless(r) => r.font_metrics(font, point_size),
+            Self::Shaped(r) => r.font_metrics(font, point_size),
+            Self::CrossFont(r) => r.font_metrics(font, point_size),
+        }
+    }
+    fn dynamic_face_for(&mut self, c: char, point_size: f32) -> Option<FontId> {
+        match self {
+            Self::Headless(r) => r.dynamic_face_for(c, point_size),
+            Self::Shaped(r) => r.dynamic_face_for(c, point_size),
+            Self::CrossFont(r) => r.dynamic_face_for(c, point_size),
+        }
+    }
+}
+
+impl ShapedRunSource for AnyRasterizer {
+    fn shaping_supported(&self) -> bool {
+        matches!(self, Self::Shaped(_))
+    }
+
+    fn shape_run(
+        &mut self,
+        text: &str,
+        chain: &[FontId],
+        attrs: &RunAttrs,
+    ) -> Result<Vec<ShapedCluster>, RenderError> {
+        match self {
+            Self::Shaped(inner) => {
+                <SwashSingle as ShapedRunSource>::shape_run(inner, text, chain, attrs)
+            }
+            _ => Err(RenderError::InvalidInput {
+                reason: "text stack does not shape runs",
+            }),
+        }
+    }
+
+    fn rasterize_shaped_cached_ref(
+        &mut self,
+        face: FontId,
+        glyph_id: u16,
+        point_size: f32,
+        features: &[bitty_config::types::OpenTypeFeature],
+    ) -> Result<Option<ShapedBitmap<'_>>, RenderError> {
+        match self {
+            Self::Shaped(inner) => <SwashSingle as ShapedRunSource>::rasterize_shaped_cached_ref(
+                inner, face, glyph_id, point_size, features,
+            ),
+            _ => Err(RenderError::InvalidInput {
+                reason: "text stack does not rasterize shaped glyphs",
+            }),
+        }
+    }
+
+    fn note_misaligned(&mut self) {
+        if let Self::Shaped(inner) = self {
+            <SwashSingle as ShapedRunSource>::note_misaligned(inner);
+        }
+    }
+
+    fn shape_stats(&self) -> (u64, u64) {
+        match self {
+            Self::Shaped(inner) => <SwashSingle as ShapedRunSource>::shape_stats(inner),
+            _ => (0, 0),
+        }
+    }
+
+    fn face_is_monospaced(&self, face: FontId) -> bool {
+        match self {
+            Self::Shaped(inner) => {
+                <SwashSingle as ShapedRunSource>::face_is_monospaced(inner, face)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Renderer selected for this runtime plus its observable text-stack facts.
+pub(super) struct SelectedRenderer {
+    pub(super) renderer: GridRenderer<FallbackRasterizer<AnyRasterizer>>,
+    pub(super) stack: TextStack,
+    /// Human-readable fallback reason (`None` when the preferred stack won).
+    pub(super) note: Option<String>,
+}
+
+/// Builds the grid renderer for `config`, applying the text-stack preference
+/// and the fallback contract (CTX-1607).
+///
+/// Selection order: deterministic headless when requested (tests/goldens),
+/// then the shaped stack when the preference allows it, then crossfont, then
+/// the headless rasterizer. Every step that loses to a fallback records a
+/// note so the runtime and the app log can name the active stack and the
+/// reason; startup never fails because a font stack is unavailable (a
+/// missing font ends on the deterministic headless rasterizer, exactly as
+/// before).
+pub(super) fn select_renderer(
+    config: &RuntimeConfig,
+    query: &FontQuery,
+    cell: CellMetrics,
+    deterministic: bool,
+) -> Result<SelectedRenderer, RuntimeError> {
+    let font_config = config.font_config();
+    if deterministic {
+        let base = AnyRasterizer::Headless(HeadlessRasterizer::new());
+        let renderer = GridRenderer::new(
+            FallbackRasterizer::with_config(base, &font_config),
+            query,
+            cell,
+        )
+        .map_err(RuntimeError::from)?;
+        return Ok(SelectedRenderer {
+            renderer,
+            stack: TextStack::Headless,
+            note: None,
+        });
+    }
+    let mut note: Option<String> = None;
+    if config.text_stack != TextStackPreference::Classic {
+        let shaped = SwashSingle::new()
+            .map_err(|err| err.to_string())
+            .and_then(|shaped| {
+                let base = AnyRasterizer::Shaped(Box::new(shaped));
+                let raster = FallbackRasterizer::with_config(base, &font_config);
+                GridRenderer::new(raster, query, cell).map_err(|err| err.to_string())
+            });
+        match shaped {
+            Ok(renderer) => {
+                return Ok(SelectedRenderer {
+                    renderer,
+                    stack: TextStack::Shaped,
+                    note,
+                });
+            }
+            Err(reason) => {
+                note = Some(format!(
+                    "shaped text stack unavailable ({reason}); using the crossfont fallback"
+                ));
+            }
+        }
+    }
+    match CrossFontRasterizer::new() {
+        Ok(crossfont) => {
+            let raster = FallbackRasterizer::with_config(
+                AnyRasterizer::CrossFont(Box::new(crossfont)),
+                &font_config,
+            );
+            match GridRenderer::new(raster, query, cell) {
+                Ok(renderer) => {
+                    return Ok(SelectedRenderer {
+                        renderer,
+                        stack: TextStack::Crossfont,
+                        note,
+                    });
+                }
+                Err(err) if matches!(err, RenderError::FontNotFound(_)) => {
+                    note = Some(format!(
+                        "crossfont could not load the configured family ({err}); using the headless rasterizer"
+                    ));
+                }
+                Err(err) => return Err(RuntimeError::from(err)),
+            }
+        }
+        Err(err) => {
+            note = Some(format!(
+                "crossfont init failed ({err}); using the headless rasterizer"
+            ));
+        }
+    }
+    let base = AnyRasterizer::Headless(HeadlessRasterizer::new());
+    let renderer = GridRenderer::new(
+        FallbackRasterizer::with_config(base, &font_config),
+        query,
+        cell,
+    )
+    .map_err(RuntimeError::from)?;
+    Ok(SelectedRenderer {
+        renderer,
+        stack: TextStack::Headless,
+        note,
+    })
 }
 
 /// Owned presentation statistics returned by [`Runtime::tick`].
@@ -3448,7 +3631,17 @@ impl Runtime {
                     },
                 };
                 let epoch_before = self.renderer.atlas_epoch();
-                let mut list = match self.renderer.render(&view_snapshot, &damage) {
+                // CTX-1607: one entry point for every text stack. The
+                // shaped default applies `font.disable_ligatures` and
+                // `font.features`; a non-shaping rasterizer (crossfont
+                // fallback / headless) is served by the per-cell path
+                // inside the same call.
+                let mut list = match self.renderer.render_shaped(
+                    &view_snapshot,
+                    &damage,
+                    self.config.disable_ligatures,
+                    &self.config.font_features,
+                ) {
                     Ok(list) => list,
                     Err(_) => continue,
                 };
@@ -3466,7 +3659,12 @@ impl Runtime {
                         ))]
                         .into_boxed_slice(),
                     };
-                    list = match self.renderer.render(&view_snapshot, &damage) {
+                    list = match self.renderer.render_shaped(
+                        &view_snapshot,
+                        &damage,
+                        self.config.disable_ligatures,
+                        &self.config.font_features,
+                    ) {
                         Ok(list) => list,
                         Err(_) => continue,
                     };

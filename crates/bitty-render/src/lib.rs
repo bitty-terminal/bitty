@@ -23,8 +23,10 @@
 //!   [`crossfont_backend::CrossFontRasterizer`]. Font discovery uses
 //!   crossfont defaults (CoreText on macOS, DirectWrite on Windows,
 //!   FreeType/fontconfig elsewhere); callers only ever see [`FontQuery`],
-//!   [`FontId`], and owned [`GlyphBitmap`] values. This is the production
-//!   default backend (see `Backend selection` below).
+//!   [`FontId`], and owned [`GlyphBitmap`] values. This is the **explicit
+//!   fallback** backend (see `Backend selection` below), not the production
+//!   default; it has no run-shaping surface, so ligatures and
+//!   `font.features` are inert there.
 //! - **`harfrust` (0.14.x) is wrapped, never adopted**, behind
 //!   [`shaped::SwashSingle::shape_run`] (run shaping over `read-fonts`
 //!   faces with per-face shape plans). Font bytes stay owned by this crate;
@@ -45,25 +47,39 @@
 //!   or narrowly forked under rule 3 of that decision; only this crate's
 //!   internals would change because no caller can observe upstream today.
 //!
-//! # Backend selection (CTX-0957 additive landing, DEC-0095)
-//!
-//! Production default stays **`crossfont`**: every production construction
-//! site builds [`crossfont_backend::CrossFontRasterizer`] (wrapped in
-//! [`fallback::FallbackRasterizer::with_default_chain`] exactly as before),
-//! so the additive landing changes zero production behavior — CJK scalars
-//! such as U+6F22/U+5B57 keep the dynamic per-glyph fontconfig fallback
-//! only the crossfont path provides today.
+//! # Backend selection (CTX-1607, supersedes the CTX-0957 opt-in landing)
 //!
 //! The shaped stack ([`shaped::SwashSingle`]: `fontdb` discovery +
-//! `harfrust` shaping + `swash` rasterization) is the **explicit opt-in**:
-//! construct it directly via [`shaped::SwashSingle::new`] and wrap it in
-//! [`fallback::FallbackRasterizer::with_default_chain`], exactly as
-//! `tests/shaped_parity.rs` does. There is deliberately no flag, env var,
-//! or silent default flip — callers that want shaping name it. Full removal
-//! of the crossfont wrap (backend delete, runtime rewire, `deny.toml`
-//! `dwrote` revoke replay) is deferred to **CTX-0961**, which owns the
-//! CJK/script chain policy, the dynamic-fallback strategy, and the per-OS
-//! discovery evidence that must land first.
+//! `harfrust` shaping + `swash` rasterization) is the **production
+//! default**. Constructing it through [`fallback::FallbackRasterizer`] and
+//! calling [`grid::GridRenderer::render_shaped`] enables programming
+//! ligatures (`calt`/`liga`/`clig`/`dlig`), configured `font.features`, and
+//! the `font.disable_ligatures` policy (`never`/`cursor`/`always`).
+//!
+//! [`crossfont_backend::CrossFontRasterizer`] remains the **explicit
+//! fallback** for platforms or fonts the shaped stack cannot handle: the
+//! runtime selects it when the shaped stack fails to initialize (missing
+//! font database, face rejected by `fontdb`/`harfrust`) or when
+//! `BITTY_TEXT_STACK=classic` is set. It is wrapped in the same
+//! [`fallback::FallbackRasterizer`] chain and served by the per-cell
+//! [`grid::GridRenderer::render`] path; the grid's shaped entry point routes
+//! a non-shaping rasterizer there automatically
+//! ([`shaped::ShapedRunSource::shaping_supported`]).
+//!
+//! The fallback is observable, never silent: the runtime records the
+//! resolved stack plus a fallback note (`Runtime::text_stack` /
+//! `Runtime::text_stack_note`), logs it at startup, and `bitty doctor`
+//! reports it in the `text-stack` row. The deterministic headless
+//! rasterizer used by golden tests is a test stack, not a production font
+//! path.
+//!
+//! Both stacks must keep identical **plain-ASCII cell metrics**: glyph
+//! origins and the cell box come from the grid, and the shaped stack
+//! reproduces FreeType's ascender/descender rounding for the pen baseline
+//! so a font switch never shifts text by a pixel. Shaped output that breaks
+//! grid tiling (overlapping or overrunning clusters) or the monospace
+//! advance invariant degrades to per-cell unshaped rendering instead of
+//! painting a misaligned glyph.
 //!
 //! # Scope boundaries of this slice
 //!
@@ -83,9 +99,7 @@
 //! pipeline headlessly (`snapshot -> RGBA`).
 //!
 //! Explicitly **out of scope** and not implemented yet: cursor visuals
-//! and scrollback viewport rendering (deferred inside [`grid`]), grid run
-//! shaping with ligature spans (Phase B extends the [`shaped`] skeleton:
-//! run caches, cluster-to-cell emission, cursor-policy un-shaping), and
+//! and scrollback viewport rendering (deferred inside [`grid`]), and
 //! subpixel RGB rendering (the *policy* is decided:
 //! [`atlas::coverage_policy_for`] earns subpixel only on LCD + non-HiDPI
 //! outputs, and every serving path implements the grayscale side; the
@@ -224,7 +238,7 @@ pub use fallback::{
 pub use geometry::{ExtentPx, RectPx};
 pub use glyph::{
     FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap, GlyphRasterizer,
-    MAX_CACHED_BITMAP_BYTES, RasterKey,
+    MAX_CACHED_BITMAP_BYTES, RasterKey, ShapedBitmap,
 };
 pub use grid::{
     AppliedDpiScale, CellMetrics, DrawList, FillRect, GlyphAtlas, GlyphInstance, GridRenderer,
@@ -239,13 +253,13 @@ pub use hidpi::{
 };
 pub use pipeline::UNDERLINE_WGSL;
 pub use shaped::{
-    ASCII_PRINTABLE_FIRST, ASCII_PRINTABLE_LAST, CJK_ADVANCE_EPSILON_PX, GlyphSource,
-    MAX_DYNAMIC_CACHE_ENTRIES, MAX_FACE_BYTES, MAX_LOADED_FACES, MAX_RUN_CACHE_BYTES,
+    ASCII_PRINTABLE_FIRST, ASCII_PRINTABLE_LAST, CJK_ADVANCE_EPSILON_PX, GRID_ADVANCE_EPSILON_PX,
+    GlyphSource, MAX_DYNAMIC_CACHE_ENTRIES, MAX_FACE_BYTES, MAX_LOADED_FACES, MAX_RUN_CACHE_BYTES,
     MAX_RUN_CACHE_ENTRIES, MAX_SHAPE_PLANS_PER_FACE, MAX_SHAPED_GLYPH_CACHE_BYTES,
     MAX_SHAPED_GLYPH_CACHE_ENTRIES, PROGRAMMING_LIGATURE_TAGS, RunAttrs, RunCacheKey, ShapePlanKey,
-    ShapedCluster, ShapedGlyphKey, ShapedRun, SwashSingle, ascii_fast_path_eligible,
-    cells_for_range, collect_run_text, features_are_unshaped, features_for_policy,
-    form_runs_for_row, harfrust_features, is_printable_ascii_byte, is_printable_ascii_str,
-    run_is_ascii_candidate,
+    ShapedCluster, ShapedGlyphKey, ShapedRun, ShapedRunSource, SwashSingle,
+    ascii_fast_path_eligible, cells_for_range, collect_run_text, cursor_intersects_ligature,
+    features_are_unshaped, features_for_policy, form_runs_for_row, harfrust_features,
+    is_printable_ascii_byte, is_printable_ascii_str, run_is_ascii_candidate,
 };
 pub use window::{MAX_WINDOW_PADDING_PX, clamp_window_padding, padded_content_rect};

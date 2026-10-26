@@ -1,6 +1,6 @@
 [package]
 name = "bitty-render"
-description = "GPU rendering pipeline for Bitty (wgpu + crossfont, with harfrust/swash opt-in)"
+description = "GPU rendering pipeline for Bitty (wgpu + harfrust/swash shaped text, crossfont fallback)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -30,14 +30,13 @@ bitty-platform = { version = "0.0.29", path = "../bitty-platform" }
 # truth for clear color, default fg/bg, cursor, selection, and ANSI 0-15
 # (CTX-0147). bitty-config stays dependency-free (pure std), so no cycle.
 bitty-config = { version = "0.0.29", path = "../bitty-config" }
-# ADR-0004 rendering rows: ADOPT wgpu (~26.x line); WRAP crossfont
-# (production default, CTX-0957 additive landing per DEC-0095); WRAP
-# harfrust/swash/fontdb as the explicit opt-in stack (shape with harfrust
-# 0.14, rasterize with swash 0.2 over shared skrifa/read-fonts, discover
-# with fontdb 0.24, which vendors its query-time parser subset instead of
-# depending on external ttf-parser, bitty#1692). Full removal of the
-# crossfont wrap is deferred to
-# CTX-0961 (chain policy + dynamic fallback + per-OS evidence).
+# ADR-0004 rendering rows: ADOPT wgpu (~26.x line); WRAP
+# harfrust/swash/fontdb as the production shaped stack (CTX-1607: shape
+# with harfrust 0.14, rasterize with swash 0.2 over shared
+# skrifa/read-fonts, discover with fontdb 0.24, which vendors its
+# query-time parser subset instead of depending on external ttf-parser,
+# bitty#1692); WRAP crossfont as the explicit fallback (forced with
+# BITTY_TEXT_STACK=classic or selected when shaped init fails).
 # Neither upstream type may appear in this crate's public API.
 wgpu = "26.0"
 crossfont = "0.9"

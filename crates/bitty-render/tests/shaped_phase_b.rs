@@ -12,7 +12,8 @@
 use bitty_config::types::{LigaturePolicy, OpenTypeFeature};
 use bitty_render::{
     CellMetrics, FallbackRasterizer, FontQuery, FontStyle, GlyphRasterizer, RunAttrs, SwashSingle,
-    cells_for_range, collect_run_text, features_for_policy, form_runs_for_row,
+    cells_for_range, collect_run_text, cursor_intersects_ligature, features_for_policy,
+    form_runs_for_row,
 };
 
 const ENABLE_ENV: &str = "BITTY_RENDER_FONT_TESTS";
@@ -190,6 +191,7 @@ fn cursor_intersects_only_ligatures() {
         x_advance_px: 9.0,
         x_offset_px: 0.0,
         uncovered: false,
+        ligature_part: false,
         byte_offset: 0,
     };
     let ligature = ShapedCluster {
@@ -199,6 +201,7 @@ fn cursor_intersects_only_ligatures() {
         x_advance_px: 18.0,
         x_offset_px: 0.0,
         uncovered: false,
+        ligature_part: true,
         byte_offset: 1,
     };
     let clusters = vec![single, ligature];
@@ -262,6 +265,105 @@ fn run_formation_groups_style_and_breaks_blanks() {
     assert_eq!(runs[0].start_col, 0);
     assert_eq!(runs[1].text, "c");
     assert_eq!(runs[1].start_col, 2);
+}
+
+/// CTX-1607: JetBrains Mono, Cascadia, and Fira Code encode programming
+/// ligatures as a `calt` chain whose first scalar becomes the font's space
+/// glyph and whose second carries the wide ligature outline (two one-cell
+/// clusters). That scaffold must be marked as one ligature span so the
+/// cursor policy un-shapes it, and `Always` must restore the plain glyphs.
+#[test]
+fn calt_scaffold_ligature_marks_the_cursor_span() {
+    let Some(mut raster) = live_chain_for("JetBrainsMono Nerd Font") else {
+        eprintln!("skipped: no host font stack or JetBrainsMono Nerd Font");
+        return;
+    };
+    let chain = raster.fonts().to_vec();
+    let attrs = RunAttrs {
+        features: Vec::new(),
+        point_size: POINT_SIZE,
+    };
+    let plain_greater = raster
+        .inner_mut()
+        .shape_run(">", &chain, &attrs)
+        .expect("plain greater shapes");
+    let plain_hyphen = raster
+        .inner_mut()
+        .shape_run("-", &chain, &attrs)
+        .expect("plain hyphen shapes");
+    let ligature = raster
+        .inner_mut()
+        .shape_run("->", &chain, &attrs)
+        .expect("ligature shapes");
+    assert_eq!(ligature.len(), 2, "scaffold encoding keeps two clusters");
+    assert_ne!(
+        ligature[1].glyph_id, plain_greater[0].glyph_id,
+        "calt must substitute the ligature outline for `>`"
+    );
+    assert!(
+        ligature.iter().all(|cluster| cluster.ligature_part),
+        "both scaffold halves must be marked: {ligature:?}"
+    );
+    assert_eq!(cursor_intersects_ligature(&ligature, 0), Some(0));
+    assert_eq!(cursor_intersects_ligature(&ligature, 1), Some(1));
+
+    let zeroed = features_for_policy(&[], LigaturePolicy::Always);
+    let zero_attrs = RunAttrs {
+        features: zeroed,
+        point_size: POINT_SIZE,
+    };
+    let plain = raster
+        .inner_mut()
+        .shape_run("->", &chain, &zero_attrs)
+        .expect("zeroed shapes");
+    assert_eq!(plain[0].glyph_id, plain_hyphen[0].glyph_id);
+    assert_eq!(plain[1].glyph_id, plain_greater[0].glyph_id);
+    assert!(
+        plain.iter().all(|cluster| !cluster.ligature_part),
+        "Always must not mark the plain glyphs as a ligature"
+    );
+}
+
+/// Render-level companion to the scaffold marker: the cursor policy must
+/// change the painted glyphs for a two-cluster `calt` ligature, not just the
+/// cluster flags.
+#[test]
+fn calt_scaffold_ligature_render_changes_under_cursor_policy() {
+    let Some(raster) = live_chain_for("JetBrainsMono Nerd Font") else {
+        eprintln!("skipped: no host font stack or JetBrainsMono Nerd Font");
+        return;
+    };
+    let query = query_for("JetBrainsMono Nerd Font");
+    let mut renderer =
+        bitty_render::GridRenderer::new(raster, &query, CellMetrics::new(9, 19).unwrap())
+            .expect("renderer builds");
+    let mut state = bitty_term_state::State::new();
+    for ch in ['-', '>'] {
+        state.apply(&bitty_term_state::TerminalAction::Print(
+            bitty_vt::GraphemeCell::from(ch),
+        ));
+    }
+    let mut snapshot = state.snapshot();
+    snapshot.cursor.position.row = 0;
+    snapshot.cursor.position.col = 0;
+    snapshot.cursor.visible = true;
+    let damage = bitty_term_state::Damage {
+        generation: snapshot.generation,
+        regions: vec![bitty_term_state::DamagedRegion::Grid(
+            bitty_term_state::DamageRect::full(snapshot.height as u16, snapshot.width as u16),
+        )]
+        .into_boxed_slice(),
+    };
+    let never = renderer
+        .render_shaped(&snapshot, &damage, LigaturePolicy::Never, &[])
+        .expect("never renders");
+    let cursor = renderer
+        .render_shaped(&snapshot, &damage, LigaturePolicy::Cursor, &[])
+        .expect("cursor renders");
+    assert_ne!(
+        never.glyphs, cursor.glyphs,
+        "Cursor must replace the scaffold ligature with plain glyphs"
+    );
 }
 
 #[test]

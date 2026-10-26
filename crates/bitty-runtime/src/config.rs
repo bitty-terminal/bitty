@@ -800,6 +800,149 @@ pub const FONT_ZOOM_MIN_PT: f32 = 6.0;
 /// Maximum live font size reachable by zoom (CTX-0263, fail-closed).
 pub const FONT_ZOOM_MAX_PT: f32 = 32.0;
 
+/// Environment override selecting the text stack (CTX-1607).
+///
+/// Accepted values are `auto` (default), `shaped`, and `classic`; unknown
+/// values stay on `auto` and surface as a startup warning through the app
+/// layer. The variable is a startup-only escape hatch, not a live-reload
+/// key: switching stacks mid-session would invalidate the shaped caches and
+/// change glyph rasterization under the user.
+pub const TEXT_STACK_ENV: &str = "BITTY_TEXT_STACK";
+
+/// Text-stack preference for a runtime (CTX-1607).
+///
+/// `Auto` (default) prefers the shaped `harfrust`/`swash` stack and falls
+/// back to the classic `crossfont` stack — then to the deterministic
+/// headless rasterizer — when the shaped stack cannot initialize.
+/// `Shaped` names the same preference explicitly; `Classic` forces the
+/// crossfont fallback (platforms/fonts the shaped stack cannot handle, or a
+/// user opt-out on font-rich hosts where discovery is expensive).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum TextStackPreference {
+    /// Prefer shaped; fall back to crossfont/headless with a diagnostic.
+    #[default]
+    Auto,
+    /// Prefer shaped; fall back with a diagnostic when unavailable.
+    Shaped,
+    /// Force the classic crossfont stack.
+    Classic,
+}
+
+impl TextStackPreference {
+    /// Parses the `BITTY_TEXT_STACK` spelling (trimmed, case-insensitive).
+    ///
+    /// Empty input is `auto`; unknown values fail closed with a `'static`
+    /// reason so a hostile environment value cannot grow an allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when `raw` is not one of `auto`/`shaped`/`classic`.
+    pub fn parse(raw: &str) -> Result<Self, &'static str> {
+        let raw = raw.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("auto") {
+            Ok(Self::Auto)
+        } else if raw.eq_ignore_ascii_case("shaped") {
+            Ok(Self::Shaped)
+        } else if raw.eq_ignore_ascii_case("classic") {
+            Ok(Self::Classic)
+        } else {
+            Err("must be one of `auto`, `shaped`, `classic`")
+        }
+    }
+
+    /// Resolves an optional environment value.
+    ///
+    /// Returns the preference plus an optional diagnostic when the value was
+    /// present but invalid (the preference stays [`Self::Auto`]).
+    #[must_use]
+    pub fn from_env_value(raw: Option<&str>) -> (Self, Option<&'static str>) {
+        match raw {
+            None => (Self::Auto, None),
+            Some(value) => match Self::parse(value) {
+                Ok(preference) => (preference, None),
+                Err(reason) => (Self::Auto, Some(reason)),
+            },
+        }
+    }
+
+    /// Reads [`TEXT_STACK_ENV`]; an invalid value resolves to `auto`.
+    ///
+    /// Callers that can report a warning (the app config mapping and
+    /// `bitty doctor`) should use [`Self::from_env_value`] instead so the
+    /// invalid spelling is observable.
+    #[must_use]
+    pub fn from_env() -> Self {
+        match std::env::var(TEXT_STACK_ENV) {
+            Ok(value) => Self::from_env_value(Some(&value)).0,
+            Err(_) => Self::Auto,
+        }
+    }
+
+    /// Stable lowercase spelling (`auto`/`shaped`/`classic`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Shaped => "shaped",
+            Self::Classic => "classic",
+        }
+    }
+}
+
+impl std::fmt::Display for TextStackPreference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Text stack actually serving a runtime (CTX-1607).
+///
+/// [`Shaped`](Self::Shaped) is the production default: `fontdb` discovery +
+/// `harfrust` shaping + `swash` rasterization, with programming ligatures
+/// and `font.features` live. [`Crossfont`](Self::Crossfont) is the explicit
+/// fallback for platforms/fonts the shaped stack cannot handle (or
+/// `BITTY_TEXT_STACK=classic`). [`Headless`](Self::Headless) is the
+/// deterministic test rasterizer, never a production font stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TextStack {
+    /// Shaped `harfrust`/`swash` stack (default).
+    Shaped,
+    /// Classic `crossfont` fallback.
+    Crossfont,
+    /// Deterministic headless rasterizer (tests / golden captures).
+    Headless,
+}
+
+impl TextStack {
+    /// Stable lowercase spelling (`shaped`/`crossfont`/`headless`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Shaped => "shaped",
+            Self::Crossfont => "crossfont",
+            Self::Headless => "headless",
+        }
+    }
+
+    /// True when a real host font stack is active (not the test fake).
+    #[must_use]
+    pub const fn is_host(self) -> bool {
+        matches!(self, Self::Shaped | Self::Crossfont)
+    }
+
+    /// True when the shaped stack serves the runtime.
+    #[must_use]
+    pub const fn is_shaped(self) -> bool {
+        matches!(self, Self::Shaped)
+    }
+}
+
+impl std::fmt::Display for TextStack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Owned runtime configuration, validated on construction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuntimeConfig {
@@ -845,6 +988,23 @@ pub struct RuntimeConfig {
     /// (`MAX_FONT_FALLBACK_ENTRIES` entries, `MAX_FONT_FAMILY_LEN` bytes
     /// each).
     pub font_fallback: Vec<String>,
+    /// Parsed OpenType feature overrides (CTX-1607; effective
+    /// `font.features`). Empty by default. Already validated by
+    /// `bitty-config`; this layer re-checks the entry bound fail-closed.
+    /// Reach the shaper through
+    /// [`GridRenderer::render_shaped`](bitty_render::grid::GridRenderer::render_shaped)
+    /// on the shaped stack; the crossfont fallback has no shaping surface,
+    /// so the values are inert there (documented fallback contract).
+    pub font_features: Vec<bitty_config::types::OpenTypeFeature>,
+    /// Programming-ligature policy (CTX-1607; effective
+    /// `font.disable_ligatures`). `Never` (default) shapes verbatim,
+    /// `Cursor` un-shapes runs under the cursor, `Always` forces the
+    /// programming-ligature features off. Inert on the crossfont fallback.
+    pub disable_ligatures: bitty_config::types::LigaturePolicy,
+    /// Text-stack preference (CTX-1607; `BITTY_TEXT_STACK`). Default
+    /// [`TextStackPreference::Auto`] = shaped default with crossfont
+    /// fallback. Startup-only: not a live-reload key.
+    pub text_stack: TextStackPreference,
     /// Lines scrolled per wheel notch, `1..=32` (CTX-0185; default 3).
     /// Applied to `Lines` deltas directly and to `Pixels` deltas via the
     /// notch equivalence (`scroll_pixels_per_notch` px = one notch).
@@ -1164,6 +1324,9 @@ impl Default for RuntimeConfig {
             font_family: font_default_family(),
             font_size: 12.0,
             font_fallback: Vec::new(),
+            font_features: Vec::new(),
+            disable_ligatures: bitty_config::types::LigaturePolicy::Never,
+            text_stack: TextStackPreference::Auto,
             scroll_lines_per_notch: DEFAULT_SCROLL_LINES_PER_NOTCH,
             scroll_pixels_per_notch: DEFAULT_SCROLL_PIXELS_PER_NOTCH,
             page_scroll_percent: DEFAULT_PAGE_SCROLL_PERCENT,
@@ -1277,6 +1440,9 @@ impl RuntimeConfig {
             font_family,
             font_size,
             font_fallback: Vec::new(),
+            font_features: Vec::new(),
+            disable_ligatures: bitty_config::types::LigaturePolicy::Never,
+            text_stack: TextStackPreference::Auto,
             scroll_lines_per_notch,
             scroll_pixels_per_notch,
             page_scroll_percent: DEFAULT_PAGE_SCROLL_PERCENT,
@@ -1371,6 +1537,15 @@ impl RuntimeConfig {
                     "font.fallback entries must be non-empty and <= MAX_FONT_FAMILY_LEN bytes",
                 ));
             }
+        }
+        // CTX-1607: the typed feature list is already validated by
+        // `bitty-config` (tag shape and value); only the entry bound is
+        // re-checked here so a hand-built runtime config cannot exceed the
+        // shaping input budget.
+        if self.font_features.len() > bitty_config::types::MAX_FONT_FEATURES {
+            return Err(RuntimeError::InvalidConfig(
+                "font.features must contain <= MAX_FONT_FEATURES entries",
+            ));
         }
         if !(1..=MAX_SCROLL_LINES_PER_NOTCH).contains(&self.scroll_lines_per_notch) {
             return Err(RuntimeError::InvalidConfig(
@@ -1576,7 +1751,11 @@ impl RuntimeConfig {
     ///
     /// Spacing uses the `bitty-config` defaults: the runtime owns cell
     /// metrics separately (`cell_width`/`cell_height`), and only the
-    /// family-plus-fallback chain reaches the rasterizer.
+    /// family-plus-fallback chain reaches the rasterizer here. CTX-1607
+    /// shaping inputs (`font.features`, `font.disable_ligatures`) travel as
+    /// the typed [`Self::font_features`] / [`Self::disable_ligatures`]
+    /// fields instead: `FontConfig` carries raw strings for configuration
+    /// validation, while the render call needs parsed tags.
     #[must_use]
     pub fn font_config(&self) -> bitty_config::types::FontConfig {
         bitty_config::types::FontConfig {
@@ -2778,6 +2957,77 @@ mod tests {
         assert_eq!((DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT), (9, 19));
         assert_eq!(cfg.font_family, "JetBrainsMono Nerd Font");
         assert!((cfg.font_size - 12.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn text_stack_preference_parses_env_spellings() {
+        // CTX-1607: the startup env escape hatch accepts the documented
+        // spellings case-insensitively, defaults to `auto`, and fails
+        // closed on unknown values while reporting a warning.
+        assert_eq!(
+            TextStackPreference::parse("auto"),
+            Ok(TextStackPreference::Auto)
+        );
+        assert_eq!(
+            TextStackPreference::parse(" SHAPED "),
+            Ok(TextStackPreference::Shaped)
+        );
+        assert_eq!(
+            TextStackPreference::parse("Classic"),
+            Ok(TextStackPreference::Classic)
+        );
+        assert_eq!(
+            TextStackPreference::parse(""),
+            Ok(TextStackPreference::Auto)
+        );
+        assert!(TextStackPreference::parse("harfbuzz").is_err());
+        assert_eq!(
+            TextStackPreference::from_env_value(None),
+            (TextStackPreference::Auto, None)
+        );
+        let (preference, warning) = TextStackPreference::from_env_value(Some("nope"));
+        assert_eq!(preference, TextStackPreference::Auto);
+        assert!(warning.is_some(), "invalid values must be observable");
+        assert_eq!(TextStackPreference::Shaped.as_str(), "shaped");
+        assert_eq!(TextStackPreference::Classic.to_string(), "classic");
+        assert!(TextStack::Shaped.is_host() && TextStack::Shaped.is_shaped());
+        assert!(TextStack::Crossfont.is_host() && !TextStack::Crossfont.is_shaped());
+        assert!(!TextStack::Headless.is_host());
+        assert_eq!(TextStack::Crossfont.to_string(), "crossfont");
+    }
+
+    #[test]
+    fn shaped_text_config_defaults_and_feature_bounds() {
+        // CTX-1607: empty feature overrides, ligatures on, shaped preferred.
+        let cfg = RuntimeConfig::default();
+        assert!(cfg.font_features.is_empty());
+        assert_eq!(
+            cfg.disable_ligatures,
+            bitty_config::types::LigaturePolicy::Never
+        );
+        assert_eq!(cfg.text_stack, TextStackPreference::Auto);
+        cfg.validate().expect("default valid");
+        let too_many = RuntimeConfig {
+            font_features: (0..=bitty_config::types::MAX_FONT_FEATURES)
+                .map(|index| {
+                    let tag = format!("ss{:02}", index % 100);
+                    bitty_config::types::OpenTypeFeature::parse(&format!("{tag}=1"))
+                        .expect("valid feature")
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(too_many.validate().is_err());
+        let ok = RuntimeConfig {
+            font_features: vec![
+                bitty_config::types::OpenTypeFeature::parse("calt=0").unwrap(),
+                bitty_config::types::OpenTypeFeature::parse("ss01=2").unwrap(),
+            ],
+            disable_ligatures: bitty_config::types::LigaturePolicy::Always,
+            text_stack: TextStackPreference::Classic,
+            ..Default::default()
+        };
+        ok.validate().expect("typed features are valid");
     }
 
     #[test]

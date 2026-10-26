@@ -211,8 +211,6 @@ elif command -v appimagetool >/dev/null 2>&1; then
   TOOL_PATH="$(command -v appimagetool)"
 elif [[ -x "/tmp/bitty/appimagetool" ]]; then
   TOOL_PATH="/tmp/bitty/appimagetool"
-elif [[ -x "/tmp/appimagetool" ]]; then
-  TOOL_PATH="/tmp/appimagetool"
 else
   echo "make-appimage: downloading appimagetool continuous release for host ${TOOL_ARCH}..."
   mkdir -p "/tmp/bitty"

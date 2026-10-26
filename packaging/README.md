@@ -13,21 +13,21 @@ and is labeled as such below.
 
 ## Formats
 
-| Format       | File                                                     | Distro                                                      |
-| ------------ | -------------------------------------------------------- | ----------------------------------------------------------- |
-| deb          | `nfpm.yaml` + `deb` packager                             | Ubuntu 24.04 (verified); Debian 12 best-effort              |
-| rpm          | `nfpm.yaml` + `rpm` packager                             | Fedora 40 (verified); RHEL 9, OpenSUSE best-effort          |
-| rpm (OBS)    | `packaging/opensuse/bitty.spec` + `_service`             | openSUSE Tumbleweed and Leap 15.6 best-effort (zypper)      |
-| apk          | `nfpm.yaml` + `apk` packager                             | Alpine 3.22 (verified; native `x86_64-unknown-linux-musl`)  |
-| archlinux    | `nfpm.yaml` + `archlinux` packager, `packaging/PKGBUILD` | Arch (verified); AUR via release publish, gated             |
-| apk (aports) | `packaging/alpine/APKBUILD`                              | In-tree aports recipe, not published to aports; best-effort |
-| ebuild       | `packaging/gentoo/` (`bitty-bin`, live `bitty-9999`)     | In-tree overlay, not in the gentoo tree; best-effort        |
-| xbps         | `packaging/void/srcpkgs/bitty/template`                  | In-tree template, not in void-packages; best-effort         |
-| ypkg         | `packaging/solus/package.yml`                            | In-tree Solus recipe, not in solus-project; best-effort     |
-| freebsd      | `packaging/freebsd/x11/bitty/` (ports recipe)            | FreeBSD 15.1 amd64 build-only; best-effort, not supported   |
-| openbsd      | `packaging/openbsd/x11/bitty/` (ports recipe)            | OpenBSD amd64 ports recipe; best-effort, not supported      |
-| netbsd       | `packaging/netbsd/x11/bitty/` (pkgsrc recipe)            | NetBSD pkgsrc recipe; best-effort, not supported            |
-| winget       | `packaging/windows/winget/`                              | Windows Package Manager (`BittyTerminal.Bitty`)             |
+| Format       | File                                                     | Distro                                                                          |
+| ------------ | -------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| deb          | `nfpm.yaml` + `deb` packager                             | Ubuntu 24.04 (verified); Debian 12 best-effort                                  |
+| rpm          | `nfpm.yaml` + `rpm` packager                             | Fedora 40 (verified); RHEL 9, OpenSUSE best-effort                              |
+| rpm (OBS)    | `packaging/opensuse/bitty.spec` + `_service`             | openSUSE Tumbleweed and Leap 15.6 best-effort (zypper)                          |
+| apk          | `nfpm.yaml` + `apk` packager                             | Alpine 3.22 (verified; native `x86_64-unknown-linux-musl`)                      |
+| archlinux    | `nfpm.yaml` + `archlinux` packager, `packaging/PKGBUILD` | Arch (verified); AUR via release publish, gated                                 |
+| apk (aports) | `packaging/alpine/APKBUILD`                              | In-tree aports recipe, not published to aports; best-effort                     |
+| ebuild       | `packaging/gentoo/` (`bitty-bin`, live `bitty-9999`)     | In-tree overlay, not in the gentoo tree; best-effort                            |
+| xbps         | `packaging/void/srcpkgs/bitty/template`                  | In-tree template, not in void-packages; best-effort                             |
+| ypkg         | `packaging/solus/package.yml`                            | In-tree Solus recipe, not in solus-project; best-effort                         |
+| freebsd      | `packaging/freebsd/x11/bitty/` (ports recipe)            | FreeBSD 15.1 amd64 build-only; best-effort, not supported                       |
+| openbsd      | `packaging/openbsd/x11/bitty/` (ports recipe)            | OpenBSD amd64 ports recipe; best-effort, not supported                          |
+| netbsd       | `packaging/netbsd/x11/bitty/` (pkgsrc recipe)            | NetBSD pkgsrc recipe; best-effort, not supported                                |
+| winget       | `packaging/windows/winget/`                              | Windows Package Manager (`BittyTerminal.Bitty`)                                 |
 | flatpak      | `packaging/flathub/run.bitty.Bitty.yaml`                 | Flathub (in-tree manifest, not submitted to Flathub; owner action, best-effort) |
 
 The upstream distro recipes (Alpine aports, Gentoo overlay, Void `xbps-src`,

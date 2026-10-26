@@ -16,5 +16,13 @@
     ".worktrees",
     "docs",
     "recording/references/health-audit-2026-08-30.md",
+    // CTX-1605: upstream winit Markdown is vendored verbatim under
+    // `vendor/winit` and is not ours to reformat. Only the crate's own
+    // documentation files are listed so `vendor/winit/PATCHES.md`, which this
+    // repository owns, stays linted.
+    "vendor/winit/README.md",
+    "vendor/winit/FEATURES.md",
+    "vendor/winit/docs",
+    "vendor/winit/src/changelog",
   ],
 }

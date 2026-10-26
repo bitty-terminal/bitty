@@ -1,5 +1,10 @@
 version: 2
 updates:
+  # CTX-1605: `winit` is not a registry dependency here. The workspace patches
+  # it to the vendored 0.30.13 tree (`vendor/winit`) carrying the upstream
+  # #4710 Wayland `Occluded` backport, so Dependabot cannot bump it and must not
+  # be "fixed" by dropping the patch. To move the pin, follow the update
+  # procedure in `vendor/winit/PATCHES.md` and re-apply the recorded diff.
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:

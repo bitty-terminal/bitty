@@ -261,9 +261,10 @@ impl EventContext<'_> {
 
 /// Point-in-time view of a window's redraw-starvation probe (issue #2570).
 ///
-/// The probe is the only Wayland occlusion source on platforms where winit
-/// exposes neither the `Suspended` lifecycle nor the `Occluded` window event.
-/// Reporting its state from a stalled main loop makes the next freeze
+/// The probe is the Wayland occlusion source that remains when the compositor
+/// never sets the xdg-shell v6 `suspended` state, which is the only case where
+/// the vendored winit patch (CTX-1605) cannot deliver `Occluded`. Reporting
+/// its state from a stalled main loop makes the next freeze
 /// self-describing: a large `pending` span names a redraw the compositor
 /// never answered, while `occluded` names an edge the application already
 /// consumed.
@@ -653,11 +654,14 @@ fn apply_optional_size(
 /// Redraw-starvation probe for the synthetic Wayland occlusion edge
 /// (issue #2570 follow-up for the `#2589` surface-visibility gate).
 ///
-/// winit 0.30.13 delivers no `WindowEvent::Occluded` on Wayland and no
-/// `Suspended` lifecycle either, so the embedder's visibility gate cannot
-/// engage on the platform #2570 reproduces on. The probe exploits what the
-/// Wayland backend *does* guarantee: a `RedrawRequested` dispatch is gated on
-/// the compositor's frame callback (`refresh_frame` /
+/// Unpatched winit 0.30.13 delivers no `WindowEvent::Occluded` on Wayland and
+/// no `Suspended` lifecycle either, so the embedder's visibility gate cannot
+/// engage on the platform #2570 reproduces on. CTX-1605 vendors that release
+/// with the upstream #4710 backport, which maps the xdg-shell v6 `suspended`
+/// state to `Occluded`; the probe stays as the fallback for compositors that
+/// never set that state and for a surface whose frame callbacks keep arriving.
+/// It exploits what the Wayland backend *does* guarantee: a `RedrawRequested`
+/// dispatch is gated on the compositor's frame callback (`refresh_frame` /
 /// `frame_callback_state`), and a compositor stops serving frame callbacks
 /// for a suspended xdg surface (a Hyprland workspace switch-away). A pending
 /// `request_redraw` that is unanswered for [`OCCLUSION_STARVE`] therefore

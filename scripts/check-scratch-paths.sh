@@ -32,9 +32,11 @@
 #   `scratch-paths-exempt: <reason>`, or the line mentions `temp_dir`,
 #   `mktemp`, or `sock` (socket paths), or — for `.rs` files — the hit sits
 #   at/after the file's first `#[cfg(test)]` line (unit-test-only region).
-#   `/tmp/bitty` itself is the workspace-sanctioned ephemeral scratch root
-#   (throwaway build/tool scratch, never durable evidence), so `/tmp/bitty`
-#   and `/tmp/bitty/...` are allowed. This does not cover `/var/tmp/bitty`.
+#   `/tmp/bitty` is the workspace-sanctioned ephemeral scratch root (throwaway
+#   build/tool scratch, never durable evidence), so only `/tmp/bitty` (end of
+#   line or before a non-path character) and `/tmp/bitty/...` are allowed;
+#   `/tmp/bitty-*`, `/tmp/bitty.*`, `/tmp/bitty2`, `/tmp/bitty/../...`, and
+#   `/var/tmp/bitty` stay flagged.
 #   The rule covers `/var/tmp/` too (the alternate system temp dir; the
 #   inner `/tmp/` of `/var/tmp/` is lookbehind-excluded, so it needs its
 #   own alternative). The match requires the leading slash NOT to follow `[A-Za-z0-9_/-]`.
@@ -64,9 +66,10 @@
 #   cannot fix and would make the gate depend on whether `git submodule
 #   update --init` ran.
 #
-#   This script and its fixture tree `scripts/tests/fixtures/scratch-paths/`
-#   are exempt from all rules (they must spell the forbidden patterns to
-#   define and test them).
+#   This script, its fixture test `scripts/tests/check-scratch-paths.test.sh`,
+#   and its fixture tree `scripts/tests/fixtures/scratch-paths/` are exempt
+#   from all rules (they must spell the forbidden patterns to define and test
+#   them).
 #
 # Escape hatch (auditable, grep-able, mirrors pty-gate):
 #   - `// scratch-paths-exempt: <reason>` (or `# ...` in shell) on the hit
@@ -79,6 +82,10 @@
 #   - Rules 2/3/4 do not scan `crates/*/tests/**` or `tests/**` fixtures:
 #     integration tests and `.bin` capture corpora embed neutral placeholders
 #     (`/home/user`) or host bytes by design.
+#   - `/tmp/bitty` is deliberately allowed, so durable evidence written there
+#     passes; keep durable evidence under `recording/`.
+#   - Traversal immediately after `/tmp/bitty` (`/tmp/bitty/../...`) is refused
+#     by the matcher, but the gate stays textual: it never resolves a path.
 #   - The `#[cfg(test)]`-region rule uses the FIRST `#[cfg(test)]` line per
 #     file; prod code placed after a trailing test module would be wrongly
 #     exempt (no such layout exists today; keep test modules trailing).
@@ -113,6 +120,8 @@ fi
 
 FAIL=0
 SELF=scripts/check-scratch-paths.sh
+# The fixture test must spell the forbidden patterns to prove the matcher.
+SELF_TEST=scripts/tests/check-scratch-paths.test.sh
 
 # --- Rule 1: recordings/ (plural) allowlist ---
 while IFS= read -r hit; do
@@ -139,7 +148,8 @@ while IFS= read -r hit; do
   FAIL=1
 done < <(
   rg -n --no-heading -g '!target/**' -g '!.git' -g '!.git/**' -g '!.worktrees/**' -g '!*.bin' -g '!docs/**' \
-    -g '!scripts/check-scratch-paths.sh' -g '!scripts/tests/fixtures/**' 'recordings/' . 2>/dev/null || true
+    -g '!scripts/check-scratch-paths.sh' -g '!scripts/tests/check-scratch-paths.test.sh' \
+    -g '!scripts/tests/fixtures/**' 'recordings/' . 2>/dev/null || true
 )
 
 # --- Rule 2: hardcoded /tmp/ writes in code + scripts ---
@@ -151,7 +161,7 @@ mapfile -d '' SRC_FILES < <(
 )
 
 for file in "${SRC_FILES[@]}"; do
-  [[ "$file" == "$SELF" ]] && continue
+  [[ "$file" == "$SELF" || "$file" == "$SELF_TEST" ]] && continue
   test_from=0
   if [[ "$file" == *.rs ]]; then
     if [[ "$(basename "$file")" == "tests.rs" ]]; then
@@ -187,13 +197,13 @@ for file in "${SRC_FILES[@]}"; do
     echo "scratch-paths[tmp-write]: $file:$hit"
     FAIL=1
   done < <(
-    rg -n -P --no-heading '(?<![A-Za-z0-9_/\-])(/var/tmp/|/tmp/(?!bitty\b))' "$file" 2>/dev/null || true
+    rg -n -P --no-heading '(?<![A-Za-z0-9_/\-])(/var/tmp/|/tmp/(?!bitty(?=$|[^[:alnum:]_.-])(?!/\.\.(?:/|$))))' "$file" 2>/dev/null || true
   )
 done
 
 # --- Rule 3: hardcoded host-absolute paths in production code (CTX-0296) ---
 for file in "${SRC_FILES[@]}"; do
-  [[ "$file" == "$SELF" ]] && continue
+  [[ "$file" == "$SELF" || "$file" == "$SELF_TEST" ]] && continue
   test_from=0
   if [[ "$file" == *.rs ]]; then
     if [[ "$(basename "$file")" == "tests.rs" ]]; then

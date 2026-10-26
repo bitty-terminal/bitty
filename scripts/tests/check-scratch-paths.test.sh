@@ -16,33 +16,48 @@ FAIL=0
 clean_out="$("$GATE" --root "$FIXTURES/clean" 2>&1)" || clean_status=$?
 clean_status="${clean_status:-0}"
 if ((clean_status != 0)); then
-	echo "FAIL: clean fixture rejected by the gate (exit $clean_status):" >&2
-	printf '%s\n' "$clean_out" >&2
-	FAIL=1
+  echo "FAIL: clean fixture rejected by the gate (exit $clean_status):" >&2
+  printf '%s\n' "$clean_out" >&2
+  FAIL=1
 fi
 
 violations_out="$("$GATE" --root "$FIXTURES/violations" 2>&1)" || violations_status=$?
 violations_status="${violations_status:-0}"
 if ((violations_status == 0)); then
-	echo "FAIL: violations fixture passed the gate:" >&2
-	printf '%s\n' "$violations_out" >&2
-	FAIL=1
+  echo "FAIL: violations fixture passed the gate:" >&2
+  printf '%s\n' "$violations_out" >&2
+  FAIL=1
 fi
 
 for tag in \
-	'scratch-paths[recordings]' \
-	'scratch-paths[tmp-write]' \
-	'scratch-paths[abs-path]' \
-	'scratch-paths[doc-abs-path]'; do
-	if ! rg -qF "$tag" <<<"$violations_out"; then
-		echo "FAIL: violations fixture did not trip $tag:" >&2
-		printf '%s\n' "$violations_out" >&2
-		FAIL=1
-	fi
+  'scratch-paths[recordings]' \
+  'scratch-paths[tmp-write]' \
+  'scratch-paths[abs-path]' \
+  'scratch-paths[doc-abs-path]'; do
+  if ! rg -qF "$tag" <<<"$violations_out"; then
+    echo "FAIL: violations fixture did not trip $tag:" >&2
+    printf '%s\n' "$violations_out" >&2
+    FAIL=1
+  fi
+done
+
+# The `/tmp/bitty` allowance must stay narrow: lookalikes and traversal are
+# still reported, so an over-broad matcher fails here instead of passing.
+for path in \
+  '/tmp/bitty-backup/state' \
+  '/tmp/bitty.log' \
+  '/tmp/bitty2/q' \
+  '/tmp/bitty/../x' \
+  '/var/tmp/bitty/appimagetool'; do
+  if ! rg -qF "$path" <<<"$violations_out"; then
+    echo "FAIL: over-broad /tmp/bitty allowlist let $path pass:" >&2
+    printf '%s\n' "$violations_out" >&2
+    FAIL=1
+  fi
 done
 
 if ((FAIL)); then
-	echo "scratch-paths-test: FAIL" >&2
-	exit 1
+  echo "scratch-paths-test: FAIL" >&2
+  exit 1
 fi
 echo "scratch-paths-test: OK"

@@ -269,8 +269,8 @@ impl EventContext<'_> {
 /// consumed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct OcclusionSnapshot {
-    /// How long the oldest unanswered [`WindowHandle::request_redraw`] has
-    /// been pending, if one is outstanding.
+    /// How long the most recent outstanding [`WindowHandle::request_redraw`]
+    /// has been pending, if one is outstanding.
     pub pending: Option<std::time::Duration>,
     /// Whether a frame callback has ever been served: the probe is armed
     /// only after the surface proved it can accept redraws.
@@ -340,8 +340,11 @@ impl WindowHandle {
     /// Samples the redraw-starvation probe for diagnostics (issue #2570).
     ///
     /// Read-only: the snapshot never mutates probe state and never affects
-    /// the synthetic occlusion edges. Lock contention (the loop adapter is
-    /// updating the probe) yields the default snapshot rather than blocking.
+    /// the synthetic occlusion edges. The lock may block the calling thread
+    /// briefly while the loop adapter updates the probe; this accessor is
+    /// intended for the event-loop thread (the watchdog context sampler).
+    /// A monitor or watchdog caller that cannot afford to wait must use its
+    /// own `try_lock` path. A poisoned probe yields the default snapshot.
     pub fn occlusion_snapshot(&self) -> OcclusionSnapshot {
         self.occlusion_probe
             .lock()

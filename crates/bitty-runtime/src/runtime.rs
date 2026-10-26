@@ -300,7 +300,10 @@ const FORWARDER_JOIN_POLL: std::time::Duration = std::time::Duration::from_milli
 /// Returns `true` when the thread was joined, `false` on timeout (the
 /// handle is dropped detached; the thread still owns its `PtyReader` and
 /// exits on EOF/disconnect without touching `Runtime` state). Never blocks
-/// beyond `timeout` plus one poll slice. Pure move helper shared by the
+/// on the forwarder beyond `timeout` plus one poll slice. The timeout
+/// diagnostic is a best-effort stderr write and can itself wait on a blocked
+/// stderr pipe, so a caller must not treat this helper as signal-safe or as a
+/// hard wall-clock bound when stderr is wedged. Pure move helper shared by the
 /// primary and per-pane teardown paths.
 pub(super) fn join_forwarder_with_timeout(
     handle: std::thread::JoinHandle<()>,
@@ -323,12 +326,19 @@ pub(super) fn join_forwarder_with_timeout(
     // EOF/disconnect; its waker clone may fire once post-detach, so wakers
     // must stay idempotent and Runtime-independent (see `PtyWaker` docs).
     // Issue #2570 telemetry: callers discard the boolean, so a detached
-    // forwarder used to be silent. Name it once per teardown with the bound
-    // so a lingering process's thread table has a matching log line.
-    eprintln!(
-        "bitty: PTY forwarder join timed out after {} ms; detached (EOF/disconnect still closes it)",
-        timeout.as_millis()
-    );
+    // forwarder used to be silent. One line per timed-out forwarder names the
+    // likely cause (the forwarder exits on EOF/disconnect) and the bound, so
+    // a lingering process's thread table has a matching log line. The write is
+    // best-effort: this runs on the `Drop for Runtime` path, where `eprintln!`
+    // would panic on a failed stderr write.
+    {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "bitty: PTY forwarder join timed out after {} ms; detached (the forwarder exits on EOF/disconnect)",
+            timeout.as_millis()
+        );
+    }
     false
 }
 

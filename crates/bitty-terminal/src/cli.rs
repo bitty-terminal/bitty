@@ -123,6 +123,10 @@ pub(crate) struct Args {
     /// `--format` shape for `bitty config show|validate` (CTX-1467).
     /// Raw on purpose: validated fail-closed at config dispatch.
     pub(crate) config_format: Option<String>,
+    /// `--json` was requested (CTX-1589). Normalized after parsing into
+    /// [`Self::config_format`] when a `config` subcommand is present; a
+    /// bare `--json` stays an unknown-flag usage error elsewhere.
+    pub(crate) config_json: bool,
     /// Ghostty-style `+<action>` alias (CTX-1467, issue #2464). Only the
     /// parsed identity is stored; dispatch always reuses the canonical
     /// `list`/`config`/`extension` fields set beside it.
@@ -476,6 +480,7 @@ impl Args {
             config_word: false,
             config_args: Vec::new(),
             config_format: None,
+            config_json: false,
             plus_action: None,
 
             init_word: false,
@@ -1340,6 +1345,14 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 out.component_no_color = true;
                 i += 1;
             }
+            "--json" => {
+                // CTX-1589: `bitty config profile ... --json` machine output.
+                // Recorded here and normalized after the parse loop: the
+                // `config` word may follow the flag (`bitty --json config`),
+                // and a bare `--json` outside `config` stays a usage error.
+                out.config_json = true;
+                i += 1;
+            }
             "--split" => {
                 // Check next token for axis (if not a flag)
                 if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
@@ -2085,6 +2098,17 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 }
                 i += 1;
             }
+        }
+    }
+    // CTX-1589: `--json` is accepted anywhere for the config surface
+    // (`bitty --json config ...`, `bitty config ... --json`) and normalized
+    // onto the existing `--format json` slot. Outside `config` it keeps the
+    // historical unknown-flag failure (exit 2) instead of being ignored.
+    if out.config_json {
+        if out.config_word {
+            out.config_format = Some(String::from("json"));
+        } else if out.unknown_flag.is_none() {
+            out.unknown_flag = Some(String::from("--json"));
         }
     }
     out

@@ -1147,7 +1147,8 @@ pub(crate) fn config_usage() -> String {
      \x20 validate  load + validate only; exit 2 when invalid, no key dump\n\
      \x20 edit      open the file in $VISUAL/$EDITOR (vi fallback), then validate\n\
      \x20           (--safe is rejected: safe mode never reads the edited file)\n\
-     \x20 profile   manage named profiles (list|show|use|path NAME)\n\
+     \x20 profile   manage named profiles\n\
+     \x20           (create|clone|rename|delete|list|show|use|get|set|path)\n\
      \n\
      config file: $XDG_CONFIG_HOME/bitty/init.lua (fallback config.lua alias)\n\
      profiles: $XDG_CONFIG_HOME/bitty/profiles/<name>.lua\n\
@@ -2114,9 +2115,10 @@ const MAX_CONFIG_ROWS: usize = 64;
 /// Bound on a diagnostic string embedded in an envelope.
 const MAX_CONFIG_MESSAGE_BYTES: usize = 1024;
 
-/// Output shape for `bitty config show|validate|edit`.
+/// Output shape for `bitty config show|validate|edit` (and the profile
+/// subcommands, CTX-1589).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfigFormat {
+pub(crate) enum ConfigFormat {
     /// Human rows / plain diagnostics (not a machine contract).
     Table,
     /// One compact versioned envelope (`jsonl` is the same single line).
@@ -2124,7 +2126,7 @@ enum ConfigFormat {
 }
 
 /// Parses `--format` for config actions (fail-closed, exit 2 upstream).
-fn config_format(args: &Args) -> Result<ConfigFormat, String> {
+pub(crate) fn config_format(args: &Args) -> Result<ConfigFormat, String> {
     match args.config_format.as_deref() {
         None => Ok(ConfigFormat::Table),
         Some(value) => {
@@ -2155,7 +2157,7 @@ fn config_command_spelling(args: &Args, cmd: ConfigCommand) -> String {
 }
 
 /// Char-boundary truncation for diagnostics.
-fn bounded_message(raw: &str) -> String {
+pub(crate) fn bounded_message(raw: &str) -> String {
     if raw.len() <= MAX_CONFIG_MESSAGE_BYTES {
         return raw.to_string();
     }
@@ -2171,7 +2173,8 @@ fn bounded_message(raw: &str) -> String {
 }
 
 /// One typed value in the bounded key projection.
-enum ConfigValue {
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ConfigValue {
     /// String value.
     Text(String),
     /// Numeric value rendered with `Display` (stable, locale-independent).
@@ -2185,7 +2188,7 @@ enum ConfigValue {
 }
 
 impl ConfigValue {
-    fn kind(&self) -> &'static str {
+    pub(crate) fn kind(&self) -> &'static str {
         match self {
             Self::Text(_) => "string",
             Self::Number(_) => "number",
@@ -2195,7 +2198,7 @@ impl ConfigValue {
         }
     }
 
-    fn json(&self) -> String {
+    pub(crate) fn json(&self) -> String {
         match self {
             Self::Text(value) => format!("\"{}\"", crate::list::json_escape(value)),
             Self::Number(value) => value.clone(),

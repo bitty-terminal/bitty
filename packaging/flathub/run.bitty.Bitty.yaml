@@ -1,0 +1,54 @@
+# Flathub Flatpak manifest for Bitty (issue #2518).
+#
+# Unlike most packages here, this is NOT consumed by the release workflow:
+# the Flathub submission itself is an owner action. For the submission
+# checklist (manifest copies + refresh procedure) see README.md in this
+# directory. It therefore avoids relative `path:` sources pointing back into this
+# repository, and instead ships everything flatpak-builder needs inside the
+# single bundle sources each release already publishes.
+#
+# Version strategy: every occurrence of the release version is pinned in this
+# file and must be refreshed on each release (the SHA256SUMS digests are
+# published under https://github.com/bitty-terminal/bitty/releases, so they
+# are known ahead of the Flathub re-review).
+app-id: run.bitty.Bitty
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+command: bitty
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --share=network
+  # Allow the terminal to launch host commands through
+  # `flatpak-spawn --host` (the standard Flathub escape hatch for
+  # terminal emulators, as used by WezTerm and GNOME Console).
+  - --talk-name=org.freedesktop.Flatpak
+  # Expose host /usr contents read-only under /run/host, so the
+  # terminal can detect host shells and run host-side tools.
+  - --filesystem=host-os:ro
+modules:
+  - name: bitty
+    buildsystem: simple
+    build-commands:
+      # The tar.zst bundle layout is `bin/bitty`, `share/...`, LICENSE, README.md,
+      # CHANGELOG.md, built by `scripts/make-unix-bundle.sh`.
+      - install -Dm755 -t /app/bin bin/bitty
+      - cp -a share/. /app/share/
+    sources:
+      - type: archive
+        archive-type: tar-zst
+        strip-components: 1
+        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.29/bitty-0.0.29-x86_64-unknown-linux-gnu.tar.zst
+        sha256: 42e324669063a15b33e270eb8f3880bfba0a320854e8c82a2ab9eae24f75ccc3
+        only-arches:
+          - x86_64
+      - type: archive
+        archive-type: tar-zst
+        strip-components: 1
+        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.29/bitty-0.0.29-aarch64-unknown-linux-gnu.tar.zst
+        sha256: c5f392873993b103c76c931046581c6c81865b954b58b49c13d9d839392425d2
+        only-arches:
+          - aarch64

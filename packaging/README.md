@@ -28,6 +28,7 @@ and is labeled as such below.
 | openbsd      | `packaging/openbsd/x11/bitty/` (ports recipe)            | OpenBSD amd64 ports recipe; best-effort, not supported      |
 | netbsd       | `packaging/netbsd/x11/bitty/` (pkgsrc recipe)            | NetBSD pkgsrc recipe; best-effort, not supported            |
 | winget       | `packaging/windows/winget/`                              | Windows Package Manager (`BittyTerminal.Bitty`)             |
+| flatpak      | `packaging/flathub/run.bitty.Bitty.yaml`                 | Flathub (in-tree manifest, not submitted to Flathub; owner action, best-effort) |
 
 The upstream distro recipes (Alpine aports, Gentoo overlay, Void `xbps-src`,
 Solus `ypkg`, FreeBSD Ports, OpenBSD Ports, NetBSD pkgsrc) are in-tree drafts: nothing is published to

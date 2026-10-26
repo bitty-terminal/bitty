@@ -624,13 +624,39 @@ mod tests {
     }
 
     #[test]
-    fn cluster_width_is_max_scalar_width() {
+    fn cluster_width_follows_cluster_presentation() {
         assert_eq!(cluster_cell_width("", AmbiguousWidth::Narrow), 0);
         assert_eq!(cluster_cell_width("a", AmbiguousWidth::Narrow), 1);
         assert_eq!(cluster_cell_width("中", AmbiguousWidth::Narrow), 2);
         assert_eq!(cluster_cell_width("e\u{0301}", AmbiguousWidth::Narrow), 1);
+        // A lone zero-width cluster owns no cell.
+        assert_eq!(cluster_cell_width("\u{0301}", AmbiguousWidth::Narrow), 0);
+        assert_eq!(cluster_cell_width("\u{200D}", AmbiguousWidth::Narrow), 0);
         let family = "👩\u{200D}👩\u{200D}👧";
         assert_eq!(cluster_cell_width(family, AmbiguousWidth::Narrow), 2);
+        // Regional-indicator pair, skin tone, VS16 heart, keycap.
+        assert_eq!(
+            cluster_cell_width("\u{1F1EB}\u{1F1F7}", AmbiguousWidth::Narrow),
+            2
+        );
+        assert_eq!(
+            cluster_cell_width("\u{1F44D}\u{1F3FD}", AmbiguousWidth::Narrow),
+            2
+        );
+        assert_eq!(
+            cluster_cell_width("\u{2764}\u{FE0F}", AmbiguousWidth::Narrow),
+            2
+        );
+        assert_eq!(
+            cluster_cell_width("#\u{FE0F}\u{20E3}", AmbiguousWidth::Narrow),
+            2
+        );
+        // Text presentation stays narrow.
+        assert_eq!(
+            cluster_cell_width("\u{2764}\u{FE0E}", AmbiguousWidth::Narrow),
+            1
+        );
+        // Ambiguous policy affects the cluster like its scalars.
         assert_eq!(cluster_cell_width("α", AmbiguousWidth::Narrow), 1);
         assert_eq!(cluster_cell_width("α", AmbiguousWidth::Wide), 2);
     }

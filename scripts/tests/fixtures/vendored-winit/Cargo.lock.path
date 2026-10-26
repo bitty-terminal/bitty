@@ -1,0 +1,12 @@
+version = 4
+
+[[package]]
+name = "bitty-platform"
+version = "0.0.29"
+dependencies = [
+ "winit",
+]
+
+[[package]]
+name = "winit"
+version = "0.30.13"

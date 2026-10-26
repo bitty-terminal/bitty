@@ -14,12 +14,16 @@ inheritance never rewrite or re-lint upstream code. Apart from this file and
 `docs/`, `examples/`, and `tests/`. The cargo registry marker `.cargo-ok` is a
 local cache artifact and is not copied.
 
+`just vendored-winit` (part of `just check`) fails when the lock or the
+resolved graph no longer comes from this directory, and when the tree drifts
+from the digest pinned below. See [Integrity](#integrity).
+
 ## Provenance
 
 | Item            | Value                                                                                 |
 | --------------- | ------------------------------------------------------------------------------------- |
 | Crate source    | `winit 0.30.13` (published 2026-03-02)                                                |
-| Source path     | `~/.cargo/registry/src/index.crates.io-*/winit-0.30.13/`                              |
+| Source path     | `$CARGO_HOME/registry/src/index.crates.io-*/winit-0.30.13/`                           |
 | Source revision | `e9809ef54b18499bb4f2cac945719ecc2a61061b` (recorded in `.cargo_vcs_info.json`)       |
 | Upstream PR     | <https://github.com/rust-windowing/winit/pull/4710>                                   |
 | PR title        | `[0.30] Wayland: emit Occluded for the xdg-shell suspended state`                     |
@@ -31,10 +35,33 @@ local cache artifact and is not copied.
 | Fetched         | 2026-10-26, from `https://github.com/rust-windowing/winit/pull/4710.diff`             |
 | Apply result    | clean, zero fuzz (`git apply --check` and `patch --dry-run --fuzz=0`)                 |
 | Diff stat       | 5 files changed, 65 insertions(+), 10 deletions(-)                                    |
+| Tree digest     | `c0c4343e576b91e6c1e88f7f1f2ba3c1d0cd9519533d0b554492385ee0510a47`                    |
 
 The PR base equals the released `0.30.13` commit, which is why the patch applies
 to the crates.io source without offsets. Only the five files below differ from
 the registry copy (verified with a recursive no-index diff of the two trees).
+
+## Integrity
+
+The tree digest above covers every vendored file rooted at `vendor/winit`,
+excluding this file and `patches/` (repository metadata, not upstream source).
+It is the SHA-256 of the sorted `sha256sum` manifest, computed exactly as:
+
+```sh
+cd vendor/winit
+find . -type f ! -name PATCHES.md ! -path './patches/*' \
+  -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum
+```
+
+`scripts/check-vendored-winit.sh` (recipe `just vendored-winit`) recomputes the
+same value and fails on any mismatch, so a stray edit inside the vendored tree
+cannot pass `just check` unnoticed. The trust model is deliberately simple: the
+digest proves the tree is the one reviewed with this file, not that upstream is
+trustworthy. Upstream trust comes from the recorded base/head commits and the
+diff review, not from the digest.
+
+Recompute the digest only after an intentional vendor change, in the same
+commit, and update the row above (the gate prints the freshly computed value).
 
 ## Files and hunks
 
@@ -92,7 +119,7 @@ diverge the vendored source from the upstream PR, which is what the
 provenance record is meant to guarantee. The behaviour is covered from Bitty's
 side by the existing `Occluded` mapping test
 (`crates/bitty-platform/src/event.rs`, `translate_window_event`) and by the
-`input-vm-test-support` surface-gate test, which drive the same
+`input-vm-test-support` surface-gate test, which drives the same
 `WindowEventKind::Occluded` edges the patch produces.
 
 ## Known upstream caveat
@@ -139,10 +166,62 @@ source in the graph:
   `.markdownlint-cli2.jsonc` `ignores`; `vendor/winit/PATCHES.md` stays linted.
   The vendored source is never reformatted.
 
+### Advisory coverage gap (RustSec)
+
+`cargo audit` and `cargo deny check advisories` match advisory ranges against
+packages that carry a registry source. A path package has no `source` and no
+`checksum`, so **the vendored winit tree is outside RustSec matching in both
+scanners**: a hypothetical advisory against `winit 0.30.13` would go unreported
+for this tree, while the same version resolved from crates.io would report it.
+This is not a hypothetical: the control test with a synthetic `time 0.1.44`
+entry shows the split — registry source matches `RUSTSEC-2020-0071`, the same
+entry without a source does not.
+
+Compensating controls, until the patch is dropped:
+
+- **Dated re-audit bound: 2027-03-31**, the same bound `deny.toml`
+  `[advisories]` records for its ignored advisories (P0-AC-034 exception
+  policy). Re-check the winit advisory feed and winit release notes by then, or
+  earlier when a winit release or a RUSTSEC entry for the 0.30 line lands.
+  Extending the bound needs a dated ADR-0004 revision.
+- **Manual synthetic-lock audit** (what the registry graph would see), from the
+  repository root:
+
+  ```sh
+  tmp="$(mktemp)"
+  python3 - "$tmp" <<'PY'
+  import pathlib, sys
+  lock = pathlib.Path("Cargo.lock").read_text(encoding="utf-8")
+  old = 'name = "winit"\nversion = "0.30.13"\n'
+  new = (
+      old
+      + 'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+      + 'checksum = "a6755fa58a9f8350bd1e472d4c3fcc25f824ec358933bba33306d0b63df5978d"\n'
+  )
+  assert lock.count(old) == 1, "winit block not found exactly once"
+  pathlib.Path(sys.argv[1]).write_text(lock.replace(old, new), encoding="utf-8")
+  PY
+  cargo audit --no-fetch --file "$tmp" \
+    --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0192 --ignore RUSTSEC-2026-0009
+  rm -f "$tmp"
+  ```
+
+  The checksum is the published `winit 0.30.13` checksum (the value the lock
+  carried before the patch). The same snippet works for any future vendored
+  release: take the fresh checksum from `cargo search`/the crates.io API and
+  bump the `version` line.
+
 ## Update procedure
 
-The `[patch.crates-io]` entry pins the graph to this path, so a plain
-`cargo update -p winit` will not move the version while the patch is active.
+The `[patch.crates-io]` entry points at this directory, so while it is active
+cargo resolves `winit` here even when a newer compatible 0.30.x release exists;
+`cargo update -p winit` is a no-op for the version. The patch only stops
+applying when the requirement itself moves past it (for example a bump to
+`0.30.14` or `0.31`), and then cargo prints a single
+`warning: patch for winit was not used in the crate graph` and silently
+resolves the registry release. `just vendored-winit` fails on exactly that
+state.
+
 To take a newer release and re-apply the patch:
 
 1. Remove `winit = { path = "vendor/winit" }` from `[patch.crates-io]` and the
@@ -150,18 +229,20 @@ To take a newer release and re-apply the patch:
 2. `cargo update -p winit --precise <new-version>` and confirm
    `cargo tree -p winit` shows the registry source.
 3. Re-extract the new release from
-   `~/.cargo/registry/src/<registry>/winit-<new-version>/` over `vendor/winit`,
-   keeping `PATCHES.md` and `patches/`.
+   `$CARGO_HOME/registry/src/<registry>/winit-<new-version>/` over
+   `vendor/winit`, keeping `PATCHES.md` and `patches/`.
 4. `git apply --check --directory=vendor/winit --verbose \
 vendor/winit/patches/0001-wayland-xdg-suspended-occluded.diff` and then apply
    it. If it does not apply, rebase the patch on the new release, update the
    base/head and SHA-256 rows above, and re-run the diff-stat check.
 5. Restore the `[patch.crates-io]` and `exclude` entries.
-6. `cargo check --workspace --all-targets`, `cargo test -p bitty-platform`,
+6. Recompute the tree digest with the command in [Integrity](#integrity), update
+   the `Tree digest` row, and run `just vendored-winit` to confirm.
+7. `cargo check --workspace --all-targets`, `cargo test -p bitty-platform`,
    the occlusion-gate test, `cargo fmt --all -- --check`, and
    `cargo deny check` before committing.
 
-If the new release already carries #4710, skip steps 3-5: delete the patch, the
+If the new release already carries #4710, skip steps 3-6: delete the patch, the
 `vendor/winit` tree, and the `exclude` entry, and record the removal in the
 commit message.
 

@@ -239,6 +239,14 @@ jobs:
         if: matrix.shard == 1
         run: cargo fmt --all -- --check
 
+      # CTX-1605: `winit` is a patched path dependency (vendor/winit). A
+      # requirement bump otherwise resolves to crates.io with only a "patch was
+      # not used" warning, dropping the Wayland Occluded edge while staying
+      # green. Offline, no build.
+      - name: Check the vendored winit resolution
+        if: matrix.shard == 1
+        run: ./scripts/check-vendored-winit.sh
+
       # Arch tooling is absent on ubuntu-24.04, so this gate runs its
       # in-tree assertions and skips the makepkg --printsrcinfo probe.
       - name: Validate packaging recipes (artifact-install consistency)

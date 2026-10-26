@@ -21,6 +21,7 @@
 
 use crate::action::TerminalAction;
 use crate::diag::{RejectLog, warn_rejection};
+use crate::iterm2_osc::{Iterm2OscScanner, OscOutcome};
 use crate::kitty_apc::{KITTY_APC_MAX_CONTROL_BYTES, KittyApcAssembler, KittyFeedOutcome};
 use crate::kitty_font_query::{KITTY_FONT_QUERY_WIRE_MAX_BYTES, parse_kitty_font_query};
 use vte::Params;
@@ -47,6 +48,7 @@ pub struct Parser {
     state_machine: vte::Parser,
     dcs: PendingDcs,
     kitty: KittyApcAssembler,
+    iterm2: Iterm2OscScanner,
     apc_buf: Vec<u8>,
     apc_payload: bool,
     in_apc: bool,
@@ -62,6 +64,7 @@ impl std::fmt::Debug for Parser {
             .field("dcs", &self.dcs)
             .field("in_apc", &self.in_apc)
             .field("kitty_pending", &self.kitty.has_pending())
+            .field("iterm2_pending", &self.iterm2.is_active())
             .finish_non_exhaustive()
     }
 }
@@ -106,6 +109,7 @@ impl Parser {
             state_machine: vte::Parser::new(),
             dcs: PendingDcs::default(),
             kitty: KittyApcAssembler::new(),
+            iterm2: Iterm2OscScanner::default(),
             apc_buf: Vec::new(),
             apc_payload: false,
             in_apc: false,
@@ -127,6 +131,7 @@ impl Parser {
             state_machine: vte::Parser::new(),
             dcs: PendingDcs::default(),
             kitty: KittyApcAssembler::with_ledger_cap(ledger_cap),
+            iterm2: Iterm2OscScanner::default(),
             apc_buf: Vec::new(),
             apc_payload: false,
             in_apc: false,
@@ -188,6 +193,7 @@ impl Parser {
             state_machine,
             dcs,
             kitty,
+            iterm2,
             apc_buf,
             apc_payload,
             in_apc,
@@ -255,6 +261,13 @@ impl Parser {
                 if next == b'_' {
                     begin_apc(kitty, apc_buf, apc_payload, in_apc, apc_discarding);
                     i = 1;
+                } else if next == b']' {
+                    // Possible `OSC 1337 ; File=` (CTX-1590): the introducer
+                    // is consumed here and the scanner decides whether the
+                    // prefix matches or must be replayed into `vte`.
+                    kitty.note_interleaved(1);
+                    iterm2.begin();
+                    i = 1;
                 } else {
                     state_machine.advance(&mut bridge, &[0x1B]);
                     i = 0;
@@ -263,6 +276,36 @@ impl Parser {
         }
 
         while i < bytes.len() {
+            if iterm2.is_active() {
+                let byte = bytes[i];
+                match iterm2.push(byte) {
+                    OscOutcome::Consumed => {
+                        kitty.note_interleaved(1);
+                        i += 1;
+                        continue;
+                    }
+                    OscOutcome::PassThrough => {
+                        for replayed in iterm2.replay() {
+                            state_machine.advance(&mut bridge, &[*replayed]);
+                        }
+                        iterm2.clear_replay();
+                        // Fall through: the current byte takes the normal
+                        // path now that `vte` has the whole OSC prefix.
+                    }
+                    OscOutcome::Finished => {
+                        finish_iterm2(&mut bridge, iterm2, reject_log);
+                        i += 1;
+                        continue;
+                    }
+                    OscOutcome::FinishedThenPassThrough => {
+                        finish_iterm2(&mut bridge, iterm2, reject_log);
+                        for replayed in iterm2.replay() {
+                            state_machine.advance(&mut bridge, &[*replayed]);
+                        }
+                        iterm2.clear_replay();
+                    }
+                }
+            }
             if *in_apc {
                 let b = bytes[i];
                 if b == 0x1B {
@@ -369,6 +412,11 @@ impl Parser {
                     if bytes[i + 1] == b'_' {
                         begin_apc(kitty, apc_buf, apc_payload, in_apc, apc_discarding);
                         i += 2;
+                    } else if bytes[i + 1] == b']' {
+                        // Possible `OSC 1337 ; File=`: see the held-ESC arm.
+                        kitty.note_interleaved(1);
+                        iterm2.begin();
+                        i += 2;
                     } else {
                         kitty.note_interleaved(1);
                         state_machine.advance(&mut bridge, &[0x1B]);
@@ -456,6 +504,27 @@ fn terminate_apc<F: FnMut(TerminalAction)>(
             payload: done.payload,
             control: done.keys,
         });
+    }
+}
+
+/// Emits the finished iTerm2 inline image or its counted refusal.
+fn finish_iterm2<F: FnMut(TerminalAction)>(
+    bridge: &mut Bridge<'_, F>,
+    iterm2: &mut Iterm2OscScanner,
+    reject_log: &mut RejectLog,
+) {
+    match iterm2.take_result() {
+        Some(Ok(request)) => bridge.emit(crate::iterm2_osc::image_action(request)),
+        Some(Err(reason)) => {
+            if let Some(occurrence) = reject_log.record() {
+                warn_rejection(
+                    occurrence,
+                    &format!("bitty: rejecting OSC 1337 inline image ({reason}): stored nothing"),
+                );
+            }
+            bridge.emit(crate::iterm2_osc::rejected_action(reason));
+        }
+        None => {}
     }
 }
 

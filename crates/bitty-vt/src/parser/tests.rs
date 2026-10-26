@@ -2928,3 +2928,167 @@ fn kitty_font_query_apc_bel_terminator_is_accepted() {
         }]
     );
 }
+
+// — CTX-1590 / issue #2217 OSC 1337 `File=` inline images: admitted images,
+// counted refusals, chunking invariance, and untouched non-image OSC paths.
+
+/// 1x1 opaque red PNG (same fixture as the runtime suite).
+const ITERM2_PNG_1X1: [u8; 70] = [
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
+    0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 218, 99, 248, 207, 192, 240, 31, 0,
+    5, 0, 1, 255, 86, 199, 47, 13, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
+fn iterm2_wire(header: &str, payload: &[u8]) -> String {
+    format!("\x1b]1337;File={header}:{}\x07", kitty_base64(payload))
+}
+
+#[test]
+fn osc1337_inline_image_emits_one_bounded_action() {
+    let wire = iterm2_wire("inline=1;width=2;height=auto", &ITERM2_PNG_1X1);
+    let actions = parse(wire.as_bytes());
+    assert_eq!(actions.len(), 1, "expected one action, got {actions:?}");
+    match &actions[0] {
+        TerminalAction::Iterm2Image {
+            cols,
+            rows,
+            payload,
+        } => {
+            assert_eq!((*cols, *rows), (2, 0));
+            assert_eq!(&**payload, ITERM2_PNG_1X1.as_slice());
+        }
+        other => panic!("expected an admitted iTerm2 image, got {other:?}"),
+    }
+}
+
+#[test]
+fn osc1337_is_chunking_invariant() {
+    let wire = iterm2_wire("inline=1;width=3;height=2", &ITERM2_PNG_1X1);
+    let whole = parse(wire.as_bytes());
+    assert_eq!(whole.len(), 1);
+    for chunk_size in [1, 2, 3, 5, 7, 16, 32] {
+        assert_eq!(
+            parse_split(wire.as_bytes(), chunk_size),
+            whole,
+            "chunk size {chunk_size} changed the OSC 1337 action stream"
+        );
+    }
+}
+
+#[test]
+fn osc1337_esc_backslash_terminator_is_accepted() {
+    let mut wire = iterm2_wire("inline=1", &ITERM2_PNG_1X1);
+    wire.pop(); // drop BEL
+    wire.push_str("\x1b\\");
+    let actions = parse(wire.as_bytes());
+    assert_eq!(actions.len(), 1, "expected one action, got {actions:?}");
+    assert!(matches!(actions[0], TerminalAction::Iterm2Image { .. }));
+    // The terminating `ESC \` is consumed, not reported as an unknown ESC.
+    assert!(
+        actions
+            .iter()
+            .all(|action| !matches!(action, TerminalAction::Unknown(_)))
+    );
+}
+
+#[test]
+fn osc1337_refusals_are_counted_inert_actions() {
+    // Oversize wire payload: the body cap drops it without buffering.
+    let mut oversize = String::from("\x1b]1337;File=inline=1:");
+    oversize.push_str(&"A".repeat(crate::ITERM2_OSC_MAX_BODY_BYTES + 8));
+    oversize.push('\x07');
+    assert_eq!(
+        parse(oversize.as_bytes()),
+        vec![TerminalAction::Iterm2ImageRejected {
+            reason: crate::Iterm2Reject::OversizePayload
+        }]
+    );
+
+    // Transmit-only (`inline=0`) is refused: no unreachable stored image.
+    assert_eq!(
+        parse(iterm2_wire("inline=0", &ITERM2_PNG_1X1).as_bytes()),
+        vec![TerminalAction::Iterm2ImageRejected {
+            reason: crate::Iterm2Reject::TransmitOnly
+        }]
+    );
+
+    // Truncated base64 never reaches the store.
+    let mut truncated = String::from("\x1b]1337;File=inline=1:");
+    let encoded = kitty_base64(&ITERM2_PNG_1X1);
+    truncated.push_str(&encoded[..encoded.len() - 3]);
+    truncated.push('\x07');
+    assert_eq!(
+        parse(truncated.as_bytes()),
+        vec![TerminalAction::Iterm2ImageRejected {
+            reason: crate::Iterm2Reject::BadBase64
+        }]
+    );
+}
+
+#[test]
+fn osc1337_oversize_body_recovers_for_the_next_image() {
+    let mut stream = String::from("\x1b]1337;File=inline=1:");
+    stream.push_str(&"B".repeat(crate::ITERM2_OSC_MAX_BODY_BYTES + 8));
+    stream.push('\x07');
+    stream.push_str(&iterm2_wire("inline=1", &ITERM2_PNG_1X1));
+    let actions = parse(stream.as_bytes());
+    assert_eq!(actions.len(), 2, "got {actions:?}");
+    assert!(matches!(
+        actions[0],
+        TerminalAction::Iterm2ImageRejected { .. }
+    ));
+    assert!(matches!(actions[1], TerminalAction::Iterm2Image { .. }));
+}
+
+#[test]
+fn osc1337_other_commands_stay_inert_unknown_osc() {
+    // `Copy=` is not an admitted command: the probe replays the prefix and
+    // `vte` reports the sequence exactly as it did before CTX-1590.
+    assert_eq!(
+        parse(b"\x1b]1337;Copy=:YWJj\x07"),
+        vec![TerminalAction::OscUnknown {
+            id: 1337,
+            data: BoundedBytes::new(b"Copy=:YWJj".to_vec()),
+        }]
+    );
+}
+
+#[test]
+fn osc1337_probe_leaves_other_osc_paths_unchanged() {
+    // Titles, prompt marks, and clipboard still dispatch through `vte`.
+    assert_eq!(
+        parse(b"\x1b]0;title\x07"),
+        vec![TerminalAction::OscTitle {
+            text: BoundedString::new("title"),
+        }]
+    );
+    assert_eq!(
+        parse(b"\x1b]133;A\x07"),
+        vec![TerminalAction::OscPromptMark {
+            kind: ZoneKind::PromptStart,
+            exit_code: None,
+        }]
+    );
+    assert!(matches!(
+        parse(b"\x1b]52;c;aGk=\x07").as_slice(),
+        [TerminalAction::OscClipboard {
+            op: ClipboardOp::Write,
+            ..
+        }]
+    ));
+}
+
+#[test]
+fn osc1337_image_keeps_stream_order_with_text() {
+    let mut stream = iterm2_wire("inline=1", &ITERM2_PNG_1X1);
+    stream.push_str("ok");
+    let actions = parse(stream.as_bytes());
+    assert!(matches!(actions[0], TerminalAction::Iterm2Image { .. }));
+    assert_eq!(
+        &actions[1..],
+        &[
+            TerminalAction::Print(GraphemeCell::from('o')),
+            TerminalAction::Print(GraphemeCell::from('k')),
+        ]
+    );
+}

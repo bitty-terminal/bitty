@@ -572,8 +572,11 @@ struct PendingKitty {
     payload: Vec<u8>,
 }
 
+/// Fail-closed standard-alphabet base64 decoder shared with the iTerm2
+/// inline-image intake (`crate::iterm2_osc`), so both protocols apply the
+/// same alphabet, padding, and decoded-limit rules.
 #[derive(Debug, Clone, Copy, Default)]
-struct Base64Stream {
+pub(crate) struct Base64Stream {
     carry: [u8; 4],
     carry_len: usize,
     padding: usize,
@@ -654,7 +657,7 @@ impl IntakeBudget {
 }
 
 impl Base64Stream {
-    fn push(
+    pub(crate) fn push(
         &mut self,
         input: &[u8],
         output: &mut Vec<u8>,
@@ -701,7 +704,11 @@ impl Base64Stream {
         Ok(())
     }
 
-    fn finish(&mut self, output: &mut Vec<u8>, limit: usize) -> Result<(), KittyApcReject> {
+    pub(crate) fn finish(
+        &mut self,
+        output: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<(), KittyApcReject> {
         if self.finished {
             return Ok(());
         }

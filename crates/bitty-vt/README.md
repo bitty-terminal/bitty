@@ -33,5 +33,7 @@ the typed action interface of the terminal-state RFC (see `src/lib.rs`).
 - `src/parser.rs` and `src/parser/` — byte driver plus dispatch and SGR.
 - `src/bounded.rs` — bounded parameter and payload types.
 - `src/kitty_apc.rs` — Kitty APC chunk reassembly under a ledger cap.
+- `src/iterm2_osc.rs` — bounded iTerm2 `OSC 1337 ; File=` inline-image
+  intake (wire/decoded/pixel caps, PNG allowlist, counted refusals).
 - `seeds/` — parser corpora seeds.
 - `tests/` — parser conformance tests.

@@ -25,6 +25,7 @@
 //! a variant for such a sequence requires an RFC revision first.
 
 use crate::bounded::{BoundedBytes, BoundedString};
+use crate::iterm2_osc::Iterm2Reject;
 use crate::kitty_apc::KittyControlKeys;
 use crate::kitty_font_query::KittyFontQuery;
 
@@ -1210,6 +1211,34 @@ pub enum TerminalAction {
     KittyFontQuery {
         /// Known keys requested by the sequence.
         query: KittyFontQuery,
+    },
+    /// An admitted iTerm2 inline image (`OSC 1337 ; File=`, CTX-1590).
+    ///
+    /// The parser pre-scans the OSC (which `vte` would buffer unbounded
+    /// before dispatching), enforces the wire/decoded/pixel caps and the
+    /// PNG allowlist, and emits this variant only for a fully validated
+    /// image. Terminal state treats it as inert; the runtime routes it to
+    /// the same store/placement/present seam as `KittyGraphics`, with the
+    /// cursor held (iTerm2 inline images never advance it).
+    ///
+    /// `inline=1` is the only admitted form, so every emitted image paints;
+    /// transmit-only (`inline=0`) requests are refused before this variant.
+    Iterm2Image {
+        /// Requested `width=` in cells (`0` derives from the PNG width).
+        cols: u16,
+        /// Requested `height=` in cells (`0` derives from the PNG height).
+        rows: u16,
+        /// Decoded PNG payload bytes.
+        payload: Box<[u8]>,
+    },
+    /// A refused iTerm2 inline image (`OSC 1337 ; File=`, CTX-1590).
+    ///
+    /// Semantically inert and carried for telemetry only: the parser already
+    /// dropped the request, so this variant never stores, places, or paints
+    /// anything. Terminal state counts it; replay reproduces the same count.
+    Iterm2ImageRejected {
+        /// Why the request was refused.
+        reason: Iterm2Reject,
     },
 
     // Unknown escape families

@@ -26,6 +26,13 @@
 //! `m=` chunks under the ledger cap. Rejections warn via `stderr`
 //! (diagnostic only, no state change) and emit no action.
 //!
+//! iTerm2 inline images (`OSC 1337 ; File=`, CTX-1590) are pre-scanned the
+//! same way: `vte`'s `std` OSC collector grows without a cap, so the
+//! bounded intake ([`iterm2_osc`]) buffers the body itself, enforces the
+//! wire/decoded/pixel caps, and diverts only the `1337;File=` prefix.
+//! Admitted images emit [`TerminalAction::Iterm2Image`]; refusals emit the
+//! inert [`TerminalAction::Iterm2ImageRejected`] telemetry action.
+//!
 //! # Example
 //!
 //! ```
@@ -54,6 +61,7 @@
 mod action;
 mod bounded;
 mod diag;
+pub mod iterm2_osc;
 pub mod kitty_apc;
 pub mod kitty_font_query;
 mod parser;
@@ -68,6 +76,12 @@ pub use action::{
     TerminalAction, UnderlineStyle, UnrecognizedSequence, ZoneKind,
 };
 pub use bounded::{BoundedBytes, BoundedString};
+pub use iterm2_osc::{
+    ITERM2_DECODE_MAX_DIMENSION, ITERM2_DECODE_MAX_PIXELS, ITERM2_OSC_MAX_ATTRIBUTE_BYTES,
+    ITERM2_OSC_MAX_BODY_BYTES, ITERM2_OSC_MAX_CELL_SPAN, ITERM2_OSC_MAX_DECODED_BYTES,
+    ITERM2_OSC_MAX_NAME_BYTES, ITERM2_OSC_MAX_WIRE_BYTES, ITERM2_OSC_PREFIX, Iterm2Reject,
+    Iterm2Request,
+};
 pub use kitty_apc::{
     KITTY_APC_DECODE_MAX_BYTES, KITTY_APC_DECODE_MAX_DIMENSION, KITTY_APC_DECODE_MAX_PIXELS,
     KITTY_APC_LEDGER_CAP, KITTY_APC_PATH_MAX_BYTES, KITTY_APC_SHM_NAME_MAX,

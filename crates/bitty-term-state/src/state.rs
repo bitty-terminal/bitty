@@ -200,6 +200,12 @@ pub struct TelemetryCounters {
     /// unresolvable animation target, over-cap frames). The wire bytes
     /// were well-formed; the request itself could not be honored.
     pub kitty_refused: u64,
+    /// iTerm2 inline-image requests (`OSC 1337 ; File=`) refused by the
+    /// bounded parser and dropped before any store, placement, or paint
+    /// (oversize payload, malformed attributes, unsupported form, bad
+    /// base64, non-PNG format, over-cap pixels). Counts only requests the
+    /// parser recognized as images, never ordinary OSC 1337 commands.
+    pub iterm2_refused: u64,
 }
 
 /// Content displacement produced by one [`State::resize`] call.
@@ -1768,6 +1774,12 @@ impl State {
             // stays inert by contract (like OSC 10/11/4 and notifications).
             TerminalAction::OscPointerShape { .. } => {}
             TerminalAction::OscUnknown { .. } => self.telemetry.unknown_osc += 1,
+            // iTerm2 inline images (CTX-1590): pixels, decode, placement,
+            // and paint live downstream exactly like kitty graphics, so the
+            // action is inert here; the refusal variant exists only to be
+            // counted (the parser already dropped that request).
+            TerminalAction::Iterm2Image { .. } => {}
+            TerminalAction::Iterm2ImageRejected { .. } => self.telemetry.iterm2_refused += 1,
             // Kitty graphics (CTX-0256 base, CTX-0950 advanced): pixel
             // decode and paint live downstream (`KittyImageLayer` routes
             // to `kitty_display_image`), but placement, deletion,

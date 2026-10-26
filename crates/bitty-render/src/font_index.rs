@@ -1383,6 +1383,10 @@ fn fontconfig_discovery() -> Option<(Vec<PathBuf>, GenericFamilies)> {
 }
 
 /// Pure fontconfig discovery (testable without mutating process env).
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
 fn fontconfig_discovery_from(
     config_file: Option<&Path>,
     xdg_config_home: Option<&Path>,

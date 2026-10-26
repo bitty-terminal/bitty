@@ -4253,7 +4253,15 @@ impl TerminalApp {
                     self.set_surface_gate(false, "occluded");
                 }
                 WindowEventKind::Occluded(false) => {
-                    crash_report::lifecycle(crash_report::Lifecycle::Revealed);
+                    // Issue #2570 follow-up: one re-shown surface must record
+                    // one `Revealed`. A `Resized`/focus-driven synthetic
+                    // reveal can run ahead of the native `Occluded(false)`
+                    // winit delivers for the same transition, so the lifecycle
+                    // mark follows the gate transition (the same condition
+                    // `set_surface_gate` uses) instead of the edge count.
+                    if !self.runtime.is_surface_visible() {
+                        crash_report::lifecycle(crash_report::Lifecycle::Revealed);
+                    }
                     // Same contract as `Resumed`: re-queue on full redraw
                     // off this transition; the runtime does the requeue.
                     self.set_surface_gate(true, "revealed");

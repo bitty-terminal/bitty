@@ -711,11 +711,20 @@ impl OcclusionProbe {
         self.redraw_seen = true;
     }
 
-    /// Records a delivered occlusion edge (native delivery, e.g. iOS or X11
-    /// `VisibilityFullyObscured`, or a synthetic starve edge from
-    /// [`Self::starvation_edge`]).
+    /// Records a delivered occlusion edge (native delivery, e.g. iOS, X11, or
+    /// the Wayland xdg-shell v6 `suspended` edge, or a synthetic starve edge
+    /// from [`Self::starvation_edge`]).
+    ///
+    /// A reveal also clears the starvation baseline: the request that was
+    /// outstanding while the surface was occluded must not be re-read as a
+    /// fresh starvation after the native reveal, or the synthetic edge would
+    /// immediately re-close the gate the reveal just opened. A reveal does not
+    /// imply that a redraw was delivered, so `redraw_seen` is left untouched.
     fn note_occluded_state(&mut self, occluded: bool) {
         self.occluded = occluded;
+        if !occluded {
+            self.last_request = None;
+        }
     }
 
     /// The synthetic occlusion edge when the pending redraw request starved
@@ -819,10 +828,12 @@ impl<H: AppHandler> Adapter<H> {
     /// Delivers the synthetic Wayland occlusion edges for every window whose
     /// pending redraw request starved past [`OCCLUSION_STARVE`].
     ///
-    /// Native `Occluded` deliveries (iOS, X11) are translated straight to the
-    /// same [`WindowEventKind::Occluded`] event, so the embedder sees one
-    /// edge vocabulary on every platform. Wayland gets the synthetic delivery
-    /// here; the probe state keeps the two from ever double-delivering.
+    /// Native `Occluded` deliveries (iOS, X11, and Wayland when the compositor
+    /// sets xdg-shell v6 `suspended`) are translated straight to the same
+    /// [`WindowEventKind::Occluded`] event, so the embedder sees one edge
+    /// vocabulary on every platform. The synthetic delivery below is the
+    /// fallback for a surface that starves without a native edge; the probe
+    /// state keeps the two from ever double-delivering.
     fn synthesize_occlusion(&mut self, event_loop: &ActiveEventLoop) {
         // Collect first: the probes and the id lookup are separate registry
         // maps, and `dispatch` borrows the registry mutably again.
@@ -938,8 +949,9 @@ impl<H: AppHandler> ApplicationHandler<WakeEvent> for Adapter<H> {
             return;
         };
         // Issue #2570 follow-up: the probe tracks the delivered occlusion
-        // state exactly, so a native edge (iOS, X11) and the synthetic
-        // starve edge never double-deliver.
+        // state exactly, so a native edge (iOS, X11, Wayland `suspended`) and
+        // the synthetic starve edge never double-deliver; a native reveal also
+        // clears the starvation baseline so the stale request cannot resurface.
         if let WindowEventKind::Occluded(occluded) = &kind {
             if let Some(probe) = self.registry.probes.get(&window_id) {
                 if let Ok(mut state) = probe.lock() {
@@ -1041,6 +1053,33 @@ mod tests {
             probe.starvation_edge(t0 + OCCLUSION_STARVE * 10),
             None,
             "with no pending request the probe stays quiet"
+        );
+    }
+
+    #[test]
+    fn native_reveal_clears_the_stale_starve_baseline() {
+        // Issue #2570 follow-up (CTX-1605 review F3): the Wayland backend now
+        // delivers native `Occluded` edges, so a request that was outstanding
+        // when the surface suspended must not resurface as a synthetic
+        // occlusion right after the native reveal. Otherwise the next
+        // `about_to_wait` closes the gate the reveal just opened and keeps it
+        // closed until the resume frame callback arrives.
+        let mut probe = OcclusionProbe::default();
+        let t0 = std::time::Instant::now();
+        probe.note_redraw_request(t0);
+        probe.note_redraw_delivered();
+        let pending = t0 + std::time::Duration::from_millis(1);
+        probe.note_redraw_request(pending);
+        probe.note_occluded_state(true);
+        probe.note_occluded_state(false);
+        assert!(
+            !probe.occluded,
+            "the native reveal must win over the stale in-flight request"
+        );
+        assert_eq!(
+            probe.starvation_edge(pending + OCCLUSION_STARVE * 2),
+            None,
+            "a stale pre-suspension request must not synthesize a second occlusion"
         );
     }
 

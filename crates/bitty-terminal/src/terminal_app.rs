@@ -1,5 +1,6 @@
 //! Window/platform event handler for the composition root (`TerminalApp`).
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::thread::JoinHandle;
 
@@ -36,6 +37,113 @@ pub(crate) const PRESENT_SETTLE: std::time::Duration = std::time::Duration::from
 /// `... — bitty-dark (default)` vs `... — bitty-dark (file)`.
 pub(crate) fn window_title_for_theme(theme_name: &str, source: &str) -> String {
     format!("bitty \u{2014} Correct Terminal \u{2014} {theme_name} ({source})")
+}
+
+/// Fixed per-process budget for the issue #2570 lifecycle diagnostics.
+///
+/// A workspace switch produces a handful of lines; a compositor that flaps
+/// focus cannot grow the log without bound. The last admitted line names the
+/// suppression, so a truncated trace is never silent about being truncated.
+/// 512 admits cover roughly 256 workspace switches, well past a long dogfood
+/// session while keeping the worst case bounded.
+const LIFECYCLE_LOG_BUDGET: u32 = 512;
+
+/// Admission result for one bounded lifecycle line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleLogAdmission {
+    /// The budget has room after this line.
+    Admitted,
+    /// This is the last line the budget admits; it names the suppression.
+    Last,
+    /// The budget is exhausted; emit nothing.
+    Suppressed,
+}
+
+/// Atomic admission gate shared by one lifecycle log class.
+#[derive(Debug)]
+struct LifecycleLogBudget {
+    remaining: AtomicU32,
+}
+
+impl LifecycleLogBudget {
+    /// Builds a gate that admits `limit` lines, the last one as
+    /// [`LifecycleLogAdmission::Last`].
+    const fn new(limit: u32) -> Self {
+        Self {
+            remaining: AtomicU32::new(limit),
+        }
+    }
+
+    /// Consumes one admission, if any.
+    fn admit(&self) -> LifecycleLogAdmission {
+        match self
+            .remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        {
+            Ok(1) => LifecycleLogAdmission::Last,
+            Ok(_) => LifecycleLogAdmission::Admitted,
+            Err(_) => LifecycleLogAdmission::Suppressed,
+        }
+    }
+}
+
+static SURFACE_LOG_BUDGET: LifecycleLogBudget = LifecycleLogBudget::new(LIFECYCLE_LOG_BUDGET);
+static FOCUS_LOG_BUDGET: LifecycleLogBudget = LifecycleLogBudget::new(LIFECYCLE_LOG_BUDGET);
+
+/// Reports one surface-visibility gate transition with present telemetry.
+///
+/// Issue #2570: the reported Hyprland freeze left no evidence of what the
+/// gate believed. These lines are rare (one hide and one show per workspace
+/// switch), bounded, and carry the acquire/present counters so the next dogfood
+/// log can distinguish "the gate engaged" from "the compositor kept serving
+/// frames and the gate never saw a signal".
+fn log_surface_gate(visible: bool, reason: &'static str) {
+    let admission = SURFACE_LOG_BUDGET.admit();
+    if admission == LifecycleLogAdmission::Suppressed {
+        return;
+    }
+    let counters = bitty_render::telemetry::snapshot();
+    let suppress = admission == LifecycleLogAdmission::Last;
+    crate::logging::info(|| {
+        format!(
+            "bitty: surface gate {} ({}); acquire_timeout={} acquire_lost={} present_err={} retry_failures={}{}",
+            if visible { "shown" } else { "hidden" },
+            reason,
+            counters.acquire_timeout,
+            counters.acquire_lost,
+            counters.present_err,
+            counters.retry_failures,
+            if suppress {
+                "; further lifecycle lines suppressed"
+            } else {
+                ""
+            },
+        )
+    });
+}
+
+/// Reports one window focus transition (issue #2570), bounded like the gate.
+///
+/// Focus loss precedes every workspace switch-away; pairing it with the gate
+/// line in the same log shows whether a hide edge followed or the compositor
+/// only moved focus.
+fn log_window_focus(focused: bool) {
+    let admission = FOCUS_LOG_BUDGET.admit();
+    if admission == LifecycleLogAdmission::Suppressed {
+        return;
+    }
+    let suppress = admission == LifecycleLogAdmission::Last;
+    crate::logging::info(|| {
+        format!(
+            "bitty: window focus {}{}",
+            if focused { "gained" } else { "lost" },
+            if suppress {
+                "; further focus lines suppressed"
+            } else {
+                ""
+            },
+        )
+    });
 }
 
 /// Stderr class for one exit-save outcome (issue #2415).
@@ -966,6 +1074,18 @@ impl TerminalApp {
         }
     }
 
+    /// Applies one embedder surface-visibility edge (issues #2589/#2570).
+    ///
+    /// The runtime treats a duplicate edge as a no-op; filtering here keeps
+    /// the bounded lifecycle log free of repeated deliveries.
+    fn set_surface_gate(&mut self, visible: bool, reason: &'static str) {
+        if self.runtime.is_surface_visible() == visible {
+            return;
+        }
+        self.runtime.set_surface_visibility(visible);
+        log_surface_gate(visible, reason);
+    }
+
     /// Mark the active main-loop phase for the opt-in stall watchdog.
     ///
     /// One relaxed store plus a timestamp when enabled; a leaked null check
@@ -1033,6 +1153,12 @@ impl TerminalApp {
             .take(8)
             .map(|band| band.plugin_id.clone())
             .collect();
+        let occlusion = self
+            .window
+            .handle
+            .as_ref()
+            .map(WindowHandle::occlusion_snapshot)
+            .unwrap_or_default();
         watchdog.update_context(WatchdogContext {
             focused_view: self.runtime.focused_view().map(|view| view.0),
             leaf_count: self.runtime.leaf_count(),
@@ -1045,6 +1171,12 @@ impl TerminalApp {
             presented_frames: self.presented_frames,
             surface: bitty_render::telemetry::snapshot(),
             lifecycle: crate::crash_report::last_lifecycle_name(),
+            surface_visible: self.runtime.is_surface_visible(),
+            redraw_pending_ms: occlusion
+                .pending
+                .map(|age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX)),
+            probe_redraw_seen: occlusion.redraw_seen,
+            probe_occluded: occlusion.occluded,
         });
     }
 
@@ -4051,7 +4183,7 @@ fn log_occlusion_awareness_once() {
         return;
     }
     eprintln!(
-        "bitty: [issue #2570 triage] Wayland session: winit 0.30.13 delivers neither `Suspended` nor `Occluded` for the xdg shell 'suspended' state; the surface-visibility gate only consumes platform `Occluded` edges (native on iOS/X11, or the synthetic redraw-starvation probe, which stays silent when a compositor keeps serving frame callbacks to a suspended surface)"
+        "bitty: [issue #2570 triage] Wayland session: compositors may send the xdg shell v6 `suspended` state (observed on Hyprland 0.56.2 during a workspace switch-away), but winit 0.30.13 exposes neither `Suspended` nor `Occluded`; the surface-visibility gate only consumes platform `Occluded` edges (native on iOS/X11, or the synthetic redraw-starvation probe, which stays silent when a compositor keeps serving frame callbacks to a suspended surface); transition lines need --log-level info (or BITTY_LOG=info), and set BITTY_STALL_WATCHDOG=1 to capture the next stall with thread and surface evidence"
     );
 }
 
@@ -4064,12 +4196,18 @@ impl TerminalApp {
         match &event {
             PlatformEvent::Resumed => {
                 crash_report::lifecycle(crash_report::Lifecycle::Resumed);
+                // Issue #2570: record the occlusion-signal deficit once on
+                // the first Wayland delivery, not only when an Occluded edge
+                // arrives (Hyprland never delivers one, so the old
+                // report-on-edge placement stayed silent exactly where the
+                // gate is blind).
+                log_occlusion_awareness_once();
                 // Issue #2589: a Wayland shell surface re-maps (a Hyprland
                 // workspace switch-back). The reveal never presents here:
                 // the runtime re-queues one full-redraw next-frame task, so
                 // the buffer present (and any failure retry) runs on its own
                 // later loop turn, off this transition.
-                self.runtime.set_surface_visibility(true);
+                self.set_surface_gate(true, "resumed");
             }
             PlatformEvent::Suspended => {
                 crash_report::lifecycle(crash_report::Lifecycle::Suspended);
@@ -4078,7 +4216,7 @@ impl TerminalApp {
                 // chain buffers, so presentation must not touch the surface
                 // until it re-maps. Cancels the queued frame into retained
                 // damage instead of acquiring.
-                self.runtime.set_surface_visibility(false);
+                self.set_surface_gate(false, "suspended");
             }
             PlatformEvent::Window { kind, .. } => match kind {
                 WindowEventKind::Resized(_) => {
@@ -4089,9 +4227,11 @@ impl TerminalApp {
                 }
                 WindowEventKind::Focused(true) => {
                     crash_report::lifecycle(crash_report::Lifecycle::Focused);
+                    log_window_focus(true);
                 }
                 WindowEventKind::Focused(false) => {
                     crash_report::lifecycle(crash_report::Lifecycle::Unfocused);
+                    log_window_focus(false);
                 }
                 WindowEventKind::CloseRequested => {
                     crash_report::lifecycle(crash_report::Lifecycle::CloseRequested);
@@ -4107,13 +4247,13 @@ impl TerminalApp {
                     // Same contract as `Suspended`: presentation must not
                     // touch the surface while occluded; the cancel + retain
                     // behavior lives in `set_surface_visibility_at`.
-                    self.runtime.set_surface_visibility(false);
+                    self.set_surface_gate(false, "occluded");
                 }
                 WindowEventKind::Occluded(false) => {
                     crash_report::lifecycle(crash_report::Lifecycle::Revealed);
                     // Same contract as `Resumed`: re-queue on full redraw
                     // off this transition; the runtime does the requeue.
-                    self.runtime.set_surface_visibility(true);
+                    self.set_surface_gate(true, "revealed");
                 }
                 _ => {}
             },
@@ -5311,5 +5451,65 @@ bitty.commands.register({
             );
         }
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_log_budget_tests {
+    use super::*;
+
+    #[test]
+    fn budget_admits_n_lines_then_suppresses_and_stays_bounded() {
+        const LIMIT: u32 = 5;
+        let budget = LifecycleLogBudget::new(LIMIT);
+        let mut results = Vec::new();
+        for _ in 0..LIMIT {
+            results.push(budget.admit());
+        }
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result != LifecycleLogAdmission::Suppressed)
+                .count(),
+            LIMIT as usize,
+            "every line inside the budget must be admitted"
+        );
+        assert_eq!(
+            results.last(),
+            Some(&LifecycleLogAdmission::Last),
+            "the last admitted line must name the suppression"
+        );
+        assert_eq!(
+            budget.admit(),
+            LifecycleLogAdmission::Suppressed,
+            "the budget must stay silent past its limit"
+        );
+
+        // The production limit admits exactly 512 lines (the last one names
+        // the suppression) and never grows past it, however many transitions
+        // a long dogfood session produces. The literal is pinned so a budget
+        // change must be deliberate rather than silently resizing the trace.
+        assert_eq!(
+            LIFECYCLE_LOG_BUDGET, 512,
+            "budget change requires a deliberate test update"
+        );
+        let production = LifecycleLogBudget::new(LIFECYCLE_LOG_BUDGET);
+        let mut emitted = 0usize;
+        let mut last = LifecycleLogAdmission::Suppressed;
+        for _ in 0..=LIFECYCLE_LOG_BUDGET + 32 {
+            let admission = production.admit();
+            if admission != LifecycleLogAdmission::Suppressed {
+                emitted += 1;
+                last = admission;
+            }
+        }
+        assert_eq!(emitted, LIFECYCLE_LOG_BUDGET as usize);
+        assert!(emitted <= LIFECYCLE_LOG_BUDGET as usize);
+        assert_eq!(last, LifecycleLogAdmission::Last);
+        assert_eq!(
+            production.admit(),
+            LifecycleLogAdmission::Suppressed,
+            "the production budget must not admit past its bound"
+        );
     }
 }

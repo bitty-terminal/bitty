@@ -300,7 +300,10 @@ const FORWARDER_JOIN_POLL: std::time::Duration = std::time::Duration::from_milli
 /// Returns `true` when the thread was joined, `false` on timeout (the
 /// handle is dropped detached; the thread still owns its `PtyReader` and
 /// exits on EOF/disconnect without touching `Runtime` state). Never blocks
-/// beyond `timeout` plus one poll slice. Pure move helper shared by the
+/// on the forwarder beyond `timeout` plus one poll slice. The timeout
+/// diagnostic is a best-effort stderr write and can itself wait on a blocked
+/// stderr pipe, so a caller must not treat this helper as signal-safe or as a
+/// hard wall-clock bound when stderr is wedged. Pure move helper shared by the
 /// primary and per-pane teardown paths.
 pub(super) fn join_forwarder_with_timeout(
     handle: std::thread::JoinHandle<()>,
@@ -322,6 +325,20 @@ pub(super) fn join_forwarder_with_timeout(
     // Timeout: detach rather than hang teardown. The thread exits on
     // EOF/disconnect; its waker clone may fire once post-detach, so wakers
     // must stay idempotent and Runtime-independent (see `PtyWaker` docs).
+    // Issue #2570 telemetry: callers discard the boolean, so a detached
+    // forwarder used to be silent. One line per timed-out forwarder names the
+    // likely cause (the forwarder exits on EOF/disconnect) and the bound, so
+    // a lingering process's thread table has a matching log line. The write is
+    // best-effort: this runs on the `Drop for Runtime` path, where `eprintln!`
+    // would panic on a failed stderr write.
+    {
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "bitty: PTY forwarder join timed out after {} ms; detached (the forwarder exits on EOF/disconnect)",
+            timeout.as_millis()
+        );
+    }
     false
 }
 
@@ -1658,9 +1675,11 @@ impl Drop for Runtime {
     /// forwarder threads with [`FORWARDER_JOIN_TIMEOUT`].
     ///
     /// Never panics and never hangs beyond the join timeout plus one poll
-    /// slice per thread. A timed-out thread is detached (still owns its
-    /// `PtyReader`, exits on EOF/disconnect); wakers must remain idempotent
-    /// and Runtime-independent for that one post-detach wake.
+    /// slice per thread. The timeout diagnostic is a best-effort stderr write,
+    /// so it can wait on a wedged pipe; it never panics. A timed-out thread is
+    /// detached (still owns its `PtyReader`, exits on EOF/disconnect); wakers
+    /// must remain idempotent and Runtime-independent for that one
+    /// post-detach wake.
     fn drop(&mut self) {
         self.shutdown_with_timeout(FORWARDER_JOIN_TIMEOUT);
     }
@@ -1673,7 +1692,9 @@ impl Runtime {
     /// (killing + reaping children so pumps reach EOF), then joins each
     /// forwarder with [`FORWARDER_JOIN_TIMEOUT`]. Returns `true` when every
     /// owned forwarder was joined, `false` when at least one timed out and
-    /// was detached. Never panics, never blocks beyond the timeout.
+    /// was detached. Never panics. Joining is bounded by the timeout; the
+    /// timeout diagnostic is a best-effort stderr write and can wait on a
+    /// wedged pipe.
     pub fn shutdown(&mut self) -> bool {
         self.shutdown_with_timeout(FORWARDER_JOIN_TIMEOUT)
     }

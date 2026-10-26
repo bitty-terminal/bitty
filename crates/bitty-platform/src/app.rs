@@ -259,6 +259,27 @@ impl EventContext<'_> {
     }
 }
 
+/// Point-in-time view of a window's redraw-starvation probe (issue #2570).
+///
+/// The probe is the only Wayland occlusion source on platforms where winit
+/// exposes neither the `Suspended` lifecycle nor the `Occluded` window event.
+/// Reporting its state from a stalled main loop makes the next freeze
+/// self-describing: a large `pending` span names a redraw the compositor
+/// never answered, while `occluded` names an edge the application already
+/// consumed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OcclusionSnapshot {
+    /// How long the most recent outstanding [`WindowHandle::request_redraw`]
+    /// has been pending, if one is outstanding.
+    pub pending: Option<std::time::Duration>,
+    /// Whether a frame callback has ever been served: the probe is armed
+    /// only after the surface proved it can accept redraws.
+    pub redraw_seen: bool,
+    /// Whether the synthetic or native occlusion edge is currently
+    /// delivered.
+    pub occluded: bool,
+}
+
 /// Owned handle to a live window.
 ///
 /// Cloning shares the same window; the window closes when the last handle
@@ -314,6 +335,21 @@ impl WindowHandle {
             probe.note_redraw_request(std::time::Instant::now());
         }
         self.window.request_redraw();
+    }
+
+    /// Samples the redraw-starvation probe for diagnostics (issue #2570).
+    ///
+    /// Read-only: the snapshot never mutates probe state and never affects
+    /// the synthetic occlusion edges. The lock may block the calling thread
+    /// briefly while the loop adapter updates the probe; this accessor is
+    /// intended for the event-loop thread (the watchdog context sampler).
+    /// A monitor or watchdog caller that cannot afford to wait must use its
+    /// own `try_lock` path. A poisoned probe yields the default snapshot.
+    pub fn occlusion_snapshot(&self) -> OcclusionSnapshot {
+        self.occlusion_probe
+            .lock()
+            .map(|probe| probe.snapshot(std::time::Instant::now()))
+            .unwrap_or_default()
     }
 
     /// Enables or disables platform IME events for this window (CTX-0367).
@@ -648,6 +684,17 @@ struct OcclusionProbe {
 const OCCLUSION_STARVE: std::time::Duration = std::time::Duration::from_millis(300);
 
 impl OcclusionProbe {
+    /// Read-only diagnostic snapshot (issue #2570).
+    fn snapshot(&self, now: std::time::Instant) -> OcclusionSnapshot {
+        OcclusionSnapshot {
+            pending: self
+                .last_request
+                .map(|at| now.saturating_duration_since(at)),
+            redraw_seen: self.redraw_seen,
+            occluded: self.occluded,
+        }
+    }
+
     /// Records a new unanswered `request_redraw` (issue #2570 probe).
     fn note_redraw_request(&mut self, now: std::time::Instant) {
         self.last_request = Some(now);
@@ -1015,6 +1062,44 @@ mod tests {
             probe.starvation_edge(pending + OCCLUSION_STARVE * 2),
             None,
             "the edge is discovered once"
+        );
+    }
+
+    #[test]
+    fn probe_snapshot_names_the_pending_redraw_and_state() {
+        // Issue #2570 observability: a watchdog sample must distinguish "no
+        // redraw outstanding", "redraw pending for N ms", and "edge already
+        // delivered" without touching the probe's transition state.
+        let mut probe = OcclusionProbe::default();
+        let t0 = std::time::Instant::now();
+        probe.note_redraw_request(t0);
+        let pending = probe.snapshot(t0 + std::time::Duration::from_millis(750));
+        assert_eq!(pending.pending, Some(std::time::Duration::from_millis(750)));
+        assert!(!pending.redraw_seen);
+        assert!(!pending.occluded);
+
+        probe.note_redraw_delivered();
+        let served = probe.snapshot(t0 + std::time::Duration::from_millis(900));
+        assert_eq!(served.pending, None);
+        assert!(served.redraw_seen);
+        assert!(!served.occluded);
+
+        let maybe_request = t0 + std::time::Duration::from_millis(900);
+        probe.note_redraw_request(maybe_request);
+        assert!(
+            probe
+                .starvation_edge(maybe_request + OCCLUSION_STARVE)
+                .unwrap_or(false)
+        );
+        let occluded = probe.snapshot(maybe_request + OCCLUSION_STARVE);
+        assert!(occluded.occluded);
+        assert_eq!(occluded.pending, Some(OCCLUSION_STARVE));
+
+        // Sampling is read-only: the starvation edge cannot fire twice.
+        assert_eq!(
+            probe.starvation_edge(maybe_request + OCCLUSION_STARVE * 2),
+            None,
+            "a snapshot must not consume or re-arm the edge"
         );
     }
 

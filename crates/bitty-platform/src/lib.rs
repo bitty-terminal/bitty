@@ -142,8 +142,8 @@ pub mod url;
 pub use raw_window_handle;
 
 pub use app::{
-    App, AppHandler, EventContext, EventWaker, WakeEvent, WindowConfig, WindowHandle,
-    opacity_requests_transparency, sanitize_opacity,
+    App, AppHandler, EventContext, EventWaker, OcclusionSnapshot, WakeEvent, WindowConfig,
+    WindowHandle, opacity_requests_transparency, sanitize_opacity,
 };
 pub use appearance::{SystemAppearance, query_system_appearance};
 pub use clipboard::Clipboard;

@@ -31,7 +31,7 @@
 //! - **Entry size**: `key.len()` plus [`value_bytes`]. The top-level key is
 //!   persisted data, so it counts toward the 64 KiB total but never toward
 //!   the 8 KiB per-value ceiling.
-//! - **Nodes** ([`value_nodes`]): one per [`LuaValue`](crate::host::LuaValue)
+//! - **Nodes** ([`value_nodes`]): one per [`LuaValue`]
 //!   node (scalars, tables, and every table key). Entry nodes are `1` for the
 //!   top-level key plus the value nodes. Single-value trees always carry an
 //!   odd node count (every non-root node belongs to exactly one key/value

@@ -294,7 +294,7 @@ pub const RC6_FD_PER_PLUGIN: usize = 16;
 /// tight.
 pub const SLICE_FUEL: i32 = 1024;
 
-/// Maximum Lua chunk bytes accepted by [`LuaVm::drive_chunk`] (`1 MiB`).
+/// Maximum Lua chunk bytes accepted by `LuaVm::drive_chunk` (`1 MiB`).
 ///
 /// Cites `PLUGIN_INIT_MAX_BYTES` (bitty-runtime, `1 MiB` `init.lua` ceiling)
 /// and [`crate::host::MODULE_FILE_MAX_BYTES`] (`1 MiB` module source ceiling)

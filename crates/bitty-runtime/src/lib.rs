@@ -45,7 +45,7 @@
 //!   `tick` reflows the tree into the container `Rect` (cell space) via
 //!   `LayoutNode::reflow`, updates each leaf [`View`]'s `origin`/`cols`/`rows`,
 //!   then renders each leaf's viewport snapshot through the shared
-//!   [`GridRenderer`] (translated to the leaf's pixel origin) and presents
+//!   `GridRenderer` (translated to the leaf's pixel origin) and presents
 //!   the combined `DrawList` once via the headless software seam. Layout math
 //!   is headless-testable without GPU/window; `set_layout` and focus moves are
 //!   deterministic. Wide-char selection snapping remains deferred.
@@ -149,7 +149,7 @@
 //!   Bounded rendering (atlas size, cache capacity) is owned by `bitty-render`.
 //!   The bounded cold-path queue is owned here; the bounded plugin side queue
 //!   and per-subscriber pipeline queues are owned by `bitty-plugin-host`.
-//! - No shell interpolation. [`Runtime::spawn_shell`] takes a direct argv[0]
+//! - No shell interpolation. [`Runtime::spawn_shell`] takes a direct `argv[0]`
 //!   via `bitty-pty::PtyBuilder`, never a shell string.
 //! - Plugin authority is deny-by-default, hash-bound, and workspace-narrowable
 //!   only (never additive). No allow-all capability exists.

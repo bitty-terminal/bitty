@@ -20,7 +20,7 @@
 //!
 //! | Dimension            | Bound | Enforcement |
 //! |----------------------|-------|-------------|
-//! | aggregate payload    | 64 KiB | [`RuntimeInspectSnapshot::enforce_budget`] drops tail rows and marks `truncated`; [`Self::fits_budget`] is the bridge's final gate |
+//! | aggregate payload    | 64 KiB | [`RuntimeInspectSnapshot::enforce_budget`] drops tail rows and marks `truncated`; [`RuntimeInspectSnapshot::fits_budget`] is the bridge's final gate |
 //! | rows per section     | 128 plugins / 256 settings / 64 extensions / 64 profiles | the application builder truncates and sets `truncated` |
 //! | path display string  | 240 bytes | [`bounded_display`] at conversion time |
 //! | other display string | 96 bytes | [`bounded_display`] at conversion time |
@@ -541,7 +541,7 @@ impl RuntimeInspectSnapshot {
     /// Convert the bounded snapshot to the Lua table returned to plugins.
     ///
     /// Every string is bounded here as defense in depth; the shape matches
-    /// [`Self::write_json`].
+    /// `Self::write_json`.
     #[must_use]
     pub fn to_lua(&self) -> LuaValue {
         LuaValue::table([

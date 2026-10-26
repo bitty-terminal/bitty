@@ -475,7 +475,7 @@ pub(crate) fn editor_round_trip(
 /// Base name of the Bitty-owned editor temp root inside its base.
 ///
 /// On Unix the creator UID is appended (`bitty-composer-<uid>`, see
-/// [`owned_temp_root_name`]) so users sharing a temp base never share a
+/// `owned_temp_root_name`) so users sharing a temp base never share a
 /// root. Other platforms keep the plain name and rely on the per-user
 /// base-directory ACL (same residual as the temp file itself).
 pub const OWNED_TEMP_DIR_NAME: &str = "bitty-composer";
@@ -658,8 +658,8 @@ fn restrict_dir_owner_only(path: &Path) -> std::io::Result<()> {
 ///
 /// On the next start after a crash, temp files whose creating process is
 /// provably dead are unlinked. A file is removed only when its name carries
-/// the [`TEMP_PREFIX`] shape with a parsed pid that is dead by
-/// [`temp_pid_is_dead`]; live-owner files, foreign names, and unprovable
+/// the `TEMP_PREFIX` shape with a parsed pid that is dead by
+/// `temp_pid_is_dead`; live-owner files, foreign names, and unprovable
 /// files are always kept (a sweep that cannot prove death must not delete).
 /// Returns the number of files removed. Best-effort and infallible: an
 /// unreadable root sweeps nothing.
@@ -1179,7 +1179,7 @@ pub fn run_editor_hosted(editor: &str, path: &Path, timeout: Duration) -> Result
 /// 6. installs the result into `buffer` (fail-closed past the cap, old
 ///    content kept).
 ///
-/// The hermetic seam (explicit temp dir) is [`process_editor_start_in`].
+/// The hermetic seam (explicit temp dir) is `process_editor_start_in`.
 pub fn process_editor_start(
     buffer: &mut CommandBuffer,
     visual: Option<&str>,

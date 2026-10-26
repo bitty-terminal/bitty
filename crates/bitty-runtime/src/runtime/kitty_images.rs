@@ -50,7 +50,7 @@
 //! payload-less `i=`/`I=`/`p=` lookups (bitty extension, no Kitty
 //! counterpart, kept only in spec shape) answer `Gi=...;OK` or
 //! `;ENOENT:<msg>`. At most one bounded reply per query, honoring `q=`
-//! suppression (see [`Runtime::answer_kitty_query`]); queries without
+//! suppression (see `Runtime::answer_kitty_query`); queries without
 //! `i=`/`I=` stay silent like kitty's `REPORT_ERROR`-with-no-reply.
 //!
 //! Still deferred (blocked, recorded in the PR body): local mediums
@@ -416,7 +416,7 @@ impl Runtime {
     /// pane's cursor and paints only on the pane's leaf (CTX-0254
     /// cross-pane spoof prevention). Alternate-screen placement reads the
     /// drained grid too: each origin keeps separate main/alt image planes
-    /// ([`Self::sync_kitty_screen_for`]), so a fullscreen TUI's preview
+    /// (`Self::sync_kitty_screen_for`), so a fullscreen TUI's preview
     /// paints on the alt plane and the main plane returns on leave (#2442).
     ///
     /// A successful display forces a full redraw so the next tick paints
@@ -1060,7 +1060,7 @@ impl Runtime {
     /// caps plus per-image/global totals, never evicting). This is the
     /// pixel half only: it records no terminal-truth gap (direct callers
     /// driving playback pair it with truth themselves); the `APC G` path
-    /// uses [`Self::kitty_ingest_frame`], which records the gap on pixel
+    /// uses `Self::kitty_ingest_frame`, which records the gap on pixel
     /// success so truth gaps never outnumber stored frames. Cached blits
     /// drop wholesale (frame bytes changed).
     ///

@@ -12,7 +12,7 @@
 //! - **L0 Mechanism** (`UiLevel::Mechanism`) — Rust owns behavior:
 //!   virtualization, IME composition, scroll physics, hit-testing, layout,
 //!   shaping, and paint. Lua never implements these; it only supplies
-//!   appearance. [`UiNodeKind`](crate::uitree::UiNodeKind) complex widgets
+//!   appearance. [`UiNodeKind`] complex widgets
 //!   (`ScrollView`, `VirtualList`, `TextInput`, `Canvas`) are L0 residents:
 //!   Lua emits the node, Rust runs it.
 //! - **L1 Primitive** (`UiLevel::Primitive`) — Lua emits retained nodes from
@@ -116,7 +116,7 @@ impl UiLevel {
         }
     }
 
-    /// Whether any [`UiNodeKind`](crate::uitree::UiNodeKind) currently
+    /// Whether any [`UiNodeKind`] currently
     /// classifies at this level. L2-L4 are unpopulated by construction
     /// until the RFC accepts their vocabularies.
     #[must_use]
@@ -142,7 +142,7 @@ impl fmt::Display for UiLevel {
 /// scroll physics, and paint budgeting (see [`crate::widget_mech`]).
 /// Every other primitive is a plain L1 declaration.
 ///
-/// Total: every [`UiNodeKind`](crate::uitree::UiNodeKind) maps.
+/// Total: every [`UiNodeKind`] maps.
 #[must_use]
 pub fn level_of(kind: &UiNodeKind) -> UiLevel {
     match kind {

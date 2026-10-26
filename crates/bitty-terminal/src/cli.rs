@@ -657,8 +657,8 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
 /// - `--split-ratio RATIO` → ratio for split
 /// - `--stack` → stack layout (2 panes)
 /// - `--overlay` → overlay layout
-/// - `--layout SPEC` → explicit layout spec (single, split:h[:ratio], stack[:n], overlay[:x,y,w,h])
-/// - `--focus SPEC` → focus (next|prev|up|down|left|right|<id>)
+/// - `--layout SPEC` → explicit layout spec (single, `split:h[:ratio]`, `stack[:n]`, `overlay[:x,y,w,h]`)
+/// - `--focus SPEC` → focus (`next|prev|up|down|left|right|<id>`)
 /// - `--config PATH` → explicit user config file (`init.lua`); when omitted
 ///   `BITTY_CONFIG` env is honored next, else the XDG default is probed
 ///   (`$XDG_CONFIG_HOME/bitty/init.lua`, fallback

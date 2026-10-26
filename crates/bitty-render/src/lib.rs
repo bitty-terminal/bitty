@@ -92,7 +92,7 @@
 //! triplet-preserving renderer itself is still deferred). Presentation pipelines and WGSL shaders
 //! **are** implemented: [`batch`] translates an owned [`DrawList`] into
 //! bounded vertex batches plus atlas-upload bookkeeping on any CPU, and the
-//! crate-private [`pipeline`](crate::pipeline) module owns the `wgpu` fill +
+//! crate-private `pipeline` module owns the `wgpu` fill +
 //! glyph pipelines, the `R8` atlas texture with dirty-region uploads, and
 //! chunked draws consumed by [`gpu::Surface::present_draw_list`].
 //! Window-surface attachment **is** implemented here as the owned [`gpu::Surface`] wrapper around
@@ -110,9 +110,9 @@
 //! in-crate fake rasterizer, the full grid pipeline including output
 //! determinism (`snapshot + damage -> DrawList`) against deterministic fake
 //! fonts, and the **headless GPU-surface seam**: [`gpu::Surface::headless`]
-//! (a fake surface that holds a [`PhysicalSize`] extent and composites
+//! (a fake surface that holds a `PhysicalSize` extent and composites
 //! `DrawList`+`Atlas` onto an in-memory RGBA buffer via the same
-//! [`software::draw_list_onto`] path the GPU backend will share). Headless
+//! `software::draw_list_onto` path the GPU backend will share). Headless
 //! surface tests exercise configuration, resize, and present composition
 //! without any display server or adapter.
 //!

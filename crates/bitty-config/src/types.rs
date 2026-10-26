@@ -2642,7 +2642,7 @@ impl std::fmt::Display for BellMode {
 pub struct TerminalConfig {
     /// Scrollback lines, `0..=MAX_TERMINAL_SCROLLBACK` (bounded memory).
     pub scrollback: u32,
-    /// Preferred shell argv[0], if overridden; trimmed non-empty when present.
+    /// Preferred shell `argv[0]`, if overridden; trimmed non-empty when present.
     pub shell: Option<String>,
     /// Lines scrolled per wheel notch, `1..=32` (CTX-0185; default 3,
     /// ghostty/alacritty-class throughput).

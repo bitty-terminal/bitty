@@ -7,7 +7,7 @@ use super::*;
 /// OS hand-off boundary for a runtime-authorized URL activation (CTX-0577).
 ///
 /// The production implementation spawns the native URL handler through
-/// [`Runtime::spawn_validated_url`]; the runtime never spawns directly from
+/// `Runtime::spawn_validated_url`; the runtime never spawns directly from
 /// the click path, so tests can install a recording double that captures the
 /// exact URL sequence the live consumer would open — without launching a
 /// browser. This is the same seam pattern as the app's `OsTitleSink`.

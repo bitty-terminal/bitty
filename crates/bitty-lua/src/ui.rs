@@ -220,7 +220,7 @@ pub const UI_MAX_THEME_TOKEN_BYTES: usize = 32;
 /// identifiers and argument keys, so they reuse
 /// [`UI_CLICK_MAX_COMMAND_BYTES`] instead of introducing a new ceiling. The
 /// id feeds the existing per-generation aggregate through
-/// [`ClickCommand::retained_string_bytes`].
+/// `ClickCommand::retained_string_bytes`.
 pub const UI_MAX_REGION_ID_BYTES: usize = UI_CLICK_MAX_COMMAND_BYTES;
 
 /// Argument name the host injects for a declared hit region (issue #2248).

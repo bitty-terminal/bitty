@@ -14,10 +14,10 @@
 //! - [`PanelRule`] — one typed declaration: a [`RuleSelector`] (which
 //!   panels), a [`RuleEffect`] (what is claimed), and a [`RuleOrigin`]
 //!   (who claims it). Effects reuse the crate vocabulary instead of
-//!   inventing a parallel one: [`SceneLayer`](crate::workspace_scene::SceneLayer)
-//!   for placement, [`PresentationMode`](crate::presentation::PresentationMode)
-//!   for presentation, [`Size`](crate::geometry::Size) for minimum size, and
-//!   [`TokenColor`](crate::theme::TokenColor) for the accent.
+//!   inventing a parallel one: [`SceneLayer`]
+//!   for placement, [`PresentationMode`]
+//!   for presentation, [`Size`] for minimum size, and
+//!   [`TokenColor`] for the accent.
 //! - [`PanelRuleSet`] — a bounded rule collection with fail-closed
 //!   admission (full set, duplicate rule id) and deterministic resolution.
 //! - Resolution — for one panel and one [`EffectKind`], the winner is the

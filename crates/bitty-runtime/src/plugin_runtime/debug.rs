@@ -15,7 +15,7 @@
 //!   precondition `bitty.events.subscribe` enforces) and whose filter
 //!   matches receives a copy into a drop-oldest ring buffer. The copy is
 //!   redacted for the owner's own grants (the same
-//!   [`redaction`](super::redaction) policy the subscriber fan-out applies)
+//!   [`redaction`] policy the subscriber fan-out applies)
 //!   and then size-bounded.
 //!
 //! Capability gating (`debug.inspect`, `debug.trace`) is enforced by

@@ -68,7 +68,7 @@
 //!   `alt+n` new panel, `alt+t` new, `alt+d`/`alt+q` close pane/view with confirm,
 //!   `alt+w` close workspace with kill-confirm,
 //!   `alt+-`/`alt+=` prev/next (`=` is the unshifted DEC `+`), `alt+tab`
-//!   last-used, `alt+[`/`alt+]` next/prev occupied with wrap (CTX-1100 #1904),
+//!   last-used, `alt+[` / `alt+]` next/prev occupied with wrap (CTX-1100 #1904),
 //!   `alt+1..=9` jump to workspace N,
 //!   `shift+alt+1..=9` move focused window to workspace N),
 //!   `toggle_floating` (alias `floating_toggle`; CTX-0962 / #1695: focused
@@ -97,7 +97,7 @@
 //! workspace entry (CTX-0257, rechorded CTX-0766): `alt+t` new workspace,
 //! `alt+1..=9` jump to
 //! workspace N, `alt+-`/`alt+=` prev/next, `alt+tab` last-used,
-//! `alt+[`/`alt+]` next/prev occupied with wrap (CTX-1100 #1904),
+//! `alt+[` / `alt+]` next/prev occupied with wrap (CTX-1100 #1904),
 //! `alt+d`/`alt+q`
 //! close pane with confirm, `alt+w` close workspace with kill-confirm,
 //! plus the Hyprland-style panel entry (CTX-0838 #1441): `alt+n`
@@ -746,7 +746,7 @@ pub enum ChromeAction {
     OpenComposer,
     /// Flip the latest command block's fold membership (CTX-0723, #980).
     ///
-    /// Present-path verb over the live [`FoldState`](bitty_rich::blocks::FoldState):
+    /// Present-path verb over the live `FoldState`:
     /// the app resolves the focused view's latest semantic command block
     /// and toggles it. Manual bind only, never in [`DEFAULT_KEYMAPS`]
     /// (same byte-identical discipline as [`Self::OpenComposer`]); the

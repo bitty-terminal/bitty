@@ -278,11 +278,11 @@ impl Runtime {
     /// Pure, headless, and deterministic: delegates to
     /// [`bitty_platform::encode_key_event`] which owns the xterm legacy table
     /// (M1 required baseline; the opt-in Kitty protocol is composed in
-    /// [`encode_key_enhanced`](Self::encode_key_enhanced)). Returns `None`
+    /// `encode_key_enhanced`). Returns `None`
     /// for release/synthetic/modifier-only/unmapped inputs. This entry point
     /// assumes no modifiers are held; the live input path
     /// ([`Self::handle_key_event`]) applies the tracked modifier snapshot via
-    /// [`encode_key_enhanced`](Self::encode_key_enhanced) instead, so
+    /// `encode_key_enhanced` instead, so
     /// `Ctrl+letter` synthesizes C0 bytes on Wayland where winit reports
     /// `text=None` (CTX-0154).
     #[must_use]
@@ -908,7 +908,7 @@ impl Runtime {
     ///   (accessibility escape).
     /// - Otherwise the event drives presentation selection: left press starts
     ///   a drag and left release commits it (the highlight stays). The press
-    ///   count comes from the bounded [`ClickTracker`](super::click::ClickTracker)
+    ///   count comes from the bounded [`ClickTracker`]
     ///   (CTX-0385): single starts a stream drag, double a word selection
     ///   ([`Selection::word_at`]), triple a full line ([`Selection::line_at`]),
     ///   and `Alt`+press a rectangular block. Drag after a multi-click
@@ -2027,7 +2027,7 @@ impl Runtime {
     /// Handles IME preedit (presentation overlay, not Terminal Truth).
     ///
     /// `cursor` is winit's byte-wise preedit cursor offset (the start of its
-    /// `(begin, end)` range); the stored [`Self::ime_cursor`] is a
+    /// `(begin, end)` range); the stored `Self::ime_cursor` is a
     /// **character index** used to place the composition caret, so a hostile
     /// offset inside a multi-byte scalar can never split a char. Text is
     /// truncated to [`IME_PREEDIT_MAX_CHARS`]
@@ -2105,7 +2105,7 @@ impl Runtime {
     /// claim, one trailing ASCII space is removed when present because fcitx5
     /// can include the committing Space in the commit text. The raw key
     /// re-inserted after the commit is consumed by
-    /// [`Self::ime_owns_key_press`](Self::ime_owns_key_press), not added by
+    /// `Self::ime_owns_key_press`, not added by
     /// the commit path.
     ///
     /// `handle_ime_commit` delegates with `Instant::now()` via

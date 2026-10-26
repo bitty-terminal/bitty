@@ -15,9 +15,9 @@
 //!   preference above plugin content theme above framework default. Rank
 //!   decides: the highest-ranked layer claiming a key wins.
 //! - [`StyleCascade`] — the per-layer key/value store over theme
-//!   [`TokenColor`](crate::theme::TokenColor) values. The framework-default
-//!   layer is pre-seeded from [`framework_default`](crate::theme::framework_default),
-//!   so resolution over [`CORE_TOKENS`](crate::theme::CORE_TOKENS) is total.
+//!   [`TokenColor`] values. The framework-default
+//!   layer is pre-seeded from [`framework_default`],
+//!   so resolution over [`CORE_TOKENS`] is total.
 //! - [`ResolvedStyle`] — the winning value plus the [`StyleOrigin`] that
 //!   supplied it, so diagnostics report the winner instead of an opaque
 //!   conflict.

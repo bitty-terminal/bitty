@@ -4,7 +4,7 @@
 //! bounded, pre-serialized vertex batches plus atlas-upload bookkeeping. It
 //! is pure CPU math with no `wgpu` dependency, so every item here runs on
 //! headless CI without a GPU, window, or filesystem. The `wgpu`-dependent
-//! half lives in [`crate::pipeline`] and consumes exactly these batches.
+//! half lives in `crate::pipeline` and consumes exactly these batches.
 //!
 //! # Coordinate systems
 //!
@@ -138,7 +138,7 @@ pub const INDICES_PER_QUAD: usize = 6;
 /// (CTX-0222: gray 128 presented as 188, theme `#1e1e2e` as `(96,96,118)`).
 /// Decoding here keeps the `Srgb` target (and its correct blending) while
 /// presenting byte-exact colors. The decode is table-backed (CTX-0471):
-/// see [`srgb8_to_linear_lut`].
+/// see `srgb8_to_linear_lut`.
 #[must_use]
 pub fn srgb8_to_linear(byte: u8) -> f32 {
     srgb8_to_linear_lut()[usize::from(byte)]

@@ -3,7 +3,7 @@
 //! CTX-0257 workspace ops entry per DEC-0034 (tiling-first, no float mode).
 //! CTX-0259 move-focused-window-to-workspace-N per DEC-0034 follow-through
 //! (`Mod+Shift+Number` / `ctl workspace move ws:N`).
-//! A workspace is a named [`LayoutNode`] + [`Focus`](bitty_ui::Focus) slot.
+//! A workspace is a named [`LayoutNode`] + [`Focus`] slot.
 //! The live `Runtime::layout`/`Runtime::focus` always mirror the active slot;
 //! every switch stashes the live pair into the outgoing slot first, so
 //! inactive slots are always fresh and no per-mutation sync hook is needed
@@ -13,7 +13,7 @@
 //! resets it to a fresh idle leaf, never strands empty); `active_workspace`
 //! is always in range; `workspace_mru` holds each live index exactly once
 //! with the active index fronted. Pane sessions stay keyed globally by
-//! [`ViewId`](bitty_ui::ViewId), so [`ViewId`]s are unique across slots
+//! [`ViewId`], so [`ViewId`]s are unique across slots
 //! (fresh ids take the max over every slot + 1).
 //!
 //! Close discipline (never silent kill): a workspace whose leaves own pane
@@ -565,7 +565,7 @@ impl Runtime {
     /// it stays visible across workspace switches without ever living in
     /// two trees at once. Only `Tiled`/`Floating` leaves pin (`Tiled`
     /// converges on `Floating`); `Fullscreen`/`Scratchpad` leaves are
-    /// refused. Sessions stay keyed globally by [`ViewId`](bitty_ui::ViewId)
+    /// refused. Sessions stay keyed globally by [`ViewId`]
     /// and are never killed here.
     ///
     /// Fail-closed with state untouched: unknown id, already-pinned id,
@@ -672,7 +672,7 @@ impl Runtime {
     /// `Tiled`/`Floating` leaves detach (`Tiled` converges on `Floating`,
     /// so an in-tree `Floating` leaf from an unpin detaches the same way);
     /// `Fullscreen`/`Scratchpad` leaves are refused. Sessions stay keyed
-    /// globally by [`ViewId`](bitty_ui::ViewId) and are never killed here.
+    /// globally by [`ViewId`] and are never killed here.
     ///
     /// Fail-closed with state untouched: unknown id, already-detached id,
     /// unsupported mode, or detaching the live layout's last leaf (an empty
@@ -780,7 +780,7 @@ impl Runtime {
 
     /// Discards detached float `id` without restoring it (issue #2141).
     ///
-    /// Drops the stored [`View`](bitty_ui::View), its Alt+drag re-anchor
+    /// Drops the stored [`View`], its Alt+drag re-anchor
     /// offset, and any in-flight drag/resize grab on it; tears down its
     /// pane session; moves focus off it onto the first live leaf and
     /// re-homes a dead primary owner. Returns `true` when a detached float
@@ -1091,7 +1091,7 @@ impl Runtime {
     /// currently at `position` (tiling-first horizontal 50/50 wrap, the same
     /// wrap [`Self::workspace_move_focused_to`] uses for cross-workspace
     /// moves). Focus stays on the moved panel; pane sessions stay keyed by
-    /// [`ViewId`](bitty_ui::ViewId) and are never killed; the pending close
+    /// [`ViewId`] and are never killed; the pending close
     /// arm (if any) is preserved untouched.
     ///
     /// Fail-closed with state untouched: unknown positions, no focused pane,
@@ -2063,7 +2063,7 @@ impl Runtime {
     ///
     /// Idle workspaces (no pane sessions) close immediately. Live ones arm
     /// a pending confirm: repeating the call (second chord press) confirms
-    /// the kill, [`Runtime::cancel_pending_ws_close`] / `Esc` cancels, and
+    /// the kill, `Runtime::cancel_pending_ws_close` / `Esc` cancels, and
     /// a pending arm for another workspace is replaced loudly. Never a
     /// silent kill.
     pub fn workspace_close_request(&mut self) -> WsCloseRequest {
@@ -2153,7 +2153,7 @@ impl Runtime {
     /// CTX-0259 DEC-0034 follow-through (`Mod+Shift+Number`): reparents the
     /// focused leaf — with its pane session untouched — into the target slot
     /// and follows focus to the target workspace (issue #1803). Returns the
-    /// moved [`ViewId`](bitty_ui::ViewId).
+    /// moved [`ViewId`].
     ///
     /// - Same-workspace is a no-op `Ok` (focus preserved).
     /// - Unknown `index` fails closed (`Err`, state untouched).
@@ -2174,10 +2174,10 @@ impl Runtime {
     ///   manual splits keep their own axis untouched) and its
     ///   focus moves to the moved window; the active workspace switches to
     ///   the target and its focus follows the moved window. This move
-    ///   bisects regardless of [`PanelLayoutMode`](crate::PanelLayoutMode)
+    ///   bisects regardless of [`PanelLayoutMode`]
     ///   (which only controls `NewPanel`); it never splits the whole
     ///   workspace root in half.
-    ///   Pane sessions stay keyed globally by [`ViewId`](bitty_ui::ViewId)
+    ///   Pane sessions stay keyed globally by [`ViewId`]
     ///   and are never killed here — the runtime-global primary PTY is never
     ///   touched and kill-confirm stays with close (the pending close arm,
     ///   if any, is preserved untouched).

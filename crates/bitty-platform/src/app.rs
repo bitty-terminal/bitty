@@ -355,7 +355,7 @@ impl WindowHandle {
     /// Enables or disables platform IME events for this window (CTX-0367).
     ///
     /// Wraps winit's `Window::set_ime_allowed`: `true` makes the window
-    /// receive [`WindowEventKind::Ime`](crate::event::WindowEventKind::Ime)
+    /// receive [`WindowEventKind::Ime`]
     /// preedit/commit events (Wayland text-input-v3, X11 XIM, macOS
     /// NSTextInputClient, Windows IMM) and makes the platform suppress raw
     /// keyboard events during composition. IME is disabled by default in

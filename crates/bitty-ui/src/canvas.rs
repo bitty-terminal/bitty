@@ -16,7 +16,7 @@
 //!   the compositor replays the retained list while it is current
 //!   (low-frequency, frame-on-demand).
 //! - [`CanvasDisplayList`] — one bounded command sequence addressed to the
-//!   `Canvas` node with [`UiNodeId`](crate::uitree::UiNodeId), the
+//!   `Canvas` node with [`UiNodeId`], the
 //!   canonical identity (this module defines no id of its own).
 //! - [`CanvasLayer`] — the retained per-scene map of display lists with a
 //!   monotonic revision. [`CanvasLayer::submit`] reports whether the
@@ -299,7 +299,7 @@ fn check_coord(value: i32) -> Result<(), CanvasError> {
 
 /// Bounded command sequence for one `Canvas` node.
 ///
-/// Addressed by [`UiNodeId`](crate::uitree::UiNodeId): the list never
+/// Addressed by [`UiNodeId`]: the list never
 /// carries pixels, only the retained commands the compositor replays at
 /// refresh.
 #[derive(Clone, Debug, PartialEq, Eq)]

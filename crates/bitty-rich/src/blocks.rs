@@ -7,13 +7,13 @@
 //! # What this module is
 //!
 //! The first step of the 008 route: stable [`CommandBlock`] identity over the
-//! ordinal-grouped [`CommandRegion`](crate::shell::CommandRegion) log plus a
+//! ordinal-grouped [`CommandRegion`] log plus a
 //! presentation-only fold projection ([`FoldState`]). Hint Mode and Composer
 //! are separate follow-ups and are explicitly out of scope here.
 //!
 //! # Anchoring model
 //!
-//! Verified: [`CommandRegion`](crate::shell::CommandRegion) records
+//! Verified: [`CommandRegion`] records
 //! `OSC 133` disposition ordinals only (`prompt_start` / `input_start` /
 //! `output_start` / `output_end` plus `exit_code`); it holds no row numbers.
 //! [`CommandBlock`] bridges that log to a stable [`CommandId`] without ever
@@ -37,7 +37,7 @@
 //! # Fold model
 //!
 //! Folding hides rows visually in the presentation layer only. It never
-//! mutates [`State`](bitty_term_state::State): no grid write, no scrollback
+//! mutates [`State`]: no grid write, no scrollback
 //! push/clear/resize, no zone/cwd edit. Copy-all, search, agent history, and
 //! replay read `State` directly and are therefore unaffected; proof tests pin
 //! `state_hash`, scrollback length, search results, snapshot cells, and the

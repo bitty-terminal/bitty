@@ -8,7 +8,7 @@
 //! `Mod+?`), dismissed by `Esc` or the same chord.
 //!
 //! Overlay-tier rules (panel pre-study §overlay, CTX-0217 tiers): the popup
-//! is presentation-only — [`Runtime::paint_help_panel`] pushes fills and
+//! is presentation-only — `Runtime::paint_help_panel` pushes fills and
 //! glyphs onto the presented frame and never touches grid cells,
 //! scrollback, layout, or focus. It is informational, not modal: while
 //! visible, other bound chords still dispatch and unbound keys still reach

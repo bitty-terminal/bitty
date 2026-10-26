@@ -3108,7 +3108,7 @@ pub(crate) fn runtime_config_from_effective(
     runtime_config_from_effective_for(effective, false)
 }
 
-/// Appearance-aware [`runtime_config_from_effective`] (CTX-0951).
+/// Appearance-aware `runtime_config_from_effective` (CTX-0951).
 ///
 /// Same mapping but a dual `appearance.theme` resolves to the half matching
 /// `prefer_light` (`true` = light OS appearance). Production passes

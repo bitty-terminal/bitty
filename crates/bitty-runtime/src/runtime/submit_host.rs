@@ -17,7 +17,7 @@
 //!   (placement view -> panel -> kernel) and holder *attribution* (which
 //!   holder belongs to which plugin) arrive at cutover with the capability
 //!   grant lane; this operation never trusts a bare boolean for the gate.
-//! - the per-plugin byte window ([`SubmitBudget`](bitty_rich::host::SubmitBudget))
+//! - the per-plugin byte window ([`SubmitBudget`])
 //!   is charged only on success; denials leave it untouched (P0-AC-014).
 //! - over-cap submissions fail closed before framing and emit nothing.
 //!

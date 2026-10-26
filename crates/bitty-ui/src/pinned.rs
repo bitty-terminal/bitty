@@ -1,10 +1,10 @@
 //! Pinned (sticky) floating panels across workspaces (CTX-1077, issue #1757).
 //!
 //! A pinned leaf is parked outside the layout tree in a window-global store
-//! (one [`PinnedStore`] instance per window, mirroring the [`ScratchpadSlot`]
+//! (one [`PinnedStore`] instance per window, mirroring the [`crate::scratchpad::ScratchpadSlot`]
 //! storage discipline). Pinning detaches the leaf via
 //! [`LayoutNode::remove_leaf`](crate::layout::LayoutNode::remove_leaf) and
-//! stamps it [`PresentationMode::Floating`](crate::presentation::PresentationMode::Floating)
+//! stamps it [`PresentationMode::Floating`]
 //! through the CW-08 gate; unpinning restores it beside its recorded anchor
 //! via [`LayoutNode::insert_beside`](crate::layout::LayoutNode::insert_beside)
 //! and keeps it `Floating` (unpin returns the floating panel to the currently

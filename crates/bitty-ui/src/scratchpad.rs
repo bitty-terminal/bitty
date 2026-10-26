@@ -3,7 +3,7 @@
 //! A scratchpad leaf is parked outside the layout tree in a single hidden
 //! slot owned by the window (one [`ScratchpadSlot`] instance per window).
 //! Hiding detaches the leaf via [`LayoutNode::remove_leaf`](crate::layout::LayoutNode::remove_leaf)
-//! and stamps it [`PresentationMode::Scratchpad`](crate::presentation::PresentationMode::Scratchpad)
+//! and stamps it [`PresentationMode::Scratchpad`]
 //! through the CW-08 gate; showing restores it beside its recorded anchor
 //! via [`LayoutNode::insert_beside`](crate::layout::LayoutNode::insert_beside)
 //! and stamps it back to `Tiled`. Toggling routes through the workspace

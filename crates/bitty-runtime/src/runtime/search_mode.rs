@@ -10,7 +10,7 @@
 //! Parked until W-01 input capture lands (owner: W-01): the `search_mode`
 //! flag, its transient readout, the release hook ([`Runtime::exit_search_mode`],
 //! kept so the `selection` lifecycle funnels still release the binding), and
-//! modal containment in [`Runtime::handle_search_mode_key`] (consume-all
+//! modal containment in `Runtime::handle_search_mode_key` (consume-all
 //! while open, so no keystroke can leak to the PTY from a half-moved modal).
 //! The overlay can no longer open (entry retired with the policy), so the
 //! containment is unreachable in practice and `input.rs` modal routing stays

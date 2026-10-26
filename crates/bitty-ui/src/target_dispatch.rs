@@ -2,11 +2,11 @@
 //!
 //! Selecting a hint label dispatches a typed command id; the targeting mechanism never
 //! implements actions internally. [`TargetDispatcher`] binds each label in
-//! a [`HintAnnotationLayer`](crate::annotation_layer::HintAnnotationLayer)
-//! to a [`QualifiedCommand`](crate::panel::QualifiedCommand) owned by the
+//! a [`HintAnnotationLayer`]
+//! to a [`QualifiedCommand`] owned by the
 //! workspace command registry, and [`TargetDispatcher::dispatch`]
 //! revalidates the bound target against the live
-//! [`TargetRegistry`](crate::targeting::TargetRegistry) before
+//! [`TargetRegistry`] before
 //! returning the command id for the router to execute.
 //!
 //! The dispatcher executes nothing: it has no `apply`/`execute` path, takes

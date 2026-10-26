@@ -484,7 +484,7 @@ pub fn check_closed_capability_with(
 
 /// Canonical closed-set validation producing package errors.
 ///
-/// Called from [`validate_capability`] so manifest-time validation enforces
+/// Called from `validate_capability` so manifest-time validation enforces
 /// exactly the host install-time set: divergent identifiers fail here instead
 /// of locking successfully and failing at install.
 ///

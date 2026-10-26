@@ -14,15 +14,15 @@
 //! |---|---|---|
 //! | `CSI c` / `CSI 0 c` (Primary DA) | `ESC[?6c` | `bitty-term-state` (unchanged) |
 //! | `ESC Z` (legacy DECID) | `ESC[?6c` | mapped by `bitty-vt` to the existing `RequestDeviceStatus` action |
-//! | `CSI > c` / `CSI > 0 c` (Secondary DA) | `ESC[>0;<ver>;1c` | [`secondary_da_reply`] |
-//! | `CSI > q` / `CSI > 0 q` (XTVERSION) | `DCS > \| Bitty <ver> ST` | [`xterm_version_reply`] |
-//! | `DCS + q <hex> ST` (XTGETTCAP) | `DCS 1 + r <hex>=<hex> ST` or `DCS 0 + r ST` | [`xtgettcap_reply`] |
-//! | `CSI Ps $ p` / `CSI ? Ps $ p` (DECRQM) | `CSI [?] Ps ; Pm $ y` (`Pm`: 0 unknown, 1 set, 2 reset) | [`decrqm_value`] reads live `State` |
-//! | `CSI 14 t` (XTWINOPS text area, pixels) | `CSI 4 ; height ; width t` | [`xtwinops_pixels_reply`]: focused leaf content grid × live cell metrics (exact multiples) |
-//! | `CSI 16 t` (XTWINOPS cell size, pixels) | `CSI 6 ; height ; width t` | [`xtwinops_cell_size_reply`]: live cell metrics (yazi/chafa sizing probe, #2131) |
-//! | `CSI 18 t` (XTWINOPS text area, cells) | `CSI 8 ; rows ; cols t` | [`xtwinops_cells_reply`]: focused leaf content grid |
-//! | `APC G i=<id>,a=q,f=..;bytes ST` (Kitty support probe, spec) | `ESC _ G i=<id>;OK ST` or `ESC _ G i=<id>;EINVAL:<msg> ST` / `;ENOSPC:<msg> ST` | [`kitty_probe_ok_reply`] / [`kitty_probe_einval_reply`] / [`kitty_probe_enospc_reply`] |
-//! | `APC G a=q,i=..[p=..] ST` with empty payload (payload-less status lookup, bitty extension in spec shape) | `ESC _ G i=<id>[,p=<pin>];OK ST` or `ESC _ G i=<id>[,p=<pin>];ENOENT:<msg> ST` (`I=` echoed when queried by number) | [`kitty_status_ok_reply`] / [`kitty_status_enoent_reply`] |
+//! | `CSI > c` / `CSI > 0 c` (Secondary DA) | `ESC[>0;<ver>;1c` | `secondary_da_reply` |
+//! | `CSI > q` / `CSI > 0 q` (XTVERSION) | `DCS > \| Bitty <ver> ST` | `xterm_version_reply` |
+//! | `DCS + q <hex> ST` (XTGETTCAP) | `DCS 1 + r <hex>=<hex> ST` or `DCS 0 + r ST` | `xtgettcap_reply` |
+//! | `CSI Ps $ p` / `CSI ? Ps $ p` (DECRQM) | `CSI [?] Ps ; Pm $ y` (`Pm`: 0 unknown, 1 set, 2 reset) | `decrqm_value` reads live `State` |
+//! | `CSI 14 t` (XTWINOPS text area, pixels) | `CSI 4 ; height ; width t` | `xtwinops_pixels_reply`: focused leaf content grid × live cell metrics (exact multiples) |
+//! | `CSI 16 t` (XTWINOPS cell size, pixels) | `CSI 6 ; height ; width t` | `xtwinops_cell_size_reply`: live cell metrics (yazi/chafa sizing probe, #2131) |
+//! | `CSI 18 t` (XTWINOPS text area, cells) | `CSI 8 ; rows ; cols t` | `xtwinops_cells_reply`: focused leaf content grid |
+//! | `APC G i=<id>,a=q,f=..;bytes ST` (Kitty support probe, spec) | `ESC _ G i=<id>;OK ST` or `ESC _ G i=<id>;EINVAL:<msg> ST` / `;ENOSPC:<msg> ST` | `kitty_probe_ok_reply` / `kitty_probe_einval_reply` / `kitty_probe_enospc_reply` |
+//! | `APC G a=q,i=..[p=..] ST` with empty payload (payload-less status lookup, bitty extension in spec shape) | `ESC _ G i=<id>[,p=<pin>];OK ST` or `ESC _ G i=<id>[,p=<pin>];ENOENT:<msg> ST` (`I=` echoed when queried by number) | `kitty_status_ok_reply` / `kitty_status_enoent_reply` |
 //!
 //! Values are bitty's TRUE capabilities, never borrowed prestige:
 //!
@@ -56,7 +56,7 @@
 //! break the exhaustive match and struct literals in `bitty-term-state`,
 //! which is out of scope). Instead the runtime matches the parser's existing
 //! [`bitty_vt::TerminalAction::Unknown`] triggers (precise
-//! kind/final/intermediate triples, see [`is_secondary_da`] et al.) and, for
+//! kind/final/intermediate triples, see `is_secondary_da` et al.) and, for
 //! the two families that carry parameters, runs bounded raw scans over the
 //! overlap-plus-new bytes with [`UnrecognizedSequence`] correlation, so bytes
 //! buried inside OSC strings can never spoof a reply. Replies are queued

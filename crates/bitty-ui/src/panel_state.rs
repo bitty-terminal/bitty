@@ -10,12 +10,12 @@
 //! What this module provides:
 //!
 //! - The seven independent state axes of one panel: [`PanelLifecycle`],
-//!   presentation (the accepted [`PresentationMode`](crate::presentation::PresentationMode),
+//!   presentation (the accepted [`PresentationMode`],
 //!   reused, never redefined), [`PanelVisibility`], [`PanelFocusState`],
 //!   [`PanelAttention`], [`PanelInteraction`], and [`PanelActivity`].
 //! - [`SevenPanelState`] — the seven axes joined to the canonical panel
-//!   and tree identities ([`PanelId`](crate::panel::PanelId) and the
-//!   canonical [`UiNodeId`](crate::uitree::UiNodeId), reused via import,
+//!   and tree identities ([`PanelId`] and the
+//!   canonical [`UiNodeId`], reused via import,
 //!   never redefined here).
 //! - The close rule: [`SevenPanelState::close`] moves the lifecycle axis
 //!   to [`PanelLifecycle::Closed`] and hides the panel, but the plugin
@@ -529,7 +529,7 @@ impl SevenPanelState {
         self.panel
     }
 
-    /// The canonical [`UiNodeId`](crate::uitree::UiNodeId) of the panel's
+    /// The canonical [`UiNodeId`] of the panel's
     /// tree node (same type the retained tree diffs by, never a copy).
     #[must_use]
     pub const fn node(&self) -> UiNodeId {

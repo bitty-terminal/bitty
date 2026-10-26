@@ -5,8 +5,8 @@
 //! # Scope
 //!
 //! This module plugs I/O behind the injectable seam: the
-//! [`SpectrumGate`](bitty_plugin_host::SpectrumGate) sampler and
-//! [`StateGate`](bitty_plugin_host::StateGate) reader closures. Gates,
+//! [`SpectrumGate`] sampler and
+//! [`StateGate`] reader closures. Gates,
 //! argv shapes, parsers, byte caps, and capability heads stay in
 //! `bitty-plugin-host::audio` (unchanged here, so the #2063 pre-init fix
 //! rebases cleanly); this module owns only the production spawner, the
@@ -16,13 +16,13 @@
 //! # Live sources
 //!
 //! - State (`get`): three `pactl` spawns per fresh read —
-//!   [`read_volume_argv`](bitty_plugin_host::read_volume_argv),
-//!   [`read_mute_argv`](bitty_plugin_host::read_mute_argv),
-//!   [`list_sinks_argv`](bitty_plugin_host::list_sinks_argv) — composed by
+//!   [`read_volume_argv`],
+//!   [`read_mute_argv`],
+//!   [`list_sinks_argv`] — composed by
 //!   [`live_read`] and parsed by the bounded contract parsers. The default
 //!   sink name parse exists in the contract but carries no `get()` field,
 //!   so it is not spawned here. The live monitor runs that read on a
-//!   short-lived sampler thread ([`SampledReads`], bitty#2425): a fresh
+//!   short-lived sampler thread (`SampledReads`, bitty#2425): a fresh
 //!   read blocks for 15-92 ms (three spawns, 5 ms `try_wait` cadence), which
 //!   is the whole RC-1 50 ms slice of a plugin that polls
 //!   `audio.state.get()` during `init.lua`, so the executor thread only ever
@@ -38,14 +38,14 @@
 //!   contract on the injected sampler path, and the monitor hides (never
 //!   fabricates) until a PipeWire/cava monitor follow-up lands.
 //! - Control (`set_volume`, `toggle_mute`): one `pactl` spawn per admitted
-//!   call ([`set_volume_argv`](bitty_plugin_host::set_volume_argv) /
-//!   [`toggle_mute_argv`](bitty_plugin_host::toggle_mute_argv)) behind the
-//!   10 Hz [`ControlGate`](bitty_plugin_host::ControlGate).
+//!   call ([`set_volume_argv`] /
+//!   [`toggle_mute_argv`]) behind the
+//!   10 Hz [`ControlGate`].
 //!
 //! # Fail-closed posture
 //!
 //! [`live_spawn`] runs the fixed `pactl` argv only (no shell, no caller
-//! text, [`check_argv`](bitty_plugin_host::check_argv) enforced before
+//! text, [`check_argv`] enforced before
 //! every spawn, byte-capped output). A missing binary, spawn failure, or
 //! non-zero exit maps to [`AudioErrorKind::MonitorUnavailable`](bitty_plugin_host::AudioErrorKind):
 //! retryable, served stale inside the hide grace by the gates, hidden past
@@ -280,7 +280,7 @@ pub fn live_spawn(argv: &[String]) -> Result<String, AudioError> {
 /// argv exists in this revision. Any spawn or parse failure propagates as
 /// the typed contract error so the gate stales-then-hides.
 ///
-/// The live monitor calls this from the [`SampledReads`] thread, never from
+/// The live monitor calls this from the `SampledReads` thread, never from
 /// the executor thread (bitty#2425).
 pub fn live_read(spawn: &SpawnFn) -> Result<AudioState, AudioError> {
     let volume_argv = read_volume_argv();
@@ -605,7 +605,7 @@ fn lock_slot(slot: &Mutex<SampleSlot>) -> std::sync::MutexGuard<'_, SampleSlot> 
 /// fixtures.
 ///
 /// The live constructor ([`Self::live`]) also installs an off-thread state
-/// sampler ([`SampledReads`], bitty#2425): a fresh `audio.state.get()` would
+/// sampler (`SampledReads`, bitty#2425): a fresh `audio.state.get()` would
 /// otherwise block the executor thread for the three `pactl` spawns, which
 /// is the whole RC-1 activation slice of a plugin that mounts a `pulseaudio`
 /// module. Injected monitors keep the synchronous reader, so fixtures stay
@@ -739,7 +739,7 @@ impl AudioMonitor {
     /// Serve `get()` with the 2 s read ceiling.
     ///
     /// On the live monitor the read itself happens off the executor thread
-    /// ([`SampledReads`]): this call never spawns or waits. The first poll
+    /// (`SampledReads`): this call never spawns or waits. The first poll
     /// before a sample lands hides (a served snapshot is never fabricated),
     /// a poll with an attempt in flight or not yet due serves last-good
     /// through [`StateGate::serve_cached`], and a landed attempt is observed

@@ -305,7 +305,7 @@ pub struct PtyBuilder {
 }
 
 impl PtyBuilder {
-    /// Starts a builder for `program`, spawned directly as an argv[0]
+    /// Starts a builder for `program`, spawned directly as an `argv[0]`
     /// executable (absolute path recommended; bare names resolve through the
     /// standard PATH search without any shell involvement).
     ///

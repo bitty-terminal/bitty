@@ -3,9 +3,9 @@
 //! Every runtime typed error surfaced by this crate carries a stable `E_*`
 //! code in the `budget` diagnostic class. [`RuntimeFault`] models the three
 //! failure styles the host must handle identically across VM backends
-//! (`OutOfMemory`, `FuelExhausted`, `HostOpCancelled`); [`from_suspend_reason`]
-//! maps the current [`SuspendReason`](crate::SuspendReason) onto that model,
-//! and [`bridge_error_for_vm_error`] lifts a [`VmError`](crate::VmError)
+//! (`OutOfMemory`, `FuelExhausted`, `HostOpCancelled`); [`RuntimeFault::from_suspend_reason`]
+//! maps the current [`SuspendReason`] onto that model,
+//! and [`bridge_error_for_vm_error`] lifts a [`VmError`]
 //! into the bridge error the host reports to Lua.
 //!
 //! Wall-clock timeout maps to [`E_TIMEOUT`], the same value the host bridge
@@ -46,7 +46,7 @@ pub fn is_budget_code(code: &str) -> bool {
 
 /// Host-side model of VM failure styles.
 ///
-/// The current backend reports these as [`SuspendReason`](crate::SuspendReason);
+/// The current backend reports these as [`SuspendReason`];
 /// the Phodopus backend reports them as `OutOfMemory`, fuel exhaustion, and
 /// host-operation cancellation. This enum is the stable mapping point both
 /// backends share: each variant carries one `E_*` code in the `budget`

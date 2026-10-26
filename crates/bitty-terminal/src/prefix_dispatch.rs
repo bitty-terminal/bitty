@@ -2,8 +2,8 @@
 //! (CTX-1002 / issue #1650, RFC OQ-056).
 //!
 //! Pure, headless decision half of the Core prefix mechanism: given the
-//! configured [`ResolvedLeader`](bitty_config::ResolvedLeader) plus the
-//! resolved [`PrefixBinding`](bitty_config::PrefixBinding) table, classify
+//! configured [`ResolvedLeader`] plus the
+//! resolved [`PrefixBinding`] table, classify
 //! one press while the Leader window is pending. The caller owns the clock
 //! (the shared [`LeaderState`](bitty_config::LeaderState) window: expiry is
 //! reaped via [`LeaderState::poll`](bitty_config::LeaderState::poll) before
@@ -22,7 +22,7 @@
 //! 2. A Leader re-press re-arms ([`PrefixPress::Rearm`], consumed); a held
 //!    Leader repeat is swallowed without restarting the window
 //!    ([`PrefixPress::Repeat`], consumed).
-//! 3. A [`match_prefix`](bitty_config::match_prefix) hit dispatches
+//! 3. A [`match_prefix`] hit dispatches
 //!    ([`PrefixPress::Dispatch`], consumed).
 //! 4. Anything else while a hint session is armed defers to it
 //!    ([`PrefixPress::DeferToHint`], not consumed here).

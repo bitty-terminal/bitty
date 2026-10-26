@@ -10,7 +10,7 @@
 //! # What this module is
 //!
 //! The third step of the 008 route (P1 anchoring + P2 fold MVP merged in
-//! #390; this is P3). It turns the [`CommandBlock`](crate::blocks::CommandBlock)
+//! #390; this is P3). It turns the [`CommandBlock`]
 //! list and the Panel/View leaf sets into keyboard-addressable targets:
 //!
 //! ```text
@@ -32,7 +32,7 @@
 //!   outside this crate on purpose.
 //! * **Generic target API** (008 section 7): any provider registers
 //!   [`HintTarget`] values. Seed providers cover
-//!   [`CommandBlock`](crate::blocks::CommandBlock) (bridged from #390) and
+//!   [`CommandBlock`] (bridged from #390) and
 //!   Panel/View leaves (by raw id, no UI dependency); links/search results
 //!   are later providers and are explicitly absent here.
 //! * **Single annotation layer** (008 section 9): one ephemeral
@@ -46,7 +46,7 @@
 //! [`HINT_TARGET_MAX`] labels, so per-label overlays would either blow the
 //! bound or force it to 256. Neither happens: [`HintBatch`] is **not** an
 //! overlay. It is one ephemeral annotation layer (same category as the
-//! [`FoldState`](crate::blocks::FoldState) projection): the compositor
+//! [`FoldState`] projection): the compositor
 //! paints its glyphs in a single pass and [`HintBatch::overlay_cost`]
 //! returns `0`. The `4+1` bound, [`OverlayManager`](https://github.com/bitty-terminal/bitty)
 //! state, and every overlay id/generation are therefore untouched by
@@ -57,10 +57,10 @@
 //!
 //! # Terminal Truth (hint chrome is presentation-only)
 //!
-//! Nothing here mutates [`State`](bitty_term_state::State): no grid write,
+//! Nothing here mutates [`State`]: no grid write,
 //! no scrollback push/clear/resize, no zone/cwd edit. Labels live in
 //! [`HintBatch`]; fold side effects land in the caller's
-//! [`FoldState`](crate::blocks::FoldState); [`DispatchOutcome::CopyRequested`]
+//! [`FoldState`]; [`DispatchOutcome::CopyRequested`]
 //! carries only a [`TargetId`] so the caller resolves bytes from truth
 //! through its own clipboard policy. Copy-all, search, agent history,
 //! replay, snapshots, and IPC grid reads therefore never observe hint
@@ -152,7 +152,7 @@ const ALPHABET_LEN: usize = 26;
 /// What kind of UI object a hint target addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum HintKind {
-    /// A [`CommandBlock`](crate::blocks::CommandBlock) from #390.
+    /// A [`CommandBlock`] from #390.
     CommandBlock,
     /// A panel leaf, addressed by raw `PanelId` value (no `bitty-ui` dep).
     Panel,
@@ -182,7 +182,7 @@ impl HintKind {
 }
 
 /// Stable anchor of one hint target: ordinal-anchored for commands (survives
-/// resize/reflow/scroll like [`CommandBlock`](crate::blocks::CommandBlock)),
+/// resize/reflow/scroll like [`CommandBlock`]),
 /// id-anchored for Panel/View leaves, cell-anchored for links.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HintAnchor {
@@ -1505,7 +1505,7 @@ impl HintSession {
     /// # Errors
     /// [`HintFeedError::NotArmed`] while disarmed; parse/dispatch errors
     /// otherwise (fold untouched on any error). Link labels fail closed
-    /// with [`DispatchError::LinkNeedsState`] here: use [`feed_link`] with
+    /// with [`DispatchError::LinkNeedsState`] here: use [`feed_link`](Self::feed_link) with
     /// live truth instead.
     pub fn feed(
         &self,

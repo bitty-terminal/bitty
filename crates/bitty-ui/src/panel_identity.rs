@@ -10,7 +10,7 @@
 //!
 //! - [`SlotNumber`] — a physical slot (`1..=MAX_IDENTITY_SLOTS`) selected
 //!   by `Mod`+Number. Slots are positions, never identities: reseating a
-//!   slot never changes the [`PanelId`](crate::panel::PanelId) behind it.
+//!   slot never changes the [`PanelId`] behind it.
 //! - [`IdentityRegistry`] — the stable `PanelId` <-> [`SlotNumber`]
 //!   binding with a bounded display title per panel. `Mod`+Number calls
 //!   [`IdentityRegistry::reseat`], which moves a panel into a slot (or
@@ -58,7 +58,7 @@ pub const MAX_IDENTITY_TITLE_LEN: usize = 64;
 /// Physical slot selected by `Mod`+Number (`1..=MAX_IDENTITY_SLOTS`).
 ///
 /// A slot is a position on the tab strip, never a panel identity. Two
-/// reseats may move the same [`PanelId`](crate::panel::PanelId) through
+/// reseats may move the same [`PanelId`] through
 /// many slots; the identity never changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SlotNumber(u8);
@@ -94,7 +94,7 @@ impl fmt::Display for SlotNumber {
 /// Deliberately capability-free: holders can compare handles and hand them
 /// back to [`IdentityRegistry::resolve`], but cannot read the raw id, forge
 /// a handle from an integer, or convert to
-/// [`PanelId`](crate::panel::PanelId). There is no `From` bridge in either
+/// [`PanelId`]. There is no `From` bridge in either
 /// direction by construction. `Display` stays opaque as well.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OpaquePanelHandle {

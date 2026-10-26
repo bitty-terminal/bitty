@@ -1996,7 +1996,7 @@ pub fn resolve_theme(name: Option<&str>) -> &'static Theme {
 ///   the dark half (dark-first default).
 ///
 /// Names are stored normalized (trimmed, lowercased) exactly as
-/// [`normalize_theme_name`] produces them, so [`find_preset`] matches.
+/// [`normalize_theme_name`] produces them, so `find_preset` matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThemeSelection {
     /// One preset for every OS appearance.

@@ -188,7 +188,7 @@ impl CapabilityLedger {
 /// v1 routing scope. The only v1 scope is in-process delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RoutingScope {
-    /// Same-window, same-process delivery through [`PanelEventBus`].
+    /// Same-window, same-process delivery through `PanelEventBus`.
     InProcess,
 }
 

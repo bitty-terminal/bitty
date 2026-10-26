@@ -3,7 +3,7 @@
 //! Headless present-path enrichment over the CW render-path issues. It
 //! consumes the accepted headless models — fold, hints, anchors,
 //! rich scene, non-terminal panel content — into a single bounded
-//! [`CwPresentPlan`] derived per [`PresentFrame`](crate::runtime::PresentFrame)
+//! [`CwPresentPlan`] derived per `PresentFrame`
 //! at refresh, without touching grid truth, GPU, PTY, or the filesystem.
 //!
 //! # Per-issue mapping
@@ -33,7 +33,7 @@
 //!
 //! # Terminal truth
 //!
-//! The only mutation in the system is the caller's [`FoldState`](bitty_rich::blocks::FoldState)
+//! The only mutation in the system is the caller's [`FoldState`]
 //! via [`apply_fold_action`] / [`dispatch_present`]. Grid, scrollback,
 //! zones, clipboard, and snapshots are never written.
 //!
@@ -45,9 +45,9 @@
 //! | provider views | [`CW_PRESENT_MAX_NONTERMINAL_ITEMS`] (64) | [`CwHintProvider::with_views`] returns `None` past the cap |
 //! | scene blocks per plan | [`CW_PRESENT_MAX_SCENE_BLOCKS`] (64) | deterministic shed of the iteration tail, [`ScenePresent::shed`] reports it |
 //! | non-terminal items | [`CW_PRESENT_MAX_NONTERMINAL_ITEMS`] (64) | saturate + [`NonTerminalPresent::truncated`] |
-//! | hint labels / text | `HINT_TARGET_MAX` / `HINT_TEXT_MAX_BYTES` (via [`HintBatch`](bitty_rich::hints::HintBatch)) | shed tail, never an overlay |
+//! | hint labels / text | `HINT_TARGET_MAX` / `HINT_TEXT_MAX_BYTES` (via [`HintBatch`]) | shed tail, never an overlay |
 //! | hint overlay entries | batch labels 1:1 (via [`HintOverlayPresent`]) | same shed as the batch, zero overlay slots |
-//! | fold ids | `FOLD_MAX` (via [`FoldState`](bitty_rich::blocks::FoldState)) | fold-to-closed fails closed |
+//! | fold ids | `FOLD_MAX` (via [`FoldState`]) | fold-to-closed fails closed |
 //! | anchors per plan | input blocks (≤ `COMMAND_BLOCK_MAX`) | no allocation beyond the input slice |
 //!
 //! No I/O, no wall-clock, no randomness, no unsafe.
@@ -708,7 +708,7 @@ pub struct CwPresentInputs<'a> {
 /// One frame's CW present enrichment: fold, hints, scene, non-terminal
 /// composed (composer retired, E-CUT-4).
 ///
-/// Derived once per [`PresentFrame`](crate::runtime::PresentFrame) at refresh
+/// Derived once per `PresentFrame` at refresh
 /// from headless inputs. Pure (except the caller's fold, which this function
 /// never mutates — dispatch goes through [`dispatch_present`]), bounded, and
 /// deterministic per input tuple.

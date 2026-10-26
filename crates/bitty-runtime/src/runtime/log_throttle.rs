@@ -5,7 +5,7 @@
 //! untrusted or malicious program. A raw `eprintln!` per event lets that
 //! child flood the owner's terminal (and any captured stderr) without bound.
 //!
-//! A [`LogThrottle`] admits at most `burst` diagnostics per fixed `window`
+//! A `LogThrottle` admits at most `burst` diagnostics per fixed `window`
 //! and counts the rest so the suppression stays visible: the next admitted
 //! message reports how many identical diagnostics were dropped, then resets
 //! the count. Deterministic via the caller-supplied [`Instant`], so tests

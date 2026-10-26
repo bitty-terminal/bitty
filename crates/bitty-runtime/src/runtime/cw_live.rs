@@ -418,7 +418,7 @@ impl Runtime {
     /// command block (issue #980).
     ///
     /// Returns `None` when no command block exists yet; otherwise the
-    /// [`apply_fold_action`](crate::cw_present::apply_fold_action) end-state
+    /// [`apply_fold_action`] end-state
     /// contract. Terminal truth is untouched.
     pub fn cw_fold_latest(&mut self, action: CwFoldAction) -> Option<bool> {
         let id = self.cw_latest_command_id()?;
@@ -439,7 +439,7 @@ impl Runtime {
     /// the admitted count (issue #984).
     ///
     /// Each ordinal replays idempotently through
-    /// [`apply_fold_action`](crate::cw_present::apply_fold_action)
+    /// [`apply_fold_action`]
     /// (`Collapse`); ordinals past the fold cap fail closed and are not
     /// counted. Unknown ordinals (evicted history) are admitted harmlessly:
     /// they contribute nothing to any projection until their blocks exist

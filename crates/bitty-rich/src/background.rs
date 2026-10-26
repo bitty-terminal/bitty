@@ -1084,7 +1084,7 @@ impl BackgroundStore {
 /// The header sniff runs first, so this function never sees an animated or
 /// unsupported container. The resident decode is a single `width * height * 4`
 /// allocation: the per-format [`image::ImageDecoder`] writes its native 8-bit
-/// channels into that buffer's prefix and [`expand_in_place`] grows them to
+/// channels into that buffer's prefix and `expand_in_place` grows them to
 /// straight-alpha RGBA8. Full-size codec scratch (progressive JPEG
 /// coefficients, WebP alpha planes) is charged separately by
 /// [`ImageHeader::peak_bytes_per_pixel`] and bounded by [`check_header_bounds`]
@@ -1098,7 +1098,7 @@ impl BackgroundStore {
 ///
 /// # Errors
 ///
-/// [`BackgroundError::`] format/bound/malformed variants from
+/// `BackgroundError` format/bound/malformed variants from
 /// [`sniff_image`], [`check_header_bounds`], or a refused decode.
 pub fn decode_background(bytes: &[u8]) -> Result<BackgroundImage, BackgroundError> {
     let header = sniff_image(bytes)?;

@@ -457,7 +457,7 @@ pub fn wsl_argv(
 /// Like [`wsl_argv`], plus `guest_cwd` (already mapped, guest-absolute) is
 /// passed as `--cd <dir>` before `--exec` so the helper starts in the
 /// component version directory. `None` omits `--cd` (inherits the guest
-/// default); `Some` must pass [`valid_helper_guest_path`]-style validation
+/// default); `Some` must pass `valid_helper_guest_path`-style validation
 /// (absolute, bounded, no `..`).
 pub fn wsl_argv_with_cwd(
     distro: &WslDistro,

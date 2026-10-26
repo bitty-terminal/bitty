@@ -116,7 +116,7 @@ pub struct WorkspaceAttention {
 ///
 /// CTX-0954: scratchpad occupancy rides the same row under the same
 /// `workspace.read` grant (no panel capability is consulted): the slot is
-/// window-global (one [`bitty_ui::ScratchpadSlot`] per window), so every row
+/// window-global (one `bitty_ui::ScratchpadSlot` per window), so every row
 /// of one `list()` result carries the same occupancy snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceInfo {
@@ -222,7 +222,7 @@ pub const SPAWN_TIMEOUT_MS: u64 = 5_000;
 ///
 /// Upper bound for [`LuaVm::set_spawn_deadline_ms`]; mirrors the spawn
 /// contract maximum (CTX-0445). Larger values are refused fail-closed with
-/// [`VmError::Budget`](crate::VmError::Budget).
+/// [`VmError::Budget`].
 pub const SPAWN_TIMEOUT_MAX_MS: u64 = 30_000;
 
 /// Maximum `process.spawn` argv entries accepted from Lua (bounded-list

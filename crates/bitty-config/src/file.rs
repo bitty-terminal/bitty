@@ -139,7 +139,7 @@
 //!   `scrollback` (`shell`, `scroll_lines_per_notch`,
 //!   `scroll_pixels_per_notch`, `page_scroll_percent`, `cursor_style`,
 //!   `bell` optional, defaulting to
-//!   [`TerminalConfig`](crate::types::TerminalConfig) defaults when absent:
+//!   [`TerminalConfig`] defaults when absent:
 //!   `cursor_style` is one of `"default"` (renderer block fallback) |
 //!   `"blinking_block"` | `"steady_block"` | `"blinking_underline"` |
 //!   `"steady_underline"` | `"blinking_bar"` | `"steady_bar"` (CTX-0756);
@@ -149,7 +149,7 @@
 //!   spellings fail closed with the field path).
 //!   `selection` is fully optional (absent table/key means "this layer says
 //!   nothing"); when present, `auto_copy` defaults to
-//!   [`SelectionConfig`](crate::types::SelectionConfig) default `false`
+//!   [`SelectionConfig`] default `false`
 //!   (CTX-0371) when omitted, so configs without `selection` keep working and
 //!   selecting text never writes the system clipboard implicitly.
 //!   `history` is fully optional (`history.capture.transcript`,
@@ -163,11 +163,11 @@
 //!   remains typed-unavailable until submitted command spans are tracked.
 //!   `layout` follows the same fully-optional pattern: absent table/key means
 //!   "this layer says nothing"; when the table is present, omitted keys
-//!   default to [`LayoutConfig`](crate::types::LayoutConfig) defaults (`0`,
+//!   default to [`LayoutConfig`] defaults (`0`,
 //!   edge-to-edge for the gaps; `0.05` for `resize_step`, CTX-0963), and
 //!   out-of-range values fail closed with the field path.
 //!   `scrollbar` follows it too: absent means "says nothing"; when present,
-//!   omitted keys default to [`ScrollbarConfig`](crate::types::ScrollbarConfig)
+//!   omitted keys default to [`ScrollbarConfig`]
 //!   defaults (`auto` mode, width `8`), unknown `mode` strings and
 //!   out-of-range `width` fail closed with the field path.
 //!   `mouse` follows it as well: absent means "says nothing"; when present,
@@ -184,7 +184,7 @@
 //!   absent-means-silent contract (#1325): absent (or empty) means "this
 //!   layer says nothing". Each entry is `{ id, enabled? }`: `id` is the
 //!   globally unique plugin identifier (required string, validated
-//!   fail-closed by [`PluginSpec`](crate::types::PluginSpec)), `enabled`
+//!   fail-closed by [`PluginSpec`]), `enabled`
 //!   is an optional boolean defaulting to `true`, so `{ id = "owner/name" }`
 //!   declares an enabled plugin and only an explicit `enabled = false` opts
 //!   out (useful to switch off a lower-precedence layer's entry under the

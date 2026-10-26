@@ -481,7 +481,7 @@ impl SensitivePathPolicy {
 
     /// Add an extra deny prefix (fail-closed on hostile input).
     ///
-    /// The prefix is stored normalized (see [`normalize_request_path`]);
+    /// The prefix is stored normalized (see `normalize_request_path`);
     /// hostile-shaped prefixes (absolute paths are allowed here — they
     /// name deny roots, not grants — but empty, over-bound, and
     /// control-bearing text is rejected).
@@ -1439,7 +1439,7 @@ impl FsAuditLedger {
     ///
     /// CodeQL models any call to these `push_*` entry points as
     /// log-tainted on the grounds that the ledger can hold file bytes;
-    /// the payload is paths-only by construction (see [`Self::push`] and
+    /// the payload is paths-only by construction (see `Self::push` and
     /// the `*_names_never_values` tests), which is the documented barrier
     /// the analyzer cannot see. Treat new `push_*` call sites as
     /// log-tainted until they carry the same names-only proof.

@@ -93,7 +93,7 @@ pub const BAND_CLICK_QUEUE_MAX: usize = 8;
 ///
 /// Wheel ticks are user-paced but burst harder than clicks; consecutive
 /// ticks for one target coalesce into a single slot (see
-/// [`Runtime::queue_band_scroll`]), so the queue holds one frame of scrolls
+/// `Runtime::queue_band_scroll`), so the queue holds one frame of scrolls
 /// the application has not drained yet. Overflow drops the newest request
 /// fail-closed and counts [`BandHostStats::scroll_queue_drops`].
 pub const BAND_SCROLL_QUEUE_MAX: usize = 8;
@@ -1123,7 +1123,7 @@ fn resolve_scroll_for_region(
 /// through `PluginRuntime::dispatch_command`, whose registration and
 /// capability gates fail closed as usual. `delta` is the signed wheel step
 /// (direction x lines, positive for wheel-up); the dispatch table carries it
-/// under [`UI_SCROLL_DELTA_ARG`](bitty_lua::ui::UI_SCROLL_DELTA_ARG),
+/// under [`UI_SCROLL_DELTA_ARG`],
 /// overwriting a declared entry of the same name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BandScrollRequest {
@@ -1302,7 +1302,7 @@ pub struct BandScrollTarget {
 /// splits its `on_scroll` command against `owner`, mirroring
 /// [`resolve_click_in_band`]. Geometry (which band owns the row) lives on
 /// [`Runtime::plugin_band_hit`]; the wheel step joins in
-/// [`Runtime::band_scroll`].
+/// `Runtime::band_scroll`.
 #[must_use]
 pub fn resolve_scroll_in_band(owner: &str, runs: &[BandRun], col: usize) -> BandScrollOutcome {
     let Some(run) = find_run_index(runs, col).and_then(|index| runs.get(index)) else {
@@ -1337,7 +1337,7 @@ pub enum BandHoverPhase {
 
 impl BandHoverPhase {
     /// Dispatch spelling carried under
-    /// [`UI_HOVER_PHASE_ARG`](bitty_lua::ui::UI_HOVER_PHASE_ARG).
+    /// [`UI_HOVER_PHASE_ARG`].
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -2575,7 +2575,7 @@ impl Runtime {
     /// Motion is inert while the window is unfocused or while a focusable
     /// overlay capture holds: a modal must never re-arm a tooltip underneath
     /// itself. The teardown transition (one leave) is queued by
-    /// [`Self::clear_band_hover`] when focus or capture state changes, not by
+    /// `Self::clear_band_hover` when focus or capture state changes, not by
     /// motion.
     pub fn update_band_hover(&mut self, pos: CursorPosition) {
         if !self.focused || self.hover_suppressed_by_overlay {

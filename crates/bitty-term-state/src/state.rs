@@ -1230,7 +1230,7 @@ impl State {
     ///
     /// Honest bound (CTX-0490): once per 2^32 distinct links the id space
     /// restarts at zero after clearing the table, so a cell that kept a
-    /// pre-wrap id can resolve to a post-wrap entry (see [`HyperlinkEntry`]).
+    /// pre-wrap id can resolve to a post-wrap entry (see `HyperlinkEntry`).
     #[must_use]
     pub fn hyperlink_entry(&self, id: HyperlinkId) -> Option<(Option<&str>, &str)> {
         let front_id = self.hyperlink_table.front()?.id.as_u32();
@@ -1360,7 +1360,7 @@ impl State {
     /// arrives on the fresh row that becomes the next prompt — the range
     /// closes at the row before the end mark, so the next prompt line is
     /// never swallowed. With no end mark yet the command is still running
-    /// and the range closes at the cursor row (see [`Self::live_output_end`]).
+    /// and the range closes at the cursor row (see `Self::live_output_end`).
     ///
     /// The `D`-row decision uses per-row print tracking
     /// (`output_on_mark_row`, decided at mark time), never column zero: a
@@ -2406,9 +2406,9 @@ impl State {
 
     /// Advances every Kitty animation by `elapsed_ms` with tick pacing
     /// (S1, #1849; CTX-1122 single-damage path): each descriptor steps
-    /// through [`placement::KittyAnimation::advance_bounded`] with
+    /// through [`crate::placement::KittyAnimation::advance_bounded`] with
     /// `max_steps` (the present tick passes
-    /// [`placement::KITTY_ANIM_MAX_STEPS_PER_TICK`]), so `Stopped`
+    /// [`crate::placement::KITTY_ANIM_MAX_STEPS_PER_TICK`]), so `Stopped`
     /// descriptors freeze, `Loading` ones park on the last frame, and
     /// `Running` ones wrap against their loop budget.
     ///
@@ -2421,7 +2421,7 @@ impl State {
     /// Scoping is unchanged (placements of untouched images keep no new
     /// damage) and a frozen animation still costs only the descriptor
     /// scan. Returns the wire image ids whose frame changed (bounded by
-    /// [`placement::KITTY_ANIM_MAX_IMAGES`]).
+    /// [`crate::placement::KITTY_ANIM_MAX_IMAGES`]).
     ///
     /// No clocks: the caller (present tick) stamps `elapsed_ms` from its
     /// own clock, keeping playback testable through virtual time.

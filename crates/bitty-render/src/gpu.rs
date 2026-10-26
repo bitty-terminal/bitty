@@ -844,7 +844,7 @@ impl SurfaceState {
 /// Hard cap on headless surface bytes (64 MiB): a 4-byte-per-pixel RGBA
 /// surface can therefore never exceed 16 Mi pixels.
 ///
-/// Mirrors [`crate::software::MAX_SURFACE_BYTES`]. It lives here (rather than
+/// Mirrors `crate::software::MAX_SURFACE_BYTES`. It lives here (rather than
 /// importing from `software`) because `software` is gated behind the
 /// `sw-fallback` feature while the headless fake compiles in every build: a
 /// `#[cfg(feature = "sw-fallback")]` test below pins the two values together
@@ -1093,7 +1093,7 @@ impl Surface {
     /// and stores deterministic defaults.
     ///
     /// Counts the attempt in [`crate::telemetry`] and delegates to
-    /// [`Self::configure_inner`].
+    /// `Self::configure_inner`.
     ///
     /// # Errors
     ///

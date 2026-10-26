@@ -10,7 +10,7 @@
 //! cache copy); Core owns its raster cache in [`crate::kitty_raster`]
 //! (S6, #1849).
 //! This module is the Core-retained placement-policy half: it stores
-//! caller-supplied decoded bitmaps (validated by [`checked_bitmap`]
+//! caller-supplied decoded bitmaps (validated by `checked_bitmap`
 //! before admission), binds them to cursor-anchored cell rects, and derives
 //! the pixel rects the present layer composites. Parser/APC wiring is
 //! unchanged: the caller passes the transmission parameters (`a`, `c`, `r`)
@@ -18,7 +18,7 @@
 //!
 //! Core keeps the pre-allocation checker ([`precheck_declared_image`]) over
 //! declared wire dimensions plus the pre-upload re-validator
-//! ([`checked_bitmap`]) regardless of the extension-side copies: a
+//! (via `checked_bitmap`) regardless of the extension-side copies: a
 //! repository split never retires a Core check (P0-AC-003/P0-AC-004).
 //!
 //! # Actions (`a=`)

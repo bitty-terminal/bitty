@@ -15,7 +15,7 @@
 //! state plus its transient readouts, the release hook
 //! ([`Runtime::exit_copy_mode`], kept so the `selection` lifecycle funnels
 //! still release the binding), and modal containment in
-//! [`Runtime::handle_copy_mode_key`] (consume-all while active, so no
+//! `Runtime::handle_copy_mode_key` (consume-all while active, so no
 //! keystroke can leak to the PTY from a half-moved modal). Copy mode can no
 //! longer activate (entry retired with the policy), so the containment is
 //! unreachable in practice and `input.rs` modal routing stays byte-identical.

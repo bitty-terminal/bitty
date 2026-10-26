@@ -8,9 +8,9 @@
 //! RFC's parser obligations.
 //!
 //! Bounded-parsing obligations are satisfied jointly: `vte` bounds parameter
-//! count (extra parameters are dropped and flagged via `ignore`),
-//! parameter magnitude (`u16` saturation), and OSC payload size (fixed
-//! buffer); this module additionally bounds every materialized string or
+//! count (extra parameters are dropped and flagged via `ignore`) and
+//! parameter magnitude (`u16` saturation) but not string payload size in its
+//! `std` build; this module additionally bounds every materialized string or
 //! byte payload through the [`crate::bounded`] types and enforces one
 //! parser-wide control-string byte cap ([`CONTROL_STRING_MAX_BYTES`]) over
 //! every string `vte` collects and over the diverted iTerm2 candidate.
@@ -22,13 +22,21 @@
 //! `no_std` build), so an unterminated `OSC`/`DCS`/`SOS`/`PM` grows memory
 //! 1:1 with input. An over-cap string is aborted with an injected `CAN`,
 //! its tail is dropped up to the real terminator, and the refusal is emitted
-//! as [`TerminalAction::ControlStringRejected`] for telemetry. Every
+//! as [`TerminalAction::ControlStringRejected`] for telemetry. The bytes
+//! forwarded before the abort are *dispatched first* — `vte` runs its OSC
+//! dispatch (or `unhook`) on the injected `CAN` — so a bounded, truncated
+//! prefix can still apply one mapped action (a truncated title, hyperlink,
+//! zone mark, cwd, palette entry, or a clipboard write still subject to the
+//! clipboard gate); only the tail past the cap is discarded. Every
 //! terminated sequence that stays under the cap is dispatched exactly as
 //! before (CTX-1592, bitty#2704).
 //!
-//! The crate holds no terminal state: the only memory retained across input
-//! chunks is the `vte` machine itself plus a pending device-control-string
-//! marker needed to report terminated-but-unmapped string sequences.
+//! The crate holds no terminal state, but it retains bounded parser buffers
+//! across input chunks: the `vte` machine (whose string collector keeps its
+//! capacity after a refusal), the pending device-control-string marker, the
+//! kitty APC assembler with at most one open chunked stream (IMG-1), the
+//! iTerm2 OSC scanner with up to its ~4.19 MiB body buffer, and the APC
+//! header buffer.
 
 use crate::action::{ControlStringKind, ControlStringReject, TerminalAction};
 use crate::diag::{RejectLog, warn_rejection};
@@ -48,12 +56,15 @@ mod tests;
 /// Parser-wide byte cap for one control string (CTX-1592, bitty#2704).
 ///
 /// A control string is an `OSC`, `DCS`, `SOS`, `PM`, or `APC` sequence, or
-/// the diverted iTerm2 `OSC 1337;File=` candidate. The cap counts introducer
-/// bytes too, and is sized so the largest legitimate control string the
+/// the diverted iTerm2 `OSC 1337;File=` candidate. The cap counts the bytes
+/// `vte` collects for the string *body*; the `ESC ]`/`ESC P`/... introducer
+/// is not charged. It is sized so the largest legitimate control string the
 /// parser accepts fits exactly: the iTerm2 body cap
 /// ([`ITERM2_OSC_MAX_BODY_BYTES`], the 4 MiB wire payload plus its attribute
 /// header) plus the `ESC ]` introducer and `1337;File=` prefix, i.e.
-/// 4 MiB + 4 KiB + 13 = 4,198,413 bytes.
+/// 4 MiB + 4 KiB + 13 = 4,198,413 bytes. The diverted candidate is the one
+/// path that charges an introducer (its `ESC ]` never reaches `vte`), so it
+/// lands on the same value for the same body.
 ///
 /// This is the bound `vte` does not provide: its `std` OSC collector is a
 /// growable `Vec` (`MAX_OSC_RAW` exists only in the `no_std` build), so an
@@ -170,13 +181,13 @@ impl Default for PendingDcs {
 /// diversion can close it before taking bytes off the wire (CTX-1590 review
 /// MF-1/MF-2).
 ///
-/// `vte` ends an `OSC` on `BEL`, `CAN`, `SUB`, or `ESC`, but a
-/// `DCS`/`SOS`/`PM` only on `CAN`, `SUB`, or `ESC`; the kind is kept so a
-/// forwarded `BEL` never clears a string that is still open. The tracked
-/// state only has to answer "would the next forwarded byte land inside a
-/// string?", so non-string sequence states collapse into [`Self::Ground`]
-/// (nothing to close) and every string state into [`Self::Other`] (only
-/// terminators can leave it).
+/// `vte` ends an `OSC` on `BEL`, `CAN`, `SUB`, or `ESC`, and a
+/// `DCS`/`SOS`/`PM` on `CAN`, `SUB`, or `ESC` (plus C1 `ST` for a hooked
+/// `DCS`); the kind is kept so a forwarded `BEL` never clears a string that
+/// is still open. The tracked state only has to answer "would the next
+/// forwarded byte land inside a string?", so non-string sequence states
+/// collapse into [`Self::Ground`] (nothing to close) and every string state
+/// into [`Self::Other`] (only terminators can leave it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum VteString {
     /// Not inside a string (`vte` Ground, or mid-CSI/mid-dispatch).
@@ -223,10 +234,11 @@ impl VteString {
                 _ => Self::Osc,
             },
             // `advance_dcs_passthrough` / `anywhere`: `CAN`/`SUB`/`ESC` end
-            // it. C1 `ST` (0x9C) unhooks only a DCS passthrough, never a
-            // SOS/PM string, so the collapsed state stays `Other` for it;
-            // `feed_vte` applies the family-specific rule from the recorded
-            // introducer (CTX-1592 byte accounting).
+            // it. C1 `ST` (0x9C) unhooks only a *hooked* DCS: a DCS header
+            // (`DcsEntry`/`DcsParam`/`DcsIntermediate`/`DcsIgnore`) and a
+            // SOS/PM string ignore it, so the collapsed state stays `Other`.
+            // `feed_vte` consults [`ControlString::dcs_hooked`] for the one
+            // family-specific case (CTX-1592).
             Self::Other => match byte {
                 0x18 | 0x1A => Self::Ground,
                 0x1B => Self::Escape,
@@ -253,9 +265,10 @@ impl VteString {
     /// `Some(true)` means "the string ends and `byte` must still be
     /// forwarded" (`ESC` opens whatever sequence follows); `Some(false)`
     /// means the byte is the terminator and is swallowed with the tail.
-    /// `Other` needs the recorded family: C1 `ST` (`0x9C`) unhooks a DCS but
-    /// does not end a SOS/PM string.
-    const fn discard_ends_at(self, kind: ControlStringKind, byte: u8) -> Option<bool> {
+    /// `Other` needs the DCS substate: C1 `ST` (`0x9C`) unhooks a DCS only
+    /// when `vte` had hooked it, and is ignored in a DCS header and in a
+    /// SOS/PM string.
+    const fn discard_ends_at(self, dcs_hooked: bool, byte: u8) -> Option<bool> {
         match self {
             Self::Osc => match byte {
                 0x07 | CAN | 0x1A => Some(false),
@@ -265,7 +278,7 @@ impl VteString {
             Self::Other => match byte {
                 CAN | 0x1A => Some(false),
                 0x1B => Some(true),
-                0x9C if matches!(kind, ControlStringKind::Dcs) => Some(false),
+                0x9C if dcs_hooked => Some(false),
                 _ => None,
             },
             Self::Ground | Self::Escape => None,
@@ -273,12 +286,36 @@ impl VteString {
     }
 }
 
+/// Substate of a `DCS` that `vte` has not hooked yet.
+///
+/// `vte` 0.15 advances `DcsEntry` → `DcsParam`/`DcsIntermediate` and calls
+/// `hook` (moving to `DcsPassthrough`) on a `0x40..=0x7E` byte. `DcsIgnore`
+/// is entered from `DcsParam` on `0x3C..=0x3F` and from `DcsIntermediate` on
+/// `0x30..=0x3F`, and reaches no hook at all. The distinction matters for
+/// the tracker because C1 `ST` (`0x9C`) unhooks only a hooked DCS: in every
+/// header substate `vte` ignores `0x9C` (`anywhere`) and stays in the
+/// header, so treating it as a terminator would desync the tracker from the
+/// machine (CTX-1592 review MF-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DcsHeader {
+    /// `DcsEntry`.
+    Entry,
+    /// `DcsParam`.
+    Param,
+    /// `DcsIntermediate`.
+    Intermediate,
+    /// `DcsIgnore`: never hooks, so every byte up to a terminator is inert.
+    Ignore,
+}
+
 /// Control-string state and the parser-wide byte budget (CTX-1592).
 ///
 /// Wraps the [`VteString`] tracker so the "would the next forwarded byte
 /// land inside a string?" answer and the per-string byte count move
 /// together: the count can only advance on bytes [`VteString::after`] maps
-/// into a string, and it resets exactly when that string ends.
+/// into a string, and it resets exactly when that string ends. It also
+/// shadows the `DCS` header substate, which the collapsed [`VteString`]
+/// cannot express (CTX-1592 review MF-1).
 #[derive(Debug)]
 struct ControlString {
     /// Reachable string state of the wrapped `vte` machine.
@@ -287,6 +324,13 @@ struct ControlString {
     bytes: usize,
     /// Family of the open `vte` string, captured at its introducer.
     kind: ControlStringKind,
+    /// `DCS` header substate while `vte` has not hooked the string; `None`
+    /// for another family, once hooked, or after the string ended.
+    dcs_header: Option<DcsHeader>,
+    /// `vte` called `hook` for the open `DCS`, so it is in
+    /// `DcsPassthrough` and C1 `ST` (`0x9C`) unhooks it. Never set for a
+    /// `DCS` header or for another family.
+    dcs_hooked: bool,
     /// Set after an overflow: the rest of the string is swallowed until its
     /// real terminator resynchronizes the wire.
     discard: Option<VteString>,
@@ -303,6 +347,8 @@ impl Default for ControlString {
             state: VteString::default(),
             bytes: 0,
             kind: ControlStringKind::Osc,
+            dcs_header: None,
+            dcs_hooked: false,
             discard: None,
             apc_bytes: 0,
             apc_refused: false,
@@ -316,24 +362,104 @@ impl ControlString {
         self.state.needs_close()
     }
 
+    /// Opens the `vte` string whose introducer is `introducer`.
+    ///
+    /// A `DCS` starts in `vte`'s `DcsEntry` header, so the substate is
+    /// recorded and [`Self::dcs_hooked`] stays clear until the final byte.
+    fn begin_vte_string(&mut self, introducer: u8) {
+        self.kind = kind_of_introducer(introducer);
+        self.bytes = 0;
+        self.dcs_header = match self.kind {
+            ControlStringKind::Dcs => Some(DcsHeader::Entry),
+            _ => None,
+        };
+        self.dcs_hooked = false;
+    }
+
+    /// Ends the open `vte` string at its terminator.
+    fn end_vte_string(&mut self) {
+        self.bytes = 0;
+        self.dcs_header = None;
+        self.dcs_hooked = false;
+    }
+
+    /// Advances the `DCS` header shadow by one forwarded body byte.
+    ///
+    /// Mirrors `vte` 0.15's `DcsEntry`/`DcsParam`/`DcsIntermediate`/
+    /// `DcsIgnore` transitions closely enough to know when the machine calls
+    /// `hook`; see [`DcsHeader`]. Terminators never reach this method.
+    fn track_dcs_header(&mut self, byte: u8) {
+        let Some(header) = self.dcs_header else {
+            return;
+        };
+        // `DcsIgnore` routes through `anywhere`: no hook, no substate change.
+        if header == DcsHeader::Ignore {
+            return;
+        }
+        if (0x40..=0x7E).contains(&byte) {
+            // `vte` hooks on the final byte and moves to `DcsPassthrough`.
+            self.dcs_header = None;
+            self.dcs_hooked = true;
+            return;
+        }
+        self.dcs_header = Some(match (header, byte) {
+            (DcsHeader::Entry, 0x20..=0x2F)
+            | (DcsHeader::Param, 0x20..=0x2F)
+            | (DcsHeader::Intermediate, 0x20..=0x2F) => DcsHeader::Intermediate,
+            // `0x30..=0x39` continue the numeric parameter, `0x3A`/`0x3B`
+            // store it, and `0x3C..=0x3F` collect a private marker; in
+            // `DcsEntry` all of them land in `DcsParam`.
+            (DcsHeader::Entry, 0x30..=0x3F) => DcsHeader::Param,
+            (DcsHeader::Param, 0x30..=0x3B) => DcsHeader::Param,
+            // A private marker in `DcsParam`, or a digit after an
+            // intermediate, is an unparseable header: `vte` never hooks it.
+            (DcsHeader::Param, 0x3C..=0x3F) | (DcsHeader::Intermediate, 0x30..=0x3F) => {
+                DcsHeader::Ignore
+            }
+            // `anywhere` (`0x00..=0x17 | 0x19 | 0x1C..=0x1F`, `0x80..=0xFF`)
+            // and `0x7F` keep the current substate.
+            _ => header,
+        });
+    }
+
     /// Opens the diverted iTerm2 candidate (`ESC ]` already consumed).
     ///
     /// The diversion replaces any open string (`vte` was closed first), so
-    /// the shared budget restarts with the two introducer bytes.
+    /// the shared budget restarts at zero: the introducer and prefix are
+    /// charged when the scanner finishes matching the prefix
+    /// ([`Self::charge_diversion`]).
     fn begin_diversion(&mut self) {
         self.state = VteString::Ground;
-        self.bytes = 2;
+        self.bytes = 0;
         self.kind = ControlStringKind::Osc;
+        self.dcs_header = None;
+        self.dcs_hooked = false;
         self.discard = None;
     }
 
     /// Charges one byte consumed by the diverted iTerm2 candidate.
     ///
-    /// The scanner's body cap plus the introducer and prefix sum to
-    /// [`CONTROL_STRING_MAX_BYTES`], so the shared budget saturates exactly
-    /// at the cap instead of overflowing; the scanner refuses an oversize
-    /// body itself (`Iterm2Reject::OversizePayload`).
-    fn charge_diversion(&mut self) {
+    /// Nothing is charged while the scanner is still probing the prefix
+    /// (CTX-1592 review F6): a non-matching candidate is replayed into
+    /// `vte`, which charges exactly the same bytes once as an ordinary
+    /// `OSC`. When the prefix completes, the two introducer bytes and the
+    /// prefix are charged in one step, so a maximum-size body lands exactly
+    /// on [`CONTROL_STRING_MAX_BYTES`].
+    ///
+    /// The counter saturates instead of refusing: the scanner's own body cap
+    /// ([`crate::iterm2_osc::ITERM2_OSC_MAX_BODY_BYTES`]) binds first and
+    /// reports `Iterm2Reject::OversizePayload`, so a diverted candidate never
+    /// produces [`TerminalAction::ControlStringRejected`].
+    fn charge_diversion(&mut self, collecting: bool) {
+        if !collecting {
+            return;
+        }
+        if self.bytes == 0 {
+            // The introducer (`ESC ]`, two bytes) and every prefix byte but
+            // the one this call charges; the running total after the add is
+            // exactly introducer + prefix.
+            self.bytes = 1 + ITERM2_OSC_PREFIX.len();
+        }
         self.bytes = self.bytes.saturating_add(1).min(CONTROL_STRING_MAX_BYTES);
     }
 
@@ -341,6 +467,8 @@ impl ControlString {
     fn end_diversion(&mut self) {
         self.state = VteString::Ground;
         self.bytes = 0;
+        self.dcs_header = None;
+        self.dcs_hooked = false;
     }
 
     /// Opens a parser-handled `APC` (`ESC _` already consumed).
@@ -462,9 +590,14 @@ impl Parser {
     /// Unterminated `APC` and held trailing `ESC` are buffered for the next
     /// call.
     ///
-    /// One control string may hold at most [`CONTROL_STRING_MAX_BYTES`]
-    /// bytes; an over-cap string emits
-    /// [`TerminalAction::ControlStringRejected`] and drops its body.
+    /// One control-string body may hold at most
+    /// [`CONTROL_STRING_MAX_BYTES`] bytes; the introducer is not charged.
+    /// A longer string is refused: the prefix already forwarded is
+    /// dispatched first, so a truncated but bounded mapped action can still
+    /// apply (for `OSC 52` the existing clipboard gate still decides
+    /// whether the write is honoured), and the tail past the cap is dropped
+    /// up to the real terminator with one
+    /// [`TerminalAction::ControlStringRejected`] emitted for telemetry.
     pub fn advance<F>(&mut self, bytes: &[u8], emit: F)
     where
         F: FnMut(TerminalAction),
@@ -623,7 +756,7 @@ impl Parser {
                 let byte = bytes[i];
                 match iterm2.push(byte) {
                     OscOutcome::Consumed => {
-                        control_string.charge_diversion();
+                        control_string.charge_diversion(iterm2.is_collecting());
                         kitty.note_interleaved(1);
                         i += 1;
                         continue;
@@ -907,9 +1040,10 @@ fn feed_vte<F: FnMut(TerminalAction)>(
     while i < bytes.len() {
         let byte = bytes[i];
         if let Some(family) = control_string.discard {
-            match family.discard_ends_at(control_string.kind, byte) {
+            match family.discard_ends_at(control_string.dcs_hooked, byte) {
                 Some(forward) => {
                     control_string.discard = None;
+                    control_string.end_vte_string();
                     if forward {
                         // `ESC` ends the string and opens what follows it.
                         control_string.state = control_string.state.after(byte);
@@ -928,23 +1062,19 @@ fn feed_vte<F: FnMut(TerminalAction)>(
             continue;
         }
         let previous = control_string.state;
-        // `advance_dcs_passthrough` ends a DCS at C1 `ST` (`0x9C`) as well
-        // as at CAN/SUB/ESC, but a SOS/PM string ignores `0x9C`. The
-        // collapsed `Other` state cannot tell them apart, so the family
-        // recorded at the introducer decides (CTX-1592).
-        if previous == VteString::Other
-            && byte == 0x9C
-            && matches!(control_string.kind, ControlStringKind::Dcs)
-        {
-            control_string.state = VteString::Ground;
-            control_string.bytes = 0;
+        // `advance_dcs_passthrough` unhooks a DCS on C1 `ST` (`0x9C`), but
+        // the DCS header states and every SOS/PM string ignore it. The
+        // collapsed `Other` state cannot tell them apart, so `dcs_hooked`
+        // decides; the byte still reaches `vte` through the trailing flush so
+        // the machine performs the unhook itself (CTX-1592 review MF-1).
+        if previous == VteString::Other && byte == 0x9C && control_string.dcs_hooked {
+            control_string.end_vte_string();
             i += 1;
             continue;
         }
         let next = previous.after(byte);
         if next.is_string() && !previous.is_string() {
-            control_string.kind = kind_of_introducer(byte);
-            control_string.bytes = 0;
+            control_string.begin_vte_string(byte);
         } else if next.is_string() {
             if control_string.bytes == CONTROL_STRING_MAX_BYTES {
                 // Flush what `vte` has not seen yet, then abort the string
@@ -963,10 +1093,11 @@ fn feed_vte<F: FnMut(TerminalAction)>(
                 continue;
             }
             control_string.bytes += 1;
+            control_string.track_dcs_header(byte);
         } else if previous.is_string() {
             // The terminator itself is not retained; the next string starts
             // from zero.
-            control_string.bytes = 0;
+            control_string.end_vte_string();
         }
         control_string.state = next;
         i += 1;
@@ -988,6 +1119,10 @@ const fn kind_of_introducer(byte: u8) -> ControlStringKind {
 }
 
 /// Emits one counted control-string refusal and its rate-limited diagnostic.
+///
+/// The diagnostic must not claim the sequence stored nothing: the prefix
+/// forwarded before the abort was dispatched and a truncated mapped action
+/// may already have applied (CTX-1592 review MF-2).
 fn emit_control_string_refusal<F: FnMut(TerminalAction)>(
     bridge: &mut Bridge<'_, F>,
     reject_log: &mut RejectLog,
@@ -997,7 +1132,8 @@ fn emit_control_string_refusal<F: FnMut(TerminalAction)>(
         warn_rejection(
             occurrence,
             &format!(
-                "bitty: rejecting {kind} control string ({}): stored nothing",
+                "bitty: rejecting {kind} control string ({}): tail discarded past \
+                 {CONTROL_STRING_MAX_BYTES} bytes, bounded prefix already dispatched",
                 ControlStringReject::Overflow.label()
             ),
         );

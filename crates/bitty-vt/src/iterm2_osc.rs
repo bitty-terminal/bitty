@@ -251,6 +251,12 @@ impl Iterm2OscScanner {
         !matches!(self.state, ScanState::Idle)
     }
 
+    /// Whether the prefix matched and the scanner is collecting the body
+    /// (the only diversion bytes that count against the shared budget).
+    pub(crate) const fn is_collecting(&self) -> bool {
+        matches!(self.state, ScanState::Collect | ScanState::AwaitSt)
+    }
+
     /// Bytes currently collected in the body buffer (cap-boundary tests).
     #[cfg(test)]
     pub(crate) fn buffered_body_len(&self) -> usize {

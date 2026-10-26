@@ -3,8 +3,9 @@
 //! `vte`'s `std` OSC collector is a growable `Vec` with no cap
 //! (`MAX_OSC_RAW` exists only in its `no_std` build), so an unterminated
 //! `OSC` — or a string interleaved with an `APC` — grew memory 1:1 with
-//! input. Before this fix, feeding 256 MiB of any of these shapes peaked at
-//! 512 MiB–1 GiB of live heap.
+//! input. For the 256 MiB bare-OSC shape the pre-fix parser measured
+//! 1,073,745,920 bytes (1 GiB) of live heap — 4x the input — and the
+//! APC-inside-OSC shape measured 1,073,746,118 bytes.
 //!
 //! These tests feed 256 MiB of each adversarial shape through the public
 //! parser API and measure the real heap peak with a per-thread tracking
@@ -13,10 +14,19 @@
 //! a byte bound, not a duration. They also assert the counted refusal and
 //! that output after the refused string still arrives.
 //!
-//! Each shape is expected to produce exactly one
-//! [`TerminalAction::ControlStringRejected`]. That action does not exist on
-//! the pre-fix parser, and the peak bound is far below the pre-fix growth, so
-//! these tests fail against `main`'s pre-fix `parser.rs`.
+//! # Pre-fix evidence method
+//!
+//! This file does not compile against `main`'s pre-fix tree as-is:
+//! `ControlStringRejected`, `ControlStringKind`, and
+//! `CONTROL_STRING_MAX_BYTES` do not exist there. The regression was
+//! collected by swapping *only* `parser.rs` and `parser/tests.rs` back to
+//! the pre-fix revision, keeping this commit's `action.rs` and `lib.rs`, and
+//! dropping the then-missing `CONTROL_STRING_MAX_BYTES` re-export from
+//! `lib.rs`. In that tree no shape emits a `ControlStringRejected` and the
+//! measured peak runs far past [`PEAK_BOUND`], so the five peak/refusal
+//! tests below fail. The iTerm2 budget test passes in both trees on purpose:
+//! that path already had its own scanner cap, and the test pins the shared
+//! budget sizing, not the regression.
 
 // The workspace lint level is `deny`; this test needs `unsafe` only for the
 // tracking `GlobalAlloc` that measures the parse peak.
@@ -132,16 +142,16 @@ const TOTAL: usize = 256 * MIB;
 /// irrelevant to where the refusal lands.
 const CHUNK: usize = 64 * 1024;
 
-/// Parser cap, spelled from the public iTerm2 constants so this test also
-/// compiles against the pre-fix parser (where
-/// `bitty_vt::CONTROL_STRING_MAX_BYTES` does not exist). A unit test in
+/// Parser cap, spelled from the public iTerm2 constants so the boundary
+/// arithmetic does not depend on the new export. A unit test in
 /// `parser::tests` pins the two values equal.
 const CAP: usize = bitty_vt::ITERM2_OSC_MAX_BODY_BYTES + bitty_vt::ITERM2_OSC_PREFIX.len() + 2;
 
 /// Hard heap bound for one 256 MiB shape. Post-fix the peak is the cap plus
 /// `vte`'s one capacity doubling and one bounded dispatch copy (~16 MiB for
 /// an OSC) — or the existing kitty/iTerm2 budgets, whichever applies. The
-/// pre-fix parser reached 512 MiB–1 GiB for the same input.
+/// pre-fix bare-OSC shape measured 1,073,745,920 bytes (1 GiB) of live heap
+/// for the same 256 MiB input.
 const PEAK_BOUND: usize = 32 * MIB;
 
 struct Outcome {
@@ -257,14 +267,16 @@ fn image_diversion_after_a_capped_string_is_admitted() {
 
 #[test]
 fn the_iterm2_diversion_shares_the_cap_without_being_refused() {
-    // The shared cap is sized by the iTerm2 maximum: a candidate body at the
-    // iTerm2 cap consumes the whole parser budget exactly and is still
-    // refused by the image scanner (OversizePayload), never by the
-    // control-string cap.
-    let mut wire = b"\x1b]1337;File=inline=1:".to_vec();
+    // A candidate body exactly at the iTerm2 body cap consumes the whole
+    // parser budget and is still refused by the image scanner itself
+    // (`OversizePayload`: the encoded payload exceeds the wire cap), never by
+    // the control-string cap.
+    let header = b"inline=1:";
+    let mut wire = b"\x1b]1337;File=".to_vec();
+    wire.extend_from_slice(header);
     wire.extend(std::iter::repeat_n(
         b'A',
-        bitty_vt::ITERM2_OSC_MAX_BODY_BYTES,
+        bitty_vt::ITERM2_OSC_MAX_BODY_BYTES - header.len(),
     ));
     wire.push(0x07);
     let actions = {

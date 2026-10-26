@@ -870,12 +870,21 @@ impl std::fmt::Display for ControlStringKind {
     }
 }
 
-/// Why a control string was refused before dispatch (CTX-1592).
+/// Why a control string was refused before its terminator (CTX-1592).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ControlStringReject {
     /// One string exceeded the parser-wide control-string byte cap
-    /// ([`crate::CONTROL_STRING_MAX_BYTES`]). The accumulated body was
-    /// dropped; only a bounded prefix ever reached the dispatcher.
+    /// ([`crate::CONTROL_STRING_MAX_BYTES`]).
+    ///
+    /// The body past the cap is dropped. This is *not* an inert refusal: the
+    /// prefix already forwarded to `vte` is dispatched before the abort (an
+    /// `OSC` dispatch or a DCS `unhook` runs on the injected `CAN`), so one
+    /// truncated, bounded mapped action may still apply — a shortened title,
+    /// hyperlink, zone mark, cwd, or palette entry, or a truncated `OSC 52`
+    /// clipboard write that remains subject to the existing clipboard gate.
+    /// Only a prefix action already bounded by [`crate::BoundedString`] /
+    /// [`crate::BoundedBytes`] (and by the consuming policy gates) can be
+    /// observed.
     Overflow,
 }
 
@@ -1306,10 +1315,15 @@ pub enum TerminalAction {
     },
     /// A control string refused by the parser-wide byte cap (CTX-1592).
     ///
-    /// Semantically inert and carried for telemetry only: the parser already
-    /// dropped the body (or aborted the parser-handled `APC`), so this
-    /// variant never stores, places, or paints anything. Terminal state counts
-    /// it separately from the iTerm2 refusal counter.
+    /// This action itself is inert telemetry: it stores, places, and paints
+    /// nothing, and terminal state only counts it. It does **not** mean the
+    /// whole string was discarded. The prefix already forwarded to `vte` is
+    /// dispatched before the abort, so one truncated but bounded mapped
+    /// action can have been applied just before this variant — a shortened
+    /// title, hyperlink, zone mark, cwd, or palette entry, or a truncated
+    /// `OSC 52` write that the existing clipboard gate still governs. Only
+    /// the tail past the cap was dropped, and the parser-handled `APC` path
+    /// (which never reaches `vte`) drops its accumulated header instead.
     ControlStringRejected {
         /// Family of the aborted string.
         kind: ControlStringKind,

@@ -209,8 +209,11 @@ pub struct TelemetryCounters {
     pub iterm2_refused: u64,
     /// Control strings (`OSC`/`DCS`/`SOS`/`PM`/`APC`) the parser aborted
     /// because one string exceeded its byte cap
-    /// (`bitty_vt::CONTROL_STRING_MAX_BYTES`, CTX-1592). The body was
-    /// dropped; only a bounded prefix ever reached dispatch. Distinct from
+    /// (`bitty_vt::CONTROL_STRING_MAX_BYTES`, CTX-1592). The body past the
+    /// cap was dropped, but the prefix already forwarded to `vte` was
+    /// dispatched first, so one truncated mapped action may have applied
+    /// before the refusal (see
+    /// `bitty_vt::ControlStringReject::Overflow`). Distinct from
     /// `iterm2_refused`, which counts image-request refusals.
     pub control_string_refused: u64,
 }
@@ -1798,8 +1801,10 @@ impl State {
             TerminalAction::Iterm2Image { .. } => {}
             TerminalAction::Iterm2ImageRejected { .. } => self.telemetry.iterm2_refused += 1,
             // CTX-1592: an over-cap control string (OSC/DCS/SOS/PM/APC) was
-            // dropped by the parser before dispatch. Counted separately from
-            // image refusals; no terminal state changes.
+            // truncated by the parser; the tail past the cap never parsed.
+            // This arm only counts it — but the bounded prefix was dispatched
+            // first, so a truncated title/zone/cwd may already have applied.
+            // Counted separately from image refusals.
             TerminalAction::ControlStringRejected { .. } => {
                 self.telemetry.control_string_refused += 1;
             }

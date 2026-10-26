@@ -63,7 +63,7 @@ nix = { workspace = true, features = ["poll"] }
 # INCR read. `x11rb` 0.13.2 is already in the lockfile through `arboard` and
 # `winit`, so this declares the direct surface the bounded client needs without
 # adding or upgrading a crate version.
-x11rb = { version = "0.13", default-features = false }
+x11rb = { version = "0.14", default-features = false }
 
 # CTX-1366: bounded Windows read uses the safe `clipboard-win::raw` wrappers
 # (`size` is `GlobalSize` before any copy; `get` copies into a caller-sized

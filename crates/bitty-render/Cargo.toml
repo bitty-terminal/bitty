@@ -43,7 +43,7 @@ wgpu = "26.0"
 crossfont = "0.9"
 # HarfBuzz shaping port (MIT, rust-version 1.85 exact). Exact pin: the
 # fontations floor drifts under swash (see skrifa note below).
-harfrust = "=0.14.0"
+harfrust = "=0.15.0"
 # Outline + bitmap rasterization (Apache-2.0 OR MIT, no declared MSRV:
 # verified on the 1.85 toolchain by the CTX-0957 implementation task).
 # Explicit std+scale+render (== upstream defaults, pinned for audit).

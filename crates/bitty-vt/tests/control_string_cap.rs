@@ -14,6 +14,12 @@
 //! a byte bound, not a duration. They also assert the counted refusal and
 //! that output after the refused string still arrives.
 //!
+//! CTX-1603 adds the alternating-string shape: many over-cap APCs, each
+//! followed by an OSC title and text, through one parser. It pins one refusal
+//! per string, the resync delivery after each refusal, and the same peak
+//! bound, so a per-string re-scan of the swallowed tail would fail on cost or
+//! memory rather than on wall clock.
+//!
 //! # Pre-fix evidence method
 //!
 //! This file does not compile against `main`'s pre-fix tree as-is:
@@ -263,6 +269,50 @@ fn image_diversion_after_a_capped_string_is_admitted() {
         "the image after the capped string must be admitted"
     );
     assert_recovers(&out.actions, "image after capped OSC");
+}
+
+#[test]
+fn alternating_refused_strings_and_text_stay_bounded() {
+    // CTX-1603: many over-cap strings alternating with text through one
+    // parser. Each refused string yields exactly one refusal, the text after
+    // every string arrives, and the peak heap stays at the cap plus `vte`'s
+    // one capacity doubling — the swallowed tail is never re-scanned.
+    const ROUNDS: usize = 8;
+    let mut round = b"\x1b_z;".to_vec();
+    round.extend(std::iter::repeat_n(b'A', CAP + 8));
+    round.extend_from_slice(b"\x1b]0;t\x07ok");
+    let (actions, peak) = peak_alloc::measure(|| {
+        let mut parser = Parser::new();
+        let mut actions = Vec::new();
+        for _ in 0..ROUNDS {
+            for chunk in round.chunks(CHUNK) {
+                parser.advance(chunk, |action| actions.push(action));
+            }
+        }
+        actions
+    });
+    eprintln!("alternating refused strings: peak {peak} bytes");
+    assert!(
+        peak <= PEAK_BOUND,
+        "alternating refused strings: peak heap {peak} bytes exceeds the {PEAK_BOUND}-byte bound"
+    );
+    assert_eq!(
+        refusal_kinds(&actions).len(),
+        ROUNDS,
+        "exactly one refusal per refused string"
+    );
+    assert_eq!(
+        actions
+            .iter()
+            .filter(|action| matches!(
+                action,
+                TerminalAction::OscTitle { text } if text.as_str() == "t"
+            ))
+            .count(),
+        ROUNDS,
+        "the title after every refused string must arrive"
+    );
+    assert_recovers(&actions, "alternating refused strings");
 }
 
 #[test]

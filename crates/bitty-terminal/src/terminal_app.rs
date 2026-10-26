@@ -5487,7 +5487,12 @@ mod lifecycle_log_budget_tests {
 
         // The production limit admits exactly 512 lines (the last one names
         // the suppression) and never grows past it, however many transitions
-        // a long dogfood session produces.
+        // a long dogfood session produces. The literal is pinned so a budget
+        // change must be deliberate rather than silently resizing the trace.
+        assert_eq!(
+            LIFECYCLE_LOG_BUDGET, 512,
+            "budget change requires a deliberate test update"
+        );
         let production = LifecycleLogBudget::new(LIFECYCLE_LOG_BUDGET);
         let mut emitted = 0usize;
         let mut last = LifecycleLogAdmission::Suppressed;

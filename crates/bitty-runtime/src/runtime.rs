@@ -1675,9 +1675,11 @@ impl Drop for Runtime {
     /// forwarder threads with [`FORWARDER_JOIN_TIMEOUT`].
     ///
     /// Never panics and never hangs beyond the join timeout plus one poll
-    /// slice per thread. A timed-out thread is detached (still owns its
-    /// `PtyReader`, exits on EOF/disconnect); wakers must remain idempotent
-    /// and Runtime-independent for that one post-detach wake.
+    /// slice per thread. The timeout diagnostic is a best-effort stderr write,
+    /// so it can wait on a wedged pipe; it never panics. A timed-out thread is
+    /// detached (still owns its `PtyReader`, exits on EOF/disconnect); wakers
+    /// must remain idempotent and Runtime-independent for that one
+    /// post-detach wake.
     fn drop(&mut self) {
         self.shutdown_with_timeout(FORWARDER_JOIN_TIMEOUT);
     }
@@ -1690,7 +1692,9 @@ impl Runtime {
     /// (killing + reaping children so pumps reach EOF), then joins each
     /// forwarder with [`FORWARDER_JOIN_TIMEOUT`]. Returns `true` when every
     /// owned forwarder was joined, `false` when at least one timed out and
-    /// was detached. Never panics, never blocks beyond the timeout.
+    /// was detached. Never panics. Joining is bounded by the timeout; the
+    /// timeout diagnostic is a best-effort stderr write and can wait on a
+    /// wedged pipe.
     pub fn shutdown(&mut self) -> bool {
         self.shutdown_with_timeout(FORWARDER_JOIN_TIMEOUT)
     }

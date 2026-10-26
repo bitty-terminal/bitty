@@ -5,7 +5,7 @@
 `fuzz/` holds the cargo-fuzz target crate for the VT parser family plus the
 content-addressed seed corpora cited by the R-001 evidence.
 
-- `fuzz/Cargo.toml` — `bitty-fuzz` package, `cargo-fuzz = true`, four
+- `fuzz/Cargo.toml` — `bitty-fuzz` package, `cargo-fuzz = true`, five
   `[[bin]]` targets, path dependency on `crates/bitty-vt`.
 - `fuzz/fuzz_targets/` — target sources (`common.rs` shared helpers).
 - `fuzz/corpora/` — retained seed corpora (this file documents them).
@@ -20,12 +20,13 @@ content-addressed seed corpora cited by the R-001 evidence.
 | `osc_string`         | OSC payload bodies (`ESC ] ...` BEL / `ST`)                                               |
 | `dcs_apc_string`     | DCS/APC/SOS/PM bodies plus kitty `APC G` single-shot and `m=1`/`m=1`/`m=0` chunked shapes |
 | `control_string_cap` | whole control strings at and past `CONTROL_STRING_MAX_BYTES` (generated corpus, below)    |
+| `parser_to_state`    | arbitrary bytes through `bitty_vt::Parser` into `bitty_term_state::State`                 |
 
 Every target feeds bytes through the real public `bitty_vt::Parser::advance`
-API and drives it to completion. Each input asserts two contract invariants:
-a fresh parser is deterministic across identical runs, and a byte-wise feed
-produces the same action sequence as one bulk feed. Each framed string
-envelope is additionally replayed at a 4 KiB kitty ledger cap
+API and drives it to completion. Every input asserts determinism across
+identical runs; every target except `control_string_cap` also asserts that a
+byte-wise feed produces the same action sequence as one bulk feed. Each framed
+string envelope is additionally replayed at a 4 KiB kitty ledger cap
 (`assert_small_ledger_invariants`) so the `KittyApcAssembler`
 overflow/chunk-growth rejection paths are reachable from a short input
 without allocating the production 320 MB ledger.

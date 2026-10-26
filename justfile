@@ -43,12 +43,11 @@ test:
 typecheck:
     cargo check --workspace --all-targets --locked
 
-# Rustdoc gate: every intra-doc link in the workspace must resolve with
-# warnings denied, so `cargo doc` cannot rot into broken, private, or
-# redundant links (CTX-1603, bitty#2713). `--no-deps` keeps third-party docs
-# out of the gate. Run before review/merge; it is intentionally not a
-# dependency of `check` because it rebuilds rustdoc metadata for every crate.
+# Doc gate: every intra-doc link resolves with `RUSTDOCFLAGS=-D warnings`.
 doc-check:
+    # Not a dependency of `check` because it rebuilds rustdoc metadata for
+    # every crate; run before review/merge. `--no-deps` keeps third-party
+    # docs out of the gate. (CTX-1603, bitty#2713.)
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
 
 # CTX-1332 (issue #2213): mandatory feature-on cold-delivery gate.

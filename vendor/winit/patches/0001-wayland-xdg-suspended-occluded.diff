@@ -1,0 +1,141 @@
+diff --git a/src/changelog/unreleased.md b/src/changelog/unreleased.md
+index f3a0f6d2c3..f20ed33b64 100644
+--- a/src/changelog/unreleased.md
++++ b/src/changelog/unreleased.md
+@@ -39,3 +39,8 @@ The migration guide could reference other migration examples in the current
+ changelog entry.
+ 
+ ## Unreleased
++
++### Added
++
++- On Wayland, emit `WindowEvent::Occluded` when the compositor suspends or resumes the window
++  (xdg-shell v6 `suspended` state).
+diff --git a/src/event.rs b/src/event.rs
+index 4e01420af3..19dc620747 100644
+--- a/src/event.rs
++++ b/src/event.rs
+@@ -415,10 +415,26 @@ pub enum WindowEvent {
+     /// [`applicationDidEnterBackground`]: https://developer.apple.com/documentation/uikit/uiapplicationdelegate/1622997-applicationdidenterbackground
+     /// [iOS application lifecycle]: https://developer.apple.com/documentation/uikit/app_and_environment/managing_your_app_s_life_cycle
+     ///
++    /// ### Wayland
++    ///
++    /// Emitted when the compositor adds or removes the xdg-shell `suspended` state (xdg_wm_base
++    /// version 6 or later), for example while the window is on a hidden workspace or the outputs
++    /// are off. A suspended window receives no frame callbacks, so a frame presented with vsync
++    /// may block until the window is shown again.
++    ///
++    /// Winit still asks for a redraw after every configure, including the one that suspends the
++    /// window, since a configure only takes effect once the application commits. Some compositors
++    /// wait for that commit, up to a short timeout, before they finish rearranging windows. An
++    /// application that calls [`Window::pre_present_notify`] before presenting doesn't block
++    /// while suspended, since winit holds back [`WindowEvent::RedrawRequested`] until the
++    /// compositor sends the next frame callback.
++    ///
++    /// [`Window::pre_present_notify`]: crate::window::Window::pre_present_notify
++    ///
+     /// ### Others
+     ///
+     /// - **Web:** Doesn't take into account CSS [`border`], [`padding`], or [`transform`].
+-    /// - **Android / Wayland / Windows / Orbital:** Unsupported.
++    /// - **Android / Windows / Orbital:** Unsupported.
+     ///
+     /// [`border`]: https://developer.mozilla.org/en-US/docs/Web/CSS/border
+     /// [`padding`]: https://developer.mozilla.org/en-US/docs/Web/CSS/padding
+diff --git a/src/platform_impl/linux/wayland/event_loop/mod.rs b/src/platform_impl/linux/wayland/event_loop/mod.rs
+index fef13f4558..f7e20c1923 100644
+--- a/src/platform_impl/linux/wayland/event_loop/mod.rs
++++ b/src/platform_impl/linux/wayland/event_loop/mod.rs
+@@ -437,6 +437,16 @@ impl<T: 'static> EventLoop<T> {
+                 );
+             }
+ 
++            if let Some(occluded) = compositor_update.occluded {
++                callback(
++                    Event::WindowEvent {
++                        window_id: crate::window::WindowId(window_id),
++                        event: WindowEvent::Occluded(occluded),
++                    },
++                    &self.window_target,
++                );
++            }
++
+             if compositor_update.close_window {
+                 callback(
+                     Event::WindowEvent {
+diff --git a/src/platform_impl/linux/wayland/state.rs b/src/platform_impl/linux/wayland/state.rs
+index 13ef99c26a..38369eb55a 100644
+--- a/src/platform_impl/linux/wayland/state.rs
++++ b/src/platform_impl/linux/wayland/state.rs
+@@ -283,14 +283,22 @@ impl WindowHandler for WinitState {
+         };
+ 
+         // Populate the configure to the window.
+-        self.window_compositor_updates[pos].resized |= self
+-            .windows
+-            .get_mut()
+-            .get_mut(&window_id)
+-            .expect("got configure for dead window.")
+-            .lock()
+-            .unwrap()
+-            .configure(configure, &self.shm, &self.subcompositor_state);
++        let (resized, was_suspended, suspended) = {
++            let mut window = self
++                .windows
++                .get_mut()
++                .get_mut(&window_id)
++                .expect("got configure for dead window.")
++                .lock()
++                .unwrap();
++            let was_suspended = window.is_suspended();
++            let resized = window.configure(configure, &self.shm, &self.subcompositor_state);
++            (resized, was_suspended, window.is_suspended())
++        };
++        self.window_compositor_updates[pos].resized |= resized;
++        if suspended != was_suspended {
++            self.window_compositor_updates[pos].occluded = Some(suspended);
++        }
+ 
+         // NOTE: configure demands wl_surface::commit, however winit doesn't commit on behalf of the
+         // users, since it can break a lot of things, thus it'll ask users to redraw instead.
+@@ -418,11 +426,20 @@ pub struct WindowCompositorUpdate {
+ 
+     /// Close the window.
+     pub close_window: bool,
++
++    /// The window became suspended (`Some(true)`) or stopped being suspended (`Some(false)`).
++    pub occluded: Option<bool>,
+ }
+ 
+ impl WindowCompositorUpdate {
+     fn new(window_id: WindowId) -> Self {
+-        Self { window_id, resized: false, scale_changed: false, close_window: false }
++        Self {
++            window_id,
++            resized: false,
++            scale_changed: false,
++            close_window: false,
++            occluded: None,
++        }
+     }
+ }
+ 
+diff --git a/src/platform_impl/linux/wayland/window/state.rs b/src/platform_impl/linux/wayland/window/state.rs
+index 1ef7a0656c..56ab9a9612 100644
+--- a/src/platform_impl/linux/wayland/window/state.rs
++++ b/src/platform_impl/linux/wayland/window/state.rs
+@@ -261,6 +261,13 @@ impl WindowState {
+         }
+     }
+ 
++    /// Whether the compositor has suspended the window, as of the last configure.
++    pub fn is_suspended(&self) -> bool {
++        self.last_configure
++            .as_ref()
++            .is_some_and(|configure| configure.state.contains(XdgWindowState::SUSPENDED))
++    }
++
+     pub fn configure(
+         &mut self,
+         configure: WindowConfigure,

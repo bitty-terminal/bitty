@@ -3243,6 +3243,32 @@ pub fn load_profile_chain_in_dir(name: &str, dir: &Path) -> Result<Vec<LayeredPl
     })
 }
 
+/// Loads a profile's parents while treating `ancestors` as already visited.
+///
+/// Same strict loader as [`load_profile_chain_in_dir`], for callers that
+/// already hold one chain link in memory. A parent chain that names an
+/// ancestor fails with [`ConfigError::CycleDetected`] **before that file is
+/// read**, so the caller never re-reads the link it already validated. The
+/// returned chain stays base-first and contains only the parents.
+///
+/// # Errors
+///
+/// Same as [`load_profile_chain_in_dir`].
+pub fn load_profile_chain_in_dir_with_ancestors(
+    name: &str,
+    dir: &Path,
+    ancestors: &[String],
+) -> Result<Vec<LayeredPlan>, ConfigError> {
+    load_profile_chain_in_dir_with_visited(name, dir, ancestors, SalvagePolicy::Strict).map(
+        |chain| {
+            chain
+                .into_iter()
+                .map(|salvaged| salvaged.layer)
+                .collect::<Vec<_>>()
+        },
+    )
+}
+
 /// Startup variant of [`load_profile_chain`] (CTX-1490, issue #2580).
 ///
 /// Every chain link may drop its own invalid top-level elements; the returned
@@ -3285,8 +3311,17 @@ fn load_profile_chain_in_dir_with(
     dir: &Path,
     policy: SalvagePolicy,
 ) -> Result<Vec<SalvagedLayer>, ConfigError> {
+    load_profile_chain_in_dir_with_visited(name, dir, &[], policy)
+}
+
+fn load_profile_chain_in_dir_with_visited(
+    name: &str,
+    dir: &Path,
+    ancestors: &[String],
+    policy: SalvagePolicy,
+) -> Result<Vec<SalvagedLayer>, ConfigError> {
     let mut chain: Vec<SalvagedLayer> = Vec::new();
-    let mut visited: Vec<String> = Vec::new();
+    let mut visited: Vec<String> = ancestors.to_vec();
     let mut current = validate_profile_name(name)?;
     loop {
         if visited.iter().any(|seen| seen == &current) {
@@ -5596,6 +5631,23 @@ mod tests {
     fn load_missing_profile_fails_closed() {
         let path = Path::new("/nonexistent-bitty-ctx0169/profiles/ghost.lua");
         assert!(load_profile_layer(path).is_err());
+    }
+
+    #[test]
+    fn profile_chain_ancestors_fail_a_cycle_before_reading() {
+        let dir =
+            std::env::temp_dir().join(format!("bitty-ctx1597-ancestors-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        // `src.lua` is deliberately absent: the ancestor marker must win
+        // before the loader opens the file.
+        let err = load_profile_chain_in_dir_with_ancestors("src", &dir, &["src".to_string()])
+            .expect_err("ancestor cycle");
+        assert!(
+            matches!(err, ConfigError::CycleDetected { .. }),
+            "ancestor cycle before read: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // CTX-0759 (#1366): `extends` is a profile-layer-only key. Profile

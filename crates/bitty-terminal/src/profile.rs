@@ -193,6 +193,7 @@ impl ProfileVerb {
 }
 
 /// A failed profile command: stable code, message, and process exit code.
+#[derive(Debug)]
 struct Failure {
     /// Envelope `error.code`.
     code: &'static str,
@@ -836,18 +837,15 @@ fn run_clone(args: &Args, dir: &Path, raw_src: &str, raw_dst: &str) -> Result<Re
     let dst_path = profile_path(dir, &dst);
     ensure_present("clone", &src, &src_path)?;
     ensure_absent("clone", &dst, &dst_path)?;
-    // The chain loader parses, migrates, and validates the source file and its
-    // ancestors; the copied bytes are exactly this chain's last link. The
-    // cross-layer merge below is the gate, because the copied profile is only
-    // ever loaded under the user selector — a leaf that is invalid in
-    // isolation may be overridden there.
-    let chain = match bitty_config::file::load_profile_chain_in_dir(&src, dir) {
-        Ok(chain) => chain,
-        Err(err) => return Err(invalid_profile("clone", &src, &err)),
-    };
+    // Read the source exactly once and parse/validate those same bytes. A
+    // second read (the old chain-load-then-copy shape) could observe a file
+    // changed by an editor, a hardlink writer, or a symlink swap between the
+    // validated chain and the copied bytes, succeeding with a source that was
+    // never validated.
+    let source = read_clone_source(dir, &src, &src_path)?;
+    let CloneSource { content, chain } = source;
     let cross = merge_with_current_user("clone", &src, args, chain)?;
     strict_post_merge_checks("clone", &cross.subject(&src), &cross.merged.effective)?;
-    let content = read_profile("clone", &src, &src_path)?;
     create_exclusive(&dst_path, &content).map_err(|err| {
         if err.kind() == std::io::ErrorKind::AlreadyExists {
             exists_failure("clone", &dst, &dst_path)
@@ -1320,6 +1318,70 @@ fn parse_profile_plan(
     let plan = bitty_config::file::parse_lua_config(content, &source)?;
     let plan = bitty_config::migrate(plan)?;
     Ok(bitty_config::LayeredPlan::new(source, plan))
+}
+
+/// One clone source: the exact bytes read once and the validated chain ending
+/// in the layer parsed from those bytes.
+#[derive(Debug)]
+struct CloneSource {
+    /// Bytes read from the source; copied verbatim on success.
+    content: String,
+    /// Base-first `extends` chain whose last link is the candidate parsed from
+    /// `content`.
+    chain: Vec<bitty_config::LayeredPlan>,
+}
+
+/// Reads a clone source exactly once and parses/validates that same content.
+///
+/// This is the only read of the source profile on the clone path. The parser
+/// re-checks the file and line bounds on the actual string, so a file that
+/// grows after the metadata check still fails before any copy.
+fn read_clone_source(dir: &Path, src: &str, src_path: &Path) -> Result<CloneSource, Failure> {
+    let content = read_profile("clone", src, src_path)?;
+    clone_source_from_content(dir, src, src_path, content)
+}
+
+/// Parses `content` as the clone candidate and loads its `extends` parents.
+///
+/// Split from [`read_clone_source`] so the single-read invariant is testable:
+/// the returned [`CloneSource::content`] is the exact string that was parsed
+/// and is what `clone` writes to the destination.
+fn clone_source_from_content(
+    dir: &Path,
+    src: &str,
+    src_path: &Path,
+    content: String,
+) -> Result<CloneSource, Failure> {
+    let candidate = parse_profile_plan(&content, src_path)
+        .map_err(|err| invalid_profile("clone", src, &err))?;
+    let mut chain = match candidate.plan.extends.as_deref() {
+        Some(parent) => {
+            // Treat the source as already visited: a parent chain that names it
+            // again (directly or through an ancestor) is a cycle and fails
+            // before the source file is read a second time.
+            let ancestors = [src.to_string()];
+            bitty_config::file::load_profile_chain_in_dir_with_ancestors(parent, dir, &ancestors)
+                .map_err(|err| invalid_profile("clone", src, &err))?
+        }
+        None => Vec::new(),
+    };
+    chain.push(candidate);
+    if chain.len() > bitty_config::file::MAX_PROFILE_CHAIN_LEN {
+        // The loader bounds the parent chain it loaded; the candidate is the
+        // extra link, so the assembled chain needs the same bound here.
+        return Err(invalid_profile(
+            "clone",
+            src,
+            &bitty_config::ConfigError::validation(
+                "extends",
+                format!(
+                    "profile extends chain exceeds {} profiles",
+                    bitty_config::file::MAX_PROFILE_CHAIN_LEN
+                ),
+            ),
+        ));
+    }
+    Ok(CloneSource { content, chain })
 }
 
 /// Validates a brand-new profile body (parse + migrate + strict merge) and
@@ -3526,6 +3588,81 @@ mod tests {
             envelope,
             "{\"v\":1,\"command\":\"config profile create\",\"ok\":false,\"error\":{\"class\":\"config\",\"code\":\"E_PROFILE_CONFLICT\",\"message\":\"bitty config profile create: exists\"},\"result\":{\"kind\":\"profile\",\"action\":\"create\",\"valid\":false,\"name\":null,\"diagnostics\":[{\"severity\":\"error\",\"message\":\"bitty config profile create: exists\"}]}}"
         );
+    }
+
+    #[test]
+    fn clone_source_parses_and_returns_the_same_bytes() {
+        let dir = scratch_dir("clone-source");
+        let src_path = dir.join("src.lua");
+        let parent_path = dir.join("parent.lua");
+        std::fs::write(&parent_path, "return {}\n").expect("parent profile");
+
+        // The source's own bytes fail to parse even though the parent chain is
+        // valid: the error must come from the candidate parse, not from a
+        // parent-chain loader.
+        let broken = "return { extends = \"parent\", font = ".to_string();
+        let err = clone_source_from_content(&dir, "src", &src_path, broken)
+            .expect_err("a syntax error must fail before any copy");
+        assert!(
+            err.message.contains("invalid profile 'src'"),
+            "source attribution: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("parse error")
+                || err.message.contains("validation error at 'config'"),
+            "the refusal is the source parse: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("profile 'parent'"),
+            "not a parent-chain error: {}",
+            err.message
+        );
+
+        // An oversized body fails on the same parse, before any copy.
+        let oversized = format!(
+            "-- {}\nreturn {{}}\n",
+            "x".repeat(bitty_config::file::MAX_CONFIG_FILE_BYTES)
+        );
+        let err = clone_source_from_content(&dir, "src", &src_path, oversized)
+            .expect_err("an oversized body must fail");
+        assert!(
+            err.message.contains("invalid profile 'src'") && err.message.contains("exceeds"),
+            "size bound on the parsed bytes: {}",
+            err.message
+        );
+
+        // Valid bytes: the returned content is byte-identical to what was
+        // parsed, and the chain is the parent followed by the candidate.
+        let content = "-- exact bytes\nreturn { extends = \"parent\" }\n".to_string();
+        let source =
+            clone_source_from_content(&dir, "src", &src_path, content.clone()).expect("valid");
+        assert_eq!(source.content, content, "clone copies the parsed bytes");
+        assert_eq!(source.chain.len(), 2, "parent then candidate");
+        let expected_parent = parent_path.display().to_string();
+        let expected_src = src_path.display().to_string();
+        assert_eq!(
+            source.chain[0].source.path.as_deref(),
+            Some(expected_parent.as_str())
+        );
+        assert_eq!(
+            source.chain[1].source.path.as_deref(),
+            Some(expected_src.as_str())
+        );
+
+        // A self-parent is rejected without loading the source as its own
+        // parent (which would be a second read of the same file).
+        let cycle = "return { extends = \"src\" }\n".to_string();
+        let err = clone_source_from_content(&dir, "src", &src_path, cycle)
+            .expect_err("a self-parent must fail");
+        assert!(
+            err.message.contains("cycle"),
+            "cycle diagnostic: {}",
+            err.message
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

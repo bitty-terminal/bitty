@@ -290,6 +290,37 @@ fn clone_copies_bytes_verbatim_and_refuses_existing_destination() {
 }
 
 #[test]
+fn clone_refuses_source_bytes_that_do_not_parse() {
+    let root = scratch_root("clone-invalid-source");
+    // The parent chain is valid; only the source's own bytes are broken. The
+    // refusal must be the candidate parse (attributed to `src`), never a
+    // parent-chain error, and no destination may be created.
+    write_profile(&root, "parent", "return {}\n");
+    write_profile(&root, "src", "return { extends = \"parent\", font = ");
+    let clone = run_bitty(&root, &["config", "profile", "clone", "src", "dst"]);
+    assert_exit(&clone, 2, "clone a syntactically invalid source");
+    let errors = stderr(&clone);
+    assert!(
+        errors.contains("invalid profile 'src'"),
+        "the error is attributed to the source: {errors}"
+    );
+    assert!(
+        errors.contains("parse error") || errors.contains("validation error at 'config'"),
+        "the error comes from parsing the source bytes: {errors}"
+    );
+    assert!(
+        !errors.contains("profile 'parent'"),
+        "the valid parent chain is not blamed: {errors}"
+    );
+    assert!(
+        !profile_path(&root, "dst").exists(),
+        "a refused clone creates no destination"
+    );
+    assert_no_temp_files(&root, "clone invalid source");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn rename_moves_in_place_and_refuses_existing_destination() {
     let root = scratch_root("rename");
     write_profile(

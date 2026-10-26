@@ -882,9 +882,10 @@ pub enum ControlStringReject {
     /// truncated, bounded mapped action may still apply — a shortened title,
     /// hyperlink, zone mark, cwd, or palette entry, or a truncated `OSC 52`
     /// clipboard write that remains subject to the existing clipboard gate.
-    /// Only a prefix action already bounded by [`crate::BoundedString`] /
-    /// [`crate::BoundedBytes`] (and by the consuming policy gates) can be
-    /// observed.
+    /// Only a prefix action already bounded by the action's own caps
+    /// ([`crate::BoundedString`]/[`crate::BoundedBytes`],
+    /// [`crate::MAX_OSC4_OPS`], fixed enums) and by the consuming policy
+    /// gates can be observed.
     Overflow,
 }
 

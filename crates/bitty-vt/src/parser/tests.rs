@@ -3600,26 +3600,161 @@ fn vte_control_string(kind: ControlStringKind, body: &[u8], terminator: &[u8]) -
     wire
 }
 
+/// Compares two action streams without dumping multi-megabyte `Debug`
+/// output on failure: reports the first differing index instead.
+fn assert_actions_eq(actual: &[TerminalAction], expected: &[TerminalAction], context: &str) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{context}: action count differs"
+    );
+    for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+        assert_eq!(actual, expected, "{context}: action {index} differs");
+    }
+}
+
 /// Asserts a multi-megabyte stream parses to `expected` whole, byte-wise
 /// (every offset is then a chunk boundary), two-way split at `cuts`, and in
 /// fixed chunks. The exhaustive two-way loop of
 /// [`assert_split_invariant`] is quadratic and is not affordable at the cap
 /// size; byte-wise feeding covers the same property linearly.
 fn assert_capped_stream_invariant(stream: &[u8], expected: &[TerminalAction], cuts: &[usize]) {
-    assert_eq!(parse(stream), expected, "whole-buffer parse");
-    assert_eq!(parse_split(stream, 1), expected, "byte-wise parse");
+    assert_actions_eq(&parse(stream), expected, "whole-buffer parse");
+    assert_actions_eq(&parse_split(stream, 1), expected, "byte-wise parse");
     for &cut in cuts {
         assert!(cut <= stream.len(), "cut {cut} beyond the stream");
         let mut parser = Parser::new();
         let mut actions = Vec::new();
         parser.advance(&stream[..cut], |action| actions.push(action));
         parser.advance(&stream[cut..], |action| actions.push(action));
-        assert_eq!(actions, expected, "split at offset {cut}");
+        assert_actions_eq(&actions, expected, &format!("split at offset {cut}"));
     }
     for chunk_size in [7, 4096, 64 * 1024] {
-        assert_eq!(
-            parse_split(stream, chunk_size),
+        assert_actions_eq(
+            &parse_split(stream, chunk_size),
             expected,
+            &format!("chunk size {chunk_size}"),
+        );
+    }
+}
+
+/// Compact fold over an action stream with a multi-megabyte text tail.
+///
+/// `TerminalAction` is 128 bytes, so the ~4.2M `Print` actions of the F-A
+/// stream cost ~0.5 GiB per copy; the chunking checks below would need two
+/// copies each. Counting and keeping only the edges pins the same behaviour
+/// without that allocation.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StreamSummary {
+    actions: usize,
+    prints: usize,
+    refusals: Vec<ControlStringKind>,
+    first: Option<TerminalAction>,
+    last: Vec<TerminalAction>,
+}
+
+impl StreamSummary {
+    fn push(&mut self, action: TerminalAction) {
+        self.actions += 1;
+        match &action {
+            TerminalAction::Print(_) => self.prints += 1,
+            TerminalAction::ControlStringRejected { kind, .. } => self.refusals.push(*kind),
+            _ => {}
+        }
+        if self.first.is_none() {
+            self.first = Some(action.clone());
+        }
+        self.last.push(action);
+        if self.last.len() > 4 {
+            self.last.remove(0);
+        }
+    }
+}
+
+/// Summarizes `bytes` fed in `chunk_size` slices (`1` = byte-wise).
+fn summarize_chunked(bytes: &[u8], chunk_size: usize) -> StreamSummary {
+    let mut parser = Parser::new();
+    let mut summary = StreamSummary::default();
+    for chunk in bytes.chunks(chunk_size.max(1)) {
+        parser.advance(chunk, |action| summary.push(action));
+    }
+    summary
+}
+
+/// Summarizes `bytes` fed as two slices split at `cut`.
+fn summarize_split(bytes: &[u8], cut: usize) -> StreamSummary {
+    let mut parser = Parser::new();
+    let mut summary = StreamSummary::default();
+    parser.advance(&bytes[..cut], |action| summary.push(action));
+    parser.advance(&bytes[cut..], |action| summary.push(action));
+    summary
+}
+
+#[test]
+fn c1_st_returns_to_ground_after_a_hooked_dcs() {
+    // C1 `ST` unhooks a hooked DCS and `vte` returns to `Ground`; the
+    // tracker must follow. Otherwise the next `CAP` bytes are counted as an
+    // unterminated DCS, faked into a refusal at the cap, and the rest of the
+    // text is swallowed (CTX-1592 re-review F-A). The tail is deliberately
+    // longer than the cap: the desync only surfaces after `CAP` bytes.
+    let mut stream = b"\x1bPqpayload\x9c".to_vec();
+    stream.extend(std::iter::repeat_n(b'B', CAP + 16));
+    stream.extend_from_slice(b"ok");
+
+    let whole = summarize_chunked(&stream, stream.len());
+    assert!(
+        whole.refusals.is_empty(),
+        "a terminated DCS must not be refused: {:?}",
+        whole.refusals
+    );
+    assert_eq!(
+        whole.actions,
+        1 + CAP + 16 + 2,
+        "every byte after `ST` dispatches"
+    );
+    assert_eq!(whole.prints, CAP + 18, "the whole text run prints");
+    assert_eq!(
+        whole.first,
+        Some(unknown(SequenceKind::Dcs, b'q', [0, 0])),
+        "the unmapped DCS is still reported once at `ST`"
+    );
+    assert_eq!(
+        whole.last,
+        vec![
+            TerminalAction::Print(GraphemeCell::from('B')),
+            TerminalAction::Print(GraphemeCell::from('B')),
+            TerminalAction::Print(GraphemeCell::from('o')),
+            TerminalAction::Print(GraphemeCell::from('k')),
+        ],
+        "the tail is text, not a swallowed string"
+    );
+
+    // `ESC P q payload` is 11 bytes, so the `0x9C` is at offset 11 and the
+    // text starts at 12; the cuts bracket the terminator and the offset the
+    // stale `Other` state used to overflow at.
+    let cuts = [
+        0,
+        1,
+        2,
+        3,
+        11,
+        12,
+        12 + CAP - 1,
+        12 + CAP,
+        12 + CAP + 1,
+        stream.len() - 2,
+    ];
+    for cut in cuts {
+        assert_eq!(
+            summarize_split(&stream, cut),
+            whole,
+            "split at offset {cut}"
+        );
+    }
+    for chunk_size in [1, 7, 4096, 64 * 1024] {
+        assert_eq!(
+            summarize_chunked(&stream, chunk_size),
+            whole,
             "chunk size {chunk_size}"
         );
     }
@@ -3776,7 +3911,7 @@ fn control_string_cap_boundary_is_per_family() {
     }
 
     // APC is parser-handled and its own header cap binds first: an over-long
-    // header is discarded without touching the shared budget (which is why
+    // header is discarded without crossing the shared budget (which is why
     // no `ControlStringRejected` appears), and the stream recovers.
     let mut apc = b"\x1b_".to_vec();
     apc.extend(std::iter::repeat_n(
@@ -3787,6 +3922,25 @@ fn control_string_cap_boundary_is_per_family() {
     let actions = parse(&apc);
     assert_eq!(count_refusals(&actions, ControlStringKind::Apc), 0);
     assert_recovers_with_ok(&actions);
+
+    // APC shared-budget boundary: the parser-handled APC charges every
+    // non-payload byte it sees (`ESC _;` charges the `;`, which fails
+    // `begin_control` and starts the discard tail), so the tail brings the
+    // total to `CAP - 1`, `CAP`, and `CAP + 1`.
+    const PREAMBLE: usize = 1;
+    for (tail_len, refused) in [(CAP - 2, 0), (CAP - 1, 0), (CAP, 1)] {
+        let mut apc = b"\x1b_;".to_vec();
+        apc.extend(std::iter::repeat_n(b'A', tail_len));
+        apc.extend_from_slice(b"\x07ok");
+        let actions = parse(&apc);
+        assert_eq!(
+            count_refusals(&actions, ControlStringKind::Apc),
+            refused,
+            "APC tail of {tail_len} bytes (shared total {})",
+            PREAMBLE + tail_len
+        );
+        assert_recovers_with_ok(&actions);
+    }
 }
 
 #[test]

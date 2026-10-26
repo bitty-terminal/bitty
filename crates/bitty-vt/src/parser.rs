@@ -34,7 +34,8 @@
 //! The crate holds no terminal state, but it retains bounded parser buffers
 //! across input chunks: the `vte` machine (whose string collector keeps its
 //! capacity after a refusal), the pending device-control-string marker, the
-//! kitty APC assembler with at most one open chunked stream (IMG-1), the
+//! kitty APC assembler with at most one open chunked stream (IMG-1 or
+//! IMG-3 for a raw `f=24`/`f=32` stream with an `s`/`v` claim), the
 //! iTerm2 OSC scanner with up to its ~4.19 MiB body buffer, and the APC
 //! header buffer.
 
@@ -376,8 +377,18 @@ impl ControlString {
         self.dcs_hooked = false;
     }
 
-    /// Ends the open `vte` string at its terminator.
+    /// Ends the open `vte` string at its terminator, returning the tracker to
+    /// `Ground` with it.
+    ///
+    /// Every byte that ends a control string leaves `vte` in `Ground` (C1
+    /// `ST` unhooks a DCS, `BEL`/`CAN`/`SUB`/`ESC`-then-`\` end the others),
+    /// so the state must move too: a stale `Other` would count the following
+    /// text as an unterminated string and fake a refusal at the cap
+    /// (CTX-1592 re-review F-A). The other callers either overwrite `state`
+    /// immediately (the `ESC` forwarded out of the discard tail) or leave it
+    /// in `Ground` (a swallowed terminator), so the reset is their answer too.
     fn end_vte_string(&mut self) {
+        self.state = VteString::Ground;
         self.bytes = 0;
         self.dcs_header = None;
         self.dcs_hooked = false;
@@ -446,10 +457,12 @@ impl ControlString {
     /// prefix are charged in one step, so a maximum-size body lands exactly
     /// on [`CONTROL_STRING_MAX_BYTES`].
     ///
-    /// The counter saturates instead of refusing: the scanner's own body cap
-    /// ([`crate::iterm2_osc::ITERM2_OSC_MAX_BODY_BYTES`]) binds first and
-    /// reports `Iterm2Reject::OversizePayload`, so a diverted candidate never
-    /// produces [`TerminalAction::ControlStringRejected`].
+    /// The counter saturates instead of refusing: the scanner's own caps bind
+    /// first (its body cap
+    /// [`crate::iterm2_osc::ITERM2_OSC_MAX_BODY_BYTES`], then its wire cap
+    /// [`crate::iterm2_osc::ITERM2_OSC_MAX_WIRE_BYTES`] for a body that
+    /// filled it) and report `Iterm2Reject::OversizePayload`, so a diverted
+    /// candidate never produces [`TerminalAction::ControlStringRejected`].
     fn charge_diversion(&mut self, collecting: bool) {
         if !collecting {
             return;

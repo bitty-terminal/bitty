@@ -208,7 +208,7 @@ pub(crate) fn system_db() -> Arc<Database> {
 /// first, then platform tails) exactly as the crossfont backend was
 /// wrapped, so per-glyph fallback needs no second implementation.
 ///
-/// Face discovery reads the process-wide [`system_db`] metadata; per-face
+/// Face discovery reads the process-wide `system_db` metadata; per-face
 /// bytes stay session-owned under [`MAX_FACE_BYTES`] and load lazily on
 /// [`GlyphRasterizer::load_font`]/dynamic fallback (CTX-1607).
 pub struct SwashSingle {

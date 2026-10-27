@@ -14,7 +14,10 @@
 //!
 //! Rule coverage (UAX #29, grapheme-cluster boundary rules):
 //!
-//! - `GB3` (`CR × LF`), `GB4`/`GB5` (break around controls): full.
+//! - `GB3` (`CR × LF`), `GB4`/`GB5` (break around controls): full. The
+//!   `Control` class is the generated `Grapheme_Cluster_Break=Control` table
+//!   (C0/C1, `ZL`/`Zp`, soft hyphen, bidi/format controls, tag-plane
+//!   scalars), so a format control never over-joins the mark that follows.
 //! - `GB6`–`GB8` (Hangul syllables): Jamo `1100..11FF`, extended Jamo
 //!   `A960..A97C`/`D7B0..D7FB`, and precomposed syllables `AC00..D7A3`.
 //! - `GB9` (`× Extend | ZWJ`): [`is_grapheme_extend`] is the full generated
@@ -68,21 +71,16 @@ const LF: u32 = 0x000A;
 
 /// Whether `cp` breaks grapheme runs on both sides (`GB4`/`GB5`).
 ///
-/// C0/C1 controls, `ZL`/`Zp` line separators, tag prefix scalars, and the
-/// format controls UAX classes as `Control` (bidi marks, Arabic format
-/// controls, `FEFF`). ZWJ is excluded: it has its own join rule.
+/// The full generated Unicode 18.0.0 `Grapheme_Cluster_Break=Control` class
+/// (`crate::unicode_tables::control`): C0/C1 controls, `ZL`/`Zp`, soft
+/// hyphen, the bidi and Arabic format controls, the bidi isolates, the
+/// interlinear/musical/shorthand format scalars, the Egyptian hieroglyph
+/// format controls, and the tag/reserved tag-plane scalars. `CR` and `LF`
+/// are their own classes in the UCD, but `GB4`/`GB5` name them explicitly
+/// alongside `Control`, so they break here too; `GB3` keeps `CR × LF`
+/// together before this check runs. ZWJ has its own join rule.
 fn is_break_control(cp: u32) -> bool {
-    matches!(cp,
-        0x0000..=0x001F
-        | 0x007F..=0x009F
-        | 0x061C
-        | 0x200B
-        | 0x200E..=0x200F
-        | 0x2028..=0x202E
-        | 0x2060..=0x2064
-        | 0xFEFF
-        | 0xE0000..=0xE0001
-    )
+    cp == CR || cp == LF || crate::unicode_tables::control(cp)
 }
 
 /// Whether `cp` is `Prepend` in the UAX #29 table (`GB9b`).
@@ -138,7 +136,7 @@ pub fn is_regional_indicator(cp: u32) -> bool {
 /// `InCB=Linker` scalars for the conjunct rule (`GB9c`).
 ///
 /// The generated Unicode 18.0.0 `DerivedCoreProperties.txt`
-/// `InCB; Linker` set (22 scalars): the viramas of Devanagari, Bengali,
+/// `InCB; Linker` set (23 scalars): the viramas of Devanagari, Bengali,
 /// Gujarati, Oriya, Telugu, Malayalam, Myanmar, Khmer, Tai Tham, Balinese,
 /// Zanabazar Square, Vedic, Javanese, Cham, Tai Viet, and the
 /// Kaithi/Sharada/Khojki/Tirhuta/Modi/Soyombo/Bhaiksuki linkers. A linker
@@ -555,6 +553,49 @@ mod tests {
                 mark as u32
             );
         }
+    }
+
+    #[test]
+    fn format_controls_break_instead_of_joining_the_following_mark() {
+        // GB4/GB5 over the full generated Control class. The historical
+        // curated list missed soft hyphen and the other format scalars, so
+        // `control + mark` over-joined through GB9; a Control must break on
+        // both sides instead.
+        for control in [
+            '\u{00AD}',  // soft hyphen
+            '\u{180E}',  // Mongolian vowel separator
+            '\u{2066}',  // left-to-right isolate
+            '\u{FFF9}',  // interlinear annotation anchor
+            '\u{13430}', // Egyptian hieroglyph vertical joiner
+            '\u{1BCA0}', // shorthand format letter overlap
+            '\u{1D173}', // musical symbol begin beam
+            '\u{E0002}', // reserved tag scalar
+            '\u{E0080}', // reserved tag scalar
+            '\u{E01F0}', // reserved tag scalar
+        ] {
+            let sequence = format!("{control}\u{0301}");
+            let actual: Vec<String> = clusters(&sequence)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(
+                actual,
+                vec![control.to_string(), "\u{0301}".to_string()],
+                "U+{:04X} must break before a combining mark",
+                control as u32
+            );
+            let after = format!("a{control}");
+            assert_eq!(
+                clusters(&after).len(),
+                2,
+                "U+{:04X} must break after a base",
+                control as u32
+            );
+        }
+        // CR and LF are their own classes: GB3 keeps them together and GB4
+        // still breaks the pair away from ordinary text.
+        assert_eq!(clusters("\r\n"), vec!["\r\n"]);
+        assert_eq!(clusters("a\r\nb"), vec!["a", "\r\n", "b"]);
     }
 
     #[test]

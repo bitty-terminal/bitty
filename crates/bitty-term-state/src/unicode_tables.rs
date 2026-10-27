@@ -70,6 +70,7 @@ pub(crate) mod counts {
     pub(crate) const GRAPHEME_EXTEND: usize = 2274;
     pub(crate) const SPACING_MARK: usize = 381;
     pub(crate) const PREPEND: usize = 27;
+    pub(crate) const CONTROL: usize = 3893;
     pub(crate) const INCB_LINKER: usize = 23;
     pub(crate) const INCB_CONSONANT: usize = 913;
     pub(crate) const INCB_EXTEND: usize = 2254;
@@ -1203,6 +1204,37 @@ pub(crate) fn prepend(cp: u32) -> bool {
     in_ranges(PREPEND_RANGES, cp)
 }
 
+/// `Grapheme_Cluster_Break=Control` ranges (UAX #29 `GB4`/`GB5`),
+/// sorted and non-overlapping. `CR`, `LF`, and `ZWJ` are separate classes
+/// handled algorithmically in `grapheme.rs`.
+pub(crate) const CONTROL_RANGES: &[(u32, u32)] = &[
+    (0x0000, 0x0009),
+    (0x000B, 0x000C),
+    (0x000E, 0x001F),
+    (0x007F, 0x009F),
+    (0x00AD, 0x00AD),
+    (0x061C, 0x061C),
+    (0x180E, 0x180E),
+    (0x200B, 0x200B),
+    (0x200E, 0x200F),
+    (0x2028, 0x202E),
+    (0x2060, 0x206F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF0, 0xFFFB),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE001F),
+    (0xE0080, 0xE00FF),
+    (0xE01F0, 0xE0FFF),
+];
+
+/// Whether `cp` is `Grapheme_Cluster_Break=Control` (UAX #29 `GB4`/`GB5`).
+#[must_use]
+pub(crate) fn control(cp: u32) -> bool {
+    in_ranges(CONTROL_RANGES, cp)
+}
+
 /// `Indic_Conjunct_Break=Linker` ranges (UAX #29 `GB9c`), sorted and
 /// non-overlapping.
 pub(crate) const INCB_LINKER_RANGES: &[(u32, u32)] = &[
@@ -1779,6 +1811,7 @@ mod tests {
         assert_sorted_disjoint("Grapheme_Extend", GRAPHEME_EXTEND_RANGES);
         assert_sorted_disjoint("SpacingMark", SPACING_MARK_RANGES);
         assert_sorted_disjoint("Prepend", PREPEND_RANGES);
+        assert_sorted_disjoint("Control", CONTROL_RANGES);
         assert_sorted_disjoint("InCB Linker", INCB_LINKER_RANGES);
         assert_sorted_disjoint("InCB Consonant", INCB_CONSONANT_RANGES);
         assert_sorted_disjoint("InCB Extend", INCB_EXTEND_RANGES);
@@ -1795,6 +1828,7 @@ mod tests {
         assert_eq!(count(GRAPHEME_EXTEND_RANGES), counts::GRAPHEME_EXTEND);
         assert_eq!(count(SPACING_MARK_RANGES), counts::SPACING_MARK);
         assert_eq!(count(PREPEND_RANGES), counts::PREPEND);
+        assert_eq!(count(CONTROL_RANGES), counts::CONTROL);
         assert_eq!(count(INCB_LINKER_RANGES), counts::INCB_LINKER);
         assert_eq!(count(INCB_CONSONANT_RANGES), counts::INCB_CONSONANT);
         assert_eq!(count(INCB_EXTEND_RANGES), counts::INCB_EXTEND);
@@ -1823,6 +1857,11 @@ mod tests {
         assert!(prepend(0x0600));
         assert!(prepend(0x11A84));
         assert!(!prepend(0x0041));
+        assert!(control(0x00AD));
+        assert!(control(0x180E));
+        assert!(control(0xE01F0));
+        assert!(!control(0x000A));
+        assert!(!control(0x0041));
         assert!(incb_linker(0x094D));
         assert!(!incb_linker(0x200C));
         assert!(incb_consonant(0x0915));

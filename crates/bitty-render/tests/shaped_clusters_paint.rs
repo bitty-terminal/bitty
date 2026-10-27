@@ -363,6 +363,11 @@ fn wide_ambiguous_cluster_keeps_its_committed_columns() {
         !columns.contains(&1),
         "no glyph may land on the spacer column: {columns:?}"
     );
+    assert_eq!(
+        renderer.counters().shaping_misaligned,
+        0,
+        "the policy span must not be read as a font advance"
+    );
 }
 
 #[test]

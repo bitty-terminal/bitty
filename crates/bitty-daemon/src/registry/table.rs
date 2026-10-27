@@ -18,8 +18,8 @@ use std::fmt;
 
 use super::id::{DaemonInstanceId, Entropy, ID_GENERATION_ATTEMPTS, OsEntropy, SessionId};
 use super::session::{
-    LifecycleState, MonotonicMs, OwnerPeer, SessionRecord, SessionSnapshot, TerminalId,
-    TerminalOutcome, TerminalReason,
+    CleanupClass, LifecycleState, MonotonicMs, OwnerPeer, SessionRecord, SessionSnapshot,
+    TerminalId, TerminalOutcome, TerminalReason,
 };
 
 /// Default live-session bound (`D-14` `max_sessions`).
@@ -201,6 +201,11 @@ pub enum RegistryRefusal {
         /// Current state.
         from: LifecycleState,
     },
+    /// `not_started` cleanup was claimed after a worker could have spawned.
+    CleanupNotStarted {
+        /// Current state; only `created` may use `not_started`.
+        from: LifecycleState,
+    },
     /// The state-revision counter would wrap; the registry fails closed.
     RevisionOverflow,
     /// The generation counter would wrap; the registry fails closed.
@@ -257,6 +262,12 @@ impl fmt::Display for RegistryRefusal {
                 write!(
                     formatter,
                     "reason {reason} cannot originate in state {from}"
+                )
+            }
+            Self::CleanupNotStarted { from } => {
+                write!(
+                    formatter,
+                    "not_started cleanup is invalid from state {from}"
                 )
             }
             Self::RevisionOverflow => formatter.write_str("state revision would wrap"),
@@ -693,6 +704,9 @@ impl SessionRegistry {
                 reason: outcome.reason(),
                 from,
             });
+        }
+        if outcome.cleanup() == CleanupClass::NotStarted && from != LifecycleState::Created {
+            return Err(RegistryRefusal::CleanupNotStarted { from });
         }
         let revision = record
             .state_revision
@@ -1327,6 +1341,43 @@ mod tests {
         );
         assert_eq!(registry.counts().running, 1);
         assert_eq!(registry.counts().created, 1);
+    }
+
+    #[test]
+    fn not_started_cleanup_is_only_valid_from_created() {
+        let mut registry = default_registry();
+        let running = create(&mut registry, "running", 1);
+        registry
+            .bind(running.session_id, ms(2))
+            .expect("bind succeeds");
+        registry
+            .begin_stopping(running.session_id, ms(3))
+            .expect("stopping succeeds");
+        let not_started = TerminalOutcome::new(
+            TerminalReason::ConsumerCancel,
+            ExitInformation::NotApplicable,
+            CleanupClass::NotStarted,
+        )
+        .expect("outcome is valid without an origin");
+        assert_eq!(
+            registry.terminate(running.session_id, not_started, ms(4)),
+            Err(RegistryRefusal::CleanupNotStarted {
+                from: LifecycleState::Stopping,
+            })
+        );
+        assert_eq!(
+            registry
+                .snapshot(running.session_id)
+                .map(|snapshot| snapshot.state),
+            Some(LifecycleState::Stopping)
+        );
+
+        let created = create(&mut registry, "created", 5);
+        let terminal = registry
+            .terminate(created.session_id, not_started, ms(6))
+            .expect("created may claim not_started");
+        assert_eq!(terminal.state, LifecycleState::Terminated);
+        assert_eq!(terminal.cleanup, Some(CleanupClass::NotStarted));
     }
 
     #[test]

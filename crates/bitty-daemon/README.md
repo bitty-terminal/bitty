@@ -90,6 +90,10 @@ the spawn returns and fsyncs again, before the worker can be exposed as bound.
 The journal holds at most `max_orphan_records` records of at most
 `orphan_record_bytes`, contains no argv, environment, cwd, content, or
 credential, and on Unix lives in a `0700` directory with `0600` files.
+`reserve` validates the worst-case committed encoding (maximum pid, start
+time, and process-group widths, plus a later quarantine timestamp), so a
+reservation never precedes a spawn unless `commit` can hold any valid
+identity.
 
 Classification is conservative and never signals by pid:
 
@@ -102,9 +106,11 @@ Classification is conservative and never signals by pid:
 | Reaper cannot verify the whole containment identity                    | `unverified`, quarantined                    |
 
 Quarantined records expire after `orphan_record_retention_ms`; operator
-retirement removes a quarantined record explicitly and never signals.
-`VerifiedOrphan` has a private constructor, so a reaper can only be asked to
-terminate an exact match.
+retirement removes a quarantined record explicitly and never signals. Boot
+comparison precedes quarantine stickiness: a record quarantined under a
+previous boot id is stale and removed immediately, without waiting for
+retention. `VerifiedOrphan` has a private constructor, so a reaper can only be
+asked to terminate an exact match.
 
 Windows: the journal compiles and enforces the same record bound, but this slice
 does not create a current-user-only DACL and has no boot-id/`/proc` probe.

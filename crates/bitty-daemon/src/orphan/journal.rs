@@ -13,12 +13,12 @@
 //! 2. [`OrphanJournal::commit`] fills the exact process identity and fsyncs it
 //!    again before the worker is exposed as bound.
 //!
-//! A record is removed only after a verified sweep or after quarantine
-//! retention expires; the explicit operator retirement path removes a
-//! quarantined record without ever signalling. Classification compares the
-//! boot id, pid, start time, and recorded process group. A reserved record has
-//! no pid, a different boot id is stale, and any unreadable, absent, reused, or
-//! mismatched process is quarantined. None of those paths can reach the
+//! A record is removed after a verified sweep, when its boot id is stale,
+//! after quarantine retention expires, or by explicit operator retirement
+//! (which never signals). Classification compares the boot id first: a
+//! different boot id is unconditionally stale. Within the current boot, a
+//! reserved record with no pid, or an unreadable, absent, reused, or
+//! mismatched process, is quarantined. None of those paths can reach the
 //! reaper.
 //!
 //! # Deferred to bitty#2604
@@ -378,6 +378,28 @@ impl OrphanRecord {
         ))
     }
 
+    /// Worst-case encoded length for this record across every valid process
+    /// identity, the committed state, and a quarantine timestamp.
+    ///
+    /// `reserve` uses this to reject a byte bound that admits the reserved
+    /// encoding but not the post-spawn commit (or a later quarantine rewrite).
+    /// Every reservation that succeeds can therefore commit any identity that
+    /// fits `Pid`, `ProcessStartTime`, and `ProcessGroupId`.
+    fn worst_case_encoded_bytes(&self) -> usize {
+        let identity = ProcessIdentity::new(
+            Pid::new(u32::MAX).expect("u32::MAX is a valid pid"),
+            ProcessStartTime::new(u64::MAX),
+            ProcessGroupId::new(u32::MAX).expect("u32::MAX is a valid process group"),
+        );
+        let mut worst_case = self.clone();
+        worst_case.class = OrphanClass::Unverified;
+        worst_case.identity = Some(identity);
+        worst_case.validated_at = Some(MonotonicMs::from_millis(u64::MAX));
+        worst_case
+            .encode()
+            .map_or(usize::MAX, |encoded| encoded.len())
+    }
+
     fn parse(session_id: SessionId, text: &str) -> Self {
         Self::parse_valid(session_id, text).unwrap_or_else(|| Self::placeholder(session_id))
     }
@@ -550,7 +572,10 @@ impl OrphanJournal {
     /// # Errors
     ///
     /// Refuses when the session already has a record, the journal is full, or
-    /// the record exceeds `orphan_record_bytes`. Nothing is written on refusal.
+    /// even the worst-case committed encoding (maximum pid, start-time, and
+    /// process-group widths, plus a later quarantine timestamp) exceeds
+    /// `orphan_record_bytes`. Nothing is written on refusal, so a reservation
+    /// never precedes a spawn unless `commit` can hold any valid identity.
     pub fn reserve(
         &mut self,
         session_id: SessionId,
@@ -567,6 +592,13 @@ impl OrphanJournal {
         }
 
         let record = OrphanRecord::reserved(session_id, generation, self.boot_id.clone(), now);
+        let worst_case = record.worst_case_encoded_bytes();
+        if worst_case > self.limits.record_bytes {
+            return Err(JournalError::RecordTooLarge {
+                bytes: worst_case,
+                limit: self.limits.record_bytes,
+            });
+        }
         self.store(&record)?;
         self.records.insert(session_id, record);
         Ok(())
@@ -763,20 +795,24 @@ fn classify(
     probe_boot: Option<&BootId>,
     probe: &dyn ProcessProbe,
 ) -> Disposition {
-    if record.class == OrphanClass::Unverified {
-        // Quarantine is a record class, not a licence to guess: once a record
-        // is unverified it never causes another signal, even if the identity
-        // later looks exact. Only a verified sweep or retention removes it.
-        return Disposition::Unverified;
-    }
     let Some(record_boot) = record.boot_id.as_ref() else {
         return Disposition::Unverified;
     };
     let Some(probe_boot) = probe_boot else {
         return Disposition::Unverified;
     };
+    // D-06 makes a foreign boot id unconditionally stale; do this before the
+    // quarantine check so a quarantined record cannot occupy a slot for the
+    // retention window after a reboot.
     if record_boot != probe_boot {
         return Disposition::Stale;
+    }
+    if record.class == OrphanClass::Unverified {
+        // Within the current boot, quarantine is a record class, not a licence
+        // to guess: once a record is unverified it never causes another signal,
+        // even if the identity later looks exact. Only a verified sweep,
+        // retirement, or retention removes it.
+        return Disposition::Unverified;
     }
     let Some(identity) = record.identity else {
         return Disposition::Unverified;
@@ -821,10 +857,13 @@ fn load_records(
         }
         check_private_file(&metadata)?;
 
-        let bytes = fs::read(entry.path())?;
-        let record = if bytes.len() > limits.record_bytes {
+        let size_bound = u64::try_from(limits.record_bytes).unwrap_or(u64::MAX);
+        let record = if metadata.len() > size_bound {
+            // Never read a record that cannot be within the bound; a corrupt
+            // oversized file is evidence to quarantine, not data to load.
             OrphanRecord::placeholder(session_id)
         } else {
+            let bytes = fs::read(entry.path())?;
             match String::from_utf8(bytes) {
                 Ok(text) => OrphanRecord::parse(session_id, &text),
                 Err(_) => OrphanRecord::placeholder(session_id),
@@ -1311,6 +1350,101 @@ mod tests {
     }
 
     #[test]
+    fn reservation_admits_every_valid_commit_and_rejects_a_lower_bound() {
+        let directory = TempDir::new().expect("temp dir");
+        let session_id = session(0x17);
+        let worst_case =
+            OrphanRecord::reserved(session_id, 0, boot(BOOT_A), MonotonicMs::from_millis(1))
+                .worst_case_encoded_bytes();
+        assert!(
+            worst_case > 205,
+            "the reproduced 205-byte bound must be below the committed worst case"
+        );
+
+        // The reported reproduction: a bound that admits the reserved encoding
+        // but not the committed encoding is refused before any reservation.
+        let mut reproduced = OrphanJournal::open(
+            directory.path().join("reproduced"),
+            limits(64, 205, 1000),
+            boot(BOOT_A),
+        )
+        .expect("journal opens");
+        assert!(matches!(
+            reproduced.reserve(session_id, 0, MonotonicMs::from_millis(1)),
+            Err(JournalError::RecordTooLarge { limit: 205, .. })
+        ));
+        assert_eq!(reproduced.counts().total(), 0);
+        assert!(!reproduced.contains(session_id));
+        assert!(!reproduced.record_path(session_id).exists());
+
+        // The exact worst-case bound accepts the reservation and every valid
+        // identity the commit can carry.
+        let mut boundary = OrphanJournal::open(
+            directory.path().join("boundary"),
+            limits(64, worst_case, 1000),
+            boot(BOOT_A),
+        )
+        .expect("journal opens");
+        let max_identity = identity(u32::MAX, u64::MAX, u32::MAX);
+        boundary
+            .reserve(session_id, 0, MonotonicMs::from_millis(1))
+            .expect("worst-case reservation fits");
+        boundary
+            .commit(session_id, max_identity)
+            .expect("any valid identity fits after reservation");
+        assert_eq!(boundary.counts().committed, 1);
+        let text = fs::read_to_string(boundary.record_path(session_id)).expect("record file");
+        assert!(text.contains("pid 4294967295"));
+        assert!(text.contains("start_time 18446744073709551615"));
+        assert!(text.contains("process_group 4294967295"));
+
+        // One byte below the worst case cannot admit a reservation.
+        let mut too_small = OrphanJournal::open(
+            directory.path().join("too-small"),
+            limits(64, worst_case - 1, 1000),
+            boot(BOOT_A),
+        )
+        .expect("journal opens");
+        assert!(matches!(
+            too_small.reserve(session_id, 0, MonotonicMs::from_millis(1)),
+            Err(JournalError::RecordTooLarge { limit, .. }) if limit == worst_case - 1
+        ));
+        assert_eq!(too_small.counts().total(), 0);
+        assert!(!too_small.record_path(session_id).exists());
+    }
+
+    #[test]
+    fn exact_match_with_an_unverified_reaper_keeps_the_record_quarantined() {
+        let directory = TempDir::new().expect("temp dir");
+        let mut history = journal_in(&directory);
+        let session_id = session(0x18);
+        reserved_and_committed(&mut history, session_id, identity(4242, 100, 4242));
+        let probe = FakeProbe::with_boot(BOOT_A).observe(
+            4242,
+            ProcessObservation::Present {
+                start_time: ProcessStartTime::new(100),
+                process_group: ProcessGroupId::new(4242).expect("positive"),
+            },
+        );
+        let mut reaper = RecordingReaper::new(ReapResult::Unverified);
+        let report = history
+            .reap(&probe, &mut reaper, MonotonicMs::from_millis(10))
+            .expect("reap succeeds");
+
+        assert_eq!(
+            report,
+            ReapReport {
+                reaped: 0,
+                unverified: 1,
+                stale: 0
+            }
+        );
+        assert_eq!(reaper.calls.len(), 1);
+        assert!(history.contains(session_id));
+        assert_eq!(history.counts().unverified, 1);
+    }
+
+    #[test]
     fn quarantine_retention_retires_unverified_records() {
         let directory = TempDir::new().expect("temp dir");
         let mut history = OrphanJournal::open(
@@ -1378,6 +1512,37 @@ mod tests {
     }
 
     #[test]
+    fn quarantined_record_from_a_previous_boot_is_stale_and_removed() {
+        let directory = TempDir::new().expect("temp dir");
+        let mut history = journal_in(&directory);
+        let session_id = session(0x19);
+        reserved_and_committed(&mut history, session_id, identity(4242, 100, 4242));
+
+        let absent = FakeProbe::with_boot(BOOT_A).observe(4242, ProcessObservation::Absent);
+        let mut reaper = RecordingReaper::new(ReapResult::Swept);
+        history
+            .reap(&absent, &mut reaper, MonotonicMs::from_millis(10))
+            .expect("first reap succeeds");
+        assert_eq!(history.counts().unverified, 1);
+
+        let foreign_boot = FakeProbe::with_boot(BOOT_B);
+        let report = history
+            .reap(&foreign_boot, &mut reaper, MonotonicMs::from_millis(20))
+            .expect("second reap succeeds");
+        assert_eq!(
+            report,
+            ReapReport {
+                reaped: 0,
+                unverified: 0,
+                stale: 1
+            }
+        );
+        assert!(reaper.calls.is_empty());
+        assert_eq!(history.counts().total(), 0);
+        assert!(!history.contains(session_id));
+    }
+
+    #[test]
     fn operator_retirement_removes_only_a_quarantined_record() {
         let directory = TempDir::new().expect("temp dir");
         let mut history = journal_in(&directory);
@@ -1441,6 +1606,31 @@ mod tests {
                 .expect("collect succeeds"),
             vec![session_id]
         );
+    }
+
+    #[test]
+    fn oversized_record_file_is_quarantined_without_being_read() {
+        let directory = TempDir::new().expect("temp dir");
+        let history = journal_in(&directory);
+        let session_id = session(0x1a);
+        write_private_file(&history.record_path(session_id), &vec![b'x'; 256])
+            .expect("oversized file written");
+        drop(history);
+
+        let mut history = OrphanJournal::open(
+            directory.path().join("journal"),
+            limits(8, 64, 100),
+            boot(BOOT_A),
+        )
+        .expect("journal reopens");
+        assert_eq!(history.counts().unverified, 1);
+        let probe = FakeProbe::with_boot(BOOT_A);
+        let mut reaper = RecordingReaper::new(ReapResult::Swept);
+        let report = history
+            .reap(&probe, &mut reaper, MonotonicMs::from_millis(10))
+            .expect("reap succeeds");
+        assert_eq!(report.unverified, 1);
+        assert!(reaper.calls.is_empty());
     }
 
     #[test]

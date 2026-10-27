@@ -533,6 +533,10 @@ pub struct SessionSnapshot {
     /// `attach_count > 0`, derived rather than stored.
     pub attached: bool,
     /// Opaque owner peer facts captured by the service layer.
+    ///
+    /// Operator-only data: consumer `session.status` responses must not
+    /// serialize it, while the operator view (`daemon.inspect`) may include
+    /// it. The registry never parses or authorizes on these bytes.
     pub owner_peer: Option<OwnerPeer>,
     /// Terminal reason, present exactly in a terminal state.
     pub terminal_reason: Option<TerminalReason>,

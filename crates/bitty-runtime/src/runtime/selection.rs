@@ -21,9 +21,10 @@
 //! CTX-1612 BiDi semantics: a pointer drag is a sweep over *painted* cells.
 //! `Simple` drags on a view with an active projection select every logical
 //! cell displayed under the swept visual span and copy them in logical
-//! order (the range is the min/max logical column of those cells). `Block`
-//! keeps its rectangle/caret-boundary model, and selection anchors remain
-//! logical so OQ-099 copy order is unchanged.
+//! order (the range is the min/max logical column of those cells); the
+//! release commits that same range. `Block` keeps its rectangle/caret-
+//! boundary model, and selection anchors remain logical so OQ-099 copy
+//! order is unchanged.
 use super::input::key_inspect_label;
 use super::*;
 use bitty_ui::selection::BufferPos;
@@ -1593,8 +1594,8 @@ impl Runtime {
     /// logical order, so the range is the min/max logical column of the
     /// swept cells. This is why an RTL line can select left-to-right
     /// visually while copying in logical order. `None` when BiDi is off, the
-    /// view failed closed, the row is pure LTR, or the sweep crosses rows
-    /// (the cell/boundary path keeps multi-row semantics).
+    /// view failed closed, the row is not reordered, or the sweep crosses
+    /// rows (the cell/boundary path keeps multi-row semantics).
     fn bidi_visual_sweep_selection(
         &self,
         owner: ViewId,
@@ -1605,10 +1606,10 @@ impl Runtime {
             return None;
         }
         let grid = self.bidi_grid_for_view(owner);
-        if grid.is_empty() {
-            return None;
-        }
         let row = usize::from(press.row);
+        // Only a reordered row gets the sweep: a pure-LTR row keeps the
+        // exact pre-BiDi caret-to-caret behavior.
+        grid.line(row)?;
         let press_visual = grid.visual_col_for_logical(row, usize::from(press.col));
         let focus_visual = grid.visual_col_for_logical(row, usize::from(focus.col));
         let (first, last) = if press_visual <= focus_visual {
@@ -1642,11 +1643,11 @@ impl Runtime {
     /// span that covers no cell installs a collapsed selection so the drag
     /// state survives until release (where a plain click still clears).
     ///
-    /// CTX-1612: a `Simple` drag on a view with an active BiDi projection
-    /// is a visual sweep: the logical range is the min/max logical column of
-    /// the cells under the swept visual span (see
-    /// [`Self::bidi_visual_sweep_selection`]). `Block` keeps the rectangle
-    /// boundary model.
+    /// CTX-1612: a `Simple` drag on a reordered row is a visual sweep: the
+    /// logical range is the min/max logical column of the cells under the
+    /// swept visual span (see [`Self::bidi_visual_sweep_selection`]).
+    /// `Block` keeps the rectangle boundary model, and
+    /// [`Self::end_boundary_selection`] commits the same sweep range.
     pub(super) fn update_boundary_selection(
         &mut self,
         focus: CellPos,
@@ -1827,6 +1828,29 @@ impl Runtime {
             self.click_tracker.reset();
             return;
         };
+        // CTX-1612: a same-row Simple sweep commits the logical min/max set
+        // the live drag already showed. Re-deriving the range from the
+        // ambiguous visual boundary on release could move or drop it.
+        if sel.selection.kind == SelectionKind::Simple {
+            let anchor = sel.anchor_press.unwrap_or(sel.selection.anchor);
+            if let Some(mut next) = self.bidi_visual_sweep_selection(sel.owner, anchor, focus) {
+                if press.col == boundary.col {
+                    // Zero caret travel on the row is a click, not a drag.
+                    self.drop_selection();
+                    return;
+                }
+                next.active = false;
+                let single_cell = next.anchor == next.focus;
+                let was_drag = super::click::cell_distance(anchor, focus)
+                    > super::click::MULTI_CLICK_MAX_CELL_DISTANCE;
+                self.install_selection(sel.owner, next, None, false);
+                self.restore_selection_meta(None, single_cell, None, None);
+                if was_drag {
+                    self.click_tracker.reset();
+                }
+                return;
+            }
+        }
         // Pointer Simple/Block drags commit in combined-buffer space
         // (issue #2470): the same span semantics as a live drag, but rows may
         // span any number of scrollback pages.

@@ -4794,14 +4794,14 @@ mod tests {
         assert_eq!(cell.col, 6, "selection anchor stays logical");
         // The pointer sits in the right half of visual cell 4, so the caret
         // is its right edge (visual 5). The edge inverse maps that to
-        // logical 6 (the boundary before א), not cell 5.
-        assert_eq!(boundary.col, 7, "caret maps through the edge inverse");
-        // A pointer on ב (visual 5) maps to the logical edge before ב (5);
-        // the right frame edge stays the line end (77), not a cell.
+        // logical 6 (the caret before ג), not cell 5.
+        assert_eq!(boundary.col, 6, "caret maps through the edge inverse");
+        // A pointer on ב (visual 5) has its right edge at visual 6, the
+        // caret before א (logical 5).
         let on_bet = rt
             .selection_press_target_with_boundary(visual_point(&rt, view, 0, 5))
             .expect("bet press");
-        assert_eq!(on_bet.2.col, 6);
+        assert_eq!(on_bet.2.col, 5);
         let right_edge = rt
             .selection_press_target_with_boundary(visual_point(&rt, view, 0, 77))
             .expect("right edge");
@@ -4912,6 +4912,125 @@ mod tests {
         let sweep = drag_selection(&mut rt, view, 0, 3);
         assert_eq!((sweep.anchor.col, sweep.focus.col), (2, 5));
         assert_eq!(rt.selection_text().as_deref(), Some("גabc"));
+    }
+
+    /// Presses, drags, and releases a `Simple` selection at visual cells.
+    fn drag_and_release(
+        rt: &mut Runtime,
+        view: ViewId,
+        press_visual: u16,
+        drag_visual: u16,
+    ) -> (
+        bitty_ui::Selection,
+        Option<String>,
+        Option<bitty_ui::Selection>,
+    ) {
+        let (owner, cell, boundary) = rt
+            .selection_press_target_with_boundary(visual_point_at(rt, view, 0, press_visual, 0.25))
+            .expect("press target");
+        rt.start_view_selection_from_pointer(
+            owner,
+            bitty_ui::SelectionKind::Simple,
+            cell,
+            boundary,
+        );
+        let (focus, boundary) = rt
+            .cursor_to_owner_cell_and_boundary(
+                view,
+                visual_point_at(rt, view, 0, drag_visual, 0.75),
+            )
+            .expect("drag target");
+        rt.update_boundary_selection(focus, boundary);
+        let live = rt.selection().expect("live sweep selection");
+        let text = rt.selection_text();
+        rt.end_boundary_selection(focus, boundary);
+        (live, text, rt.selection())
+    }
+
+    #[test]
+    fn drag_release_commits_the_visual_sweep_range() {
+        // The release must commit the logical min/max set the live drag
+        // showed; re-deriving it from the ambiguous edge inverse could move
+        // or drop the selection (the reverse-sweep case used to drop it).
+        for (text, press, drag, range, copy) in [
+            ("abc אבג", 2u16, 6u16, (2u16, 6u16), "c אבג"),
+            ("א中ב", 0, 3, (0, 3), "א中ב"),
+            ("אבגabc", 0, 3, (2, 5), "גabc"),
+            ("א中", 0, 2, (0, 2), "א中"),
+        ] {
+            let mut rt = bidi_runtime();
+            print_bidi(&mut rt, text);
+            let view = rt.primary_view.expect("primary view");
+            let (live, live_text, committed) = drag_and_release(&mut rt, view, press, drag);
+            assert_eq!(
+                (live.anchor.col, live.focus.col),
+                range,
+                "{text:?} live sweep"
+            );
+            assert_eq!(live_text.as_deref(), Some(copy), "{text:?} live copy");
+            let committed = committed.expect("release keeps the selection");
+            assert_eq!(
+                (committed.anchor.col, committed.focus.col),
+                range,
+                "{text:?} committed range"
+            );
+            assert!(!committed.active, "a released selection is inactive");
+            assert_eq!(rt.selection_text().as_deref(), Some(copy), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn alt_stale_scroll_offset_keeps_hit_testing_on_the_live_alt_grid() {
+        let mut rt = bidi_runtime();
+        // Push history into the scrollback ring, then park the primary view
+        // in history so `scroll_offset != 0`.
+        for i in 0..30 {
+            rt.handle_pty_bytes(format!("history {i:02}\r\n").as_bytes());
+        }
+        let view = rt.primary_view.expect("primary view");
+        let max = rt.state.scrollback_len();
+        assert!(max > 0, "must have scrollback");
+        rt.find_view_mut(view)
+            .expect("primary view")
+            .scroll_by(3, max);
+        assert!(rt.is_viewport_scrolled(view));
+        // Entering the alternate screen keeps the stale offset but owns no
+        // history view: paint (`viewport_snapshot`) and hit testing must
+        // both read the live alt grid, never the primary scrollback.
+        rt.handle_pty_bytes(b"\x1b[?1049h");
+        assert_eq!(rt.view_scroll_offset(view), 3, "offset stays stale");
+        rt.handle_pty_bytes(b"\x1b[H");
+        print_bidi(&mut rt, "אבג");
+        assert!(!rt.is_viewport_scrolled(view), "alt owns no history view");
+        assert!(rt.bidi_enabled_for_view(view));
+        assert_eq!(
+            rt.logical_col_for_visual(view, 0, 0),
+            2,
+            "visual 0 is ג (logical 2) in the live alt grid"
+        );
+        assert_eq!(rt.visual_col_for_logical(view, 0, 2), 0);
+    }
+
+    #[test]
+    fn click_without_motion_still_clears_on_a_reordered_row() {
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "abc אבג");
+        let view = rt.primary_view.expect("primary view");
+        let pos = visual_point_at(&rt, view, 0, 4, 0.25);
+        let (owner, cell, boundary) = rt
+            .selection_press_target_with_boundary(pos)
+            .expect("press target");
+        rt.start_view_selection_from_pointer(
+            owner,
+            bitty_ui::SelectionKind::Simple,
+            cell,
+            boundary,
+        );
+        let (focus, boundary) = rt
+            .cursor_to_owner_cell_and_boundary(view, pos)
+            .expect("release target");
+        rt.end_boundary_selection(focus, boundary);
+        assert!(rt.selection().is_none(), "a click is not a selection");
     }
 
     #[test]

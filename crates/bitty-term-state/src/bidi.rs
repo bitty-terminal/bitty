@@ -15,8 +15,9 @@
 //! logical order exactly as before, so rendered output and hashes are
 //! unchanged.
 //!
-//! Paragraph extent (OQ-091 point 1): one *logical line*. Soft-wrap flags
-//! are supplied out of band ([`logical_line_ranges`]) because the snapshot
+//! Paragraph extent: this S0 implementation resolves one *logical line* and
+//! does not decide the open `OQ-091` extent question. Soft-wrap flags are
+//! supplied out of band ([`logical_line_ranges`]) because the snapshot
 //! schema stays unchanged; a hard line break starts a new paragraph. The
 //! viewport edge is a paragraph boundary for callers without wrap flags.
 //! Lines longer than [`MAX_BIDI_PARAGRAPH_CELLS`] resolve in independent
@@ -192,6 +193,10 @@ pub struct BidiLine {
     widths: Vec<u8>,
     /// True on the trailing half of a wide lead.
     spacers: Vec<bool>,
+    /// Visual caret edge -> logical caret edge, the inverse of
+    /// [`Self::visual_caret_col`] (see
+    /// [`Self::logical_caret_edge_for_visual`]); length `columns + 1`.
+    caret_edges: Vec<u16>,
     /// Content columns; erased layout padding outside it keeps identity.
     content: Range<usize>,
     has_rtl: bool,
@@ -320,56 +325,90 @@ impl BidiLine {
     ///
     /// The edge inverse for caret/selection boundaries:
     /// [`Self::logical_col_for_visual`] maps a *cell*, so using it for an
-    /// edge shifts a boundary drag by one logical cell. The map is total for
-    /// every content edge: an interior edge names the logical end of the
-    /// cell immediately to its left in visual order (after that cell), the
-    /// first edge uses the first cell's leading edge, and the last edge is
-    /// the logical line end. Spacer columns are never caret positions; an
-    /// edge inside a wide lead resolves to the lead's trailing edge.
+    /// edge shifts a boundary drag by one logical cell. This map is the
+    /// inverse of [`Self::visual_caret_col`] wherever that inverse is
+    /// unique, so a caret edge round-trips. Two logical carets can share one
+    /// visual edge at a level-run boundary; the later logical edge (the
+    /// larger column) wins, which keeps a boundary drag on the line end.
+    /// Spacer columns are never caret positions: an interior edge of a wide
+    /// lead resolves to the lead's logical trailing edge, and any other
+    /// unclaimed edge resolves to the leading logical edge of the cell on
+    /// its right, so a drag that reaches it includes that cell. Edges
+    /// outside the content span are identity (layout padding), and the map
+    /// is total: every content edge has a logical answer.
     #[must_use]
     pub fn logical_caret_edge_for_visual(&self, visual_edge: usize) -> usize {
-        if self.content.is_empty()
-            || visual_edge < self.content.start
-            || visual_edge > self.content.end
-        {
-            return visual_edge;
+        self.caret_edges
+            .get(visual_edge)
+            .map_or(visual_edge, |edge| usize::from(*edge))
+    }
+
+    /// Builds the visual-edge -> logical-edge inverse for this row.
+    ///
+    /// The forward map is authoritative where it is injective; the two
+    /// remaining edge classes are filled explicitly (see
+    /// [`Self::logical_caret_edge_for_visual`]).
+    fn build_caret_edges(&self) -> Vec<u16> {
+        let to_u16 =
+            |value: usize| u16::try_from(value.min(usize::from(u16::MAX))).unwrap_or(u16::MAX);
+        let mut edges: Vec<u16> = (0..=self.levels.len()).map(to_u16).collect();
+        let mut claimed = vec![false; edges.len()];
+        for logical in self.content.start..=self.content.end {
+            // A spacer column is not a caret position: the caret lives only
+            // at a lead's leading/trailing edge.
+            if logical < self.content.end && self.spacers.get(logical).copied().unwrap_or(false) {
+                continue;
+            }
+            let visual = self.visual_caret_col(logical);
+            if let Some(slot) = edges.get_mut(visual) {
+                *slot = to_u16(logical);
+                if let Some(flag) = claimed.get_mut(visual) {
+                    *flag = true;
+                }
+            }
+        }
+        for visual in self.content.start..=self.content.end {
+            if claimed.get(visual).copied().unwrap_or(false) {
+                continue;
+            }
+            let logical = self.unclaimed_caret_edge(visual);
+            if let Some(slot) = edges.get_mut(visual) {
+                *slot = to_u16(logical.clamp(self.content.start, self.content.end));
+            }
+        }
+        edges
+    }
+
+    /// Logical edge for a visual edge that no logical caret claims.
+    fn unclaimed_caret_edge(&self, visual_edge: usize) -> usize {
+        let logical = self.logical_col_for_visual(visual_edge);
+        // Interior of a wide lead: the edge belongs to the lead, whose
+        // logical trailing edge is the inclusive selection end.
+        if self.spacers.get(logical).copied().unwrap_or(false) && logical > self.content.start {
+            let lead = logical - 1;
+            return lead + self.lead_width(lead);
         }
         if visual_edge == self.content.end {
-            return self.content.end;
-        }
-        let lead_at = |visual: usize| {
-            let mut logical = self.logical_col_for_visual(visual);
-            if self.spacers.get(logical).copied().unwrap_or(false) && logical > 0 {
-                logical -= 1;
+            // Right edge of the row: the trailing side of the cell left of
+            // it, in logical order.
+            let mut left = self.logical_col_for_visual(visual_edge.saturating_sub(1));
+            if self.spacers.get(left).copied().unwrap_or(false) && left > self.content.start {
+                left -= 1;
             }
-            logical
-        };
-        let logical = if visual_edge == self.content.start {
-            let lead = lead_at(visual_edge);
-            if self.levels.get(lead).copied().unwrap_or(0) % 2 == 1 {
-                lead + self.lead_width(lead)
-            } else {
-                lead
-            }
-        } else {
-            let left = lead_at(visual_edge.saturating_sub(1));
-            let right = lead_at(visual_edge);
-            let left_level = self.levels.get(left).copied().unwrap_or(0);
-            let right_level = self.levels.get(right).copied().unwrap_or(0);
-            // Across a level boundary, entering an RTL run from the left
-            // means "before that run" (its logical start). Inside a run the
-            // edge is the logical end of the cell on the left (which is the
-            // same position as the right cell's start for LTR, and the RTL
-            // cell's logical end for RTL). This keeps every content edge
-            // assigned even when the forward caret map has no matching
-            // logical edge.
-            if left != right && left_level != right_level && right_level % 2 == 1 {
-                right
+            return if self.levels.get(left).copied().unwrap_or(0) % 2 == 1 {
+                left
             } else {
                 left + self.lead_width(left)
-            }
-        };
-        logical.min(self.content.end).max(self.content.start)
+            };
+        }
+        // A level-run boundary that no caret claims: the edge is the
+        // leading visual edge of the cell on its right, so a drag that
+        // reaches the edge includes that cell.
+        if self.levels.get(logical).copied().unwrap_or(0) % 2 == 1 {
+            logical + self.lead_width(logical)
+        } else {
+            logical
+        }
     }
 
     /// Leading-cell width (`1` or `2`), ignoring a spacer's own half.
@@ -444,12 +483,13 @@ impl BidiLine {
             }
             visual_col += width;
         }
-        let line = Self {
+        let mut line = Self {
             paragraph_level,
             levels: levels.to_vec(),
             visual_to_logical,
             logical_to_visual,
             spacers: spacers.to_vec(),
+            caret_edges: Vec::new(),
             widths: spacers
                 .iter()
                 .enumerate()
@@ -466,6 +506,7 @@ impl BidiLine {
             content: content.clone(),
             has_rtl: true,
         };
+        line.caret_edges = line.build_caret_edges();
         Some(line)
     }
 }

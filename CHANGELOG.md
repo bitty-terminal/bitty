@@ -20,7 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behavior fixes do change committed cells versus the previous release:
   `U+2066..U+2069` isolates now resolve zero-width, and a bidi control at
   column 0 after a hard break is dropped instead of attaching to the
-  previous row. With BiDi off, rendered bytes and hashes are identical.
+  previous row. With BiDi off no reordering runs and the paint path is
+  unchanged; the canonical hash, `Snapshot` schema, and codec are identical
+  to the previous release, while the two committed-cell fixes above can
+  still change rendered output.
   Hit tests, cursor/IME paint, selection paint, and hyperlink underlines use
   one shared per-row map only when the painted `Snapshot` is the logical
   state grid; windowed/truncated, placeholder-bearing, and alt-stale views

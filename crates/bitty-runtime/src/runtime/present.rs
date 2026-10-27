@@ -7277,6 +7277,54 @@ mod present_origin_tests {
     }
 
     #[test]
+    fn reused_bidi_cursor_uses_the_per_view_visual_column() {
+        use crate::runtime::RuntimeConfig;
+        use crate::{LayoutNode, Runtime, View, ViewId};
+        use bitty_platform::PhysicalSize;
+
+        let mut rt = Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime must build");
+        rt.set_bidi(true);
+        let view = ViewId::new(1);
+        rt.set_layout(LayoutNode::leaf(View::new(view, 80, 24)));
+        rt.handle_resize(PhysicalSize::new(736, 472))
+            .expect("resize applies");
+        rt.set_focus(view);
+        for scalar in "abc אבג".chars() {
+            rt.state
+                .apply(&TerminalAction::Print(bitty_vt::GraphemeCell::from(scalar)));
+        }
+        // Park the cursor on ג (logical 6) so both the cell column and the
+        // caret edge project onto the reordered run.
+        rt.state.apply(&TerminalAction::CursorPosition {
+            row: bitty_vt::Row::SENTINEL,
+            col: bitty_vt::Col(7),
+        });
+        let snapshot = rt.snapshot();
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .expect("primary frame");
+        // The logical end-of-line cursor (col 7) paints at visual 4, the
+        // same column the fresh leaf pass computes.
+        let paint = rt
+            .reused_cursor_paint(&frame, view, &snapshot, 0, 0)
+            .expect("visible cursor");
+        assert_eq!(paint.cursor.position.col, 4, "per-view visual cell");
+        assert_eq!(paint.caret_col, 5, "per-view caret edge");
+        // A state grid that no longer matches the painted frame fails
+        // closed exactly like the glyphs: identity columns.
+        rt.state.resize(80, 24);
+        let snapshot = rt.snapshot();
+        let paint = rt
+            .reused_cursor_paint(&frame, view, &snapshot, 0, 0)
+            .expect("visible cursor");
+        assert_eq!(paint.cursor.position.col, 6, "failed-closed identity");
+        assert_eq!(paint.caret_col, 6);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn retained_pane_cursor_repaint_uses_pane_grid_for_wide_cell() {
         require_pty!();
@@ -10781,5 +10829,156 @@ mod bidi_paint_tests {
         let mut bar = block;
         bar.cursor.cursor_style = bitty_term_state::CursorStyle::SteadyBar;
         assert_eq!(Runtime::cursor_overlay_col(&bar), caret);
+    }
+
+    /// Cursor paint for `text` with the cursor on a logical column, under
+    /// the per-view BiDi decision.
+    fn wide_cursor_paint(
+        text: &str,
+        logical_col: u16,
+        style: bitty_term_state::CursorStyle,
+    ) -> CursorPaint {
+        let mut state = bidi_state(text);
+        cursor_at(&mut state, logical_col);
+        let snapshot = state.snapshot();
+        let mut cursor = snapshot.cursor.clone();
+        cursor.cursor_style = style;
+        let cell_width = normalize_cursor_cell(&mut cursor, &snapshot);
+        let (visual_col, caret_col) = cursor_visual_cols(true, &snapshot, None, &cursor);
+        cursor.position.col = visual_col;
+        CursorPaint {
+            origin_x: 0,
+            origin_y: 0,
+            cursor,
+            caret_col,
+            cols: snapshot.width,
+            rows: snapshot.height,
+            cells_available: u16::try_from(
+                snapshot
+                    .width
+                    .saturating_sub(usize::from(visual_col))
+                    .max(1),
+            )
+            .unwrap_or(u16::MAX),
+            cell_width,
+        }
+    }
+
+    #[test]
+    fn wide_rtl_block_underline_and_bar_cover_the_painted_glyph() {
+        // א中ב paints ב | 中 (two cells) | א; the cursor on 中 owns both
+        // painted cells. Block and underline cover the glyph span, a bar is
+        // a thin insertion edge at the cell's visual left edge.
+        let palette = bitty_render::grid::ThemePalette::bitty_dark();
+        let cell = CellMetrics::new(8, 16).expect("cell metrics");
+        let block = wide_cursor_paint("א中ב", 1, bitty_term_state::CursorStyle::SteadyBlock);
+        assert_eq!((block.cursor.position.col, block.cell_width), (1, 2));
+        let fill = bitty_render::grid::cursor_fill_in_for_width(
+            &palette,
+            &block.cursor,
+            cell,
+            block.cell_width,
+            block.cols,
+            block.rows,
+        )
+        .expect("block fill");
+        assert_eq!(
+            (fill.rect.x, fill.rect.width, fill.rect.height),
+            (8, 16, 16),
+            "block covers both painted cells"
+        );
+        let underline =
+            wide_cursor_paint("א中ב", 1, bitty_term_state::CursorStyle::SteadyUnderline);
+        let fill = bitty_render::grid::cursor_fill_in_for_width(
+            &palette,
+            &underline.cursor,
+            cell,
+            underline.cell_width,
+            underline.cols,
+            underline.rows,
+        )
+        .expect("underline fill");
+        assert_eq!((fill.rect.x, fill.rect.width), (8, 16));
+        assert_eq!(
+            fill.rect.y.saturating_add(fill.rect.height as i32),
+            16,
+            "underline hugs the cell bottom"
+        );
+        let bar = wide_cursor_paint("א中ב", 1, bitty_term_state::CursorStyle::SteadyBar);
+        assert_eq!(Runtime::cursor_overlay_col(&bar), bar.caret_col);
+        let mut bar_cursor = bar.cursor.clone();
+        bar_cursor.position.col = Runtime::cursor_overlay_col(&bar);
+        let fill = bitty_render::grid::cursor_fill_in_for_width(
+            &palette,
+            &bar_cursor,
+            cell,
+            bar.cell_width,
+            bar.cols,
+            bar.rows,
+        )
+        .expect("bar fill");
+        assert_eq!(
+            (fill.rect.x, fill.rect.width),
+            (8, 1),
+            "a bar is a thin caret, not a glyph-wide block"
+        );
+    }
+
+    #[test]
+    fn wide_rtl_ime_rect_covers_the_lead_and_its_spacer() {
+        let mut rt = Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime must build");
+        let paint = wide_cursor_paint("א中ב", 1, bitty_term_state::CursorStyle::SteadyBar);
+        rt.arm_ime_caret(&paint);
+        let area = rt.ime_cursor_area().expect("armed caret");
+        let (cell_width, _) = rt.live_cell_size();
+        assert_eq!(
+            area.width,
+            2 * cell_width,
+            "the IME rect spans the wide lead's two cells"
+        );
+        assert_eq!(area.x, paint.cursor.position.col as i32 * cell_width as i32);
+    }
+
+    #[test]
+    fn right_edge_bar_and_ime_stay_inside_the_last_cell() {
+        // A full-width RTL row puts logical 0 (א) on the last painted cell;
+        // its caret edge is the grid's right edge. The bar and the platform
+        // IME rect must clamp inside the last cell, never paint past it.
+        let text: String = std::iter::repeat_n('א', 80).collect();
+        let paint = wide_cursor_paint(&text, 0, bitty_term_state::CursorStyle::SteadyBar);
+        assert_eq!(
+            (paint.cursor.position.col, paint.caret_col),
+            (79, 79),
+            "the right-edge caret clamps to the last cell"
+        );
+        let palette = bitty_render::grid::ThemePalette::bitty_dark();
+        let cell = CellMetrics::new(8, 16).expect("cell metrics");
+        let mut bar_cursor = paint.cursor.clone();
+        bar_cursor.position.col = Runtime::cursor_overlay_col(&paint);
+        let fill = bitty_render::grid::cursor_fill_in_for_width(
+            &palette,
+            &bar_cursor,
+            cell,
+            paint.cell_width,
+            paint.cols,
+            paint.rows,
+        )
+        .expect("bar fill");
+        assert_eq!(
+            (fill.rect.x, fill.rect.width),
+            (79 * 8, 1),
+            "the bar stays inside the last cell"
+        );
+        let mut rt = Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime must build");
+        rt.arm_ime_caret(&paint);
+        let area = rt.ime_cursor_area().expect("armed caret");
+        let (cell_width, _) = rt.live_cell_size();
+        assert_eq!(area.x, 79 * cell_width as i32);
+        assert_eq!(
+            area.width, cell_width,
+            "a one-cell bar keeps a one-cell rect"
+        );
     }
 }

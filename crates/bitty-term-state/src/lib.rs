@@ -47,7 +47,7 @@
 //! | [`DAMAGE_MAX_REGIONS_PER_BATCH`](damage::DAMAGE_MAX_REGIONS_PER_BATCH) | 256 | Coarse fallback beyond the cap |
 //! | [`HYPERLINK_TABLE_MAX`] | 1024 | Bounded link table (threat T-01) |
 //! | [`MAX_CLUSTER_SCALARS`] | 6 | Per-cell cluster-tail cap (threat T-01; CTX-1609; the historical `MAX_ZEROWIDTH_CHARS` name aliases the same bound) |
-//! | [`MAX_BIDI_PARAGRAPH_CELLS`] | 4096 | BiDi paragraph bound: longer logical lines split at cell boundaries (CTX-1612; `OQ-091` paragraph extent = logical line) |
+//! | [`MAX_BIDI_PARAGRAPH_CELLS`] | 4096 | BiDi paragraph bound: longer logical lines split at cell boundaries (CTX-1612; the S0 caller resolves one logical line, `OQ-091` paragraph extent stays open) |
 //! | [`ZONE_RECORDS_MAX`] | 1024 | Bounded `OSC 133` zone log |
 //! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 13 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds saved cursor style/visibility, v3 combining buffers, v4 soft-wrap flags, v5 synchronized-update mode, v6 hyperlink id-space position, v7 alternate-scroll mode, v8 Kitty keyboard stack, v9 inactive-screen Kitty register, v10 zone anchors, v11 OSC 133 output tracking, v12 cell layout-padding marker, v13 East Asian ambiguous-width policy) |
 //!

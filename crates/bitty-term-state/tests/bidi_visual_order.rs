@@ -83,12 +83,13 @@ fn mixed_ltr_rtl_line_reverses_only_the_rtl_run() {
     }
     assert!(seen.iter().all(|seen| *seen));
     assert_eq!(row_text(&snapshot, 0, 7), "abc אבג");
-    // Edge inverse: visual edge 5 names the logical end of the cell to its
-    // left (ג, 7); the line end (visual 7) is the logical end 7.
-    assert_eq!(line.logical_caret_edge_for_visual(5), 7);
-    assert_eq!(line.logical_caret_edge_for_visual(4), 6);
+    // Edge inverse (CTX-1612 review): visual 5 is the caret before ג
+    // (logical 6), visual 4 is the end-of-line caret (logical 7, the left
+    // edge of the reversed tail), and the Latin/space edges stay identity.
+    assert_eq!(line.logical_caret_edge_for_visual(5), 6);
+    assert_eq!(line.logical_caret_edge_for_visual(4), 7);
     assert_eq!(line.logical_caret_edge_for_visual(3), 3);
-    assert_eq!(line.logical_caret_edge_for_visual(7), 7);
+    assert_eq!(line.logical_caret_edge_for_visual(7), 4);
 }
 
 #[test]
@@ -118,11 +119,12 @@ fn rtl_paragraph_keeps_the_latin_run_ltr_and_reverses_the_hebrew_run() {
         9,
         "padding beyond end is identity"
     );
-    // Edge inverse for the RTL paragraph: visual edge 5 is the logical end
-    // of the cell to its left (ג, 7); edge 4 is the logical end of space (4).
-    assert_eq!(line.logical_caret_edge_for_visual(5), 3);
-    assert_eq!(line.logical_caret_edge_for_visual(4), 4);
-    assert_eq!(line.logical_caret_edge_for_visual(3), 3);
+    // Edge inverse for the RTL paragraph (a full visual reversal): visual
+    // edge 5 is the caret before ב (logical 2), edge 4 the caret before ג
+    // (logical 3), and edge 3 the end-of-line caret (logical 7).
+    assert_eq!(line.logical_caret_edge_for_visual(5), 2);
+    assert_eq!(line.logical_caret_edge_for_visual(4), 3);
+    assert_eq!(line.logical_caret_edge_for_visual(3), 7);
     // Outside content stays identity.
     assert_eq!(line.logical_caret_edge_for_visual(12), 12);
 }
@@ -133,34 +135,68 @@ fn pure_rtl_edges_invert() {
     let snapshot = state.snapshot();
     let grid = grid_for(&snapshot);
     let line = grid.line(0).expect("RTL line");
-    // Right-to-left visual order: every interior edge is the logical end of
-    // the cell to its left; the line end stays the logical end.
-    assert_eq!(line.logical_caret_edge_for_visual(3), 3);
-    assert_eq!(line.logical_caret_edge_for_visual(2), 2);
-    assert_eq!(line.logical_caret_edge_for_visual(1), 3);
+    // Logical edges 0..3 map to visual edges 3,2,1,0: the inverse is a
+    // full reversal, so every caret round-trips.
+    assert_eq!(line.logical_caret_edge_for_visual(3), 0);
+    assert_eq!(line.logical_caret_edge_for_visual(2), 1);
+    assert_eq!(line.logical_caret_edge_for_visual(1), 2);
     assert_eq!(line.logical_caret_edge_for_visual(0), 3);
 }
 
 #[test]
 fn edge_inverse_is_total_at_rtl_ltr_boundaries() {
-    // א中ב: visual 中 | spacer | ב | א; edge 3 is the logical end of ב (4),
-    // not identity. The wide spacer has no caret position of its own.
+    // א中ב: visual ב | 中+spacer | א. Visual edge 3 is the left edge of א,
+    // which no forward caret claims; it resolves to logical 1 (after א)
+    // instead of identity. The interior wide edge 2 resolves to the lead's
+    // logical trailing edge (3), and the two outer edges stay exact.
     let state = state_with_text("א中ב");
     let snapshot = state.snapshot();
     let grid = grid_for(&snapshot);
     let line = grid.line(0).expect("RTL line");
-    assert_eq!(line.logical_caret_edge_for_visual(3), 0);
-    assert_eq!(line.logical_caret_edge_for_visual(1), 4);
-    assert_eq!(line.logical_caret_edge_for_visual(4), 4);
-    // אבגabc: visual a b c ג ב א; edge 3 is the logical end of c (6), not
-    // identity.
+    assert_eq!(line.logical_caret_edge_for_visual(0), 4);
+    assert_eq!(line.logical_caret_edge_for_visual(1), 3);
+    assert_eq!(line.logical_caret_edge_for_visual(2), 3);
+    assert_eq!(line.logical_caret_edge_for_visual(3), 1);
+    assert_eq!(line.logical_caret_edge_for_visual(4), 0);
+    // אבגabc: visual a b c | ג ב א. Edge 3 is the end-of-line caret
+    // (logical 6); edge 4 is the caret before ג (logical 2), and the far
+    // right edge is the caret before א (logical 0).
     let state = state_with_text("אבגabc");
     let snapshot = state.snapshot();
     let grid = grid_for(&snapshot);
     let line = grid.line(0).expect("RTL line");
-    assert_eq!(line.logical_caret_edge_for_visual(3), 2);
-    assert_eq!(line.logical_caret_edge_for_visual(4), 3);
-    assert_eq!(line.logical_caret_edge_for_visual(6), 6);
+    assert_eq!(line.logical_caret_edge_for_visual(3), 6);
+    assert_eq!(line.logical_caret_edge_for_visual(4), 2);
+    assert_eq!(line.logical_caret_edge_for_visual(6), 0);
+}
+
+#[test]
+fn caret_edges_round_trip_where_the_forward_map_is_injective() {
+    // A caret edge that one logical position claims resolves back to it, so
+    // mapping a cursor or a drag boundary through both maps is stable.
+    for text in ["אבג", "abc אבג", "אבג abc", "אבגabc", "א中ב", "א中", "אב中"] {
+        let state = state_with_text(text);
+        let snapshot = state.snapshot();
+        let grid = grid_for(&snapshot);
+        let Some(line) = grid.line(0) else {
+            continue;
+        };
+        let content = line.content();
+        for logical in content.start..=content.end {
+            if logical < content.end && snapshot.cells[logical].spacer {
+                // A spacer is not a caret position (the caret lives at the
+                // enclosing lead's edges).
+                continue;
+            }
+            let visual = line.visual_caret_col(logical);
+            let back = line.logical_caret_edge_for_visual(visual);
+            // Shared edges resolve to the later logical position.
+            assert!(
+                back == logical || (back > logical && line.visual_caret_col(back) == visual),
+                "{text:?} logical {logical} -> visual {visual} -> {back}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -426,30 +462,6 @@ fn over_width_rows_fail_closed_to_identity() {
     let grid = BidiGrid::resolve(&cells, width, 1, None, ParaDirection::Auto);
     assert!(grid.line(0).is_none(), "u16 maps must fail closed");
     assert_eq!(grid.logical_col_for_visual(0, 12_345), 12_345);
-}
-
-#[test]
-fn zz_edge_probe() {
-    for text in ["א中ב", "אבגabc"] {
-        let state = state_with_text(text);
-        let snapshot = state.snapshot();
-        let grid = grid_for(&snapshot);
-        let line = grid.line(0).expect("line");
-        println!("text={text:?} content={:?}", line.content());
-        println!(
-            " carets {:?}",
-            (0..=8)
-                .map(|i| line.visual_caret_col(i))
-                .collect::<Vec<_>>()
-        );
-        println!(
-            " edges  {:?}",
-            (0..=8)
-                .map(|i| line.logical_caret_edge_for_visual(i))
-                .collect::<Vec<_>>()
-        );
-        println!(" levels {:?}", &line.levels()[..8]);
-    }
 }
 
 #[test]

@@ -2880,9 +2880,10 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     /// visual placement of rows that resolve to an odd bidi level. No
     /// cached state depends on it (cells, snapshots, the canonical hash, and
     /// the codec are untouched), so the switch is live-appliable and a
-    /// pure-LTR session renders byte-identically either way. The default is
+    /// pure-LTR session paints the same rows either way. The default is
     /// `false` until the owner accepts the display-spoofing (Trojan-Source)
-    /// risk recorded in the PR.
+    /// risk; the risk-register row is still pending (deferred, see the
+    /// owning task), so the opt-in is not a recorded acceptance yet.
     pub fn set_bidi(&mut self, enabled: bool) {
         self.bidi = enabled;
     }

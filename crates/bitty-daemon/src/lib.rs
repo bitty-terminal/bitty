@@ -94,6 +94,7 @@ pub mod handshake;
 pub mod idempotency;
 pub mod lease;
 pub mod limits;
+pub mod operator;
 pub mod orphan;
 pub mod peer;
 pub mod platform;

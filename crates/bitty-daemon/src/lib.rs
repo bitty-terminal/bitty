@@ -1,12 +1,14 @@
 //! `bitty-daemon`: the `bittyd` session-host crate seam.
 //!
-//! Status: **seam only**. This crate fixes the service version, the capability
-//! set, and the version-negotiation skeleton required by the accepted
-//! [`bittyd` Session-Host Contract]; it starts no listener, binds no endpoint,
-//! creates no socket file, and owns no session state. The IPC service task
-//! (bitty#2607) replaces the not-wired branch in [`seam::SeamStatus`] with the
-//! real `bitty-ipc` v1 server loop; the registry task (bitty#2601) adds session
-//! records and counters.
+//! Status: **seam plus the in-memory registry core**. This crate fixes the
+//! service version, the capability set, and the version-negotiation skeleton
+//! required by the accepted [`bittyd` Session-Host Contract], and implements
+//! the registry half of bitty#2601: server-generated ids, session records,
+//! counters, retention, and the bounded orphan journal. It still starts no
+//! listener, binds no endpoint, creates no socket file, spawns no worker, and
+//! exposes no IPC method. The IPC service task (bitty#2607) replaces the
+//! not-wired branch in [`seam::SeamStatus`] with the real `bitty-ipc` v1 server
+//! loop and maps registry refusals onto the service error taxonomy.
 //!
 //! # Ownership and dependency direction
 //!
@@ -28,16 +30,21 @@
 //! - [`contract::NEGOTIATE_METHOD`] and [`handshake::negotiate`]: the
 //!   `daemon.negotiate` version half of the handshake.
 //! - [`seam::SeamStatus`]: the explicit no-endpoint status the binary prints.
+//! - [`registry::SessionRegistry`] and [`registry::SessionSnapshot`]: instance
+//!   and session ids, lifecycle generation/revision counters, derived attach
+//!   count, terminal classification, and bounded retention (`D-02`, `D-03`,
+//!   `D-04`, `D-14`).
+//! - [`orphan::OrphanJournal`]: the two-phase bounded orphan journal and the
+//!   exact-identity [`orphan::OrphanReaper`] seam (`D-06`).
 //!
 //! # Deferred, by owning slice
 //!
 //! | Contract area | Owner |
 //! | --- | --- |
-//! | Instance/session ids, registry, counters, retention, orphan records | bitty#2601 |
 //! | `bitty-ipc` v1 server loop, peer capture/re-check, scope evaluation, endpoint lock and tamper detection, method dispatch, error mapping | bitty#2607 |
 //! | Advertised limits and compiled system maxima | bitty#2603 |
-//! | Endpoint discovery and platform cells | bitty#2604 |
-//! | Leases, control token, attach/detach, abort/kill | bitty#2609 |
+//! | Endpoint discovery, containment identity, production orphan reaper, platform probes and journal ACLs | bitty#2604 |
+//! | Leases, control token, attach/detach authority, abort/kill | bitty#2609 |
 //! | Event stream and heartbeat | bitty#2602 |
 //! | Conformance corpus and fake-server parity | bitty#2605 |
 //!
@@ -48,6 +55,8 @@
 pub mod cli;
 pub mod contract;
 pub mod handshake;
+pub mod orphan;
+pub mod registry;
 pub mod seam;
 
 /// Crate version reported by `bittyd --version`, from Cargo metadata.

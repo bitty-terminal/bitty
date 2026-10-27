@@ -1126,6 +1126,14 @@ fn main() {
             image_roots: &runtime.config().background_image_roots,
             history_capture: app_config.effective.history.capture.clone(),
             inspect: Some(&inspect_context),
+            // CTX-1613: only a direct child of the resolved config root is a
+            // writable user layer. An explicit `--config` outside it (or a
+            // safe-mode run) leaves the backend unwired, so `config.set`
+            // fails closed instead of writing a foreign file.
+            config_file: inspect_context
+                .config_file
+                .as_deref()
+                .filter(|path| inspect_context.config_dir.as_deref() == path.parent()),
         },
     );
     let live_snapshot = plugin_session

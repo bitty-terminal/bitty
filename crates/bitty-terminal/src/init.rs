@@ -4706,8 +4706,28 @@ pub(crate) fn write_init_config(
 
 /// Copies the current bytes to a collision-free `<name>.bak[.N]` sibling
 /// using `create_new` so the sole recovery copy is never overwritten.
-fn write_recoverable_backup(
+///
+/// Shared with the plugin `config.manage` writer (CTX-1613): a plugin write
+/// keeps the same recovery copy as `bitty init --force`, and a failed write
+/// leaves both the target and the backup untouched.
+pub(crate) fn write_recoverable_backup(
     target: &std::path::Path,
+) -> Result<std::path::PathBuf, InitWriteError> {
+    write_recoverable_backup_with_mode(target, false)
+}
+
+/// [`write_recoverable_backup`] with an owner-only (`0600`) copy, used by the
+/// plugin `config.manage` writer: a user-layer backup must not be group or
+/// world readable even when the previous file was.
+pub(crate) fn write_recoverable_backup_owner_only(
+    target: &std::path::Path,
+) -> Result<std::path::PathBuf, InitWriteError> {
+    write_recoverable_backup_with_mode(target, true)
+}
+
+fn write_recoverable_backup_with_mode(
+    target: &std::path::Path,
+    owner_only: bool,
 ) -> Result<std::path::PathBuf, InitWriteError> {
     let meta = std::fs::metadata(target).map_err(|err| {
         InitWriteError::Io(format!(
@@ -4738,11 +4758,16 @@ fn write_recoverable_backup(
         } else {
             target.with_file_name(format!("{name}.bak.{attempt}"))
         };
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        if owner_only {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+        }
+        match options.open(&candidate) {
             Ok(mut file) => {
                 file.write_all(&previous).map_err(|err| {
                     InitWriteError::Io(format!(

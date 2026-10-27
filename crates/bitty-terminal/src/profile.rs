@@ -56,6 +56,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::cli::Args;
 use crate::config_cli::{ConfigFormat, ConfigValue, bounded_message, config_format};
 use crate::init::{InitWriteError, render_selector_lua, write_init_config};
+use bitty_runtime::plugin_runtime::{
+    ConfigApplyOutcome, ConfigChange, ConfigSettingValue, ConfigWriteFailure,
+};
 
 /// Maximum profiles listed by `config profile list` (deterministic bound).
 pub(crate) const PROFILE_LIST_CAP: usize = 256;
@@ -2371,6 +2374,21 @@ fn write_profile_atomic(
     content: &str,
     expected: Option<&ProfileIdentity>,
 ) -> Result<(), ProfileWriteError> {
+    write_profile_atomic_with(path, content, expected, false)
+}
+
+/// [`write_profile_atomic`] with an explicit permission policy.
+///
+/// `owner_only` forces `0600` on the staged file (used for the user-layer
+/// `config.manage` writer: configuration can name local resources and must
+/// never be group/world readable). Profile commands keep the historical
+/// preserve-the-existing-mode behavior.
+fn write_profile_atomic_with(
+    path: &Path,
+    content: &str,
+    expected: Option<&ProfileIdentity>,
+    owner_only: bool,
+) -> Result<(), ProfileWriteError> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     if !parent.as_os_str().is_empty() {
         std::fs::create_dir_all(parent).map_err(ProfileWriteError::Io)?;
@@ -2379,7 +2397,11 @@ fn write_profile_atomic(
         || String::from("profile.lua"),
         |name| name.to_string_lossy().into_owned(),
     );
-    let permissions = std::fs::metadata(path).ok().map(|meta| meta.permissions());
+    let permissions = if owner_only {
+        None
+    } else {
+        std::fs::metadata(path).ok().map(|meta| meta.permissions())
+    };
     let mut temp = None;
     for _ in 0..PROFILE_MAX_TEMP_ATTEMPTS {
         let counter = PROFILE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -2411,7 +2433,18 @@ fn write_profile_atomic(
         let _ = std::fs::remove_file(&temp_path);
         return Err(ProfileWriteError::Io(err));
     }
-    if let Some(permissions) = permissions {
+    if owner_only {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(err) =
+                std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))
+            {
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(ProfileWriteError::Io(err));
+            }
+        }
+    } else if let Some(permissions) = permissions {
         let _ = std::fs::set_permissions(&temp_path, permissions);
     }
     #[cfg(test)]
@@ -3774,9 +3807,307 @@ fn rewrite_selector_profile(content: &str, new_profile: &str) -> Option<String> 
     Some(out)
 }
 
+/// App-side backend for the `config.manage` write head (CTX-1613,
+/// bitty#2393).
+///
+/// Writes only the user layer (`<config-dir>/init.lua` or its `config.lua`
+/// alias, resolved at startup): profiles, system paths, and the managed
+/// plugin ledger are never addressable because the target is fixed here and
+/// no call carries a path.
+///
+/// Every change is re-validated through the same strict loader `config
+/// check` uses (user layer + the selector's profile chain + local theme
+/// selection + keymaps + runtime/background-image validation) before any
+/// byte is replaced. The commit is the existing atomic profile writer: a
+/// unique sibling temporary file, `sync_all`, a pre-commit identity re-check,
+/// rename, and a parent-directory sync. Failures leave the previous bytes
+/// byte-identical, and a `.bak` of the previous content is written first.
+pub(crate) struct UserLayerConfigWriter {
+    /// Resolved user config directory (`$XDG_CONFIG_HOME/bitty`).
+    config_dir: PathBuf,
+    /// Resolved user-layer file (`init.lua` or the `config.lua` alias).
+    target: PathBuf,
+}
+
+impl UserLayerConfigWriter {
+    /// Build a writer for one resolved user-layer file.
+    ///
+    /// Returns `None` when the target is not a direct child of `config_dir`:
+    /// an explicit `--config` outside the user root must never become a
+    /// plugin write target.
+    pub(crate) fn new(config_dir: PathBuf, target: PathBuf) -> Option<Self> {
+        let parent = target.parent()?;
+        if parent != config_dir {
+            return None;
+        }
+        Some(Self { config_dir, target })
+    }
+
+    fn apply_change(
+        &self,
+        change: &ConfigChange,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        // Defense in depth: re-check the fixed target invariant even though
+        // the constructor enforces it.
+        let Some(parent) = self.target.parent() else {
+            return Err(ConfigWriteFailure::Unsafe);
+        };
+        if parent != self.config_dir {
+            return Err(ConfigWriteFailure::Unsafe);
+        }
+        // Defense in depth: the service already checked the allowlist and
+        // shape; the writer refuses anything outside it again so a future
+        // caller cannot reach a schema field the plugin surface excludes
+        // (for example `terminal.shell`).
+        let allowed = bitty_runtime::plugin_runtime::writable_setting(change.key())
+            .ok_or(ConfigWriteFailure::Invalid)?;
+        if allowed.key != change.setting().key {
+            return Err(ConfigWriteFailure::Invalid);
+        }
+        let field = schema_field_entry(change.key()).ok_or(ConfigWriteFailure::Invalid)?;
+
+        let (content, identity, existed) = match std::fs::symlink_metadata(&self.target) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    // Never write through a symlink: the resolved target is
+                    // outside this host's fixed user-layer address.
+                    return Err(ConfigWriteFailure::Unsafe);
+                }
+                if !meta.is_file() {
+                    return Err(ConfigWriteFailure::Unsafe);
+                }
+                let (content, identity) = read_profile(ReadIntent::Edit, "config", &self.target)
+                    .map_err(|_| ConfigWriteFailure::Io)?;
+                (content, Some(identity), true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                (String::from("return {}\n"), None, false)
+            }
+            Err(_) => return Err(ConfigWriteFailure::Io),
+        };
+
+        let segments: Vec<&str> = change.key().split('.').collect();
+        let table = segments[0];
+        let mut updated = content.clone();
+        // The typed plan merges pinned tables as complete structs: creating
+        // one in the user layer without its inherited leaves would reset
+        // every omitted sibling to the core default. Pin the resolved
+        // effective table first, then edit exactly one leaf.
+        if PINNED_TABLES.contains(&table) {
+            let current = parse_user_plan(&updated, &self.target)
+                .map_err(|error| config_invalid("seed parse", error))?;
+            if !declares_table(&current.plan, table) {
+                let seed = inherited_table_literal(
+                    table,
+                    &merged_current_unvalidated(Some(current), &self.config_dir)
+                        .map_err(|error| config_invalid("seed merge", error))?
+                        .effective,
+                );
+                updated = set_lua_path(&updated, &[table], &seed)
+                    .map_err(|error| config_invalid("seed splice", format_args!("{error}")))?;
+            }
+        }
+        updated = set_lua_path(&updated, &segments, &change.value().render_literal())
+            .map_err(|error| config_invalid("value splice", format_args!("{error}")))?;
+        let merged = validate_user_candidate(&updated, &self.target, &self.config_dir)?;
+        // Defense in depth: the bytes just spliced must re-read as the
+        // requested value. Never report success for a write that landed
+        // somewhere the merge does not read.
+        if !matches_request(field, &merged.effective, change.value()) {
+            return Err(config_invalid(
+                "round trip",
+                format_args!(
+                    "'{}' re-reads as {:?} instead of {:?}",
+                    change.key(),
+                    (field.get)(&merged.effective),
+                    change.value()
+                ),
+            ));
+        }
+        if existed && content == updated {
+            return Ok(ConfigApplyOutcome::Unchanged);
+        }
+        if existed {
+            crate::init::write_recoverable_backup_owner_only(&self.target)
+                .map_err(|_| ConfigWriteFailure::Io)?;
+            write_profile_atomic_with(&self.target, &updated, identity.as_ref(), true).map_err(
+                |error| match error {
+                    ProfileWriteError::NotRegular => ConfigWriteFailure::Unsafe,
+                    ProfileWriteError::Changed | ProfileWriteError::Io(_) => ConfigWriteFailure::Io,
+                },
+            )?;
+        } else {
+            create_user_config_exclusive(&self.target, &updated)
+                .map_err(|_| ConfigWriteFailure::Io)?;
+        }
+        Ok(ConfigApplyOutcome::Applied)
+    }
+}
+
+impl bitty_runtime::plugin_runtime::ConfigWriteBackend for UserLayerConfigWriter {
+    fn apply(&self, change: &ConfigChange) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        match self.apply_change(change) {
+            Ok(outcome) => Ok(outcome),
+            Err(failure) => {
+                // The host log may carry the path; the plugin-visible
+                // diagnostic is the path-free failure class only.
+                crate::logging::warn(|| {
+                    format!(
+                        "bitty: config.manage write refused for '{}' at '{}' ({:?})",
+                        change.key(),
+                        self.target.display(),
+                        failure
+                    )
+                });
+                Err(failure)
+            }
+        }
+    }
+}
+
+/// Parse one user-layer body strictly (never a profile layer).
+fn parse_user_plan(
+    content: &str,
+    path: &Path,
+) -> Result<bitty_config::LayeredPlan, bitty_config::ConfigError> {
+    let source = bitty_config::plan::ConfigSource::new(
+        bitty_config::plan::LayerKind::User,
+        Some(path.display().to_string()),
+    );
+    let plan = bitty_config::file::parse_lua_config(content, &source)?;
+    let plan = bitty_config::migrate(plan)?;
+    Ok(bitty_config::LayeredPlan::new(source, plan))
+}
+
+/// Merge a candidate user layer over its selector's profile chain without
+/// validation (seeding only).
+fn merged_current_unvalidated(
+    user: Option<bitty_config::LayeredPlan>,
+    config_dir: &Path,
+) -> Result<bitty_config::MergedConfig, bitty_config::ConfigError> {
+    let selector = user
+        .as_ref()
+        .and_then(|layer| layer.plan.selector.as_ref())
+        .map(|selector| selector.profile.clone());
+    let chain = match selector {
+        Some(name) => bitty_config::file::load_profile_chain_in_dir(
+            &name,
+            &config_dir.join(bitty_config::file::PROFILES_DIR_NAME),
+        )?,
+        None => Vec::new(),
+    };
+    bitty_config::file::resolve_effective_with_profiles_unvalidated(
+        user,
+        chain,
+        &bitty_config::file::CliOverrides::default(),
+    )
+}
+
+/// Validate a candidate user layer exactly as the next launch would load it.
+fn validate_user_candidate(
+    content: &str,
+    path: &Path,
+    config_dir: &Path,
+) -> Result<bitty_config::MergedConfig, ConfigWriteFailure> {
+    let candidate =
+        parse_user_plan(content, path).map_err(|error| config_invalid("candidate parse", error))?;
+    let selector = candidate
+        .plan
+        .selector
+        .as_ref()
+        .map(|selector| selector.profile.clone());
+    let chain = match selector {
+        Some(name) => bitty_config::file::load_profile_chain_in_dir(
+            &name,
+            &config_dir.join(bitty_config::file::PROFILES_DIR_NAME),
+        )
+        .map_err(|error| config_invalid("profile chain", error))?,
+        None => Vec::new(),
+    };
+    let merged = bitty_config::file::resolve_effective_with_profiles(
+        Some(candidate),
+        chain,
+        &bitty_config::file::CliOverrides::default(),
+    )
+    .map_err(|error| config_invalid("strict merge", error))?;
+    // The same strict post-merge gates `config check` runs: local theme
+    // selection, keymap resolution, runtime bounds, and the background
+    // image root/header/decode pipeline. A plugin write must not bypass
+    // what the CLI refuses.
+    let mut resolved = merged.effective.clone();
+    bitty_config::local_theme::apply_selection(&mut resolved)
+        .map_err(|error| config_invalid("local theme", error))?;
+    bitty_config::keymap::resolve_keymaps(&resolved)
+        .map_err(|error| config_invalid("keymaps", error))?;
+    let runtime = crate::config_cli::runtime_config_from_effective_for(
+        &resolved,
+        crate::config_cli::startup_prefer_light(),
+    )
+    .map_err(|error| config_invalid("runtime config", error))?;
+    bitty_runtime::validate_background_images(&runtime)
+        .map_err(|error| config_invalid("background images", error))?;
+    Ok(merged)
+}
+
+/// Log one refused validation stage host-side and return the path-free class.
+///
+/// The plugin never sees the detail; the local log keeps the exact loader
+/// error for the operator and the security reviewer.
+fn config_invalid(context: &str, error: impl std::fmt::Display) -> ConfigWriteFailure {
+    crate::logging::warn(|| format!("bitty: config.manage {context} refused: {error}"));
+    ConfigWriteFailure::Invalid
+}
+
+/// Whether the merged effective value equals the typed request.
+fn matches_request(
+    field: &SchemaField,
+    effective: &bitty_config::EffectiveConfig,
+    requested: &ConfigSettingValue,
+) -> bool {
+    match ((field.get)(effective), requested) {
+        (ConfigValue::Text(actual), ConfigSettingValue::Text(expected)) => actual == *expected,
+        (ConfigValue::Number(actual), ConfigSettingValue::Integer(expected)) => {
+            actual == expected.to_string()
+        }
+        (ConfigValue::Number(actual), ConfigSettingValue::Number(expected)) => {
+            actual == format!("{expected}")
+        }
+        (ConfigValue::Bool(actual), ConfigSettingValue::Bool(expected)) => actual == *expected,
+        _ => false,
+    }
+}
+
+/// Create one brand-new user-layer file exclusively with owner-only mode.
+fn create_user_config_exclusive(path: &Path, content: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    let result = file
+        .write_all(content.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(path);
+        return Err(error);
+    }
+    sync_parent_dir(path);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bitty_runtime::plugin_runtime::ConfigWriteBackend;
 
     fn scratch_dir(tag: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -4698,11 +5029,370 @@ mod tests {
     }
 
     #[test]
+    fn config_manage_allowlist_matches_the_schema_projection() {
+        // The plugin write surface is a projection of the documented scalar
+        // schema: every writable key resolves to a schema field of the same
+        // kind, and no scalar field outside the documented exclusions is
+        // silently unreachable.
+        use bitty_runtime::plugin_runtime::{CONFIG_WRITABLE_SETTINGS, ConfigValueKind};
+        for setting in CONFIG_WRITABLE_SETTINGS {
+            let field = schema_field_entry(setting.key)
+                .unwrap_or_else(|| panic!("'{}' must exist in SCHEMA_FIELDS", setting.key));
+            let kind = match field.kind {
+                FieldKind::Text => ConfigValueKind::Text,
+                FieldKind::Integer => ConfigValueKind::Integer,
+                FieldKind::Number => ConfigValueKind::Number,
+                FieldKind::Bool => ConfigValueKind::Bool,
+                FieldKind::List => {
+                    panic!("'{}' is list-valued and must stay CLI-only", setting.key)
+                }
+            };
+            assert_eq!(setting.kind, kind, "kind drift for '{}'", setting.key);
+        }
+        for excluded in [
+            "terminal.shell",
+            "mod_key",
+            "mouse.right",
+            "mouse.middle",
+            "font.fallback",
+            "session.restore_on_startup",
+        ] {
+            assert!(
+                bitty_runtime::plugin_runtime::writable_setting(excluded).is_none(),
+                "'{excluded}' must stay CLI-only"
+            );
+            assert!(
+                schema_field_entry(excluded).is_some(),
+                "'{excluded}' exists in the schema but is intentionally excluded"
+            );
+        }
+    }
+
+    #[test]
     fn success_envelope_escapes_the_command() {
         let envelope = success_envelope("config \"profile\"", "{\"kind\":\"profile\"}");
         assert_eq!(
             envelope,
             "{\"v\":1,\"command\":\"config \\\"profile\\\"\",\"ok\":true,\"result\":{\"kind\":\"profile\"}}"
         );
+    }
+
+    // ── config.manage user-layer writer (CTX-1613, bitty#2393) ────────
+
+    fn config_writer(dir: &Path) -> UserLayerConfigWriter {
+        UserLayerConfigWriter::new(dir.to_path_buf(), dir.join("init.lua"))
+            .expect("init.lua is a direct child of the config dir")
+    }
+
+    fn setting_change(key: &str, value: ConfigSettingValue) -> ConfigChange {
+        let setting = bitty_runtime::plugin_runtime::writable_setting(key).expect("allowlisted");
+        ConfigChange::new(setting, value)
+    }
+
+    fn merged_for(dir: &Path, content: &str) -> bitty_config::MergedConfig {
+        validate_user_candidate(content, &dir.join("init.lua"), dir).expect("valid candidate")
+    }
+
+    #[test]
+    fn config_writer_applies_a_theme_alias_by_name() {
+        // The dashboard's primary write: a theme selection. A preset alias
+        // must round-trip as written, since the writer re-reads the merged
+        // value and refuses a mismatch.
+        let dir = scratch_dir("cfg-theme");
+        let writer = config_writer(&dir);
+        let outcome = writer
+            .apply(&setting_change(
+                "appearance.theme",
+                ConfigSettingValue::text("catppuccin").expect("text"),
+            ))
+            .expect("applied");
+        assert_eq!(outcome, ConfigApplyOutcome::Applied);
+        let content = std::fs::read_to_string(dir.join("init.lua")).expect("layer");
+        assert!(content.contains("theme = \"catppuccin\""), "{content}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_writer_constructor_refuses_targets_outside_the_user_root() {
+        let dir = scratch_dir("cfg-root");
+        assert!(UserLayerConfigWriter::new(dir.clone(), dir.join("init.lua")).is_some());
+        assert!(
+            UserLayerConfigWriter::new(dir.clone(), dir.join("nested/init.lua")).is_none(),
+            "only a direct child of the config root is addressable"
+        );
+        assert!(
+            UserLayerConfigWriter::new(dir.clone(), dir.join("../init.lua")).is_none(),
+            "traversal never resolves outside the root"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_writer_creates_the_user_layer_and_applies_one_value() {
+        let dir = scratch_dir("cfg-create");
+        let writer = config_writer(&dir);
+        let outcome = writer
+            .apply(&setting_change(
+                "font.size",
+                ConfigSettingValue::number(12.5).expect("number"),
+            ))
+            .expect("applied");
+        assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+        let path = dir.join("init.lua");
+        let content = std::fs::read_to_string(&path).expect("written layer");
+        assert!(content.starts_with("return {"), "{content}");
+        assert!(content.contains("size = 12.5"), "{content}");
+        // The strict loader reads exactly the requested value back.
+        let merged = merged_for(&dir, &content);
+        let field = schema_field_entry("font.size").expect("schema field");
+        assert_eq!(
+            (field.get)(&merged.effective),
+            ConfigValue::Number(String::from("12.5"))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "user-layer writes are owner-only");
+        }
+        assert!(
+            !dir.join("init.lua.bak").exists(),
+            "a brand-new layer has no previous bytes to back up"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_writer_backs_up_and_keeps_the_selector_and_profile_layers() {
+        let dir = scratch_dir("cfg-existing");
+        let path = dir.join("init.lua");
+        std::fs::write(&path, render_selector_lua("work")).expect("selector");
+        std::fs::create_dir_all(dir.join("profiles")).expect("profiles dir");
+        std::fs::write(
+            dir.join("profiles/work.lua"),
+            "return { font = { family = \"Work Mono\", size = 13 } }\n",
+        )
+        .expect("profile");
+        let before = std::fs::read(&path).expect("preimage");
+
+        let writer = config_writer(&dir);
+        let outcome = writer
+            .apply(&setting_change(
+                "font.size",
+                ConfigSettingValue::number(12.5).expect("number"),
+            ))
+            .expect("applied");
+        assert_eq!(outcome, ConfigApplyOutcome::Applied);
+
+        let content = std::fs::read_to_string(&path).expect("layer");
+        assert!(content.contains("profile = \"work\""), "selector survives");
+        assert!(
+            content.contains("family = \"Work Mono\""),
+            "the inherited font table is pinned, never reset: {content}"
+        );
+        assert!(content.contains("size = 12.5"), "{content}");
+        // Recovery copy is the exact previous bytes.
+        let backup = std::fs::read(dir.join("init.lua.bak")).expect("backup");
+        assert_eq!(backup, before, "the .bak holds the previous bytes");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("init.lua.bak"))
+                .expect("backup meta")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "the recovery copy is owner-only");
+        }
+        // The merged value is the requested one and the profile still loads.
+        let merged = merged_for(&dir, &content);
+        let field = schema_field_entry("font.size").expect("schema field");
+        assert_eq!(
+            (field.get)(&merged.effective),
+            ConfigValue::Number(String::from("12.5"))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).expect("meta").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the replaced layer is owner-only");
+        }
+
+        // Re-applying the same value is a byte-identical no-op.
+        let after = std::fs::read(&path).expect("bytes");
+        let outcome = writer
+            .apply(&setting_change(
+                "font.size",
+                ConfigSettingValue::number(12.5).expect("number"),
+            ))
+            .expect("unchanged");
+        assert_eq!(outcome, ConfigApplyOutcome::Unchanged);
+        assert_eq!(std::fs::read(&path).expect("bytes"), after);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_writer_refuses_an_invalid_value_with_identical_bytes() {
+        let dir = scratch_dir("cfg-invalid");
+        let path = dir.join("init.lua");
+        let original = "return { window = { opacity = 0.9 } }\n";
+        std::fs::write(&path, original).expect("layer");
+        let writer = config_writer(&dir);
+        // The typed schema bounds opacity to 0..=1; the strict loader must
+        // reject it before any byte is replaced.
+        let failure = writer
+            .apply(&setting_change(
+                "window.opacity",
+                ConfigSettingValue::number(5.0).expect("number"),
+            ))
+            .expect_err("schema rejects the value");
+        assert_eq!(failure, ConfigWriteFailure::Invalid);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("bytes"),
+            original,
+            "a refused validation leaves the previous bytes"
+        );
+        assert!(!dir.join("init.lua.bak").exists(), "no backup on refusal");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_writer_refuses_keys_outside_the_plugin_allowlist() {
+        let dir = scratch_dir("cfg-key");
+        static SHELL: bitty_runtime::plugin_runtime::ConfigSettingKey =
+            bitty_runtime::plugin_runtime::ConfigSettingKey {
+                key: "terminal.shell",
+                kind: bitty_runtime::plugin_runtime::ConfigValueKind::Text,
+            };
+        let change = ConfigChange::new(&SHELL, ConfigSettingValue::text("/bin/sh").expect("text"));
+        let writer = config_writer(&dir);
+        let failure = writer.apply(&change).expect_err("not allowlisted");
+        assert_eq!(failure, ConfigWriteFailure::Invalid);
+        assert!(!dir.join("init.lua").exists(), "nothing was created");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_writer_failure_leaves_bytes_and_never_a_partial_file() {
+        let dir = scratch_dir("cfg-commit");
+        let path = dir.join("init.lua");
+        let original = "return { font = { family = \"Mono\", size = 11 } }\n";
+        std::fs::write(&path, original).expect("layer");
+        let writer = config_writer(&dir);
+        // Fault injection: remove the staged temporary file at the commit
+        // point, so the rename fails after validation. The target must keep
+        // its exact previous bytes and no partial file may remain.
+        let _hook = arm_commit_hook(|target: &Path| {
+            let parent = target.parent().expect("parent");
+            for entry in std::fs::read_dir(parent).expect("read dir") {
+                let entry = entry.expect("entry");
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".init.lua.tmp-")
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        });
+        let failure = writer
+            .apply(&setting_change(
+                "font.size",
+                ConfigSettingValue::number(12.5).expect("number"),
+            ))
+            .expect_err("commit failed");
+        assert_eq!(failure, ConfigWriteFailure::Io);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("bytes"),
+            original,
+            "a failed commit is byte-identical"
+        );
+        assert!(
+            !std::fs::read_dir(&dir)
+                .expect("dir")
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-")),
+            "no temporary file is left behind"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_writer_never_writes_through_a_symlink() {
+        let dir = scratch_dir("cfg-symlink");
+        let outside = dir.join("outside.lua");
+        let outside_bytes = "return { font = { size = 99 } }\n";
+        std::fs::write(&outside, outside_bytes).expect("outside file");
+        let path = dir.join("init.lua");
+        std::os::unix::fs::symlink(&outside, &path).expect("symlink");
+        let writer = config_writer(&dir);
+        let failure = writer
+            .apply(&setting_change(
+                "font.size",
+                ConfigSettingValue::number(12.5).expect("number"),
+            ))
+            .expect_err("symlink refused");
+        assert_eq!(failure, ConfigWriteFailure::Unsafe);
+        assert_eq!(
+            std::fs::read_to_string(&outside).expect("outside bytes"),
+            outside_bytes,
+            "the symlink target is never touched"
+        );
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("symlink meta")
+                .file_type()
+                .is_symlink(),
+            "the symlink is not replaced"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_writer_output_is_ascii_bounded_and_local() {
+        // Diagnostics and values stay bounded; the writer never returns a
+        // path in a failure class (the service maps the class to its typed
+        // error and never sees the backend's local log line).
+        let dir = scratch_dir("cfg-paths");
+        let writer = config_writer(&dir);
+        for failure in [
+            ConfigWriteFailure::Invalid,
+            ConfigWriteFailure::Unavailable,
+            ConfigWriteFailure::Unsafe,
+            ConfigWriteFailure::Io,
+        ] {
+            let rendered = format!("{failure:?}");
+            assert!(!rendered.contains('/'), "{rendered}");
+        }
+        // A text value at the schema's family bound renders and is stored
+        // verbatim; the service's wider 1 KiB bound is not the schema bound,
+        // and the strict loader stays authoritative.
+        let text = "M".repeat(128);
+        writer
+            .apply(&setting_change(
+                "font.family",
+                ConfigSettingValue::text(&text).expect("bounded text"),
+            ))
+            .expect("applied");
+        let content = std::fs::read_to_string(dir.join("init.lua")).expect("layer");
+        assert!(content.contains(&text), "the full bounded text is stored");
+
+        // A value inside the service bound but outside the schema bound is
+        // refused by the loader and leaves the bytes untouched.
+        let before = std::fs::read_to_string(dir.join("init.lua")).expect("layer");
+        let failure = writer
+            .apply(&setting_change(
+                "font.family",
+                ConfigSettingValue::text(&"N".repeat(1024)).expect("service bound"),
+            ))
+            .expect_err("schema bound refuses");
+        assert_eq!(failure, ConfigWriteFailure::Invalid);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("init.lua")).expect("layer"),
+            before
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

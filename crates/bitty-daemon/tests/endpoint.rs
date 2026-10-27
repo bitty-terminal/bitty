@@ -181,16 +181,21 @@ fn a_stale_socket_with_a_drifted_mode_is_still_reclaimed() {
     let socket = temp.runtime_dir().join("bittyd.sock");
     let stale = UnixListener::bind(&socket).expect("bind the socket to go stale");
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o755)).expect("drift the mode");
-    let stale_inode = inode_of(&socket);
     drop(stale);
 
     // A dead socket owned by this uid is reclaimable: the mode check belongs
     // to the bound endpoint, and a crash between bind and chmod must not brick
-    // the next start. A *live* endpoint is never unlinked.
+    // the next start. A *live* endpoint is never unlinked. The inode is not
+    // asserted to change: a freshly created socket can reuse the inode of the
+    // object removed moments earlier (observed on CI), so the mode and a real
+    // connect are the load-bearing evidence.
     let endpoint = open_endpoint(&env_for(temp.path())).expect("a dead socket is reclaimed");
-    assert_ne!(inode_of(endpoint.socket_path()), stale_inode);
     assert_eq!(mode_of(endpoint.socket_path()), SOCKET_MODE);
+    std::os::unix::net::UnixStream::connect(endpoint.socket_path())
+        .expect("the reclaimed endpoint accepts connections");
+    let path = endpoint.socket_path().to_path_buf();
     endpoint.close().expect("clean shutdown");
+    assert!(!path.exists(), "clean shutdown removes the socket");
 }
 
 #[test]

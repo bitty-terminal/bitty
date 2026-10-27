@@ -21,6 +21,10 @@ RELEASE=".github/workflows/release.yml"
 REPAIR=".github/workflows/repair-release-channels.yml"
 FAIL=0
 
+# The spec's default version must track the workspace version, so the guard
+# never pins a stale release number.
+WS_VER="$(scripts/check-release-version.sh --print)"
+
 pass() {
   echo "PASS: $1"
 }
@@ -155,8 +159,8 @@ expect_contains "$BUILD_SRPM" 'rpm -qp --qf' \
 
 expect_contains "packaging/bitty.spec" 'Version:        %{version}' \
   "spec version is overridable"
-expect_contains "packaging/bitty.spec" '%{!?version:%global version 0.0.29}' \
-  "spec keeps a default version"
+expect_contains "packaging/bitty.spec" "%{!?version:%global version ${WS_VER}}" \
+  "spec keeps a default version matching the workspace ($WS_VER)"
 expect_contains "packaging/bitty.spec" "BuildRequires:  zstd" \
   "spec declares zstd for .tar.zst extraction"
 expect_contains "packaging/bitty.spec" "%global debug_package %{nil}" \

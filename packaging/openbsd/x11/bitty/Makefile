@@ -5,7 +5,7 @@
 #
 #   cp -R packaging/openbsd/x11/bitty /usr/ports/x11/bitty
 #   cd /usr/ports/x11/bitty
-#   make makesum      # once the v0.0.29 tag exists; see distinfo
+#   make makesum      # once the v0.0.30 tag exists; see distinfo
 #   make install clean
 #
 # packaging/openbsd.md documents the workflow; packaging/README.md documents the
@@ -15,7 +15,7 @@
 
 COMMENT =	GPU-accelerated terminal emulator with panes and Lua extensions
 
-V =		0.0.29
+V =		0.0.30
 DISTNAME =	bitty-${V}
 PKGNAME =	bitty-${V}
 CATEGORIES =	x11

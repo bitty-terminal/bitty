@@ -5,31 +5,115 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.0.30] - 2026-10-28
 
 ### Added
 
-- **Paint-time Unicode BiDi (UAX #9) foundation (`CTX-1612`, bitty#1766):**
-  logical lines now resolve through `unicode-bidi` 0.3.18 (new direct
-  dependency of `bitty-term-state` only: MIT OR Apache-2.0, MSRV 1.47, safe
-  Rust, UCD 16.0.0 bidi classes) and rows with an odd resolved level can be
-  painted in visual order. `Cell` layout, the `Snapshot` schema, the
-  canonical hash (v13), and the codec are unchanged; the policy defaults to
-  `terminal.bidi = off` until the owner accepts the display-spoofing
-  (Trojan-Source) risk, and a project layer cannot enable it. Two input
-  behavior fixes do change committed cells versus the previous release:
-  `U+2066..U+2069` isolates now resolve zero-width, and a bidi control at
-  column 0 after a hard break is dropped instead of attaching to the
-  previous row. With BiDi off no reordering runs and the paint path is
-  unchanged; the canonical hash, `Snapshot` schema, and codec are identical
-  to the previous release, while the two committed-cell fixes above can
-  still change rendered output.
-  Hit tests, cursor/IME paint, selection paint, and hyperlink underlines use
-  one shared per-row map only when the painted `Snapshot` is the logical
-  state grid; windowed/truncated, placeholder-bearing, and alt-stale views
-  fail closed to logical identity in both paint and hit testing. Deferred:
-  shaped RTL emission (RTL rows use the per-cell path), scrolled-history
-  paragraphs, `terminal.bidi_direction`, and the risk-register row.
+- **iTerm2 OSC 1337 inline images (`CTX-1590`, bitty#2217):** `OSC 1337 ;
+  File=` PNG images now store, place, and paint through the Kitty seam, with
+  the cursor advanced past the span (`C=0`) as `imgcat` does. Requests are
+  capped before decode (4 MiB base64 wire, 3 MiB decoded, 16,777,216 px);
+  fourteen refusal reasons plus an `iterm2_refused` counter keep rejected
+  requests inert, `bitty inspect protocol iterm2-inline-images` reports the
+  subset, and sixel stays refused.
+- **Named profiles from the CLI (`CTX-1589`, bitty#2449):** `bitty config
+  profile create|clone|rename|delete|list|show|use|get|set|path`, with
+  `--json` on every state-reporting verb. Names keep a fixed grammar
+  (`default` reserved) and symlinks are refused; writes are atomic and
+  validated against the merged user layer plus candidate chain. `set`
+  addresses dotted schema paths and pins the whole inherited table, so
+  editing one leaf keeps its siblings.
+- **Grapheme clusters and East Asian Width (`CTX-1609`, bitty#1767):** an
+  extended grapheme cluster is now one layout unit — cursor, backspace,
+  selection, and paint step by cluster — with UAX #29 / UAX #11 properties
+  generated from pinned UCD 18.0.0 snapshots. `terminal.ambiguous_width =
+  narrow|wide` (default `narrow`, restart required) applies East Asian
+  Ambiguous width.
+- **Paint-time Unicode BiDi foundation (UAX #9) (`CTX-1612`, bitty#1766):**
+  logical lines resolve through `unicode-bidi` 0.3.18 (MIT OR Apache-2.0,
+  UCD 16.0.0 classes), and odd-level rows can paint in visual order. `Cell`,
+  the `Snapshot` schema, the canonical hash (v13), and the codec are
+  unchanged; `terminal.bidi` defaults to `off` until the owner accepts the
+  display-spoofing (Trojan-Source) risk, and a project layer cannot enable
+  it. Two input behavior fixes do change committed cells versus the previous
+  release: `U+2066..U+2069` isolates now resolve zero-width, and a bidi
+  control at column 0 after a hard break is dropped instead of attaching to
+  the previous row. With BiDi off no reordering runs and the paint path is
+  unchanged, yet those two fixes can still change rendered output. Deferred:
+  shaped RTL emission, scrolled-history paragraphs,
+  `terminal.bidi_direction`, and the risk-register row.
+- **`config.manage` write surface (`CTX-1613`, bitty#2393):**
+  `bitty.config.preview` / `bitty.config.set` write the user layer through a
+  parameter-free high-risk head that needs a recorded approval and a one-shot
+  token bound to the previewed bytes; the preview names every key it will
+  write, pinned seeds included. An allowlist (`history.capture.*` excluded)
+  and safe-mode denial bound it.
+- **Internal groundwork (`CTX-1614`, `CTX-1615`, `CTX-1616`, `CTX-1619`,
+  `CTX-1620`, `CTX-1621`, `CTX-1622`, `CTX-1623`; bitty#2163, bitty#2741,
+  bitty#2606, bitty#2601, bitty#2602, bitty#2603, bitty#2604, bitty#2609):**
+  the `bitty-rich` Kitty backend is injectable through a dyn handle;
+  `preview.yml` publishes daily `BITTY_CHANNEL=preview` archives with
+  provenance and 14-release retention, and `bitty-daemon` with `bittyd`
+  carries the accepted contract, session registry, orphan journal, bounded
+  event stream, compiled limits with idempotency and audit, endpoint and
+  peer-trust primitives, and attach leases with control transfer. The binary
+  still binds no socket and serves no IPC method.
+
+### Changed
+
+- **The shaped text stack is the production default (`CTX-1607`,
+  bitty#2219):** `auto` resolves shaped → crossfont → headless, and
+  `BITTY_TEXT_STACK=classic` forces the old path. Shaping gains segment-aware
+  keys, `calt` detection, and advance gates that degrade to unshaped
+  painting. PB-1 holds through a versioned font index at
+  `$XDG_CACHE_HOME/bitty/font-index-v2`: `SwashSingle::new` drops from
+  ~233 ms to 7.3–7.8 ms warm and `bitty --headless` from ~279 ms to ~37 ms.
+  The index is a parse cache; corrupt or over-cap caches fail soft and
+  `BITTY_FONT_INDEX=0` forces the old scan. Expect one visible change: the
+  pen baseline uses the measured face metrics instead of the legacy 3/4-cell
+  rule (17 px rather than 14 px on the reference font).
+
+### Fixed
+
+- **Wayland finally gets its occlusion edge (`CTX-1482`, `CTX-1605`,
+  bitty#2715):** winit 0.30.13 never constructs `Occluded` on Wayland, so the
+  0.0.29 surface gate was inert there while Hyprland kept serving frame
+  callbacks. A redraw unanswered past 300 ms now synthesizes the edge, and
+  winit is vendored with upstream PR #4710 behind a lock/digest gate.
+- **Deterministic present, docs, and gates (`CTX-1594`, `CTX-1596`,
+  `CTX-1603`, `CTX-1606`, `CTX-1611`, `CTX-1617`, `CTX-1618`; bitty#2703,
+  bitty#2706, bitty#2720, bitty#2740, bitty#2749):** all tiled-drag
+  release arms use the supplied clock instead of `Instant::now()`, the
+  automation registry is serialized, and the
+  font-index truncation test is path-independent. The soak gets a 300 s
+  nextest period above its own 240 s budget, `cargo doc` with `-D warnings`
+  is clean after 336 documentation-only fixes, `just doc-check` now runs in
+  CI, and `check-scratch-paths.sh` allows only `/tmp/bitty`.
+
+### Security
+
+- **Control strings are bounded (`CTX-1592`, bitty#2704):** one parser-level
+  budget of 4,198,413 bytes covers a bare OSC of any id, DCS, SOS, PM, and
+  the Kitty APC path; a discarded APC now aborts at `ESC` without consuming
+  the next byte (`CTX-1603`, bitty#2712). On overflow the parser flushes
+  `CAN` and swallows the rest until the real terminator: a 256 MiB
+  unterminated OSC peaks at 16.8 MB instead of 1,073,745,920 bytes. Refusal
+  is bounded, not inert — the forwarded prefix can still apply one truncated
+  mapped action (including an `OSC 52` write under the clipboard gate).
+- **Two iTerm2 escapes closed (`CTX-1590`, bitty#2217):** the private
+  `VteString` tracker mapped `0x7F..=0xFF` to `Ground` while `vte` stays in
+  `Escape`, so a following raw `]` opened an unobserved `OSC`. The tracker
+  now mirrors `advance_esc`, all bytes go through one `feed_vte()`, and open
+  strings close before diversion.
+- **`config.manage` cannot be granted by a project (`CTX-1613`,
+  bitty#2393):** the head is on the sensitive list, a development root no
+  longer grants it, activation skips recorded-only heads and the RPC layer
+  denies them, and `history.capture.*` stays off the allowlist.
+- **Vendored winit sits outside advisory matching (`CTX-1605`,
+  bitty#2715):** `PATCHES.md` records that path packages are matched by
+  neither `cargo audit` nor `cargo deny`, states the 2027-03-31 bound, and
+  documents a synthetic-lock `cargo audit --file` procedure that `deny.toml`
+  points at; a 217-file digest gates the tree.
 
 ## [0.0.29] - 2026-10-26
 

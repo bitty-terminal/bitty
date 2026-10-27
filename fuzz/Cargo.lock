@@ -31,14 +31,14 @@ dependencies = [
 
 [[package]]
 name = "bitty-term-state"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "bitty-vt",
 ]
 
 [[package]]
 name = "bitty-vt"
-version = "0.0.29"
+version = "0.0.30"
 dependencies = [
  "miniz_oxide",
  "vte",

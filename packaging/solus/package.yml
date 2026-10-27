@@ -1,13 +1,13 @@
 # Solus package recipe for 'bitty'
 name: bitty
-version: 0.0.29
+version: 0.0.30
 release: 1
 source:
   # checksum=SKIP is deliberate for the in-tree draft: the distfile is the
   # GitHub tag archive, which only exists once the release tag is pushed.
   # At tag time replace SKIP with the sha256 digest calculated from the
   # downloaded release tarball (see packaging/solus.md).
-  - https://github.com/bitty-terminal/bitty/archive/refs/tags/v0.0.29.tar.gz: SKIP
+  - https://github.com/bitty-terminal/bitty/archive/refs/tags/v0.0.30.tar.gz: SKIP
 license:
   - Apache-2.0
   - MIT

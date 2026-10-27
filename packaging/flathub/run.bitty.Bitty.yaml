@@ -45,14 +45,14 @@ modules:
       - type: archive
         archive-type: tar-zst
         strip-components: 1
-        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.29/bitty-0.0.29-x86_64-unknown-linux-gnu.tar.zst
+        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.30/bitty-0.0.30-x86_64-unknown-linux-gnu.tar.zst
         sha256: 42e324669063a15b33e270eb8f3880bfba0a320854e8c82a2ab9eae24f75ccc3
         only-arches:
           - x86_64
       - type: archive
         archive-type: tar-zst
         strip-components: 1
-        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.29/bitty-0.0.29-aarch64-unknown-linux-gnu.tar.zst
+        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.30/bitty-0.0.30-aarch64-unknown-linux-gnu.tar.zst
         sha256: c5f392873993b103c76c931046581c6c81865b954b58b49c13d9d839392425d2
         only-arches:
           - aarch64

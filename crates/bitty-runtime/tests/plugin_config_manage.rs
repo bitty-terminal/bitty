@@ -2,11 +2,12 @@
 //! (CTX-1613, bitty#2393).
 //!
 //! The write-only `config.manage` head is exercised through the real Lua
-//! bridge: deny-by-default without the grant, a digest-bound preview/apply
-//! pair, one-shot consent tokens, and shape refusals for paths, tables, and
-//! extra arguments. The durable writer is a recording backend here; the
-//! atomic user-layer writer is covered by the application's unit tests.
-//! Headless and Windows-safe (temp dirs only).
+//! bridge: deny-by-default without the grant, dev-root packages that merely
+//! declare the head do not receive it, a preview/apply pair bound to the
+//! rendered candidate, one-shot approval tokens, and shape refusals for paths,
+//! tables, and extra arguments. The durable writer is a recording backend
+//! here; the atomic user-layer writer is covered by the application's unit
+//! tests. Headless and Windows-safe (temp dirs only).
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -15,8 +16,9 @@ use std::rc::Rc;
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
-    ConfigApplyOutcome, ConfigChange, ConfigWriteBackend, ConfigWriteFailure, EmptySettings,
-    PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+    ConfigApplyOutcome, ConfigChange, ConfigPreviewRendering, ConfigWriteBackend,
+    ConfigWriteFailure, EmptySettings, PluginRecord, PluginRuntime, PluginRuntimeConfig,
+    SnapshotSource, SourceClass, candidate_digest, content_digest, manifest_toml, write_index,
 };
 
 struct NoSnapshot;
@@ -32,11 +34,35 @@ impl SnapshotSource for NoSnapshot {
 struct RecordingBackend {
     calls: RefCell<Vec<ConfigChange>>,
     failure: Option<ConfigWriteFailure>,
+    stale: bool,
 }
 
 impl ConfigWriteBackend for RecordingBackend {
-    fn apply(&self, change: &ConfigChange) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+    fn preview(
+        &self,
+        _plugin_id: &str,
+        change: &ConfigChange,
+    ) -> Result<ConfigPreviewRendering, ConfigWriteFailure> {
+        Ok(ConfigPreviewRendering {
+            changed_keys: vec![change.key()],
+            rendered: change.rendered().to_string(),
+            candidate_digest: candidate_digest(change.rendered().as_bytes()),
+        })
+    }
+
+    fn apply(
+        &self,
+        _plugin_id: &str,
+        change: &ConfigChange,
+        expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
         self.calls.borrow_mut().push(change.clone());
+        if self.stale {
+            return Err(ConfigWriteFailure::Stale);
+        }
+        if candidate_digest(change.rendered().as_bytes()) != expected_candidate_digest {
+            return Err(ConfigWriteFailure::Stale);
+        }
         match self.failure {
             Some(failure) => Err(failure),
             None => Ok(ConfigApplyOutcome::Applied),
@@ -57,13 +83,17 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn runtime(root: PathBuf, backend: Option<Rc<RecordingBackend>>) -> PluginRuntime {
+fn runtime(
+    store_root: Option<PathBuf>,
+    dev_root: Option<PathBuf>,
+    backend: Option<Rc<RecordingBackend>>,
+) -> PluginRuntime {
     let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
-        data_dir: None,
-        store_root: None,
+        data_dir: Some(temp_dir("state")),
+        store_root,
         bundled_roots: Vec::new(),
-        third_party_roots: vec![root],
+        third_party_roots: dev_root.into_iter().collect(),
         settings: Rc::new(EmptySettings),
         snapshot: Rc::new(NoSnapshot),
     });
@@ -75,7 +105,17 @@ fn runtime(root: PathBuf, backend: Option<Rc<RecordingBackend>>) -> PluginRuntim
 
 /// Write a plugin package under `root/<id>/`.
 fn write_plugin(root: &Path, id: &str, capabilities: &[&str], commands: &[&str], init_src: &str) {
-    let plugin = root.join(id);
+    write_package_at(&root.join(id), id, capabilities, commands, init_src);
+}
+
+/// Write one plugin package into exactly `plugin`.
+fn write_package_at(
+    plugin: &Path,
+    id: &str,
+    capabilities: &[&str],
+    commands: &[&str],
+    init_src: &str,
+) {
     std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
     let capabilities_toml = capabilities
         .iter()
@@ -109,6 +149,34 @@ commands = [{commands}]
     std::fs::write(plugin.join("lua/init.lua"), init_src).expect("init");
 }
 
+/// Build an installed (`Registry`) store record whose recorded grant carries
+/// `config.manage`, then write the store index.
+fn write_store_package(
+    store: &Path,
+    id: &str,
+    capabilities: &[&str],
+    commands: &[&str],
+    init_src: &str,
+) -> PluginRecord {
+    let version = "0.1.0";
+    let relative = format!("packages/{id}/{version}");
+    let package_root = store.join(&relative);
+    write_package_at(&package_root, id, capabilities, commands, init_src);
+    let manifest_bytes =
+        std::fs::read(package_root.join("bitty-plugin.toml")).expect("manifest bytes");
+    let manifest = manifest_toml::parse_manifest(&manifest_bytes).expect("manifest parses");
+    PluginRecord {
+        source_class: SourceClass::Registry,
+        plugin_id: id.to_string(),
+        version: version.to_string(),
+        root: relative,
+        manifest_hash: manifest.manifest_hash(),
+        content_digest: content_digest(&package_root).expect("content digest"),
+        enabled: true,
+        granted: vec!["config.manage".to_string()],
+    }
+}
+
 fn pid(id: &str) -> PluginId {
     PluginId::new(id).expect("id")
 }
@@ -133,7 +201,7 @@ end
 bitty.commands.register({ id = "preview", title = "Preview", run = function()
   local p, err = preview()
   if not p then return err end
-  return p.rendered
+  return p.rendered .. "|" .. table.concat(p.keys, ",")
 end })
 bitty.commands.register({ id = "apply", title = "Apply", run = function()
   local p, err = preview()
@@ -182,19 +250,44 @@ end })
 
 const PROBE_COMMANDS: &[&str] = &["preview", "apply", "replay", "changed", "bad", "keys"];
 
-fn probe_runtime(
-    declared: &[&str],
-    backend: Option<Rc<RecordingBackend>>,
-) -> (PluginRuntime, Rc<RecordingBackend>) {
-    let root = temp_dir("probe");
-    write_plugin(&root, "xuepoo.configprobe", declared, PROBE_COMMANDS, PROBE);
-    let backend = backend.unwrap_or_else(|| Rc::new(RecordingBackend::default()));
-    let mut rt = runtime(root, Some(Rc::clone(&backend)));
+/// Granted store package: a recorded grant is the only way a plugin receives
+/// `config.manage` (review B2).
+fn granted_runtime() -> (PluginRuntime, Rc<RecordingBackend>) {
+    let store = temp_dir("store");
+    let record = write_store_package(
+        &store,
+        "xuepoo.configprobe",
+        &["config.manage"],
+        PROBE_COMMANDS,
+        PROBE,
+    );
+    write_index(&store, &[record]).expect("store index");
+    let backend = Rc::new(RecordingBackend::default());
+    let mut rt = runtime(Some(store), None, Some(Rc::clone(&backend)));
     rt.discover();
     for (id, result) in rt.activate_discovered() {
         result.unwrap_or_else(|error| panic!("activate {id}: {error}"));
     }
     (rt, backend)
+}
+
+/// Development package that declares the write head but has no recorded
+/// grant: the head must be withheld (review B2).
+fn dev_runtime_without_record() -> (PluginRuntime, PathBuf) {
+    let root = temp_dir("dev");
+    write_plugin(
+        &root,
+        "xuepoo.configprobe",
+        &["config.manage"],
+        PROBE_COMMANDS,
+        PROBE,
+    );
+    let mut rt = runtime(None, Some(root.clone()), None);
+    rt.discover();
+    for (id, result) in rt.activate_discovered() {
+        result.unwrap_or_else(|error| panic!("activate {id}: {error}"));
+    }
+    (rt, root)
 }
 
 fn run(rt: &mut PluginRuntime, command: &str) -> String {
@@ -205,25 +298,38 @@ fn run(rt: &mut PluginRuntime, command: &str) -> String {
 }
 
 #[test]
-fn writes_are_denied_without_the_config_manage_grant() {
-    // The plugin declares no capability at all: the namespace is present but
-    // every call fails closed, so a read-only dashboard cannot write.
-    let (mut rt, backend) = probe_runtime(&[], None);
+fn dev_root_declaration_without_a_record_gets_no_write_grant() {
+    // A `BITTY_PLUGIN_DIR` package declaring `config.manage` still activates,
+    // but the head is withheld and every write fails closed.
+    let (mut rt, root) = dev_runtime_without_record();
     assert_eq!(run(&mut rt, "preview"), "ERR:E_CAPABILITY_DENIED");
     assert_eq!(run(&mut rt, "apply"), "ERR:E_CAPABILITY_DENIED");
-    assert!(
-        backend.calls.borrow().is_empty(),
-        "nothing reached the writer"
-    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn writes_are_denied_without_the_config_manage_grant() {
+    // A package with no declared capability at all: the namespace is present
+    // but every call fails closed, so a read-only dashboard cannot write.
+    let root = temp_dir("dev-none");
+    write_plugin(&root, "xuepoo.configprobe", &[], PROBE_COMMANDS, PROBE);
+    let mut rt = runtime(None, Some(root.clone()), None);
+    rt.discover();
+    for (id, result) in rt.activate_discovered() {
+        result.unwrap_or_else(|error| panic!("activate {id}: {error}"));
+    }
+    assert_eq!(run(&mut rt, "preview"), "ERR:E_CAPABILITY_DENIED");
+    assert_eq!(run(&mut rt, "apply"), "ERR:E_CAPABILITY_DENIED");
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
 fn preview_and_apply_carry_the_exact_rendered_change() {
-    let (mut rt, backend) = probe_runtime(&["config.manage"], None);
+    let (mut rt, backend) = granted_runtime();
     assert_eq!(
         run(&mut rt, "preview"),
-        "appearance.theme = \"catppuccin\"",
-        "the preview renders the exact change, not plugin-provided text"
+        "appearance.theme = \"catppuccin\"|appearance.theme",
+        "the preview renders the candidate and lists the changed keys"
     );
     assert!(backend.calls.borrow().is_empty(), "preview never writes");
     assert_eq!(run(&mut rt, "apply"), "true|auto");
@@ -234,10 +340,10 @@ fn preview_and_apply_carry_the_exact_rendered_change() {
 }
 
 #[test]
-fn consent_tokens_are_one_shot_and_value_bound() {
-    let (mut rt, backend) = probe_runtime(&["config.manage"], None);
-    assert_eq!(run(&mut rt, "replay"), "E_CONFIG_CONSENT_REQUIRED");
-    assert_eq!(run(&mut rt, "changed"), "E_CONFIG_CONSENT_MISMATCH");
+fn approval_tokens_are_one_shot_and_value_bound() {
+    let (mut rt, backend) = granted_runtime();
+    assert_eq!(run(&mut rt, "replay"), "E_CONFIG_APPROVAL_REQUIRED");
+    assert_eq!(run(&mut rt, "changed"), "E_CONFIG_APPROVAL_REQUIRED");
     assert_eq!(
         backend.calls.borrow().len(),
         1,
@@ -247,18 +353,18 @@ fn consent_tokens_are_one_shot_and_value_bound() {
 
 #[test]
 fn bridge_rejects_extra_arguments_and_non_scalar_values() {
-    let (mut rt, backend) = probe_runtime(&["config.manage"], None);
+    let (mut rt, backend) = granted_runtime();
     assert_eq!(
         run(&mut rt, "bad"),
-        "ERR:E_DEF_INVALID,ERR:E_CONFIG_CONSENT_MISMATCH,ERR:E_DEF_INVALID,ERR:E_CONFIG_KEY,\
-ERR:E_CONFIG_VALUE,ERR:E_CONFIG_VALUE,ERR:E_CONFIG_VALUE,ERR:E_CONFIG_CONSENT_MISMATCH"
+        "ERR:E_DEF_INVALID,ERR:E_CONFIG_APPROVAL_MISMATCH,ERR:E_DEF_INVALID,ERR:E_CONFIG_KEY,\
+ERR:E_CONFIG_VALUE,ERR:E_CONFIG_VALUE,ERR:E_CONFIG_VALUE,ERR:E_CONFIG_APPROVAL_MISMATCH"
     );
     assert!(backend.calls.borrow().is_empty(), "no malformed call wrote");
 }
 
 #[test]
 fn no_path_or_command_key_is_addressable() {
-    let (mut rt, backend) = probe_runtime(&["config.manage"], None);
+    let (mut rt, backend) = granted_runtime();
     assert_eq!(
         run(&mut rt, "keys"),
         "ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY"
@@ -271,23 +377,24 @@ fn no_path_or_command_key_is_addressable() {
 
 #[test]
 fn granted_generation_without_a_backend_fails_closed() {
-    let root = temp_dir("unwired");
-    write_plugin(
-        &root,
+    let store = temp_dir("unwired");
+    let record = write_store_package(
+        &store,
         "xuepoo.configprobe",
         &["config.manage"],
         PROBE_COMMANDS,
         PROBE,
     );
-    let mut rt = runtime(root, None);
+    write_index(&store, &[record]).expect("store index");
+    let mut rt = runtime(Some(store), None, None);
     rt.discover();
     for (id, result) in rt.activate_discovered() {
         result.unwrap_or_else(|error| panic!("activate {id}: {error}"));
     }
     assert_eq!(
         run(&mut rt, "preview"),
-        "appearance.theme = \"catppuccin\"",
-        "preview is host-side and still renders"
+        "ERR:E_CONFIG_UNAVAILABLE",
+        "no writable layer is a typed unavailable, not a generic not-implemented"
     );
-    assert_eq!(run(&mut rt, "apply"), "ERR:E_NOT_IMPLEMENTED");
+    assert_eq!(run(&mut rt, "apply"), "ERR:E_CONFIG_UNAVAILABLE");
 }

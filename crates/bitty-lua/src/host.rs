@@ -1227,14 +1227,20 @@ pub trait HostServices {
     }
     /// Read a typed setting; `Ok(None)` means absent.
     fn settings_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError>;
-    /// Render one allowlisted configuration change and issue its consent
-    /// digest for `bitty.config.preview` (CTX-1613, bitty#2393).
+    /// Render one allowlisted configuration change and issue its approval
+    /// token for `bitty.config.preview` (CTX-1613, bitty#2393).
     ///
-    /// Returns `(digest, rendered)` where `rendered` is the exact
-    /// `key = literal` change the user approves. The default fails closed
-    /// with `E_NOT_IMPLEMENTED`: a host without the write service can never
-    /// gain writes from the always-present `bitty.config` namespace.
-    fn config_preview(&self, key: &str, value: &LuaValue) -> Result<(String, String), BridgeError> {
+    /// Returns `(digest, rendered, changed_keys)` where `rendered` is the
+    /// exact bounded diff the user approves and `changed_keys` lists every
+    /// setting leaf the candidate changes (including pinned seeds). The
+    /// default fails closed with `E_NOT_IMPLEMENTED`: a host without the
+    /// write service can never gain writes from the always-present
+    /// `bitty.config` namespace.
+    fn config_preview(
+        &self,
+        key: &str,
+        value: &LuaValue,
+    ) -> Result<(String, String, Vec<String>), BridgeError> {
         let _ = (key, value);
         Err(BridgeError::not_implemented("bitty.config.preview"))
     }
@@ -6638,7 +6644,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     // write-only surface for the `config.manage` head. Both calls reject any
     // extra argument at the bridge, accept one allowlisted dotted key and one
     // typed scalar (never a loose key/value table, path, argv, or URL), and
-    // delegate allowlist/consent/budget enforcement to the host. Without the
+    // delegate allowlist/approval/budget enforcement to the host. Without the
     // grant the host denies with `E_CAPABILITY_DENIED`, so the namespace
     // stays present but read-only.
     let config = Table::new(&ctx);
@@ -6670,7 +6676,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     };
                     let value = LuaValue::from_lua(stack.get(1), state.limits)
                         .map_err(|error| error.to_error(ctx))?;
-                    let (digest, rendered) = state
+                    let (digest, rendered, keys) = state
                         .bounded(|_expiry| state.services.config_preview(&key, &value))
                         .map_err(|error| error.to_error(ctx))?;
                     stack.replace(
@@ -6678,6 +6684,10 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         LuaValue::table([
                             ("digest", LuaValue::String(digest)),
                             ("rendered", LuaValue::String(rendered)),
+                            (
+                                "keys",
+                                LuaValue::array(keys.into_iter().map(LuaValue::String).collect()),
+                            ),
                         ])
                         .to_lua(ctx),
                     );
@@ -6719,7 +6729,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                         _ => {
                             return Err(BridgeError::new(
                                 "validation",
-                                "E_CONFIG_CONSENT_MISMATCH",
+                                "E_CONFIG_APPROVAL_MISMATCH",
                                 "config.set approval must be the digest from config.preview",
                             )
                             .to_error(ctx));

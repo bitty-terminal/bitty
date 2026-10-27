@@ -55,9 +55,11 @@ use bitty_plugin_host::{
 };
 
 use super::config_write::{
-    CONFIG_SET_MAX_RENDERED_BYTES, CONFIG_SET_MAX_WALL_MS, ConfigApplyOutcome, ConfigChange,
-    ConfigPreview, ConfigSetOutcome, ConfigSettingValue, ConfigWriteBackend, ConfigWriteGate,
-    check_result_rows, config_key_error, consent_digest, writable_setting,
+    CONFIG_PREVIEW_MAX_KEYS, CONFIG_PREVIEW_MAX_RENDERED_BYTES, CONFIG_SET_MAX_RENDERED_BYTES,
+    CONFIG_SET_MAX_WALL_MS, ConfigApplyOutcome, ConfigChange, ConfigPreviewRendering,
+    ConfigPreviewToken, ConfigSetOutcome, ConfigSettingValue, ConfigWriteBackend, ConfigWriteGate,
+    approval_digest, check_result_rows, config_backend_error, config_key_error, config_unavailable,
+    writable_setting,
 };
 use super::history::{
     HISTORY_GRANT_SCOPE_CACHE_MAX, HISTORY_RATE_WINDOW, HistoryProvider, history_caps,
@@ -2020,7 +2022,7 @@ pub struct PluginServices {
     /// Write-only: `runtime.inspect` never implies it and it never implies a
     /// read. Safe mode denies regardless of the recorded grant.
     config_manage_granted: Cell<bool>,
-    /// Per-generation consent digests, call budget, and byte budget.
+    /// Per-generation approval tokens, call budget, and byte budget.
     config_gate: RefCell<ConfigWriteGate>,
     /// Durable user-layer backend for `config.set`.
     ///
@@ -3470,14 +3472,14 @@ impl PluginServices {
     }
 }
 
-/// Typed consent mismatch for `config.set` (CTX-1613, bitty#2393).
+/// Typed approval mismatch for `config.set` (CTX-1613, bitty#2393).
 ///
 /// Never echoes the supplied or expected digest: a plugin learns only that
 /// the approval did not match the exact rendered change.
-fn config_consent_mismatch() -> BridgeError {
+fn config_approval_mismatch() -> BridgeError {
     BridgeError::new(
         "runtime",
-        "E_CONFIG_CONSENT_MISMATCH",
+        "E_CONFIG_APPROVAL_MISMATCH",
         "config.set approval does not match this exact rendered change",
     )
 }
@@ -3523,13 +3525,13 @@ impl PluginServices {
         Ok(())
     }
 
-    /// Render one change and issue its consent digest.
+    /// Render one change through the backend and issue its approval token.
     fn config_preview_at(
         &self,
         key: &str,
         value: &LuaValue,
         started: Instant,
-    ) -> Result<ConfigPreview, BridgeError> {
+    ) -> Result<ConfigPreviewToken, BridgeError> {
         self.config_authorize()?;
         // Exact allowlist membership: no path, argv, URL, or family prefix
         // reaches the backend. The rejected key is never echoed.
@@ -3543,18 +3545,51 @@ impl PluginServices {
                 "rendered config change exceeds its byte bound",
             ));
         }
+        let backend = self
+            .config_backend
+            .borrow()
+            .clone()
+            .ok_or_else(config_unavailable)?;
         self.config_charge(started, change.rendered().len())?;
-        let digest = consent_digest(&self.plugin_id, &change);
-        self.config_gate
-            .borrow_mut()
-            .issue(digest.clone(), change.key(), change.value().clone());
-        Ok(ConfigPreview {
+        // The backend renders the exact candidate user-layer bytes,
+        // including pinned-table seeds, so the token binds what will be
+        // committed rather than the one leaf the plugin named.
+        let rendering: ConfigPreviewRendering = backend
+            .preview(&self.plugin_id, &change)
+            .map_err(|failure| config_backend_error(failure, change.key()))?;
+        if rendering.changed_keys.len() > CONFIG_PREVIEW_MAX_KEYS
+            || rendering.rendered.len() > CONFIG_PREVIEW_MAX_RENDERED_BYTES
+            || rendering.candidate_digest.len() != 64
+            || !rendering
+                .candidate_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_LIMIT",
+                "config.preview rendering exceeds its bounds",
+            ));
+        }
+        let digest = approval_digest(&self.plugin_id, &change, &rendering);
+        self.config_gate.borrow_mut().issue(
+            digest.clone(),
+            change.key(),
+            change.value().clone(),
+            rendering.candidate_digest,
+        );
+        Ok(ConfigPreviewToken {
             digest,
-            rendered: change.rendered().to_string(),
+            rendered: rendering.rendered,
+            changed_keys: rendering.changed_keys,
         })
     }
 
-    fn config_preview(&self, key: &str, value: &LuaValue) -> Result<ConfigPreview, BridgeError> {
+    fn config_preview(
+        &self,
+        key: &str,
+        value: &LuaValue,
+    ) -> Result<ConfigPreviewToken, BridgeError> {
         self.config_preview_at(key, value, Instant::now())
     }
 
@@ -3585,18 +3620,19 @@ impl PluginServices {
             ));
         }
         // The digest is lowercase SHA-256 hex; anything else is a client
-        // bug and refuses before the comparison, without echoing the token.
+        // bug and refuses before the token lookup, without echoing the token.
         if digest.len() != 64
             || !digest
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
-            return Err(config_consent_mismatch());
+            return Err(config_approval_mismatch());
         }
-        let expected = consent_digest(&self.plugin_id, &change);
-        if digest != expected {
-            return Err(config_consent_mismatch());
-        }
+        let backend = self
+            .config_backend
+            .borrow()
+            .clone()
+            .ok_or_else(config_unavailable)?;
         // Charge before consuming the token: a budget refusal leaves the
         // approval usable inside the window, while an accepted call spends
         // it exactly once.
@@ -3604,23 +3640,22 @@ impl PluginServices {
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }
-        if !self
-            .config_gate
-            .borrow_mut()
-            .consume(&expected, change.key(), change.value())
-        {
+        let Some(candidate_digest) =
+            self.config_gate
+                .borrow_mut()
+                .consume(digest, change.key(), change.value())
+        else {
             return Err(BridgeError::new(
                 "runtime",
-                "E_CONFIG_CONSENT_REQUIRED",
-                "config.set requires a config.preview digest for this exact change",
+                "E_CONFIG_APPROVAL_REQUIRED",
+                "config.set requires a fresh config.preview token for this exact change",
             ));
-        }
-        let backend = self
-            .config_backend
-            .borrow()
-            .clone()
-            .ok_or_else(|| BridgeError::not_implemented("bitty.config.set"))?;
-        match backend.apply(&change) {
+        };
+        // The backend re-renders the candidate and refuses (without writing)
+        // unless the exact bytes match the approved digest, so a profile or
+        // concurrent edit between preview and set cannot commit a different
+        // change under the same approval.
+        match backend.apply(&self.plugin_id, &change, &candidate_digest) {
             Ok(ConfigApplyOutcome::Applied) => Ok(ConfigSetOutcome {
                 applied: true,
                 reload: "auto",
@@ -3631,11 +3666,7 @@ impl PluginServices {
             }),
             // Only the path-free failure class crosses the boundary; the
             // backend's own diagnostic may name a host path and stays local.
-            Err(failure) => Err(BridgeError::new(
-                "io",
-                failure.code(),
-                format!("{} (key '{}')", failure.message(), change.key()),
-            )),
+            Err(failure) => Err(config_backend_error(failure, change.key())),
         }
     }
 
@@ -3689,9 +3720,21 @@ impl HostServices for PluginServices {
         Ok(self.settings.get(key))
     }
 
-    fn config_preview(&self, key: &str, value: &LuaValue) -> Result<(String, String), BridgeError> {
+    fn config_preview(
+        &self,
+        key: &str,
+        value: &LuaValue,
+    ) -> Result<(String, String, Vec<String>), BridgeError> {
         let preview = PluginServices::config_preview(self, key, value)?;
-        Ok((preview.digest, preview.rendered))
+        Ok((
+            preview.digest,
+            preview.rendered,
+            preview
+                .changed_keys
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        ))
     }
 
     fn config_set(
@@ -10110,7 +10153,9 @@ mod tests {
 #[cfg(test)]
 mod history_tests {
     use super::*;
-    use crate::plugin_runtime::config_write::{CONFIG_SET_CALLS_PER_SECOND, ConfigWriteFailure};
+    use crate::plugin_runtime::config_write::{
+        CONFIG_SET_CALLS_PER_SECOND, ConfigWriteFailure, outstanding_previews,
+    };
     use crate::plugin_runtime::history::{
         BoundedHistory, HISTORY_GRANT_SCOPE_CACHE_MAX, HISTORY_MAX_QUERIES_PER_WINDOW,
         HISTORY_MAX_ROWS_PER_QUERY,
@@ -10866,46 +10911,102 @@ mod history_tests {
 
     // ── config.manage (CTX-1613, bitty#2393) ──────────────────────────
 
-    /// Recording backend: counts calls and can inject a typed failure.
+    /// Recording backend: renders candidates, counts preview/apply calls, and
+    /// can inject a typed failure or a moved candidate.
     struct RecordingConfigBackend {
-        calls: RefCell<Vec<ConfigChange>>,
+        previews: RefCell<Vec<(String, ConfigChange)>>,
+        calls: RefCell<Vec<(String, ConfigChange, String)>>,
         outcome: ConfigApplyOutcome,
         failure: Option<ConfigWriteFailure>,
+        nonce: Cell<u32>,
+        stale: Cell<bool>,
     }
 
     impl RecordingConfigBackend {
         fn applied() -> Rc<Self> {
             Rc::new(Self {
+                previews: RefCell::new(Vec::new()),
                 calls: RefCell::new(Vec::new()),
                 outcome: ConfigApplyOutcome::Applied,
                 failure: None,
+                nonce: Cell::new(0),
+                stale: Cell::new(false),
             })
         }
 
         fn failure(failure: ConfigWriteFailure) -> Rc<Self> {
             Rc::new(Self {
+                previews: RefCell::new(Vec::new()),
                 calls: RefCell::new(Vec::new()),
                 outcome: ConfigApplyOutcome::Applied,
                 failure: Some(failure),
+                nonce: Cell::new(0),
+                stale: Cell::new(false),
             })
         }
 
         fn unchanged() -> Rc<Self> {
             Rc::new(Self {
+                previews: RefCell::new(Vec::new()),
                 calls: RefCell::new(Vec::new()),
                 outcome: ConfigApplyOutcome::Unchanged,
                 failure: None,
+                nonce: Cell::new(0),
+                stale: Cell::new(false),
             })
         }
 
         fn call_count(&self) -> usize {
             self.calls.borrow().len()
         }
+
+        fn preview_count(&self) -> usize {
+            self.previews.borrow().len()
+        }
+
+        fn bump_nonce(&self) {
+            self.nonce.set(self.nonce.get() + 1);
+        }
+
+        fn rendering_for(&self, change: &ConfigChange) -> ConfigPreviewRendering {
+            let candidate = format!("{}\0nonce={}", change.rendered(), self.nonce.get());
+            ConfigPreviewRendering {
+                changed_keys: vec![change.key()],
+                rendered: change.rendered().to_string(),
+                candidate_digest: bitty_package::integrity::sha256_hex(candidate.as_bytes()),
+            }
+        }
     }
 
     impl ConfigWriteBackend for RecordingConfigBackend {
-        fn apply(&self, change: &ConfigChange) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
-            self.calls.borrow_mut().push(change.clone());
+        fn preview(
+            &self,
+            plugin_id: &str,
+            change: &ConfigChange,
+        ) -> Result<ConfigPreviewRendering, ConfigWriteFailure> {
+            self.previews
+                .borrow_mut()
+                .push((plugin_id.to_string(), change.clone()));
+            Ok(self.rendering_for(change))
+        }
+
+        fn apply(
+            &self,
+            plugin_id: &str,
+            change: &ConfigChange,
+            expected_candidate_digest: &str,
+        ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+            self.calls.borrow_mut().push((
+                plugin_id.to_string(),
+                change.clone(),
+                expected_candidate_digest.to_string(),
+            ));
+            if self.stale.get() {
+                return Err(ConfigWriteFailure::Stale);
+            }
+            if self.rendering_for(change).candidate_digest != expected_candidate_digest {
+                return Err(ConfigWriteFailure::Stale);
+            }
             match self.failure {
                 Some(failure) => Err(failure),
                 None => Ok(self.outcome),
@@ -10962,20 +11063,24 @@ mod history_tests {
             "config.manage must not grant runtime.inspect"
         );
 
-        // A granted generation without a wired backend fails closed, but
-        // preview still renders (it has no durable effect).
+        // A granted generation without a wired backend fails closed with the
+        // typed unavailable class, never a generic not-implemented.
         let unwired = config_services(None);
-        let preview = unwired
-            .config_preview("appearance.theme", &theme_text("catppuccin"))
-            .expect("preview is host-side");
-        let error = unwired
-            .config_set(
-                "appearance.theme",
-                &theme_text("catppuccin"),
-                &preview.digest,
-            )
-            .expect_err("no backend");
-        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+        for error in [
+            unwired
+                .config_preview("appearance.theme", &theme_text("catppuccin"))
+                .expect_err("no backend"),
+            unwired
+                .config_set(
+                    "appearance.theme",
+                    &theme_text("catppuccin"),
+                    &"0".repeat(64),
+                )
+                .expect_err("no backend"),
+        ] {
+            assert_eq!(error.code, "E_CONFIG_UNAVAILABLE");
+            assert_eq!(error.class, "runtime");
+        }
     }
 
     #[test]
@@ -10987,7 +11092,9 @@ mod history_tests {
             .config_preview("appearance.theme", &theme_text("catppuccin"))
             .expect("preview");
         assert_eq!(preview.rendered, "appearance.theme = \"catppuccin\"");
+        assert_eq!(preview.changed_keys, vec!["appearance.theme"]);
         assert_eq!(preview.digest.len(), 64);
+        assert_eq!(backend.preview_count(), 1, "preview renders, never writes");
         assert_eq!(backend.call_count(), 0, "preview never writes");
 
         let outcome = services
@@ -11004,11 +11111,16 @@ mod history_tests {
         );
         assert_eq!(backend.call_count(), 1);
         assert_eq!(
-            backend.calls.borrow()[0].rendered(),
+            backend.calls.borrow()[0].1.rendered(),
             "appearance.theme = \"catppuccin\""
         );
+        assert_eq!(
+            backend.calls.borrow()[0].0,
+            "xuepoo.test",
+            "the backend receives the plugin identity for attribution"
+        );
 
-        // One digest authorizes one write: replaying the approved token can
+        // One token authorizes one write: replaying the approved token can
         // never re-apply a stale row.
         let error = services
             .config_set(
@@ -11017,29 +11129,67 @@ mod history_tests {
                 &preview.digest,
             )
             .expect_err("replay refused");
-        assert_eq!(error.code, "E_CONFIG_CONSENT_REQUIRED");
+        assert_eq!(error.code, "E_CONFIG_APPROVAL_REQUIRED");
         assert_eq!(backend.call_count(), 1, "no second write");
     }
 
     #[test]
-    fn config_set_consent_is_bound_to_the_exact_rendered_change() {
+    fn re_preview_replaces_the_outstanding_approval() {
+        // Review B6: one exact change has one live approval. Re-previewing
+        // replaces the token instead of stacking a second usable one.
+        let backend = RecordingConfigBackend::applied();
+        let services = config_services(Some(Rc::clone(&backend)));
+        let first = services
+            .config_preview("appearance.theme", &theme_text("catppuccin"))
+            .expect("first preview");
+        backend.bump_nonce();
+        let second = services
+            .config_preview("appearance.theme", &theme_text("catppuccin"))
+            .expect("second preview");
+        assert_ne!(first.digest, second.digest, "the candidate moved");
+        assert_eq!(
+            outstanding_previews(&services.config_gate.borrow()),
+            1,
+            "the repeated preview replaced the old approval"
+        );
+        let error = services
+            .config_set("appearance.theme", &theme_text("catppuccin"), &first.digest)
+            .expect_err("stale approval");
+        assert_eq!(error.code, "E_CONFIG_APPROVAL_REQUIRED");
+        services
+            .config_set(
+                "appearance.theme",
+                &theme_text("catppuccin"),
+                &second.digest,
+            )
+            .expect("current approval applies");
+        assert_eq!(backend.call_count(), 1);
+    }
+
+    #[test]
+    fn config_set_approval_is_bound_to_the_exact_change() {
+        // The host cannot prove human intent: a granted plugin can call
+        // `preview` itself. What it does enforce is that the applied bytes
+        // equal the previewed candidate and that the token is one-shot. The
+        // two-press confirmation is a dashboard UI contract, recorded in the
+        // plugin, not a host guarantee.
         let backend = RecordingConfigBackend::applied();
         let services = config_services(Some(Rc::clone(&backend)));
         let preview = services
             .config_preview("appearance.theme", &theme_text("catppuccin"))
             .expect("preview");
 
-        // Same digest, different value: refused before the backend.
+        // Same token, different value: the token is value-bound.
         let error = services
             .config_set("appearance.theme", &theme_text("dracula"), &preview.digest)
             .expect_err("value changed");
-        assert_eq!(error.code, "E_CONFIG_CONSENT_MISMATCH");
+        assert_eq!(error.code, "E_CONFIG_APPROVAL_REQUIRED");
 
-        // Same digest, different key: refused.
+        // Same token, different key: key-bound.
         let error = services
             .config_set("font.family", &theme_text("catppuccin"), &preview.digest)
             .expect_err("key changed");
-        assert_eq!(error.code, "E_CONFIG_CONSENT_MISMATCH");
+        assert_eq!(error.code, "E_CONFIG_APPROVAL_REQUIRED");
 
         // Malformed tokens (short, uppercase, non-hex) refuse as mismatches.
         for token in [
@@ -11050,23 +11200,43 @@ mod history_tests {
             let error = services
                 .config_set("appearance.theme", &theme_text("catppuccin"), &token)
                 .expect_err("bad token");
-            assert_eq!(error.code, "E_CONFIG_CONSENT_MISMATCH");
+            assert_eq!(error.code, "E_CONFIG_APPROVAL_MISMATCH");
         }
 
-        // Correct digest without a preview: the token was never issued.
-        let correct = consent_digest(
-            "xuepoo.test",
-            &ConfigChange::new(
-                writable_setting("appearance.theme").expect("allowlisted"),
-                ConfigSettingValue::text("catppuccin").expect("text"),
-            ),
-        );
+        // A well-formed token that was never issued is still refused.
         let fresh = config_services(Some(Rc::clone(&backend)));
         let error = fresh
-            .config_set("appearance.theme", &theme_text("catppuccin"), &correct)
+            .config_set(
+                "appearance.theme",
+                &theme_text("catppuccin"),
+                &"0".repeat(64),
+            )
             .expect_err("unissued token");
-        assert_eq!(error.code, "E_CONFIG_CONSENT_REQUIRED");
+        assert_eq!(error.code, "E_CONFIG_APPROVAL_REQUIRED");
         assert_eq!(backend.call_count(), 0, "nothing reached the writer");
+    }
+
+    #[test]
+    fn config_set_refuses_a_moved_candidate() {
+        // Review B3: `set` re-renders and verifies the exact bytes before
+        // commit. A profile edit between preview and set refuses as stale,
+        // leaving the previous bytes untouched.
+        let backend = RecordingConfigBackend::applied();
+        let services = config_services(Some(Rc::clone(&backend)));
+        let preview = services
+            .config_preview("appearance.theme", &theme_text("catppuccin"))
+            .expect("preview");
+        backend.stale.set(true);
+        let error = services
+            .config_set(
+                "appearance.theme",
+                &theme_text("catppuccin"),
+                &preview.digest,
+            )
+            .expect_err("candidate moved");
+        assert_eq!(error.code, "E_CONFIG_STALE");
+        assert_eq!(backend.call_count(), 1);
+        assert_eq!(error.class, "runtime");
     }
 
     #[test]
@@ -11134,7 +11304,7 @@ mod history_tests {
         assert_eq!(error.code, "E_CONFIG_VALUE");
 
         // A hostile-looking string stays data: it is quoted and escaped, and
-        // the exact escaped rendering is what the digest binds.
+        // the exact escaped rendering is what the approval binds.
         let hostile = "\"; os.execute('id'); --";
         let preview = services
             .config_preview("appearance.theme", &theme_text(hostile))
@@ -11148,10 +11318,9 @@ mod history_tests {
             .expect("literal write");
         assert!(outcome.applied);
         assert_eq!(backend.call_count(), 1);
-        assert_eq!(backend.calls.borrow()[0].rendered(), preview.rendered);
         assert_eq!(
-            backend.calls.borrow()[0].value(),
-            &ConfigSettingValue::text(hostile).expect("text")
+            backend.calls.borrow()[0].1.rendered(),
+            "appearance.theme = \"\\\"; os.execute('id'); --\""
         );
     }
 
@@ -11183,7 +11352,7 @@ mod history_tests {
         assert_eq!(error.code, "E_DEF_LIMIT");
 
         // Wall budget: an authorization path already past 10 ms refuses
-        // before the backend, so a deadline never commits a write.
+        // before the token is consumed, so a deadline never commits a write.
         let backend = RecordingConfigBackend::applied();
         let wall = config_services(Some(Rc::clone(&backend)));
         let preview = wall
@@ -11264,11 +11433,20 @@ mod history_tests {
 
     #[test]
     fn config_set_backend_failures_are_path_free() {
-        for (failure, expected) in [
-            (ConfigWriteFailure::Invalid, "E_CONFIG_INVALID"),
-            (ConfigWriteFailure::Unavailable, "E_CONFIG_UNAVAILABLE"),
-            (ConfigWriteFailure::Unsafe, "E_CONFIG_UNSAFE"),
-            (ConfigWriteFailure::Io, "E_CONFIG_IO"),
+        for (failure, expected, class) in [
+            (
+                ConfigWriteFailure::Invalid,
+                "E_CONFIG_INVALID",
+                "validation",
+            ),
+            (
+                ConfigWriteFailure::Unavailable,
+                "E_CONFIG_UNAVAILABLE",
+                "runtime",
+            ),
+            (ConfigWriteFailure::Unsafe, "E_CONFIG_UNSAFE", "io"),
+            (ConfigWriteFailure::Stale, "E_CONFIG_STALE", "runtime"),
+            (ConfigWriteFailure::Io, "E_CONFIG_IO", "io"),
         ] {
             let backend = RecordingConfigBackend::failure(failure);
             let services = config_services(Some(Rc::clone(&backend)));
@@ -11283,6 +11461,7 @@ mod history_tests {
                 )
                 .expect_err("backend refused");
             assert_eq!(error.code, expected);
+            assert_eq!(error.class, class);
             assert_eq!(backend.call_count(), 1, "the backend was reached once");
             assert!(
                 !error.message.contains('/') && !error.message.contains('~'),

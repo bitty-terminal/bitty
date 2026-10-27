@@ -2406,11 +2406,19 @@ fn write_profile_atomic_with(
     for _ in 0..PROFILE_MAX_TEMP_ATTEMPTS {
         let counter = PROFILE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let candidate = parent.join(format!(".{name}.tmp-{}-{counter}", std::process::id()));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        if owner_only {
+            // Owner-only from creation: the staged file holds configuration
+            // bytes and must never be group/world readable, not even for the
+            // instant between write and a later chmod.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+        }
+        match options.open(&candidate) {
             Ok(file) => {
                 temp = Some((candidate, file));
                 break;
@@ -2433,19 +2441,10 @@ fn write_profile_atomic_with(
         let _ = std::fs::remove_file(&temp_path);
         return Err(ProfileWriteError::Io(err));
     }
-    if owner_only {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Err(err) =
-                std::fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600))
-            {
-                let _ = std::fs::remove_file(&temp_path);
-                return Err(ProfileWriteError::Io(err));
-            }
+    if !owner_only {
+        if let Some(permissions) = permissions {
+            let _ = std::fs::set_permissions(&temp_path, permissions);
         }
-    } else if let Some(permissions) = permissions {
-        let _ = std::fs::set_permissions(&temp_path, permissions);
     }
     #[cfg(test)]
     run_commit_hook(path);
@@ -3843,10 +3842,14 @@ impl UserLayerConfigWriter {
         Some(Self { config_dir, target })
     }
 
-    fn apply_change(
+    /// Render the exact candidate user-layer bytes and the bounded diff.
+    ///
+    /// Neither `preview` nor a refused `apply` writes anything: the only
+    /// filesystem mutation is the read of the current layer.
+    fn render_change(
         &self,
         change: &ConfigChange,
-    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+    ) -> Result<RenderedUserLayer, ConfigWriteFailure> {
         // Defense in depth: re-check the fixed target invariant even though
         // the constructor enforces it.
         let Some(parent) = self.target.parent() else {
@@ -3866,7 +3869,7 @@ impl UserLayerConfigWriter {
         }
         let field = schema_field_entry(change.key()).ok_or(ConfigWriteFailure::Invalid)?;
 
-        let (content, identity, existed) = match std::fs::symlink_metadata(&self.target) {
+        let (previous, identity, existed) = match std::fs::symlink_metadata(&self.target) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
                     // Never write through a symlink: the resolved target is
@@ -3888,11 +3891,14 @@ impl UserLayerConfigWriter {
 
         let segments: Vec<&str> = change.key().split('.').collect();
         let table = segments[0];
-        let mut updated = content.clone();
+        let mut updated = previous.clone();
+        let mut changed_keys: Vec<&'static str> = vec![change.key()];
         // The typed plan merges pinned tables as complete structs: creating
         // one in the user layer without its inherited leaves would reset
         // every omitted sibling to the core default. Pin the resolved
-        // effective table first, then edit exactly one leaf.
+        // effective table first, then edit exactly one leaf. Every seeded
+        // schema-visible leaf is listed for approval (`terminal.shell` and
+        // `font.fallback` are written only when the literal contains them).
         if PINNED_TABLES.contains(&table) {
             let current = parse_user_plan(&updated, &self.target)
                 .map_err(|error| config_invalid("seed parse", error))?;
@@ -3903,6 +3909,7 @@ impl UserLayerConfigWriter {
                         .map_err(|error| config_invalid("seed merge", error))?
                         .effective,
                 );
+                changed_keys.extend(seed_changed_keys(table, &seed));
                 updated = set_lua_path(&updated, &[table], &seed)
                     .map_err(|error| config_invalid("seed splice", format_args!("{error}")))?;
             }
@@ -3924,45 +3931,203 @@ impl UserLayerConfigWriter {
                 ),
             ));
         }
-        if existed && content == updated {
+        let rendered = bounded_line_diff(&previous, &updated)?;
+        changed_keys.sort_unstable();
+        changed_keys.dedup();
+        Ok(RenderedUserLayer {
+            candidate_digest: bitty_package::integrity::sha256_hex(updated.as_bytes()),
+            content: updated,
+            previous,
+            identity,
+            existed,
+            changed_keys,
+            rendered,
+        })
+    }
+}
+
+/// One fully rendered candidate: the exact bytes a commit would write.
+struct RenderedUserLayer {
+    /// Candidate user-layer bytes (hashed into the approval).
+    content: String,
+    /// Bytes currently on disk (the rolling `.bak` source).
+    previous: String,
+    /// Identity captured from the open handle, if the file existed.
+    identity: Option<ProfileIdentity>,
+    /// Whether the target existed when the candidate was rendered.
+    existed: bool,
+    /// Schema-visible leaves the candidate declares/changes.
+    changed_keys: Vec<&'static str>,
+    /// Exact bounded diff shown for approval.
+    rendered: String,
+    /// SHA-256 of `content`.
+    candidate_digest: String,
+}
+
+impl bitty_runtime::plugin_runtime::ConfigWriteBackend for UserLayerConfigWriter {
+    fn preview(
+        &self,
+        plugin_id: &str,
+        change: &ConfigChange,
+    ) -> Result<bitty_runtime::plugin_runtime::ConfigPreviewRendering, ConfigWriteFailure> {
+        match self.render_change(change) {
+            Ok(rendered) => Ok(bitty_runtime::plugin_runtime::ConfigPreviewRendering {
+                changed_keys: rendered.changed_keys,
+                rendered: rendered.rendered,
+                candidate_digest: rendered.candidate_digest,
+            }),
+            Err(failure) => {
+                log_config_refusal(plugin_id, change.key(), &self.target, failure);
+                Err(failure)
+            }
+        }
+    }
+
+    fn apply(
+        &self,
+        plugin_id: &str,
+        change: &ConfigChange,
+        expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        let rendered = match self.render_change(change) {
+            Ok(rendered) => rendered,
+            Err(failure) => {
+                log_config_refusal(plugin_id, change.key(), &self.target, failure);
+                return Err(failure);
+            }
+        };
+        // Re-render immediately before commit: a profile edit, selector
+        // change, or concurrent writer between preview and set moves the
+        // candidate bytes and refuses as stale with nothing written.
+        if rendered.candidate_digest != expected_candidate_digest {
+            let failure = ConfigWriteFailure::Stale;
+            log_config_refusal(plugin_id, change.key(), &self.target, failure);
+            return Err(failure);
+        }
+        if rendered.existed && rendered.previous == rendered.content {
             return Ok(ConfigApplyOutcome::Unchanged);
         }
-        if existed {
-            crate::init::write_recoverable_backup_owner_only(&self.target)
-                .map_err(|_| ConfigWriteFailure::Io)?;
-            write_profile_atomic_with(&self.target, &updated, identity.as_ref(), true).map_err(
-                |error| match error {
-                    ProfileWriteError::NotRegular => ConfigWriteFailure::Unsafe,
-                    ProfileWriteError::Changed | ProfileWriteError::Io(_) => ConfigWriteFailure::Io,
-                },
-            )?;
-        } else {
-            create_user_config_exclusive(&self.target, &updated)
-                .map_err(|_| ConfigWriteFailure::Io)?;
+        if rendered.existed {
+            // One rolling owner-only `.bak`, replaced atomically from the
+            // bytes already read. No collision search and no path re-read:
+            // repeated writes can never exhaust backup names or split the
+            // recovery copy across `.bak.N` files.
+            let name = self.target.file_name().map_or_else(
+                || String::from("init.lua"),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            let backup = self.target.with_file_name(format!("{name}.bak"));
+            if let Err(failure) = write_profile_atomic_with(&backup, &rendered.previous, None, true)
+                .map_err(write_failure)
+            {
+                log_config_refusal(plugin_id, change.key(), &self.target, failure);
+                return Err(failure);
+            }
+            if let Err(failure) = write_profile_atomic_with(
+                &self.target,
+                &rendered.content,
+                rendered.identity.as_ref(),
+                true,
+            )
+            .map_err(write_failure)
+            {
+                log_config_refusal(plugin_id, change.key(), &self.target, failure);
+                return Err(failure);
+            }
+        } else if let Err(failure) = create_user_config_exclusive(&self.target, &rendered.content)
+            .map_err(|_| ConfigWriteFailure::Io)
+        {
+            log_config_refusal(plugin_id, change.key(), &self.target, failure);
+            return Err(failure);
         }
         Ok(ConfigApplyOutcome::Applied)
     }
 }
 
-impl bitty_runtime::plugin_runtime::ConfigWriteBackend for UserLayerConfigWriter {
-    fn apply(&self, change: &ConfigChange) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
-        match self.apply_change(change) {
-            Ok(outcome) => Ok(outcome),
-            Err(failure) => {
-                // The host log may carry the path; the plugin-visible
-                // diagnostic is the path-free failure class only.
-                crate::logging::warn(|| {
-                    format!(
-                        "bitty: config.manage write refused for '{}' at '{}' ({:?})",
-                        change.key(),
-                        self.target.display(),
-                        failure
-                    )
-                });
-                Err(failure)
-            }
-        }
+/// Map one atomic-replace failure to the path-free class.
+fn write_failure(error: ProfileWriteError) -> ConfigWriteFailure {
+    match error {
+        ProfileWriteError::NotRegular => ConfigWriteFailure::Unsafe,
+        ProfileWriteError::Changed | ProfileWriteError::Io(_) => ConfigWriteFailure::Io,
     }
+}
+
+/// Log one refusal with plugin attribution; the plugin sees only the class.
+fn log_config_refusal(plugin_id: &str, key: &str, target: &Path, failure: ConfigWriteFailure) {
+    crate::logging::warn(|| {
+        format!(
+            "bitty: config.manage write by '{plugin_id}' refused for '{key}' at '{}' \
+             ({:?})",
+            target.display(),
+            failure
+        )
+    });
+}
+
+/// Exact bounded line diff between the current and candidate user layer.
+///
+/// Only the changed middle (common prefix/suffix stripped) is rendered, so a
+/// single-leaf edit shows one removed and one inserted line. Over the preview
+/// line/byte bound the change is refused rather than truncated: the user can
+/// never approve bytes they cannot see in full.
+fn bounded_line_diff(previous: &str, updated: &str) -> Result<String, ConfigWriteFailure> {
+    use bitty_runtime::plugin_runtime::{
+        CONFIG_PREVIEW_MAX_LINES, CONFIG_PREVIEW_MAX_RENDERED_BYTES,
+    };
+    if previous == updated {
+        return Ok(String::new());
+    }
+    let old: Vec<&str> = previous.lines().collect();
+    let new: Vec<&str> = updated.lines().collect();
+    let mut prefix = 0;
+    while prefix < old.len() && prefix < new.len() && old[prefix] == new[prefix] {
+        prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < old.len().saturating_sub(prefix)
+        && suffix < new.len().saturating_sub(prefix)
+        && old[old.len() - 1 - suffix] == new[new.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    let removed = &old[prefix..old.len() - suffix];
+    let added = &new[prefix..new.len() - suffix];
+    if removed.len().saturating_add(added.len()) > CONFIG_PREVIEW_MAX_LINES {
+        return Err(ConfigWriteFailure::Invalid);
+    }
+    let mut rendered = String::new();
+    for line in removed {
+        rendered.push('-');
+        rendered.push_str(line);
+        rendered.push('\n');
+    }
+    for line in added {
+        rendered.push('+');
+        rendered.push_str(line);
+        rendered.push('\n');
+    }
+    if rendered.len() > CONFIG_PREVIEW_MAX_RENDERED_BYTES {
+        return Err(ConfigWriteFailure::Invalid);
+    }
+    Ok(rendered.trim_end_matches('\n').to_string())
+}
+
+/// Schema-visible leaves a pinned-table seed actually emits.
+///
+/// The seed literal is generated by the typed plan, so the leaf token is
+/// stable (`family = `, `enabled = `, `fallback = { ... }`). Non-schema
+/// leaves (font features, background images, colors) remain visible in the
+/// rendered diff and are bound by the candidate digest.
+fn seed_changed_keys(table: &str, seed: &str) -> Vec<&'static str> {
+    SCHEMA_FIELDS
+        .iter()
+        .filter(|field| field.path.split('.').next() == Some(table))
+        .filter(|field| {
+            let leaf = field.path.rsplit('.').next().unwrap_or(field.path);
+            seed.contains(&format!("{leaf} = "))
+        })
+        .map(|field| field.path)
+        .collect()
 }
 
 /// Parse one user-layer body strictly (never a profile layer).
@@ -4107,7 +4272,7 @@ fn create_user_config_exclusive(path: &Path, content: &str) -> std::io::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bitty_runtime::plugin_runtime::ConfigWriteBackend;
+    use bitty_runtime::plugin_runtime::{ConfigPreviewRendering, ConfigWriteBackend};
 
     fn scratch_dir(tag: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -5056,6 +5221,8 @@ mod tests {
             "mouse.middle",
             "font.fallback",
             "session.restore_on_startup",
+            "history.capture.transcript",
+            "history.capture.commands",
         ] {
             assert!(
                 bitty_runtime::plugin_runtime::writable_setting(excluded).is_none(),
@@ -5089,6 +5256,18 @@ mod tests {
         ConfigChange::new(setting, value)
     }
 
+    fn preview(writer: &UserLayerConfigWriter, change: &ConfigChange) -> ConfigPreviewRendering {
+        writer.preview("xuepoo.test", change).expect("preview")
+    }
+
+    fn apply(
+        writer: &UserLayerConfigWriter,
+        change: &ConfigChange,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        let approved = writer.preview("xuepoo.test", change)?;
+        writer.apply("xuepoo.test", change, &approved.candidate_digest)
+    }
+
     fn merged_for(dir: &Path, content: &str) -> bitty_config::MergedConfig {
         validate_user_candidate(content, &dir.join("init.lua"), dir).expect("valid candidate")
     }
@@ -5100,12 +5279,14 @@ mod tests {
         // value and refuses a mismatch.
         let dir = scratch_dir("cfg-theme");
         let writer = config_writer(&dir);
-        let outcome = writer
-            .apply(&setting_change(
-                "appearance.theme",
-                ConfigSettingValue::text("catppuccin").expect("text"),
-            ))
-            .expect("applied");
+        let change = setting_change(
+            "appearance.theme",
+            ConfigSettingValue::text("catppuccin").expect("text"),
+        );
+        let approved = preview(&writer, &change);
+        assert!(approved.changed_keys.contains(&"appearance.theme"));
+        assert!(approved.rendered.contains("theme = \"catppuccin\""));
+        let outcome = apply(&writer, &change).expect("applied");
         assert_eq!(outcome, ConfigApplyOutcome::Applied);
         let content = std::fs::read_to_string(dir.join("init.lua")).expect("layer");
         assert!(content.contains("theme = \"catppuccin\""), "{content}");
@@ -5131,12 +5312,33 @@ mod tests {
     fn config_writer_creates_the_user_layer_and_applies_one_value() {
         let dir = scratch_dir("cfg-create");
         let writer = config_writer(&dir);
-        let outcome = writer
-            .apply(&setting_change(
-                "font.size",
-                ConfigSettingValue::number(12.5).expect("number"),
-            ))
-            .expect("applied");
+        let change = setting_change(
+            "font.size",
+            ConfigSettingValue::number(12.5).expect("number"),
+        );
+        // Review B3: the preview lists every schema-visible leaf the pinned
+        // font table will write, including the inherited family/fallback.
+        let approved = preview(&writer, &change);
+        for key in ["font.size", "font.family", "font.fallback"] {
+            assert!(
+                approved.changed_keys.contains(&key),
+                "seed leaf '{key}' must be visible: {:?}",
+                approved.changed_keys
+            );
+        }
+        assert!(
+            approved.rendered.contains("family = "),
+            "{}",
+            approved.rendered
+        );
+        assert!(
+            approved.rendered.contains("fallback = "),
+            "{}",
+            approved.rendered
+        );
+        assert_eq!(approved.candidate_digest.len(), 64);
+
+        let outcome = apply(&writer, &change).expect("applied");
         assert_eq!(outcome, ConfigApplyOutcome::Applied);
 
         let path = dir.join("init.lua");
@@ -5177,12 +5379,24 @@ mod tests {
         let before = std::fs::read(&path).expect("preimage");
 
         let writer = config_writer(&dir);
-        let outcome = writer
-            .apply(&setting_change(
-                "font.size",
-                ConfigSettingValue::number(12.5).expect("number"),
-            ))
-            .expect("applied");
+        let change = setting_change(
+            "font.size",
+            ConfigSettingValue::number(12.5).expect("number"),
+        );
+        // Review B3: the approval shows the pinned family, not just the leaf.
+        let approved = preview(&writer, &change);
+        assert!(
+            approved.changed_keys.contains(&"font.family"),
+            "the pinned family is part of the approval: {:?}",
+            approved.changed_keys
+        );
+        assert!(
+            approved.rendered.contains("family = \"Work Mono\""),
+            "the preview renders the pinned family: {}",
+            approved.rendered
+        );
+        assert!(approved.rendered.contains("size = 12.5"));
+        let outcome = apply(&writer, &change).expect("applied");
         assert_eq!(outcome, ConfigApplyOutcome::Applied);
 
         let content = std::fs::read_to_string(&path).expect("layer");
@@ -5221,15 +5435,114 @@ mod tests {
 
         // Re-applying the same value is a byte-identical no-op.
         let after = std::fs::read(&path).expect("bytes");
-        let outcome = writer
-            .apply(&setting_change(
-                "font.size",
-                ConfigSettingValue::number(12.5).expect("number"),
-            ))
-            .expect("unchanged");
+        let outcome = apply(&writer, &change).expect("unchanged");
         assert_eq!(outcome, ConfigApplyOutcome::Unchanged);
         assert_eq!(std::fs::read(&path).expect("bytes"), after);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn preview_discloses_a_pinned_terminal_shell_and_binds_it() {
+        // Review B3: editing `terminal.scrollback` while the profile sets
+        // `terminal.shell` pins (and therefore writes) the shell. The shell
+        // must be visible in the preview and bound by the candidate digest.
+        let dir = scratch_dir("cfg-shell");
+        std::fs::write(dir.join("init.lua"), render_selector_lua("work")).expect("selector");
+        std::fs::create_dir_all(dir.join("profiles")).expect("profiles dir");
+        std::fs::write(
+            dir.join("profiles/work.lua"),
+            "return { terminal = { scrollback = 2000, shell = \"/bin/fish\" } }\n",
+        )
+        .expect("profile");
+
+        let writer = config_writer(&dir);
+        let change = setting_change(
+            "terminal.scrollback",
+            ConfigSettingValue::integer(4000).expect("integer"),
+        );
+        let approved = preview(&writer, &change);
+        assert!(
+            approved.changed_keys.contains(&"terminal.shell"),
+            "the pinned shell must be disclosed: {:?}",
+            approved.changed_keys
+        );
+        assert!(
+            approved.rendered.contains("shell = \"/bin/fish\""),
+            "the preview shows the exact shell line: {}",
+            approved.rendered
+        );
+        assert!(approved.rendered.contains("scrollback = 4000"));
+        apply(&writer, &change).expect("applied");
+        let content = std::fs::read_to_string(dir.join("init.lua")).expect("layer");
+        assert!(content.contains("shell = \"/bin/fish\""), "{content}");
+        assert!(content.contains("scrollback = 4000"), "{content}");
+
+        // The approval is bound to those bytes: a concurrent writer changing
+        // the user layer between preview and commit refuses as stale with the
+        // file untouched.
+        let second = setting_change(
+            "terminal.scrollback",
+            ConfigSettingValue::integer(5000).expect("integer"),
+        );
+        let old_approval = preview(&writer, &second);
+        let concurrent = format!("{content}-- concurrent edit\n");
+        std::fs::write(dir.join("init.lua"), &concurrent).expect("layer moved");
+        let failure = writer
+            .apply("xuepoo.test", &second, &old_approval.candidate_digest)
+            .expect_err("candidate moved");
+        assert_eq!(failure, ConfigWriteFailure::Stale);
+        let unchanged = std::fs::read_to_string(dir.join("init.lua")).expect("layer");
+        assert_eq!(unchanged, concurrent, "a stale approval writes nothing");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn font_fallback_is_written_only_when_the_seed_shows_it() {
+        // Seeded font table: fallback is pinned and must appear in the
+        // preview. A user layer that already declares `font` is edited in
+        // place, so fallback is neither written nor claimed.
+        let seeded_dir = scratch_dir("cfg-fallback-seeded");
+        let seeded = config_writer(&seeded_dir);
+        let change = setting_change(
+            "font.size",
+            ConfigSettingValue::number(12.5).expect("number"),
+        );
+        let approved = preview(&seeded, &change);
+        assert!(approved.changed_keys.contains(&"font.fallback"));
+        assert!(approved.rendered.contains("fallback = "));
+        apply(&seeded, &change).expect("applied");
+        assert!(
+            std::fs::read_to_string(seeded_dir.join("init.lua"))
+                .expect("layer")
+                .contains("fallback = ")
+        );
+
+        let declared_dir = scratch_dir("cfg-fallback-declared");
+        std::fs::write(
+            declared_dir.join("init.lua"),
+            "return { font = { family = \"Mono\", size = 11 } }\n",
+        )
+        .expect("layer");
+        let declared = config_writer(&declared_dir);
+        let edit = setting_change(
+            "font.size",
+            ConfigSettingValue::number(13.0).expect("number"),
+        );
+        let approved = preview(&declared, &edit);
+        assert!(
+            !approved.changed_keys.contains(&"font.fallback"),
+            "fallback is not written when no seed emits it: {:?}",
+            approved.changed_keys
+        );
+        assert!(!approved.rendered.contains("fallback = "));
+        apply(&declared, &edit).expect("applied");
+        assert!(
+            !std::fs::read_to_string(declared_dir.join("init.lua"))
+                .expect("layer")
+                .contains("fallback = ")
+        );
+        let _ = std::fs::remove_dir_all(seeded_dir);
+        let _ = std::fs::remove_dir_all(declared_dir);
     }
 
     #[test]
@@ -5241,12 +5554,14 @@ mod tests {
         let writer = config_writer(&dir);
         // The typed schema bounds opacity to 0..=1; the strict loader must
         // reject it before any byte is replaced.
-        let failure = writer
-            .apply(&setting_change(
+        let failure = apply(
+            &writer,
+            &setting_change(
                 "window.opacity",
                 ConfigSettingValue::number(5.0).expect("number"),
-            ))
-            .expect_err("schema rejects the value");
+            ),
+        )
+        .expect_err("schema rejects the value");
         assert_eq!(failure, ConfigWriteFailure::Invalid);
         assert_eq!(
             std::fs::read_to_string(&path).expect("bytes"),
@@ -5267,7 +5582,9 @@ mod tests {
             };
         let change = ConfigChange::new(&SHELL, ConfigSettingValue::text("/bin/sh").expect("text"));
         let writer = config_writer(&dir);
-        let failure = writer.apply(&change).expect_err("not allowlisted");
+        let failure = writer
+            .preview("xuepoo.test", &change)
+            .expect_err("not allowlisted");
         assert_eq!(failure, ConfigWriteFailure::Invalid);
         assert!(!dir.join("init.lua").exists(), "nothing was created");
         let _ = std::fs::remove_dir_all(dir);
@@ -5280,27 +5597,19 @@ mod tests {
         let original = "return { font = { family = \"Mono\", size = 11 } }\n";
         std::fs::write(&path, original).expect("layer");
         let writer = config_writer(&dir);
-        // Fault injection: remove the staged temporary file at the commit
-        // point, so the rename fails after validation. The target must keep
-        // its exact previous bytes and no partial file may remain.
-        let _hook = arm_commit_hook(|target: &Path| {
-            let parent = target.parent().expect("parent");
-            for entry in std::fs::read_dir(parent).expect("read dir") {
-                let entry = entry.expect("entry");
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(".init.lua.tmp-")
-                {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
-        });
+        let change = setting_change(
+            "font.size",
+            ConfigSettingValue::number(12.5).expect("number"),
+        );
+        let approved = preview(&writer, &change);
+        // Fault injection: make the directory read-only after the preview, so
+        // the staged write fails at creation. The target must keep its exact
+        // previous bytes and no partial file may remain.
+        let mut permissions = std::fs::metadata(&dir).expect("dir meta").permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&dir, permissions).expect("read-only dir");
         let failure = writer
-            .apply(&setting_change(
-                "font.size",
-                ConfigSettingValue::number(12.5).expect("number"),
-            ))
+            .apply("xuepoo.test", &change, &approved.candidate_digest)
             .expect_err("commit failed");
         assert_eq!(failure, ConfigWriteFailure::Io);
         assert_eq!(
@@ -5315,6 +5624,53 @@ mod tests {
                 .any(|entry| entry.file_name().to_string_lossy().contains(".tmp-")),
             "no temporary file is left behind"
         );
+        let mut restore = std::fs::metadata(&dir).expect("dir meta").permissions();
+        // Restoring the scratch directory is not the read-only bypass clippy
+        // warns about; the directory is test-owned and removed below.
+        #[allow(clippy::permissions_set_readonly_false)]
+        restore.set_readonly(false);
+        std::fs::set_permissions(&dir, restore).expect("writable dir");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_writer_keeps_one_rolling_backup_across_many_writes() {
+        // Review B4: a rolling `.bak` must never exhaust names. Every write
+        // succeeds, exactly one backup remains, it holds the immediately
+        // previous bytes, and the target still loads.
+        let dir = scratch_dir("cfg-rolling");
+        let path = dir.join("init.lua");
+        std::fs::write(&path, "return { terminal = { scrollback = 1000 } }\n").expect("layer");
+        let writer = config_writer(&dir);
+        for value in 2000..=2100 {
+            apply(
+                &writer,
+                &setting_change(
+                    "terminal.scrollback",
+                    ConfigSettingValue::integer(value).expect("integer"),
+                ),
+            )
+            .unwrap_or_else(|failure| panic!("write {value}: {failure:?}"));
+        }
+        let content = std::fs::read_to_string(&path).expect("layer");
+        assert!(content.contains("scrollback = 2100"), "{content}");
+        let backup = std::fs::read_to_string(dir.join("init.lua.bak")).expect("one backup");
+        assert!(
+            backup.contains("scrollback = 2099"),
+            "the rolling backup holds the previous bytes: {backup}"
+        );
+        let backups: Vec<String> = std::fs::read_dir(&dir)
+            .expect("dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".bak"))
+            .collect();
+        assert_eq!(
+            backups,
+            vec![String::from("init.lua.bak")],
+            "no .bak.N files"
+        );
+        merged_for(&dir, &content);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -5328,12 +5684,14 @@ mod tests {
         let path = dir.join("init.lua");
         std::os::unix::fs::symlink(&outside, &path).expect("symlink");
         let writer = config_writer(&dir);
-        let failure = writer
-            .apply(&setting_change(
+        let failure = apply(
+            &writer,
+            &setting_change(
                 "font.size",
                 ConfigSettingValue::number(12.5).expect("number"),
-            ))
-            .expect_err("symlink refused");
+            ),
+        )
+        .expect_err("symlink refused");
         assert_eq!(failure, ConfigWriteFailure::Unsafe);
         assert_eq!(
             std::fs::read_to_string(&outside).expect("outside bytes"),
@@ -5361,6 +5719,7 @@ mod tests {
             ConfigWriteFailure::Invalid,
             ConfigWriteFailure::Unavailable,
             ConfigWriteFailure::Unsafe,
+            ConfigWriteFailure::Stale,
             ConfigWriteFailure::Io,
         ] {
             let rendered = format!("{failure:?}");
@@ -5370,24 +5729,28 @@ mod tests {
         // verbatim; the service's wider 1 KiB bound is not the schema bound,
         // and the strict loader stays authoritative.
         let text = "M".repeat(128);
-        writer
-            .apply(&setting_change(
+        apply(
+            &writer,
+            &setting_change(
                 "font.family",
                 ConfigSettingValue::text(&text).expect("bounded text"),
-            ))
-            .expect("applied");
+            ),
+        )
+        .expect("applied");
         let content = std::fs::read_to_string(dir.join("init.lua")).expect("layer");
         assert!(content.contains(&text), "the full bounded text is stored");
 
         // A value inside the service bound but outside the schema bound is
         // refused by the loader and leaves the bytes untouched.
         let before = std::fs::read_to_string(dir.join("init.lua")).expect("layer");
-        let failure = writer
-            .apply(&setting_change(
+        let failure = apply(
+            &writer,
+            &setting_change(
                 "font.family",
                 ConfigSettingValue::text(&"N".repeat(1024)).expect("service bound"),
-            ))
-            .expect_err("schema bound refuses");
+            ),
+        )
+        .expect_err("schema bound refuses");
         assert_eq!(failure, ConfigWriteFailure::Invalid);
         assert_eq!(
             std::fs::read_to_string(dir.join("init.lua")).expect("layer"),

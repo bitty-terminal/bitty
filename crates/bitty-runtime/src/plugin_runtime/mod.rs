@@ -84,13 +84,14 @@ pub use component_requests::{
     QueuedComponentRequest, broker_request, outcome_value,
 };
 pub use config_write::{
-    CONFIG_SET_BYTES_PER_SECOND, CONFIG_SET_CALLS_PER_SECOND, CONFIG_SET_DIGEST_DOMAIN,
+    CONFIG_PREVIEW_MAX_KEYS, CONFIG_PREVIEW_MAX_LINES, CONFIG_PREVIEW_MAX_RENDERED_BYTES,
+    CONFIG_SET_APPROVAL_DOMAIN, CONFIG_SET_BYTES_PER_SECOND, CONFIG_SET_CALLS_PER_SECOND,
     CONFIG_SET_MAX_KEY_BYTES, CONFIG_SET_MAX_OUTSTANDING_PREVIEWS, CONFIG_SET_MAX_RENDERED_BYTES,
     CONFIG_SET_MAX_ROWS, CONFIG_SET_MAX_VALUE_BYTES, CONFIG_SET_MAX_WALL_MS,
     CONFIG_SET_RATE_WINDOW, CONFIG_WRITABLE_SETTINGS, ConfigApplyOutcome, ConfigChange,
-    ConfigPreview, ConfigSetOutcome, ConfigSettingKey, ConfigSettingValue, ConfigValueKind,
-    ConfigWriteBackend, ConfigWriteFailure, ConfigWriteGate, consent_digest, consent_preimage,
-    writable_setting,
+    ConfigPreviewRendering, ConfigPreviewToken, ConfigSetOutcome, ConfigSettingKey,
+    ConfigSettingValue, ConfigValueKind, ConfigWriteBackend, ConfigWriteFailure, ConfigWriteGate,
+    approval_digest, approval_preimage, candidate_digest, writable_setting,
 };
 pub use fs::{
     FakeFileSystem, FileSystem, NativeFileSystem, STALE_TEMP_AGE_SECS, clean_temp_siblings,
@@ -2594,7 +2595,8 @@ impl PluginRuntime {
         // Policy half: declare, resolve, register, grant, activate. The grant
         // is the intersection of the manifest's declared capabilities with the
         // consented record (RFC B.4: grants are bound to the manifest hash);
-        // development and bundled packages without a record grant in full.
+        // development and bundled packages without a record grant in full,
+        // except heads that require a recorded grant (`config.manage`).
         let hash = manifest.manifest_hash();
         let declared =
             manifest
@@ -4904,7 +4906,16 @@ fn effective_granted(
     recorded: Option<&[String]>,
 ) -> Result<BTreeSet<CapabilityId>, PluginRuntimeError> {
     let Some(recorded) = recorded else {
-        return Ok(declared.clone());
+        // CTX-1613 (bitty#2393): development and bundled packages without a
+        // record grant in full, **except** heads that require a recorded,
+        // explicit decision. `config.manage` writes user configuration, so a
+        // package that merely declares it activates with the head withheld
+        // and every write fails closed until a grant record exists.
+        return Ok(declared
+            .iter()
+            .filter(|capability| !capability.requires_recorded_grant())
+            .cloned()
+            .collect());
     };
     let mut effective = BTreeSet::new();
     for raw in recorded {
@@ -5272,6 +5283,36 @@ plugin-api = "^1.0"
         raw.iter()
             .map(|grant| CapabilityId::parse(grant).expect("test grant parses"))
             .collect()
+    }
+
+    #[test]
+    fn effective_granted_withholds_config_manage_without_a_record() {
+        // CTX-1613 review B2: the no-record development/bundled seam grants
+        // declared heads, but configuration writes need an explicit record.
+        let id = PluginId::new("xuepoo.devprobe").expect("id");
+        let declared = parsed_grants(&["terminal.semantic-read", "config.manage"]);
+        let granted = effective_granted(&id, &declared, None).expect("computed");
+        assert!(
+            granted
+                .iter()
+                .any(|capability| capability.as_str() == "terminal.semantic-read"),
+            "ordinary declared heads keep the development seam"
+        );
+        assert!(
+            !granted
+                .iter()
+                .any(|capability| capability.as_str() == "config.manage"),
+            "config.manage must never be granted implicitly"
+        );
+
+        let recorded = vec!["config.manage".to_string()];
+        let granted = effective_granted(&id, &declared, Some(&recorded)).expect("recorded grant");
+        assert_eq!(granted, parsed_grants(&["config.manage"]));
+        assert!(
+            granted
+                .iter()
+                .all(|capability| capability.as_str() != "terminal.semantic-read")
+        );
     }
 
     fn service_test_manifest(

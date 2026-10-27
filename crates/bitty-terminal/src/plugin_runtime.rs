@@ -1069,18 +1069,21 @@ mod tests {
         );
     }
 
-    /// Composition-root wiring for `config.manage` (CTX-1613): a development
-    /// package granted the write head gets the production user-layer writer,
-    /// writes through the real strict loader/atomic path, and a package
-    /// without the grant stays read-only.
+    /// Composition-root wiring for `config.manage` (CTX-1613): an installed
+    /// package with a recorded grant gets the production user-layer writer,
+    /// writes through the real strict loader/atomic path, and a denied key
+    /// stays unaddressable. A dev-root declaration alone cannot obtain the
+    /// write head (review B2).
     #[test]
     fn discover_wires_the_config_manage_user_layer_writer() {
         let config_dir = fs_list_probe_root("config-root");
         let target = config_dir.join("init.lua");
 
-        let root = fs_list_probe_root("config-plugins");
+        let store = fs_list_probe_root("config-store");
         let id = "xuepoo.configprobe";
-        let plugin = root.join(id);
+        let version = "0.1.0";
+        let relative = format!("packages/{id}/{version}");
+        let plugin = store.join(&relative);
         std::fs::create_dir_all(plugin.join("lua")).expect("plugin dirs");
         std::fs::write(
             plugin.join("bitty-plugin.toml"),
@@ -1123,17 +1126,33 @@ mod tests {
             inspect: None,
             config_file: Some(&target),
         };
+        let manifest_bytes = std::fs::read(plugin.join("bitty-plugin.toml")).expect("manifest");
+        let manifest =
+            bitty_runtime::plugin_runtime::manifest_toml::parse_manifest(&manifest_bytes)
+                .expect("manifest parses");
+        let record = bitty_runtime::plugin_runtime::PluginRecord {
+            source_class: bitty_runtime::plugin_runtime::SourceClass::Registry,
+            plugin_id: id.to_string(),
+            version: version.to_string(),
+            root: relative,
+            manifest_hash: manifest.manifest_hash(),
+            content_digest: bitty_runtime::plugin_runtime::content_digest(&plugin)
+                .expect("content digest"),
+            enabled: true,
+            granted: vec!["config.manage".to_string()],
+        };
+        bitty_runtime::plugin_runtime::write_index(&store, &[record]).expect("store index");
         let session = discover_with_roots(
             false,
             80,
             24,
             &seed,
-            None,
-            vec![root],
+            Some(store.clone()),
+            Vec::new(),
             None,
             Some(config_dir.clone()),
         )
-        .expect("dev root must yield a session");
+        .expect("store package must yield a session");
         let mut runtime = session.runtime;
         runtime.set_host_call_deadline_ms(Some(HARNESS_HOST_CALL_DEADLINE_MS));
         let plugin_id = bitty_plugin_host::manifest::PluginId::new(id).expect("id");
@@ -1151,6 +1170,7 @@ mod tests {
             settle_dispatch(&mut runtime, plugin_id.as_str(), "denied", &[]).expect_value("denied");
         assert_eq!(denied, LuaValue::String("E_CONFIG_KEY".to_string()));
         let _ = std::fs::remove_dir_all(&config_dir);
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     /// Development package declaring `runtime.inspect` with one command

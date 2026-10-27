@@ -397,6 +397,10 @@ pub fn is_sensitive_head(head: &str) -> bool {
             | "ui.protocol-register"
             | "runtime.configure"
             | "runtime.plugin-manage"
+            // CTX-1613 (bitty#2393): configuration writes must never be
+            // preselected by a consent profile; every plugin requests and the
+            // user grants `config.manage` explicitly.
+            | "config.manage"
             | "debug.inspect"
             | "debug.trace"
             | "debug.control"
@@ -554,6 +558,39 @@ mod tests {
     }
 
     #[test]
+    fn every_high_risk_head_is_sensitive() {
+        // CTX-1613 review B1: the consent-profile preselection gate must
+        // never lag the high-risk presentation set. Every head the UI must
+        // present distinctly is also too sensitive for any profile to
+        // preselect; a new high-risk head without a sensitivity entry fails
+        // here instead of silently becoming preselectable.
+        use bitty_package::manifest::{CLOSED_CAPABILITY_HEADS, capability_requires_param};
+        for head in CLOSED_CAPABILITY_HEADS {
+            let raw = if capability_requires_param(head) {
+                format!("{head}:param")
+            } else {
+                (*head).to_string()
+            };
+            let id = CapabilityId::parse(&raw).expect("closed head parses");
+            if id.is_high_risk() {
+                assert!(
+                    is_sensitive_head(head),
+                    "high-risk head '{head}' must also be profile-sensitive"
+                );
+                assert!(
+                    is_sensitive(&id),
+                    "high-risk capability '{raw}' must be profile-sensitive"
+                );
+            }
+        }
+        // The new write head is both high-risk and explicitly sensitive.
+        let config = CapabilityId::parse("config.manage").expect("config.manage");
+        assert!(config.is_high_risk());
+        assert!(is_sensitive_head("config.manage"));
+        assert!(is_sensitive(&config));
+    }
+
+    #[test]
     fn profiles_never_declare_sensitive_heads() {
         let forbidden_heads = [
             "process.editor",
@@ -567,6 +604,7 @@ mod tests {
             "terminal.input.submit",
             "terminal.manage",
             "runtime.plugin-manage",
+            "config.manage",
             "debug.control",
             "ui.protocol-register",
             "browser.embed",

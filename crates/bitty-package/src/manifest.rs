@@ -432,7 +432,7 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "audio.state.control",
     // Configuration write family (CTX-1613, bitty#2393). `config.manage` is
     // the single, write-only, high-risk head: the user layer only, no
-    // parameter, allowlisted keys, per-change consent digest, and bounded
+    // parameter, allowlisted keys, per-change approval token, and bounded
     // calls. Configuration reads stay on `runtime.inspect`; neither head
     // implies the other, so a dashboard can never turn a read grant into a
     // write (or a write grant into a read).

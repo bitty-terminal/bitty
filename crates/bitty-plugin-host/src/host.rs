@@ -376,6 +376,13 @@ impl PluginHost {
                 .grants
                 .is_granted(id, &hash, cap, &entry.manifest.capabilities)
             {
+                // A head that needs a recorded approval is never satisfied by
+                // a development-root declaration alone. Activation still
+                // succeeds so the plugin's other capabilities work; the RPC
+                // layer denies this head until the approval is recorded.
+                if cap.requires_recorded_grant() {
+                    continue;
+                }
                 missing.push(cap.as_str().to_string());
             }
         }
@@ -509,9 +516,10 @@ impl PluginHost {
             let missing: Vec<String> = required
                 .iter()
                 .filter(|cap| {
-                    !self
-                        .grants
-                        .is_granted(id, &hash, cap, &new_manifest.capabilities)
+                    !cap.requires_recorded_grant()
+                        && !self
+                            .grants
+                            .is_granted(id, &hash, cap, &new_manifest.capabilities)
                 })
                 .map(|cap| cap.as_str().to_string())
                 .collect();

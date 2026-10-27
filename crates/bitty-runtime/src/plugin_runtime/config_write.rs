@@ -10,18 +10,25 @@
 //!
 //! - one allowlisted dotted key and one typed scalar value per call (no loose
 //!   key/value table, no path, no argv, no URL);
-//! - consent is hash-bound: `preview` renders the exact change and returns a
-//!   SHA-256 digest; `set` accepts only a digest it issued for the same
-//!   `(plugin, key, value)` triple in this generation, and consumes it;
-//! - calls, bytes, and wall time are budgeted per generation;
+//! - approval is **token-bound**: the backend renders the exact candidate
+//!   user-layer bytes (including pinned-table seeds) and returns the changed
+//!   keys plus a bounded exact diff; `preview` hashes that rendering into a
+//!   one-shot token, and `set` re-renders and refuses unless the exact bytes
+//!   are unchanged (`E_CONFIG_STALE` otherwise);
+//! - calls, bytes, wall time, keys, and diff size are budgeted per generation;
 //! - safe mode denies before any state is read;
 //! - the durable write is delegated to a [`ConfigWriteBackend`] that only
 //!   reports a path-free [`ConfigWriteFailure`], so plugin-visible diagnostics
 //!   never contain host paths.
 //!
+//! **The host does not prove human intent.** A granted plugin can call
+//! `preview` itself; the host enforces the grant plus a one-shot,
+//! value-and-bytes-bound preview token. The two-press confirmation is a
+//! dashboard UI contract, recorded separately in the plugin.
+//!
 //! The user-layer target, the strict loader, and the atomic replace live in
 //! the application backend (`bitty`'s `UserLayerConfigWriter`); this module
-//! owns validation, consent, and bounds only.
+//! owns validation, approval tokens, and bounds only.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -37,6 +44,19 @@ pub const CONFIG_SET_MAX_VALUE_BYTES: usize = 1024;
 /// Maximum rendered `key = value` bytes (escaped text can double).
 pub const CONFIG_SET_MAX_RENDERED_BYTES: usize =
     CONFIG_SET_MAX_KEY_BYTES + (CONFIG_SET_MAX_VALUE_BYTES * 2) + 8;
+
+/// Maximum keys one preview may list (pinned tables expand to their leaves).
+pub const CONFIG_PREVIEW_MAX_KEYS: usize = 64;
+
+/// Maximum exact rendered diff bytes one preview may carry.
+///
+/// A pinned table literal is bounded by the typed schema; 8 KiB leaves room
+/// for the widest table plus the leaf line while staying far below the user
+/// layer's 64 KiB file bound.
+pub const CONFIG_PREVIEW_MAX_RENDERED_BYTES: usize = 8 * 1024;
+
+/// Maximum diff lines one preview may carry.
+pub const CONFIG_PREVIEW_MAX_LINES: usize = 128;
 
 /// Maximum `config.manage` calls per generation per second (preview + set).
 pub const CONFIG_SET_CALLS_PER_SECOND: u32 = 16;
@@ -65,9 +85,9 @@ pub const CONFIG_SET_MAX_WALL_MS: u64 = 10;
 /// [`CONFIG_SET_BYTES_PER_SECOND`].
 pub const CONFIG_SET_RATE_WINDOW: Duration = Duration::from_secs(1);
 
-/// Consent-digest domain separator (versioned so the preimage can never be
+/// Approval-digest domain separator (versioned so the preimage can never be
 /// confused with another SHA-256 use).
-pub const CONFIG_SET_DIGEST_DOMAIN: &str = "bitty-config-manage/v1";
+pub const CONFIG_SET_APPROVAL_DOMAIN: &str = "bitty-config-manage/v1";
 
 /// Value kind of one writable setting (mirrors the typed config schema).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -83,7 +103,7 @@ pub enum ConfigValueKind {
 }
 
 impl ConfigValueKind {
-    /// Stable kind label used in the consent preimage.
+    /// Stable kind label used in the approval preimage.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -183,14 +203,10 @@ pub const CONFIG_WRITABLE_SETTINGS: &[ConfigSettingKey] = &[
         key: "selection.auto_copy",
         kind: ConfigValueKind::Bool,
     },
-    ConfigSettingKey {
-        key: "history.capture.transcript",
-        kind: ConfigValueKind::Bool,
-    },
-    ConfigSettingKey {
-        key: "history.capture.commands",
-        kind: ConfigValueKind::Bool,
-    },
+    // `history.capture.*` is deliberately absent: transcript/command capture
+    // determines what terminal-derived content is retained, so enabling it is
+    // not a presentation setting a plugin may flip. It stays on the explicit
+    // CLI/user path (review B5).
     ConfigSettingKey {
         key: "layout.gaps_in",
         kind: ConfigValueKind::Integer,
@@ -240,6 +256,9 @@ pub const CONFIG_WRITABLE_SETTINGS: &[ConfigSettingKey] = &[
         kind: ConfigValueKind::Integer,
     },
     ConfigSettingKey {
+        // P-3 permits this row. Its preview must state the exact resulting
+        // policy (always prompt / never prompt) rather than a bare enum token,
+        // because the setting changes whether closing can lose work.
         key: "close_confirm",
         kind: ConfigValueKind::Text,
     },
@@ -347,7 +366,7 @@ impl ConfigSettingValue {
 
     /// Render the exact Lua literal the backend writes and the user approves.
     ///
-    /// Both the backend and the consent digest use this one function, so the
+    /// Both the backend and the approval digest use this one function, so the
     /// approved rendering and the persisted bytes cannot diverge.
     #[must_use]
     pub fn render_literal(&self) -> String {
@@ -430,13 +449,33 @@ impl ConfigChange {
     }
 }
 
-/// One issued preview: the exact change the user is asked to approve.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConfigPreview {
-    /// SHA-256 hex of the consent preimage.
-    pub digest: String,
-    /// `key = literal` rendering.
+/// One backend-rendered candidate: the exact bytes a commit would write.
+///
+/// The backend owns the user-layer rendering (including pinned-table seeds),
+/// so the preview token binds what will actually be committed, not merely the
+/// one leaf the plugin named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigPreviewRendering {
+    /// Every setting leaf whose value changes, sorted and deduplicated.
+    ///
+    /// A pinned-table seed lists the leaves the seed writes (including leaves
+    /// outside the plugin allowlist, so the user sees the full effect).
+    pub changed_keys: Vec<&'static str>,
+    /// Exact inserted/replaced lines the user approves (bounded).
     pub rendered: String,
+    /// SHA-256 of the exact candidate user-layer bytes.
+    pub candidate_digest: String,
+}
+
+/// One host-issued preview token: the approval a `set` must present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigPreviewToken {
+    /// SHA-256 hex of the approval preimage (plugin + change + rendering).
+    pub digest: String,
+    /// Exact rendered diff returned by the backend.
+    pub rendered: String,
+    /// Setting leaves the candidate changes.
+    pub changed_keys: Vec<&'static str>,
 }
 
 /// Result of one accepted `config.set`.
@@ -461,6 +500,9 @@ pub enum ConfigWriteFailure {
     /// The target is not a regular owner-controlled file (symlink, FIFO,
     /// directory, foreign owner), or the write would leave the user layer.
     Unsafe,
+    /// The candidate bytes moved between preview and commit (a profile or
+    /// concurrent edit changed the seed); nothing was written.
+    Stale,
     /// Atomic replace failed; the previous bytes are intact.
     Io,
 }
@@ -473,7 +515,18 @@ impl ConfigWriteFailure {
             Self::Invalid => "E_CONFIG_INVALID",
             Self::Unavailable => "E_CONFIG_UNAVAILABLE",
             Self::Unsafe => "E_CONFIG_UNSAFE",
+            Self::Stale => "E_CONFIG_STALE",
             Self::Io => "E_CONFIG_IO",
+        }
+    }
+
+    /// Stable error class for the bridge table.
+    #[must_use]
+    pub const fn class(self) -> &'static str {
+        match self {
+            Self::Invalid => "validation",
+            Self::Unavailable | Self::Stale => "runtime",
+            Self::Unsafe | Self::Io => "io",
         }
     }
 
@@ -484,6 +537,7 @@ impl ConfigWriteFailure {
             Self::Invalid => "the configuration change failed validation",
             Self::Unavailable => "no writable user configuration layer is available",
             Self::Unsafe => "the user configuration target is not a safe regular file",
+            Self::Stale => "the configuration candidate changed since it was previewed",
             Self::Io => "the atomic user configuration replace failed",
         }
     }
@@ -491,17 +545,37 @@ impl ConfigWriteFailure {
 
 /// Backend contract for one durable, validated user-layer change.
 ///
-/// Implementations must re-validate the change through the strict loader and
-/// commit atomically (temp + fsync + rename + directory fsync, owner-only
-/// mode, `.bak` of the previous bytes). A returned error must leave the
-/// previous bytes untouched.
+/// `preview` renders the exact candidate bytes without touching disk;
+/// `apply` re-renders, refuses with [`ConfigWriteFailure::Stale`] unless the
+/// candidate digest matches the approved one, and only then commits
+/// atomically (temp + fsync + rename + directory fsync, owner-only mode,
+/// rolling `.bak`). A returned error must leave the previous bytes untouched.
 pub trait ConfigWriteBackend {
-    /// Apply one change; `Unchanged` means the value already matched.
+    /// Render the exact candidate for approval, changing nothing.
     ///
     /// # Errors
     ///
     /// Returns a path-free [`ConfigWriteFailure`].
-    fn apply(&self, change: &ConfigChange) -> Result<ConfigApplyOutcome, ConfigWriteFailure>;
+    fn preview(
+        &self,
+        plugin_id: &str,
+        change: &ConfigChange,
+    ) -> Result<ConfigPreviewRendering, ConfigWriteFailure>;
+
+    /// Apply one approved change; `Unchanged` means the value already matched.
+    ///
+    /// Re-renders and compares the candidate digest to `expected` before any
+    /// write; a mismatch returns [`ConfigWriteFailure::Stale`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a path-free [`ConfigWriteFailure`].
+    fn apply(
+        &self,
+        plugin_id: &str,
+        change: &ConfigChange,
+        expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure>;
 }
 
 /// Backend result for one change.
@@ -513,20 +587,21 @@ pub enum ConfigApplyOutcome {
     Unchanged,
 }
 
-/// Per-generation rate window and consent-preview table.
+/// Per-generation rate window and one-shot approval table.
 #[derive(Debug)]
 pub struct ConfigWriteGate {
     window_start: Instant,
     calls: u32,
     bytes: usize,
-    issued: VecDeque<IssuedPreview>,
+    issued: VecDeque<IssuedApproval>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct IssuedPreview {
+struct IssuedApproval {
     digest: String,
     key: &'static str,
     value: ConfigSettingValue,
+    candidate_digest: String,
 }
 
 impl ConfigWriteGate {
@@ -560,50 +635,112 @@ impl ConfigWriteGate {
         true
     }
 
-    /// Remember one issued preview (bounded, drop-oldest).
-    pub fn issue(&mut self, digest: String, key: &'static str, value: ConfigSettingValue) {
+    /// Remember one issued approval (bounded, drop-oldest).
+    ///
+    /// A repeated preview of the same `(key, value)` replaces the outstanding
+    /// approval instead of stacking a second token: one exact change can only
+    /// ever have one live approval.
+    pub fn issue(
+        &mut self,
+        digest: String,
+        key: &'static str,
+        value: ConfigSettingValue,
+        candidate_digest: String,
+    ) {
+        self.issued
+            .retain(|issued| !(issued.key == key && issued.value == value));
         if self.issued.len() >= CONFIG_SET_MAX_OUTSTANDING_PREVIEWS {
             self.issued.pop_front();
         }
-        self.issued.push_back(IssuedPreview { digest, key, value });
+        self.issued.push_back(IssuedApproval {
+            digest,
+            key,
+            value,
+            candidate_digest,
+        });
     }
 
-    /// Consume the digest issued for exactly this `(key, value)` triple.
+    /// Consume the approval issued for exactly this `(key, value)` triple.
     ///
-    /// One digest authorizes one write: a second `set` with the same token is
-    /// refused, so a stale row cannot be replayed.
-    pub fn consume(&mut self, digest: &str, key: &str, value: &ConfigSettingValue) -> bool {
-        let Some(index) = self.issued.iter().position(|issued| {
+    /// Returns the approved candidate digest. One token authorizes one write:
+    /// a second `set` with the same token is refused, so a stale row cannot be
+    /// replayed.
+    pub fn consume(
+        &mut self,
+        digest: &str,
+        key: &str,
+        value: &ConfigSettingValue,
+    ) -> Option<String> {
+        let index = self.issued.iter().position(|issued| {
             issued.digest == digest && issued.key == key && issued.value == *value
-        }) else {
-            return false;
-        };
-        self.issued.remove(index);
-        true
+        })?;
+        Some(self.issued.remove(index)?.candidate_digest)
     }
 }
 
-/// Number of outstanding previews (tests/diagnostics).
+/// Number of outstanding approvals (tests/diagnostics).
 #[must_use]
 pub fn outstanding_previews(gate: &ConfigWriteGate) -> usize {
     gate.issued.len()
 }
 
-/// Build the versioned consent preimage for one change.
+/// Build the versioned approval preimage for one rendered change.
 #[must_use]
-pub fn consent_preimage(plugin_id: &str, change: &ConfigChange) -> String {
+pub fn approval_preimage(
+    plugin_id: &str,
+    change: &ConfigChange,
+    rendering: &ConfigPreviewRendering,
+) -> String {
     format!(
-        "{CONFIG_SET_DIGEST_DOMAIN}\0{plugin_id}\0{}\0{}\0{}",
+        "{CONFIG_SET_APPROVAL_DOMAIN}\0{plugin_id}\0{}\0{}\0{}\0{}\0{}",
         change.key(),
         change.value().kind().as_str(),
-        change.rendered()
+        change.rendered(),
+        rendering.candidate_digest,
+        rendering.changed_keys.join("\n")
     )
 }
 
-/// SHA-256 consent digest over [`consent_preimage`].
+/// SHA-256 approval digest over [`approval_preimage`].
 #[must_use]
-pub fn consent_digest(plugin_id: &str, change: &ConfigChange) -> String {
-    bitty_package::integrity::sha256_hex(consent_preimage(plugin_id, change).as_bytes())
+pub fn approval_digest(
+    plugin_id: &str,
+    change: &ConfigChange,
+    rendering: &ConfigPreviewRendering,
+) -> String {
+    bitty_package::integrity::sha256_hex(approval_preimage(plugin_id, change, rendering).as_bytes())
+}
+
+/// SHA-256 of the exact candidate user-layer bytes.
+///
+/// Backends hash the rendered candidate with this helper so the runtime and
+/// the tests share one definition.
+#[must_use]
+pub fn candidate_digest(bytes: &[u8]) -> String {
+    bitty_package::integrity::sha256_hex(bytes)
+}
+
+/// Map one backend failure to the plugin-visible typed error.
+///
+/// Only the path-free class and message cross; the backend's own diagnostic
+/// (which may name a host path) stays in the host log.
+#[must_use]
+pub fn config_backend_error(failure: ConfigWriteFailure, key: &str) -> BridgeError {
+    BridgeError::new(
+        failure.class(),
+        failure.code(),
+        format!("{} (key '{key}')", failure.message()),
+    )
+}
+
+/// No writable user layer: same class as a missing backend.
+#[must_use]
+pub fn config_unavailable() -> BridgeError {
+    BridgeError::new(
+        ConfigWriteFailure::Unavailable.class(),
+        ConfigWriteFailure::Unavailable.code(),
+        ConfigWriteFailure::Unavailable.message(),
+    )
 }
 
 /// Validate the one-row result bound before a result is built.
@@ -669,12 +806,19 @@ mod tests {
             "mouse.middle",
             "font.fallback",
             "session.restore_on_startup",
+            // Review B5: capture retention is not a plugin presentation
+            // setting; it stays on the explicit CLI/user path.
+            "history.capture.transcript",
+            "history.capture.commands",
         ] {
             assert!(
                 writable_setting(forbidden).is_none(),
                 "{forbidden} must stay CLI-only"
             );
         }
+        // `close_confirm` is allowed by P-3, but the preview must disclose the
+        // resulting policy (see the allowlist comment).
+        assert!(writable_setting("close_confirm").is_some());
     }
 
     #[test]
@@ -737,22 +881,65 @@ mod tests {
         assert_eq!(change.value().kind(), ConfigValueKind::Text);
     }
 
+    fn rendering(candidate: &str, keys: &[&'static str]) -> ConfigPreviewRendering {
+        ConfigPreviewRendering {
+            changed_keys: keys.to_vec(),
+            rendered: format!("rendered:{candidate}"),
+            candidate_digest: bitty_package::integrity::sha256_hex(candidate.as_bytes()),
+        }
+    }
+
     #[test]
-    fn consent_digest_binds_plugin_key_value_and_rendering() {
+    fn approval_digest_binds_plugin_key_value_and_exact_candidate() {
         let theme = setting("appearance.theme");
         let change =
             ConfigChange::new(theme, ConfigSettingValue::text("catppuccin").expect("text"));
-        let digest = consent_digest("bitty-terminal.dashboard", &change);
+        let approved = rendering(
+            "return { appearance = { theme = \"catppuccin\" } }",
+            &["appearance.theme"],
+        );
+        let digest = approval_digest("bitty-terminal.dashboard", &change, &approved);
         assert_eq!(digest.len(), 64);
         assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(digest, consent_digest("bitty-terminal.dashboard", &change));
-        assert_ne!(digest, consent_digest("other.plugin", &change));
+        assert_eq!(
+            digest,
+            approval_digest("bitty-terminal.dashboard", &change, &approved)
+        );
+        assert_ne!(
+            digest,
+            approval_digest("other.plugin", &change, &approved),
+            "plugin identity is bound"
+        );
+
+        // The exact candidate bytes are bound: a profile edit that changes a
+        // pinned seed produces a different approval, even for the same leaf.
+        let moved_seed = rendering(
+            "return { appearance = { theme = \"catppuccin\" }, terminal = { shell = \"/bin/fish\" } }",
+            &["appearance.theme", "terminal.shell"],
+        );
+        assert_ne!(
+            digest,
+            approval_digest("bitty-terminal.dashboard", &change, &moved_seed),
+            "a different pinned seed invalidates the approval"
+        );
+        assert_ne!(
+            approval_preimage("p", &change, &approved),
+            approval_preimage("p", &change, &moved_seed),
+            "the preimage carries the candidate digest and changed keys"
+        );
+
+        // The changed-key list is part of the binding (seed visibility).
+        let hidden_keys = rendering("return { appearance = { theme = \"catppuccin\" } }", &[]);
+        assert_ne!(
+            digest,
+            approval_digest("bitty-terminal.dashboard", &change, &hidden_keys)
+        );
 
         let other_value =
             ConfigChange::new(theme, ConfigSettingValue::text("dracula").expect("text"));
         assert_ne!(
             digest,
-            consent_digest("bitty-terminal.dashboard", &other_value)
+            approval_digest("bitty-terminal.dashboard", &other_value, &approved)
         );
 
         let other_key = ConfigChange::new(
@@ -760,7 +947,7 @@ mod tests {
             ConfigSettingValue::text("catppuccin").expect("text"),
         );
         assert_ne!(
-            consent_digest("bitty-terminal.dashboard", &other_key),
+            approval_digest("bitty-terminal.dashboard", &other_key, &approved),
             digest
         );
 
@@ -775,8 +962,8 @@ mod tests {
             ConfigSettingValue::number(1.0).expect("number"),
         );
         assert_ne!(
-            consent_preimage("p", &text_one),
-            consent_preimage("p", &number_one)
+            approval_preimage("p", &text_one, &approved),
+            approval_preimage("p", &number_one, &approved)
         );
 
         // The preimage carries the rendered change, not a plugin-supplied
@@ -785,7 +972,10 @@ mod tests {
             theme,
             ConfigSettingValue::text(" catppuccin").expect("text"),
         );
-        assert_ne!(digest, consent_digest("bitty-terminal.dashboard", &padded));
+        assert_ne!(
+            digest,
+            approval_digest("bitty-terminal.dashboard", &padded, &approved)
+        );
     }
 
     #[test]
@@ -812,17 +1002,35 @@ mod tests {
     }
 
     #[test]
-    fn previews_are_one_shot_and_bounded() {
+    fn approvals_are_one_shot_unique_and_bounded() {
         let start = Instant::now();
         let mut gate = ConfigWriteGate::new(start);
         let value = ConfigSettingValue::text("catppuccin").expect("text");
         let change = ConfigChange::new(setting("appearance.theme"), value.clone());
-        let digest = consent_digest("p", &change);
-        gate.issue(digest.clone(), change.key(), value.clone());
+        let approved = rendering("candidate-one", &["appearance.theme"]);
+        let digest = approval_digest("p", &change, &approved);
+        gate.issue(
+            digest.clone(),
+            change.key(),
+            value.clone(),
+            approved.candidate_digest.clone(),
+        );
         assert_eq!(outstanding_previews(&gate), 1);
-        assert!(gate.consume(&digest, change.key(), &value));
+        // Re-previewing the same exact change replaces the approval instead of
+        // stacking a second token (one live approval per change).
+        gate.issue(
+            digest.clone(),
+            change.key(),
+            value.clone(),
+            approved.candidate_digest.clone(),
+        );
+        assert_eq!(outstanding_previews(&gate), 1, "no duplicate approvals");
+        assert_eq!(
+            gate.consume(&digest, change.key(), &value),
+            Some(approved.candidate_digest.clone())
+        );
         assert!(
-            !gate.consume(&digest, change.key(), &value),
+            gate.consume(&digest, change.key(), &value).is_none(),
             "tokens are one-shot"
         );
         assert_eq!(outstanding_previews(&gate), 0);
@@ -830,12 +1038,18 @@ mod tests {
         for index in 0..CONFIG_SET_MAX_OUTSTANDING_PREVIEWS + 4 {
             let value = ConfigSettingValue::text(&format!("theme{index}")).expect("text");
             let change = ConfigChange::new(setting("appearance.theme"), value.clone());
-            gate.issue(consent_digest("p", &change), change.key(), value);
+            let approved = rendering(&format!("candidate-{index}"), &["appearance.theme"]);
+            gate.issue(
+                approval_digest("p", &change, &approved),
+                change.key(),
+                value,
+                approved.candidate_digest,
+            );
         }
         assert_eq!(
             outstanding_previews(&gate),
             CONFIG_SET_MAX_OUTSTANDING_PREVIEWS,
-            "old previews drop instead of growing the table"
+            "old approvals drop instead of growing the table"
         );
     }
 
@@ -853,11 +1067,15 @@ mod tests {
             ConfigWriteFailure::Invalid,
             ConfigWriteFailure::Unavailable,
             ConfigWriteFailure::Unsafe,
+            ConfigWriteFailure::Stale,
             ConfigWriteFailure::Io,
         ] {
             assert!(!failure.message().contains('/'));
             assert!(!failure.message().contains("~"));
             assert!(failure.code().starts_with("E_CONFIG_"));
+            assert!(!failure.class().is_empty());
         }
+        assert_eq!(ConfigWriteFailure::Stale.code(), "E_CONFIG_STALE");
+        assert_eq!(config_unavailable().code, "E_CONFIG_UNAVAILABLE");
     }
 }

@@ -68,7 +68,7 @@ pub enum CapabilityFamily {
     /// A NEW family beside `runtime.*`: the accepted read query stays
     /// `runtime.inspect` (dashboard P-2), while `config.manage` is the only
     /// write head. It writes the user layer only, is high-risk, takes no
-    /// parameter, and requires a digest-bound per-change consent. Neither
+    /// parameter, and requires a bytes-bound per-change approval token. Neither
     /// side implies the other: a read grant never widens into a write, and
     /// a write grant never widens into a read.
     Config,
@@ -382,6 +382,18 @@ impl CapabilityId {
     pub fn has_param(&self) -> bool {
         self.has_param
     }
+
+    /// Whether this head may only be granted by a recorded, explicit decision.
+    ///
+    /// Development (`local-path`) packages and bundled packages otherwise
+    /// receive every declared head when no grant record exists (the trusted
+    /// development seam). Configuration writes must never ride that seam: a
+    /// package that merely declares `config.manage` activates without it and
+    /// every write fails closed until a recorded grant exists.
+    #[must_use]
+    pub fn requires_recorded_grant(&self) -> bool {
+        self.as_str().split(':').next() == Some("config.manage")
+    }
 }
 
 impl std::fmt::Display for CapabilityId {
@@ -537,8 +549,8 @@ pub fn effect_statement_with(catalog: &CapabilityCatalog, id: &CapabilityId) -> 
         "audio.state.read" => "Read volume, mute, and port state (bounded snapshot)",
         "audio.state.control" => "Change volume and mute state (bounded steps)",
         "config.manage" => {
-            "Change allowlisted user configuration values (write-only, high-risk, per-change \
-             consent)"
+            "Change allowlisted user configuration values (write-only, high-risk, \
+             per-change approval)"
         }
         _ => "Requested capability",
     }
@@ -918,8 +930,8 @@ mod tests {
         assert!(granted.is_high_risk());
         assert_eq!(
             effect_statement(&granted),
-            "Change allowlisted user configuration values (write-only, high-risk, per-change \
-             consent)"
+            "Change allowlisted user configuration values (write-only, high-risk, \
+             per-change approval)"
         );
         assert!(CapabilityId::parse("config.manage:user").is_err());
         for unknown in [
@@ -977,6 +989,28 @@ mod tests {
                 "'{head}' must never imply config.manage"
             );
         }
+    }
+
+    #[test]
+    fn only_config_manage_requires_a_recorded_grant() {
+        // CTX-1613 review B2: the development/bundled "no record grants in
+        // full" seam must not hand out configuration writes. Exactly one
+        // accepted head opts out of implicit granting.
+        use bitty_package::manifest as package_manifest;
+        for head in package_manifest::CLOSED_CAPABILITY_HEADS {
+            let raw = if package_manifest::capability_requires_param(head) {
+                format!("{head}:param")
+            } else {
+                (*head).to_string()
+            };
+            let id = CapabilityId::parse(&raw).expect("closed head parses");
+            assert_eq!(
+                id.requires_recorded_grant(),
+                *head == "config.manage",
+                "recorded-grant requirement drift for '{head}'"
+            );
+        }
+        assert!(CapabilityId::parse("config.manage:extra").is_err());
     }
 
     #[test]

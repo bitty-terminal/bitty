@@ -5729,6 +5729,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    // Unix-only: the fault is injected by making the directory read-only,
+    // which does not prevent file creation on Windows. The commit path itself
+    // is platform-independent, and the Windows write path is covered by the
+    // happy-path and conflict tests.
+    #[cfg(unix)]
     #[test]
     fn config_writer_failure_leaves_bytes_and_never_a_partial_file() {
         let dir = scratch_dir("cfg-commit");

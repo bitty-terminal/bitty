@@ -1,0 +1,815 @@
+name: Preview Release
+
+# Nightly preview channel (bitty#2655, CTX-1615).
+#
+# Accepted contract:
+# bitty-terminal-docs/specifications/preview-release-contract.md.
+#
+# Two UTC crons cover the nominal 23:30 Europe/Berlin slot in both daylight
+# saving offsets. The cron is only a trigger: the preflight decides whether a
+# run belongs to a cadence slot, and an off-slot firing is a successful no-op.
+#
+# This workflow is a separate publisher with no stable authority. It ships
+# archives and a public GitHub pre-release only: no package channel, no stable
+# pointer, no object-storage mirror, no installer, no signature, no SBOM.
+# Stable bytes are produced only by release.yml.
+
+on:
+  schedule:
+    # Cron A: 21:30 UTC = 23:30 Europe/Berlin while CEST is in effect.
+    - cron: "30 21 * * *"
+    # Cron B: 22:30 UTC = 23:30 Europe/Berlin while CET is in effect.
+    - cron: "30 22 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build, verify, and smoke without creating a tag or release
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-release
+  cancel-in-progress: false
+
+env:
+  # P-01/P-02: the schedule zone and accepted lateness window are policy, not
+  # per-run knobs. They live in scripts/preview-preflight.sh; the workflow only
+  # consumes the script's outputs.
+  PREVIEW_KEEP_RELEASES: "14"
+
+jobs:
+  # P-01, P-02, P-08, P-11: the only authority on whether this run is a cadence
+  # slot. Every downstream job gates on `needs.preflight.outputs.run == 'true'`.
+  preflight:
+    name: Preview preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run: ${{ steps.preflight.outputs.run }}
+      reason: ${{ steps.preflight.outputs.reason }}
+      cadence_date: ${{ steps.preflight.outputs.cadence_date }}
+      tag: ${{ steps.preflight.outputs.tag }}
+      base_version: ${{ steps.preflight.outputs.base_version }}
+      sha: ${{ steps.preflight.outputs.sha }}
+    steps:
+      # Scheduled runs already target the default branch; the explicit `main`
+      # ref makes the manual-dispatch contract identical and guarantees the
+      # previewed commit is on main.
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Resolve the main commit
+        id: main
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+          echo "preview candidate: $sha"
+
+      - name: List remote tags once
+        run: |
+          set -euo pipefail
+          git ls-remote --tags origin 'refs/tags/v*' >"$RUNNER_TEMP/preview-tags.txt"
+
+      # Release creation time, not the tag date, decides the retention and
+      # same-commit markers. An empty list is valid before the first preview.
+      - name: List published preview releases (oldest first)
+        id: releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # An off-slot cron must stay a green no-op even when the release API
+          # is unavailable; the script then falls back to tag markers.
+          if gh release list --exclude-drafts --limit 100 \
+            --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | .[].tagName' \
+            >"$RUNNER_TEMP/preview-releases.txt"; then
+            echo "available=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "::warning::could not list releases; using tag markers for the same-commit no-op"
+            : >"$RUNNER_TEMP/preview-releases.txt"
+            echo "available=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide the cadence slot
+        id: preflight
+        run: |
+          set -euo pipefail
+          args=(
+            --tags-file "$RUNNER_TEMP/preview-tags.txt"
+            --commit "${{ steps.main.outputs.sha }}"
+            --output "$GITHUB_OUTPUT"
+            --summary "$GITHUB_STEP_SUMMARY"
+          )
+          if [[ "${{ steps.releases.outputs.available }}" == "true" ]]; then
+            args+=(--releases-file "$RUNNER_TEMP/preview-releases.txt")
+          fi
+          scripts/preview-preflight.sh "${args[@]}"
+
+      # Required gate: the exact commit's CI push run is green. A missing,
+      # pending, or red run fails closed. Skipped for off-slot no-ops so an
+      # off-season cron never spends API calls or turns green into red.
+      - name: Require a green CI push run for the preview commit
+        if: steps.preflight.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          runs="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs?head_sha=${sha}&per_page=100")"
+          latest="$(
+            jq -r '
+              [.workflow_runs[]
+               | select(.name == "CI" and .event == "push" and .head_branch == "main")]
+              | sort_by(.created_at) | last // empty
+              | [.status, .conclusion, .html_url] | @tsv
+            ' <<<"$runs"
+          )"
+          if [[ -z "$latest" ]]; then
+            echo "::error::no CI push run found for ${sha}; refusing to preview an unverified commit" >&2
+            exit 1
+          fi
+          IFS=$'\t' read -r status conclusion url <<<"$latest"
+          echo "CI push run: status=${status} conclusion=${conclusion:-pending} ${url}"
+          if [[ "$status" != "completed" || "$conclusion" != "success" ]]; then
+            echo "::error::CI push run for ${sha} is not green (status=${status}, conclusion=${conclusion:-pending})" >&2
+            exit 1
+          fi
+
+  # P-07: the three accepted Tier 1 cells. The build is a release build with
+  # the preview channel compiled in; every gate that can run on the producing
+  # host runs here, before any archive exists.
+  build:
+    name: Build ${{ matrix.target }}
+    needs: preflight
+    if: needs.preflight.outputs.run == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Check out the preflight commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          fetch-depth: 1
+
+      # Required gate: the workspace version is the single source of truth and
+      # must still be the base version the preflight accepted.
+      - name: Check version consistency
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(bash scripts/check-release-version.sh --print)"
+          if [[ "$version" != "${{ needs.preflight.outputs.base_version }}" ]]; then
+            echo "::error::workspace version ${version} != preflight base version ${{ needs.preflight.outputs.base_version }}" >&2
+            exit 1
+          fi
+          bash scripts/check-release-version.sh
+
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >>"$GITHUB_OUTPUT"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
+          targets: ${{ matrix.target }}
+
+      - name: Resolve release RUSTFLAGS (remapped builder roots)
+        id: release-flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags="$(scripts/release-rustflags.sh)"
+          printf 'flags=%s\n' "$flags" >>"$GITHUB_OUTPUT"
+          echo "release RUSTFLAGS: $flags"
+
+      - name: Install Linux font stack
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libfontconfig1-dev libfreetype6-dev
+
+      - name: Build bitty (preview channel)
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ steps.release-flags.outputs.flags }}
+          # P-10/P-15: the channel is the only preview marker in the binary;
+          # the base version and archive names stay bare.
+          BITTY_CHANNEL: preview
+        run: cargo build --release --locked -p bitty-terminal --target ${{ matrix.target }}
+
+      - name: Check release binary has no builder paths
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bin="target/${TARGET}/release/bitty"
+          if [[ "$TARGET" == *windows* ]]; then
+            bin="${bin}.exe"
+          fi
+          bash scripts/check-release-paths.sh --binary "$bin"
+
+      - name: Assert the mandatory preview artifacts
+        shell: bash
+        env:
+          BASE_VERSION: ${{ needs.preflight.outputs.base_version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          bin="target/${TARGET}/release/bitty"
+          if [[ "$TARGET" == *windows* ]]; then
+            bin="${bin}.exe"
+          fi
+          case "$TARGET" in
+          x86_64-unknown-linux-gnu)
+            bash scripts/check-binary-arch.sh --binary "$bin" --arch x86_64
+            ;;
+          aarch64-apple-darwin)
+            arches="$(lipo -archs "$bin")"
+            if [[ "$arches" != "arm64" ]]; then
+              echo "::error::macOS preview binary is not arm64-only: ${arches}" >&2
+              exit 1
+            fi
+            ;;
+          x86_64-pc-windows-msvc)
+            # The Windows smoke job runs the executable on a Windows runner;
+            # this cell only needs the artifact to exist.
+            ;;
+          *)
+            echo "::error::unexpected preview target: ${{ matrix.target }}" >&2
+            exit 1
+            ;;
+          esac
+          if [[ "$TARGET" != *windows* ]]; then
+            scripts/check-version-output.sh "$BASE_VERSION" "$bin"
+            out="$("$bin" --version)"
+            if [[ "$out" != *" (preview "* ]]; then
+              echo "::error::preview binary does not report the preview channel: ${out}" >&2
+              exit 1
+            fi
+          else
+            [[ -f "$bin" ]] || {
+              echo "::error::Windows binary not found: $bin" >&2
+              exit 1
+            }
+          fi
+
+      - name: Stage the build artifact
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ext=""
+          if [[ "$TARGET" == *windows* ]]; then
+            ext=".exe"
+          fi
+          cp "target/${TARGET}/release/bitty${ext}" "dist/bitty-${TARGET}${ext}"
+          ls -lh "dist/bitty-${TARGET}${ext}"
+
+      - name: Upload the build artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bitty-preview-build-${{ matrix.target }}
+          path: dist/bitty-${{ matrix.target }}*
+          if-no-files-found: error
+          retention-days: 7
+
+  # P-07/P-15: archives only. Linux and Windows reuse the stable packers; macOS
+  # has a new packer because the stable Unix packer carries Linux desktop
+  # members and the stable macOS delivery is a signed-flow DMG that previews do
+  # not ship. Asset names carry the bare base version.
+  package:
+    name: Package ${{ matrix.target }}
+    needs: [preflight, build]
+    if: needs.preflight.outputs.run == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            packer: linux
+            archive_suffix: x86_64-unknown-linux-gnu.tar.zst
+          - os: macos-15
+            target: aarch64-apple-darwin
+            packer: macos
+            archive_suffix: aarch64-apple-darwin.tar.zst
+          - os: ubuntu-24.04
+            target: x86_64-pc-windows-msvc
+            packer: windows
+            archive_suffix: windows-x86_64.zip
+    steps:
+      - name: Check out the preflight commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          fetch-depth: 1
+
+      - name: Download the build artifact
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bitty-preview-build-${{ matrix.target }}
+          path: dist
+
+      - name: Assemble the preview archive
+        shell: bash
+        env:
+          BASE_VERSION: ${{ needs.preflight.outputs.base_version }}
+          ARCHIVE: bitty-${{ needs.preflight.outputs.base_version }}-${{ matrix.archive_suffix }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.packer }}" in
+          linux)
+            bash scripts/make-unix-bundle.sh \
+              --version "$BASE_VERSION" \
+              --target "$TARGET" \
+              --binary "dist/bitty-${TARGET}" \
+              --output "dist/${ARCHIVE}"
+            ;;
+          macos)
+            bash scripts/make-macos-preview-archive.sh \
+              --version "$BASE_VERSION" \
+              --target "$TARGET" \
+              --binary "dist/bitty-${TARGET}" \
+              --output "dist/${ARCHIVE}"
+            ;;
+          windows)
+            bash scripts/make-windows-zip.sh \
+              --version "$BASE_VERSION" \
+              --exe "dist/bitty-${TARGET}.exe" \
+              --output "dist/${ARCHIVE}"
+            ;;
+          *)
+            echo "::error::unexpected packer: ${{ matrix.packer }}" >&2
+            exit 1
+            ;;
+          esac
+          # Sidecars use the GNU sha256sum format and the archive basename so
+          # the release job can verify them from inside `dist/`.
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$ARCHIVE" >"${ARCHIVE}.sha256"
+            else
+              shasum -a 256 "$ARCHIVE" >"${ARCHIVE}.sha256"
+            fi
+            cat "${ARCHIVE}.sha256"
+          )
+
+      - name: Enforce the per-archive size bound
+        shell: bash
+        env:
+          ARCHIVE: bitty-${{ needs.preflight.outputs.base_version }}-${{ matrix.archive_suffix }}
+        run: |
+          set -euo pipefail
+          max=134217728 # 128 MiB, P-06
+          size="$(wc -c <"dist/${ARCHIVE}")"
+          echo "archive ${ARCHIVE}: ${size} bytes (cap ${max})"
+          if ((size > max)); then
+            echo "::error::preview archive ${ARCHIVE} is ${size} bytes, above the 128 MiB cap" >&2
+            exit 1
+          fi
+          if ((size == 0)); then
+            echo "::error::preview archive ${ARCHIVE} is empty" >&2
+            exit 1
+          fi
+
+      - name: Verify the macOS archive version output
+        if: matrix.packer == 'macos'
+        shell: bash
+        env:
+          BASE_VERSION: ${{ needs.preflight.outputs.base_version }}
+          ARCHIVE: bitty-${{ needs.preflight.outputs.base_version }}-${{ matrix.archive_suffix }}
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          zstd -dc "dist/${ARCHIVE}" | tar -xf - -C "$tmp"
+          top="${ARCHIVE%.tar.zst}"
+          exe="$tmp/${top}/bin/bitty"
+          scripts/check-version-output.sh "$BASE_VERSION" "$exe"
+          out="$("$exe" --version)"
+          if [[ "$out" != *" (preview "* ]]; then
+            echo "::error::macOS preview binary does not report the preview channel: ${out}" >&2
+            exit 1
+          fi
+
+      # P-07: Linux runs the archive in one clean container.
+      - name: Linux archive smoke in a clean container
+        if: matrix.packer == 'linux'
+        shell: bash
+        env:
+          BASE_VERSION: ${{ needs.preflight.outputs.base_version }}
+          ARCHIVE: bitty-${{ needs.preflight.outputs.base_version }}-${{ matrix.archive_suffix }}
+          TOPDIR: bitty-${{ needs.preflight.outputs.base_version }}-x86_64-unknown-linux-gnu
+        run: |
+          set -euo pipefail
+          scripts/preview-linux-smoke.sh \
+            --archive "dist/${ARCHIVE}" \
+            --base-version "$BASE_VERSION" \
+            --topdir "$TOPDIR"
+
+      - name: Upload the preview archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bitty-preview-archive-${{ matrix.target }}
+          path: |
+            dist/bitty-${{ needs.preflight.outputs.base_version }}-${{ matrix.archive_suffix }}
+            dist/bitty-${{ needs.preflight.outputs.base_version }}-${{ matrix.archive_suffix }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # P-07: Windows is a required preview smoke, not a stable gate. The archive is
+  # assembled on Linux (the stable packer) and executed on a clean Windows
+  # runner; macOS intentionally has no launch smoke because previews ship no
+  # `.app` or DMG.
+  smoke-windows:
+    name: Windows smoke
+    needs: [preflight, package]
+    if: needs.preflight.outputs.run == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Download the Windows archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bitty-preview-archive-x86_64-pc-windows-msvc
+          path: pkg
+
+      - name: Expand and run bitty.exe
+        shell: pwsh
+        env:
+          BASE_VERSION: ${{ needs.preflight.outputs.base_version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Get-ChildItem -Path pkg -Filter '*.zip' | Select-Object -First 1
+          if (-not $zip) { throw 'preview ZIP artifact not found' }
+          Write-Host "archive: $($zip.Name)"
+          $expectedName = "bitty-$env:BASE_VERSION-windows-x86_64.zip"
+          if ($zip.Name -ne $expectedName) {
+            throw "unexpected archive name: $($zip.Name) (want $expectedName)"
+          }
+          $dest = Join-Path $env:RUNNER_TEMP 'bitty-preview-zip'
+          if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+          Expand-Archive -Path $zip.FullName -DestinationPath $dest
+          $dirs = @(Get-ChildItem -Path $dest -Directory)
+          if ($dirs.Count -ne 0) {
+            throw "unexpected directories in archive root: $($dirs.Name -join ', ')"
+          }
+          $expected = @('bitty.exe', 'LICENSE', 'README.md', 'CHANGELOG.md')
+          $actual = @(Get-ChildItem -Path $dest -File | ForEach-Object { $_.Name })
+          if (Compare-Object $expected $actual) {
+            throw "archive contents mismatch: $($actual -join ', ')"
+          }
+          $exe = Join-Path $dest 'bitty.exe'
+          $output = (& $exe --version 2>&1 | Out-String)
+          $code = $LASTEXITCODE
+          if ($code -ne 0) { throw "bitty --version exited $code" }
+          $pattern = '\Abitty ' + [regex]::Escape($env:BASE_VERSION) + ' \(preview [^\s()]+\)(?:\r\n|\n)\z'
+          Write-Host "bitty --version => $($output.TrimEnd())"
+          if ($output -cnotmatch $pattern) {
+            throw "version/channel mismatch: '$output'"
+          }
+
+  # P-03, P-06, P-10, P-15: verify every archive, attest it, then publish one
+  # public pre-release with the bare base version in the asset names. A
+  # dry-run dispatch stops here without creating a tag or release.
+  release:
+    name: Publish the preview pre-release
+    needs: [preflight, package, smoke-windows]
+    if: needs.preflight.outputs.run == 'true' && (github.event_name != 'workflow_dispatch' || !inputs.dry_run)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out the preflight commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          fetch-depth: 1
+
+      - name: Download the preview archives
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bitty-preview-archive-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify assets, checksums, and retention bounds
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_VERSION: ${{ needs.preflight.outputs.base_version }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          CADENCE_DATE: ${{ needs.preflight.outputs.cadence_date }}
+          SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          set -euo pipefail
+          linux="bitty-${BASE_VERSION}-x86_64-unknown-linux-gnu.tar.zst"
+          macos="bitty-${BASE_VERSION}-aarch64-apple-darwin.tar.zst"
+          windows="bitty-${BASE_VERSION}-windows-x86_64.zip"
+          expected="$(
+            printf '%s\n' \
+              "$linux" "$linux.sha256" \
+              "$macos" "$macos.sha256" \
+              "$windows" "$windows.sha256" |
+              LC_ALL=C sort
+          )"
+          actual="$(find dist -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::unexpected downloaded assets:" >&2
+            diff <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") >&2 || true
+            exit 1
+          fi
+
+          for archive in "$linux" "$macos" "$windows"; do
+            (cd dist && sha256sum -c "${archive}.sha256")
+          done
+          (
+            cd dist
+            sha256sum "$linux" "$macos" "$windows" >SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+
+          toolchain="$(scripts/rust-channel.sh)"
+          date_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          printf '{\n  "commit": "%s",\n  "tag": "%s",\n  "date": "%s",\n  "toolchain": "%s",\n  "build_runner": "github-actions",\n  "channel": "preview",\n  "base_version": "%s",\n  "cadence_date": "%s"\n}\n' \
+            "$SHA" "$TAG" "$date_now" "$toolchain" "$BASE_VERSION" "$CADENCE_DATE" >dist/provenance.json
+          cat dist/provenance.json
+
+          count="$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if [[ "$count" -ne 8 ]]; then
+            echo "::error::preview release would carry ${count} assets, expected 8" >&2
+            exit 1
+          fi
+
+          # P-06 bounds: 128 MiB per archive and 2 GiB total. The per-archive
+          # bound is also enforced before upload; this re-check covers a
+          # corrupted or replaced artifact between jobs.
+          per_archive_max=134217728
+          total_max=2147483648
+          for archive in "$linux" "$macos" "$windows"; do
+            size="$(wc -c <"dist/${archive}")"
+            if ((size > per_archive_max)); then
+              echo "::error::${archive} is ${size} bytes, above the 128 MiB cap" >&2
+              exit 1
+            fi
+          done
+          total="$(find dist -maxdepth 1 -type f -printf '%s\n' | awk '{ sum += $1 } END { print sum + 0 }')"
+          echo "preview asset bytes: ${total} (cap ${total_max})"
+          if ((total > total_max)); then
+            echo "::error::preview assets total ${total} bytes, above the 2 GiB cap" >&2
+            exit 1
+          fi
+
+          # P-06: workflow artifact volume is capped at 256 MiB per run. Query
+          # this run only, so an older run's leftovers cannot fail a new night.
+          artifact_bytes="$(
+            gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
+              --jq '[.artifacts[].size_in_bytes] | add // 0'
+          )"
+          echo "workflow artifact bytes: ${artifact_bytes} (cap 268435456)"
+          if ((artifact_bytes > 268435456)); then
+            echo "::error::workflow artifacts total ${artifact_bytes} bytes, above the 256 MiB per-run cap" >&2
+            exit 1
+          fi
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.zst
+            dist/*.zip
+
+      - name: Verify the attestations in the run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for archive in dist/*.tar.zst dist/*.zip; do
+            gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
+          done
+
+      - name: Create the annotated preview tag
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SHA: ${{ needs.preflight.outputs.sha }}
+          BASE_VERSION: ${{ needs.preflight.outputs.base_version }}
+          CADENCE_DATE: ${{ needs.preflight.outputs.cadence_date }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::preview tag ${TAG} already exists; refusing to move or reuse it" >&2
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Bitty ${BASE_VERSION} preview ${CADENCE_DATE} (${SHA})" "$SHA"
+          git push origin "refs/tags/${TAG}"
+
+      - name: Write the preview release notes
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          BASE_VERSION: ${{ needs.preflight.outputs.base_version }}
+          CADENCE_DATE: ${{ needs.preflight.outputs.cadence_date }}
+          SHA: ${{ needs.preflight.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Build the file with printf (never an unquoted heredoc) so Markdown
+          # code spans in the notes cannot be evaluated as commands.
+          {
+            printf '%s\n' \
+              '**Unsupported preview build.** This is an automated nightly preview, not a' \
+              'stable release. There is no upgrade path, no backport, no migration, and no' \
+              'support commitment. Download and run it from this page only; do not install' \
+              'it through a package manager. An issue is triaged only when it reproduces on' \
+              'a stable build.' \
+              ''
+            printf -- '- Base version: %s\n' "$BASE_VERSION"
+            printf -- '- Channel: preview\n'
+            printf -- '- Cadence date: %s\n' "$CADENCE_DATE"
+            printf -- '- Commit: %s\n' "$SHA"
+            printf -- '- Provenance: build-provenance attestations are attached to every archive.\n'
+            printf '  Verify one with: gh attestation verify <asset> --repo %s\n' "$GITHUB_REPOSITORY"
+            printf '%s\n' \
+              '' \
+              'The archives are unsigned and unnotarized. The macOS archive is an' \
+              'unnotarized CLI tarball (no .app, no DMG), so Gatekeeper and quarantine' \
+              'apply. No installers, no package-manager payloads, and no stable pointer are' \
+              'produced by this channel.'
+          } >preview-notes.md
+          cat preview-notes.md
+
+      - name: Publish the public pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          BASE_VERSION: ${{ needs.preflight.outputs.base_version }}
+        run: |
+          set -euo pipefail
+          # `gh release create` creates a draft, uploads every asset, and only
+          # then publishes, so a failed upload never exposes a partial release.
+          # --prerelease and --latest=false keep the release out of the stable
+          # "latest" slot.
+          gh release create "$TAG" dist/* \
+            --verify-tag \
+            --prerelease \
+            --latest=false \
+            --title "Bitty ${BASE_VERSION} preview (${TAG##*.})" \
+            --notes-file preview-notes.md
+
+      - name: Confirm the release is a pre-release and not latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          release="$(
+            gh release view "$TAG" --json isPrerelease,isDraft,assets
+          )"
+          echo "$release"
+          if [[ "$(jq -r '.isPrerelease' <<<"$release")" != "true" ]]; then
+            echo "::error::preview release ${TAG} is not marked as a pre-release" >&2
+            exit 1
+          fi
+          if [[ "$(jq -r '.isDraft' <<<"$release")" != "false" ]]; then
+            echo "::error::preview release ${TAG} is still a draft" >&2
+            exit 1
+          fi
+          latest="$(gh release list --exclude-drafts --limit 100 --json tagName,isLatest \
+            | jq -r '[.[] | select(.isLatest) | .tagName] | first // empty')"
+          if [[ "$latest" == "$TAG" ]]; then
+            echo "::error::preview release ${TAG} is marked latest" >&2
+            exit 1
+          fi
+          asset_count="$(jq '.assets | length' <<<"$release")"
+          if [[ "$asset_count" -ne 8 ]]; then
+            echo "::error::preview release ${TAG} carries ${asset_count} assets, expected 8" >&2
+            exit 1
+          fi
+
+  # P-06: prune after a successful publish. A prune failure is reported by the
+  # failed job (the preview stays published) and never deletes a stable release,
+  # a non-preview tag, or a preview whose commit is also a stable tag target.
+  prune:
+    name: Prune old preview releases
+    needs: [preflight, release]
+    if: needs.preflight.outputs.run == 'true' && (github.event_name != 'workflow_dispatch' || !inputs.dry_run)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the preflight commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.sha }}
+          fetch-depth: 1
+
+      - name: Delete previews beyond the retention window
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP: ${{ env.PREVIEW_KEEP_RELEASES }}
+        run: |
+          set -euo pipefail
+          KEEP="${KEEP:-14}"
+          preview_re='^v[0-9]+\.[0-9]+\.[0-9]+-preview\.[0-9]{8}$'
+          gh release list --exclude-drafts --limit 100 \
+            --json tagName,createdAt,isPrerelease |
+            jq -c --arg re "$preview_re" '
+              [.[] | select(.isPrerelease and (.tagName | test($re)))]
+              | sort_by(.createdAt) | reverse
+            ' >preview-releases.json
+          count="$(jq 'length' preview-releases.json)"
+          echo "published preview releases: ${count} (keep ${KEEP})"
+          if ((count <= KEEP)); then
+            {
+              echo "### Preview retention"
+              echo ""
+              echo "Kept ${count} preview releases; nothing to prune."
+            } >>"$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # Resolve commits of every stable tag so a promoted preview is kept as
+          # evidence even after it falls outside the count window.
+          git ls-remote --tags origin 'refs/tags/v*' >all-tags.txt
+          awk '
+            $2 ~ /\^\{\}$/ {
+              tag = $2
+              sub(/\^\{\}$/, "", tag)
+              if (tag ~ /^refs\/tags\/v[0-9]+\.[0-9]+\.[0-9]+$/) print $1
+            }
+            $2 ~ /^refs\/tags\/v[0-9]+\.[0-9]+\.[0-9]+$/ { print $1 }
+          ' all-tags.txt | LC_ALL=C sort -u >stable-commits.txt
+
+          jq -r ".[${KEEP}:][] | .tagName" preview-releases.json >prune.txt
+          deleted=0
+          kept=0
+          while IFS= read -r tag; do
+            [[ -n "$tag" ]] || continue
+            commit="$(git ls-remote origin "refs/tags/${tag}^{}" | awk 'NR == 1 { print $1 }')"
+            if [[ -z "$commit" ]]; then
+              commit="$(git ls-remote origin "refs/tags/${tag}" | awk 'NR == 1 { print $1 }')"
+            fi
+            if [[ -z "$commit" ]]; then
+              echo "::error::cannot resolve the commit for preview tag ${tag}; refusing to guess" >&2
+              exit 1
+            fi
+            if grep -qxF "$commit" stable-commits.txt; then
+              echo "keep ${tag}: commit ${commit} is a stable tag target"
+              kept=$((kept + 1))
+              continue
+            fi
+            gh release delete "$tag" --cleanup-tag --yes
+            deleted=$((deleted + 1))
+          done <prune.txt
+
+          {
+            echo "### Preview retention"
+            echo ""
+            echo "Kept ${KEEP} newest preview releases; deleted ${deleted}."
+            echo "Excluded ${kept} preview(s) whose commit is a stable tag target."
+          } >>"$GITHUB_STEP_SUMMARY"

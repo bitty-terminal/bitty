@@ -462,6 +462,23 @@ release-smoke-test:
 release-channels-test:
     ./scripts/tests/check-release-channels.test.sh
 
+# Nightly preview preflight matrix (CTX-1615): the Europe/Berlin window, the
+# no-backdating and same-date no-ops, the exact stable bound, and the
+# vX.Y.Z-preview.YYYYMMDD grammar.
+preview-preflight-test:
+    ./scripts/tests/preview-preflight.test.sh
+
+# macOS arm64 preview archive packer (CTX-1615): arm64-only target, bare base
+# version, fixed payload, and the accepted asset basename.
+macos-preview-archive-test:
+    ./scripts/tests/make-macos-preview-archive.test.sh
+
+# Static isolation proof (CTX-1615): preview.yml carries no stable surface, and
+# every release.yml publisher keeps needs.validate, the stable output, and the
+# dash guard.
+preview-isolation-test:
+    ./scripts/tests/check-preview-isolation.test.sh
+
 # Hermetic importer coverage for the APT signing secret: armored, base64,
 # escaped-newline, wrong fingerprint, public-only, and unparseable material.
 apt-gpg-import-test:
@@ -534,7 +551,7 @@ commit-check message:
 # Local CI-equivalent gate. Registry-free by contract: `catalog-test` runs
 # hermetic fixtures; the strict registry drift gate is `check-registry` and
 # needs a bitty-plugins checkout (see CONTRIBUTING.md).
-check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate vendored-winit vendored-winit-test pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test apt-gpg-import-test release-channels-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test nix-lock-test m1-matrix-test compat-matrix-test compat-freshness-test perf-disk-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-test nix-patch-test
+check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate vendored-winit vendored-winit-test pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test apt-gpg-import-test release-channels-test preview-preflight-test macos-preview-archive-test preview-isolation-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test nix-lock-test m1-matrix-test compat-matrix-test compat-freshness-test perf-disk-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-test nix-patch-test
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

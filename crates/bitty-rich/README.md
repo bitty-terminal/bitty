@@ -47,9 +47,9 @@ and closed `OQ-008`, `OQ-015`, and `OQ-016` at design level.
   raster mechanics moved to the `bitty-graphics` extension behind
   `src/kitty_seam.rs` (W-141 extraction); bounded `APC G` intake lives in
   `bitty-vt/src/kitty_apc.rs`.
-- `src/kitty_seam.rs` — Core-owned decode/raster traits, seam caps, and the
-  Core-local backend; the only Core source module allowed to name the graphics
-  extension crate.
+- `src/kitty_seam.rs` — Core-owned decode/raster traits, the dyn seam handle
+  (`KittyBackendHandle`), seam caps, and the Core-local backend; the only Core
+  source module allowed to name the graphics extension crate.
 - `src/hyperlink.rs`, `src/shell.rs`, `src/clipboard.rs` — link table, shell
   zones plus the single OSC 7/133 read view (`ShellIntegration`: cwd, zones,
   command regions, last exit code), and clipboard helpers.
@@ -69,7 +69,11 @@ and the rich scene model. This crate's `image`, `scene`, `kitty_place`,
 `kitty_unicode`, `background`, and `geometry` modules are therefore
 Core-retained implementation, not extraction material; only
 `kitty_decode`/`kitty_raster` are extension-bound, and their Core copies stay
-behind `kitty_seam.rs` (`CoreKittyBackend` is the Core-local backend).
+behind `kitty_seam.rs` (`CoreKittyBackend` is the Core-local backend). The
+runtime holds that backend behind one dyn handle (`KittyBackendHandle`) and the
+composition root injects it through `Runtime::set_kitty_backend`; the default
+binding is `CoreKittyBackend`, so behavior is unchanged until the extension
+implements the seam.
 The composition-root binding has no separate open task: the remaining
 extension-side gate is `bitty-graphics#17` (the packed component is a
 version-only stub; its serve loop is not wired), and Core tracks the remainder

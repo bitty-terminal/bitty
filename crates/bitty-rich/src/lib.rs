@@ -80,7 +80,10 @@
 //! [`kitty_decode`] and nearest-neighbor raster mechanics in
 //! [`kitty_raster`] (both Core-owned behind the [`kitty_seam`] traits; the
 //! graphics extension implements the same traits on its own side, and Core
-//! never depends on extension internals). [`kitty_seam`] is the single
+//! never depends on extension internals). The runtime binds both behind one
+//! dyn handle ([`kitty_seam::KittyBackendHandle`], default
+//! [`kitty_seam::CoreKittyBackend`]) and injects it at the composition root.
+//! [`kitty_seam`] is the single
 //! source module that may name the graphics extension crate; every other
 //! module reaches the extension-bound mechanics through its traits. Seam
 //! items are public at [`kitty_seam`] only: the crate-root re-exports were

@@ -20,6 +20,10 @@
 //!   spelling for direct callers).
 //! - [`KittyDecodeBackend`] / [`KittyRasterBackend`]: decode (borrowed and
 //!   owned) plus raster (whole-rect and clipped) over Core-owned carriers.
+//! - [`KittyBackend`] / [`KittyBackendHandle`]: the dyn-safe composition of
+//!   both traits that the composition root holds and injects, so runtime
+//!   call sites dispatch through one object and never name the free
+//!   functions ([`CoreKittyBackend`] is the in-tree binding).
 //! - Caps, verbatim: 8192 px/side, 4096 x 4096 px area, 64 MiB RGBA,
 //!   32 blits and 64 MiB per frame (compile-time asserted below against
 //!   the [`crate::kitty_place`] twins so drift fails the build, not a
@@ -170,13 +174,44 @@ pub trait KittyRasterBackend {
     ) -> Option<Vec<u8>>;
 }
 
+/// Complete Core-owned Kitty graphics backend: decode and raster behind one
+/// dyn-safe object.
+///
+/// The two mechanics traits stay separate so each can be bound and tested on
+/// its own; this supertrait is what the composition root actually holds, so a
+/// runtime stores one [`KittyBackendHandle`] instead of two seam objects. It
+/// is `Send + Sync + Debug` so the handle fits any runtime threading shape and
+/// keeps the owning type's `Debug` impl derivable.
+///
+/// Every implementation of [`KittyDecodeBackend`] + [`KittyRasterBackend`] is
+/// a [`KittyBackend`] through the blanket impl; the in-tree implementation is
+/// [`CoreKittyBackend`].
+pub trait KittyBackend:
+    KittyDecodeBackend + KittyRasterBackend + Send + Sync + std::fmt::Debug
+{
+}
+
+impl<T> KittyBackend for T where
+    T: KittyDecodeBackend + KittyRasterBackend + Send + Sync + std::fmt::Debug
+{
+}
+
+/// Shared dyn handle to a [`KittyBackend`] — the composition-root shape.
+///
+/// `Arc` (not `Box`) so the injecting caller can keep its own handle (counters
+/// in tests, a shared backend in the app) while the runtime owns the same
+/// object. Construction defaults to `Arc::new(CoreKittyBackend::new())`; the
+/// composition root replaces it through the runtime setter
+/// (`Runtime::set_kitty_backend`).
+pub type KittyBackendHandle = std::sync::Arc<dyn KittyBackend>;
+
 /// In-repo [`KittyDecodeBackend`] + [`KittyRasterBackend`]: the Core-owned
 /// decode/raster mechanics behind the seam traits.
 ///
 /// Stateless (every bound comes from Core constants and the shared minimal
-/// codec); `Copy` so the composition root holds it inline wherever the
-/// transmit and present paths need it. The extension implements the same
-/// traits on its side; swapping implementations never touches the call
+/// codec); `Copy` so the composition root can build the default handle inline
+/// where the transmit and present paths need it. The extension implements the
+/// same traits on its side; swapping implementations never touches the call
 /// sites, which name only the traits and this backend type — never an
 /// extension crate.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]

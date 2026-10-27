@@ -1,7 +1,8 @@
 # Vendored `winit` patches
 
-This directory is the crates.io release `winit 0.30.13` plus the single
-upstream patch recorded below. The workspace consumes it through
+This directory is the crates.io release `winit 0.30.13` plus the two patches
+recorded below: an upstream Wayland backport and a local CodeQL null-pointer
+hardening. The workspace consumes it through
 `[patch.crates-io]` in the repository root `Cargo.toml`; the version
 requirement in `[workspace.dependencies]` stays on the released `0.30.13`, so
 dropping the patch is a deletion rather than a dependency bump.
@@ -32,10 +33,13 @@ from the digest pinned below. See [Integrity](#integrity).
 | PR commits      | one: `e2cb6c08`, authored 2026-09-23                                                  |
 | Patch           | `patches/0001-wayland-xdg-suspended-occluded.diff`                                    |
 | Patch SHA-256   | `467156b345e49449422a7ba968ff5a259c085e8f953b75b5daec7a7b4c6c220c`                    |
+| Patch 2         | `patches/0002-codeql-null-guards.diff`                                                |
+| Patch 2 SHA-256 | `31331ad8e0c71e6dd15fc0fd95512750d9b00842ee56de11c1d46904e52e0b05`                    |
+| Patch 2 origin  | local hardening for CodeQL alerts 9 and 10 (not an upstream change)                   |
 | Fetched         | 2026-10-26, from `https://github.com/rust-windowing/winit/pull/4710.diff`             |
 | Apply result    | clean, zero fuzz (`git apply --check` and `patch --dry-run --fuzz=0`)                 |
 | Diff stat       | 5 files changed, 65 insertions(+), 10 deletions(-)                                    |
-| Tree digest     | `c0c4343e576b91e6c1e88f7f1f2ba3c1d0cd9519533d0b554492385ee0510a47`                    |
+| Tree digest     | `49d2421aaa8e4acac83857157b371ed166e2faafbf5e69d1597228426f92e43e`                    |
 
 The PR base equals the released `0.30.13` commit, which is why the patch applies
 to the crates.io source without offsets. Only the five files below differ from
@@ -56,9 +60,9 @@ find . -type f ! -name PATCHES.md ! -path './patches/*' \
 `scripts/check-vendored-winit.sh` (recipe `just vendored-winit`) recomputes the
 same value and fails on any mismatch, so a stray edit inside the vendored tree
 cannot pass `just check` unnoticed. Because the tree digest excludes
-`patches/`, the same gate also hashes the recorded diff file named by the
-`Patch` row and compares it with `Patch SHA-256`, so editing the patch alone
-fails too. The trust model is deliberately simple: the
+`patches/`, the same gate also hashes every recorded diff file named by a
+`Patch`/`Patch <n>` row and compares it with the matching `Patch SHA-256` row,
+so editing or dropping a patch alone fails too. The trust model is deliberately simple: the
 digest proves the tree is the one reviewed with this file, not that upstream is
 trustworthy. Upstream trust comes from the recorded base/head commits and the
 diff review, not from the digest.
@@ -66,7 +70,7 @@ diff review, not from the digest.
 Recompute the digest only after an intentional vendor change, in the same
 commit, and update the row above (the gate prints the freshly computed value).
 
-## Files and hunks
+## Patch 0001: files and hunks
 
 | File                                                | Hunks                                            | Change                                                                                                                                                                   |
 | --------------------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -76,7 +80,7 @@ commit, and update the row above (the gate prints the freshly computed value).
 | `src/platform_impl/linux/wayland/state.rs`          | `@@ -283,14 +283,22 @@`, `@@ -418,11 +426,20 @@` | Compares `WindowState::is_suspended()` before and after each configure, records the edge in `WindowCompositorUpdate::occluded`, and initialises the new field to `None`. |
 | `src/platform_impl/linux/wayland/window/state.rs`   | `@@ -261,6 +261,13 @@`                           | Adds `WindowState::is_suspended()`, reading `XdgWindowState::SUSPENDED` from `last_configure`.                                                                           |
 
-## Why
+## Patch 0001: why
 
 xdg-shell `xdg_wm_base` version 6 adds a `suspended` toplevel state. A
 compositor sets it when a toplevel is not visible (hidden workspace, outputs
@@ -125,7 +129,7 @@ side by the existing `Occluded` mapping test
 `input-vm-test-support` surface-gate test, which drives the same
 `WindowEventKind::Occluded` edges the patch produces.
 
-## Known upstream caveat
+## Patch 0001: known upstream caveat
 
 Upstream review is not settled, and the patch is carried with that risk stated:
 
@@ -146,6 +150,40 @@ Upstream review is not settled, and the patch is carried with that risk stated:
   about compositor support for the v6 `suspended` state. Compositors that never
   set `suspended` simply produce no edge, which is the pre-patch behaviour; the
   gate then relies on the synthetic probe as before.
+
+## Patch 0002: CodeQL null-pointer guards
+
+Two `rust/access-invalid-pointer` alerts (high) on this tree are real enough to
+guard locally; both are undefined-behaviour paths on pointers whose null-ness
+the Xlib/XKB contracts leave to runtime state:
+
+| File                                              | Line | Change                                                                                                                                                                                                         |
+| ------------------------------------------------- | ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `src/platform_impl/linux/common/xkb/keymap.rs`    | 991  | `first_keysym_by_level` dereferences the out-pointer only when `count == 1 && !keysyms.is_null()`.                                                                                                             |
+| `src/platform_impl/linux/x11/ime/input_method.rs` | 63   | `InputMethod::new` returns early on a null `styles`, and builds `supported_styles` as an empty slice when `count_styles == 0` or the pointer is null instead of calling `std::slice::from_raw_parts(null, 0)`. |
+
+The second one is the substantive fix: `from_raw_parts` requires a non-null,
+aligned pointer even for a zero-length slice, so a server that reports no XIM
+styles reached undefined behaviour. The first is defensive — Xlib returns a
+valid pointer whenever the count is one — but the guard costs nothing and keeps
+the scanner quiet without a dismissal. Behaviour is unchanged for every valid
+server response.
+
+Exit plan: drop this patch as soon as a `winit` release Bitty can adopt carries
+equivalent guards (check `first_keysym_by_level` and `InputMethod::new` at the
+same call sites) or CodeQL stops reporting the two locations on the new tree.
+
+### Static-analysis note
+
+CodeQL's `rust/access-invalid-pointer` query rejects any read through the
+`XIMStyles` out-pointer of `XGetIMValues`, including the null-guarded
+`std::ptr::read` used here, because it treats pointers written by FFI calls as
+unvalidated. The Xlib contract is the proof the query cannot see: on success the
+call stores a live `XIMStyles` owned by the display connection and released with
+`XFree`. The guard removes the real defect (`from_raw_parts(null, 0)`); the
+remaining alert is dismissed in code scanning with this rationale, never muted
+by a path exclusion or a query filter, and the patch leaves with the exit plan
+above.
 
 ## Supply chain
 
@@ -238,10 +276,10 @@ To take a newer release and re-apply the patch:
 3. Re-extract the new release from
    `$CARGO_HOME/registry/src/<registry>/winit-<new-version>/` over
    `vendor/winit`, keeping `PATCHES.md` and `patches/`.
-4. `git apply --check --directory=vendor/winit --verbose \
-vendor/winit/patches/0001-wayland-xdg-suspended-occluded.diff` and then apply
-   it. If it does not apply, rebase the patch on the new release, update the
-   base/head and SHA-256 rows above, and re-run the diff-stat check.
+4. `git apply --check --directory=vendor/winit --verbose` each diff under
+   `vendor/winit/patches/` in numeric order, then apply them. If one does not
+   apply, rebase it on the new release, update its provenance and SHA-256 rows
+   above, and re-run the diff-stat check.
 5. Restore the `[patch.crates-io]` and `exclude` entries.
 6. Recompute the tree digest with the command in [Integrity](#integrity), update
    the `Tree digest` row, and run `just vendored-winit` to confirm.

@@ -19,9 +19,10 @@
 #      `PATCHES.md` (files are hashed as `sha256sum` prints them, sorted under
 #      `LC_ALL=C`; `PATCHES.md` and `patches/` are metadata, not vendored
 #      source, and are excluded).
-#   4. The recorded patch file (`Patch` row) hashes to the `Patch SHA-256`
-#      pinned in `PATCHES.md`. The tree digest deliberately excludes
-#      `patches/`, so this row is what protects the recorded diff itself.
+#   4. Every recorded patch file (`Patch`/`Patch <n>` row) hashes to its
+#      matching `Patch SHA-256` row in `PATCHES.md`, and no hash row is
+#      orphaned. The tree digest deliberately excludes `patches/`, so these
+#      rows are what protect the recorded diffs themselves.
 #
 # Options (fixture tests use them; the defaults are the repository state):
 #   --tree DIR       vendored crate directory (default: vendor/winit)
@@ -189,29 +190,42 @@ else:
             "recompute it after an intentional vendor change (procedure in PATCHES.md)"
         )
 
-# 4. The recorded patch file itself: the tree digest above excludes `patches/`.
-patch_row = re.search(r"\|\s*Patch\s*\|\s*`([^`]+)`\s*\|", patches_text)
-patch_hash_row = re.search(
-    r"\|\s*Patch SHA-256\s*\|\s*`?([0-9a-f]{64})`?\s*\|", patches_text
-)
-if patch_row is None:
-    fail(f"{patches_path} has no `Patch` row naming the recorded diff")
-elif patch_hash_row is None:
-    fail(f"{patches_path} has no `Patch SHA-256` row with a 64-hex value")
-else:
-    patch_relative = patch_row.group(1)
+# 4. The recorded patch files themselves: the tree digest above excludes
+# `patches/`. Rows may be written `Patch` / `Patch SHA-256` (patch 1) or
+# `Patch <n>` / `Patch <n> SHA-256`; every path row needs its own hash row.
+patch_rows = {
+    number or "1": path
+    for number, path in re.findall(
+        r"\|\s*Patch(?:\s+(\d+))?\s*\|\s*`([^`]+)`\s*\|", patches_text
+    )
+}
+patch_hash_rows = {
+    number or "1": digest
+    for number, digest in re.findall(
+        r"\|\s*Patch(?:\s+(\d+))?\s+SHA-256\s*\|\s*`?([0-9a-f]{64})`?\s*\|",
+        patches_text,
+    )
+}
+if not patch_rows:
+    fail(f"{patches_path} has no `Patch` row naming a recorded diff")
+for number, patch_relative in sorted(patch_rows.items()):
+    if number not in patch_hash_rows:
+        fail(f"{patches_path} has no `Patch {number} SHA-256` row")
+        continue
     patch_file = pathlib.Path(tree_path, patch_relative)
     if not patch_file.is_file():
         fail(f"recorded patch {patch_relative} is missing under {tree_path}")
-    else:
-        computed_patch = hashlib.sha256(patch_file.read_bytes()).hexdigest()
-        recorded_patch = patch_hash_row.group(1)
-        if computed_patch != recorded_patch:
-            fail(
-                f"recorded patch {patch_relative} is {computed_patch}, "
-                f"{patches_path} records {recorded_patch}; restore the fetched diff "
-                "or update the `Patch SHA-256` row"
-            )
+        continue
+    computed_patch = hashlib.sha256(patch_file.read_bytes()).hexdigest()
+    recorded_patch = patch_hash_rows[number]
+    if computed_patch != recorded_patch:
+        fail(
+            f"recorded patch {patch_relative} is {computed_patch}, "
+            f"{patches_path} records {recorded_patch}; restore the diff "
+            f"or update the `Patch {number} SHA-256` row"
+        )
+for number in sorted(set(patch_hash_rows) - set(patch_rows)):
+    fail(f"{patches_path} has a `Patch {number} SHA-256` row without a matching path row")
 
 if failures:
     for message in failures:

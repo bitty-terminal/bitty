@@ -2,26 +2,30 @@
 # measure-startup.sh — windowed PB-1 launch samples (p50/p99 over N runs).
 #
 # PB-1 is the real-window launch-to-first-frame budget in
-# docs/specifications/performance-budget-rfc.md#pb-1: <= 100 ms p50 and
-# <= 200 ms p99 on the reference desktop. A shell script cannot observe the
-# first presented frame, so this harness times `bitty --headless` (one
-# headless tick, then exit) as a *launch proxy*: process start, argument and
-# config parsing, font discovery + index reconciliation, runtime and grid
-# renderer construction, and the first tick are inside the number; GPU/window
-# creation and presentation are not. Use `tools/perf/startup` for the
-# instrumented real-window phase timeline; this harness exists to compare
-# warm-index launch behaviour across builds on one machine.
+# docs/specifications/performance-budget-rfc.md#pb-1-cold-startup-time:
+# <= 100 ms p50 and <= 200 ms p99 on the reference desktop. A shell script
+# cannot observe the first presented frame, so this harness times
+# `bitty --headless` (one headless tick, then exit) as a *launch proxy*:
+# process start, argument and config parsing, font discovery + index
+# reconciliation, runtime and grid renderer construction, and the first tick
+# are inside the number; GPU/window creation and presentation are not. Use
+# `tools/perf/startup` for the instrumented real-window phase timeline; this
+# harness exists to compare warm-index launch behaviour across builds on one
+# machine.
 #
 # Warm-index condition: every launch shares one isolated XDG cache tree. The
 # first launch builds `font-index-v2` (reported separately as `cold`), and
 # the sampled window starts at launch 2, so `p50`/`p99` measure the
-# warm-index path. `--cold` deletes the index before every launch instead and
-# reports a cold window.
+# warm-index path. The harness fails if that cold launch leaves no index (the
+# warm samples would silently be cold-index launches). `--cold` deletes the
+# index before every launch instead and reports a cold window.
 #
-# Sampling: N launches (default 30), nearest-rank percentiles
+# Sampling: N launches (default 50), nearest-rank percentiles
 # (p50 = ceil(0.50 * N), p99 = ceil(0.99 * N)), wall-clock milliseconds
-# around the child process. This is developer evidence, not a CI gate:
-# nothing in `just check` or the release workflow calls it.
+# around the child process. A p99 claim needs >= 100 samples (below that the
+# nearest-rank p99 is the window max); the harness says so when `--runs` is
+# smaller. This is developer evidence, not a CI gate: nothing in `just check`
+# or the release workflow calls it.
 #
 # Isolation and process safety: HOME, XDG_CONFIG_HOME, XDG_DATA_HOME,
 # XDG_STATE_HOME, XDG_CACHE_HOME, and XDG_RUNTIME_DIR all point into one
@@ -37,17 +41,17 @@
 set -euo pipefail
 export LC_ALL=C
 
-RUNS=30
+RUNS=50
 BIN=""
 COLD=0
 
 usage() {
-  sed -n '2,35p' "$0"
+  sed -n '2,40p' "$0"
   cat <<'EOF'
 
 Options:
   --binary PATH  bitty executable (default: <repo>/target/release/bitty)
-  --runs N       sampled launches 1..10000 (default: 30)
+  --runs N       sampled launches 1..10000 (default: 50)
   --cold         delete font-index-v2 before every launch
   -h, --help     show this help
 EOF
@@ -138,7 +142,7 @@ time_launch() {
 
 echo "measure-startup: windowed PB-1 launch proxy (bitty --headless), not the real-window gate"
 echo "binary: $BIN"
-echo "budget: p50 <= 100 ms / p99 <= 200 ms (real window, performance-budget-rfc.md#pb-1)"
+echo "budget: p50 <= 100 ms / p99 <= 200 ms (real window, performance-budget-rfc.md#pb-1-cold-startup-time)"
 
 cold_ms=""
 if ((COLD)); then
@@ -146,8 +150,14 @@ if ((COLD)); then
 else
   rm -f "$index_path"
   cold_ms="$(time_launch)"
+  # If the cold launch wrote no index, every later sample would silently be a
+  # cold-index launch and the warm-index claim would be false.
+  [[ -f "$index_path" ]] || fail "cold launch wrote no font index at $index_path; warm samples would be cold-index launches"
   echo "warm-index condition: ON (launch 1 builds the index; samples are warm)"
   echo "cold launch: ${cold_ms}ms (index build, excluded from the window)"
+fi
+if ((RUNS < 100)); then
+  echo "note: p99 needs >= 100 samples to be meaningful; at --runs ${RUNS} the p99 column is the nearest-rank max (raise --runs for a p99 claim)."
 fi
 
 samples=()

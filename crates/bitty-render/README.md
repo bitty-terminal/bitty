@@ -42,10 +42,12 @@ bounded parallel workers, then writes the index atomically. Every start
 runs discovery again and reconciles the cache: new/removed/changed fonts and
 fontconfig changes are picked up, foreign/missing entries are dropped, and
 only changed/new paths are reparsed. A warm start reads no face bytes at all;
-the cold build reads only those three metadata tables, never outline or
-layout data. The runtime still loads the primary face at startup to build its
-grid renderer, and other faces load lazily. The v2 index carries a content
-hash so a syntactically valid line mutation is rejected and rebuilt. The
+the cold build's bounded reader reads only each face's `name`/`OS/2`/`post`
+tables, never outline or layout data, and a file it cannot name falls back to
+fontdb's loader, which reads the whole file. The runtime still loads the
+primary face at startup to build its grid renderer, and other faces load
+lazily. The v2 index carries a content hash so a syntactically valid line
+mutation is rejected and rebuilt. The
 cache holds at most 16,384 faces / 32 MiB: faces past that bound are neither
 persisted nor visible to a cached start, and overflow paths are reparsed on
 every start while the retained prefix keeps the cache file read-only. The

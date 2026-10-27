@@ -98,11 +98,13 @@
 //! runs discovery again and reconciles the cache against the current path
 //! set (new/removed/changed fonts, fontconfig changes, foreign entries),
 //! reparsing only changed/new paths before building a metadata-only `fontdb`
-//! database. A warm start reads no face bytes at all; the cold build reads
-//! only those three metadata tables, never outline or layout data. The
-//! runtime's `GridRenderer::new` still loads the primary face at startup to
-//! build its glyph cache. The v2 cache carries an FNV-1a content hash over its
-//! generic/face lines, so valid-line corruption is rejected and rebuilt. Face bytes still load lazily
+//! database. A warm start reads no face bytes at all; the cold build's
+//! bounded reader reads only those three metadata tables (never outline or
+//! layout data), and a file it cannot name falls back to fontdb's loader,
+//! which reads the whole file. The runtime's `GridRenderer::new` still loads
+//! the primary face at startup to build its glyph cache. The v2 cache carries
+//! an FNV-1a content hash over its generic/face lines, so valid-line
+//! corruption is rejected and rebuilt. Face bytes still load lazily
 //! for the faces a frame needs, and missing-glyph fallback loads a covering
 //! face on demand. The cache is capped at 16,384 faces / 32 MiB: faces past
 //! the cap are neither persisted nor visible to a cached start, and overflow

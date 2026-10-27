@@ -23,11 +23,13 @@
 //!   with an unchanged stat, reparse changed/new paths (and drop foreign,
 //!   missing, or stale entries), take generic aliases from the fresh
 //!   discovery, and build a metadata-only [`fontdb::Database`]. A warm start
-//!   reads no face bytes at all; the cold build reads only each face's
-//!   `name`/`OS/2`/`post` tables (never outline, layout, or variation data).
-//!   The runtime still loads the primary face to construct its grid renderer;
-//!   [`super::shaped::SwashSingle`] loads only the faces the first frames need
-//!   and keeps dynamic (missing-glyph) fallback on demand.
+//!   reads no face bytes at all. The cold build's bounded reader reads only
+//!   each face's `name`/`OS/2`/`post` tables (never outline, layout, or
+//!   variation data); a file that reader cannot name falls back to fontdb's
+//!   loader, which reads the whole file. The runtime still loads the primary
+//!   face to construct its grid renderer; [`super::shaped::SwashSingle`] loads
+//!   only the faces the first frames need and keeps dynamic (missing-glyph)
+//!   fallback on demand.
 //! - **Correctness:** entries carry path, face index, family names, style,
 //!   weight, stretch, monospace flag, and the file size/mtime they were
 //!   parsed from. Selection metadata is **query-compatible** with fontdb's
@@ -646,7 +648,20 @@ fn reconcile(
 /// byte bound (`cached_body_len` is exactly the writer's `out.len()` after its
 /// last face line). A representable line that still fits means the next write
 /// would change the file.
+///
+/// `new_faces` must be in the writer's order, sorted by `(path, face_index)`
+/// (`build_index_counted` normalizes it). The scan stops at the first
+/// representable line, so an out-of-order slice could under-report that the
+/// cache still needs a rewrite.
 fn writer_stops_before(cached_len: usize, cached_body_len: usize, new_faces: &[IndexFace]) -> bool {
+    debug_assert!(
+        new_faces.windows(2).all(|pair| pair[0]
+            .path
+            .cmp(&pair[1].path)
+            .then(pair[0].face_index.cmp(&pair[1].face_index))
+            .is_le()),
+        "new_faces must be sorted by (path, face_index)"
+    );
     if cached_len >= MAX_INDEX_FACES {
         return true;
     }
@@ -1198,11 +1213,14 @@ fn scan_workers(path_count: usize) -> usize {
 
 /// Parses every face in one font file.
 ///
-/// Reads only the SFNT table directory and the `name`, `OS/2`, and `post`
-/// tables instead of loading the whole font: outline/GSUB/GPOS/variation
-/// data dominates font size and is irrelevant to face selection. This keeps
-/// the cold scan both fast and memory-bounded (a few hundred KiB per worker
-/// instead of hundreds of MiB for a full-file read).
+/// The bounded reader reads only the SFNT table directory and the `name`,
+/// `OS/2`, and `post` tables instead of loading the whole font:
+/// outline/GSUB/GPOS/variation data dominates font size and is irrelevant to
+/// face selection. This keeps the cold scan both fast and memory-bounded (a
+/// few hundred KiB per worker instead of hundreds of MiB for a full-file
+/// read). A file the bounded reader cannot name (unusual encodings or
+/// synthetic table layouts) falls back to [`parse_with_fontdb`], which loads
+/// the whole file through fontdb; those files are the exception.
 fn parse_font(path: &Path, stat: Option<Stat>) -> Vec<IndexFace> {
     // The line format is UTF-8; a non-UTF-8 path would not survive the
     // round trip and would look stale on every launch. Such paths are rare
@@ -3188,6 +3206,151 @@ mod tests {
             assert!(
                 !outcome.changed,
                 "start {start} must not rewrite the unchanged capped cache"
+            );
+        }
+        let after = std::fs::metadata(&index_path).expect("index stat");
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().ok(), after.modified().ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn byte_capped_face_set_stays_read_only_on_the_next_start() {
+        let dir = temp_dir("byte-cap");
+        let overflow = write_font(&dir, "zzz-overflow.ttf");
+        let root = dir.join("cache");
+        std::fs::create_dir_all(&root).expect("cache dir");
+        let generic = GenericFamilies::default();
+        let stat = Stat {
+            size: 4_096,
+            mtime_secs: 1_700_000_000,
+            mtime_nanos: 0,
+        };
+        let families = |index: usize| {
+            (0..MAX_INDEX_FAMILIES)
+                .map(|family| {
+                    format!(
+                        "{index:05}-{family:02}-{}",
+                        "x".repeat(MAX_INDEX_FAMILY_BYTES - 9)
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let post_script_name =
+            |index: usize| format!("{index:05}{}", "p".repeat(MAX_INDEX_POSTSCRIPT_BYTES - 5));
+        let face = |path: PathBuf, index: usize| IndexFace {
+            path,
+            face_index: 0,
+            families: families(index),
+            post_script_name: post_script_name(index),
+            style: 0,
+            weight: 400,
+            stretch: 5,
+            monospaced: true,
+            file_size: stat.size,
+            mtime_secs: stat.mtime_secs,
+            mtime_nanos: stat.mtime_nanos,
+        };
+
+        // The real overflow face is the one the writer must not append.
+        let overflow_face = {
+            let mut faces = fixture_faces(std::slice::from_ref(&overflow));
+            assert_eq!(faces.len(), 1);
+            let mut face = faces.remove(0);
+            assert!(sanitize_face(&mut face));
+            face
+        };
+        let overflow_line = serialize_face(&overflow_face).len() + 1;
+
+        // Header (version + generic lines) exactly as the writer emits it.
+        let empty = serialize_index(&FontIndex {
+            faces: Vec::new(),
+            generic: generic.clone(),
+        });
+        let header_len = empty.len() - trailing_line_bytes(&empty);
+        let usable = MAX_INDEX_BYTES as usize - END_MARKER_RESERVE - header_len;
+
+        // Serialized face lines are printable ASCII and only the path length
+        // varies, so the line length is linear in it. Search the path length
+        // that leaves less than one overflow line of headroom: the byte cap,
+        // not the face-count cap, must be what stops the writer.
+        let mut probe = face(PathBuf::from("d".repeat(64)), 0);
+        assert!(sanitize_face(&mut probe));
+        let base = serialize_face(&probe).len() + 1 - 64;
+        let mut chosen = None;
+        for path_len in 64..=MAX_INDEX_PATH_BYTES {
+            let line_len = base + path_len;
+            let count = usable / line_len;
+            if !(2..MAX_INDEX_FACES).contains(&count) {
+                continue;
+            }
+            let remainder = usable - count * line_len;
+            if remainder < overflow_line {
+                chosen = Some((path_len, line_len, count));
+                break;
+            }
+        }
+        let (path_len, line_len, count) =
+            chosen.expect("a path length must leave less than one overflow line of headroom");
+        let synthetic_path = |index: usize| {
+            PathBuf::from(format!(
+                "/bitty-cap-{index:05}-{}",
+                "d".repeat(path_len - 17)
+            ))
+        };
+        let mut faces = Vec::with_capacity(count);
+        let mut stats = HashMap::new();
+        let mut paths = Vec::with_capacity(count + 1);
+        for index in 0..count {
+            let path = synthetic_path(index);
+            stats.insert(path.clone(), stat);
+            paths.push(path.clone());
+            faces.push(face(path, index));
+        }
+        stats.insert(
+            overflow.clone(),
+            Stat::read(&overflow).expect("overflow stat"),
+        );
+        paths.push(overflow);
+        write_index(
+            &root.join(INDEX_FILE_NAME),
+            &FontIndex {
+                faces,
+                generic: generic.clone(),
+            },
+        )
+        .expect("seed byte-capped cache");
+        let index_path = root.join(INDEX_FILE_NAME);
+        let before = std::fs::metadata(&index_path).expect("index stat");
+        assert!(before.len() as u64 <= MAX_INDEX_BYTES);
+        let body_len = header_len + count * line_len;
+        assert!(
+            body_len + overflow_line + END_MARKER_RESERVE > MAX_INDEX_BYTES as usize,
+            "the seed must leave no room for the overflow line"
+        );
+        assert!(
+            before.len() as usize > MAX_INDEX_BYTES as usize - 2 * line_len,
+            "the seed must sit near the byte cap"
+        );
+        for start in 1..=2 {
+            let outcome = load_or_build_with(&root, || DiscoveredFonts {
+                paths: paths.clone(),
+                generic: generic.clone(),
+                stats: stats.clone(),
+            })
+            .unwrap_or_else(|| panic!("start {start} must load the byte-capped cache"));
+            assert_eq!(
+                outcome.index.faces.len(),
+                count + 1,
+                "start {start} keeps the cached prefix plus the reparsed overflow face"
+            );
+            assert_eq!(
+                outcome.parsed_paths, 1,
+                "start {start} still parses the overflow path"
+            );
+            assert!(
+                !outcome.changed,
+                "start {start} must not rewrite the byte-capped cache"
             );
         }
         let after = std::fs::metadata(&index_path).expect("index stat");

@@ -114,8 +114,8 @@ use crate::glyph::{
     RasterKey,
 };
 use crate::shaped::{
-    RunAttrs, ShapedCluster, ShapedRunSource, cells_for_range_in, features_for_policy,
-    form_runs_for_row,
+    RunAttrs, ShapedCluster, ShapedRunSource, cells_for_range, cells_for_range_in,
+    features_for_policy, form_runs_for_row,
 };
 
 /// Straight-alpha RGBA color, `[r, g, b, a]` bytes.
@@ -4205,11 +4205,21 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
             }
             LigaturePolicy::Never | LigaturePolicy::Always => &clusters,
         };
-        // Median single-cell advance for the CJK epsilon gate.
+        // Median single-cell advance for the grid-advance gate.
+        //
+        // Entries that share a byte offset with another entry are members of
+        // one multi-glyph cluster (a base plus its matra, a conjunct, a
+        // decomposed SARA AM). Their individual advances step the pen inside
+        // that cluster and say nothing about the per-cell lattice, so they
+        // must not pollute the reference: `कि` reports 4.16 px and 13.81 px
+        // for one committed cell, and a median picked from those would flag
+        // every real Indian cluster as misaligned.
+        let multi_member = multi_member_entries(clusters_ref);
         let mut singles: Vec<f32> = clusters_ref
             .iter()
-            .filter(|c| !c.uncovered && c.cells.1 == 1)
-            .map(|c| c.x_advance_px)
+            .zip(&multi_member)
+            .filter(|(cluster, multi)| !**multi && !cluster.uncovered && cluster.cells.1 == 1)
+            .map(|(cluster, _)| cluster.x_advance_px)
             .collect();
         singles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let single_advance = if singles.is_empty() {
@@ -4318,13 +4328,24 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
             // length, CJK width, and sub-pixel cell rounding. Mark-only
             // groups carry no spacing scalar and are positioned by GPOS,
             // so they are exempt.
+            //
+            // CTX-1609: the gate is a *layout* check, so it measures the
+            // shaper's own cell count, not the grid policy span. A cluster
+            // with several shaped members (`कि`, `क्ष`, `กำ`, a decomposed
+            // Hangul syllable) is one committed unit whose members advance
+            // inside that unit; there is no per-cell advance to reconcile,
+            // and enforcing one degraded every such cluster to lead-only
+            // (issue #1767). The same narrow measurement keeps a wide
+            // East-Asian ambiguous cluster shaped: the font advance is one
+            // cell while the policy span is two.
             let group_advance: f32 = group.iter().map(|c| c.x_advance_px).sum();
             let reference_advance = if single_advance > 0.0 {
                 single_advance
             } else {
                 self.cell.width as f32
             };
-            let per_cell_advance = group_advance / count as f32;
+            let advance_cells = cells_for_range(slice).max(1);
+            let per_cell_advance = group_advance / advance_cells as f32;
             // Multi-cell spans are only held to the monospace cell lattice
             // on faces that declare monospaced metrics: a proportional
             // face's ligature advance is unrelated to the terminal cell
@@ -4335,7 +4356,8 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
                     .inner()
                     .face_is_monospaced(lead.face)
             });
-            let enforce_advance = count == 1 || monospaced;
+            let multi_glyph = group.len() > 1;
+            let enforce_advance = !multi_glyph && (advance_cells == 1 || monospaced);
             let advance_ok = cluster_base_scalar_count(slice) == 0
                 || !enforce_advance
                 || (per_cell_advance.is_finite()
@@ -4649,6 +4671,29 @@ fn cluster_block_base(text: &str) -> Option<char> {
         (Some(base), None) if crate::fallback::is_block_element(base) => Some(base),
         _ => None,
     }
+}
+
+/// Marks shaped entries that share a byte offset with another entry.
+///
+/// A shaper emits one entry per glyph, so a multi-glyph grapheme cluster
+/// (base + matra, base + virama + consonant, a decomposed SARA AM, a
+/// decomposed Hangul syllable) shows up as several entries at the same byte
+/// offset. Their advances are intra-cluster pen steps, not cell advances
+/// (CTX-1609), so the grid-advance reference must skip them.
+fn multi_member_entries(clusters: &[ShapedCluster]) -> Vec<bool> {
+    let mut multi = vec![false; clusters.len()];
+    let mut start = 0usize;
+    while start < clusters.len() {
+        let mut end = start + 1;
+        while end < clusters.len() && clusters[end].byte_offset == clusters[start].byte_offset {
+            end += 1;
+        }
+        if end - start > 1 {
+            multi[start..end].fill(true);
+        }
+        start = end;
+    }
+    multi
 }
 
 /// Byte range and index range of one paint group (CTX-1609).

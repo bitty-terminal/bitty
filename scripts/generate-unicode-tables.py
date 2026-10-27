@@ -11,7 +11,7 @@ Sources (Unicode 18.0.0):
 - ``EastAsianWidth.txt`` for the East_Asian_Width property (UAX #11).
 - ``emoji-data.txt`` for the Extended_Pictographic property (UTS #51).
 - ``auxiliary/GraphemeBreakProperty.txt`` for the grapheme-cluster break
-  classes ``Extend``, ``SpacingMark``, and ``Prepend`` (UAX #29).
+  classes ``Extend``, ``SpacingMark``, ``Prepend``, and ``Control`` (UAX #29).
 - ``DerivedCoreProperties.txt`` for ``InCB; Linker``, ``InCB; Consonant``,
   and ``InCB; Extend`` (UAX #29 ``GB9c``).
 
@@ -21,6 +21,10 @@ unassigned CJK / plane 2 / plane 3 ranges appear explicitly in
 EastAsianWidth.txt, so the default plus the emitted ranges is the complete
 property (not a curated subset). The grapheme properties are emitted
 exhaustively as their own sorted range tables.
+
+The emitted Rust is formatted with the pinned ``rustfmt`` before the script
+returns, so regeneration is byte-identical without a manual ``cargo fmt``:
+CI's formatting gate covers the generated file like any other source.
 
 Usage::
 
@@ -37,16 +41,17 @@ from __future__ import annotations
 import argparse
 import hashlib
 import re
+import subprocess
 import sys
 from pathlib import Path
 
 EAW_CLASSES = ("N", "Na", "A", "H", "W", "F")
 EMOJI_PROPERTY = "Extended_Pictographic"
 MAX_CODE_POINT = 0x10FFFF
-# Grapheme_Cluster_Break classes the segmenter reads. ``Control``, ``CR``,
-# ``LF``, ``ZWJ``, ``Regional_Indicator``, and the Hangul classes stay
-# algorithmic in `grapheme.rs`.
-GCB_PROPERTIES = ("Extend", "SpacingMark", "Prepend")
+# Grapheme_Cluster_Break classes the segmenter reads. `CR`, `LF`, `ZWJ`,
+# `Regional_Indicator`, and the Hangul classes stay algorithmic in
+# `grapheme.rs`.
+GCB_PROPERTIES = ("Extend", "SpacingMark", "Prepend", "Control")
 # Indic_Conjunct_Break classes for GB9c.
 INCB_PROPERTIES = ("Linker", "Consonant", "Extend")
 
@@ -246,6 +251,7 @@ def main(argv: list[str]) -> int:
     extend = select(gcb, "Extend")
     spacing_mark = select(gcb, "SpacingMark")
     prepend = select(gcb, "Prepend")
+    control = select(gcb, "Control")
     incb = merge_ranges(parse_incb(args.derived_core))
     incb_linker = select(incb, "Linker")
     incb_consonant = select(incb, "Consonant")
@@ -262,6 +268,7 @@ def main(argv: list[str]) -> int:
         "GRAPHEME_EXTEND": scalar_count(extend),
         "SPACING_MARK": scalar_count(spacing_mark),
         "PREPEND": scalar_count(prepend),
+        "CONTROL": scalar_count(control),
         "INCB_LINKER": scalar_count(incb_linker),
         "INCB_CONSONANT": scalar_count(incb_consonant),
         "INCB_EXTEND": scalar_count(incb_extend),
@@ -339,6 +346,7 @@ pub(crate) mod counts {{
     pub(crate) const GRAPHEME_EXTEND: usize = {counts["GRAPHEME_EXTEND"]};
     pub(crate) const SPACING_MARK: usize = {counts["SPACING_MARK"]};
     pub(crate) const PREPEND: usize = {counts["PREPEND"]};
+    pub(crate) const CONTROL: usize = {counts["CONTROL"]};
     pub(crate) const INCB_LINKER: usize = {counts["INCB_LINKER"]};
     pub(crate) const INCB_CONSONANT: usize = {counts["INCB_CONSONANT"]};
     pub(crate) const INCB_EXTEND: usize = {counts["INCB_EXTEND"]};
@@ -430,6 +438,20 @@ pub(crate) fn spacing_mark(cp: u32) -> bool {{
 #[must_use]
 pub(crate) fn prepend(cp: u32) -> bool {{
     in_ranges(PREPEND_RANGES, cp)
+}}
+
+{
+        emit_range_table(
+            "CONTROL_RANGES",
+            "`Grapheme_Cluster_Break=Control` ranges (UAX #29 `GB4`/`GB5`),\n/// sorted and non-overlapping. `CR`, `LF`, and `ZWJ` are separate classes\n/// handled algorithmically in `grapheme.rs`.",
+            control,
+        )
+    }
+
+/// Whether `cp` is `Grapheme_Cluster_Break=Control` (UAX #29 `GB4`/`GB5`).
+#[must_use]
+pub(crate) fn control(cp: u32) -> bool {{
+    in_ranges(CONTROL_RANGES, cp)
 }}
 
 {
@@ -534,6 +556,7 @@ mod tests {{
         assert_sorted_disjoint("Grapheme_Extend", GRAPHEME_EXTEND_RANGES);
         assert_sorted_disjoint("SpacingMark", SPACING_MARK_RANGES);
         assert_sorted_disjoint("Prepend", PREPEND_RANGES);
+        assert_sorted_disjoint("Control", CONTROL_RANGES);
         assert_sorted_disjoint("InCB Linker", INCB_LINKER_RANGES);
         assert_sorted_disjoint("InCB Consonant", INCB_CONSONANT_RANGES);
         assert_sorted_disjoint("InCB Extend", INCB_EXTEND_RANGES);
@@ -547,6 +570,7 @@ mod tests {{
         assert_eq!(count(GRAPHEME_EXTEND_RANGES), counts::GRAPHEME_EXTEND);
         assert_eq!(count(SPACING_MARK_RANGES), counts::SPACING_MARK);
         assert_eq!(count(PREPEND_RANGES), counts::PREPEND);
+        assert_eq!(count(CONTROL_RANGES), counts::CONTROL);
         assert_eq!(count(INCB_LINKER_RANGES), counts::INCB_LINKER);
         assert_eq!(count(INCB_CONSONANT_RANGES), counts::INCB_CONSONANT);
         assert_eq!(count(INCB_EXTEND_RANGES), counts::INCB_EXTEND);
@@ -575,6 +599,11 @@ mod tests {{
         assert!(prepend(0x0600));
         assert!(prepend(0x11A84));
         assert!(!prepend(0x0041));
+        assert!(control(0x00AD));
+        assert!(control(0x180E));
+        assert!(control(0xE01F0));
+        assert!(!control(0x000A));
+        assert!(!control(0x0041));
         assert!(incb_linker(0x094D));
         assert!(!incb_linker(0x200C));
         assert!(incb_consonant(0x0915));
@@ -586,11 +615,24 @@ mod tests {{
 '''
 
     args.output.write_text(header, encoding="utf-8")
+    # The generated Rust is committed as-is and CI's `cargo fmt --check` gate
+    # runs over it, so format it here: regeneration is then byte-identical
+    # without a manual `cargo fmt` step. `rustfmt` ships with the pinned
+    # toolchain (see `rust-toolchain.toml`).
+    formatted = subprocess.run(
+        ["rustfmt", "--edition", "2024", str(args.output)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if formatted.returncode != 0:
+        raise SystemExit(f"rustfmt failed on {args.output}: {formatted.stderr.strip()}")
     print(
         f"wrote {args.output} (UCD {ucd}: {len(eaw)} EAW ranges, "
         f"{len(extended)} Extended_Pictographic ranges, "
         f"{len(extend)} Extend, {len(spacing_mark)} SpacingMark, "
-        f"{len(prepend)} Prepend, {len(incb_linker)} Linker, "
+        f"{len(prepend)} Prepend, {len(control)} Control, "
+        f"{len(incb_linker)} Linker, "
         f"{len(incb_consonant)} InCB Consonant, {len(incb_extend)} InCB Extend ranges)"
     )
     return 0

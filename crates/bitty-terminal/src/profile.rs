@@ -2526,7 +2526,7 @@ fn run_commit_hook(path: &Path) {
 /// class in [`run_rename`].
 ///
 /// Production is [`rename_no_replace`]; unit tests replace the platform call
-/// through [`PROFILE_RENAME_OVERRIDE`] so the `AlreadyExists` mapping is
+/// through `PROFILE_RENAME_OVERRIDE` so the `AlreadyExists` mapping is
 /// exercised on every host, not only where `RENAME_NOREPLACE` exists.
 fn commit_profile_rename(old: &Path, new: &Path) -> std::io::Result<()> {
     #[cfg(test)]

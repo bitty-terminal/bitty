@@ -3922,6 +3922,50 @@ impl FakeShaper {
                 .any(|feature| feature.tag == *tag && feature.value == 0)
         })
     }
+
+    /// Deterministic multi-glyph cluster models (CTX-1609).
+    ///
+    /// Real Indic clusters shape into several entries whose advances are
+    /// intra-cluster pen steps, not cell advances. These models make that
+    /// layout available to the grid tests without a host font.
+    fn multi_glyph_clusters(text: &str, face: FontId) -> Option<Vec<crate::shaped::ShapedCluster>> {
+        let entry = |cells: (usize, usize), glyph_id: u16, advance: f32, offset: usize| {
+            crate::shaped::ShapedCluster {
+                cells,
+                glyph_id,
+                face,
+                x_advance_px: advance,
+                x_offset_px: 0.0,
+                uncovered: false,
+                ligature_part: cells.1 > 1,
+                byte_offset: offset,
+            }
+        };
+        match text {
+            // Devanagari KA + vowel sign I: one committed cell, two glyphs
+            // (the matra is a 4.16 px step, the base 13.81 px).
+            "\u{0915}\u{093F}" => Some(vec![
+                entry((0, 1), 200, 4.16, 0),
+                entry((0, 1), 201, 13.81, 0),
+            ]),
+            // Devanagari KA + virama + SSA: one committed cell, the applied
+            // virama joins at the lead offset and the second consonant
+            // shapes at its own byte offset (6).
+            "\u{0915}\u{094D}\u{0937}" => Some(vec![
+                entry((0, 1), 202, 13.81, 0),
+                entry((0, 1), 203, 0.0, 0),
+                entry((1, 1), 204, 9.70, 6),
+            ]),
+            // ZWJ family: the font's ligature is one two-cell entry.
+            "\u{1F468}\u{200D}\u{1F469}" => Some(vec![entry((0, 2), 205, 16.0, 0)]),
+            // Regional-indicator pair without a flag ligature: both
+            // indicators paint, one per committed column.
+            "\u{1F1EB}\u{1F1F7}" => {
+                Some(vec![entry((0, 1), 206, 8.0, 0), entry((1, 1), 207, 8.0, 4)])
+            }
+            _ => None,
+        }
+    }
 }
 
 impl GlyphRasterizer for FakeShaper {
@@ -3952,6 +3996,9 @@ impl crate::shaped::ShapedRunSource for FakeShaper {
             ));
         }
         let face = chain[0];
+        if let Some(clusters) = Self::multi_glyph_clusters(text, face) {
+            return Ok(clusters);
+        }
         let ligates =
             matches!(text, "->" | "!=" | "=>") && !Self::ligature_features_zeroed(&attrs.features);
         if ligates {
@@ -4151,6 +4198,134 @@ fn shaped_feature_overrides_reach_the_shaper() {
             .last()
             .expect("shaped once"),
         &features
+    );
+}
+
+/// Multi-glyph clusters paint every shaped member (CTX-1609, issue #1767).
+///
+/// A cluster is one committed layout unit, but its shaped members advance
+/// inside that unit: `कि` is 4.16 px + 13.81 px for one cell and `क्ष` adds
+/// a second consonant at its own byte offset. The grid-advance gate must not
+/// read those pen steps as a per-cell advance and degrade the group to
+/// lead-only.
+#[test]
+fn shaped_multi_glyph_cluster_paints_every_member() {
+    for (text, cells, expected) in [
+        ("\u{0915}\u{093F}", 1usize, 2usize),
+        ("\u{0915}\u{094D}\u{0937}", 1, 3),
+    ] {
+        let mut renderer = shaped_renderer(FakeShaper::shaped());
+        let state = shaped_state(text);
+        assert_eq!(
+            state.snapshot().cells[0].width as usize,
+            cells,
+            "{text:?}: grid truth commits one layout unit"
+        );
+        let list = renderer
+            .render_shaped(
+                &state.snapshot(),
+                &full_damage(&state),
+                bitty_config::types::LigaturePolicy::Never,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            list.glyphs.len(),
+            expected,
+            "{text:?} must paint every shaped member: {list:?}"
+        );
+        assert_eq!(
+            renderer.counters().shaping_misaligned,
+            0,
+            "{text:?} must not degrade to the unshaped path"
+        );
+        // The lead stays on the committed column; the applied virama and the
+        // conjunct consonant advance inside the cluster and may overhang by
+        // at most the one adjacent column (glyph ink is never clipped).
+        let column = |x: i32| x / i32::try_from(cell_metrics().width).unwrap();
+        assert_eq!(column(list.glyphs[0].dest[0]), 0, "{text:?}: lead column");
+        for glyph in &list.glyphs {
+            assert!(
+                (0..=1).contains(&column(glyph.dest[0])),
+                "{text:?}: member escapes the span: {glyph:?}"
+            );
+        }
+    }
+}
+
+/// A regional-indicator pair without a flag ligature paints both indicators.
+#[test]
+fn shaped_flag_pair_without_ligature_paints_both_indicators() {
+    let mut renderer = shaped_renderer(FakeShaper::shaped());
+    let state = shaped_state("\u{1F1EB}\u{1F1F7}");
+    assert_eq!(
+        state.snapshot().cells[0].width,
+        2,
+        "one two-cell layout unit"
+    );
+    let list = renderer
+        .render_shaped(
+            &state.snapshot(),
+            &full_damage(&state),
+            bitty_config::types::LigaturePolicy::Never,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(list.glyphs.len(), 2, "both indicators paint: {list:?}");
+    let cell = i32::try_from(cell_metrics().width).unwrap();
+    let columns: Vec<i32> = list.glyphs.iter().map(|g| g.dest[0] / cell).collect();
+    assert_eq!(columns, vec![0, 1], "one indicator per committed column");
+}
+
+/// A ZWJ family that the font ligates stays one two-column glyph.
+#[test]
+fn shaped_zwj_family_ligature_paints_one_glyph_over_two_columns() {
+    let mut renderer = shaped_renderer(FakeShaper::shaped());
+    let state = shaped_state("\u{1F468}\u{200D}\u{1F469}");
+    let list = renderer
+        .render_shaped(
+            &state.snapshot(),
+            &full_damage(&state),
+            bitty_config::types::LigaturePolicy::Never,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(list.glyphs.len(), 1, "one family ligature: {list:?}");
+    assert_eq!(renderer.counters().shaping_misaligned, 0);
+}
+
+/// A wide East-Asian ambiguous cluster keeps its shaped glyph (CTX-1609).
+///
+/// The font advance is one cell while the committed span is two, so the
+/// advance gate must measure the shaper's own (narrow) cell count or the
+/// cluster always degrades under `terminal.ambiguous_width = "wide"`.
+#[test]
+fn shaped_wide_ambiguous_cluster_stays_shaped() {
+    let mut renderer = shaped_renderer(FakeShaper::shaped());
+    renderer.set_ambiguous_width(bitty_term_state::AmbiguousWidth::Wide);
+    let mut state = State::new();
+    state.set_ambiguous_width(bitty_term_state::AmbiguousWidth::Wide);
+    state.apply(&print('\u{03B1}'));
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.cells[0].width, 2, "policy span is two cells");
+    assert!(snapshot.cells[1].spacer);
+    let list = renderer
+        .render_shaped(
+            &snapshot,
+            &full_damage(&state),
+            bitty_config::types::LigaturePolicy::Never,
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        list.glyphs.len(),
+        1,
+        "the ambiguous scalar paints: {list:?}"
+    );
+    assert_eq!(
+        renderer.counters().shaping_misaligned,
+        0,
+        "the policy span must not be read as a font advance"
     );
 }
 

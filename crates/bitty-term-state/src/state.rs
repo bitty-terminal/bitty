@@ -24,7 +24,7 @@ use crate::damage::{
     DAMAGE_HISTORY_BATCHES, DAMAGE_MAX_REGIONS_PER_BATCH, Damage, DamageRect, DamagedRegion,
     coalesce,
 };
-use crate::grapheme::{Graphemes, cluster_cell_width, cluster_cell_width_parts, cluster_continues};
+use crate::grapheme::{Graphemes, cluster_cell_width_parts, cluster_continues};
 use crate::grid::{Grid, ScreenPair};
 use crate::image::ImageStore;
 use crate::kitty_unicode::{KittyUnicodeCell, KittyUnicodeRunCells};
@@ -1175,6 +1175,17 @@ impl State {
     /// caps lines per pane); this method stays total over any input and
     /// returns the pushed line count. It records no damage: restore callers
     /// force a full present after rehydration.
+    ///
+    /// CTX-1609 storage rules mirror `State::print`:
+    ///
+    /// - `Cell::glyph` always names a scalar with an outline. A cluster's
+    ///   leading zero-width scalars (a `Prepend`, a stray mark) never take
+    ///   the glyph slot; they attach to the preceding cell's tail so copy
+    ///   order stays byte-exact, and a line-leading one is dropped exactly
+    ///   like a lone combining mark.
+    /// - Past `MAX_CLUSTER_SCALARS` a zero-width continuation is dropped
+    ///   and a printable one starts a fresh cell, so a long printable
+    ///   cluster is never silently truncated.
     pub fn restore_scrollback_text(&mut self, lines: &[&str]) -> usize {
         let width = self.width.max(1);
         let blank = Style::default();
@@ -1184,48 +1195,103 @@ impl State {
             // CTX-1609: one extended grapheme cluster is one layout unit, so
             // a restored ZWJ family, flag pair, or combining sequence keeps
             // the same cell shape the print path would have produced.
-            for cluster in Graphemes::new(text) {
+            //
+            // Zero-width scalars have no cell of their own: attach them to
+            // the last restored cell, stepping back over a wide spacer, the
+            // way `print`'s `attach_zerowidth` does. A line-leading scalar
+            // has no target and is dropped.
+            let attach = |cells: &mut Vec<Cell>, scalars: &[char]| {
+                let target = match cells.last() {
+                    Some(cell) if cell.spacer => cells.len().checked_sub(2),
+                    Some(_) => cells.len().checked_sub(1),
+                    None => None,
+                };
+                if let Some(index) = target {
+                    for scalar in scalars {
+                        let _ = cells[index].push_zerowidth(*scalar);
+                    }
+                }
+            };
+            'line: for cluster in Graphemes::new(text) {
                 if cells.len() >= width {
                     break;
                 }
-                let mut scalars = cluster.chars();
-                let Some(first) = scalars.next() else {
-                    continue;
-                };
-                let first = if first.is_control() {
-                    '\u{FFFD}'
-                } else {
-                    first
-                };
-                let cluster_width = cluster_cell_width(cluster, self.ambiguous_width);
-                if cluster_width == 0 {
-                    continue;
-                }
-                if cluster_width == 2 && cells.len() + 2 > width {
-                    break;
-                }
-                let mut cell = Cell {
-                    glyph: first,
-                    style: blank,
-                    width: cluster_width,
-                    spacer: false,
-                    padding: false,
-                    hyperlink: None,
-                    zerowidth: Zerowidth::new(),
-                };
-                for scalar in scalars {
+                // Split into leading zero-width scalars, the spacing glyph,
+                // and the continuation tail.
+                let mut leading: Vec<char> = Vec::new();
+                let mut glyph: Option<char> = None;
+                let mut tail: VecDeque<char> = VecDeque::new();
+                for scalar in cluster.chars() {
                     let scalar = if scalar.is_control() {
                         '\u{FFFD}'
                     } else {
                         scalar
                     };
-                    // The buffer is bounded; excess scalars are dropped on
-                    // restore exactly like the live over-cap degradation.
-                    let _ = cell.push_zerowidth(scalar);
+                    match glyph {
+                        None if char_cell_width_in(scalar, self.ambiguous_width) == 0 => {
+                            leading.push(scalar);
+                        }
+                        None => glyph = Some(scalar),
+                        Some(_) => tail.push_back(scalar),
+                    }
                 }
-                cells.push(cell);
-                if cluster_width == 2 {
-                    cells.push(Cell::wide_spacer(blank));
+                let Some(first) = glyph else {
+                    // All-zero-width cluster: no cell of its own.
+                    attach(&mut cells, &leading);
+                    continue;
+                };
+                // Leading zero-width scalars (a `Prepend` joins forward, so
+                // it leads the next cluster) never occupy the glyph slot:
+                // attach them to the preceding cell's tail, exactly where
+                // `print`'s zero-width path puts them. Copy order survives
+                // (`"a\u{0600}1"` restores as `a\u{0600}` + `1`), and a
+                // line-leading prepend is dropped.
+                attach(&mut cells, &leading);
+                let mut glyph = first;
+                loop {
+                    let mut cell = Cell {
+                        glyph,
+                        style: blank,
+                        width: 1,
+                        spacer: false,
+                        padding: false,
+                        hyperlink: None,
+                        zerowidth: Zerowidth::new(),
+                    };
+                    let mut overflow: Option<char> = None;
+                    while let Some(scalar) = tail.pop_front() {
+                        if cell.push_zerowidth(scalar) {
+                            continue;
+                        }
+                        if char_cell_width_in(scalar, self.ambiguous_width) == 0 {
+                            // Zero-width overflow: `print` drops it.
+                            continue;
+                        }
+                        overflow = Some(scalar);
+                        break;
+                    }
+                    let cluster_width = cluster_cell_width_parts(
+                        cell.glyph,
+                        cell.zerowidth.as_slice(),
+                        self.ambiguous_width,
+                    );
+                    if cluster_width == 0 {
+                        break;
+                    }
+                    if cluster_width == 2 && cells.len() + 2 > width {
+                        // A wide scalar without room truncates the line,
+                        // mirroring resize reflow.
+                        break 'line;
+                    }
+                    cell.width = cluster_width;
+                    cells.push(cell);
+                    if cluster_width == 2 {
+                        cells.push(Cell::wide_spacer(blank));
+                    }
+                    match overflow {
+                        Some(next) if cells.len() < width => glyph = next,
+                        _ => break,
+                    }
                 }
             }
             while cells.len() < width {

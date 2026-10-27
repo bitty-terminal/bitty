@@ -284,9 +284,10 @@ fn prepend_takes_no_cell_and_never_hides_its_base() {
         assert_eq!(cursor_col(&state), 2);
         assert_eq!(collect(&cells[..2]), format!("x{prepend}{base}"));
 
-        // At the line start there is no preceding cell: the prepend is
-        // dropped under the same documented rule as a lone combining mark,
-        // and the base still owns the lead cell.
+        // At the start of the *first* row there is no preceding cell: the
+        // prepend is dropped under the same documented rule as a lone
+        // combining mark, and the base still owns the lead cell. (A later
+        // row start reaches back to the previous row's last cell, below.)
         let state = state_with_text(&format!("{prepend}{base}"));
         let snapshot = state.snapshot();
         let cells = row(&snapshot, 0);
@@ -294,6 +295,24 @@ fn prepend_takes_no_cell_and_never_hides_its_base() {
         assert_eq!(cells[0].width, 1);
         assert_eq!(cursor_col(&state), 1);
     }
+
+    // A prepend that starts a *later* row reaches back to the previous row's
+    // last cell, exactly like the combining-mark path (`attach_zerowidth`
+    // steps back a row when the cursor is at column zero).
+    let mut state = State::new();
+    print_text(&mut state, &"a".repeat(80));
+    print_text(&mut state, "\u{0600}1");
+    let snapshot = state.snapshot();
+    let first_row = row(&snapshot, 0);
+    let second_row = row(&snapshot, 1);
+    assert_eq!(first_row[79].glyph, 'a');
+    assert_eq!(
+        first_row[79].zerowidth.as_slice(),
+        &['\u{0600}'],
+        "a later-row prepend attaches to the previous row's last cell"
+    );
+    assert_eq!(second_row[0].glyph, '1');
+    assert_eq!(second_row[0].width, 1);
 }
 
 #[test]
@@ -371,4 +390,63 @@ fn collect(cells: &[Cell]) -> String {
         cell.push_text_into(&mut out);
     }
     out
+}
+
+#[test]
+fn restored_prepend_never_occupies_the_glyph_slot() {
+    // Session restore mirrors `print`: the glyph slot always names a scalar
+    // with an outline. Before this rule a restored `"\u{0600}1"` stored the
+    // zero-width prepend as `Cell::glyph` and hid the base in the tail.
+    let mut state = State::with_scrollback_lines(8);
+    state.restore_scrollback_text(&["\u{0600}1"]);
+    let line = state.scrollback_line(0).expect("line stored");
+    assert_eq!(
+        line.cells[0].glyph, '1',
+        "a line-leading prepend is dropped, never the base"
+    );
+    assert_eq!(line.cells[0].width, 1);
+    assert!(line.cells[0].zerowidth.is_empty());
+    assert!(state.check_invariants().is_ok());
+
+    // Mid-line the prepend rides the preceding cell's tail, exactly where
+    // `print` attaches it: copy order stays byte-exact and the base still
+    // owns its own cell.
+    let mut state = State::with_scrollback_lines(8);
+    state.restore_scrollback_text(&["a\u{0600}1"]);
+    let line = state.scrollback_line(0).expect("line stored");
+    assert_eq!(line.cells[0].glyph, 'a');
+    assert_eq!(line.cells[0].zerowidth.as_slice(), &['\u{0600}']);
+    assert_eq!(line.cells[1].glyph, '1');
+    assert_eq!(line.cells[1].width, 1);
+    assert_eq!(collect(&line.cells[..2]), "a\u{0600}1");
+    assert!(state.check_invariants().is_ok());
+}
+
+#[test]
+fn restored_over_cap_printable_continuation_starts_a_fresh_cell() {
+    // A cluster whose printable continuation exceeds the tail bound mirrors
+    // `print`: the overflow scalar starts a fresh cell instead of being
+    // dropped, so a long restored cluster keeps every byte.
+    let text = format!("\u{0915}{}", "\u{093F}".repeat(MAX_CLUSTER_SCALARS + 2));
+    let mut state = State::with_scrollback_lines(8);
+    state.restore_scrollback_text(&[text.as_str()]);
+    let line = state.scrollback_line(0).expect("line stored");
+    assert_eq!(line.cells[0].glyph, '\u{0915}');
+    assert_eq!(line.cells[0].zerowidth.len(), MAX_CLUSTER_SCALARS);
+    assert_eq!(
+        line.cells[1].glyph, '\u{093F}',
+        "the printable overflow starts a fresh cell"
+    );
+    assert_eq!(line.cells[1].zerowidth.len(), 1);
+    assert_eq!(collect(&line.cells[..2]), text);
+    assert!(state.check_invariants().is_ok());
+
+    // Zero-width overflow still drops, matching `print`'s bounded buffer.
+    let marks = format!("a{}", "\u{0301}".repeat(MAX_CLUSTER_SCALARS + 2));
+    let mut state = State::with_scrollback_lines(8);
+    state.restore_scrollback_text(&[marks.as_str()]);
+    let line = state.scrollback_line(0).expect("line stored");
+    assert_eq!(line.cells[0].glyph, 'a');
+    assert_eq!(line.cells[0].zerowidth.len(), MAX_CLUSTER_SCALARS);
+    assert_eq!(line.cells[1].glyph, ' ', "no fresh cell for dropped marks");
 }

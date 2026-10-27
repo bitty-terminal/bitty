@@ -254,8 +254,11 @@ impl Lease {
 }
 
 /// The contract's compiled `lease_record_bytes` ceiling (`D-14`).
-const LEASE_RECORD_BYTES: usize = 512;
-const _: () = assert!(std::mem::size_of::<Lease>() <= LEASE_RECORD_BYTES);
+// A lease record must stay small enough for the per-session metadata budget;
+// 512 bytes is the ceiling the contract's `lease_record_bytes` accounting
+// assumes. Kept as a literal so the compile-time assert also builds on the
+// MSRV toolchain, where a const used only by another const is dead code.
+const _: () = assert!(std::mem::size_of::<Lease>() <= 512);
 
 #[cfg(test)]
 mod tests {
@@ -353,6 +356,6 @@ mod tests {
 
     #[test]
     fn lease_fits_the_contract_record_budget() {
-        assert!(std::mem::size_of::<Lease>() <= LEASE_RECORD_BYTES);
+        assert!(std::mem::size_of::<Lease>() <= 512);
     }
 }

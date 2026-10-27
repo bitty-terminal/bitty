@@ -11,6 +11,7 @@
 //! | [`SessionRegistry::create`] | `session.create`, after scopes/consent/spawn validation |
 //! | [`SessionRegistry::bind`] | worker bind, exactly once in v0.2.0 |
 //! | [`SessionRegistry::attach`] / [`SessionRegistry::detach`] | lease layer (bitty#2609) updates the derived attach count |
+//! | [`SessionRegistry::record_lease_mutation`] | control transfer with an unchanged attach count |
 //! | [`SessionRegistry::heartbeat`] | `D-12` last-seen refresh, never a revision bump |
 //! | [`SessionRegistry::note_visible_mutation`] | one revision bump for a mutation the lease layer owns |
 //! | [`SessionRegistry::begin_stopping`] | accepted abort/drain before termination |
@@ -23,10 +24,13 @@
 //! and is only removed by retention.
 //!
 //! The effective bounds are derived from the compiled advertised table with
-//! [`RegistryLimits::from_limits`]. Deferred to their owning slices: lease
-//! authority and attach caps (bitty#2609), IPC decoding, error mapping,
-//! `daemon.status` serialization, and the audit sink writer (bitty#2607), and
-//! process containment or orphan reaping (bitty#2604).
+//! [`RegistryLimits::from_limits`]. The lease, control-token, and abort state
+//! machine lives in [`crate::lease`] (bitty#2609) and drives this registry
+//! through the operations above; the bounded event stream lives in
+//! [`crate::events`] (bitty#2602) and wraps the same registry. Deferred to
+//! their owning slices: IPC decoding, scopes, error mapping, `daemon.status`
+//! serialization, and the audit sink writer (bitty#2607), and process
+//! containment or orphan reaping (bitty#2604).
 
 mod id;
 mod session;

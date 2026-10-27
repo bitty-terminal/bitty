@@ -26,6 +26,17 @@ path = "src/main.rs"
 # `bitty-runtime`, and `tempfile`); this adds no package version, no build-time
 # codegen, and no second RNG stack. Entropy failure is a hard refusal.
 getrandom = "0.4"
+# CTX-1623: the control token is stored as a domain-separated SHA-256 digest
+# (contract D-07/D-09). `sha2` 0.11.0 is already in the lockfile through
+# `bitty-ipc-devtools`; no new package version is resolved.
+sha2 = "0.11"
+# CTX-1623: constant-time digest comparison for the control token. `subtle`
+# 2.6.1 is already in the lockfile through the ed25519/rustls paths; the crate
+# has no dependencies of its own.
+subtle = "2.6"
+# CTX-1623: zeroize the one-time control token when its response is dropped.
+# 1.9.0 is already in the lockfile (bitty-runtime pins the same release).
+zeroize = "1.9"
 # bitty#2606: the seam declares no mechanism edge yet. The contract fixes the
 # allowed direction (bittyd -> bitty-term-state, bitty-pty,
 # bitty-plugin-host, bitty-ipc); each edge is added by the slice that

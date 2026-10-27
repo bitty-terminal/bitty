@@ -16,30 +16,33 @@ The normative service surface is the accepted
 (contract tracked by bitty#2546/#2663); this crate seam is bitty#2606
 (CTX-1616).
 
-## Status: seam plus the in-memory state core and session event stream
+## Status: seam plus the in-memory state core, event stream, limits, idempotency, audit, and attach/control state machine
 
 This crate fixes the service version, the capability set, and the
-version-negotiation skeleton, and implements the registry half of bitty#2601
+version-negotiation skeleton, implements the registry half of bitty#2601
 (server-generated ids, the in-memory session registry, generation and revision
-counters, retention), the bounded orphan journal, the event stream of bitty#2602
-(snapshot plus bounded backlog, revision ordering, per-lease routing,
-control-frame reservation, the terminal-event guarantee, and heartbeat/last-seen),
-the compiled limits and advertised triples of bitty#2603, the two bounded
-idempotency stores, and the bounded content-free audit ring. It **starts no
-listener**, binds no endpoint, creates no socket file, spawns no worker, and
-serves no IPC method. `bittyd` with no arguments still reports the no-endpoint
-seam and exits 0; the state core and the event stream are library surfaces for
-bitty#2607 to drive.
+counters, retention, and the bounded orphan journal), the event stream of
+bitty#2602 (snapshot plus bounded backlog, revision ordering, per-lease
+routing, control-frame reservation, the terminal-event guarantee, and
+heartbeat/last-seen), the compiled limits and advertised triples of bitty#2603,
+the two bounded idempotency stores, the bounded content-free audit ring, and the
+attach/control half of bitty#2609 (observer and controller leases, the 256-bit
+control token, explicit transfer, detach/revocation, lease expiry, and the
+abort/kill pipeline). It **starts no listener**, binds no endpoint, creates no
+socket file, spawns no worker, signals no process, and serves no IPC method.
+`bittyd` with no arguments still reports the no-endpoint seam and exits 0; the
+state core, the event stream, the limit/idempotency/audit stores, and the lease
+state machine are library surfaces for bitty#2607 to drive.
 
 The contract areas that follow are deliberately deferred to their owning
 slices:
 
-| Area                                                                                                                                                                                                                        | Owner      |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| `bitty-ipc` v1 server loop, peer capture and re-check, scope evaluation, endpoint lock and tamper detection, method dispatch, error mapping, event framing and correlation id, refusal-to-result mapping, audit sink writer | bitty#2607 |
-| Endpoint discovery, cgroup/subreaper containment, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs                                                                                       | bitty#2604 |
-| Leases, control token, attach/detach authority, abort/kill                                                                                                                                                                  | bitty#2609 |
-| Conformance corpus and fake-server parity                                                                                                                                                                                   | bitty#2605 |
+| Area                                                                                                                                                                                                                                                    | Owner                |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| `bitty-ipc` v1 server loop, peer capture and re-check, scope evaluation, observer-grant consumption, endpoint lock and tamper detection, method dispatch, error mapping, event framing and correlation id, refusal-to-result mapping, audit sink writer | bitty#2607           |
+| Observer-grant store (mint, single-use consume, TTL, peer binding, revoke)                                                                                                                                                                              | bitty#2609 follow-up |
+| Endpoint discovery, cgroup/subreaper containment, signal delivery and reaping, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs                                                                                      | bitty#2604           |
+| Conformance corpus and fake-server parity                                                                                                                                                                                                               | bitty#2605           |
 
 Nothing here authorizes autostart, a service file, a TCP listener, or desktop
 wiring; all four stay out of scope.
@@ -71,7 +74,8 @@ file, and owns only metadata.
   is regenerated, and a collected id is never recycled as a new value.
 - `SessionRegistry::create` starts at generation `0` and state revision `0`;
   `bind` increments the generation exactly once (v0.2.0 permits one bind);
-  `attach`/`detach` drive the derived attach count; `heartbeat` updates
+  `attach`/`detach` drive the derived attach count; `record_lease_mutation`
+  bumps the revision for a transfer that keeps the count; `heartbeat` updates
   last-seen without a revision bump; `begin_stopping` and `terminate` apply one
   revision bump per snapshot-visible transition. Counters use checked
   arithmetic and fail closed.
@@ -85,6 +89,48 @@ file, and owns only metadata.
 - Enforced bounds come from the compiled `D-14` table in `limits`; the
   `RegistryLimits` constants and `RegistryLimits::from_limits` cannot drift from
   the advertised values.
+
+## Attach, control, and stop state machine (bitty#2609)
+
+`lease::SessionHost` owns the registry plus the per-session lease table, so an
+attach, detach, claim, transfer, or terminal transition is one atomic
+`&mut` operation. It holds no connection, queue, socket, file, or process.
+
+- Roles and bounds: one controller lease per session, plus observers up to
+  `max_attaches_per_session` (default 8, ceiling 16); the controller is
+  additional to that observer cap (`D-09`). Every attach mints a distinct
+  128-bit `attach_id`. A new observer at the cap is shed; existing leases are
+  never evicted.
+- Control token: 256 bits from the OS CSPRNG, returned once at create, stored
+  only as a domain-separated SHA-256 digest, verified in constant time
+  (`subtle`), rotated on every claim and transfer, and retired on controller
+  revocation and terminal transition. The raw token is zeroized on drop and its
+  `Debug` prints only `ControlToken(<redacted>)`; no snapshot, notice, refusal,
+  or `SessionHost` debug output carries it.
+- Authorization: the IPC slice authenticates the peer, checks instance, scope,
+  visibility, observer grant, and operator capability; `SessionHost` owns the
+  lease liveness/role relation, the generation fence, and the token comparison,
+  in that order (role/relation, generation, token). A stale generation is
+  refused before the token digest is touched. An observer is always
+  `ControllerRequired` for control methods and never becomes controller by
+  waiting, by disconnect, or by racing an attach.
+- Expiry and renewal are driven by the injected `MonotonicMs`; a lease is live
+  before `expires_at` and expired exactly at it. Expiry detaches only: the
+  worker keeps running, the generation is unchanged, and a controller expiry
+  leaves control vacant with the current token still reclaimable.
+- Stop pipeline: a generation-0 stop commits a cancel intent that refuses
+  `bind`; completing it records `not_started`/`swept`/`unverified` cleanup. A
+  running stop moves to `stopping`, arms the abort or drain grace, then
+  escalates to kill at the deadline. Terminations classify as `worker_exit`,
+  `worker_signal`, `spawn_failed`, or the accepted stop reason. The terminal
+  transition retires the token, detaches every lease (one visible detach bump
+  each, so the frozen record reports no attaches), and returns exactly one
+  `TerminalNotice`; a duplicate returns `AlreadyTerminal` and no second notice.
+- Deliberately not in this module: the observer-grant store, idempotency
+  stores, PTY containment/signalling/reaping, event queues, peer
+  authentication, scopes, audit files, and endpoint handling. `attach_observer`
+  assumes bitty#2607 has already consumed a valid grant; do not expose the
+  observer role without that check.
 
 `orphan` is the two-phase, bounded orphan journal. `reserve` fsyncs a
 `reserved` record (session id, generation, boot id, reserved-at) before the
@@ -415,6 +461,8 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
 - `src/events/` — the event envelope and kinds, the bounded backlog ring, lease
   queues with the control reservation, the enforced limits, and the per-session
   stream.
+- `src/lease/` — the control token and digest, lease records and limits, the
+  lease/control/stop state machine, and its closed refusals.
 - `src/orphan/` — process identity probes, the bounded journal, classification,
   and the exact-identity reaper seam.
 - `src/seam.rs` — explicit no-listener/no-endpoint status.
@@ -433,6 +481,8 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
   binding, TTL boundaries, capacity eviction, and hostile key streams.
 - `tests/audit.rs` — overflow visibility, stable ids, structural content-free
   records, refusal representation, and capacity derivation.
+- `tests/leases.rs` — public attach, claim, transfer, expiry, detach, stop, and
+  token-minimization behavior.
 - `tests/orphan_journal.rs` — public journal reserve/commit/reap, no-signal
   paths, owner-private Unix files, and the no-argv/env record shape.
 - `tests/endpoint.rs` — real Unix endpoint behavior: modes and owners, second

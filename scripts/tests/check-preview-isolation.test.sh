@@ -245,14 +245,40 @@ for job in "${preview_jobs[@]}"; do
   fi
 done
 
-for job in isolation build package release; do
+for job in isolation build package release prune; do
   block="$(extract_job "$PREVIEW_ACTIVE" "$job")"
-  if grep -qF 'ref: ${{ needs.preflight.outputs.sha }}' <<<"$block"; then
-    pass "preview job '$job' checks out the pinned preflight commit"
+  if grep -qF 'ref: ${{ github.sha }}' <<<"$block"; then
+    pass "preview job '$job' checks out the pinned run commit"
   else
-    fail "preview job '$job' does not pin the preflight commit"
+    fail "preview job '$job' does not pin the run commit"
   fi
 done
+
+# A `needs.*.outputs.*` ref is tainted for CodeQL (job outputs are untrusted
+# input), so the checkout ref must come from a trusted context only.
+expect_absent "$PREVIEW_ACTIVE" "needs.preflight.outputs.sha" \
+  "preview workflow never checks out a job-output ref"
+
+# GitHub expressions inside `run:` scripts are shell injection surface;
+# values reach a script only through `env:` and quoted expansions.
+if awk '
+  {
+    match($0, /^ */)
+    indent = RLENGTH
+    if (indent == 8 && $0 ~ /^ *run:/) {
+      if (index($0, "${{") > 0) bad = 1
+      inrun = ($0 ~ /^ *run:[ ]*[|>]/)
+      next
+    }
+    if (inrun && indent <= 8 && $0 !~ /^ *$/) inrun = 0
+    if (inrun && index($0, "${{") > 0) bad = 1
+  }
+  END { exit bad ? 1 : 0 }
+' "$PREVIEW_ACTIVE"; then
+  pass "preview run steps pass context values through env"
+else
+  fail "preview run step interpolates a GitHub expression into the script"
+fi
 
 # The isolation proof must run before any build leg starts.
 isolation_block="$(extract_job "$PREVIEW_ACTIVE" isolation)"

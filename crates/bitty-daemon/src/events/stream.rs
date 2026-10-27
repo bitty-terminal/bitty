@@ -26,6 +26,18 @@
 //! - **Bounded memory.** Every queue is capped by [`EventLimits`]; a stalled
 //!   consumer costs at most one lease queue and is closed when a control frame
 //!   no longer fits.
+//! - **Retention-bound stream state.** A stream entry exists only while the
+//!   registry still resolves its id. A terminal record collected by TTL or
+//!   evicted by `max_retained_terminal_records` releases its stream entry in
+//!   the same operation; every still-attached lease is closed with
+//!   [`LeaseCloseReason::TerminalEventLost`] and reported, never dropped
+//!   silently.
+//! - **Retained terminal leases.** A terminal transition freezes the registry
+//!   record (`D-04`), so a retained snapshot's `attach_count` can be higher
+//!   than the leases the stream still holds. Closing a lease on a terminal
+//!   record is stream-only and never calls `registry.detach`; the divergence is
+//!   bounded by `max_attaches_per_session` per retained record and by the
+//!   retention cap, which now bounds the stream map as well.
 //!
 //! # Compiled caps
 //!
@@ -34,8 +46,9 @@
 //! one lease queue is 256 events / 65,536 bytes (`max_lease_queue_events` /
 //! `max_lease_queue_bytes`), leases per session are 8 default / 16 maximum
 //! (`max_attaches_per_session`), the lease TTL is 15,000 ms
-//! (`attach_lease_ttl_ms`), and a session keeps at most 512 attach keys
-//! (`max_idempotency_keys_per_session`). The control reservation is 8 frames /
+//! (`attach_lease_ttl_ms`), and a session keeps at most 512 attach keys / 65,536
+//! accounted bytes (`max_idempotency_keys_per_session` /
+//! `max_idempotency_bytes_per_session`). The control reservation is 8 frames /
 //! 8,192 bytes of every lease queue.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -45,7 +58,7 @@ use crate::registry::{
     AttachId, CreateSession, DaemonInstanceId, MonotonicMs, RegistryRefusal, SessionId,
     SessionRegistry, SessionSnapshot, TerminalOutcome,
 };
-use crate::registry::{Entropy, OsEntropy};
+use crate::registry::{Entropy, ID_GENERATION_ATTEMPTS, OsEntropy};
 
 use super::backlog::Backlog;
 use super::event::{AttachKey, Event, EventDetail, EventKind, TerminalMarker};
@@ -58,6 +71,8 @@ use super::limits::EventLimits;
 pub enum EventRefusal {
     /// The session registry refused the underlying call.
     Registry(RegistryRefusal),
+    /// The constructor received a registry that already holds records.
+    RegistryNotEmpty,
     /// No stream state exists for this session; it is unknown or collected.
     UnknownSession,
     /// The named lease is not attached to this session. The service layer maps
@@ -69,7 +84,7 @@ pub enum EventRefusal {
         /// The enforced bound.
         limit: usize,
     },
-    /// The attach-key store is at `max_idempotency_keys_per_session`.
+    /// The attach-key store is at its entry or accounted-byte bound.
     IdempotencyCapacity {
         /// The enforced bound.
         limit: usize,
@@ -107,6 +122,8 @@ pub enum EventRefusal {
     },
     /// Server-side attach id generation failed.
     IdGenerationFailed,
+    /// Fresh attach ids repeatedly collided with a live lease.
+    IdCollision,
     /// The close cascade exceeded its structural bound; the stream fails closed.
     DeliveryLoop {
         /// Steps attempted before the refusal.
@@ -135,13 +152,16 @@ impl fmt::Display for EventRefusal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Registry(refusal) => write!(formatter, "registry refused: {refusal}"),
+            Self::RegistryNotEmpty => {
+                formatter.write_str("the event stream requires an empty registry")
+            }
             Self::UnknownSession => formatter.write_str("session stream not found"),
             Self::NotAttached => formatter.write_str("lease is not attached to this session"),
             Self::MaxAttaches { limit } => {
                 write!(formatter, "attach limit {limit} reached for this session")
             }
             Self::IdempotencyCapacity { limit } => {
-                write!(formatter, "attach key store is full at {limit} entries")
+                write!(formatter, "attach key store is full at {limit}")
             }
             Self::IdempotencyConflict => {
                 formatter.write_str("attach key was already used with different parameters")
@@ -166,6 +186,7 @@ impl fmt::Display for EventRefusal {
             Self::EmptyHeartbeat => formatter.write_str("heartbeat names no lease"),
             Self::InvalidRequest { reason } => write!(formatter, "invalid request: {reason}"),
             Self::IdGenerationFailed => formatter.write_str("attach id generation failed"),
+            Self::IdCollision => formatter.write_str("attach id generation collided repeatedly"),
             Self::DeliveryLoop { steps } => {
                 write!(
                     formatter,
@@ -345,7 +366,8 @@ pub enum DetachCause {
 pub struct DetachOutcome {
     /// The snapshot after the detach and any close cascade.
     pub snapshot: SessionSnapshot,
-    /// The canonical event at the detach revision.
+    /// The canonical `session_state` event at the detach revision. Survivors
+    /// receive this frame; the revoked target receives `final_frame` instead.
     pub event: Event,
     /// The `lease_revoked` frame for the removed lease, when it was revoked.
     /// The transport writes it before closing the connection; a self-detach
@@ -367,6 +389,17 @@ pub struct MutationReport {
     pub closed: Vec<LeaseClose>,
 }
 
+/// A terminal session whose stream state was dropped because the registry no
+/// longer resolved its id (TTL collection or retention-cap eviction).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetiredSession {
+    /// The retired session.
+    pub session_id: SessionId,
+    /// Leases still attached when the record was retired; each is closed with
+    /// [`LeaseCloseReason::TerminalEventLost`].
+    pub closed: Vec<LeaseClose>,
+}
+
 /// The result of a terminal transition (`D-10` terminal guarantee).
 #[derive(Debug, Clone)]
 pub struct TerminalReport {
@@ -375,8 +408,22 @@ pub struct TerminalReport {
     /// The canonical `session_terminal` event.
     pub event: Event,
     /// Leases closed with `TerminalEventLost` before the transition became
-    /// visible; each one knows it missed the event and reconciles with status.
+    /// visible, plus every lease on a session the retention cap evicted during
+    /// this call.
     pub lost: Vec<AttachId>,
+    /// Terminal sessions whose stream state this call pruned after the
+    /// registry evicted them.
+    pub retired: Vec<RetiredSession>,
+}
+
+/// The result of [`SessionEventStream::collect_retained`].
+#[derive(Debug, Clone)]
+pub struct RetentionReport {
+    /// Session ids collected by TTL.
+    pub collected: Vec<SessionId>,
+    /// Stream entries dropped because the registry no longer resolves them,
+    /// with every still-attached lease closed as lost.
+    pub retired: Vec<RetiredSession>,
 }
 
 /// The result of `expire_leases`.
@@ -437,6 +484,7 @@ pub struct SessionEventStream {
     limits: EventLimits,
     entropy: Box<dyn Entropy + Send>,
     sessions: BTreeMap<SessionId, SessionStream>,
+    pending_retired: Vec<RetiredSession>,
 }
 
 impl fmt::Debug for SessionEventStream {
@@ -446,6 +494,7 @@ impl fmt::Debug for SessionEventStream {
             .field("instance_id", &self.registry.instance_id())
             .field("limits", &self.limits)
             .field("sessions", &self.sessions.len())
+            .field("pending_retired", &self.pending_retired.len())
             .finish()
     }
 }
@@ -456,16 +505,27 @@ impl SessionEventStream {
     /// The registry must be empty: the stream mirrors every session's
     /// `state_revision` and cannot reconstruct a ring that predates it. The
     /// daemon composes both at startup, before the first `create`.
-    #[must_use]
-    pub fn new(registry: SessionRegistry) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventRefusal::RegistryNotEmpty`] when the registry already
+    /// holds a live or retained record.
+    pub fn new(registry: SessionRegistry) -> Result<Self, EventRefusal> {
         Self::with_limits(registry, EventLimits::default())
     }
 
     /// Wrap an empty registry with enforced event bounds and the OS CSPRNG.
     ///
     /// The registry must be empty; see [`Self::new`].
-    #[must_use]
-    pub fn with_limits(registry: SessionRegistry, limits: EventLimits) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EventRefusal::RegistryNotEmpty`] when the registry already
+    /// holds a live or retained record.
+    pub fn with_limits(
+        registry: SessionRegistry,
+        limits: EventLimits,
+    ) -> Result<Self, EventRefusal> {
         Self::with_entropy(registry, limits, Box::new(OsEntropy))
     }
 
@@ -473,17 +533,17 @@ impl SessionEventStream {
         registry: SessionRegistry,
         limits: EventLimits,
         entropy: Box<dyn Entropy + Send>,
-    ) -> Self {
-        debug_assert!(
-            registry.snapshots().next().is_none(),
-            "the event stream must wrap an empty registry"
-        );
-        Self {
+    ) -> Result<Self, EventRefusal> {
+        if registry.snapshots().next().is_some() {
+            return Err(EventRefusal::RegistryNotEmpty);
+        }
+        Ok(Self {
             registry,
             limits,
             entropy,
             sessions: BTreeMap::new(),
-        }
+            pending_retired: Vec::new(),
+        })
     }
 
     /// The wrapped registry, for status reads that carry no stream state.
@@ -506,6 +566,11 @@ impl SessionEventStream {
 
     /// Register a new session and its empty ring at revision `0`.
     ///
+    /// A defensive sweep also drops any terminal entry the registry can no
+    /// longer resolve; the cap normally evicts during `terminate`, so this is a
+    /// no-op for a correctly sequenced caller. Any retired lease is available
+    /// through [`Self::take_retired`].
+    ///
     /// # Errors
     ///
     /// Returns the registry refusal unchanged; no stream state is inserted.
@@ -520,6 +585,8 @@ impl SessionEventStream {
             snapshot.session_id,
             SessionStream::new(instance_id, snapshot.session_id, self.limits),
         );
+        let retired = self.prune_unresolved();
+        self.pending_retired.extend(retired);
         Ok(snapshot)
     }
 
@@ -563,10 +630,14 @@ impl SessionEventStream {
                     closed: Vec::new(),
                 });
             }
-            if session.attach_keys.len() >= self.limits.max_attach_keys_per_session() {
-                return Err(EventRefusal::IdempotencyCapacity {
-                    limit: self.limits.max_attach_keys_per_session(),
-                });
+            let keys_limit = self.limits.max_attach_keys_per_session();
+            if session.attach_keys.len() >= keys_limit {
+                return Err(EventRefusal::IdempotencyCapacity { limit: keys_limit });
+            }
+            let bytes_limit = self.limits.max_attach_keys_bytes_per_session();
+            let entry_bytes = key.accounted_bytes() + std::mem::size_of::<AttachKeyEntry>();
+            if session.attach_keys_bytes().saturating_add(entry_bytes) > bytes_limit {
+                return Err(EventRefusal::IdempotencyCapacity { limit: bytes_limit });
             }
         }
 
@@ -583,8 +654,20 @@ impl SessionEventStream {
             });
         }
 
-        let attach_id = AttachId::generate_with(self.entropy.as_mut())
-            .map_err(|_| EventRefusal::IdGenerationFailed)?;
+        // Never reuse a live lease id: an overwrite would desynchronise the
+        // registry's attach count from the lease map. The retry bound keeps a
+        // broken entropy source a typed refusal rather than a loop.
+        let live_ids: BTreeSet<AttachId> = session.leases.keys().copied().collect();
+        let mut attach_id = None;
+        for _ in 0..ID_GENERATION_ATTEMPTS {
+            let candidate = AttachId::generate_with(self.entropy.as_mut())
+                .map_err(|_| EventRefusal::IdGenerationFailed)?;
+            if !live_ids.contains(&candidate) {
+                attach_id = Some(candidate);
+                break;
+            }
+        }
+        let attach_id = attach_id.ok_or(EventRefusal::IdCollision)?;
         let snapshot = self.registry.attach(session_id, now)?;
         let event = {
             let session = self
@@ -630,6 +713,11 @@ impl SessionEventStream {
 
     /// Detach one lease and emit the one event for that visible mutation.
     ///
+    /// Survivors receive the canonical `session_state` frame. A revocation adds
+    /// a target-only `lease_revoked` final frame, so the revoked flag is
+    /// attributable to the lease it names and is not broadcast to every
+    /// surviving lease.
+    ///
     /// # Errors
     ///
     /// Refuses when the session or the lease is unknown, or the registry refuses
@@ -650,20 +738,26 @@ impl SessionEventStream {
         }
 
         let snapshot = self.registry.detach(session_id, now)?;
-        let kind = match cause {
-            DetachCause::SelfDetach => EventKind::SessionState,
-            DetachCause::Revoked => EventKind::LeaseRevoked,
-        };
         let event = {
             let session = self
                 .sessions
                 .get_mut(&session_id)
                 .ok_or(EventRefusal::UnknownSession)?;
-            session.append(snapshot.state_revision, kind, None, EventDetail::None, now)?
+            session.append(
+                snapshot.state_revision,
+                EventKind::SessionState,
+                None,
+                EventDetail::None,
+                now,
+            )?
         };
         let final_frame = match cause {
             DetachCause::SelfDetach => None,
-            DetachCause::Revoked => Some(event.routed_to(attach_id)),
+            DetachCause::Revoked => {
+                let mut frame = event.routed_to(attach_id);
+                frame.kind = EventKind::LeaseRevoked;
+                Some(frame)
+            }
         };
         {
             let session = self
@@ -1074,14 +1168,28 @@ impl SessionEventStream {
             .sessions
             .get_mut(&session_id)
             .ok_or(EventRefusal::UnknownSession)?;
-        session.terminal = Some(TerminalSlot {
-            event: event.clone(),
-            pending,
-        });
+        // No pending consumer means no pin: storing an empty slot would retain
+        // the terminal event until retention for nobody.
+        if pending.is_empty() {
+            session.terminal = None;
+        } else {
+            session.terminal = Some(TerminalSlot {
+                event: event.clone(),
+                pending,
+            });
+        }
+
+        // The registry may have evicted an older retained record while inserting
+        // this one. Drop its stream state and report every still-attached lease.
+        let retired = self.prune_unresolved();
+        for session in &retired {
+            lost.extend(session.closed.iter().map(|close| close.attach_id));
+        }
         Ok(TerminalReport {
             snapshot,
             event,
             lost,
+            retired,
         })
     }
 
@@ -1248,13 +1356,31 @@ impl SessionEventStream {
     ///
     /// Collection is the bound on a pinned terminal event that no consumer ever
     /// acknowledges: the record, the slot, and every lease record go away
-    /// together.
-    pub fn collect_retained(&mut self, now: MonotonicMs) -> Vec<SessionId> {
+    /// together. Every still-attached lease is reported as `TerminalEventLost`
+    /// in [`RetentionReport::retired`], so the transport is never dropped
+    /// silently.
+    pub fn collect_retained(&mut self, now: MonotonicMs) -> RetentionReport {
         let collected = self.registry.collect_retained(now);
+        let mut retired = Vec::with_capacity(collected.len());
         for session_id in &collected {
-            self.sessions.remove(session_id);
+            if let Some(session) = self.sessions.remove(session_id) {
+                retired.push(RetiredSession {
+                    session_id: *session_id,
+                    closed: retired_closes(&session),
+                });
+            }
         }
-        collected
+        retired.extend(self.prune_unresolved());
+        RetentionReport { collected, retired }
+    }
+
+    /// Drain terminal sessions pruned by the defensive `create` sweep.
+    ///
+    /// `terminate` and `collect_retained` return their retired entries directly;
+    /// this is the escape hatch for the documented no-op sweep in `create`.
+    #[must_use]
+    pub fn take_retired(&mut self) -> Vec<RetiredSession> {
+        std::mem::take(&mut self.pending_retired)
     }
 
     /// Live leases on one session.
@@ -1321,6 +1447,14 @@ impl SessionEventStream {
             .map(|session| session.attach_keys.len())
     }
 
+    /// Accounted bytes for one session's attach-key store.
+    #[must_use]
+    pub fn attach_key_bytes(&self, session_id: SessionId) -> Option<usize> {
+        self.sessions
+            .get(&session_id)
+            .map(SessionStream::attach_keys_bytes)
+    }
+
     /// Accounted stream bytes for one session: the ring, every lease queue, the
     /// fixed per-lease and per-key records, and the terminal slot event.
     ///
@@ -1381,6 +1515,33 @@ impl SessionEventStream {
             event,
             closed: delivered.closed,
         })
+    }
+
+    /// Drop terminal stream entries the registry no longer resolves.
+    ///
+    /// Only a terminal entry can disappear from the registry without a stream
+    /// call: the retention cap evicts during `terminate`, and TTL collection
+    /// removes records directly. A live entry that is missing is an invariant
+    /// failure, not a retirement, and is left for the next operation to refuse.
+    fn prune_unresolved(&mut self) -> Vec<RetiredSession> {
+        let stale: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|(session_id, session)| {
+                session.terminalized && self.registry.snapshot(**session_id).is_none()
+            })
+            .map(|(session_id, _)| *session_id)
+            .collect();
+        let mut retired = Vec::with_capacity(stale.len());
+        for session_id in stale {
+            if let Some(session) = self.sessions.remove(&session_id) {
+                retired.push(RetiredSession {
+                    session_id,
+                    closed: retired_closes(&session),
+                });
+            }
+        }
+        retired
     }
 
     fn replay_for(
@@ -1578,9 +1739,143 @@ impl SessionEventStream {
     }
 }
 
+/// Every lease still attached when its session record was retired. The
+/// terminal record is gone, so each lease gets the typed close instead of being
+/// dropped with the map entry.
+fn retired_closes(session: &SessionStream) -> Vec<LeaseClose> {
+    session
+        .leases
+        .keys()
+        .map(|attach_id| LeaseClose {
+            attach_id: *attach_id,
+            reason: LeaseCloseReason::TerminalEventLost,
+        })
+        .collect()
+}
+
 /// The leases that accepted one canonical event.
 #[derive(Debug)]
 struct Delivered {
     recipients: Vec<AttachId>,
     closed: Vec<LeaseClose>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::{CreateSession, IdError, RegistryLimits, TerminalId};
+
+    struct FixedEntropy(u8);
+
+    impl Entropy for FixedEntropy {
+        fn fill(&mut self, destination: &mut [u8]) -> Result<(), IdError> {
+            destination.fill(self.0);
+            Ok(())
+        }
+    }
+
+    struct SequenceEntropy(VecDeque<u8>);
+
+    impl Entropy for SequenceEntropy {
+        fn fill(&mut self, destination: &mut [u8]) -> Result<(), IdError> {
+            destination.fill(self.0.pop_front().unwrap_or(0xaa));
+            Ok(())
+        }
+    }
+
+    fn registry_limits() -> RegistryLimits {
+        RegistryLimits::new(4, 4, 4096, 600_000).expect("registry limits")
+    }
+
+    fn created(stream: &mut SessionEventStream) -> SessionSnapshot {
+        stream
+            .create(
+                CreateSession {
+                    terminal_id: Some(
+                        TerminalId::supplied("term-collision").expect("valid terminal id"),
+                    ),
+                    owner_peer: None,
+                },
+                MonotonicMs::from_millis(1),
+            )
+            .expect("create")
+    }
+
+    fn attach(stream: &mut SessionEventStream, session_id: SessionId, now: u64) -> AttachOutcome {
+        stream
+            .attach(
+                AttachRequest {
+                    session_id,
+                    after_revision: 0,
+                    idempotency_key: None,
+                },
+                MonotonicMs::from_millis(now),
+            )
+            .expect("attach")
+    }
+
+    #[test]
+    fn a_live_attach_id_collision_is_retried_then_refused() {
+        let registry = SessionRegistry::new(registry_limits()).expect("registry");
+        let mut stream = SessionEventStream::with_entropy(
+            registry,
+            EventLimits::default(),
+            Box::new(FixedEntropy(0x11)),
+        )
+        .expect("empty registry");
+        let snapshot = created(&mut stream);
+        let first = attach(&mut stream, snapshot.session_id, 2);
+        assert_eq!(first.attach_id.as_hex(), "1".repeat(32));
+
+        assert_eq!(
+            stream
+                .attach(
+                    AttachRequest {
+                        session_id: snapshot.session_id,
+                        after_revision: 1,
+                        idempotency_key: None,
+                    },
+                    MonotonicMs::from_millis(3),
+                )
+                .unwrap_err(),
+            EventRefusal::IdCollision
+        );
+        assert_eq!(stream.lease_count(snapshot.session_id), Some(1));
+        assert_eq!(
+            stream
+                .registry()
+                .snapshot(snapshot.session_id)
+                .expect("snapshot")
+                .attach_count,
+            1
+        );
+    }
+
+    #[test]
+    fn a_collision_within_the_retry_bound_mints_a_fresh_lease() {
+        let registry = SessionRegistry::new(registry_limits()).expect("registry");
+        let mut entropy = VecDeque::new();
+        entropy.push_back(0x11);
+        entropy.push_back(0x11);
+        entropy.push_back(0x22);
+        let mut stream = SessionEventStream::with_entropy(
+            registry,
+            EventLimits::default(),
+            Box::new(SequenceEntropy(entropy)),
+        )
+        .expect("empty registry");
+        let snapshot = created(&mut stream);
+        let first = attach(&mut stream, snapshot.session_id, 2);
+        let second = attach(&mut stream, snapshot.session_id, 3);
+        assert_ne!(first.attach_id, second.attach_id);
+        assert_eq!(stream.lease_count(snapshot.session_id), Some(2));
+        assert_eq!(
+            stream
+                .registry()
+                .snapshot(snapshot.session_id)
+                .expect("snapshot")
+                .attach_count,
+            2
+        );
+    }
 }

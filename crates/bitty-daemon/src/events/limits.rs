@@ -12,6 +12,7 @@
 //! | Leases per session | 8 | 16 | `max_attaches_per_session` |
 //! | Lease heartbeat TTL | 15,000 ms | 15,000 ms | `attach_lease_ttl_ms` |
 //! | Attach keys per session | 512 | 512 | `max_idempotency_keys_per_session` |
+//! | Attach-key store bytes per session | 65,536 | 65,536 | `max_idempotency_bytes_per_session` |
 //!
 //! The reservation inside one lease queue is [`LEASE_CONTROL_RESERVATION_EVENTS`]
 //! frames and [`LEASE_CONTROL_RESERVATION_BYTES`] bytes: the share a future
@@ -52,6 +53,14 @@ pub const ATTACH_LEASE_TTL_MS: u64 = 15_000;
 /// Default and compiled ceiling for one session's attach-key dedupe store
 /// (`D-18` `max_idempotency_keys_per_session`).
 pub const MAX_ATTACH_KEYS_PER_SESSION: usize = 512;
+
+/// Default and compiled ceiling for the accounted bytes of one session's
+/// attach-key dedupe store (`D-18` `max_idempotency_bytes_per_session`).
+///
+/// The key count alone is not a memory bound: a 128-byte key plus its fixed
+/// entry can cost roughly 168 bytes, so 512 entries would exceed the contract's
+/// 65,536-byte limit. The stream enforces both bounds.
+pub const MAX_ATTACH_KEYS_BYTES_PER_SESSION: usize = 65_536;
 
 /// Frames one lease queue always keeps free for control frames (`D-10`).
 ///
@@ -201,6 +210,12 @@ impl EventLimits {
     #[must_use]
     pub const fn max_attach_keys_per_session(self) -> usize {
         self.max_attach_keys_per_session
+    }
+
+    /// Accounted bytes for one session's attach-key dedupe store.
+    #[must_use]
+    pub const fn max_attach_keys_bytes_per_session(self) -> usize {
+        MAX_ATTACH_KEYS_BYTES_PER_SESSION
     }
 
     /// Depth a future shed-able class may use: the queue minus the reservation.

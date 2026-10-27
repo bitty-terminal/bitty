@@ -47,4 +47,4 @@ pub use self::table::{
 /// Entropy plumbing shared with the event stream (bitty#2602): the stream mints
 /// `attach_id` values from the same source the registry mints sessions from, so
 /// tests can drive both sequences deterministically.
-pub(crate) use self::id::{Entropy, OsEntropy};
+pub(crate) use self::id::{Entropy, ID_GENERATION_ATTEMPTS, OsEntropy};

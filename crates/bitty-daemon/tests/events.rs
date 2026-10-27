@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 
 use bitty_daemon::events::{
     AttachKey, AttachRequest, DetachCause, Event, EventDetail, EventKind, EventLimits,
-    EventRefusal, LEASE_CONTROL_RESERVATION_BYTES, LEASE_CONTROL_RESERVATION_EVENTS,
-    LeaseCloseReason, MAX_LEASE_QUEUE_BYTES, MAX_LEASE_QUEUE_EVENTS, SessionEventStream,
+    EventRefusal, LEASE_CONTROL_RESERVATION_BYTES, LEASE_CONTROL_RESERVATION_EVENTS, LeaseClose,
+    LeaseCloseReason, MAX_ATTACH_KEYS_BYTES_PER_SESSION, MAX_LEASE_QUEUE_BYTES,
+    MAX_LEASE_QUEUE_EVENTS, SessionEventStream,
 };
 use bitty_daemon::registry::{
     AttachId, CleanupClass, CreateSession, ExitInformation, LifecycleState, MonotonicMs,
@@ -45,6 +46,7 @@ fn new_stream(limits: EventLimits) -> SessionEventStream {
         SessionRegistry::new(registry_limits()).expect("registry"),
         limits,
     )
+    .expect("empty registry")
 }
 
 fn create(stream: &mut SessionEventStream, terminal_id: &str, now: u64) -> SessionSnapshot {
@@ -419,7 +421,7 @@ fn terminal_event_survives_trimming_and_is_delivered_once() {
 fn an_unacknowledged_terminal_event_is_pinned_only_until_retention() {
     let mut stream = new_stream(EventLimits::default());
     let created = create(&mut stream, "term-5", 1);
-    attach(&mut stream, created.session_id, 0, None, 2);
+    let lease = attach(&mut stream, created.session_id, 0, None, 2);
     let terminal = terminate(
         &mut stream,
         created.session_id,
@@ -434,14 +436,26 @@ fn an_unacknowledged_terminal_event_is_pinned_only_until_retention() {
         Some(1)
     );
 
-    assert!(stream.collect_retained(ms(3 + 600_000 - 1)).is_empty());
+    assert!(
+        stream
+            .collect_retained(ms(3 + 600_000 - 1))
+            .collected
+            .is_empty()
+    );
     assert_eq!(
         stream.pending_terminal_consumers(created.session_id),
         Some(1)
     );
+    let report = stream.collect_retained(ms(3 + 600_000));
+    assert_eq!(report.collected, vec![created.session_id]);
+    assert_eq!(report.retired.len(), 1);
+    assert_eq!(report.retired[0].session_id, created.session_id);
     assert_eq!(
-        stream.collect_retained(ms(3 + 600_000)),
-        vec![created.session_id]
+        report.retired[0].closed,
+        vec![LeaseClose {
+            attach_id: lease.attach_id,
+            reason: LeaseCloseReason::TerminalEventLost,
+        }]
     );
     assert_eq!(stream.pending_terminal_consumers(created.session_id), None);
     assert_eq!(stream.session_count(), 0);
@@ -953,18 +967,27 @@ fn control_transfer_and_daemon_stopping_are_control_frames() {
             ms(7),
         )
         .expect("revoke");
-    assert_eq!(revoked.event.kind, EventKind::LeaseRevoked);
+    assert_eq!(
+        revoked.event.kind,
+        EventKind::SessionState,
+        "survivors see a normal state mutation"
+    );
     assert_eq!(
         revoked
             .final_frame
             .map(|frame| (frame.kind, frame.attach_id)),
-        Some((EventKind::LeaseRevoked, Some(second.attach_id)))
+        Some((EventKind::LeaseRevoked, Some(second.attach_id))),
+        "only the revoked lease gets the typed final frame"
     );
     let delivered = stream
         .take_deliveries(created.session_id, first.attach_id)
         .expect("drain");
     assert_eq!(revisions(&delivered), vec![4]);
-    assert_eq!(delivered[0].kind, EventKind::LeaseRevoked);
+    assert_eq!(
+        delivered[0].kind,
+        EventKind::SessionState,
+        "a survivor must not see another lease's lease_revoked"
+    );
     assert_eq!(
         stream.take_deliveries(created.session_id, second.attach_id),
         Err(EventRefusal::NotAttached)
@@ -1448,9 +1471,13 @@ fn no_event_loss_or_duplication_across_ten_thousand_randomized_operations() {
 
         // A terminal session is collected once its retention TTL passes.
         if models[&session_id].terminal {
-            let collected = stream.collect_retained(ms(now + 600_000));
-            for collected_id in collected {
-                models.remove(&collected_id);
+            let report = stream.collect_retained(ms(now + 600_000));
+            for collected_id in report
+                .collected
+                .iter()
+                .chain(report.retired.iter().map(|retired| &retired.session_id))
+            {
+                models.remove(collected_id);
             }
         }
     }
@@ -1465,4 +1492,355 @@ fn no_event_loss_or_duplication_across_ten_thousand_randomized_operations() {
         "the run audited a replay on most steps: {replays}"
     );
     let _ = seed;
+}
+
+#[test]
+fn retention_cap_bounds_stream_state_and_reports_retired_leases() {
+    let registry_limits = RegistryLimits::default();
+    let retained_limit = registry_limits.max_retained_terminal_records();
+    let live_limit = registry_limits.max_sessions();
+    let registry = SessionRegistry::new(registry_limits).expect("registry");
+    let mut stream =
+        SessionEventStream::with_limits(registry, EventLimits::default()).expect("stream");
+    let cycles = 300usize;
+    let mut lost = Vec::new();
+    let mut retired = Vec::new();
+    for index in 0..cycles {
+        let now = u64::try_from(index).expect("small") * 10 + 1;
+        let created = create(&mut stream, &format!("ret-{index}"), now);
+        let _lease = attach(&mut stream, created.session_id, 0, None, now + 1);
+        stream.bind(created.session_id, ms(now + 2)).expect("bind");
+        let report = terminate(
+            &mut stream,
+            created.session_id,
+            TerminalReason::WorkerExit,
+            ExitInformation::ExitCode(0),
+            CleanupClass::Swept,
+            now + 3,
+        );
+        lost.extend(report.lost);
+        retired.extend(report.retired);
+    }
+
+    assert_eq!(stream.registry().live_count(), 0);
+    assert_eq!(stream.registry().retained_count(), retained_limit);
+    assert!(
+        stream.session_count() <= live_limit + retained_limit,
+        "stream state {} exceeded live + retained {}",
+        stream.session_count(),
+        live_limit + retained_limit
+    );
+    assert_eq!(stream.session_count(), retained_limit);
+    assert_eq!(retired.len(), cycles - retained_limit);
+    assert_eq!(lost.len(), cycles - retained_limit);
+    assert!(retired.iter().all(|session| {
+        session.closed.len() == 1
+            && session.closed[0].reason == LeaseCloseReason::TerminalEventLost
+            && stream.lease_count(session.session_id).is_none()
+    }));
+}
+
+#[test]
+fn attach_key_store_enforces_the_byte_bound_at_the_boundary() {
+    let mut stream = new_stream(EventLimits::default());
+    let created = create(&mut stream, "term-key-bytes", 1);
+    let first = attach(&mut stream, created.session_id, 0, Some("a"), 2);
+    let first_bytes = stream
+        .attach_key_bytes(created.session_id)
+        .expect("session has an attach-key store");
+    let overhead = first_bytes - 1;
+    stream
+        .detach(
+            created.session_id,
+            first.attach_id,
+            DetachCause::SelfDetach,
+            ms(3),
+        )
+        .expect("detach");
+
+    let limit = MAX_ATTACH_KEYS_BYTES_PER_SESSION;
+    let key_len = 128usize;
+    let entry = overhead + key_len;
+    let mut used = stream
+        .attach_key_bytes(created.session_id)
+        .expect("session has an attach-key store");
+    let mut full_entries = (limit - used) / entry;
+    loop {
+        let remaining = limit - (used + full_entries * entry);
+        if remaining > overhead && remaining <= overhead + 128 {
+            break;
+        }
+        assert!(full_entries > 0, "no representable remainder");
+        full_entries -= 1;
+    }
+
+    for index in 0..full_entries {
+        let mut key = vec![b'k'; key_len];
+        key[..8].copy_from_slice(format!("{index:08}").as_bytes());
+        let revision = stream
+            .registry()
+            .snapshot(created.session_id)
+            .expect("snapshot")
+            .state_revision;
+        let outcome = stream
+            .attach(
+                AttachRequest {
+                    session_id: created.session_id,
+                    after_revision: revision,
+                    idempotency_key: Some(AttachKey::new(&key).expect("bounded key")),
+                },
+                ms(4 + u64::try_from(index).expect("small") * 2),
+            )
+            .expect("attach within the byte bound");
+        stream
+            .detach(
+                created.session_id,
+                outcome.attach_id,
+                DetachCause::SelfDetach,
+                ms(5 + u64::try_from(index).expect("small") * 2),
+            )
+            .expect("detach");
+    }
+
+    used = stream
+        .attach_key_bytes(created.session_id)
+        .expect("session has an attach-key store");
+    let remaining = limit - used;
+    let final_key = vec![b'f'; remaining - overhead];
+    let revision = stream
+        .registry()
+        .snapshot(created.session_id)
+        .expect("snapshot")
+        .state_revision;
+    stream
+        .attach(
+            AttachRequest {
+                session_id: created.session_id,
+                after_revision: revision,
+                idempotency_key: Some(AttachKey::new(&final_key).expect("final key")),
+            },
+            ms(1_000),
+        )
+        .expect("fill the byte bound exactly");
+    assert_eq!(
+        stream.attach_key_bytes(created.session_id),
+        Some(limit),
+        "the final key fills the accounted store exactly"
+    );
+
+    assert!(
+        stream
+            .attach_key_count(created.session_id)
+            .expect("session has an attach-key store")
+            < stream.limits().max_attach_keys_per_session(),
+        "the refusal must come from the byte bound, not the entry bound"
+    );
+    let revision = stream
+        .registry()
+        .snapshot(created.session_id)
+        .expect("snapshot")
+        .state_revision;
+    assert_eq!(
+        stream
+            .attach(
+                AttachRequest {
+                    session_id: created.session_id,
+                    after_revision: revision,
+                    idempotency_key: Some(AttachKey::new(b"overflow").expect("bounded key")),
+                },
+                ms(1_001),
+            )
+            .unwrap_err(),
+        EventRefusal::IdempotencyCapacity { limit }
+    );
+    assert_eq!(stream.attach_key_bytes(created.session_id), Some(limit));
+}
+
+#[test]
+fn daemon_stopping_closes_a_full_queue_and_reports_the_lost_lease() {
+    let mut stream =
+        new_stream(EventLimits::new(256, 262_144, 3, 65_536, 8, 15_000, 8).expect("limits"));
+    let created = create(&mut stream, "term-stopping-full", 1);
+    let stalled = attach(&mut stream, created.session_id, 0, None, 2);
+    let healthy = attach(&mut stream, created.session_id, 1, None, 3);
+    stream.bind(created.session_id, ms(4)).expect("bind");
+    stream
+        .begin_stopping(created.session_id, ms(5))
+        .expect("stopping");
+    let _ = stream
+        .take_deliveries(created.session_id, healthy.attach_id)
+        .expect("drain healthy lease");
+
+    let report = stream.publish_daemon_stopping(60_000, ms(6));
+    assert_eq!(report.sessions, 1);
+    assert_eq!(report.delivered, 1);
+    assert!(report.failed.is_empty());
+    assert_eq!(
+        report.closed,
+        vec![(
+            created.session_id,
+            LeaseClose {
+                attach_id: stalled.attach_id,
+                reason: LeaseCloseReason::TerminalEventLost,
+            },
+        )]
+    );
+    assert_eq!(stream.lease_count(created.session_id), Some(1));
+}
+
+#[test]
+fn a_non_terminal_control_frame_closes_a_full_queue() {
+    let mut stream =
+        new_stream(EventLimits::new(256, 262_144, 3, 65_536, 8, 15_000, 8).expect("limits"));
+    let created = create(&mut stream, "term-full-control", 1);
+    let stalled = attach(&mut stream, created.session_id, 0, None, 2);
+    let healthy = attach(&mut stream, created.session_id, 1, None, 3);
+    stream.bind(created.session_id, ms(4)).expect("bind");
+    stream
+        .begin_stopping(created.session_id, ms(5))
+        .expect("stopping");
+    let _ = stream
+        .take_deliveries(created.session_id, healthy.attach_id)
+        .expect("drain healthy lease");
+
+    let transfer = stream
+        .publish_control_transfer(
+            created.session_id,
+            stalled.attach_id,
+            healthy.attach_id,
+            ms(6),
+        )
+        .expect("control transfer");
+    assert_eq!(
+        transfer.closed,
+        vec![LeaseClose {
+            attach_id: stalled.attach_id,
+            reason: LeaseCloseReason::TerminalEventLost,
+        }]
+    );
+    assert_eq!(stream.lease_count(created.session_id), Some(1));
+}
+
+#[test]
+fn expiry_closes_a_full_downstream_queue() {
+    let mut stream =
+        new_stream(EventLimits::new(256, 262_144, 3, 65_536, 8, 15_000, 8).expect("limits"));
+    let created = create(&mut stream, "term-expiry-cascade", 1);
+    let expiring = attach(&mut stream, created.session_id, 0, None, 2);
+    let full = attach(&mut stream, created.session_id, 1, None, 3);
+    stream.bind(created.session_id, ms(4)).expect("bind");
+    stream
+        .begin_stopping(created.session_id, ms(5))
+        .expect("stopping");
+    let _ = stream
+        .take_deliveries(created.session_id, expiring.attach_id)
+        .expect("drain expiring lease");
+    stream
+        .publish_control_transfer(
+            created.session_id,
+            expiring.attach_id,
+            full.attach_id,
+            ms(6),
+        )
+        .expect("fill the downstream queue");
+    stream
+        .heartbeat(created.session_id, &[full.attach_id], ms(10))
+        .expect("keep the downstream lease alive");
+
+    let expiry = stream
+        .expire_leases(created.session_id, ms(6 + 15_000))
+        .expect("expire");
+    assert_eq!(expiry.expired, vec![expiring.attach_id]);
+    assert_eq!(
+        expiry.closed,
+        vec![LeaseClose {
+            attach_id: full.attach_id,
+            reason: LeaseCloseReason::TerminalEventLost,
+        }]
+    );
+    assert_eq!(stream.lease_count(created.session_id), Some(0));
+}
+
+#[test]
+fn attach_refuses_a_revision_ahead_of_the_stream() {
+    let mut stream = new_stream(EventLimits::default());
+    let created = create(&mut stream, "term-revision-ahead", 1);
+    assert_eq!(
+        stream
+            .attach(
+                AttachRequest {
+                    session_id: created.session_id,
+                    after_revision: 1,
+                    idempotency_key: None,
+                },
+                ms(2),
+            )
+            .unwrap_err(),
+        EventRefusal::RevisionAhead {
+            requested: 1,
+            current: 0,
+        }
+    );
+    assert_eq!(stream.lease_count(created.session_id), Some(0));
+}
+
+#[test]
+fn attach_key_conflict_after_the_original_lease_is_gone() {
+    let mut stream = new_stream(EventLimits::default());
+    let created = create(&mut stream, "term-key-gone", 1);
+    let first = attach(&mut stream, created.session_id, 0, Some("gone"), 2);
+    stream
+        .detach(
+            created.session_id,
+            first.attach_id,
+            DetachCause::SelfDetach,
+            ms(3),
+        )
+        .expect("detach");
+
+    assert_eq!(
+        stream
+            .attach(
+                AttachRequest {
+                    session_id: created.session_id,
+                    after_revision: 1,
+                    idempotency_key: Some(AttachKey::new(b"gone").expect("key")),
+                },
+                ms(4),
+            )
+            .unwrap_err(),
+        EventRefusal::IdempotencyConflict
+    );
+    assert_eq!(
+        stream
+            .attach(
+                AttachRequest {
+                    session_id: created.session_id,
+                    after_revision: 0,
+                    idempotency_key: Some(AttachKey::new(b"gone").expect("key")),
+                },
+                ms(5),
+            )
+            .unwrap_err(),
+        EventRefusal::NotAttached
+    );
+    assert_eq!(stream.lease_count(created.session_id), Some(0));
+}
+
+#[test]
+fn a_non_empty_registry_is_refused() {
+    let mut registry = SessionRegistry::new(registry_limits()).expect("registry");
+    registry
+        .create(
+            CreateSession {
+                terminal_id: Some(TerminalId::supplied("term-non-empty").expect("terminal id")),
+                owner_peer: None,
+            },
+            ms(1),
+        )
+        .expect("create");
+    assert_eq!(
+        SessionEventStream::with_limits(registry, EventLimits::default()).unwrap_err(),
+        EventRefusal::RegistryNotEmpty
+    );
 }

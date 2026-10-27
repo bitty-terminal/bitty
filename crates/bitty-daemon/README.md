@@ -159,9 +159,17 @@ per-session stream cannot disagree. Source: contract `D-10`, `D-12`, `D-14`,
   (`max_event_backlog_events` / `max_event_backlog_bytes`), lease queue 256
   events / 65,536 bytes (`max_lease_queue_events` / `max_lease_queue_bytes`),
   8 leases per session default and 16 maximum (`max_attaches_per_session`),
-  15,000 ms lease TTL (`attach_lease_ttl_ms`), 512 attach keys per session
-  (`max_idempotency_keys_per_session`), and an 8-frame / 8,192-byte control
+  15,000 ms lease TTL (`attach_lease_ttl_ms`), 512 attach keys / 65,536
+  accounted bytes per session (`max_idempotency_keys_per_session` /
+  `max_idempotency_bytes_per_session`), and an 8-frame / 8,192-byte control
   reservation per lease queue (`D-10`).
+- Stream state is retention-bound. A terminal entry is dropped when the registry
+  collects it by TTL or evicts it at `max_retained_terminal_records`; every
+  still-attached lease is closed with `TerminalEventLost` and reported through
+  `TerminalReport::retired` or `RetentionReport::retired`. A retained terminal
+  snapshot can therefore report
+  an `attach_count` higher than the surviving stream leases: the registry record
+  is frozen by `D-04`, while closing a lease on it is stream-only.
 - `daemon_stopping` is a daemon-scoped control frame: it is queued to every live
   lease without a revision bump and is not part of a session backlog.
 - `last_worker_seen_at` is absent: a terminal session has no supervision liveness

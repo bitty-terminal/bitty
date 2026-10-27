@@ -19,6 +19,7 @@
 //! | Leases per session | 8 | 16 | `D-14` `max_attaches_per_session` |
 //! | Lease heartbeat TTL | 15,000 ms | 15,000 ms | `D-14` `attach_lease_ttl_ms` |
 //! | Attach keys per session | 512 | 512 | `D-18` `max_idempotency_keys_per_session` |
+//! | Attach-key store bytes per session | 65,536 | 65,536 | `D-18` `max_idempotency_bytes_per_session` |
 //! | Control reservation per lease queue | 8 frames / 8,192 bytes | same | `D-10` control frames are never shed |
 //!
 //! # Admission policy
@@ -63,12 +64,13 @@ pub use self::event::{
 pub use self::lease::{LeaseClose, LeaseCloseReason};
 pub use self::limits::{
     ATTACH_LEASE_TTL_MS, EventLimits, LEASE_CONTROL_RESERVATION_BYTES,
-    LEASE_CONTROL_RESERVATION_EVENTS, MAX_ATTACH_KEYS_PER_SESSION,
-    MAX_ATTACHES_PER_SESSION_DEFAULT, MAX_ATTACHES_PER_SESSION_SYSTEM_MAX, MAX_EVENT_BACKLOG_BYTES,
-    MAX_EVENT_BACKLOG_EVENTS, MAX_LEASE_QUEUE_BYTES, MAX_LEASE_QUEUE_EVENTS,
+    LEASE_CONTROL_RESERVATION_EVENTS, MAX_ATTACH_KEYS_BYTES_PER_SESSION,
+    MAX_ATTACH_KEYS_PER_SESSION, MAX_ATTACHES_PER_SESSION_DEFAULT,
+    MAX_ATTACHES_PER_SESSION_SYSTEM_MAX, MAX_EVENT_BACKLOG_BYTES, MAX_EVENT_BACKLOG_EVENTS,
+    MAX_LEASE_QUEUE_BYTES, MAX_LEASE_QUEUE_EVENTS,
 };
 pub use self::stream::{
     AttachOutcome, AttachRequest, DaemonStoppingReport, DetachCause, DetachOutcome, EventRefusal,
-    ExpiryOutcome, HeartbeatReport, LeaseHeartbeat, MutationReport, Replay, SessionEventStream,
-    TerminalReport,
+    ExpiryOutcome, HeartbeatReport, LeaseHeartbeat, MutationReport, Replay, RetentionReport,
+    RetiredSession, SessionEventStream, TerminalReport,
 };

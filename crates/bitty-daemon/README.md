@@ -16,26 +16,27 @@ The normative service surface is the accepted
 (contract tracked by bitty#2546/#2663); this crate seam is bitty#2606
 (CTX-1616).
 
-## Status: seam plus the in-memory registry core and event stream
+## Status: seam plus the in-memory state core and session event stream
 
 This crate fixes the service version, the capability set, and the
-version-negotiation skeleton, and implements the registry half of bitty#2601:
-server-generated ids, the in-memory session registry, generation and revision
-counters, retention, and the bounded orphan journal, plus the event stream of
-bitty#2602: snapshot plus bounded backlog, revision ordering, per-lease routing,
-control-frame reservation, the terminal-event guarantee, and heartbeat/last-seen.
-It **starts no listener**, binds no endpoint, creates no socket file, spawns no
-worker, and serves no IPC method. `bittyd` with no arguments still reports the
-no-endpoint seam and exits 0; the registry and the event stream are library
-surfaces for bitty#2607 to drive.
+version-negotiation skeleton, and implements the registry half of bitty#2601
+(server-generated ids, the in-memory session registry, generation and revision
+counters, retention), the bounded orphan journal, the event stream of bitty#2602
+(snapshot plus bounded backlog, revision ordering, per-lease routing,
+control-frame reservation, the terminal-event guarantee, and heartbeat/last-seen),
+the compiled limits and advertised triples of bitty#2603, the two bounded
+idempotency stores, and the bounded content-free audit ring. It **starts no
+listener**, binds no endpoint, creates no socket file, spawns no worker, and
+serves no IPC method. `bittyd` with no arguments still reports the no-endpoint
+seam and exits 0; the state core and the event stream are library surfaces for
+bitty#2607 to drive.
 
 The contract areas that follow are deliberately deferred to their owning
 slices:
 
 | Area                                                                                                                                                                          | Owner      |
 | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| `bitty-ipc` v1 server loop, peer capture and re-check, scope evaluation, endpoint lock and tamper detection, method dispatch, error mapping, event framing and correlation id | bitty#2607 |
-| Advertised limits and compiled system maxima                                                                                                                                  | bitty#2603 |
+| `bitty-ipc` v1 server loop, peer capture and re-check, scope evaluation, endpoint lock and tamper detection, method dispatch, error mapping, event framing and correlation id, refusal-to-result mapping, audit sink writer | bitty#2607 |
 | Endpoint discovery, cgroup/subreaper containment, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs                                         | bitty#2604 |
 | Leases, control token, attach/detach authority, abort/kill                                                                                                                    | bitty#2609 |
 | Conformance corpus and fake-server parity                                                                                                                                     | bitty#2605 |
@@ -55,6 +56,7 @@ of the service surface.
 | Capabilities         | `terminal_sessions`, `events`, `observer_grants`, `control_transfer`, `idempotent_mutations` enabled; `worker_sessions` disabled | `contract::CAPABILITIES`        |
 | Handshake method     | `daemon.negotiate`                                                                                                               | `contract::NEGOTIATE_METHOD`    |
 | Negotiation rule     | same major, client minor in `[min_client_minor, server_minor]`; every other case is `VersionMismatch` before any operation       | `handshake::negotiate`          |
+| Limits advertisement | every `D-14` row plus the inherited `RC-9`/`RC-10` bounds as `{effective, default, system_max}`                                  | `handshake::NegotiateResponse`  |
 | Worker sessions      | `false` in every v0.2.0 build (`D-01`); enabling needs an ADR 0019 amendment and a dedicated security review                     | `contract::CAPABILITIES`        |
 
 ## Registry core (bitty#2601)
@@ -80,10 +82,9 @@ file, and owns only metadata.
 - A live session's `terminal_id` is unique; a retained terminal record may share
   it. Refusals (`max_sessions`, `session_record_bytes`, duplicate terminal id)
   are whole: no partial record, no counter change.
-- Enforced bounds are compiled from `D-14`: `max_sessions` 16/64,
-  `max_retained_terminal_records` 64, `session_record_bytes` 4096,
-  `terminal_retention_ms` 600000/3600000. Advertising them as
-  `{effective, default, system_max}` belongs to bitty#2603.
+- Enforced bounds come from the compiled `D-14` table in `limits`; the
+  `RegistryLimits` constants and `RegistryLimits::from_limits` cannot drift from
+  the advertised values.
 
 `orphan` is the two-phase, bounded orphan journal. `reserve` fsyncs a
 `reserved` record (session id, generation, boot id, reserved-at) before the
@@ -121,16 +122,84 @@ caller-supplied boot id and every record classifies as unverified, so nothing is
 signalled. The journal inherits the ACL of the daemon-owned runtime directory;
 bitty#2604 owns that directory and its current-user-only DACL.
 
-`handshake::NegotiateResponse` carries only the version and capability facts
-this seam owns. The remaining response fields (`wire_version` (transport-owned),
+## Limits (bitty#2603)
+
+`limits` is the single compiled source of truth for `D-14` and the inherited
+`RC-9`/`RC-10` transport bounds.
+
+- `LimitId::ALL` has 54 entries in contract order: the 46 `D-14` rows, then
+  `max_connections_per_endpoint`, `max_frame_bytes`, `max_chunk_bytes`,
+  `max_pending_requests`, `max_channel_capacity`, `max_request_rate_per_sec`,
+  `max_request_burst`, and `max_request_payload_bytes`. Each entry exposes
+  `name()`, `default_value()`, `system_max_value()`, `source()`, `floor()`, and
+  `stage()`.
+- `Limits::default()` uses every compiled default. `Limits::new` applies
+  lower-only-or-up-to-maximum overrides; above `system_max`, below the compiled
+  floor, a duplicate, or a change to a fixed inherited bound is a typed
+  `LimitsError`, and no partial `Limits` is produced. Configuration may raise an
+  effective value back up to `system_max`, never above it.
+- `Limits::advertised()` yields the `{effective, default, system_max}` triples;
+  `handshake::negotiate` returns them in `NegotiateResponse::limits` for the
+  run, so a client parameterizes on `effective`, never on a default.
+- The enforcement-order table in the module docs assigns every limit to a
+  stage (`ConnectionAdmission` through `AuditSink`) and states the refusal
+  ordering for bitty#2607: a breach refuses whole before the protected
+  registry, stream, lease, grant, or idempotency structure changes; the only
+  write a refusal may perform is its own audit record.
+
+## Idempotency (bitty#2603)
+
+`idempotency` implements the two bounded `D-18` stores over one engine.
+
+- `IdempotencyStore::session` is 512 keys / 65,536 accounted bytes at the
+  compiled maxima, with a 128-byte descriptor budget per entry.
+  `IdempotencyStore::create` is 128 keys / 32,768 bytes, with a 256-byte entry
+  budget and the `create_idempotency_ttl_ms` retention floor.
+- `begin` returns `Admission::Replay` for the same key, method, target, and
+  fingerprint; the executor does not run twice. A duplicate while the original
+  call is in flight is `InFlight`. A different fingerprint, method, or target is
+  a typed `Conflict`. A lease-bound result is replayed only on its originating
+  connection; a create result replays across connections.
+- At capacity the oldest retirable entry is evicted first: a refusal that
+  applied nothing, or a create key whose session is terminal and whose retention
+  floor passed. In-flight and live applied entries are never evicted; when no
+  entry is retirable the store fails closed with `Capacity`. A hostile stream of
+  fresh keys stays inside the key and byte bounds.
+- `retire_session` releases the per-session store at the terminal transition and
+  marks create keys terminal for the TTL floor; `evict_expired` applies that
+  floor. Termination and revocation are keyless and never consult either store.
+- `IdempotencyKey` has a redacted `Debug` and no `Display`; no refusal carries a
+  raw key.
+
+## Audit (bitty#2603)
+
+`audit` owns the typed, content-free record shape and the bounded ring.
+
+- `AuditRecord` carries a stable `AuditEventId`, an injected `MonotonicMs`,
+  the daemon instance, the action, the static result, optional session
+  counters, optional authenticated actor facts, the action target, optional
+  refusal counts, and optional terminal classification.
+- There is no `String`, `Vec`, payload, argv, environment, clipboard, prompt,
+  transcript, raw `terminal_id`, control token, or caller label field. A create
+  or terminal transition uses `AuditTarget::terminal_digest`; a refusal carries
+  its static `RefusalCode` and numeric `AuditCounts` only.
+- The ring holds `audit_file_bytes × audit_segments / AUDIT_RECORD_BYTES`
+  records (320 accounted bytes each). Overflow drops the oldest record, counts
+  it in `AuditCounters::dropped`, and never reuses an event id. `appended`,
+  `dropped`, `refusals`, and `terminal_transitions` are observable.
+- The ring is the staging buffer; the owner-private rotating file sink and the
+  per-connection refusal budget stay with bitty#2607.
+
+`handshake::NegotiateResponse` carries the version, capability, and effective
+limit facts. The remaining response fields (`wire_version` (transport-owned),
 `daemon_instance_id`, `daemon_pid`, `server_identity`, `peer_identity`,
-`client_id`, `scopes`, `limits`, `server_monotonic_ms`, `daemon_state`) and the
-optional request fields (`client_correlation`, `operator_capability`,
-`host_grant`) are listed in the module docs and arrive with
-bitty#2601/#2603/#2607. `client_correlation` is bounded to 128 bytes of valid
-UTF-8 with no control characters and is recorded only as a truncated 128-bit
-SHA-256 digest (`D-08`); `operator_capability` and `host_grant` stay out of this
-crate until the slice that owns their secret lifetime and storage exists.
+`client_id`, `scopes`, `server_monotonic_ms`, `daemon_state`) and the optional
+request fields (`client_correlation`, `operator_capability`, `host_grant`) are
+listed in the module docs and arrive with bitty#2601/#2607. `client_correlation`
+is bounded to 128 bytes of valid UTF-8 with no control characters and is
+recorded only as a truncated 128-bit SHA-256 digest (`D-08`);
+`operator_capability` and `host_grant` stay out of this crate until the slice
+that owns their secret lifetime and storage exists.
 
 ## Event stream (bitty#2602)
 
@@ -218,8 +287,16 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
   dependency yet.
 - `src/lib.rs` — crate docs, status, and the deferral map.
 - `src/contract.rs` — service version, capability set, method name.
-- `src/handshake.rs` — `daemon.negotiate` request/response skeleton and the
-  `D-11` acceptance rule.
+- `src/handshake.rs` — `daemon.negotiate` request/response skeleton, the `D-11`
+  acceptance rule, and the advertised effective limits.
+- `src/limits.rs` — the compiled `D-14` and inherited transport table, the
+  `{effective, default, system_max}` triples, configuration validation, and the
+  enforcement-stage ordering.
+- `src/codes.rs` — the closed static refusal-code set from the error taxonomy.
+- `src/idempotency.rs` — the two bounded `D-18` stores, replay, conflict,
+  capacity retirement, and the create-key TTL floor.
+- `src/audit.rs` — the content-free `D-16` record shape, stable event ids,
+  injected timestamps, counters, and the bounded ring.
 - `src/registry/` — ids, session records and lifecycle, the registry table,
   counters, retention, and refusals.
 - `src/events/` — the event envelope and kinds, the bounded backlog ring, lease
@@ -237,6 +314,12 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
 - `tests/events.rs` — public stream behavior: revision ordering, replay and
   truncation boundaries, the terminal guarantee, control frames, heartbeat
   memory stability, and the seeded 10,000-operation no-loss audit.
+- `tests/limits.rs` — boundary triples for every cap, configuration refusals,
+  the advertised shape, registry/orphan derivation, and whole-request refusal.
+- `tests/idempotency.rs` — counting-executor replay, conflict, connection
+  binding, TTL boundaries, capacity eviction, and hostile key streams.
+- `tests/audit.rs` — overflow visibility, stable ids, structural content-free
+  records, refusal representation, and capacity derivation.
 - `tests/orphan_journal.rs` — public journal reserve/commit/reap, no-signal
   paths, owner-private Unix files, and the no-argv/env record shape.
 

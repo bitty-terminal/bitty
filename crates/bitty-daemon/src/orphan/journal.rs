@@ -41,6 +41,7 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
+use crate::limits::{LimitId, Limits};
 use crate::registry::{MonotonicMs, SessionId};
 
 use super::identity::{
@@ -49,17 +50,21 @@ use super::identity::{
 };
 
 /// Compiled ceiling for journal records (`D-14` `max_orphan_records`).
-pub const MAX_ORPHAN_RECORDS_SYSTEM_MAX: usize = 64;
+pub const MAX_ORPHAN_RECORDS_SYSTEM_MAX: usize =
+    LimitId::MaxOrphanRecords.system_max_value() as usize;
 
 /// Compiled ceiling for one journal record (`D-14` `orphan_record_bytes`).
-pub const ORPHAN_RECORD_BYTES_SYSTEM_MAX: usize = 4096;
+pub const ORPHAN_RECORD_BYTES_SYSTEM_MAX: usize =
+    LimitId::OrphanRecordBytes.system_max_value() as usize;
 
 /// Default quarantine retention (`D-14` `orphan_record_retention_ms`).
-pub const ORPHAN_RECORD_RETENTION_MS_DEFAULT: u64 = 3_600_000;
+pub const ORPHAN_RECORD_RETENTION_MS_DEFAULT: u64 =
+    LimitId::OrphanRecordRetentionMs.default_value();
 
 /// Compiled ceiling for quarantine retention (`D-14`
 /// `orphan_record_retention_ms` system maximum).
-pub const ORPHAN_RECORD_RETENTION_MS_SYSTEM_MAX: u64 = 86_400_000;
+pub const ORPHAN_RECORD_RETENTION_MS_SYSTEM_MAX: u64 =
+    LimitId::OrphanRecordRetentionMs.system_max_value();
 
 const JOURNAL_HEADER: &str = "bittyd-orphan 1";
 const RECORD_SUFFIX: &str = ".orphan";
@@ -129,6 +134,16 @@ impl OrphanJournalLimits {
     #[must_use]
     pub const fn quarantine_retention_ms(self) -> u64 {
         self.quarantine_retention_ms
+    }
+
+    /// Derive the journal bounds from the effective advertised limits.
+    #[must_use]
+    pub fn from_limits(limits: &Limits) -> Self {
+        Self {
+            max_records: limits.effective_usize(LimitId::MaxOrphanRecords),
+            record_bytes: limits.effective_usize(LimitId::OrphanRecordBytes),
+            quarantine_retention_ms: limits.effective(LimitId::OrphanRecordRetentionMs),
+        }
     }
 }
 

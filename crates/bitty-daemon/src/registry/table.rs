@@ -21,35 +21,38 @@ use super::session::{
     CleanupClass, LifecycleState, MonotonicMs, OwnerPeer, SessionRecord, SessionSnapshot,
     TerminalId, TerminalOutcome, TerminalReason,
 };
+use crate::limits::{LimitId, Limits};
 
 /// Default live-session bound (`D-14` `max_sessions`).
-pub const MAX_SESSIONS_DEFAULT: usize = 16;
+pub const MAX_SESSIONS_DEFAULT: usize = LimitId::MaxSessions.default_value() as usize;
 
 /// Compiled ceiling for live sessions (`D-14` `max_sessions` system maximum).
-pub const MAX_SESSIONS_SYSTEM_MAX: usize = 64;
+pub const MAX_SESSIONS_SYSTEM_MAX: usize = LimitId::MaxSessions.system_max_value() as usize;
 
 /// Default and compiled ceiling for retained terminal records
 /// (`D-14` `max_retained_terminal_records`).
-pub const MAX_RETAINED_TERMINAL_RECORDS_SYSTEM_MAX: usize = 64;
+pub const MAX_RETAINED_TERMINAL_RECORDS_SYSTEM_MAX: usize =
+    LimitId::MaxRetainedTerminalRecords.system_max_value() as usize;
 
 /// Default and compiled ceiling for one session's metadata
 /// (`D-14` `session_record_bytes`).
-pub const SESSION_RECORD_BYTES_SYSTEM_MAX: usize = 4096;
+pub const SESSION_RECORD_BYTES_SYSTEM_MAX: usize =
+    LimitId::SessionRecordBytes.system_max_value() as usize;
 
 /// Default terminal-record retention (`D-14` `terminal_retention_ms`).
-pub const TERMINAL_RETENTION_MS_DEFAULT: u64 = 600_000;
+pub const TERMINAL_RETENTION_MS_DEFAULT: u64 = LimitId::TerminalRetentionMs.default_value();
 
 /// Compiled ceiling for terminal-record retention
 /// (`D-14` `terminal_retention_ms` system maximum).
-pub const TERMINAL_RETENTION_MS_SYSTEM_MAX: u64 = 3_600_000;
+pub const TERMINAL_RETENTION_MS_SYSTEM_MAX: u64 = LimitId::TerminalRetentionMs.system_max_value();
 
 /// Enforced registry bounds for one daemon instance.
 ///
-/// The service layer receives the effective values from configuration and
-/// passes them here; bitty#2603 owns advertising them as
-/// `{effective, default, system_max}`. Construction refuses a value above the
-/// compiled ceiling (`D-14`): a configuration mistake cannot raise a bound past
-/// the reviewed maximum.
+/// The service layer derives these from the effective [`Limits`] with
+/// [`Self::from_limits`]; the compiled `{effective, default, system_max}`
+/// triples are advertised by `crate::limits`. Construction refuses a value
+/// above the compiled ceiling (`D-14`): a configuration mistake cannot raise a
+/// bound past the reviewed maximum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegistryLimits {
     max_sessions: usize,
@@ -119,6 +122,22 @@ impl RegistryLimits {
     #[must_use]
     pub const fn terminal_retention_ms(self) -> u64 {
         self.terminal_retention_ms
+    }
+
+    /// Derive the registry bounds from the effective advertised limits.
+    ///
+    /// [`Limits`] has already validated every effective value against its
+    /// compiled floor and system maximum, so this constructor cannot produce
+    /// an out-of-range value and does not re-run the refusal path.
+    #[must_use]
+    pub fn from_limits(limits: &Limits) -> Self {
+        Self {
+            max_sessions: limits.effective_usize(LimitId::MaxSessions),
+            max_retained_terminal_records: limits
+                .effective_usize(LimitId::MaxRetainedTerminalRecords),
+            session_record_bytes: limits.effective_usize(LimitId::SessionRecordBytes),
+            terminal_retention_ms: limits.effective(LimitId::TerminalRetentionMs),
+        }
     }
 }
 

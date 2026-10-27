@@ -78,6 +78,12 @@ macro_rules! hex_identifier {
             pub fn as_hex(self) -> String {
                 encode_hex(&self.0)
             }
+
+            /// The raw 128 bits, for fixed-size targets and digests.
+            #[must_use]
+            pub const fn as_bytes(&self) -> &[u8; ID_BYTES] {
+                &self.0
+            }
         }
 
         impl fmt::Display for $name {

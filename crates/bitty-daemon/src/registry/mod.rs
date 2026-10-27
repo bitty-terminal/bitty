@@ -22,10 +22,11 @@
 //! lowercase hex. A terminal record is read-only: it never bumps a counter again
 //! and is only removed by retention.
 //!
-//! Deferred to their owning slices: lease authority and attach caps
-//! (bitty#2609), IPC decoding, error mapping, and `daemon.status` serialization
-//! (bitty#2607), advertised limit objects (bitty#2603), and process
-//! containment or orphan reaping (bitty#2604).
+//! The effective bounds are derived from the compiled advertised table with
+//! [`RegistryLimits::from_limits`]. Deferred to their owning slices: lease
+//! authority and attach caps (bitty#2609), IPC decoding, error mapping,
+//! `daemon.status` serialization, and the audit sink writer (bitty#2607), and
+//! process containment or orphan reaping (bitty#2604).
 
 mod id;
 mod session;

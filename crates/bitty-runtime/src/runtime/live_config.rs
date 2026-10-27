@@ -78,6 +78,20 @@ impl Runtime {
         self.pending_full_redraw = true;
     }
 
+    /// Live-installs the paint-time BiDi policy (`terminal.bidi`, CTX-1612).
+    ///
+    /// Terminal Truth is untouched: the renderer reorders rows at paint
+    /// time, so a toggle only needs one full redraw to replace retained
+    /// leaf lists painted under the previous policy.
+    pub fn set_bidi(&mut self, enabled: bool) {
+        if self.config.bidi == enabled {
+            return;
+        }
+        self.config.bidi = enabled;
+        self.renderer.set_bidi(enabled);
+        self.pending_full_redraw = true;
+    }
+
     /// Live-swaps the palette for an OS appearance change (CTX-0951, issue
     /// #1669).
     ///

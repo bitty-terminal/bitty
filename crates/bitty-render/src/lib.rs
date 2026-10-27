@@ -296,10 +296,11 @@ pub use shaped::{
     ASCII_PRINTABLE_FIRST, ASCII_PRINTABLE_LAST, CJK_ADVANCE_EPSILON_PX, GRID_ADVANCE_EPSILON_PX,
     GlyphSource, MAX_DYNAMIC_CACHE_ENTRIES, MAX_FACE_BYTES, MAX_LOADED_FACES, MAX_RUN_CACHE_BYTES,
     MAX_RUN_CACHE_ENTRIES, MAX_SHAPE_PLANS_PER_FACE, MAX_SHAPED_GLYPH_CACHE_BYTES,
-    MAX_SHAPED_GLYPH_CACHE_ENTRIES, PROGRAMMING_LIGATURE_TAGS, RunAttrs, RunCacheKey, ShapePlanKey,
-    ShapedCluster, ShapedGlyphKey, ShapedRun, ShapedRunSource, SwashSingle,
+    MAX_SHAPED_GLYPH_CACHE_ENTRIES, PROGRAMMING_LIGATURE_TAGS, RunAttrs, RunCacheKey, RunDirection,
+    ShapePlanKey, ShapedCluster, ShapedGlyphKey, ShapedRun, ShapedRunSource, SwashSingle,
     ascii_fast_path_eligible, cells_for_range, cells_for_range_in, collect_run_text,
     cursor_intersects_ligature, features_are_unshaped, features_for_policy, form_runs_for_row,
-    harfrust_features, is_printable_ascii_byte, is_printable_ascii_str, run_is_ascii_candidate,
+    form_runs_for_row_at_levels, harfrust_features, is_printable_ascii_byte,
+    is_printable_ascii_str, run_is_ascii_candidate,
 };
 pub use window::{MAX_WINDOW_PADDING_PX, clamp_window_padding, padded_content_rect};

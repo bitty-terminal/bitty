@@ -1248,6 +1248,12 @@ pub struct RuntimeConfig {
     /// Applied by [`crate::Runtime`] when a terminal is created; the policy
     /// is never changed live because it would re-interpret committed cells.
     pub ambiguous_width: bitty_term_state::AmbiguousWidth,
+    /// Paint-time Unicode BiDi reordering (`terminal.bidi`, CTX-1612).
+    ///
+    /// Default **off** until the owner accepts the display-spoofing
+    /// (Trojan-Source) risk; unlike `ambiguous_width` this is live-appliable
+    /// because it never changes committed cells, only paint order.
+    pub bidi: bool,
     /// Auto-cancel timeout for pending paste confirmation (issue #1438).
     ///
     /// A gated paste that has not been confirmed (by repeating the paste gesture)
@@ -1384,6 +1390,7 @@ impl Default for RuntimeConfig {
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell_mode: DEFAULT_BELL_MODE,
             ambiguous_width: DEFAULT_AMBIGUOUS_WIDTH,
+            bidi: false,
             paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
             panel_layout_mode: PanelLayoutMode::default(),
         }
@@ -1501,6 +1508,7 @@ impl RuntimeConfig {
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell_mode: DEFAULT_BELL_MODE,
             ambiguous_width: DEFAULT_AMBIGUOUS_WIDTH,
+            bidi: false,
             paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
             panel_layout_mode: PanelLayoutMode::default(),
         };

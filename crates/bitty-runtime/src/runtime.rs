@@ -2175,6 +2175,8 @@ impl Runtime {
         // (both paint paths re-measure cluster widths when placing glyphs).
         runtime.state.set_ambiguous_width(config.ambiguous_width);
         runtime.renderer.set_ambiguous_width(config.ambiguous_width);
+        // CTX-1612: paint-time BiDi reordering is opt-in (`terminal.bidi`).
+        runtime.renderer.set_bidi(config.bidi);
         runtime.init_workspaces();
         runtime.reload_backgrounds()?;
         Ok(runtime)
@@ -2467,6 +2469,8 @@ impl Runtime {
         // (both paint paths re-measure cluster widths when placing glyphs).
         runtime.state.set_ambiguous_width(config.ambiguous_width);
         runtime.renderer.set_ambiguous_width(config.ambiguous_width);
+        // CTX-1612: paint-time BiDi reordering is opt-in (`terminal.bidi`).
+        runtime.renderer.set_bidi(config.bidi);
         runtime.init_workspaces();
         runtime.reload_backgrounds()?;
         Ok(runtime)

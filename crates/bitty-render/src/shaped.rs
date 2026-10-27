@@ -972,12 +972,14 @@ pub fn collect_run_text(cells: &[bitty_term_state::Cell]) -> String {
 /// concatenated text, the emitter maps clusters back onto `start_col`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShapedRun {
-    /// Grid column where this run starts.
+    /// Grid column where this run starts (logical).
     pub start_col: usize,
     /// Run text (`Cell::glyph` + `zerowidth` per cell).
     pub text: String,
     /// Number of grid columns this run covers.
     pub col_count: usize,
+    /// Shaping direction implied by the run's resolved bidi level.
+    pub direction: RunDirection,
 }
 
 /// Groups one snapshot row into shapeable runs (design 2.2).
@@ -998,18 +1000,41 @@ pub fn form_runs_for_row(
     row_cells: &[bitty_term_state::Cell],
     row_start_col: usize,
 ) -> Vec<ShapedRun> {
+    form_runs_for_row_at_levels(row_cells, row_start_col, None)
+}
+
+/// Groups one snapshot row into shapeable runs, splitting on bidi level.
+///
+/// `levels` is the per-column resolved level for this physical row (the
+/// renderer's [`BidiLine::levels`](bitty_term_state::BidiLine::levels));
+/// `None` is the historical LTR-only grouping. A run breaks when the level
+/// changes — not merely when its parity changes — so an RTL embedding
+/// boundary can never ligate across two runs that rule L2 reorders
+/// differently. Style, blank, and spacer rules are unchanged.
+#[must_use]
+pub fn form_runs_for_row_at_levels(
+    row_cells: &[bitty_term_state::Cell],
+    row_start_col: usize,
+    levels: Option<&[u8]>,
+) -> Vec<ShapedRun> {
     let mut runs = Vec::new();
     let mut current_style: Option<bitty_term_state::Style> = None;
     let mut current_text = String::new();
     let mut current_start = 0usize;
     let mut current_cols = 0usize;
+    let mut current_level: Option<u8> = None;
 
-    let flush = |runs: &mut Vec<ShapedRun>, text: &mut String, start: usize, cols: usize| {
+    let flush = |runs: &mut Vec<ShapedRun>,
+                 text: &mut String,
+                 start: usize,
+                 cols: usize,
+                 level: Option<u8>| {
         if !text.is_empty() {
             runs.push(ShapedRun {
                 start_col: start,
                 text: std::mem::take(text),
                 col_count: cols,
+                direction: RunDirection::from_level(level.unwrap_or(0)),
             });
         }
     };
@@ -1025,24 +1050,46 @@ pub fn form_runs_for_row(
             if current_style.is_some() {
                 continue;
             }
-            flush(&mut runs, &mut current_text, current_start, current_cols);
+            flush(
+                &mut runs,
+                &mut current_text,
+                current_start,
+                current_cols,
+                current_level,
+            );
             current_cols = 0;
+            current_level = None;
             continue;
         }
         if cell.is_blank() {
-            flush(&mut runs, &mut current_text, current_start, current_cols);
+            flush(
+                &mut runs,
+                &mut current_text,
+                current_start,
+                current_cols,
+                current_level,
+            );
             current_style = None;
             current_cols = 0;
+            current_level = None;
             continue;
         }
+        let level = levels.and_then(|levels| levels.get(offset).copied());
         match &current_style {
-            Some(style) if *style == cell.style => {
+            Some(style) if *style == cell.style && current_level == level => {
                 cell.push_text_into(&mut current_text);
                 current_cols += usize::from(cell.width).max(1);
             }
             _ => {
-                flush(&mut runs, &mut current_text, current_start, current_cols);
+                flush(
+                    &mut runs,
+                    &mut current_text,
+                    current_start,
+                    current_cols,
+                    current_level,
+                );
                 current_style = Some(cell.style);
+                current_level = level;
                 current_start = col;
                 current_text = String::new();
                 cell.push_text_into(&mut current_text);
@@ -1050,7 +1097,13 @@ pub fn form_runs_for_row(
             }
         }
     }
-    flush(&mut runs, &mut current_text, current_start, current_cols);
+    flush(
+        &mut runs,
+        &mut current_text,
+        current_start,
+        current_cols,
+        current_level,
+    );
     runs
 }
 
@@ -1361,17 +1414,46 @@ impl SwashSingle {
 // Phase B shaping skeleton
 // ---------------------------------------------------------------------------
 
-/// Attributes for one shaped run (grid row segment, LTR only).
+/// Shaping direction of one run (CTX-1612).
 ///
-/// The terminal grid pins logical order (bidi/reordering is an explicit
-/// non-goal, parity with the kitty grid model); direction is therefore not
-/// a field — every run shapes left-to-right.
+/// Grid truth stays logical; a run formed from odd (RTL) resolved levels
+/// shapes right-to-left so HarfBuzz applies joining and kerning in the
+/// script's own direction. The emitter still paints each cluster at the
+/// visual column the line map assigns, so the direction never leaks into
+/// `Cell`/`Snapshot`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum RunDirection {
+    /// Left-to-right run (even bidi level).
+    #[default]
+    Ltr,
+    /// Right-to-left run (odd bidi level).
+    Rtl,
+}
+
+impl RunDirection {
+    /// Direction implied by a resolved bidi level (`level % 2`).
+    #[must_use]
+    pub const fn from_level(level: u8) -> Self {
+        if level % 2 == 0 { Self::Ltr } else { Self::Rtl }
+    }
+
+    fn harfrust(self) -> harfrust::Direction {
+        match self {
+            Self::Ltr => harfrust::Direction::LeftToRight,
+            Self::Rtl => harfrust::Direction::RightToLeft,
+        }
+    }
+}
+
+/// Attributes for one shaped run (one logical level/style segment).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunAttrs {
     /// OpenType feature overrides for this run (already validated).
     pub features: Vec<bitty_config::types::OpenTypeFeature>,
     /// Point size for advances (`(0, 3999]`, like [`FontQuery`]).
     pub point_size: f32,
+    /// Shaping direction (even/odd bidi level; LTR when BiDi is off).
+    pub direction: RunDirection,
 }
 
 /// Run-shaping extension of [`GlyphRasterizer`] (CTX-1607).
@@ -1391,7 +1473,8 @@ pub trait ShapedRunSource: GlyphRasterizer {
     /// True when this rasterizer can shape runs and rasterize shaped glyphs.
     fn shaping_supported(&self) -> bool;
 
-    /// Shapes one LTR run over `chain` (see [`SwashSingle::shape_run`]).
+    /// Shapes one run over `chain` in `attrs.direction` (see
+    /// [`SwashSingle::shape_run`]).
     ///
     /// # Errors
     ///
@@ -1485,6 +1568,8 @@ pub struct ShapePlanKey {
     pub features_hash: u64,
     /// Hash of the plan's script/language segment properties.
     segment_hash: u64,
+    /// Shaping direction (CTX-1612: RTL and LTR plans never collide).
+    direction: RunDirection,
 }
 
 impl ShapePlanKey {
@@ -1494,7 +1579,7 @@ impl ShapePlanKey {
     /// untrusted input lengths).
     #[must_use]
     pub fn new(face: FontId, features: &[bitty_config::types::OpenTypeFeature]) -> Self {
-        Self::for_segment(face, features, None, None)
+        Self::for_segment(face, features, None, None, RunDirection::Ltr)
     }
 
     /// Derives the key for `face` + `features` + the buffer's guessed
@@ -1505,6 +1590,7 @@ impl ShapePlanKey {
         features: &[bitty_config::types::OpenTypeFeature],
         script: Option<harfrust::Script>,
         language: Option<&harfrust::Language>,
+        direction: RunDirection,
     ) -> Self {
         use std::hash::{Hash as _, Hasher as _};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1514,6 +1600,7 @@ impl ShapePlanKey {
             face,
             features_hash: features_hash(features),
             segment_hash: hasher.finish(),
+            direction,
         }
     }
 }
@@ -1552,6 +1639,8 @@ pub struct RunCacheKey {
     pub features_hash: u64,
     /// Bit pattern of the point size (exact, no float fuzz).
     pub size_bits: u32,
+    /// Shaping direction (CTX-1612: the same text shapes differently).
+    pub direction: RunDirection,
 }
 
 impl RunCacheKey {
@@ -1562,6 +1651,7 @@ impl RunCacheKey {
         chain: &[FontId],
         features: &[bitty_config::types::OpenTypeFeature],
         point_size: f32,
+        direction: RunDirection,
     ) -> Self {
         const FNV_OFFSET: u64 = 0xcbf29ce484222325;
         const FNV_PRIME: u64 = 0x100000001b3;
@@ -1582,6 +1672,7 @@ impl RunCacheKey {
             chain_hash,
             features_hash: features_hash(features),
             size_bits: point_size.to_bits(),
+            direction,
         }
     }
 }
@@ -1711,6 +1802,8 @@ struct ShapeInput<'a> {
     features: &'a [harfrust::Feature],
     /// Validated features for the plan-cache key.
     validated: &'a [bitty_config::types::OpenTypeFeature],
+    /// Shaping direction for the buffer and the retained plan.
+    direction: RunDirection,
 }
 
 impl SwashSingle {
@@ -1747,7 +1840,13 @@ impl SwashSingle {
         // Run-shape cache (design 5): steady-state scroll converges to
         // ~zero shapes per frame. Key includes features-hash, so the
         // cursor-unshape variant is a second cached entry, not a reshape.
-        let run_key = RunCacheKey::new(text, chain, &attrs.features, attrs.point_size);
+        let run_key = RunCacheKey::new(
+            text,
+            chain,
+            &attrs.features,
+            attrs.point_size,
+            attrs.direction,
+        );
         if let Some(cached) = self.run_cache.get(&run_key).cloned() {
             self.touch_run_lru(run_key);
             self.shape_hits = self.shape_hits.saturating_add(1);
@@ -1811,6 +1910,7 @@ impl SwashSingle {
             px,
             features: &features,
             validated: &attrs.features,
+            direction: attrs.direction,
         };
         let mut clusters = self.shape_with(primary_input)?;
         // Fallback reshape: one grapheme cluster at a time, tails in order.
@@ -1880,6 +1980,7 @@ impl SwashSingle {
                     px,
                     features: &features,
                     validated: &attrs.features,
+                    direction: attrs.direction,
                 };
                 let reshaped = self.shape_with(tail_input)?;
                 if reshaped.iter().all(|c| !c.uncovered) {
@@ -1914,6 +2015,7 @@ impl SwashSingle {
                             px,
                             features: &features,
                             validated: &attrs.features,
+                            direction: attrs.direction,
                         };
                         let reshaped = self.shape_with(dynamic_input)?;
                         if reshaped.iter().all(|c| !c.uncovered) {
@@ -1948,6 +2050,7 @@ impl SwashSingle {
             px,
             features,
             validated,
+            direction,
         } = input;
         let blob: std::sync::Arc<dyn AsRef<[u8]> + Send + Sync> = face.data.clone();
         let font = harfrust::Font::new(blob, face.face_index)
@@ -1962,7 +2065,7 @@ impl SwashSingle {
         let mut buffer = harfrust::Buffer::new();
         buffer.push_str(text);
         buffer.guess_segment_properties();
-        buffer.set_direction(harfrust::Direction::LeftToRight);
+        buffer.set_direction(direction.harfrust());
         let script = buffer.script();
         let language = buffer.language();
         // Retained plan LRU (design 5): at most MAX_SHAPE_PLANS_PER_FACE
@@ -1972,15 +2075,10 @@ impl SwashSingle {
         // field borrows keep this `unsafe`-free: the plan owns its maps and
         // never borrows `font`, so an immutable borrow of `shape_plans`
         // coexists with the mutable `scale_ctx` borrow below.
-        let plan_key = ShapePlanKey::for_segment(id, validated, script, language);
+        let plan_key = ShapePlanKey::for_segment(id, validated, script, language, direction);
         if !self.shape_plans.contains_key(&plan_key) {
-            let fresh = harfrust::ShapePlan::new(
-                &font,
-                harfrust::Direction::LeftToRight,
-                script,
-                language,
-                features,
-            );
+            let fresh =
+                harfrust::ShapePlan::new(&font, direction.harfrust(), script, language, features);
             self.evict_plans_for_face_if_full(id);
             self.shape_plans.insert(plan_key, fresh);
             self.shape_plan_lru.push_back(plan_key);
@@ -2016,6 +2114,14 @@ impl SwashSingle {
             ));
         }
         let mut clusters = Vec::with_capacity(infos.len());
+        // CTX-1612: cluster byte ranges come from the sorted set of shaper
+        // offsets, never from the next entry. HarfBuzz emits an RTL run in
+        // visual (descending-offset) order, where `infos[i + 1].cluster` is
+        // *smaller* than the current one; the historical ascending
+        // assumption collapsed every RTL cluster to one byte.
+        let mut offsets: Vec<usize> = infos.iter().map(|info| info.cluster as usize).collect();
+        offsets.sort_unstable();
+        offsets.dedup();
         let swash_font = Self::font_ref(face)?;
         let mut scaler = self
             .scale_ctx
@@ -2027,13 +2133,13 @@ impl SwashSingle {
         // to a blank outline is the first half of a programming ligature
         // (the font draws the wide outline from the following cell).
         let mut scaffolds = Vec::with_capacity(infos.len());
-        for (i, (info, pos)) in infos.iter().zip(positions.iter()).enumerate() {
+        for (info, pos) in infos.iter().zip(positions.iter()) {
             let start = info.cluster as usize;
-            let end = if i + 1 < infos.len() {
-                (infos[i + 1].cluster as usize).max(start)
-            } else {
-                text.len()
-            };
+            let end = offsets
+                .binary_search(&start)
+                .ok()
+                .and_then(|index| offsets.get(index + 1).copied())
+                .unwrap_or(text.len());
             // Defensive: a cluster index past the text is corrupt output.
             if start > text.len() || end > text.len() {
                 return Err(RenderError::UpstreamRasterizer(
@@ -2069,6 +2175,14 @@ impl SwashSingle {
                 ligature_part: cells > 1,
                 byte_offset: base_offset + start,
             });
+        }
+        // CTX-1612: keep shaper output in logical byte order so downstream
+        // grouping (grapheme clusters, ligature spans, cursor overlap) sees
+        // ascending offsets for both directions. The stable sort preserves
+        // HarfBuzz's member order inside one cluster, which is the order
+        // its advances and GPOS offsets were computed in.
+        if direction == RunDirection::Rtl {
+            clusters.sort_by_key(|cluster| cluster.byte_offset);
         }
         // Scaffold pass (CTX-1607): a blank left half owns its own one-cell
         // cluster, so mark it and the following body cluster as one
@@ -2329,6 +2443,7 @@ mod tests {
             start_col: 4,
             text: "abc123".to_string(),
             col_count: 6,
+            direction: crate::RunDirection::Ltr,
         };
         assert!(run_is_ascii_candidate(&candidate));
         // Byte/cell mismatch (wide scalar span, combining expansion): shaped.
@@ -2336,24 +2451,28 @@ mod tests {
             start_col: 0,
             text: "漢".to_string(),
             col_count: 2,
+            direction: crate::RunDirection::Ltr,
         };
         assert!(!run_is_ascii_candidate(&wide));
         let empty = ShapedRun {
             start_col: 0,
             text: String::new(),
             col_count: 0,
+            direction: crate::RunDirection::Ltr,
         };
         assert!(!run_is_ascii_candidate(&empty));
         let mixed = ShapedRun {
             start_col: 0,
             text: "A漢".to_string(),
             col_count: 3,
+            direction: crate::RunDirection::Ltr,
         };
         assert!(!run_is_ascii_candidate(&mixed));
         let marked = ShapedRun {
             start_col: 0,
             text: "é".to_string(),
             col_count: 1,
+            direction: crate::RunDirection::Ltr,
         };
         assert!(!run_is_ascii_candidate(&marked));
     }
@@ -2412,6 +2531,7 @@ mod tests {
             start_col: 0,
             text: "seq 12345".to_string(),
             col_count: 9,
+            direction: crate::RunDirection::Ltr,
         };
         let always = features_for_policy(&[], LigaturePolicy::Always);
         assert!(ascii_fast_path_eligible(&run, &always));
@@ -2421,12 +2541,14 @@ mod tests {
             start_col: 0,
             text: "漢".to_string(),
             col_count: 2,
+            direction: crate::RunDirection::Ltr,
         };
         assert!(!ascii_fast_path_eligible(&cjk, &always));
         let ligature_text = ShapedRun {
             start_col: 0,
             text: "->".to_string(),
             col_count: 2,
+            direction: crate::RunDirection::Ltr,
         };
         // Ligature-formable ASCII is still a candidate structurally, but the
         // feature half decides: Always bypasses (ligatures forced off),
@@ -2470,6 +2592,78 @@ mod tests {
         assert_eq!(offset.len(), 1, "offset row keeps one run: {offset:?}");
         assert_eq!(offset[0].start_col, 3);
         assert_eq!(offset[0].col_count, 2);
+    }
+
+    #[test]
+    fn level_aware_run_formation_splits_on_level_changes() {
+        // CTX-1612: a run breaks on any resolved level change, not just on a
+        // parity change, so L2 can never ligate across two embedding runs.
+        use bitty_term_state::{Cell, Style};
+        let style = Style::default();
+        let cell = |glyph: char| {
+            let mut cell = Cell::erased(style);
+            cell.glyph = glyph;
+            cell.padding = false;
+            cell
+        };
+        let row = vec![cell('a'), cell('b'), cell('א'), cell('ב')];
+        let levels = [0u8, 0, 1, 1];
+        let runs = form_runs_for_row_at_levels(&row, 0, Some(&levels));
+        assert_eq!(runs.len(), 2, "{runs:?}");
+        assert_eq!(runs[0].text, "ab");
+        assert_eq!(runs[0].direction, RunDirection::Ltr);
+        assert_eq!(runs[1].text, "אב");
+        assert_eq!(runs[1].direction, RunDirection::Rtl);
+        // Same parity, different level (1 vs 3): still two runs.
+        let nested = [0u8, 0, 1, 3];
+        let runs = form_runs_for_row_at_levels(&row, 0, Some(&nested));
+        assert_eq!(runs.len(), 3, "{runs:?}");
+        assert!(
+            runs[1..]
+                .iter()
+                .all(|run| run.direction == RunDirection::Rtl)
+        );
+        // No level hint keeps the historical LTR-only grouping.
+        let flat = form_runs_for_row(&row, 0);
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].direction, RunDirection::Ltr);
+    }
+
+    #[test]
+    fn rtl_shaping_keeps_ascending_logical_cluster_ranges() {
+        // CTX-1612: HarfBuzz emits an RTL run in visual (descending-offset)
+        // order. Cluster byte ranges must still come from the sorted offset
+        // set, and the returned vector stays in logical order so the
+        // emitter's grapheme grouping works for both directions.
+        let (mut shaper, face) = shaper_with_demo_font();
+        let attrs = RunAttrs {
+            features: Vec::new(),
+            point_size: 12.0,
+            direction: RunDirection::Rtl,
+        };
+        let clusters = shaper
+            .shape_run("AB", &[face], &attrs)
+            .expect("demo face shapes");
+        assert!(!clusters.is_empty());
+        assert!(
+            clusters
+                .windows(2)
+                .all(|pair| pair[0].byte_offset <= pair[1].byte_offset),
+            "clusters must be in logical order: {clusters:?}"
+        );
+        assert_eq!(clusters[0].cells, (0, 1));
+        assert_eq!(clusters[1].cells, (1, 1));
+        // The direction is part of the cache key: the same text shapes twice.
+        let ltr = RunAttrs {
+            direction: RunDirection::Ltr,
+            ..attrs.clone()
+        };
+        let _ = shaper.shape_run("AB", &[face], &ltr).expect("LTR shape");
+        assert_eq!(
+            shaper.shape_stats().1,
+            2,
+            "LTR and RTL are distinct cache entries"
+        );
     }
 
     #[test]

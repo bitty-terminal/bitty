@@ -755,6 +755,8 @@ pub fn inspect_config(query: &str) -> Option<ConfigInfo> {
         "terminal.bell" => defaults.terminal.bell.as_str().to_string(),
         // CTX-1609: default East Asian Ambiguous width policy (narrow).
         "terminal.ambiguous_width" => defaults.terminal.ambiguous_width.as_str().to_string(),
+        // CTX-1612: default BiDi policy (off until the risk is accepted).
+        "terminal.bidi" => defaults.terminal.bidi.as_str().to_string(),
         "selection.auto_copy" => defaults.selection.auto_copy.to_string(),
         "history.capture.transcript" => defaults.history.capture.transcript.to_string(),
         "history.capture.commands" => defaults.history.capture.commands.to_string(),
@@ -1303,7 +1305,7 @@ pub fn run_inspect(request: &InspectRequest) -> i32 {
             }
             None => {
                 let message = format!(
-                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, terminal.scroll_lines_per_notch, terminal.scroll_pixels_per_notch, terminal.page_scroll_percent, terminal.cursor_style, terminal.bell, terminal.ambiguous_width, selection.auto_copy, history.capture.transcript, history.capture.commands, layout.gaps_in, layout.resize_step, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, mouse.right, mouse.middle, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key, close_confirm)",
+                    "bitty inspect: unknown config key {:?} (try font.size, font.family, appearance.theme, window.opacity, terminal.scrollback, terminal.scroll_lines_per_notch, terminal.scroll_pixels_per_notch, terminal.page_scroll_percent, terminal.cursor_style, terminal.bell, terminal.ambiguous_width, terminal.bidi, selection.auto_copy, history.capture.transcript, history.capture.commands, layout.gaps_in, layout.resize_step, decoration.content_inset, scrollbar.mode, mouse.focus_follows_mouse, mouse.focus_follows_mouse_delay_ms, mouse.right, mouse.middle, appearance.animations.enabled, appearance.animations.reduced_motion, appearance.animations.duration_ms.open, appearance.animations.easing.open, mod_key, close_confirm)",
                     request.value,
                 );
                 if emit_json {

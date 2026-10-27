@@ -3024,20 +3024,38 @@ impl State {
     /// deferred wrap is latched (the latch is preserved for the next
     /// full-width print), else the cell left of the cursor, else the last
     /// column of the previous row. A spacer target steps back to its
-    /// leading half. With no preceding cell (top-left corner) or a full
-    /// continuation buffer, the mark is dropped: the buffer stays bounded
-    /// (threat T-01) and the cursor never moves.
+    /// leading half. With no preceding cell (top-left corner), a bidi
+    /// control at column 0 (CTX-1612), or a full continuation buffer, the
+    /// mark is dropped: the buffer stays bounded (threat T-01) and the
+    /// cursor never moves.
     ///
     /// CTX-1609: a selector-16 mark can widen the cluster it joins when the
     /// target is the immediate predecessor of the cursor; marks attached
     /// after a cursor move never resize an older cell.
+    ///
+    /// CTX-1612: a bidi format control at column 0 after a HARD line break
+    /// has no preceding cell on its own logical line. It is dropped instead
+    /// of attaching to the previous row's last cell: crossing the break
+    /// would make the control reorder the previous logical line and corrupt
+    /// the reconstructed text of both lines. When the previous row is
+    /// soft-wrapped the control is still in the same paragraph and attaches
+    /// normally. Non-bidi zero-width scalars keep the historical step-back.
     fn attach_zerowidth(&mut self, mark: char) {
         let (row, col) = self.cursor_xy();
+        // A control at column 0 belongs to the current logical line. Only a
+        // HARD break makes it line-leading: when the previous row is
+        // soft-wrapped, the control is still inside the same paragraph and
+        // correctly joins the previous row's last cell.
+        let previous_row_soft_wrapped = row > 0 && self.screens_active().wrapped(row - 1);
+        let line_leading_control = col == 0
+            && !self.cursor.pending_wrap
+            && !previous_row_soft_wrapped
+            && crate::bidi::is_bidi_format_scalar(mark);
         let (target_row, target_col) = if self.cursor.pending_wrap {
             (row, col)
         } else if col > 0 {
             (row, col - 1)
-        } else if row > 0 {
+        } else if row > 0 && !line_leading_control {
             (row - 1, self.width - 1)
         } else {
             return;

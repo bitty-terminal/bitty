@@ -4691,6 +4691,39 @@ fn runtime_config_inherits_file_ambiguous_width() {
 }
 
 #[test]
+fn runtime_config_inherits_file_bidi() {
+    // CTX-1612: `terminal.bidi` flows file -> effective -> runtime, default
+    // off, and the user layer may opt in while a project layer cannot.
+    use bitty_config::file::{parse_lua_config, resolve_effective};
+    use bitty_config::plan::{ConfigSource, LayerKind};
+    let src = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan = parse_lua_config(
+        r#"return { terminal = { scrollback = 10000, bidi = "on" } }"#,
+        &src,
+    )
+    .expect("bidi parses");
+    let merged = resolve_effective(Some(bitty_config::plan::LayeredPlan::new(src, plan)), None)
+        .expect("merge");
+    let cfg = runtime_config_from_effective(&merged.effective).expect("runtime cfg builds");
+    assert!(cfg.bidi, "user layer can enable paint-time reordering");
+    assert_eq!(
+        merged.source_of("terminal.bidi").unwrap().layer,
+        LayerKind::User
+    );
+    // Absent key keeps the off default.
+    let src2 = ConfigSource::new(LayerKind::User, Some("init.lua"));
+    let plan2 = parse_lua_config(r#"return { terminal = { scrollback = 10000 } }"#, &src2)
+        .expect("minimal terminal parses");
+    let merged2 = resolve_effective(
+        Some(bitty_config::plan::LayeredPlan::new(src2, plan2)),
+        None,
+    )
+    .expect("merge");
+    let cfg2 = runtime_config_from_effective(&merged2.effective).expect("builds");
+    assert!(!cfg2.bidi);
+}
+
+#[test]
 fn runtime_config_inherits_file_cursor_style_and_bell() {
     // CTX-0756 (issue #1359): `terminal.cursor_style` / `terminal.bell`
     // flow file -> effective -> runtime; crate defaults stay equal

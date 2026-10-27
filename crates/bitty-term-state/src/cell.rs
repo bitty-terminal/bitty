@@ -510,6 +510,10 @@ pub(crate) fn is_zero_width(cp: u32) -> bool {
         | 0x200B..=0x200F
         | 0x202A..=0x202E
         | 0x2060..=0x2064
+        // CTX-1612: LRI/RLI/FSI/PDI are zero-width isolate formatting
+        // scalars (UAX #9 X5a-X5c/X6a); before this fix they resolved to
+        // EAW `N` and consumed a cell each, shifting every following column.
+        | 0x2066..=0x2069
         | 0x20D0..=0x20FF
         | 0x302A..=0x302D
         | 0x3099..=0x309A
@@ -557,6 +561,19 @@ mod tests {
         assert_eq!(char_cell_width('\u{0301}'), 0);
         assert_eq!(char_cell_width('\u{200D}'), 0);
         assert_eq!(char_cell_width('\u{FE0F}'), 0);
+    }
+
+    #[test]
+    fn bidi_format_controls_are_zero_cells() {
+        // CTX-1612: embeddings/overrides (U+202A..U+202E), marks/isolation
+        // controls (U+200E/U+200F, U+061C), and isolates (U+2066..U+2069)
+        // consume no grid column.
+        for scalar in [
+            '\u{200E}', '\u{200F}', '\u{061C}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+            '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
+            assert_eq!(char_cell_width(scalar), 0, "{scalar:?} is zero-width");
+        }
     }
 
     #[test]

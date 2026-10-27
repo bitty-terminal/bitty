@@ -93,6 +93,7 @@ pub fn merge_class_for(field: &str) -> Option<MergeClass> {
         | "terminal.cursor_style"
         | "terminal.bell"
         | "terminal.ambiguous_width"
+        | "terminal.bidi"
         | "selection.auto_copy"
         | "history.capture.transcript"
         | "history.capture.commands"
@@ -833,6 +834,7 @@ const ATTRIBUTED_FIELDS: &[&str] = &[
     "terminal.cursor_style",
     "terminal.bell",
     "terminal.ambiguous_width",
+    "terminal.bidi",
     "terminal",
     "selection.auto_copy",
     "selection",
@@ -1323,6 +1325,7 @@ fn merge_layers_inner(
                 "terminal.cursor_style",
                 "terminal.bell",
                 "terminal.ambiguous_width",
+                "terminal.bidi",
             ] {
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
@@ -1361,6 +1364,10 @@ fn merge_layers_inner(
                     }
                     "terminal.ambiguous_width" => {
                         effective.terminal.ambiguous_width = term.ambiguous_width;
+                    }
+                    // CTX-1612: paint-time BiDi policy (scalar-replace leaf).
+                    "terminal.bidi" => {
+                        effective.terminal.bidi = term.bidi;
                     }
                     _ => {}
                 }
@@ -2947,6 +2954,7 @@ fn merge_layers_allow_policy_violations(
                 "terminal.cursor_style",
                 "terminal.bell",
                 "terminal.ambiguous_width",
+                "terminal.bidi",
             ] {
                 if is_policy {
                     policy_fields.insert(field.to_string(), src.clone());
@@ -2985,6 +2993,10 @@ fn merge_layers_allow_policy_violations(
                     }
                     "terminal.ambiguous_width" => {
                         effective.terminal.ambiguous_width = term.ambiguous_width;
+                    }
+                    // CTX-1612: paint-time BiDi policy (scalar-replace leaf).
+                    "terminal.bidi" => {
+                        effective.terminal.bidi = term.bidi;
                     }
                     _ => {}
                 }
@@ -5326,6 +5338,11 @@ mod tests {
         // CTX-1609: the ambiguous-width policy is a scalar-replace leaf.
         assert_eq!(
             merge_class_for("terminal.ambiguous_width"),
+            Some(MergeClass::ScalarReplace)
+        );
+        // CTX-1612: the paint-time BiDi policy is scalar-replace too.
+        assert_eq!(
+            merge_class_for("terminal.bidi"),
             Some(MergeClass::ScalarReplace)
         );
         // CTX-0191: selection opt-out is scalar-replace like scrollback.

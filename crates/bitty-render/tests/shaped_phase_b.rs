@@ -58,6 +58,7 @@ fn ligature_spans_cover_n_cells() {
     let attrs = RunAttrs {
         features: Vec::new(),
         point_size: POINT_SIZE,
+        direction: bitty_render::RunDirection::Ltr,
     };
     // `fi` ligates to a single glyph covering two cells.
     let fi = raster
@@ -95,6 +96,7 @@ fn run_cache_serves_hits_without_reshaping() {
     let attrs = RunAttrs {
         features: Vec::new(),
         point_size: POINT_SIZE,
+        direction: bitty_render::RunDirection::Ltr,
     };
     let inner = raster.inner_mut();
     let (hits_before, misses_before) = inner.shape_stats();
@@ -129,6 +131,7 @@ fn shape_plan_cache_stays_bounded_per_face() {
         let attrs = RunAttrs {
             features: vec![parsed],
             point_size: POINT_SIZE,
+            direction: bitty_render::RunDirection::Ltr,
         };
         raster
             .inner_mut()
@@ -282,6 +285,7 @@ fn calt_scaffold_ligature_marks_the_cursor_span() {
     let attrs = RunAttrs {
         features: Vec::new(),
         point_size: POINT_SIZE,
+        direction: bitty_render::RunDirection::Ltr,
     };
     let plain_greater = raster
         .inner_mut()
@@ -311,6 +315,7 @@ fn calt_scaffold_ligature_marks_the_cursor_span() {
     let zero_attrs = RunAttrs {
         features: zeroed,
         point_size: POINT_SIZE,
+        direction: bitty_render::RunDirection::Ltr,
     };
     let plain = raster
         .inner_mut()

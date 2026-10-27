@@ -21,6 +21,11 @@ name = "bittyd"
 path = "src/main.rs"
 
 [dependencies]
+# CTX-1619: server-generated 128-bit ids for the registry (contract D-02).
+# The 0.4 line is already in the workspace lockfile (`bitty-rich`,
+# `bitty-runtime`, and `tempfile`); this adds no package version, no build-time
+# codegen, and no second RNG stack. Entropy failure is a hard refusal.
+getrandom = "0.4"
 # bitty#2606: the seam declares no mechanism edge yet. The contract fixes the
 # allowed direction (bittyd -> bitty-term-state, bitty-pty,
 # bitty-plugin-host, bitty-ipc); each edge is added by the slice that
@@ -30,6 +35,10 @@ path = "src/main.rs"
 # package.
 
 [dev-dependencies]
+# CTX-1619: temporary journal directories for the orphan-journal tests. The
+# 3.27.0 line is already in the workspace lockfile (through `proptest`), so
+# this adds no package version and stays out of the shipped daemon.
+tempfile = "3"
 # Workspace graph for the one-way dependency check. `serde_json` is already
 # in the lockfile through the existing graph, so this adds no package version
 # and stays out of the shipped daemon.

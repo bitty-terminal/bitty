@@ -71,6 +71,7 @@ define_refusal_codes! {
     IdempotencyConflict => "idempotency_conflict",
     IdempotencyCapacity => "idempotency_capacity",
     TerminalEventLost => "terminal_event_lost",
+    InvalidMethod => "invalid_method",
     InvalidRequest => "invalid_request",
     Timeout => "timeout",
     Internal => "internal",
@@ -91,7 +92,7 @@ mod tests {
     fn every_code_has_a_unique_static_spelling() {
         let spellings: BTreeSet<_> = RefusalCode::ALL.iter().map(|code| code.as_str()).collect();
         assert_eq!(spellings.len(), RefusalCode::ALL.len());
-        assert_eq!(RefusalCode::ALL.len(), 31);
+        assert_eq!(RefusalCode::ALL.len(), 32);
         for code in RefusalCode::ALL {
             assert!(code.as_str().bytes().all(|byte| {
                 byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'

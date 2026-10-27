@@ -4,8 +4,9 @@
 //! The table below is the single compiled source of truth for every numeric
 //! bound in the accepted [`bittyd` Session-Host Contract]. The 46 rows of the
 //! `D-14` table keep their contract order; the eight transport bounds inherited
-//! from the accepted `bitty-ipc` v1 `RC-9`/`RC-10` constraints follow, because
-//! the handshake advertises them through the same schema with
+//! from the accepted `bitty-ipc` v1 `RC-9`/`RC-10` constraints follow in the
+//! prose order of that paragraph (the contract defines no normative order for
+//! them), because the handshake advertises them through the same schema with
 //! `effective == default == system_max`.
 //!
 //! # Configuration rule
@@ -19,37 +20,52 @@
 //!
 //! # Enforcement order (normative for bitty#2607)
 //!
-//! A limit is enforced in the stage reported by [`LimitId::stage`], in this
-//! order, before the structure the limit protects is mutated:
+//! A limit is evaluated at the stage reported by [`LimitId::stage`]. Stages
+//! that can refuse a request are ordered before the structure they protect is
+//! mutated:
 //!
 //! 1. [`EnforcementStage::ConnectionAdmission`] — inherited frame, chunk,
 //!    payload, pending-request, channel, rate, connection, and per-connection
 //!    pending-byte bounds; a connection over a bound is refused or shed before
 //!    a request is decoded.
-//! 2. [`EnforcementStage::Handshake`] — `negotiate_timeout_ms` and
-//!    `pre_auth_max_bytes`; exceeding either closes the connection before any
-//!    session operation.
-//! 3. [`EnforcementStage::RequestAdmission`] — `request_timeout_ms` and the
-//!    `terminal_id_bytes`, `attach_id_bytes`, and `grant_id_bytes` shape bounds;
-//!    a malformed identifier is refused before any lookup.
-//! 4. [`EnforcementStage::Idempotency`] — the per-session and create-key store
+//! 2. [`EnforcementStage::Handshake`] — `pre_auth_max_bytes`; exceeding it
+//!    closes the connection before any session operation.
+//! 3. [`EnforcementStage::RequestAdmission`] — the `terminal_id_bytes`,
+//!    `attach_id_bytes`, and `grant_id_bytes` shape bounds; a malformed
+//!    identifier is refused before any lookup.
+//! 4. [`EnforcementStage::AuditSink`] — `audit_file_bytes`, `audit_segments`,
+//!    and `refusal_audit_budget_per_sec`. The sink availability/rotation check
+//!    runs here, **before** a privileged mutation (`D-16`: an unavailable sink
+//!    refuses the action with `Internal` and changes no state). The refusal
+//!    record for a refused action is appended after the refusal decision; that
+//!    append is the only write a refusal performs.
+//! 5. [`EnforcementStage::Idempotency`] — the per-session and create-key store
 //!    caps and the create-key retention floor; a full store refuses new keyed
 //!    work before the executor runs.
-//! 5. [`EnforcementStage::RegistryAdmission`] — `max_sessions`,
-//!    `session_record_bytes`, `max_retained_terminal_records`, and
-//!    `terminal_retention_ms`; a breach refuses before a record is inserted,
-//!    transitioned, or collected out of order.
-//! 6. [`EnforcementStage::SessionMutation`] — attach caps and TTLs, grant caps
-//!    and TTLs, spawn-spec bounds, content cap, and abort/drain grace; a breach
-//!    refuses before a lease, grant, spawn, content write, or transition.
-//! 7. [`EnforcementStage::EventDelivery`] — event backlog, lease queue, and
-//!    connection outbound bounds; a breach sheds or closes before an event is
-//!    appended or a response byte is queued.
-//! 8. [`EnforcementStage::Containment`] — orphan-journal and reap bounds; a
-//!    breach refuses a spawn before the journal record is written.
-//! 9. [`EnforcementStage::AuditSink`] — audit segment and refusal-budget
-//!    bounds; an unavailable or degraded sink refuses a privileged mutation
-//!    before it is applied.
+//! 6. [`EnforcementStage::RegistryAdmission`] — `max_sessions` and
+//!    `session_record_bytes`; a breach refuses before a record is inserted or
+//!    transitioned.
+//! 7. [`EnforcementStage::SessionMutation`] — attach caps, grant caps, and
+//!    spawn-spec bounds; a breach refuses before a lease, grant, spawn, or
+//!    transition.
+//! 8. [`EnforcementStage::ContentPlane`] — `max_content_bytes_per_session`.
+//!    This is not a whole-request refusal: the content owner prunes grid,
+//!    scrollback, and images to fit the per-session cap.
+//! 9. [`EnforcementStage::Retention`] — `max_retained_terminal_records` and
+//!    `terminal_retention_ms` (and orphan quarantine retention). Bounded
+//!    records are collected/evicted oldest-first; a cap breach is not a
+//!    request refusal.
+//! 10. [`EnforcementStage::EventDelivery`] — event backlog, lease queue, and
+//!     connection outbound bounds; a breach sheds or closes before an event is
+//!     appended or a response byte is queued.
+//! 11. [`EnforcementStage::Containment`] — orphan-journal bounds; a breach
+//!     refuses a spawn before the journal record is written.
+//! 12. [`EnforcementStage::Deadline`] — heartbeat, lease, grant, request,
+//!     handshake, idle, spawn-bind, abort, drain, and reap timers. These are
+//!     supervisor/timer bounds, not pre-mutation refusal caps; they decide when
+//!     a lease expires, a request times out, or a grace period escalates. They
+//!     produce timeouts and expiry transitions, never a `LimitExceeded`
+//!     refusal by themselves.
 //!
 //! A refusal carries the limit and the observed count (`D-14`), applies nothing
 //! to the registry, event ring, lease store, grant store, or idempotency store,
@@ -110,20 +126,26 @@ pub enum EnforcementStage {
     ConnectionAdmission,
     /// Pre-auth handshake bounds.
     Handshake,
-    /// Request shape and deadline bounds, before any lookup.
+    /// Request shape bounds, before any lookup.
     RequestAdmission,
+    /// Audit sink availability and rotation, before a privileged mutation.
+    AuditSink,
     /// Idempotency-store admission, before the executor runs.
     Idempotency,
     /// Session-registry admission, before a record changes.
     RegistryAdmission,
-    /// Lease, grant, spawn, content, and lifecycle mutation guards.
+    /// Lease, grant, and spawn mutation guards.
     SessionMutation,
+    /// Content-plane pruning; never a whole-request refusal.
+    ContentPlane,
+    /// Bounded record collection/eviction; never a request refusal.
+    Retention,
     /// Event backlog, lease queue, and outbound buffering.
     EventDelivery,
-    /// Orphan-journal containment and reap bounds.
+    /// Orphan-journal containment bounds.
     Containment,
-    /// Audit sink and refusal-budget bounds.
-    AuditSink,
+    /// Timer and deadline bounds; not pre-mutation refusal caps.
+    Deadline,
 }
 
 impl EnforcementStage {
@@ -134,12 +156,15 @@ impl EnforcementStage {
             Self::ConnectionAdmission => "connection_admission",
             Self::Handshake => "handshake",
             Self::RequestAdmission => "request_admission",
+            Self::AuditSink => "audit_sink",
             Self::Idempotency => "idempotency",
             Self::RegistryAdmission => "registry_admission",
             Self::SessionMutation => "session_mutation",
+            Self::ContentPlane => "content_plane",
+            Self::Retention => "retention",
             Self::EventDelivery => "event_delivery",
             Self::Containment => "containment",
-            Self::AuditSink => "audit_sink",
+            Self::Deadline => "deadline",
         }
     }
 }
@@ -165,8 +190,10 @@ macro_rules! define_limits {
         /// Identifier of one advertised limit, in contract order.
         ///
         /// The discriminants are the row indices in the compiled table; the
-        /// declaration order is the `D-14` order followed by the inherited
-        /// transport bounds.
+        /// declaration order is the `D-14` table order followed by the
+        /// inherited transport bounds. The inherited rows have no normative
+        /// order in the contract; they follow the prose order of the inherited
+        /// transport paragraph here for deterministic advertisement.
         #[repr(usize)]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub enum LimitId {
@@ -202,32 +229,32 @@ define_limits! {
     MaxSessions => ("max_sessions", 16, 64, ContractD14, RegistryAdmission),
     MaxAttachesPerSession => ("max_attaches_per_session", 8, 16, ContractD14, SessionMutation),
     MaxAttachesPerConnection => ("max_attaches_per_connection", 8, 16, ContractD14, SessionMutation),
-    MaxRetainedTerminalRecords => ("max_retained_terminal_records", 64, 64, ContractD14, RegistryAdmission),
+    MaxRetainedTerminalRecords => ("max_retained_terminal_records", 64, 64, ContractD14, Retention),
     SessionRecordBytes => ("session_record_bytes", 4096, 4096, ContractD14, RegistryAdmission),
-    TerminalRetentionMs => ("terminal_retention_ms", 600_000, 3_600_000, ContractD14, RegistryAdmission),
+    TerminalRetentionMs => ("terminal_retention_ms", 600_000, 3_600_000, ContractD14, Retention),
     MaxEventBacklogEvents => ("max_event_backlog_events", 256, 256, ContractD14, EventDelivery),
     MaxEventBacklogBytes => ("max_event_backlog_bytes", 262_144, 262_144, ContractD14, EventDelivery),
     MaxLeaseQueueEvents => ("max_lease_queue_events", 256, 256, ContractD14, EventDelivery),
     MaxLeaseQueueBytes => ("max_lease_queue_bytes", 65_536, 65_536, ContractD14, EventDelivery),
     MaxConnectionPendingBytes => ("max_connection_pending_bytes", 1_048_576, 1_048_576, ContractD14, ConnectionAdmission),
     MaxConnectionOutboundBytes => ("max_connection_outbound_bytes", 1_048_576, 1_048_576, ContractD14, EventDelivery),
-    AttachHeartbeatIntervalMs => ("attach_heartbeat_interval_ms", 5_000, 5_000, ContractD14, SessionMutation),
-    AttachLeaseTtlMs => ("attach_lease_ttl_ms", 15_000, 15_000, ContractD14, SessionMutation),
-    ObserverGrantTtlMs => ("observer_grant_ttl_ms", 60_000, 300_000, ContractD14, SessionMutation),
+    AttachHeartbeatIntervalMs => ("attach_heartbeat_interval_ms", 5_000, 5_000, ContractD14, Deadline),
+    AttachLeaseTtlMs => ("attach_lease_ttl_ms", 15_000, 15_000, ContractD14, Deadline),
+    ObserverGrantTtlMs => ("observer_grant_ttl_ms", 60_000, 300_000, ContractD14, Deadline),
     MaxPendingObserverGrantsPerSession => ("max_pending_observer_grants_per_session", 8, 8, ContractD14, SessionMutation),
-    HostGrantTtlMs => ("host_grant_ttl_ms", 300_000, 900_000, ContractD14, SessionMutation),
+    HostGrantTtlMs => ("host_grant_ttl_ms", 300_000, 900_000, ContractD14, Deadline),
     MaxPendingHostGrants => ("max_pending_host_grants", 8, 8, ContractD14, SessionMutation),
     HostGrantRecordBytes => ("host_grant_record_bytes", 128, 128, ContractD14, SessionMutation),
     GrantIdBytes => ("grant_id_bytes", 32, 32, ContractD14, RequestAdmission),
-    TransportIdleMs => ("transport_idle_ms", 30_000, 30_000, ContractD14, ConnectionAdmission),
-    RequestTimeoutMs => ("request_timeout_ms", 10_000, 10_000, ContractD14, RequestAdmission),
-    NegotiateTimeoutMs => ("negotiate_timeout_ms", 5_000, 5_000, ContractD14, Handshake),
+    TransportIdleMs => ("transport_idle_ms", 30_000, 30_000, ContractD14, Deadline),
+    RequestTimeoutMs => ("request_timeout_ms", 10_000, 10_000, ContractD14, Deadline),
+    NegotiateTimeoutMs => ("negotiate_timeout_ms", 5_000, 5_000, ContractD14, Deadline),
     PreAuthMaxBytes => ("pre_auth_max_bytes", 8_192, 8_192, ContractD14, Handshake),
-    SpawnBindTimeoutMs => ("spawn_bind_timeout_ms", 30_000, 30_000, ContractD14, SessionMutation),
-    AbortGraceMs => ("abort_grace_ms", 5_000, 5_000, ContractD14, SessionMutation),
-    DrainGraceMs => ("drain_grace_ms", 10_000, 10_000, ContractD14, SessionMutation),
-    OrphanReapGraceMs => ("orphan_reap_grace_ms", 5_000, 5_000, ContractD14, Containment),
-    OrphanRecordRetentionMs => ("orphan_record_retention_ms", 3_600_000, 86_400_000, ContractD14, Containment),
+    SpawnBindTimeoutMs => ("spawn_bind_timeout_ms", 30_000, 30_000, ContractD14, Deadline),
+    AbortGraceMs => ("abort_grace_ms", 5_000, 5_000, ContractD14, Deadline),
+    DrainGraceMs => ("drain_grace_ms", 10_000, 10_000, ContractD14, Deadline),
+    OrphanReapGraceMs => ("orphan_reap_grace_ms", 5_000, 5_000, ContractD14, Deadline),
+    OrphanRecordRetentionMs => ("orphan_record_retention_ms", 3_600_000, 86_400_000, ContractD14, Retention),
     MaxIdempotencyKeysPerSession => ("max_idempotency_keys_per_session", 512, 512, ContractD14, Idempotency),
     MaxIdempotencyBytesPerSession => ("max_idempotency_bytes_per_session", 65_536, 65_536, ContractD14, Idempotency),
     MaxCreateIdempotencyKeys => ("max_create_idempotency_keys", 128, 128, ContractD14, Idempotency),
@@ -244,14 +271,14 @@ define_limits! {
     MaxSpawnEnvEntries => ("max_spawn_env_entries", 128, 128, ContractD14, SessionMutation),
     MaxSpawnFieldBytes => ("max_spawn_field_bytes", 4_096, 4_096, ContractD14, SessionMutation),
     MaxSpawnSpecBytes => ("max_spawn_spec_bytes", 65_536, 65_536, ContractD14, SessionMutation),
-    MaxContentBytesPerSession => ("max_content_bytes_per_session", 268_435_456, 268_435_456, ContractD14, SessionMutation),
-    MaxConnectionsPerEndpoint => ("max_connections_per_endpoint", 16, 16, InheritedTransport, ConnectionAdmission),
+    MaxContentBytesPerSession => ("max_content_bytes_per_session", 268_435_456, 268_435_456, ContractD14, ContentPlane),
     MaxFrameBytes => ("max_frame_bytes", 262_144, 262_144, InheritedTransport, ConnectionAdmission),
     MaxChunkBytes => ("max_chunk_bytes", 262_144, 262_144, InheritedTransport, ConnectionAdmission),
     MaxPendingRequests => ("max_pending_requests", 64, 64, InheritedTransport, ConnectionAdmission),
     MaxChannelCapacity => ("max_channel_capacity", 256, 256, InheritedTransport, ConnectionAdmission),
     MaxRequestRatePerSec => ("max_request_rate_per_sec", 100, 100, InheritedTransport, ConnectionAdmission),
     MaxRequestBurst => ("max_request_burst", 200, 200, InheritedTransport, ConnectionAdmission),
+    MaxConnectionsPerEndpoint => ("max_connections_per_endpoint", 16, 16, InheritedTransport, ConnectionAdmission),
     MaxRequestPayloadBytes => ("max_request_payload_bytes", 1_048_576, 1_048_576, InheritedTransport, ConnectionAdmission),
 }
 
@@ -310,8 +337,11 @@ impl LimitId {
     /// silently disable the mechanism. The two idempotency byte bounds have
     /// the compiled descriptor budget as their floor, and `audit_file_bytes`
     /// has the compiled audit-record budget, so the smallest accepted
-    /// configuration still holds one entry. Fixed transport bounds have their
-    /// own value as the floor.
+    /// configuration still holds one entry. The fixed-format identifier bounds
+    /// (`terminal_id_bytes`, `attach_id_bytes`, `grant_id_bytes`) have their
+    /// system maximum as the floor: the registry and wire formats enforce the
+    /// fixed widths, so a lowered advertisement could not be honored. Fixed
+    /// transport bounds have their own value as the floor.
     #[must_use]
     pub const fn floor(self) -> u64 {
         if self.is_fixed() {
@@ -321,6 +351,9 @@ impl LimitId {
             Self::MaxIdempotencyBytesPerSession => SESSION_IDEMPOTENCY_ENTRY_BYTES as u64,
             Self::MaxCreateIdempotencyBytes => CREATE_IDEMPOTENCY_ENTRY_BYTES as u64,
             Self::AuditFileBytes => AUDIT_RECORD_BYTES as u64,
+            Self::TerminalIdBytes | Self::AttachIdBytes | Self::GrantIdBytes => {
+                self.system_max_value()
+            }
             _ => 1,
         }
     }
@@ -718,6 +751,14 @@ mod tests {
     }
 
     #[test]
+    fn from_name_round_trips_every_compiled_name() {
+        assert_eq!(LimitId::ALL.len(), 54);
+        for limit in LimitId::ALL {
+            assert_eq!(LimitId::from_name(limit.name()), Some(limit));
+        }
+    }
+
+    #[test]
     fn compiled_defaults_and_maxima_are_ordered() {
         for limit in LimitId::ALL {
             assert!(
@@ -756,13 +797,29 @@ mod tests {
             EnforcementStage::Containment
         );
         assert_eq!(LimitId::AuditSegments.stage(), EnforcementStage::AuditSink);
+        assert_eq!(
+            LimitId::MaxContentBytesPerSession.stage(),
+            EnforcementStage::ContentPlane
+        );
+        assert_eq!(
+            LimitId::MaxRetainedTerminalRecords.stage(),
+            EnforcementStage::Retention
+        );
+        assert_eq!(
+            LimitId::AttachLeaseTtlMs.stage(),
+            EnforcementStage::Deadline
+        );
         assert!(EnforcementStage::ConnectionAdmission < EnforcementStage::Handshake);
         assert!(EnforcementStage::Handshake < EnforcementStage::RequestAdmission);
+        assert!(EnforcementStage::RequestAdmission < EnforcementStage::AuditSink);
+        assert!(EnforcementStage::AuditSink < EnforcementStage::Idempotency);
         assert!(EnforcementStage::Idempotency < EnforcementStage::RegistryAdmission);
         assert!(EnforcementStage::RegistryAdmission < EnforcementStage::SessionMutation);
-        assert!(EnforcementStage::SessionMutation < EnforcementStage::EventDelivery);
+        assert!(EnforcementStage::SessionMutation < EnforcementStage::ContentPlane);
+        assert!(EnforcementStage::ContentPlane < EnforcementStage::Retention);
+        assert!(EnforcementStage::Retention < EnforcementStage::EventDelivery);
         assert!(EnforcementStage::EventDelivery < EnforcementStage::Containment);
-        assert!(EnforcementStage::Containment < EnforcementStage::AuditSink);
+        assert!(EnforcementStage::Containment < EnforcementStage::Deadline);
     }
 
     #[test]
@@ -867,6 +924,31 @@ mod tests {
                 floor: 320,
             })
         );
+    }
+
+    #[test]
+    fn fixed_format_identifier_bounds_are_not_lowerable() {
+        for limit in [
+            LimitId::TerminalIdBytes,
+            LimitId::AttachIdBytes,
+            LimitId::GrantIdBytes,
+        ] {
+            assert_eq!(limit.floor(), limit.system_max_value());
+            assert_eq!(
+                Limits::new(&[LimitOverride::new(limit, limit.system_max_value())])
+                    .expect("the fixed value is accepted")
+                    .effective(limit),
+                limit.system_max_value()
+            );
+            assert_eq!(
+                Limits::new(&[LimitOverride::new(limit, limit.system_max_value() - 1)]),
+                Err(LimitsError::BelowFloor {
+                    limit,
+                    requested: limit.system_max_value() - 1,
+                    floor: limit.system_max_value(),
+                })
+            );
+        }
     }
 
     #[test]

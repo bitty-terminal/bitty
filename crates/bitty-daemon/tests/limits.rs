@@ -53,6 +53,25 @@ fn every_cap_accepts_limit_minus_one_and_limit_and_refuses_limit_plus_one() {
                 }),
                 "{limit}"
             );
+        } else if maximum == limit.floor() {
+            assert_eq!(
+                below_max,
+                Err(LimitsError::BelowFloor {
+                    limit,
+                    requested: maximum - 1,
+                    floor: maximum,
+                }),
+                "{limit}"
+            );
+            assert_eq!(
+                above_max,
+                Err(LimitsError::AboveSystemMax {
+                    limit,
+                    requested: maximum + 1,
+                    system_max: maximum,
+                }),
+                "{limit}"
+            );
         } else {
             assert_eq!(
                 below_max
@@ -203,6 +222,30 @@ fn duplicate_overrides_refuse_the_whole_configuration() {
             limit: LimitId::MaxSessions
         }
     );
+}
+
+#[test]
+fn fixed_format_identifier_bounds_cannot_be_advertised_lower_than_enforced() {
+    assert_eq!(
+        bitty_daemon::registry::TERMINAL_ID_MAX_BYTES,
+        LimitId::TerminalIdBytes.system_max_value() as usize
+    );
+    for limit in [
+        LimitId::TerminalIdBytes,
+        LimitId::AttachIdBytes,
+        LimitId::GrantIdBytes,
+    ] {
+        assert_eq!(limit.floor(), limit.system_max_value());
+        assert_eq!(
+            Limits::new(&[LimitOverride::new(limit, limit.system_max_value() - 1)]),
+            Err(LimitsError::BelowFloor {
+                limit,
+                requested: limit.system_max_value() - 1,
+                floor: limit.system_max_value(),
+            })
+        );
+        assert_eq!(Limits::default().effective(limit), limit.system_max_value());
+    }
 }
 
 #[test]

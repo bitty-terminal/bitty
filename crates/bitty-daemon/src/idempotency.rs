@@ -36,6 +36,15 @@
 //! 3. A different fingerprint, method, or target for the same key is
 //!    [`IdempotencyRefusal::Conflict`] and applies nothing.
 //!
+//! # Reservation lifecycle
+//!
+//! Every [`Admission::Execute`] reservation must be completed exactly once with
+//! the real outcome. The store intentionally has no `cancel`/`abandon`: an
+//! executor that knows nothing was applied completes with
+//! [`IdempotencyResult::Refused`], while an executor whose outcome is unknown
+//! must keep the entry in flight and reconcile. Removing an unknown outcome
+//! could let a retry apply the mutation twice, which `D-18` forbids.
+//!
 //! # Capacity and retirement (`D-18`)
 //!
 //! At capacity the store evicts the oldest *retirable* entry first: a stored
@@ -49,6 +58,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::codes::RefusalCode;
 use crate::limits::{
@@ -130,6 +140,12 @@ pub enum IdempotentMethod {
 }
 
 impl IdempotentMethod {
+    /// Every keyed method.
+    ///
+    /// Termination and revocation are absent by construction: they are keyless
+    /// and must never consult either store (`D-18`, C-18).
+    pub const ALL: [Self; 4] = [Self::Create, Self::Attach, Self::Grant, Self::Transfer];
+
     /// The contract method name.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -386,7 +402,11 @@ pub struct AppliedResult {
     pub revision: u64,
     /// 64-bit result handle.
     pub result_ref: u64,
-    /// Whether control had already been claimed when the descriptor was stored.
+    /// Whether control had already been claimed when this replay was built.
+    ///
+    /// The original descriptor starts `false`; [`IdempotencyStore::mark_control_claimed`]
+    /// flips it after a successful claim or transfer, so a later duplicate
+    /// create returns `true` and no token (`D-18`).
     pub control_claimed: bool,
 }
 
@@ -450,11 +470,14 @@ pub enum Admission {
 
 /// A reserved in-flight entry.
 ///
-/// The raw key is private and redacted in [`fmt::Debug`]; the reservation is
-/// only valid for the store that produced it and for that one entry.
+/// The raw key is private and redacted in [`fmt::Debug`]. A reservation is
+/// valid only for the store that produced it (`store_id`), for that one entry
+/// (`sequence`), and for that method. There is no abandon/cancel: every
+/// reservation must be completed with the real outcome (see the module docs).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Reservation {
     key: IdempotencyKey,
+    store_id: u64,
     sequence: u64,
     method: IdempotentMethod,
 }
@@ -488,7 +511,9 @@ pub enum IdempotencyRefusal {
         presented: IdempotentIdentity,
     },
     /// A duplicate arrived while the original execution is still in flight.
-    /// The caller must not execute again.
+    /// The caller must not execute again; it is reported as
+    /// `Denied/IdempotencyConflict` (see [`Self::code`]) and the client retries
+    /// after the original completes.
     InFlight,
     /// A lease-bound result was presented on a different connection
     /// (`Denied/IdempotencyConflict`). The caller must not execute it again.
@@ -510,8 +535,20 @@ pub enum IdempotencyRefusal {
     },
     /// The reservation does not belong to a live in-flight entry in this store.
     UnknownReservation,
+    /// The reservation belongs to a different store instance.
+    WrongStore,
+    /// A session store was asked to retire a different session.
+    WrongSession {
+        /// The session the store was built for.
+        expected: SessionId,
+        /// The session passed to `retire_session`.
+        actual: SessionId,
+    },
     /// The entry was already completed.
     AlreadyCompleted,
+    /// Control cannot be marked claimed on a missing, in-flight, or refused
+    /// create entry.
+    ControlNotApplicable,
     /// The applied result class does not match the reserved method.
     ResultMismatch {
         /// The reserved method.
@@ -549,7 +586,15 @@ impl fmt::Display for IdempotencyRefusal {
                 write!(formatter, "{method} does not belong to the {scope} store")
             }
             Self::UnknownReservation => formatter.write_str("unknown idempotency reservation"),
+            Self::WrongStore => formatter.write_str("reservation belongs to a different store"),
+            Self::WrongSession { expected, actual } => write!(
+                formatter,
+                "session store for {expected} cannot retire {actual}"
+            ),
             Self::AlreadyCompleted => formatter.write_str("request is already completed"),
+            Self::ControlNotApplicable => {
+                formatter.write_str("control cannot be marked claimed on this entry")
+            }
             Self::ResultMismatch { method, class } => {
                 write!(
                     formatter,
@@ -557,6 +602,32 @@ impl fmt::Display for IdempotencyRefusal {
                 )
             }
             Self::SequenceExhausted => formatter.write_str("idempotency sequence would wrap"),
+        }
+    }
+}
+
+impl IdempotencyRefusal {
+    /// The static result code this refusal maps to in the closed taxonomy.
+    ///
+    /// A duplicate while the original is in flight maps to
+    /// `Denied/IdempotencyConflict`: the key cannot be replayed yet and the
+    /// client must retry or reconcile. Store-wiring and invariant failures map
+    /// to `Internal`.
+    #[must_use]
+    pub const fn code(self) -> RefusalCode {
+        match self {
+            Self::Conflict { .. } | Self::InFlight | Self::ReplayOnOtherConnection => {
+                RefusalCode::IdempotencyConflict
+            }
+            Self::Capacity { .. } => RefusalCode::IdempotencyCapacity,
+            Self::WrongScope { .. }
+            | Self::UnknownReservation
+            | Self::WrongStore
+            | Self::WrongSession { .. }
+            | Self::AlreadyCompleted
+            | Self::ControlNotApplicable
+            | Self::ResultMismatch { .. }
+            | Self::SequenceExhausted => RefusalCode::Internal,
         }
     }
 }
@@ -661,7 +732,9 @@ impl Entry {
 /// Construction takes the effective limits; see the module documentation for
 /// the admission protocol and the retirement rules.
 pub struct IdempotencyStore {
+    store_id: u64,
     scope: IdempotencyScope,
+    session_id: Option<SessionId>,
     max_keys: usize,
     max_bytes: usize,
     entry_bytes: usize,
@@ -671,12 +744,22 @@ pub struct IdempotencyStore {
     next_sequence: u64,
 }
 
+/// Process-local store identity. Reservations carry it so a reservation from
+/// one store cannot complete an entry in another store with the same key and
+/// sequence.
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_store_id() -> u64 {
+    NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 impl IdempotencyStore {
-    /// Build the per-session store from the effective limits.
+    /// Build the per-session store for `session_id` from the effective limits.
     #[must_use]
-    pub fn session(limits: &Limits) -> Self {
+    pub fn session(limits: &Limits, session_id: SessionId) -> Self {
         Self::new(
             IdempotencyScope::Session,
+            Some(session_id),
             limits.effective_usize(LimitId::MaxIdempotencyKeysPerSession),
             limits.effective_usize(LimitId::MaxIdempotencyBytesPerSession),
             SESSION_IDEMPOTENCY_ENTRY_BYTES,
@@ -689,6 +772,7 @@ impl IdempotencyStore {
     pub fn create(limits: &Limits) -> Self {
         Self::new(
             IdempotencyScope::Create,
+            None,
             limits.effective_usize(LimitId::MaxCreateIdempotencyKeys),
             limits.effective_usize(LimitId::MaxCreateIdempotencyBytes),
             CREATE_IDEMPOTENCY_ENTRY_BYTES,
@@ -698,13 +782,16 @@ impl IdempotencyStore {
 
     fn new(
         scope: IdempotencyScope,
+        session_id: Option<SessionId>,
         max_keys: usize,
         max_bytes: usize,
         entry_bytes: usize,
         ttl_floor_ms: Option<u64>,
     ) -> Self {
         Self {
+            store_id: next_store_id(),
             scope,
+            session_id,
             max_keys,
             max_bytes,
             entry_bytes,
@@ -713,6 +800,18 @@ impl IdempotencyStore {
             order: BTreeMap::new(),
             next_sequence: 1,
         }
+    }
+
+    /// The process-local store identity.
+    #[must_use]
+    pub const fn store_id(&self) -> u64 {
+        self.store_id
+    }
+
+    /// The session this store belongs to, for a per-session store.
+    #[must_use]
+    pub const fn session_id(&self) -> Option<SessionId> {
+        self.session_id
     }
 
     /// The store's scope.
@@ -851,6 +950,7 @@ impl IdempotencyStore {
         self.order.insert(sequence, request.key);
         Ok(Admission::Execute(Reservation {
             key: request.key,
+            store_id: self.store_id,
             sequence,
             method: request.method,
         }))
@@ -860,15 +960,19 @@ impl IdempotencyStore {
     ///
     /// # Errors
     ///
-    /// Refuses an unknown, stale, or already completed reservation, and an
-    /// applied result whose class does not match the reserved method. A
-    /// refusal leaves the entry in flight so the caller can retry with a valid
-    /// result.
+    /// Refuses a reservation from another store
+    /// ([`IdempotencyRefusal::WrongStore`]), an unknown, stale, or already
+    /// completed reservation, and an applied result whose class does not match
+    /// the reserved method. A refusal leaves the entry in flight so the caller
+    /// can retry with a valid result.
     pub fn complete(
         &mut self,
         reservation: Reservation,
         result: IdempotencyResult,
     ) -> Result<(), IdempotencyRefusal> {
+        if reservation.store_id != self.store_id {
+            return Err(IdempotencyRefusal::WrongStore);
+        }
         let entry = self
             .entries
             .get_mut(&reservation.key)
@@ -902,13 +1006,30 @@ impl IdempotencyStore {
     /// the terminal transition, not at collection). The create store marks the
     /// matching applied entries as retirable once `create_idempotency_ttl_ms`
     /// has elapsed since insertion; refused entries are already retirable.
-    /// Returns the number of entries released or marked.
-    pub fn retire_session(&mut self, session_id: SessionId) -> usize {
+    ///
+    /// A per-session store refuses a different session with
+    /// [`IdempotencyRefusal::WrongSession`] and leaves the store untouched; a
+    /// wiring mistake must not wipe a live session's dedupe state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdempotencyRefusal::WrongSession`] for a per-session store
+    /// built for another session.
+    pub fn retire_session(&mut self, session_id: SessionId) -> Result<usize, IdempotencyRefusal> {
         if self.scope == IdempotencyScope::Session {
+            let expected = self
+                .session_id
+                .expect("a session store is constructed with a session id");
+            if session_id != expected {
+                return Err(IdempotencyRefusal::WrongSession {
+                    expected,
+                    actual: session_id,
+                });
+            }
             let released = self.entries.len();
             self.entries.clear();
             self.order.clear();
-            return released;
+            return Ok(released);
         }
 
         let mut marked = 0;
@@ -920,7 +1041,38 @@ impl IdempotencyStore {
                 }
             }
         }
-        marked
+        Ok(marked)
+    }
+
+    /// Mark a create entry's control as claimed after a successful claim or
+    /// transfer (`D-18`).
+    ///
+    /// A duplicate create then replays the descriptor with
+    /// `control_claimed = true` and no token. Marking an already-claimed entry
+    /// is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdempotencyRefusal::ControlNotApplicable`] for a missing,
+    /// in-flight, or refused entry, or for a non-create store.
+    pub fn mark_control_claimed(&mut self, key: IdempotencyKey) -> Result<(), IdempotencyRefusal> {
+        if self.scope != IdempotencyScope::Create {
+            return Err(IdempotencyRefusal::ControlNotApplicable);
+        }
+        let entry = self
+            .entries
+            .get_mut(&key)
+            .ok_or(IdempotencyRefusal::ControlNotApplicable)?;
+        match &mut entry.state {
+            EntryState::Complete {
+                result: IdempotencyResult::Applied(applied),
+                ..
+            } => {
+                applied.control_claimed = true;
+                Ok(())
+            }
+            _ => Err(IdempotencyRefusal::ControlNotApplicable),
+        }
     }
 
     /// Remove create keys whose retention floor has passed and whose session is
@@ -966,7 +1118,9 @@ impl fmt::Debug for IdempotencyStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("IdempotencyStore")
+            .field("store_id", &self.store_id)
             .field("scope", &self.scope)
+            .field("session_id", &self.session_id)
             .field("entries", &self.entries.len())
             .field("max_keys", &self.max_keys)
             .field("max_bytes", &self.max_bytes)
@@ -1011,8 +1165,25 @@ mod tests {
         )
     }
 
+    fn create_request(seed: u8) -> IdempotentRequest {
+        IdempotentRequest::new(
+            key(seed),
+            IdempotentMethod::Create,
+            IdempotencyTarget::terminal_digest([seed; 16]),
+            fingerprint(seed.wrapping_add(1)),
+            1,
+        )
+    }
+
     fn applied(seed: u8, class: AppliedClass) -> IdempotencyResult {
         IdempotencyResult::Applied(AppliedResult::new(class, session_id(seed), 0, 0, 1, false))
+    }
+
+    fn seed(store: &mut IdempotencyStore, request: IdempotentRequest, result: IdempotencyResult) {
+        let Admission::Execute(reservation) = store.begin(request, ms(1)).expect("begin") else {
+            panic!("new key executes");
+        };
+        store.complete(reservation, result).expect("complete");
     }
 
     #[test]
@@ -1031,6 +1202,7 @@ mod tests {
         assert!(!format!("{value:?}").contains("ab"));
         let reservation = Reservation {
             key: value,
+            store_id: 1,
             sequence: 1,
             method: IdempotentMethod::Attach,
         };
@@ -1038,7 +1210,7 @@ mod tests {
         assert!(!rendered.contains("ab"));
         assert!(rendered.contains("Attach"));
 
-        let store = IdempotencyStore::session(&Limits::default());
+        let store = IdempotencyStore::session(&Limits::default(), session_id(1));
         assert_eq!(store.len(), 0);
         assert!(store.is_empty());
         assert_eq!(store.capacity(), 512);
@@ -1052,7 +1224,7 @@ mod tests {
 
     #[test]
     fn replay_returns_the_identical_result_and_never_executes_twice() {
-        let mut store = IdempotencyStore::session(&Limits::default());
+        let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
         let request = request(1, IdempotentMethod::Attach);
         let stored = applied(2, AppliedClass::Attached);
 
@@ -1070,7 +1242,7 @@ mod tests {
 
     #[test]
     fn duplicate_in_flight_is_refused_without_a_second_admission() {
-        let mut store = IdempotencyStore::session(&Limits::default());
+        let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
         let request = request(1, IdempotentMethod::Attach);
         let first = store.begin(request, ms(1)).expect("begin");
         assert!(matches!(first, Admission::Execute(_)));
@@ -1084,7 +1256,7 @@ mod tests {
 
     #[test]
     fn a_different_fingerprint_for_the_same_key_is_a_conflict() {
-        let mut store = IdempotencyStore::session(&Limits::default());
+        let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
         let request = request(1, IdempotentMethod::Attach);
         let Admission::Execute(reservation) = store.begin(request, ms(1)).expect("begin") else {
             panic!("first request executes");
@@ -1110,7 +1282,7 @@ mod tests {
 
     #[test]
     fn scope_guards_separate_the_two_stores() {
-        let mut session_store = IdempotencyStore::session(&Limits::default());
+        let mut session_store = IdempotencyStore::session(&Limits::default(), session_id(1));
         assert!(matches!(
             session_store.begin(request(1, IdempotentMethod::Create), ms(1)),
             Err(IdempotencyRefusal::WrongScope { .. })
@@ -1125,7 +1297,7 @@ mod tests {
 
     #[test]
     fn completion_rejects_unknown_reservations_and_wrong_classes() {
-        let mut store = IdempotencyStore::session(&Limits::default());
+        let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
         let Admission::Execute(reservation) = store
             .begin(request(1, IdempotentMethod::Attach), ms(1))
             .expect("begin")
@@ -1133,10 +1305,12 @@ mod tests {
             panic!("new key executes");
         };
 
+        let store_id = store.store_id();
         assert_eq!(
             store.complete(
                 Reservation {
                     key: key(9),
+                    store_id,
                     sequence: 9,
                     method: IdempotentMethod::Attach,
                 },
@@ -1168,7 +1342,7 @@ mod tests {
             LimitOverride::new(LimitId::MaxIdempotencyBytesPerSession, 256),
         ])
         .expect("small valid store");
-        let mut store = IdempotencyStore::session(&limits);
+        let mut store = IdempotencyStore::session(&limits, session_id(1));
         assert_eq!(store.capacity(), 2);
 
         let first = request(1, IdempotentMethod::Attach);
@@ -1221,7 +1395,7 @@ mod tests {
             LimitOverride::new(LimitId::MaxIdempotencyBytesPerSession, 128),
         ])
         .expect("small valid store");
-        let mut store = IdempotencyStore::session(&limits);
+        let mut store = IdempotencyStore::session(&limits, session_id(1));
 
         let first = request(1, IdempotentMethod::Attach);
         assert!(matches!(
@@ -1247,7 +1421,7 @@ mod tests {
             LimitOverride::new(LimitId::MaxIdempotencyBytesPerSession, 512),
         ])
         .expect("small valid store");
-        let mut store = IdempotencyStore::session(&limits);
+        let mut store = IdempotencyStore::session(&limits, session_id(1));
         for seed in 0..4u8 {
             let request = request(seed, IdempotentMethod::Attach);
             let Admission::Execute(reservation) =
@@ -1303,7 +1477,7 @@ mod tests {
             Ok(Admission::Replay(applied(3, AppliedClass::Created)))
         );
 
-        assert_eq!(store.retire_session(session_id(3)), 1);
+        assert_eq!(store.retire_session(session_id(3)).expect("retire"), 1);
         assert_eq!(store.len(), 1);
         let ttl = limits.effective(LimitId::CreateIdempotencyTtlMs);
         let due = 1 + ttl;
@@ -1331,13 +1505,223 @@ mod tests {
 
         let ttl = store.ttl_floor_ms().expect("create store has a TTL");
         assert_eq!(store.evict_expired(ms(ttl + 1)), 0);
-        assert_eq!(store.retire_session(session_id(99)), 0);
+        assert_eq!(store.retire_session(session_id(99)).expect("retire"), 0);
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn session_store_release_refuses_a_mismatched_session() {
+        let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
+        let request = request(1, IdempotentMethod::Attach);
+        seed(&mut store, request, applied(2, AppliedClass::Attached));
+        assert_eq!(store.len(), 1);
+
+        assert_eq!(
+            store.retire_session(session_id(9)),
+            Err(IdempotencyRefusal::WrongSession {
+                expected: session_id(1),
+                actual: session_id(9),
+            })
+        );
+        assert_eq!(store.len(), 1);
+        assert_eq!(
+            store.begin(request, ms(2)),
+            Ok(Admission::Replay(applied(2, AppliedClass::Attached)))
+        );
+    }
+
+    #[test]
+    fn a_reservation_cannot_complete_in_another_store() {
+        let mut first = IdempotencyStore::session(&Limits::default(), session_id(1));
+        let mut second = IdempotencyStore::session(&Limits::default(), session_id(2));
+        let request = request(1, IdempotentMethod::Attach);
+
+        let Admission::Execute(reservation) = first.begin(request, ms(1)).expect("begin") else {
+            panic!("first store executes");
+        };
+        assert!(matches!(
+            second.begin(request, ms(1)),
+            Ok(Admission::Execute(_))
+        ));
+        assert_eq!(
+            second.complete(reservation, applied(2, AppliedClass::Attached)),
+            Err(IdempotencyRefusal::WrongStore)
+        );
+        assert_eq!(second.len(), 1);
+        assert_eq!(
+            second.begin(request, ms(2)),
+            Err(IdempotencyRefusal::InFlight)
+        );
+    }
+
+    #[test]
+    fn an_aba_reservation_is_rejected_after_re_admission() {
+        let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
+        let request = request(1, IdempotentMethod::Attach);
+        let Admission::Execute(old) = store.begin(request, ms(1)).expect("begin") else {
+            panic!("first admission executes");
+        };
+        store
+            .complete(old, applied(2, AppliedClass::Attached))
+            .expect("complete");
+        assert_eq!(store.retire_session(session_id(1)).expect("retire"), 1);
+
+        let Admission::Execute(new) = store.begin(request, ms(2)).expect("begin") else {
+            panic!("re-admission executes");
+        };
+        assert_eq!(
+            store.complete(old, applied(2, AppliedClass::Attached)),
+            Err(IdempotencyRefusal::UnknownReservation)
+        );
+        store
+            .complete(new, applied(2, AppliedClass::Attached))
+            .expect("new reservation completes");
+    }
+
+    #[test]
+    fn control_claimed_transitions_once_and_replays() {
+        let mut store = IdempotencyStore::create(&Limits::default());
+        let request = create_request(1);
+        let stored = applied(2, AppliedClass::Created);
+        seed(&mut store, request, stored);
+
+        let applied_with_claim = IdempotencyResult::Applied(AppliedResult::new(
+            AppliedClass::Created,
+            session_id(2),
+            0,
+            0,
+            1,
+            true,
+        ));
+        assert_eq!(store.begin(request, ms(2)), Ok(Admission::Replay(stored)));
+        store
+            .mark_control_claimed(key(1))
+            .expect("claim is recorded");
+        store
+            .mark_control_claimed(key(1))
+            .expect("claim is idempotent");
+        assert_eq!(
+            store.begin(request, ms(3)),
+            Ok(Admission::Replay(applied_with_claim))
+        );
+        assert_eq!(
+            store.mark_control_claimed(key(99)),
+            Err(IdempotencyRefusal::ControlNotApplicable)
+        );
+
+        let mut refused_store = IdempotencyStore::create(&Limits::default());
+        seed(
+            &mut refused_store,
+            create_request(1),
+            IdempotencyResult::Refused(RefusalCode::ConsentRequired),
+        );
+        assert_eq!(
+            refused_store.mark_control_claimed(key(1)),
+            Err(IdempotencyRefusal::ControlNotApplicable)
+        );
+    }
+
+    #[test]
+    fn control_claim_is_not_applicable_to_a_session_store() {
+        let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
+        assert_eq!(
+            store.mark_control_claimed(key(1)),
+            Err(IdempotencyRefusal::ControlNotApplicable)
+        );
+    }
+
+    #[test]
+    fn refusal_codes_are_mapped_into_the_closed_taxonomy() {
+        let identity = IdempotentIdentity {
+            method: IdempotentMethod::Attach,
+            target: target(1),
+            fingerprint: fingerprint(2),
+        };
+        assert_eq!(
+            IdempotencyRefusal::Conflict {
+                existing: identity,
+                presented: identity,
+            }
+            .code(),
+            RefusalCode::IdempotencyConflict
+        );
+        assert_eq!(
+            IdempotencyRefusal::InFlight.code(),
+            RefusalCode::IdempotencyConflict
+        );
+        assert_eq!(
+            IdempotencyRefusal::ReplayOnOtherConnection.code(),
+            RefusalCode::IdempotencyConflict
+        );
+        assert_eq!(
+            IdempotencyRefusal::Capacity {
+                max_keys: 1,
+                max_bytes: 128,
+            }
+            .code(),
+            RefusalCode::IdempotencyCapacity
+        );
+        assert_eq!(IdempotencyRefusal::WrongStore.code(), RefusalCode::Internal);
+        assert_eq!(
+            IdempotencyRefusal::WrongSession {
+                expected: session_id(1),
+                actual: session_id(2),
+            }
+            .code(),
+            RefusalCode::Internal
+        );
+    }
+
+    #[test]
+    fn termination_and_revocation_are_absent_from_the_keyed_methods() {
+        // C-18's end-to-end "a full store never blocks termination" needs the
+        // bitty#2607 service layer. Structurally, the keyed method set excludes
+        // abort/kill/stop/detach-other/grant-revoke, so no store capacity can
+        // gate them.
+        assert_eq!(IdempotentMethod::ALL.len(), 4);
+        for method in IdempotentMethod::ALL {
+            assert!(matches!(
+                method.scope(),
+                IdempotencyScope::Session | IdempotencyScope::Create
+            ));
+        }
+    }
+
+    #[test]
+    fn an_uncompleted_reservation_keeps_the_entry_in_flight() {
+        let limits = Limits::new(&[
+            LimitOverride::new(LimitId::MaxIdempotencyKeysPerSession, 1),
+            LimitOverride::new(LimitId::MaxIdempotencyBytesPerSession, 128),
+        ])
+        .expect("small valid store");
+        let mut store = IdempotencyStore::session(&limits, session_id(1));
+        let Admission::Execute(reservation) = store
+            .begin(request(1, IdempotentMethod::Attach), ms(1))
+            .expect("begin")
+        else {
+            panic!("new key executes");
+        };
+        let _ = reservation;
+
+        // There is no abandon/cancel: the entry stays in flight, a duplicate
+        // is refused, and capacity protects it from eviction.
+        assert_eq!(
+            store.begin(request(1, IdempotentMethod::Attach), ms(2)),
+            Err(IdempotencyRefusal::InFlight)
+        );
+        assert_eq!(
+            store.begin(request(2, IdempotentMethod::Attach), ms(3)),
+            Err(IdempotencyRefusal::Capacity {
+                max_keys: 1,
+                max_bytes: 128,
+            })
+        );
         assert_eq!(store.len(), 1);
     }
 
     #[test]
     fn session_store_release_is_immediate_and_total() {
-        let mut store = IdempotencyStore::session(&Limits::default());
+        let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
         for seed in 0..8u8 {
             let request = request(seed, IdempotentMethod::Attach);
             let Admission::Execute(reservation) = store.begin(request, ms(1)).expect("begin")
@@ -1348,7 +1732,7 @@ mod tests {
                 .complete(reservation, applied(seed, AppliedClass::Attached))
                 .expect("complete");
         }
-        assert_eq!(store.retire_session(session_id(1)), 8);
+        assert_eq!(store.retire_session(session_id(1)).expect("retire"), 8);
         assert!(store.is_empty());
         assert_eq!(store.accounted_bytes(), 0);
     }

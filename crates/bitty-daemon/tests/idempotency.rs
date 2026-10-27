@@ -59,7 +59,7 @@ fn small_session_store(max_keys: u64, max_bytes: u64) -> IdempotencyStore {
         LimitOverride::new(LimitId::MaxIdempotencyBytesPerSession, max_bytes),
     ])
     .expect("valid small store");
-    IdempotencyStore::session(&limits)
+    IdempotencyStore::session(&limits, session_id(1))
 }
 
 struct Executor {
@@ -101,7 +101,7 @@ fn seed(store: &mut IdempotencyStore, request: IdempotentRequest, result: Idempo
 
 #[test]
 fn replay_returns_the_identical_result_and_never_executes_twice() {
-    let mut store = IdempotencyStore::session(&Limits::default());
+    let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
     let mut executor = Executor::new();
     let request = request(1, IdempotentMethod::Attach);
     let result = applied(2, AppliedClass::Attached);
@@ -124,7 +124,7 @@ fn replay_returns_the_identical_result_and_never_executes_twice() {
 
 #[test]
 fn duplicate_while_in_flight_is_refused_without_executing_again() {
-    let mut store = IdempotencyStore::session(&Limits::default());
+    let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
     let mut executor = Executor::new();
     let request = request(1, IdempotentMethod::Attach);
     let result = applied(2, AppliedClass::Attached);
@@ -146,7 +146,7 @@ fn duplicate_while_in_flight_is_refused_without_executing_again() {
 
 #[test]
 fn same_key_with_a_different_fingerprint_is_a_conflict() {
-    let mut store = IdempotencyStore::session(&Limits::default());
+    let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
     let request = request(1, IdempotentMethod::Attach);
     seed(&mut store, request, applied(2, AppliedClass::Attached));
 
@@ -168,7 +168,7 @@ fn same_key_with_a_different_fingerprint_is_a_conflict() {
 
 #[test]
 fn a_refused_result_replays_without_re_execution() {
-    let mut store = IdempotencyStore::session(&Limits::default());
+    let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
     let mut executor = Executor::new();
     let request = request(1, IdempotentMethod::Grant);
     let refused = IdempotencyResult::Refused(RefusalCode::ConsentRequired);
@@ -201,7 +201,7 @@ fn create_keys_retire_only_after_the_terminal_transition_and_ttl_floor() {
 
     let due = 1 + ttl;
     assert_eq!(store.evict_expired(ms(due + 10)), 0);
-    assert_eq!(store.retire_session(session_id(2)), 1);
+    assert_eq!(store.retire_session(session_id(2)).expect("retire"), 1);
     assert_eq!(store.evict_expired(ms(due - 1)), 0);
     assert_eq!(store.len(), 1);
 
@@ -227,7 +227,7 @@ fn create_keys_are_not_retired_while_the_session_is_live_even_past_the_ttl() {
 
     let ttl = limits.effective(LimitId::CreateIdempotencyTtlMs);
     assert_eq!(store.evict_expired(ms(ttl + 10_000)), 0);
-    assert_eq!(store.retire_session(session_id(99)), 0);
+    assert_eq!(store.retire_session(session_id(99)).expect("retire"), 0);
     assert_eq!(store.len(), 1);
     assert_eq!(
         store.begin(request, ms(ttl + 10_001)),
@@ -362,7 +362,7 @@ fn seed_static(store: &mut IdempotencyStore, seed: u16) {
 
 #[test]
 fn stores_refuse_methods_from_the_other_scope() {
-    let mut session_store = IdempotencyStore::session(&Limits::default());
+    let mut session_store = IdempotencyStore::session(&Limits::default(), session_id(1));
     assert!(matches!(
         session_store.begin(create_request(1), ms(1)),
         Err(IdempotencyRefusal::WrongScope { .. })
@@ -379,7 +379,7 @@ fn stores_refuse_methods_from_the_other_scope() {
 
 #[test]
 fn a_conflict_never_prints_the_raw_key() {
-    let mut store = IdempotencyStore::session(&Limits::default());
+    let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
     let request = request(0xabab, IdempotentMethod::Attach);
     seed(&mut store, request, applied(2, AppliedClass::Attached));
 
@@ -393,7 +393,7 @@ fn a_conflict_never_prints_the_raw_key() {
 
 #[test]
 fn lease_bound_replays_are_restricted_to_the_originating_connection() {
-    let mut store = IdempotencyStore::session(&Limits::default());
+    let mut store = IdempotencyStore::session(&Limits::default(), session_id(1));
     let request = request(1, IdempotentMethod::Attach);
     seed(&mut store, request, applied(2, AppliedClass::Attached));
 
@@ -421,4 +421,88 @@ fn create_results_replay_across_connections_after_a_lost_response() {
         store.begin(other_connection, ms(2)),
         Ok(Admission::Replay(applied(2, AppliedClass::Created)))
     );
+}
+
+#[test]
+fn create_store_capacity_is_128_entries_and_32_768_bytes() {
+    let limits = Limits::default();
+    let mut store = IdempotencyStore::create(&limits);
+    assert_eq!(store.capacity(), 128);
+    assert_eq!(store.max_bytes(), 32_768);
+
+    for seed in 0..128u16 {
+        let request = create_request(seed);
+        let Admission::Execute(reservation) = store.begin(request, ms(1)).expect("begin") else {
+            panic!("new create key executes");
+        };
+        store
+            .complete(
+                reservation,
+                applied(u8::try_from(seed).expect("bounded"), AppliedClass::Created),
+            )
+            .expect("complete");
+    }
+    assert_eq!(store.len(), 128);
+    assert_eq!(store.accounted_bytes(), 32_768);
+    assert_eq!(
+        store.begin(create_request(128), ms(2)),
+        Err(IdempotencyRefusal::Capacity {
+            max_keys: 128,
+            max_bytes: 32_768,
+        })
+    );
+    assert_eq!(store.len(), 128);
+}
+
+#[test]
+fn create_store_byte_bound_can_be_lowered_independently() {
+    let limits = Limits::new(&[
+        LimitOverride::new(LimitId::MaxCreateIdempotencyKeys, 128),
+        LimitOverride::new(LimitId::MaxCreateIdempotencyBytes, 256),
+    ])
+    .expect("valid create-store budget");
+    let mut store = IdempotencyStore::create(&limits);
+    assert_eq!(store.capacity(), 1);
+
+    let Admission::Execute(reservation) = store.begin(create_request(1), ms(1)).expect("begin")
+    else {
+        panic!("new create key executes");
+    };
+    store
+        .complete(reservation, applied(2, AppliedClass::Created))
+        .expect("complete");
+    assert_eq!(
+        store.begin(create_request(2), ms(2)),
+        Err(IdempotencyRefusal::Capacity {
+            max_keys: 128,
+            max_bytes: 256,
+        })
+    );
+    assert_eq!(store.accounted_bytes(), 256);
+}
+
+#[test]
+fn lowered_create_ttl_is_honored_after_the_terminal_transition() {
+    let limits = Limits::new(&[LimitOverride::new(LimitId::CreateIdempotencyTtlMs, 10)])
+        .expect("valid lowered TTL");
+    let mut store = IdempotencyStore::create(&limits);
+    let request = create_request(1);
+    let Admission::Execute(reservation) = store.begin(request, ms(1)).expect("begin") else {
+        panic!("new create key executes");
+    };
+    store
+        .complete(reservation, applied(2, AppliedClass::Created))
+        .expect("complete");
+
+    assert_eq!(
+        store.evict_expired(ms(100)),
+        0,
+        "live session never retires"
+    );
+    assert_eq!(store.retire_session(session_id(2)).expect("retire"), 1);
+    let due = 1 + 10;
+    assert_eq!(store.evict_expired(ms(due - 1)), 0);
+    assert_eq!(store.len(), 1);
+    assert_eq!(store.evict_expired(ms(due)), 1);
+    assert!(store.is_empty());
 }

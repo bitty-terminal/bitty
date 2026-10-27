@@ -50,9 +50,9 @@ fn record_is_copy_fixed_size_and_has_no_content_fields() {
         std::mem::size_of::<AuditRecord>()
     );
 
-    // No field can be a String, Vec, Box, or borrowed text: every one of those
-    // would make AuditRecord non-Copy and/or give it a destructor. The marker
-    // check below proves the raw terminal id is not a field.
+    // A String, Vec, or Box field would make AuditRecord non-Copy or give it a
+    // destructor. A static string would still be Copy, so the marker check
+    // below proves the raw terminal id is absent from the closed field list.
     let marker = "terminal-marker-must-not-be-copied";
     let terminal_id = bitty_daemon::registry::TerminalId::supplied(marker).expect("safe marker");
     assert_eq!(terminal_id.as_str(), marker);

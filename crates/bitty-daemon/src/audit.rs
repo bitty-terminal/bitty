@@ -16,8 +16,10 @@
 //! # What a record may contain
 //!
 //! Every field is a closed enum, a numeric counter, a fixed-size identifier,
-//! or a digest. There is no `String`, `Vec`, byte payload, or borrowed text
-//! field:
+//! or a digest. There is no `String`, `Vec`, `Box`, byte payload, or stored
+//! borrowed text field. A `&'static str` would be `Copy` and allocation-free,
+//! so the no-text guarantee comes from the closed field list and the marker
+//! test, not from `Copy` alone:
 //!
 //! - no terminal content, PTY bytes, scrollback, clipboard, or transcript;
 //! - no argv, environment, working directory, or spawn-spec value;
@@ -42,7 +44,10 @@
 //! record and increments [`AuditCounters::dropped`]; the append, the drop, the
 //! refusal count, and the terminal-transition count are all observable. Event
 //! ids are strictly increasing and never reused, so a reader can detect the
-//! gap left by a dropped oldest record.
+//! gap left by a dropped oldest record. The sink writer removes batches with
+//! [`AuditRing::drain`] or [`AuditRing::take_until`]; an explicit drain is not
+//! an overflow and increments [`AuditCounters::drained`], not
+//! [`AuditCounters::dropped`].
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -106,10 +111,18 @@ pub enum AuditAction {
     Attach,
     /// `session.detach`.
     Detach,
-    /// `session.grant` mint.
+    /// `session.grant` mint (observer grant).
     Grant,
-    /// `session.grant.revoke`.
+    /// `session.grant.revoke` (observer grant).
     GrantRevoke,
+    /// `daemon.host_grant` mint (host-consent grant).
+    HostGrant,
+    /// `daemon.host_grant.revoke`.
+    HostGrantRevoke,
+    /// `daemon.host_grant.consume`.
+    HostGrantConsume,
+    /// `daemon.host_grant.expire`.
+    HostGrantExpire,
     /// `session.control.transfer`.
     Transfer,
     /// Controller-only terminal resize.
@@ -147,6 +160,10 @@ impl AuditAction {
             Self::Detach => "session.detach",
             Self::Grant => "session.grant",
             Self::GrantRevoke => "session.grant.revoke",
+            Self::HostGrant => "daemon.host_grant",
+            Self::HostGrantRevoke => "daemon.host_grant.revoke",
+            Self::HostGrantConsume => "daemon.host_grant.consume",
+            Self::HostGrantExpire => "daemon.host_grant.expire",
             Self::Transfer => "session.control.transfer",
             Self::Resize => "session.resize",
             Self::Abort => "session.abort",
@@ -519,9 +536,10 @@ impl AuditEntry {
 /// One immutable audit record.
 ///
 /// The type is `Copy`, has no destructor, and every field is a closed enum,
-/// numeric counter, fixed-size id, or digest. A content field (`String`,
-/// `Vec`, `&str`, byte payload) would make one of those properties fail; the
-/// unit tests assert them structurally.
+/// numeric counter, fixed-size id, or digest. There is no `String`, `Vec`,
+/// `Box`, byte payload, or stored borrowed text field. A `&'static str` field
+/// would still be `Copy`, so the tests combine the fixed size and no-destructor
+/// checks with a marker test that proves a raw terminal id is absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditRecord {
     /// Stable, never-reused event id.
@@ -553,6 +571,8 @@ pub struct AuditCounters {
     pub appended: u64,
     /// Oldest records dropped because the ring was full.
     pub dropped: u64,
+    /// Records removed by an explicit drain for the sink writer.
+    pub drained: u64,
     /// Appended records whose result was a refusal.
     pub refusals: u64,
     /// Appended records carrying a terminal classification.
@@ -700,6 +720,49 @@ impl AuditRing {
         self.records.iter()
     }
 
+    /// Remove up to `max` oldest records for the sink writer.
+    ///
+    /// The returned vector is bounded by the ring capacity and by `max`; the
+    /// records are [`Copy`] values and keep their event ids. An explicit drain
+    /// is not an overflow and does not increment [`AuditCounters::dropped`]; it
+    /// increments [`AuditCounters::drained`].
+    pub fn drain(&mut self, max: usize) -> Vec<AuditRecord> {
+        let take = max.min(self.records.len());
+        let mut drained = Vec::with_capacity(take);
+        for _ in 0..take {
+            if let Some(record) = self.records.pop_front() {
+                drained.push(record);
+            }
+        }
+        self.counters.drained = self
+            .counters
+            .drained
+            .saturating_add(u64::try_from(drained.len()).unwrap_or(u64::MAX));
+        drained
+    }
+
+    /// Remove every retained record with an event id at or before `through`.
+    ///
+    /// A sink writer tracks the last event id it persisted and calls this with
+    /// that id. If the oldest retained id is greater than `through`, nothing is
+    /// removed. Draining does not reuse event ids and does not increment
+    /// [`AuditCounters::dropped`].
+    pub fn take_until(&mut self, through: AuditEventId) -> Vec<AuditRecord> {
+        let mut drained = Vec::new();
+        while let Some(record) = self.records.front() {
+            if record.event_id > through {
+                break;
+            }
+            let record = self.records.pop_front().expect("checked above");
+            drained.push(record);
+        }
+        self.counters.drained = self
+            .counters
+            .drained
+            .saturating_add(u64::try_from(drained.len()).unwrap_or(u64::MAX));
+        drained
+    }
+
     /// The oldest retained record.
     #[must_use]
     pub fn oldest(&self) -> Option<&AuditRecord> {
@@ -763,10 +826,10 @@ mod tests {
             "record is {} bytes, budget is {AUDIT_RECORD_BYTES}",
             std::mem::size_of::<AuditRecord>()
         );
-        // A String, Vec, or borrowed text field would make the type non-Copy
-        // and give it a destructor; the assertions above are the structural
-        // guard, and the field list is the closed vocabulary documented on the
-        // type.
+        // A String, Vec, or Box field would make the type non-Copy or give it
+        // a destructor. A static string would still be Copy, so the field list
+        // plus the marker test is the no-text guard; the assertions above are
+        // the fixed-size/no-heap proof.
     }
 
     #[test]
@@ -912,6 +975,77 @@ mod tests {
             audit_ring_capacity(&defaults),
             (1_048_576 * 2) / AUDIT_RECORD_BYTES
         );
+    }
+
+    #[test]
+    fn host_grant_actions_use_the_grant_id_target() {
+        let actions = [
+            (AuditAction::HostGrant, "daemon.host_grant"),
+            (AuditAction::HostGrantRevoke, "daemon.host_grant.revoke"),
+            (AuditAction::HostGrantConsume, "daemon.host_grant.consume"),
+            (AuditAction::HostGrantExpire, "daemon.host_grant.expire"),
+        ];
+        let grant_id = [0x42; 16];
+        let mut ring = AuditRing::new(instance(1), &small_limits(8));
+        for (action, spelling) in actions {
+            assert_eq!(action.as_str(), spelling);
+            let event_id = ring
+                .record(
+                    AuditEntry::new(action).target(AuditTarget::grant(grant_id)),
+                    ms(1),
+                )
+                .expect("append");
+            let record = ring
+                .records()
+                .find(|record| record.event_id == event_id)
+                .expect("record retained");
+            assert_eq!(record.target.kind(), AuditTargetKind::Grant);
+            assert_eq!(record.target.id(), grant_id);
+        }
+        assert_eq!(ring.counters().appended, 4);
+    }
+
+    #[test]
+    fn drain_is_bounded_and_take_until_tracks_the_last_written_id() {
+        let mut ring = AuditRing::new(instance(1), &small_limits(8));
+        for action in [
+            AuditAction::Negotiate,
+            AuditAction::Create,
+            AuditAction::Attach,
+        ] {
+            ring.record(AuditEntry::new(action), ms(1)).expect("append");
+        }
+
+        let first = ring.drain(2);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].event_id.get(), 1);
+        assert_eq!(first[1].event_id.get(), 2);
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring.counters().drained, 2);
+        assert_eq!(ring.counters().dropped, 0);
+
+        let rest = ring.take_until(AuditEventId::FIRST);
+        assert!(rest.is_empty(), "nothing at or before id 1 remains");
+        let rest = ring.take_until(AuditEventId(3));
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].event_id.get(), 3);
+        assert!(ring.is_empty());
+        assert_eq!(ring.counters().drained, 3);
+        assert_eq!(ring.counters().dropped, 0);
+    }
+
+    #[test]
+    fn ring_record_budget_fits_inside_the_sink_budget() {
+        for limits in [Limits::default(), small_limits(7)] {
+            let capacity = audit_ring_capacity(&limits);
+            let accounted = u64::try_from(capacity)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(AUDIT_RECORD_BYTES as u64);
+            let sink = limits
+                .effective(LimitId::AuditFileBytes)
+                .saturating_mul(limits.effective(LimitId::AuditSegments));
+            assert!(accounted <= sink, "{accounted} > {sink}");
+        }
     }
 
     #[test]

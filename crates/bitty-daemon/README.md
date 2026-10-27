@@ -128,9 +128,10 @@ bitty#2604 owns that directory and its current-user-only DACL.
 `RC-9`/`RC-10` transport bounds.
 
 - `LimitId::ALL` has 54 entries in contract order: the 46 `D-14` rows, then
-  `max_connections_per_endpoint`, `max_frame_bytes`, `max_chunk_bytes`,
+  the inherited bounds in prose order: `max_frame_bytes`, `max_chunk_bytes`,
   `max_pending_requests`, `max_channel_capacity`, `max_request_rate_per_sec`,
-  `max_request_burst`, and `max_request_payload_bytes`. Each entry exposes
+  `max_request_burst`, `max_connections_per_endpoint`, and
+  `max_request_payload_bytes`. Each entry exposes
   `name()`, `default_value()`, `system_max_value()`, `source()`, `floor()`, and
   `stage()`.
 - `Limits::default()` uses every compiled default. `Limits::new` applies
@@ -141,11 +142,19 @@ bitty#2604 owns that directory and its current-user-only DACL.
 - `Limits::advertised()` yields the `{effective, default, system_max}` triples;
   `handshake::negotiate` returns them in `NegotiateResponse::limits` for the
   run, so a client parameterizes on `effective`, never on a default.
-- The enforcement-order table in the module docs assigns every limit to a
-  stage (`ConnectionAdmission` through `AuditSink`) and states the refusal
-  ordering for bitty#2607: a breach refuses whole before the protected
-  registry, stream, lease, grant, or idempotency structure changes; the only
-  write a refusal may perform is its own audit record.
+- The fixed-format identifier bounds (`terminal_id_bytes`, `attach_id_bytes`,
+  `grant_id_bytes`) have their system maximum as their compiled floor, so a
+  lowered configuration cannot advertise a value the registry or wire format
+  does not enforce. `TERMINAL_ID_MAX_BYTES` is derived from the same table.
+- The ordered stage table in the module docs assigns every limit to a stage.
+  The audit-sink availability gate precedes the mutating stages (`D-16`), the
+  content cap prunes rather than refusing, retained-record collection is a
+  retention stage, and heartbeat/lease/grant/request/idle/grace bounds are
+  timer stages that produce timeouts/expiry transitions, not `LimitExceeded`
+  refusals.
+  A refusal refuses whole before the protected registry, stream, lease, grant,
+  or idempotency structure changes; the only write a refusal may perform is its
+  own audit record.
 
 ## Idempotency (bitty#2603)
 
@@ -157,9 +166,23 @@ bitty#2604 owns that directory and its current-user-only DACL.
   budget and the `create_idempotency_ttl_ms` retention floor.
 - `begin` returns `Admission::Replay` for the same key, method, target, and
   fingerprint; the executor does not run twice. A duplicate while the original
-  call is in flight is `InFlight`. A different fingerprint, method, or target is
-  a typed `Conflict`. A lease-bound result is replayed only on its originating
-  connection; a create result replays across connections.
+  call is in flight is `InFlight` and maps to `IdempotencyConflict`. A
+  different fingerprint, method, or target is a typed `Conflict`. A lease-bound
+  result is replayed only on its originating connection; a create result
+  replays across connections. A reservation is bound to its store identity and
+  sequence, so it cannot complete an entry in another store or after a later
+  re-admission.
+- A per-session store is constructed for one `SessionId`; `retire_session`
+  refuses a different session and leaves the live store untouched. Store
+  wiring/invariant refusals map to `Internal`; capacity maps to
+  `IdempotencyCapacity`.
+- `mark_control_claimed` flips a completed create descriptor to
+  `control_claimed = true`, so a later duplicate returns no token (`D-18`).
+  There is deliberately no abandon/cancel: every reservation must complete
+  with the real outcome, and an unknown outcome stays in flight and is
+  reconciled rather than evicted. C-18's end-to-end termination-under-full-
+  store proof needs bitty#2607; the keyed method set structurally excludes
+  termination and revocation.
 - At capacity the oldest retirable entry is evicted first: a refusal that
   applied nothing, or a create key whose session is terminal and whose retention
   floor passed. In-flight and live applied entries are never evicted; when no
@@ -179,14 +202,20 @@ bitty#2604 owns that directory and its current-user-only DACL.
   the daemon instance, the action, the static result, optional session
   counters, optional authenticated actor facts, the action target, optional
   refusal counts, and optional terminal classification.
-- There is no `String`, `Vec`, payload, argv, environment, clipboard, prompt,
-  transcript, raw `terminal_id`, control token, or caller label field. A create
+- There is no `String`, `Vec`, `Box`, payload, argv, environment, clipboard,
+  prompt, transcript, raw `terminal_id`, control token, or caller label field. A create
   or terminal transition uses `AuditTarget::terminal_digest`; a refusal carries
   its static `RefusalCode` and numeric `AuditCounts` only.
 - The ring holds `audit_file_bytes × audit_segments / AUDIT_RECORD_BYTES`
-  records (320 accounted bytes each). Overflow drops the oldest record, counts
-  it in `AuditCounters::dropped`, and never reuses an event id. `appended`,
-  `dropped`, `refusals`, and `terminal_transitions` are observable.
+  records (320 accounted bytes each); the accounted ring bytes are therefore
+  capped by the sink budget. Overflow drops the oldest record, counts it in
+  `AuditCounters::dropped`, and never reuses an event id. `appended`, `dropped`,
+  `drained`, `refusals`, and `terminal_transitions` are observable.
+- `drain(max)` and `take_until(event_id)` remove bounded, `Copy` records for
+  the sink writer; a drain is not an overflow and bumps `drained`, not
+  `dropped`.
+- Host-consent grants have `daemon.host_grant` mint, consume, revoke, and expiry
+  actions; a grant action targets `AuditTarget::grant` (`grant_id`).
 - The ring is the staging buffer; the owner-private rotating file sink and the
   per-connection refusal budget stay with bitty#2607.
 

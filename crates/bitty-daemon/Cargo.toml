@@ -66,7 +66,7 @@ zeroize = "1.9"
 # (flock, fcntl), `socket` (SO_PEERCRED / LOCAL_PEER*, the non-blocking stale
 # probe), `user` (uid/gid), `signal` (peer liveness), `process` (pid types).
 # Windows compiles the typed UnsupportedPlatform path and links no nix code.
-nix = { workspace = true, features = ["fs", "poll", "process", "signal", "socket", "user"] }
+nix = { workspace = true, features = ["fs", "poll", "process", "signal", "socket", "uio", "user"] }
 
 [dev-dependencies]
 # CTX-1619: temporary journal directories for the orphan-journal tests. The

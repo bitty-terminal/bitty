@@ -29,12 +29,11 @@
 //! transport, and no TCP listener is ever opened.
 
 use std::fmt;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
 use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use bitty_ipc_api::frame::{MAX_BUFFERED_BYTES, MAX_FRAME_BYTES};
 use bitty_ipc_core::RateLimiter;
 use serde_json::Value;
 
@@ -45,6 +44,7 @@ use crate::limits::{LimitId, Limits};
 use crate::operator::{OperatorError, OperatorStore};
 use crate::registry::MonotonicMs;
 use crate::service::dispatch::{Refusal, ServerFacts, Service, ServiceError, StopMode};
+use crate::service::frame::{FramePeer, PeerFrameReader, enable_credentials};
 use crate::service::protocol::Connection;
 use crate::service::scopes::{MethodResolution, ServiceMethod, ServiceScopeSet, resolve};
 use crate::service::wire::{self, RequestEnvelope};
@@ -54,9 +54,6 @@ pub const TAMPER_INTERVAL_MS: u64 = 5_000;
 
 /// Poll tick; bounds the idle, negotiate, and tamper timers.
 pub const TICK_MS: u16 = 250;
-
-/// Bytes read from one ready socket per wakeup.
-const READ_CHUNK_BYTES: usize = 16 * 1024;
 
 /// The loop configuration.
 #[derive(Debug, Clone)]
@@ -165,7 +162,7 @@ struct PeerIo {
     stream: std::os::unix::net::UnixStream,
     client: Connection,
     facts: ServerFacts,
-    input: Vec<u8>,
+    reader: PeerFrameReader,
     output: Vec<u8>,
     limiter: RateLimiter,
     accepted_at_ms: u64,
@@ -181,7 +178,6 @@ impl PeerIo {
 
     fn close(&mut self) {
         self.closed = true;
-        self.input.clear();
         self.output.clear();
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
@@ -358,6 +354,9 @@ fn accept_peer(
     facts: &ServerFacts,
     now: MonotonicMs,
 ) -> Option<PeerIo> {
+    // Enable credential receiving before any frame can be read: the kernel
+    // attaches SCM_CREDENTIALS based on the flag at send time.
+    enable_credentials(&stream).ok()?;
     let peer = crate::peer::PeerGuard::capture(&stream).ok()?;
     let client_id = ClientId::generate().ok()?;
     let scopes = EffectiveScopes {
@@ -370,7 +369,7 @@ fn accept_peer(
         stream,
         client,
         facts: *facts,
-        input: Vec::new(),
+        reader: PeerFrameReader::new(),
         output: Vec::new(),
         limiter: RateLimiter::new(
             u32::try_from(config.limits.effective(LimitId::MaxRequestRatePerSec))
@@ -391,46 +390,29 @@ fn read_peer(
     now: MonotonicMs,
     shutting_down: &mut bool,
 ) {
-    let mut chunk = [0u8; READ_CHUNK_BYTES];
+    let expected = FramePeer {
+        uid: peer.client.peer_uid(),
+        pid: peer.client.peer().identity().pid(),
+    };
     loop {
-        match peer.stream.read(&mut chunk) {
-            Ok(0) => {
-                peer.close();
-                return;
-            }
-            Ok(read) => {
-                peer.last_activity_ms = now.as_millis();
-                peer.pre_auth_bytes = peer.pre_auth_bytes.saturating_add(read);
-                peer.input.extend_from_slice(&chunk[..read]);
-                if peer.input.len() > MAX_BUFFERED_BYTES {
-                    peer.close();
-                    return;
-                }
-                if !peer.client.is_negotiated()
-                    && peer.pre_auth_bytes
-                        > usize::try_from(config.limits.effective(LimitId::PreAuthMaxBytes))
-                            .unwrap_or(usize::MAX)
-                {
-                    peer.close();
-                    return;
-                }
-            }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+        let payload = match peer.reader.read(&peer.stream, expected) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => return,
             Err(_) => {
                 peer.close();
                 return;
             }
-        }
-    }
-    loop {
-        let payload = match take_frame(&mut peer.input) {
-            None => break,
-            Some(Ok(payload)) => payload,
-            Some(Err(_)) => {
-                peer.close();
-                return;
-            }
         };
+        peer.last_activity_ms = now.as_millis();
+        peer.pre_auth_bytes = peer.pre_auth_bytes.saturating_add(4 + payload.len());
+        if !peer.client.is_negotiated()
+            && peer.pre_auth_bytes
+                > usize::try_from(config.limits.effective(LimitId::PreAuthMaxBytes))
+                    .unwrap_or(usize::MAX)
+        {
+            peer.close();
+            return;
+        }
         if !handle_payload(peer, service, &payload, now, shutting_down) {
             peer.close();
             return;
@@ -463,31 +445,6 @@ fn flush_peer(peer: &mut PeerIo) {
             }
         }
     }
-}
-
-/// Extract one complete frame payload from the input buffer.
-///
-/// Returns `None` when the buffer holds no complete frame, `Some(Err(..))` for
-/// an over-bound declared length, and never consumes a partial frame.
-fn take_frame(input: &mut Vec<u8>) -> Option<Result<Vec<u8>, Refusal>> {
-    if input.len() < 4 {
-        return None;
-    }
-    let declared = u32::from_be_bytes([input[0], input[1], input[2], input[3]]) as usize;
-    if declared > MAX_FRAME_BYTES {
-        input.clear();
-        return Some(Err(Refusal::limit_exceeded(
-            MAX_FRAME_BYTES as u64,
-            declared as u64,
-        )));
-    }
-    let total = 4 + declared;
-    if input.len() < total {
-        return None;
-    }
-    let payload = input[4..total].to_vec();
-    input.drain(..total);
-    Some(Ok(payload))
 }
 
 /// Handle one frame payload. Returns `false` when the connection must close.

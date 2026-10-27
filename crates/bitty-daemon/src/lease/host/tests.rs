@@ -123,6 +123,15 @@ impl Harness {
             .control_view(session_id, ms(now))
             .expect("session exists")
     }
+
+    /// Internal lease-record count, including expired records awaiting a
+    /// sweep. Only the bound tests need the raw table size.
+    fn record_count(&self, session_id: SessionId) -> usize {
+        self.host
+            .sessions
+            .get(&session_id)
+            .map_or(0, |state| state.leases.len())
+    }
 }
 
 fn token_hex(token: &ControlToken) -> String {
@@ -187,14 +196,17 @@ fn bind_then_claim_rotates_the_token_and_binds_one_controller() {
     assert!(view.claimed);
     assert_eq!(view.token_state, ControlTokenState::Current);
 
-    let before = harness.host.snapshot(session_id).expect("snapshot");
+    let before = harness.host.snapshot(session_id, ms(4)).expect("snapshot");
     assert_refused!(
         harness
             .host
             .claim_controller(session_id, 1, &claimed_token, ms(4)),
         LeaseRefusal::ControlHeld
     );
-    assert_eq!(harness.host.snapshot(session_id).expect("snapshot"), before);
+    assert_eq!(
+        harness.host.snapshot(session_id, ms(4)).expect("snapshot"),
+        before
+    );
 }
 
 #[test]
@@ -382,7 +394,7 @@ fn stale_generation_is_refused_before_the_token_comparison() {
         .expect("self detach");
     let revision = harness
         .host
-        .snapshot(session_id)
+        .snapshot(session_id, ms(6))
         .expect("snapshot")
         .state_revision;
     assert_refused!(
@@ -409,7 +421,7 @@ fn observer_cannot_abort_transfer_or_revoke() {
     let observer = harness.attach(session_id, 4);
     let revision = harness
         .host
-        .snapshot(session_id)
+        .snapshot(session_id, ms(5))
         .expect("snapshot")
         .state_revision;
 
@@ -455,7 +467,7 @@ fn observer_cannot_abort_transfer_or_revoke() {
         Err(LeaseRefusal::ControllerRequired)
     );
 
-    let after = harness.host.snapshot(session_id).expect("snapshot");
+    let after = harness.host.snapshot(session_id, ms(5)).expect("snapshot");
     assert_eq!(after.state_revision, revision);
     assert_eq!(after.state, LifecycleState::Running);
     assert_eq!(after.attach_count, 2);
@@ -468,7 +480,7 @@ fn controller_self_detach_vacates_control_and_the_current_token_reclaims() {
     harness.bind(session_id, 2);
     let (controller, token) = harness.claim(session_id, 1, &create_token, 3);
     let observer = harness.attach(session_id, 4);
-    let before = harness.host.snapshot(session_id).expect("snapshot");
+    let before = harness.host.snapshot(session_id, ms(5)).expect("snapshot");
 
     let detached = harness
         .host
@@ -532,7 +544,7 @@ fn operator_revoke_of_the_controller_retires_control_forever() {
     let observer = harness.attach(session_id, 4);
     let generation = harness
         .host
-        .snapshot(session_id)
+        .snapshot(session_id, ms(5))
         .expect("snapshot")
         .generation;
 
@@ -556,7 +568,7 @@ fn operator_revoke_of_the_controller_retires_control_forever() {
     assert_eq!(view.attach_count, 1);
     assert!(harness.host.lease(observer.attach_id()).is_some());
 
-    let running = harness.host.snapshot(session_id).expect("snapshot");
+    let running = harness.host.snapshot(session_id, ms(6)).expect("snapshot");
     assert_eq!(running.state, LifecycleState::Running);
     assert_eq!(running.generation, generation);
     for presented in [&token, &wrong_token()] {
@@ -650,7 +662,7 @@ fn duplicate_detach_is_idempotent_and_keeps_the_revision() {
     assert_eq!(
         harness
             .host
-            .snapshot(session_id)
+            .snapshot(session_id, ms(4))
             .expect("snapshot")
             .state_revision,
         revision
@@ -673,7 +685,7 @@ fn duplicate_detach_is_idempotent_and_keeps_the_revision() {
     assert_eq!(
         harness
             .host
-            .snapshot(session_id)
+            .snapshot(session_id, ms(5))
             .expect("snapshot")
             .state_revision,
         revision
@@ -720,7 +732,7 @@ fn lease_expiry_boundaries_renewal_and_detach_only() {
 
     let revision = harness
         .host
-        .snapshot(session_id)
+        .snapshot(session_id, ms(299))
         .expect("snapshot")
         .state_revision;
     let expired = harness.host.expire_due(ms(299));
@@ -729,7 +741,10 @@ fn lease_expiry_boundaries_renewal_and_detach_only() {
     assert_eq!(expired[0].role, LeaseRole::Observer);
     assert!(harness.host.expire_due(ms(299)).is_empty());
 
-    let after = harness.host.snapshot(session_id).expect("snapshot");
+    let after = harness
+        .host
+        .snapshot(session_id, ms(299))
+        .expect("snapshot");
     assert_eq!(after.state, LifecycleState::Running);
     assert_eq!(after.generation, bound.generation);
     assert_eq!(after.attach_count, 0);
@@ -746,7 +761,7 @@ fn expired_leases_cannot_act_and_claim_vacates_an_expired_controller() {
     let observer = harness.attach(session_id, 100);
     let revision = harness
         .host
-        .snapshot(session_id)
+        .snapshot(session_id, ms(200))
         .expect("snapshot")
         .state_revision;
 
@@ -776,7 +791,7 @@ fn expired_leases_cannot_act_and_claim_vacates_an_expired_controller() {
     assert_eq!(
         harness
             .host
-            .snapshot(session_id)
+            .snapshot(session_id, ms(200))
             .expect("snapshot")
             .state_revision,
         revision
@@ -798,8 +813,9 @@ fn expired_leases_cannot_act_and_claim_vacates_an_expired_controller() {
         "the due detach and the claim's attach are two snapshot-visible mutations"
     );
     assert_eq!(
-        vacated.revision, claimed.session.state_revision,
-        "the expiry is visible in the claim's snapshot revision"
+        vacated.revision,
+        claimed.session.state_revision - 1,
+        "the detach event carries its own revision; the claim bumps once more"
     );
     assert_eq!(
         harness.control(session_id, 201).controller,
@@ -880,7 +896,7 @@ fn observer_resize_is_refused_and_controller_resize_bumps_once() {
     harness.bind(session_id, 2);
     let (controller, _) = harness.claim(session_id, 1, &create_token, 3);
     let observer = harness.attach(session_id, 4);
-    let before = harness.host.snapshot(session_id).expect("snapshot");
+    let before = harness.host.snapshot(session_id, ms(5)).expect("snapshot");
 
     assert_refused!(
         harness.host.record_resize(observer.attach_id(), ms(5)),
@@ -893,7 +909,7 @@ fn observer_resize_is_refused_and_controller_resize_bumps_once() {
         LeaseRefusal::ControllerRequired
     );
     assert_eq!(
-        harness.host.snapshot(session_id).expect("snapshot"),
+        harness.host.snapshot(session_id, ms(5)).expect("snapshot"),
         before,
         "an observer resize applies nothing"
     );
@@ -975,7 +991,7 @@ fn transfer_moves_control_demotes_the_old_controller_and_rotates_the_token() {
     harness.bind(session_id, 2);
     let (controller, token) = harness.claim(session_id, 1, &create_token, 3);
     let observer = harness.attach(session_id, 4);
-    let before = harness.host.snapshot(session_id).expect("snapshot");
+    let before = harness.host.snapshot(session_id, ms(5)).expect("snapshot");
 
     let transferred = harness
         .host
@@ -1023,9 +1039,9 @@ fn transfer_moves_control_demotes_the_old_controller_and_rotates_the_token() {
         Some(observer.attach_id())
     );
 
-    // D-09: the rotated token is addressed to the target lease only. The
-    // requesting connection (the previous controller) cannot take it, and the
-    // target takes the secret that actually verifies.
+    // D-09: the rotated token value is addressed to the target lease only. The
+    // previous controller's attach id cannot take it; routing is bitty#2607's
+    // responsibility, but no requester result field carries the secret.
     let rendered = format!("{transferred:?}");
     assert!(
         rendered.contains("ControlToken(<redacted>)") && !rendered.contains(&token_hex(&token)),
@@ -1034,7 +1050,7 @@ fn transfer_moves_control_demotes_the_old_controller_and_rotates_the_token() {
     let delivery = transferred
         .delivery
         .take_for(controller.attach_id())
-        .expect_err("the source response must not carry the rotated token");
+        .expect_err("a non-target attach id cannot take the rotated token");
     assert_eq!(delivery.target(), observer.attach_id());
     let rotated_token = delivery
         .take_for(observer.attach_id())
@@ -1133,7 +1149,7 @@ fn transfer_from_vacant_control_uses_the_token_and_requires_an_observer_target()
         LeaseRefusal::TargetNotObserver
     );
     // A stale generation applies nothing.
-    let before = harness.host.snapshot(session_id).expect("snapshot");
+    let before = harness.host.snapshot(session_id, ms(8)).expect("snapshot");
     assert_refused!(
         harness.host.transfer_control(
             session_id,
@@ -1147,7 +1163,10 @@ fn transfer_from_vacant_control_uses_the_token_and_requires_an_observer_target()
             current_revision: before.state_revision
         }
     );
-    assert_eq!(harness.host.snapshot(session_id).expect("snapshot"), before);
+    assert_eq!(
+        harness.host.snapshot(session_id, ms(8)).expect("snapshot"),
+        before
+    );
 }
 
 #[test]
@@ -1172,7 +1191,11 @@ fn pre_bind_cancel_blocks_bind_and_completes_not_started() {
     assert_eq!(accepted.reason, TerminalReason::ConsumerCancel);
     assert!(harness.control(session_id, 2).pending_cancel);
     assert_eq!(
-        harness.host.snapshot(session_id).expect("snapshot").state,
+        harness
+            .host
+            .snapshot(session_id, ms(2))
+            .expect("snapshot")
+            .state,
         LifecycleState::Created
     );
 
@@ -1281,7 +1304,7 @@ fn generation_zero_stop_loses_to_a_committed_bind() {
     let mut harness = Harness::new();
     let (session_id, token) = harness.create("term-bind-race", 1);
     harness.bind(session_id, 2);
-    let before = harness.host.snapshot(session_id).expect("snapshot");
+    let before = harness.host.snapshot(session_id, ms(3)).expect("snapshot");
 
     assert_eq!(
         harness.host.abort(
@@ -1303,7 +1326,7 @@ fn generation_zero_stop_loses_to_a_committed_bind() {
             current_revision: before.state_revision
         })
     );
-    let after = harness.host.snapshot(session_id).expect("snapshot");
+    let after = harness.host.snapshot(session_id, ms(3)).expect("snapshot");
     assert_eq!(after, before);
     assert_eq!(after.state, LifecycleState::Running);
 }
@@ -1951,7 +1974,7 @@ fn entropy_failure_on_create_and_claim_leaves_no_state() {
         ms(1),
     );
     assert!(matches!(refusal, Err(LeaseRefusal::EntropyUnavailable)));
-    assert_eq!(host.registry().live_count(), 0);
+    assert_eq!(host.live_count(), 0);
 
     let registry = SessionRegistry::with_entropy(
         RegistryLimits::new(4, 4, 4096, 600_000).expect("valid"),
@@ -1975,13 +1998,16 @@ fn entropy_failure_on_create_and_claim_leaves_no_state() {
         .expect("create");
     let token = created.control_token;
     host.bind(created.session.session_id, ms(2)).expect("bind");
-    let before = host.snapshot(created.session.session_id).expect("snapshot");
+    let before = host
+        .snapshot(created.session.session_id, ms(3))
+        .expect("snapshot");
     assert!(matches!(
         host.claim_controller(created.session.session_id, 1, &token, ms(3)),
         Err(LeaseRefusal::EntropyUnavailable)
     ));
     assert_eq!(
-        host.snapshot(created.session.session_id).expect("snapshot"),
+        host.snapshot(created.session.session_id, ms(3))
+            .expect("snapshot"),
         before
     );
     assert_eq!(
@@ -2044,7 +2070,7 @@ fn an_observer_lease_with_the_current_token_is_never_control_at_vacant_control()
         None,
         "control is vacant"
     );
-    let before = harness.host.snapshot(session_id).expect("snapshot");
+    let before = harness.host.snapshot(session_id, ms(7)).expect("snapshot");
 
     let observer_with_token = ControlAuthority::lease(observer.attach_id()).with_token(&token);
     assert_eq!(
@@ -2075,7 +2101,7 @@ fn an_observer_lease_with_the_current_token_is_never_control_at_vacant_control()
     );
 
     assert_eq!(
-        harness.host.snapshot(session_id).expect("snapshot"),
+        harness.host.snapshot(session_id, ms(7)).expect("snapshot"),
         before,
         "no observer attempt applied anything"
     );
@@ -2111,7 +2137,7 @@ fn a_control_token_is_bound_to_one_session() {
     harness.bind(first, 2);
     harness.bind(second, 2);
     let (controller, first_token) = harness.claim(first, 1, &first_create, 3);
-    let second_before = harness.host.snapshot(second).expect("snapshot");
+    let second_before = harness.host.snapshot(second, ms(4)).expect("snapshot");
 
     // Cross-session replay: the first session's rotated token carries no
     // authority in the second, on either the claim or the token-only path.
@@ -2132,7 +2158,7 @@ fn a_control_token_is_bound_to_one_session() {
         Err(LeaseRefusal::InvalidControlToken)
     );
     assert_eq!(
-        harness.host.snapshot(second).expect("snapshot"),
+        harness.host.snapshot(second, ms(4)).expect("snapshot"),
         second_before
     );
     assert_eq!(harness.control(second, 4).controller, None);
@@ -2161,7 +2187,10 @@ fn an_expired_controller_with_a_wrong_token_is_refused_and_survives() {
     let (session_id, create_token) = harness.create("term-expired-wrong-token", 1);
     harness.bind(session_id, 2);
     let (controller, token) = harness.claim(session_id, 1, &create_token, 100);
-    let before = harness.host.snapshot(session_id).expect("snapshot");
+    let before = harness
+        .host
+        .snapshot(session_id, ms(200))
+        .expect("snapshot");
 
     assert_refused!(
         harness
@@ -2170,7 +2199,10 @@ fn an_expired_controller_with_a_wrong_token_is_refused_and_survives() {
         LeaseRefusal::InvalidControlToken
     );
     assert_eq!(
-        harness.host.snapshot(session_id).expect("snapshot"),
+        harness
+            .host
+            .snapshot(session_id, ms(200))
+            .expect("snapshot"),
         before,
         "a refused claim does not touch the revision"
     );
@@ -2207,7 +2239,10 @@ fn transfer_targets_must_be_live_observers_of_this_session() {
     let observer = harness.attach(session_id, 100);
     let (controller, _) = harness.claim(session_id, 1, &create_token, 150);
     let foreign = harness.attach(foreign_session, 100);
-    let before = harness.host.snapshot(session_id).expect("snapshot");
+    let before_foreign = harness
+        .host
+        .snapshot(session_id, ms(160))
+        .expect("snapshot");
 
     // A foreign-session handle is not a transfer target.
     assert_refused!(
@@ -2220,13 +2255,23 @@ fn transfer_targets_must_be_live_observers_of_this_session() {
         ),
         LeaseRefusal::NotAttached
     );
-    assert_eq!(harness.host.snapshot(session_id).expect("snapshot"), before);
+    assert_eq!(
+        harness
+            .host
+            .snapshot(session_id, ms(160))
+            .expect("snapshot"),
+        before_foreign
+    );
     assert_eq!(
         harness.control(session_id, 160).controller,
         Some(controller.attach_id())
     );
 
     // The controller is live at 200 (claimed at 150); the observer is not.
+    let before_expired = harness
+        .host
+        .snapshot(session_id, ms(200))
+        .expect("snapshot");
     assert_refused!(
         harness.host.transfer_control(
             session_id,
@@ -2237,7 +2282,13 @@ fn transfer_targets_must_be_live_observers_of_this_session() {
         ),
         LeaseRefusal::NotAttached
     );
-    assert_eq!(harness.host.snapshot(session_id).expect("snapshot"), before);
+    assert_eq!(
+        harness
+            .host
+            .snapshot(session_id, ms(200))
+            .expect("snapshot"),
+        before_expired
+    );
     assert!(harness.host.lease(foreign.attach_id()).is_some());
     assert_eq!(harness.control(foreign_session, 160).attach_count, 1);
 }
@@ -2378,7 +2429,7 @@ fn a_daemon_termination_without_an_accepted_stop_is_an_unexpected_exit() {
     let mut harness = Harness::new();
     let (session_id, _) = harness.create("term-unexpected-daemon", 1);
     harness.bind(session_id, 2);
-    let before = harness.host.snapshot(session_id).expect("snapshot");
+    let before = harness.host.snapshot(session_id, ms(3)).expect("snapshot");
     assert_eq!(
         harness.host.record_termination(
             session_id,
@@ -2390,7 +2441,10 @@ fn a_daemon_termination_without_an_accepted_stop_is_an_unexpected_exit() {
             state: LifecycleState::Running
         })
     );
-    assert_eq!(harness.host.snapshot(session_id).expect("snapshot"), before);
+    assert_eq!(
+        harness.host.snapshot(session_id, ms(3)).expect("snapshot"),
+        before
+    );
 }
 
 #[test]
@@ -2427,7 +2481,7 @@ fn pre_bind_cancel_completes_with_unverified_cleanup() {
 }
 
 #[test]
-fn expired_observers_do_not_consume_the_attach_cap() {
+fn expired_observers_do_not_consume_the_attach_cap_and_are_swept() {
     let mut harness = Harness::new();
     let (session_id, _) = harness.create("term-cap-expired", 1);
     for _ in 0..4 {
@@ -2442,30 +2496,127 @@ fn expired_observers_do_not_consume_the_attach_cap() {
         0,
         "every lease had expired"
     );
+    assert_eq!(harness.record_count(session_id), 4);
 
-    let fresh = harness.attach(session_id, 200);
+    let fresh = harness
+        .host
+        .attach_observer(session_id, ms(200))
+        .expect("expired records do not consume the cap");
+    assert_eq!(
+        fresh.expired.len(),
+        4,
+        "the attach-entry sweep removes them and surfaces the detaches"
+    );
+    assert_eq!(harness.record_count(session_id), 1);
+    assert_eq!(fresh.session.attach_count, 1);
     assert_eq!(harness.control(session_id, 200).attach_count, 1);
+    assert!(
+        harness.host.expire_due(ms(200)).is_empty(),
+        "the attach already swept the session"
+    );
+    assert!(harness.host.lease(fresh.lease.attach_id()).is_some());
+}
+
+#[test]
+fn attach_cycles_without_a_sweep_stay_inside_the_record_bound() {
+    // Probe from the review: attach two or more observers per TTL cycle and
+    // never call `expire_due`. The attach-entry sweep must keep the table at
+    // `max_attaches_per_session + controller` records, not let the registry
+    // `u16` become the bound.
+    let mut harness = Harness::new(); // observer cap 4, TTL 100
+    let (session_id, create_token) = harness.create("term-record-bound", 1);
+    harness.bind(session_id, 2);
+    let _controller = harness.claim(session_id, 1, &create_token, 100);
+    let mut observed_max = 0;
+    let mut swept_total = 0;
+
+    for cycle in 0..100u64 {
+        let base = 100 + cycle * 100;
+        observed_max = observed_max.max(harness.record_count(session_id));
+        for offset in 0..4u64 {
+            let attached = harness
+                .host
+                .attach_observer(session_id, ms(base + offset))
+                .expect("attach at the cycle");
+            swept_total += attached.expired.len();
+            observed_max = observed_max.max(harness.record_count(session_id));
+        }
+    }
+
     assert_eq!(
-        harness
-            .host
-            .snapshot(session_id)
-            .expect("snapshot")
-            .attach_count,
-        5,
-        "the registry still holds the unswept records"
+        observed_max,
+        4 + 1,
+        "the bound is the observer cap plus the controller"
+    );
+    assert!(swept_total >= 99, "the entry sweep reclaimed the records");
+    assert!(harness.record_count(session_id) <= 5);
+    assert!(
+        !harness.host.expire_due(ms(30_000)).is_empty(),
+        "the tail still reaches the timer"
+    );
+    assert_eq!(harness.record_count(session_id), 0);
+}
+
+#[test]
+fn snapshot_attach_count_matches_control_view_at_the_same_now() {
+    let mut harness = Harness::new();
+    let (session_id, create_token) = harness.create("term-count-consistent", 1);
+    harness.bind(session_id, 2);
+    let (controller, _) = harness.claim(session_id, 1, &create_token, 3);
+    let observer = harness.attach(session_id, 100);
+
+    // Both leases are expired and unswept at 300.
+    let snapshot = harness
+        .host
+        .snapshot(session_id, ms(300))
+        .expect("snapshot");
+    let view = harness.control(session_id, 300);
+    assert_eq!(
+        snapshot.attach_count, view.attach_count,
+        "status and control view agree on the live count"
+    );
+    assert_eq!(snapshot.attach_count, 0);
+    assert_eq!(snapshot.attached, view.attach_count > 0);
+    assert!(!snapshot.attached);
+    assert_eq!(
+        harness.record_count(session_id),
+        2,
+        "records remain until the sweep, but they are not counted"
     );
 
-    let expired = harness.host.expire_due(ms(200));
-    assert_eq!(expired.len(), 4);
+    let expired = harness.host.expire_due(ms(300));
+    assert_eq!(expired.len(), 2);
     assert_eq!(
         harness
             .host
-            .snapshot(session_id)
+            .snapshot(session_id, ms(300))
             .expect("snapshot")
             .attach_count,
-        1
+        0
     );
-    assert!(harness.host.lease(fresh.attach_id()).is_some());
+
+    let live = harness.attach(session_id, 400);
+    let snapshot = harness
+        .host
+        .snapshot(session_id, ms(400))
+        .expect("snapshot");
+    let view = harness.control(session_id, 400);
+    assert_eq!(snapshot.attach_count, view.attach_count);
+    assert_eq!(snapshot.attach_count, 1);
+    assert!(snapshot.attached);
+    let listed = harness
+        .host
+        .snapshots(ms(400))
+        .find(|entry| entry.session_id == session_id)
+        .expect("listed");
+    assert_eq!(listed.attach_count, snapshot.attach_count);
+    assert_eq!(controller.role(), LeaseRole::Controller);
+    assert_eq!(
+        harness.host.lease(observer.attach_id()).map(Lease::role),
+        None,
+        "the expired observer was swept"
+    );
+    assert!(harness.host.lease(live.attach_id()).is_some());
 }
 
 #[test]
@@ -2475,7 +2626,10 @@ fn expire_due_reports_the_post_detach_revision_for_each_removal() {
     harness.bind(session_id, 2);
     let first = harness.attach(session_id, 100);
     let second = harness.attach(session_id, 100);
-    let before = harness.host.snapshot(session_id).expect("snapshot");
+    let before = harness
+        .host
+        .snapshot(session_id, ms(200))
+        .expect("snapshot");
 
     let expired = harness.host.expire_due(ms(200));
     assert_eq!(expired.len(), 2);
@@ -2490,7 +2644,7 @@ fn expire_due_reports_the_post_detach_revision_for_each_removal() {
     assert_eq!(
         harness
             .host
-            .snapshot(session_id)
+            .snapshot(session_id, ms(200))
             .expect("snapshot")
             .state_revision,
         before.state_revision + 2
@@ -2549,7 +2703,7 @@ fn a_foreign_detach_target_is_not_attached_and_survives() {
     harness.bind(first, 2);
     let (controller, _) = harness.claim(first, 1, &first_token, 3);
     let foreign = harness.attach(second, 4);
-    let before = harness.host.snapshot(second).expect("snapshot");
+    let before = harness.host.snapshot(second, ms(5)).expect("snapshot");
 
     assert_refused!(
         harness.host.detach(
@@ -2569,7 +2723,19 @@ fn a_foreign_detach_target_is_not_attached_and_survives() {
         ),
         LeaseRefusal::NotAttached
     );
-    assert_eq!(harness.host.snapshot(second).expect("snapshot"), before);
+    assert_refused!(
+        harness.host.detach(
+            first,
+            foreign.attach_id(),
+            &ControlAuthority::lease(foreign.attach_id()),
+            ms(5),
+        ),
+        LeaseRefusal::NotAttached
+    );
+    assert_eq!(
+        harness.host.snapshot(second, ms(5)).expect("snapshot"),
+        before
+    );
     assert!(harness.host.lease(foreign.attach_id()).is_some());
 }
 
@@ -2596,7 +2762,9 @@ fn a_repeated_token_mint_is_refused_as_a_failed_rotation() {
         .expect("create");
     let token = created.control_token;
     host.bind(created.session.session_id, ms(2)).expect("bind");
-    let before = host.snapshot(created.session.session_id).expect("snapshot");
+    let before = host
+        .snapshot(created.session.session_id, ms(3))
+        .expect("snapshot");
 
     assert_eq!(
         host.claim_controller(created.session.session_id, 1, &token, ms(3))
@@ -2604,7 +2772,8 @@ fn a_repeated_token_mint_is_refused_as_a_failed_rotation() {
         Some(LeaseRefusal::EntropyUnavailable)
     );
     assert_eq!(
-        host.snapshot(created.session.session_id).expect("snapshot"),
+        host.snapshot(created.session.session_id, ms(3))
+            .expect("snapshot"),
         before
     );
     let view = host

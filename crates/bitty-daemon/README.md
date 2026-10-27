@@ -81,11 +81,14 @@ file, and owns only metadata.
   is regenerated, and a collected id is never recycled as a new value.
 - `SessionRegistry::create` starts at generation `0` and state revision `0`;
   `bind` increments the generation exactly once (v0.2.0 permits one bind);
-  `attach`/`detach` drive the derived attach count; `record_lease_mutation`
-  bumps the revision for a transfer that keeps the count; `heartbeat` updates
-  last-seen without a revision bump; `begin_stopping` and `terminate` apply one
-  revision bump per snapshot-visible transition. Counters use checked
-  arithmetic and fail closed.
+  `attach`/`detach` drive the stored attach/detach record count, which the lease
+  layer composes into the live `attach_count` for service snapshots
+  (`record_lease_mutation` bumps the revision for a transfer that keeps the
+  count); `heartbeat` updates last-seen without a revision bump;
+  `begin_stopping` and `terminate` apply one revision bump per snapshot-visible
+  transition. A terminal session has no live lease, so the lease layer detaches
+  every lease before it terminates and the frozen record reports no attaches.
+  Counters use checked arithmetic and fail closed.
 - Terminal states are immutable. A terminal record is retained (never live,
   never revived) until `terminal_retention_ms` or
   `max_retained_terminal_records` collects it in deterministic
@@ -106,10 +109,13 @@ attach, detach, claim, transfer, or terminal transition is one atomic
 - Roles and bounds: one controller lease per session, plus observers up to
   `max_attaches_per_session` (default 8, ceiling 16); the controller is
   additional to that observer cap (`D-09`). Every attach mints a distinct
-  128-bit `attach_id`. A new observer at the cap is shed; existing leases are
-  never evicted. An expired observer that the sweep has not removed yet does not
-  consume a slot (the sweep still reclaims its record), and
-  `ControlView::attach_count` counts only live leases.
+  128-bit `attach_id`. A new observer at the live cap is shed; existing leases
+  are never evicted. The table is hard-bounded to
+  `max_attaches_per_session + controller`: an attach checks the live observer
+  cap, sweeps the session's expired records (returned as `Attached::expired` for
+  the event layer), applies a record backstop, and only then inserts.
+  `ControlView::attach_count` and `SessionSnapshot::attach_count` both report
+  the live count.
 - Control token: 256 bits from the OS CSPRNG, returned once at create, stored
   only as a domain-separated SHA-256 digest, verified in constant time
   (`subtle`), rotated on every claim and transfer, and retired on controller
@@ -147,15 +153,18 @@ attach, detach, claim, transfer, or terminal transition is one atomic
   record still awaiting the sweep; `authorize_content_read` (role-agnostic) and
   `authorize_controller` (controller-only) are the liveness-checked entry
   points. Both are read-only and never renew; the client heartbeat and
-  `record_resize` renew.
+  `record_resize` renew. Status/list use `SessionHost::snapshot`/`snapshots`,
+  which compose the live `attach_count` from the lease table; the raw
+  `SessionRegistry` snapshot is a storage view and is never served as status.
 - Expiry and renewal are driven by the injected `MonotonicMs`; a lease is live
   before `expires_at` and expired exactly at it. Expiry detaches only: the
   worker keeps running, the generation is unchanged, and a controller expiry
-  leaves control vacant with the current token still reclaimable. `expire_due`
-  reports each removal with the post-detach `state_revision` the event slice
-  needs. A claim or transfer that vacates an already-expired controller commits
-  that due detach first, so it advances the revision twice; a later counter fault
-  refuses the operation but leaves the due detach in place.
+  leaves control vacant with the current token still reclaimable. Every
+  `LeaseExpiry` carries the `state_revision` of its own detach mutation; when a
+  claim or transfer vacates an already-expired controller, that detach revision
+  is the operation's final revision minus one because the claim/transfer then
+  bumps once more. A later counter fault refuses the operation but leaves the
+  due detach in place.
 - Stop pipeline: a generation-0 stop commits a cancel intent that refuses
   `bind`; completing it records `not_started`/`swept`/`unverified` cleanup. A
   running stop moves to `stopping`, arms the abort or drain grace, then

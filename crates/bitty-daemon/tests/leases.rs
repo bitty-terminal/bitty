@@ -148,7 +148,10 @@ fn expiry_detaches_without_aborting_or_changing_the_generation() {
     let observer = host
         .attach_observer(session_id, ms(10))
         .expect("observer attach");
-    let revision = host.snapshot(session_id).expect("snapshot").state_revision;
+    let revision = host
+        .snapshot(session_id, ms(209))
+        .expect("snapshot")
+        .state_revision;
 
     assert!(host.heartbeat(observer.lease.attach_id(), ms(109)).is_ok());
     assert!(
@@ -159,7 +162,7 @@ fn expiry_detaches_without_aborting_or_changing_the_generation() {
     assert_eq!(expired.len(), 1);
     assert_eq!(expired[0].attach_id, observer.lease.attach_id());
 
-    let snapshot = host.snapshot(session_id).expect("snapshot");
+    let snapshot = host.snapshot(session_id, ms(209)).expect("snapshot");
     assert_eq!(snapshot.state, LifecycleState::Running);
     assert_eq!(snapshot.generation, 1);
     assert_eq!(snapshot.attach_count, 0);
@@ -246,7 +249,7 @@ fn token_never_appears_in_public_snapshots_or_debug_output() {
     let rendered = format!(
         "{:?}|{:?}|{:?}|{:?}",
         host,
-        host.snapshot(session_id).expect("snapshot"),
+        host.snapshot(session_id, ms(4)).expect("snapshot"),
         notice,
         claimed.lease
     );
@@ -363,7 +366,7 @@ fn operator_stop_and_exit_classification_are_public() {
 }
 
 #[test]
-fn transfer_delivery_is_addressed_to_the_target_lease_only() {
+fn transfer_delivery_requires_the_target_attach_id() {
     let mut host = host(8);
     let (session_id, create_token) = create(&mut host, "term-transfer-delivery", 1);
     host.bind(session_id, ms(2)).expect("bind");
@@ -383,7 +386,7 @@ fn transfer_delivery_is_addressed_to_the_target_lease_only() {
         )
         .expect("transfer");
 
-    // The requester cannot take the rotated secret; only the target lease can.
+    // The value names the recipient; bitty#2607 owns the actual routing.
     assert_eq!(
         transferred.delivery.target(),
         observer.lease.attach_id(),
@@ -392,10 +395,10 @@ fn transfer_delivery_is_addressed_to_the_target_lease_only() {
     let delivery = transferred
         .delivery
         .take_for(claimed.lease.attach_id())
-        .expect_err("the requesting connection must not receive the rotated token");
+        .expect_err("a non-target attach id cannot take the token");
     let rotated_token = delivery
         .take_for(observer.lease.attach_id())
-        .expect("the target lease receives the rotated token");
+        .expect("the target attach id takes the token");
     assert_ne!(token_hex(&rotated_token), token_hex(&claimed.control_token));
 
     // The delivered token is the one that verifies after the target leaves.

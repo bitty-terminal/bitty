@@ -143,8 +143,19 @@ pub struct CreatedSession {
 pub struct Attached {
     /// The new observer lease.
     pub lease: Lease,
-    /// The session snapshot after the attach revision bump.
+    /// The session snapshot after the attach revision bump. `attach_count` is
+    /// the live count (expired leases are not counted).
     pub session: SessionSnapshot,
+    /// Expired leases removed by the attach-entry sweep, in sweep order.
+    ///
+    /// The attach is the cap entry point, so it sweeps the target session's
+    /// expired records before counting (`D-12`, `R-S18`) instead of letting
+    /// them accumulate until the timer. The event layer must publish one
+    /// detach event per entry, at the carried revision, before the attach
+    /// event. A refusal before the sweep carries none; a counter fault after
+    /// the sweep is fail-closed and can drop those due detaches because the
+    /// session's counters are already unusable.
+    pub expired: Vec<LeaseExpiry>,
 }
 
 /// A successful controller claim.
@@ -192,7 +203,10 @@ pub struct Transferred {
 /// makes the target part of the value: [`TransferDelivery::take_for`] yields
 /// the token only for the target attach id and returns the delivery unchanged
 /// otherwise, so a response encoder cannot silently take another lease's
-/// secret. The token is zeroized on drop when it is never taken.
+/// secret. This is a check on the value's shape, not a routing guarantee:
+/// bitty#2607 owns delivering the token to the target lease's own queue and
+/// excluding it from the requesting connection's response. The token is
+/// zeroized on drop when it is never taken.
 #[derive(Debug)]
 pub struct TransferDelivery {
     target: AttachId,
@@ -221,8 +235,8 @@ impl TransferDelivery {
     }
 }
 
-/// A lease removed by [`SessionHost::expire_due`] or by a claim/transfer
-/// vacating an expired controller.
+/// A lease removed by [`SessionHost::expire_due`], an attach-entry sweep, or a
+/// claim/transfer vacating an expired controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseExpiry {
     /// Session the lease belonged to.
@@ -231,9 +245,13 @@ pub struct LeaseExpiry {
     pub attach_id: AttachId,
     /// Role at expiry.
     pub role: LeaseRole,
-    /// The `state_revision` of the snapshot in which the removal is visible:
-    /// the post-detach revision for a sweep, or the post-claim/post-transfer
-    /// revision when an expired controller is vacated by that operation.
+    /// `state_revision` of the detach mutation that removed this lease.
+    ///
+    /// For a sweep this is the post-detach revision. When a claim or transfer
+    /// vacates an expired controller, the detach commits first and the
+    /// claim/transfer then bumps once more, so this value is the final snapshot
+    /// revision minus one; the detach event must use this revision, not the
+    /// operation's final revision.
     pub revision: u64,
 }
 
@@ -380,7 +398,11 @@ pub struct TerminalNotice {
     pub cleanup: CleanupClass,
     /// Who caused the terminal transition.
     pub actor: Actor,
-    /// Leases that were live at the transition.
+    /// Lease records still registered at the transition.
+    ///
+    /// This includes an expired lease that the sweep has not removed yet: its
+    /// connection may still be subscribed, so the event layer must reserve or
+    /// close it rather than leak the subscription. Order is unspecified.
     pub attached: Vec<AttachId>,
 }
 
@@ -552,11 +574,11 @@ impl SessionHost {
         self.registry.instance_id()
     }
 
-    /// Read-only registry access for `session.status`, `session.list`, and
-    /// `daemon.inspect`.
+    /// Number of live sessions in the registry (retained terminal records are
+    /// not live).
     #[must_use]
-    pub const fn registry(&self) -> &SessionRegistry {
-        &self.registry
+    pub fn live_count(&self) -> usize {
+        self.registry.live_count()
     }
 
     /// The enforced lease bounds.
@@ -565,10 +587,29 @@ impl SessionHost {
         self.limits
     }
 
-    /// A session snapshot from the registry.
+    /// The contract-visible status snapshot for a session (`D-03`, `R-S18`).
+    ///
+    /// `attach_count` and `attached` are composed from the live lease table at
+    /// `now`, so an expired lease that [`SessionHost::expire_due`] has not
+    /// removed yet is not counted. The registry revision and the stored record
+    /// count are untouched by expiry until the sweep; this method is a view,
+    /// not a mutation.
     #[must_use]
-    pub fn snapshot(&self, session_id: SessionId) -> Option<SessionSnapshot> {
-        self.registry.snapshot(session_id)
+    pub fn snapshot(&self, session_id: SessionId, now: MonotonicMs) -> Option<SessionSnapshot> {
+        self.registry
+            .snapshot(session_id)
+            .map(|snapshot| self.compose_snapshot(snapshot, now))
+    }
+
+    /// Every live then retained snapshot in session-id order, each with the
+    /// live attach count at `now` (`session.list`, `daemon.inspect`).
+    ///
+    /// Bounded by `max_sessions + max_retained_terminal_records`; the raw
+    /// registry count is never served because expiry belongs to this layer.
+    pub fn snapshots(&self, now: MonotonicMs) -> impl Iterator<Item = SessionSnapshot> + '_ {
+        self.registry
+            .snapshots()
+            .map(move |snapshot| self.compose_snapshot(snapshot, now))
     }
 
     /// The non-secret control summary, or `None` for an unknown session.
@@ -612,9 +653,10 @@ impl SessionHost {
     ///
     /// Both roles pass; the point is liveness: an expired, revoked, or foreign
     /// handle is [`LeaseRefusal::NotAttached`]. The caller still checks the
-    /// `session.inspect` scope and the event-subscription rules (bitty#2607 /
-    /// bitty#2602). This is read-only and never renews the lease; the heartbeat
-    /// or a controller content operation does.
+    /// `session.inspect` scope and, for terminal content, `terminal.inspect`,
+    /// plus the event-subscription rules (bitty#2607 / bitty#2602). This is
+    /// read-only and never renews the lease; the heartbeat or a controller
+    /// content operation does.
     ///
     /// # Errors
     ///
@@ -663,7 +705,7 @@ impl SessionHost {
         self.sessions
             .insert(session.session_id, SessionLeaseState::new(digest));
         Ok(CreatedSession {
-            session,
+            session: self.compose_snapshot(session, now),
             control_token,
         })
     }
@@ -689,7 +731,10 @@ impl SessionHost {
         {
             return Err(LeaseRefusal::CancelPending);
         }
-        self.registry.bind(session_id, now).map_err(Into::into)
+        self.registry
+            .bind(session_id, now)
+            .map(|snapshot| self.compose_snapshot(snapshot, now))
+            .map_err(Into::into)
     }
 
     /// Collect retained terminal records past their TTL and drop their control
@@ -720,9 +765,11 @@ impl SessionHost {
     ///
     /// Refuses when the session is unknown or terminal, or when the
     /// per-session observer cap is reached. The controller lease is additional
-    /// (`D-09`), so observers never consume the controller's slot. An expired
-    /// observer still awaiting [`SessionHost::expire_due`] does not consume a
-    /// slot: expiry already detached it from authority.
+    /// (`D-09`), so observers never consume the controller's slot. Expired
+    /// observers are swept at this entry point before the attach (`Attached::expired`),
+    /// so they neither consume a slot nor accumulate while the timer is late; a
+    /// hard record backstop (`max_attaches_per_session + controller`) refuses
+    /// `MaxAttaches` if a sweep could not keep the table inside the bound.
     pub fn attach_observer(
         &mut self,
         session_id: SessionId,
@@ -734,17 +781,31 @@ impl SessionHost {
             .get(&session_id)
             .ok_or(LeaseRefusal::SessionNotFound)?;
         let limit = self.limits.max_attaches_per_session();
-        let observers = state
+        let live_observers = state
             .leases
             .values()
             .filter(|lease| lease.role() == LeaseRole::Observer)
             .filter(|lease| !lease.is_expired_at(now))
             .count();
-        if observers >= limit {
+        if live_observers >= limit {
             return Err(LeaseRefusal::MaxAttaches { limit });
         }
 
         let attach_id = self.mint_attach_id()?;
+        let expired = self.sweep_session(session_id, now);
+        // Backstop: after a successful sweep the table holds the live observer
+        // count plus at most one controller, so the bound is already held. A
+        // surviving overage means the sweep could not remove a record (counter
+        // fault); refuse rather than let the table grow.
+        let records = self
+            .sessions
+            .get(&session_id)
+            .map_or(0, |state| state.leases.len());
+        let hard_limit = limit.saturating_add(1);
+        if records >= hard_limit {
+            return Err(LeaseRefusal::MaxAttaches { limit });
+        }
+
         let lease = Lease::new(
             attach_id,
             LeaseRole::Observer,
@@ -758,7 +819,11 @@ impl SessionHost {
             .ok_or(LeaseRefusal::SessionNotFound)?;
         state.leases.insert(attach_id, lease);
         self.lease_sessions.insert(attach_id, session_id);
-        Ok(Attached { lease, session })
+        Ok(Attached {
+            lease,
+            session: self.compose_snapshot(session, now),
+            expired,
+        })
     }
 
     /// Claim the controller lease with the current control token.
@@ -835,9 +900,9 @@ impl SessionHost {
         );
 
         let vacated_controller = if let Some(expired) = expired_controller {
-            // A due detach commits before the attach; the event slice sees the
-            // removal in the final snapshot revision below.
-            Some(self.remove_lease(session_id, expired.attach_id(), now)?.0)
+            // A due detach commits before the attach; its own snapshot revision
+            // is the detach event's revision, not the claim's final revision.
+            Some(self.remove_lease(session_id, expired.attach_id(), now)?)
         } else {
             None
         };
@@ -853,17 +918,18 @@ impl SessionHost {
         state.claimed = true;
         self.lease_sessions.insert(attach_id, session_id);
 
-        let vacated_expired_controller = vacated_controller.map(|vacated| LeaseExpiry {
-            session_id,
-            attach_id: vacated.attach_id(),
-            role: vacated.role(),
-            revision: session.state_revision,
-        });
+        let vacated_expired_controller =
+            vacated_controller.map(|(vacated, detached)| LeaseExpiry {
+                session_id,
+                attach_id: vacated.attach_id(),
+                role: vacated.role(),
+                revision: detached.state_revision,
+            });
 
         Ok(Claimed {
             lease,
             control_token,
-            session,
+            session: self.compose_snapshot(session, now),
             vacated_expired_controller,
         })
     }
@@ -913,7 +979,10 @@ impl SessionHost {
             lease.renew(now, ttl);
             *lease
         };
-        Ok(LeaseHeartbeat { lease, session })
+        Ok(LeaseHeartbeat {
+            lease,
+            session: self.compose_snapshot(session, now),
+        })
     }
 
     /// Detach one lease, or revoke another lease with control authority.
@@ -951,7 +1020,7 @@ impl SessionHost {
             .ok_or(LeaseRefusal::SessionNotFound)?;
         if snapshot.state.is_terminal() {
             return Ok(Detached {
-                session: snapshot,
+                session: self.compose_snapshot(snapshot, now),
                 attach_id: target,
                 role: None,
                 was_attached: false,
@@ -959,6 +1028,17 @@ impl SessionHost {
                 control_retired: false,
                 actor: authority_actor(authority),
             });
+        }
+
+        if self
+            .lease_sessions
+            .get(&target)
+            .is_some_and(|owner| *owner != session_id)
+        {
+            // A handle issued to another session is a foreign handle, not a
+            // removed one: it must not read as an idempotent no-op, on the own
+            // path or through any other authority.
+            return Err(LeaseRefusal::NotAttached);
         }
 
         let own = !authority.is_operator() && authority.lease == Some(target);
@@ -973,7 +1053,7 @@ impl SessionHost {
                 // is the contract's idempotent `not_attached` acknowledgement,
                 // not a mutation.
                 return Ok(Detached {
-                    session: snapshot,
+                    session: self.compose_snapshot(snapshot, now),
                     attach_id: target,
                     role: None,
                     was_attached: false,
@@ -1000,15 +1080,6 @@ impl SessionHost {
             .get(&session_id)
             .and_then(|state| state.leases.get(&target))
             .copied();
-        if self
-            .lease_sessions
-            .get(&target)
-            .is_some_and(|owner| *owner != session_id)
-        {
-            // A handle issued to another session is a foreign handle, not a
-            // removed one: it must not read as an idempotent no-op.
-            return Err(LeaseRefusal::NotAttached);
-        }
         let controller_target = self
             .sessions
             .get(&session_id)
@@ -1028,7 +1099,7 @@ impl SessionHost {
                     .snapshot(session_id)
                     .ok_or(LeaseRefusal::SessionNotFound)?;
                 return Ok(Detached {
-                    session,
+                    session: self.compose_snapshot(session, now),
                     attach_id: target,
                     role: Some(LeaseRole::Controller),
                     was_attached: false,
@@ -1038,7 +1109,7 @@ impl SessionHost {
                 });
             }
             return Ok(Detached {
-                session: snapshot,
+                session: self.compose_snapshot(snapshot, now),
                 attach_id: target,
                 role: None,
                 was_attached: false,
@@ -1065,7 +1136,7 @@ impl SessionHost {
         }
 
         Ok(Detached {
-            session,
+            session: self.compose_snapshot(session, now),
             attach_id: target,
             role: Some(lease.role()),
             was_attached: true,
@@ -1131,7 +1202,7 @@ impl SessionHost {
             .ok_or(LeaseRefusal::NotAttached)?;
         let snapshot = self.registry.record_lease_mutation(session_id, now)?;
         self.renew_lease(attach_id, now);
-        Ok(snapshot)
+        Ok(self.compose_snapshot(snapshot, now))
     }
 
     /// Remove every lease whose TTL lapsed at `now`.
@@ -1140,23 +1211,43 @@ impl SessionHost {
     /// mutations the event layer must publish. Expiry only detaches: the worker
     /// keeps running, the generation is unchanged, and a controller expiry
     /// leaves control vacant with the current token still reclaimable. Each
-    /// entry carries the `state_revision` of the post-detach snapshot in which
-    /// that removal is visible, ready for the event envelope.
+    /// entry carries the `state_revision` of the detach mutation, ready for the
+    /// event envelope.
     pub fn expire_due(&mut self, now: MonotonicMs) -> Vec<LeaseExpiry> {
-        let due: Vec<(SessionId, AttachId, LeaseRole)> = self
+        let session_ids: Vec<SessionId> = self.sessions.keys().copied().collect();
+        let mut expired = Vec::new();
+        for session_id in session_ids {
+            expired.extend(self.sweep_session(session_id, now));
+        }
+        expired
+    }
+
+    /// Remove one session's expired leases and return their detach mutations.
+    ///
+    /// [`SessionHost::expire_due`] sweeps every session and
+    /// [`SessionHost::attach_observer`] calls this at its entry point. The
+    /// status/list/authorize paths may call it when they want to publish due
+    /// detaches immediately; they never need it for the live count, which
+    /// [`SessionHost::snapshot`] composes without a mutation. The registry
+    /// detach runs first; a counter fault leaves the lease in place for the
+    /// next sweep instead of desynchronizing the derived count. Expiry is never
+    /// an abort and never changes the generation.
+    pub fn sweep_session(&mut self, session_id: SessionId, now: MonotonicMs) -> Vec<LeaseExpiry> {
+        let due: Vec<(AttachId, LeaseRole)> = self
             .sessions
-            .iter()
-            .flat_map(|(session_id, state)| {
+            .get(&session_id)
+            .map(|state| {
                 state
                     .leases
                     .values()
                     .filter(|lease| lease.is_expired_at(now))
-                    .map(move |lease| (*session_id, lease.attach_id(), lease.role()))
+                    .map(|lease| (lease.attach_id(), lease.role()))
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
 
         let mut expired = Vec::with_capacity(due.len());
-        for (session_id, attach_id, role) in due {
+        for (attach_id, role) in due {
             let exists = self
                 .sessions
                 .get(&session_id)
@@ -1164,9 +1255,6 @@ impl SessionHost {
             if !exists {
                 continue;
             }
-            // Registry first: a failed detach (terminal record or counter
-            // fault) leaves the lease in place for the next sweep instead of
-            // desynchronizing the derived count.
             let Ok(session) = self.registry.detach(session_id, now) else {
                 continue;
             };
@@ -1256,7 +1344,7 @@ impl SessionHost {
         let digest = ControlTokenDigest::of(&control_token);
 
         let vacated_controller = if let Some(expired) = expired_controller {
-            Some(self.remove_lease(session_id, expired.attach_id(), now)?.0)
+            Some(self.remove_lease(session_id, expired.attach_id(), now)?)
         } else {
             None
         };
@@ -1283,15 +1371,16 @@ impl SessionHost {
         }
         self.renew_lease(target, now);
 
-        let vacated_expired_controller = vacated_controller.map(|vacated| LeaseExpiry {
-            session_id,
-            attach_id: vacated.attach_id(),
-            role: vacated.role(),
-            revision: session.state_revision,
-        });
+        let vacated_expired_controller =
+            vacated_controller.map(|(vacated, detached)| LeaseExpiry {
+                session_id,
+                attach_id: vacated.attach_id(),
+                role: vacated.role(),
+                revision: detached.state_revision,
+            });
 
         Ok(Transferred {
-            session,
+            session: self.compose_snapshot(session, now),
             actor: authorized.actor(),
             previous_controller,
             controller: target,
@@ -1333,7 +1422,9 @@ impl SessionHost {
             .snapshot(session_id)
             .ok_or(LeaseRefusal::SessionNotFound)?;
         if snapshot.state.is_terminal() {
-            return Ok(StopOutcome::AlreadyTerminal { session: snapshot });
+            return Ok(StopOutcome::AlreadyTerminal {
+                session: self.compose_snapshot(snapshot, now),
+            });
         }
         let authorized = self.authorize_control(session_id, expected_generation, authority, now)?;
         self.commit_stop(
@@ -1367,7 +1458,9 @@ impl SessionHost {
             .snapshot(session_id)
             .ok_or(LeaseRefusal::SessionNotFound)?;
         if snapshot.state.is_terminal() {
-            return Ok(StopOutcome::AlreadyTerminal { session: snapshot });
+            return Ok(StopOutcome::AlreadyTerminal {
+                session: self.compose_snapshot(snapshot, now),
+            });
         }
         if snapshot.generation != expected_generation {
             return Err(stale_generation(&snapshot));
@@ -1408,7 +1501,9 @@ impl SessionHost {
             .snapshot(session_id)
             .ok_or(LeaseRefusal::SessionNotFound)?;
         if snapshot.state.is_terminal() {
-            return Ok(StopOutcome::AlreadyTerminal { session: snapshot });
+            return Ok(StopOutcome::AlreadyTerminal {
+                session: self.compose_snapshot(snapshot, now),
+            });
         }
         if snapshot.generation != expected_generation {
             return Err(stale_generation(&snapshot));
@@ -1419,7 +1514,7 @@ impl SessionHost {
             .ok_or(LeaseRefusal::SessionNotFound)?;
         if let Some(intent) = state.cancel {
             return Ok(StopOutcome::PreBindCancel(PreBindCancelAccepted {
-                session: snapshot,
+                session: self.compose_snapshot(snapshot, now),
                 reason: intent.reason,
                 actor: intent.actor,
                 already_accepted: true,
@@ -1439,7 +1534,7 @@ impl SessionHost {
             stop.escalated = true;
             let generation = snapshot.generation;
             return Ok(StopOutcome::Accepted(StopAccepted {
-                session: snapshot,
+                session: self.compose_snapshot(snapshot, now),
                 generation,
                 stage: AbortStage::KillDue,
                 deadline: now,
@@ -1457,7 +1552,7 @@ impl SessionHost {
                 actor: Actor::Operator,
             });
             return Ok(StopOutcome::PreBindCancel(PreBindCancelAccepted {
-                session: snapshot,
+                session: self.compose_snapshot(snapshot, now),
                 reason: TerminalReason::OperatorAbort,
                 actor: Actor::Operator,
                 already_accepted: false,
@@ -1476,7 +1571,7 @@ impl SessionHost {
             escalated: true,
         });
         Ok(StopOutcome::Accepted(StopAccepted {
-            session,
+            session: self.compose_snapshot(session, now),
             generation: expected_generation,
             stage: AbortStage::KillDue,
             deadline: now,
@@ -1541,7 +1636,9 @@ impl SessionHost {
             .snapshot(session_id)
             .ok_or(LeaseRefusal::SessionNotFound)?;
         if snapshot.state.is_terminal() {
-            return Ok(Termination::AlreadyTerminal { session: snapshot });
+            return Ok(Termination::AlreadyTerminal {
+                session: self.compose_snapshot(snapshot, now),
+            });
         }
         let intent = self
             .sessions
@@ -1597,7 +1694,9 @@ impl SessionHost {
             .snapshot(session_id)
             .ok_or(LeaseRefusal::SessionNotFound)?;
         if snapshot.state.is_terminal() {
-            return Ok(Termination::AlreadyTerminal { session: snapshot });
+            return Ok(Termination::AlreadyTerminal {
+                session: self.compose_snapshot(snapshot, now),
+            });
         }
         let (reason, exit, actor) = {
             let state = self
@@ -1684,7 +1783,7 @@ impl SessionHost {
             .and_then(|state| state.cancel)
         {
             return Ok(StopOutcome::PreBindCancel(PreBindCancelAccepted {
-                session: snapshot,
+                session: self.compose_snapshot(snapshot, now),
                 reason: intent.reason,
                 actor: intent.actor,
                 already_accepted: true,
@@ -1700,7 +1799,7 @@ impl SessionHost {
                     state: snapshot.state,
                 })?;
             return Ok(StopOutcome::Accepted(StopAccepted {
-                session: snapshot,
+                session: self.compose_snapshot(snapshot, now),
                 generation: stop_generation,
                 stage: stop.stage(now),
                 deadline: stop.deadline,
@@ -1717,7 +1816,7 @@ impl SessionHost {
                 .ok_or(LeaseRefusal::SessionNotFound)?;
             state.cancel = Some(CancelIntent { reason, actor });
             return Ok(StopOutcome::PreBindCancel(PreBindCancelAccepted {
-                session: snapshot,
+                session: self.compose_snapshot(snapshot, now),
                 reason,
                 actor,
                 already_accepted: false,
@@ -1738,7 +1837,7 @@ impl SessionHost {
         });
         self.renew_authorized(authorized, now);
         Ok(StopOutcome::Accepted(StopAccepted {
-            session,
+            session: self.compose_snapshot(session, now),
             generation,
             stage: AbortStage::Graceful,
             deadline,
@@ -1944,6 +2043,22 @@ impl SessionHost {
                 lease.renew(now, ttl);
             }
         }
+    }
+
+    /// Compose the live attach count into a registry snapshot.
+    ///
+    /// The registry stores attach/detach records; only this layer knows the
+    /// lease TTL, so `attach_count`/`attached` must be derived here at the
+    /// request instant (`R-S18`). A session without a lease table is terminal
+    /// or already collected: its count is zero.
+    fn compose_snapshot(&self, mut snapshot: SessionSnapshot, now: MonotonicMs) -> SessionSnapshot {
+        let count = self
+            .sessions
+            .get(&snapshot.session_id)
+            .map_or(0, |state| state.live_attach_count(now));
+        snapshot.attach_count = count;
+        snapshot.attached = count > 0;
+        snapshot
     }
 
     fn live_session(&self, session_id: SessionId) -> Result<SessionSnapshot, LeaseRefusal> {

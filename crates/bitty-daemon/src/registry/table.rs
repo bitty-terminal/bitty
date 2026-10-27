@@ -440,6 +440,12 @@ impl SessionRegistry {
     }
 
     /// A snapshot for a live or retained session.
+    ///
+    /// This is the registry's storage view: `attach_count` is the stored
+    /// attach/detach record count, because expiry belongs to the lease layer.
+    /// Service status/list must use [`crate::lease::SessionHost::snapshot`] /
+    /// [`crate::lease::SessionHost::snapshots`], which compose the live count
+    /// (`R-S18`).
     #[must_use]
     pub fn snapshot(&self, session_id: SessionId) -> Option<SessionSnapshot> {
         self.live
@@ -452,8 +458,10 @@ impl SessionRegistry {
     /// session-id order.
     ///
     /// Bounded by `max_sessions + max_retained_terminal_records` (128 at the
-    /// compiled maxima); `daemon.inspect` and `daemon.status` use this read
-    /// surface. Authorization and serialization stay in the IPC slice.
+    /// compiled maxima); `daemon.inspect` and `daemon.status` use the
+    /// lease-layer composed variant
+    /// ([`crate::lease::SessionHost::snapshots`]), never this raw storage view.
+    /// Authorization and serialization stay in the IPC slice.
     pub fn snapshots(&self) -> impl Iterator<Item = SessionSnapshot> + '_ {
         self.live
             .values()

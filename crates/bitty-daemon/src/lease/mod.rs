@@ -33,7 +33,10 @@
 //!   a lookup that also returns an expired record still awaiting the sweep;
 //!   [`SessionHost::authorize_content_read`] and
 //!   [`SessionHost::authorize_controller`] are the liveness-checked entry
-//!   points.
+//!   points. [`SessionHost::attach_observer`] sweeps the session at entry so
+//!   expired records stay inside the record bound and their detaches reach the
+//!   event layer, and [`SessionHost::snapshot`] composes the live
+//!   `attach_count` (`R-S18`).
 //! - Controller-only content authority: [`SessionHost::authorize_controller`]
 //!   gates input/resize, and [`SessionHost::record_resize`] increments the
 //!   revision exactly once. An observer resize is refused and changes nothing.

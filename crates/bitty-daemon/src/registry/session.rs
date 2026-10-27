@@ -518,7 +518,12 @@ impl MonotonicMs {
     }
 }
 
-/// The read-only service snapshot of one session (`D-03`, "Status and list").
+/// The read-only snapshot of one session (`D-03`, "Status and list").
+///
+/// The lease layer ([`crate::lease::SessionHost`]) composes the live
+/// `attach_count`/`attached` values into every service snapshot; a raw
+/// `SessionRegistry` snapshot instead carries the stored attach/detach record
+/// count because expiry belongs to the lease layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSnapshot {
     /// Server-assigned session identity.
@@ -534,6 +539,12 @@ pub struct SessionSnapshot {
     /// Snapshot-visible mutation counter.
     pub state_revision: u64,
     /// Live lease count, derived from the lease layer.
+    ///
+    /// The lease layer owns the TTL, so [`crate::lease::SessionHost`] composes
+    /// this value from its live lease table at the request instant; an expired
+    /// lease is excluded even before `expire_due` removes the record. A raw
+    /// `SessionRegistry` snapshot instead carries the stored attach/detach
+    /// record count and is not a service snapshot.
     pub attach_count: u16,
     /// `attach_count > 0`, derived rather than stored.
     pub attached: bool,

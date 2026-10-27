@@ -2,6 +2,7 @@
 members = [
   "crates/bitty-terminal",
   "crates/bitty-config",
+  "crates/bitty-daemon",
   "crates/bitty-lua",
   "crates/bitty-package",
   "crates/bitty-platform",

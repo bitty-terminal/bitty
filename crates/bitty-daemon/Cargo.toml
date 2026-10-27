@@ -1,0 +1,36 @@
+[package]
+name = "bitty-daemon"
+description = "bittyd session-host daemon for Bitty: service version, capability set, and handshake seam"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["daemon", "session", "ipc", "bitty"]
+categories = ["command-line-utilities"]
+# The daemon ships as a binary, never as a crates.io library: the published
+# surface stays inside the workspace until the session-host contract is
+# implemented and reviewed (bitty#2606, ADR 0019).
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "bittyd"
+path = "src/main.rs"
+
+[dependencies]
+# bitty#2606: the seam declares no mechanism edge yet. The contract fixes the
+# allowed direction (bittyd -> bitty-term-state, bitty-pty,
+# bitty-plugin-host, bitty-ipc); each edge is added by the slice that
+# consumes it (registry bitty#2601, IPC service bitty#2607, platform cells
+# bitty#2604). Never add the reverse edge: `tests/dependency_direction.rs`
+# reads `cargo metadata` and fails when any non-daemon crate depends on this
+# package.
+
+[dev-dependencies]
+# Workspace graph for the one-way dependency check. `serde_json` is already
+# in the lockfile through the existing graph, so this adds no package version
+# and stays out of the shipped daemon.
+serde_json = "1"

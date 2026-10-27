@@ -224,7 +224,10 @@ dependencies = [
  "getrandom 0.4.3",
  "nix 0.31.3",
  "serde_json",
+ "sha2",
+ "subtle",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]

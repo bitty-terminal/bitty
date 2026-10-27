@@ -1,9 +1,9 @@
-//! Server-generated 128-bit identifiers (contract `D-02`).
+//! Server-generated 128-bit identifiers (contract `D-02`, `D-09`).
 //!
-//! `daemon_instance_id` and `session_id` are 128-bit values from the operating
-//! system CSPRNG, encoded as exactly 32 lowercase hex characters. They are not
-//! secrets: the client echoes them for fencing, and a parsed value never
-//! carries authority. Only the daemon mints them.
+//! `daemon_instance_id`, `session_id`, and `attach_id` are 128-bit values from
+//! the operating system CSPRNG, encoded as exactly 32 lowercase hex characters.
+//! They are not secrets: the client echoes them for fencing, and a parsed value
+//! never carries authority. Only the daemon mints them.
 //!
 //! Entropy failure is a hard refusal ([`IdError::RandomUnavailable`]); there is
 //! no deterministic fallback, no counter-derived id, and no reuse of a value
@@ -115,7 +115,7 @@ hex_identifier!(
 );
 hex_identifier!(
     AttachId,
-    "Server-assigned lease identity (contract `D-02`, `D-09`; \
+    "Server-assigned attach-lease identity (contract `D-02`, `D-09`; \
      `attach_id_bytes` = 32 hex characters)."
 );
 
@@ -179,6 +179,9 @@ impl AttachId {
     }
 
     /// Mint a fresh attach id from an injected entropy source (bitty#2602).
+    ///
+    /// Only the lease layer mints attach ids; a client-supplied value is parsed
+    /// for lookup and never becomes a new identity.
     pub(crate) fn generate_with(entropy: &mut dyn Entropy) -> Result<Self, IdError> {
         random_bytes(entropy).map(Self)
     }
@@ -187,9 +190,9 @@ impl AttachId {
     ///
     /// # Errors
     ///
-    /// Returns [`IdError`] for a non-canonical encoding. Parsing confers no
-    /// authority: the lease layer still decides whether the id names a live
-    /// lease.
+    /// Returns [`IdError`] for a non-canonical encoding. A parsed value is a
+    /// handle, never authority: the lease layer still decides whether the id
+    /// names a live lease with the requested role.
     pub fn parse(value: &str) -> Result<Self, IdError> {
         value.parse()
     }
@@ -298,16 +301,26 @@ mod tests {
 
     #[test]
     fn attach_ids_are_canonical_and_unique() {
+        let mut entropy = OsEntropy;
         let mut seen = HashSet::new();
         for _ in 0..4096 {
             let id = AttachId::generate().expect("OS entropy is available");
             let text = id.as_hex();
             assert_eq!(text.len(), ID_HEX_CHARS);
             assert_eq!(text, id.to_string());
+            assert!(
+                text.bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            );
             assert!(seen.insert(id), "a fresh attach id repeated within one run");
             assert_eq!(AttachId::parse(&text), Ok(id));
         }
         assert_eq!(AttachId::parse(""), Err(IdError::InvalidLength));
+
+        // The injected source mints the same identity shape for the event
+        // stream (bitty#2602) and the lease layer (bitty#2609).
+        let minted = AttachId::generate_with(&mut entropy).expect("OS entropy is available");
+        assert_eq!(AttachId::parse(&minted.as_hex()), Ok(minted));
     }
 
     #[test]
@@ -343,6 +356,14 @@ mod tests {
             SessionId::parse(&session.as_hex().to_uppercase()),
             Err(IdError::InvalidCharacter)
         );
+
+        let attach = AttachId::generate_with(&mut OsEntropy).expect("OS entropy is available");
+        assert_eq!(AttachId::parse(&attach.as_hex()), Ok(attach));
+        assert_eq!(AttachId::parse(""), Err(IdError::InvalidLength));
+        assert_eq!(
+            AttachId::parse(&attach.as_hex().to_uppercase()),
+            Err(IdError::InvalidCharacter)
+        );
     }
 
     #[test]
@@ -357,6 +378,10 @@ mod tests {
         );
         assert_eq!(
             SessionId::generate_with(&mut entropy),
+            Err(IdError::RandomUnavailable)
+        );
+        assert_eq!(
+            AttachId::generate_with(&mut entropy),
             Err(IdError::RandomUnavailable)
         );
         assert_eq!(random_hex(&mut entropy), Err(IdError::RandomUnavailable));

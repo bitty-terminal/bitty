@@ -440,6 +440,12 @@ impl SessionRegistry {
     }
 
     /// A snapshot for a live or retained session.
+    ///
+    /// This is the registry's storage view: `attach_count` is the stored
+    /// attach/detach record count, because expiry belongs to the lease layer.
+    /// Service status/list must use [`crate::lease::SessionHost::snapshot`] /
+    /// [`crate::lease::SessionHost::snapshots`], which compose the live count
+    /// (`R-S18`).
     #[must_use]
     pub fn snapshot(&self, session_id: SessionId) -> Option<SessionSnapshot> {
         self.live
@@ -452,8 +458,10 @@ impl SessionRegistry {
     /// session-id order.
     ///
     /// Bounded by `max_sessions + max_retained_terminal_records` (128 at the
-    /// compiled maxima); `daemon.inspect` and `daemon.status` use this read
-    /// surface. Authorization and serialization stay in the IPC slice.
+    /// compiled maxima); `daemon.inspect` and `daemon.status` use the
+    /// lease-layer composed variant
+    /// ([`crate::lease::SessionHost::snapshots`]), never this raw storage view.
+    /// Authorization and serialization stay in the IPC slice.
     pub fn snapshots(&self) -> impl Iterator<Item = SessionSnapshot> + '_ {
         self.live
             .values()
@@ -637,6 +645,43 @@ impl SessionRegistry {
         Ok(record.snapshot())
     }
 
+    /// Record a snapshot-visible lease mutation whose attach count does not
+    /// change (contract `D-03`: a control transfer or controller resize
+    /// increments `state_revision`).
+    ///
+    /// A transfer keeps both leases and only swaps their roles, so
+    /// [`Self::attach`] and [`Self::detach`] would misstate the count. The
+    /// revision increments once and `last_seen` refreshes; the generation and
+    /// the attach count are untouched.
+    ///
+    /// # Errors
+    ///
+    /// Refuses on an unknown or terminal session, or when the revision would
+    /// wrap.
+    pub fn record_lease_mutation(
+        &mut self,
+        session_id: SessionId,
+        now: MonotonicMs,
+    ) -> Result<SessionSnapshot, RegistryRefusal> {
+        if !self.live.contains_key(&session_id) {
+            return Err(self.lookup_refusal(session_id));
+        }
+        let record = self.live.get_mut(&session_id).expect("checked above");
+        if record.state.is_terminal() {
+            return Err(RegistryRefusal::NotRunning {
+                state: record.state,
+            });
+        }
+
+        let revision = record
+            .state_revision
+            .checked_add(1)
+            .ok_or(RegistryRefusal::RevisionOverflow)?;
+        record.state_revision = revision;
+        record.last_seen = now;
+        Ok(record.snapshot())
+    }
+
     /// Refresh `last_seen` without touching `state_revision` (`D-03`, `D-12`).
     ///
     /// # Errors
@@ -733,8 +778,11 @@ impl SessionRegistry {
     /// Record the terminal transition and move the record to retention.
     ///
     /// The revision increments exactly once; the generation never changes. The
-    /// terminal record is immutable from this point and only retention removes
-    /// it.
+    /// frozen record keeps the derived attach count the caller left it with:
+    /// the lease layer detaches every lease before this call (`D-09`), so its
+    /// terminal record reports no attaches, while the event stream may keep a
+    /// pinned lease attached to a terminal record (`D-18`). The terminal record
+    /// is immutable from this point and only retention removes it.
     ///
     /// # Errors
     ///
@@ -1186,6 +1234,57 @@ mod tests {
         assert_eq!(detached.attach_count, 0);
         assert_eq!(detached.state_revision, 1);
         assert_eq!(detached.last_seen_ms, ms(3));
+    }
+
+    #[test]
+    fn lease_mutation_bumps_revision_without_changing_the_count() {
+        let mut registry = default_registry();
+        let created = create(&mut registry, "term", 1);
+        registry
+            .bind(created.session_id, ms(2))
+            .expect("bind succeeds");
+        let attached = registry
+            .attach(created.session_id, ms(3))
+            .expect("attach succeeds");
+        assert_eq!(attached.attach_count, 1);
+
+        let transferred = registry
+            .record_lease_mutation(created.session_id, ms(4))
+            .expect("lease mutation succeeds");
+        assert_eq!(transferred.state_revision, attached.state_revision + 1);
+        assert_eq!(transferred.attach_count, 1);
+        assert!(transferred.attached);
+        assert_eq!(transferred.generation, attached.generation);
+        assert_eq!(transferred.last_seen_ms, ms(4));
+
+        // The lease layer releases its leases before the terminal transition
+        // (`D-09`); the registry keeps the count it is handed.
+        let detached = registry
+            .detach(created.session_id, ms(5))
+            .expect("detach succeeds");
+        assert_eq!(detached.state_revision, transferred.state_revision + 1);
+        assert_eq!(detached.attach_count, 0);
+
+        let stopping = registry
+            .begin_stopping(created.session_id, ms(6))
+            .expect("stopping succeeds");
+        assert_eq!(stopping.state_revision, detached.state_revision + 1);
+        let terminal = terminate(
+            &mut registry,
+            created.session_id,
+            TerminalReason::DaemonStop,
+            ExitInformation::NotApplicable,
+            CleanupClass::Swept,
+            7,
+        );
+        assert_eq!(terminal.state_revision, stopping.state_revision + 1);
+        assert_eq!(terminal.attach_count, 0);
+        assert_eq!(
+            registry.record_lease_mutation(created.session_id, ms(7)),
+            Err(RegistryRefusal::NotRunning {
+                state: LifecycleState::Terminated
+            })
+        );
     }
 
     #[test]
@@ -1703,8 +1802,13 @@ mod tests {
         registry
             .attach(created.session_id, ms(3))
             .expect("attach succeeds");
+        // A terminal session has no live lease (`D-09`), so the caller detaches
+        // before the transition and the frozen record reports no attaches.
         registry
-            .begin_stopping(created.session_id, ms(4))
+            .detach(created.session_id, ms(4))
+            .expect("detach succeeds");
+        registry
+            .begin_stopping(created.session_id, ms(5))
             .expect("stopping succeeds");
         let snapshot = terminate(
             &mut registry,
@@ -1712,14 +1816,14 @@ mod tests {
             TerminalReason::WorkerExit,
             ExitInformation::ExitCode(7),
             CleanupClass::Swept,
-            5,
+            6,
         );
 
         assert_eq!(snapshot.state, LifecycleState::Exited);
         assert_eq!(snapshot.generation, 1);
-        assert_eq!(snapshot.state_revision, 4);
-        assert_eq!(snapshot.attach_count, 1);
-        assert!(snapshot.attached);
+        assert_eq!(snapshot.state_revision, 5);
+        assert_eq!(snapshot.attach_count, 0);
+        assert!(!snapshot.attached);
         assert_eq!(snapshot.terminal_reason, Some(TerminalReason::WorkerExit));
         assert_eq!(snapshot.exit, ExitInformation::ExitCode(7));
         assert_eq!(snapshot.cleanup, Some(CleanupClass::Swept));

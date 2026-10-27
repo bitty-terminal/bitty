@@ -575,6 +575,17 @@ pub(crate) struct StartupSeed<'a> {
     /// (issue #2396). The snapshot is built only when a discovered package
     /// declares `runtime.inspect`.
     pub(crate) inspect: Option<&'a crate::runtime_inspect::RuntimeInspectContext>,
+    /// Resolved user-layer file a `config.manage` write may target
+    /// (CTX-1613). Only a direct child of the resolved config root is ever
+    /// wired; `None` (safe mode, explicit `--config` outside the root, or a
+    /// test) leaves granted writes failing closed with
+    /// `E_CONFIG_UNAVAILABLE`.
+    pub(crate) config_file: Option<&'a Path>,
+    /// Profile chain startup actually loaded (`--profile`/`BITTY_PROFILE`
+    /// over the user layer's selector), if any (CTX-1613). The writer seeds
+    /// and validates against that chain, so it never pins or accepts another
+    /// profile's values. `None` means startup loaded no profile.
+    pub(crate) config_profile: Option<&'a str>,
 }
 
 /// Discover and activate installed and development plugins, returning the
@@ -703,7 +714,30 @@ pub(crate) fn discover_with_roots(
             runtime.set_budget_file_error(error);
         }
     }
-    runtime.set_settings_dir(settings_dir);
+    runtime.set_settings_dir(settings_dir.clone());
+    // CTX-1613 (bitty#2393): install the user-layer writer for the
+    // `config.manage` write head. Only a target that is a direct child of the
+    // resolved config root is accepted; an explicit `--config` outside the
+    // user root, a missing root, or safe mode leaves the backend unwired, so
+    // granted calls fail closed with `E_CONFIG_UNAVAILABLE`. The
+    // per-generation grant and the call-time gate stay as the first two
+    // layers.
+    if !safe_mode {
+        if let (Some(target), Some(config_dir)) = (seed.config_file, settings_dir.as_deref()) {
+            if let Some(writer) = crate::profile::UserLayerConfigWriter::new(
+                config_dir.to_path_buf(),
+                target.to_path_buf(),
+                seed.config_profile.map(str::to_string),
+            ) {
+                runtime.set_config_write_backend(Some(Rc::new(writer)));
+            } else {
+                crate::logging::warn(|| {
+                    "bitty: config.manage target is outside the user config root; writes disabled"
+                        .to_string()
+                });
+            }
+        }
+    }
     // CTX-1345: install the production `bitty.panel.create` backend before
     // activation so panel-creating generations capture a real allocator.
     // The registry is process-owned and lives as long as the plugin runtime
@@ -1023,6 +1057,8 @@ mod tests {
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: None,
+            config_file: None,
+            config_profile: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], Some(home), None)
             .expect("dev root must yield a session");
@@ -1040,6 +1076,111 @@ mod tests {
             value,
             LuaValue::String("~/docs/a.txt:file:true,~/docs/b.txt:file:true".to_string())
         );
+    }
+
+    /// Composition-root wiring for `config.manage` (CTX-1613): an installed
+    /// package with a recorded grant gets the production user-layer writer,
+    /// writes through the real strict loader/atomic path, and a denied key
+    /// stays unaddressable. A dev-root declaration alone cannot obtain the
+    /// write head (review B2).
+    #[test]
+    fn discover_wires_the_config_manage_user_layer_writer() {
+        let config_dir = fs_list_probe_root("config-root");
+        let target = config_dir.join("init.lua");
+
+        let store = fs_list_probe_root("config-store");
+        let id = "xuepoo.configprobe";
+        let version = "0.1.0";
+        let relative = format!("packages/{id}/{version}");
+        let plugin = store.join(&relative);
+        std::fs::create_dir_all(plugin.join("lua")).expect("plugin dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Config\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[capabilities]\nconfig.manage = true\n\n[lazy]\ncommands = [\"{id}:apply\", \"{id}:denied\"]\nevents = []\n"
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin.join("lua/init.lua"),
+            r#"
+            local function apply()
+              local preview = bitty.config.preview("font.size", 15)
+              local out = bitty.config.set("font.size", 15, preview.digest)
+              return tostring(out.applied) .. ":" .. out.reload
+            end
+            local function denied()
+              local ok, error = pcall(bitty.config.preview, "terminal.shell", "/bin/sh")
+              if ok then return "ACCEPTED" end
+              return error.code
+            end
+            bitty.commands.register({ id = "apply", title = "Apply", run = apply })
+            bitty.commands.register({ id = "denied", title = "Denied", run = denied })
+            "#,
+        )
+        .expect("init");
+
+        let live = Runtime::with_defaults().expect("defaults");
+        let summaries = live.workspace_summaries();
+        let leaves = live.layout().leaf_ids();
+        let pinned = live.pinned_views();
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            keymaps: &[],
+            targets: &[],
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
+            config_file: Some(&target),
+            config_profile: None,
+        };
+        let manifest_bytes = std::fs::read(plugin.join("bitty-plugin.toml")).expect("manifest");
+        let manifest =
+            bitty_runtime::plugin_runtime::manifest_toml::parse_manifest(&manifest_bytes)
+                .expect("manifest parses");
+        let record = bitty_runtime::plugin_runtime::PluginRecord {
+            source_class: bitty_runtime::plugin_runtime::SourceClass::Registry,
+            plugin_id: id.to_string(),
+            version: version.to_string(),
+            root: relative,
+            manifest_hash: manifest.manifest_hash(),
+            content_digest: bitty_runtime::plugin_runtime::content_digest(&plugin)
+                .expect("content digest"),
+            enabled: true,
+            granted: vec!["config.manage".to_string()],
+        };
+        bitty_runtime::plugin_runtime::write_index(&store, &[record]).expect("store index");
+        let session = discover_with_roots(
+            false,
+            80,
+            24,
+            &seed,
+            Some(store.clone()),
+            Vec::new(),
+            None,
+            Some(config_dir.clone()),
+        )
+        .expect("store package must yield a session");
+        let mut runtime = session.runtime;
+        runtime.set_host_call_deadline_ms(Some(HARNESS_HOST_CALL_DEADLINE_MS));
+        let plugin_id = bitty_plugin_host::manifest::PluginId::new(id).expect("id");
+        let applied =
+            settle_dispatch(&mut runtime, plugin_id.as_str(), "apply", &[]).expect_value("apply");
+        assert_eq!(
+            applied,
+            LuaValue::String("true:auto".to_string()),
+            "the real writer applied the change"
+        );
+        let content = std::fs::read_to_string(&target).expect("written user layer");
+        assert!(content.contains("size = 15"), "{content}");
+        bitty_config::file::load_user_layer(&target).expect("strict loader accepts the write");
+        let denied =
+            settle_dispatch(&mut runtime, plugin_id.as_str(), "denied", &[]).expect_value("denied");
+        assert_eq!(denied, LuaValue::String("E_CONFIG_KEY".to_string()));
+        let _ = std::fs::remove_dir_all(&config_dir);
+        let _ = std::fs::remove_dir_all(&store);
     }
 
     /// Development package declaring `runtime.inspect` with one command
@@ -1105,6 +1246,8 @@ mod tests {
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: Some(context),
+            config_file: None,
+            config_profile: None,
         }
     }
 
@@ -1224,6 +1367,8 @@ mod tests {
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: None,
+            config_file: None,
+            config_profile: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -1414,6 +1559,8 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: None,
+            config_file: None,
+            config_profile: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -1643,6 +1790,8 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: None,
+            config_file: None,
+            config_profile: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -1806,6 +1955,8 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: None,
+            config_file: None,
+            config_profile: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -2203,6 +2354,8 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             image_roots: &[],
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: None,
+            config_file: None,
+            config_profile: None,
         };
         discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session")

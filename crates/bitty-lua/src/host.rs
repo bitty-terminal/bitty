@@ -1227,6 +1227,40 @@ pub trait HostServices {
     }
     /// Read a typed setting; `Ok(None)` means absent.
     fn settings_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError>;
+    /// Render one allowlisted configuration change and issue its approval
+    /// token for `bitty.config.preview` (CTX-1613, bitty#2393).
+    ///
+    /// Returns `(digest, rendered, changed_keys)` where `rendered` is the
+    /// exact bounded diff the user approves and `changed_keys` lists every
+    /// setting leaf the candidate changes (including pinned seeds). The
+    /// default fails closed with `E_NOT_IMPLEMENTED`: a host without the
+    /// write service can never gain writes from the always-present
+    /// `bitty.config` namespace.
+    fn config_preview(
+        &self,
+        key: &str,
+        value: &LuaValue,
+    ) -> Result<(String, String, Vec<String>), BridgeError> {
+        let _ = (key, value);
+        Err(BridgeError::not_implemented("bitty.config.preview"))
+    }
+    /// Apply one change bound to a digest issued by [`HostServices::config_preview`].
+    ///
+    /// Returns `(applied, reload)`: `applied` is false for an idempotent
+    /// no-op, and `reload` is `auto` when the app's config watcher must
+    /// re-read the user layer. `expiry` is the bridge's cheap-call deadline;
+    /// implementations must check it before committing and never report an
+    /// already-committed write as a timeout. The default fails closed.
+    fn config_set(
+        &self,
+        key: &str,
+        value: &LuaValue,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        let _ = (key, value, digest, expiry);
+        Err(BridgeError::not_implemented("bitty.config.set"))
+    }
     /// Read one host environment variable for `bitty.env.get` (CTX-0330).
     ///
     /// Host-mediated and grant-gated: the implementation must return
@@ -6606,6 +6640,120 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         )
         .expect("runtime table accepts 'inspect'");
 
+    // CTX-1613 (bitty#2393): `bitty.config.preview`/`bitty.config.set`. The
+    // write-only surface for the `config.manage` head. Both calls reject any
+    // extra argument at the bridge, accept one allowlisted dotted key and one
+    // typed scalar (never a loose key/value table, path, argv, or URL), and
+    // delegate allowlist/approval/budget enforcement to the host. Without the
+    // grant the host denies with `E_CAPABILITY_DENIED`, so the namespace
+    // stays present but read-only.
+    let config = Table::new(&ctx);
+    config
+        .set(
+            ctx,
+            "preview",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(2), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "config.preview takes exactly two arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let key = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(key)) => key,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_KEY",
+                                "config.preview key must be a dotted setting string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let value = LuaValue::from_lua(stack.get(1), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let (digest, rendered, keys) = state
+                        .bounded(|_expiry| state.services.config_preview(&key, &value))
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("digest", LuaValue::String(digest)),
+                            ("rendered", LuaValue::String(rendered)),
+                            (
+                                "keys",
+                                LuaValue::array(keys.into_iter().map(LuaValue::String).collect()),
+                            ),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("config table accepts 'preview'");
+    config
+        .set(
+            ctx,
+            "set",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(3), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "config.set takes exactly three arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let key = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(key)) => key,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_KEY",
+                                "config.set key must be a dotted setting string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let value = LuaValue::from_lua(stack.get(1), state.limits)
+                        .map_err(|error| error.to_error(ctx))?;
+                    let digest = match LuaValue::from_lua(stack.get(2), state.limits) {
+                        Ok(LuaValue::String(digest)) => digest,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_APPROVAL_MISMATCH",
+                                "config.set approval must be the digest from config.preview",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let (applied, reload) = state
+                        .bounded_mutation(|expiry| {
+                            state.services.config_set(&key, &value, &digest, expiry)
+                        })
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("applied", LuaValue::Bool(applied)),
+                            ("reload", LuaValue::String(reload.to_string())),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("config table accepts 'set'");
+
     let root = Table::new(&ctx);
     root.set(ctx, "api_version", API_VERSION)
         .expect("root accepts api_version");
@@ -6658,6 +6806,8 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts history");
     root.set(ctx, "runtime", readonly_table(ctx, runtime))
         .expect("root accepts runtime");
+    root.set(ctx, "config", readonly_table(ctx, config))
+        .expect("root accepts config");
     root.set(ctx, "component", readonly_table(ctx, component))
         .expect("root accepts component");
     Value::Table(readonly_table(ctx, root))

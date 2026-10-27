@@ -1820,6 +1820,51 @@ mod tests {
     }
 
     #[test]
+    fn config_manage_grant_round_trips_and_rejects_unknown_config_heads() {
+        // CTX-1613 (bitty#2393): the write head is an ordinary exact-set
+        // grant (no first-party bypass), so it persists and reloads like
+        // every other head while unknown `config.*` spellings fail closed at
+        // parse time instead of minting authority.
+        let pid = PluginId::new("bitty-terminal.dashboard").unwrap();
+        let granted: BTreeSet<_> = [cap("config.manage")].into_iter().collect();
+        let mut store = GrantStore::new();
+        store.insert(GrantRecord::granted(
+            pid.clone(),
+            "cfg1",
+            granted.clone(),
+            1,
+        ));
+        let rendered = store.render().unwrap();
+        let reloaded = GrantStore::parse(&rendered).unwrap();
+
+        let declared_write = declared(&["config.manage"]);
+        assert!(reloaded.is_granted(&pid, "cfg1", &cap("config.manage"), &declared_write));
+        // The write head carries no read: read stays on `runtime.inspect`.
+        assert!(!reloaded.is_granted(&pid, "cfg1", &cap("runtime.inspect"), &declared_write));
+        // A grant record never widens past the manifest's declared set.
+        assert!(!reloaded.is_granted(
+            &pid,
+            "cfg1",
+            &cap("config.manage"),
+            &declared(&["runtime.inspect"])
+        ));
+        // Adding `config.manage` to an update is an expansion (re-prompt),
+        // never a silent carry-forward.
+        assert!(!store.can_carry_forward(&BTreeSet::new(), &granted));
+        // Unknown `config.*` heads never parse out of a persisted store.
+        for head in ["config.read", "config.write", "config.set"] {
+            let hostile = rendered.replace("config.manage", head);
+            assert!(
+                GrantStore::parse(&hostile).is_err(),
+                "unknown '{head}' must fail closed instead of becoming a grant"
+            );
+        }
+        // The same refusal applies to the runtime parse path.
+        assert!(CapabilityId::parse("config.read").is_err());
+        assert!(CapabilityId::parse("config.manage").is_ok());
+    }
+
+    #[test]
     fn persist_load_missing_file_is_empty() {
         let dir = std::env::temp_dir().join(format!(
             "bitty-ctx0765-grant-{}-missing",

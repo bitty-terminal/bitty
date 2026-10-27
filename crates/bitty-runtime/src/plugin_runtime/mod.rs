@@ -23,6 +23,7 @@
 
 pub mod audio;
 pub mod component_requests;
+pub mod config_write;
 pub mod debug;
 pub mod device_providers;
 pub mod fs;
@@ -81,6 +82,16 @@ pub use component_requests::{
     COMPONENT_COMPLETION_CAPACITY, COMPONENT_IN_FLIGHT_PER_PLUGIN,
     COMPONENT_REQUEST_QUEUE_CAPACITY, ComponentPollOutcome, ComponentRequestQueue,
     QueuedComponentRequest, broker_request, outcome_value,
+};
+pub use config_write::{
+    CONFIG_PREVIEW_MAX_KEYS, CONFIG_PREVIEW_MAX_LINES, CONFIG_PREVIEW_MAX_RENDERED_BYTES,
+    CONFIG_SET_APPROVAL_DOMAIN, CONFIG_SET_BYTES_PER_SECOND, CONFIG_SET_CALLS_PER_SECOND,
+    CONFIG_SET_MAX_KEY_BYTES, CONFIG_SET_MAX_OUTSTANDING_PREVIEWS, CONFIG_SET_MAX_RENDERED_BYTES,
+    CONFIG_SET_MAX_ROWS, CONFIG_SET_MAX_VALUE_BYTES, CONFIG_SET_MAX_WALL_MS,
+    CONFIG_SET_RATE_WINDOW, CONFIG_WRITABLE_SETTINGS, ConfigApplyOutcome, ConfigChange,
+    ConfigPreviewRendering, ConfigPreviewToken, ConfigSetOutcome, ConfigSettingKey,
+    ConfigSettingValue, ConfigValueKind, ConfigWriteBackend, ConfigWriteFailure, ConfigWriteGate,
+    approval_digest, approval_preimage, candidate_digest, writable_setting,
 };
 pub use fs::{
     FakeFileSystem, FileSystem, NativeFileSystem, STALE_TEMP_AGE_SECS, clean_temp_siblings,
@@ -820,6 +831,14 @@ pub struct PluginRuntime {
     /// Replaceable through [`PluginRuntime::set_theme_persist_backend`] so
     /// durability and failure can be injected deterministically.
     theme_persist_backend: Option<ThemePersistHandler>,
+    /// CTX-1613: durable user-layer backend behind `config.set`.
+    ///
+    /// `None` by default (no writable configuration layer configured):
+    /// granted calls fail closed with `E_CONFIG_UNAVAILABLE` and have no side
+    /// effect. Captured only by `config.manage` generations at activation;
+    /// the backend returns a path-free failure class so plugin diagnostics
+    /// never carry host paths.
+    config_write_backend: Option<Rc<dyn ConfigWriteBackend>>,
     /// CTX-0941: runtime-shared single-owner focusable-overlay capture switch
     /// and bounded input queue. Shared with every generation's services so the
     /// single-owner invariant holds across plugins and reload.
@@ -1018,6 +1037,7 @@ impl PluginRuntime {
             ))),
             component_requests: Rc::new(RefCell::new(ComponentRequestQueue::new())),
             theme_persist_backend: None,
+            config_write_backend: None,
             overlay_capture: Rc::new(RefCell::new(OverlayCapture::new())),
             presentation_overlay: Rc::new(RefCell::new(PresentationOverlay::new())),
             overlay_peers: Rc::new(RefCell::new(BTreeMap::new())),
@@ -1567,6 +1587,15 @@ impl PluginRuntime {
     /// with state untouched.
     pub fn set_theme_persist_backend(&mut self, backend: Option<ThemePersistHandler>) {
         self.theme_persist_backend = backend;
+    }
+
+    /// Install the durable user-layer backend for `config.set` (CTX-1613,
+    /// bitty#2393). Call before activation: only `config.manage` generations
+    /// capture the current backend, and `None` leaves granted calls failing
+    /// closed with `E_CONFIG_UNAVAILABLE`. Deterministic failure can be injected
+    /// through the [`ConfigWriteBackend`] implementation.
+    pub fn set_config_write_backend(&mut self, backend: Option<Rc<dyn ConfigWriteBackend>>) {
+        self.config_write_backend = backend;
     }
 
     /// Current durable-commit backend for confirmed colorschemes, if any.
@@ -2566,7 +2595,8 @@ impl PluginRuntime {
         // Policy half: declare, resolve, register, grant, activate. The grant
         // is the intersection of the manifest's declared capabilities with the
         // consented record (RFC B.4: grants are bound to the manifest hash);
-        // development and bundled packages without a record grant in full.
+        // development and bundled packages without a record grant in full,
+        // except heads that require a recorded grant (`config.manage`).
         let hash = manifest.manifest_hash();
         let declared =
             manifest
@@ -2682,6 +2712,14 @@ impl PluginRuntime {
         let runtime_configure = granted
             .iter()
             .any(|capability| capability.as_str() == "runtime.configure");
+        // CTX-1613 (bitty#2393): the write-only configuration head. It is
+        // independent of `runtime.inspect`/`runtime.configure` (read never
+        // implies write and write never implies read); the backend below is
+        // installed only for a granted generation and the call-time gate
+        // stays as the second layer.
+        let config_manage = granted
+            .iter()
+            .any(|capability| capability.as_str() == "config.manage");
         // CTX-0889 fail-closed: declaring a `workspace.*` event kind (which
         // admits both subscription and `debug.trace` observation) requires
         // `workspace.read`. Reject before any VM exists instead of letting
@@ -2883,6 +2921,14 @@ impl PluginRuntime {
         plugin_services.set_theme_access(runtime_configure);
         if runtime_configure {
             plugin_services.set_theme_queue(Some(self.theme_requests.clone()));
+        }
+        // CTX-1613 (bitty#2393): the user-layer write backend. Installed only
+        // for `config.manage` generations (no backend without grant); the
+        // call-time gate and safe-mode denial in `config_set` stay as the
+        // second layer.
+        plugin_services.set_config_access(config_manage);
+        if config_manage {
+            plugin_services.set_config_write_backend(self.config_write_backend.clone());
         }
         plugin_services.set_granted_capabilities(
             granted
@@ -4860,7 +4906,16 @@ fn effective_granted(
     recorded: Option<&[String]>,
 ) -> Result<BTreeSet<CapabilityId>, PluginRuntimeError> {
     let Some(recorded) = recorded else {
-        return Ok(declared.clone());
+        // CTX-1613 (bitty#2393): development and bundled packages without a
+        // record grant in full, **except** heads that require a recorded,
+        // explicit decision. `config.manage` writes user configuration, so a
+        // package that merely declares it activates with the head withheld
+        // and every write fails closed until a grant record exists.
+        return Ok(declared
+            .iter()
+            .filter(|capability| !capability.requires_recorded_grant())
+            .cloned()
+            .collect());
     };
     let mut effective = BTreeSet::new();
     for raw in recorded {
@@ -5228,6 +5283,36 @@ plugin-api = "^1.0"
         raw.iter()
             .map(|grant| CapabilityId::parse(grant).expect("test grant parses"))
             .collect()
+    }
+
+    #[test]
+    fn effective_granted_withholds_config_manage_without_a_record() {
+        // CTX-1613 review B2: the no-record development/bundled seam grants
+        // declared heads, but configuration writes need an explicit record.
+        let id = PluginId::new("xuepoo.devprobe").expect("id");
+        let declared = parsed_grants(&["terminal.semantic-read", "config.manage"]);
+        let granted = effective_granted(&id, &declared, None).expect("computed");
+        assert!(
+            granted
+                .iter()
+                .any(|capability| capability.as_str() == "terminal.semantic-read"),
+            "ordinary declared heads keep the development seam"
+        );
+        assert!(
+            !granted
+                .iter()
+                .any(|capability| capability.as_str() == "config.manage"),
+            "config.manage must never be granted implicitly"
+        );
+
+        let recorded = vec!["config.manage".to_string()];
+        let granted = effective_granted(&id, &declared, Some(&recorded)).expect("recorded grant");
+        assert_eq!(granted, parsed_grants(&["config.manage"]));
+        assert!(
+            granted
+                .iter()
+                .all(|capability| capability.as_str() != "terminal.semantic-read")
+        );
     }
 
     fn service_test_manifest(

@@ -239,6 +239,13 @@ jobs:
         if: matrix.shard == 1
         run: cargo fmt --all -- --check
 
+      # CTX-1611 (bitty#2735): a private intra-doc link must fail the PR.
+      # Shares the workspace build cache with the steps above; `--no-deps`
+      # keeps third-party docs out of the gate.
+      - name: Check rustdoc
+        if: matrix.shard == 1
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked
+
       # CTX-1605: `winit` is a patched path dependency (vendor/winit). A
       # requirement bump otherwise resolves to crates.io with only a "patch was
       # not used" warning, dropping the Wayland Occluded edge while staying

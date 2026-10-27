@@ -38,8 +38,27 @@ jobs:
     name: Validate packaging
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      stable: ${{ steps.stable.outputs.stable }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # One explicit stable-tag predicate shared by every publisher. A job
+      # must not infer stability from its `needs` chain: preview-shaped tags
+      # also match the broad `startsWith(refs/tags/v)` trigger. `stable` is
+      # true only for an exact vX.Y.Z tag; every other ref is false.
+      - name: Compute the stable tag predicate
+        id: stable
+        run: |
+          set -euo pipefail
+          stable=false
+          if [[ "${GITHUB_REF:-}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              stable=true
+            fi
+          fi
+          echo "stable=${stable}" >>"$GITHUB_OUTPUT"
+          echo "stable tag predicate: stable=${stable} ref=${GITHUB_REF:-none}"
       - name: Require a stable release tag
         if: startsWith(github.ref, 'refs/tags/')
         env:
@@ -1335,6 +1354,7 @@ jobs:
     name: Create GitHub Release
     needs:
       [
+        validate,
         build,
         build-alpine,
         build-freebsd,
@@ -1349,7 +1369,7 @@ jobs:
       ]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && needs.validate.outputs.stable == 'true' && !contains(github.ref_name, '-')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Download all artifacts
@@ -1382,11 +1402,11 @@ jobs:
   aur:
     name: Publish AUR (Arch)
     environment: release
-    needs: release
+    needs: [release, validate]
     runs-on: ubuntu-24.04
     container: archlinux:latest
     timeout-minutes: 10
-    if: startsWith(github.ref, 'refs/tags/v') && vars.AUR_PUBLISH == 'true'
+    if: startsWith(github.ref, 'refs/tags/v') && vars.AUR_PUBLISH == 'true' && needs.validate.outputs.stable == 'true' && !contains(github.ref_name, '-')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Arch build dependencies
@@ -1456,11 +1476,11 @@ jobs:
     environment: release
     # The PKGBUILD points at the R2/CDN release path (CTX-1413, #1847), so the
     # publish waits for the immutable mirror instead of racing it.
-    needs: r2-mirror
+    needs: [r2-mirror, validate]
     runs-on: ubuntu-24.04
     container: archlinux:latest
     timeout-minutes: 10
-    if: startsWith(github.ref, 'refs/tags/v') && vars.AUR_BIN_PUBLISH == 'true'
+    if: startsWith(github.ref, 'refs/tags/v') && vars.AUR_BIN_PUBLISH == 'true' && needs.validate.outputs.stable == 'true' && !contains(github.ref_name, '-')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Arch build dependencies
@@ -1567,10 +1587,10 @@ jobs:
     environment: release
     # R2/CDN is the primary formula source (CTX-1413, #1847); wait for the
     # immutable mirror so the rendered URLs and digests describe published bytes.
-    needs: r2-mirror
+    needs: [r2-mirror, validate]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    if: startsWith(github.ref, 'refs/tags/v') && vars.HOMEBREW_PUBLISH == 'true'
+    if: startsWith(github.ref, 'refs/tags/v') && vars.HOMEBREW_PUBLISH == 'true' && needs.validate.outputs.stable == 'true' && !contains(github.ref_name, '-')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Update Homebrew Formula
@@ -1637,10 +1657,10 @@ jobs:
     environment: release
     # R2/CDN is the primary manifest source (CTX-1413, #1847); wait for the
     # immutable mirror so the rendered URLs and hashes describe published bytes.
-    needs: r2-mirror
+    needs: [r2-mirror, validate]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    if: startsWith(github.ref, 'refs/tags/v') && vars.SCOOP_PUBLISH == 'true'
+    if: startsWith(github.ref, 'refs/tags/v') && vars.SCOOP_PUBLISH == 'true' && needs.validate.outputs.stable == 'true' && !contains(github.ref_name, '-')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Update Scoop manifest
@@ -1705,12 +1725,12 @@ jobs:
   copr:
     name: Publish Fedora Copr
     environment: release
-    needs: [build, r2-mirror]
+    needs: [validate, build, r2-mirror]
     runs-on: ubuntu-24.04
     # Allow a full 10800 s Copr timeout plus check-out/SRPM overhead; the job
     # waits synchronously for the slowest enabled chroot (ctx-1584).
     timeout-minutes: 200
-    if: startsWith(github.ref, 'refs/tags/v') && vars.COPR_PUBLISH != 'false'
+    if: startsWith(github.ref, 'refs/tags/v') && vars.COPR_PUBLISH != 'false' && needs.validate.outputs.stable == 'true' && !contains(github.ref_name, '-')
     env:
       TAG: ${{ github.ref_name }}
       # Slow mirrors (e.g. openeuler-24.03-aarch64, bitty#2693) need more than
@@ -1807,10 +1827,10 @@ jobs:
   apt:
     name: Publish Debian/Ubuntu APT (R2)
     environment: release
-    needs: [build, r2-mirror]
+    needs: [validate, build, r2-mirror]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    if: startsWith(github.ref, 'refs/tags/v') && vars.APT_PUBLISH != 'false'
+    if: startsWith(github.ref, 'refs/tags/v') && vars.APT_PUBLISH != 'false' && needs.validate.outputs.stable == 'true' && !contains(github.ref_name, '-')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1904,10 +1924,10 @@ jobs:
   nix:
     name: Publish Nix Flake (Cachix)
     environment: release
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
-    if: startsWith(github.ref, 'refs/tags/v') && vars.NIX_PUBLISH != 'false'
+    if: startsWith(github.ref, 'refs/tags/v') && vars.NIX_PUBLISH != 'false' && needs.validate.outputs.stable == 'true' && !contains(github.ref_name, '-')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1941,10 +1961,10 @@ jobs:
   r2-mirror:
     name: Mirror release to R2
     environment: release
-    needs: release
+    needs: [release, validate]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && needs.validate.outputs.stable == 'true' && !contains(github.ref_name, '-')
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -2069,10 +2089,10 @@ jobs:
   r2-stable:
     name: Publish R2 stable pointers
     environment: release
-    needs: r2-mirror
+    needs: [r2-mirror, validate]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
+    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') && needs.validate.outputs.stable == 'true'
     env:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

@@ -346,7 +346,9 @@ fi
 # --- Workflow wiring --------------------------------------------------------
 
 for job in aur-bin homebrew scoop; do
-  if grep -q 'needs: r2-mirror' <<<"$(job_block "$job")"; then
+  # CTX-1615 added `validate` alongside the existing dependency; accept either
+  # the scalar or list form while still requiring r2-mirror.
+  if grep -Eq '^    needs:.*\br2-mirror\b|^ +r2-mirror,?$' <<<"$(job_block "$job")"; then
     pass "release.yml $job waits for r2-mirror"
   else
     fail "release.yml $job does not wait for r2-mirror"

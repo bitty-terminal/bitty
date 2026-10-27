@@ -1485,19 +1485,21 @@ pub struct Runtime {
     /// decode and raster through the
     /// [`bitty_rich::kitty_seam::KittyDecodeBackend`] and
     /// [`bitty_rich::kitty_seam::KittyRasterBackend`] traits, never the free
-    /// functions directly. The composition root holds the in-repo
-    /// [`bitty_rich::kitty_seam::CoreKittyBackend`] here; the extension
+    /// functions directly. Construction installs the in-tree
+    /// [`bitty_rich::kitty_seam::CoreKittyBackend`]; the composition root can
+    /// swap it through [`Runtime::set_kitty_backend`], and the extension
     /// implements the same traits on its side, so swapping implementations
     /// never touches the call sites (W-147: no extension identifier in Core
     /// sources).
-    kitty_graphics: bitty_rich::kitty_seam::CoreKittyBackend,
+    kitty_graphics: bitty_rich::kitty_seam::KittyBackendHandle,
     /// Scaled-blit raster cache across present frames (S6, #1849), keyed
     /// by image identity plus content generation (never a bare id), frame
     /// index, and full/visible geometry.
     ///
-    /// Pure optimization over [`bitty_rich::rasterize_kitty_clipped`]: a
-    /// miss falls back to the uncached path, so correctness never depends
-    /// on it. Bounded to 32 entries / 64 MiB (the per-frame ceilings);
+    /// Pure optimization over the seam's clipped raster
+    /// ([`bitty_rich::kitty_seam::KittyRasterBackend`]): a miss falls back
+    /// to the uncached path, so correctness never depends on it. Bounded to
+    /// 32 entries / 64 MiB (the per-frame ceilings);
     /// cleared wholesale on every layer mutation (store incl. eviction,
     /// protocol delete, `clear_origin`, `retire_origin`) so no stale entry
     /// can survive, with the generation in the key as defense-in-depth.
@@ -2096,7 +2098,7 @@ impl Runtime {
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
             kitty_origin: None,
-            kitty_graphics: bitty_rich::kitty_seam::CoreKittyBackend::new(),
+            kitty_graphics: std::sync::Arc::new(bitty_rich::kitty_seam::CoreKittyBackend::new()),
             kitty_local_queue: std::collections::VecDeque::new(),
             kitty_local_in_flight: None,
             kitty_local_orphans: Vec::new(),
@@ -2390,7 +2392,7 @@ impl Runtime {
             inspect_ring: crate::inspect::InputRing::new(),
             kitty_images: bitty_rich::KittyImageLayer::new(),
             kitty_origin: None,
-            kitty_graphics: bitty_rich::kitty_seam::CoreKittyBackend::new(),
+            kitty_graphics: std::sync::Arc::new(bitty_rich::kitty_seam::CoreKittyBackend::new()),
             kitty_local_queue: std::collections::VecDeque::new(),
             kitty_local_in_flight: None,
             kitty_local_orphans: Vec::new(),

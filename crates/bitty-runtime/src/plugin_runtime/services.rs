@@ -54,6 +54,11 @@ use bitty_plugin_host::{
     TrustLevel, parse_service_reference, service_version_satisfies, value_satisfies_schema,
 };
 
+use super::config_write::{
+    CONFIG_SET_MAX_RENDERED_BYTES, CONFIG_SET_MAX_WALL_MS, ConfigApplyOutcome, ConfigChange,
+    ConfigPreview, ConfigSetOutcome, ConfigSettingValue, ConfigWriteBackend, ConfigWriteGate,
+    check_result_rows, config_key_error, consent_digest, writable_setting,
+};
 use super::history::{
     HISTORY_GRANT_SCOPE_CACHE_MAX, HISTORY_RATE_WINDOW, HistoryProvider, history_caps,
     history_error, history_page_value, history_source, history_unavailable,
@@ -2010,6 +2015,20 @@ pub struct PluginServices {
     /// Shared at activation only with `runtime.configure` generations; `None`
     /// leaves granted calls failing closed with `E_NOT_IMPLEMENTED`.
     theme_requests: RefCell<Option<Rc<RefCell<ThemeRequestQueue>>>>,
+    /// Whether this generation holds `config.manage` (CTX-1613, bitty#2393).
+    ///
+    /// Write-only: `runtime.inspect` never implies it and it never implies a
+    /// read. Safe mode denies regardless of the recorded grant.
+    config_manage_granted: Cell<bool>,
+    /// Per-generation consent digests, call budget, and byte budget.
+    config_gate: RefCell<ConfigWriteGate>,
+    /// Durable user-layer backend for `config.set`.
+    ///
+    /// Installed only for a granted generation (no backend without grant);
+    /// `None` leaves granted calls failing closed with `E_NOT_IMPLEMENTED`.
+    /// The backend returns only a path-free failure class, so plugin
+    /// diagnostics never carry host paths.
+    config_backend: RefCell<Option<Rc<dyn ConfigWriteBackend>>>,
     /// Runtime-shared `bitty.fx.pulse` intent queue (CTX-1139). Shared at
     /// activation only with `panel.focus` generations; `None` leaves granted
     /// calls failing closed with `E_NOT_IMPLEMENTED`.
@@ -2147,6 +2166,9 @@ impl PluginServices {
             image_roots: RefCell::new(None),
             theme_configure_granted: Cell::new(false),
             theme_requests: RefCell::new(None),
+            config_manage_granted: Cell::new(false),
+            config_gate: RefCell::new(ConfigWriteGate::new(Instant::now())),
+            config_backend: RefCell::new(None),
             fx_requests: RefCell::new(None),
             sensor_host: RefCell::new(None),
             device_host: RefCell::new(None),
@@ -2366,6 +2388,23 @@ impl PluginServices {
     /// verb without a host.
     pub fn set_theme_queue(&self, queue: Option<Rc<RefCell<ThemeRequestQueue>>>) {
         *self.theme_requests.borrow_mut() = queue;
+    }
+
+    /// Grant `config.manage` from the activation snapshot (CTX-1613,
+    /// bitty#2393). Write-only: it never grants `runtime.inspect` and
+    /// `runtime.inspect` never grants it. Absent grants fail closed with
+    /// `E_CAPABILITY_DENIED`; safe mode denies even when recorded.
+    pub fn set_config_access(&self, granted: bool) {
+        self.config_manage_granted.set(granted);
+    }
+
+    /// Attach the durable user-layer backend for `config.set` (CTX-1613,
+    /// bitty#2393). Installed only for a granted generation; without it a
+    /// granted write fails closed with `E_NOT_IMPLEMENTED`. The backend owns
+    /// validation and the atomic replace and returns only a path-free failure
+    /// class.
+    pub fn set_config_write_backend(&self, backend: Option<Rc<dyn ConfigWriteBackend>>) {
+        *self.config_backend.borrow_mut() = backend;
     }
 
     /// Shared enqueue core behind `theme_preview`/`theme_confirm` (CTX-1169,
@@ -3431,6 +3470,193 @@ impl PluginServices {
     }
 }
 
+/// Typed consent mismatch for `config.set` (CTX-1613, bitty#2393).
+///
+/// Never echoes the supplied or expected digest: a plugin learns only that
+/// the approval did not match the exact rendered change.
+fn config_consent_mismatch() -> BridgeError {
+    BridgeError::new(
+        "runtime",
+        "E_CONFIG_CONSENT_MISMATCH",
+        "config.set approval does not match this exact rendered change",
+    )
+}
+
+/// Inherent `config.manage` core (CTX-1613, bitty#2393).
+///
+/// Split from the [`HostServices`] impl so tests can inject a start
+/// instant while the bridge keeps a thin, argument-checking surface.
+impl PluginServices {
+    /// Grant and safe-mode gate shared by `config.preview`/`config.set`
+    /// (CTX-1613, bitty#2393).
+    ///
+    /// Safe mode denies even with the grant recorded, and an ungranted
+    /// generation learns nothing about the allowlist or the backend.
+    fn config_authorize(&self) -> Result<(), BridgeError> {
+        if self.safe_mode.get() || !self.config_manage_granted.get() {
+            return Err(BridgeError::capability_denied("config.manage"));
+        }
+        Ok(())
+    }
+
+    /// Charge one call and its rendered bytes after shape validation.
+    ///
+    /// Bounds are fail-closed: the call budget (16/s), the byte budget
+    /// (4 KiB/s), and the 10 ms authorization wall budget refuse without
+    /// clamping. The durable write is dispatched only after every check.
+    fn config_charge(&self, started: Instant, bytes: usize) -> Result<(), BridgeError> {
+        check_result_rows(1)?;
+        if started.elapsed() > Duration::from_millis(CONFIG_SET_MAX_WALL_MS) {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_LIMIT",
+                "config.manage exceeded its 10 ms authorization budget",
+            ));
+        }
+        if !self.config_gate.borrow_mut().charge(Instant::now(), bytes) {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_LIMIT",
+                "config.manage exceeded 16 calls or 4096 bytes per second",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Render one change and issue its consent digest.
+    fn config_preview_at(
+        &self,
+        key: &str,
+        value: &LuaValue,
+        started: Instant,
+    ) -> Result<ConfigPreview, BridgeError> {
+        self.config_authorize()?;
+        // Exact allowlist membership: no path, argv, URL, or family prefix
+        // reaches the backend. The rejected key is never echoed.
+        let setting = writable_setting(key).ok_or_else(config_key_error)?;
+        let value = ConfigSettingValue::from_lua(setting.kind, value)?;
+        let change = ConfigChange::new(setting, value);
+        if change.rendered().len() > CONFIG_SET_MAX_RENDERED_BYTES {
+            return Err(BridgeError::new(
+                "validation",
+                "E_CONFIG_VALUE",
+                "rendered config change exceeds its byte bound",
+            ));
+        }
+        self.config_charge(started, change.rendered().len())?;
+        let digest = consent_digest(&self.plugin_id, &change);
+        self.config_gate
+            .borrow_mut()
+            .issue(digest.clone(), change.key(), change.value().clone());
+        Ok(ConfigPreview {
+            digest,
+            rendered: change.rendered().to_string(),
+        })
+    }
+
+    fn config_preview(&self, key: &str, value: &LuaValue) -> Result<ConfigPreview, BridgeError> {
+        self.config_preview_at(key, value, Instant::now())
+    }
+
+    /// Apply one change bound to a preview digest issued by this generation.
+    ///
+    /// `expiry` is the bridge's cheap-call deadline. It is checked before the
+    /// consent token is consumed and before the backend is called, so an
+    /// already-expired call never commits. Once the backend returns, the
+    /// caller must not turn a slow `fsync` into a timeout: the bridge uses
+    /// the mutating-call guard for exactly this reason.
+    fn config_set_with_expiry(
+        &self,
+        key: &str,
+        value: &LuaValue,
+        digest: &str,
+        started: Instant,
+        expiry: Instant,
+    ) -> Result<ConfigSetOutcome, BridgeError> {
+        self.config_authorize()?;
+        let setting = writable_setting(key).ok_or_else(config_key_error)?;
+        let value = ConfigSettingValue::from_lua(setting.kind, value)?;
+        let change = ConfigChange::new(setting, value);
+        if change.rendered().len() > CONFIG_SET_MAX_RENDERED_BYTES {
+            return Err(BridgeError::new(
+                "validation",
+                "E_CONFIG_VALUE",
+                "rendered config change exceeds its byte bound",
+            ));
+        }
+        // The digest is lowercase SHA-256 hex; anything else is a client
+        // bug and refuses before the comparison, without echoing the token.
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(config_consent_mismatch());
+        }
+        let expected = consent_digest(&self.plugin_id, &change);
+        if digest != expected {
+            return Err(config_consent_mismatch());
+        }
+        // Charge before consuming the token: a budget refusal leaves the
+        // approval usable inside the window, while an accepted call spends
+        // it exactly once.
+        self.config_charge(started, change.rendered().len())?;
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        if !self
+            .config_gate
+            .borrow_mut()
+            .consume(&expected, change.key(), change.value())
+        {
+            return Err(BridgeError::new(
+                "runtime",
+                "E_CONFIG_CONSENT_REQUIRED",
+                "config.set requires a config.preview digest for this exact change",
+            ));
+        }
+        let backend = self
+            .config_backend
+            .borrow()
+            .clone()
+            .ok_or_else(|| BridgeError::not_implemented("bitty.config.set"))?;
+        match backend.apply(&change) {
+            Ok(ConfigApplyOutcome::Applied) => Ok(ConfigSetOutcome {
+                applied: true,
+                reload: "auto",
+            }),
+            Ok(ConfigApplyOutcome::Unchanged) => Ok(ConfigSetOutcome {
+                applied: false,
+                reload: "none",
+            }),
+            // Only the path-free failure class crosses the boundary; the
+            // backend's own diagnostic may name a host path and stays local.
+            Err(failure) => Err(BridgeError::new(
+                "io",
+                failure.code(),
+                format!("{} (key '{}')", failure.message(), change.key()),
+            )),
+        }
+    }
+
+    /// Test convenience: apply with the default 10 ms authorization budget.
+    #[cfg(test)]
+    fn config_set(
+        &self,
+        key: &str,
+        value: &LuaValue,
+        digest: &str,
+    ) -> Result<ConfigSetOutcome, BridgeError> {
+        self.config_set_with_expiry(
+            key,
+            value,
+            digest,
+            Instant::now(),
+            Instant::now() + Duration::from_millis(CONFIG_SET_MAX_WALL_MS),
+        )
+    }
+}
+
 impl HostServices for PluginServices {
     fn store_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
         Ok(self.store.borrow().get(key))
@@ -3461,6 +3687,29 @@ impl HostServices for PluginServices {
             ));
         }
         Ok(self.settings.get(key))
+    }
+
+    fn config_preview(&self, key: &str, value: &LuaValue) -> Result<(String, String), BridgeError> {
+        let preview = PluginServices::config_preview(self, key, value)?;
+        Ok((preview.digest, preview.rendered))
+    }
+
+    fn config_set(
+        &self,
+        key: &str,
+        value: &LuaValue,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        let outcome = PluginServices::config_set_with_expiry(
+            self,
+            key,
+            value,
+            digest,
+            Instant::now(),
+            expiry,
+        )?;
+        Ok((outcome.applied, outcome.reload))
     }
 
     fn env_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
@@ -9861,6 +10110,7 @@ mod tests {
 #[cfg(test)]
 mod history_tests {
     use super::*;
+    use crate::plugin_runtime::config_write::{CONFIG_SET_CALLS_PER_SECOND, ConfigWriteFailure};
     use crate::plugin_runtime::history::{
         BoundedHistory, HISTORY_GRANT_SCOPE_CACHE_MAX, HISTORY_MAX_QUERIES_PER_WINDOW,
         HISTORY_MAX_ROWS_PER_QUERY,
@@ -10612,5 +10862,434 @@ mod history_tests {
             .expect_err("over budget");
         assert_eq!(error.code, "E_DEF_LIMIT");
         assert_eq!(error.class, "validation");
+    }
+
+    // ── config.manage (CTX-1613, bitty#2393) ──────────────────────────
+
+    /// Recording backend: counts calls and can inject a typed failure.
+    struct RecordingConfigBackend {
+        calls: RefCell<Vec<ConfigChange>>,
+        outcome: ConfigApplyOutcome,
+        failure: Option<ConfigWriteFailure>,
+    }
+
+    impl RecordingConfigBackend {
+        fn applied() -> Rc<Self> {
+            Rc::new(Self {
+                calls: RefCell::new(Vec::new()),
+                outcome: ConfigApplyOutcome::Applied,
+                failure: None,
+            })
+        }
+
+        fn failure(failure: ConfigWriteFailure) -> Rc<Self> {
+            Rc::new(Self {
+                calls: RefCell::new(Vec::new()),
+                outcome: ConfigApplyOutcome::Applied,
+                failure: Some(failure),
+            })
+        }
+
+        fn unchanged() -> Rc<Self> {
+            Rc::new(Self {
+                calls: RefCell::new(Vec::new()),
+                outcome: ConfigApplyOutcome::Unchanged,
+                failure: None,
+            })
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.borrow().len()
+        }
+    }
+
+    impl ConfigWriteBackend for RecordingConfigBackend {
+        fn apply(&self, change: &ConfigChange) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+            self.calls.borrow_mut().push(change.clone());
+            match self.failure {
+                Some(failure) => Err(failure),
+                None => Ok(self.outcome),
+            }
+        }
+    }
+
+    fn config_services(backend: Option<Rc<RecordingConfigBackend>>) -> PluginServices {
+        let services = services();
+        services.set_config_access(true);
+        if let Some(backend) = backend {
+            services.set_config_write_backend(Some(backend));
+        }
+        services
+    }
+
+    fn theme_text(value: &str) -> LuaValue {
+        LuaValue::String(value.to_string())
+    }
+
+    #[test]
+    fn config_manage_requires_its_own_write_grant() {
+        // CTX-1613: `config.manage` is deny-by-default and independent of
+        // the read inspection head. A read-only dashboard stays read-only.
+        let denied = services();
+        for error in [
+            denied
+                .config_preview("appearance.theme", &theme_text("catppuccin"))
+                .expect_err("no grant"),
+            denied
+                .config_set(
+                    "appearance.theme",
+                    &theme_text("catppuccin"),
+                    &"0".repeat(64),
+                )
+                .expect_err("no grant"),
+        ] {
+            assert_eq!(error.code, "E_CAPABILITY_DENIED");
+            assert_eq!(error.message, "capability 'config.manage' is not granted");
+        }
+
+        // Holding the read head never grants the write head.
+        let read_only = services();
+        read_only.set_runtime_inspect(true, Some(RuntimeInspectSnapshot::default()));
+        let error = read_only
+            .config_preview("appearance.theme", &theme_text("catppuccin"))
+            .expect_err("read never implies write");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+
+        // Holding the write head never grants the read head either.
+        let write_only = config_services(None);
+        assert!(
+            !write_only.runtime_inspect_granted.get(),
+            "config.manage must not grant runtime.inspect"
+        );
+
+        // A granted generation without a wired backend fails closed, but
+        // preview still renders (it has no durable effect).
+        let unwired = config_services(None);
+        let preview = unwired
+            .config_preview("appearance.theme", &theme_text("catppuccin"))
+            .expect("preview is host-side");
+        let error = unwired
+            .config_set(
+                "appearance.theme",
+                &theme_text("catppuccin"),
+                &preview.digest,
+            )
+            .expect_err("no backend");
+        assert_eq!(error.code, "E_NOT_IMPLEMENTED");
+    }
+
+    #[test]
+    fn config_set_applies_only_after_preview_and_reports_reload() {
+        let backend = RecordingConfigBackend::applied();
+        let services = config_services(Some(Rc::clone(&backend)));
+
+        let preview = services
+            .config_preview("appearance.theme", &theme_text("catppuccin"))
+            .expect("preview");
+        assert_eq!(preview.rendered, "appearance.theme = \"catppuccin\"");
+        assert_eq!(preview.digest.len(), 64);
+        assert_eq!(backend.call_count(), 0, "preview never writes");
+
+        let outcome = services
+            .config_set(
+                "appearance.theme",
+                &theme_text("catppuccin"),
+                &preview.digest,
+            )
+            .expect("applied");
+        assert!(outcome.applied);
+        assert_eq!(
+            outcome.reload, "auto",
+            "the watcher re-reads the user layer"
+        );
+        assert_eq!(backend.call_count(), 1);
+        assert_eq!(
+            backend.calls.borrow()[0].rendered(),
+            "appearance.theme = \"catppuccin\""
+        );
+
+        // One digest authorizes one write: replaying the approved token can
+        // never re-apply a stale row.
+        let error = services
+            .config_set(
+                "appearance.theme",
+                &theme_text("catppuccin"),
+                &preview.digest,
+            )
+            .expect_err("replay refused");
+        assert_eq!(error.code, "E_CONFIG_CONSENT_REQUIRED");
+        assert_eq!(backend.call_count(), 1, "no second write");
+    }
+
+    #[test]
+    fn config_set_consent_is_bound_to_the_exact_rendered_change() {
+        let backend = RecordingConfigBackend::applied();
+        let services = config_services(Some(Rc::clone(&backend)));
+        let preview = services
+            .config_preview("appearance.theme", &theme_text("catppuccin"))
+            .expect("preview");
+
+        // Same digest, different value: refused before the backend.
+        let error = services
+            .config_set("appearance.theme", &theme_text("dracula"), &preview.digest)
+            .expect_err("value changed");
+        assert_eq!(error.code, "E_CONFIG_CONSENT_MISMATCH");
+
+        // Same digest, different key: refused.
+        let error = services
+            .config_set("font.family", &theme_text("catppuccin"), &preview.digest)
+            .expect_err("key changed");
+        assert_eq!(error.code, "E_CONFIG_CONSENT_MISMATCH");
+
+        // Malformed tokens (short, uppercase, non-hex) refuse as mismatches.
+        for token in [
+            "0".repeat(63),
+            preview.digest.to_uppercase(),
+            "z".repeat(64),
+        ] {
+            let error = services
+                .config_set("appearance.theme", &theme_text("catppuccin"), &token)
+                .expect_err("bad token");
+            assert_eq!(error.code, "E_CONFIG_CONSENT_MISMATCH");
+        }
+
+        // Correct digest without a preview: the token was never issued.
+        let correct = consent_digest(
+            "xuepoo.test",
+            &ConfigChange::new(
+                writable_setting("appearance.theme").expect("allowlisted"),
+                ConfigSettingValue::text("catppuccin").expect("text"),
+            ),
+        );
+        let fresh = config_services(Some(Rc::clone(&backend)));
+        let error = fresh
+            .config_set("appearance.theme", &theme_text("catppuccin"), &correct)
+            .expect_err("unissued token");
+        assert_eq!(error.code, "E_CONFIG_CONSENT_REQUIRED");
+        assert_eq!(backend.call_count(), 0, "nothing reached the writer");
+    }
+
+    #[test]
+    fn config_set_reports_unchanged_without_a_reload() {
+        let backend = RecordingConfigBackend::unchanged();
+        let services = config_services(Some(Rc::clone(&backend)));
+        let preview = services
+            .config_preview("font.size", &LuaValue::Number(12.5))
+            .expect("preview");
+        let outcome = services
+            .config_set("font.size", &LuaValue::Number(12.5), &preview.digest)
+            .expect("unchanged");
+        assert!(!outcome.applied);
+        assert_eq!(outcome.reload, "none");
+        assert_eq!(backend.call_count(), 1);
+    }
+
+    #[test]
+    fn config_set_refuses_injection_shapes_before_the_backend() {
+        let backend = RecordingConfigBackend::applied();
+        let services = config_services(Some(Rc::clone(&backend)));
+
+        // No path, argv, shell, or family-prefix key is addressable.
+        for key in [
+            "terminal.shell",
+            "/etc/bitty/init.lua",
+            "../../init",
+            "profiles/default",
+            "appearance",
+            "Appearance.Theme",
+            "appearance.theme ",
+        ] {
+            let error = services
+                .config_preview(key, &theme_text("catppuccin"))
+                .expect_err("not allowlisted");
+            assert_eq!(error.code, "E_CONFIG_KEY", "{key}");
+            assert!(
+                !error.message.contains(key),
+                "rejected key must not be echoed"
+            );
+        }
+
+        // Values are typed scalars: tables are never a loose key/value bag.
+        for value in [
+            LuaValue::Table(vec![(
+                LuaValue::String("appearance.theme".to_string()),
+                LuaValue::String("catppuccin".to_string()),
+            )]),
+            LuaValue::Bool(true),
+            LuaValue::Nil,
+        ] {
+            let error = services
+                .config_preview("appearance.theme", &value)
+                .expect_err("wrong value shape");
+            assert_eq!(error.code, "E_CONFIG_VALUE");
+        }
+
+        // Control characters never enter a persisted literal.
+        let error = services
+            .config_preview(
+                "appearance.theme",
+                &theme_text("catppuccin\nappearance = { theme = \"x\" }"),
+            )
+            .expect_err("control characters");
+        assert_eq!(error.code, "E_CONFIG_VALUE");
+
+        // A hostile-looking string stays data: it is quoted and escaped, and
+        // the exact escaped rendering is what the digest binds.
+        let hostile = "\"; os.execute('id'); --";
+        let preview = services
+            .config_preview("appearance.theme", &theme_text(hostile))
+            .expect("text stays text");
+        assert_eq!(
+            preview.rendered,
+            "appearance.theme = \"\\\"; os.execute('id'); --\""
+        );
+        let outcome = services
+            .config_set("appearance.theme", &theme_text(hostile), &preview.digest)
+            .expect("literal write");
+        assert!(outcome.applied);
+        assert_eq!(backend.call_count(), 1);
+        assert_eq!(backend.calls.borrow()[0].rendered(), preview.rendered);
+        assert_eq!(
+            backend.calls.borrow()[0].value(),
+            &ConfigSettingValue::text(hostile).expect("text")
+        );
+    }
+
+    #[test]
+    fn config_set_enforces_call_byte_and_wall_budgets() {
+        // Calls: a 17th call in the one-second window refuses.
+        let services = config_services(Some(RecordingConfigBackend::applied()));
+        for call in 0..CONFIG_SET_CALLS_PER_SECOND {
+            services
+                .config_preview("appearance.theme", &theme_text(&format!("theme{call}")))
+                .expect("budgeted preview");
+        }
+        let error = services
+            .config_preview("appearance.theme", &theme_text("theme-last"))
+            .expect_err("over call budget");
+        assert_eq!(error.code, "E_DEF_LIMIT");
+
+        // Bytes: four ~1 KiB previews fit; the fifth crosses 4 KiB.
+        let bytes_services = config_services(Some(RecordingConfigBackend::applied()));
+        let large = "x".repeat(1000);
+        for _ in 0..4 {
+            bytes_services
+                .config_preview("font.family", &theme_text(&large))
+                .expect("byte-budgeted preview");
+        }
+        let error = bytes_services
+            .config_preview("font.family", &theme_text(&large))
+            .expect_err("over byte budget");
+        assert_eq!(error.code, "E_DEF_LIMIT");
+
+        // Wall budget: an authorization path already past 10 ms refuses
+        // before the backend, so a deadline never commits a write.
+        let backend = RecordingConfigBackend::applied();
+        let wall = config_services(Some(Rc::clone(&backend)));
+        let preview = wall
+            .config_preview("appearance.theme", &theme_text("catppuccin"))
+            .expect("preview");
+        let started = Instant::now()
+            .checked_sub(Duration::from_millis(CONFIG_SET_MAX_WALL_MS + 1))
+            .expect("monotonic clock has enough history");
+        let error = wall
+            .config_set_with_expiry(
+                "appearance.theme",
+                &theme_text("catppuccin"),
+                &preview.digest,
+                started,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .expect_err("deadline exceeded");
+        assert_eq!(error.code, "E_DEF_LIMIT");
+        assert_eq!(backend.call_count(), 0);
+
+        // A bridge deadline already passed refuses before the token is
+        // consumed, so the approval remains usable and nothing is written.
+        let expired = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("monotonic clock has enough history");
+        let wall = config_services(Some(Rc::clone(&backend)));
+        let preview = wall
+            .config_preview("appearance.theme", &theme_text("catppuccin"))
+            .expect("preview");
+        let error = wall
+            .config_set_with_expiry(
+                "appearance.theme",
+                &theme_text("catppuccin"),
+                &preview.digest,
+                Instant::now(),
+                expired,
+            )
+            .expect_err("expired call");
+        assert_eq!(error.code, "E_TIMEOUT");
+        assert_eq!(backend.call_count(), 0);
+        wall.config_set(
+            "appearance.theme",
+            &theme_text("catppuccin"),
+            &preview.digest,
+        )
+        .expect("the approval survived the timeout");
+        assert_eq!(backend.call_count(), 1);
+
+        // A value over 1 KiB is refused before any budget is consumed.
+        let error = services
+            .config_preview("font.family", &theme_text(&"y".repeat(1025)))
+            .expect_err("oversize value");
+        assert_eq!(error.code, "E_CONFIG_VALUE");
+    }
+
+    #[test]
+    fn config_manage_safe_mode_denies_even_with_grant_and_backend() {
+        let backend = RecordingConfigBackend::applied();
+        let services = config_services(Some(Rc::clone(&backend)));
+        let preview = services
+            .config_preview("appearance.theme", &theme_text("catppuccin"))
+            .expect("preview before safe mode");
+        services.set_safe_mode(true);
+        let error = services
+            .config_preview("appearance.theme", &theme_text("catppuccin"))
+            .expect_err("safe mode denies previews");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        let error = services
+            .config_set(
+                "appearance.theme",
+                &theme_text("catppuccin"),
+                &preview.digest,
+            )
+            .expect_err("safe mode denies writes");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert_eq!(backend.call_count(), 0);
+    }
+
+    #[test]
+    fn config_set_backend_failures_are_path_free() {
+        for (failure, expected) in [
+            (ConfigWriteFailure::Invalid, "E_CONFIG_INVALID"),
+            (ConfigWriteFailure::Unavailable, "E_CONFIG_UNAVAILABLE"),
+            (ConfigWriteFailure::Unsafe, "E_CONFIG_UNSAFE"),
+            (ConfigWriteFailure::Io, "E_CONFIG_IO"),
+        ] {
+            let backend = RecordingConfigBackend::failure(failure);
+            let services = config_services(Some(Rc::clone(&backend)));
+            let preview = services
+                .config_preview("appearance.theme", &theme_text("catppuccin"))
+                .expect("preview");
+            let error = services
+                .config_set(
+                    "appearance.theme",
+                    &theme_text("catppuccin"),
+                    &preview.digest,
+                )
+                .expect_err("backend refused");
+            assert_eq!(error.code, expected);
+            assert_eq!(backend.call_count(), 1, "the backend was reached once");
+            assert!(
+                !error.message.contains('/') && !error.message.contains('~'),
+                "diagnostics must not carry host paths: {}",
+                error.message
+            );
+            assert!(error.message.contains("appearance.theme"));
+        }
     }
 }

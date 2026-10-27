@@ -82,7 +82,7 @@
 //! graphics extension implements the same traits on its own side, and Core
 //! never depends on extension internals). The runtime binds both behind one
 //! dyn handle ([`kitty_seam::KittyBackendHandle`], default
-//! [`kitty_seam::CoreKittyBackend`]) and injects it at the composition root.
+//! [`kitty_seam::CoreKittyBackend`]) and can inject it at the composition root.
 //! [`kitty_seam`] is the single
 //! source module that may name the graphics extension crate; every other
 //! module reaches the extension-bound mechanics through its traits. Seam

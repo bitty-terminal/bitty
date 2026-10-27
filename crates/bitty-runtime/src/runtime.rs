@@ -1486,8 +1486,8 @@ pub struct Runtime {
     /// [`bitty_rich::kitty_seam::KittyDecodeBackend`] and
     /// [`bitty_rich::kitty_seam::KittyRasterBackend`] traits, never the free
     /// functions directly. Construction installs the in-tree
-    /// [`bitty_rich::kitty_seam::CoreKittyBackend`]; the composition root
-    /// swaps it through [`Runtime::set_kitty_backend`], and the extension
+    /// [`bitty_rich::kitty_seam::CoreKittyBackend`]; the composition root can
+    /// swap it through [`Runtime::set_kitty_backend`], and the extension
     /// implements the same traits on its side, so swapping implementations
     /// never touches the call sites (W-147: no extension identifier in Core
     /// sources).

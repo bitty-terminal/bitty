@@ -266,7 +266,7 @@ impl Runtime {
     /// Binds the Kitty decode/raster backend behind the Core-owned seam
     /// (CTX-1614, #2163).
     ///
-    /// The composition root owns this call: it passes a shared
+    /// The composition root is the intended caller: it passes a shared
     /// [`bitty_rich::kitty_seam::KittyBackend`] handle, and every decode
     /// (transmit, owned frame, edit) and raster (present) call site then
     /// dispatches through it — no call site names the in-repo free functions.
@@ -275,7 +275,12 @@ impl Runtime {
     /// unbound runtime keeps the byte-identical Core-local behavior; the
     /// graphics extension binds the same traits on its side (W-147 keeps its
     /// identifier out of Core sources).
+    ///
+    /// Rebinding drops the scaled-blit raster cache first: cached entries hold
+    /// bytes produced by the previous backend, and a later present must never
+    /// paint them under a new handle.
     pub fn set_kitty_backend(&mut self, backend: bitty_rich::kitty_seam::KittyBackendHandle) {
+        self.invalidate_kitty_raster_cache();
         self.kitty_graphics = backend;
     }
 

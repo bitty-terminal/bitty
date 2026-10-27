@@ -217,6 +217,46 @@ fn rebinding_replaces_the_previous_backend() {
 }
 
 #[test]
+fn rebinding_drops_cached_blits_from_the_previous_backend() {
+    let first = Arc::new(StubBackend::default());
+    let mut rt = runtime_with(first.clone());
+    transmit(&mut rt);
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+    let first_rasters = first.rasters();
+    assert!(first_rasters >= 1, "the first present rasterized");
+    assert!(
+        rt.kitty_raster_len() >= 1,
+        "the first present warmed the raster cache"
+    );
+
+    // Rebind after a present: the cached blit bytes came from the old
+    // backend, so the cache must drop before the new handle serves a frame.
+    let second = Arc::new(StubBackend::default());
+    rt.set_kitty_backend(as_dyn_backend(second.clone()));
+    assert_eq!(
+        rt.kitty_raster_len(),
+        0,
+        "rebind must drop cached blits from the previous backend"
+    );
+
+    // Force another present with identical blit geometry: one printed cell
+    // damages the grid, while the image placement stays at its cell.
+    rt.handle_pty_bytes(b"Z");
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1);
+    assert!(
+        second.rasters() >= 1,
+        "the next present must rasterize through the new backend"
+    );
+    assert_eq!(
+        first.rasters(),
+        first_rasters,
+        "the replaced backend is never called again"
+    );
+}
+
+#[test]
 fn default_binding_keeps_the_in_tree_backend() {
     let mut rt = Runtime::with_defaults().expect("defaults build");
 

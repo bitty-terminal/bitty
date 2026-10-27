@@ -201,16 +201,16 @@ impl<T> KittyBackend for T where
 /// `Arc` (not `Box`) so the injecting caller can keep its own handle (counters
 /// in tests, a shared backend in the app) while the runtime owns the same
 /// object. Construction defaults to `Arc::new(CoreKittyBackend::new())`; the
-/// composition root replaces it through the runtime setter
-/// (`Runtime::set_kitty_backend`).
+/// composition root can replace it through the runtime setter
+/// (`Runtime::set_kitty_backend`); today only tests do.
 pub type KittyBackendHandle = std::sync::Arc<dyn KittyBackend>;
 
 /// In-repo [`KittyDecodeBackend`] + [`KittyRasterBackend`]: the Core-owned
 /// decode/raster mechanics behind the seam traits.
 ///
 /// Stateless (every bound comes from Core constants and the shared minimal
-/// codec); `Copy` so the composition root can build the default handle inline
-/// where the transmit and present paths need it. The extension implements the
+/// codec); `Copy` so the two `Runtime` constructors can build the default
+/// handle inline. The extension implements the
 /// same traits on its side; swapping implementations never touches the call
 /// sites, which name only the traits and this backend type — never an
 /// extension crate.

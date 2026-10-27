@@ -71,7 +71,7 @@ Core-retained implementation, not extraction material; only
 `kitty_decode`/`kitty_raster` are extension-bound, and their Core copies stay
 behind `kitty_seam.rs` (`CoreKittyBackend` is the Core-local backend). The
 runtime holds that backend behind one dyn handle (`KittyBackendHandle`) and the
-composition root injects it through `Runtime::set_kitty_backend`; the default
+composition root can inject it through `Runtime::set_kitty_backend`; the default
 binding is `CoreKittyBackend`, so behavior is unchanged until the extension
 implements the seam.
 The composition-root binding has no separate open task: the remaining

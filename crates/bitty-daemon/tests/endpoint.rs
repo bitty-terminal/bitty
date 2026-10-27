@@ -161,15 +161,15 @@ fn a_stale_socket_is_reclaimed() {
     let socket = temp.runtime_dir().join("bittyd.sock");
     let stale = UnixListener::bind(&socket).expect("bind the socket to go stale");
     fs::set_permissions(&socket, fs::Permissions::from_mode(SOCKET_MODE)).expect("socket mode");
-    let stale_inode = inode_of(&socket);
     drop(stale);
     assert!(
         UnixStream::connect(&socket).is_err(),
         "the stale endpoint refuses connections"
     );
 
+    // The inode is not asserted to change: a freshly created socket can reuse
+    // the inode of the object removed moments earlier (observed on CI).
     let endpoint = open_endpoint(&env_for(temp.path())).expect("a stale socket is reclaimed");
-    assert_ne!(inode_of(endpoint.socket_path()), stale_inode);
     UnixStream::connect(endpoint.socket_path()).expect("the reclaimed endpoint accepts");
     endpoint.close().expect("clean shutdown");
 }

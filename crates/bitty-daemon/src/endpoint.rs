@@ -1260,8 +1260,12 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
 
         static NEXT: AtomicU32 = AtomicU32::new(0);
+        // Keep the prefix short: macOS `TMPDIR` is already ~49 bytes and the
+        // contract refuses a socket path over 103 bytes, so a test name in the
+        // directory would make the path itself the failure.
+        let short = &label[..label.len().min(6)];
         let path = std::env::temp_dir().join(format!(
-            "bittyd-endpoint-unit-{label}-{}-{}",
+            "bd-{short}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));

@@ -409,7 +409,8 @@ pub struct TerminalReport {
     pub event: Event,
     /// Leases closed with `TerminalEventLost` before the transition became
     /// visible, plus every lease on a session the retention cap evicted during
-    /// this call.
+    /// this call. This flat list overlaps [`RetiredSession::closed`]; a consumer
+    /// that needs the session association uses [`TerminalReport::retired`].
     pub lost: Vec<AttachId>,
     /// Terminal sessions whose stream state this call pruned after the
     /// registry evicted them.
@@ -655,14 +656,18 @@ impl SessionEventStream {
         }
 
         // Never reuse a live lease id: an overwrite would desynchronise the
-        // registry's attach count from the lease map. The retry bound keeps a
-        // broken entropy source a typed refusal rather than a loop.
-        let live_ids: BTreeSet<AttachId> = session.leases.keys().copied().collect();
+        // registry's attach count from the lease map. The key store also
+        // reserves its attach ids: a stored key outlives its lease, and a
+        // replayed key must resolve only the lease that key originally minted.
+        // The retry bound keeps a broken entropy source a typed refusal rather
+        // than a loop.
+        let mut reserved: BTreeSet<AttachId> = session.leases.keys().copied().collect();
+        reserved.extend(session.attach_keys.values().map(|entry| entry.attach_id));
         let mut attach_id = None;
         for _ in 0..ID_GENERATION_ATTEMPTS {
             let candidate = AttachId::generate_with(self.entropy.as_mut())
                 .map_err(|_| EventRefusal::IdGenerationFailed)?;
-            if !live_ids.contains(&candidate) {
+            if !reserved.contains(&candidate) {
                 attach_id = Some(candidate);
                 break;
             }
@@ -1848,6 +1853,77 @@ mod tests {
                 .expect("snapshot")
                 .attach_count,
             1
+        );
+    }
+
+    #[test]
+    fn a_stored_key_reserves_its_attach_id_after_the_lease_is_gone() {
+        let registry = SessionRegistry::new(registry_limits()).expect("registry");
+        let mut stream = SessionEventStream::with_entropy(
+            registry,
+            EventLimits::default(),
+            Box::new(FixedEntropy(0x11)),
+        )
+        .expect("empty registry");
+        let snapshot = created(&mut stream);
+        let first = stream
+            .attach(
+                AttachRequest {
+                    session_id: snapshot.session_id,
+                    after_revision: 0,
+                    idempotency_key: Some(AttachKey::new(b"k1").expect("key")),
+                },
+                MonotonicMs::from_millis(2),
+            )
+            .expect("attach k1");
+        stream
+            .detach(
+                snapshot.session_id,
+                first.attach_id,
+                DetachCause::SelfDetach,
+                MonotonicMs::from_millis(3),
+            )
+            .expect("detach");
+        let revision = stream
+            .registry()
+            .snapshot(snapshot.session_id)
+            .expect("snapshot")
+            .state_revision;
+
+        assert_eq!(
+            stream
+                .attach(
+                    AttachRequest {
+                        session_id: snapshot.session_id,
+                        after_revision: revision,
+                        idempotency_key: Some(AttachKey::new(b"k2").expect("key")),
+                    },
+                    MonotonicMs::from_millis(4),
+                )
+                .unwrap_err(),
+            EventRefusal::IdCollision
+        );
+        assert_eq!(stream.lease_count(snapshot.session_id), Some(0));
+        assert_eq!(
+            stream
+                .registry()
+                .snapshot(snapshot.session_id)
+                .expect("snapshot")
+                .attach_count,
+            0
+        );
+        assert_eq!(
+            stream
+                .attach(
+                    AttachRequest {
+                        session_id: snapshot.session_id,
+                        after_revision: 0,
+                        idempotency_key: Some(AttachKey::new(b"k1").expect("key")),
+                    },
+                    MonotonicMs::from_millis(5),
+                )
+                .unwrap_err(),
+            EventRefusal::NotAttached
         );
     }
 

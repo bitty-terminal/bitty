@@ -213,6 +213,10 @@ impl EventLimits {
     }
 
     /// Accounted bytes for one session's attach-key dedupe store.
+    ///
+    /// This is the compiled contract ceiling; the method deliberately ignores
+    /// `self` because `D-18` fixes one value and no configuration surface may
+    /// raise or lower it.
     #[must_use]
     pub const fn max_attach_keys_bytes_per_session(self) -> usize {
         MAX_ATTACH_KEYS_BYTES_PER_SESSION

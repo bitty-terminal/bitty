@@ -76,11 +76,14 @@
 //!
 //! Overflow paths are re-parsed on every start because the cache does not
 //! record them (that would defeat the cap), but the cache itself stays
-//! **read-only** while the persisted, capped face set is unchanged: newly
-//! parsed faces that sort past the retained set and are discarded by the
-//! writer's caps do not count as a change. Only a real change (a dropped
-//! path, a changed stat, an alias change, or a new face that displaces a
-//! retained one) rewrites the index.
+//! **read-only** while the persisted, capped prefix is unchanged: newly
+//! parsed faces that the writer's caps discard do not count as a change,
+//! wherever they sort. The byte bound is a total budget, so a line it cannot
+//! fit could only reach the file by displacing a retained face; keeping the
+//! retained prefix is stable (the displaced face is reparsed anyway), and the
+//! decision must not hinge on `Path`'s platform-dependent ordering. Only a real
+//! change (a dropped path, a changed stat, an alias change, or a new face that
+//! fits under both caps) rewrites the index.
 //!
 //! # PATCHES: `BITTY_FONT_INDEX=0`
 //!
@@ -559,10 +562,10 @@ where
 ///   the path is reparsed (when it still exists).
 /// - Paths present in discovery but absent from the cache are parsed.
 /// - Generic aliases always come from the fresh discovery.
-/// - Faces the writer's caps discard do not count as a change. A host above
-///   [`MAX_INDEX_FACES`]/[`MAX_INDEX_BYTES`] reparses its overflow paths on
-///   every start, but the capped cache it would write is identical, so the
-///   file stays read-only (see "Caps and overflow").
+/// - Faces the writer's caps discard do not count as a change, wherever they
+///   sort. A host above [`MAX_INDEX_FACES`]/[`MAX_INDEX_BYTES`] reparses its
+///   overflow paths on every start, but the retained capped prefix cannot
+///   grow, so the file stays read-only (see "Caps and overflow").
 fn reconcile(
     cached: FontIndex,
     discovered: &DiscoveredFonts,
@@ -580,7 +583,6 @@ fn reconcile(
     let mut faces = Vec::new();
     let mut kept_paths: HashSet<PathBuf> = HashSet::new();
     let mut kept_faces = 0usize;
-    let mut last_kept: Option<(PathBuf, u32)> = None;
     for (path, group) in by_path {
         if !discovered_paths.contains(path.as_path()) {
             continue;
@@ -592,11 +594,6 @@ fn reconcile(
         };
         if !group.iter().all(|face| stat.matches(face)) {
             continue;
-        }
-        if let Some(face) = group.last() {
-            // Faces inside a group are `(path, face_index)`-ordered; the last
-            // kept group therefore holds the highest retained key.
-            last_kept = Some((face.path.clone(), face.face_index));
         }
         kept_faces = kept_faces.saturating_add(group.len());
         kept_paths.insert(path);
@@ -611,19 +608,13 @@ fn reconcile(
         .collect();
     let (new_faces, parsed_paths) = build_index_counted(&parse_paths, &discovered.stats);
     let appended = !new_faces.is_empty();
-    // Parsed faces only reach the file when they sort after every retained
-    // face and one of the writer's caps is still open; otherwise the writer
-    // would produce exactly the file already on disk.
+    // Parsed faces only reach the file when one of the writer's caps is still
+    // open. Otherwise the retained prefix cannot grow: a write could only swap
+    // a retained tail face for the append, which is not worth a rewrite because
+    // the displaced face is reparsed like any other overflow path.
     let cache_already_capped = appended
         && !dropped
         && !generic_changed
-        && new_faces.iter().all(|face| match &last_kept {
-            Some((path, index)) => {
-                face.path.as_path() > path.as_path()
-                    || (face.path == *path && face.face_index > *index)
-            }
-            None => false,
-        })
         && writer_stops_before(cached_len, cached_body_len, &new_faces);
     let changed = dropped || generic_changed || (appended && !cache_already_capped);
     faces.extend(new_faces);
@@ -640,8 +631,8 @@ fn reconcile(
     )
 }
 
-/// True when the writer would not append any of `new_faces` after the
-/// `cached_len` faces already on disk.
+/// True when the writer's caps leave no room for any of `new_faces` after the
+/// `cached_len` faces and `cached_body_len` bytes already on disk.
 ///
 /// Mirrors [`serialize_index`]'s caps: the face-count bound, the per-line bound
 /// (unrepresentable lines are skipped, so the scan continues), and the total
@@ -649,19 +640,20 @@ fn reconcile(
 /// last face line). A representable line that still fits means the next write
 /// would change the file.
 ///
-/// `new_faces` must be in the writer's order, sorted by `(path, face_index)`
-/// (`build_index_counted` normalizes it). The scan stops at the first
-/// representable line, so an out-of-order slice could under-report that the
-/// cache still needs a rewrite.
+/// The answer is deliberately independent of where a new face sorts relative
+/// to the retained prefix. `Path`'s order is component-based, so on Windows a
+/// drive-prefixed path (`C:\...`, `Component::Prefix`) orders before a
+/// root-relative one (`/...`, `Component::RootDir`): gating the decision on
+/// "sorts after every retained face" would make the same host rewrite or not
+/// depending only on the shape of its font paths. A line the byte budget cannot
+/// fit would have to displace a retained face to reach the file; keeping the
+/// retained prefix leaves the cache stable and read-only, and the displaced
+/// face is reparsed on the next start exactly like any other overflow path.
+///
+/// `new_faces` must still be in the writer's order (sorted by `(path,
+/// face_index)`, which `build_index_counted` normalizes) because the scan stops
+/// at the first representable line, mirroring [`serialize_index`]'s `break`.
 fn writer_stops_before(cached_len: usize, cached_body_len: usize, new_faces: &[IndexFace]) -> bool {
-    debug_assert!(
-        new_faces.windows(2).all(|pair| pair[0]
-            .path
-            .cmp(&pair[1].path)
-            .then(pair[0].face_index.cmp(&pair[1].face_index))
-            .is_le()),
-        "new_faces must be sorted by (path, face_index)"
-    );
     if cached_len >= MAX_INDEX_FACES {
         return true;
     }
@@ -3356,6 +3348,48 @@ mod tests {
         let after = std::fs::metadata(&index_path).expect("index stat");
         assert_eq!(before.len(), after.len());
         assert_eq!(before.modified().ok(), after.modified().ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn byte_capped_reconcile_ignores_where_the_append_sorts() {
+        // `Path`'s order is component-based, so on Windows a drive-prefixed
+        // path (`C:\...`, a `Prefix` component) orders before a root-relative
+        // one (`/...`, a `RootDir` component). An append can therefore sort
+        // before the retained prefix on one platform and after it on another.
+        // The byte cap is a total budget, so the capped decision must not
+        // depend on that order: a line it cannot fit would have to displace a
+        // retained face to reach the file, and keeping the retained prefix
+        // leaves the cache stable and read-only.
+        let dir = temp_dir("byte-cap-order");
+        let earlier = write_font(&dir, "a-earlier.ttf");
+        let retained = write_font(&dir, "zzz-retained.ttf");
+        let cached = fixture_faces(std::slice::from_ref(&retained));
+        assert_eq!(cached.len(), 1);
+        let appended = fixture_faces(std::slice::from_ref(&earlier));
+        assert_eq!(appended.len(), 1);
+        assert!(
+            appended[0].path < cached[0].path,
+            "the append must sort before the retained face for this regression"
+        );
+        let appended_line = serialize_face(&appended[0]).len() + 1;
+        // One retained face already consumes the byte budget down to the
+        // trailing end marker, so the append cannot fit anywhere.
+        let cached_body_len = MAX_INDEX_BYTES as usize - END_MARKER_RESERVE - appended_line + 1;
+        let (index, parsed_paths, changed) = reconcile(
+            FontIndex {
+                faces: cached,
+                generic: GenericFamilies::default(),
+            },
+            &DiscoveredFonts::from_paths(vec![retained, earlier], GenericFamilies::default()),
+            cached_body_len,
+        );
+        assert_eq!(parsed_paths, 1, "the earlier path is reparsed");
+        assert_eq!(index.faces.len(), 2, "the in-memory index keeps both faces");
+        assert!(
+            !changed,
+            "the byte cap must keep the cache read-only regardless of path order"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

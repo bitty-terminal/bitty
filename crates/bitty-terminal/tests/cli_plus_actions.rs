@@ -307,7 +307,7 @@ fn json_schemas_stay_stable_for_every_static_action() {
 
     // Config show: every key row carries a layer and a source.
     let config = stdout(&fixture.run(&["+show-config", "--format", "json"]));
-    assert!(config.contains("\"count\":31"), "{config}");
+    assert!(config.contains("\"count\":32"), "{config}");
     assert!(config.contains("\"layer\":\"core-defaults\""));
     assert!(config.contains("\"source\":\"default\""));
 }

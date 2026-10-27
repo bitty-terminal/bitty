@@ -218,6 +218,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitty-daemon"
+version = "0.0.29"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "bitty-execution"
 version = "0.0.1"
 source = "git+https://github.com/bitty-terminal/bitty-execution?rev=36404ab#36404ab9302a3119b404d3bd1cca44fa7230c3bc"

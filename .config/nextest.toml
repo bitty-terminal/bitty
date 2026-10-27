@@ -38,6 +38,15 @@ max-threads = 2
 filter = 'package(bitty-pty) | binary(/^(m1_shell_coverage|selection_view_owned|mouse_report_panes|session_save_restore|pane_damage|shell_input_1356|panel_session_invariants|focused_input_modes|poll_budget_0476|copy_search_view_bound|dogfooding|shell_knob|resize_scrollback)$/)'
 test-group = "live-pty"
 
+# The 1000-tick headless soak enforces its own 240 s hang budget (twice the
+# slowest Tier-1 observation, including Windows). nextest's default 60 s x 3
+# kills the process at 180 s first, so a correct but loaded Windows run can
+# never reach its guard. Give this one test a single period above its budget;
+# the test still fails itself when it exceeds 240 s.
+[[profile.default.overrides]]
+filter = 'test(soak_headless_1000_ticks_bounded_and_deterministic)'
+slow-timeout = { period = "300s", terminate-after = 1 }
+
 # Retries apply ONLY to the system group: a transient spawn/scheduling miss is
 # retried visibly (nextest prints RETRY), never silently. Unit tests get no
 # retries, so real bugs stay red.

@@ -79,7 +79,14 @@ impl<'a> ControlAuthority<'a> {
         }
     }
 
-    /// Attach the current control token to a lease request.
+    /// Attach a presented control token to this authority.
+    ///
+    /// The token is only consulted when the authority names no lease (a
+    /// connection that presented the token without an attach). A lease-bearing
+    /// authority is decided by its role alone: an observer lease never becomes
+    /// controller, with or without a token (`D-09`). The setter stays available
+    /// so a service layer that always records the presented token cannot
+    /// accidentally turn that token into authority.
     #[must_use]
     pub const fn with_token(mut self, token: &'a ControlToken) -> Self {
         self.token = Some(token);
@@ -154,18 +161,64 @@ pub struct Claimed {
 }
 
 /// A successful control transfer.
+///
+/// The rotated token is **not** part of the requester's result. It is carried
+/// by [`TransferDelivery`], which only yields the secret to a caller resolving
+/// the target lease, so a transfer response on the requesting connection can
+/// never contain the new controller's token (`D-09`). The service layer
+/// (bitty#2607) routes the delivery to the target lease's own queue and
+/// excludes it from the requester's response.
 #[derive(Debug)]
 pub struct Transferred {
     /// The session snapshot after the transfer revision bump.
     pub session: SessionSnapshot,
+    /// The authority that requested the transfer: the previous controller lease
+    /// or the control token while control was vacant.
+    pub actor: Actor,
     /// The previous controller, demoted to observer.
     pub previous_controller: Option<AttachId>,
     /// The new controller lease.
     pub controller: AttachId,
-    /// The rotated 256-bit control token (returned once to the new controller).
-    pub control_token: ControlToken,
+    /// The rotated token addressed to the new controller.
+    pub delivery: TransferDelivery,
     /// An expired controller lease that the transfer vacated first.
     pub vacated_expired_controller: Option<LeaseExpiry>,
+}
+
+/// A rotated control token addressed to exactly one target lease.
+///
+/// A transfer rotates the token for the *new* controller, so the secret must
+/// travel to that lease and never back to the requester (`D-09`). The wrapper
+/// makes the target part of the value: [`TransferDelivery::take_for`] yields
+/// the token only for the target attach id and returns the delivery unchanged
+/// otherwise, so a response encoder cannot silently take another lease's
+/// secret. The token is zeroized on drop when it is never taken.
+#[derive(Debug)]
+pub struct TransferDelivery {
+    target: AttachId,
+    token: ControlToken,
+}
+
+impl TransferDelivery {
+    /// The one lease that may receive this token.
+    #[must_use]
+    pub const fn target(&self) -> AttachId {
+        self.target
+    }
+
+    /// Consume the delivery for `attach_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the unchanged delivery when `attach_id` is not the target, so a
+    /// mismatched caller cannot consume or leak the secret.
+    pub fn take_for(self, attach_id: AttachId) -> Result<ControlToken, Self> {
+        if attach_id == self.target {
+            Ok(self.token)
+        } else {
+            Err(self)
+        }
+    }
 }
 
 /// A lease removed by [`SessionHost::expire_due`] or by a claim/transfer
@@ -178,6 +231,10 @@ pub struct LeaseExpiry {
     pub attach_id: AttachId,
     /// Role at expiry.
     pub role: LeaseRole,
+    /// The `state_revision` of the snapshot in which the removal is visible:
+    /// the post-detach revision for a sweep, or the post-claim/post-transfer
+    /// revision when an expired controller is vacated by that operation.
+    pub revision: u64,
 }
 
 /// A successful detach or revocation.
@@ -296,9 +353,21 @@ pub enum ExitObservation {
 /// The terminal notice the event layer publishes exactly once.
 ///
 /// It carries no token, no terminal content, and no caller string. `attached`
-/// is the lease set that was live at the transition: bitty#2602 must reserve a
+/// is every lease record still registered at the transition — including one
+/// whose TTL had already lapsed but which the sweep had not removed yet, because
+/// its connection may still be subscribed — and bitty#2602 must reserve a
 /// terminal control-frame slot for each entry or close that lease with
-/// `TerminalEventLost` before the terminal snapshot becomes visible.
+/// `TerminalEventLost` **before** the terminal snapshot becomes visible.
+///
+/// # Ordering
+///
+/// [`SessionHost::record_termination`] and
+/// [`SessionHost::complete_pre_bind_cancel`] make the terminal snapshot visible
+/// in the registry as they return. The caller must therefore reserve the slots
+/// for `attached`, enqueue the notices, and only then release the `&mut
+/// SessionHost` (or serve any `session.status`); otherwise a concurrent status
+/// can observe `terminated` before a lease's terminal slot exists. Slot
+/// reservation, queues, and `TerminalEventLost` belong to bitty#2602.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TerminalNotice {
     /// The terminal snapshot (attach count already released).
@@ -343,7 +412,8 @@ pub struct ControlView {
     pub session_id: SessionId,
     /// The live controller lease, if any.
     pub controller: Option<AttachId>,
-    /// Live lease count (controller included).
+    /// Live lease count at the query instant, controller included. An expired
+    /// lease that the sweep has not removed yet is not counted.
     pub attach_count: u16,
     /// Whether a claim or transfer has ever rotated the create token.
     pub claimed: bool,
@@ -512,7 +582,7 @@ impl SessionHost {
         Some(ControlView {
             session_id,
             controller: state.live_controller(now),
-            attach_count: state.attach_count(),
+            attach_count: state.live_attach_count(now),
             claimed: state.claimed,
             token_state,
             pending_cancel: state.cancel.is_some(),
@@ -520,8 +590,14 @@ impl SessionHost {
         })
     }
 
-    /// One live lease by handle, or `None` when it was never issued, detached,
-    /// revoked, or collected.
+    /// The lease record for a handle, or `None` when it was never issued,
+    /// detached, revoked, or collected.
+    ///
+    /// The record is returned even when it has expired and the sweep has not
+    /// removed it yet, so this is a lookup, not an authorization: a caller that
+    /// needs a live lease must check [`Lease::is_expired_at`] against its own
+    /// `now`, or call [`SessionHost::authorize_content_read`] /
+    /// [`SessionHost::authorize_controller`], which check liveness.
     #[must_use]
     pub fn lease(&self, attach_id: AttachId) -> Option<Lease> {
         let session_id = self.lease_sessions.get(&attach_id)?;
@@ -529,6 +605,31 @@ impl SessionHost {
             .get(session_id)
             .and_then(|state| state.leases.get(&attach_id))
             .copied()
+    }
+
+    /// Authorize a role-agnostic content read (metadata events, snapshot
+    /// subscription) against a live lease.
+    ///
+    /// Both roles pass; the point is liveness: an expired, revoked, or foreign
+    /// handle is [`LeaseRefusal::NotAttached`]. The caller still checks the
+    /// `session.inspect` scope and the event-subscription rules (bitty#2607 /
+    /// bitty#2602). This is read-only and never renews the lease; the heartbeat
+    /// or a controller content operation does.
+    ///
+    /// # Errors
+    ///
+    /// Refuses with [`LeaseRefusal::NotAttached`] for an unknown, revoked, or
+    /// expired lease.
+    pub fn authorize_content_read(
+        &self,
+        attach_id: AttachId,
+        now: MonotonicMs,
+    ) -> Result<Lease, LeaseRefusal> {
+        let session_id = *self
+            .lease_sessions
+            .get(&attach_id)
+            .ok_or(LeaseRefusal::NotAttached)?;
+        self.actionable_lease(session_id, attach_id, now)
     }
 
     /// The stop view for a session, if a stop is in progress.
@@ -611,13 +712,17 @@ impl SessionHost {
     /// valid single-use observer grant. Grant mint, consume, TTL, and peer
     /// binding are the grant store's responsibility; this method assumes the
     /// grant was already validated and must not be exposed to a bare
-    /// connection.
+    /// connection. The grant must be consumed only **after** this call returns
+    /// `Ok`, so a refused attach (`MaxAttaches`, `NotRunning`) does not burn a
+    /// single-use grant for a lease that was never created.
     ///
     /// # Errors
     ///
     /// Refuses when the session is unknown or terminal, or when the
     /// per-session observer cap is reached. The controller lease is additional
-    /// (`D-09`), so observers never consume the controller's slot.
+    /// (`D-09`), so observers never consume the controller's slot. An expired
+    /// observer still awaiting [`SessionHost::expire_due`] does not consume a
+    /// slot: expiry already detached it from authority.
     pub fn attach_observer(
         &mut self,
         session_id: SessionId,
@@ -633,6 +738,7 @@ impl SessionHost {
             .leases
             .values()
             .filter(|lease| lease.role() == LeaseRole::Observer)
+            .filter(|lease| !lease.is_expired_at(now))
             .count();
         if observers >= limit {
             return Err(LeaseRefusal::MaxAttaches { limit });
@@ -658,9 +764,19 @@ impl SessionHost {
     /// Claim the controller lease with the current control token.
     ///
     /// The claim creates a new controller lease (it never promotes an existing
-    /// observer lease), rotates the token, and returns the new token once. The
-    /// generation is checked before the token digest so a stale request cannot
-    /// probe the token.
+    /// observer lease), rotates the token, and returns the new token once on
+    /// this connection: a claim names no lease, so the requester *is* the new
+    /// controller and the secret has no other recipient. The generation is
+    /// checked before the token digest so a stale request cannot probe the
+    /// token.
+    ///
+    /// Vacating an expired controller is a separate snapshot-visible
+    /// mutation from the claim itself, so that claim advances
+    /// `state_revision` twice (the due detach, then the attach) and reports the
+    /// detach as [`Claimed::vacated_expired_controller`]. A claim that refuses
+    /// changes nothing, with one documented exception: if the expired-controller
+    /// detach succeeds and a later counter fault refuses the attach, the due
+    /// detach stands, control stays vacant, and the token is unchanged.
     ///
     /// # Errors
     ///
@@ -669,7 +785,9 @@ impl SessionHost {
     /// - [`LeaseRefusal::StaleGeneration`] for a generation mismatch;
     /// - [`LeaseRefusal::ControlHeld`] when a live controller exists;
     /// - [`LeaseRefusal::InvalidControlToken`] for a missing, stale, rotated,
-    ///   or retired token.
+    ///   or retired token;
+    /// - [`LeaseRefusal::EntropyUnavailable`] when the CSPRNG fails or returns
+    ///   the current secret again (a failed rotation).
     ///
     /// The single controller lease is additional to the observer cap (`D-09`),
     /// so a session full of observers can still gain a controller without
@@ -706,7 +824,7 @@ impl SessionHost {
             return Err(LeaseRefusal::InvalidControlToken);
         }
 
-        let control_token = self.mint_token()?;
+        let control_token = self.mint_rotated_token(session_id)?;
         let digest = ControlTokenDigest::of(&control_token);
         let attach_id = self.mint_attach_id()?;
         let lease = Lease::new(
@@ -716,13 +834,10 @@ impl SessionHost {
             self.limits.attach_lease_ttl_ms(),
         );
 
-        let vacated_expired_controller = if let Some(expired) = expired_controller {
-            self.remove_lease(session_id, expired.attach_id(), now)?;
-            Some(LeaseExpiry {
-                session_id,
-                attach_id: expired.attach_id(),
-                role: expired.role(),
-            })
+        let vacated_controller = if let Some(expired) = expired_controller {
+            // A due detach commits before the attach; the event slice sees the
+            // removal in the final snapshot revision below.
+            Some(self.remove_lease(session_id, expired.attach_id(), now)?.0)
         } else {
             None
         };
@@ -737,6 +852,13 @@ impl SessionHost {
         state.token = TokenSlot::Current(digest);
         state.claimed = true;
         self.lease_sessions.insert(attach_id, session_id);
+
+        let vacated_expired_controller = vacated_controller.map(|vacated| LeaseExpiry {
+            session_id,
+            attach_id: vacated.attach_id(),
+            role: vacated.role(),
+            revision: session.state_revision,
+        });
 
         Ok(Claimed {
             lease,
@@ -766,6 +888,19 @@ impl SessionHost {
             .get(&attach_id)
             .ok_or(LeaseRefusal::NotAttached)?;
         let ttl = self.limits.attach_lease_ttl_ms();
+        // Liveness is checked before the registry mutation; the lease is
+        // renewed only after the registry accepted the heartbeat, so a refusal
+        // leaves the lease table untouched (whole refusal).
+        let live = self
+            .sessions
+            .get(&session_id)
+            .and_then(|state| state.leases.get(&attach_id))
+            .copied()
+            .ok_or(LeaseRefusal::NotAttached)?;
+        if live.is_expired_at(now) {
+            return Err(LeaseRefusal::NotAttached);
+        }
+        let session = self.registry.heartbeat(session_id, now)?;
         let lease = {
             let state = self
                 .sessions
@@ -775,13 +910,9 @@ impl SessionHost {
                 .leases
                 .get_mut(&attach_id)
                 .ok_or(LeaseRefusal::NotAttached)?;
-            if lease.is_expired_at(now) {
-                return Err(LeaseRefusal::NotAttached);
-            }
             lease.renew(now, ttl);
             *lease
         };
-        let session = self.registry.heartbeat(session_id, now)?;
         Ok(LeaseHeartbeat { lease, session })
     }
 
@@ -790,17 +921,23 @@ impl SessionHost {
     /// Own detach is always allowed and never requires the control token.
     /// Detaching another lease requires the current controller lease, the
     /// current control token while control is vacant, or the operator path.
-    /// Detach never aborts and never changes the generation. A repeat naming a
-    /// known session returns `was_attached = false` without a revision bump;
-    /// the host keeps no per-connection handle history, so bitty#2607 maps a
-    /// previously issued but removed handle to the contract's `not_attached`
-    /// reply.
+    /// Detach never aborts and never changes the generation.
+    ///
+    /// A target handle that was issued to another session is
+    /// [`LeaseRefusal::NotAttached`] (mapped by bitty#2607 to the uniform
+    /// `NotFound`), so a handle cannot probe or revoke a foreign lease. A handle
+    /// never issued in this session — including one already removed — is the
+    /// idempotent `Detached { was_attached: false }` acknowledgement without a
+    /// revision bump; the host keeps no per-connection handle history, so
+    /// bitty#2607 maps a previously issued but removed handle to the contract's
+    /// `not_attached` reply.
     ///
     /// # Errors
     ///
     /// Refuses with [`LeaseRefusal::NotAttached`] for an expired or unknown
-    /// actor, [`LeaseRefusal::ControllerRequired`] for an observer actor, or
-    /// [`LeaseRefusal::InvalidControlToken`] for a stale token.
+    /// actor or a foreign target, [`LeaseRefusal::ControllerRequired`] for an
+    /// observer actor, or [`LeaseRefusal::InvalidControlToken`] for a stale
+    /// token.
     pub fn detach(
         &mut self,
         session_id: SessionId,
@@ -863,6 +1000,15 @@ impl SessionHost {
             .get(&session_id)
             .and_then(|state| state.leases.get(&target))
             .copied();
+        if self
+            .lease_sessions
+            .get(&target)
+            .is_some_and(|owner| *owner != session_id)
+        {
+            // A handle issued to another session is a foreign handle, not a
+            // removed one: it must not read as an idempotent no-op.
+            return Err(LeaseRefusal::NotAttached);
+        }
         let controller_target = self
             .sessions
             .get(&session_id)
@@ -935,7 +1081,10 @@ impl SessionHost {
     /// The caller still checks `terminal.input` or `terminal.manage` scope and
     /// the actual PTY operation (bitty#2607/bitty#2604). An observer is
     /// [`LeaseRefusal::ControllerRequired`]; an expired or revoked lease is
-    /// [`LeaseRefusal::NotAttached`].
+    /// [`LeaseRefusal::NotAttached`]. This is a read-only check that never
+    /// renews the lease: liveness comes from the client heartbeat
+    /// ([`SessionHost::heartbeat`]), and [`SessionHost::record_resize`] renews
+    /// the controller as part of its mutation.
     ///
     /// # Errors
     ///
@@ -990,7 +1139,9 @@ impl SessionHost {
     /// The daemon's timer calls this; the returned entries are the exact detach
     /// mutations the event layer must publish. Expiry only detaches: the worker
     /// keeps running, the generation is unchanged, and a controller expiry
-    /// leaves control vacant with the current token still reclaimable.
+    /// leaves control vacant with the current token still reclaimable. Each
+    /// entry carries the `state_revision` of the post-detach snapshot in which
+    /// that removal is visible, ready for the event envelope.
     pub fn expire_due(&mut self, now: MonotonicMs) -> Vec<LeaseExpiry> {
         let due: Vec<(SessionId, AttachId, LeaseRole)> = self
             .sessions
@@ -1016,9 +1167,9 @@ impl SessionHost {
             // Registry first: a failed detach (terminal record or counter
             // fault) leaves the lease in place for the next sweep instead of
             // desynchronizing the derived count.
-            if self.registry.detach(session_id, now).is_err() {
+            let Ok(session) = self.registry.detach(session_id, now) else {
                 continue;
-            }
+            };
             if let Some(state) = self.sessions.get_mut(&session_id) {
                 state.leases.remove(&attach_id);
                 if state.controller == Some(attach_id) {
@@ -1030,6 +1181,7 @@ impl SessionHost {
                 session_id,
                 attach_id,
                 role,
+                revision: session.state_revision,
             });
         }
         expired
@@ -1043,12 +1195,27 @@ impl SessionHost {
     /// (on the terminal content plane) `terminal.input`/`terminal.manage`;
     /// bitty#2607 checks those scopes, this method checks the lease role.
     ///
+    /// # Token delivery (`D-09`)
+    ///
+    /// The rotated token belongs to the **new controller**, not to the
+    /// requester. [`Transferred`] therefore carries it only inside a
+    /// [`TransferDelivery`] addressed to the target attach id; the caller takes
+    /// it with [`TransferDelivery::take_for`] while routing the new
+    /// controller's own message and must never encode it into the requesting
+    /// connection's response. This holds for a transfer started by the previous
+    /// controller and for one started with the token while control was vacant.
+    ///
     /// # Errors
     ///
     /// Refuses with [`LeaseRefusal::NotRunning`], [`LeaseRefusal::StaleGeneration`],
     /// [`LeaseRefusal::ControllerRequired`], [`LeaseRefusal::ControlHeld`],
-    /// [`LeaseRefusal::InvalidControlToken`], [`LeaseRefusal::NotAttached`], or
-    /// [`LeaseRefusal::TargetNotObserver`]; nothing changes on refusal.
+    /// [`LeaseRefusal::InvalidControlToken`], [`LeaseRefusal::NotAttached`] (a
+    /// foreign, unknown, or expired target), or
+    /// [`LeaseRefusal::TargetNotObserver`]; [`LeaseRefusal::EntropyUnavailable`]
+    /// when the CSPRNG fails or repeats the current secret. Nothing changes on
+    /// refusal, except that vacating an already-expired controller commits that
+    /// due detach first: if a later counter fault refuses the transfer, the
+    /// expired lease is gone, control stays vacant, and the token is unchanged.
     pub fn transfer_control(
         &mut self,
         session_id: SessionId,
@@ -1085,16 +1252,11 @@ impl SessionHost {
             Authorized::Operator => return Err(LeaseRefusal::OperatorPathRequired),
         };
 
-        let control_token = self.mint_token()?;
+        let control_token = self.mint_rotated_token(session_id)?;
         let digest = ControlTokenDigest::of(&control_token);
 
-        let vacated_expired_controller = if let Some(expired) = expired_controller {
-            self.remove_lease(session_id, expired.attach_id(), now)?;
-            Some(LeaseExpiry {
-                session_id,
-                attach_id: expired.attach_id(),
-                role: expired.role(),
-            })
+        let vacated_controller = if let Some(expired) = expired_controller {
+            Some(self.remove_lease(session_id, expired.attach_id(), now)?.0)
         } else {
             None
         };
@@ -1121,11 +1283,22 @@ impl SessionHost {
         }
         self.renew_lease(target, now);
 
+        let vacated_expired_controller = vacated_controller.map(|vacated| LeaseExpiry {
+            session_id,
+            attach_id: vacated.attach_id(),
+            role: vacated.role(),
+            revision: session.state_revision,
+        });
+
         Ok(Transferred {
             session,
+            actor: authorized.actor(),
             previous_controller,
             controller: target,
-            control_token,
+            delivery: TransferDelivery {
+                target,
+                token: control_token,
+            },
             vacated_expired_controller,
         })
     }
@@ -1210,6 +1383,15 @@ impl SessionHost {
     /// and records the exit. A `created` session commits the same generation-0
     /// cancel intent as [`SessionHost::abort`]. A stop already accepted keeps
     /// its first effective reason and is only escalated.
+    ///
+    /// `kill` is the operator abort path, so it always classifies an accepted
+    /// stop as `operator_abort` (or keeps an earlier consumer reason). A
+    /// `daemon.stop force` must **not** use it as its first step: force calls
+    /// [`SessionHost::operator_stop`] with [`DaemonStopCause::DaemonStop`] (or
+    /// [`DaemonStopCause::HostShutdown`]) and then calls `kill` at the same
+    /// instant to move the deadline to `now`. That two-step keeps the
+    /// daemon-stop reason and still kills immediately; `kill` alone would
+    /// report `operator_abort`.
     ///
     /// # Errors
     ///
@@ -1392,6 +1574,11 @@ impl SessionHost {
     /// lease. A duplicate observation returns [`Termination::AlreadyTerminal`]
     /// and never produces a second notice.
     ///
+    /// The terminal snapshot becomes visible in the registry as this returns;
+    /// the caller must reserve the terminal slot for every `attached` lease and
+    /// enqueue the notice before it releases the `&mut SessionHost` (see
+    /// [`TerminalNotice`]).
+    ///
     /// # Errors
     ///
     /// Refuses with [`LeaseRefusal::CancelPending`] when the caller must first
@@ -1560,6 +1747,12 @@ impl SessionHost {
         }))
     }
 
+    /// Commit the one terminal transition.
+    ///
+    /// The terminal snapshot becomes visible to the registry here. The caller
+    /// must reserve every lease slot listed in the notice and enqueue it before
+    /// it releases the `&mut SessionHost` (see [`TerminalNotice`]); this method
+    /// cannot reserve slots because the queues belong to bitty#2602.
     fn finish_terminal(
         &mut self,
         session_id: SessionId,
@@ -1617,20 +1810,18 @@ impl SessionHost {
             return Ok(Relation::Operator);
         }
         if let Some(lease_id) = authority.lease {
+            // A lease-bearing request is decided by its role alone. An
+            // observer never carries control authority, even with a valid
+            // token and even with control vacant (`D-09`), so the token is
+            // never consulted on this branch.
             let lease = self.actionable_lease(session_id, lease_id, now)?;
             if lease.role().can_control() {
                 return Ok(Relation::Controller(lease_id));
             }
-            let state = self
-                .sessions
-                .get(&session_id)
-                .ok_or(LeaseRefusal::SessionNotFound)?;
-            if state.live_controller(now).is_some() {
-                return Err(LeaseRefusal::ControllerRequired);
-            }
-            let token = authority.token.ok_or(LeaseRefusal::ControllerRequired)?;
-            return Ok(Relation::VacantToken(token));
+            return Err(LeaseRefusal::ControllerRequired);
         }
+        // No lease: the only remaining non-operator authority is the token,
+        // and it is valid only while control is vacant.
         let token = authority.token.ok_or(LeaseRefusal::ControllerRequired)?;
         let state = self
             .sessions
@@ -1770,6 +1961,25 @@ impl SessionHost {
             .map_err(|_| LeaseRefusal::EntropyUnavailable)
     }
 
+    /// Mint the replacement token for a claim or transfer.
+    ///
+    /// A rotation must change the secret. A CSPRNG that repeats the currently
+    /// stored token is broken, and silently accepting the repeat would leave the
+    /// previous holder's secret valid after a "rotation", so the repeat is
+    /// refused as [`LeaseRefusal::EntropyUnavailable`] (fail closed) and the
+    /// operation changes nothing.
+    fn mint_rotated_token(&mut self, session_id: SessionId) -> Result<ControlToken, LeaseRefusal> {
+        let token = self.mint_token()?;
+        let repeats_current = self
+            .sessions
+            .get(&session_id)
+            .is_some_and(|state| state.token_matches(&token));
+        if repeats_current {
+            return Err(LeaseRefusal::EntropyUnavailable);
+        }
+        Ok(token)
+    }
+
     fn mint_attach_id(&mut self) -> Result<AttachId, LeaseRefusal> {
         for _ in 0..ID_GENERATION_ATTEMPTS {
             let attach_id = AttachId::generate_with(self.entropy.as_mut())
@@ -1848,8 +2058,18 @@ impl SessionLeaseState {
             .copied()
     }
 
-    fn attach_count(&self) -> u16 {
-        u16::try_from(self.leases.len()).unwrap_or(u16::MAX)
+    /// Live lease count at `now`, controller included.
+    ///
+    /// An expired lease awaiting [`SessionHost::expire_due`] is not live and is
+    /// excluded, so the view says what the contract means by `attach_count`
+    /// for authority rather than how many records the sweep still holds.
+    fn live_attach_count(&self, now: MonotonicMs) -> u16 {
+        let live = self
+            .leases
+            .values()
+            .filter(|lease| !lease.is_expired_at(now))
+            .count();
+        u16::try_from(live).unwrap_or(u16::MAX)
     }
 }
 

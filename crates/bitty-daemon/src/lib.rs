@@ -63,10 +63,11 @@
 //!   (`D-16`).
 //! - [`lease::SessionHost`]: observer/controller leases, the observer cap,
 //!   distinct attach ids, lease expiry and renewal, the 256-bit control token
-//!   (digest-only, constant-time), explicit control transfer, detach and
-//!   revocation, generation-0 cancel intent, the graceful-to-kill stop
-//!   pipeline, exit classification, and the one terminal notice (`D-03`,
-//!   `D-04`, `D-05`, `D-07`, `D-09`, `D-17`, `D-18`).
+//!   (digest-only, constant-time), explicit control transfer with the rotated
+//!   token delivered only to the target lease, detach and revocation,
+//!   generation-0 cancel intent, the graceful-to-kill stop pipeline, exit
+//!   classification, and the one terminal notice (`D-03`, `D-04`, `D-05`,
+//!   `D-07`, `D-09`, `D-17`, `D-18`).
 //! - [`orphan::OrphanJournal`]: the two-phase bounded orphan journal and the
 //!   exact-identity [`orphan::OrphanReaper`] seam (`D-06`).
 //!

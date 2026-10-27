@@ -42,6 +42,17 @@ impl Entropy for BudgetEntropy {
     }
 }
 
+/// A broken source that returns the same bytes every time; a rotation from it
+/// is not a rotation.
+struct ConstantEntropy;
+
+impl Entropy for ConstantEntropy {
+    fn fill(&mut self, destination: &mut [u8]) -> Result<(), crate::registry::IdError> {
+        destination.fill(0x2a);
+        Ok(())
+    }
+}
+
 fn ms(value: u64) -> MonotonicMs {
     MonotonicMs::from_millis(value)
 }
@@ -777,12 +788,18 @@ fn expired_leases_cannot_act_and_claim_vacates_an_expired_controller() {
         .host
         .claim_controller(session_id, 1, &token, ms(201))
         .expect("claim vacates the expired controller");
+    let vacated = claimed
+        .vacated_expired_controller
+        .expect("expired controller reported");
+    assert_eq!(vacated.attach_id, controller.attach_id());
     assert_eq!(
-        claimed
-            .vacated_expired_controller
-            .expect("expired controller reported")
-            .attach_id,
-        controller.attach_id()
+        claimed.session.state_revision,
+        revision + 2,
+        "the due detach and the claim's attach are two snapshot-visible mutations"
+    );
+    assert_eq!(
+        vacated.revision, claimed.session.state_revision,
+        "the expiry is visible in the claim's snapshot revision"
     );
     assert_eq!(
         harness.control(session_id, 201).controller,
@@ -976,6 +993,11 @@ fn transfer_moves_control_demotes_the_old_controller_and_rotates_the_token() {
     );
     assert_eq!(transferred.controller, observer.attach_id());
     assert_eq!(
+        transferred.actor,
+        Actor::Lease(controller.attach_id()),
+        "the transfer result records who requested it (audit D-16)"
+    );
+    assert_eq!(
         transferred.session.state_revision,
         before.state_revision + 1,
         "a transfer is one revision, not a detach plus an attach"
@@ -1000,7 +1022,24 @@ fn transfer_moves_control_demotes_the_old_controller_and_rotates_the_token() {
         harness.control(session_id, 5).controller,
         Some(observer.attach_id())
     );
-    assert_ne!(token_hex(&token), token_hex(&transferred.control_token));
+
+    // D-09: the rotated token is addressed to the target lease only. The
+    // requesting connection (the previous controller) cannot take it, and the
+    // target takes the secret that actually verifies.
+    let rendered = format!("{transferred:?}");
+    assert!(
+        rendered.contains("ControlToken(<redacted>)") && !rendered.contains(&token_hex(&token)),
+        "debug output never carries a token"
+    );
+    let delivery = transferred
+        .delivery
+        .take_for(controller.attach_id())
+        .expect_err("the source response must not carry the rotated token");
+    assert_eq!(delivery.target(), observer.attach_id());
+    let rotated_token = delivery
+        .take_for(observer.attach_id())
+        .expect("target delivery");
+    assert_ne!(token_hex(&token), token_hex(&rotated_token));
 
     // The old controller is now an observer and cannot act.
     assert_eq!(
@@ -1031,7 +1070,7 @@ fn transfer_moves_control_demotes_the_old_controller_and_rotates_the_token() {
     assert!(
         harness
             .host
-            .claim_controller(session_id, 1, &transferred.control_token, ms(8))
+            .claim_controller(session_id, 1, &rotated_token, ms(8))
             .is_ok()
     );
 }
@@ -1978,4 +2017,642 @@ fn a_lease_from_another_session_is_not_attached() {
             .session_id,
         first
     );
+}
+
+#[test]
+fn an_observer_lease_with_the_current_token_is_never_control_at_vacant_control() {
+    // D-09: an observer carries no abort, transfer, or detach-other authority.
+    // Presenting the current token must not promote it; only a connection with
+    // no lease can use the token, and only while control is vacant.
+    let mut harness = Harness::new();
+    let (session_id, create_token) = harness.create("term-observer-token", 1);
+    harness.bind(session_id, 2);
+    let (controller, token) = harness.claim(session_id, 1, &create_token, 3);
+    harness
+        .host
+        .detach(
+            session_id,
+            controller.attach_id(),
+            &ControlAuthority::lease(controller.attach_id()),
+            ms(4),
+        )
+        .expect("controller self detach");
+    let observer = harness.attach(session_id, 5);
+    let other = harness.attach(session_id, 6);
+    assert_eq!(
+        harness.control(session_id, 6).controller,
+        None,
+        "control is vacant"
+    );
+    let before = harness.host.snapshot(session_id).expect("snapshot");
+
+    let observer_with_token = ControlAuthority::lease(observer.attach_id()).with_token(&token);
+    assert_eq!(
+        harness.host.abort(
+            session_id,
+            1,
+            &observer_with_token,
+            ConsumerStopCause::Cancel,
+            ms(7),
+        ),
+        Err(LeaseRefusal::ControllerRequired)
+    );
+    assert_refused!(
+        harness.host.transfer_control(
+            session_id,
+            1,
+            &observer_with_token,
+            other.attach_id(),
+            ms(7),
+        ),
+        LeaseRefusal::ControllerRequired
+    );
+    assert_eq!(
+        harness
+            .host
+            .detach(session_id, other.attach_id(), &observer_with_token, ms(7),),
+        Err(LeaseRefusal::ControllerRequired)
+    );
+
+    assert_eq!(
+        harness.host.snapshot(session_id).expect("snapshot"),
+        before,
+        "no observer attempt applied anything"
+    );
+    assert_eq!(harness.control(session_id, 7).attach_count, 2);
+    assert_eq!(
+        harness.control(session_id, 7).token_state,
+        ControlTokenState::Current,
+        "the observer attempts did not rotate or retire the token"
+    );
+
+    // The same token on a connection with no lease still authorizes the
+    // vacant-control path.
+    assert!(matches!(
+        harness
+            .host
+            .abort(
+                session_id,
+                1,
+                &ControlAuthority::token(&token),
+                ConsumerStopCause::Cancel,
+                ms(8),
+            )
+            .expect("token-only abort"),
+        StopOutcome::Accepted(_)
+    ));
+}
+
+#[test]
+fn a_control_token_is_bound_to_one_session() {
+    let mut harness = Harness::new();
+    let (first, first_create) = harness.create("term-token-a", 1);
+    let (second, _) = harness.create("term-token-b", 1);
+    harness.bind(first, 2);
+    harness.bind(second, 2);
+    let (controller, first_token) = harness.claim(first, 1, &first_create, 3);
+    let second_before = harness.host.snapshot(second).expect("snapshot");
+
+    // Cross-session replay: the first session's rotated token carries no
+    // authority in the second, on either the claim or the token-only path.
+    assert_refused!(
+        harness
+            .host
+            .claim_controller(second, 1, &first_token, ms(4)),
+        LeaseRefusal::InvalidControlToken
+    );
+    assert_eq!(
+        harness.host.abort(
+            second,
+            1,
+            &ControlAuthority::token(&first_token),
+            ConsumerStopCause::Cancel,
+            ms(4),
+        ),
+        Err(LeaseRefusal::InvalidControlToken)
+    );
+    assert_eq!(
+        harness.host.snapshot(second).expect("snapshot"),
+        second_before
+    );
+    assert_eq!(harness.control(second, 4).controller, None);
+
+    // The token still verifies in its own session.
+    harness
+        .host
+        .detach(
+            first,
+            controller.attach_id(),
+            &ControlAuthority::lease(controller.attach_id()),
+            ms(5),
+        )
+        .expect("self detach");
+    assert!(
+        harness
+            .host
+            .claim_controller(first, 1, &first_token, ms(5))
+            .is_ok()
+    );
+}
+
+#[test]
+fn an_expired_controller_with_a_wrong_token_is_refused_and_survives() {
+    let mut harness = Harness::new();
+    let (session_id, create_token) = harness.create("term-expired-wrong-token", 1);
+    harness.bind(session_id, 2);
+    let (controller, token) = harness.claim(session_id, 1, &create_token, 100);
+    let before = harness.host.snapshot(session_id).expect("snapshot");
+
+    assert_refused!(
+        harness
+            .host
+            .claim_controller(session_id, 1, &wrong_token(), ms(200)),
+        LeaseRefusal::InvalidControlToken
+    );
+    assert_eq!(
+        harness.host.snapshot(session_id).expect("snapshot"),
+        before,
+        "a refused claim does not touch the revision"
+    );
+    assert!(
+        harness.host.lease(controller.attach_id()).is_some(),
+        "the expired controller is not removed by a refused claim"
+    );
+    assert_eq!(harness.control(session_id, 200).controller, None);
+    assert_eq!(
+        harness.control(session_id, 200).token_state,
+        ControlTokenState::Current
+    );
+
+    let expired = harness.host.expire_due(ms(200));
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].attach_id, controller.attach_id());
+    assert_eq!(expired[0].revision, before.state_revision + 1);
+    // The current token still reclaims control after the sweep.
+    assert!(
+        harness
+            .host
+            .claim_controller(session_id, 1, &token, ms(201))
+            .is_ok()
+    );
+}
+
+#[test]
+fn transfer_targets_must_be_live_observers_of_this_session() {
+    let mut harness = Harness::new();
+    let (session_id, create_token) = harness.create("term-target-a", 1);
+    let (foreign_session, _) = harness.create("term-target-b", 1);
+    harness.bind(session_id, 2);
+    harness.bind(foreign_session, 2);
+    let observer = harness.attach(session_id, 100);
+    let (controller, _) = harness.claim(session_id, 1, &create_token, 150);
+    let foreign = harness.attach(foreign_session, 100);
+    let before = harness.host.snapshot(session_id).expect("snapshot");
+
+    // A foreign-session handle is not a transfer target.
+    assert_refused!(
+        harness.host.transfer_control(
+            session_id,
+            1,
+            &ControlAuthority::lease(controller.attach_id()),
+            foreign.attach_id(),
+            ms(160),
+        ),
+        LeaseRefusal::NotAttached
+    );
+    assert_eq!(harness.host.snapshot(session_id).expect("snapshot"), before);
+    assert_eq!(
+        harness.control(session_id, 160).controller,
+        Some(controller.attach_id())
+    );
+
+    // The controller is live at 200 (claimed at 150); the observer is not.
+    assert_refused!(
+        harness.host.transfer_control(
+            session_id,
+            1,
+            &ControlAuthority::lease(controller.attach_id()),
+            observer.attach_id(),
+            ms(200),
+        ),
+        LeaseRefusal::NotAttached
+    );
+    assert_eq!(harness.host.snapshot(session_id).expect("snapshot"), before);
+    assert!(harness.host.lease(foreign.attach_id()).is_some());
+    assert_eq!(harness.control(foreign_session, 160).attach_count, 1);
+}
+
+#[test]
+fn after_a_transfer_the_demoted_controller_cannot_resize_or_authorize() {
+    let mut harness = Harness::new();
+    let (session_id, create_token) = harness.create("term-demoted", 1);
+    harness.bind(session_id, 2);
+    let (controller, _) = harness.claim(session_id, 1, &create_token, 3);
+    let observer = harness.attach(session_id, 4);
+    let transferred = harness
+        .host
+        .transfer_control(
+            session_id,
+            1,
+            &ControlAuthority::lease(controller.attach_id()),
+            observer.attach_id(),
+            ms(5),
+        )
+        .expect("transfer");
+
+    assert_refused!(
+        harness.host.record_resize(controller.attach_id(), ms(6)),
+        LeaseRefusal::ControllerRequired
+    );
+    assert_eq!(
+        harness
+            .host
+            .authorize_controller(controller.attach_id(), ms(6)),
+        Err(LeaseRefusal::ControllerRequired)
+    );
+    // The demoted lease is still attached for content reads and metadata.
+    assert_eq!(
+        harness
+            .host
+            .authorize_content_read(controller.attach_id(), ms(6))
+            .expect("attached as observer")
+            .role(),
+        LeaseRole::Observer
+    );
+
+    let resized = harness
+        .host
+        .record_resize(transferred.controller, ms(6))
+        .expect("the new controller may resize");
+    assert_eq!(
+        resized.state_revision,
+        transferred.session.state_revision + 1
+    );
+}
+
+#[test]
+fn revocation_and_expiry_during_stopping_are_reflected_in_the_terminal_notice() {
+    let mut harness = Harness::new();
+    let (session_id, create_token) = harness.create("term-stopping-revoke", 1);
+    harness.bind(session_id, 2);
+    let (controller, _) = harness.claim(session_id, 1, &create_token, 150);
+    let expiring = harness.attach(session_id, 100);
+    let live = harness.attach(session_id, 180);
+    harness
+        .host
+        .operator_stop(session_id, 1, DaemonStopCause::HostShutdown, ms(190))
+        .expect("shutdown stop");
+
+    let revoked = harness
+        .host
+        .detach(
+            session_id,
+            controller.attach_id(),
+            &ControlAuthority::operator(),
+            ms(191),
+        )
+        .expect("operator revoke during stopping");
+    assert!(revoked.was_attached);
+    assert!(revoked.revoked);
+    assert!(revoked.control_retired);
+
+    let expired = harness.host.expire_due(ms(200));
+    assert_eq!(expired.len(), 1);
+    assert_eq!(expired[0].attach_id, expiring.attach_id());
+    assert_eq!(expired[0].role, LeaseRole::Observer);
+
+    let Termination::Completed(notice) = harness
+        .host
+        .record_termination(
+            session_id,
+            ExitObservation::DaemonTerminated,
+            CleanupClass::Swept,
+            ms(201),
+        )
+        .expect("terminal")
+    else {
+        panic!("terminal notice");
+    };
+    assert_eq!(notice.reason, TerminalReason::HostShutdown);
+    assert_eq!(notice.attached, vec![live.attach_id()]);
+    assert_eq!(
+        harness.control(session_id, 201).token_state,
+        ControlTokenState::Retired
+    );
+}
+
+#[test]
+fn an_unswept_expired_lease_is_closed_by_the_terminal_notice() {
+    let mut harness = Harness::new();
+    let (session_id, _) = harness.create("term-expired-terminate", 1);
+    harness.bind(session_id, 2);
+    let observer = harness.attach(session_id, 100);
+
+    let Termination::Completed(notice) = harness
+        .host
+        .record_termination(
+            session_id,
+            ExitObservation::Exited { code: 0 },
+            CleanupClass::Swept,
+            ms(300),
+        )
+        .expect("terminal")
+    else {
+        panic!("terminal notice");
+    };
+    assert_eq!(
+        notice.attached,
+        vec![observer.attach_id()],
+        "the event layer must still account for the connection"
+    );
+    assert_eq!(notice.session.attach_count, 0);
+    assert!(harness.host.lease(observer.attach_id()).is_none());
+    assert!(
+        harness.host.expire_due(ms(300)).is_empty(),
+        "the terminal transition removed the expired record"
+    );
+}
+
+#[test]
+fn a_daemon_termination_without_an_accepted_stop_is_an_unexpected_exit() {
+    let mut harness = Harness::new();
+    let (session_id, _) = harness.create("term-unexpected-daemon", 1);
+    harness.bind(session_id, 2);
+    let before = harness.host.snapshot(session_id).expect("snapshot");
+    assert_eq!(
+        harness.host.record_termination(
+            session_id,
+            ExitObservation::DaemonTerminated,
+            CleanupClass::Swept,
+            ms(3),
+        ),
+        Err(LeaseRefusal::UnexpectedExit {
+            state: LifecycleState::Running
+        })
+    );
+    assert_eq!(harness.host.snapshot(session_id).expect("snapshot"), before);
+}
+
+#[test]
+fn pre_bind_cancel_completes_with_unverified_cleanup() {
+    let mut harness = Harness::new();
+    let (session_id, token) = harness.create("term-prebind-unverified", 1);
+    let StopOutcome::PreBindCancel(intent) = harness
+        .host
+        .abort(
+            session_id,
+            0,
+            &ControlAuthority::token(&token),
+            ConsumerStopCause::Cancel,
+            ms(2),
+        )
+        .expect("pre-bind abort")
+    else {
+        panic!("pre-bind cancel intent");
+    };
+    assert_eq!(intent.reason, TerminalReason::ConsumerCancel);
+
+    let Termination::Completed(notice) = harness
+        .host
+        .complete_pre_bind_cancel(session_id, CleanupClass::Unverified, ms(3))
+        .expect("complete unverified")
+    else {
+        panic!("terminal notice");
+    };
+    assert_eq!(notice.cleanup, CleanupClass::Unverified);
+    assert_eq!(notice.session.state, LifecycleState::Terminated);
+    assert_eq!(notice.session.generation, 0);
+    assert_eq!(notice.reason, TerminalReason::ConsumerCancel);
+    assert!(notice.attached.is_empty());
+}
+
+#[test]
+fn expired_observers_do_not_consume_the_attach_cap() {
+    let mut harness = Harness::new();
+    let (session_id, _) = harness.create("term-cap-expired", 1);
+    for _ in 0..4 {
+        harness.attach(session_id, 100);
+    }
+    assert_refused!(
+        harness.host.attach_observer(session_id, ms(150)),
+        LeaseRefusal::MaxAttaches { limit: 4 }
+    );
+    assert_eq!(
+        harness.control(session_id, 200).attach_count,
+        0,
+        "every lease had expired"
+    );
+
+    let fresh = harness.attach(session_id, 200);
+    assert_eq!(harness.control(session_id, 200).attach_count, 1);
+    assert_eq!(
+        harness
+            .host
+            .snapshot(session_id)
+            .expect("snapshot")
+            .attach_count,
+        5,
+        "the registry still holds the unswept records"
+    );
+
+    let expired = harness.host.expire_due(ms(200));
+    assert_eq!(expired.len(), 4);
+    assert_eq!(
+        harness
+            .host
+            .snapshot(session_id)
+            .expect("snapshot")
+            .attach_count,
+        1
+    );
+    assert!(harness.host.lease(fresh.attach_id()).is_some());
+}
+
+#[test]
+fn expire_due_reports_the_post_detach_revision_for_each_removal() {
+    let mut harness = Harness::new();
+    let (session_id, _) = harness.create("term-expire-revisions", 1);
+    harness.bind(session_id, 2);
+    let first = harness.attach(session_id, 100);
+    let second = harness.attach(session_id, 100);
+    let before = harness.host.snapshot(session_id).expect("snapshot");
+
+    let expired = harness.host.expire_due(ms(200));
+    assert_eq!(expired.len(), 2);
+    let mut revisions: Vec<u64> = expired.iter().map(|entry| entry.revision).collect();
+    revisions.sort_unstable();
+    assert_eq!(
+        revisions,
+        vec![before.state_revision + 1, before.state_revision + 2]
+    );
+    let ids: HashSet<AttachId> = expired.iter().map(|entry| entry.attach_id).collect();
+    assert_eq!(ids, HashSet::from([first.attach_id(), second.attach_id()]));
+    assert_eq!(
+        harness
+            .host
+            .snapshot(session_id)
+            .expect("snapshot")
+            .state_revision,
+        before.state_revision + 2
+    );
+}
+
+#[test]
+fn daemon_stop_force_is_stop_then_kill_and_keeps_the_daemon_reason() {
+    let mut harness = Harness::new();
+    let (session_id, _) = harness.create("term-force", 1);
+    harness.bind(session_id, 2);
+    let StopOutcome::Accepted(graceful) = harness
+        .host
+        .operator_stop(session_id, 1, DaemonStopCause::DaemonStop, ms(10))
+        .expect("drain")
+    else {
+        panic!("accepted stop");
+    };
+    assert_eq!(graceful.stage, AbortStage::Graceful);
+
+    let StopOutcome::Accepted(forced) = harness
+        .host
+        .kill(session_id, 1, ms(10))
+        .expect("force escalation")
+    else {
+        panic!("accepted stop");
+    };
+    assert!(forced.already_accepted);
+    assert_eq!(forced.stage, AbortStage::KillDue);
+    assert_eq!(forced.deadline, ms(10));
+
+    let Termination::Completed(notice) = harness
+        .host
+        .record_termination(
+            session_id,
+            ExitObservation::DaemonTerminated,
+            CleanupClass::Swept,
+            ms(11),
+        )
+        .expect("terminal")
+    else {
+        panic!("terminal notice");
+    };
+    assert_eq!(
+        notice.reason,
+        TerminalReason::DaemonStop,
+        "kill must not overwrite the force stop's daemon reason"
+    );
+}
+
+#[test]
+fn a_foreign_detach_target_is_not_attached_and_survives() {
+    let mut harness = Harness::new();
+    let (first, first_token) = harness.create("term-foreign-detach-a", 1);
+    let (second, _) = harness.create("term-foreign-detach-b", 1);
+    harness.bind(first, 2);
+    let (controller, _) = harness.claim(first, 1, &first_token, 3);
+    let foreign = harness.attach(second, 4);
+    let before = harness.host.snapshot(second).expect("snapshot");
+
+    assert_refused!(
+        harness.host.detach(
+            first,
+            foreign.attach_id(),
+            &ControlAuthority::lease(controller.attach_id()),
+            ms(5),
+        ),
+        LeaseRefusal::NotAttached
+    );
+    assert_refused!(
+        harness.host.detach(
+            first,
+            foreign.attach_id(),
+            &ControlAuthority::operator(),
+            ms(5),
+        ),
+        LeaseRefusal::NotAttached
+    );
+    assert_eq!(harness.host.snapshot(second).expect("snapshot"), before);
+    assert!(harness.host.lease(foreign.attach_id()).is_some());
+}
+
+#[test]
+fn a_repeated_token_mint_is_refused_as_a_failed_rotation() {
+    let registry = SessionRegistry::with_entropy(
+        RegistryLimits::new(4, 4, 4096, 600_000).expect("valid registry limits"),
+        Box::new(CounterEntropy { next: 1 }),
+    )
+    .expect("registry");
+    let mut host = SessionHost::with_parts(
+        registry,
+        LeaseLimits::new(4, 100, 50, 70).expect("limits"),
+        Box::new(ConstantEntropy),
+    );
+    let created = host
+        .create(
+            CreateSession {
+                terminal_id: Some(TerminalId::supplied("term-mint-repeat").expect("valid")),
+                owner_peer: None,
+            },
+            ms(1),
+        )
+        .expect("create");
+    let token = created.control_token;
+    host.bind(created.session.session_id, ms(2)).expect("bind");
+    let before = host.snapshot(created.session.session_id).expect("snapshot");
+
+    assert_eq!(
+        host.claim_controller(created.session.session_id, 1, &token, ms(3))
+            .err(),
+        Some(LeaseRefusal::EntropyUnavailable)
+    );
+    assert_eq!(
+        host.snapshot(created.session.session_id).expect("snapshot"),
+        before
+    );
+    let view = host
+        .control_view(created.session.session_id, ms(3))
+        .expect("view");
+    assert_eq!(view.attach_count, 0, "no controller lease was created");
+    assert_eq!(
+        view.token_state,
+        ControlTokenState::Current,
+        "the unrotated token is still current"
+    );
+}
+
+#[test]
+fn authorize_content_read_checks_liveness_for_both_roles() {
+    let mut harness = Harness::new();
+    let (session_id, create_token) = harness.create("term-content-read", 1);
+    harness.bind(session_id, 2);
+    let (controller, _) = harness.claim(session_id, 1, &create_token, 3);
+    let observer = harness.attach(session_id, 100);
+
+    assert_eq!(
+        harness
+            .host
+            .authorize_content_read(controller.attach_id(), ms(4))
+            .expect("controller read")
+            .role(),
+        LeaseRole::Controller
+    );
+    assert_eq!(
+        harness
+            .host
+            .authorize_content_read(observer.attach_id(), ms(199))
+            .expect("observer read")
+            .role(),
+        LeaseRole::Observer
+    );
+    assert_refused!(
+        harness
+            .host
+            .authorize_content_read(observer.attach_id(), ms(200)),
+        LeaseRefusal::NotAttached
+    );
+    // The raw lookup still returns the record; only the authorized entry point
+    // treats it as detached.
+    let expired = harness
+        .host
+        .lease(observer.attach_id())
+        .expect("lookup returns the unswept record");
+    assert!(expired.is_expired_at(ms(200)));
 }

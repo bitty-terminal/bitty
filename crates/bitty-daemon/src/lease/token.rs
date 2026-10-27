@@ -2,9 +2,13 @@
 //!
 //! The token is minted from the operating-system CSPRNG at session creation,
 //! returned exactly once in the create response, rotated on every successful
-//! claim or transfer, and never stored in the clear. The daemon keeps only
-//! [`ControlTokenDigest`], a domain-separated SHA-256 digest, and verifies a
-//! presented token with a constant-time comparison (`subtle`).
+//! claim or transfer, and never stored in the clear. A claim returns the rotated
+//! token on the claiming connection because that connection becomes the new
+//! controller; a transfer returns it only inside
+//! [`TransferDelivery`](super::host::TransferDelivery), addressed to the target
+//! lease. The daemon keeps only [`ControlTokenDigest`], a domain-separated
+//! SHA-256 digest, and verifies a presented token with a constant-time
+//! comparison (`subtle`).
 //!
 //! `ControlToken` deliberately implements neither `Clone` nor `Display` and its
 //! [`std::fmt::Debug`] output is a static redaction. The only way to obtain the
@@ -50,7 +54,10 @@ impl ControlToken {
     ///
     /// Construction never grants authority: the digest comparison decides.
     /// Callers must not log, persist, or place the bytes in a child
-    /// environment.
+    /// environment. The receiving `ControlToken` zeroizes its own copy on drop,
+    /// but the wire/frame buffer the bytes were decoded from is owned by
+    /// bitty#2607 and must be zeroized there as soon as the request that carried
+    /// the token is handled; this type cannot reach it.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; Self::BYTES]) -> Self {
         Self(bytes)

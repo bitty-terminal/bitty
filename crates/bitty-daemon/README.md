@@ -62,6 +62,13 @@ of the service surface.
 | Limits advertisement | every `D-14` row plus the inherited `RC-9`/`RC-10` bounds as `{effective, default, system_max}`                                  | `handshake::NegotiateResponse`  |
 | Worker sessions      | `false` in every v0.2.0 build (`D-01`); enabling needs an ADR 0019 amendment and a dedicated security review                     | `contract::CAPABILITIES`        |
 
+The enabled capability bits describe the v1 contract surface the crate is being
+built toward, not delivered method behavior: this slice still binds no endpoint
+and serves no method, so nothing can consume `events`,
+`observer_grants`, `control_transfer`, or `idempotent_mutations` until
+bitty#2607/#2602/#2603 land. Do not cite the bit set as evidence that a
+capability works.
+
 ## Registry core (bitty#2601)
 
 `registry` is the in-memory session registry. It starts no listener, touches no
@@ -100,24 +107,55 @@ attach, detach, claim, transfer, or terminal transition is one atomic
   `max_attaches_per_session` (default 8, ceiling 16); the controller is
   additional to that observer cap (`D-09`). Every attach mints a distinct
   128-bit `attach_id`. A new observer at the cap is shed; existing leases are
-  never evicted.
+  never evicted. An expired observer that the sweep has not removed yet does not
+  consume a slot (the sweep still reclaims its record), and
+  `ControlView::attach_count` counts only live leases.
 - Control token: 256 bits from the OS CSPRNG, returned once at create, stored
   only as a domain-separated SHA-256 digest, verified in constant time
   (`subtle`), rotated on every claim and transfer, and retired on controller
-  revocation and terminal transition. The raw token is zeroized on drop and its
-  `Debug` prints only `ControlToken(<redacted>)`; no snapshot, notice, refusal,
-  or `SessionHost` debug output carries it.
+  revocation and terminal transition. A rotation that repeats the current secret
+  is refused as `EntropyUnavailable` rather than accepted as a rotation. The raw
+  token is zeroized on drop and its `Debug` prints only
+  `ControlToken(<redacted>)`; no snapshot, notice, refusal, or `SessionHost`
+  debug output carries it.
+- Token delivery (`D-09`): a claim returns the rotated token on the claiming
+  connection because that connection becomes the controller. A transfer rotates
+  the token for the **target** lease, so `Transferred` carries it only inside a
+  `TransferDelivery` addressed to the target attach id; `TransferDelivery::take_for`
+  refuses any other attach id and returns the delivery unchanged. The service
+  layer routes the secret to the target lease's own queue and must never encode
+  it into the requesting connection's response. Nothing else in the requester's
+  result contains it.
+
+  | `Transferred` field                                     | Requesting connection | Target lease message                |
+  | ------------------------------------------------------- | --------------------- | ----------------------------------- |
+  | `session`, `actor`, `previous_controller`, `controller` | response payload      | state/control event                 |
+  | `delivery`                                              | **never**             | `take_for(target.attach_id())` only |
+
 - Authorization: the IPC slice authenticates the peer, checks instance, scope,
   visibility, observer grant, and operator capability; `SessionHost` owns the
   lease liveness/role relation, the generation fence, and the token comparison,
   in that order (role/relation, generation, token). A stale generation is
   refused before the token digest is touched. An observer is always
   `ControllerRequired` for control methods and never becomes controller by
-  waiting, by disconnect, or by racing an attach.
+  waiting, by disconnect, or by racing an attach — **and never by presenting the
+  current token**: a lease-bearing authority is decided by its role alone, and
+  the token is only consulted for a request with no lease. `ControlAuthority::operator()`
+  is unauthenticated by construction, so only the daemon's own service code may
+  build it, behind the bitty#2607 `daemon.control` check.
+- Lease reads: `SessionHost::lease` is a lookup that also returns an expired
+  record still awaiting the sweep; `authorize_content_read` (role-agnostic) and
+  `authorize_controller` (controller-only) are the liveness-checked entry
+  points. Both are read-only and never renew; the client heartbeat and
+  `record_resize` renew.
 - Expiry and renewal are driven by the injected `MonotonicMs`; a lease is live
   before `expires_at` and expired exactly at it. Expiry detaches only: the
   worker keeps running, the generation is unchanged, and a controller expiry
-  leaves control vacant with the current token still reclaimable.
+  leaves control vacant with the current token still reclaimable. `expire_due`
+  reports each removal with the post-detach `state_revision` the event slice
+  needs. A claim or transfer that vacates an already-expired controller commits
+  that due detach first, so it advances the revision twice; a later counter fault
+  refuses the operation but leaves the due detach in place.
 - Stop pipeline: a generation-0 stop commits a cancel intent that refuses
   `bind`; completing it records `not_started`/`swept`/`unverified` cleanup. A
   running stop moves to `stopping`, arms the abort or drain grace, then
@@ -126,11 +164,20 @@ attach, detach, claim, transfer, or terminal transition is one atomic
   transition retires the token, detaches every lease (one visible detach bump
   each, so the frozen record reports no attaches), and returns exactly one
   `TerminalNotice`; a duplicate returns `AlreadyTerminal` and no second notice.
+  The caller must reserve a terminal slot for every `attached` lease (including
+  an expired-but-unswept one) and enqueue the notice before it releases the
+  `&mut SessionHost`, so `session.status` cannot show the terminal snapshot
+  first.
+- `session.kill` is the operator-abort path and classifies an accepted stop as
+  `operator_abort`. `daemon.stop force` must therefore call
+  `operator_stop(DaemonStop | HostShutdown)` and then `kill` at the same instant:
+  the two-step keeps the daemon-stop reason and moves the deadline to `now`.
 - Deliberately not in this module: the observer-grant store, idempotency
   stores, PTY containment/signalling/reaping, event queues, peer
   authentication, scopes, audit files, and endpoint handling. `attach_observer`
-  assumes bitty#2607 has already consumed a valid grant; do not expose the
-  observer role without that check.
+  assumes bitty#2607 has already validated a grant; bitty#2607 consumes the
+  single-use grant only after the call returns `Ok`, so a refused attach does not
+  burn it. Do not expose the observer role without that check.
 
 `orphan` is the two-phase, bounded orphan journal. `reserve` fsyncs a
 `reserved` record (session id, generation, boot id, reserved-at) before the
@@ -481,8 +528,8 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
   binding, TTL boundaries, capacity eviction, and hostile key streams.
 - `tests/audit.rs` — overflow visibility, stable ids, structural content-free
   records, refusal representation, and capacity derivation.
-- `tests/leases.rs` — public attach, claim, transfer, expiry, detach, stop, and
-  token-minimization behavior.
+- `tests/leases.rs` — public attach, claim, transfer (with target-addressed
+  token delivery), expiry, detach, stop, and token-minimization behavior.
 - `tests/orphan_journal.rs` — public journal reserve/commit/reap, no-signal
   paths, owner-private Unix files, and the no-argv/env record shape.
 - `tests/endpoint.rs` — real Unix endpoint behavior: modes and owners, second

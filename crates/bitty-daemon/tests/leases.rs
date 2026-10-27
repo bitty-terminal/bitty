@@ -361,3 +361,58 @@ fn operator_stop_and_exit_classification_are_public() {
         "a terminal session is read-only for attach"
     );
 }
+
+#[test]
+fn transfer_delivery_is_addressed_to_the_target_lease_only() {
+    let mut host = host(8);
+    let (session_id, create_token) = create(&mut host, "term-transfer-delivery", 1);
+    host.bind(session_id, ms(2)).expect("bind");
+    let claimed = host
+        .claim_controller(session_id, 1, &create_token, ms(3))
+        .expect("claim");
+    let observer = host
+        .attach_observer(session_id, ms(4))
+        .expect("observer attach");
+    let transferred = host
+        .transfer_control(
+            session_id,
+            1,
+            &ControlAuthority::lease(claimed.lease.attach_id()),
+            observer.lease.attach_id(),
+            ms(5),
+        )
+        .expect("transfer");
+
+    // The requester cannot take the rotated secret; only the target lease can.
+    assert_eq!(
+        transferred.delivery.target(),
+        observer.lease.attach_id(),
+        "the delivery names the new controller"
+    );
+    let delivery = transferred
+        .delivery
+        .take_for(claimed.lease.attach_id())
+        .expect_err("the requesting connection must not receive the rotated token");
+    let rotated_token = delivery
+        .take_for(observer.lease.attach_id())
+        .expect("the target lease receives the rotated token");
+    assert_ne!(token_hex(&rotated_token), token_hex(&claimed.control_token));
+
+    // The delivered token is the one that verifies after the target leaves.
+    host.detach(
+        session_id,
+        observer.lease.attach_id(),
+        &ControlAuthority::lease(observer.lease.attach_id()),
+        ms(6),
+    )
+    .expect("target self detach");
+    assert!(
+        host.claim_controller(session_id, 1, &claimed.control_token, ms(7))
+            .is_err(),
+        "the pre-transfer token stays rotated"
+    );
+    assert!(
+        host.claim_controller(session_id, 1, &rotated_token, ms(8))
+            .is_ok()
+    );
+}

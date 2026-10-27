@@ -1,8 +1,14 @@
 //! Closed refusals for the attach/lease/control state machine.
 //!
-//! Every variant is a whole refusal: no lease was created or removed, no
-//! counter moved, and no token was rotated. No variant carries a secret, a
-//! caller-supplied string, or another session's details.
+//! A refusal never revokes or detaches a live lease, rotates the token, bumps
+//! the revision for its own operation, or changes the registry counters. The
+//! single exception is the **due** detach of an already-expired controller at
+//! the start of a claim or transfer: that detach was implied by the TTL and
+//! commits before a later counter fault refuses the operation, leaving the
+//! expired lease removed, control vacant, and the token unchanged.
+//!
+//! No variant carries a secret, a caller-supplied string, or another session's
+//! details.
 //!
 //! The IPC slice (bitty#2607) maps these onto the contract's service codes.
 //! [`crate::lease`] documents the mapping; the important distinctions are
@@ -68,7 +74,8 @@ pub enum LeaseRefusal {
     RevisionOverflow,
     /// The generation counter would wrap; the state fails closed.
     GenerationOverflow,
-    /// The operating-system CSPRNG was unavailable while minting a secret or id.
+    /// The operating-system CSPRNG was unavailable while minting a secret or id,
+    /// or it repeated the current control token during a rotation.
     EntropyUnavailable,
     /// Fresh random ids repeatedly collided with live leases.
     IdCollision,
@@ -125,7 +132,9 @@ impl fmt::Display for LeaseRefusal {
             Self::TerminalOutcome(error) => write!(formatter, "terminal outcome: {error}"),
             Self::RevisionOverflow => formatter.write_str("state revision would wrap"),
             Self::GenerationOverflow => formatter.write_str("generation would wrap"),
-            Self::EntropyUnavailable => formatter.write_str("operating system entropy unavailable"),
+            Self::EntropyUnavailable => {
+                formatter.write_str("operating system entropy unavailable or not fresh")
+            }
             Self::IdCollision => formatter.write_str("server-side id generation kept colliding"),
             Self::InvalidLimits {
                 limit,

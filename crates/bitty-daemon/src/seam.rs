@@ -146,6 +146,7 @@ mod tests {
         assert!(rendered.contains("session-host seam"));
         assert!(rendered.contains("service API: 1.0 (accepted client range 1.0..=1.0)"));
         assert!(rendered.contains("terminal_sessions"));
+        assert!(rendered.contains("observer_grants"));
         assert!(rendered.contains("worker sessions: unsupported"));
         assert!(rendered.contains("ipc service: not wired"));
         assert!(rendered.contains("endpoint: none bound"));

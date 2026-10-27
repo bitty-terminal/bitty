@@ -2,8 +2,10 @@
 //!
 //! The binary must answer `--version`, must report the seam (no endpoint
 //! bound) with no arguments, and must create no runtime file while doing so.
-//! The no-argument test runs with a throwaway `XDG_RUNTIME_DIR` so a future
-//! accidental socket bind or lock file is caught here, not on a user host.
+//! The no-argument tests run with a throwaway `XDG_RUNTIME_DIR` so a future
+//! accidental socket bind or lock file is caught here, not on a user host; one
+//! variant also sets `BITTYD_ENDPOINT` to prove the seam ignores the override
+//! instead of creating the requested path.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -114,6 +116,42 @@ fn no_arguments_reports_the_seam_and_creates_no_endpoint() {
         !socket.exists(),
         "the seam must not create a socket file: {}",
         socket.display()
+    );
+    let created = entries(runtime_dir.path());
+    assert!(
+        created.is_empty(),
+        "the seam must not create runtime files, found: {created:?}"
+    );
+}
+
+#[test]
+fn endpoint_override_creates_nothing() {
+    let runtime_dir = TempDir::new("endpoint");
+    let endpoint = runtime_dir
+        .path()
+        .join("explicit")
+        .join("bittyd-requested.sock");
+    let output = Command::new(BITTYD)
+        .env("XDG_RUNTIME_DIR", runtime_dir.path())
+        .env("BITTYD_ENDPOINT", &endpoint)
+        .output()
+        .expect("run bittyd with an endpoint override");
+    assert!(
+        output.status.success(),
+        "bittyd with an endpoint override must exit 0"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "bittyd seam status wrote to stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("session-host seam"), "stdout: {stdout}");
+    assert!(stdout.contains("endpoint: none bound"), "stdout: {stdout}");
+    assert!(
+        !endpoint.exists(),
+        "the seam must not create the requested endpoint: {}",
+        endpoint.display()
     );
     let created = entries(runtime_dir.path());
     assert!(

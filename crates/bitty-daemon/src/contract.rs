@@ -32,10 +32,11 @@ pub const SERVICE_API_VERSION: ServiceApiVersion =
     ServiceApiVersion::new(SERVICE_API_MAJOR, SERVICE_API_MINOR, MIN_CLIENT_MINOR);
 
 /// Capability names in contract order (`D-11`).
-pub const CAPABILITY_NAMES: [&str; 5] = [
+pub const CAPABILITY_NAMES: [&str; 6] = [
     "terminal_sessions",
     "worker_sessions",
     "events",
+    "observer_grants",
     "control_transfer",
     "idempotent_mutations",
 ];
@@ -51,6 +52,7 @@ pub const CAPABILITIES: Capabilities = Capabilities {
     terminal_sessions: true,
     worker_sessions: false,
     events: true,
+    observer_grants: true,
     control_transfer: true,
     idempotent_mutations: true,
 };
@@ -149,6 +151,8 @@ pub struct Capabilities {
     pub worker_sessions: bool,
     /// Ordered, revision-tagged event delivery is available.
     pub events: bool,
+    /// Observer leases can be created from an observer grant.
+    pub observer_grants: bool,
     /// Explicit controller transfer is available.
     pub control_transfer: bool,
     /// Mutating methods accept idempotency keys.
@@ -159,11 +163,12 @@ impl Capabilities {
     /// Pair every contract capability name with its advertised value, in
     /// contract order.
     #[must_use]
-    pub const fn all(self) -> [(&'static str, bool); 5] {
+    pub const fn all(self) -> [(&'static str, bool); 6] {
         [
             ("terminal_sessions", self.terminal_sessions),
             ("worker_sessions", self.worker_sessions),
             ("events", self.events),
+            ("observer_grants", self.observer_grants),
             ("control_transfer", self.control_transfer),
             ("idempotent_mutations", self.idempotent_mutations),
         ]
@@ -227,6 +232,7 @@ mod tests {
                 "terminal_sessions",
                 "worker_sessions",
                 "events",
+                "observer_grants",
                 "control_transfer",
                 "idempotent_mutations",
             ]
@@ -242,6 +248,7 @@ mod tests {
                 terminal_sessions: true,
                 worker_sessions: false,
                 events: true,
+                observer_grants: true,
                 control_transfer: true,
                 idempotent_mutations: true,
             }
@@ -251,6 +258,7 @@ mod tests {
             vec![
                 "terminal_sessions",
                 "events",
+                "observer_grants",
                 "control_transfer",
                 "idempotent_mutations",
             ]

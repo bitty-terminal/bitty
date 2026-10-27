@@ -23,7 +23,8 @@
 //! - [`contract::SERVICE_API_VERSION`]: service API `1.0` with minimum client
 //!   minor `0` (contract D-11).
 //! - [`contract::CAPABILITIES`]: `terminal_sessions`, `worker_sessions`
-//!   (false), `events`, `control_transfer`, `idempotent_mutations`.
+//!   (false), `events`, `observer_grants`, `control_transfer`,
+//!   `idempotent_mutations`.
 //! - [`contract::NEGOTIATE_METHOD`] and [`handshake::negotiate`]: the
 //!   `daemon.negotiate` version half of the handshake.
 //! - [`seam::SeamStatus`]: the explicit no-endpoint status the binary prints.

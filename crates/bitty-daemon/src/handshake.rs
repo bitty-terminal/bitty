@@ -9,15 +9,24 @@
 //!
 //! | Field | Owner |
 //! | --- | --- |
+//! | `wire_version` (transport-owned) | bitty#2607 |
 //! | `daemon_instance_id` | bitty#2601 |
 //! | `daemon_pid`, `server_identity`, `peer_identity`, `client_id`, `scopes`, `daemon_state` | bitty#2607 |
 //! | `limits` | bitty#2603 |
 //! | `server_monotonic_ms` | bitty#2607 |
 //!
-//! The request's optional `client_instance` (audit-only, bounded, never
-//! authority; `D-08`) and `operator_capability` (secret, owner-private; `D-07`)
-//! are also deferred to bitty#2607 so their bounds and secret handling land
-//! with the code that reads them.
+//! The request's optional fields are also deferred to bitty#2607 so their
+//! bounds and secret handling land with the code that reads them:
+//!
+//! - `client_correlation`: an audit-only consumer value bounded to 128 bytes
+//!   and valid UTF-8 with no control characters. The daemon hashes it on
+//!   receipt and records only a truncated 128-bit SHA-256 digest as
+//!   `client_correlation_digest`; the raw value is never stored, logged,
+//!   echoed, or evaluated for authorization, and a malformed value is refused
+//!   with `InvalidRequest` rather than normalized (`D-08`).
+//! - `operator_capability`: a secret, owner-private capability (`D-07`).
+//! - `host_grant`: an optional single-use, peer-bound, TTL-bounded host-consent
+//!   grant, consumed at most once by `daemon.negotiate` (`D-07`).
 //!
 //! A version mismatch is a typed refusal before any session operation; the
 //! transport-level mapping to the `bitty-ipc` error taxonomy belongs to

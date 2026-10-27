@@ -13,7 +13,8 @@ and bounded by
 [ADR 0008](https://github.com/bitty-terminal/bitty-docs/blob/main/docs/decisions/adrs/ADR-0008-headless.md).
 The normative service surface is the accepted
 [`bittyd` Session-Host Contract](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/bittyd-session-host-contract.md)
-(bitty#2606, CTX-1616).
+(contract tracked by bitty#2546/#2663); this crate seam is bitty#2606
+(CTX-1616).
 
 ## Status: seam only
 
@@ -43,22 +44,25 @@ wiring; all four stay out of scope.
 Source: contract decisions `D-01`, `D-08`, `D-11`, and the "Handshake" section
 of the service surface.
 
-| Item                 | Value                                                                                                                      | Where                           |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
-| Service API version  | `{major: 1, minor: 0}`                                                                                                     | `contract::SERVICE_API_VERSION` |
-| Minimum client minor | `0` (`1.0..=1.0` accepted)                                                                                                 | `contract::MIN_CLIENT_MINOR`    |
-| Capabilities         | `terminal_sessions`, `events`, `control_transfer`, `idempotent_mutations` enabled; `worker_sessions` disabled              | `contract::CAPABILITIES`        |
-| Handshake method     | `daemon.negotiate`                                                                                                         | `contract::NEGOTIATE_METHOD`    |
-| Negotiation rule     | same major, client minor in `[min_client_minor, server_minor]`; every other case is `VersionMismatch` before any operation | `handshake::negotiate`          |
-| Worker sessions      | `false` in every v0.2.0 build (`D-01`); enabling needs an ADR 0019 amendment and a dedicated security review               | `contract::CAPABILITIES`        |
+| Item                 | Value                                                                                                                            | Where                           |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
+| Service API version  | `{major: 1, minor: 0}`                                                                                                           | `contract::SERVICE_API_VERSION` |
+| Minimum client minor | `0` (`1.0..=1.0` accepted)                                                                                                       | `contract::MIN_CLIENT_MINOR`    |
+| Capabilities         | `terminal_sessions`, `events`, `observer_grants`, `control_transfer`, `idempotent_mutations` enabled; `worker_sessions` disabled | `contract::CAPABILITIES`        |
+| Handshake method     | `daemon.negotiate`                                                                                                               | `contract::NEGOTIATE_METHOD`    |
+| Negotiation rule     | same major, client minor in `[min_client_minor, server_minor]`; every other case is `VersionMismatch` before any operation       | `handshake::negotiate`          |
+| Worker sessions      | `false` in every v0.2.0 build (`D-01`); enabling needs an ADR 0019 amendment and a dedicated security review                     | `contract::CAPABILITIES`        |
 
 `handshake::NegotiateResponse` carries only the version and capability facts
-this seam owns. The remaining response fields (`daemon_instance_id`,
-`daemon_pid`, `server_identity`, `peer_identity`, `client_id`, `scopes`,
-`limits`, `server_monotonic_ms`, `daemon_state`) and the optional request
-fields (`client_instance`, `operator_capability`) are listed in the module
-docs and arrive with bitty#2601/#2603/#2607. `operator_capability` stays out of
-this crate until the slice that owns its secret lifetime and storage exists.
+this seam owns. The remaining response fields (`wire_version` (transport-owned),
+`daemon_instance_id`, `daemon_pid`, `server_identity`, `peer_identity`,
+`client_id`, `scopes`, `limits`, `server_monotonic_ms`, `daemon_state`) and the
+optional request fields (`client_correlation`, `operator_capability`,
+`host_grant`) are listed in the module docs and arrive with
+bitty#2601/#2603/#2607. `client_correlation` is bounded to 128 bytes of valid
+UTF-8 with no control characters and is recorded only as a truncated 128-bit
+SHA-256 digest (`D-08`); `operator_capability` and `host_grant` stay out of this
+crate until the slice that owns their secret lifetime and storage exists.
 
 ## CLI
 
@@ -88,8 +92,8 @@ when:
 - any non-daemon crate depends on `bitty-daemon` (normal, dev, build,
   optional, or target-specific edge);
 - `bitty-daemon` is not a workspace member;
-- the crate has anything other than one library and exactly one binary
-  (`bittyd`).
+- the crate has other than one library and one binary (`bittyd`); test targets
+  are allowed and are not counted.
 
 A daemon-shaped global in a terminal or mechanism crate is a contract
 violation, not a wiring detail (ADR 0008 / ADR 0019).

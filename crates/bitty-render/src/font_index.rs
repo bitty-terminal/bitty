@@ -1933,6 +1933,32 @@ mod tests {
         build_index(paths)
     }
 
+    /// Synthetic face whose serialized path is exactly `path_len` bytes.
+    ///
+    /// The truncation cases build their input at the API level so their byte
+    /// offsets depend only on these constants, never on the host temp-root
+    /// length.
+    fn synthetic_face(index: usize, path_len: usize) -> IndexFace {
+        let prefix = format!("/bitty-index-{index:03}-");
+        assert!(path_len > prefix.len() + 4, "path must hold the prefix");
+        IndexFace {
+            path: PathBuf::from(format!(
+                "{prefix}{}.ttf",
+                "p".repeat(path_len - prefix.len() - 4)
+            )),
+            face_index: 0,
+            families: vec![format!("Bitty Synthetic {index:03}")],
+            post_script_name: format!("BittySynthetic-{index:03}"),
+            style: 0,
+            weight: 400,
+            stretch: 5,
+            monospaced: true,
+            file_size: 4_096,
+            mtime_secs: 1_700_000_000,
+            mtime_nanos: 0,
+        }
+    }
+
     fn discovered(paths: Vec<PathBuf>) -> DiscoveredFonts {
         DiscoveredFonts::from_paths(paths, GenericFamilies::default())
     }
@@ -2082,39 +2108,61 @@ mod tests {
 
     #[test]
     fn boundary_truncated_index_is_rejected() {
-        let dir = temp_dir("boundary");
-        let path = write_font(&dir, "a.ttf");
-        let index = FontIndex {
-            faces: fixture_faces(&[path]),
-            generic: GenericFamilies::default(),
-        };
-        let text = serialize_index(&index);
-        let mut cut = 0;
-        for line in text.split_inclusive('\n') {
-            cut += line.len();
-            if cut < text.len() {
+        // Built at the API level: the old fixture wrote one face into a real
+        // temp directory, so the temp-root length shifted every cut offset and
+        // decided whether the sampled offsets hit the one accepted cut (a
+        // complete end marker that lost only its trailing newline).
+        for path_len in [24, MAX_INDEX_PATH_BYTES] {
+            let index = FontIndex {
+                faces: (0..3).map(|face| synthetic_face(face, path_len)).collect(),
+                generic: GenericFamilies {
+                    monospace: "Bitty Synthetic".to_string(),
+                    ..GenericFamilies::default()
+                },
+            };
+            let text = serialize_index(&index);
+            assert!(
+                text.is_ascii(),
+                "the fixture must stay ASCII so every byte offset is a char boundary"
+            );
+            assert_eq!(
+                text.lines()
+                    .filter(|line| line.starts_with("face\t"))
+                    .count(),
+                3,
+                "the fixture must serialize every face"
+            );
+            assert!(parse_index(&text).is_some());
+
+            // The only accepted truncation is a complete end marker that lost
+            // just its trailing newline (`lines()` does not need it).
+            assert!(text.ends_with('\n'));
+            let marker_without_newline = &text[..text.len() - 1];
+            assert!(
+                parse_index(marker_without_newline).is_some(),
+                "a complete end marker without its trailing newline stays valid"
+            );
+
+            // Any shorter cut, on a line boundary or mid-line, must fail closed
+            // for both a short path and the longest representable synthetic
+            // path (the latter models a host with a very long temp root).
+            let mut cut = 0;
+            for line in text.split_inclusive('\n') {
+                cut += line.len();
+                if cut < text.len() {
+                    assert!(
+                        parse_index(&text[..cut]).is_none(),
+                        "line truncation after {cut} bytes (path {path_len}) must reject"
+                    );
+                }
+            }
+            for cut in (1..text.len()).filter(|cut| *cut != text.len() - 1) {
                 assert!(
                     parse_index(&text[..cut]).is_none(),
-                    "truncation after {cut} bytes must reject the cache"
+                    "truncation at {cut} bytes (path {path_len}) must reject"
                 );
             }
         }
-        // Mid-line cuts too (the escaped format is ASCII, so slicing is safe).
-        // A cut that only drops the final newline still leaves a complete end
-        // marker, which the parser accepts by design (the marker line does not
-        // require a trailing newline); the byte count varies with the temp
-        // path, so that one cut is skipped rather than assumed absent.
-        for cut in (1..text.len()).step_by(5) {
-            if cut == text.len() - 1 {
-                continue;
-            }
-            assert!(
-                parse_index(&text[..cut]).is_none(),
-                "mid-line truncation at {cut} must reject the cache"
-            );
-        }
-        assert!(parse_index(&text).is_some());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2826,15 +2874,19 @@ mod tests {
 
     #[test]
     fn serialized_size_stays_under_the_read_bound() {
+        // Fixed-width fields make every face line the same length, so the exact
+        // byte-cap cut is a function of these constants alone: no temp root, no
+        // host path length, and no vacuous pass if `TMPDIR` changes.
         let family = |face: usize, name: usize| {
             let prefix = format!("{face:04}-{name:02}-");
             let mut value = prefix;
             value.push_str(&"x".repeat(MAX_INDEX_FAMILY_BYTES - value.len()));
             value
         };
-        let faces: Vec<IndexFace> = (0..4_200)
+        let total = 5_000;
+        let faces: Vec<IndexFace> = (0..total)
             .map(|face| IndexFace {
-                path: PathBuf::from(format!("/tmp/bitty-size-{face}.ttf")),
+                path: PathBuf::from(format!("/bitty-size-{face:04}.ttf")),
                 face_index: 0,
                 families: (0..MAX_INDEX_FAMILIES)
                     .map(|name| family(face, name))
@@ -2849,21 +2901,59 @@ mod tests {
                 mtime_nanos: 0,
             })
             .collect();
+        let first_path = faces[0].path.clone();
+        let mut probe = faces[0].clone();
+        assert!(sanitize_face(&mut probe));
+        let line_len = serialize_face(&probe).len() + 1;
+        assert!(
+            faces.iter().all(|face| {
+                let mut face = face.clone();
+                sanitize_face(&mut face) && serialize_face(&face).len() + 1 == line_len
+            }),
+            "the fixture relies on uniform face-line lengths"
+        );
+        let empty = serialize_index(&FontIndex {
+            faces: Vec::new(),
+            generic: GenericFamilies::default(),
+        });
+        let header_len = empty.len() - trailing_line_bytes(&empty);
+        let usable = MAX_INDEX_BYTES as usize - END_MARKER_RESERVE - header_len;
+        let expected = usable / line_len;
+        assert!(
+            expected < total && expected < MAX_INDEX_FACES,
+            "the byte cap (not the count cap or the fixture) must stop the writer"
+        );
+
         let text = serialize_index(&FontIndex {
             faces,
             generic: GenericFamilies::default(),
         });
+        assert!(text.starts_with("v2\n"));
         assert!(
             text.len() as u64 <= MAX_INDEX_BYTES,
             "writer must stop before the reader's byte bound"
         );
-        assert!(text.starts_with("v2\n"));
-        let parsed = parse_index(&text).expect("bounded index must parse");
-        assert!(!parsed.faces.is_empty());
-        assert!(
-            parsed.faces.len() < 4_200,
-            "the size cap must truncate the face set"
+        let body_len = header_len + expected * line_len;
+        assert_eq!(
+            text.len() - trailing_line_bytes(&text),
+            body_len,
+            "the writer keeps exactly the faces that fit"
         );
+        assert!(
+            text.len() - body_len <= END_MARKER_RESERVE,
+            "the end marker stays inside the reserved space"
+        );
+        assert!(
+            body_len + line_len + END_MARKER_RESERVE > MAX_INDEX_BYTES as usize,
+            "the writer must stop at the cap, not short of it: the next face no longer fits"
+        );
+        let parsed = parse_index(&text).expect("bounded index must parse");
+        assert_eq!(
+            parsed.faces.len(),
+            expected,
+            "the exact retained count is deterministic"
+        );
+        assert_eq!(parsed.faces[0].path, first_path);
     }
 
     #[test]

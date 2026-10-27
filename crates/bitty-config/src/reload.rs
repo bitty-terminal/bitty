@@ -151,6 +151,7 @@ impl std::fmt::Display for ReloadClass {
 /// | `terminal.cursor_style`         | RestartRequired    |
 /// | `terminal.bell`                 | RestartRequired    |
 /// | `terminal.ambiguous_width`      | RestartRequired    |
+/// | `terminal.bidi`                 | Live (paint-time policy) |
 /// | `selection.auto_copy`     | RestartRequired    |
 /// | `history.capture.transcript` | RestartRequired |
 /// | `history.capture.commands`   | RestartRequired |
@@ -263,6 +264,9 @@ pub const LIVE_FIELDS: &[&str] = &[
     // reconciles live like the keymaps — unlike `layout.gaps_in/out`, which
     // are stamped into every layout call at startup.
     "layout.resize_step",
+    // CTX-1612: paint-time BiDi never changes committed cells; the runtime
+    // installs it on the renderer and forces one full redraw.
+    "terminal.bidi",
     // CTX-0873: the bar band is presentation chrome; the runtime re-solves
     // the band and reflows in place (no PTY recreation).
     "workspace.show_bar",
@@ -648,6 +652,13 @@ pub fn diff(old: &EffectiveConfig, new: &EffectiveConfig) -> ReloadReport {
         "terminal.ambiguous_width",
         old.terminal.ambiguous_width.as_str().to_string(),
         new.terminal.ambiguous_width.as_str().to_string(),
+    );
+    // CTX-1612: the paint-time BiDi policy is live-appliable (no committed
+    // cell changes), so a change classifies Live and reaches the renderer.
+    push_if_changed(
+        "terminal.bidi",
+        old.terminal.bidi.as_str().to_string(),
+        new.terminal.bidi.as_str().to_string(),
     );
     // CTX-0191: auto-copy is adopted at startup (RuntimeConfig is built once
     // from the effective config), so changes are restart-required, not live.
@@ -1350,6 +1361,22 @@ mod tests {
         );
         assert_eq!(from_default.font, EffectiveConfig::default().font);
         from_default.validate().expect("safe decoration is valid");
+    }
+
+    #[test]
+    fn bidi_is_live_because_it_never_changes_committed_cells() {
+        assert_eq!(classify_field("terminal.bidi"), ReloadClass::Live);
+        let mut edited = EffectiveConfig::default();
+        edited.terminal.bidi = crate::types::BidiMode::On;
+        let report = diff(&EffectiveConfig::default(), &edited);
+        let change = report
+            .diffs
+            .iter()
+            .find(|diff| diff.field == "terminal.bidi")
+            .expect("bidi change is diffed");
+        assert_eq!(change.class, ReloadClass::Live);
+        assert_eq!(change.before, "off");
+        assert_eq!(change.after, "on");
     }
 
     #[test]

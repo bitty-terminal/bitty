@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Paint-time Unicode BiDi (UAX #9) foundation (`CTX-1612`, bitty#1766):**
+  logical lines now resolve through `unicode-bidi` 0.3.18 (new direct
+  dependency of `bitty-term-state` only: MIT OR Apache-2.0, MSRV 1.47, safe
+  Rust, UCD 16.0.0 bidi classes) and rows with an odd resolved level can be
+  painted in visual order. Terminal Truth is unchanged: `Cell`, `Snapshot`,
+  the canonical hash (v13), and the codec stay logical, and the policy
+  defaults to `terminal.bidi = off` until the owner accepts the
+  display-spoofing (Trojan-Source) risk. With it off, rendered bytes are
+  identical to the previous release. Hit tests, cursor/IME paint, selection
+  paint, and hyperlink underlines share one visual↔logical column map.
+  `U+2066..U+2069` isolates now resolve zero-width, and a bidi control at
+  column 0 is dropped instead of attaching to the previous row. Deferred:
+  shaped RTL emission (RTL rows use the per-cell path), scrolled-history
+  paragraphs, `terminal.bidi_direction`, and the risk-register row.
+
 ## [0.0.29] - 2026-10-26
 
 ### Fixed

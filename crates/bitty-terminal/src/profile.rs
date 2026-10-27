@@ -2025,6 +2025,7 @@ fn terminal_table_literal(terminal: &bitty_config::TerminalConfig) -> String {
         "ambiguous_width",
         lua_string_literal(terminal.ambiguous_width.as_str()),
     ));
+    entries.push(("bidi", lua_string_literal(terminal.bidi.as_str())));
     lua_table_literal(&entries)
 }
 
@@ -2828,6 +2829,11 @@ const SCHEMA_FIELDS: &[SchemaField] = &[
         get: get_ambiguous_width,
     },
     SchemaField {
+        path: "terminal.bidi",
+        kind: FieldKind::Text,
+        get: get_bidi,
+    },
+    SchemaField {
         path: "selection.auto_copy",
         kind: FieldKind::Bool,
         get: get_auto_copy,
@@ -2994,6 +3000,9 @@ fn get_bell(e: &bitty_config::EffectiveConfig) -> ConfigValue {
 }
 fn get_ambiguous_width(e: &bitty_config::EffectiveConfig) -> ConfigValue {
     ConfigValue::Text(e.terminal.ambiguous_width.as_str().to_string())
+}
+fn get_bidi(e: &bitty_config::EffectiveConfig) -> ConfigValue {
+    ConfigValue::Text(e.terminal.bidi.as_str().to_string())
 }
 fn get_auto_copy(e: &bitty_config::EffectiveConfig) -> ConfigValue {
     ConfigValue::Bool(e.selection.auto_copy)

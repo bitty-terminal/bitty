@@ -147,8 +147,10 @@
 //!   `"both"`, where `audible`/`both` count without sounding until the
 //!   owner-pending OS primitive lands (OQ-076, CTX-0754/#1361);
 //!   `ambiguous_width` is `"narrow"` (default) | `"wide"` and selects the
-//!   East Asian Ambiguous cell policy (CTX-1609); unknown spellings fail
-//!   closed with the field path).
+//!   East Asian Ambiguous cell policy (CTX-1609); `bidi` is `"off"`
+//!   (default) | `"on"` and enables paint-time UAX #9 reordering
+//!   (CTX-1612, live-appliable, Trojan-Source risk documented on the owning
+//!   task); unknown spellings fail closed with the field path).
 //!   `selection` is fully optional (absent table/key means "this layer says
 //!   nothing"); when present, `auto_copy` defaults to
 //!   [`SelectionConfig`] default `false`
@@ -2031,6 +2033,20 @@ fn build_plan_from_data(
                         }
                     },
                 };
+                // CTX-1612: paint-time BiDi is a closed enum leaf like the
+                // ambiguous-width policy; absent inherits the off default.
+                let bidi = match t.bidi.as_deref() {
+                    None => defaults.bidi,
+                    Some(raw) => match crate::types::BidiMode::parse(raw.trim()) {
+                        Some(mode) => mode,
+                        None => {
+                            return Err(ConfigError::validation(
+                                "terminal.bidi",
+                                "must be one of \"off\", \"on\"",
+                            ));
+                        }
+                    },
+                };
                 Some(TerminalConfig {
                     scrollback: scrollback as u32,
                     shell: t.shell,
@@ -2040,6 +2056,7 @@ fn build_plan_from_data(
                     cursor_style,
                     bell,
                     ambiguous_width,
+                    bidi,
                 })
             }
             None => {
@@ -3753,6 +3770,40 @@ mod tests {
                 msg.contains("terminal.ambiguous_width"),
                 "must name the field: {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn lua_terminal_bidi_parses_and_validates() {
+        // CTX-1612: optional closed-enum leaf; absent keeps the off default,
+        // both spellings round-trip, wrong shapes/spellings fail closed.
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000, bidi = "on" } }"#,
+            &test_source(),
+        )
+        .expect("on policy parses");
+        assert_eq!(plan.terminal.unwrap().bidi, crate::types::BidiMode::On);
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000, bidi = "off" } }"#,
+            &test_source(),
+        )
+        .expect("off policy parses");
+        assert_eq!(plan.terminal.unwrap().bidi, crate::types::BidiMode::Off);
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000 } }"#,
+            &test_source(),
+        )
+        .expect("absent key keeps the default");
+        assert_eq!(plan.terminal.unwrap().bidi, crate::types::DEFAULT_BIDI);
+        for bad in [
+            r#"return { terminal = { scrollback = 10000, bidi = "auto" } }"#,
+            r#"return { terminal = { scrollback = 10000, bidi = "ON" } }"#,
+            r#"return { terminal = { scrollback = 10000, bidi = 1 } }"#,
+            r#"return { terminal = { scrollback = 10000, bidi = true } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("terminal.bidi"), "must name the field: {msg}");
         }
     }
 

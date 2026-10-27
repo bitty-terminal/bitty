@@ -120,6 +120,7 @@ fn shape(
         &RunAttrs {
             features: Vec::new(),
             point_size: POINT_SIZE,
+            direction: bitty_render::RunDirection::Ltr,
         },
     )
 }
@@ -270,6 +271,7 @@ fn shaped_zwj_family_without_ligature_paints_every_base() {
         // repeat the call with the disabling feature explicitly.
         features: features.clone(),
         point_size: POINT_SIZE,
+        direction: bitty_render::RunDirection::Ltr,
     };
     let chain: Vec<FontId> = raster.fonts().to_vec();
     let clusters = raster

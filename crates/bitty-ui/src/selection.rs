@@ -1597,4 +1597,18 @@ mod tests {
         let wide = Selection::simple(CellPos::new(0, 0), CellPos::new(0, 1));
         assert_eq!(wide.text(&snap), "\u{1F1EF}\u{1F1F5}");
     }
+    #[test]
+    fn copy_order_stays_logical_over_an_rtl_run() {
+        // CTX-1612: anchors and copy stay logical even though the renderer
+        // paints the Hebrew run right-to-left. A visual left-to-right drag
+        // over the same cells still copies in logical order.
+        let mut state = State::new();
+        prints(&mut state, "abc אבג");
+        let snapshot = state.snapshot();
+        let logical = Selection::simple(CellPos::new(0, 4), CellPos::new(0, 6));
+        assert_eq!(logical.text(&snapshot), "אבג");
+        // The reverse anchor order produces the same logical range text.
+        let reversed = Selection::simple(CellPos::new(0, 6), CellPos::new(0, 4));
+        assert_eq!(reversed.text(&snapshot), "אבג");
+    }
 }

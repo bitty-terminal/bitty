@@ -79,6 +79,7 @@ fn shape(raster: &mut FallbackRasterizer<SwashSingle>, text: &str) -> Vec<Shaped
             &RunAttrs {
                 features: Vec::new(),
                 point_size: POINT_SIZE,
+                direction: bitty_render::RunDirection::Ltr,
             },
         )
         .expect("cluster shapes")

@@ -414,7 +414,9 @@ impl TrustStore {
 /// `terminal.bell` (CTX-0756: presentation-only chrome like scroll speed;
 /// `bell` never grants OSC 9/777 notification permission, which stays
 /// deny-by-default), `terminal.ambiguous_width` (CTX-1609: a cell-width
-/// policy with no process authority), `selection.auto_copy`,
+/// policy with no process authority), `terminal.bidi` (CTX-1612: a
+/// paint-time reorder policy with no process authority),
+/// `selection.auto_copy`,
 /// `decoration` (geometry and the CTX-0340 outline colors), `scrollbar`,
 /// `mouse`, `appearance`, `views` (CTX-0343 per-View appearance; like
 /// `decoration`, presentation-only chrome, still grammar/bounds checked).

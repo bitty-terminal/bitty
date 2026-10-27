@@ -320,6 +320,9 @@ pub struct TerminalData {
     /// `terminal.ambiguous_width`; present only when the key is set, raw
     /// spelling validated downstream in `bitty-config`).
     pub ambiguous_width: Option<String>,
+    /// Paint-time BiDi policy string (CTX-1612 `terminal.bidi`; present only
+    /// when the key is set, raw spelling validated downstream).
+    pub bidi: Option<String>,
 }
 
 /// Selection overrides, plain data (CTX-0191; see [`FontData`] for `Option`
@@ -1696,6 +1699,7 @@ impl ConfigData {
                             "cursor_style",
                             "bell",
                             "ambiguous_width",
+                            "bidi",
                         ],
                     )?;
                     let scrollback = match get_field(nested, "scrollback") {
@@ -1731,6 +1735,10 @@ impl ConfigData {
                         Some(v) => Some(expect_string("terminal.ambiguous_width", v)?),
                         None => None,
                     };
+                    let bidi = match get_field(nested, "bidi") {
+                        Some(v) => Some(expect_string("terminal.bidi", v)?),
+                        None => None,
+                    };
                     out.terminal = Some(TerminalData {
                         scrollback,
                         shell,
@@ -1740,6 +1748,7 @@ impl ConfigData {
                         cursor_style,
                         bell,
                         ambiguous_width,
+                        bidi,
                     });
                 }
                 "selection" => {

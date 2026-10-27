@@ -3157,6 +3157,7 @@ fn ascii_fast_path_emission_matches_per_cell_glyphs() {
         start_col: 0,
         text: "ABC123".to_string(),
         col_count: 6,
+        direction: crate::RunDirection::Ltr,
     };
     let (fg, _) = resolved_colors(&snap.cells[0].style);
     let spans = fast.emit_ascii_fast_path(&run, 0, 0, 6, fg, &mut fast_list);
@@ -3183,6 +3184,7 @@ fn ascii_fast_path_clips_dirty_and_skips_spaces() {
         start_col: 0,
         text: "A C".to_string(),
         col_count: 3,
+        direction: crate::RunDirection::Ltr,
     };
     let descriptor = super::SnapshotDamage::new(&snap, &full_damage(&state), cell_metrics());
     let plan = plan_frame(&descriptor);
@@ -3248,6 +3250,7 @@ fn ascii_fast_path_empty_dirty_emits_nothing() {
         start_col: 0,
         text: "A".to_string(),
         col_count: 1,
+        direction: crate::RunDirection::Ltr,
     };
     let descriptor = super::SnapshotDamage::new(&snap, &full_damage(&state), cell_metrics());
     let plan = plan_frame(&descriptor);

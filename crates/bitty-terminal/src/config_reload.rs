@@ -174,6 +174,7 @@ fn runtime_adopts(field: &str) -> bool {
             | "layout.resize_step"
             | "workspace.show_bar"
             | "workspace.bar.edge"
+            | "terminal.bidi"
     ) || field.starts_with("appearance.animations")
         || field == "views"
         || field.starts_with(bitty_config::VIEWS_FIELD_PREFIX)
@@ -409,6 +410,8 @@ pub(crate) fn apply_live_presentation(
     // `set_background_appearance`, so the check runs against exactly the
     // config this reload adopts, never a stale mix of old and new.
     runtime.set_theme_palette(resolved.theme);
+    // CTX-1612: paint-time BiDi policy (Live; one full redraw).
+    runtime.set_bidi(resolved.bidi);
     runtime
         .set_decoration(resolved.decoration)
         .map_err(|err| format!("decoration: {err}"))?;

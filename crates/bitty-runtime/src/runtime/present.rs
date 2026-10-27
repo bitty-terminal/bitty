@@ -9,7 +9,6 @@ use bitty_render::{
     RunAttrs, ShapedBitmap, ShapedCluster, ShapedRunSource, SwashSingle,
     gpu::PresentStats as RenderPresentStats,
 };
-use bitty_rich::kitty_seam::KittyRasterBackend as _;
 
 /// First retry delay after a failed real-GPU present (issue #2570).
 const SURFACE_RETRY_INITIAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -5559,8 +5558,9 @@ impl Runtime {
     /// the cursor wins regardless of image z. The 32-blit / 64-MiB budget
     /// counts kitty blits only; the cursor overlay is never counted.
     ///
-    /// Raster is the Core-owned nearest-neighbor step behind the
-    /// [`bitty_rich::kitty_seam`] traits (the extension implements the same
+    /// Raster is the Core-owned nearest-neighbor step behind the injected
+    /// [`bitty_rich::kitty_seam::KittyBackend`] dyn handle
+    /// ([`Self::set_kitty_backend`]; the extension implements the same
     /// traits on its side): the image scales into the unclamped placement
     /// extent and only the viewport-visible window is allocated, so a
     /// partially visible placement paints at true scale instead of

@@ -281,6 +281,71 @@ per-session stream cannot disagree. Source: contract `D-10`, `D-12`, `D-14`,
   arrive with bitty#2607, and bitty#2605 adds the V-21, V-23, C-04, and C-06
   corpus vectors against a real transport.
 
+## Endpoint and peer trust (bitty#2604)
+
+`endpoint::open_endpoint` resolves, locks, attests, and binds the per-user
+endpoint; `peer::PeerGuard` captures and re-checks the authenticated peer. The
+crate still accepts nothing and parses nothing.
+
+| Item                 | Rule                                                                                                                    | Where                                 |
+| -------------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| Unix endpoint        | `$XDG_RUNTIME_DIR/bitty/bittyd.sock`, socket `0600`, directory `0700`, both owned by the user                           | `endpoint::EndpointPaths`             |
+| Override             | `BITTYD_ENDPOINT` names the socket path directly; it is a path, not a credential, and is absolute with a name           | `endpoint::ENDPOINT_ENV`              |
+| Missing runtime root | Typed `NoEndpoint`; no `/tmp` fallback, no abstract namespace, no TCP                                                   | `endpoint::EndpointError::NoEndpoint` |
+| Path bound           | `> 107` bytes on Linux, `> 103` elsewhere: refused before any directory is created, never truncated                     | `endpoint::MAX_SOCKET_PATH_BYTES`     |
+| Single instance      | Non-blocking exclusive `flock` on `bittyd.lock` held for the process lifetime; a second start is `AlreadyRunning`       | `endpoint::LOCK_FILE_NAME`            |
+| Lock lifetime        | The kernel releases the lock on process death; the lock file is never unlinked (unlinking would defeat single-instance) | `endpoint::acquire_instance_lock`     |
+| Live endpoint        | A successful probe connect (or `EAGAIN` from a full accept queue) is `AlreadyRunning` and is never unlinked             | `endpoint::probe_endpoint`            |
+| Stale endpoint       | `ECONNREFUSED` after the lock is held: quarantine-rename, re-attest the moved object, then remove                       | `endpoint::reclaim_stale_socket`      |
+| Tamper               | Symlink, non-socket, foreign owner, or a bound socket whose mode/identity drifted: `Tampered`, nothing unlinked         | `endpoint::TamperKind`                |
+| Clean shutdown       | Remove the socket only while the path still names this process's object (device, inode, and uid)                        | `endpoint::BoundEndpoint::close`      |
+| Tamper interval      | `BoundEndpoint::reattest` re-runs the directory and socket checks for the loop bitty#2607 owns                          | `endpoint::BoundEndpoint::reattest`   |
+| Peer capture         | `SO_PEERCRED` on Linux, `LOCAL_PEERCRED` + `LOCAL_PEERPID` on macOS, bounded reads, fail closed when unavailable        | `peer::PeerGuard::capture`            |
+| Peer re-check        | Start time and uid (Linux), pid liveness (macOS), user namespace (Linux); a recycled pid or changed identity is refused | `peer::PeerGuard::recheck`            |
+| Boundaries           | `session.create`, controller attach, abort, kill, transfer, detach-other, grant mint/revoke, `daemon.stop`              | `peer::DispatchBoundary`              |
+| Unsupported cells    | Typed `UnsupportedPlatform`, no transport created                                                                       | `platform::PlatformCell`              |
+
+Platform matrix (`D-15`):
+
+| Cell               | Endpoint          | Peer mechanism                                                        | This slice                                                         |
+| ------------------ | ----------------- | --------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| Linux x86_64       | Unix socket       | `SO_PEERCRED` + `/proc` start time + user namespace                   | implemented, native-tested on this host                            |
+| Linux ARM64        | Unix socket       | same as Linux x86_64                                                  | implemented, needs native-runner evidence                          |
+| macOS ARM64/x86_64 | Unix socket       | `LOCAL_PEERCRED` + `LOCAL_PEERPID`; no start time in the safe surface | implemented and cross-checked; conformance-gated, no advertisement |
+| FreeBSD x86_64     | none              | `LOCAL_PEERCRED` exposes uid/gid only; no pid in the safe API         | typed `UnsupportedPlatform`; no weaker check                       |
+| Windows x86_64     | named pipe (plan) | client pid + token SID (plan)                                         | typed `UnsupportedPlatform`                                        |
+| Other cells        | none              | none                                                                  | typed `UnsupportedPlatform`                                        |
+
+Windows plan, not implemented here: a local `\\.\pipe\bittyd-<SID>` with a
+current-user-only DACL, remote clients rejected at the pipe level,
+`GetNamedPipeClientProcessId` plus token SID comparison, and fail-closed
+SID/AppContainer/integrity-level mismatches. It needs the reviewed Win32 FFI
+seam (`bitty-ipc-winpipe`) and native-runner conformance before any Windows
+build advertises a service endpoint.
+
+A missing endpoint is a normal state, not an error that changes the consumer's
+transport selection: clients treat `NoEndpoint` as "the daemon is not running".
+
+What bitty#2607 must wire:
+
+- call `endpoint::open_endpoint(&EndpointEnv::from_process())` at startup,
+  map `Tampered` to exit code 6, and call `BoundEndpoint::reattest` on the
+  bounded tamper interval;
+- accept on `BoundEndpoint::listener()`, enable `SO_PASSCRED`, and require
+  per-frame `SCM_CREDENTIALS` on Linux (`D-07`);
+- call `peer::PeerGuard::capture(&stream, uid)` at accept before parsing any
+  frame, and `PeerGuard::recheck(boundary)` before each privileged dispatch
+  (`DispatchBoundary::ALL` is the current closed set);
+- map `PeerError::UnsupportedPlatform` to `Denied/UnsupportedPlatform` and
+  every other peer failure to `Unauthenticated`, closing the connection;
+- bound the accept queue, connection count, and handshake time (bitty#2603
+  supplies the advertised limits).
+
+What bitty#2609 must wire: no peer or endpoint change is required for leases,
+but a controller claim, abort, transfer, detach-other, and operator revoke are
+privileged dispatches, so each must call `PeerGuard::recheck` with the matching
+`DispatchBoundary` before it applies anything.
+
 ## CLI
 
 ```text

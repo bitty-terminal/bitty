@@ -287,6 +287,141 @@ impl Runtime {
         }
     }
 
+    /// Builds the BiDi projection for one snapshot (CTX-1612).
+    ///
+    /// Returns an empty grid when `terminal.bidi` is off, so every caller can
+    /// use the shared column maps unconditionally and the LTR path pays no
+    /// allocation. `wraps` is the out-of-band soft-wrap hint (rows joined
+    /// into one logical paragraph); `None` treats each row as its own
+    /// paragraph.
+    pub(super) fn bidi_grid_for_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        wraps: Option<&[bool]>,
+    ) -> bitty_term_state::BidiGrid {
+        if !self.config.bidi {
+            return bitty_term_state::BidiGrid::default();
+        }
+        bitty_term_state::BidiGrid::resolve(
+            &snapshot.cells,
+            snapshot.width,
+            snapshot.height,
+            wraps,
+            bitty_term_state::ParaDirection::Auto,
+        )
+    }
+
+    /// Soft-wrap hint for a live state snapshot (viewport edge = boundary).
+    ///
+    /// The hint stays out of `Snapshot` (schema/codec unchanged) and is
+    /// rebuilt per call; a state taller than the painted window joins the
+    /// visible rows exactly like the renderer's leaf pass.
+    pub(super) fn wraps_for_state(
+        &self,
+        state: &bitty_term_state::State,
+        snapshot: &Snapshot,
+    ) -> Vec<bool> {
+        (0..snapshot.height)
+            .map(|row| state.row_soft_wrapped(row))
+            .collect()
+    }
+
+    /// Whether `view` may paint a BiDi projection at all (CTX-1612).
+    ///
+    /// Paint and hit testing must resolve the *same* grid. The renderer
+    /// paints a windowed/truncated `viewport_snapshot` when the leaf frame
+    /// differs from the state grid, blanks Kitty placeholders (which can
+    /// change a paragraph), and a session-less leaf paints an erased grid;
+    /// the logical state map is not the painted map in any of those cases.
+    /// All of them fail closed to identity here, and the renderer receives
+    /// the same decision, so a pointer can never resolve a different
+    /// projection than the glyphs it sees.
+    pub(super) fn bidi_enabled_for_view(&self, view: ViewId) -> bool {
+        if !self.config.bidi {
+            return false;
+        }
+        let Some(leaf) = self.find_view(view) else {
+            return false;
+        };
+        let scrolled = self.is_viewport_scrolled(view);
+        let snapshot = if scrolled {
+            let Some(viewport) = self.viewport_snapshot_for(view) else {
+                return false;
+            };
+            viewport
+        } else {
+            let Some(state) = self.live_view_state(view) else {
+                return false;
+            };
+            state.snapshot()
+        };
+        // A live leaf paints a `viewport_snapshot` sized to the content
+        // frame; a scrolled composite is sized to the stored View. The
+        // logical state grid is the painted grid only when those dimensions
+        // match exactly.
+        let (width, height) = if scrolled {
+            (leaf.cols() as usize, leaf.rows() as usize)
+        } else {
+            let Some(frame) = self
+                .present_frames()
+                .into_iter()
+                .find(|frame| frame.view == view)
+            else {
+                return false;
+            };
+            (usize::from(frame.cols), usize::from(frame.rows))
+        };
+        if snapshot.width != width || snapshot.height != height {
+            return false;
+        }
+        // Kitty placeholders are blanked for the glyph pass; rebuilding the
+        // paragraph with the placeholder scalar would not match the paint.
+        !snapshot
+            .cells
+            .iter()
+            .any(|cell| bitty_term_state::is_kitty_placeholder(cell.glyph))
+    }
+
+    /// BiDi projection for `view`'s painted grid (live window or scrolled
+    /// viewport composite).
+    pub(super) fn bidi_grid_for_view(&self, view: ViewId) -> bitty_term_state::BidiGrid {
+        if !self.bidi_enabled_for_view(view) {
+            return bitty_term_state::BidiGrid::default();
+        }
+        if self.is_viewport_scrolled(view) {
+            return self
+                .viewport_snapshot_for(view)
+                .map(|snapshot| self.bidi_grid_for_snapshot(&snapshot, None))
+                .unwrap_or_default();
+        }
+        let Some(state) = self.live_view_state(view) else {
+            return bitty_term_state::BidiGrid::default();
+        };
+        let snapshot = state.snapshot();
+        let wraps = self.wraps_for_state(state, &snapshot);
+        self.bidi_grid_for_snapshot(&snapshot, Some(&wraps))
+    }
+
+    /// Shared paint map: logical grid column -> visual column (CTX-1612).
+    ///
+    /// Identity when BiDi is off, the row is pure LTR, or the view owns no
+    /// grid. The renderer consumes the same `BidiGrid` maps, so paint and
+    /// hit testing can never derive a different column.
+    #[must_use]
+    pub fn visual_col_for_logical(&self, view: ViewId, row: usize, logical_col: usize) -> usize {
+        self.bidi_grid_for_view(view)
+            .visual_col_for_logical(row, logical_col)
+    }
+
+    /// Shared hit-test inverse: visual column -> logical grid column.
+    ///
+    /// Identity when BiDi is off or the row is pure LTR.
+    #[must_use]
+    pub fn logical_col_for_visual(&self, view: ViewId, row: usize, visual_col: usize) -> usize {
+        self.bidi_grid_for_view(view)
+            .logical_col_for_visual(row, visual_col)
+    }
+
     /// Converts a physical cursor position to a grid cell coordinate using
     /// the live (DPI-scaled) cell metrics. Clamped to the current snapshot bounds.
     ///
@@ -302,6 +437,12 @@ impl Runtime {
     ///
     /// CTX-0223: the window padding inset shifts the grid origin the same
     /// way, so it is subtracted first (physical pixels at the live scale).
+    ///
+    /// CTX-1612: under `terminal.bidi = on` the pointer column is a painted
+    /// (visual) column and the returned `CellPos` is logical; the primary
+    /// view's shared map performs the inversion. The map is identity when the
+    /// policy is off or the view fails closed (windowed/truncated/alt
+    /// stale), matching the renderer's paint decision.
     #[must_use]
     pub fn cursor_to_cell(&self, pos: CursorPosition) -> CellPos {
         let snap = self.state.snapshot();
@@ -338,6 +479,19 @@ impl Runtime {
         let max_row = snap.height.saturating_sub(1) as i64;
         let clamped_col = col.clamp(0, max_col) as u16;
         let clamped_row = row.clamp(0, max_row) as u16;
+        // CTX-1612: the pointer addresses a painted (visual) column; the
+        // primary grid cell is logical. The primary view's per-view
+        // projection is the same one the renderer paints with; it is
+        // identity when BiDi is off, the row has no odd level, or the view
+        // failed closed (windowed/truncated/placeholder/alt stale).
+        let clamped_col = match self.primary_view {
+            Some(view) => u16::try_from(
+                self.bidi_grid_for_view(view)
+                    .logical_col_for_visual(usize::from(clamped_row), usize::from(clamped_col)),
+            )
+            .unwrap_or(clamped_col),
+            None => clamped_col,
+        };
         bitty_ui::snap_to_leading(&snap, CellPos::new(clamped_row, clamped_col))
     }
 
@@ -2053,7 +2207,14 @@ impl Runtime {
             let max_row = leaf.rows().saturating_sub(1);
             let max_col = leaf.cols().saturating_sub(1);
             let row = local.row.min(max_row);
-            let col = local.col.min(max_col);
+            let visual_col = usize::from(local.col.min(max_col));
+            // S0: a scrolled composite has no wrap side-channel, so each row
+            // is its own paragraph (viewport-edge boundary rule). The view
+            // projection fails closed to identity when paint did.
+            let col = self
+                .bidi_grid_for_view(owner)
+                .logical_col_for_visual(usize::from(row), visual_col);
+            let col = u16::try_from(col).unwrap_or(max_col);
             let cell = CellPos::new(row, col);
             return Some(bitty_ui::snap_to_leading(&viewport, cell));
         }
@@ -2063,7 +2224,14 @@ impl Runtime {
         let row = start
             .saturating_add(usize::from(local.row))
             .min(snap.height.saturating_sub(1));
-        let col = usize::from(local.col).min(snap.width.saturating_sub(1));
+        let visual_col = usize::from(local.col).min(snap.width.saturating_sub(1));
+        // CTX-1612: `local.col` is a painted (visual) column; selection
+        // anchors and mouse reports stay logical, so the shared inverse
+        // runs before wide-char snapping. The same per-view decision as the
+        // renderer governs windowed/truncated/placeholder leaves.
+        let col = self
+            .bidi_grid_for_view(owner)
+            .logical_col_for_visual(row, visual_col);
         let cell = CellPos::new(
             u16::try_from(row).unwrap_or(u16::MAX),
             u16::try_from(col).unwrap_or(u16::MAX),
@@ -2149,16 +2317,22 @@ impl Runtime {
         if let Some((view, local)) = self.present_cell_in(&frames, pos) {
             let frame = frames.iter().find(|frame| frame.view == view)?;
             let cell = self.frame_cell_to_owner_cell(view, frame.rows, local)?;
-            let boundary =
-                self.frame_boundary_to_owner(view, self.clamped_frame_boundary(frame, pos)?)?;
+            let boundary = self.frame_boundary_to_owner(
+                view,
+                usize::from(cell.row),
+                self.clamped_frame_boundary(frame, pos)?,
+            )?;
             return Some((view, cell, boundary));
         }
         let focused = self.focused_view()?;
         let frame = frames.iter().find(|frame| frame.view == focused)?;
         let local = self.clamped_frame_cell(frame, pos)?;
         let cell = self.frame_cell_to_owner_cell(focused, frame.rows, local)?;
-        let boundary =
-            self.frame_boundary_to_owner(focused, self.clamped_frame_boundary(frame, pos)?)?;
+        let boundary = self.frame_boundary_to_owner(
+            focused,
+            usize::from(cell.row),
+            self.clamped_frame_boundary(frame, pos)?,
+        )?;
         Some((focused, cell, boundary))
     }
 
@@ -2170,10 +2344,22 @@ impl Runtime {
     fn frame_boundary_to_owner(
         &self,
         owner: ViewId,
+        row: usize,
         boundary: SelectionBoundary,
     ) -> Option<SelectionBoundary> {
         let (width, _) = self.selection_extent(owner)?;
-        Some(SelectionBoundary::new(boundary.col.min(width)))
+        let col = boundary.col.min(width);
+        // CTX-1612: a caret is an *edge*, so it maps through the edge
+        // inverse, never `logical_col_for_visual` (a cell). Selection anchors
+        // stay logical; a visually left-to-right drag over RTL text may be a
+        // logical right-to-left range, and copy still reads logical cells
+        // (OQ-099). Identity when the view failed closed to no projection.
+        let mapped = self
+            .bidi_grid_for_view(owner)
+            .logical_caret_edge_for_visual(row, usize::from(col));
+        Some(SelectionBoundary::new(
+            u16::try_from(mapped).unwrap_or(col).min(width),
+        ))
     }
 
     /// Maps a physical cursor position into `owner`'s clamped cell **and**
@@ -2191,8 +2377,11 @@ impl Runtime {
         let frame = frames.iter().find(|frame| frame.view == owner)?;
         let local = self.clamped_frame_cell(frame, pos)?;
         let cell = self.frame_cell_to_owner_cell(owner, frame.rows, local)?;
-        let boundary =
-            self.frame_boundary_to_owner(owner, self.clamped_frame_boundary(frame, pos)?)?;
+        let boundary = self.frame_boundary_to_owner(
+            owner,
+            usize::from(cell.row),
+            self.clamped_frame_boundary(frame, pos)?,
+        )?;
         Some((cell, boundary))
     }
 
@@ -4440,5 +4629,479 @@ mod tests {
         );
         rt.set_ipc_socket_path(String::new());
         assert_eq!(rt.ipc_socket_path(), None);
+    }
+    // ------------------------------------------------------------------
+    // CTX-1612: one shared BiDi column map, one test per consumer.
+    // ------------------------------------------------------------------
+
+    fn bidi_runtime() -> Runtime {
+        let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+        rt.set_bidi(true);
+        let view = ViewId::new(1);
+        rt.set_layout(LayoutNode::leaf(View::new(view, 80, 24)));
+        rt.handle_resize(bitty_platform::PhysicalSize::new(736, 472))
+            .expect("resize applies");
+        rt.set_focus(view);
+        rt
+    }
+
+    fn print_bidi(rt: &mut Runtime, text: &str) {
+        for scalar in text.chars() {
+            rt.state
+                .apply(&TerminalAction::Print(bitty_vt::GraphemeCell::from(scalar)));
+        }
+    }
+
+    /// Pointer at a fraction `frac` (0..1) of one painted visual cell.
+    fn visual_point_at(
+        rt: &Runtime,
+        view: ViewId,
+        row: u16,
+        visual_col: u16,
+        frac: f64,
+    ) -> CursorPosition {
+        let frame = rt
+            .present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .expect("presented view");
+        let live = rt.live_cell_metrics();
+        let pad = f64::from(rt.window_padding_physical());
+        CursorPosition {
+            x: pad
+                + f64::from(frame.content.x)
+                + (f64::from(visual_col) + frac) * f64::from(live.width),
+            y: pad + f64::from(frame.content.y) + (f64::from(row) + 0.5) * f64::from(live.height),
+        }
+    }
+
+    /// Pointer at the center of one painted visual cell.
+    fn visual_point(rt: &Runtime, view: ViewId, row: u16, visual_col: u16) -> CursorPosition {
+        visual_point_at(rt, view, row, visual_col, 0.5)
+    }
+
+    fn drag_selection(
+        rt: &mut Runtime,
+        view: ViewId,
+        press_visual: u16,
+        drag_visual: u16,
+    ) -> bitty_ui::Selection {
+        drag_selection_at(rt, view, press_visual, 0.25, drag_visual, 0.75)
+    }
+
+    fn drag_selection_at(
+        rt: &mut Runtime,
+        view: ViewId,
+        press_visual: u16,
+        press_frac: f64,
+        drag_visual: u16,
+        drag_frac: f64,
+    ) -> bitty_ui::Selection {
+        let (owner, cell, boundary) = rt
+            .selection_press_target_with_boundary(visual_point_at(
+                rt,
+                view,
+                0,
+                press_visual,
+                press_frac,
+            ))
+            .expect("press target");
+        rt.start_view_selection_from_pointer(
+            owner,
+            bitty_ui::SelectionKind::Simple,
+            cell,
+            boundary,
+        );
+        let (focus, boundary) = rt
+            .cursor_to_owner_cell_and_boundary(
+                view,
+                visual_point_at(rt, view, 0, drag_visual, drag_frac),
+            )
+            .expect("drag target");
+        rt.update_boundary_selection(focus, boundary);
+        rt.selection().expect("selection")
+    }
+
+    #[test]
+    fn shared_maps_invert_on_the_primary_grid() {
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "abc אבג");
+        let view = rt.primary_view.expect("primary view");
+        assert_eq!(rt.visual_col_for_logical(view, 0, 6), 4);
+        assert_eq!(rt.logical_col_for_visual(view, 0, 4), 6);
+        assert_eq!(
+            rt.visual_col_for_logical(view, 0, 0),
+            0,
+            "Latin stays logical"
+        );
+    }
+
+    #[test]
+    fn cursor_to_cell_maps_the_primary_visual_pointer() {
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "abc אבג");
+        let live = rt.live_cell_metrics();
+        let pad = f64::from(rt.window_padding_physical());
+        let scale = rt.dpi_scale();
+        let deco = (f64::from(rt.config.decoration.gaps_out)
+            + f64::from(rt.config.decoration.border)
+            + f64::from(rt.config.decoration.content_inset))
+            * scale;
+        let gap_x = (f64::from(rt.config.gaps_out) + f64::from(rt.container.x))
+            * f64::from(live.width)
+            + deco;
+        let gap_y = (f64::from(rt.config.gaps_out) + f64::from(rt.container.y))
+            * f64::from(live.height)
+            + deco;
+        let pos = CursorPosition {
+            x: pad + gap_x + 4.5 * f64::from(live.width),
+            y: pad + gap_y + 0.5 * f64::from(live.height),
+        };
+        assert_eq!(
+            rt.cursor_to_cell(pos).col,
+            6,
+            "visual column 4 shows logical א"
+        );
+    }
+
+    #[test]
+    fn frame_cell_to_owner_cell_inverts_the_painted_column() {
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "abc אבג");
+        let view = rt.primary_view.expect("primary view");
+        let rows = rt.present_frames()[0].rows;
+        let cell = rt
+            .frame_cell_to_owner_cell(view, rows, CellPos::new(0, 4))
+            .expect("mapped cell");
+        assert_eq!(cell.col, 6);
+        // Pure LTR keeps identity.
+        let latin = rt
+            .frame_cell_to_owner_cell(view, rows, CellPos::new(0, 1))
+            .expect("mapped cell");
+        assert_eq!(latin.col, 1);
+    }
+
+    #[test]
+    fn selection_press_maps_visual_cell_and_caret_to_logical() {
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "abc אבג");
+        let view = rt.primary_view.expect("primary view");
+        let pos = visual_point(&rt, view, 0, 4);
+        let (hit, cell, boundary) = rt
+            .selection_press_target_with_boundary(pos)
+            .expect("press target");
+        assert_eq!(hit, view);
+        assert_eq!(cell.col, 6, "selection anchor stays logical");
+        // The pointer sits in the right half of visual cell 4, so the caret
+        // is its right edge (visual 5). The edge inverse maps that to
+        // logical 6 (the caret before ג), not cell 5.
+        assert_eq!(boundary.col, 6, "caret maps through the edge inverse");
+        // A pointer on ב (visual 5) has its right edge at visual 6, the
+        // caret before א (logical 5).
+        let on_bet = rt
+            .selection_press_target_with_boundary(visual_point(&rt, view, 0, 5))
+            .expect("bet press");
+        assert_eq!(on_bet.2.col, 5);
+        let right_edge = rt
+            .selection_press_target_with_boundary(visual_point(&rt, view, 0, 77))
+            .expect("right edge");
+        assert_eq!(right_edge.2.col, 77);
+    }
+
+    #[test]
+    fn mouse_report_reports_the_logical_column() {
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "abc אבג");
+        let view = rt.primary_view.expect("primary view");
+        let pos = visual_point(&rt, view, 0, 4);
+        assert_eq!(
+            rt.mouse_report_cell(pos).col,
+            6,
+            "app coordinates are logical"
+        );
+    }
+
+    #[test]
+    fn hyperlink_hit_test_follows_the_glyphs_not_the_cells() {
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "abc ");
+        rt.state.apply(&TerminalAction::OscHyperlink {
+            link: Some(bitty_vt::Hyperlink {
+                id: None,
+                uri: bitty_vt::BoundedString::new("https://example.com/bidi"),
+            }),
+        });
+        print_bidi(&mut rt, "א");
+        rt.state.apply(&TerminalAction::OscHyperlink { link: None });
+        print_bidi(&mut rt, "בג");
+        let view = rt.primary_view.expect("primary view");
+        // א is logical 4, painted at visual 6; ב/ג are unlinked.
+        let linked = visual_point(&rt, view, 0, 6);
+        assert_eq!(
+            rt.hyperlink_uri_at(linked).as_deref(),
+            Some("https://example.com/bidi")
+        );
+        let unlinked = visual_point(&rt, view, 0, 4);
+        assert_eq!(rt.hyperlink_uri_at(unlinked), None);
+        let hovered = rt.hovered_hyperlink_at(linked).expect("hover span");
+        assert_eq!(hovered.uri, "https://example.com/bidi");
+        assert_eq!(hovered.col_start, 4, "span stays logical");
+        assert!(rt.hovered_hyperlink_at(unlinked).is_none());
+    }
+
+    #[test]
+    fn drag_selection_across_an_rtl_run_maps_visual_edges_to_logical() {
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "abc אבג");
+        let view = rt.primary_view.expect("primary view");
+        // Press on ג (visual 4) and drag rightward across the RTL run to א
+        // (visual 6): the logical range is the full Hebrew run in logical
+        // order, not the visual reversal.
+        let forward = drag_selection(&mut rt, view, 4, 6);
+        assert_eq!((forward.anchor.col, forward.focus.col), (4, 6));
+        assert_eq!(rt.selection_text().as_deref(), Some("אבג"));
+        // The reverse visual drag yields the same logical (normalized) range
+        // and copy order; drag direction is visual, copy is logical.
+        let reverse = drag_selection_at(&mut rt, view, 6, 0.75, 4, 0.25);
+        assert_eq!((reverse.anchor.col, reverse.focus.col), (4, 6));
+        assert_eq!(rt.selection_text().as_deref(), Some("אבג"));
+    }
+
+    #[test]
+    fn drag_selection_handles_run_boundaries_and_the_right_edge() {
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "abc אבג");
+        let view = rt.primary_view.expect("primary view");
+        // Start at the line start and drag past the right edge: the end is
+        // the last painted cell, never a cell inverse that would shift the
+        // focus into the RTL run.
+        let right = drag_selection(&mut rt, view, 0, 77);
+        assert_eq!(
+            right.focus.col, 76,
+            "the last painted cell is the inclusive selection end"
+        );
+        assert_eq!(right.anchor.col, 0);
+        assert!(
+            rt.selection_text()
+                .is_some_and(|text| text.starts_with("abc אבג")),
+            "logical copy order: {:?}",
+            rt.selection_text()
+        );
+        // Cross the Latin/RTL boundary in the other direction: the anchor
+        // and focus stay logical even though the painted run reverses.
+        let boundary = drag_selection(&mut rt, view, 2, 6);
+        assert_eq!((boundary.anchor.col, boundary.focus.col), (2, 6));
+        assert_eq!(rt.selection_text().as_deref(), Some("c אבג"));
+    }
+
+    #[test]
+    fn drag_selection_maps_rtl_ltr_boundaries_with_wide_and_combining_cells() {
+        let mut rt = bidi_runtime();
+        // Visual: ב | spacer | 中 | א; the full sweep is the logical line in
+        // logical order, and edge 3 is not an identity boundary.
+        print_bidi(&mut rt, "א中ב");
+        let view = rt.primary_view.expect("primary view");
+        let full = drag_selection(&mut rt, view, 0, 3);
+        assert_eq!((full.anchor.col, full.focus.col), (0, 3));
+        assert_eq!(rt.selection_text().as_deref(), Some("א中ב"));
+        // Visual: a b c ג ב א; sweeping abc into the RTL run selects the
+        // min/max logical cells under the swept span.
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "אבגabc");
+        let view = rt.primary_view.expect("primary view");
+        let sweep = drag_selection(&mut rt, view, 0, 3);
+        assert_eq!((sweep.anchor.col, sweep.focus.col), (2, 5));
+        assert_eq!(rt.selection_text().as_deref(), Some("גabc"));
+    }
+
+    /// Presses, drags, and releases a `Simple` selection at visual cells.
+    fn drag_and_release(
+        rt: &mut Runtime,
+        view: ViewId,
+        press_visual: u16,
+        drag_visual: u16,
+    ) -> (
+        bitty_ui::Selection,
+        Option<String>,
+        Option<bitty_ui::Selection>,
+    ) {
+        let (owner, cell, boundary) = rt
+            .selection_press_target_with_boundary(visual_point_at(rt, view, 0, press_visual, 0.25))
+            .expect("press target");
+        rt.start_view_selection_from_pointer(
+            owner,
+            bitty_ui::SelectionKind::Simple,
+            cell,
+            boundary,
+        );
+        let (focus, boundary) = rt
+            .cursor_to_owner_cell_and_boundary(
+                view,
+                visual_point_at(rt, view, 0, drag_visual, 0.75),
+            )
+            .expect("drag target");
+        rt.update_boundary_selection(focus, boundary);
+        let live = rt.selection().expect("live sweep selection");
+        let text = rt.selection_text();
+        rt.end_boundary_selection(focus, boundary);
+        (live, text, rt.selection())
+    }
+
+    #[test]
+    fn drag_release_commits_the_visual_sweep_range() {
+        // The release must commit the logical min/max set the live drag
+        // showed; re-deriving it from the ambiguous edge inverse could move
+        // or drop the selection (the reverse-sweep case used to drop it).
+        for (text, press, drag, range, copy) in [
+            ("abc אבג", 2u16, 6u16, (2u16, 6u16), "c אבג"),
+            ("א中ב", 0, 3, (0, 3), "א中ב"),
+            ("אבגabc", 0, 3, (2, 5), "גabc"),
+            ("א中", 0, 2, (0, 2), "א中"),
+        ] {
+            let mut rt = bidi_runtime();
+            print_bidi(&mut rt, text);
+            let view = rt.primary_view.expect("primary view");
+            let (live, live_text, committed) = drag_and_release(&mut rt, view, press, drag);
+            assert_eq!(
+                (live.anchor.col, live.focus.col),
+                range,
+                "{text:?} live sweep"
+            );
+            assert_eq!(live_text.as_deref(), Some(copy), "{text:?} live copy");
+            let committed = committed.expect("release keeps the selection");
+            assert_eq!(
+                (committed.anchor.col, committed.focus.col),
+                range,
+                "{text:?} committed range"
+            );
+            assert!(!committed.active, "a released selection is inactive");
+            assert_eq!(rt.selection_text().as_deref(), Some(copy), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn alt_stale_scroll_offset_keeps_hit_testing_on_the_live_alt_grid() {
+        let mut rt = bidi_runtime();
+        // Push history into the scrollback ring, then park the primary view
+        // in history so `scroll_offset != 0`.
+        for i in 0..30 {
+            rt.handle_pty_bytes(format!("history {i:02}\r\n").as_bytes());
+        }
+        let view = rt.primary_view.expect("primary view");
+        let max = rt.state.scrollback_len();
+        assert!(max > 0, "must have scrollback");
+        rt.find_view_mut(view)
+            .expect("primary view")
+            .scroll_by(3, max);
+        assert!(rt.is_viewport_scrolled(view));
+        // Entering the alternate screen keeps the stale offset but owns no
+        // history view: paint (`viewport_snapshot`) and hit testing must
+        // both read the live alt grid, never the primary scrollback.
+        rt.handle_pty_bytes(b"\x1b[?1049h");
+        assert_eq!(rt.view_scroll_offset(view), 3, "offset stays stale");
+        rt.handle_pty_bytes(b"\x1b[H");
+        print_bidi(&mut rt, "אבג");
+        assert!(!rt.is_viewport_scrolled(view), "alt owns no history view");
+        assert!(rt.bidi_enabled_for_view(view));
+        assert_eq!(
+            rt.logical_col_for_visual(view, 0, 0),
+            2,
+            "visual 0 is ג (logical 2) in the live alt grid"
+        );
+        assert_eq!(rt.visual_col_for_logical(view, 0, 2), 0);
+    }
+
+    #[test]
+    fn click_without_motion_still_clears_on_a_reordered_row() {
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "abc אבג");
+        let view = rt.primary_view.expect("primary view");
+        let pos = visual_point_at(&rt, view, 0, 4, 0.25);
+        let (owner, cell, boundary) = rt
+            .selection_press_target_with_boundary(pos)
+            .expect("press target");
+        rt.start_view_selection_from_pointer(
+            owner,
+            bitty_ui::SelectionKind::Simple,
+            cell,
+            boundary,
+        );
+        let (focus, boundary) = rt
+            .cursor_to_owner_cell_and_boundary(view, pos)
+            .expect("release target");
+        rt.end_boundary_selection(focus, boundary);
+        assert!(rt.selection().is_none(), "a click is not a selection");
+    }
+
+    #[test]
+    fn windowed_cursor_to_cell_uses_the_failed_closed_identity() {
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "abc אבג");
+        rt.state.resize(80, 24);
+        assert!(!rt.bidi_enabled_for_view(rt.primary_view.expect("view")));
+        let live = rt.live_cell_metrics();
+        let pad = f64::from(rt.window_padding_physical());
+        let scale = rt.dpi_scale();
+        let deco = (f64::from(rt.config.decoration.gaps_out)
+            + f64::from(rt.config.decoration.border)
+            + f64::from(rt.config.decoration.content_inset))
+            * scale;
+        let gap_x = (f64::from(rt.config.gaps_out) + f64::from(rt.container.x))
+            * f64::from(live.width)
+            + deco;
+        let gap_y = (f64::from(rt.config.gaps_out) + f64::from(rt.container.y))
+            * f64::from(live.height)
+            + deco;
+        let pos = CursorPosition {
+            x: pad + gap_x + 4.5 * f64::from(live.width),
+            y: pad + gap_y + 0.5 * f64::from(live.height),
+        };
+        assert_eq!(
+            rt.cursor_to_cell(pos).col,
+            4,
+            "windowed primary keeps logical coordinates"
+        );
+    }
+
+    #[test]
+    fn windowed_and_truncated_views_fail_closed_to_identity() {
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "abc אבג");
+        let view = rt.primary_view.expect("primary view");
+        assert!(rt.bidi_enabled_for_view(view));
+        // A state grid larger than the painted content frame makes the
+        // renderer window it (`viewport_snapshot`); the state map is not
+        // the painted map.
+        rt.state.resize(80, 24);
+        assert!(!rt.bidi_enabled_for_view(view));
+        assert!(rt.bidi_grid_for_view(view).is_empty());
+        let rows = rt.present_frames()[0].rows;
+        let cell = rt
+            .frame_cell_to_owner_cell(view, rows, CellPos::new(0, 4))
+            .expect("windowed cell");
+        assert_eq!(cell.col, 4, "windowed hit test stays identity");
+        // Truncated width only (same height) is also not the logical map.
+        rt.state.resize(40, 22);
+        assert!(!rt.bidi_enabled_for_view(view));
+    }
+
+    #[test]
+    fn session_less_and_alt_stale_views_fail_closed() {
+        let mut rt = bidi_runtime();
+        let primary = rt.primary_view.expect("primary view");
+        let extra = ViewId::new(2);
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(primary, 80, 24)),
+            LayoutNode::leaf(View::new(extra, 80, 24)),
+        ));
+        // The extra leaf owns no session and paints an erased grid; a
+        // logical map from the primary state would be a different view.
+        assert!(!rt.bidi_enabled_for_view(extra));
+        assert!(rt.bidi_grid_for_view(extra).is_empty());
+        // Entering the alternate screen does not make the stale view live.
+        rt.handle_pty_bytes(b"\x1b[?1049h");
+        assert!(!rt.bidi_enabled_for_view(extra));
     }
 }

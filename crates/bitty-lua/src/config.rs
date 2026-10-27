@@ -32,7 +32,7 @@
 //!     appearance = { theme = "bitty-dark" }, -- wins over the alias
 //!     font = { family = "JetBrains Mono", size = 13.0 },
 //!     window = { opacity = 0.95, padding = 8 },
-//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, page_scroll_percent = 75, cursor_style = "steady_bar", bell = "visual", ambiguous_width = "narrow" },
+//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, page_scroll_percent = 75, cursor_style = "steady_bar", bell = "visual", ambiguous_width = "narrow", bidi = "off" },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
 //!     history = { capture = { transcript = true, commands = false } }, -- opt in to bounded plugin history capture; both default false (CTX-1352)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177)
@@ -320,6 +320,9 @@ pub struct TerminalData {
     /// `terminal.ambiguous_width`; present only when the key is set, raw
     /// spelling validated downstream in `bitty-config`).
     pub ambiguous_width: Option<String>,
+    /// Paint-time BiDi policy string (CTX-1612 `terminal.bidi`; present only
+    /// when the key is set, raw spelling validated downstream).
+    pub bidi: Option<String>,
 }
 
 /// Selection overrides, plain data (CTX-0191; see [`FontData`] for `Option`
@@ -1696,6 +1699,7 @@ impl ConfigData {
                             "cursor_style",
                             "bell",
                             "ambiguous_width",
+                            "bidi",
                         ],
                     )?;
                     let scrollback = match get_field(nested, "scrollback") {
@@ -1731,6 +1735,10 @@ impl ConfigData {
                         Some(v) => Some(expect_string("terminal.ambiguous_width", v)?),
                         None => None,
                     };
+                    let bidi = match get_field(nested, "bidi") {
+                        Some(v) => Some(expect_string("terminal.bidi", v)?),
+                        None => None,
+                    };
                     out.terminal = Some(TerminalData {
                         scrollback,
                         shell,
@@ -1740,6 +1748,7 @@ impl ConfigData {
                         cursor_style,
                         bell,
                         ambiguous_width,
+                        bidi,
                     });
                 }
                 "selection" => {

@@ -1560,6 +1560,14 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 println!(
                     "{}",
                     check_row(
+                        "terminal.bidi",
+                        e.terminal.bidi.as_str().to_string(),
+                        &src("terminal.bidi")
+                    )
+                );
+                println!(
+                    "{}",
+                    check_row(
                         "selection.auto_copy",
                         format!("{}", e.selection.auto_copy),
                         &src("selection.auto_copy")
@@ -2354,6 +2362,10 @@ fn config_rows(loaded: &LoadedConfig) -> (Vec<ConfigRow>, bool) {
         ConfigValue::Text(effective.terminal.ambiguous_width.as_str().to_string()),
     );
     push(
+        "terminal.bidi",
+        ConfigValue::Text(effective.terminal.bidi.as_str().to_string()),
+    );
+    push(
         "terminal.page_scroll_percent",
         ConfigValue::Number(format!("{}", effective.terminal.page_scroll_percent)),
     );
@@ -3121,6 +3133,9 @@ pub(crate) fn runtime_config_from_effective_for_with_warnings(
             bitty_config::AmbiguousWidth::Narrow => bitty_term_state::AmbiguousWidth::Narrow,
             bitty_config::AmbiguousWidth::Wide => bitty_term_state::AmbiguousWidth::Wide,
         };
+        // CTX-1612: paint-time BiDi policy; off keeps every painted column
+        // identical to the pre-BiDi renderer.
+        cfg.bidi = matches!(effective.terminal.bidi, bitty_config::BidiMode::On);
         (cfg, warnings)
     })
     .map_err(|err| format!("bitty: invalid effective config for runtime: {err}"))

@@ -114,6 +114,7 @@ fn shape(
         &RunAttrs {
             features: Vec::new(),
             point_size: POINT_SIZE,
+            direction: bitty_render::RunDirection::Ltr,
         },
     )
 }

@@ -338,6 +338,7 @@ fn shape_run_clusters_ascii_and_flags_tofu() {
     let attrs = RunAttrs {
         features: Vec::new(),
         point_size: POINT_SIZE,
+        direction: bitty_render::RunDirection::Ltr,
     };
     let chain: Vec<FontId> = raster.fonts().to_vec();
     let primary = chain[0];
@@ -484,6 +485,7 @@ fn shape_run_uses_dynamic_for_unchained_script() {
     let attrs = RunAttrs {
         features: Vec::new(),
         point_size: POINT_SIZE,
+        direction: bitty_render::RunDirection::Ltr,
     };
     let clusters = raster
         .inner_mut()

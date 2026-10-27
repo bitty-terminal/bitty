@@ -2491,6 +2491,14 @@ pub const DEFAULT_BELL_MODE: BellMode = BellMode::Visual;
 /// Default `terminal.ambiguous_width` (CTX-1609): `narrow`.
 pub const DEFAULT_AMBIGUOUS_WIDTH: AmbiguousWidth = AmbiguousWidth::Narrow;
 
+/// Default `terminal.bidi` (CTX-1612): `off`.
+///
+/// Reordering is a display-spoofing capability (Trojan-Source class); the
+/// default stays off until the owner accepts the risk and a risk-register
+/// row lands. `off` keeps every byte and every painted column identical to
+/// the pre-BiDi renderer.
+pub const DEFAULT_BIDI: BidiMode = BidiMode::Off;
+
 /// Default cursor rendering shape (CTX-0756, issue #1359
 /// `terminal.cursor_style`).
 ///
@@ -2698,6 +2706,57 @@ impl std::fmt::Display for AmbiguousWidth {
     }
 }
 
+/// Paint-time BiDi reordering policy (CTX-1612 `terminal.bidi`).
+///
+/// `off` (default) paints logical order exactly as before. `on` resolves
+/// UAX #9 per logical line and paints rows with an odd resolved level in
+/// visual order; Terminal Truth, the canonical hash, and the codec are
+/// unchanged, so the switch is live-appliable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BidiMode {
+    /// Reordering disabled (default; no Trojan-Source display capability).
+    #[default]
+    Off,
+    /// Reorder rows with a resolved RTL level at paint time.
+    On,
+}
+
+impl BidiMode {
+    /// Parses a config string (exact lowercase; fail-closed).
+    ///
+    /// Returns `None` for anything but `"off"` and `"on"`.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "off" => Some(Self::Off),
+            "on" => Some(Self::On),
+            _ => None,
+        }
+    }
+
+    /// Validate a parsed value (total; exhaustive for future variants).
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        match self {
+            Self::Off | Self::On => Ok(()),
+        }
+    }
+
+    /// Canonical config spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+        }
+    }
+}
+
+impl std::fmt::Display for BidiMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Terminal behavior configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalConfig {
@@ -2728,6 +2787,9 @@ pub struct TerminalConfig {
     /// state at creation; restart-required because it never re-measures
     /// already committed cells.
     pub ambiguous_width: AmbiguousWidth,
+    /// Paint-time BiDi reordering (`terminal.bidi`; default [`DEFAULT_BIDI`]).
+    /// Never changes committed cells, so the policy is live-appliable.
+    pub bidi: BidiMode,
 }
 
 impl Default for TerminalConfig {
@@ -2741,6 +2803,7 @@ impl Default for TerminalConfig {
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell: DEFAULT_BELL_MODE,
             ambiguous_width: DEFAULT_AMBIGUOUS_WIDTH,
+            bidi: DEFAULT_BIDI,
         }
     }
 }
@@ -2784,6 +2847,9 @@ impl TerminalConfig {
         self.ambiguous_width
             .validate()
             .map_err(|e| ConfigError::validation("terminal.ambiguous_width", e.to_string()))?;
+        self.bidi
+            .validate()
+            .map_err(|e| ConfigError::validation("terminal.bidi", e.to_string()))?;
         if let Some(s) = &self.shell {
             let t = s.trim();
             if t.is_empty() {
@@ -5424,6 +5490,27 @@ mod tests {
                 err.to_string().contains("must be within [10, 100]"),
                 "{err}"
             );
+        }
+    }
+
+    #[test]
+    fn bidi_parses_round_trips_and_defaults_off() {
+        // CTX-1612: reordering is opt-in (Trojan-Source risk). Defaults are
+        // `off` in the constant, the enum, and the effective config; both
+        // exact lowercase spellings round-trip and everything else fails
+        // closed.
+        assert_eq!(DEFAULT_BIDI, BidiMode::Off);
+        assert_eq!(BidiMode::default(), BidiMode::Off);
+        assert_eq!(EffectiveConfig::default().terminal.bidi, BidiMode::Off);
+        for (raw, expected) in [("off", BidiMode::Off), ("on", BidiMode::On)] {
+            let parsed = BidiMode::parse(raw).expect("accepted spelling");
+            assert_eq!(parsed, expected);
+            assert_eq!(parsed.as_str(), raw);
+            assert_eq!(parsed.to_string(), raw);
+            parsed.validate().expect("parsed value valid");
+        }
+        for bad in ["auto", "OFF", "On", "", "true"] {
+            assert!(BidiMode::parse(bad).is_none(), "rejects {bad:?}");
         }
     }
 

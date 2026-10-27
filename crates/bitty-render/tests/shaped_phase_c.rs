@@ -84,6 +84,7 @@ fn shape_run_rejects_invalid_point_size() {
         let attrs = RunAttrs {
             features: Vec::new(),
             point_size: bad,
+            direction: bitty_render::RunDirection::Ltr,
         };
         let err = shaper
             .shape_run("hello", &empty_chain, &attrs)
@@ -102,6 +103,7 @@ fn shape_run_rejects_empty_chain_without_panicking() {
     let attrs = RunAttrs {
         features: Vec::new(),
         point_size: POINT_SIZE,
+        direction: bitty_render::RunDirection::Ltr,
     };
     // Adversarial corpus: empty, NUL, lone mark, Zalgo, mixed scripts,
     // regional indicators, overlong rows. Every input fails closed with
@@ -422,6 +424,7 @@ fn combining_sequence_renders_without_splitting_truth() {
     let attrs = RunAttrs {
         features: Vec::new(),
         point_size: POINT_SIZE,
+        direction: bitty_render::RunDirection::Ltr,
     };
     let text = "e\u{301}";
     let clusters = raster

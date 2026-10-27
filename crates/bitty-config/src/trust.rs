@@ -428,6 +428,19 @@ pub fn validate_project_plan(plan: &ConfigPlan) -> Result<(), ConfigError> {
             message: "project config must not declare terminal.shell".into(),
         });
     }
+    // CTX-1612: paint-time BiDi reordering is a display-spoofing
+    // (Trojan-Source) capability. A project-local file must not turn it on
+    // until the owner accepts the risk and the security corpus carries the
+    // risk row; the user layer keeps the escape hatch.
+    if plan
+        .terminal
+        .as_ref()
+        .is_some_and(|t| t.bidi == crate::types::BidiMode::On)
+    {
+        return Err(ConfigError::TrustViolation {
+            message: "project config must not enable terminal.bidi".into(),
+        });
+    }
     if plan.plugins.is_some() {
         return Err(ConfigError::TrustViolation {
             message: "project config must not declare plugins".into(),
@@ -691,6 +704,21 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_project_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn project_plan_rejects_enabling_bidi() {
+        // CTX-1612: reordering is a Trojan-Source display capability and
+        // stays out of project layers until the risk row/consent exists.
+        let plan = ConfigPlan {
+            terminal: Some(TerminalConfig {
+                bidi: crate::types::BidiMode::On,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_project_plan(&plan).expect_err("bidi must be rejected");
+        assert!(err.to_string().contains("terminal.bidi"), "{err}");
     }
 
     #[test]

@@ -17,6 +17,13 @@
 //! cursor and no private channel. Both paths therefore share one selection
 //! algebra and one clipboard gate, and "refresh a page" means resolving the
 //! same stable identities, never trusting a row index.
+//!
+//! CTX-1612 BiDi semantics: a pointer drag is a sweep over *painted* cells.
+//! `Simple` drags on a view with an active projection select every logical
+//! cell displayed under the swept visual span and copy them in logical
+//! order (the range is the min/max logical column of those cells). `Block`
+//! keeps its rectangle/caret-boundary model, and selection anchors remain
+//! logical so OQ-099 copy order is unchanged.
 use super::input::key_inspect_label;
 use super::*;
 use bitty_ui::selection::BufferPos;
@@ -1579,12 +1586,67 @@ impl Runtime {
         ))
     }
 
+    /// Logical selection for a same-row visual sweep under BiDi (CTX-1612).
+    ///
+    /// A mouse drag is a sweep over *painted* cells. The selected logical
+    /// set is every logical cell displayed under that visual span, copied in
+    /// logical order, so the range is the min/max logical column of the
+    /// swept cells. This is why an RTL line can select left-to-right
+    /// visually while copying in logical order. `None` when BiDi is off, the
+    /// view failed closed, the row is pure LTR, or the sweep crosses rows
+    /// (the cell/boundary path keeps multi-row semantics).
+    fn bidi_visual_sweep_selection(
+        &self,
+        owner: ViewId,
+        press: CellPos,
+        focus: CellPos,
+    ) -> Option<Selection> {
+        if press.row != focus.row {
+            return None;
+        }
+        let grid = self.bidi_grid_for_view(owner);
+        if grid.is_empty() {
+            return None;
+        }
+        let row = usize::from(press.row);
+        let press_visual = grid.visual_col_for_logical(row, usize::from(press.col));
+        let focus_visual = grid.visual_col_for_logical(row, usize::from(focus.col));
+        let (first, last) = if press_visual <= focus_visual {
+            (press_visual, focus_visual)
+        } else {
+            (focus_visual, press_visual)
+        };
+        let mut logical_min = usize::MAX;
+        let mut logical_max = 0usize;
+        for visual in first..=last {
+            let logical = grid.logical_col_for_visual(row, visual);
+            logical_min = logical_min.min(logical);
+            logical_max = logical_max.max(logical);
+        }
+        if logical_min == usize::MAX {
+            return None;
+        }
+        let to_u16 = |col: usize| u16::try_from(col.min(usize::from(u16::MAX))).ok();
+        Some(Selection {
+            anchor: CellPos::new(press.row, to_u16(logical_min)?),
+            focus: CellPos::new(press.row, to_u16(logical_max)?),
+            kind: SelectionKind::Simple,
+            active: true,
+        })
+    }
+
     /// Updates a pointer caret drag (issue #2480).
     ///
     /// Only `Simple` and `Block` drags carry a press boundary; word/line
     /// drags keep the cell-based [`Self::update_selection`] path. A caret
     /// span that covers no cell installs a collapsed selection so the drag
     /// state survives until release (where a plain click still clears).
+    ///
+    /// CTX-1612: a `Simple` drag on a view with an active BiDi projection
+    /// is a visual sweep: the logical range is the min/max logical column of
+    /// the cells under the swept visual span (see
+    /// [`Self::bidi_visual_sweep_selection`]). `Block` keeps the rectangle
+    /// boundary model.
     pub(super) fn update_boundary_selection(
         &mut self,
         focus: CellPos,
@@ -1611,6 +1673,18 @@ impl Runtime {
             self.drop_selection();
             return;
         };
+        if sel.selection.kind == SelectionKind::Simple {
+            let anchor = sel.anchor_press.unwrap_or(sel.selection.anchor);
+            if let Some(next) = self.bidi_visual_sweep_selection(sel.owner, anchor, focus) {
+                let single_cell = next.anchor == next.focus;
+                self.install_selection(sel.owner, next, sel.anchor_press, true);
+                // A visual sweep is a live-viewport range; drop the
+                // persistent-buffer projection so the logical min/max set
+                // is what `selection()` returns.
+                self.restore_selection_meta(Some(press), single_cell, None, None);
+                return;
+            }
+        }
         // Pointer Simple/Block drags carry buffer anchors (issue #2470):
         // extend in combined-buffer space so the range can cross pages.
         if sel.selection.kind == SelectionKind::Simple || sel.selection.kind == SelectionKind::Block

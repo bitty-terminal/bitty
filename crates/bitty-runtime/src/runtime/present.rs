@@ -2470,21 +2470,33 @@ impl Runtime {
         }
         let cell_width =
             normalize_reused_cursor_cell(&mut cursor, pane_snapshot.as_ref(), snapshot);
-        // CTX-1612: paint the cursor at its visual caret column (logical
-        // truth); the retained path uses the pane's own wrap flags.
-        let (grid_snapshot, wraps) = match pane_snapshot.as_ref() {
-            Some(pane) => {
-                let wraps = self
-                    .pane_sessions
-                    .get(&view_id)
-                    .map(|sess| self.wraps_for_state(&sess.state, pane))
-                    .unwrap_or_default();
-                (pane, Some(wraps))
+        // CTX-1612: use the same per-view decision, painted snapshot, and
+        // wrap hint as the leaf render. A windowed/truncated/placeholder
+        // view fails closed exactly like its glyphs; a retained cursor must
+        // never resolve a different map than the frame it sits on.
+        let view_bidi = self.bidi_enabled_for_view(view_id);
+        let base_snap = pane_snapshot.as_ref().unwrap_or(snapshot);
+        let mut painted = viewport_snapshot(base_snap, frame.cols, frame.rows);
+        for cell in &mut painted.cells {
+            if bitty_term_state::is_kitty_placeholder(cell.glyph) {
+                cell.glyph = ' ';
+                cell.zerowidth = bitty_term_state::Zerowidth::new();
             }
-            None => (snapshot, None),
-        };
+        }
+        let owner_state = self
+            .pane_sessions
+            .get(&view_id)
+            .map(|sess| &sess.state)
+            .unwrap_or(&self.state);
+        let wraps = present_wraps_for(
+            view_bidi,
+            owner_state,
+            base_snap,
+            false,
+            usize::from(frame.rows),
+        );
         let (visual_col, caret_col) =
-            cursor_visual_cols(self.config.bidi, grid_snapshot, wraps.as_deref(), &cursor);
+            cursor_visual_cols(view_bidi, &painted, wraps.as_deref(), &cursor);
         cursor.position.col = visual_col;
         let rows = usize::from(frame.rows);
         let cols = usize::from(frame.cols);

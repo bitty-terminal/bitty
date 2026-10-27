@@ -480,18 +480,17 @@ impl Runtime {
         let clamped_col = col.clamp(0, max_col) as u16;
         let clamped_row = row.clamp(0, max_row) as u16;
         // CTX-1612: the pointer addresses a painted (visual) column; the
-        // primary grid cell is logical. Shared inverse, identity when BiDi
-        // is off or the row has no odd level.
-        let clamped_col = if self.config.bidi {
-            let snapshot = self.state.snapshot();
-            let wraps = self.wraps_for_state(&self.state, &snapshot);
-            let grid = self.bidi_grid_for_snapshot(&snapshot, Some(&wraps));
-            u16::try_from(
-                grid.logical_col_for_visual(usize::from(clamped_row), usize::from(clamped_col)),
+        // primary grid cell is logical. The primary view's per-view
+        // projection is the same one the renderer paints with; it is
+        // identity when BiDi is off, the row has no odd level, or the view
+        // failed closed (windowed/truncated/placeholder/alt stale).
+        let clamped_col = match self.primary_view {
+            Some(view) => u16::try_from(
+                self.bidi_grid_for_view(view)
+                    .logical_col_for_visual(usize::from(clamped_row), usize::from(clamped_col)),
             )
-            .unwrap_or(clamped_col)
-        } else {
-            clamped_col
+            .unwrap_or(clamped_col),
+            None => clamped_col,
         };
         bitty_ui::snap_to_leading(&snap, CellPos::new(clamped_row, clamped_col))
     }
@@ -4796,13 +4795,13 @@ mod tests {
         // The pointer sits in the right half of visual cell 4, so the caret
         // is its right edge (visual 5). The edge inverse maps that to
         // logical 6 (the boundary before א), not cell 5.
-        assert_eq!(boundary.col, 6, "caret maps through the edge inverse");
+        assert_eq!(boundary.col, 7, "caret maps through the edge inverse");
         // A pointer on ב (visual 5) maps to the logical edge before ב (5);
         // the right frame edge stays the line end (77), not a cell.
         let on_bet = rt
             .selection_press_target_with_boundary(visual_point(&rt, view, 0, 5))
             .expect("bet press");
-        assert_eq!(on_bet.2.col, 5);
+        assert_eq!(on_bet.2.col, 6);
         let right_edge = rt
             .selection_press_target_with_boundary(visual_point(&rt, view, 0, 77))
             .expect("right edge");
@@ -4891,8 +4890,58 @@ mod tests {
         // Cross the Latin/RTL boundary in the other direction: the anchor
         // and focus stay logical even though the painted run reverses.
         let boundary = drag_selection(&mut rt, view, 2, 6);
-        assert_eq!((boundary.anchor.col, boundary.focus.col), (2, 3));
-        assert_eq!(rt.selection_text().as_deref(), Some("c "));
+        assert_eq!((boundary.anchor.col, boundary.focus.col), (2, 6));
+        assert_eq!(rt.selection_text().as_deref(), Some("c אבג"));
+    }
+
+    #[test]
+    fn drag_selection_maps_rtl_ltr_boundaries_with_wide_and_combining_cells() {
+        let mut rt = bidi_runtime();
+        // Visual: ב | spacer | 中 | א; the full sweep is the logical line in
+        // logical order, and edge 3 is not an identity boundary.
+        print_bidi(&mut rt, "א中ב");
+        let view = rt.primary_view.expect("primary view");
+        let full = drag_selection(&mut rt, view, 0, 3);
+        assert_eq!((full.anchor.col, full.focus.col), (0, 3));
+        assert_eq!(rt.selection_text().as_deref(), Some("א中ב"));
+        // Visual: a b c ג ב א; sweeping abc into the RTL run selects the
+        // min/max logical cells under the swept span.
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "אבגabc");
+        let view = rt.primary_view.expect("primary view");
+        let sweep = drag_selection(&mut rt, view, 0, 3);
+        assert_eq!((sweep.anchor.col, sweep.focus.col), (2, 5));
+        assert_eq!(rt.selection_text().as_deref(), Some("גabc"));
+    }
+
+    #[test]
+    fn windowed_cursor_to_cell_uses_the_failed_closed_identity() {
+        let mut rt = bidi_runtime();
+        print_bidi(&mut rt, "abc אבג");
+        rt.state.resize(80, 24);
+        assert!(!rt.bidi_enabled_for_view(rt.primary_view.expect("view")));
+        let live = rt.live_cell_metrics();
+        let pad = f64::from(rt.window_padding_physical());
+        let scale = rt.dpi_scale();
+        let deco = (f64::from(rt.config.decoration.gaps_out)
+            + f64::from(rt.config.decoration.border)
+            + f64::from(rt.config.decoration.content_inset))
+            * scale;
+        let gap_x = (f64::from(rt.config.gaps_out) + f64::from(rt.container.x))
+            * f64::from(live.width)
+            + deco;
+        let gap_y = (f64::from(rt.config.gaps_out) + f64::from(rt.container.y))
+            * f64::from(live.height)
+            + deco;
+        let pos = CursorPosition {
+            x: pad + gap_x + 4.5 * f64::from(live.width),
+            y: pad + gap_y + 0.5 * f64::from(live.height),
+        };
+        assert_eq!(
+            rt.cursor_to_cell(pos).col,
+            4,
+            "windowed primary keeps logical coordinates"
+        );
     }
 
     #[test]

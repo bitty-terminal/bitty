@@ -75,6 +75,7 @@ pub mod audit;
 pub mod cli;
 pub mod codes;
 pub mod contract;
+pub mod endpoint;
 pub mod events;
 pub mod endpoint;
 pub mod handshake;

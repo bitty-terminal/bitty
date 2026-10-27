@@ -107,6 +107,11 @@ hex_identifier!(
     SessionId,
     "Server-assigned session identity (contract `D-02`)."
 );
+hex_identifier!(
+    AttachId,
+    "Server-assigned lease identity (contract `D-02`, `D-09`; \
+     `attach_id_bytes` = 32 hex characters)."
+);
 
 impl DaemonInstanceId {
     /// Mint a fresh instance id from the OS CSPRNG.
@@ -151,6 +156,34 @@ impl SessionId {
     /// Returns [`IdError`] for a non-canonical encoding. Parsing does not
     /// confer authority: the registry still decides whether the record exists
     /// in this instance.
+    pub fn parse(value: &str) -> Result<Self, IdError> {
+        value.parse()
+    }
+}
+
+impl AttachId {
+    /// Mint a fresh attach id from the OS CSPRNG.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdError::RandomUnavailable`] when the OS CSPRNG fails; a
+    /// lease is never admitted with a fallback identity.
+    pub fn generate() -> Result<Self, IdError> {
+        Self::generate_with(&mut OsEntropy)
+    }
+
+    /// Mint a fresh attach id from an injected entropy source (bitty#2602).
+    pub(crate) fn generate_with(entropy: &mut dyn Entropy) -> Result<Self, IdError> {
+        random_bytes(entropy).map(Self)
+    }
+
+    /// Parse a canonical attach id for lookup and acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdError`] for a non-canonical encoding. Parsing confers no
+    /// authority: the lease layer still decides whether the id names a live
+    /// lease.
     pub fn parse(value: &str) -> Result<Self, IdError> {
         value.parse()
     }
@@ -255,6 +288,20 @@ mod tests {
                 "a fresh session id repeated within one run"
             );
         }
+    }
+
+    #[test]
+    fn attach_ids_are_canonical_and_unique() {
+        let mut seen = HashSet::new();
+        for _ in 0..4096 {
+            let id = AttachId::generate().expect("OS entropy is available");
+            let text = id.as_hex();
+            assert_eq!(text.len(), ID_HEX_CHARS);
+            assert_eq!(text, id.to_string());
+            assert!(seen.insert(id), "a fresh attach id repeated within one run");
+            assert_eq!(AttachId::parse(&text), Ok(id));
+        }
+        assert_eq!(AttachId::parse(""), Err(IdError::InvalidLength));
     }
 
     #[test]

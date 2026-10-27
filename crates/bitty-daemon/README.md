@@ -16,27 +16,29 @@ The normative service surface is the accepted
 (contract tracked by bitty#2546/#2663); this crate seam is bitty#2606
 (CTX-1616).
 
-## Status: seam plus the in-memory registry core
+## Status: seam plus the in-memory registry core and event stream
 
 This crate fixes the service version, the capability set, and the
 version-negotiation skeleton, and implements the registry half of bitty#2601:
 server-generated ids, the in-memory session registry, generation and revision
-counters, retention, and the bounded orphan journal. It **starts no listener**,
-binds no endpoint, creates no socket file, spawns no worker, and serves no IPC
-method. `bittyd` with no arguments still reports the no-endpoint seam and exits
-0; the registry is a library surface for bitty#2607 to drive.
+counters, retention, and the bounded orphan journal, plus the event stream of
+bitty#2602: snapshot plus bounded backlog, revision ordering, per-lease routing,
+control-frame reservation, the terminal-event guarantee, and heartbeat/last-seen.
+It **starts no listener**, binds no endpoint, creates no socket file, spawns no
+worker, and serves no IPC method. `bittyd` with no arguments still reports the
+no-endpoint seam and exits 0; the registry and the event stream are library
+surfaces for bitty#2607 to drive.
 
 The contract areas that follow are deliberately deferred to their owning
 slices:
 
-| Area                                                                                                                                        | Owner      |
-| ------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| `bitty-ipc` v1 server loop, peer capture and re-check, scope evaluation, endpoint lock and tamper detection, method dispatch, error mapping | bitty#2607 |
-| Advertised limits and compiled system maxima                                                                                                | bitty#2603 |
-| Endpoint discovery, cgroup/subreaper containment, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs       | bitty#2604 |
-| Leases, control token, attach/detach authority, abort/kill                                                                                  | bitty#2609 |
-| Event stream, backlog, heartbeat                                                                                                            | bitty#2602 |
-| Conformance corpus and fake-server parity                                                                                                   | bitty#2605 |
+| Area                                                                                                                                                                          | Owner      |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| `bitty-ipc` v1 server loop, peer capture and re-check, scope evaluation, endpoint lock and tamper detection, method dispatch, error mapping, event framing and correlation id | bitty#2607 |
+| Advertised limits and compiled system maxima                                                                                                                                  | bitty#2603 |
+| Endpoint discovery, cgroup/subreaper containment, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs                                         | bitty#2604 |
+| Leases, control token, attach/detach authority, abort/kill                                                                                                                    | bitty#2609 |
+| Conformance corpus and fake-server parity                                                                                                                                     | bitty#2605 |
 
 Nothing here authorizes autostart, a service file, a TCP listener, or desktop
 wiring; all four stay out of scope.
@@ -97,13 +99,13 @@ identity.
 
 Classification is conservative and never signals by pid:
 
-| Observation                                                            | Outcome                                      |
-| ---------------------------------------------------------------------- | -------------------------------------------- |
-| Exact boot id, pid, start time, and process group                      | only this reaches `OrphanReaper`             |
-| Different boot id                                                      | `stale`, discarded, never signalled          |
-| Reserved record with no pid                                            | `unverified`, quarantined, never signalled   |
-| Absent pid, unreadable start time, reused start time, group mismatch   | `unverified`, quarantined, never signalled   |
-| Reaper cannot verify the whole containment identity                    | `unverified`, quarantined                    |
+| Observation                                                          | Outcome                                    |
+| -------------------------------------------------------------------- | ------------------------------------------ |
+| Exact boot id, pid, start time, and process group                    | only this reaches `OrphanReaper`           |
+| Different boot id                                                    | `stale`, discarded, never signalled        |
+| Reserved record with no pid                                          | `unverified`, quarantined, never signalled |
+| Absent pid, unreadable start time, reused start time, group mismatch | `unverified`, quarantined, never signalled |
+| Reaper cannot verify the whole containment identity                  | `unverified`, quarantined                  |
 
 Quarantined records expire after `orphan_record_retention_ms`; operator
 retirement removes a quarantined record explicitly and never signals. Boot
@@ -129,6 +131,52 @@ bitty#2601/#2603/#2607. `client_correlation` is bounded to 128 bytes of valid
 UTF-8 with no control characters and is recorded only as a truncated 128-bit
 SHA-256 digest (`D-08`); `operator_capability` and `host_grant` stay out of this
 crate until the slice that owns their secret lifetime and storage exists.
+
+## Event stream (bitty#2602)
+
+`events::SessionEventStream` wraps one `SessionRegistry` and owns every
+snapshot-visible mutation together with its event, so `state_revision` and the
+per-session stream cannot disagree. Source: contract `D-10`, `D-12`, `D-14`,
+`D-18`.
+
+- `attach` returns the snapshot at the current revision plus the bounded backlog
+  after the requested revision. `backlog_truncated` and `earliest_revision` make
+  a dropped history explicit; there is no unbounded replay. A duplicate attach
+  key with the same parameters returns the same lease and bumps nothing, and the
+  stored key outlives the lease so a retry after detach answers `NotAttached`
+  instead of minting a second lease.
+- Every visible mutation (bind, attach, detach, lease expiry, control transfer,
+  begin-stopping, terminate) appends exactly one event at `previous + 1`;
+  heartbeat, `last_seen`, and a repeated idempotent request append none. The
+  stream refuses a revision that is not the next one instead of serving a gap.
+- Events are routed per lease: the ring stores canonical entries and the stream
+  enqueues a materialized copy on each recipient, never on a detached lease.
+- Control frames are never shed. A lease whose queue cannot accept one is closed
+  with `TerminalEventLost`; at `terminate` that reservation runs before the
+  terminal state becomes visible, and the terminal event is pinned until every
+  recipient acknowledges it or retention collects the record.
+- Compiled caps: backlog 256 events / 262,144 bytes per session
+  (`max_event_backlog_events` / `max_event_backlog_bytes`), lease queue 256
+  events / 65,536 bytes (`max_lease_queue_events` / `max_lease_queue_bytes`),
+  8 leases per session default and 16 maximum (`max_attaches_per_session`),
+  15,000 ms lease TTL (`attach_lease_ttl_ms`), 512 attach keys / 65,536
+  accounted bytes per session (`max_idempotency_keys_per_session` /
+  `max_idempotency_bytes_per_session`), and an 8-frame / 8,192-byte control
+  reservation per lease queue (`D-10`).
+- Stream state is retention-bound. A terminal entry is dropped when the registry
+  collects it by TTL or evicts it at `max_retained_terminal_records`; every
+  still-attached lease is closed with `TerminalEventLost` and reported through
+  `TerminalReport::retired` or `RetentionReport::retired`. A retained terminal
+  snapshot can therefore report
+  an `attach_count` higher than the surviving stream leases: the registry record
+  is frozen by `D-04`, while closing a lease on it is stream-only.
+- `daemon_stopping` is a daemon-scoped control frame: it is queued to every live
+  lease without a revision bump and is not part of a session backlog.
+- `last_worker_seen_at` is absent: a terminal session has no supervision liveness
+  signal, so the stream reports none.
+- bitty#2603 advertises these limits as `{effective, default, system_max}` and
+  surfaces the queue/backlog counters in `daemon.status`; bitty#2605 adds the
+  V-21, V-23, C-04, and C-06 corpus vectors against a real transport.
 
 ## CLI
 
@@ -174,6 +222,9 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
   `D-11` acceptance rule.
 - `src/registry/` — ids, session records and lifecycle, the registry table,
   counters, retention, and refusals.
+- `src/events/` — the event envelope and kinds, the bounded backlog ring, lease
+  queues with the control reservation, the enforced limits, and the per-session
+  stream.
 - `src/orphan/` — process identity probes, the bounded journal, classification,
   and the exact-identity reaper seam.
 - `src/seam.rs` — explicit no-listener/no-endpoint status.
@@ -183,6 +234,9 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
 - `tests/binary.rs` — `--version`, no-argument seam, no runtime files, usage
   error.
 - `tests/registry.rs` — public registry lifecycle, ids, refusals, limits.
+- `tests/events.rs` — public stream behavior: revision ordering, replay and
+  truncation boundaries, the terminal guarantee, control frames, heartbeat
+  memory stability, and the seeded 10,000-operation no-loss audit.
 - `tests/orphan_journal.rs` — public journal reserve/commit/reap, no-signal
   paths, owner-private Unix files, and the no-argv/env record shape.
 

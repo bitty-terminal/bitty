@@ -641,6 +641,43 @@ impl SessionRegistry {
         Ok(record.snapshot())
     }
 
+    /// Record one snapshot-visible mutation owned by another layer (`D-03`).
+    ///
+    /// `D-03` lists control claim, control transfer, control vacancy, controller
+    /// resize, observer-grant mint/consume/revoke, and lease revocation as
+    /// revision bumps. Their authority lives in the lease layer (bitty#2609)
+    /// while the counter belongs to the session record, so the lease layer
+    /// applies the mutation and then records the single revision bump here.
+    /// Only `state_revision` and `last_seen` change: no lifecycle state, no
+    /// generation, no attach count, and no terminal field.
+    ///
+    /// # Errors
+    ///
+    /// Refuses on an unknown or terminal session, or when the revision would
+    /// wrap; a refusal leaves the record unchanged.
+    pub fn note_visible_mutation(
+        &mut self,
+        session_id: SessionId,
+        now: MonotonicMs,
+    ) -> Result<SessionSnapshot, RegistryRefusal> {
+        if !self.live.contains_key(&session_id) {
+            return Err(self.lookup_refusal(session_id));
+        }
+        let record = self.live.get_mut(&session_id).expect("checked above");
+        if record.state.is_terminal() {
+            return Err(RegistryRefusal::NotRunning {
+                state: record.state,
+            });
+        }
+        let revision = record
+            .state_revision
+            .checked_add(1)
+            .ok_or(RegistryRefusal::RevisionOverflow)?;
+        record.state_revision = revision;
+        record.last_seen = now;
+        Ok(record.snapshot())
+    }
+
     /// Accept a graceful stop: `running` -> `stopping`, one revision bump.
     ///
     /// # Errors
@@ -690,6 +727,40 @@ impl SessionRegistry {
         outcome: TerminalOutcome,
         now: MonotonicMs,
     ) -> Result<SessionSnapshot, RegistryRefusal> {
+        let (target, revision) = self.check_terminal_transition(session_id, outcome)?;
+        let mut record = self.live.remove(&session_id).expect("checked above");
+        record.state = target;
+        record.state_revision = revision;
+        record.terminal_reason = Some(outcome.reason());
+        record.exit = outcome.exit();
+        record.cleanup = Some(outcome.cleanup());
+        record.last_seen = now;
+        record.terminalized_at = Some(now);
+        let snapshot = record.snapshot();
+
+        self.retained.insert(session_id, record);
+        self.retention_order.insert((now, session_id));
+        self.enforce_retention_cap();
+        Ok(snapshot)
+    }
+
+    /// Validate a terminal transition without applying it (`D-04`).
+    ///
+    /// The event stream calls this before it reserves a control slot on every
+    /// lease, so a transition the registry would refuse cannot have closed a
+    /// lease first. Returns the target state and the revision the transition
+    /// would take.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same refusal [`SessionRegistry::terminate`] would: unknown or
+    /// terminal session, a transition outside the `D-04` table, a reason that
+    /// cannot originate in the current state, or a revision wrap.
+    pub(crate) fn check_terminal_transition(
+        &self,
+        session_id: SessionId,
+        outcome: TerminalOutcome,
+    ) -> Result<(LifecycleState, u64), RegistryRefusal> {
         if !self.live.contains_key(&session_id) {
             return Err(self.lookup_refusal(session_id));
         }
@@ -712,21 +783,7 @@ impl SessionRegistry {
             .state_revision
             .checked_add(1)
             .ok_or(RegistryRefusal::RevisionOverflow)?;
-
-        let mut record = self.live.remove(&session_id).expect("checked above");
-        record.state = target;
-        record.state_revision = revision;
-        record.terminal_reason = Some(outcome.reason());
-        record.exit = outcome.exit();
-        record.cleanup = Some(outcome.cleanup());
-        record.last_seen = now;
-        record.terminalized_at = Some(now);
-        let snapshot = record.snapshot();
-
-        self.retained.insert(session_id, record);
-        self.retention_order.insert((now, session_id));
-        self.enforce_retention_cap();
-        Ok(snapshot)
+        Ok((target, revision))
     }
 
     /// Collect retained terminal records older than `terminal_retention_ms`.
@@ -983,6 +1040,77 @@ mod tests {
             Err(RegistryRefusal::AlreadyBound { generation: 1 })
         );
         assert_eq!(registry.snapshot(created.session_id), Some(bound));
+    }
+
+    #[test]
+    fn note_visible_mutation_bumps_only_the_revision() {
+        let mut registry = default_registry();
+        let created = create(&mut registry, "term", 1);
+        registry
+            .bind(created.session_id, ms(2))
+            .expect("bind succeeds");
+        let before = registry
+            .snapshot(created.session_id)
+            .expect("record exists");
+
+        let after = registry
+            .note_visible_mutation(created.session_id, ms(3))
+            .expect("control mutation is recorded");
+        assert_eq!(after.state_revision, before.state_revision + 1);
+        assert_eq!(after.state, before.state);
+        assert_eq!(after.generation, before.generation);
+        assert_eq!(after.attach_count, before.attach_count);
+        assert_eq!(after.last_seen_ms, ms(3));
+        assert_eq!(after.terminal_reason, None);
+
+        let terminal = terminate(
+            &mut registry,
+            created.session_id,
+            TerminalReason::WorkerExit,
+            ExitInformation::ExitCode(0),
+            CleanupClass::Swept,
+            4,
+        );
+        assert_eq!(
+            registry.note_visible_mutation(created.session_id, ms(5)),
+            Err(RegistryRefusal::NotRunning {
+                state: terminal.state
+            })
+        );
+        assert_eq!(registry.snapshot(created.session_id), Some(terminal));
+    }
+
+    #[test]
+    fn note_visible_mutation_overflow_fails_closed() {
+        let mut registry = default_registry();
+        let created = create(&mut registry, "term", 1);
+        {
+            let record = registry
+                .live
+                .get_mut(&created.session_id)
+                .expect("record is live");
+            record.state_revision = u64::MAX;
+        }
+        assert_eq!(
+            registry.note_visible_mutation(created.session_id, ms(2)),
+            Err(RegistryRefusal::RevisionOverflow)
+        );
+        assert_eq!(
+            registry
+                .snapshot(created.session_id)
+                .map(|snapshot| snapshot.state_revision),
+            Some(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn note_visible_mutation_refuses_an_unknown_session() {
+        let mut registry = default_registry();
+        let unknown = SessionId::parse("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").expect("canonical");
+        assert_eq!(
+            registry.note_visible_mutation(unknown, ms(1)),
+            Err(RegistryRefusal::NotFound)
+        );
     }
 
     #[test]

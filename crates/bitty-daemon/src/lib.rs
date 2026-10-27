@@ -1,14 +1,17 @@
 //! `bitty-daemon`: the `bittyd` session-host crate seam.
 //!
-//! Status: **seam plus the in-memory registry core**. This crate fixes the
-//! service version, the capability set, and the version-negotiation skeleton
-//! required by the accepted [`bittyd` Session-Host Contract], and implements
-//! the registry half of bitty#2601: server-generated ids, session records,
-//! counters, retention, and the bounded orphan journal. It still starts no
+//! Status: **seam plus the in-memory registry core and the session event
+//! stream**. This crate fixes the service version, the capability set, and the
+//! version-negotiation skeleton required by the accepted [`bittyd` Session-Host
+//! Contract], and implements the registry half of bitty#2601: server-generated
+//! ids, session records, counters, retention, and the bounded orphan journal,
+//! plus the event stream of bitty#2602: snapshot plus bounded backlog,
+//! per-session revision ordering, per-lease routing, control-frame reservation,
+//! the terminal-event guarantee, and heartbeat/last-seen. It still starts no
 //! listener, binds no endpoint, creates no socket file, spawns no worker, and
 //! exposes no IPC method. The IPC service task (bitty#2607) replaces the
 //! not-wired branch in [`seam::SeamStatus`] with the real `bitty-ipc` v1 server
-//! loop and maps registry refusals onto the service error taxonomy.
+//! loop and maps registry and event refusals onto the service error taxonomy.
 //!
 //! # Ownership and dependency direction
 //!
@@ -34,6 +37,10 @@
 //!   and session ids, lifecycle generation/revision counters, derived attach
 //!   count, terminal classification, and bounded retention (`D-02`, `D-03`,
 //!   `D-04`, `D-14`).
+//! - [`events::SessionEventStream`]: snapshot at the current revision plus a
+//!   bounded backlog, one event per visible mutation in revision order,
+//!   per-lease routing, the control-frame reservation, the terminal-event
+//!   guarantee, and heartbeat/last-seen (`D-10`, `D-12`, `D-14`, `D-18`).
 //! - [`orphan::OrphanJournal`]: the two-phase bounded orphan journal and the
 //!   exact-identity [`orphan::OrphanReaper`] seam (`D-06`).
 //!
@@ -41,11 +48,10 @@
 //!
 //! | Contract area | Owner |
 //! | --- | --- |
-//! | `bitty-ipc` v1 server loop, peer capture/re-check, scope evaluation, endpoint lock and tamper detection, method dispatch, error mapping | bitty#2607 |
+//! | `bitty-ipc` v1 server loop, peer capture/re-check, scope evaluation, endpoint lock and tamper detection, method dispatch, error mapping, event framing and correlation id | bitty#2607 |
 //! | Advertised limits and compiled system maxima | bitty#2603 |
 //! | Endpoint discovery, containment identity, production orphan reaper, platform probes and journal ACLs | bitty#2604 |
 //! | Leases, control token, attach/detach authority, abort/kill | bitty#2609 |
-//! | Event stream and heartbeat | bitty#2602 |
 //! | Conformance corpus and fake-server parity | bitty#2605 |
 //!
 //! [`bittyd` Session-Host Contract]: https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/bittyd-session-host-contract.md
@@ -54,6 +60,7 @@
 
 pub mod cli;
 pub mod contract;
+pub mod events;
 pub mod handshake;
 pub mod orphan;
 pub mod registry;

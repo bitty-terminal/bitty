@@ -12,14 +12,15 @@
 //! | [`SessionRegistry::bind`] | worker bind, exactly once in v0.2.0 |
 //! | [`SessionRegistry::attach`] / [`SessionRegistry::detach`] | lease layer (bitty#2609) updates the derived attach count |
 //! | [`SessionRegistry::heartbeat`] | `D-12` last-seen refresh, never a revision bump |
+//! | [`SessionRegistry::note_visible_mutation`] | one revision bump for a mutation the lease layer owns |
 //! | [`SessionRegistry::begin_stopping`] | accepted abort/drain before termination |
 //! | [`SessionRegistry::terminate`] | terminal transition with reason, exit, and cleanup |
 //! | [`SessionRegistry::collect_retained`] | TTL collection after the terminal snapshot |
 //!
 //! Ids are minted server-side from the OS CSPRNG; no client-supplied value is
-//! an identity. `daemon_instance_id` and `session_id` are 128-bit lowercase
-//! hex. A terminal record is read-only: it never bumps a counter again and is
-//! only removed by retention.
+//! an identity. `daemon_instance_id`, `session_id`, and `attach_id` are 128-bit
+//! lowercase hex. A terminal record is read-only: it never bumps a counter again
+//! and is only removed by retention.
 //!
 //! Deferred to their owning slices: lease authority and attach caps
 //! (bitty#2609), IPC decoding, error mapping, and `daemon.status` serialization
@@ -30,7 +31,7 @@ mod id;
 mod session;
 mod table;
 
-pub use self::id::{DaemonInstanceId, ID_HEX_CHARS, IdError, SessionId};
+pub use self::id::{AttachId, DaemonInstanceId, ID_HEX_CHARS, IdError, SessionId};
 pub use self::session::{
     CleanupClass, ExitInformation, LifecycleState, MAX_OWNER_PEER_BYTES, MonotonicMs, OwnerPeer,
     OwnerPeerError, SessionKind, SessionSnapshot, TERMINAL_ID_MAX_BYTES, TerminalId,
@@ -42,3 +43,8 @@ pub use self::table::{
     SESSION_RECORD_BYTES_SYSTEM_MAX, SessionRegistry, TERMINAL_RETENTION_MS_DEFAULT,
     TERMINAL_RETENTION_MS_SYSTEM_MAX,
 };
+
+/// Entropy plumbing shared with the event stream (bitty#2602): the stream mints
+/// `attach_id` values from the same source the registry mints sessions from, so
+/// tests can drive both sequences deterministically.
+pub(crate) use self::id::{Entropy, ID_GENERATION_ATTEMPTS, OsEntropy};

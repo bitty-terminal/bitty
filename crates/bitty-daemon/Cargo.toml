@@ -34,6 +34,14 @@ getrandom = "0.4"
 # reads `cargo metadata` and fails when any non-daemon crate depends on this
 # package.
 
+[target.'cfg(unix)'.dependencies]
+# bitty#2604: endpoint, lock, and peer-trust primitives. `nix` is already in
+# the workspace lockfile; features are the minimum this crate uses: `fs`
+# (flock, fcntl), `socket` (SO_PEERCRED / LOCAL_PEER*, the non-blocking stale
+# probe), `user` (uid/gid), `signal` (peer liveness), `process` (pid types).
+# Windows compiles the typed UnsupportedPlatform path and links no nix code.
+nix = { workspace = true, features = ["fs", "process", "signal", "socket", "user"] }
+
 [dev-dependencies]
 # CTX-1619: temporary journal directories for the orphan-journal tests. The
 # 3.27.0 line is already in the workspace lockfile (through `proptest`), so

@@ -9,7 +9,9 @@
 //! revision ordering, per-lease routing, control-frame reservation, the
 //! terminal-event guarantee, and heartbeat/last-seen), the compiled limits and
 //! advertised triples of bitty#2603, the two bounded idempotency stores, and
-//! the bounded content-free audit ring. It still starts no listener, binds no
+//! the bounded content-free audit ring, and the endpoint, instance-lock, and
+//! peer-trust primitives of bitty#2604 ([`endpoint`], [`peer`], [`platform`]).
+//! It still starts no listener, binds no
 //! endpoint, creates no socket file, spawns no worker, and exposes no IPC
 //! method. The IPC service task (bitty#2607) replaces the not-wired branch in
 //! [`seam::SeamStatus`] with the real `bitty-ipc` v1 server loop and maps
@@ -75,11 +77,14 @@ pub mod audit;
 pub mod cli;
 pub mod codes;
 pub mod contract;
+pub mod endpoint;
 pub mod events;
 pub mod handshake;
 pub mod idempotency;
 pub mod limits;
 pub mod orphan;
+pub mod peer;
+pub mod platform;
 pub mod registry;
 pub mod seam;
 

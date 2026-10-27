@@ -63,6 +63,15 @@ pub enum CapabilityFamily {
     /// needs explicit consent. Scope travels with the host call, never as
     /// a grant parameter (same precedent as `terminal.input.submit`).
     Audio,
+    /// Configuration write family (CTX-1613, bitty#2393).
+    ///
+    /// A NEW family beside `runtime.*`: the accepted read query stays
+    /// `runtime.inspect` (dashboard P-2), while `config.manage` is the only
+    /// write head. It writes the user layer only, is high-risk, takes no
+    /// parameter, and requires a digest-bound per-change consent. Neither
+    /// side implies the other: a read grant never widens into a write, and
+    /// a write grant never widens into a read.
+    Config,
 }
 
 impl CapabilityFamily {
@@ -86,6 +95,7 @@ impl CapabilityFamily {
             "workspace" => Some(Self::Workspace),
             "history" => Some(Self::History),
             "audio" => Some(Self::Audio),
+            "config" => Some(Self::Config),
             _ => None,
         }
     }
@@ -111,6 +121,7 @@ impl CapabilityFamily {
             Self::Workspace => "workspace",
             Self::History => "history",
             Self::Audio => "audio",
+            Self::Config => "config",
         }
     }
 
@@ -219,6 +230,9 @@ impl CapabilityFamily {
             // fast-poll read, state snapshot read, and the separate control
             // head. Read never implies control.
             Self::Audio => &["audio.spectrum", "audio.state.read", "audio.state.control"],
+            // Configuration write family (CTX-1613, bitty#2393): one
+            // write-only head, no parameter. Reads stay on `runtime.inspect`.
+            Self::Config => &["config.manage"],
         }
     }
 }
@@ -353,7 +367,8 @@ impl CapabilityId {
     /// Whether this identifier is flagged high-risk per RFC rule 3.
     ///
     /// High-risk: `terminal.input.all`, `terminal.raw-read`, `ui.protocol-register`,
-    /// `debug.control`, `runtime.plugin-manage`, `browser.embed`, and `env.read`.
+    /// `debug.control`, `runtime.plugin-manage`, `browser.embed`, `env.read`, and
+    /// `config.manage`.
     /// Consent UI must present them
     /// distinctly and they cannot be granted implicitly via workspace config or
     /// service indirection.
@@ -415,6 +430,10 @@ fn is_high_risk(head: &str) -> bool {
             // Environment variables routinely carry credentials, so every
             // `env.read` grant gets distinct consent presentation.
             | "env.read"
+            // CTX-1613 (bitty#2393): writes persisted user configuration.
+            // High-risk by construction: the granted plugin can change what
+            // the next launch loads, so consent is explicit and per change.
+            | "config.manage"
     )
 }
 
@@ -517,6 +536,10 @@ pub fn effect_statement_with(catalog: &CapabilityCatalog, id: &CapabilityId) -> 
         "audio.spectrum" => "Read the audio level meter (bounded fast poll, 5 Hz ceiling)",
         "audio.state.read" => "Read volume, mute, and port state (bounded snapshot)",
         "audio.state.control" => "Change volume and mute state (bounded steps)",
+        "config.manage" => {
+            "Change allowlisted user configuration values (write-only, high-risk, per-change \
+             consent)"
+        }
         _ => "Requested capability",
     }
 }
@@ -577,6 +600,57 @@ pub fn validate_closed_capability_with(
     })
 }
 
+/// Capabilities one accepted grant implies.
+///
+/// The table is deliberately empty for every head: no accepted grant widens
+/// another. In particular `config.manage` (CTX-1613, bitty#2393) is
+/// write-only and implies no read (`runtime.inspect` stays its own grant),
+/// and no read or management head implies `config.manage`. A future widening
+/// must be added here explicitly and reviewed; the default is no widening.
+#[must_use]
+pub fn implied_capabilities(granted: &CapabilityId) -> &'static [&'static str] {
+    let head = granted
+        .as_str()
+        .split(':')
+        .next()
+        .unwrap_or(granted.as_str());
+    IMPLIED_CAPABILITIES
+        .iter()
+        .find(|(granter, _)| *granter == head)
+        .map_or(&[], |(_, implied)| *implied)
+}
+
+/// The closed table of grant widenings. Empty by design (see
+/// [`implied_capabilities`]).
+const IMPLIED_CAPABILITIES: &[(&str, &[&str])] = &[];
+
+/// Expand one granted identifier into its closed capability set.
+///
+/// Every implied head is re-validated against the Core closed vocabulary and
+/// parsed into a [`CapabilityId`]; a widening that names an unknown head is a
+/// hard error instead of silently minting authority. Today the closure is the
+/// granted identifier itself, so the round trip is exact.
+pub fn expand_grant(
+    granted: &CapabilityId,
+) -> Result<std::collections::BTreeSet<CapabilityId>, PluginError> {
+    let mut closure = std::collections::BTreeSet::new();
+    closure.insert(granted.clone());
+    for implied in implied_capabilities(granted) {
+        let id = CapabilityId::parse(implied).map_err(|error| {
+            PluginError::capability(
+                *implied,
+                format!(
+                    "implied capability of '{}' is not in the closed vocabulary: {}",
+                    granted.as_str(),
+                    error
+                ),
+            )
+        })?;
+        closure.insert(id);
+    }
+    Ok(closure)
+}
+
 /// Closed identifier validation against a catalog.
 ///
 /// Returns error if the head is not a known capability; otherwise returns true
@@ -626,6 +700,7 @@ mod tests {
             "layout.provider",
             "workspace.read",
             "workspace.control",
+            "config.manage",
         ] {
             assert!(CapabilityId::parse(id).is_ok(), "should parse {id}");
         }
@@ -656,6 +731,7 @@ mod tests {
             CapabilityFamily::Workspace,
             CapabilityFamily::History,
             CapabilityFamily::Audio,
+            CapabilityFamily::Config,
         ];
         for family in families {
             assert!(family.denied_without_grant());
@@ -830,6 +906,80 @@ mod tests {
     }
 
     #[test]
+    fn config_family_is_write_only_and_high_risk() {
+        // CTX-1613 (bitty#2393, OQ-D1): the configuration write surface is
+        // one write-only head in a new family. Reads stay on the accepted
+        // `runtime.inspect` query, so no `config.read`/`config.write` pair
+        // exists and neither direction implies the other.
+        let granted = CapabilityId::parse("config.manage").expect("config.manage parses");
+        assert_eq!(granted.family(), CapabilityFamily::Config);
+        assert_eq!(granted.family().as_str(), "config");
+        assert!(!granted.has_param());
+        assert!(granted.is_high_risk());
+        assert_eq!(
+            effect_statement(&granted),
+            "Change allowlisted user configuration values (write-only, high-risk, per-change \
+             consent)"
+        );
+        assert!(CapabilityId::parse("config.manage:user").is_err());
+        for unknown in [
+            "config.read",
+            "config.write",
+            "config.set",
+            "config.preview",
+            "config",
+        ] {
+            assert!(
+                CapabilityId::parse(unknown).is_err(),
+                "'{unknown}' must stay outside the closed set"
+            );
+        }
+        assert_eq!(
+            CapabilityFamily::Config.closed_identifiers(),
+            &["config.manage"]
+        );
+        assert_eq!(
+            CapabilityFamily::parse("config"),
+            Some(CapabilityFamily::Config)
+        );
+    }
+
+    #[test]
+    fn config_manage_grant_implies_nothing_and_is_never_implied() {
+        // CTX-1613 (bitty#2393): grant/implied rules are exact. The write
+        // head widens to itself only, and no other accepted head (including
+        // the read and management heads) widens to it.
+        use bitty_package::manifest as package_manifest;
+
+        let granted = CapabilityId::parse("config.manage").expect("config.manage parses");
+        assert!(implied_capabilities(&granted).is_empty());
+        let closure = expand_grant(&granted).expect("closure expands");
+        assert_eq!(closure.len(), 1);
+        assert!(closure.contains(&granted));
+
+        for head in package_manifest::CLOSED_CAPABILITY_HEADS {
+            if *head == "config.manage" {
+                continue;
+            }
+            let raw = if package_manifest::capability_requires_param(head) {
+                format!("{head}:param")
+            } else {
+                (*head).to_string()
+            };
+            let other = CapabilityId::parse(&raw).expect("closed head parses");
+            assert!(
+                implied_capabilities(&other).is_empty(),
+                "'{head}' must not imply any capability"
+            );
+            let closure = expand_grant(&other).expect("closure expands");
+            assert!(
+                !closure.contains(&granted),
+                "'{head}' must never imply config.manage"
+            );
+        }
+    }
+
+    #[test]
     fn terminal_family_stays_frozen() {
         // RFC-0004 non-goal: no `terminal.*` member is widened,
         // reinterpreted, or given a read sub-scope. The v1 set is exactly
@@ -947,6 +1097,7 @@ mod tests {
             CapabilityFamily::Workspace,
             CapabilityFamily::History,
             CapabilityFamily::Audio,
+            CapabilityFamily::Config,
         ] {
             host_heads.extend(family.closed_identifiers().iter().copied());
         }

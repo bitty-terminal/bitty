@@ -326,6 +326,12 @@ pub const CAPABILITY_FAMILIES: &[&str] = &[
     // implies control; scope travels with the host call, never as a grant
     // parameter (same precedent as `terminal.input.submit`).
     "audio",
+    // Configuration write family (CTX-1613, bitty#2393). A NEW family beside
+    // `runtime.*`: capability-less config reads stay on the accepted
+    // `runtime.inspect` query (P-2), while `config.manage` is the only
+    // write head. Read is never folded into the write grant and the write
+    // grant never implies a read; OQ-D1 resolved as one write-only head.
+    "config",
 ];
 
 /// Every non-parameterized capability head in the closed normative set.
@@ -424,6 +430,13 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "audio.spectrum",
     "audio.state.read",
     "audio.state.control",
+    // Configuration write family (CTX-1613, bitty#2393). `config.manage` is
+    // the single, write-only, high-risk head: the user layer only, no
+    // parameter, allowlisted keys, per-change consent digest, and bounded
+    // calls. Configuration reads stay on `runtime.inspect`; neither head
+    // implies the other, so a dashboard can never turn a read grant into a
+    // write (or a write grant into a read).
+    "config.manage",
 ];
 
 /// Whether a closed capability head requires a `:PARAMETER`.

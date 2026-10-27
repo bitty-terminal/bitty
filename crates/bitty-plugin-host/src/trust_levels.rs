@@ -296,7 +296,13 @@ impl CapabilityDomain {
             // passes them through and their grants decide elsewhere, so the
             // matrix never invents authority the accepted grammar does not
             // already name.
-            | CapabilityFamily::Audio => &[],
+            | CapabilityFamily::Audio
+            // Configuration write family (CTX-1613, bitty#2393): user-layer
+            // writes are neither filesystem nor process authority in this
+            // matrix; the dedicated `config.manage` grant (high-risk,
+            // per-change consent) is the only gate and the trust gate passes
+            // the family through without inventing domain authority.
+            | CapabilityFamily::Config => &[],
         }
     }
 }

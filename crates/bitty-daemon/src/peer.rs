@@ -281,8 +281,7 @@ pub struct PeerGuard {
 }
 
 impl PeerGuard {
-    /// Capture and authenticate the connected peer before parsing any request.
-    ///
+    /// Capture and authenticate the connected peer before parsing any request.    ///
     /// The argument is the accepted, connected [`UnixStream`], not a generic
     /// descriptor: `SO_PEERCRED` on a *listening* socket reports the daemon's
     /// own pid/uid/gid, so an `AsFd` API would let a caller "authenticate" the
@@ -323,6 +322,39 @@ impl PeerGuard {
     /// refusal.
     pub fn recheck(&self, boundary: DispatchBoundary) -> Result<(), PeerError> {
         self.recheck_with(&PlatformProbe, boundary)
+    }
+
+    /// A guard bound to the current test process.
+    ///
+    /// Test-only: it captures `SO_PEERCRED` from a socketpair, which reports
+    /// the current process, so `recheck` exercises the real `/proc` path and
+    /// succeeds for every boundary while the test process is alive.
+    #[cfg(test)]
+    #[cfg(unix)]
+    pub(crate) fn for_current_process() -> Self {
+        let (stream, other) = UnixStream::pair().expect("socketpair");
+        let guard = Self::capture(&stream).expect("capture self");
+        drop(other);
+        guard
+    }
+
+    /// A guard whose captured start time is forged.
+    ///
+    /// Test-only: a live pid with a start time that does not match `/proc` is
+    /// exactly the recycled-pid condition `recheck` must refuse.
+    #[cfg(test)]
+    #[cfg(unix)]
+    pub(crate) fn with_forged_start_time(pid: u32, start_time: u64) -> Self {
+        let uid = geteuid().as_raw();
+        Self {
+            identity: PeerIdentity {
+                uid,
+                gid: nix::unistd::getegid().as_raw(),
+                pid,
+                start_time: Some(start_time),
+            },
+            expected_uid: uid,
+        }
     }
 
     #[cfg(unix)]
@@ -782,6 +814,30 @@ mod tests {
         for boundary in DispatchBoundary::ALL {
             assert!(boundary.method().contains('.'));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recycled_pid_is_refused_by_the_start_time() {
+        let real = PeerGuard::for_current_process();
+        let start_time = real
+            .identity()
+            .start_time()
+            .expect("Linux exposes a process start time");
+        let forged =
+            PeerGuard::with_forged_start_time(std::process::id(), start_time.saturating_add(1));
+        let error = forged
+            .recheck(DispatchBoundary::CreateSession)
+            .expect_err("a pid with a different start time is a recycled pid");
+        assert!(matches!(
+            error,
+            PeerError::RecheckFailed {
+                boundary: DispatchBoundary::CreateSession,
+                cause: PeerCause::Changed { .. }
+            }
+        ));
+        real.recheck(DispatchBoundary::CreateSession)
+            .expect("the real process still matches");
     }
 
     #[cfg(unix)]

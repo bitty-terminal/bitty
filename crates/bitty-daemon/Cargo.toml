@@ -27,6 +27,11 @@ path = "src/main.rs"
 # `rev = "9493674"` pin the workspace already resolves through
 # `bitty-runtime`, so this adds no package version and no second wire format.
 bitty-ipc-api = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674" }
+# bitty#2607: the v1 envelope is JSON, so the service loop needs one bounded
+# parser/renderer. `serde_json` 1.0 is already resolved and in the lockfile
+# through the existing workspace graph; this moves it from the dev graph to
+# the daemon's runtime graph and adds no package version.
+serde_json = "1"
 # CTX-1619: server-generated 128-bit ids for the registry (contract D-02).
 # The 0.4 line is already in the workspace lockfile (`bitty-rich`,
 # `bitty-runtime`, and `tempfile`); this adds no package version, no build-time
@@ -64,7 +69,3 @@ nix = { workspace = true, features = ["fs", "process", "signal", "socket", "user
 # 3.27.0 line is already in the workspace lockfile (through `proptest`), so
 # this adds no package version and stays out of the shipped daemon.
 tempfile = "3"
-# Workspace graph for the one-way dependency check. `serde_json` is already
-# in the lockfile through the existing graph, so this adds no package version
-# and stays out of the shipped daemon.
-serde_json = "1"

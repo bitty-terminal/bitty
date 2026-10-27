@@ -1,0 +1,302 @@
+//! The bounded `bitty-ipc` v1 envelopes and the typed parameter helpers.
+//!
+//! The daemon serves the accepted `bitty-ipc` v1 wire envelope: a JSON object
+//! with `v`, `id`, `method`, and `params` on the request side, and `v`, `id`,
+//! and `ok` plus `result` or `error` on the response side. The framing (a
+//! 4-byte big-endian length prefix) and the length bound come from
+//! `bitty-ipc-api`; this module only parses and renders the envelope and never
+//! invents a second wire format.
+//!
+//! Rules enforced here:
+//!
+//! - `v` must be a supported wire version, refused whole before the service
+//!   sees the request;
+//! - `id` is a bounded correlation value, validated by `bitty-ipc-api`;
+//! - `method` is validated by the `bitty-ipc` grammar, and a grammar violation
+//!   is `InvalidMethod` (a well-formed unknown method is `NotFound` later);
+//! - `params` is bounded and depth-checked, and an ambient `auth`, `scope`, or
+//!   `role` field is rejected rather than ignored;
+//! - an error response carries only the static class, code, message, and
+//!   numeric counts from the refusal. No caller bytes, path, token, bearer, or
+//!   another session's details can be rendered.
+
+use serde_json::{Map, Value, json};
+
+use bitty_ipc_api::error::ErrorClass;
+use bitty_ipc_api::frame::encode_frame;
+use bitty_ipc_api::wire::{
+    MAX_ID_BYTES, MAX_JSON_DEPTH, validate_id, validate_json_depth, validate_method,
+    validate_no_ambient_auth, validate_response_envelope, validate_wire_version,
+};
+
+use crate::handshake::ACCEPTED_WIRE_VERSION;
+use crate::registry::DaemonInstanceId;
+use crate::service::dispatch::{Refusal, RefusalKind};
+
+/// A parsed `bitty-ipc` v1 request envelope.
+#[derive(Debug, Clone)]
+pub struct RequestEnvelope {
+    /// The correlation id echoed on the response.
+    pub id: String,
+    /// The validated method name.
+    pub method: String,
+    /// The request parameters (`Null` when absent).
+    pub params: Value,
+}
+
+impl RequestEnvelope {
+    /// Parse one frame payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns a static [`Refusal`]: `InvalidRequest` for a malformed payload,
+    /// `InvalidMethod` for a grammar-invalid method, `VersionMismatch` for an
+    /// unsupported `v`, and `LimitExceeded` for an over-long `id`.
+    pub fn parse(payload: &[u8]) -> Result<Self, Refusal> {
+        let value: Value =
+            serde_json::from_slice(payload).map_err(|_| Refusal::invalid_request())?;
+        let object = value.as_object().ok_or_else(Refusal::invalid_request)?;
+        let version = object
+            .get("v")
+            .and_then(Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or_else(Refusal::invalid_request)?;
+        validate_wire_version(version).map_err(|_| Refusal::version_mismatch())?;
+
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(Refusal::invalid_request)?;
+        validate_id(id).map_err(|error| match error {
+            bitty_ipc_api::error::IpcError::LimitExceeded { limit, actual, .. } => {
+                Refusal::limit_exceeded(
+                    u64::try_from(limit).unwrap_or(u64::MAX),
+                    u64::try_from(actual).unwrap_or(u64::MAX),
+                )
+            }
+            _ => Refusal::invalid_request(),
+        })?;
+        if id.len() > MAX_ID_BYTES {
+            return Err(Refusal::invalid_request());
+        }
+
+        let method = object
+            .get("method")
+            .and_then(Value::as_str)
+            .ok_or_else(Refusal::invalid_request)?;
+        validate_method(method).map_err(|_| Refusal::invalid_method())?;
+
+        let params = object.get("params").cloned().unwrap_or(Value::Null);
+        if !params.is_null() {
+            let encoded = serde_json::to_vec(&params).map_err(|_| Refusal::invalid_request())?;
+            validate_json_depth(&encoded, MAX_JSON_DEPTH)
+                .map_err(|_| Refusal::invalid_request())?;
+            validate_no_ambient_auth(&encoded).map_err(|_| Refusal::invalid_request())?;
+        }
+        validate_no_ambient_auth(payload).map_err(|_| Refusal::invalid_request())?;
+
+        Ok(Self {
+            id: id.to_owned(),
+            method: method.to_owned(),
+            params,
+        })
+    }
+}
+
+/// Render a success response frame payload.
+///
+/// # Errors
+///
+/// Returns [`Refusal::internal`] when the result cannot be encoded or violates
+/// the response envelope bound.
+pub fn render_success(id: &str, result: &Value) -> Result<Vec<u8>, Refusal> {
+    let payload = serde_json::to_vec(&json!({
+        "v": ACCEPTED_WIRE_VERSION,
+        "id": id,
+        "ok": true,
+        "result": result,
+    }))
+    .map_err(|_| Refusal::internal())?;
+    validate_response_envelope(ACCEPTED_WIRE_VERSION, id, &payload)
+        .map_err(|_| Refusal::internal())?;
+    Ok(payload)
+}
+
+/// Render an error response frame payload.
+///
+/// # Errors
+///
+/// Returns [`Refusal::internal`] when the error cannot be encoded.
+pub fn render_error(id: &str, refusal: Refusal) -> Result<Vec<u8>, Refusal> {
+    let mut error = Map::new();
+    error.insert(
+        "class".to_owned(),
+        Value::String(class_name(refusal.class()).to_owned()),
+    );
+    error.insert("code".to_owned(), Value::String(refusal.code().to_owned()));
+    error.insert(
+        "message".to_owned(),
+        Value::String(refusal.message().to_owned()),
+    );
+    if let Some((actual, limit)) = refusal.counts() {
+        error.insert(
+            "counts".to_owned(),
+            json!({"actual": actual, "limit": limit}),
+        );
+    }
+    if let RefusalKind::Timeout {
+        request_id,
+        timeout_ms,
+    } = refusal.kind()
+    {
+        error.insert("request_id".to_owned(), json!(request_id));
+        error.insert("timeout_ms".to_owned(), json!(timeout_ms));
+    }
+    let payload = serde_json::to_vec(&json!({
+        "v": ACCEPTED_WIRE_VERSION,
+        "id": id,
+        "ok": false,
+        "error": Value::Object(error),
+    }))
+    .map_err(|_| Refusal::internal())?;
+    validate_response_envelope(ACCEPTED_WIRE_VERSION, id, &payload)
+        .map_err(|_| Refusal::internal())?;
+    Ok(payload)
+}
+
+/// Encode one payload as a length-prefixed frame.
+///
+/// # Errors
+///
+/// Returns [`Refusal::internal`] when the payload exceeds the frame bound.
+pub fn frame(payload: &[u8]) -> Result<Vec<u8>, Refusal> {
+    encode_frame(payload).map_err(|_| Refusal::internal())
+}
+
+fn class_name(class: ErrorClass) -> &'static str {
+    match class {
+        ErrorClass::Framing => "Framing",
+        ErrorClass::Channel => "Channel",
+        ErrorClass::Transport => "Transport",
+        ErrorClass::Timeout => "Timeout",
+        ErrorClass::Validation => "Validation",
+        ErrorClass::Scope => "Scope",
+        ErrorClass::Unauthenticated => "Unauthenticated",
+        ErrorClass::Denied => "Denied",
+        ErrorClass::NotFound => "NotFound",
+        ErrorClass::Unavailable => "Unavailable",
+        ErrorClass::Internal => "Internal",
+    }
+}
+
+/// Typed parameter extraction.
+///
+/// Every failure is a static `InvalidRequest`; no helper echoes the offending
+/// value or a field name from the caller.
+pub mod params {
+    use super::{DaemonInstanceId, Map, Refusal, Value};
+
+    /// The parameter object, or `None` when the request carries no parameters.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidRequest` when the parameters are present but not a JSON object.
+    pub fn object(params: &Value) -> Result<Option<&Map<String, Value>>, Refusal> {
+        match params {
+            Value::Null => Ok(None),
+            Value::Object(map) => Ok(Some(map)),
+            _ => Err(Refusal::invalid_request()),
+        }
+    }
+
+    /// A required string field.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidRequest` when the field is missing or not a string.
+    pub fn required_string<'a>(
+        fields: Option<&'a Map<String, Value>>,
+        key: &str,
+    ) -> Result<&'a str, Refusal> {
+        string_field(fields, key)?.ok_or_else(Refusal::invalid_request)
+    }
+
+    /// An optional string field.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidRequest` when the field is present but not a string.
+    pub fn string_field<'a>(
+        fields: Option<&'a Map<String, Value>>,
+        key: &str,
+    ) -> Result<Option<&'a str>, Refusal> {
+        match fields.and_then(|map| map.get(key)) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) => Ok(Some(value)),
+            Some(_) => Err(Refusal::invalid_request()),
+        }
+    }
+
+    /// An optional unsigned integer field.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidRequest` when the field is present but not a `u64`.
+    pub fn u64_field(
+        fields: Option<&Map<String, Value>>,
+        key: &str,
+    ) -> Result<Option<u64>, Refusal> {
+        match fields.and_then(|map| map.get(key)) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Number(number)) => number
+                .as_u64()
+                .map(Some)
+                .ok_or_else(Refusal::invalid_request),
+            Some(_) => Err(Refusal::invalid_request()),
+        }
+    }
+
+    /// A required unsigned integer field.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidRequest` when the field is missing or not a `u64`.
+    pub fn required_u64(fields: Option<&Map<String, Value>>, key: &str) -> Result<u64, Refusal> {
+        u64_field(fields, key)?.ok_or_else(Refusal::invalid_request)
+    }
+
+    /// An optional boolean field.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidRequest` when the field is present but not a boolean.
+    pub fn bool_field(
+        fields: Option<&Map<String, Value>>,
+        key: &str,
+    ) -> Result<Option<bool>, Refusal> {
+        match fields.and_then(|map| map.get(key)) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Bool(value)) => Ok(Some(*value)),
+            Some(_) => Err(Refusal::invalid_request()),
+        }
+    }
+
+    /// An optional daemon-instance field.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidRequest` when the field is not a 32-character lowercase hex
+    /// instance id.
+    pub fn instance_field(
+        fields: Option<&Map<String, Value>>,
+        key: &str,
+    ) -> Result<Option<DaemonInstanceId>, Refusal> {
+        let Some(value) = string_field(fields, key)? else {
+            return Ok(None);
+        };
+        value
+            .parse::<DaemonInstanceId>()
+            .map(Some)
+            .map_err(|_| Refusal::invalid_request())
+    }
+}

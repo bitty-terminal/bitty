@@ -118,6 +118,16 @@ pub trait AuditWriter {
     fn sync(&mut self) -> Result<(), AuditSinkError>;
 }
 
+impl<T: AuditWriter + ?Sized> AuditWriter for Box<T> {
+    fn append_line(&mut self, line: &[u8]) -> Result<(), AuditSinkError> {
+        (**self).append_line(line)
+    }
+
+    fn sync(&mut self) -> Result<(), AuditSinkError> {
+        (**self).sync()
+    }
+}
+
 /// An owner-private, bounded, rotating audit file.
 #[cfg(unix)]
 #[derive(Debug)]

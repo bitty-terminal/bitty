@@ -309,7 +309,7 @@ impl Refusal {
     #[must_use]
     pub fn code(self) -> &'static str {
         match self.kind {
-            RefusalKind::Denied(code) => code.as_str(),
+            RefusalKind::Denied(code) => code.wire_name(),
             RefusalKind::NotFound => "NotFound",
             RefusalKind::InvalidMethod => "InvalidMethod",
             RefusalKind::InvalidRequest => "InvalidRequest",

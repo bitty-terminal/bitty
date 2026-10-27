@@ -29,12 +29,23 @@ macro_rules! define_refusal_codes {
                 $(Self::$variant,)*
             ];
 
-            /// The stable static spelling.
+            /// The stable static audit spelling (snake case).
             #[must_use]
             pub const fn as_str(self) -> &'static str {
                 match self {
                     $(
                         Self::$variant => $spelling,
+                    )*
+                }
+            }
+
+            /// The frozen wire spelling (`Denied.code`), `PascalCase` per the
+            /// service refusal taxonomy (`bitty#2664`).
+            #[must_use]
+            pub const fn wire_name(self) -> &'static str {
+                match self {
+                    $(
+                        Self::$variant => stringify!($variant),
                     )*
                 }
             }
@@ -98,6 +109,62 @@ mod tests {
                 byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
             }));
             assert_eq!(code.to_string(), code.as_str());
+        }
+    }
+
+    #[test]
+    fn every_code_has_a_unique_wire_spelling() {
+        let wire: BTreeSet<_> = RefusalCode::ALL
+            .iter()
+            .map(|code| code.wire_name())
+            .collect();
+        assert_eq!(wire.len(), RefusalCode::ALL.len());
+        for code in RefusalCode::ALL {
+            assert!(
+                code.wire_name()
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric()),
+                "{} is not a wire word",
+                code.wire_name()
+            );
+            assert_eq!(code.wire_name(), stringify_code(code));
+        }
+    }
+
+    fn stringify_code(code: RefusalCode) -> &'static str {
+        match code {
+            RefusalCode::VersionMismatch => "VersionMismatch",
+            RefusalCode::Unauthenticated => "Unauthenticated",
+            RefusalCode::FrameTooLarge => "FrameTooLarge",
+            RefusalCode::PayloadTooLarge => "PayloadTooLarge",
+            RefusalCode::LimitExceeded => "LimitExceeded",
+            RefusalCode::PendingLimitExceeded => "PendingLimitExceeded",
+            RefusalCode::ChannelFull => "ChannelFull",
+            RefusalCode::RateLimited => "RateLimited",
+            RefusalCode::ScopeViolation => "ScopeViolation",
+            RefusalCode::ConsentRequired => "ConsentRequired",
+            RefusalCode::ControllerRequired => "ControllerRequired",
+            RefusalCode::InvalidControlToken => "InvalidControlToken",
+            RefusalCode::ObserverGrantRequired => "ObserverGrantRequired",
+            RefusalCode::AlreadyNegotiated => "AlreadyNegotiated",
+            RefusalCode::UnsupportedCapability => "UnsupportedCapability",
+            RefusalCode::UnsupportedPlatform => "UnsupportedPlatform",
+            RefusalCode::StaleInstance => "StaleInstance",
+            RefusalCode::StaleGeneration => "StaleGeneration",
+            RefusalCode::NotFound => "NotFound",
+            RefusalCode::ControlHeld => "ControlHeld",
+            RefusalCode::SessionStopping => "SessionStopping",
+            RefusalCode::NotRunning => "NotRunning",
+            RefusalCode::TerminalAlreadyHosted => "TerminalAlreadyHosted",
+            RefusalCode::ActiveSessions => "ActiveSessions",
+            RefusalCode::DaemonStopping => "DaemonStopping",
+            RefusalCode::IdempotencyConflict => "IdempotencyConflict",
+            RefusalCode::IdempotencyCapacity => "IdempotencyCapacity",
+            RefusalCode::TerminalEventLost => "TerminalEventLost",
+            RefusalCode::InvalidMethod => "InvalidMethod",
+            RefusalCode::InvalidRequest => "InvalidRequest",
+            RefusalCode::Timeout => "Timeout",
+            RefusalCode::Internal => "Internal",
         }
     }
 

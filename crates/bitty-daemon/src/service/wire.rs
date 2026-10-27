@@ -29,7 +29,10 @@ use bitty_ipc_api::wire::{
     validate_no_ambient_auth, validate_response_envelope, validate_wire_version,
 };
 
-use crate::handshake::ACCEPTED_WIRE_VERSION;
+use crate::contract::{CAPABILITIES, ClientVersion};
+use crate::handshake::{
+    ACCEPTED_WIRE_VERSION, ClientCorrelation, HandshakeResponse, NegotiateRequest, SecretBearer,
+};
 use crate::registry::DaemonInstanceId;
 use crate::service::dispatch::{Refusal, RefusalKind};
 
@@ -171,6 +174,103 @@ pub fn render_error(id: &str, refusal: Refusal) -> Result<Vec<u8>, Refusal> {
 /// Returns [`Refusal::internal`] when the payload exceeds the frame bound.
 pub fn frame(payload: &[u8]) -> Result<Vec<u8>, Refusal> {
     encode_frame(payload).map_err(|_| Refusal::internal())
+}
+
+/// Parse the `daemon.negotiate` request parameters.
+///
+/// # Errors
+///
+/// `InvalidRequest` for a malformed `client_version`, `client_correlation`, or
+/// `host_grant`; `Unauthenticated` for a present but malformed
+/// `operator_capability`, so the response never distinguishes a bad bearer from
+/// a missing capability file.
+pub fn parse_negotiate(params: &Value) -> Result<NegotiateRequest, Refusal> {
+    let map = params.as_object().ok_or_else(Refusal::invalid_request)?;
+    let version = map
+        .get("client_version")
+        .and_then(Value::as_object)
+        .ok_or_else(Refusal::invalid_request)?;
+    let major = version
+        .get("major")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(Refusal::invalid_request)?;
+    let minor = version
+        .get("minor")
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+        .ok_or_else(Refusal::invalid_request)?;
+    let mut request = NegotiateRequest::new(ClientVersion::new(major, minor));
+    if let Some(value) = map.get("client_correlation") {
+        let correlation = value.as_str().ok_or_else(Refusal::invalid_request)?;
+        request = request.with_client_correlation(
+            ClientCorrelation::parse(correlation).map_err(|_| Refusal::invalid_request())?,
+        );
+    }
+    if let Some(value) = map.get("operator_capability") {
+        let raw = value.as_str().ok_or_else(Refusal::unauthenticated)?;
+        let capability = SecretBearer::parse(raw).map_err(|_| Refusal::unauthenticated())?;
+        request = request.with_operator_capability(capability);
+    }
+    if let Some(value) = map.get("host_grant") {
+        let raw = value.as_str().ok_or_else(Refusal::invalid_request)?;
+        request = request
+            .with_host_grant(SecretBearer::parse(raw).map_err(|_| Refusal::invalid_request())?);
+    }
+    Ok(request)
+}
+
+/// Render the complete handshake response as a JSON value.
+///
+/// # Errors
+///
+/// Always `Ok`; the signature stays `Result` so a future field with a fallible
+/// encoding does not change the server call site.
+pub fn handshake_value(response: &HandshakeResponse) -> Result<Value, Refusal> {
+    let capabilities: Map<String, Value> = CAPABILITIES
+        .all()
+        .into_iter()
+        .map(|(name, enabled)| (name.to_owned(), Value::Bool(enabled)))
+        .collect();
+    let limits: Vec<Value> = response
+        .limits
+        .advertised()
+        .map(|entry| {
+            json!({
+                "name": entry.name,
+                "effective": entry.value.effective(),
+                "default": entry.value.default_value(),
+                "system_max": entry.value.system_max(),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "wire_version": response.wire_version,
+        "service_api_version": {
+            "major": response.service_api_version.major,
+            "minor": response.service_api_version.minor,
+            "min_client_minor": response.service_api_version.min_client_minor,
+        },
+        "daemon_instance_id": response.daemon_instance_id.as_hex(),
+        "daemon_pid": response.daemon_pid,
+        "server_identity": {
+            "uid": response.server_identity.uid,
+            "endpoint_kind": response.server_identity.endpoint_kind.as_str(),
+            "endpoint_owner": response.server_identity.endpoint_owner,
+            "endpoint_mode": response.server_identity.endpoint_mode,
+        },
+        "peer_identity": {
+            "uid": response.peer_identity.uid,
+            "pid": response.peer_identity.pid,
+            "start_time": response.peer_identity.start_time,
+        },
+        "client_id": response.client_id.as_hex(),
+        "scopes": response.scopes.names(),
+        "capabilities": Value::Object(capabilities),
+        "limits": limits,
+        "server_monotonic_ms": response.server_monotonic_ms,
+        "daemon_state": response.daemon_state.as_str(),
+    }))
 }
 
 fn class_name(class: ErrorClass) -> &'static str {

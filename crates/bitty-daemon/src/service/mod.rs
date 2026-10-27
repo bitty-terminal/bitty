@@ -11,6 +11,7 @@
 //! | [`grants`] | Host-consent and observer grants: mint, single-use consume, TTL, revoke |
 //! | [`wire`] | The bounded `bitty-ipc` v1 envelopes and the static error rendering |
 //! | [`dispatch`] | The eleven-stage authorization order and the closed refusal mapping |
+//! | [`server`] | Endpoint admission, connection cap, rate and payload limits, and shutdown |
 //!
 //! Every refusal is a static code with static counts and bounds. No caller
 //! bytes, path, token, bearer, terminal text, or another session's fields are
@@ -22,6 +23,7 @@ pub mod dispatch;
 pub mod grants;
 pub mod protocol;
 pub mod scopes;
+pub mod server;
 pub mod wire;
 
 pub use dispatch::{Refusal, Service};
@@ -31,3 +33,4 @@ pub use scopes::{
     IdempotencyClass, MethodResolution, ScopeRequirement, ServiceMethod, ServiceScope,
     ServiceScopeSet, resolve,
 };
+pub use server::{ServerConfig, ServerError, ServerOutcome, run};

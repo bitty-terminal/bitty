@@ -1,7 +1,8 @@
 //! bitty#2606 / CTX-1616: `bittyd` binary seam behavior.
 //!
-//! The binary must answer `--version`, must report the seam (no endpoint
-//! bound) with no arguments, and must create no runtime file while doing so.
+//! The binary must answer `--version`, must report the service status (no
+//! endpoint bound) with no arguments, and must create no runtime file while
+//! doing so.
 //! The no-argument tests run with a throwaway `XDG_RUNTIME_DIR` so a future
 //! accidental socket bind or lock file is caught here, not on a user host; one
 //! variant also sets `BITTYD_ENDPOINT` to prove the seam ignores the override
@@ -106,7 +107,7 @@ fn no_arguments_reports_the_seam_and_creates_no_endpoint() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("session-host seam"), "stdout: {stdout}");
     assert!(
-        stdout.contains("ipc service: not wired"),
+        stdout.contains("ipc service: wired (bitty-ipc v1"),
         "stdout: {stdout}"
     );
     assert!(stdout.contains("endpoint: none bound"), "stdout: {stdout}");

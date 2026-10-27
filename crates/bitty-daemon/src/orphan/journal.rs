@@ -864,9 +864,16 @@ fn load_records(
             OrphanRecord::placeholder(session_id)
         } else {
             let bytes = fs::read(entry.path())?;
-            match String::from_utf8(bytes) {
-                Ok(text) => OrphanRecord::parse(session_id, &text),
-                Err(_) => OrphanRecord::placeholder(session_id),
+            // The stat gate above is advisory: a file that grows between the
+            // stat and the read is still read at its new size, so re-check
+            // before decoding rather than trusting the metadata alone.
+            if bytes.len() as u64 > size_bound {
+                OrphanRecord::placeholder(session_id)
+            } else {
+                match String::from_utf8(bytes) {
+                    Ok(text) => OrphanRecord::parse(session_id, &text),
+                    Err(_) => OrphanRecord::placeholder(session_id),
+                }
             }
         };
         records.insert(session_id, record);

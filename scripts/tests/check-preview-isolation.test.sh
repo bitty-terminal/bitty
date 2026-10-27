@@ -170,21 +170,29 @@ expect_present "$PREVIEW_ACTIVE" "gh release delete" \
 expect_present "$PREVIEW_ACTIVE" "--cleanup-tag" \
   "retention pruning removes the matching preview tag"
 
-# Stable readers reject the preview identity. The tag-equality mode is safe to
-# invoke; the bootstrap rejection is asserted statically because running an
-# installer is not a unit-test action.
+# Stable readers reject the preview identity. The Unix bootstrap runs in
+# --dry-run with a pinned prerelease version: normalize_version rejects the
+# dash before any network call, so this is a real hermetic assertion. The
+# PowerShell equivalent is asserted statically because pwsh is not available on
+# every test host.
 if scripts/check-release-version.sh --tag v0.0.30-preview.20261027 >/dev/null 2>&1; then
   fail "check-release-version.sh accepted a preview tag"
 else
   pass "check-release-version.sh rejects a preview tag"
 fi
-for installer in scripts/install.sh scripts/install.ps1; do
-  if grep -qF "prerelease versions are not served by the bootstrap scripts" "$installer"; then
-    pass "$installer rejects prerelease versions"
-  else
-    fail "$installer has no prerelease rejection"
-  fi
-done
+INSTALL_LOG="$TMP_BASE/install.log"
+if BITTY_VERSION=v0.0.30-preview.20261027 bash scripts/install.sh --dry-run >"$INSTALL_LOG" 2>&1; then
+  fail "install.sh accepted a prerelease version"
+elif grep -qF "prerelease versions are not served by the bootstrap scripts" "$INSTALL_LOG"; then
+  pass "install.sh rejects a prerelease version before any network access"
+else
+  fail "install.sh failed without the prerelease refusal: $(tr '\n' ' ' <"$INSTALL_LOG")"
+fi
+if grep -qF "prerelease versions are not served by the bootstrap scripts" scripts/install.ps1; then
+  pass "scripts/install.ps1 rejects prerelease versions"
+else
+  fail "scripts/install.ps1 has no prerelease rejection"
+fi
 
 # --- 3. Preview triggers and per-job gating ---------------------------------
 if grep -qF 'cron: "30 21 * * *"' "$PREVIEW_ACTIVE" &&
@@ -237,7 +245,7 @@ for job in "${preview_jobs[@]}"; do
   fi
 done
 
-for job in build package release; do
+for job in isolation build package release; do
   block="$(extract_job "$PREVIEW_ACTIVE" "$job")"
   if grep -qF 'ref: ${{ needs.preflight.outputs.sha }}' <<<"$block"; then
     pass "preview job '$job' checks out the pinned preflight commit"
@@ -245,6 +253,22 @@ for job in build package release; do
     fail "preview job '$job' does not pin the preflight commit"
   fi
 done
+
+# The isolation proof must run before any build leg starts.
+isolation_block="$(extract_job "$PREVIEW_ACTIVE" isolation)"
+build_block="$(extract_job "$PREVIEW_ACTIVE" build)"
+if grep -qF "./scripts/tests/check-preview-isolation.test.sh" <<<"$isolation_block"; then
+  pass "the isolation job runs the preview isolation test"
+else
+  fail "the isolation job does not run the preview isolation test"
+fi
+if grep -Eq '^    needs:.*\bisolation\b|^ +isolation,?$' <<<"$build_block"; then
+  pass "the build job waits for the isolation gate"
+else
+  fail "the build job does not declare needs: isolation"
+fi
+expect_absent "$PREVIEW_ACTIVE" "--skip-arch-check" \
+  "preview workflow does not bypass the macOS arch assertion"
 
 # --- 4. Stable predicate regression on every publisher ---------------------
 if grep -qF 'stable: ${{ steps.stable.outputs.stable }}' "$RELEASE_ACTIVE"; then

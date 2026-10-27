@@ -25,6 +25,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly ACCEPTED_TARGET="aarch64-apple-darwin"
 PAYLOAD=("LICENSE" "README.md" "CHANGELOG.md")
 DRY_RUN=0
+SKIP_ARCH_CHECK=0
 
 VERSION=""
 TARGET="$ACCEPTED_TARGET"
@@ -34,7 +35,7 @@ OUTPUT=""
 usage() {
   cat <<'EOF'
 Usage: scripts/make-macos-preview-archive.sh --version VERSION --binary PATH --output PATH
-                                             [--target TARGET] [--dry-run]
+                                             [--target TARGET] [--dry-run] [--skip-arch-check]
 
   --version VERSION  release base version embedded in the archive name (X.Y.Z)
   --binary PATH      aarch64-apple-darwin bitty binary to pack as bin/bitty
@@ -42,6 +43,8 @@ Usage: scripts/make-macos-preview-archive.sh --version VERSION --binary PATH --o
                      bitty-<VERSION>-aarch64-apple-darwin.tar.zst
   --target TARGET    rust target triple (default and accepted: aarch64-apple-darwin)
   --dry-run          validate and stage the payload only; do not write the archive
+  --skip-arch-check  skip the lipo arm64 assertion (fixture tests only; never
+                     use for a release archive)
 EOF
 }
 
@@ -67,6 +70,10 @@ while (($#)); do
     ;;
   --dry-run)
     DRY_RUN=1
+    shift
+    ;;
+  --skip-arch-check)
+    SKIP_ARCH_CHECK=1
     shift
     ;;
   -h | --help)
@@ -97,9 +104,13 @@ EXPECTED_NAME="bitty-${VERSION}-${TARGET}.tar.zst"
   die "--output basename must be $EXPECTED_NAME, got: $(basename "$OUTPUT")"
 
 # A Mach-O binary must carry exactly the arm64 slice. lipo exists on the macOS
-# packaging runner; the fixture test runs on any host, so the check is skipped
-# there with an explicit note rather than silently claiming success.
-if command -v lipo >/dev/null 2>&1; then
+# packaging runner, which is where the production workflow runs this packer.
+# The hermetic fixture test uses a shell-script fake binary (not a Mach-O), so
+# it explicitly opts out with --skip-arch-check; a host without lipo emits a
+# note and leaves the assertion to the macOS runner.
+if ((SKIP_ARCH_CHECK)); then
+  echo "make-macos-preview-archive: WARNING: --skip-arch-check: arm64 slice assertion skipped (fixture only)" >&2
+elif command -v lipo >/dev/null 2>&1; then
   arches="$(lipo -archs "$BINARY" 2>/dev/null || true)"
   [[ "$arches" == "arm64" ]] ||
     die "binary is not an arm64-only Mach-O (lipo -archs: '${arches:-unknown}')"

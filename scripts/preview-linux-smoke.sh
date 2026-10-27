@@ -77,6 +77,8 @@ done
 [[ -n "$TOPDIR" ]] || usage_error "--topdir is required"
 [[ "$TOPDIR" =~ ^bitty-[0-9]+\.[0-9]+\.[0-9]+-[a-z0-9_-]+$ ]] ||
   die "unexpected archive top-level directory: $TOPDIR"
+[[ -n "$IMAGE" ]] || usage_error "--image is required"
+[[ "$IMAGE" != -* ]] || usage_error "--image must not start with '-', got: $IMAGE"
 command -v docker >/dev/null 2>&1 || die "docker not found"
 
 ARCHIVE_DIR="$(cd "$(dirname "$ARCHIVE")" && pwd)"

@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # make-macos-preview-archive.test.sh — fixture test for the macOS preview packer.
 #
-# Uses an ephemeral fake binary plus the repo's own LICENSE/README/CHANGELOG
-# (no network, no macOS, no cargo build): dry-run staging, real assembly, the
-# fixed member list, the executable bit, and the argument-validation failures
-# that keep the accepted asset name and arm64-only matrix from drifting.
+# Uses an ephemeral shell-script fake binary plus the repo's own
+# LICENSE/README/CHANGELOG (no network, no macOS, no cargo build): dry-run
+# staging, real assembly, the fixed member list, the executable bit, and the
+# argument-validation failures that keep the accepted asset name and arm64-only
+# matrix from drifting. The fake is not a Mach-O, so fixture invocations pass
+# --skip-arch-check; the production workflow never does.
 # Follows the PASS:/FAIL: convention of the other scripts/tests/*.test.sh gates.
 set -euo pipefail
 
@@ -48,7 +50,7 @@ chmod +x "$FAKE_BIN"
 
 # --- dry-run stages the payload without writing the archive ---
 if "$SCRIPT" --version "$VERSION" --target "$TARGET" \
-  --binary "$FAKE_BIN" --output "$OUT" --dry-run >/dev/null 2>&1; then
+  --binary "$FAKE_BIN" --output "$OUT" --dry-run --skip-arch-check >/dev/null 2>&1; then
   if [[ -e "$OUT" ]]; then
     fail "dry-run wrote the archive"
   else
@@ -60,7 +62,7 @@ fi
 
 # --- real assembly ---
 if ! "$SCRIPT" --version "$VERSION" --target "$TARGET" \
-  --binary "$FAKE_BIN" --output "$OUT" >/dev/null 2>&1; then
+  --binary "$FAKE_BIN" --output "$OUT" --skip-arch-check >/dev/null 2>&1; then
   fail "assembly exited non-zero"
 fi
 [[ -f "$OUT" ]] || fail "archive not created"
@@ -100,6 +102,16 @@ if "$DEST/$TOPDIR/bin/bitty" --version | grep -qF "bitty $VERSION"; then
   pass "extracted binary runs"
 else
   fail "extracted binary did not report $VERSION"
+fi
+
+# --- the fixture-only arch opt-out is explicit and loud ---
+if "$SCRIPT" --version "$VERSION" --target "$TARGET" \
+  --binary "$FAKE_BIN" --output "$TMP_BASE/skip/$TOPDIR.tar.zst" --dry-run --skip-arch-check \
+  >"$TMP_BASE/skip.log" 2>&1 &&
+  grep -qF -- "--skip-arch-check: arm64 slice assertion skipped" "$TMP_BASE/skip.log"; then
+  pass "--skip-arch-check opts out of lipo with a warning"
+else
+  fail "--skip-arch-check did not opt out loudly"
 fi
 
 # --- accepted matrix and asset name are enforced ---

@@ -13,6 +13,10 @@
 //! bounded raster cache, S6 #1849), both consumed behind the Core-owned
 //! [`bitty_rich::kitty_seam`] traits; the graphics extension implements the
 //! same traits on its side, and Core never depends on extension internals.
+//! The runtime holds that seam as a dyn handle
+//! ([`Runtime::set_kitty_backend`], default `CoreKittyBackend`), so the
+//! decode call sites here and the raster call sites in `present.rs` never
+//! name the free functions.
 //! Placement policy (admission, per-origin quotas, origin
 //! tagging, alternate-screen plane swaps) is unchanged and unit-tested in
 //! `bitty-rich`.
@@ -97,7 +101,7 @@
 //! has deterministic two-layer semantics.
 
 use super::*;
-use bitty_rich::kitty_seam::{KittyDecodeBackend as _, KittyTransmitFormat};
+use bitty_rich::kitty_seam::KittyTransmitFormat;
 
 /// Typed Kitty display-routing rejection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,6 +261,27 @@ impl Runtime {
     #[must_use]
     pub fn kitty_raster_bytes(&self) -> usize {
         self.kitty_raster_cache.total_bytes()
+    }
+
+    /// Binds the Kitty decode/raster backend behind the Core-owned seam
+    /// (CTX-1614, #2163).
+    ///
+    /// The composition root is the intended caller: it passes a shared
+    /// [`bitty_rich::kitty_seam::KittyBackend`] handle, and every decode
+    /// (transmit, owned frame, edit) and raster (present) call site then
+    /// dispatches through it — no call site names the in-repo free functions.
+    /// Construction installs
+    /// `Arc::new(bitty_rich::kitty_seam::CoreKittyBackend::new())`, so an
+    /// unbound runtime keeps the byte-identical Core-local behavior; the
+    /// graphics extension binds the same traits on its side (W-147 keeps its
+    /// identifier out of Core sources).
+    ///
+    /// Rebinding drops the scaled-blit raster cache first: cached entries hold
+    /// bytes produced by the previous backend, and a later present must never
+    /// paint them under a new handle.
+    pub fn set_kitty_backend(&mut self, backend: bitty_rich::kitty_seam::KittyBackendHandle) {
+        self.invalidate_kitty_raster_cache();
+        self.kitty_graphics = backend;
     }
 
     /// Enables or disables the raster cache (S6, #1849, disable-path test

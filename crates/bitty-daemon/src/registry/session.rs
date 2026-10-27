@@ -14,7 +14,12 @@ use super::id::{Entropy, SessionId, random_hex};
 
 /// Maximum bytes in a client-supplied `terminal_id` (contract `D-02`,
 /// `terminal_id_bytes`).
-pub const TERMINAL_ID_MAX_BYTES: usize = 128;
+///
+/// This is a byte-bounded identifier limit: its compiled floor is the system
+/// maximum, so the handshake advertises this same value and a configuration
+/// cannot lower the advertisement below the registry check.
+pub const TERMINAL_ID_MAX_BYTES: usize =
+    crate::limits::LimitId::TerminalIdBytes.system_max_value() as usize;
 
 /// Maximum bytes in the opaque owner peer facts this registry stores.
 ///

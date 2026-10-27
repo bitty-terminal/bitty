@@ -219,6 +219,16 @@ bitty.commands.register({ id = "replay", title = "Replay", run = function()
   if again_ok then return "REPLAYED" end
   return again.code
 end })
+bitty.commands.register({ id = "apply_digest", title = "Apply digest", run = function(digest)
+  local ok, out = pcall(bitty.config.set, "appearance.theme", "catppuccin", digest)
+  if not ok then return "ERR:" .. out.code end
+  return tostring(out.applied) .. "|" .. out.reload
+end })
+bitty.commands.register({ id = "digest", title = "Digest", run = function()
+  local p, err = preview()
+  if not p then return err end
+  return p.digest
+end })
 bitty.commands.register({ id = "changed", title = "Changed", run = function()
   local p, err = preview()
   if not p then return err end
@@ -248,7 +258,16 @@ bitty.commands.register({ id = "keys", title = "Bad keys", run = function()
 end })
 "##;
 
-const PROBE_COMMANDS: &[&str] = &["preview", "apply", "replay", "changed", "bad", "keys"];
+const PROBE_COMMANDS: &[&str] = &[
+    "preview",
+    "apply",
+    "replay",
+    "changed",
+    "bad",
+    "keys",
+    "digest",
+    "apply_digest",
+];
 
 /// Granted store package: a recorded grant is the only way a plugin receives
 /// `config.manage` (review B2).
@@ -349,6 +368,36 @@ fn approval_tokens_are_one_shot_and_value_bound() {
         1,
         "only the first apply wrote"
     );
+}
+
+#[test]
+fn approval_tokens_are_generation_bound() {
+    // CTX-1613: the approval table lives on the generation. A reload drops
+    // the old table, so a token minted before it can never authorize a write
+    // in the new generation even though the rendered change is identical.
+    let (mut rt, backend) = granted_runtime();
+    let id = pid("xuepoo.configprobe");
+    let digest = run(&mut rt, "digest");
+    assert_eq!(digest.len(), 64, "preview issued a token: {digest}");
+    assert!(backend.calls.borrow().is_empty(), "no write yet");
+
+    rt.reload(&id).expect("reload the generation");
+    let replay = string(
+        rt.dispatch_command(&id, "apply_digest", &[LuaValue::String(digest)])
+            .expect("dispatch apply_digest"),
+    );
+    assert_eq!(
+        replay, "ERR:E_CONFIG_APPROVAL_REQUIRED",
+        "a pre-reload token never authorizes the new generation"
+    );
+    assert!(
+        backend.calls.borrow().is_empty(),
+        "the stale token reached no backend"
+    );
+
+    // The reloaded generation mints and applies its own token normally.
+    assert_eq!(run(&mut rt, "apply"), "true|auto");
+    assert_eq!(backend.calls.borrow().len(), 1);
 }
 
 #[test]

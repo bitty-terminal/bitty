@@ -2027,7 +2027,7 @@ pub struct PluginServices {
     /// Durable user-layer backend for `config.set`.
     ///
     /// Installed only for a granted generation (no backend without grant);
-    /// `None` leaves granted calls failing closed with `E_NOT_IMPLEMENTED`.
+    /// `None` leaves granted calls failing closed with `E_CONFIG_UNAVAILABLE`.
     /// The backend returns only a path-free failure class, so plugin
     /// diagnostics never carry host paths.
     config_backend: RefCell<Option<Rc<dyn ConfigWriteBackend>>>,
@@ -2402,7 +2402,7 @@ impl PluginServices {
 
     /// Attach the durable user-layer backend for `config.set` (CTX-1613,
     /// bitty#2393). Installed only for a granted generation; without it a
-    /// granted write fails closed with `E_NOT_IMPLEMENTED`. The backend owns
+    /// granted call fails closed with `E_CONFIG_UNAVAILABLE`. The backend owns
     /// validation and the atomic replace and returns only a path-free failure
     /// class.
     pub fn set_config_write_backend(&self, backend: Option<Rc<dyn ConfigWriteBackend>>) {
@@ -3596,7 +3596,7 @@ impl PluginServices {
     /// Apply one change bound to a preview digest issued by this generation.
     ///
     /// `expiry` is the bridge's cheap-call deadline. It is checked before the
-    /// consent token is consumed and before the backend is called, so an
+    /// approval token is consumed and before the backend is called, so an
     /// already-expired call never commits. Once the backend returns, the
     /// caller must not turn a slow `fsync` into a timeout: the bridge uses
     /// the mutating-call guard for exactly this reason.

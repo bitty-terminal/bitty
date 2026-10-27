@@ -834,7 +834,7 @@ pub struct PluginRuntime {
     /// CTX-1613: durable user-layer backend behind `config.set`.
     ///
     /// `None` by default (no writable configuration layer configured):
-    /// granted writes drain to a typed `E_NOT_IMPLEMENTED` with no side
+    /// granted calls fail closed with `E_CONFIG_UNAVAILABLE` and have no side
     /// effect. Captured only by `config.manage` generations at activation;
     /// the backend returns a path-free failure class so plugin diagnostics
     /// never carry host paths.
@@ -1591,8 +1591,8 @@ impl PluginRuntime {
 
     /// Install the durable user-layer backend for `config.set` (CTX-1613,
     /// bitty#2393). Call before activation: only `config.manage` generations
-    /// capture the current backend, and `None` leaves granted writes failing
-    /// closed with `E_NOT_IMPLEMENTED`. Deterministic failure can be injected
+    /// capture the current backend, and `None` leaves granted calls failing
+    /// closed with `E_CONFIG_UNAVAILABLE`. Deterministic failure can be injected
     /// through the [`ConfigWriteBackend`] implementation.
     pub fn set_config_write_backend(&mut self, backend: Option<Rc<dyn ConfigWriteBackend>>) {
         self.config_write_backend = backend;

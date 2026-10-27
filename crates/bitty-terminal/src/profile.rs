@@ -3826,6 +3826,13 @@ pub(crate) struct UserLayerConfigWriter {
     config_dir: PathBuf,
     /// Resolved user-layer file (`init.lua` or the `config.lua` alias).
     target: PathBuf,
+    /// Profile chain startup actually loaded (`--profile`/`BITTY_PROFILE`
+    /// over the user layer's own selector), if any.
+    ///
+    /// The writer seeds and validates against the chain the next launch will
+    /// load: this resolved name wins over the selector still stored in the
+    /// layer.
+    active_profile: Option<String>,
 }
 
 impl UserLayerConfigWriter {
@@ -3833,13 +3840,22 @@ impl UserLayerConfigWriter {
     ///
     /// Returns `None` when the target is not a direct child of `config_dir`:
     /// an explicit `--config` outside the user root must never become a
-    /// plugin write target.
-    pub(crate) fn new(config_dir: PathBuf, target: PathBuf) -> Option<Self> {
+    /// plugin write target. `active_profile` is the resolved profile startup
+    /// loaded (the selector stays in the layer).
+    pub(crate) fn new(
+        config_dir: PathBuf,
+        target: PathBuf,
+        active_profile: Option<String>,
+    ) -> Option<Self> {
         let parent = target.parent()?;
         if parent != config_dir {
             return None;
         }
-        Some(Self { config_dir, target })
+        Some(Self {
+            config_dir,
+            target,
+            active_profile,
+        })
     }
 
     /// Render the exact candidate user-layer bytes and the bounded diff.
@@ -3905,9 +3921,13 @@ impl UserLayerConfigWriter {
             if !declares_table(&current.plan, table) {
                 let seed = inherited_table_literal(
                     table,
-                    &merged_current_unvalidated(Some(current), &self.config_dir)
-                        .map_err(|error| config_invalid("seed merge", error))?
-                        .effective,
+                    &merged_current_unvalidated(
+                        Some(current),
+                        &self.config_dir,
+                        self.active_profile.as_deref(),
+                    )
+                    .map_err(|error| config_invalid("seed merge", error))?
+                    .effective,
                 );
                 changed_keys.extend(seed_changed_keys(table, &seed));
                 updated = set_lua_path(&updated, &[table], &seed)
@@ -3916,7 +3936,12 @@ impl UserLayerConfigWriter {
         }
         updated = set_lua_path(&updated, &segments, &change.value().render_literal())
             .map_err(|error| config_invalid("value splice", format_args!("{error}")))?;
-        let merged = validate_user_candidate(&updated, &self.target, &self.config_dir)?;
+        let merged = validate_user_candidate(
+            &updated,
+            &self.target,
+            &self.config_dir,
+            self.active_profile.as_deref(),
+        )?;
         // Defense in depth: the bytes just spliced must re-read as the
         // requested value. Never report success for a write that landed
         // somewhere the merge does not read.
@@ -4048,7 +4073,11 @@ impl bitty_runtime::plugin_runtime::ConfigWriteBackend for UserLayerConfigWriter
 fn write_failure(error: ProfileWriteError) -> ConfigWriteFailure {
     match error {
         ProfileWriteError::NotRegular => ConfigWriteFailure::Unsafe,
-        ProfileWriteError::Changed | ProfileWriteError::Io(_) => ConfigWriteFailure::Io,
+        // A pre-commit identity mismatch wrote nothing: the candidate moved
+        // under the approval, which is the `Stale` contract (the caller can
+        // re-preview), not an I/O fault.
+        ProfileWriteError::Changed => ConfigWriteFailure::Stale,
+        ProfileWriteError::Io(_) => ConfigWriteFailure::Io,
     }
 }
 
@@ -4144,16 +4173,30 @@ fn parse_user_plan(
     Ok(bitty_config::LayeredPlan::new(source, plan))
 }
 
-/// Merge a candidate user layer over its selector's profile chain without
+/// Profile the next launch loads: the one-launch request wins over the user
+/// layer's own selector, matching startup resolution.
+///
+/// CTX-1613 review: seeding or validating against the selector while startup
+/// runs `--profile`/`BITTY_PROFILE` would pin (and accept) a different
+/// profile's values, changing settings the user never saw approved.
+fn resolved_profile_name(
+    user: Option<&bitty_config::LayeredPlan>,
+    active_profile: Option<&str>,
+) -> Option<String> {
+    active_profile.map(str::to_string).or_else(|| {
+        user.and_then(|layer| layer.plan.selector.as_ref())
+            .map(|selector| selector.profile.clone())
+    })
+}
+
+/// Merge a candidate user layer over its active profile chain without
 /// validation (seeding only).
 fn merged_current_unvalidated(
     user: Option<bitty_config::LayeredPlan>,
     config_dir: &Path,
+    active_profile: Option<&str>,
 ) -> Result<bitty_config::MergedConfig, bitty_config::ConfigError> {
-    let selector = user
-        .as_ref()
-        .and_then(|layer| layer.plan.selector.as_ref())
-        .map(|selector| selector.profile.clone());
+    let selector = resolved_profile_name(user.as_ref(), active_profile);
     let chain = match selector {
         Some(name) => bitty_config::file::load_profile_chain_in_dir(
             &name,
@@ -4173,14 +4216,11 @@ fn validate_user_candidate(
     content: &str,
     path: &Path,
     config_dir: &Path,
+    active_profile: Option<&str>,
 ) -> Result<bitty_config::MergedConfig, ConfigWriteFailure> {
     let candidate =
         parse_user_plan(content, path).map_err(|error| config_invalid("candidate parse", error))?;
-    let selector = candidate
-        .plan
-        .selector
-        .as_ref()
-        .map(|selector| selector.profile.clone());
+    let selector = resolved_profile_name(Some(&candidate), active_profile);
     let chain = match selector {
         Some(name) => bitty_config::file::load_profile_chain_in_dir(
             &name,
@@ -5247,7 +5287,7 @@ mod tests {
     // ── config.manage user-layer writer (CTX-1613, bitty#2393) ────────
 
     fn config_writer(dir: &Path) -> UserLayerConfigWriter {
-        UserLayerConfigWriter::new(dir.to_path_buf(), dir.join("init.lua"))
+        UserLayerConfigWriter::new(dir.to_path_buf(), dir.join("init.lua"), None)
             .expect("init.lua is a direct child of the config dir")
     }
 
@@ -5269,7 +5309,16 @@ mod tests {
     }
 
     fn merged_for(dir: &Path, content: &str) -> bitty_config::MergedConfig {
-        validate_user_candidate(content, &dir.join("init.lua"), dir).expect("valid candidate")
+        merged_for_active(dir, content, None)
+    }
+
+    fn merged_for_active(
+        dir: &Path,
+        content: &str,
+        active_profile: Option<&str>,
+    ) -> bitty_config::MergedConfig {
+        validate_user_candidate(content, &dir.join("init.lua"), dir, active_profile)
+            .expect("valid candidate")
     }
 
     #[test]
@@ -5296,14 +5345,104 @@ mod tests {
     #[test]
     fn config_writer_constructor_refuses_targets_outside_the_user_root() {
         let dir = scratch_dir("cfg-root");
-        assert!(UserLayerConfigWriter::new(dir.clone(), dir.join("init.lua")).is_some());
+        assert!(UserLayerConfigWriter::new(dir.clone(), dir.join("init.lua"), None).is_some());
         assert!(
-            UserLayerConfigWriter::new(dir.clone(), dir.join("nested/init.lua")).is_none(),
+            UserLayerConfigWriter::new(dir.clone(), dir.join("nested/init.lua"), None).is_none(),
             "only a direct child of the config root is addressable"
         );
         assert!(
-            UserLayerConfigWriter::new(dir.clone(), dir.join("../init.lua")).is_none(),
+            UserLayerConfigWriter::new(dir.clone(), dir.join("../init.lua"), None).is_none(),
             "traversal never resolves outside the root"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_writer_seeds_and_validates_the_active_profile_over_the_selector() {
+        // CTX-1613 review: startup applies `--profile`/`BITTY_PROFILE` over
+        // the layer's own selector. Seeding from the selector would pin a
+        // different profile's inherited values into the user layer, changing
+        // settings the user never saw approved; validating against the
+        // selector could also accept a candidate the next launch refuses.
+        let dir = scratch_dir("cfg-active-profile");
+        std::fs::write(dir.join("init.lua"), render_selector_lua("home")).expect("selector");
+        std::fs::create_dir_all(dir.join("profiles")).expect("profiles dir");
+        std::fs::write(
+            dir.join("profiles/home.lua"),
+            "return { font = { family = \"Home Mono\", size = 11 } }\n",
+        )
+        .expect("home profile");
+        std::fs::write(
+            dir.join("profiles/work.lua"),
+            "return { font = { family = \"Work Mono\", size = 13 } }\n",
+        )
+        .expect("work profile");
+
+        let writer = UserLayerConfigWriter::new(
+            dir.clone(),
+            dir.join("init.lua"),
+            Some(String::from("work")),
+        )
+        .expect("direct child");
+        let change = setting_change(
+            "font.size",
+            ConfigSettingValue::number(15.0).expect("number"),
+        );
+        let approved = preview(&writer, &change);
+        assert!(
+            approved.rendered.contains("family = \"Work Mono\""),
+            "the seed comes from the profile startup loads: {}",
+            approved.rendered
+        );
+        assert!(
+            !approved.rendered.contains("Home Mono"),
+            "the selector profile never seeds an active-request write: {}",
+            approved.rendered
+        );
+        apply(&writer, &change).expect("applied");
+
+        let content = std::fs::read_to_string(dir.join("init.lua")).expect("layer");
+        assert!(content.contains("profile = \"home\""), "selector survives");
+        assert!(content.contains("family = \"Work Mono\""), "{content}");
+        assert!(content.contains("size = 15"), "{content}");
+        // The strict loader accepts the candidate on the chain the next
+        // launch with the same request resolves.
+        let merged = merged_for_active(&dir, &content, Some("work"));
+        let family = schema_field_entry("font.family").expect("schema field");
+        assert_eq!(
+            (family.get)(&merged.effective),
+            ConfigValue::Text(String::from("Work Mono"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn config_writer_maps_a_precommit_race_to_stale() {
+        // CodeRabbit review: a concurrent writer that lands after the
+        // apply-time render is the `Stale` contract (nothing was written, the
+        // plugin can re-preview), never an I/O fault.
+        let dir = scratch_dir("cfg-stale-map");
+        let path = dir.join("init.lua");
+        std::fs::write(&path, "return { font = { size = 11 } }\n").expect("layer");
+        let (_, identity) = read_profile(ReadIntent::Edit, "config", &path).expect("preimage");
+        let concurrent = "return { font = { size = 99 } }\n";
+        let _hook = arm_commit_hook({
+            let path = path.clone();
+            move |_candidate| std::fs::write(&path, concurrent).expect("concurrent edit")
+        });
+        let failure = write_profile_atomic_with(
+            &path,
+            "return { font = { size = 12 } }\n",
+            Some(&identity),
+            true,
+        )
+        .expect_err("identity moved before the rename");
+        assert!(matches!(failure, ProfileWriteError::Changed));
+        assert_eq!(write_failure(failure), ConfigWriteFailure::Stale);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("bytes"),
+            concurrent,
+            "the concurrent bytes survive"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -5704,6 +5843,38 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "the symlink is not replaced"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_writer_refuses_a_fifo_target_without_blocking() {
+        // Review B4: a raced FIFO target must be refused before any read
+        // (a blocking open on a writer-less FIFO would hang the app), and
+        // the entry must not be replaced.
+        use std::os::unix::fs::FileTypeExt;
+
+        let dir = scratch_dir("cfg-fifo");
+        let path = dir.join("init.lua");
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR).expect("fifo");
+        let writer = config_writer(&dir);
+        let failure = writer
+            .preview(
+                "xuepoo.test",
+                &setting_change(
+                    "font.size",
+                    ConfigSettingValue::number(12.5).expect("number"),
+                ),
+            )
+            .expect_err("fifo refused");
+        assert_eq!(failure, ConfigWriteFailure::Unsafe);
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("fifo meta")
+                .file_type()
+                .is_fifo(),
+            "the FIFO is not replaced"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

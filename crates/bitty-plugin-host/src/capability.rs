@@ -444,7 +444,10 @@ fn is_high_risk(head: &str) -> bool {
             | "env.read"
             // CTX-1613 (bitty#2393): writes persisted user configuration.
             // High-risk by construction: the granted plugin can change what
-            // the next launch loads, so consent is explicit and per change.
+            // the next launch loads. The host enforces the grant plus a
+            // one-shot approval token bound to the exact rendered bytes; the
+            // two-press confirmation is a dashboard UI contract, not a host
+            // guarantee.
             | "config.manage"
     )
 }

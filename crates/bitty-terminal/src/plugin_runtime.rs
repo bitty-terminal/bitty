@@ -578,8 +578,14 @@ pub(crate) struct StartupSeed<'a> {
     /// Resolved user-layer file a `config.manage` write may target
     /// (CTX-1613). Only a direct child of the resolved config root is ever
     /// wired; `None` (safe mode, explicit `--config` outside the root, or a
-    /// test) leaves granted writes failing closed with `E_NOT_IMPLEMENTED`.
+    /// test) leaves granted writes failing closed with
+    /// `E_CONFIG_UNAVAILABLE`.
     pub(crate) config_file: Option<&'a Path>,
+    /// Profile chain startup actually loaded (`--profile`/`BITTY_PROFILE`
+    /// over the user layer's selector), if any (CTX-1613). The writer seeds
+    /// and validates against that chain, so it never pins or accepts another
+    /// profile's values. `None` means startup loaded no profile.
+    pub(crate) config_profile: Option<&'a str>,
 }
 
 /// Discover and activate installed and development plugins, returning the
@@ -713,13 +719,15 @@ pub(crate) fn discover_with_roots(
     // `config.manage` write head. Only a target that is a direct child of the
     // resolved config root is accepted; an explicit `--config` outside the
     // user root, a missing root, or safe mode leaves the backend unwired, so
-    // granted writes fail closed with `E_NOT_IMPLEMENTED`. The per-generation
-    // grant and the call-time gate stay as the first two layers.
+    // granted calls fail closed with `E_CONFIG_UNAVAILABLE`. The
+    // per-generation grant and the call-time gate stay as the first two
+    // layers.
     if !safe_mode {
         if let (Some(target), Some(config_dir)) = (seed.config_file, settings_dir.as_deref()) {
             if let Some(writer) = crate::profile::UserLayerConfigWriter::new(
                 config_dir.to_path_buf(),
                 target.to_path_buf(),
+                seed.config_profile.map(str::to_string),
             ) {
                 runtime.set_config_write_backend(Some(Rc::new(writer)));
             } else {
@@ -1050,6 +1058,7 @@ mod tests {
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: None,
             config_file: None,
+            config_profile: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], Some(home), None)
             .expect("dev root must yield a session");
@@ -1125,6 +1134,7 @@ mod tests {
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: None,
             config_file: Some(&target),
+            config_profile: None,
         };
         let manifest_bytes = std::fs::read(plugin.join("bitty-plugin.toml")).expect("manifest");
         let manifest =
@@ -1237,6 +1247,7 @@ mod tests {
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: Some(context),
             config_file: None,
+            config_profile: None,
         }
     }
 
@@ -1357,6 +1368,7 @@ mod tests {
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: None,
             config_file: None,
+            config_profile: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -1548,6 +1560,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: None,
             config_file: None,
+            config_profile: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -1778,6 +1791,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: None,
             config_file: None,
+            config_profile: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -1942,6 +1956,7 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: None,
             config_file: None,
+            config_profile: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -2340,6 +2355,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             history_capture: bitty_config::HistoryCaptureConfig::default(),
             inspect: None,
             config_file: None,
+            config_profile: None,
         };
         discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session")

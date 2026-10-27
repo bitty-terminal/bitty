@@ -9,7 +9,9 @@
 //!   runtime's own `PluginHost`. The component broker's capability gate reads
 //!   that host, and before this mirror it was empty in production, so every
 //!   request would deny as "plugin is not registered". Nothing is granted
-//!   here: the mirror reproduces the activated generation's existing grant.
+//!   here: the mirror reproduces the activated generation's existing grant,
+//!   including the heads that require a recorded decision (CTX-1613), which
+//!   are never reconstructed from the manifest alone.
 //!   A hot reload with a new manifest hash replaces the mirrored predecessor,
 //!   so the policy host follows the live generation rather than the startup
 //!   snapshot.
@@ -157,8 +159,17 @@ pub fn mirror_plugin_authority(
                 .iter()
                 .filter_map(|capability| CapabilityId::parse(capability).ok())
                 .collect(),
+            // The development/bundled seam grants every declared head except
+            // the ones that require a recorded decision (CTX-1613). The
+            // mirror must reproduce the plugin runtime's decision instead of
+            // recomputing a wider one: `config.manage` is withheld here for
+            // the same reason `effective_granted` withholds it, so the
+            // policy host never names a write grant the user never made.
             None => match manifest.capabilities.all_ids() {
-                Ok(ids) => ids,
+                Ok(ids) => ids
+                    .into_iter()
+                    .filter(|capability| !capability.requires_recorded_grant())
+                    .collect(),
                 Err(error) => {
                     if registered_hash.is_some() {
                         let _ = remove_mirrored(runtime, id, &mut warn);
@@ -301,5 +312,89 @@ mod tests {
                 .expect("runtime");
         assert!(!plugin_is_active(&runtime, "acme.missing"));
         assert!(!plugin_is_active(&runtime, "not a valid id"));
+    }
+
+    #[test]
+    fn mirror_never_grants_a_recorded_only_head_to_a_dev_root() {
+        // CTX-1613: a development-root package that merely declares
+        // `config.manage` activates, but the mirrored policy-host grant must
+        // reproduce the plugin runtime's decision and withhold the write
+        // head. A mirror that recomputed the declared set in full would name
+        // a high-risk grant the user never recorded.
+        use std::rc::Rc;
+
+        use bitty_lua::{BridgeError, LuaValue};
+        use bitty_runtime::plugin_runtime::{
+            EmptySettings, LifecycleState, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
+        };
+
+        struct NoSnapshot;
+
+        impl SnapshotSource for NoSnapshot {
+            fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+                Err(BridgeError::capability_denied("terminal.semantic-read"))
+            }
+        }
+
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tag = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "bitty-component-mirror-{}-{tag}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let plugin = root.join("xuepoo.mirrorprobe");
+        std::fs::create_dir_all(plugin.join("lua")).expect("plugin dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            "[plugin]\nid = \"xuepoo.mirrorprobe\"\nname = \"Mirror\"\nversion = \"0.1.0\"\n\
+             description = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n\
+             [capabilities]\nconfig.manage = true\n",
+        )
+        .expect("manifest");
+        std::fs::write(plugin.join("lua/init.lua"), "return {}\n").expect("init");
+
+        let mut plugins = PluginRuntime::new(PluginRuntimeConfig {
+            safe_mode: false,
+            data_dir: Some(root.join("plugins-state")),
+            store_root: None,
+            bundled_roots: Vec::new(),
+            third_party_roots: vec![root.clone()],
+            settings: Rc::new(EmptySettings),
+            snapshot: Rc::new(NoSnapshot),
+        });
+        assert_eq!(plugins.discover().len(), 1, "one dev plugin discovered");
+        for (id, result) in plugins.activate_discovered() {
+            let report = result.unwrap_or_else(|error| panic!("activate {id}: {error}"));
+            assert_eq!(
+                report.state,
+                LifecycleState::Active,
+                "the recorded-only head must not block activation"
+            );
+        }
+
+        let mut runtime =
+            Runtime::with_deterministic_rasterizer(bitty_runtime::RuntimeConfig::default())
+                .expect("runtime");
+        let mirrored = mirror_plugin_authority(&mut runtime, &plugins, |plugin, reason| {
+            panic!("mirror refused {plugin}: {reason}");
+        });
+        assert_eq!(mirrored, 1, "the generation is mirrored");
+        let id = PluginId::new("xuepoo.mirrorprobe").expect("plugin id");
+        assert!(
+            plugin_is_active(&runtime, "xuepoo.mirrorprobe"),
+            "the plugin keeps its other authority"
+        );
+        let hash = plugins
+            .discovered_package(&id)
+            .expect("discovered package")
+            .manifest
+            .manifest_hash();
+        let config_manage = CapabilityId::parse("config.manage").expect("closed head");
+        assert!(
+            !runtime.is_capability_granted(&id, &hash, &config_manage),
+            "the policy host must never name an unrecorded write grant"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 }

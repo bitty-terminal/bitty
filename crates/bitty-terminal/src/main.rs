@@ -1134,6 +1134,12 @@ fn main() {
                 .config_file
                 .as_deref()
                 .filter(|path| inspect_context.config_dir.as_deref() == path.parent()),
+            // The profile chain the writer seeds/validates against must match
+            // the one startup loaded: `--profile`/`BITTY_PROFILE` first, then
+            // the user layer's selector. The inspect context carries exactly
+            // that resolved name; safe mode reports `None` and never installs
+            // the writer anyway.
+            config_profile: inspect_context.profile.as_deref(),
         },
     );
     let live_snapshot = plugin_session

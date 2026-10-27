@@ -499,6 +499,34 @@ impl ServiceMethod {
         }
     }
 
+    /// The audit action label for this method.
+    ///
+    /// Mode-dependent methods (`daemon.host_grant`) use the mint label; the
+    /// revoke mode records its own more specific label inside the handler.
+    #[must_use]
+    pub const fn audit_action(self) -> crate::audit::AuditAction {
+        use crate::audit::AuditAction;
+        match self {
+            Self::DaemonNegotiate => AuditAction::Negotiate,
+            Self::DaemonStatus => AuditAction::DaemonStatus,
+            Self::DaemonStop => AuditAction::Stop,
+            Self::DaemonHostGrant => AuditAction::HostGrant,
+            Self::DaemonOrphansVerify => AuditAction::OrphanVerify,
+            Self::SessionCreate => AuditAction::Create,
+            Self::SessionStatus => AuditAction::Status,
+            Self::SessionList => AuditAction::List,
+            Self::SessionAttach => AuditAction::Attach,
+            Self::SessionGrant => AuditAction::Grant,
+            Self::SessionGrantRevoke => AuditAction::GrantRevoke,
+            Self::SessionDetach => AuditAction::Detach,
+            Self::SessionControlTransfer => AuditAction::Transfer,
+            Self::SessionResize => AuditAction::Resize,
+            Self::SessionAbort => AuditAction::Abort,
+            Self::SessionKill => AuditAction::Kill,
+            Self::LeaseHeartbeat => AuditAction::Heartbeat,
+        }
+    }
+
     /// Whether the method is a state-changing method that requires an audit
     /// admission and, for the privileged subset, a peer re-check.
     #[must_use]

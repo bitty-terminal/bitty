@@ -279,6 +279,22 @@ impl Refusal {
         }
     }
 
+    /// The static code recorded in audit for any refusal class.
+    #[must_use]
+    pub const fn audit_code(self) -> RefusalCode {
+        match self.kind {
+            RefusalKind::Denied(code) => code,
+            RefusalKind::NotFound => RefusalCode::NotFound,
+            RefusalKind::InvalidMethod => RefusalCode::InvalidMethod,
+            RefusalKind::InvalidRequest => RefusalCode::InvalidRequest,
+            RefusalKind::Timeout { .. } => RefusalCode::Timeout,
+            RefusalKind::VersionMismatch => RefusalCode::VersionMismatch,
+            RefusalKind::Unauthenticated => RefusalCode::Unauthenticated,
+            RefusalKind::LimitExceeded { .. } => RefusalCode::LimitExceeded,
+            RefusalKind::Internal => RefusalCode::Internal,
+        }
+    }
+
     /// Whether this refusal closes the connection.
     #[must_use]
     pub const fn closes_connection(self) -> bool {
@@ -469,6 +485,12 @@ impl Service {
         self.audit.is_degraded()
     }
 
+    /// The append/refusal/terminal counters of the audit ring.
+    #[must_use]
+    pub fn audit_counters(&self) -> crate::audit::AuditCounters {
+        self.audit.counters()
+    }
+
     /// Read-only access for adapters and tests.
     #[must_use]
     pub const fn host(&self) -> &SessionHost {
@@ -547,11 +569,27 @@ impl Service {
         if connection.is_negotiated() {
             return Err(Refusal::denied(RefusalCode::AlreadyNegotiated));
         }
-        let negotiated = crate::handshake::negotiate(request, &self.limits)
-            .map_err(|_| Refusal::version_mismatch())?;
+        let negotiated = match crate::handshake::negotiate(request, &self.limits) {
+            Ok(negotiated) => negotiated,
+            Err(_) => {
+                let _ = self.audit.record(
+                    AuditEntry::new(AuditAction::Negotiate)
+                        .actor(connection.audit_actor())
+                        .result(AuditResult::Refused(RefusalCode::VersionMismatch)),
+                    now,
+                );
+                return Err(Refusal::version_mismatch());
+            }
+        };
 
         if let Some(presented) = request.operator_capability.as_ref() {
             if !self.operator.verify(presented) {
+                let _ = self.audit.record(
+                    AuditEntry::new(AuditAction::Negotiate)
+                        .actor(connection.audit_actor())
+                        .result(AuditResult::Refused(RefusalCode::Unauthenticated)),
+                    now,
+                );
                 return Err(Refusal::unauthenticated());
             }
             for scope in ServiceScope::operator().iter() {
@@ -608,6 +646,29 @@ impl Service {
     /// Returns a [`Refusal`] for every failure stage. Nothing is applied on a
     /// refusal.
     pub fn dispatch(
+        &mut self,
+        connection: &mut Connection,
+        method: ServiceMethod,
+        params: &Value,
+        now: MonotonicMs,
+    ) -> Result<Value, Refusal> {
+        let result = self.dispatch_inner(connection, method, params, now);
+        if let Err(refusal) = result {
+            // D-16: a refusal is attributed. The per-connection suppression
+            // budget/aggregation is a tracked follow-up (README).
+            let mut entry = AuditEntry::new(method.audit_action())
+                .actor(connection.audit_actor())
+                .result(AuditResult::Refused(refusal.audit_code()))
+                .target(AuditTarget::none());
+            if let Some((actual, limit)) = refusal.counts() {
+                entry = entry.counts(AuditCounts::new(actual, limit, None));
+            }
+            let _ = self.audit.record(entry, now);
+        }
+        result
+    }
+
+    fn dispatch_inner(
         &mut self,
         connection: &mut Connection,
         method: ServiceMethod,
@@ -1085,7 +1146,9 @@ impl Service {
                 let grant_id = parse_grant_id(fields)?;
                 self.recheck(connection, DispatchBoundary::HostGrantRevoke)?;
                 self.admit()?;
-                let outcome = self.grants.revoke(grant_id, now.as_millis());
+                let outcome = self
+                    .grants
+                    .revoke_kind(grant_id, GrantKind::Host, now.as_millis());
                 self.record(
                     AuditAction::HostGrantRevoke,
                     connection,
@@ -1345,14 +1408,15 @@ impl Service {
         match admission {
             Ok(Admission::Replay(IdempotencyResult::Applied(applied))) => {
                 let snapshot = self.snapshot(applied.session_id, now)?;
+                let attach = self
+                    .host
+                    .find_attach_by_ref(applied.session_id, applied.result_ref);
                 Ok(json!({
                     "session": session_json(&snapshot),
-                    "attach_id": self
-                        .host
-                        .find_attach_by_ref(applied.session_id, applied.result_ref)
-                        .map(|attach| attach.as_hex()),
+                    "attach_id": attach.map(|attach| attach.as_hex()),
                     "role": "controller",
                     "replayed": true,
+                    "not_attached": attach.is_none(),
                 }))
             }
             Ok(Admission::Replay(IdempotencyResult::Refused(code))) => Err(Refusal::denied(code)),
@@ -1619,7 +1683,9 @@ impl Service {
             self.control_authority(connection, session_id, token.as_ref(), true, now)?;
         self.recheck(connection, DispatchBoundary::ObserverGrantRevoke)?;
         self.admit()?;
-        let outcome = self.grants.revoke(grant_id, now.as_millis());
+        let outcome = self
+            .grants
+            .revoke_kind(grant_id, GrantKind::Observer, now.as_millis());
         self.record(
             AuditAction::GrantRevoke,
             connection,
@@ -1722,13 +1788,14 @@ impl Service {
         match admission {
             Ok(Admission::Replay(IdempotencyResult::Applied(applied))) => {
                 let snapshot = self.snapshot(applied.session_id, now)?;
+                let controller = self
+                    .host
+                    .find_attach_by_ref(applied.session_id, applied.result_ref);
                 Ok(json!({
                     "session": session_json(&snapshot),
-                    "controller": self
-                        .host
-                        .find_attach_by_ref(applied.session_id, applied.result_ref)
-                        .map(|attach| attach.as_hex()),
+                    "controller": controller.map(|attach| attach.as_hex()),
                     "replayed": true,
+                    "not_attached": controller.is_none(),
                 }))
             }
             Ok(Admission::Replay(IdempotencyResult::Refused(code))) => Err(Refusal::denied(code)),
@@ -2241,7 +2308,7 @@ impl Counts {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2999,6 +3066,7 @@ mod tests {
 
         let mut creator = consumer();
         negotiate_ok(&mut service, &mut creator, 3);
+        let refusals = service.audit_counters().refusals;
         let error = service
             .dispatch(
                 &mut creator,
@@ -3008,6 +3076,10 @@ mod tests {
             )
             .expect_err("no terminal.manage");
         assert_eq!(error.denied_code(), Some(RefusalCode::ScopeViolation));
+        assert!(
+            service.audit_counters().refusals > refusals,
+            "a refused mutation is attributed (D-16)"
+        );
     }
 
     #[test]

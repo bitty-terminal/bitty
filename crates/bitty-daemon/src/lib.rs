@@ -1,26 +1,38 @@
 //! `bitty-daemon`: the `bittyd` session-host crate seam.
 //!
-//! Status: **seam plus the in-memory state core, the session event stream, the
-//! compiled limits with their idempotency and audit stores, the endpoint,
-//! instance-lock, and peer-trust primitives, and the attach/control state
-//! machine**. This crate fixes the service version, the capability set, and the
-//! version-negotiation skeleton required by the accepted [`bittyd` Session-Host
+//! Status: **service loop plus the in-memory state core, the session event
+//! stream, the compiled limits with their idempotency and audit stores, the
+//! endpoint, instance-lock, and peer-trust primitives, and the attach/control
+//! state machine**. This crate fixes the service version, the capability set,
+//! and the version negotiation required by the accepted [`bittyd` Session-Host
 //! Contract]. It implements the registry half of bitty#2601 (server-generated
 //! ids, session records, counters, retention), the bounded orphan journal, the
 //! event stream of bitty#2602 (snapshot plus bounded backlog, per-session
 //! revision ordering, per-lease routing, control-frame reservation, the
 //! terminal-event guarantee, and heartbeat/last-seen), the compiled limits and
 //! advertised triples of bitty#2603, the two bounded idempotency stores, the
-//! bounded content-free audit ring, the endpoint, instance-lock, and
-//! peer-trust primitives of bitty#2604 ([`endpoint`], [`peer`], [`platform`]),
-//! and the lease, control-token, control transfer, and abort/kill half of
-//! bitty#2609. It still starts no listener, binds no
-//! endpoint, creates no socket file, spawns no worker, and exposes no IPC
-//! method. The IPC service task (bitty#2607) replaces the not-wired branch in
-//! [`seam::SeamStatus`] with the real `bitty-ipc` v1 server loop,
-//! authenticates peers, evaluates scopes and observer grants, and maps
-//! registry, event, limit, idempotency, audit, and state-machine refusals onto
-//! the service error taxonomy.
+//! bounded content-free audit ring and its owner-private sink, the endpoint,
+//! instance-lock, and peer-trust primitives of bitty#2604 ([`endpoint`],
+//! [`peer`], [`platform`]), the lease, control-token, control transfer, and
+//! abort/kill half of bitty#2609, and the bitty#2607 service surface:
+//!
+//! - [`service::scopes`]: the `session.*` / `daemon.*` registry and the frozen
+//!   method catalog, deny-by-default;
+//! - [`service::wire`] and [`service::protocol`]: the bounded v1 envelopes and
+//!   the per-connection state;
+//! - [`service::grants`]: host-consent and observer grants;
+//! - [`service::frame`]: per-frame `SCM_CREDENTIALS` on Linux;
+//! - [`service::dispatch`]: the eleven-stage authorization order and the
+//!   closed refusal mapping;
+//! - [`service::server`]: the `bittyd start` admission loop, limits, signals,
+//!   and shutdown;
+//! - [`operator`] and [`audit_sink`]: the per-boot operator capability and the
+//!   fail-closed audit writer.
+//!
+//! `bittyd start` binds the per-user endpoint, mints the operator capability,
+//! serves the bitty-ipc v1 envelope, and stops on `daemon.stop` or a signal.
+//! It still spawns no worker, signals no process, and opens no TCP listener.
+//! Plain `bittyd` prints status and creates no runtime file.
 //!
 //! # Ownership and dependency direction
 //!
@@ -73,12 +85,14 @@
 //!
 //! # Deferred, by owning slice
 //!
-//! | Contract area | Owner |
-//! | --- | --- |
-//! | `bitty-ipc` v1 server loop, peer capture/re-check, scope evaluation, observer-grant consumption, endpoint lock and tamper detection, method dispatch, error mapping, event framing and correlation id, refusal-to-result mapping, audit sink writer | bitty#2607 |
-//! | Observer-grant store (mint, single-use consume, TTL, peer binding, revoke) | bitty#2609 follow-up |
-//! | Endpoint discovery, containment identity, graceful/kill signalling, reaping, platform probes and journal ACLs | bitty#2604 |
-//! | Conformance corpus and fake-server parity | bitty#2605 |
+//! | Contract area | Owner | Answer today |
+//! | --- | --- | --- |
+//! | Worker spawn and bind | bitty#2604 | `session.create` registers a `created` session; nothing binds generation 1 |
+//! | Containment identity, signalling, reaping, the production orphan reaper, platform probes and journal ACLs | bitty#2604 | `daemon.orphans.verify` is `Denied/UnsupportedCapability` |
+//! | Terminal content plane, including `session.resize` | bitty#2604 / terminal contract | no `terminal.*` scope is granted; `session.resize` is `Denied/ScopeViolation` |
+//! | Pushing session events on a connection (no subscribe method) | bitty#2602 | `session.status`/`session.list` are the reconciliation reads |
+//! | Per-connection refusal-audit budget aggregation | bitty#2603 follow-up | every refusal is recorded; aggregation is not implemented |
+//! | Conformance corpus and fake-server parity | bitty#2605 | not part of this crate |
 //!
 //! [`bittyd` Session-Host Contract]: https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/bittyd-session-host-contract.md
 

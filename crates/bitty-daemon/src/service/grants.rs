@@ -566,15 +566,21 @@ impl GrantStore {
         })
     }
 
-    /// Revoke a grant by its non-secret id.
+    /// Revoke a grant by its non-secret id when it has `kind`.
     ///
-    /// Keyless and naturally idempotent: a second revoke, an unknown id, and an
-    /// already-consumed id all return [`RevokeOutcome::NotActive`].
-    pub fn revoke(&mut self, grant_id: GrantId, now_ms: u64) -> RevokeOutcome {
+    /// `daemon.host_grant` revokes host consent and `session.grant.revoke`
+    /// revokes observer grants; a wrong-kind id is `NotActive`, never a
+    /// cross-kind revoke.
+    pub fn revoke_kind(
+        &mut self,
+        grant_id: GrantId,
+        kind: GrantKind,
+        now_ms: u64,
+    ) -> RevokeOutcome {
         let Some(record) = self.grants.get_mut(&grant_id) else {
             return RevokeOutcome::NotActive;
         };
-        if !record.is_active(now_ms) {
+        if record.kind != kind || !record.is_active(now_ms) {
             return RevokeOutcome::NotActive;
         }
         record.revoked = true;
@@ -714,7 +720,10 @@ mod tests {
             GrantRefusal::Unusable
         );
         // Revoked.
-        assert_eq!(store.revoke(minted.grant_id, 11), RevokeOutcome::Revoked);
+        assert_eq!(
+            store.revoke_kind(minted.grant_id, GrantKind::Host, 11),
+            RevokeOutcome::Revoked
+        );
         assert_eq!(
             store
                 .consume(&minted.bearer, GrantKind::Host, 1000, None, 12)
@@ -783,10 +792,16 @@ mod tests {
     fn revoke_is_idempotent_and_reports_not_active() {
         let mut store = store();
         let minted = store.mint_host(1000, 10).expect("mint");
-        assert_eq!(store.revoke(minted.grant_id, 11), RevokeOutcome::Revoked);
-        assert_eq!(store.revoke(minted.grant_id, 12), RevokeOutcome::NotActive);
         assert_eq!(
-            store.revoke(GrantId::generate().expect("entropy"), 12),
+            store.revoke_kind(minted.grant_id, GrantKind::Host, 11),
+            RevokeOutcome::Revoked
+        );
+        assert_eq!(
+            store.revoke_kind(minted.grant_id, GrantKind::Host, 12),
+            RevokeOutcome::NotActive
+        );
+        assert_eq!(
+            store.revoke_kind(GrantId::generate().expect("entropy"), GrantKind::Host, 12),
             RevokeOutcome::NotActive
         );
     }
@@ -831,7 +846,7 @@ mod tests {
     fn eviction_drops_retired_records() {
         let mut store = store();
         let minted = store.mint_host(1000, 10).expect("mint");
-        store.revoke(minted.grant_id, 11);
+        store.revoke_kind(minted.grant_id, GrantKind::Host, 11);
         assert_eq!(store.evict_expired(12), 1);
         assert!(store.is_empty());
     }

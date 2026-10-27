@@ -42,6 +42,7 @@ pub const CAPABILITY_FILE_NAME: &str = "bittyd.operator";
 pub const CAPABILITY_BYTES: usize = 32;
 
 /// Largest file the loader will read; one capability plus a newline.
+#[cfg(unix)]
 const MAX_CAPABILITY_FILE_BYTES: u64 = 128;
 
 /// A refused operator-capability operation.

@@ -103,6 +103,16 @@ impl PeerFrameReader {
         Self::default()
     }
 
+    /// Bytes buffered for the frame currently being assembled.
+    #[must_use]
+    pub fn buffered_len(&self) -> usize {
+        self.header.len()
+            + self
+                .declared
+                .map(|declared| self.body.len().min(declared))
+                .unwrap_or(0)
+    }
+
     /// Read one complete frame payload.
     ///
     /// Returns `Ok(None)` when no complete frame is ready yet (the state is

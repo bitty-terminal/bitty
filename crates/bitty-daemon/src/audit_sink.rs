@@ -31,7 +31,9 @@ use crate::audit::{
     AuditCounters, AuditEventId, AuditRecord, AuditResult, AuditRing, AuditTerminal,
 };
 use crate::codes::RefusalCode;
-use crate::limits::{LimitId, Limits};
+#[cfg(unix)]
+use crate::limits::LimitId;
+use crate::limits::Limits;
 use crate::registry::{
     CleanupClass, DaemonInstanceId, ExitInformation, LifecycleState, MonotonicMs, TerminalReason,
 };
@@ -566,7 +568,7 @@ pub const fn reason_spelling(reason: TerminalReason) -> &'static str {
     reason.as_str()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::audit::{

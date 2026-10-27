@@ -134,6 +134,9 @@ struct Client {
 impl Client {
     fn connect(socket: &Path) -> Self {
         let stream = UnixStream::connect(socket).expect("connect");
+        // Linux attaches SCM_CREDENTIALS on send when the sending socket has
+        // SO_PASSCRED; a client that skips this is refused as Unauthenticated.
+        bitty_daemon::service::frame::enable_credentials(&stream).expect("per-frame credentials");
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("read timeout");

@@ -21,6 +21,7 @@
 //! [`bittyd` Session-Host Contract]: https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/bittyd-session-host-contract.md
 
 pub mod dispatch;
+#[cfg(unix)]
 pub mod frame;
 pub mod grants;
 pub mod protocol;

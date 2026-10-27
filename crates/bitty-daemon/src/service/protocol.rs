@@ -225,7 +225,7 @@ impl std::fmt::Debug for Connection {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::handshake::ClientId;

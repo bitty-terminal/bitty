@@ -27,7 +27,7 @@
 //!   and named only in `execution_jobs.rs`, `execution_component/`, and its
 //!   fixture binary (`SOURCE_SEAM_FILES`).
 //!   Seam crates
-//!   (`bitty-ipc`, `bitty-ipc-api`, `bitty-network-wire`,
+//!   (`bitty-ipc`, `bitty-ipc-api`, `bitty-ipc-core`, `bitty-network-wire`,
 //!   `bitty-network-publication`, `bitty-observability-api`,
 //!   `bitty-platform-services`, `bitty-url-detector`) are
 //!   contract/codec/transport seams Core is expected to link; `SEAM_CRATES`
@@ -104,6 +104,7 @@ const EXTENSION_CRATES: &[&str] = &[
     "bitty-net",
     "bitty-ipc",
     "bitty-ipc-api",
+    "bitty-ipc-core",
     "bitty-network-wire",
     "bitty-network-publication",
     "bitty-observability-api",
@@ -127,7 +128,14 @@ const SEAM_CRATES: &[(&str, &[&str])] = &[
     ("bitty-network-wire", &["bitty-runtime"]),
     // Feature-gated provider-publication control-record contract (CTX-1390,
     // bitty#2322): intentionally linked by the runtime, default-off.
-    ("bitty-ipc-api", &["bitty-runtime"]),
+    // CTX-1531 / bitty#2607: the daemon reuses the v1 method grammar and
+    // envelope vocabulary from `bitty-ipc-api` instead of defining a second
+    // one (`bitty#2664` one-spelling rule).
+    ("bitty-ipc-api", &["bitty-runtime", "bitty-daemon"]),
+    // CTX-1531 / bitty#2607: the daemon uses the accepted RC-9 token-bucket
+    // limiter from `bitty-ipc-core` in its admission loop. One exact consumer,
+    // no other workspace edge, and no Core source naming outside the daemon.
+    ("bitty-ipc-core", &["bitty-daemon"]),
     // Feature-gated publication-control transport (CTX-1373, bitty#2199):
     // intentionally linked by the runtime, default-off.
     ("bitty-network-publication", &["bitty-runtime"]),

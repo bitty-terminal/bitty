@@ -15,7 +15,8 @@ use bitty_vt::{
 };
 
 use crate::cell::{
-    AttributeChangeKind, Attributes, Cell, HyperlinkId, Style, Zerowidth, char_cell_width,
+    AmbiguousWidth, AttributeChangeKind, Attributes, Cell, HyperlinkId, Style, Zerowidth,
+    char_cell_width_in,
 };
 use crate::charsets::Charsets;
 use crate::cursor::{Cursor, CursorPosition, SavedCursor};
@@ -23,6 +24,7 @@ use crate::damage::{
     DAMAGE_HISTORY_BATCHES, DAMAGE_MAX_REGIONS_PER_BATCH, Damage, DamageRect, DamagedRegion,
     coalesce,
 };
+use crate::grapheme::{Graphemes, cluster_cell_width, cluster_cell_width_parts, cluster_continues};
 use crate::grid::{Grid, ScreenPair};
 use crate::image::ImageStore;
 use crate::kitty_unicode::{KittyUnicodeCell, KittyUnicodeRunCells};
@@ -278,6 +280,11 @@ pub struct State {
     /// `DECSCUSR 0` (`CursorStyle::Default`) reset; `Default` itself means
     /// the renderer's block fallback.
     default_cursor_style: CursorStyle,
+    /// East Asian Ambiguous width policy (CTX-1609
+    /// `terminal.ambiguous_width`). Applied at terminal creation and
+    /// immutable for the lifetime of this state: changing it later would
+    /// re-interpret already committed cell widths and invalidate the grid.
+    ambiguous_width: AmbiguousWidth,
     modes: Modes,
     scroll_region_top: u16,
     scroll_region_bottom: u16,
@@ -355,6 +362,7 @@ impl State {
             saved_cursors: [None, None],
             cursor: Cursor::default(),
             default_cursor_style: CursorStyle::Default,
+            ambiguous_width: AmbiguousWidth::Narrow,
             modes: Modes::default(),
             scroll_region_top: 0,
             scroll_region_bottom: (GRID_ROWS - 1) as u16,
@@ -412,6 +420,26 @@ impl State {
             CursorStyle::Default => self.default_cursor_style,
             other => other,
         }
+    }
+
+    /// Configured East Asian Ambiguous width policy (CTX-1609
+    /// `terminal.ambiguous_width`; default [`AmbiguousWidth::Narrow`]).
+    #[must_use]
+    pub fn ambiguous_width(&self) -> AmbiguousWidth {
+        self.ambiguous_width
+    }
+
+    /// Sets the East Asian Ambiguous width policy (the effective
+    /// `terminal.ambiguous_width` value, applied by the runtime at terminal
+    /// creation).
+    ///
+    /// The policy is an input to every later width resolution; it does not
+    /// re-measure cells already placed, so a live change would leave mixed
+    /// widths and is rejected by the reload classifier
+    /// (`terminal.ambiguous_width` is restart-required). Calling this on a
+    /// fresh state is the supported path.
+    pub fn set_ambiguous_width(&mut self, policy: AmbiguousWidth) {
+        self.ambiguous_width = policy;
     }
 
     // ------------------------------------------------------------------
@@ -1153,46 +1181,51 @@ impl State {
         let mut pushed = 0usize;
         for text in lines {
             let mut cells: Vec<Cell> = Vec::with_capacity(width);
-            for scalar in text.chars() {
+            // CTX-1609: one extended grapheme cluster is one layout unit, so
+            // a restored ZWJ family, flag pair, or combining sequence keeps
+            // the same cell shape the print path would have produced.
+            for cluster in Graphemes::new(text) {
                 if cells.len() >= width {
                     break;
                 }
-                let scalar = if scalar.is_control() {
+                let mut scalars = cluster.chars();
+                let Some(first) = scalars.next() else {
+                    continue;
+                };
+                let first = if first.is_control() {
                     '\u{FFFD}'
                 } else {
-                    scalar
+                    first
                 };
-                match char_cell_width(scalar) {
-                    0 => {
-                        if let Some(prev) = cells.last_mut() {
-                            let _ = prev.push_zerowidth(scalar);
-                        }
-                    }
-                    2 => {
-                        if cells.len() + 2 <= width {
-                            cells.push(Cell {
-                                glyph: scalar,
-                                style: blank,
-                                width: 2,
-                                spacer: false,
-                                padding: false,
-                                hyperlink: None,
-                                zerowidth: Zerowidth::new(),
-                            });
-                            cells.push(Cell::wide_spacer(blank));
-                        } else {
-                            break;
-                        }
-                    }
-                    _ => cells.push(Cell {
-                        glyph: scalar,
-                        style: blank,
-                        width: 1,
-                        spacer: false,
-                        padding: false,
-                        hyperlink: None,
-                        zerowidth: Zerowidth::new(),
-                    }),
+                let cluster_width = cluster_cell_width(cluster, self.ambiguous_width);
+                if cluster_width == 0 {
+                    continue;
+                }
+                if cluster_width == 2 && cells.len() + 2 > width {
+                    break;
+                }
+                let mut cell = Cell {
+                    glyph: first,
+                    style: blank,
+                    width: cluster_width,
+                    spacer: false,
+                    padding: false,
+                    hyperlink: None,
+                    zerowidth: Zerowidth::new(),
+                };
+                for scalar in scalars {
+                    let scalar = if scalar.is_control() {
+                        '\u{FFFD}'
+                    } else {
+                        scalar
+                    };
+                    // The buffer is bounded; excess scalars are dropped on
+                    // restore exactly like the live over-cap degradation.
+                    let _ = cell.push_zerowidth(scalar);
+                }
+                cells.push(cell);
+                if cluster_width == 2 {
+                    cells.push(Cell::wide_spacer(blank));
                 }
             }
             while cells.len() < width {
@@ -1895,14 +1928,32 @@ impl State {
             self.print_kitty_placeholder(ch);
             return;
         }
-        let glyph_width = char_cell_width(ch);
+        let glyph_width = char_cell_width_in(ch, self.ambiguous_width);
         if glyph_width == 0 {
             // CR-TERM-01: zero-width scalars (combining marks, ZWJ,
             // variation selectors) attach to the preceding cell's bounded
-            // combining buffer instead of being silently dropped. The
-            // cursor does not advance and no wrap is consumed.
+            // cluster buffer instead of being silently dropped. The cursor
+            // does not advance and no wrap is consumed. A selector-16 can
+            // widen the cluster it joins (CTX-1609).
             self.attach_zerowidth(ch);
             return;
+        }
+        // CTX-1609: an extended grapheme cluster is one layout unit. When
+        // this scalar does not break before the cell immediately preceding
+        // the cursor (GB6-GB13: ZWJ emoji sequences, regional-indicator
+        // pairs, Hangul jamo, linker conjuncts, spacing marks), append it
+        // to that cell instead of placing a new one.
+        if let Some((row, col)) = self.cluster_target() {
+            let cell = *self.screens_active().get(row, col);
+            if !cell.spacer
+                && cluster_continues(cell.glyph, cell.zerowidth.as_slice(), ch)
+                && self.extend_cluster(row, col, ch)
+            {
+                return;
+            }
+            // A full continuation buffer falls through and lays this scalar
+            // out as a fresh cluster (documented over-cap degradation), so
+            // text is never silently dropped.
         }
         let cols = self.width as u16;
         // Consume a pending wrap before placing the glyph (DECAWM).
@@ -2793,6 +2844,114 @@ impl State {
         runs
     }
 
+    /// Target cell for a printable cluster continuation: the last written
+    /// cell (the cursor cell itself while a deferred wrap is latched, else
+    /// the cell left of the cursor), stepping back over a wide spacer.
+    ///
+    /// Printable continuations never cross a row boundary: a scalar printed
+    /// at column 0 starts a new cluster instead of joining the previous
+    /// row's last cell (a mark may still attach there through the historical
+    /// combining path).
+    fn cluster_target(&self) -> Option<(usize, usize)> {
+        let (row, col) = self.cursor_xy();
+        let target_col = if self.cursor.pending_wrap {
+            col
+        } else if col > 0 {
+            col - 1
+        } else {
+            return None;
+        };
+        let target_col = if self.screens_active().get(row, target_col).spacer {
+            if target_col == 0 {
+                return None;
+            }
+            target_col - 1
+        } else {
+            target_col
+        };
+        Some((row, target_col))
+    }
+
+    /// Appends `scalar` to the cluster rooted at `(row, col)` (CTX-1609).
+    ///
+    /// Returns `false` without mutating when the bounded continuation
+    /// buffer is full; the caller then lays the scalar out as a fresh
+    /// cluster (documented degradation for over-cap sequences).
+    fn extend_cluster(&mut self, row: usize, col: usize, scalar: char) -> bool {
+        let mut cell = *self.screens_active().get(row, col);
+        if !cell.push_zerowidth(scalar) {
+            return false;
+        }
+        let width =
+            cluster_cell_width_parts(cell.glyph, cell.zerowidth.as_slice(), self.ambiguous_width);
+        self.commit_cluster_cell(row, col, cell, width, true);
+        // A printable continuation is output on this row just like the base
+        // that opened the cluster (CTX-0996); zero-width attachments below
+        // deliberately leave the base's original output mark alone.
+        self.note_output_print();
+        true
+    }
+
+    /// Stores a cluster cell and widens it to `width` when it outgrew the
+    /// originally committed width (CTX-1609).
+    ///
+    /// Cluster width is decided when the base is placed and can only grow
+    /// afterwards: a regional-indicator pair or a selector-16 keycap turns
+    /// one column into two, while a later text-presentation selector never
+    /// narrows an already placed wide cell (that would move content).
+    /// Growth needs the next column for the wide spacer; at the last column
+    /// the cluster keeps its committed width and the stored text still
+    /// carries every scalar. `allow_grow` is `false` when the cell is not
+    /// the immediate predecessor of the cursor (a mark attached after a
+    /// cursor move must not overwrite an unrelated neighbour).
+    fn commit_cluster_cell(
+        &mut self,
+        row: usize,
+        col: usize,
+        mut cell: Cell,
+        width: u8,
+        allow_grow: bool,
+    ) {
+        let grew = allow_grow && width > cell.width && col + 1 < self.width;
+        if !grew {
+            self.screens_active_mut().set(row, col, cell);
+            self.damage_grid_rect(row as u16, col as u16, row as u16, col as u16);
+            return;
+        }
+        if self.modes.insert {
+            let erase = self.bce_style();
+            self.screens_active_mut()
+                .insert_blanks_in_row(row, col + 1, 1, &erase);
+        } else {
+            // Our spacer replaces `col + 1`; if that cell previously held a
+            // different pair's leading half, its spacer at `col + 2` would
+            // survive unpaired.
+            let ahead = *self.screens_active().get(row, col + 1);
+            if ahead.width == 2 && !ahead.spacer && col + 2 < self.width {
+                let erase = self.bce_style();
+                self.screens_active_mut()
+                    .set(row, col + 2, Cell::erased(erase));
+                let c = (col + 2) as u16;
+                self.damage_grid_rect(row as u16, c, row as u16, c);
+            }
+        }
+        cell.width = width;
+        let style = cell.style;
+        self.screens_active_mut().set(row, col, cell);
+        self.screens_active_mut()
+            .set(row, col + 1, Cell::wide_spacer(style));
+        self.damage_grid_rect(row as u16, col as u16, row as u16, (col + 1) as u16);
+        // The cluster completed at the cell immediately before the cursor,
+        // so the cursor advances over the new spacer.
+        let advanced = col + 2;
+        if advanced >= self.width {
+            self.cursor.position.col = self.width as u16 - 1;
+            self.cursor.pending_wrap = self.modes.auto_wrap;
+        } else {
+            self.cursor.position.col = advanced as u16;
+        }
+    }
+
     /// Attaches a zero-width scalar to the preceding cell (CR-TERM-01).
     ///
     /// The target is the last written cell: the cursor cell itself while a
@@ -2800,8 +2959,12 @@ impl State {
     /// full-width print), else the cell left of the cursor, else the last
     /// column of the previous row. A spacer target steps back to its
     /// leading half. With no preceding cell (top-left corner) or a full
-    /// combining buffer, the mark is dropped: the buffer stays bounded
+    /// continuation buffer, the mark is dropped: the buffer stays bounded
     /// (threat T-01) and the cursor never moves.
+    ///
+    /// CTX-1609: a selector-16 mark can widen the cluster it joins when the
+    /// target is the immediate predecessor of the cursor; marks attached
+    /// after a cursor move never resize an older cell.
     fn attach_zerowidth(&mut self, mark: char) {
         let (row, col) = self.cursor_xy();
         let (target_row, target_col) = if self.cursor.pending_wrap {
@@ -2824,13 +2987,10 @@ impl State {
         if !cell.push_zerowidth(mark) {
             return;
         }
-        self.screens_active_mut().set(target_row, target_col, cell);
-        self.damage_grid_rect(
-            target_row as u16,
-            target_col as u16,
-            target_row as u16,
-            target_col as u16,
-        );
+        let active = target_row == row && target_col + usize::from(cell.width) == col;
+        let width =
+            cluster_cell_width_parts(cell.glyph, cell.zerowidth.as_slice(), self.ambiguous_width);
+        self.commit_cluster_cell(target_row, target_col, cell, width, active);
     }
 
     fn print_control(&mut self, byte: u8) {

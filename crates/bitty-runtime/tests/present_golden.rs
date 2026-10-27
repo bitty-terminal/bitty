@@ -58,6 +58,13 @@
 //! (theme idle outline) painted on the overlay-rounded layer, instead of a
 //! full-cell ANSI 12 border. This is an explicit behavior change: geometry
 //! inside the panel, text, and the hidden-frame digest are unchanged.
+//!
+//! The `zwj_family`, `regional_pair`, and `variation_selector` digests were
+//! re-recorded under CTX-1609 (#1767): an extended grapheme cluster is now
+//! one layout unit (one leading cell plus its wide spacer), so a ZWJ family,
+//! a regional-indicator flag, and a selector-16 heart each occupy two columns
+//! instead of six, two, and one. This is an explicit Terminal Truth behavior
+//! change, not golden drift.
 #![forbid(unsafe_code)]
 
 use bitty_runtime::{
@@ -312,36 +319,35 @@ fn golden_wide_and_combining_glyphs() {
 
 #[test]
 fn golden_grapheme_zwj_family() {
-    // Issue #2262: the grid keeps four wide leads, four spacers, and the
-    // join controls; the unshaped headless fallback still paints one glyph
-    // per base and never a glyph for a spacer or joiner. This digest pins
-    // that Terminal-Truth-preserving fallback while the shaped path (live
-    // font tests) covers the one-cluster ligature.
+    // CTX-1609: the grid keeps one wide lead carrying the whole family plus
+    // one spacer; the unshaped headless fallback paints the lead glyph and
+    // never a glyph for a spacer or joiner.
     let mut rt = make_runtime();
     let _ = rt.tick().expect("first tick presents");
     rt.handle_pty_bytes("\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}".as_bytes());
     let frame = rt.tick().expect("ZWJ family presents");
-    assert_digest("zwj_family", &rt, &frame, 0x48c4_44c6_46f0_c639);
+    assert_digest("zwj_family", &rt, &frame, 0xa8e6_4ae0_5cc4_be97);
 }
 
 #[test]
 fn golden_grapheme_regional_indicator_pair() {
-    // Flag sequences are two width-1 cells; no spacer or width change.
+    // CTX-1609: a regional-indicator pair grows to one two-cell cluster.
     let mut rt = make_runtime();
     let _ = rt.tick().expect("first tick presents");
     rt.handle_pty_bytes("\u{1F1EF}\u{1F1F5}".as_bytes());
     let frame = rt.tick().expect("regional indicator pair presents");
-    assert_digest("regional_pair", &rt, &frame, 0x6a5b_d5e7_4846_ae49);
+    assert_digest("regional_pair", &rt, &frame, 0x4ad6_df79_54e8_ea76);
 }
 
 #[test]
 fn golden_grapheme_variation_selector() {
-    // U+2764 U+FE0F stays one width-1 cell with the selector in zerowidth.
+    // CTX-1609: U+2764 U+FE0F is one two-cell emoji-presentation cluster
+    // with the selector in zerowidth.
     let mut rt = make_runtime();
     let _ = rt.tick().expect("first tick presents");
     rt.handle_pty_bytes("\u{2764}\u{FE0F}".as_bytes());
     let frame = rt.tick().expect("variation selector presents");
-    assert_digest("variation_selector", &rt, &frame, 0x162e_18ef_fa55_533e);
+    assert_digest("variation_selector", &rt, &frame, 0x4ad6_df79_54e8_ea76);
 }
 
 #[test]

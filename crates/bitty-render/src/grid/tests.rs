@@ -2536,7 +2536,7 @@ fn render_maintains_single_epoch_under_eviction() {
 // shaped emission path. No fonts needed — all cases are deterministic.
 // ---------------------------------------------------------------------------
 
-use super::{cluster_group_end, shaped_dest_x, union_span};
+use super::{paint_group_range, shaped_dest_x, union_span};
 use crate::shaped::ShapedCluster;
 
 fn phase_c_cluster(byte_offset: usize, col: usize, count: usize) -> ShapedCluster {
@@ -2567,35 +2567,40 @@ fn shaped_dest_x_applies_gpos_offset() {
 }
 
 #[test]
-fn cluster_group_end_uses_next_distinct_offset() {
-    // One glyph per cluster: each group ends at the next offset.
+fn paint_group_range_spans_one_grapheme_cluster() {
+    // One glyph per cluster: each group ends at the next cluster boundary.
     let solo = vec![
         phase_c_cluster(0, 0, 1),
         phase_c_cluster(1, 1, 1),
         phase_c_cluster(2, 2, 1),
     ];
-    assert_eq!(cluster_group_end(&solo, 0, 3), 1);
-    assert_eq!(cluster_group_end(&solo, 2, 3), 3);
-    // Base + mark sharing offset 1: the group ending at 0 spans to 3.
+    assert_eq!(paint_group_range("abc", &solo, 0), (1, 1));
+    assert_eq!(paint_group_range("abc", &solo, 2), (3, 3));
+    // Base + mark sharing offset 1: one cluster, both entries in the group.
     let grouped = vec![
         phase_c_cluster(0, 0, 1),
         phase_c_cluster(1, 1, 1),
         phase_c_cluster(1, 1, 1),
-        phase_c_cluster(3, 2, 1),
+        phase_c_cluster(4, 2, 1),
     ];
-    assert_eq!(cluster_group_end(&grouped, 0, 4), 1);
-    assert_eq!(cluster_group_end(&grouped, 1, 4), 3);
-    assert_eq!(cluster_group_end(&grouped, 2, 4), 3);
-    assert_eq!(cluster_group_end(&grouped, 3, 4), 4);
+    assert_eq!(paint_group_range("ae\u{0301}b", &grouped, 0), (1, 1));
+    assert_eq!(paint_group_range("ae\u{0301}b", &grouped, 1), (4, 3));
+    assert_eq!(paint_group_range("ae\u{0301}b", &grouped, 3), (5, 4));
+    // A conjunct splits into two shaper entries but stays one cluster.
+    let conjunct = vec![
+        phase_c_cluster(0, 0, 1),
+        phase_c_cluster(0, 0, 1),
+        phase_c_cluster(6, 1, 1),
+    ];
+    assert_eq!(
+        paint_group_range("\u{0915}\u{094D}\u{0937}", &conjunct, 0),
+        (9, 3)
+    );
     // Trailing group ends at the run length.
-    assert_eq!(cluster_group_end(&solo, 2, 99), 99);
-    // Non-monotonic shaper output degrades to a wider slice, never a panic.
-    let ragged = vec![phase_c_cluster(0, 0, 1), phase_c_cluster(5, 1, 1)];
-    assert_eq!(cluster_group_end(&ragged, 0, 6), 5);
-    assert_eq!(cluster_group_end(&ragged, 1, 6), 6);
-    // Empty list and out-of-range index read as the run length.
-    assert_eq!(cluster_group_end(&[], 0, 7), 7);
-    assert_eq!(cluster_group_end(&solo, 9, 7), 7);
+    assert_eq!(paint_group_range("abc", &solo, 2).0, 3);
+    // Out-of-range and empty input read as the run length.
+    assert_eq!(paint_group_range("abc", &[], 0), (3, 1));
+    assert_eq!(paint_group_range("abc", &solo, 9), (3, 10));
 }
 
 #[test]
@@ -3520,9 +3525,10 @@ fn four_line_paste_state_keeps_the_diacritic() {
     ]);
     let (frame, counters, glyphs) = render_script(&script);
     let stride = 80 * 8;
-    // 3 ASCII + 2 CJK leaders + 1 é + 4 ZWJ-family people = 10 instances;
-    // ZWJ never rasterizes.
-    assert_eq!(glyphs, 10);
+    // 3 ASCII + 2 CJK leaders + 1 é + 1 ZWJ-family lead = 7 instances;
+    // the cluster tail (joiners and the other family members) never
+    // rasterizes in the unshaped path (CTX-1609).
+    assert_eq!(glyphs, 7);
     assert_eq!(counters.missing_glyphs, 0);
 
     let single = render_script(&[print('\u{00E9}')]);
@@ -3559,8 +3565,10 @@ fn four_line_paste_state_combining_eacute_matches_precomposed() {
         "decomposed row 3 must paint the precomposed é frame"
     );
     assert_eq!(counters.missing_glyphs, 0);
-    // 3 ASCII + 2 CJK + base e + mark + 2 people = 9 instances.
-    assert_eq!(glyphs, 9);
+    // 3 ASCII + 2 CJK + base e + mark + 1 family lead = 8 instances
+    // (CTX-1609: the family occupies one cell; the rest of the cluster is
+    // text truth, not a separate glyph).
+    assert_eq!(glyphs, 8);
 }
 
 #[test]
@@ -4190,8 +4198,10 @@ fn shaped_advance_misalignment_degrades_to_unshaped() {
     assert_eq!(renderer.counters().shaping_misaligned, 1);
 }
 
-/// Clusters that reuse a pen column break grid tiling; only the offending
-/// group degrades (earlier groups keep their shaped output).
+/// A corrupt shaper that reports every cluster at column 0 cannot stack
+/// glyphs: grid placement derives from the committed span (prefix
+/// measurement), so every cluster still paints at its own column and no
+/// degrade fires (CTX-1609).
 #[test]
 fn shaped_tiling_break_degrades_the_offending_group() {
     let mut renderer = shaped_renderer(FakeShaper {
@@ -4208,8 +4218,16 @@ fn shaped_tiling_break_degrades_the_offending_group() {
             &[],
         )
         .unwrap();
-    assert_eq!(list.glyphs.len(), 2);
-    assert_eq!(renderer.counters().shaping_misaligned, 1);
+    assert_eq!(
+        list.glyphs.len(),
+        2,
+        "every cluster paints at its grid column"
+    );
+    assert_eq!(
+        renderer.counters().shaping_misaligned,
+        0,
+        "claimed-corrupt columns are ignored, never degrade the frame"
+    );
 }
 
 /// A non-shaping source (classic crossfont / deterministic headless) is

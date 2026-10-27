@@ -45,7 +45,7 @@
 //!     -- missing/unreadable files fail closed. `blur_radius` is recognized
 //!     -- only as 0 (OQ-038: background blur has no accepted design); a
 //!     -- positive value fails closed instead of being a silent no-op.
-//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, page_scroll_percent = 75, cursor_style = "steady_bar", bell = "visual" },
+//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, page_scroll_percent = 75, cursor_style = "steady_bar", bell = "visual", ambiguous_width = "narrow" },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
 //!     history = { capture = { transcript = true, commands = false } }, -- opt in to bounded plugin history capture; both default false (CTX-1352)
 //!     layout = { gaps_in = 1, gaps_out = 2, resize_step = 0.05 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177, default 0/0) + tiled resize step as split-ratio delta per keypress, 0.01..=0.20 (CTX-0963, default 0.05)
@@ -145,8 +145,10 @@
 //!   `"steady_underline"` | `"blinking_bar"` | `"steady_bar"` (CTX-0756);
 //!   `bell` is one of `"off"` | `"visual"` (default) | `"audible"` |
 //!   `"both"`, where `audible`/`both` count without sounding until the
-//!   owner-pending OS primitive lands (OQ-076, CTX-0754/#1361); unknown
-//!   spellings fail closed with the field path).
+//!   owner-pending OS primitive lands (OQ-076, CTX-0754/#1361);
+//!   `ambiguous_width` is `"narrow"` (default) | `"wide"` and selects the
+//!   East Asian Ambiguous cell policy (CTX-1609); unknown spellings fail
+//!   closed with the field path).
 //!   `selection` is fully optional (absent table/key means "this layer says
 //!   nothing"); when present, `auto_copy` defaults to
 //!   [`SelectionConfig`] default `false`
@@ -2014,6 +2016,21 @@ fn build_plan_from_data(
                         }
                     },
                 };
+                // CTX-1609: the East Asian Ambiguous width policy is a closed
+                // enum leaf like `cursor_style`/`bell`; absent inherits the
+                // narrow default, unknown spellings fail closed.
+                let ambiguous_width = match t.ambiguous_width.as_deref() {
+                    None => defaults.ambiguous_width,
+                    Some(raw) => match crate::types::AmbiguousWidth::parse(raw.trim()) {
+                        Some(policy) => policy,
+                        None => {
+                            return Err(ConfigError::validation(
+                                "terminal.ambiguous_width",
+                                "must be one of \"narrow\", \"wide\"",
+                            ));
+                        }
+                    },
+                };
                 Some(TerminalConfig {
                     scrollback: scrollback as u32,
                     shell: t.shell,
@@ -2022,6 +2039,7 @@ fn build_plan_from_data(
                     page_scroll_percent,
                     cursor_style,
                     bell,
+                    ambiguous_width,
                 })
             }
             None => {
@@ -3686,6 +3704,53 @@ mod tests {
             let msg = err.to_string();
             assert!(
                 msg.contains("terminal.cursor_style") || msg.contains("terminal.bell"),
+                "must name the field: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_terminal_ambiguous_width_parses_and_validates() {
+        // CTX-1609: the policy is an optional closed-enum leaf; absent keeps
+        // the narrow default, both spellings round-trip, and wrong shapes or
+        // spellings fail closed naming the field path.
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000, ambiguous_width = "wide" } }"#,
+            &test_source(),
+        )
+        .expect("wide policy parses");
+        assert_eq!(
+            plan.terminal.unwrap().ambiguous_width,
+            crate::types::AmbiguousWidth::Wide
+        );
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000, ambiguous_width = "narrow" } }"#,
+            &test_source(),
+        )
+        .expect("narrow policy parses");
+        assert_eq!(
+            plan.terminal.unwrap().ambiguous_width,
+            crate::types::AmbiguousWidth::Narrow
+        );
+        let plan = parse_lua_config(
+            r#"return { terminal = { scrollback = 10000 } }"#,
+            &test_source(),
+        )
+        .expect("absent key keeps the default");
+        assert_eq!(
+            plan.terminal.unwrap().ambiguous_width,
+            crate::types::DEFAULT_AMBIGUOUS_WIDTH
+        );
+        for bad in [
+            r#"return { terminal = { scrollback = 10000, ambiguous_width = "cjk" } }"#,
+            r#"return { terminal = { scrollback = 10000, ambiguous_width = "WIDE" } }"#,
+            r#"return { terminal = { scrollback = 10000, ambiguous_width = 2 } }"#,
+            r#"return { terminal = { scrollback = 10000, ambiguous_width = true } }"#,
+        ] {
+            let err = parse_lua_config(bad, &test_source()).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("terminal.ambiguous_width"),
                 "must name the field: {msg}"
             );
         }

@@ -54,7 +54,10 @@ use crate::cell::{Attributes, Cell, Style};
 /// v12 adds `Cell::padding` (`#2529`): reflow treats marked blanks as layout
 /// padding rather than content, so states differing only in that marker can
 /// produce different future terminal text.
-pub const CANONICAL_HASH_VERSION: u32 = 12;
+/// v13 adds the East Asian Ambiguous width policy (CTX-1609): the policy
+/// decides the width of every later `A` scalar, so states differing only in
+/// it are not behaviorally identical.
+pub const CANONICAL_HASH_VERSION: u32 = 13;
 
 /// Incremental canonical writer backing the state hash.
 pub(crate) struct CanonicalHasher {
@@ -219,6 +222,6 @@ mod tests {
 
     #[test]
     fn version_pin_is_explicit() {
-        assert_eq!(CANONICAL_HASH_VERSION, 12);
+        assert_eq!(CANONICAL_HASH_VERSION, 13);
     }
 }

@@ -131,6 +131,19 @@ fn combining_mark_changes_state_hash() {
 }
 
 #[test]
+fn ambiguous_width_policy_participates_in_the_state_hash() {
+    // CTX-1609: the policy decides the width of every later Ambiguous
+    // scalar, so two otherwise identical states are not replay-equivalent.
+    let narrow = State::new();
+    let mut wide = State::new();
+    wide.set_ambiguous_width(crate::cell::AmbiguousWidth::Wide);
+    assert_ne!(narrow.state_hash(), wide.state_hash());
+    let mut wide_again = State::new();
+    wide_again.set_ambiguous_width(crate::cell::AmbiguousWidth::Wide);
+    assert_eq!(wide.state_hash(), wide_again.state_hash());
+}
+
+#[test]
 fn layout_padding_marker_changes_state_hash() {
     let content = State::new();
     let mut layout_padding = content.clone();

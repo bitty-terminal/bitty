@@ -37,10 +37,10 @@
 //! | [`DAMAGE_HISTORY_BATCHES`](damage::DAMAGE_HISTORY_BATCHES) | 64 | Bounded `damage_since` window |
 //! | [`DAMAGE_MAX_REGIONS_PER_BATCH`](damage::DAMAGE_MAX_REGIONS_PER_BATCH) | 256 | Coarse fallback beyond the cap |
 //! | [`HYPERLINK_TABLE_MAX`] | 1024 | Bounded link table (threat T-01) |
-//! | [`MAX_ZEROWIDTH_CHARS`] | 5 | Per-cell combining-mark cap (threat T-01; Alacritty zerowidth parity) |
+//! | [`MAX_CLUSTER_SCALARS`] | 6 | Per-cell cluster-tail cap (threat T-01; CTX-1609; the historical `MAX_ZEROWIDTH_CHARS` name aliases the same bound) |
 //! | [`MAX_BIDI_PARAGRAPH_CELLS`](bidi::MAX_BIDI_PARAGRAPH_CELLS) | 4096 | Candidate BiDi paragraph bound: longer logical paragraphs split at cell boundaries (M1-21 scope-deferred reorder; `OQ-091` open) |
 //! | [`ZONE_RECORDS_MAX`] | 1024 | Bounded `OSC 133` zone log |
-//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 12 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds saved cursor style/visibility, v3 combining buffers, v4 soft-wrap flags, v5 synchronized-update mode, v6 hyperlink id-space position, v7 alternate-scroll mode, v8 Kitty keyboard stack, v9 inactive-screen Kitty register, v10 zone anchors, v11 OSC 133 output tracking, v12 cell layout-padding marker) |
+//! | [`CANONICAL_HASH_VERSION`](canonical_public::CANONICAL_HASH_VERSION) | 13 | RFC replay guarantee 2 serialization version (evolution policy per RFC open item; v2 adds saved cursor style/visibility, v3 combining buffers, v4 soft-wrap flags, v5 synchronized-update mode, v6 hyperlink id-space position, v7 alternate-scroll mode, v8 Kitty keyboard stack, v9 inactive-screen Kitty register, v10 zone anchors, v11 OSC 133 output tracking, v12 cell layout-padding marker, v13 East Asian ambiguous-width policy) |
 //!
 //! # Determinism
 //!
@@ -79,6 +79,7 @@ pub mod scrollback;
 pub mod search;
 mod state;
 mod tabs;
+mod unicode_tables;
 
 /// Re-exported canonical-hash serialization version; see the crate-level
 /// constant register.
@@ -95,8 +96,8 @@ pub use bitty_vt::{
     MouseTrackingMode, Rgb, StatusKind, TerminalAction, UnderlineStyle, ZoneKind,
 };
 pub use cell::{
-    AmbiguousWidth, Attributes, Cell, HyperlinkId, MAX_ZEROWIDTH_CHARS, Style, Zerowidth,
-    char_cell_width, char_cell_width_in,
+    AmbiguousWidth, Attributes, Cell, HyperlinkId, MAX_CLUSTER_SCALARS, MAX_ZEROWIDTH_CHARS, Style,
+    Zerowidth, char_cell_width, char_cell_width_in,
 };
 pub use cursor::{Cursor, CursorPosition};
 pub use damage::{Damage, DamageRect, DamagedRegion};

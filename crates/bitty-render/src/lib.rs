@@ -56,6 +56,16 @@
 //!
 //! # Backend selection (CTX-1607, supersedes the CTX-0957 opt-in landing)
 //!
+//! The classic crossfont path is a **documented degraded fallback for
+//! grapheme clusters** (CTX-1609, issue #1767): with no shaper, a multi-base
+//! cluster paints its leading scalar plus its zero-width mark shapes, and the
+//! printable continuations (an Indic matra or second conjunct consonant, a
+//! Thai floating mark, the second regional indicator, decomposed Hangul jamo)
+//! stay in Terminal Truth for copy, search, and accessibility. Nothing is
+//! faked at the base's pen position. [`grid::GridRenderer::render_shaped`]
+//! paints every shaped glyph of the cluster; the runtime tick diagnostics
+//! report `crossfont=true` while that degraded path is the active one.
+//!
 //! The shaped stack ([`shaped::SwashSingle`]: `fontdb` discovery +
 //! `harfrust` shaping + `swash` rasterization) is the **production
 //! default**. Constructing it through [`fallback::FallbackRasterizer`] and
@@ -282,8 +292,8 @@ pub use shaped::{
     MAX_RUN_CACHE_ENTRIES, MAX_SHAPE_PLANS_PER_FACE, MAX_SHAPED_GLYPH_CACHE_BYTES,
     MAX_SHAPED_GLYPH_CACHE_ENTRIES, PROGRAMMING_LIGATURE_TAGS, RunAttrs, RunCacheKey, ShapePlanKey,
     ShapedCluster, ShapedGlyphKey, ShapedRun, ShapedRunSource, SwashSingle,
-    ascii_fast_path_eligible, cells_for_range, collect_run_text, cursor_intersects_ligature,
-    features_are_unshaped, features_for_policy, form_runs_for_row, harfrust_features,
-    is_printable_ascii_byte, is_printable_ascii_str, run_is_ascii_candidate,
+    ascii_fast_path_eligible, cells_for_range, cells_for_range_in, collect_run_text,
+    cursor_intersects_ligature, features_are_unshaped, features_for_policy, form_runs_for_row,
+    harfrust_features, is_printable_ascii_byte, is_printable_ascii_str, run_is_ascii_candidate,
 };
 pub use window::{MAX_WINDOW_PADDING_PX, clamp_window_padding, padded_content_rect};

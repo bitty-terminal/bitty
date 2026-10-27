@@ -97,6 +97,13 @@ pub const DEFAULT_CURSOR_STYLE: bitty_vt::CursorStyle = bitty_vt::CursorStyle::D
 pub const DEFAULT_BELL_MODE: crate::runtime::bell::BellMode =
     crate::runtime::bell::BellMode::Visual;
 
+/// Default East Asian Ambiguous width policy (CTX-1609
+/// `terminal.ambiguous_width`): `Narrow`. Mirrors `bitty-config`
+/// `DEFAULT_AMBIGUOUS_WIDTH` by value; the runtime reuses the terminal-state
+/// enum directly because grid and policy live in the same crate.
+pub const DEFAULT_AMBIGUOUS_WIDTH: bitty_term_state::AmbiguousWidth =
+    bitty_term_state::AmbiguousWidth::Narrow;
+
 /// Minimum paste confirmation timeout in seconds (issue #1438).
 /// Prevents accidentally setting a timeout too short for users to react.
 pub const MIN_PASTE_CONFIRM_TIMEOUT_SECS: u64 = 1;
@@ -1236,6 +1243,11 @@ pub struct RuntimeConfig {
     /// effective value post-construction, following the `focus_follows_mouse`
     /// pattern.
     pub bell_mode: crate::runtime::bell::BellMode,
+    /// East Asian Ambiguous width policy (CTX-1609
+    /// `terminal.ambiguous_width`; default [`DEFAULT_AMBIGUOUS_WIDTH`]).
+    /// Applied by [`crate::Runtime`] when a terminal is created; the policy
+    /// is never changed live because it would re-interpret committed cells.
+    pub ambiguous_width: bitty_term_state::AmbiguousWidth,
     /// Auto-cancel timeout for pending paste confirmation (issue #1438).
     ///
     /// A gated paste that has not been confirmed (by repeating the paste gesture)
@@ -1371,6 +1383,7 @@ impl Default for RuntimeConfig {
             animations: AnimationPolicy::default(),
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell_mode: DEFAULT_BELL_MODE,
+            ambiguous_width: DEFAULT_AMBIGUOUS_WIDTH,
             paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
             panel_layout_mode: PanelLayoutMode::default(),
         }
@@ -1487,6 +1500,7 @@ impl RuntimeConfig {
             animations: AnimationPolicy::default(),
             cursor_style: DEFAULT_CURSOR_STYLE,
             bell_mode: DEFAULT_BELL_MODE,
+            ambiguous_width: DEFAULT_AMBIGUOUS_WIDTH,
             paste_confirm_timeout: crate::runtime::DEFAULT_PASTE_CONFIRM_TIMEOUT,
             panel_layout_mode: PanelLayoutMode::default(),
         };

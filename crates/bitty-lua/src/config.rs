@@ -32,7 +32,7 @@
 //!     appearance = { theme = "bitty-dark" }, -- wins over the alias
 //!     font = { family = "JetBrains Mono", size = 13.0 },
 //!     window = { opacity = 0.95, padding = 8 },
-//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, page_scroll_percent = 75, cursor_style = "steady_bar", bell = "visual" },
+//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, page_scroll_percent = 75, cursor_style = "steady_bar", bell = "visual", ambiguous_width = "narrow" },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
 //!     history = { capture = { transcript = true, commands = false } }, -- opt in to bounded plugin history capture; both default false (CTX-1352)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177)
@@ -316,6 +316,10 @@ pub struct TerminalData {
     /// present only when the key is set, raw spelling validated downstream
     /// in `bitty-config`).
     pub bell: Option<String>,
+    /// East Asian Ambiguous width policy string (CTX-1609
+    /// `terminal.ambiguous_width`; present only when the key is set, raw
+    /// spelling validated downstream in `bitty-config`).
+    pub ambiguous_width: Option<String>,
 }
 
 /// Selection overrides, plain data (CTX-0191; see [`FontData`] for `Option`
@@ -1691,6 +1695,7 @@ impl ConfigData {
                             "page_scroll_percent",
                             "cursor_style",
                             "bell",
+                            "ambiguous_width",
                         ],
                     )?;
                     let scrollback = match get_field(nested, "scrollback") {
@@ -1722,6 +1727,10 @@ impl ConfigData {
                         Some(v) => Some(expect_string("terminal.bell", v)?),
                         None => None,
                     };
+                    let ambiguous_width = match get_field(nested, "ambiguous_width") {
+                        Some(v) => Some(expect_string("terminal.ambiguous_width", v)?),
+                        None => None,
+                    };
                     out.terminal = Some(TerminalData {
                         scrollback,
                         shell,
@@ -1730,6 +1739,7 @@ impl ConfigData {
                         page_scroll_percent,
                         cursor_style,
                         bell,
+                        ambiguous_width,
                     });
                 }
                 "selection" => {
@@ -2810,16 +2820,27 @@ mod tests {
         let term = data.terminal.unwrap();
         assert_eq!(term.cursor_style.as_deref(), Some("steady_bar"));
         assert_eq!(term.bell.as_deref(), Some("both"));
+        // CTX-1609: the ambiguous-width policy string extracts raw too.
+        let data =
+            eval_ok(r#"return { terminal = { scrollback = 10000, ambiguous_width = "wide" } }"#);
+        assert_eq!(
+            data.terminal.unwrap().ambiguous_width.as_deref(),
+            Some("wide")
+        );
+        let data = eval_ok(r#"return { terminal = { scrollback = 10000 } }"#);
+        assert_eq!(data.terminal.unwrap().ambiguous_width, None);
         let mut vm = LuaVm::new("test.terminal-cursor-bell-type");
         for code in [
             r#"return { terminal = { scrollback = 10000, cursor_style = 5 } }"#,
             r#"return { terminal = { scrollback = 10000, bell = true } }"#,
+            r#"return { terminal = { scrollback = 10000, ambiguous_width = 2 } }"#,
         ] {
             match vm.eval_config(code).expect("no refuse") {
                 ConfigOutcome::ShapeError { message } => {
                     assert!(
                         message.contains("terminal.cursor_style")
-                            || message.contains("terminal.bell"),
+                            || message.contains("terminal.bell")
+                            || message.contains("terminal.ambiguous_width"),
                         "must name the field: {message}"
                     );
                 }

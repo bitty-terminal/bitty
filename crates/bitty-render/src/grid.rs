@@ -12,9 +12,20 @@
 //! 2. **Place**: every cell covered by a planned dirty rectangle is
 //!    examined. Backgrounds merge into maximal horizontal same-color runs
 //!    per row (CTX-0471) and, with text decorations, become [`FillRect`]s;
-//!    a printable base scalar, plus each visible combining mark in the
-//!    cell's bounded `zerowidth` buffer (CR-TERM-01), becomes a
-//!    [`GlyphInstance`].
+//!    a printable base scalar, plus each visible zero-width mark in the
+//!    cell's bounded `zerowidth` cluster-tail buffer (CR-TERM-01,
+//!    CTX-1609), becomes a [`GlyphInstance`]. The shaped path
+//!    ([`GridRenderer::render_shaped`]) paints *every* shaped glyph of a
+//!    cluster inside the cluster's committed cell span — Indic matras and
+//!    conjunct consonants, Thai floating marks, decomposed Hangul jamo, and
+//!    both regional indicators of a flag. A cluster whose shaped advance is
+//!    wider than its committed cells keeps its glyph ink overhanging into
+//!    the next column, exactly like any other glyph bitmap; the next cluster
+//!    still starts on its own committed column. The classic crossfont path
+//!    ([`GridRenderer::render`]) is a documented degraded fallback: it has
+//!    no shaper, so a multi-base cluster paints its leading glyph plus its
+//!    zero-width marks and the printable continuations stay in Terminal
+//!    Truth for copy/search/accessibility.
 //!    Underline paint is style-faithful (CTX-0583, refined CTX-1007):
 //!    `Single`/`Double` are full-width bars, while `Curly`/`Dotted`/`Dashed`
 //!    decompose into bounded, deterministic rectangle patterns anchored to
@@ -103,7 +114,7 @@ use crate::glyph::{
     RasterKey,
 };
 use crate::shaped::{
-    RunAttrs, ShapedCluster, ShapedRunSource, cells_for_range, features_for_policy,
+    RunAttrs, ShapedCluster, ShapedRunSource, cells_for_range_in, features_for_policy,
     form_runs_for_row,
 };
 
@@ -2758,6 +2769,13 @@ pub struct GridRenderer<R: GlyphRasterizer> {
     block_masks: HashMap<(char, u32, u32), Vec<u8>>,
     point_size: f32,
     cell: CellMetrics,
+    /// East Asian Ambiguous width policy the state layer committed cell
+    /// widths under (`terminal.ambiguous_width`). Span math in both paint
+    /// paths must measure text with this same policy, or a group after an
+    /// ambiguous scalar lands one column off. Embedders install the
+    /// resolved policy with [`GridRenderer::set_ambiguous_width`]; the
+    /// default is the state-layer default (narrow).
+    ambiguous_width: bitty_term_state::AmbiguousWidth,
     /// Resolved terminal palette (CTX-0355) used for default cell colors,
     /// ANSI 0–15, and the fill colors the planner emits. Defaults to the
     /// designed Bitty Dark preset; embedders override it with
@@ -2818,10 +2836,29 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             block_masks: HashMap::new(),
             point_size: query.point_size,
             cell,
+            ambiguous_width: bitty_term_state::AmbiguousWidth::Narrow,
             palette: ThemePalette::default(),
             baseline_offset,
             counters: RenderCounters::default(),
         })
+    }
+
+    /// The East Asian Ambiguous width policy span math measures under.
+    #[must_use]
+    pub const fn ambiguous_width(&self) -> bitty_term_state::AmbiguousWidth {
+        self.ambiguous_width
+    }
+
+    /// Installs the resolved `terminal.ambiguous_width` policy (CTX-1609).
+    ///
+    /// The state layer commits `Cell::width` under this policy; the shaped
+    /// and unshaped paint paths re-measure cluster spans for placement and
+    /// must resolve ambiguous scalars the same way. Defaults to the
+    /// state-layer default (narrow). No cached state depends on the policy:
+    /// rasterized glyphs and run shaping are policy-independent, only the
+    /// column arithmetic changes.
+    pub fn set_ambiguous_width(&mut self, policy: bitty_term_state::AmbiguousWidth) {
+        self.ambiguous_width = policy;
     }
 
     /// The resolved terminal palette used by [`Self::render`].
@@ -3448,16 +3485,18 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
 
     /// Emits a cell's zero-width scalars over their base glyph (CR-TERM-01).
     ///
-    /// `Cell::zerowidth` carries combining marks, joiners, and selectors
-    /// attached to the base cell. The unshaped paint path used to drop the
-    /// whole buffer, so a base + mark cell — for example the `e` + U+0301
-    /// corpus line in the #2264 report — painted as a bare `e`. Painting
-    /// each visible mark at the pen position the font expects restores the
-    /// diacritic without touching Terminal Truth: the cell keeps its base
-    /// scalar and mark buffer, so selection, copy, search, and accessibility
-    /// text stay byte-identical. (A genuinely precomposed U+00E9 cell was
-    /// already painted correctly; this closes the equivalent decomposed
-    /// encoding, which is what the reported corpus stores.)
+    /// `Cell::zerowidth` carries the cluster tail: combining marks, joiners,
+    /// selectors, and (CTX-1609) printable continuation scalars. Only
+    /// zero-width mark shapes paint here; printable continuations need the
+    /// shaped path. The unshaped paint path used to drop the whole buffer,
+    /// so a base + mark cell — for example the `e` + U+0301 corpus line in
+    /// the #2264 report — painted as a bare `e`. Painting each visible mark
+    /// at the pen position the font expects restores the diacritic without
+    /// touching Terminal Truth: the cell keeps its base scalar and mark
+    /// buffer, so selection, copy, search, and accessibility text stay
+    /// byte-identical. (A genuinely precomposed U+00E9 cell was already
+    /// painted correctly; this closes the equivalent decomposed encoding,
+    /// which is what the reported corpus stores.)
     ///
     /// Join controls (ZWNJ/ZWJ), variation selectors, and tag scalars carry
     /// no glyph of their own; they are skipped rather than rasterized (a
@@ -3797,10 +3836,12 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
     ///
     /// Phase C hardening (issue #1666): row backgrounds repaint the union
     /// of emitted cluster spans (wide spans crossing the dirty edge never
-    /// overpaint stale texels); glyphs sharing one shaper byte offset emit
-    /// as a group over their full cluster text; GPOS mark shifts apply to
-    /// glyph destinations; invisible-attribute runs emit no glyph, tofu,
-    /// or fallback — backgrounds only.
+    /// overpaint stale texels); a paint group is one extended grapheme
+    /// cluster (CTX-1609: the shaper may split a conjunct into several byte
+    /// offsets, and every member still paints) and carries the shaper's
+    /// accumulated pen so reordered members land where the font put them;
+    /// GPOS mark shifts apply to glyph destinations; invisible-attribute
+    /// runs emit no glyph, tofu, or fallback — backgrounds only.
     ///
     /// Grid-tiling gate (CTX-1607): every emitted group must start at the
     /// run's running pen column, stay inside the run's cell span, and
@@ -4178,61 +4219,45 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
         };
         let cols = snapshot.width;
         let mut emitted: Vec<(usize, usize)> = Vec::new();
-        // Grouped emission (Phase C): consecutive glyphs sharing one
-        // shaper byte offset (base + mark) emit as one group sharing the
-        // full cluster text. Slicing at the next *entry* would hand the
-        // first glyph an empty slice (vacuous CJK gate) and the second the
-        // whole text (a later gate failure then emits only part of the
-        // cluster) — grouping keeps the gate and the fallback whole.
+        // Grouped emission (CTX-1609, issue #1767): one paint group is one
+        // extended grapheme cluster of the run text, which is the unit grid
+        // truth committed. A shaper may split a cluster into several
+        // byte-offset groups — `क्ष` returns the conjunct consonant at its
+        // own offset — so grouping by offset alone would drop that
+        // consonant; grouping by the cluster keeps the CJK gate, the tofu
+        // decision, and the unshaped fallback whole.
         let mut idx = 0usize;
-        // Running pen column (run-relative). Every group must start where
-        // the previous one ended; a shaper that overlaps, reorders, or
-        // overruns the run breaks grid tiling and degrades that group.
-        let mut pen_col = 0usize;
         while idx < clusters_ref.len() {
-            let first = &clusters_ref[idx];
-            let group_offset = first.byte_offset;
-            let mut group_end = idx + 1;
-            while group_end < clusters_ref.len()
-                && clusters_ref[group_end].byte_offset == group_offset
-            {
-                group_end += 1;
-            }
+            let group_offset = clusters_ref[idx].byte_offset;
+            let (byte_end, group_end) = paint_group_range(&run.text, clusters_ref, idx);
             let group = &clusters_ref[idx..group_end];
-            let byte_end = cluster_group_end(clusters_ref, idx, run.text.len());
             let slice = run.text.get(group_offset..byte_end).unwrap_or("");
-            // Group span from grid truth (the empty-slice member's stored
-            // count is a 1-cell placeholder, never authoritative).
-            let count = cells_for_range(slice).max(1);
-            // Grid-true placement: the running pen column, never the
-            // shaper's claimed origin. The two agree for well-formed
-            // output; on corruption only the grid-true column is painted.
-            let abs_start = run.start_col.saturating_add(pen_col);
-            let abs_end = abs_start.saturating_add(count);
-            let tiling_ok = first.cells.0 == pen_col
-                && count <= run.col_count.saturating_sub(pen_col)
-                && abs_end <= snapshot.width;
-            pen_col = pen_col.saturating_add(count);
-            let dirty_start = dirty_cols.start.max(run.start_col);
-            let dirty_end = dirty_cols.end.min(run.start_col + run.col_count);
-            if abs_end <= dirty_start || abs_start >= dirty_end {
+            let prefix = run.text.get(..group_offset).unwrap_or("");
+            // Cluster span from grid truth, under the resolved ambiguous
+            // width policy: `run.col_count` already sums the committed
+            // `Cell::width` values, and a prefix measured with the same
+            // per-cluster rule maps the group back onto those columns. A
+            // group starting past the run's committed columns belongs to a
+            // cluster the print path already over-filled, so it stays in
+            // Terminal Truth rather than painting beyond the run.
+            let start_off = cells_for_range_in(prefix, self.ambiguous_width);
+            if start_off >= run.col_count {
                 idx = group_end;
                 continue;
             }
-            if !tiling_ok {
-                // Broken tiling: never paint the malformed span. Every
-                // scalar keeps its grid-true per-cell position instead.
-                self.counters.shaping_misaligned += 1;
-                self.cache.rasterizer_mut().inner_mut().note_misaligned();
-                if abs_start < snapshot.width {
-                    self.emit_unshaped_slice(
-                        slice,
-                        row,
-                        abs_start,
-                        self.shaped_run_fg(snapshot, row, cols, run),
-                        list,
-                    );
-                }
+            // The empty-slice member's stored count is a 1-cell placeholder,
+            // never authoritative; a shaper-merged span (an `fi` ligature is
+            // one glyph over two clusters) is, so the span is the larger of
+            // the cluster's own cells and the group's declared cells.
+            let declared = group.first().map_or(1, |c| c.cells.1.max(1));
+            let count = cells_for_range_in(slice, self.ambiguous_width)
+                .max(declared)
+                .min(run.col_count.saturating_sub(start_off));
+            let abs_start = run.start_col + start_off;
+            let abs_end = abs_start + count;
+            let dirty_start = dirty_cols.start.max(run.start_col);
+            let dirty_end = dirty_cols.end.min(run.start_col + run.col_count);
+            if abs_end <= dirty_start || abs_start >= dirty_end {
                 idx = group_end;
                 continue;
             }
@@ -4261,19 +4286,15 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
                     }
                 }
             }
-            // A shaper cluster may emit several glyphs at one byte offset.
-            // When the cluster text spans more than one base cell and the
-            // group is not a single ligated glyph, those members are a
-            // per-base fallback (join controls and selectors shape as
-            // separate zero-advance glyphs). Positioning every member at
-            // the cluster origin would stack the bases in one cell, so the
-            // deterministic per-cell path emits each base at its own grid
-            // column instead; Terminal Truth is unchanged.
-            if group.len() > 1 && cluster_base_scalar_count(slice) > 1 {
-                self.emit_unshaped_slice(slice, row, abs_start, fg, list);
-                idx = group_end;
-                continue;
-            }
+            // A cluster may emit several glyphs (base + mark, base + virama +
+            // consonant, a decomposed SARA AM, a decomposed Hangul syllable),
+            // and HB may place them at several byte offsets. Every drawable
+            // member paints, advanced by the shaper's own pen movement:
+            // dropping the tail would lose the matra or the second consonant
+            // (CTX-1609, issue #1767). Zero-advance members (marks, joiners)
+            // share the base origin, and a cluster wider than its committed
+            // span overhangs like any glyph bitmap instead of being clipped.
+            //
             // Coverage is per glyph: when no group member is drawable
             // the leading position names one tofu box for the whole span,
             // while a covered base still emits when only a trailing mark
@@ -4308,11 +4329,12 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
             // on faces that declare monospaced metrics: a proportional
             // face's ligature advance is unrelated to the terminal cell
             // width, while a terminal face's must tile its N cells exactly.
-            let monospaced = self
-                .cache
-                .rasterizer()
-                .inner()
-                .face_is_monospaced(first.face);
+            let monospaced = group.first().is_some_and(|lead| {
+                self.cache
+                    .rasterizer()
+                    .inner()
+                    .face_is_monospaced(lead.face)
+            });
             let enforce_advance = count == 1 || monospaced;
             let advance_ok = cluster_base_scalar_count(slice) == 0
                 || !enforce_advance
@@ -4328,11 +4350,19 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
                 idx = group_end;
                 continue;
             }
+            // Paint every drawable member of the cluster. The pen advances
+            // by the shaper's reported advance; a cluster wider than its
+            // committed span overhangs like any glyph bitmap (glyph ink is
+            // never clipped to the cell), while the next cluster still
+            // starts on its committed column.
+            let mut pen_px = 0.0_f32;
             for member in group {
-                if member.uncovered {
-                    continue;
+                if !member.uncovered {
+                    self.emit_shaped_cluster(
+                        member, effective, row, abs_start, count, pen_px, fg, list,
+                    )?;
                 }
-                self.emit_shaped_cluster(member, effective, row, abs_start, count, fg, list)?;
+                pen_px += member.x_advance_px.max(0.0);
             }
             idx = group_end;
         }
@@ -4356,7 +4386,12 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
         }
     }
 
-    /// Emits one shaped cluster as a single wide glyph instance.
+    /// Emits one shaped glyph as a single wide glyph instance.
+    ///
+    /// `pen_px` is the shaper's accumulated advance from the cluster origin
+    /// to this member's pen position; zero for the lead and for zero-advance
+    /// marks. The GPOS offset is added on top, so a reordered Indic matra
+    /// lands where HarfBuzz placed it inside the same cell.
     #[allow(clippy::too_many_arguments)]
     fn emit_shaped_cluster(
         &mut self,
@@ -4365,6 +4400,7 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
         row: usize,
         abs_col: usize,
         span_cols: usize,
+        pen_px: f32,
         color: Rgba8,
         list: &mut DrawList,
     ) -> Result<(), RenderError> {
@@ -4390,10 +4426,15 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
             features,
         );
         let source = self.atlas.ensure_shaped_cached(shaped_key, bitmap.inner);
-        // Grid origin plus bearing plus the shaper's GPOS horizontal
-        // offset (Phase C): combining marks shaped as separate glyphs
-        // carry their mark shift in `x_offset_px`, previously dropped.
-        let dest_x = shaped_dest_x(abs_col, self.cell.width, metrics.left, cluster.x_offset_px);
+        // Grid origin plus bearing plus the shaper's accumulated pen and
+        // GPOS horizontal offset (Phase C): combining marks and reordered
+        // members shaped as separate glyphs carry their placement there.
+        let dest_x = shaped_dest_x(
+            abs_col,
+            self.cell.width,
+            metrics.left,
+            pen_px + cluster.x_offset_px,
+        );
         let baseline = row as i64 * i64::from(self.cell.height) + self.baseline_offset;
         let dest_y = baseline - i64::from(metrics.top);
         let instance = match source {
@@ -4430,17 +4471,28 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
         Ok(())
     }
 
-    /// Emits one cluster's text per cell through the unshaped path
-    /// (CJK-epsilon fallback; every visible scalar keeps grid-true
+    /// Emits one cluster's text per grid cell through the unshaped path
+    /// (CJK-epsilon fallback; every committed cluster keeps grid-true
     /// placement).
     ///
-    /// Zero-width scalars own no cell. Join controls, variation selectors,
-    /// and tags are skipped: advancing them would shift a ZWJ sequence into
-    /// spacer columns and paint a stray glyph over the following cell.
-    /// Visible combining marks paint at the preceding base's pen origin,
-    /// mirroring the #2279 cell path, so a per-base fallback never drops a
-    /// diacritic. All bytes stay in Terminal Truth for selection, copy,
-    /// search, and accessibility.
+    /// CTX-1609: the slice is split into extended grapheme clusters and each
+    /// cluster paints its leading scalar at the column span the print path
+    /// committed (one or two cells), measured under the renderer's
+    /// `terminal.ambiguous_width` policy so a wide ambiguous scalar keeps its
+    /// committed column. Join controls, variation selectors, and tags are
+    /// skipped: advancing them would shift a ZWJ sequence into spacer columns
+    /// and paint a stray glyph over the following cell. Visible combining
+    /// marks paint at the base's pen origin, mirroring the #2279 cell path, so
+    /// a per-cluster fallback never drops a diacritic.
+    ///
+    /// Classic crossfont fallback (documented degradation): only scalars with
+    /// a zero-width mark shape paint over the base. Printable continuations of
+    /// a multi-base cluster (an Indic matra or second consonant, a Thai
+    /// floating mark, the second regional indicator, a decomposed Hangul
+    /// jamo) stay in Terminal Truth for the shaped path; faking them at the
+    /// base's pen origin would paint a wrong glyph in a wrong place. The
+    /// shaped stack ([`Self::render_shaped`]) paints every shaped glyph of the
+    /// cluster inside its span.
     fn emit_unshaped_slice(
         &mut self,
         slice: &str,
@@ -4450,26 +4502,31 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
         list: &mut DrawList,
     ) {
         let mut col = abs_col;
-        let mut last_base: Option<(usize, i32)> = None;
-        for ch in slice.chars() {
-            let width = usize::from(bitty_term_state::char_cell_width(ch));
+        for cluster in bitty_term_state::Graphemes::new(slice) {
+            let width = usize::from(bitty_term_state::cluster_cell_width(
+                cluster,
+                self.ambiguous_width,
+            ));
+            let mut chars = cluster.chars();
+            let Some(base) = chars.next() else {
+                continue;
+            };
             if width == 0 {
-                if is_paintable_zerowidth(ch) {
-                    if let Some((base_col, pen_advance)) = last_base {
-                        if let Some(advance) =
-                            self.emit_mark(ch, row, base_col, pen_advance, fg, list)
-                        {
-                            last_base = Some((base_col, pen_advance.saturating_add(advance)));
-                        }
-                    }
-                }
                 continue;
             }
-            let (emitted, advance) = self.emit_glyph(ch, row, col, width, fg, list);
+            let (emitted, advance) = self.emit_glyph(base, row, col, width, fg, list);
             if !emitted {
                 self.counters.blank_cells_skipped += 1;
             }
-            last_base = Some((col, advance.max(0)));
+            let mut pen_advance = advance.max(0);
+            for mark in chars {
+                if !is_paintable_zerowidth(mark) {
+                    continue;
+                }
+                if let Some(advance) = self.emit_mark(mark, row, col, pen_advance, fg, list) {
+                    pen_advance = pen_advance.saturating_add(advance);
+                }
+            }
             col += width;
         }
     }
@@ -4532,11 +4589,13 @@ fn push_cached_glyph(
 
 /// Whether a zero-width scalar attached to a cell has a visible mark shape.
 ///
-/// `Grapheme_Extend` covers combining marks (and emoji modifiers, which are
-/// wide scalars stored in their own cells, so they never reach the mark
-/// buffer in practice). Join controls and selectors/tags carry no mark shape;
-/// they are skipped so a missing-glyph tofu box can never be painted over
-/// their base.
+/// `Grapheme_Extend` covers combining marks. CTX-1609 stores the whole
+/// cluster tail in this buffer, including printable scalars (regional
+/// indicators, emoji modifiers, spacing marks); those are not overlay marks
+/// and the unshaped path must not paint them at the base's pen position, so
+/// only zero-cell-width scalars qualify. Join controls and selectors/tags
+/// carry no mark shape and are skipped so a missing-glyph tofu box can never
+/// be painted over their base.
 #[must_use]
 fn is_paintable_zerowidth(ch: char) -> bool {
     let cp = ch as u32;
@@ -4549,7 +4608,7 @@ fn is_paintable_zerowidth(ch: char) -> bool {
     ) {
         return false;
     }
-    bitty_term_state::is_grapheme_extend(cp)
+    bitty_term_state::char_cell_width(ch) == 0 && bitty_term_state::is_grapheme_extend(cp)
 }
 
 /// Destination x for one shaped glyph instance (Phase C hardening).
@@ -4564,18 +4623,6 @@ fn shaped_dest_x(abs_col: usize, cell_width: u32, left_bearing: i32, x_offset_px
     abs_col as i64 * i64::from(cell_width) + i64::from(left_bearing) + x_offset_px.round() as i64
 }
 
-/// Counts base scalars in one cluster slice (issue #2262).
-///
-/// Zero-width scalars (join controls, variation selectors, combining marks)
-/// contribute nothing. A count above one means the cluster spans more than
-/// one grid position, so a multi-glyph shaper group is a per-base fallback
-/// rather than one ligated glyph and must keep per-cell placement.
-fn cluster_base_scalar_count(text: &str) -> usize {
-    text.chars()
-        .filter(|ch| bitty_term_state::char_cell_width(*ch) > 0)
-        .count()
-}
-
 /// Returns the block scalar owning a one-cell cluster, if any (issue #2315).
 ///
 /// A cluster qualifies when it has exactly one spacing scalar and that
@@ -4583,6 +4630,17 @@ fn cluster_base_scalar_count(text: &str) -> usize {
 /// join controls, variation selectors) do not disqualify it. Ligatures and
 /// other multi-base clusters return `None` and keep shaping, so block
 /// coverage never changes a ligature run.
+/// Counts base (spacing) scalars in a cluster slice (CTX-1607 gate).
+///
+/// Zero-width scalars — combining marks, join controls, variation
+/// selectors — carry no cell of their own, so a zero count makes the
+/// group mark-only and exempts it from the grid-advance gate.
+fn cluster_base_scalar_count(text: &str) -> usize {
+    text.chars()
+        .filter(|ch| bitty_term_state::char_cell_width(*ch) > 0)
+        .count()
+}
+
 fn cluster_block_base(text: &str) -> Option<char> {
     let mut bases = text
         .chars()
@@ -4593,23 +4651,41 @@ fn cluster_block_base(text: &str) -> Option<char> {
     }
 }
 
-/// End byte of the cluster group starting at `idx`: the next *distinct*
-/// byte offset in the cluster list, or `run_len` for the trailing group
-/// (Phase C grouping).
+/// Byte range and index range of one paint group (CTX-1609).
 ///
-/// The shaper may emit several glyphs for one cluster (base + mark share
-/// one byte offset). Slicing a member at the next *entry* hands a
-/// same-offset follower an empty slice; slicing at the next *distinct*
-/// offset gives the whole group its full text for the CJK gate and the
-/// unshaped fallback. Only strictly-greater offsets qualify, so
-/// non-monotonic shaper output degrades to a wider (never panicking)
-/// slice via [`str::get`].
-fn cluster_group_end(clusters: &[ShapedCluster], idx: usize, run_len: usize) -> usize {
-    let start = clusters.get(idx).map_or(run_len, |c| c.byte_offset);
-    clusters
-        .get(idx + 1..)
-        .and_then(|tail| tail.iter().map(|c| c.byte_offset).find(|&off| off > start))
-        .unwrap_or(run_len)
+/// A paint group is one extended grapheme cluster of the run text, the unit
+/// grid truth committed. The shaper may split that cluster into several
+/// byte-offset entries — a conjunct consonant after a virama shapes at its
+/// own offset (`क्ष` -> `क्` at 0 and `ष` at 6) — so grouping by offset
+/// alone would drop the second consonant. `byte_end` is the cluster's end
+/// byte; the returned index is the first entry at or past it (entries with
+/// out-of-range offsets are consumed rather than looping).
+fn paint_group_range(text: &str, clusters: &[ShapedCluster], idx: usize) -> (usize, usize) {
+    let start = clusters
+        .get(idx)
+        .map_or(text.len(), |c| c.byte_offset.min(text.len()));
+    let mut byte_end = bitty_term_state::Graphemes::new(text.get(start..).unwrap_or(""))
+        .next()
+        .map_or(text.len(), |cluster| start + cluster.len());
+    let mut end = idx + 1;
+    while end < clusters.len() && clusters[end].byte_offset < byte_end {
+        end += 1;
+    }
+    // CTX-1609: a shaper may merge several grapheme clusters into one
+    // ligature glyph (`fi`, `->`, a ZWJ family), reporting a single entry
+    // whose committed cell span exceeds the first cluster. The group's text
+    // must then reach the next entry's offset (the run end for a trailing
+    // ligature), or the degrade and measure paths slice the ligature
+    // mid-sequence and silently drop its tail scalars.
+    if clusters.get(idx).is_some_and(|leader| leader.ligature_part) {
+        let next = clusters
+            .get(end)
+            .map_or(text.len(), |c| c.byte_offset.min(text.len()));
+        if next > byte_end {
+            byte_end = next;
+        }
+    }
+    (byte_end, end)
 }
 
 /// Union of emitted column spans on one row (Phase C partial-damage).

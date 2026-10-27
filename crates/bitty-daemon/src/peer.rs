@@ -125,13 +125,17 @@ pub enum DispatchBoundary {
     ObserverGrantMint,
     /// `session.grant.revoke` (observer-grant revocation).
     ObserverGrantRevoke,
+    /// `daemon.host_grant` mint (host-consent grant).
+    HostGrantMint,
+    /// `daemon.host_grant` revoke (host-consent grant).
+    HostGrantRevoke,
     /// `daemon.stop` in any mode.
     DaemonStop,
 }
 
 impl DispatchBoundary {
     /// Every privileged boundary in contract order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::CreateSession,
         Self::ControllerAttach,
         Self::Abort,
@@ -140,6 +144,8 @@ impl DispatchBoundary {
         Self::DetachOther,
         Self::ObserverGrantMint,
         Self::ObserverGrantRevoke,
+        Self::HostGrantMint,
+        Self::HostGrantRevoke,
         Self::DaemonStop,
     ];
 
@@ -155,6 +161,7 @@ impl DispatchBoundary {
             Self::DetachOther => "session.detach",
             Self::ObserverGrantMint => "session.grant",
             Self::ObserverGrantRevoke => "session.grant.revoke",
+            Self::HostGrantMint | Self::HostGrantRevoke => "daemon.host_grant",
             Self::DaemonStop => "daemon.stop",
         }
     }
@@ -749,7 +756,11 @@ mod tests {
 
     #[test]
     fn dispatch_boundaries_are_the_contract_methods() {
-        assert_eq!(DispatchBoundary::ALL.len(), 9);
+        assert_eq!(
+            DispatchBoundary::ALL.len(),
+            11,
+            "the nine contract boundaries plus the two host-grant modes"
+        );
         assert_eq!(DispatchBoundary::CreateSession.method(), "session.create");
         assert_eq!(
             DispatchBoundary::ControlTransfer.method(),
@@ -758,6 +769,14 @@ mod tests {
         assert_eq!(
             DispatchBoundary::ObserverGrantRevoke.method(),
             "session.grant.revoke"
+        );
+        assert_eq!(
+            DispatchBoundary::HostGrantMint.method(),
+            DispatchBoundary::HostGrantRevoke.method()
+        );
+        assert_eq!(
+            DispatchBoundary::HostGrantMint.method(),
+            "daemon.host_grant"
         );
         assert_eq!(DispatchBoundary::DaemonStop.to_string(), "daemon.stop");
         for boundary in DispatchBoundary::ALL {

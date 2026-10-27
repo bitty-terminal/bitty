@@ -21,6 +21,12 @@ name = "bittyd"
 path = "src/main.rs"
 
 [dependencies]
+# bitty#2607: the service scope registry reuses the `bitty-ipc` v1 method
+# grammar and v1 vocabulary instead of defining a second one (bitty#2664
+# freeze: one spelling, one registry). The crate is the same git source and
+# `rev = "9493674"` pin the workspace already resolves through
+# `bitty-runtime`, so this adds no package version and no second wire format.
+bitty-ipc-api = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674" }
 # CTX-1619: server-generated 128-bit ids for the registry (contract D-02).
 # The 0.4 line is already in the workspace lockfile (`bitty-rich`,
 # `bitty-runtime`, and `tempfile`); this adds no package version, no build-time

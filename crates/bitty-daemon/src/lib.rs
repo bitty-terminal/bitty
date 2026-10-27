@@ -99,6 +99,7 @@ pub mod peer;
 pub mod platform;
 pub mod registry;
 pub mod seam;
+pub mod service;
 
 /// Crate version reported by `bittyd --version`, from Cargo metadata.
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -6,7 +6,7 @@
 //! refusal, the path-length bound, and owner-checked removal. Nothing here
 //! accepts a connection in the daemon role: the listener is only probed.
 
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
@@ -347,4 +347,168 @@ fn reattest_reports_directory_and_socket_drift() {
 
     endpoint.reattest().expect("the restored endpoint attests");
     endpoint.close().expect("clean shutdown");
+}
+
+#[test]
+fn reattest_reports_a_missing_socket_and_close_is_ok() {
+    let temp = TempDir::new("missing-socket");
+    let endpoint = open_endpoint(&env_for(temp.path())).expect("bind the endpoint");
+    let socket = endpoint.socket_path().to_path_buf();
+    fs::remove_file(&socket).expect("delete the socket");
+
+    let error = endpoint.reattest().expect_err("a deleted socket is tamper");
+    assert!(
+        matches!(
+            error,
+            EndpointError::Tampered {
+                kind: TamperKind::Missing,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(error.is_tamper());
+    assert_eq!(error.result_code(), Some("Unauthenticated"));
+
+    // A clean shutdown after the object is already gone is not an error.
+    endpoint.close().expect("close after deletion is Ok");
+}
+
+#[test]
+fn reattest_reports_a_missing_runtime_directory() {
+    let temp = TempDir::new("missing-dir");
+    let endpoint = open_endpoint(&env_for(temp.path())).expect("bind the endpoint");
+    let runtime_dir = endpoint.runtime_dir().to_path_buf();
+    fs::remove_dir_all(&runtime_dir).expect("delete the runtime directory");
+
+    let error = endpoint
+        .reattest()
+        .expect_err("a deleted runtime directory is tamper");
+    assert!(
+        matches!(
+            error,
+            EndpointError::Tampered {
+                kind: TamperKind::Missing,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(error.is_tamper());
+    assert!(!runtime_dir.exists());
+}
+
+#[test]
+fn reattest_reports_a_replaced_socket() {
+    let temp = TempDir::new("replaced-socket");
+    let endpoint = open_endpoint(&env_for(temp.path())).expect("bind the endpoint");
+    let socket = endpoint.socket_path().to_path_buf();
+    fs::remove_file(&socket).expect("remove the bound socket");
+    let replacement = UnixListener::bind(&socket).expect("bind a replacement");
+    fs::set_permissions(&socket, fs::Permissions::from_mode(SOCKET_MODE)).expect("socket mode");
+
+    let error = endpoint.reattest().expect_err("a replacement is tamper");
+    assert!(
+        matches!(
+            error,
+            EndpointError::Tampered {
+                kind: TamperKind::Replaced,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(is_socket(&socket));
+    drop(replacement);
+    drop(endpoint);
+}
+
+#[test]
+fn close_leaves_the_lock_file_in_place() {
+    let temp = TempDir::new("lock-kept");
+    let endpoint = open_endpoint(&env_for(temp.path())).expect("bind the endpoint");
+    let paths = EndpointPaths::resolve(&env_for(temp.path())).expect("resolve");
+    let inode = inode_of(paths.lock());
+    endpoint.close().expect("clean shutdown");
+    assert!(
+        fs::symlink_metadata(paths.lock())
+            .expect("the lock file survives a clean shutdown")
+            .file_type()
+            .is_file()
+    );
+    assert_eq!(inode_of(paths.lock()), inode);
+    assert_eq!(mode_of(paths.lock()), LOCK_FILE_MODE);
+}
+
+#[test]
+fn a_symlinked_lock_path_is_refused_at_startup() {
+    let temp = TempDir::new("lock-symlink");
+    create_runtime_dir(&temp);
+    let paths = EndpointPaths::resolve(&env_for(temp.path())).expect("resolve");
+    let target = temp.path().join("lock-target");
+    fs::write(&target, b"keep").expect("write the target");
+    std::os::unix::fs::symlink(&target, paths.lock()).expect("create the symlink");
+
+    let error = open_endpoint(&env_for(temp.path())).expect_err("a symlink must refuse");
+    assert!(
+        matches!(
+            error,
+            EndpointError::Tampered {
+                kind: TamperKind::Symlink,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(
+        fs::symlink_metadata(paths.lock())
+            .expect("the symlink is untouched")
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read(&target).expect("target intact"), b"keep");
+}
+
+#[test]
+fn a_directory_at_the_lock_path_is_refused_at_startup() {
+    let temp = TempDir::new("lock-dir");
+    create_runtime_dir(&temp);
+    let paths = EndpointPaths::resolve(&env_for(temp.path())).expect("resolve");
+    fs::create_dir(paths.lock()).expect("create the directory");
+
+    let error = open_endpoint(&env_for(temp.path())).expect_err("a directory must refuse");
+    assert!(
+        matches!(
+            error,
+            EndpointError::Tampered {
+                kind: TamperKind::NotARegularFile,
+                ..
+            }
+        ),
+        "{error}"
+    );
+    assert!(paths.lock().is_dir());
+}
+
+#[test]
+fn a_shared_runtime_root_is_refused() {
+    for mode in [0o770, 0o707, 0o777] {
+        let temp = TempDir::new("shared-root");
+        let root = temp.path().to_path_buf();
+        fs::set_permissions(&root, fs::Permissions::from_mode(mode)).expect("share the root");
+        let error = open_endpoint(&env_for(&root)).expect_err("a shared root must refuse");
+        match error {
+            EndpointError::Tampered {
+                kind: TamperKind::SharedRuntimeRoot { mode: observed },
+                ..
+            } => assert_eq!(observed, mode),
+            other => panic!("unexpected error for mode {mode:o}: {other}"),
+        }
+        assert!(
+            !root.join(RUNTIME_SUBDIR).exists(),
+            "nothing is created under a shared runtime root"
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(RUNTIME_DIR_MODE))
+            .expect("restore the root for cleanup");
+    }
 }

@@ -26,21 +26,40 @@
 //!
 //! # Stale sockets
 //!
-//! An existing endpoint path is first attested (no symlink, a socket, owned by
-//! this uid, mode `0600`). A non-blocking connect then classifies it: a
-//! successful connect, or `EAGAIN` from a full accept queue, means the
+//! An existing endpoint path is first attested for type and owner (no symlink,
+//! a socket, owned by this uid). Its mode is deliberately not part of that
+//! check: a dead socket left by a crash between `bind` and the `0600` chmod is
+//! still this user's object to reclaim. A non-blocking connect then classifies
+//! it: a successful connect, or `EAGAIN` from a full accept queue, means the
 //! endpoint is live and is **never** unlinked; `ECONNREFUSED` (or a path that
 //! vanished) is stale and is reclaimed by renaming it to a private quarantine
 //! name, re-checking the quarantined object's identity, and only then removing
 //! it. Any other probe error is ambiguous and refuses takeover. This module
-//! never removes a path it did not prove stale and owned.
+//! never removes a path it did not prove stale and owned. The `0600` mode is
+//! applied and attested on the socket this process binds.
 //!
 //! # Tamper checks
 //!
-//! Startup attests the runtime directory and socket; [`BoundEndpoint::reattest`]
-//! repeats the check for the bounded tamper interval the service loop owns. A
-//! mismatch is [`EndpointError::Tampered`], the contract's exit-code `6` path
-//! (`D-05`): it is not retried through a weaker transport.
+//! Startup attests the runtime root, the runtime directory, and the socket;
+//! [`BoundEndpoint::reattest`] repeats the directory and socket checks for the
+//! bounded tamper interval the service loop owns. A mismatch, including a
+//! deleted directory or socket ([`TamperKind::Missing`]), is
+//! [`EndpointError::Tampered`], the contract's exit-code `6` path (`D-05`): it
+//! is not retried through a weaker transport. When the endpoint is derived from
+//! `$XDG_RUNTIME_DIR`, that root must be owned by this uid and must not be
+//! group- or world-writable; a shared root is
+//! [`TamperKind::SharedRuntimeRoot`]. An endpoint override names its own
+//! directory, which is attested as an exact `0700` owned directory.
+//!
+//! # Same-uid boundary
+//!
+//! A few checks are necessarily check-then-act: the path-based `chmod` after
+//! `bind` (a Linux socket inode ignores `fchmod`) and the identity check before
+//! unlinking on shutdown. They are not atomic against another process running
+//! as the same user, which is already inside the daemon's trust boundary. The
+//! checks that must stop a *different* user are structural: the `0700` runtime
+//! directory, the owned non-shared runtime root, and the owner/mode/identity
+//! attestations.
 //!
 //! # Windows
 //!
@@ -49,7 +68,9 @@
 //! rejected at the pipe level, `GetNamedPipeClientProcessId` plus token SID
 //! comparison, and fail-closed SID/AppContainer/integrity-level mismatches.
 //! [`open_endpoint`] returns [`EndpointError::UnsupportedPlatform`] on Windows
-//! until that transport and its native-runner conformance exist.
+//! until that transport and its native-runner conformance exist, and on any
+//! cell whose peer mechanism lacks a start time (macOS in this slice), so a
+//! cross-check can never be read as advertisement.
 //!
 //! This module binds a listener but never accepts on it: the `bitty-ipc` v1
 //! service loop (bitty#2607) owns `accept`, framing, and dispatch.
@@ -168,7 +189,9 @@ impl EndpointEnv {
 /// `6` path; the service loop (bitty#2607) owns the process-exit mapping.
 #[derive(Debug)]
 pub enum EndpointError {
-    /// The compiled cell has no accepted endpoint transport (`D-15`).
+    /// The compiled cell has no accepted endpoint transport, or its peer
+    /// mechanism is incomplete for the accepted re-check (`D-15`; macOS in
+    /// this slice). Nothing is bound.
     UnsupportedPlatform {
         /// The refused cell.
         cell: PlatformCell,
@@ -334,6 +357,13 @@ pub enum TamperKind {
     },
     /// The bound endpoint was replaced by another object.
     Replaced,
+    /// The runtime directory or socket is gone (deleted or replaced).
+    Missing,
+    /// The runtime root is writable by group or other users.
+    SharedRuntimeRoot {
+        /// The observed permission bits.
+        mode: u32,
+    },
     /// An existing endpoint that could not be classified safely.
     ProbeAmbiguous,
 }
@@ -352,6 +382,11 @@ impl fmt::Display for TamperKind {
                 write!(formatter, "mode {mode:o} is not the required {expected:o}")
             }
             Self::Replaced => formatter.write_str("endpoint was replaced by another object"),
+            Self::Missing => formatter.write_str("endpoint path is missing"),
+            Self::SharedRuntimeRoot { mode } => write!(
+                formatter,
+                "runtime root mode {mode:o} is writable by group or other users"
+            ),
             Self::ProbeAmbiguous => {
                 formatter.write_str("liveness probe was ambiguous; refusing takeover")
             }
@@ -363,6 +398,7 @@ impl fmt::Display for TamperKind {
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointPaths {
+    runtime_root: Option<PathBuf>,
     runtime_dir: PathBuf,
     socket: PathBuf,
     lock: PathBuf,
@@ -386,7 +422,7 @@ impl EndpointPaths {
     /// - [`EndpointError::PathTooLong`] when the socket path exceeds
     ///   [`MAX_SOCKET_PATH_BYTES`].
     pub fn resolve(env: &EndpointEnv) -> Result<Self, EndpointError> {
-        let (runtime_dir, socket) = match env.endpoint_override() {
+        let (runtime_root, runtime_dir, socket) = match env.endpoint_override() {
             Some(override_path) => {
                 let path = PathBuf::from(override_path);
                 if !path.is_absolute() {
@@ -405,7 +441,9 @@ impl EndpointPaths {
                     path: path.clone(),
                     reason: "the endpoint override has no parent directory".to_string(),
                 })?;
-                (parent.to_path_buf(), path)
+                // The override parent is the endpoint directory itself, so it
+                // is attested directly; there is no separate runtime root.
+                (None, parent.to_path_buf(), path)
             }
             None => {
                 let Some(root) = env.xdg_runtime_dir() else {
@@ -424,7 +462,7 @@ impl EndpointPaths {
                 }
                 let runtime_dir = root.join(RUNTIME_SUBDIR);
                 let socket = runtime_dir.join(SOCKET_FILE_NAME);
-                (runtime_dir, socket)
+                (Some(root), runtime_dir, socket)
             }
         };
 
@@ -439,6 +477,7 @@ impl EndpointPaths {
 
         let lock = runtime_dir.join(LOCK_FILE_NAME);
         Ok(Self {
+            runtime_root,
             runtime_dir,
             socket,
             lock,
@@ -546,7 +585,7 @@ impl BoundEndpoint {
     /// has drifted from the contract mode.
     pub fn reattest(&self) -> Result<(), EndpointError> {
         attest_directory_path(&self.paths.runtime_dir, self.uid)?;
-        let metadata = symlink_metadata(&self.paths.socket, "inspect the endpoint socket")?;
+        let metadata = attested_metadata(&self.paths.socket, "inspect the endpoint socket")?;
         attest_socket_metadata(&self.paths.socket, &metadata, self.uid)?;
         if SocketIdentity::from_metadata(&metadata) != self.identity {
             return Err(EndpointError::Tampered {
@@ -570,6 +609,11 @@ impl BoundEndpoint {
         self.remove_owned_socket()
     }
 
+    /// Check-then-act on the socket path, deliberately not atomic against a
+    /// same-uid process: that process is inside the daemon trust boundary, and
+    /// the `0700` runtime directory plus the owned runtime root are what keep a
+    /// different user out. The identity check still refuses to unlink anything
+    /// this process did not bind.
     fn remove_owned_socket(&self) -> Result<(), EndpointError> {
         let path = &self.paths.socket;
         let metadata = match std::fs::symlink_metadata(path) {
@@ -631,7 +675,8 @@ pub struct BoundEndpoint {
 /// # Errors
 ///
 /// - [`EndpointError::UnsupportedPlatform`] on a cell without an accepted
-///   transport; nothing is created.
+///   transport or without a complete peer mechanism (macOS in this slice);
+///   nothing is created.
 /// - [`EndpointError::NoEndpoint`] / [`EndpointError::InvalidPath`] /
 ///   [`EndpointError::PathTooLong`] for an unusable endpoint path.
 /// - [`EndpointError::AlreadyRunning`] when another instance holds the lock or
@@ -649,6 +694,9 @@ fn open_endpoint_for_cell(
     cell: PlatformCell,
     env: &EndpointEnv,
 ) -> Result<BoundEndpoint, EndpointError> {
+    if !cell.serves_endpoint() {
+        return Err(EndpointError::UnsupportedPlatform { cell });
+    }
     match cell.transport() {
         EndpointTransport::UnixSocket => open_unix(env),
         EndpointTransport::WindowsNamedPipe | EndpointTransport::Unsupported => {
@@ -661,7 +709,7 @@ fn open_endpoint_for_cell(
 fn open_unix(env: &EndpointEnv) -> Result<BoundEndpoint, EndpointError> {
     let paths = EndpointPaths::resolve(env)?;
     let uid = getuid().as_raw();
-    prepare_runtime_dir(&paths.runtime_dir, uid)?;
+    prepare_runtime_dir(&paths.runtime_dir, paths.runtime_root.as_deref(), uid)?;
     let lock = acquire_instance_lock(&paths, uid)?;
     clear_stale_socket(&paths.socket, uid)?;
     let (listener, identity) = bind_endpoint(&paths.socket, uid)?;
@@ -685,28 +733,13 @@ fn open_unix(_env: &EndpointEnv) -> Result<BoundEndpoint, EndpointError> {
 }
 
 #[cfg(unix)]
-fn prepare_runtime_dir(dir: &Path, uid: u32) -> Result<(), EndpointError> {
-    if let Some(parent) = dir.parent() {
-        match std::fs::metadata(parent) {
-            Ok(metadata) if metadata.is_dir() => {}
-            Ok(_) => {
-                return Err(EndpointError::NoEndpoint {
-                    reason: format!("the runtime root {} is not a directory", parent.display()),
-                });
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(EndpointError::NoEndpoint {
-                    reason: format!("the runtime root {} does not exist", parent.display()),
-                });
-            }
-            Err(source) => {
-                return Err(EndpointError::Io {
-                    action: "inspect the runtime root",
-                    path: parent.to_path_buf(),
-                    source,
-                });
-            }
-        }
+fn prepare_runtime_dir(
+    dir: &Path,
+    runtime_root: Option<&Path>,
+    uid: u32,
+) -> Result<(), EndpointError> {
+    if let Some(root) = runtime_root {
+        attest_runtime_root(root, uid)?;
     }
     match std::fs::symlink_metadata(dir) {
         Ok(metadata) => attest_directory(dir, &metadata, uid),
@@ -734,10 +767,72 @@ fn prepare_runtime_dir(dir: &Path, uid: u32) -> Result<(), EndpointError> {
     }
 }
 
+/// The runtime root (`$XDG_RUNTIME_DIR`) must be a directory owned by this
+/// uid and must not be writable by group or other users. The endpoint's own
+/// `0700` directory is what actually isolates the socket; the root check closes
+/// the rename/replace path for a different user. An endpoint override names a
+/// directory that is attested directly instead.
+#[cfg(unix)]
+fn attest_runtime_root(root: &Path, uid: u32) -> Result<(), EndpointError> {
+    let metadata = match std::fs::metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(EndpointError::NoEndpoint {
+                reason: format!("the runtime root {} does not exist", root.display()),
+            });
+        }
+        Err(source) => {
+            return Err(EndpointError::Io {
+                action: "inspect the runtime root",
+                path: root.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !metadata.is_dir() {
+        return Err(EndpointError::NoEndpoint {
+            reason: format!("the runtime root {} is not a directory", root.display()),
+        });
+    }
+    let owner = metadata.uid();
+    if owner != uid {
+        return Err(tampered(
+            root,
+            TamperKind::ForeignOwner {
+                owner,
+                expected: uid,
+            },
+        ));
+    }
+    let mode = metadata.mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(tampered(root, TamperKind::SharedRuntimeRoot { mode }));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn attest_directory_path(dir: &Path, uid: u32) -> Result<(), EndpointError> {
-    let metadata = symlink_metadata(dir, "attest the endpoint runtime directory")?;
+    let metadata = attested_metadata(dir, "attest the endpoint runtime directory")?;
     attest_directory(dir, &metadata, uid)
+}
+
+/// Read the metadata of a path that must exist for the endpoint to be sound.
+/// A missing directory or socket is a tamper signal (an unlink-based split),
+/// never a generic I/O failure, so #2607's exit-6 mapping cannot miss it.
+#[cfg(unix)]
+fn attested_metadata(path: &Path, action: &'static str) -> Result<Metadata, EndpointError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(tampered(path, TamperKind::Missing))
+        }
+        Err(source) => Err(EndpointError::Io {
+            action,
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 #[cfg(unix)]
@@ -1185,7 +1280,12 @@ mod tests {
 
         for cell in [
             PlatformCell::FreeBsdX86_64,
+            PlatformCell::FreeBsdOther,
             PlatformCell::WindowsX86_64,
+            PlatformCell::WindowsOther,
+            PlatformCell::MacosArm64,
+            PlatformCell::MacosX86_64,
+            PlatformCell::MacosOther,
             PlatformCell::Other,
         ] {
             let error =
@@ -1203,6 +1303,66 @@ mod tests {
             assert_eq!(entries, 0, "a refused cell must not create an endpoint");
             let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    #[cfg(unix)]
+    fn lock_paths(prefix: &str) -> EndpointPaths {
+        let root = scratch_dir(prefix);
+        let env = EndpointEnv::new(None, Some(root.join("bittyd.sock").into_os_string()));
+        EndpointPaths::resolve(&env).expect("resolve the lock paths")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_lock_path_is_refused() {
+        let paths = lock_paths("lock-symlink");
+        std::os::unix::fs::symlink("/nonexistent", paths.lock()).expect("create the symlink");
+        match acquire_instance_lock(&paths, getuid().as_raw()).unwrap_err() {
+            EndpointError::Tampered {
+                kind: TamperKind::Symlink,
+                ..
+            } => {}
+            other => panic!("unexpected error: {other}"),
+        }
+        assert!(
+            std::fs::symlink_metadata(paths.lock())
+                .expect("the symlink is untouched")
+                .file_type()
+                .is_symlink()
+        );
+        let _ = std::fs::remove_dir_all(paths.runtime_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_at_the_lock_path_is_refused() {
+        let paths = lock_paths("lock-directory");
+        std::fs::create_dir(paths.lock()).expect("create the directory");
+        match acquire_instance_lock(&paths, getuid().as_raw()).unwrap_err() {
+            EndpointError::Tampered {
+                kind: TamperKind::NotARegularFile,
+                ..
+            } => {}
+            other => panic!("unexpected error: {other}"),
+        }
+        let _ = std::fs::remove_dir_all(paths.runtime_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_at_the_lock_path_is_refused() {
+        use nix::sys::stat::Mode;
+
+        let paths = lock_paths("lock-fifo");
+        nix::unistd::mkfifo(paths.lock(), Mode::S_IRUSR | Mode::S_IWUSR).expect("create the FIFO");
+        match acquire_instance_lock(&paths, getuid().as_raw()).unwrap_err() {
+            EndpointError::Tampered {
+                kind: TamperKind::NotARegularFile,
+                ..
+            } => {}
+            other => panic!("unexpected error: {other}"),
+        }
+        let _ = std::fs::remove_dir_all(paths.runtime_dir());
     }
 
     #[cfg(unix)]

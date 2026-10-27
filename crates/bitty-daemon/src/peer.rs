@@ -9,11 +9,14 @@
 //!   namespace or container mapping is `Unauthenticated`, never same-user
 //!   success (`D-15`).
 //! - macOS: `LOCAL_PEERCRED` for uid/gid and `LOCAL_PEERPID` for the pid. The
-//!   start time is not exposed through the safe API surface in this slice, so
-//!   the macOS re-check is liveness-only; the cell stays conformance-gated and
-//!   must not be advertised before a start-time mechanism lands.
+//!   safe API surface exposes no process start time in this slice, so the
+//!   mechanism is incomplete and [`crate::platform::PlatformCell::serves_endpoint`]
+//!   is false. Capture refuses with [`PeerError::UnsupportedPlatform`]; the
+//!   code is compiled and cross-checked but no macOS build can serve an
+//!   endpoint or construct a guard until a start-time mechanism lands.
 //! - Every other cell: [`PeerError::UnsupportedPlatform`]. A weaker check is
-//!   never substituted.
+//!   never substituted. FreeBSD has `LOCAL_PEERCRED` (uid/gid) but no pid in
+//!   the safe API, so it fails the same gate.
 //!
 //! Re-check failures fail closed: a dead peer, a recycled pid, a changed start
 //! time, a changed uid, a changed user namespace, or an unavailable
@@ -25,11 +28,32 @@
 //! start time is what makes the check meaningful. On Linux the capture reads
 //! `/proc/<pid>/stat` once for the start time and `/proc/<pid>/status` for the
 //! effective uid, both with a fixed byte bound and a fail-closed parse.
+//!
+//! # Known caveats (recorded follow-ups)
+//!
+//! - The start time is a per-boot tick, not a boot id. Re-checking happens
+//!   inside one daemon lifetime, so a reboot ends the daemon before the value
+//!   could be compared across boots; recording a boot id and holding a pidfd
+//!   (Linux `SO_PEERPIDFD`) would harden the capture against a pid reused
+//!   between `SO_PEERCRED` and the `/proc` reads.
+//! - The `/proc` evidence is a mixed snapshot: the start time, effective uid,
+//!   and user namespace are separate reads, so a peer that exits and has its
+//!   pid reused between them can yield fields from two processes. The
+//!   start-time comparison at every re-check refuses the recycled pid after
+//!   the fact, but the capture observation is not atomic; a pidfd would close
+//!   that window.
 
 use std::fmt;
 
 #[cfg(unix)]
 use std::os::fd::AsFd;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+
+#[cfg(unix)]
+use nix::sys::socket::{getsockopt, sockopt};
+#[cfg(unix)]
+use nix::unistd::geteuid;
 
 #[cfg(unix)]
 use crate::platform::PeerMechanism;
@@ -252,19 +276,28 @@ pub struct PeerGuard {
 impl PeerGuard {
     /// Capture and authenticate the connected peer before parsing any request.
     ///
-    /// The capture takes the connected Unix stream's descriptor. Windows has
-    /// no capture path until the named-pipe transport lands; the endpoint
-    /// refuses that cell before a connection exists.
+    /// The argument is the accepted, connected [`UnixStream`], not a generic
+    /// descriptor: `SO_PEERCRED` on a *listening* socket reports the daemon's
+    /// own pid/uid/gid, so an `AsFd` API would let a caller "authenticate" the
+    /// listener as its own peer. The expect-uid is read from the process with
+    /// `geteuid()`; it is never a caller-supplied value. An
+    /// `SO_ACCEPTCONN` check refuses a listening descriptor as belt-and-braces
+    /// for any future raw-descriptor path.
+    ///
+    /// Windows has no capture path until the named-pipe transport lands; the
+    /// endpoint refuses that cell before a connection exists.
     ///
     /// # Errors
     ///
-    /// [`PeerError::UnsupportedPlatform`] when the compiled cell has no
-    /// accepted mechanism, and [`PeerError::CaptureFailed`] when the kernel
-    /// credential is unavailable, the peer is not `expected_uid`, the peer is
-    /// already gone, or the identity cannot be bounded and verified.
+    /// [`PeerError::UnsupportedPlatform`] when the compiled cell is not
+    /// servable (no accepted transport, or a peer mechanism without a start
+    /// time), and [`PeerError::CaptureFailed`] when the kernel credential is
+    /// unavailable, the descriptor is a listening socket or not a socket, the
+    /// peer is not the daemon uid, the peer is already gone, or the identity
+    /// cannot be bounded and verified.
     #[cfg(unix)]
-    pub fn capture<S: AsFd>(socket: S, expected_uid: u32) -> Result<Self, PeerError> {
-        Self::capture_for_cell(PlatformCell::current(), socket, expected_uid)
+    pub fn capture(stream: &UnixStream) -> Result<Self, PeerError> {
+        Self::capture_inner(stream, geteuid().as_raw())
     }
 
     /// The captured peer identity, for audit and diagnostics.
@@ -286,13 +319,35 @@ impl PeerGuard {
     }
 
     #[cfg(unix)]
+    fn capture_inner<S: AsFd>(socket: S, expected_uid: u32) -> Result<Self, PeerError> {
+        Self::capture_for_cell(PlatformCell::current(), socket, expected_uid)
+    }
+
+    #[cfg(unix)]
     fn capture_for_cell<S: AsFd>(
         cell: PlatformCell,
         socket: S,
         expected_uid: u32,
     ) -> Result<Self, PeerError> {
-        if matches!(cell.peer_mechanism(), PeerMechanism::Unsupported) {
+        if !cell.serves_endpoint() {
             return Err(PeerError::UnsupportedPlatform { cell });
+        }
+        let listening =
+            getsockopt(&socket, sockopt::AcceptConn).map_err(|error| PeerError::CaptureFailed {
+                cause: PeerCause::Unavailable {
+                    reason: format!("SO_ACCEPTCONN query failed: {error}"),
+                },
+            })?;
+        if listening {
+            return Err(PeerError::CaptureFailed {
+                cause: PeerCause::Unauthenticated {
+                    reason: concat!(
+                        "a listening socket has no connected peer; ",
+                        "its SO_PEERCRED is the daemon's own identity"
+                    )
+                    .to_string(),
+                },
+            });
         }
         let identity = capture_identity(cell.peer_mechanism(), socket, expected_uid)
             .map_err(|cause| PeerError::CaptureFailed { cause })?;
@@ -725,6 +780,77 @@ mod tests {
         assert_eq!(error.result_code(), "UnsupportedPlatform");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn macos_is_refused_structurally_not_by_prose() {
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let uid = geteuid().as_raw();
+        let error = PeerGuard::capture_for_cell(PlatformCell::MacosArm64, &socket, uid)
+            .expect_err("macOS has no start-time mechanism, so it must not capture");
+        assert!(matches!(
+            error,
+            PeerError::UnsupportedPlatform {
+                cell: PlatformCell::MacosArm64
+            }
+        ));
+        assert_eq!(error.result_code(), "UnsupportedPlatform");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_refuses_a_listening_socket() {
+        let dir = scratch_dir("listener");
+        let path = dir.join("listener.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind a listener");
+        // `SO_PEERCRED` on a listening socket reports the daemon's own
+        // credentials; the structural signature and `SO_ACCEPTCONN` must
+        // refuse before that value can be mistaken for a peer.
+        let error = PeerGuard::capture_inner(&listener, geteuid().as_raw())
+            .expect_err("a listening socket has no peer to authenticate");
+        assert!(matches!(
+            error,
+            PeerError::CaptureFailed {
+                cause: PeerCause::Unauthenticated { .. }
+            }
+        ));
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn capture_refuses_a_non_socket_descriptor() {
+        let dir = scratch_dir("plain-file");
+        let path = dir.join("plain.txt");
+        std::fs::write(&path, b"not a socket").expect("write the file");
+        let file = std::fs::File::open(&path).expect("open the file");
+        let error = PeerGuard::capture_inner(&file, geteuid().as_raw())
+            .expect_err("a regular file has no peer credentials");
+        assert!(matches!(
+            error,
+            PeerError::CaptureFailed {
+                cause: PeerCause::Unavailable { .. }
+            }
+        ));
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scratch_dir(label: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "bittyd-peer-unit-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create scratch dir");
+        path
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn capture_matches_the_current_process_identity() {
@@ -732,7 +858,7 @@ mod tests {
         let uid = nix::unistd::getuid().as_raw();
         let gid = nix::unistd::getgid().as_raw();
         let pid = u32::try_from(nix::unistd::getpid().as_raw()).expect("pid fits u32");
-        let guard = PeerGuard::capture(&socket, uid).expect("capture the peer");
+        let guard = PeerGuard::capture(&socket).expect("capture the peer");
         let identity = guard.identity();
         assert_eq!(identity.uid(), uid);
         assert_eq!(identity.gid(), gid);
@@ -756,9 +882,9 @@ mod tests {
     #[test]
     fn capture_refuses_a_foreign_uid() {
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        let uid = nix::unistd::getuid().as_raw();
+        let uid = geteuid().as_raw();
         let other = uid.wrapping_add(1);
-        let error = PeerGuard::capture(&socket, other).expect_err("uid mismatch must refuse");
+        let error = PeerGuard::capture_inner(&socket, other).expect_err("uid mismatch must refuse");
         assert!(matches!(
             error,
             PeerError::CaptureFailed {
@@ -772,8 +898,7 @@ mod tests {
     #[test]
     fn recheck_refuses_a_changed_start_time() {
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        let uid = nix::unistd::getuid().as_raw();
-        let guard = PeerGuard::capture(&socket, uid).expect("capture the peer");
+        let guard = PeerGuard::capture(&socket).expect("capture the peer");
         let expected = guard.identity().start_time().expect("Linux start time");
 
         struct DriftProbe(u64);
@@ -809,8 +934,7 @@ mod tests {
         }
 
         let (socket, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        let uid = nix::unistd::getuid().as_raw();
-        let guard = PeerGuard::capture(&socket, uid).expect("capture the peer");
+        let guard = PeerGuard::capture(&socket).expect("capture the peer");
         let error = guard
             .recheck_with(&GoneProbe, DispatchBoundary::Abort)
             .expect_err("a dead peer must be refused");

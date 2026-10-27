@@ -7,7 +7,7 @@
 //! `LOCAL_PEERPID` read without a `fork` or any `unsafe` code. The helper
 //! connects, signals readiness, and waits for the parent to release it.
 
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use std::fs;
 use std::io::{Read, Write};
@@ -71,8 +71,8 @@ impl Drop for TempDir {
     }
 }
 
-fn accept_with_deadline(listener: &UnixListener) -> UnixStream {
-    let deadline = Instant::now() + Duration::from_secs(15);
+fn accept_with_timeout(listener: &UnixListener, timeout: Duration) -> Option<UnixStream> {
+    let deadline = Instant::now() + timeout;
     listener
         .set_nonblocking(true)
         .expect("set the listener non-blocking");
@@ -82,18 +82,22 @@ fn accept_with_deadline(listener: &UnixListener) -> UnixStream {
                 stream
                     .set_nonblocking(false)
                     .expect("the accepted stream is blocking");
-                return stream;
+                return Some(stream);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(
-                    Instant::now() < deadline,
-                    "the peer helper did not connect in time"
-                );
+                if Instant::now() >= deadline {
+                    return None;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(error) => panic!("accept failed: {error}"),
         }
     }
+}
+
+fn accept_with_deadline(listener: &UnixListener) -> UnixStream {
+    accept_with_timeout(listener, Duration::from_secs(15))
+        .expect("the peer helper did not connect in time")
 }
 
 #[test]
@@ -119,7 +123,7 @@ fn captures_and_rechecks_a_child_process_peer() {
         .expect("the helper reports readiness");
 
     let uid = fs::metadata(temp.path()).expect("temp metadata").uid();
-    let guard = PeerGuard::capture(&stream, uid).expect("capture the child peer");
+    let guard = PeerGuard::capture(&stream).expect("capture the child peer");
     assert_eq!(guard.identity().pid(), child.id());
     assert_eq!(guard.identity().uid(), uid);
     #[cfg(target_os = "linux")]
@@ -150,4 +154,67 @@ fn captures_and_rechecks_a_child_process_peer() {
         ),
         "unexpected re-check failure: {error}"
     );
+}
+
+/// The uid is mapped to the same value through an unprivileged user
+/// namespace, so `SO_PEERCRED` alone cannot distinguish the child. Only the
+/// user-namespace comparison refuses it (`D-15`).
+#[test]
+fn refuses_a_peer_from_a_different_user_namespace() {
+    let temp = TempDir::new("userns");
+    let socket = temp.path().join("peer.sock");
+    let listener = UnixListener::bind(&socket).expect("bind the peer socket");
+    let mut child = match Command::new("unshare")
+        .arg("-Ur")
+        .arg(std::env::current_exe().expect("the test binary"))
+        .args(["--exact", "peer_helper_child", "--nocapture"])
+        .env(HELPER_ENV, &socket)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            eprintln!(
+                "skip: cannot spawn `unshare` for the user-namespace test: {error};                  the check stays unpinned on this host"
+            );
+            return;
+        }
+    };
+
+    let Some(mut stream) = accept_with_timeout(&listener, Duration::from_secs(15)) else {
+        match child.try_wait() {
+            Ok(Some(status)) => eprintln!(
+                "skip: `unshare -Ur` did not start the helper ({status}); the kernel or a                  security policy denied an unprivileged user namespace"
+            ),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the user-namespace helper never connected");
+            }
+            Err(error) => panic!("waiting for the unshare helper failed: {error}"),
+        }
+        return;
+    };
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(15)))
+        .expect("set the read timeout");
+    let mut ready = [0u8; 1];
+    stream
+        .read_exact(&mut ready)
+        .expect("the helper reports readiness");
+
+    let error = PeerGuard::capture(&stream)
+        .expect_err("a uid mapped through a user namespace must not be same-user success");
+    assert!(
+        matches!(
+            error,
+            PeerError::CaptureFailed {
+                cause: PeerCause::Unauthenticated { .. }
+            }
+        ),
+        "unexpected capture result: {error}"
+    );
+
+    stream.write_all(b"x").expect("release the helper");
+    let _ = child.wait();
 }

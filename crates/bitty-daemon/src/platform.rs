@@ -4,20 +4,24 @@
 //! peer-identity mechanism. This module turns that table into a compiled
 //! decision so no call site can fall back to a weaker transport by accident:
 //!
-//! | Cell                     | Endpoint transport | Peer mechanism                              |
-//! | ------------------------ | ------------------ | ------------------------------------------- |
-//! | Linux x86_64 / ARM64     | Unix socket        | `SO_PEERCRED`, `/proc` start time, user-ns   |
-//! | macOS ARM64 / x86_64     | Unix socket        | `LOCAL_PEERCRED` + `LOCAL_PEERPID`          |
-//! | FreeBSD x86_64           | none yet           | `LOCAL_PEERCRED` only; no pid in the safe API |
-//! | Windows x86_64           | named pipe (plan)  | client pid + token SID (plan)               |
-//! | Other cells              | none               | none                                        |
+//! | Cell                          | Endpoint transport | Peer mechanism                              | Servable |
+//! | ----------------------------- | ------------------ | ------------------------------------------- | -------- |
+//! | Linux x86_64 / ARM64 / other  | Unix socket        | `SO_PEERCRED`, `/proc` start time, user-ns   | yes      |
+//! | macOS ARM64 / x86_64 / other  | Unix socket        | `LOCAL_PEERCRED` + `LOCAL_PEERPID`, no start time | no  |
+//! | FreeBSD x86_64 / other        | none yet           | `LOCAL_PEERCRED` only; no pid in the safe API | no     |
+//! | Windows x86_64 / other        | named pipe (plan)  | client pid + token SID (plan)               | no       |
+//! | Unlisted cells                | none               | none                                        | no       |
 //!
-//! A cell without a [`EndpointTransport::UnixSocket`] answer refuses with
-//! `Denied/UnsupportedPlatform`; there is no fallback socket, no abstract
-//! namespace, and no TCP listener. FreeBSD is refused rather than served with
-//! a weaker check: the accepted re-check needs the peer pid and start time, and
-//! the safe `nix` surface on FreeBSD exposes `xucred` (uid/gid) only. Windows
-//! has a designed named-pipe transport but no implementation in this slice:
+//! [`PlatformCell::serves_endpoint`] is the single gate: a cell is servable
+//! only when it has an accepted transport **and** a complete peer mechanism
+//! (a captured pid plus a process start time, which the re-check needs). macOS
+//! has the socket and `LOCAL_PEERCRED`/`LOCAL_PEERPID`, but the safe API
+//! surface exposes no start time in this slice, so it is refused with
+//! `Denied/UnsupportedPlatform` rather than served with a liveness-only
+//! check. FreeBSD is refused for the same reason: `xucred` has no pid at all.
+//! There is no fallback socket, no abstract namespace, and no TCP listener.
+//! Windows has a designed named-pipe transport but no implementation in this
+//! slice:
 //! `\\.\pipe\bittyd-<SID>` with a current-user-only DACL, remote clients
 //! rejected at the pipe level, `GetNamedPipeClientProcessId` plus token SID
 //! comparison, and fail-closed SID/AppContainer/integrity-level mismatches.
@@ -43,8 +47,12 @@ pub enum PlatformCell {
     MacosOther,
     /// FreeBSD on x86_64: tier 2.
     FreeBsdX86_64,
+    /// Any other FreeBSD architecture.
+    FreeBsdOther,
     /// Windows on x86_64: tier 1, conformance-gated.
     WindowsX86_64,
+    /// Any other Windows architecture.
+    WindowsOther,
     /// Any cell the contract does not list.
     Other,
 }
@@ -67,10 +75,14 @@ const CURRENT_CELL: PlatformCell = PlatformCell::MacosX86_64;
     not(any(target_arch = "x86_64", target_arch = "aarch64"))
 ))]
 const CURRENT_CELL: PlatformCell = PlatformCell::MacosOther;
-#[cfg(target_os = "freebsd")]
+#[cfg(all(target_os = "freebsd", target_arch = "x86_64"))]
 const CURRENT_CELL: PlatformCell = PlatformCell::FreeBsdX86_64;
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "freebsd", not(target_arch = "x86_64")))]
+const CURRENT_CELL: PlatformCell = PlatformCell::FreeBsdOther;
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 const CURRENT_CELL: PlatformCell = PlatformCell::WindowsX86_64;
+#[cfg(all(target_os = "windows", not(target_arch = "x86_64")))]
+const CURRENT_CELL: PlatformCell = PlatformCell::WindowsOther;
 #[cfg(not(any(
     target_os = "linux",
     target_os = "macos",
@@ -97,7 +109,9 @@ impl PlatformCell {
             Self::MacosX86_64 => "macos-x86_64",
             Self::MacosOther => "macos-other",
             Self::FreeBsdX86_64 => "freebsd-x86_64",
+            Self::FreeBsdOther => "freebsd-other",
             Self::WindowsX86_64 => "windows-x86_64",
+            Self::WindowsOther => "windows-other",
             Self::Other => "other",
         }
     }
@@ -116,8 +130,10 @@ impl PlatformCell {
             Self::MacosArm64 | Self::MacosX86_64 | Self::MacosOther => {
                 EndpointTransport::UnixSocket
             }
-            Self::WindowsX86_64 => EndpointTransport::WindowsNamedPipe,
-            Self::FreeBsdX86_64 | Self::Other => EndpointTransport::Unsupported,
+            Self::WindowsX86_64 | Self::WindowsOther => EndpointTransport::WindowsNamedPipe,
+            Self::FreeBsdX86_64 | Self::FreeBsdOther | Self::Other => {
+                EndpointTransport::Unsupported
+            }
         }
     }
 
@@ -135,8 +151,26 @@ impl PlatformCell {
             Self::MacosArm64 | Self::MacosX86_64 | Self::MacosOther => {
                 PeerMechanism::AppleLocalPeer
             }
-            Self::FreeBsdX86_64 | Self::WindowsX86_64 | Self::Other => PeerMechanism::Unsupported,
+            Self::FreeBsdX86_64
+            | Self::FreeBsdOther
+            | Self::WindowsX86_64
+            | Self::WindowsOther
+            | Self::Other => PeerMechanism::Unsupported,
         }
+    }
+
+    /// Whether this build may serve an endpoint on this cell.
+    ///
+    /// Both halves are required: an accepted transport **and** a complete peer
+    /// mechanism (a pid plus a start time the re-check can compare). macOS is
+    /// compiled but not servable in this slice because the safe surface has no
+    /// peer start time; [`crate::endpoint::open_endpoint`] refuses it with
+    /// [`crate::endpoint::EndpointError::UnsupportedPlatform`] before creating
+    /// anything.
+    #[must_use]
+    pub const fn serves_endpoint(self) -> bool {
+        matches!(self.transport(), EndpointTransport::UnixSocket)
+            && self.peer_mechanism().provides_start_time()
     }
 }
 
@@ -163,10 +197,22 @@ pub enum EndpointTransport {
 pub enum PeerMechanism {
     /// `SO_PEERCRED` plus the peer's `/proc` start time and user namespace.
     LinuxPeerCred,
-    /// `LOCAL_PEERCRED` uid/gid plus `LOCAL_PEERPID`.
+    /// `LOCAL_PEERCRED` uid/gid plus `LOCAL_PEERPID`. The safe surface exposes
+    /// no start time, so this mechanism is incomplete for the accepted
+    /// re-check and is not servable.
     AppleLocalPeer,
     /// No accepted mechanism; peer operations fail closed.
     Unsupported,
+}
+
+impl PeerMechanism {
+    /// Whether the mechanism exposes the process start time the peer re-check
+    /// requires. A mechanism without it is not acceptable, even when it can
+    /// capture a pid.
+    #[must_use]
+    pub const fn provides_start_time(self) -> bool {
+        matches!(self, Self::LinuxPeerCred)
+    }
 }
 
 #[cfg(test)]
@@ -190,7 +236,7 @@ mod tests {
     }
 
     #[test]
-    fn apple_cells_use_the_local_peer_socket_options() {
+    fn apple_cells_have_the_socket_but_are_not_servable() {
         assert_eq!(
             PlatformCell::MacosArm64.transport(),
             EndpointTransport::UnixSocket
@@ -199,6 +245,12 @@ mod tests {
             PlatformCell::MacosX86_64.peer_mechanism(),
             PeerMechanism::AppleLocalPeer
         );
+        assert!(!PeerMechanism::AppleLocalPeer.provides_start_time());
+        assert!(!PlatformCell::MacosArm64.serves_endpoint());
+        assert!(!PlatformCell::MacosX86_64.serves_endpoint());
+        assert!(!PlatformCell::MacosOther.serves_endpoint());
+        assert!(PeerMechanism::LinuxPeerCred.provides_start_time());
+        assert!(PlatformCell::LinuxX86_64.serves_endpoint());
     }
 
     #[test]
@@ -223,12 +275,18 @@ mod tests {
             PlatformCell::WindowsX86_64.peer_mechanism(),
             PeerMechanism::Unsupported
         );
+        assert!(!PlatformCell::WindowsX86_64.serves_endpoint());
+        assert!(!PlatformCell::WindowsOther.serves_endpoint());
+        assert!(!PlatformCell::FreeBsdOther.serves_endpoint());
+        assert!(!PlatformCell::Other.serves_endpoint());
     }
 
     #[test]
     fn cell_names_are_stable_diagnostics() {
         assert_eq!(PlatformCell::LinuxX86_64.name(), "linux-x86_64");
         assert_eq!(PlatformCell::WindowsX86_64.to_string(), "windows-x86_64");
+        assert_eq!(PlatformCell::FreeBsdOther.name(), "freebsd-other");
+        assert_eq!(PlatformCell::WindowsOther.name(), "windows-other");
         assert_eq!(PlatformCell::Other.name(), "other");
         assert!(!PlatformCell::current().name().is_empty());
     }

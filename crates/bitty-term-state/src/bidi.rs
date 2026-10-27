@@ -192,6 +192,9 @@ pub struct BidiLine {
     widths: Vec<u8>,
     /// True on the trailing half of a wide lead.
     spacers: Vec<bool>,
+    /// Visual caret edge -> logical caret edge (inverse of
+    /// [`Self::visual_caret_col`], length `columns + 1`).
+    visual_edge_to_logical: Vec<u16>,
     /// Content columns; erased layout padding outside it keeps identity.
     content: Range<usize>,
     has_rtl: bool,
@@ -280,17 +283,21 @@ impl BidiLine {
 
     /// Visual column of the caret at logical insertion point `logical_col`.
     ///
-    /// Cursor and IME painting use this instead of
-    /// [`Self::visual_col_for_logical`]: a caret is an *edge*, not a cell.
-    /// Inside an RTL run the insertion point before a logical cell is the
-    /// cell's right visual edge, and the end-of-line caret sits at the left
-    /// edge of the last logical cell. Identity outside the content span.
+    /// A caret is an *edge*, not a cell: inside an RTL run the insertion
+    /// point before a logical cell is that cell's right visual edge; the
+    /// end-of-line caret (`logical_col == content.end`) sits at the leading
+    /// edge of the last logical cell for an RTL tail and at the trailing
+    /// edge for an LTR tail. Values below the content start and beyond the
+    /// content end are identity (padding), never projected into the run.
     #[must_use]
     pub fn visual_caret_col(&self, logical_col: usize) -> usize {
         if self.content.is_empty() || logical_col < self.content.start {
             return logical_col;
         }
-        if logical_col >= self.content.end {
+        if logical_col > self.content.end {
+            return logical_col;
+        }
+        if logical_col == self.content.end {
             let mut last = self.content.end - 1;
             // A trailing spacer names the wide lead it belongs to; the caret
             // edge is the lead's, not the spacer's half-column.
@@ -312,6 +319,27 @@ impl BidiLine {
         }
     }
 
+    /// Logical caret edge (0..=columns) displayed at visual caret edge.
+    ///
+    /// The edge inverse for drag selection: [`Self::logical_col_for_visual`]
+    /// maps a *cell*, so using it for an edge shifts a right-boundary drag by
+    /// one logical cell. Visual edges outside the content span are identity;
+    /// content edges win inside it (the left edge of an RTL run is its
+    /// logical end). Two logical edges can share one visual edge at a level
+    /// run boundary; the later logical edge (the line end) wins, so a
+    /// right-edge drag stays at the end instead of jumping into the run.
+    #[must_use]
+    pub fn logical_caret_edge_for_visual(&self, visual_edge: usize) -> usize {
+        if visual_edge >= self.visual_edge_to_logical.len() {
+            return visual_edge;
+        }
+        let in_content = (self.content.start..=self.content.end).contains(&visual_edge);
+        if !in_content {
+            return visual_edge;
+        }
+        usize::from(self.visual_edge_to_logical[visual_edge])
+    }
+
     /// Builds the column maps for one physical row, or `None` when every
     /// lead level is even (logical order == visual order).
     ///
@@ -324,6 +352,11 @@ impl BidiLine {
         content: Range<usize>,
     ) -> Option<Self> {
         if levels.len() != spacers.len() || levels.is_empty() || content.is_empty() {
+            return None;
+        }
+        // The maps are `u16` per column; a viewport wider than that fails
+        // closed to identity rather than silently aliasing columns.
+        if levels.len() > usize::from(u16::MAX) {
             return None;
         }
         let content = content.start.min(levels.len())..content.end.min(levels.len());
@@ -370,12 +403,15 @@ impl BidiLine {
             }
             visual_col += width;
         }
-        Some(Self {
+        let mut line = Self {
             paragraph_level,
             levels: levels.to_vec(),
             visual_to_logical,
             logical_to_visual,
             spacers: spacers.to_vec(),
+            visual_edge_to_logical: (0..=levels.len())
+                .map(|edge| u16::try_from(edge).unwrap_or(u16::MAX))
+                .collect(),
             widths: spacers
                 .iter()
                 .enumerate()
@@ -389,9 +425,16 @@ impl BidiLine {
                     }
                 })
                 .collect(),
-            content,
+            content: content.clone(),
             has_rtl: true,
-        })
+        };
+        for logical in content.start..=content.end {
+            let visual = line.visual_caret_col(logical);
+            if let Some(slot) = line.visual_edge_to_logical.get_mut(visual) {
+                *slot = u16::try_from(logical).unwrap_or(u16::MAX);
+            }
+        }
+        Some(line)
     }
 }
 
@@ -508,6 +551,17 @@ impl BidiGrid {
         self.line(row)
             .map_or(logical_col, |line| line.visual_caret_col(logical_col))
     }
+
+    /// Shared drag-caret inverse: visual edge -> logical edge.
+    ///
+    /// Identity when not reordered. This is the edge inverse, not
+    /// [`Self::logical_col_for_visual`] (which maps a cell).
+    #[must_use]
+    pub fn logical_caret_edge_for_visual(&self, row: usize, visual_edge: usize) -> usize {
+        self.line(row).map_or(visual_edge, |line| {
+            line.logical_caret_edge_for_visual(visual_edge)
+        })
+    }
 }
 
 /// Splits soft-wrap flags into logical-line row ranges.
@@ -573,17 +627,19 @@ fn resolve_cell_levels(
     let mut paragraph_level = 0u8;
     // Bound the work per paragraph: resolve independent chunks of at most
     // MAX_BIDI_PARAGRAPH_CELLS lead cells. Neutrals at a split resolve as L
-    // in each chunk, matching the historical split contract.
-    for (chunk_index, chunk) in leads.chunks(MAX_BIDI_PARAGRAPH_CELLS).enumerate() {
+    // in each chunk, matching the historical split contract. The split
+    // helper is the single source of the chunk arithmetic.
+    for (chunk_start, chunk_end) in bidi_paragraph_splits(leads.len(), MAX_BIDI_PARAGRAPH_CELLS) {
+        let Some(chunk) = leads.get(chunk_start..chunk_end) else {
+            continue;
+        };
         let first_byte = chunk.first().map_or(0, |(_, byte)| *byte);
-        let end_byte = leads
-            .get(chunk_index * MAX_BIDI_PARAGRAPH_CELLS + chunk.len())
-            .map_or(text.len(), |(_, byte)| *byte);
+        let end_byte = leads.get(chunk_end).map_or(text.len(), |(_, byte)| *byte);
         let chunk_text = text.get(first_byte..end_byte).unwrap_or("");
         let Some(resolved) = resolve_text(chunk_text, direction) else {
             continue;
         };
-        if chunk_index == 0 {
+        if chunk_start == 0 {
             paragraph_level = resolved.paragraph_level;
         }
         // Merge the chunk's scalar levels with its lead offsets; both lists

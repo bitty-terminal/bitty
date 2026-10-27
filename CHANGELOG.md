@@ -13,14 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logical lines now resolve through `unicode-bidi` 0.3.18 (new direct
   dependency of `bitty-term-state` only: MIT OR Apache-2.0, MSRV 1.47, safe
   Rust, UCD 16.0.0 bidi classes) and rows with an odd resolved level can be
-  painted in visual order. Terminal Truth is unchanged: `Cell`, `Snapshot`,
-  the canonical hash (v13), and the codec stay logical, and the policy
-  defaults to `terminal.bidi = off` until the owner accepts the
-  display-spoofing (Trojan-Source) risk. With it off, rendered bytes are
-  identical to the previous release. Hit tests, cursor/IME paint, selection
-  paint, and hyperlink underlines share one visual↔logical column map.
+  painted in visual order. `Cell` layout, the `Snapshot` schema, the
+  canonical hash (v13), and the codec are unchanged; the policy defaults to
+  `terminal.bidi = off` until the owner accepts the display-spoofing
+  (Trojan-Source) risk, and a project layer cannot enable it. Two input
+  behavior fixes do change committed cells versus the previous release:
   `U+2066..U+2069` isolates now resolve zero-width, and a bidi control at
-  column 0 is dropped instead of attaching to the previous row. Deferred:
+  column 0 after a hard break is dropped instead of attaching to the
+  previous row. With BiDi off, rendered bytes and hashes are identical.
+  Hit tests, cursor/IME paint, selection paint, and hyperlink underlines use
+  one shared per-row map only when the painted `Snapshot` is the logical
+  state grid; windowed/truncated, placeholder-bearing, and alt-stale views
+  fail closed to logical identity in both paint and hit testing. Deferred:
   shaped RTL emission (RTL rows use the per-cell path), scrolled-history
   paragraphs, `terminal.bidi_direction`, and the risk-register row.
 

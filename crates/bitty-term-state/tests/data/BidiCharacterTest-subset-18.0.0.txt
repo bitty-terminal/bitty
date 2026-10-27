@@ -17,7 +17,13 @@
 #     `unicode-bidi` 0.3.18 ships UCD 16.0.0 bidi classes (age data from
 #     DerivedAge-18.0.0.txt, sha256 58b04334e3a31f9612694bbc3f6bff4a302b7d424565bca9c47e30aa74f8dbac);
 #   - keep every case using an explicit bidi formatting scalar, then take a
-#     deterministic stride over the rest, capped at 3000 cases.
+#     deterministic stride of 31 over the rest, capped at 3000 cases.
+#
+# Generator note: this is a one-off filter over the source file (the rule
+# above is exact and reproducible); no generator script is checked in. The
+# selected counts and the UCD-16 skip count are asserted by
+# tests/bidi_conformance.rs, so regenerating with a newer source or a
+# `unicode-bidi` bump cannot silently change coverage.
 #
 # Counts: source_cases=91707 skipped_scalar_count=37
 # skipped_ucd16_unassigned=0 eligible=91670

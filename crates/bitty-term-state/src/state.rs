@@ -3033,17 +3033,24 @@ impl State {
     /// target is the immediate predecessor of the cursor; marks attached
     /// after a cursor move never resize an older cell.
     ///
-    /// CTX-1612: a bidi format control at column 0 has no preceding cell on
-    /// its own line. It is dropped instead of attaching to the previous
-    /// row's last cell: crossing a hard line break would make the control
-    /// reorder the previous logical line and corrupt the reconstructed text
-    /// of both lines. Non-bidi zero-width scalars keep the historical
-    /// step-back (a combining mark or prepend that follows a hard break
-    /// still attaches to the previous row's last cell).
+    /// CTX-1612: a bidi format control at column 0 after a HARD line break
+    /// has no preceding cell on its own logical line. It is dropped instead
+    /// of attaching to the previous row's last cell: crossing the break
+    /// would make the control reorder the previous logical line and corrupt
+    /// the reconstructed text of both lines. When the previous row is
+    /// soft-wrapped the control is still in the same paragraph and attaches
+    /// normally. Non-bidi zero-width scalars keep the historical step-back.
     fn attach_zerowidth(&mut self, mark: char) {
         let (row, col) = self.cursor_xy();
-        let line_leading_control =
-            col == 0 && !self.cursor.pending_wrap && crate::bidi::is_bidi_format_scalar(mark);
+        // A control at column 0 belongs to the current logical line. Only a
+        // HARD break makes it line-leading: when the previous row is
+        // soft-wrapped, the control is still inside the same paragraph and
+        // correctly joins the previous row's last cell.
+        let previous_row_soft_wrapped = row > 0 && self.screens_active().wrapped(row - 1);
+        let line_leading_control = col == 0
+            && !self.cursor.pending_wrap
+            && !previous_row_soft_wrapped
+            && crate::bidi::is_bidi_format_scalar(mark);
         let (target_row, target_col) = if self.cursor.pending_wrap {
             (row, col)
         } else if col > 0 {

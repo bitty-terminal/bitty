@@ -57,6 +57,11 @@ use crate::cell::{Attributes, Cell, Style};
 /// v13 adds the East Asian Ambiguous width policy (CTX-1609): the policy
 /// decides the width of every later `A` scalar, so states differing only in
 /// it are not behaviorally identical.
+///
+/// Paint-time BiDi (CTX-1612) adds **no** hash field and keeps v13:
+/// paragraph levels and visual columns are derived from the same logical
+/// cells at paint time, never stored, so replay and the canonical bytes of
+/// a given action stream are unchanged by `terminal.bidi`.
 pub const CANONICAL_HASH_VERSION: u32 = 13;
 
 /// Incremental canonical writer backing the state hash.

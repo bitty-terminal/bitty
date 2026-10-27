@@ -475,13 +475,20 @@ pub(super) struct PresentedLeaf {
 /// batches (`DECTCEM` visibility, `CUP` moves) advance the generation without
 /// grid damage, and the overlay must track the current snapshot even when the
 /// leaf's retained list is reused.
+#[derive(Clone)]
 struct CursorPaint {
     /// Content origin in physical px, window padding already added.
     origin_x: i32,
     /// Content origin in physical px, window padding already added.
     origin_y: i32,
-    /// Cursor with its row translated into viewport coordinates.
+    /// Cursor with its row translated into viewport coordinates and its
+    /// column set to the visual *cell* column (block/underline/IME).
     cursor: bitty_term_state::Cursor,
+    /// Visual caret edge for a bar cursor (clamped to the last cell).
+    ///
+    /// A bar is an insertion edge; block/underline and the IME cell rect
+    /// cover the cell named by `cursor.position.col`.
+    caret_col: u16,
     /// Viewport dimensions the cursor was translated against.
     cols: usize,
     /// Viewport dimensions the cursor was translated against.
@@ -585,6 +592,9 @@ struct ScrollShiftInput<'a> {
     higher_floats: &'a [bitty_render::geometry::RectPx],
     scrolled_viewport: bool,
     full_frame: bool,
+    /// Soft-wrap hint for the source grid (CTX-1612); `None` for scrolled
+    /// composites and fail-closed views.
+    wraps: Option<&'a [bool]>,
 }
 
 /// Shifted retained primitives for one scrolled leaf (CTX-1207
@@ -1319,19 +1329,27 @@ fn present_wraps_for(
     )
 }
 
-/// Visual column the cursor/IME caret paints at (CTX-1612).
+/// Visual `(cell column, caret edge)` for the cursor overlay (CTX-1612).
 ///
 /// `snapshot`/`wraps` are exactly the ones handed to the renderer, so the
-/// overlay and the glyphs share one projection. Identity when BiDi is off or
-/// the row is pure LTR.
-fn cursor_visual_col(
+/// overlay and the glyphs share one projection. Block/underline cursors and
+/// the IME cell rect use the cell column; a bar may use the caret edge. Both
+/// are clamped inside `[0, cols - 1]`: a caret at the right edge of the grid
+/// must not paint outside the last cell. Identity when BiDi is off or the row
+/// is pure LTR.
+fn cursor_visual_cols(
     bidi_enabled: bool,
     snapshot: &Snapshot,
     wraps: Option<&[bool]>,
     cursor: &bitty_term_state::Cursor,
-) -> u16 {
+) -> (u16, u16) {
+    let last = snapshot.width.saturating_sub(1);
+    let clamp = |col: usize| u16::try_from(col.min(last)).unwrap_or(0);
     if !bidi_enabled {
-        return cursor.position.col;
+        return (
+            clamp(usize::from(cursor.position.col)),
+            clamp(usize::from(cursor.position.col)),
+        );
     }
     let grid = bitty_term_state::BidiGrid::resolve(
         &snapshot.cells,
@@ -1340,11 +1358,12 @@ fn cursor_visual_col(
         wraps,
         bitty_term_state::ParaDirection::Auto,
     );
-    let col = grid.visual_caret_col(
-        usize::from(cursor.position.row),
-        usize::from(cursor.position.col),
-    );
-    u16::try_from(col).unwrap_or(cursor.position.col)
+    let row = usize::from(cursor.position.row);
+    let logical = usize::from(cursor.position.col);
+    (
+        clamp(grid.visual_col_for_logical(row, logical)),
+        clamp(grid.visual_caret_col(row, logical)),
+    )
 }
 
 /// Creates a viewport snapshot of `snapshot` limited to `cols x rows`.
@@ -1462,6 +1481,7 @@ impl Runtime {
             higher_floats,
             scrolled_viewport,
             full_frame,
+            wraps,
         } = input;
         if full_frame || scrolled_viewport || !higher_floats.is_empty() {
             return None;
@@ -1469,7 +1489,7 @@ impl Runtime {
         // CTX-1612: retained primitives are shifted as one rigid block.
         // Inside a paragraph rule L2 reorders that assumption, so any
         // reordered row on the source grid opts out and repaints fully.
-        if self.config.bidi && !self.bidi_grid_for_snapshot(base_snap, None).is_empty() {
+        if self.config.bidi && !self.bidi_grid_for_snapshot(base_snap, wraps).is_empty() {
             return None;
         }
         // Scroll motions merged across the tick's batches: every action
@@ -2463,8 +2483,9 @@ impl Runtime {
             }
             None => (snapshot, None),
         };
-        cursor.position.col =
-            cursor_visual_col(self.config.bidi, grid_snapshot, wraps.as_deref(), &cursor);
+        let (visual_col, caret_col) =
+            cursor_visual_cols(self.config.bidi, grid_snapshot, wraps.as_deref(), &cursor);
+        cursor.position.col = visual_col;
         let rows = usize::from(frame.rows);
         let cols = usize::from(frame.cols);
         let start = cursor_follow_window_start(usize::from(cursor.position.row), base_height, rows);
@@ -2478,6 +2499,7 @@ impl Runtime {
             origin_x,
             origin_y,
             cursor,
+            caret_col,
             cols,
             rows,
             cells_available,
@@ -2513,6 +2535,22 @@ impl Runtime {
         });
     }
 
+    /// Visual cell column the cursor fill starts at (CTX-1612).
+    ///
+    /// Block/underline and the IME/occluder geometry cover the logical
+    /// cursor cell (`cursor.position.col` already holds its visual column); a
+    /// bar is an insertion edge and uses the clamped caret column.
+    fn cursor_overlay_col(paint: &CursorPaint) -> u16 {
+        if matches!(
+            paint.cursor.cursor_style,
+            bitty_term_state::CursorStyle::BlinkingBar | bitty_term_state::CursorStyle::SteadyBar
+        ) {
+            paint.caret_col
+        } else {
+            paint.cursor.position.col
+        }
+    }
+
     /// Paints the deferred focused-cursor overlay after the kitty image
     /// layer (#1849 S7 cursor-on-top). The fill lands in the CTX-0347
     /// overlay layer so it stays visible above a per-`View` background
@@ -2540,6 +2578,10 @@ impl Runtime {
             return false;
         }
         let live = self.live_cell_metrics();
+        let mut cursor = paint.cursor.clone();
+        // A bar is an insertion edge; block/underline keep the cell column.
+        // `cursor_visual_cols` already clamped both inside the last cell.
+        cursor.position.col = Self::cursor_overlay_col(paint);
         // DECSCUSR shape comes from the shared render primitive
         // (`bitty_render::grid::cursor_fill`: block = full cell, bar = left
         // strip, underline = bottom strip, 15% thickness per DEC-0017
@@ -2548,7 +2590,7 @@ impl Runtime {
         // the selected preset (CTX-0219: no hardcoded white).
         if let Some(fill) = bitty_render::grid::cursor_fill_in_for_width(
             &self.config.theme,
-            &paint.cursor,
+            &cursor,
             live,
             paint.cell_width,
             paint.cols,
@@ -3722,11 +3764,15 @@ impl Runtime {
                     .get(&view_id)
                     .map(|sess| &sess.state)
                     .unwrap_or(&self.state);
+                // One decision for paint and hit testing: windowed,
+                // truncated, placeholder-bearing, and alt-stale leaves fail
+                // closed to identity in both places (CTX-1612).
+                let view_bidi = self.bidi_enabled_for_view(view_id);
                 let view_wraps = present_wraps_for(
-                    self.config.bidi,
+                    view_bidi,
                     owner_state,
                     base_snap,
-                    scrolled,
+                    self.is_viewport_scrolled(view_id),
                     usize::from(frame.rows),
                 );
                 // A re-rendered leaf is redrawn in full, except for the
@@ -3754,6 +3800,7 @@ impl Runtime {
                     higher_floats: &higher_floats,
                     scrolled_viewport: scrolled,
                     full_frame,
+                    wraps: view_wraps.as_deref(),
                 });
                 let mut damage = match &shift {
                     Some(shift) => Damage {
@@ -3780,12 +3827,13 @@ impl Runtime {
                 // `font.features`; a non-shaping rasterizer (crossfont
                 // fallback / headless) is served by the per-cell path
                 // inside the same call.
-                let mut list = match self.renderer.render_shaped_with_wraps(
+                let mut list = match self.renderer.render_shaped_with_bidi(
                     &view_snapshot,
                     &damage,
                     self.config.disable_ligatures,
                     &self.config.font_features,
                     view_wraps.as_deref(),
+                    view_bidi,
                 ) {
                     Ok(list) => list,
                     Err(_) => continue,
@@ -3804,12 +3852,13 @@ impl Runtime {
                         ))]
                         .into_boxed_slice(),
                     };
-                    list = match self.renderer.render_shaped_with_wraps(
+                    list = match self.renderer.render_shaped_with_bidi(
                         &view_snapshot,
                         &damage,
                         self.config.disable_ligatures,
                         &self.config.font_features,
                         view_wraps.as_deref(),
+                        view_bidi,
                     ) {
                         Ok(list) => list,
                         Err(_) => continue,
@@ -3842,17 +3891,19 @@ impl Runtime {
                         // the overlay paints at the visual caret column the
                         // shared map assigns. Block geometry still covers the
                         // whole logical cluster (cell_width above).
-                        cursor.position.col = cursor_visual_col(
-                            self.config.bidi,
+                        let (visual_col, caret_col) = cursor_visual_cols(
+                            view_bidi,
                             &view_snapshot,
                             view_wraps.as_deref(),
                             &cursor,
                         );
+                        cursor.position.col = visual_col;
                         let cells_available = frame.cols.saturating_sub(cursor.position.col).max(1);
                         let paint = CursorPaint {
                             origin_x: origin_px_x,
                             origin_y: origin_px_y,
                             cursor,
+                            caret_col,
                             cols: view_snapshot.width,
                             rows: view_snapshot.height,
                             cells_available,
@@ -4417,7 +4468,11 @@ impl Runtime {
                     .collect::<Vec<_>>(),
             )
         };
-        let bidi = self.bidi_grid_for_snapshot(&snapshot, selection_wraps.as_deref());
+        let bidi = if self.bidi_enabled_for_view(owner) {
+            self.bidi_grid_for_snapshot(&snapshot, selection_wraps.as_deref())
+        } else {
+            bitty_term_state::BidiGrid::default()
+        };
         let rects = selection_row_rects(
             &self.config.theme,
             sel.kind,
@@ -10629,19 +10684,90 @@ mod bidi_paint_tests {
         assert_eq!(spans, vec![(0, 16), (24, 32)], "{spans:?}");
     }
 
+    fn cursor_at(state: &mut bitty_term_state::State, col: u16) {
+        state.apply(&bitty_term_state::TerminalAction::CursorPosition {
+            row: bitty_vt::Row::SENTINEL,
+            col: bitty_vt::Col(col + 1),
+        });
+    }
+
     #[test]
-    fn input_cursor_paints_at_the_visual_caret_column() {
-        let state = bidi_state("אבג");
+    fn cursor_visual_cols_separate_the_cell_and_caret_edge() {
+        let mut state = bidi_state("אבג");
         let snapshot = state.snapshot();
-        // Logical end of an RTL line paints at the left edge.
-        assert_eq!(
-            cursor_visual_col(true, &snapshot, None, &snapshot.cursor),
-            0
-        );
-        // BiDi off keeps the logical column.
-        assert_eq!(
-            cursor_visual_col(false, &snapshot, None, &snapshot.cursor),
-            3
-        );
+        // End of an RTL line: the block/underline/IME cell is the padding
+        // cell after the run; the bar caret is the left edge of the run.
+        let (cell, caret) = cursor_visual_cols(true, &snapshot, None, &snapshot.cursor);
+        assert_eq!((cell, caret), (3, 0));
+        // BiDi off keeps the logical column for both.
+        let (cell, caret) = cursor_visual_cols(false, &snapshot, None, &snapshot.cursor);
+        assert_eq!((cell, caret), (3, 3));
+        // Middle of the RTL run: cell 1 (ב), bar at its right edge 2.
+        cursor_at(&mut state, 1);
+        let snapshot = state.snapshot();
+        let (cell, caret) = cursor_visual_cols(true, &snapshot, None, &snapshot.cursor);
+        assert_eq!((cell, caret), (1, 2));
+        // Start of the RTL run: cell 2 (א), bar at its right edge 3.
+        cursor_at(&mut state, 0);
+        let snapshot = state.snapshot();
+        let (cell, caret) = cursor_visual_cols(true, &snapshot, None, &snapshot.cursor);
+        assert_eq!((cell, caret), (2, 3));
+    }
+
+    #[test]
+    fn cursor_visual_cols_clamp_full_width_and_keep_padding_identity() {
+        // Full-width RTL: the last logical cell is the leftmost visual cell;
+        // a caret at its right edge must still be clamped inside the grid.
+        let text: String = std::iter::repeat_n('א', 80).collect();
+        let mut state = bidi_state(&text);
+        cursor_at(&mut state, 79);
+        let snapshot = state.snapshot();
+        let (cell, caret) = cursor_visual_cols(true, &snapshot, None, &snapshot.cursor);
+        assert_eq!(cell, 0);
+        assert_eq!(caret, 1);
+        // Trailing padding is outside content: identity, never projected.
+        let mut state = bidi_state("אבג");
+        cursor_at(&mut state, 10);
+        let snapshot = state.snapshot();
+        let (cell, caret) = cursor_visual_cols(true, &snapshot, None, &snapshot.cursor);
+        assert_eq!((cell, caret), (10, 10));
+    }
+
+    #[test]
+    fn cursor_visual_cols_cover_a_wide_rtl_pair() {
+        let mut state = bidi_state("א中ב");
+        cursor_at(&mut state, 1);
+        let snapshot = state.snapshot();
+        // 中 is logical 1, visual 1 with a 2-cell span; the bar sits at the
+        // cell edge and the block covers both cells via `cell_width`.
+        let (cell, caret) = cursor_visual_cols(true, &snapshot, None, &snapshot.cursor);
+        assert_eq!((cell, caret), (1, 1));
+    }
+
+    #[test]
+    fn cursor_overlay_uses_the_bar_edge_but_block_and_underline_cells() {
+        let mut state = bidi_state("אבג");
+        cursor_at(&mut state, 1);
+        let snapshot = state.snapshot();
+        let (cell, caret) = cursor_visual_cols(true, &snapshot, None, &snapshot.cursor);
+        let base = CursorPaint {
+            origin_x: 0,
+            origin_y: 0,
+            cursor: snapshot.cursor.clone(),
+            caret_col: caret,
+            cols: snapshot.width,
+            rows: snapshot.height,
+            cells_available: 1,
+            cell_width: 1,
+        };
+        let mut block = base.clone();
+        block.cursor.position.col = cell;
+        assert_eq!(Runtime::cursor_overlay_col(&block), cell);
+        let mut underline = block.clone();
+        underline.cursor.cursor_style = bitty_term_state::CursorStyle::SteadyUnderline;
+        assert_eq!(Runtime::cursor_overlay_col(&underline), cell);
+        let mut bar = block;
+        bar.cursor.cursor_style = bitty_term_state::CursorStyle::SteadyBar;
+        assert_eq!(Runtime::cursor_overlay_col(&bar), caret);
     }
 }

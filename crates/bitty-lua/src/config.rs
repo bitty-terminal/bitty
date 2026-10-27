@@ -32,7 +32,7 @@
 //!     appearance = { theme = "bitty-dark" }, -- wins over the alias
 //!     font = { family = "JetBrains Mono", size = 13.0 },
 //!     window = { opacity = 0.95, padding = 8 },
-//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, page_scroll_percent = 75, cursor_style = "steady_bar", bell = "visual", ambiguous_width = "narrow" },
+//!     terminal = { scrollback = 10000, shell = "/bin/fish", scroll_lines_per_notch = 3, scroll_pixels_per_notch = 16, page_scroll_percent = 75, cursor_style = "steady_bar", bell = "visual", ambiguous_width = "narrow", bidi = "off" },
 //!     selection = { auto_copy = true }, -- opt in to copy-on-select; false (default) matches kitty/ghostty (CTX-0371)
 //!     history = { capture = { transcript = true, commands = false } }, -- opt in to bounded plugin history capture; both default false (CTX-1352)
 //!     layout = { gaps_in = 1, gaps_out = 2 }, -- Hyprland-like panel gaps in cells, 0 = edge-to-edge (CTX-0177)

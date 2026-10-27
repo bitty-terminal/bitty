@@ -13,6 +13,9 @@ use bitty_render::glyph::{
     RasterKey,
 };
 use bitty_render::grid::{CellMetrics, DrawList, GridRenderer};
+use bitty_render::{
+    FallbackRasterizer, RunAttrs, ShapedCluster, ShapedRunSource, glyph::ShapedBitmap,
+};
 use bitty_term_state::{Damage, DamageRect, DamagedRegion, Snapshot, State, TerminalAction};
 use bitty_vt::GraphemeCell;
 
@@ -21,6 +24,43 @@ use bitty_vt::GraphemeCell;
 #[derive(Debug, Default)]
 struct TagRasterizer {
     next: u64,
+}
+
+impl ShapedRunSource for TagRasterizer {
+    fn shaping_supported(&self) -> bool {
+        false
+    }
+
+    fn shape_run(
+        &mut self,
+        _text: &str,
+        _chain: &[FontId],
+        _attrs: &RunAttrs,
+    ) -> Result<Vec<ShapedCluster>, RenderError> {
+        Err(RenderError::InvalidInput {
+            reason: "deterministic test rasterizer does not shape",
+        })
+    }
+
+    fn rasterize_shaped_cached_ref(
+        &mut self,
+        _face: FontId,
+        _glyph_id: u16,
+        _point_size: f32,
+        _features: &[bitty_config::types::OpenTypeFeature],
+    ) -> Result<Option<ShapedBitmap<'_>>, RenderError> {
+        Ok(None)
+    }
+
+    fn note_misaligned(&mut self) {}
+
+    fn shape_stats(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
+    fn face_is_monospaced(&self, _face: FontId) -> bool {
+        false
+    }
 }
 
 impl GlyphRasterizer for TagRasterizer {
@@ -58,6 +98,20 @@ fn renderer() -> GridRenderer<TagRasterizer> {
     };
     GridRenderer::new(
         TagRasterizer::default(),
+        &query,
+        CellMetrics::new(8, 32).unwrap(),
+    )
+    .unwrap()
+}
+
+fn shaped_renderer() -> GridRenderer<FallbackRasterizer<TagRasterizer>> {
+    let query = FontQuery {
+        family: "Tag".into(),
+        style: FontStyle::Normal,
+        point_size: 12.0,
+    };
+    GridRenderer::new(
+        FallbackRasterizer::with_default_chain(TagRasterizer::default()),
         &query,
         CellMetrics::new(8, 32).unwrap(),
     )
@@ -199,4 +253,29 @@ fn rendering_leaves_the_canonical_hash_unchanged() {
         bitty_term_state::canonical_public::CANONICAL_HASH_VERSION,
         13
     );
+}
+
+#[test]
+fn shaped_entry_point_falls_back_to_the_visual_per_cell_path() {
+    // CTX-1612: the deterministic rasterizer cannot shape, so the shaped
+    // entry point must delegate to the per-cell path with the same BiDi
+    // decision. This is the shipped RTL fallback (shaped RTL pen placement
+    // is deferred), and it must still paint the Hebrew run in visual order.
+    let state = state_with("abc אבג");
+    let snapshot = state.snapshot();
+    let damage = full_damage(&snapshot);
+    let mut renderer = shaped_renderer();
+    renderer.set_bidi(true);
+    let list = renderer
+        .render_shaped(
+            &snapshot,
+            &damage,
+            bitty_config::types::LigaturePolicy::Cursor,
+            &[],
+        )
+        .expect("shaped entry point");
+    let painted = painted_cells(&list);
+    assert!(painted.contains(&('א', 6)), "{painted:?}");
+    assert!(painted.contains(&('ב', 5)), "{painted:?}");
+    assert!(painted.contains(&('ג', 4)), "{painted:?}");
 }

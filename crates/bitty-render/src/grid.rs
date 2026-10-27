@@ -115,7 +115,7 @@ use crate::glyph::{
     RasterKey,
 };
 use crate::shaped::{
-    RunAttrs, ShapedCluster, ShapedRunSource, cells_for_range, cells_for_range_in,
+    RunAttrs, RunDirection, ShapedCluster, ShapedRunSource, cells_for_range, cells_for_range_in,
     features_for_policy, form_runs_for_row_at_levels,
 };
 
@@ -3075,6 +3075,22 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         damage: &Damage,
         wraps: Option<&[bool]>,
     ) -> Result<DrawList, RenderError> {
+        self.render_with_bidi(snapshot, damage, wraps, self.bidi)
+    }
+
+    /// [`Self::render`] with an explicit per-view BiDi decision.
+    ///
+    /// The runtime passes `false` for windowed/truncated/alt-stale leaves
+    /// where the painted `Snapshot` is not the logical state grid; hit
+    /// testing fails closed to identity for the same leaves, so paint and
+    /// pointer mapping agree. `wraps` is only meaningful when `bidi_enabled`.
+    pub fn render_with_bidi(
+        &mut self,
+        snapshot: &Snapshot,
+        damage: &Damage,
+        wraps: Option<&[bool]>,
+        bidi_enabled: bool,
+    ) -> Result<DrawList, RenderError> {
         self.counters.frames_planned += 1;
 
         let descriptor = SnapshotDamage::new(snapshot, damage, self.cell);
@@ -3111,7 +3127,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         // is tiny and bounded).
         let cols = snapshot.width;
         let dirty_rects = list.plan.dirty_rects.clone();
-        let bidi = self.bidi_grid(snapshot, wraps);
+        let bidi = self.bidi_grid(snapshot, wraps, bidi_enabled);
 
         // Bounded frame-consistent pass (CTX-0531). Pass 1 may observe
         // exhaustion: its partial list is discarded, the atlas is reset
@@ -3142,8 +3158,13 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     /// without an odd level allocate nothing. The wrap hint is the caller's
     /// soft-wrap flags (out of band); `None` treats each row as its own
     /// paragraph (the viewport edge rule for S0).
-    fn bidi_grid(&self, snapshot: &Snapshot, wraps: Option<&[bool]>) -> BidiGrid {
-        if !self.bidi {
+    fn bidi_grid(
+        &self,
+        snapshot: &Snapshot,
+        wraps: Option<&[bool]>,
+        bidi_enabled: bool,
+    ) -> BidiGrid {
+        if !self.bidi || !bidi_enabled {
             return BidiGrid::default();
         }
         BidiGrid::resolve(
@@ -3184,6 +3205,9 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             images: Vec::new(),
             plan: plan.clone(),
         };
+        // A reordered row repaints end to end; coalesced dirty rectangles can
+        // still name the same row more than once. Paint it once per frame.
+        let mut bidi_rows_painted = vec![false; snapshot.height];
         for dirty in dirty_rects {
             let col_range = pixel_span_to_cells(dirty.x, dirty.width, self.cell.width);
             let row_range = pixel_span_to_cells(dirty.y, dirty.height, self.cell.height);
@@ -3196,6 +3220,14 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 // partial damage would leave stale glyphs at the swapped
                 // position. Over-damage is the only failure direction.
                 let visual_row = bidi.line(row).is_some();
+                if visual_row {
+                    if bidi_rows_painted.get(row).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some(slot) = bidi_rows_painted.get_mut(row) {
+                        *slot = true;
+                    }
+                }
                 let paint_cols = if visual_row {
                     0..cols
                 } else {
@@ -3966,12 +3998,29 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
         features: &[bitty_config::types::OpenTypeFeature],
         wraps: Option<&[bool]>,
     ) -> Result<DrawList, RenderError> {
+        self.render_shaped_with_bidi(snapshot, damage, policy, features, wraps, self.bidi)
+    }
+
+    /// [`Self::render_shaped`] with an explicit per-view BiDi decision.
+    ///
+    /// See [`Self::render_with_bidi`] for the windowed/truncated/alt-stale
+    /// fail-closed contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_shaped_with_bidi(
+        &mut self,
+        snapshot: &Snapshot,
+        damage: &Damage,
+        policy: bitty_config::types::LigaturePolicy,
+        features: &[bitty_config::types::OpenTypeFeature],
+        wraps: Option<&[bool]>,
+        bidi_enabled: bool,
+    ) -> Result<DrawList, RenderError> {
         // Fallback contract (CTX-1607): the classic crossfont stack and the
         // deterministic headless rasterizer cannot shape, so they are served
         // by the per-cell path unchanged. The check is one virtual call per
         // frame; `render` owns its own frame counter.
         if !self.cache.rasterizer().inner().shaping_supported() {
-            return self.render_with_wraps(snapshot, damage, wraps);
+            return self.render_with_bidi(snapshot, damage, wraps, bidi_enabled);
         }
         self.counters.frames_planned += 1;
 
@@ -3998,7 +4047,7 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
 
         let cols = snapshot.width;
         let dirty_rects = list.plan.dirty_rects.clone();
-        let bidi = self.bidi_grid(snapshot, wraps);
+        let bidi = self.bidi_grid(snapshot, wraps, bidi_enabled);
 
         let counters_before = self.counters;
         let atlas_costs_before = self.atlas.cost_snapshot();
@@ -4069,6 +4118,7 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
             None
         };
         let effective = features_for_policy(features, policy);
+        let mut bidi_rows_painted = vec![false; snapshot.height];
         for dirty in dirty_rects {
             let col_range = pixel_span_to_cells(dirty.x, dirty.width, self.cell.width);
             let row_range = pixel_span_to_cells(dirty.y, dirty.height, self.cell.height);
@@ -4083,6 +4133,12 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
                 // the full row repaints because reordering decouples logical
                 // damage from painted position.
                 if bidi.line(row).is_some() {
+                    if bidi_rows_painted.get(row).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    if let Some(slot) = bidi_rows_painted.get_mut(row) {
+                        *slot = true;
+                    }
                     let mut background_run = BackgroundRun::default();
                     for visual_col in 0..cols {
                         let logical_col = bidi.logical_col_for_visual(row, visual_col);
@@ -4251,6 +4307,16 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
         // painted by the caller, glyph emission stops here (all variants —
         // shaped, tofu, and unshaped fallback alike).
         if shaped_run_is_invisible(snapshot, row, snapshot.width, run) {
+            return Ok(vec![(run.start_col, run.col_count)]);
+        }
+        // CTX-1612: reordered rows never reach the shaped emitter (they are
+        // painted by the per-cell visual row). If a future caller bypasses
+        // that gate, degrade to the per-cell path instead of silently
+        // applying the LTR pen model to RTL output.
+        if run.direction == RunDirection::Rtl {
+            self.counters.shaping_fallback_runs += 1;
+            let fg = self.shaped_run_fg(snapshot, row, snapshot.width, run);
+            self.emit_unshaped_slice(&run.text, row, run.start_col, fg, list);
             return Ok(vec![(run.start_col, run.col_count)]);
         }
         // ASCII fast path (CTX-1230, issue #2092): printable ASCII runs

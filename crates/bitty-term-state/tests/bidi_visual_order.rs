@@ -83,6 +83,11 @@ fn mixed_ltr_rtl_line_reverses_only_the_rtl_run() {
     }
     assert!(seen.iter().all(|seen| *seen));
     assert_eq!(row_text(&snapshot, 0, 7), "abc אבג");
+    // Edge inverse: visual edge 5 is the boundary before א (logical 6),
+    // not cell 5; the line end is visual 4 (logical 7).
+    assert_eq!(line.logical_caret_edge_for_visual(5), 6);
+    assert_eq!(line.logical_caret_edge_for_visual(4), 7);
+    assert_eq!(line.logical_caret_edge_for_visual(3), 3);
 }
 
 #[test]
@@ -107,6 +112,31 @@ fn rtl_paragraph_keeps_the_latin_run_ltr_and_reverses_the_hebrew_run() {
     assert_eq!(line.visual_caret_col(0), 7);
     assert_eq!(line.visual_caret_col(4), 0);
     assert_eq!(line.visual_caret_col(7), 3);
+    assert_eq!(
+        line.visual_caret_col(9),
+        9,
+        "padding beyond end is identity"
+    );
+    // Edge inverse for the RTL paragraph: visual edge 5 is the boundary
+    // between ג and ב (logical 2); visual edge 3 is the line end (7).
+    assert_eq!(line.logical_caret_edge_for_visual(5), 2);
+    assert_eq!(line.logical_caret_edge_for_visual(4), 3);
+    assert_eq!(line.logical_caret_edge_for_visual(3), 7);
+    // Outside content stays identity.
+    assert_eq!(line.logical_caret_edge_for_visual(12), 12);
+}
+
+#[test]
+fn pure_rtl_edges_invert() {
+    let state = state_with_text("אבג");
+    let snapshot = state.snapshot();
+    let grid = grid_for(&snapshot);
+    let line = grid.line(0).expect("RTL line");
+    // Logical edges 0..3 map to visual edges 3,2,1,0.
+    assert_eq!(line.logical_caret_edge_for_visual(3), 0);
+    assert_eq!(line.logical_caret_edge_for_visual(2), 1);
+    assert_eq!(line.logical_caret_edge_for_visual(1), 2);
+    assert_eq!(line.logical_caret_edge_for_visual(0), 3);
 }
 
 #[test]
@@ -284,6 +314,94 @@ fn text_level_resolution_matches_known_uax9_examples() {
     let forced = resolve_text("אבג abc", ParaDirection::Ltr).expect("text");
     assert_eq!(forced.paragraph_level, 0);
     assert_eq!(forced.visual, vec![2, 1, 0, 3, 4, 5, 6]);
+}
+
+#[test]
+fn bidi_control_at_column_zero_follows_the_break_kind() {
+    // Soft wrap: the next row is still the same logical line, so a control
+    // at its column 0 joins the previous row's last cell.
+    let mut state = State::new();
+    print_text(&mut state, &"a".repeat(81));
+    assert!(state.row_soft_wrapped(0));
+    state.apply(&TerminalAction::CursorPosition {
+        row: bitty_vt::Row(2),
+        col: bitty_vt::Col(1),
+    });
+    print_text(&mut state, "\u{2067}b");
+    let snapshot = state.snapshot();
+    assert_eq!(snapshot.cells[79].glyph, 'a');
+    assert_eq!(snapshot.cells[79].zerowidth.as_slice(), &['\u{2067}']);
+    // Hard break: the control is line-leading and dropped, never attached
+    // to the previous line.
+    let mut state = State::new();
+    print_text(&mut state, &"a".repeat(80));
+    state.apply(&TerminalAction::PrintControl(ControlChar(0x0D)));
+    state.apply(&TerminalAction::PrintControl(ControlChar(0x0A)));
+    print_text(&mut state, "\u{2067}b");
+    let snapshot = state.snapshot();
+    assert!(snapshot.cells[79].zerowidth.is_empty());
+    assert_eq!(snapshot.cells[80].glyph, 'b');
+}
+
+#[test]
+fn nested_embeddings_and_isolates_stay_zero_width() {
+    let state = state_with_text("x\u{202A}a\u{202E}b\u{202C}\u{2067}אב\u{2069}c\u{202C}y");
+    let snapshot = state.snapshot();
+    let text: String = snapshot.cells[..3].iter().map(|cell| cell.glyph).collect();
+    assert_eq!(text, "xab", "controls never consume a cell");
+    assert!(snapshot.cells[0].zerowidth.as_slice().contains(&'\u{202A}'));
+    let before_isolate = snapshot
+        .cells
+        .iter()
+        .find(|cell| cell.glyph == 'b')
+        .expect("cell before the isolate");
+    assert!(
+        before_isolate.zerowidth.as_slice().contains(&'\u{2067}'),
+        "RLI stays on the preceding cell tail"
+    );
+    let grid = grid_for(&snapshot);
+    let line = grid.line(0).expect("RTL isolate");
+    assert!(line.has_rtl());
+}
+
+#[test]
+fn wide_and_combining_clusters_move_as_one_unit() {
+    let state = state_with_text("א中\u{0301}ב");
+    let snapshot = state.snapshot();
+    let cells = &snapshot.cells[..4];
+    assert_eq!(cells[0].glyph, 'א');
+    assert_eq!(cells[1].glyph, '中');
+    assert_eq!(cells[1].width, 2);
+    assert!(cells[2].spacer);
+    assert_eq!(cells[1].zerowidth.as_slice(), &['\u{0301}']);
+    assert_eq!(cells[3].glyph, 'ב');
+    let grid = grid_for(&snapshot);
+    let line = grid.line(0).expect("RTL line");
+    assert_eq!(line.visual_col_for_logical(1), 1);
+    assert_eq!(line.visual_col_for_logical(2), 2);
+    assert_eq!(
+        line.visual_caret_col(4),
+        0,
+        "end caret before the wide pair"
+    );
+}
+
+#[test]
+fn over_width_rows_fail_closed_to_identity() {
+    let width = usize::from(u16::MAX) + 1;
+    let text: String = std::iter::repeat_n('א', width).collect();
+    let cells: Vec<Cell> = text
+        .chars()
+        .map(|glyph| {
+            let mut cell = Cell::erased(bitty_term_state::Style::default());
+            cell.glyph = glyph;
+            cell.padding = false;
+            cell
+        })
+        .collect();
+    let grid = BidiGrid::resolve(&cells, width, 1, None, ParaDirection::Auto);
+    assert!(grid.line(0).is_none(), "u16 maps must fail closed");
+    assert_eq!(grid.logical_col_for_visual(0, 12_345), 12_345);
 }
 
 #[test]

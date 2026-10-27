@@ -15,7 +15,7 @@ use super::id::{Entropy, SessionId, random_hex};
 /// Maximum bytes in a client-supplied `terminal_id` (contract `D-02`,
 /// `terminal_id_bytes`).
 ///
-/// This is a fixed-format identifier bound: its compiled floor is the system
+/// This is a byte-bounded identifier limit: its compiled floor is the system
 /// maximum, so the handshake advertises this same value and a configuration
 /// cannot lower the advertisement below the registry check.
 pub const TERMINAL_ID_MAX_BYTES: usize =

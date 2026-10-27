@@ -1631,6 +1631,20 @@ mod tests {
     }
 
     #[test]
+    fn control_claim_is_not_applicable_while_in_flight() {
+        let mut store = IdempotencyStore::create(&Limits::default());
+        assert!(matches!(
+            store.begin(create_request(1), ms(1)),
+            Ok(Admission::Execute(_))
+        ));
+        assert_eq!(
+            store.mark_control_claimed(key(1)),
+            Err(IdempotencyRefusal::ControlNotApplicable)
+        );
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
     fn refusal_codes_are_mapped_into_the_closed_taxonomy() {
         let identity = IdempotentIdentity {
             method: IdempotentMethod::Attach,

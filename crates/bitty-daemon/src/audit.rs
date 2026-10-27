@@ -13,6 +13,18 @@
 //! writer when it writes the owner-private file; no wall-clock value enters the
 //! in-memory ring or its order.
 //!
+//! # Sink handoff (bitty#2607)
+//!
+//! [`AuditRing::drain`] and [`AuditRing::take_until`] remove records from the
+//! ring and transfer ownership to the caller. They are not re-queued: if the
+//! sink write or rename fails, the writer must persist or retry the returned
+//! records, or the loss is visible only through the sink error path.
+//!
+//! A sink writer's last-event-id cursor is scoped to one
+//! `daemon_instance_id`. A fresh daemon instance starts a new event-id sequence
+//! at 1, so the cursor must reset when the instance changes; carrying an old
+//! cursor across instances would silently skip the new records.
+//!
 //! # What a record may contain
 //!
 //! Every field is a closed enum, a numeric counter, a fixed-size identifier,
@@ -92,11 +104,14 @@ impl fmt::Display for AuditEventId {
     }
 }
 
-/// The service action an audit record describes.
+/// The action or audit event label an audit record describes.
 ///
-/// The spellings are the contract method names for wire actions plus two
-/// internal lifecycle actions. Reads are included because a refused read is a
-/// refusal record (`D-16`).
+/// Variants documented as a **wire method** use the contract method spelling.
+/// Variants documented as an **audit event label** are daemon-internal events
+/// or a mode of a wire method and use a non-method spelling, so a reader cannot
+/// mistake them for callable methods. Reads are included because a refused
+/// read is a refusal record (`D-16`). The wire spellings remain open until
+/// bitty#2664 freezes JSON keys; these are the stable internal labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AuditAction {
     /// `daemon.negotiate`.
@@ -115,13 +130,13 @@ pub enum AuditAction {
     Grant,
     /// `session.grant.revoke` (observer grant).
     GrantRevoke,
-    /// `daemon.host_grant` mint (host-consent grant).
+    /// Wire method `daemon.host_grant` mint (host-consent grant).
     HostGrant,
-    /// `daemon.host_grant.revoke`.
+    /// Audit event label `host_grant.revoke` (revoke mode of the wire method).
     HostGrantRevoke,
-    /// `daemon.host_grant.consume`.
+    /// Audit event label `host_grant.consume`.
     HostGrantConsume,
-    /// `daemon.host_grant.expire`.
+    /// Audit event label `host_grant.expire`.
     HostGrantExpire,
     /// `session.control.transfer`.
     Transfer,
@@ -141,9 +156,9 @@ pub enum AuditAction {
     OrphanVerify,
     /// `lease.heartbeat`.
     Heartbeat,
-    /// The internal worker bind lifecycle step.
+    /// Audit event label `session.bind` (internal lifecycle step).
     Bind,
-    /// The internal worker-exit lifecycle step.
+    /// Audit event label `session.worker_exit` (internal lifecycle step).
     WorkerExit,
 }
 
@@ -161,9 +176,9 @@ impl AuditAction {
             Self::Grant => "session.grant",
             Self::GrantRevoke => "session.grant.revoke",
             Self::HostGrant => "daemon.host_grant",
-            Self::HostGrantRevoke => "daemon.host_grant.revoke",
-            Self::HostGrantConsume => "daemon.host_grant.consume",
-            Self::HostGrantExpire => "daemon.host_grant.expire",
+            Self::HostGrantRevoke => "host_grant.revoke",
+            Self::HostGrantConsume => "host_grant.consume",
+            Self::HostGrantExpire => "host_grant.expire",
             Self::Transfer => "session.control.transfer",
             Self::Resize => "session.resize",
             Self::Abort => "session.abort",
@@ -723,9 +738,11 @@ impl AuditRing {
     /// Remove up to `max` oldest records for the sink writer.
     ///
     /// The returned vector is bounded by the ring capacity and by `max`; the
-    /// records are [`Copy`] values and keep their event ids. An explicit drain
-    /// is not an overflow and does not increment [`AuditCounters::dropped`]; it
-    /// increments [`AuditCounters::drained`].
+    /// records are [`Copy`] values and keep their event ids. Ownership transfers
+    /// to the caller: if the sink write fails, retry with the returned records,
+    /// because they are no longer in the ring. An explicit drain is not an
+    /// overflow and does not increment [`AuditCounters::dropped`]; it increments
+    /// [`AuditCounters::drained`].
     pub fn drain(&mut self, max: usize) -> Vec<AuditRecord> {
         let take = max.min(self.records.len());
         let mut drained = Vec::with_capacity(take);
@@ -744,9 +761,12 @@ impl AuditRing {
     /// Remove every retained record with an event id at or before `through`.
     ///
     /// A sink writer tracks the last event id it persisted and calls this with
-    /// that id. If the oldest retained id is greater than `through`, nothing is
-    /// removed. Draining does not reuse event ids and does not increment
-    /// [`AuditCounters::dropped`].
+    /// that id. The cursor is per `daemon_instance_id`: reset it when the
+    /// instance changes, because a new instance starts a new event-id sequence
+    /// at 1. If the oldest retained id is greater than `through`, nothing is
+    /// removed. Ownership transfers to the caller, so a failed sink write must
+    /// retry with the returned records. Draining does not reuse event ids and
+    /// does not increment [`AuditCounters::dropped`].
     pub fn take_until(&mut self, through: AuditEventId) -> Vec<AuditRecord> {
         let mut drained = Vec::new();
         while let Some(record) = self.records.front() {
@@ -981,9 +1001,9 @@ mod tests {
     fn host_grant_actions_use_the_grant_id_target() {
         let actions = [
             (AuditAction::HostGrant, "daemon.host_grant"),
-            (AuditAction::HostGrantRevoke, "daemon.host_grant.revoke"),
-            (AuditAction::HostGrantConsume, "daemon.host_grant.consume"),
-            (AuditAction::HostGrantExpire, "daemon.host_grant.expire"),
+            (AuditAction::HostGrantRevoke, "host_grant.revoke"),
+            (AuditAction::HostGrantConsume, "host_grant.consume"),
+            (AuditAction::HostGrantExpire, "host_grant.expire"),
         ];
         let grant_id = [0x42; 16];
         let mut ring = AuditRing::new(instance(1), &small_limits(8));
@@ -1036,11 +1056,16 @@ mod tests {
 
     #[test]
     fn ring_record_budget_fits_inside_the_sink_budget() {
+        let record_bytes = u64::try_from(std::mem::size_of::<AuditRecord>()).unwrap_or(u64::MAX);
+        assert!(
+            record_bytes <= AUDIT_RECORD_BYTES as u64,
+            "record is {record_bytes} bytes, accounting unit is {AUDIT_RECORD_BYTES}"
+        );
         for limits in [Limits::default(), small_limits(7)] {
             let capacity = audit_ring_capacity(&limits);
             let accounted = u64::try_from(capacity)
                 .unwrap_or(u64::MAX)
-                .saturating_mul(AUDIT_RECORD_BYTES as u64);
+                .saturating_mul(record_bytes);
             let sink = limits
                 .effective(LimitId::AuditFileBytes)
                 .saturating_mul(limits.effective(LimitId::AuditSegments));

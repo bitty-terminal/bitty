@@ -34,12 +34,12 @@ bitty#2607 to drive.
 The contract areas that follow are deliberately deferred to their owning
 slices:
 
-| Area                                                                                                                                                                          | Owner      |
-| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| Area                                                                                                                                                                                                                        | Owner      |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
 | `bitty-ipc` v1 server loop, peer capture and re-check, scope evaluation, endpoint lock and tamper detection, method dispatch, error mapping, event framing and correlation id, refusal-to-result mapping, audit sink writer | bitty#2607 |
-| Endpoint discovery, cgroup/subreaper containment, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs                                         | bitty#2604 |
-| Leases, control token, attach/detach authority, abort/kill                                                                                                                    | bitty#2609 |
-| Conformance corpus and fake-server parity                                                                                                                                     | bitty#2605 |
+| Endpoint discovery, cgroup/subreaper containment, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs                                                                                       | bitty#2604 |
+| Leases, control token, attach/detach authority, abort/kill                                                                                                                                                                  | bitty#2609 |
+| Conformance corpus and fake-server parity                                                                                                                                                                                   | bitty#2605 |
 
 Nothing here authorizes autostart, a service file, a TCP listener, or desktop
 wiring; all four stay out of scope.
@@ -142,7 +142,7 @@ bitty#2604 owns that directory and its current-user-only DACL.
 - `Limits::advertised()` yields the `{effective, default, system_max}` triples;
   `handshake::negotiate` returns them in `NegotiateResponse::limits` for the
   run, so a client parameterizes on `effective`, never on a default.
-- The fixed-format identifier bounds (`terminal_id_bytes`, `attach_id_bytes`,
+- The byte-bounded identifier limits (`terminal_id_bytes`, `attach_id_bytes`,
   `grant_id_bytes`) have their system maximum as their compiled floor, so a
   lowered configuration cannot advertise a value the registry or wire format
   does not enforce. `TERMINAL_ID_MAX_BYTES` is derived from the same table.
@@ -213,9 +213,13 @@ bitty#2604 owns that directory and its current-user-only DACL.
   `drained`, `refusals`, and `terminal_transitions` are observable.
 - `drain(max)` and `take_until(event_id)` remove bounded, `Copy` records for
   the sink writer; a drain is not an overflow and bumps `drained`, not
-  `dropped`.
-- Host-consent grants have `daemon.host_grant` mint, consume, revoke, and expiry
-  actions; a grant action targets `AuditTarget::grant` (`grant_id`).
+  `dropped`. They transfer ownership, so a failed sink write retries the
+  returned records. The writer's last-event-id cursor is per
+  `daemon_instance_id` and must reset when the instance changes.
+- Host-consent grants use the `daemon.host_grant` wire method for mint and the
+  audit event labels `host_grant.consume`, `host_grant.revoke`, and
+  `host_grant.expire`; every grant action targets `AuditTarget::grant`
+  (`grant_id`).
 - The ring is the staging buffer; the owner-private rotating file sink and the
   per-connection refusal budget stay with bitty#2607.
 
@@ -272,9 +276,10 @@ per-session stream cannot disagree. Source: contract `D-10`, `D-12`, `D-14`,
   lease without a revision bump and is not part of a session backlog.
 - `last_worker_seen_at` is absent: a terminal session has no supervision liveness
   signal, so the stream reports none.
-- bitty#2603 advertises these limits as `{effective, default, system_max}` and
-  surfaces the queue/backlog counters in `daemon.status`; bitty#2605 adds the
-  V-21, V-23, C-04, and C-06 corpus vectors against a real transport.
+- The compiled `D-14` table advertises these caps as
+  `{effective, default, system_max}`; `daemon.status` queue/backlog counters
+  arrive with bitty#2607, and bitty#2605 adds the V-21, V-23, C-04, and C-06
+  corpus vectors against a real transport.
 
 ## CLI
 

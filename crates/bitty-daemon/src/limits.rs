@@ -169,6 +169,29 @@ impl EnforcementStage {
     }
 }
 
+impl EnforcementStage {
+    /// Whether a breach of a limit in this stage is a whole-request refusal.
+    ///
+    /// [`Self::ContentPlane`], [`Self::Retention`], and [`Self::Deadline`] are
+    /// pruning, collection, and timer stages; a limit in those stages must
+    /// never be turned into a [`LimitRefusal`].
+    #[must_use]
+    pub const fn refuses(self) -> bool {
+        matches!(
+            self,
+            Self::ConnectionAdmission
+                | Self::Handshake
+                | Self::RequestAdmission
+                | Self::AuditSink
+                | Self::Idempotency
+                | Self::RegistryAdmission
+                | Self::SessionMutation
+                | Self::EventDelivery
+                | Self::Containment
+        )
+    }
+}
+
 impl fmt::Display for EnforcementStage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
@@ -324,6 +347,15 @@ impl LimitId {
         LIMIT_TABLE[self as usize].stage
     }
 
+    /// Whether a breach of this limit is a whole-request refusal.
+    ///
+    /// Content, retention, and timer limits return `false`; they prune, collect,
+    /// or expire and must not produce a [`LimitRefusal`].
+    #[must_use]
+    pub const fn is_refusal_cap(self) -> bool {
+        self.stage().refuses()
+    }
+
     /// Whether this is an inherited transport bound that cannot be configured.
     #[must_use]
     pub const fn is_fixed(self) -> bool {
@@ -337,7 +369,7 @@ impl LimitId {
     /// silently disable the mechanism. The two idempotency byte bounds have
     /// the compiled descriptor budget as their floor, and `audit_file_bytes`
     /// has the compiled audit-record budget, so the smallest accepted
-    /// configuration still holds one entry. The fixed-format identifier bounds
+    /// configuration still holds one entry. The byte-bounded identifier limits
     /// (`terminal_id_bytes`, `attach_id_bytes`, `grant_id_bytes`) have their
     /// system maximum as the floor: the registry and wire formats enforce the
     /// fixed widths, so a lowered advertisement could not be honored. Fixed
@@ -514,6 +546,9 @@ impl std::error::Error for LimitsError {}
 
 /// A whole-request limit refusal: which limit, its enforced value, and the
 /// observed count.
+///
+/// Build this only for a limit whose [`LimitId::is_refusal_cap`] is true.
+/// Content-plane, retention, and timer limits never refuse a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LimitRefusal {
     limit: LimitId,
@@ -693,8 +728,15 @@ impl Limits {
     }
 
     /// Build a whole-request refusal carrying the enforced value of `limit`.
+    ///
+    /// Only a limit whose [`LimitId::is_refusal_cap`] is true may become a
+    /// refusal; content, retention, and timer limits prune, collect, or expire.
     #[must_use]
     pub fn refusal(&self, limit: LimitId, actual: u64) -> LimitRefusal {
+        debug_assert!(
+            limit.is_refusal_cap(),
+            "limit {limit} is not a whole-request refusal cap"
+        );
         LimitRefusal::new(limit, self.effective(limit), actual)
     }
 }
@@ -809,6 +851,29 @@ mod tests {
             LimitId::AttachLeaseTtlMs.stage(),
             EnforcementStage::Deadline
         );
+        assert!(EnforcementStage::AuditSink.refuses());
+        assert!(EnforcementStage::SessionMutation.refuses());
+        for stage in [
+            EnforcementStage::ContentPlane,
+            EnforcementStage::Retention,
+            EnforcementStage::Deadline,
+        ] {
+            assert!(!stage.refuses(), "{stage}");
+        }
+        for limit in LimitId::ALL {
+            if !limit.is_refusal_cap() {
+                assert!(matches!(
+                    limit.stage(),
+                    EnforcementStage::ContentPlane
+                        | EnforcementStage::Retention
+                        | EnforcementStage::Deadline
+                ));
+            }
+        }
+        assert!(!LimitId::MaxContentBytesPerSession.is_refusal_cap());
+        assert!(!LimitId::MaxRetainedTerminalRecords.is_refusal_cap());
+        assert!(!LimitId::AttachLeaseTtlMs.is_refusal_cap());
+        assert!(LimitId::MaxSessions.is_refusal_cap());
         assert!(EnforcementStage::ConnectionAdmission < EnforcementStage::Handshake);
         assert!(EnforcementStage::Handshake < EnforcementStage::RequestAdmission);
         assert!(EnforcementStage::RequestAdmission < EnforcementStage::AuditSink);

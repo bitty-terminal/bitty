@@ -15,41 +15,44 @@
 
 use std::fmt;
 
+use crate::limits::{LimitId, Limits};
 use crate::registry::{AttachId, MonotonicMs};
 
 use super::refusal::LeaseRefusal;
 
 /// Default per-session observer cap (`D-14` `max_attaches_per_session`).
-pub const MAX_ATTACHES_PER_SESSION_DEFAULT: usize = 8;
+pub const MAX_ATTACHES_PER_SESSION_DEFAULT: usize =
+    LimitId::MaxAttachesPerSession.default_value() as usize;
 
 /// Compiled per-session observer cap (`D-14` system maximum).
-pub const MAX_ATTACHES_PER_SESSION_SYSTEM_MAX: usize = 16;
+pub const MAX_ATTACHES_PER_SESSION_SYSTEM_MAX: usize =
+    LimitId::MaxAttachesPerSession.system_max_value() as usize;
 
 /// Default lease TTL (`D-14` `attach_lease_ttl_ms`).
-pub const ATTACH_LEASE_TTL_MS_DEFAULT: u64 = 15_000;
+pub const ATTACH_LEASE_TTL_MS_DEFAULT: u64 = LimitId::AttachLeaseTtlMs.default_value();
 
 /// Compiled lease TTL ceiling (`D-14` system maximum).
-pub const ATTACH_LEASE_TTL_MS_SYSTEM_MAX: u64 = 15_000;
+pub const ATTACH_LEASE_TTL_MS_SYSTEM_MAX: u64 = LimitId::AttachLeaseTtlMs.system_max_value();
 
 /// Default abort grace before escalation to kill (`D-14` `abort_grace_ms`).
-pub const ABORT_GRACE_MS_DEFAULT: u64 = 5_000;
+pub const ABORT_GRACE_MS_DEFAULT: u64 = LimitId::AbortGraceMs.default_value();
 
 /// Compiled abort-grace ceiling (`D-14` system maximum).
-pub const ABORT_GRACE_MS_SYSTEM_MAX: u64 = 5_000;
+pub const ABORT_GRACE_MS_SYSTEM_MAX: u64 = LimitId::AbortGraceMs.system_max_value();
 
 /// Default daemon drain grace (`D-14` `drain_grace_ms`).
-pub const DRAIN_GRACE_MS_DEFAULT: u64 = 10_000;
+pub const DRAIN_GRACE_MS_DEFAULT: u64 = LimitId::DrainGraceMs.default_value();
 
 /// Compiled drain-grace ceiling (`D-14` system maximum).
-pub const DRAIN_GRACE_MS_SYSTEM_MAX: u64 = 10_000;
+pub const DRAIN_GRACE_MS_SYSTEM_MAX: u64 = LimitId::DrainGraceMs.system_max_value();
 
 /// Enforced lease bounds for one daemon instance.
 ///
-/// The service layer receives effective values from configuration and passes
-/// them here; bitty#2603 owns advertising them as
-/// `{effective, default, system_max}`. Construction refuses a value above the
-/// compiled ceiling, so configuration cannot raise a bound past the reviewed
-/// maximum.
+/// The service layer derives these from the effective [`Limits`] with
+/// [`Self::from_limits`]; the compiled `{effective, default, system_max}`
+/// triples are advertised by `crate::limits`. Construction refuses a value
+/// above the compiled ceiling, so configuration cannot raise a bound past the
+/// reviewed maximum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaseLimits {
     max_attaches_per_session: usize,
@@ -117,16 +120,26 @@ impl LeaseLimits {
     pub const fn drain_grace_ms(self) -> u64 {
         self.drain_grace_ms
     }
+
+    /// Derive the lease bounds from the effective advertised limits.
+    ///
+    /// [`Limits`] has already validated every effective value against its
+    /// compiled floor and system maximum, so this constructor cannot produce
+    /// an out-of-range value and does not re-run the refusal path.
+    #[must_use]
+    pub fn from_limits(limits: &Limits) -> Self {
+        Self {
+            max_attaches_per_session: limits.effective_usize(LimitId::MaxAttachesPerSession),
+            attach_lease_ttl_ms: limits.effective(LimitId::AttachLeaseTtlMs),
+            abort_grace_ms: limits.effective(LimitId::AbortGraceMs),
+            drain_grace_ms: limits.effective(LimitId::DrainGraceMs),
+        }
+    }
 }
 
 impl Default for LeaseLimits {
     fn default() -> Self {
-        Self {
-            max_attaches_per_session: MAX_ATTACHES_PER_SESSION_DEFAULT,
-            attach_lease_ttl_ms: ATTACH_LEASE_TTL_MS_DEFAULT,
-            abort_grace_ms: ABORT_GRACE_MS_DEFAULT,
-            drain_grace_ms: DRAIN_GRACE_MS_DEFAULT,
-        }
+        Self::from_limits(&Limits::default())
     }
 }
 
@@ -262,6 +275,8 @@ const _: () = assert!(std::mem::size_of::<Lease>() <= 512);
 
 #[cfg(test)]
 mod tests {
+    use crate::limits::LimitOverride;
+
     use super::*;
 
     fn ms(value: u64) -> MonotonicMs {
@@ -318,6 +333,30 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn limits_derive_from_the_advertised_table() {
+        assert_eq!(
+            LeaseLimits::from_limits(&Limits::default()),
+            LeaseLimits::default()
+        );
+        let lowered = Limits::new(&[
+            LimitOverride::new(LimitId::MaxAttachesPerSession, 4),
+            LimitOverride::new(LimitId::AttachLeaseTtlMs, 12_000),
+            LimitOverride::new(LimitId::AbortGraceMs, 2_000),
+            LimitOverride::new(LimitId::DrainGraceMs, 4_000),
+        ])
+        .expect("valid overrides");
+        let lease = LeaseLimits::from_limits(&lowered);
+        assert_eq!(lease.max_attaches_per_session(), 4);
+        assert_eq!(lease.attach_lease_ttl_ms(), 12_000);
+        assert_eq!(lease.abort_grace_ms(), 2_000);
+        assert_eq!(lease.drain_grace_ms(), 4_000);
+        assert_eq!(
+            MAX_ATTACHES_PER_SESSION_SYSTEM_MAX,
+            LimitId::MaxAttachesPerSession.system_max_value() as usize
+        );
     }
 
     #[test]

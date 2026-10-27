@@ -76,20 +76,20 @@ test = false
 doc = false
 
 [dependencies]
-bitty-config = { version = "0.0.29", path = "../bitty-config" }
-bitty-vt = { version = "0.0.29", path = "../bitty-vt" }
-bitty-term-state = { version = "0.0.29", path = "../bitty-term-state" }
-bitty-pty = { version = "0.0.29", path = "../bitty-pty" }
-bitty-render = { version = "0.0.29", path = "../bitty-render" }
-bitty-platform = { version = "0.0.29", path = "../bitty-platform" }
-bitty-ui = { version = "0.0.29", path = "../bitty-ui" }
-bitty-lua = { version = "0.0.29", path = "../bitty-lua" }
-bitty-plugin-host = { version = "0.0.29", path = "../bitty-plugin-host" }
+bitty-config = { version = "0.0.30", path = "../bitty-config" }
+bitty-vt = { version = "0.0.30", path = "../bitty-vt" }
+bitty-term-state = { version = "0.0.30", path = "../bitty-term-state" }
+bitty-pty = { version = "0.0.30", path = "../bitty-pty" }
+bitty-render = { version = "0.0.30", path = "../bitty-render" }
+bitty-platform = { version = "0.0.30", path = "../bitty-platform" }
+bitty-ui = { version = "0.0.30", path = "../bitty-ui" }
+bitty-lua = { version = "0.0.30", path = "../bitty-lua" }
+bitty-plugin-host = { version = "0.0.30", path = "../bitty-plugin-host" }
 # CTX-1151 (#1984): inherited-OS-confinement adapter for admitted tool
 # spawns (Linux Landlock; fail-closed degrade elsewhere). First-party
 # workspace crate, no new supply-chain surface (its only syscall dep is the
 # workspace `libc`, Linux-gated there).
-bitty-sandbox = { version = "0.0.29", path = "../bitty-sandbox" }
+bitty-sandbox = { version = "0.0.30", path = "../bitty-sandbox" }
 # `version` below is required for `cargo publish` (lockfile pins 0.0.1 for
 # each); the git rev stays the build source until each crate lands on
 # crates.io (see CTX-1172 publish order notes).
@@ -114,11 +114,11 @@ bitty-execution = { version = "0.0.1", git = "https://github.com/bitty-terminal/
 bitty-ipc-api = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674", optional = true }
 # CTX-0406: the package-manager staging path evaluates the closed compat
 # requirement grammar with the same pure implementation the plugin host uses.
-bitty-package = { version = "0.0.29", path = "../bitty-package" }
+bitty-package = { version = "0.0.30", path = "../bitty-package" }
 # CTX-0248: the tick overlay path stores Kitty images and computes
 # placement rects through the rich layer (moved from dev-dependencies;
 # same workspace crate, no new supply-chain surface).
-bitty-rich = { version = "0.0.29", path = "../bitty-rich" }
+bitty-rich = { version = "0.0.30", path = "../bitty-rich" }
 # CTX-0906 (DIR-030): the component broker speaks native-component wire
 # protocol v1 to out-of-process components (first: `bitty-net`). On this path
 # Core links only the dependency-free codec crate, never a general network

@@ -1143,12 +1143,14 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          # CTX-1439 / #2429: attempt-scoped so a re-run cannot merge a
-          # superseded attempt's TSV into the Tier 1 aggregate.
-          name: compat-results-linux-x11-${{ github.run_attempt }}
+          # CTX-1624 / #2753: one stable artifact per platform. `overwrite`
+          # replaces it on a re-run, so a partially re-run workflow still
+          # leaves exactly one TSV per platform for the Tier 1 aggregate.
+          name: compat-results-linux-x11
           path: compat-results/linux-x11*
           if-no-files-found: error
           retention-days: 7
+          overwrite: true
 
       - name: Show sccache stats (compat-linux-x11)
         if: always()
@@ -1249,11 +1251,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          # CTX-1439 / #2429: attempt-scoped (see the compat-linux-x11 upload).
-          name: compat-results-linux-wayland-${{ github.run_attempt }}
+          # CTX-1624 / #2753: stable name, overwritten on a re-run (see the
+          # compat-linux-x11 upload).
+          name: compat-results-linux-wayland
           path: compat-results/linux-wayland*
           if-no-files-found: error
           retention-days: 7
+          overwrite: true
 
       - name: Show sccache stats (compat-linux-wayland)
         if: always()
@@ -1425,11 +1429,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          # CTX-1439 / #2429: attempt-scoped (see linux-x11 upload).
-          name: compat-results-macos-${{ github.run_attempt }}
+          # CTX-1624 / #2753: stable name, overwritten on a re-run (see the
+          # compat-linux-x11 upload).
+          name: compat-results-macos
           path: compat-results/macos*
           if-no-files-found: error
           retention-days: 7
+          overwrite: true
 
   supply-chain:
     name: Supply chain (deny/audit)
@@ -1653,11 +1659,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          # CTX-1439 / #2429: attempt-scoped (see linux-x11 upload).
-          name: compat-results-windows-${{ github.run_attempt }}
+          # CTX-1624 / #2753: stable name, overwritten on a re-run (see the
+          # compat-linux-x11 upload).
+          name: compat-results-windows
           path: compat-results/windows*
           if-no-files-found: error
           retention-days: 7
+          overwrite: true
 
       # CTX-1061 (#1861): Windows live execution for install.ps1. The shell
       # fixture test pins the URL templates statically; this leg proves the
@@ -1756,8 +1764,8 @@ jobs:
   # PERF-11 / CTX-0692: aggregate the four ADR-0002 Tier 1 platform legs of
   # the compat release matrix (14 surfaces x 4 terminals) into a single
   # pass/fail view. Each platform job runs the release-matrix suites by name
-  # and uploads a `compat-results-<platform>-<run_attempt>` artifact; this job
-  # stitches this attempt's four into one table on the run summary and fails if
+  # and uploads a `compat-results-<platform>` artifact; this job
+  # stitches the run's four into one table on the run summary and fails if
   # any platform is missing a suite, reported a fail, or had a failed job
   # result. That makes a regression on one Tier 1 platform a single visible
   # check instead of four scattered job logs.
@@ -1768,14 +1776,23 @@ jobs:
   # those results. The macOS and Windows legs still run inline in their
   # platform jobs. Coverage and the gate are unchanged.
   #
-  # CTX-1439 / #2429: the attempt suffix is load-bearing. Artifact names were
-  # fixed per platform before, and a re-run appends artifacts instead of
-  # replacing them, so `pattern: compat-results-*` with `merge-multiple: true`
-  # unpacked every attempt into one directory and the aggregate read a
-  # superseded attempt's TSV first. Scoping both sides to
-  # `${{ github.run_attempt }}` removes that ambiguity rather than resolving
-  # it (see run 39658576023: three `compat-results-linux-wayland` artifacts,
-  # attempt 3 passing yet the aggregate reporting `live_compat status=fail`).
+  # CTX-1439 / #2429 introduced per-attempt artifact names because a re-upload
+  # to a fixed name appended artifacts instead of replacing them, so
+  # `pattern: compat-results-*` with `merge-multiple: true` unpacked every
+  # attempt into one directory and the aggregate read a superseded attempt's
+  # TSV first (run 39658576023).
+  #
+  # CTX-1624 / #2753: the attempt suffix cannot survive a partial re-run.
+  # `gh run rerun --failed` re-runs only the failed jobs while
+  # `${{ github.run_attempt }}` increments for the whole run, so succeeded legs
+  # keep their `-N-1` artifacts while this job looks for `-N` and downloads
+  # nothing (run 40500927980 attempt 3). The names are therefore stable per
+  # platform again, and every upload passes `overwrite: true`, which deletes
+  # the same-named artifact in the run before recreating it. A re-run leg
+  # replaces its own TSV, untouched legs keep publishing theirs, and the
+  # un-suffixed pattern below selects exactly one result per platform - the
+  # append ambiguity above is resolved by the overwrite instead of by naming.
+  # The `m1-results-*` matrix already relies on the same stable-name contract.
   #
   # MSRV is intentionally not a leg: it is a compile-floor gate
   # (`cargo +1.85 check`), not a Tier 1 platform run.
@@ -1798,16 +1815,32 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Download per-platform compat results (current attempt only)
+      - name: Download per-platform compat results
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          # CTX-1439 / #2429: artifact names carry the uploading attempt, so
-          # this pattern selects only this attempt's four legs. A re-run
-          # therefore never unpacks a superseded attempt's TSV (which the
-          # aggregate would otherwise read first per suite).
-          pattern: compat-results-*-${{ github.run_attempt }}
+          # CTX-1624 / #2753: names are stable per platform and every upload
+          # overwrites its own artifact, so this pattern selects exactly one
+          # TSV per platform even after a partial re-run.
+          pattern: compat-results-*
           path: compat-results
           merge-multiple: true
+
+      # CTX-1624 / #2753: fail closed (and name the platform) when a leg
+      # produced no artifact at all, instead of letting the aggregate report
+      # the same absence once per suite.
+      - name: Verify every platform result is present
+        run: |
+          set -euo pipefail
+          missing=()
+          while read -r platform; do
+            [ -n "$platform" ] || continue
+            [ -f "compat-results/${platform}.tsv" ] || missing+=("$platform")
+          done < <(./scripts/compat-matrix.sh platforms)
+          if ((${#missing[@]} > 0)); then
+            echo "::error::compat aggregate is missing results for platform(s): ${missing[*]}"
+            ls -l compat-results || true
+            exit 1
+          fi
 
       - name: Aggregate compat release matrix
         run: |

@@ -85,6 +85,7 @@
 #![forbid(unsafe_code)]
 
 pub mod audit;
+pub mod audit_sink;
 pub mod cli;
 pub mod codes;
 pub mod contract;

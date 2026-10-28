@@ -339,6 +339,24 @@ jobs:
       - name: Run tests (nextest, ci profile, shard ${{ matrix.shard }}/2)
         run: cargo nextest run --workspace --locked --profile ci --partition hash:${{ matrix.shard }}/2
 
+      # bitty#2605: the fake-server half of the shared conformance corpus. It
+      # runs on every consumer-relevant change (the whole Quality job) and its
+      # evidence is uploaded separately from the real-service row, so a fake
+      # run can never close a real row. Shard 1 only: artifact names are unique
+      # per workflow run.
+      - name: Run bittyd conformance (fake reference server)
+        if: matrix.shard == 1
+        run: cargo test -p bitty-daemon --test conformance --locked fake_conformance_corpus
+
+      - name: Upload bittyd conformance evidence (fake)
+        if: always() && matrix.shard == 1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bittyd-conformance-fake
+          path: target/conformance/linux-x86_64.fake.json
+          if-no-files-found: error
+          retention-days: 7
+
       # CTX-1332 (issue #2213): the cold-delivery phase/origin/fence suites are
       # behind the default-off `input-vm-test-support` feature. This required
       # step runs the same feature-on selection as `just cold-delivery-test`,
@@ -767,6 +785,24 @@ jobs:
 
       - name: Run harness=false platform entry points (X11)
         run: xvfb-run -a cargo test -p bitty-platform --test headless_run --test winit_window --locked
+
+      # bitty#2605: the real-service conformance row runs in the Linux Tier-1
+      # job. The corpus records typed skips for the injected-clock and
+      # adapter-owned rows; a fake pass never closes a real row. The parity
+      # document compares the two typed signatures.
+      - name: Run bittyd conformance (real service)
+        run: cargo test -p bitty-daemon --test conformance --locked
+
+      - name: Upload bittyd conformance evidence (linux-x86_64)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bittyd-conformance-linux-x86_64
+          path: |
+            target/conformance/linux-x86_64.real.json
+            target/conformance/linux-x86_64.parity.json
+          if-no-files-found: error
+          retention-days: 7
 
       # #2561: report the budget before the bench build and fail with an
       # infrastructure signal when it cannot fit (see the quality job step).

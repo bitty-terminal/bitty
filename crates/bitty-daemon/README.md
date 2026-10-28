@@ -49,7 +49,7 @@ running service gives today:
 | Terminal content plane, including `session.resize` (`terminal.manage`) | bitty#2604 / terminal contract | the daemon grants no `terminal.*` scope, so `session.resize` is `Denied/ScopeViolation` |
 | Pushing session events on a connection (no subscribe method; the event stream owns its own registry) | bitty#2602 | `session.status`/`session.list` are the reconciliation reads; no event frame is sent |
 | Per-connection refusal-audit aggregation for method refusals (`refusal_audit_budget_per_sec`) | bitty#2603 follow-up | every refused method gets one individual record; the wire-level refusal budget is enforced (see below), but the method-refusal histogram is not implemented |
-| Conformance corpus and fake-server parity | bitty#2605 | not part of this crate |
+| Conformance corpus and fake-server parity | bitty#2605 | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; V-07 (bitty#2768) and C-04 (bitty#2767) are recorded known defects |
 
 Nothing here authorizes autostart, a service file, a TCP listener, or desktop
 wiring; all four stay out of scope.
@@ -674,6 +674,66 @@ passed to another process is attributed to the injecting process's pid and is
 refused. Cells without the mechanism fall back to the captured process
 re-check before every privileged action; the residual is stated, not hidden,
 and those cells are not servable in this slice.
+
+## Conformance harness (bitty#2605)
+
+`tests/harness/` is the shared conformance suite. One machine-readable vector
+set (`tests/harness/corpus.json`, schema `bittyd-conformance-corpus/1`) drives
+two independent drivers:
+
+- `fake.rs`: an in-process reference server labeled `candidate-not-bittyd` on
+  every run. It implements the handshake, create, status, list, attach, detach,
+  grant mint/consume/revoke/transfer, abort, kill, heartbeat, stop, and the
+  closed refusal set over an in-memory transport, with injected time and
+  limits. It never claims a real process.
+- `real.rs`: the built `bittyd` binary against a throwaway runtime/state root,
+  speaking the real `bitty-ipc` v1 frames over the Unix endpoint with
+  per-frame credentials. Linux x86_64 is the servable cell in this slice;
+  other cells record a typed `cell-not-servable` skip instead of a silent pass.
+
+Both drivers run the same expectations and write separate evidence files under
+`target/conformance/` (or `$CARGO_TARGET_DIR/conformance/`):
+
+```text
+<cell>.fake.json    # label candidate-not-bittyd
+<cell>.real.json    # label bittyd-real-service
+<cell>.parity.json  # shared vectors compared, divergences, not_compared
+```
+
+Each row records the vector id, driver, status (`pass`, `skip`,
+`known-defect`, `fail`), typed skip reason, deferred requirement, daemon
+instance id, and a step signature (`ok`, refusal class/code, or closed). The
+file records the crate version, commit, cell, advertised capabilities, and the
+effective limits from the handshake, never a host path, username, socket path,
+port, token, or capability value.
+
+Corpus rules:
+
+- every vector declares setup, injected time/limits, steps, typed expected
+  results, post-state assertions, and forbidden observations; a vector that
+  asserts only "no crash" is rejected by the parser;
+- `session.attach` freezes the request field `attach_role` (the response keeps
+  `role`), and the ambient-authority fields `role`, `auth`, and `scope` stay
+  refused;
+- a vector that does not run on a driver carries a typed skip reason;
+- `known_defect` rows (currently V-07/bitty#2768 and C-04/bitty#2767) are
+  excluded from the parity gate, recorded in the evidence, and fail the suite
+  if they unexpectedly pass so the marker cannot rot;
+- fault injection covers a transport drop during abort, the pre-auth partial
+  frame, the frame bound, the pending grant cap, the attach cap, and an
+  instance change (restart); queue pressure with an injected outbound cap is
+  a fake-only row because the served loop has no clock/limit injection point.
+
+Run it with:
+
+```sh
+cargo test -p bitty-daemon --test conformance --locked
+```
+
+The `Quality gates` job names the fake suite; the Linux Tier-1 job names the
+real suite and uploads `bittyd-conformance-linux-x86_64`. The parity check
+compares the two signatures for every shared, non-known-defect vector and
+fails on any divergence.
 
 ## CLI
 

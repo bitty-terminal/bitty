@@ -196,7 +196,8 @@ impl ContainmentKind {
     pub const fn cleanup_claim(self) -> &'static str {
         match self {
             Self::CgroupV2 => "swept",
-            Self::Subreaper | Self::Refused => "unverified",
+            Self::Subreaper => "unverified",
+            Self::Refused => "none",
         }
     }
 }

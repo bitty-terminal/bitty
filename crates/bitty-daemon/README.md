@@ -611,7 +611,11 @@ and `daemon_state`.
   closes after that frame drains. A single non-blocking `MSG_PEEK` decides;
   the queued bytes are never read, parsed, or resumed, so a partially sent
   second frame cannot become a fresh request and no pipelined method is ever
-  served after the handshake. The refusal omits `id` because the tail is
+  served after the handshake. The same rule governs the handshake response
+  itself: reading stays closed until the response has fully drained, and a
+  byte already queued at that moment is refused the same way, so a frame that
+  arrives between the peek and the completed flush cannot be served either.
+  The refusal omits `id` because the tail is
   unattributable without parsing it (the second no-`id` contract exception
   above); a client that pipelined must reconnect.
 - **A failed handshake is final.** `VersionMismatch`, `Unauthenticated`, and

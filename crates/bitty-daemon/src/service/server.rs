@@ -347,12 +347,30 @@ mod unix {
         /// first; reading stops and the stream is shut down only once `output`
         /// drains.
         close_after_write: bool,
+        /// A successful `daemon.negotiate` response is still queued.
+        ///
+        /// The client cannot have seen the handshake before its last byte is
+        /// written, so reading stays closed until `output` drains; the loop
+        /// re-checks the socket at that point and refuses any byte that raced
+        /// the flush (`D-11`) instead of serving it as a post-handshake
+        /// request.
+        handshake_flush_gate: bool,
         closed: bool,
     }
 
     impl PeerIo {
         fn wants_write(&self) -> bool {
             !self.closed && !self.output.is_empty()
+        }
+
+        /// Whether the loop may read another frame from this peer now.
+        ///
+        /// A retired connection only drains; a negotiated connection whose
+        /// handshake response is still queued must not read, because a frame
+        /// that arrives in that window was sent before the client could have
+        /// seen the handshake.
+        fn reads_input(&self) -> bool {
+            !self.closed && !self.close_after_write && !self.handshake_flush_gate
         }
 
         /// Stop reading and close after the queued bytes are written.
@@ -448,7 +466,14 @@ mod unix {
                 nix::poll::PollFlags::POLLIN,
             ));
             for peer in &peers {
-                let mut flags = nix::poll::PollFlags::POLLIN;
+                // A peer that must not read yet (retired, or a handshake
+                // response still queued) is only watched for writability, so
+                // its input cannot turn the loop into a spin and cannot be
+                // parsed before the handshake drains.
+                let mut flags = nix::poll::PollFlags::empty();
+                if peer.reads_input() {
+                    flags |= nix::poll::PollFlags::POLLIN;
+                }
                 if peer.wants_write() {
                     flags |= nix::poll::PollFlags::POLLOUT;
                 }
@@ -507,15 +532,22 @@ mod unix {
                     .get(index)
                     .copied()
                     .unwrap_or_else(nix::poll::PollFlags::empty);
-                // A retired connection has already refused; no further frame is
-                // read, only the queued refusal bytes are flushed.
-                if !peer.close_after_write && ready.contains(nix::poll::PollFlags::POLLIN) {
+                // A retired connection has already refused, and a negotiated
+                // one waits for its handshake response to drain; neither reads.
+                if peer.reads_input() && ready.contains(nix::poll::PollFlags::POLLIN) {
                     read_peer(peer, &mut service, &config, current, &mut shutting_down);
                 }
                 if !peer.closed
                     && (ready.contains(nix::poll::PollFlags::POLLOUT) || peer.wants_write())
                 {
                     flush_peer(peer);
+                }
+                // The handshake becomes visible to the client only when its
+                // last byte is written, so this is the one point where a byte
+                // that raced the flush is still attributable to the
+                // pre-handshake window. Decide it here, not on a later read.
+                if peer.handshake_flush_gate && !peer.closed && peer.output.is_empty() {
+                    finish_handshake_flush(peer, &mut service, current);
                 }
                 if peer.drained() {
                     peer.close();
@@ -683,6 +715,7 @@ mod unix {
             wire_audit: WireAuditBudget::new(now.as_millis()),
             drain_deadline_ms: None,
             close_after_write: false,
+            handshake_flush_gate: false,
             closed: false,
         })
     }
@@ -773,14 +806,15 @@ mod unix {
                 // unattributable by construction; the caller flushes it
                 // before the stream closes.
                 if peer.reader.buffered_len() > 0 || input_pending(&peer.stream) {
-                    let refusal = Refusal::denied(RefusalCode::AlreadyNegotiated);
-                    record_floodable_wire(peer, service, refusal, now);
-                    if !reply_without_id(peer, refusal) {
-                        peer.close();
-                        return;
-                    }
-                    peer.retire();
+                    refuse_pre_handshake_tail(peer, service, now);
+                    return;
                 }
+                // Nothing is queued yet, but the handshake response is still
+                // in `output`. Reading stays closed until it fully drains:
+                // a frame that arrives after this peek but before the client
+                // can see the handshake is refused at that point instead of
+                // being served as a fresh request on the next iteration.
+                peer.handshake_flush_gate = !peer.output.is_empty();
                 return;
             }
             if peer.close_after_write {
@@ -794,6 +828,36 @@ mod unix {
                 return;
             }
         }
+    }
+
+    /// Refuse a tail that arrived before the client could see the handshake.
+    ///
+    /// The queued bytes are never parsed, so the request is unattributable by
+    /// construction and the refusal omits `id`. Reading stops and the stream is
+    /// shut down only after the refusal frame drains.
+    fn refuse_pre_handshake_tail(peer: &mut PeerIo, service: &mut Service, now: MonotonicMs) {
+        let refusal = Refusal::denied(RefusalCode::AlreadyNegotiated);
+        record_floodable_wire(peer, service, refusal, now);
+        if !reply_without_id(peer, refusal) {
+            peer.close();
+            return;
+        }
+        peer.retire();
+    }
+
+    /// Decide the post-negotiate read gate once the handshake response drains.
+    ///
+    /// The client cannot have received the handshake before its last byte is
+    /// written, so a byte already queued at this instant was sent inside the
+    /// pre-handshake window and is refused exactly like a pipelined tail. A
+    /// well-behaved client cannot have received and answered within the same
+    /// flush. With the socket quiet, the gate clears and reading resumes.
+    fn finish_handshake_flush(peer: &mut PeerIo, service: &mut Service, now: MonotonicMs) {
+        if peer.reader.buffered_len() > 0 || input_pending(&peer.stream) {
+            refuse_pre_handshake_tail(peer, service, now);
+            return;
+        }
+        peer.handshake_flush_gate = false;
     }
 
     /// Attribute and close a frame-level failure.
@@ -1182,7 +1246,22 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
-        use super::{PeerTimer, peer_timer};
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        use bitty_ipc_core::RateLimiter;
+
+        use super::{PeerIo, PeerTimer, WireAuditBudget, finish_handshake_flush, peer_timer};
+        use crate::audit_sink::{AuditSinkError, AuditWriter};
+        use crate::handshake::{ClientId, EffectiveScopes, EndpointKind, ServerIdentity};
+        use crate::limits::Limits;
+        use crate::operator::OperatorStore;
+        use crate::peer::PeerGuard;
+        use crate::registry::MonotonicMs;
+        use crate::service::dispatch::{ServerFacts, Service};
+        use crate::service::frame::PeerFrameReader;
+        use crate::service::protocol::Connection;
+        use crate::service::scopes::ServiceScopeSet;
 
         #[test]
         fn a_retired_peer_has_a_bounded_drain_deadline_and_no_second_timeout() {
@@ -1290,6 +1369,120 @@ mod unix {
                 listed + aggregate.other,
                 u32::try_from(codes.len()).unwrap()
             );
+        }
+
+        /// A `PeerIo` whose handshake response has just drained.
+        ///
+        /// `output` holds the handshake bytes until the test drains it, so the
+        /// gate is exercised exactly where the loop calls it.
+        fn gated_peer() -> (PeerIo, UnixStream) {
+            let (stream, client) = UnixStream::pair().expect("socketpair");
+            stream.set_nonblocking(true).expect("non-blocking");
+            let uid = nix::unistd::geteuid().as_raw();
+            let peer = PeerIo {
+                stream,
+                client: Connection::new(
+                    ClientId::generate().expect("entropy"),
+                    PeerGuard::for_current_process(),
+                    EffectiveScopes {
+                        service: ServiceScopeSet::baseline(),
+                        transport: bitty_ipc_api::scope::ScopeSet::new(),
+                    },
+                ),
+                facts: ServerFacts {
+                    server_identity: ServerIdentity {
+                        uid,
+                        endpoint_kind: EndpointKind::UnixSocket,
+                        endpoint_owner: uid,
+                        endpoint_mode: 0o600,
+                    },
+                    daemon_pid: std::process::id(),
+                },
+                reader: PeerFrameReader::new(),
+                output: b"handshake".to_vec(),
+                limiter: RateLimiter::new(100, 200),
+                accepted_at_ms: 0,
+                last_activity_ms: 0,
+                pre_auth_bytes: 0,
+                wire_audit: WireAuditBudget::new(0),
+                drain_deadline_ms: None,
+                close_after_write: false,
+                handshake_flush_gate: true,
+                closed: false,
+            };
+            (peer, client)
+        }
+
+        /// An audit writer that keeps the unit test off the filesystem.
+        struct NullWriter;
+
+        impl AuditWriter for NullWriter {
+            fn append_line(&mut self, _line: &[u8]) -> Result<(), AuditSinkError> {
+                Ok(())
+            }
+
+            fn sync(&mut self) -> Result<(), AuditSinkError> {
+                Ok(())
+            }
+        }
+
+        fn test_service() -> (Service, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("temp dir");
+            std::fs::set_permissions(
+                dir.path(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .expect("chmod");
+            let operator = OperatorStore::create_in(dir.path()).expect("operator store");
+            let service =
+                Service::new(Limits::default(), operator, Box::new(NullWriter)).expect("service");
+            (service, dir)
+        }
+
+        /// The one framed refusal rendered into an otherwise empty queue.
+        fn framed_refusal(output: &[u8]) -> serde_json::Value {
+            let header: [u8; 4] = output[..4].try_into().expect("frame header");
+            let len = usize::try_from(u32::from_be_bytes(header)).expect("frame length");
+            assert_eq!(output.len(), 4 + len, "one complete frame");
+            serde_json::from_slice(&output[4..]).expect("refusal json")
+        }
+
+        /// A byte that raced the handshake flush is refused without an id and
+        /// the peer retires, so it can never be served as a fresh request.
+        #[test]
+        fn a_byte_queued_when_the_handshake_drains_is_refused_without_an_id() {
+            let (mut service, _dir) = test_service();
+            let (mut peer, mut client) = gated_peer();
+            peer.output.clear(); // the flush drained the handshake response
+            client.write_all(b"\x00").expect("racing byte");
+
+            finish_handshake_flush(&mut peer, &mut service, MonotonicMs::from_millis(1));
+
+            assert!(peer.close_after_write, "the raced tail retires the peer");
+            assert!(!peer.reads_input(), "a retired peer never reads again");
+            let refusal = framed_refusal(&peer.output);
+            assert_eq!(refusal["ok"], false, "{refusal}");
+            assert_eq!(refusal["error"]["class"], "Denied", "{refusal}");
+            assert_eq!(refusal["error"]["code"], "AlreadyNegotiated", "{refusal}");
+            assert!(
+                refusal.get("id").is_none(),
+                "a raced tail is never parsed for an id: {refusal}"
+            );
+        }
+
+        /// A quiet drain clears the gate and resumes normal reading.
+        #[test]
+        fn a_quiet_handshake_drain_clears_the_gate() {
+            let (mut service, _dir) = test_service();
+            let (mut peer, _client) = gated_peer();
+            peer.output.clear(); // the flush drained the handshake response
+
+            finish_handshake_flush(&mut peer, &mut service, MonotonicMs::from_millis(1));
+
+            assert!(!peer.handshake_flush_gate);
+            assert!(peer.reads_input());
+            assert!(!peer.close_after_write);
+            assert!(peer.output.is_empty(), "a quiet drain writes nothing");
         }
     }
 }

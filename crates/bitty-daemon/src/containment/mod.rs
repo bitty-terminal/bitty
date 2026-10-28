@@ -6,16 +6,16 @@
 //!
 //! | Plan | Mechanism | Whole-tree proof | Cleanup claim |
 //! | --- | --- | --- | --- |
-//! | [`ContainmentPlan::cgroup_v2`] | delegated cgroup v2 subtree | `cgroup.procs` empty and `cgroup.events` `populated 0` | `swept` |
-//! | [`ContainmentPlan::subreaper`] | `PR_SET_CHILD_SUBREAPER` + recorded process group | recorded pids gone, no adopted child | `unverified` (always) |
-//! | [`ContainmentPlan::refused`] | none | none | no spawn, typed refusal |
+//! | `ContainmentKind::CgroupV2` | delegated cgroup v2 subtree | `cgroup.procs` empty and `cgroup.events` `populated 0` | `swept` |
+//! | `ContainmentKind::Subreaper` | `PR_SET_CHILD_SUBREAPER` + recorded process group | recorded pids gone, no adopted child | `unverified` (always) |
+//! | `ContainmentKind::Refused` | none | none | no spawn, typed refusal |
 //!
 //! The fallback is deliberately weaker and says so. A process group alone can
 //! never prove a whole tree (`setsid`/`setpgid` escapes it), so the subreaper
 //! plan kills only what it recorded and reports `unverified` instead of
 //! claiming `swept`. Only the cgroup plan can produce a verified sweep.
 //!
-//! Selection is explicit: [`probe`] returns the plan it selected with the
+//! Selection is explicit: [`ContainmentReport::probe`] returns the plan it selected with the
 //! reason the stronger plan was unavailable. There is no silent downgrade, no
 //! name/pattern lookup, and no pid signal for a process the daemon did not
 //! record.

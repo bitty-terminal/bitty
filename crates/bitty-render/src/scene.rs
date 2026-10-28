@@ -39,7 +39,7 @@
 //! keeps the previous visible scene.
 //!
 //! What remains open: an image node is admitted and counted
-//! ([`ScenePaint::images`]) but not yet forwarded to the admitted image plane;
+//! ([`ScenePaintOp::Image`]) but not yet forwarded to the admitted image plane;
 //! OQ-051 image forwarding is a separate slice.
 //!
 //! # Budgets

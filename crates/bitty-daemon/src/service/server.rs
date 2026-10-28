@@ -28,7 +28,7 @@
 //! the contract's exit-code `6` path; it is never retried through a weaker
 //! transport, and no TCP listener is ever opened.
 
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "linux"))]
 mod unix {
     use std::fmt;
     use std::io::{ErrorKind, Write};
@@ -562,10 +562,10 @@ mod unix {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, target_os = "linux"))]
 pub use unix::{ServerConfig, ServerError, ServerOutcome, TAMPER_INTERVAL_MS, TICK_MS, run};
 
-#[cfg(not(unix))]
+#[cfg(not(all(unix, target_os = "linux")))]
 mod unsupported {
     use std::fmt;
     use std::path::PathBuf;
@@ -655,5 +655,5 @@ mod unsupported {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(all(unix, target_os = "linux")))]
 pub use unsupported::{ServerConfig, ServerError, ServerOutcome, TAMPER_INTERVAL_MS, TICK_MS, run};

@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 //! bitty#2607 / CTX-1531: process-level service-loop behavior.
 //!
 //! These tests start the real `bittyd start` binary against a throwaway

@@ -229,9 +229,9 @@ pub fn credentials_match(
     }
 }
 
-#[cfg(target_os = "linux")]
 type ReadOutcome = Option<(Vec<u8>, Option<FramePeer>)>;
 
+#[cfg(target_os = "linux")]
 fn read_some(stream: &UnixStream, want: usize) -> Result<ReadOutcome, FrameError> {
     use std::io::IoSliceMut;
     use std::os::fd::AsRawFd;

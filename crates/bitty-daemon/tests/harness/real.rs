@@ -115,9 +115,10 @@ impl Daemon {
         let mut daemon = Self { child };
         let deadline = Instant::now() + START_BUDGET;
         while Instant::now() < deadline {
-            // Readiness is an accepted connection, not merely a socket path:
-            // a stale file or a listener that cannot accept must not count.
-            if UnixStream::connect(root.endpoint()).is_ok() {
+            // Readiness is an accepted connection plus the operator
+            // capability: the socket is bound before the capability is
+            // minted, and the driver reads it immediately after `start`.
+            if root.capability().exists() && UnixStream::connect(root.endpoint()).is_ok() {
                 return Ok(daemon);
             }
             if daemon.child.try_wait().ok().flatten().is_some() {

@@ -474,6 +474,31 @@ impl FakeDriver {
         }
     }
 
+    /// The real service's control-method visibility mapping.
+    ///
+    /// A live vacant control with a missing, stale, or rotated token is
+    /// `Denied/InvalidControlToken`; an unknown, terminal, or occupied target
+    /// keeps the uniform `NotFound`.
+    fn control_visible(
+        &self,
+        connection: &str,
+        session_id: &str,
+        token: Option<&str>,
+    ) -> Result<(), (&'static str, &'static str)> {
+        if self.session_visible(connection, session_id, token) {
+            return Ok(());
+        }
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| !is_terminal(session.state) && session.controller.is_none())
+        {
+            Err(("Denied", "InvalidControlToken"))
+        } else {
+            Err(("NotFound", "NotFound"))
+        }
+    }
+
     fn session_json(session: &FakeSession) -> Value {
         let mut value = json!({
             "session_id": session.id,
@@ -800,8 +825,8 @@ impl FakeDriver {
             return self.refuse("session.attach", "Validation", "InvalidRequest", None);
         };
         let token = params.get("control_token").and_then(Value::as_str);
-        if !self.session_visible(connection, session_id, token) {
-            return self.refuse("session.attach", "NotFound", "NotFound", None);
+        if let Err((class, code)) = self.control_visible(connection, session_id, token) {
+            return self.refuse("session.attach", class, code, None);
         }
         let Some(session) = self.sessions.get(session_id) else {
             return self.refuse("session.attach", "NotFound", "NotFound", None);
@@ -957,8 +982,8 @@ impl FakeDriver {
             return self.refuse("session.grant", "Validation", "InvalidRequest", None);
         };
         let token = params.get("control_token").and_then(Value::as_str);
-        if !self.session_visible(connection, session_id, token) {
-            return self.refuse("session.grant", "NotFound", "NotFound", None);
+        if let Err((class, code)) = self.control_visible(connection, session_id, token) {
+            return self.refuse("session.grant", class, code, None);
         }
         if let Err((class, code)) = self.control_authority(connection, session_id, token) {
             return self.refuse("session.grant", class, code, None);
@@ -1050,8 +1075,8 @@ impl FakeDriver {
         if let Some(bearer) = &bearer {
             let session_id = self.grants[bearer].session.clone();
             let token = params.get("control_token").and_then(Value::as_str);
-            if !self.session_visible(connection, &session_id, token) {
-                return self.refuse("session.grant.revoke", "NotFound", "NotFound", None);
+            if let Err((class, code)) = self.control_visible(connection, &session_id, token) {
+                return self.refuse("session.grant.revoke", class, code, None);
             }
             if let Err((class, code)) = self.control_authority(connection, &session_id, token) {
                 return self.refuse("session.grant.revoke", class, code, None);
@@ -1120,8 +1145,8 @@ impl FakeDriver {
                 unreachable!("checked above");
             };
             let token = params.get("control_token").and_then(Value::as_str);
-            if !self.session_visible(connection, session_id, token) {
-                return self.refuse("session.detach", "NotFound", "NotFound", None);
+            if let Err((class, code)) = self.control_visible(connection, session_id, token) {
+                return self.refuse("session.detach", class, code, None);
             }
             if let Err((class, code)) = self.control_authority(connection, session_id, token) {
                 return self.refuse("session.detach", class, code, None);
@@ -1184,8 +1209,8 @@ impl FakeDriver {
             );
         };
         let token = params.get("control_token").and_then(Value::as_str);
-        if !self.session_visible(connection, session_id, token) {
-            return self.refuse("session.control.transfer", "NotFound", "NotFound", None);
+        if let Err((class, code)) = self.control_visible(connection, session_id, token) {
+            return self.refuse("session.control.transfer", class, code, None);
         }
         let Some(session) = self.sessions.get(session_id) else {
             return self.refuse("session.control.transfer", "NotFound", "NotFound", None);
@@ -1260,8 +1285,8 @@ impl FakeDriver {
             .and_then(Value::as_str)
             .unwrap_or("");
         let token = params.get("control_token").and_then(Value::as_str);
-        if !self.session_visible(connection, session_id, token) {
-            return self.refuse("session.abort", "NotFound", "NotFound", None);
+        if let Err((class, code)) = self.control_visible(connection, session_id, token) {
+            return self.refuse("session.abort", class, code, None);
         }
         let Some(session) = self.sessions.get(session_id) else {
             return self.refuse("session.abort", "NotFound", "NotFound", None);

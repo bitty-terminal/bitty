@@ -5169,6 +5169,256 @@
       ]
     },
     {
+      "id": "C-09",
+      "title": "A missing, stale, or rotated control token at a vacant control is InvalidControlToken",
+      "area": "control",
+      "decisions": [
+        "D-07",
+        "D-09"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c09-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "c09-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller"
+            },
+            "hex_len": {
+              "attach_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.detach",
+          "params": {
+            "attach_id": "@controller_attach"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "was_attached": true
+            }
+          }
+        },
+        {
+          "connection": "claimant",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "claimant",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "control_token": "@create_token",
+            "idempotency_key": "c09-grant-stale"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "InvalidControlToken"
+          }
+        },
+        {
+          "connection": "claimant",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c09-grant-missing"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "InvalidControlToken"
+          }
+        },
+        {
+          "connection": "claimant",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "control_token": "@controller_token",
+            "idempotency_key": "c09-grant-current"
+          },
+          "capture": {
+            "observer_grant": "grant"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session_id": "@session_id"
+            },
+            "hex_len": {
+              "grant_id": 32,
+              "grant": 64
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@observer_grant"
+          },
+          "capture": {
+            "observer_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "observer"
+            },
+            "hex_len": {
+              "attach_id": 32
+            },
+            "absent": [
+              "control_token"
+            ]
+          }
+        },
+        {
+          "connection": "claimant",
+          "method": "session.control.transfer",
+          "params": {
+            "session_id": "@session_id",
+            "attach_id": "@observer_attach",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "c09-transfer-stale"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "InvalidControlToken"
+          }
+        },
+        {
+          "connection": "claimant",
+          "method": "session.control.transfer",
+          "params": {
+            "session_id": "@session_id",
+            "attach_id": "@observer_attach",
+            "expected_generation": 0,
+            "control_token": "@controller_token",
+            "idempotency_key": "c09-transfer-current"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "controller": "@observer_attach"
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "observer",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.attach_count": 1
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a missing or stale token at a vacant control never mints, attaches, or transfers",
+        "the current token still reaches the control method",
+        "the refusal echoes no token"
+      ]
+    },
+    {
       "id": "F-01",
       "title": "Injected outbound-queue pressure closes only the offending connection",
       "area": "bounds",

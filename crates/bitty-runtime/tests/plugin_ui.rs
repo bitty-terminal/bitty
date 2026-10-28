@@ -245,7 +245,7 @@ impl Fixture {
             claims,
             commands,
             events,
-            None,
+            Some(MOUNT_LOOP_WALL_BUDGET_MS),
             init_src,
         )
     }

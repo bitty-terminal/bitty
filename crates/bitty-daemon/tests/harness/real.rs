@@ -262,11 +262,15 @@ fn is_eof(error: &std::io::Error) -> bool {
 }
 
 fn write_frame(stream: &mut UnixStream, value: &Value) -> std::io::Result<()> {
+    stream.write_all(&frame_bytes(value)?)
+}
+
+fn frame_bytes(value: &Value) -> std::io::Result<Vec<u8>> {
     let payload = serde_json::to_vec(value)?;
     let mut frame = Vec::with_capacity(4 + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     frame.extend_from_slice(&payload);
-    stream.write_all(&frame)
+    Ok(frame)
 }
 
 fn reply_from(value: Value) -> Reply {
@@ -730,6 +734,100 @@ impl Driver for RealDriver {
         } else {
             transport_failure("NotClosed")
         }
+    }
+
+    fn raw_request(&mut self, connection: &str, request: Value, expect_eof: bool) -> Outcome {
+        self.requests.push(RequestRecord {
+            method: request
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("raw")
+                .to_owned(),
+            params: request.get("params").cloned().unwrap_or(Value::Null),
+        });
+        let client = self.client(connection);
+        let Ok(bytes) = frame_bytes(&request) else {
+            return transport_failure("EncodeFailed");
+        };
+        if client.send_raw(&bytes).is_err() {
+            return transport_failure("WriteFailed");
+        }
+        let outcome = match client.recv() {
+            Ok(outcome) => outcome,
+            Err(_) => return transport_failure("ReadFailed"),
+        };
+        if expect_eof && !client.eof(EOF_BUDGET) {
+            return transport_failure("NotClosed");
+        }
+        outcome
+    }
+
+    fn pipelined_negotiate(
+        &mut self,
+        connection: &str,
+        second: &Value,
+        partial_body: Option<usize>,
+    ) -> Outcome {
+        let negotiate_id = self.next_request_id();
+        let second_id = self.next_request_id();
+        let negotiation = json!({
+            "v": 1,
+            "id": negotiate_id,
+            "method": "daemon.negotiate",
+            "params": {"client_version": {"major": 1, "minor": 0}},
+        });
+        let Value::Object(mut request) = second.clone() else {
+            return transport_failure("BadRequest");
+        };
+        request.insert("v".to_owned(), json!(1));
+        request.insert("id".to_owned(), json!(second_id));
+        let request = Value::Object(request);
+        self.requests.push(RequestRecord {
+            method: "daemon.negotiate".to_owned(),
+            params: json!({"client_version": {"major": 1, "minor": 0}}),
+        });
+        self.requests.push(RequestRecord {
+            method: second
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("pipelined")
+                .to_owned(),
+            params: second.get("params").cloned().unwrap_or(Value::Null),
+        });
+        let (Ok(head), Ok(tail)) = (frame_bytes(&negotiation), frame_bytes(&request)) else {
+            return transport_failure("EncodeFailed");
+        };
+        let split = partial_body
+            .map_or(tail.len(), |body| 4 + body)
+            .min(tail.len());
+        let mut batch = head;
+        batch.extend_from_slice(&tail[..split]);
+        let client = self.client(connection);
+        if client.send_raw(&batch).is_err() {
+            return transport_failure("WriteFailed");
+        }
+        // A partial tail is only completed after the first write, reproducing
+        // the wire evidence: a frame split across two writes must not resume
+        // as a fresh request. A server that already refused and closed rejects
+        // the tail; that is the expected outcome, not a harness failure.
+        if split < tail.len() {
+            let _ = client.send_raw(&tail[split..]);
+        }
+        let handshake = match client.recv() {
+            Ok(outcome) => outcome,
+            Err(_) => return transport_failure("ReadFailed"),
+        };
+        if !matches!(&handshake, Outcome::Reply(reply) if reply.ok) {
+            return transport_failure("HandshakeFailed");
+        }
+        let refusal = match client.recv() {
+            Ok(outcome) => outcome,
+            Err(_) => return transport_failure("ReadFailed"),
+        };
+        if !client.eof(EOF_BUDGET) {
+            return transport_failure("NotClosed");
+        }
+        refusal
     }
 
     fn restart(&mut self) -> Result<Vars, String> {

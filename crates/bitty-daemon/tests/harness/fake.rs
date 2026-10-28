@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{Value, json};
 
 use bitty_daemon::contract::CAPABILITIES;
+use bitty_daemon::handshake::{ClientCorrelation, GrantCorrelation, hex};
 use bitty_daemon::limits::{LimitId, LimitOverride, Limits};
 
 use crate::harness::corpus::{DriverKind, Vector};
@@ -44,6 +45,8 @@ pub struct FakeDriver {
     grants: BTreeMap<String, FakeGrant>,
     connections: BTreeMap<String, FakeConn>,
     create_keys: BTreeMap<String, (String, String)>,
+    /// Keyed observer-grant mints: key -> (grant id, TTL/binding fingerprint).
+    grant_keys: BTreeMap<String, (String, String)>,
     deliveries: BTreeMap<String, String>,
     detached: BTreeMap<String, (String, String)>,
     requests: Vec<RequestRecord>,
@@ -58,6 +61,8 @@ struct FakeConn {
     leases: BTreeSet<String>,
     host_grant: Option<String>,
     pending: BTreeMap<String, String>,
+    /// The 32-hex `client_correlation_digest` this connection negotiated.
+    correlation: Option<String>,
     closed: bool,
 }
 
@@ -90,6 +95,9 @@ struct FakeGrant {
     expires_ms: u64,
     consumed: bool,
     revoked: bool,
+    /// Optional 32-hex correlation digest the consuming connection must
+    /// present.
+    correlation: Option<String>,
 }
 
 impl FakeDriver {
@@ -107,6 +115,7 @@ impl FakeDriver {
             grants: BTreeMap::new(),
             connections: BTreeMap::new(),
             create_keys: BTreeMap::new(),
+            grant_keys: BTreeMap::new(),
             deliveries: BTreeMap::new(),
             detached: BTreeMap::new(),
             requests: Vec::new(),
@@ -133,6 +142,7 @@ impl FakeDriver {
         self.grants.clear();
         self.connections.clear();
         self.create_keys.clear();
+        self.grant_keys.clear();
         self.deliveries.clear();
         self.detached.clear();
         self.requests.clear();
@@ -182,9 +192,14 @@ impl FakeDriver {
     }
 
     fn mint_host_grant(&mut self) -> String {
+        let ttl = self.limits.effective(LimitId::HostGrantTtlMs);
+        self.mint_host_grant_with(ttl, None)
+    }
+
+    fn mint_host_grant_with(&mut self, ttl_ms: u64, correlation: Option<String>) -> String {
         let id = self.mint_id();
         let bearer = self.mint_token();
-        let expires = self.now() + self.limits.effective(LimitId::HostGrantTtlMs);
+        let expires = self.now() + ttl_ms;
         self.grants.insert(
             bearer.clone(),
             FakeGrant {
@@ -194,6 +209,7 @@ impl FakeDriver {
                 expires_ms: expires,
                 consumed: false,
                 revoked: false,
+                correlation,
             },
         );
         bearer
@@ -330,10 +346,23 @@ impl FakeDriver {
             self.connection(connection).closed = true;
             return outcome;
         }
+        let correlation = match params.get("client_correlation").and_then(Value::as_str) {
+            Some(raw) => match ClientCorrelation::parse(raw) {
+                Ok(correlation) => Some(hex(&correlation.digest())),
+                Err(_) => {
+                    let outcome =
+                        self.refuse("daemon.negotiate", "Validation", "InvalidRequest", None);
+                    self.connection(connection).closed = true;
+                    return outcome;
+                }
+            },
+            None => None,
+        };
         {
             let conn = self.connection(connection);
             conn.negotiated = true;
             conn.scopes = BASELINE.iter().map(|scope| (*scope).to_owned()).collect();
+            conn.correlation = correlation.clone();
             if operator {
                 conn.scopes.insert("daemon.inspect".to_owned());
                 conn.scopes.insert("daemon.control".to_owned());
@@ -342,7 +371,11 @@ impl FakeDriver {
         if let Some(bearer) = params.get("host_grant").and_then(Value::as_str) {
             let now = self.now();
             let valid = self.grants.get(bearer).is_some_and(|grant| {
-                grant.kind == "host" && !grant.consumed && !grant.revoked && grant.expires_ms > now
+                grant.kind == "host"
+                    && !grant.consumed
+                    && !grant.revoked
+                    && grant.expires_ms > now
+                    && correlation_accepts(grant.correlation.as_deref(), correlation.as_deref())
             });
             if valid {
                 if let Some(grant) = self.grants.get_mut(bearer) {
@@ -356,6 +389,7 @@ impl FakeDriver {
         let client_id = self.mint_id();
         let mut scopes: Vec<String> = [
             "session.inspect",
+            "session.host",
             "session.attach",
             "session.control",
             "daemon.inspect",
@@ -366,14 +400,17 @@ impl FakeDriver {
         .filter(|scope| self.has_scope(connection, scope))
         .map(str::to_owned)
         .collect();
+        // The service-scope catalog order, then the transport scopes, exactly
+        // as `EffectiveScopes::names` renders them.
         scopes.sort_by_key(|scope| match scope.as_str() {
             "session.inspect" => 0,
-            "session.attach" => 1,
-            "session.control" => 2,
-            "daemon.inspect" => 3,
-            "daemon.control" => 4,
-            "process.spawn" => 5,
-            _ => 6,
+            "session.host" => 1,
+            "session.attach" => 2,
+            "session.control" => 3,
+            "daemon.inspect" => 4,
+            "daemon.control" => 5,
+            "process.spawn" => 6,
+            _ => 7,
         });
         let limits: Vec<Value> = LimitId::ALL
             .into_iter()
@@ -646,8 +683,35 @@ impl FakeDriver {
         if !self.has_scope(connection, "daemon.control") {
             return self.refuse("daemon.host_grant", "Denied", "ScopeViolation", None);
         }
+        // A field for another method is refused, never ignored.
+        if params.get("observer_correlation_digest").is_some() {
+            return self.refuse("daemon.host_grant", "Validation", "InvalidRequest", None);
+        }
+        let ttl_limit = self.limits.effective(LimitId::HostGrantTtlMs);
         match params.get("action").and_then(Value::as_str) {
             Some("mint") => {
+                let ttl_ms = match optional_ttl(params, "ttl_ms", ttl_limit) {
+                    Ok(ttl) => ttl,
+                    Err(counts) => {
+                        return self.refuse(
+                            "daemon.host_grant",
+                            "Validation",
+                            "InvalidRequest",
+                            counts,
+                        );
+                    }
+                };
+                let correlation = match optional_correlation(params, "client_correlation_digest") {
+                    Ok(correlation) => correlation,
+                    Err(()) => {
+                        return self.refuse(
+                            "daemon.host_grant",
+                            "Validation",
+                            "InvalidRequest",
+                            None,
+                        );
+                    }
+                };
                 let limit = self.limits.effective_usize(LimitId::MaxPendingHostGrants);
                 let active = self
                     .grants
@@ -667,7 +731,10 @@ impl FakeDriver {
                         Some((0, limit as u64)),
                     );
                 }
-                let bearer = self.mint_host_grant();
+                let bearer = self.mint_host_grant_with(
+                    ttl_ms.unwrap_or_else(|| self.limits.effective(LimitId::HostGrantTtlMs)),
+                    correlation,
+                );
                 let grant = &self.grants[&bearer];
                 let value = json!({
                     "grant_id": grant.id,
@@ -677,6 +744,12 @@ impl FakeDriver {
                 self.reply("daemon.host_grant", value)
             }
             Some("revoke") => {
+                // `ttl_ms` and both digest fields are mint-only.
+                if params.get("ttl_ms").is_some()
+                    || params.get("client_correlation_digest").is_some()
+                {
+                    return self.refuse("daemon.host_grant", "Validation", "InvalidRequest", None);
+                }
                 let Some(id) = params.get("grant_id").and_then(Value::as_str) else {
                     return self.refuse("daemon.host_grant", "Validation", "InvalidRequest", None);
                 };
@@ -913,12 +986,16 @@ impl FakeDriver {
             return self.refuse("session.attach", "Denied", "ObserverGrantRequired", None);
         };
         let now = self.now();
+        let observed = self
+            .conn(connection)
+            .and_then(|conn| conn.correlation.as_deref());
         let valid = self.grants.get(bearer).is_some_and(|grant| {
             grant.kind == "observer"
                 && grant.session == session_id
                 && !grant.consumed
                 && !grant.revoked
                 && grant.expires_ms > now
+                && correlation_accepts(grant.correlation.as_deref(), observed)
         });
         if !valid {
             return self.refuse("session.attach", "Denied", "ObserverGrantRequired", None);
@@ -1008,6 +1085,10 @@ impl FakeDriver {
     }
 
     fn session_grant(&mut self, connection: &str, params: &Value) -> Outcome {
+        // A field for another method is refused, never ignored.
+        if params.get("client_correlation_digest").is_some() {
+            return self.refuse("session.grant", "Validation", "InvalidRequest", None);
+        }
         let Some(session_id) = params.get("session_id").and_then(Value::as_str) else {
             return self.refuse("session.grant", "Validation", "InvalidRequest", None);
         };
@@ -1029,6 +1110,22 @@ impl FakeDriver {
         }
         let Some(key) = params.get("idempotency_key").and_then(Value::as_str) else {
             return self.refuse("session.grant", "Validation", "InvalidRequest", None);
+        };
+        let ttl_ms = match optional_ttl(
+            params,
+            "ttl_ms",
+            self.limits.effective(LimitId::ObserverGrantTtlMs),
+        ) {
+            Ok(ttl) => ttl,
+            Err(counts) => {
+                return self.refuse("session.grant", "Validation", "InvalidRequest", counts);
+            }
+        };
+        let correlation = match optional_correlation(params, "observer_correlation_digest") {
+            Ok(correlation) => correlation,
+            Err(()) => {
+                return self.refuse("session.grant", "Validation", "InvalidRequest", None);
+            }
         };
         let limit = self
             .limits
@@ -1053,7 +1150,17 @@ impl FakeDriver {
             );
         }
         let key = format!("grant:{session_id}:{key}");
-        if let Some((id, _)) = self.create_keys.get(&key) {
+        // A keyed duplicate with a different TTL or binding is a different
+        // request, never a descriptor replay.
+        let fingerprint = format!(
+            "{}|{}",
+            ttl_ms.unwrap_or_default(),
+            correlation_str(&correlation)
+        );
+        if let Some((id, recorded)) = self.grant_keys.get(&key) {
+            if recorded != &fingerprint {
+                return self.refuse("session.grant", "Denied", "IdempotencyConflict", None);
+            }
             let id = id.clone();
             // The record may have been retired by the sweep. The key still
             // remembers the id, so the replay answers the original grant with
@@ -1083,7 +1190,8 @@ impl FakeDriver {
         }
         let id = self.mint_id();
         let bearer = self.mint_token();
-        let expires = self.now() + self.limits.effective(LimitId::ObserverGrantTtlMs);
+        let expires = self.now()
+            + ttl_ms.unwrap_or_else(|| self.limits.effective(LimitId::ObserverGrantTtlMs));
         self.grants.insert(
             bearer.clone(),
             FakeGrant {
@@ -1093,10 +1201,10 @@ impl FakeDriver {
                 expires_ms: expires,
                 consumed: false,
                 revoked: false,
+                correlation,
             },
         );
-        self.create_keys
-            .insert(key, (id.clone(), session_id.to_owned()));
+        self.grant_keys.insert(key, (id.clone(), fingerprint));
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.revision += 1;
         }
@@ -1113,6 +1221,13 @@ impl FakeDriver {
     }
 
     fn session_grant_revoke(&mut self, connection: &str, params: &Value) -> Outcome {
+        // `ttl_ms` and both digest fields are mint-only.
+        if params.get("ttl_ms").is_some()
+            || params.get("observer_correlation_digest").is_some()
+            || params.get("client_correlation_digest").is_some()
+        {
+            return self.refuse("session.grant.revoke", "Validation", "InvalidRequest", None);
+        }
         let Some(id) = params.get("grant_id").and_then(Value::as_str) else {
             return self.refuse("session.grant.revoke", "Validation", "InvalidRequest", None);
         };
@@ -1122,6 +1237,20 @@ impl FakeDriver {
             .find(|(_, grant)| grant.id == id && grant.kind == "observer")
             .map(|(bearer, _)| bearer.clone());
         if let Some(bearer) = &bearer {
+            let correlation = self.grants[bearer].correlation.clone();
+            let observed = self
+                .conn(connection)
+                .and_then(|conn| conn.correlation.clone());
+            if !self.has_scope(connection, "daemon.control")
+                && !correlation_accepts(correlation.as_deref(), observed.as_deref())
+            {
+                // A correlation mismatch is the unknown-grant answer: the
+                // revoke is not attempted and nothing is disclosed.
+                return self.reply(
+                    "session.grant.revoke",
+                    json!({"grant_id": id, "revoked": false, "not_active": true}),
+                );
+            }
             let session_id = self.grants[bearer].session.clone();
             let token = params.get("control_token").and_then(Value::as_str);
             if let Err((class, code)) = self.control_visible(connection, &session_id, token) {
@@ -1252,7 +1381,7 @@ impl FakeDriver {
                 None,
             );
         };
-        let Some(target) = params.get("attach_id").and_then(Value::as_str) else {
+        let Some(target) = canonical_target_attach(params) else {
             return self.refuse(
                 "session.control.transfer",
                 "Validation",
@@ -1260,7 +1389,7 @@ impl FakeDriver {
                 None,
             );
         };
-        let Some(generation) = params.get("expected_generation").and_then(Value::as_u64) else {
+        let Some(generation) = canonical_generation(params) else {
             return self.refuse(
                 "session.control.transfer",
                 "Validation",
@@ -1337,7 +1466,7 @@ impl FakeDriver {
         let Some(session_id) = params.get("session_id").and_then(Value::as_str) else {
             return self.refuse("session.abort", "Validation", "InvalidRequest", None);
         };
-        let Some(generation) = params.get("expected_generation").and_then(Value::as_u64) else {
+        let Some(generation) = canonical_generation(params) else {
             return self.refuse("session.abort", "Validation", "InvalidRequest", None);
         };
         let reason = params
@@ -1398,10 +1527,9 @@ impl FakeDriver {
         let Some(session_id) = params.get("session_id").and_then(Value::as_str) else {
             return self.refuse("session.kill", "Validation", "InvalidRequest", None);
         };
-        let generation = params
-            .get("expected_generation")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let Some(generation) = canonical_generation(params) else {
+            return self.refuse("session.kill", "Validation", "InvalidRequest", None);
+        };
         if !self.session_visible(connection, session_id, None) {
             return self.refuse("session.kill", "NotFound", "NotFound", None);
         }
@@ -1649,6 +1777,23 @@ impl Driver for FakeDriver {
         Outcome::Closed
     }
 
+    fn raw_request(&mut self, _connection: &str, _request: Value, _expect_eof: bool) -> Outcome {
+        // The in-memory fake has no frame envelope, so the raw-frame vectors
+        // are real-only and carry a typed skip here.
+        Outcome::Closed
+    }
+
+    fn pipelined_negotiate(
+        &mut self,
+        _connection: &str,
+        _second: &Value,
+        _partial_body: Option<usize>,
+    ) -> Outcome {
+        // The fake dispatches synchronously per call and has no socket batch,
+        // so the pipelining vectors are real-only and carry a typed skip here.
+        Outcome::Closed
+    }
+
     fn restart(&mut self) -> Result<Vars, String> {
         self.instance = self.mint_id();
         self.operator_capability = self.mint_token();
@@ -1698,5 +1843,149 @@ impl Driver for FakeDriver {
 
     fn finish(&mut self) {
         self.connections.clear();
+    }
+}
+
+/// An optional positive `ttl_ms` no greater than the compiled limit.
+///
+/// `Err(None)` is a malformed value, `Err(Some(counts))` an out-of-range one
+/// that carries the observed value and the bound.
+fn optional_ttl(
+    params: &Value,
+    key: &str,
+    limit_ms: u64,
+) -> Result<Option<u64>, Option<(u64, u64)>> {
+    let Some(value) = params.get(key) else {
+        return Ok(None);
+    };
+    let ttl = value.as_u64().ok_or(None)?;
+    if ttl == 0 || ttl > limit_ms {
+        return Err(Some((ttl, limit_ms)));
+    }
+    Ok(Some(ttl))
+}
+
+/// An optional correlation digest, normalized to its 32-hex binding.
+fn optional_correlation(params: &Value, key: &str) -> Result<Option<String>, ()> {
+    let Some(value) = params.get(key) else {
+        return Ok(None);
+    };
+    let raw = value.as_str().ok_or(())?;
+    let parsed = GrantCorrelation::parse(raw).map_err(|_| ())?;
+    Ok(Some(hex(parsed.as_bytes())))
+}
+
+/// Whether a grant's optional binding accepts the acting connection.
+fn correlation_accepts(bound: Option<&str>, observed: Option<&str>) -> bool {
+    match bound {
+        None => true,
+        Some(bound) => observed == Some(bound),
+    }
+}
+
+fn correlation_str(correlation: &Option<String>) -> String {
+    correlation.clone().unwrap_or_else(|| "none".to_owned())
+}
+
+/// The canonical `generation` with the deprecated `expected_generation` alias.
+///
+/// The raw JSON values are compared before either is converted, matching the
+/// service: a wrongly typed field is still a conflict, so `1` and `"1"` are an
+/// ambiguous pair rather than one usable alias.
+fn canonical_generation(params: &Value) -> Option<u64> {
+    let canonical = params.get("generation");
+    let alias = params.get("expected_generation");
+    let value = match (canonical, alias) {
+        (Some(canonical), Some(alias)) if canonical != alias => return None,
+        (Some(canonical), _) => canonical,
+        (None, Some(alias)) => alias,
+        (None, None) => return None,
+    };
+    value.as_u64()
+}
+
+/// The canonical `target_attach_id` with the deprecated `attach_id` alias.
+///
+/// The raw JSON values are compared before either is converted, matching the
+/// service, so a wrongly typed field cannot be dropped before the conflict
+/// check.
+fn canonical_target_attach(params: &Value) -> Option<&str> {
+    let canonical = params.get("target_attach_id");
+    let alias = params.get("attach_id");
+    let value = match (canonical, alias) {
+        (Some(canonical), Some(alias)) if canonical != alias => return None,
+        (Some(canonical), _) => canonical,
+        (None, Some(alias)) => alias,
+        (None, None) => return None,
+    };
+    value.as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{canonical_generation, canonical_target_attach};
+
+    #[test]
+    fn generation_alias_conflicts_use_the_raw_json_value() {
+        assert_eq!(canonical_generation(&json!({"generation": 1})), Some(1));
+        assert_eq!(
+            canonical_generation(&json!({"expected_generation": 1})),
+            Some(1)
+        );
+        assert_eq!(
+            canonical_generation(&json!({"generation": 1, "expected_generation": 1})),
+            Some(1)
+        );
+        assert_eq!(
+            canonical_generation(&json!({"generation": 1, "expected_generation": 2})),
+            None
+        );
+        assert_eq!(
+            canonical_generation(&json!({"generation": 1, "expected_generation": "1"})),
+            None
+        );
+        assert_eq!(
+            canonical_generation(&json!({"generation": 1, "expected_generation": 1.0})),
+            None
+        );
+        assert_eq!(
+            canonical_generation(&json!({"generation": "1", "expected_generation": 1})),
+            None
+        );
+        assert_eq!(canonical_generation(&json!({})), None);
+    }
+
+    #[test]
+    fn target_attach_alias_conflicts_use_the_raw_json_value() {
+        let target = "1".repeat(32);
+        let other = "2".repeat(32);
+        assert_eq!(
+            canonical_target_attach(&json!({"target_attach_id": &target})),
+            Some(target.as_str())
+        );
+        assert_eq!(
+            canonical_target_attach(&json!({
+                "target_attach_id": &target,
+                "attach_id": &target,
+            })),
+            Some(target.as_str())
+        );
+        assert_eq!(
+            canonical_target_attach(&json!({
+                "target_attach_id": &target,
+                "attach_id": &other,
+            })),
+            None
+        );
+        assert_eq!(
+            canonical_target_attach(&json!({
+                "target_attach_id": &target,
+                "attach_id": 1,
+            })),
+            None
+        );
+        assert_eq!(canonical_target_attach(&json!({})), None);
     }
 }

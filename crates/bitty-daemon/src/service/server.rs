@@ -347,12 +347,33 @@ mod unix {
         /// first; reading stops and the stream is shut down only once `output`
         /// drains.
         close_after_write: bool,
+        /// A successful `daemon.negotiate` response is still queued.
+        ///
+        /// The pre-handshake decision already ran when that response was
+        /// queued and its first byte had not been written; bytes observed
+        /// there are refused and the peer retires. This flag only keeps
+        /// reading closed until `output` drains, so a byte that arrives after
+        /// the response write begins is parsed as a post-handshake frame only
+        /// once negotiation is visibly complete. Clearing it never inspects
+        /// input.
+        handshake_flush_gate: bool,
         closed: bool,
     }
 
     impl PeerIo {
         fn wants_write(&self) -> bool {
             !self.closed && !self.output.is_empty()
+        }
+
+        /// Whether the loop may read another frame from this peer now.
+        ///
+        /// A retired connection only drains; a negotiated connection whose
+        /// handshake response is still queued does not read yet. That window is
+        /// not a refusal boundary: the pre-write decision already ran, and the
+        /// first written response byte makes everything that follows a
+        /// post-handshake frame.
+        fn reads_input(&self) -> bool {
+            !self.closed && !self.close_after_write && !self.handshake_flush_gate
         }
 
         /// Stop reading and close after the queued bytes are written.
@@ -448,7 +469,14 @@ mod unix {
                 nix::poll::PollFlags::POLLIN,
             ));
             for peer in &peers {
-                let mut flags = nix::poll::PollFlags::POLLIN;
+                // A peer that must not read yet (retired, or a handshake
+                // response still queued) is only watched for writability, so
+                // its input cannot turn the loop into a spin and cannot be
+                // parsed before the handshake drains.
+                let mut flags = nix::poll::PollFlags::empty();
+                if peer.reads_input() {
+                    flags |= nix::poll::PollFlags::POLLIN;
+                }
                 if peer.wants_write() {
                     flags |= nix::poll::PollFlags::POLLOUT;
                 }
@@ -507,15 +535,22 @@ mod unix {
                     .get(index)
                     .copied()
                     .unwrap_or_else(nix::poll::PollFlags::empty);
-                // A retired connection has already refused; no further frame is
-                // read, only the queued refusal bytes are flushed.
-                if !peer.close_after_write && ready.contains(nix::poll::PollFlags::POLLIN) {
+                // A retired connection has already refused, and a negotiated
+                // one waits for its handshake response to drain; neither reads.
+                if peer.reads_input() && ready.contains(nix::poll::PollFlags::POLLIN) {
                     read_peer(peer, &mut service, &config, current, &mut shutting_down);
                 }
                 if !peer.closed
                     && (ready.contains(nix::poll::PollFlags::POLLOUT) || peer.wants_write())
                 {
                     flush_peer(peer);
+                }
+                // The handshake response is fully written, so reading may
+                // resume. The pre-handshake decision already ran when the
+                // response was queued; nothing queued from here on is a
+                // pipelined tail.
+                if peer.handshake_flush_gate && !peer.closed && peer.output.is_empty() {
+                    finish_handshake_flush(peer);
                 }
                 if peer.drained() {
                     peer.close();
@@ -683,6 +718,7 @@ mod unix {
             wire_audit: WireAuditBudget::new(now.as_millis()),
             drain_deadline_ms: None,
             close_after_write: false,
+            handshake_flush_gate: false,
             closed: false,
         })
     }
@@ -701,6 +737,7 @@ mod unix {
             uid: peer.client.peer_uid(),
             pid: peer.client.peer().identity().pid(),
         };
+        let was_negotiated = peer.client.is_negotiated();
         loop {
             // Pre-authentication: the byte budget covers completed frames *and*
             // the frame being assembled, so a client cannot dribble a full
@@ -737,22 +774,53 @@ mod unix {
                         refusal,
                         now,
                     );
-                    // A complete frame has a correlation id, so the refusal is
-                    // a typed frame; a partial one was refused mid-assembly
-                    // above and can only be audited, never answered. Either
-                    // way, let already-queued bytes drain before the close.
-                    if let Some((id, _, _)) = envelope_correlation(&payload) {
-                        if !reply(peer, &id, Err(refusal)) {
-                            peer.close();
+                    // A complete frame with a usable correlation id gets a
+                    // typed refusal; an over-long id gets the same refusal
+                    // with the id omitted; an unreadable one can only be
+                    // audited. Every path drains before the close.
+                    match envelope_correlation(&payload) {
+                        EnvelopeHead::Parsed { id, .. } => {
+                            if !reply(peer, &id, Err(refusal)) {
+                                peer.close();
+                            }
                         }
-                    } else {
-                        peer.retire();
+                        EnvelopeHead::OverlongId => {
+                            if !reply_without_id(peer, refusal) {
+                                peer.close();
+                            }
+                            peer.retire();
+                        }
+                        EnvelopeHead::Malformed => peer.retire(),
                     }
                     return;
                 }
             }
             if !handle_payload(peer, service, &payload, now, shutting_down) {
                 peer.close();
+                return;
+            }
+            if !was_negotiated && peer.client.is_negotiated() {
+                // No pre-auth pipelining (`D-11`): the negotiate response is
+                // queued here, but its first byte has not been written yet.
+                // This peek is the whole decision boundary -- every byte
+                // queued now arrived before the client could see the
+                // handshake, so a complete frame or a fragment of one is
+                // refused as a whole and the connection closes. The queued
+                // bytes are never parsed, so a partially sent second frame
+                // can never be resumed and parsed as a fresh request. The
+                // refusal carries no `id` because the tail is unattributable
+                // by construction; the caller flushes it before the stream
+                // closes.
+                if refuse_queued_pre_handshake_tail(peer, service, now) {
+                    return;
+                }
+                // Nothing was queued at the boundary. Reading stays closed
+                // until the response drains only so the client sees the
+                // handshake before any post-handshake reply; the gate then
+                // clears without a second peek. A client may legitimately
+                // write its next frame as soon as it reads the response, and
+                // on localhost that byte is often already queued by then.
+                peer.handshake_flush_gate = !peer.output.is_empty();
                 return;
             }
             if peer.close_after_write {
@@ -766,6 +834,56 @@ mod unix {
                 return;
             }
         }
+    }
+
+    /// Refuse a tail that is already queued at the handshake decision point.
+    ///
+    /// The caller runs this once per connection: after the negotiate response
+    /// is queued, before its first byte is written. That instant is the whole
+    /// boundary between a pre-handshake tail and a post-handshake frame; a
+    /// byte that arrives later belongs to the negotiated connection.
+    ///
+    /// Returns `true` when the peer was retired and the caller must return.
+    fn refuse_queued_pre_handshake_tail(
+        peer: &mut PeerIo,
+        service: &mut Service,
+        now: MonotonicMs,
+    ) -> bool {
+        if peer.reader.buffered_len() == 0 && !input_pending(&peer.stream) {
+            return false;
+        }
+        refuse_pre_handshake_tail(peer, service, now);
+        true
+    }
+
+    /// Refuse a tail that arrived before the client could see the handshake.
+    ///
+    /// The queued bytes are never parsed, so the request is unattributable by
+    /// construction and the refusal omits `id`. Reading stops and the stream is
+    /// shut down only after the refusal frame drains.
+    fn refuse_pre_handshake_tail(peer: &mut PeerIo, service: &mut Service, now: MonotonicMs) {
+        // Drop anything the frame reader assembled: the tail is refused as a
+        // whole, and the reset makes the "never resumed" property structural
+        // instead of relying on `retire` stopping every later read.
+        peer.reader = PeerFrameReader::new();
+        let refusal = Refusal::denied(RefusalCode::AlreadyNegotiated);
+        record_floodable_wire(peer, service, refusal, now);
+        if !reply_without_id(peer, refusal) {
+            peer.close();
+            return;
+        }
+        peer.retire();
+    }
+
+    /// End the post-negotiate read gate once the handshake response drains.
+    ///
+    /// The refusal decision belongs to the single pre-write peek that ran when
+    /// the response was queued; this is not a second boundary. By the time the
+    /// last response byte is written, a byte the client sent after reading the
+    /// handshake is a normal post-handshake frame, so the gate clears without
+    /// inspecting or refusing anything. Reading resumes on the next poll.
+    fn finish_handshake_flush(peer: &mut PeerIo) {
+        peer.handshake_flush_gate = false;
     }
 
     /// Attribute and close a frame-level failure.
@@ -833,27 +951,56 @@ mod unix {
     ) -> bool {
         use crate::audit::AuditAction;
 
-        let Some((id, method_name, wire_version)) = envelope_correlation(payload) else {
-            // No correlation id can be echoed, so there is no conforming
-            // response; the refusal is still attributed exactly once. Any
-            // earlier response already queued is flushed before the close.
-            service.record_refusal(
-                &peer.client,
-                AuditAction::Wire,
-                Refusal::invalid_request(),
-                now,
-            );
-            peer.retire();
-            return true;
+        let (id, method_name, wire_version) = match envelope_correlation(payload) {
+            EnvelopeHead::Parsed {
+                id,
+                method,
+                version,
+            } => (id, method, version),
+            EnvelopeHead::OverlongId => {
+                // A complete frame with an over-bound `id` is answered with a
+                // typed `InvalidRequest` whose response omits the id, then the
+                // connection retires after the frame drains. Echoing the value
+                // would repeat the bound violation.
+                let refusal = Refusal::invalid_request();
+                service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+                if !reply_without_id(peer, refusal) {
+                    peer.close();
+                    return false;
+                }
+                peer.retire();
+                return true;
+            }
+            EnvelopeHead::Malformed => {
+                // No correlation id can be echoed, so there is no conforming
+                // response; the refusal is still attributed exactly once. Any
+                // earlier response already queued is flushed before the close.
+                service.record_refusal(
+                    &peer.client,
+                    AuditAction::Wire,
+                    Refusal::invalid_request(),
+                    now,
+                );
+                peer.retire();
+                return true;
+            }
         };
+        // Every refused `daemon.negotiate` is final: the refusal frame drains,
+        // then the connection closes. There is no second handshake.
+        let negotiate_method = method_name == crate::contract::NEGOTIATE_METHOD;
         if !peer.client.is_negotiated() {
             // Stage 1 stays first: an unsupported per-frame `v` is
             // `VersionMismatch` before the handshake gate.
             match wire_version {
                 None => {
+                    // The transport refuses a frame without the wire version
+                    // before the handshake gate, and the refusal is final: a
+                    // later negotiate on the same connection is never served.
                     let refusal = Refusal::invalid_request();
                     record_floodable_wire(peer, service, refusal, now);
-                    return reply(peer, &id, Err(refusal));
+                    let keeps_open = reply(peer, &id, Err(refusal));
+                    peer.retire();
+                    return keeps_open;
                 }
                 Some(version) if bitty_ipc_api::wire::validate_wire_version(version).is_err() => {
                     let refusal = Refusal::version_mismatch();
@@ -876,7 +1023,11 @@ mod unix {
         if peer.limiter.check(now.as_millis()).is_err() {
             let refusal = Refusal::denied(crate::codes::RefusalCode::RateLimited);
             record_floodable_wire(peer, service, refusal, now);
-            return reply(peer, &id, Err(refusal));
+            let keeps_open = reply(peer, &id, Err(refusal));
+            if negotiate_method {
+                peer.retire();
+            }
+            return keeps_open;
         }
         let envelope = match RequestEnvelope::parse(payload) {
             Ok(envelope) => envelope,
@@ -886,7 +1037,11 @@ mod unix {
                 } else {
                     record_floodable_wire(peer, service, refusal, now);
                 }
-                return reply(peer, &id, Err(refusal));
+                let keeps_open = reply(peer, &id, Err(refusal));
+                if negotiate_method {
+                    peer.retire();
+                }
+                return keeps_open;
             }
         };
         let method = match resolve(&envelope.method) {
@@ -907,10 +1062,17 @@ mod unix {
         } else {
             service.dispatch(&mut peer.client, method, &envelope.params, now)
         };
+        let failed = result.is_err();
         if result.is_ok() {
             service.route_deliveries(&mut peer.client);
         }
         let keeps_open = reply(peer, &id, result);
+        if failed && negotiate_method {
+            // A refused negotiate is terminal, including the `InvalidRequest`
+            // produced by `wire::parse_negotiate`. The refusal stays queued and
+            // drains before the stream closes.
+            peer.retire();
+        }
         if service.stop_requested().is_some() {
             *shutting_down = true;
         }
@@ -959,6 +1121,47 @@ mod unix {
         }
     }
 
+    /// Append a refusal whose request `id` could not be echoed.
+    ///
+    /// Returns `false` when the frame cannot be rendered; the caller closes.
+    fn reply_without_id(peer: &mut PeerIo, refusal: Refusal) -> bool {
+        let Ok(payload) = wire::render_error_without_id(refusal) else {
+            return false;
+        };
+        let Ok(bytes) = wire::frame(&payload) else {
+            return false;
+        };
+        peer.output.extend_from_slice(&bytes);
+        true
+    }
+
+    /// Whether the socket holds at least one unread byte.
+    ///
+    /// Called only at the handshake decision point. The frame reader never
+    /// reads past the end of the current frame, so a tail that arrived with
+    /// the negotiate request is still in the socket buffer. A single
+    /// non-blocking `MSG_PEEK` observes it without consuming or parsing it,
+    /// which is what keeps a partial second frame from ever becoming a fresh
+    /// request. EOF and `EAGAIN` both mean nothing is queued; an unreadable
+    /// socket is treated as queued so the caller fails closed.
+    fn input_pending(stream: &std::os::unix::net::UnixStream) -> bool {
+        use std::os::fd::AsRawFd;
+
+        use nix::sys::socket::{MsgFlags, recv};
+
+        let mut byte = [0u8; 1];
+        match recv(
+            stream.as_raw_fd(),
+            &mut byte,
+            MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT,
+        ) {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => false,
+            Err(_) => true,
+        }
+    }
+
     /// Record a non-closing wire refusal within the per-connection budget.
     ///
     /// The window rollover is checked first: if the previous window suppressed
@@ -999,24 +1202,55 @@ mod unix {
         }
     }
 
+    /// The envelope head the server needs before it validates the grammar or
+    /// resolves the catalog.
+    enum EnvelopeHead {
+        /// A bounded correlation id, method, and optional wire version.
+        Parsed {
+            id: String,
+            method: String,
+            version: Option<u16>,
+        },
+        /// A complete JSON frame whose `id` is over the correlation bound.
+        OverlongId,
+        /// No correlation id can be read (malformed JSON or a missing/empty
+        /// or non-string id).
+        Malformed,
+    }
+
     /// The envelope's correlation id and method name, when they are safe to
     /// echo and compare.
     ///
     /// This is the bounded pre-parse read the stage-2 negotiate gate needs: it
     /// extracts only the two strings the server must know before it validates
-    /// the grammar or resolves the catalog.
-    fn envelope_correlation(payload: &[u8]) -> Option<(String, String, Option<u16>)> {
-        let value: Value = serde_json::from_slice(payload).ok()?;
-        let id = value.get("id")?.as_str()?;
-        if id.is_empty() || id.len() > bitty_ipc_api::wire::MAX_ID_BYTES {
-            return None;
+    /// the grammar or resolves the catalog. An over-long id is distinguished
+    /// from an unreadable frame so the server can answer `InvalidRequest`
+    /// without echoing the value.
+    fn envelope_correlation(payload: &[u8]) -> EnvelopeHead {
+        let Ok(value) = serde_json::from_slice::<Value>(payload) else {
+            return EnvelopeHead::Malformed;
+        };
+        let Some(id) = value.get("id").and_then(Value::as_str) else {
+            return EnvelopeHead::Malformed;
+        };
+        if id.len() > bitty_ipc_api::wire::MAX_ID_BYTES {
+            return EnvelopeHead::OverlongId;
         }
-        let method = value.get("method")?.as_str()?;
+        if id.is_empty() {
+            return EnvelopeHead::Malformed;
+        }
+        let Some(method) = value.get("method").and_then(Value::as_str) else {
+            return EnvelopeHead::Malformed;
+        };
         let version = value
             .get("v")
             .and_then(Value::as_u64)
             .and_then(|version| u16::try_from(version).ok());
-        Some((id.to_owned(), method.to_owned(), version))
+        EnvelopeHead::Parsed {
+            id: id.to_owned(),
+            method: method.to_owned(),
+            version,
+        }
     }
 
     fn server_facts(endpoint: &BoundEndpoint) -> Result<ServerFacts, ServerError> {
@@ -1038,7 +1272,25 @@ mod unix {
 
     #[cfg(test)]
     mod tests {
-        use super::{PeerTimer, peer_timer};
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        use bitty_ipc_core::RateLimiter;
+
+        use super::{
+            PeerIo, PeerTimer, WireAuditBudget, finish_handshake_flush, peer_timer,
+            refuse_queued_pre_handshake_tail,
+        };
+        use crate::audit_sink::{AuditSinkError, AuditWriter};
+        use crate::handshake::{ClientId, EffectiveScopes, EndpointKind, ServerIdentity};
+        use crate::limits::Limits;
+        use crate::operator::OperatorStore;
+        use crate::peer::PeerGuard;
+        use crate::registry::MonotonicMs;
+        use crate::service::dispatch::{ServerFacts, Service};
+        use crate::service::frame::PeerFrameReader;
+        use crate::service::protocol::Connection;
+        use crate::service::scopes::ServiceScopeSet;
 
         #[test]
         fn a_retired_peer_has_a_bounded_drain_deadline_and_no_second_timeout() {
@@ -1146,6 +1398,148 @@ mod unix {
                 listed + aggregate.other,
                 u32::try_from(codes.len()).unwrap()
             );
+        }
+
+        /// A `PeerIo` with the handshake response still queued.
+        ///
+        /// `output` holds the handshake bytes until the test drains it, so both
+        /// the pre-write decision and the drain gate are exercised exactly where
+        /// the loop calls them.
+        fn gated_peer() -> (PeerIo, UnixStream) {
+            let (stream, client) = UnixStream::pair().expect("socketpair");
+            stream.set_nonblocking(true).expect("non-blocking");
+            let uid = nix::unistd::geteuid().as_raw();
+            let peer = PeerIo {
+                stream,
+                client: Connection::new(
+                    ClientId::generate().expect("entropy"),
+                    PeerGuard::for_current_process(),
+                    EffectiveScopes {
+                        service: ServiceScopeSet::baseline(),
+                        transport: bitty_ipc_api::scope::ScopeSet::new(),
+                    },
+                ),
+                facts: ServerFacts {
+                    server_identity: ServerIdentity {
+                        uid,
+                        endpoint_kind: EndpointKind::UnixSocket,
+                        endpoint_owner: uid,
+                        endpoint_mode: 0o600,
+                    },
+                    daemon_pid: std::process::id(),
+                },
+                reader: PeerFrameReader::new(),
+                output: b"handshake".to_vec(),
+                limiter: RateLimiter::new(100, 200),
+                accepted_at_ms: 0,
+                last_activity_ms: 0,
+                pre_auth_bytes: 0,
+                wire_audit: WireAuditBudget::new(0),
+                drain_deadline_ms: None,
+                close_after_write: false,
+                handshake_flush_gate: true,
+                closed: false,
+            };
+            (peer, client)
+        }
+
+        /// An audit writer that keeps the unit test off the filesystem.
+        struct NullWriter;
+
+        impl AuditWriter for NullWriter {
+            fn append_line(&mut self, _line: &[u8]) -> Result<(), AuditSinkError> {
+                Ok(())
+            }
+
+            fn sync(&mut self) -> Result<(), AuditSinkError> {
+                Ok(())
+            }
+        }
+
+        fn test_service() -> (Service, tempfile::TempDir) {
+            let dir = tempfile::tempdir().expect("temp dir");
+            std::fs::set_permissions(
+                dir.path(),
+                std::os::unix::fs::PermissionsExt::from_mode(0o700),
+            )
+            .expect("chmod");
+            let operator = OperatorStore::create_in(dir.path()).expect("operator store");
+            let service =
+                Service::new(Limits::default(), operator, Box::new(NullWriter)).expect("service");
+            (service, dir)
+        }
+
+        /// The one framed refusal rendered into an otherwise empty queue.
+        fn framed_refusal(output: &[u8]) -> serde_json::Value {
+            let header: [u8; 4] = output[..4].try_into().expect("frame header");
+            let len = usize::try_from(u32::from_be_bytes(header)).expect("frame length");
+            assert_eq!(output.len(), 4 + len, "one complete frame");
+            serde_json::from_slice(&output[4..]).expect("refusal json")
+        }
+
+        /// A byte queued before the response's first byte is a pipelined tail:
+        /// refused without an id, never parsed, and the peer retires.
+        #[test]
+        fn a_byte_queued_before_the_response_is_written_is_refused_without_an_id() {
+            let (mut service, _dir) = test_service();
+            let (mut peer, mut client) = gated_peer();
+            peer.output.clear(); // isolate the refusal from the handshake bytes
+            client.write_all(b"\x00").expect("pre-response byte");
+
+            assert!(refuse_queued_pre_handshake_tail(
+                &mut peer,
+                &mut service,
+                MonotonicMs::from_millis(1),
+            ));
+
+            assert!(peer.close_after_write, "the tail retires the peer");
+            assert!(!peer.reads_input(), "a retired peer never reads again");
+            let refusal = framed_refusal(&peer.output);
+            assert_eq!(refusal["ok"], false, "{refusal}");
+            assert_eq!(refusal["error"]["class"], "Denied", "{refusal}");
+            assert_eq!(refusal["error"]["code"], "AlreadyNegotiated", "{refusal}");
+            assert!(
+                refusal.get("id").is_none(),
+                "a pre-response tail is never parsed for an id: {refusal}"
+            );
+        }
+
+        /// A quiet socket at the pre-write decision point is not a tail: the
+        /// handshake proceeds and no refusal is queued.
+        #[test]
+        fn a_quiet_socket_at_the_decision_point_does_not_refuse() {
+            let (mut service, _dir) = test_service();
+            let (mut peer, _client) = gated_peer();
+
+            assert!(!refuse_queued_pre_handshake_tail(
+                &mut peer,
+                &mut service,
+                MonotonicMs::from_millis(1),
+            ));
+
+            assert!(!peer.close_after_write);
+            assert!(peer.handshake_flush_gate, "the caller still gates reads");
+            assert_eq!(peer.output, b"handshake", "nothing is appended");
+        }
+
+        /// A byte already queued when the handshake response drains is a
+        /// post-handshake frame: the pre-write peek was the only boundary, so
+        /// the gate clears without a refusal and reading resumes.
+        #[test]
+        fn a_byte_queued_when_the_handshake_drains_is_a_post_handshake_frame() {
+            let (mut peer, mut client) = gated_peer();
+            peer.output.clear(); // the flush drained the handshake response
+            client.write_all(b"\x00").expect("post-handshake byte");
+
+            finish_handshake_flush(&mut peer);
+
+            assert!(!peer.handshake_flush_gate);
+            assert!(
+                !peer.close_after_write,
+                "a post-handshake byte never retires the peer"
+            );
+            assert!(peer.reads_input(), "reading resumes once the gate clears");
+            assert!(peer.output.is_empty(), "the gate writes no refusal");
         }
     }
 }

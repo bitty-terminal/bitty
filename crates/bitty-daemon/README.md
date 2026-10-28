@@ -510,7 +510,12 @@ A frame-level, byte-budget, or deadline closure is one aggregated `wire` audit
 record (D-16). When the refusal follows a complete envelope the typed refusal
 frame is written and then the connection closes; a closure inside a partial
 frame has no correlation id to echo, so it is audited and closed without a
-partial response. A refusal that
+partial response. A complete frame whose `id` is over the 64-byte bound is a
+**deliberate contract exception**: the refusal is `InvalidRequest` with `id`
+omitted, and the connection retires after that frame drains, so the value is
+never echoed and the stream cannot be mistaken for a correlated exchange. The
+pipelined-tail refusal below is the second, and only other, no-`id` shape; both
+are the consequence of refusing bytes the server must not parse. A refusal that
 [`Refusal::closes_connection`](../src/service/dispatch.rs) marks (`VersionMismatch`,
 `Unauthenticated`, `Denied/AlreadyNegotiated`) keeps its frame queued, stops
 reading, and shuts the stream down only after the queued bytes drain.
@@ -565,6 +570,16 @@ capability always grants both).
 and `scope` as ambient-authority fields and refuses any of them at depth 1, so
 the service parameter cannot share those names.
 
+The accepted session-host contract spells the effectful parameter `generation`
+for `session.abort`, `session.kill`, and `session.control.transfer`, and
+`target_attach_id` for the transfer target. Those are the canonical spellings
+in the corpus. The pre-freeze `expected_generation` / `attach_id` spellings are
+accepted as deprecated aliases for one release; `session.attach` keeps
+`expected_generation` because that is its accepted spelling. Presenting both
+spellings with different values is `InvalidRequest`, never a precedence guess.
+The aliases are a compatibility window, not a second contract: a future
+release removes them and the corpus already uses only the canonical names.
+
 ### Handshake
 
 `daemon.negotiate` is the only pre-authentication method. The request carries
@@ -577,7 +592,7 @@ and `daemon_state`.
 
 - `client_correlation` is ≤ 128 bytes with no control characters, hashed on
   receipt; only the truncated 128-bit digest is audited and the raw value never
-  survives parsing.
+  survives parsing. The same digest binds a grant when the mint names it.
 - A present but invalid `operator_capability` is one static
   `Unauthenticated` refusal that closes the connection. Verification is an
   in-memory constant-time compare; the request path never reads the capability
@@ -589,11 +604,29 @@ and `daemon_state`.
   `Denied/AlreadyNegotiated` and closes after the refusal frame is flushed.
   The gate runs after the per-frame wire version and before the rate limiter,
   the method grammar, and the catalog, so an unnegotiated connection cannot
-  probe which methods exist. A frame that
-  is already in the socket buffer when a successful negotiate is processed is
-  served after the handshake (the server does not discard pipelined bytes);
-  it can never widen the connection's scopes, and there is still exactly one
-  handshake per connection.
+  probe which methods exist.
+- **No pre-auth pipelining.** After a successful `daemon.negotiate`, any byte
+  already queued before the response's first byte is written — a complete
+  frame or a fragment of one — is refused with a typed
+  `Denied/AlreadyNegotiated` frame and the connection closes after that frame
+  drains. A single non-blocking `MSG_PEEK` at that decision point decides; the
+  queued bytes are never read, parsed, or resumed, so a partially sent second
+  frame cannot become a fresh request and no pipelined method is ever served
+  after the handshake. A byte that arrives after the response write begins is
+  a post-handshake frame, parsed only after negotiation completes, so a client
+  that writes its next request as soon as it reads the handshake is served
+  normally. The refusal omits `id` because the tail is unattributable without
+  parsing it (the second no-`id` contract exception above); a client that
+  pipelined must reconnect.
+- **A failed handshake is final.** `VersionMismatch`, `Unauthenticated`, and
+  every refusal of a `daemon.negotiate` request — including the
+  `InvalidRequest` produced by a malformed negotiate payload or a refused
+  capability check — drains its refusal frame and then closes. There is no
+  second negotiate and no best-effort retry on the same connection.
+- **A pre-handshake frame without a wire version is final.** A frame that
+  omits `v` before the connection is negotiated is `InvalidRequest`, drains,
+  and closes; the transport check runs before the negotiate-only gate, so the
+  same connection cannot negotiate afterwards.
 - Envelope-level refusals that never resolve to a catalog method (malformed
   envelope or id, unsupported wire version, unknown or malformed method,
   rate limit before parsing, frame or deadline closure) are one `wire` refusal
@@ -602,14 +635,45 @@ and `daemon_state`.
 ### Grants
 
 `service::grants` holds host-consent and observer grants: 256-bit bearer,
-non-secret 128-bit `grant_id`, peer-uid binding, TTL from `host_grant_ttl_ms` /
-`observer_grant_ttl_ms`, pending caps (`max_pending_host_grants`,
-`max_pending_observer_grants_per_session`), single use, and idempotent revoke
-by `grant_id`. Missing, expired, consumed, revoked, wrong-session, and
-wrong-peer cases are one `Unusable` refusal. The bearer is retained only while
-the grant is live so a keyed `session.grant` replay can return the same
-unconsumed bearer; it is cleared on consume and revoke. A mint at the cap is
-`LimitExceeded`.
+non-secret 128-bit `grant_id`, peer-uid binding, optional correlation-digest
+binding, TTL from `host_grant_ttl_ms` / `observer_grant_ttl_ms`, pending caps
+(`max_pending_host_grants`, `max_pending_observer_grants_per_session`), single
+use, and idempotent revoke by `grant_id`. Missing, expired, consumed, revoked,
+wrong-session, wrong-peer, and wrong-correlation cases are one `Unusable`
+refusal. The bearer is retained only while the grant is live so a keyed
+`session.grant` replay can return the same unconsumed bearer; it is cleared on
+consume and revoke. A mint at the cap is `LimitExceeded`.
+
+The accepted optional mint fields are enforced, not ignored:
+
+- `ttl_ms` (both mints) is a positive integer no greater than the compiled
+  `observer_grant_ttl_ms` / `host_grant_ttl_ms`; `0` and an over-limit value
+  are `InvalidRequest` with `counts.actual` and `counts.limit`, and the stored
+  expiry uses the requested TTL. Omitting the field keeps the compiled default.
+- `observer_correlation_digest` (`session.grant`) and
+  `client_correlation_digest` (`daemon.host_grant`) bind a grant to the digest
+  the **mint request names**, not to the minting connection: the operator or
+  controller names the 128-bit `client_correlation_digest` that a later client
+  or observer will present at `daemon.negotiate`. The value is **exactly 32
+  lowercase hex characters**; any other width or case is `InvalidRequest`,
+  because it could never equal a connection's 128-bit digest and would mint a
+  grant that is dead on arrival. A bound grant is usable only from a connection
+  whose negotiation digest matches: a mismatch adds no scope at host-grant
+  consume, is `Denied/ObserverGrantRequired` at observer attach (the
+  contract's static wrong-peer code), and is `Denied/ConsentRequired` at
+  create. On a non-operator `session.grant.revoke` a mismatch returns the same
+  `not_active` success as an unknown grant id and revokes nothing, so the
+  128-bit id is not an existence oracle for the binding. The operator path
+  keeps the contract's "operator may revoke any grant" authority and is not
+  correlation-gated; `daemon.host_grant` revoke is operator-only. Omitting the
+  field keeps the historical uid-only binding.
+- `ttl_ms` and the digest fields are mint-only, and each digest field belongs
+  to exactly one method: `client_correlation_digest` on `session.grant` and
+  `observer_correlation_digest` on `daemon.host_grant` are cross-method fields
+  and are `InvalidRequest`, never silently ignored. Sending a mint-only field
+  on either revoke is likewise `InvalidRequest`. A keyed `session.grant`
+  duplicate with a different TTL or digest is `Denied/IdempotencyConflict`,
+  never a replay of a grant bound differently.
 
 The store is bounded by more than the active caps. The server loop sweeps
 retired records on `GRANT_SWEEP_INTERVAL_MS`, a consumed host grant is retained

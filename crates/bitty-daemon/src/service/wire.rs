@@ -131,6 +131,48 @@ pub fn render_success(id: &str, result: &Value) -> Result<Vec<u8>, Refusal> {
 ///
 /// Returns [`Refusal::internal`] when the error cannot be encoded.
 pub fn render_error(id: &str, refusal: Refusal) -> Result<Vec<u8>, Refusal> {
+    let error = error_object(refusal);
+    let payload = serde_json::to_vec(&json!({
+        "v": ACCEPTED_WIRE_VERSION,
+        "id": id,
+        "ok": false,
+        "error": error,
+    }))
+    .map_err(|_| Refusal::internal())?;
+    validate_response_envelope(ACCEPTED_WIRE_VERSION, id, &payload)
+        .map_err(|_| Refusal::internal())?;
+    Ok(payload)
+}
+
+/// Render a refusal whose request `id` cannot be echoed.
+///
+/// A complete frame with an over-long `id` still gets a typed refusal, but the
+/// response omits `id`: the value failed the bound, so echoing it would repeat
+/// the violation and the client cannot correlate it anyway. The connection
+/// retires immediately after this frame drains.
+///
+/// # Errors
+///
+/// Returns [`Refusal::internal`] when the error cannot be encoded or the
+/// response envelope exceeds the frame/depth bound.
+pub fn render_error_without_id(refusal: Refusal) -> Result<Vec<u8>, Refusal> {
+    let error = error_object(refusal);
+    let payload = serde_json::to_vec(&json!({
+        "v": ACCEPTED_WIRE_VERSION,
+        "ok": false,
+        "error": error,
+    }))
+    .map_err(|_| Refusal::internal())?;
+    validate_wire_version(ACCEPTED_WIRE_VERSION).map_err(|_| Refusal::internal())?;
+    validate_json_depth(&payload, MAX_JSON_DEPTH).map_err(|_| Refusal::internal())?;
+    if payload.len() > bitty_ipc_api::frame::MAX_FRAME_BYTES {
+        return Err(Refusal::internal());
+    }
+    Ok(payload)
+}
+
+/// The static error object shared by both response shapes.
+fn error_object(refusal: Refusal) -> Value {
     let mut error = Map::new();
     error.insert(
         "class".to_owned(),
@@ -155,16 +197,7 @@ pub fn render_error(id: &str, refusal: Refusal) -> Result<Vec<u8>, Refusal> {
         error.insert("request_id".to_owned(), json!(request_id));
         error.insert("timeout_ms".to_owned(), json!(timeout_ms));
     }
-    let payload = serde_json::to_vec(&json!({
-        "v": ACCEPTED_WIRE_VERSION,
-        "id": id,
-        "ok": false,
-        "error": Value::Object(error),
-    }))
-    .map_err(|_| Refusal::internal())?;
-    validate_response_envelope(ACCEPTED_WIRE_VERSION, id, &payload)
-        .map_err(|_| Refusal::internal())?;
-    Ok(payload)
+    Value::Object(error)
 }
 
 /// Encode one payload as a length-prefixed frame.

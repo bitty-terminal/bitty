@@ -141,9 +141,15 @@ pub const MAX_SCENE_TEXT_LINES: usize = MAX_SNAPSHOT_NODES;
 
 /// Maximum painted scene text bytes one host retains (CTX-1628).
 ///
-/// Reuses the bounded component projection ceiling so scene text and a
-/// component projection cannot diverge in size.
-pub const MAX_SCENE_TEXT_BYTES: usize = MAX_COMPONENT_PROJECTION_BYTES;
+/// Mirrors the accepted `SCN-4` ceiling
+/// (`bitty_rich::scene::SCENE_MAX_RICH_BYTES_PER_TERMINAL`, 2 MiB): an
+/// admitted scene must be projectable, so the accessibility channel may not
+/// hold a smaller ceiling than the paint path or an admitted scene would paint
+/// while the projection refused atomically. `bitty-ui` deliberately takes no
+/// production dependency on `bitty-rich` (W-147 keeps the Core graph small),
+/// so the value is mirrored here and pinned by a test that compares it with
+/// the scene constant.
+pub const MAX_SCENE_TEXT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Default-off component host configuration.
 ///
@@ -981,10 +987,21 @@ impl UiSnapshotHost {
     /// different projection.
     ///
     /// Bounds are the existing ceilings ([`MAX_SCENE_TEXT_LINES`] =
-    /// [`MAX_SNAPSHOT_NODES`], and `MAX_SCENE_TEXT_BYTES` =
-    /// `MAX_COMPONENT_PROJECTION_BYTES`). Overflow is refused before any
-    /// mutation with a typed error: neither the scene node nor a text row is
-    /// added, and the host keeps its previous content.
+    /// [`MAX_SNAPSHOT_NODES`], and [`MAX_SCENE_TEXT_BYTES`] = the accepted
+    /// `SCN-4` scene ceiling, so an admitted scene can always be projected).
+    /// Overflow is refused before any mutation with a typed error: neither
+    /// the scene node nor a text row is added, and the host keeps its
+    /// previous content.
+    ///
+    /// # Attribution limitation
+    ///
+    /// The pinned accessibility model exposes a scene node as kind + identity
+    /// only, so scene lines travel the terminal leaf's text-run channel with
+    /// leaf-local row ordinals. They are not yet positioned next to the scene
+    /// node in tree order, and a row ordinal is a leaf row, not a document
+    /// line; consumers must not infer cross-leaf positions from it. Closing
+    /// that gap needs a positioned text run in the extension model, not a
+    /// Core-side reordering.
     ///
     /// # Errors
     ///
@@ -1419,6 +1436,36 @@ mod tests {
         }
         assert_eq!(scenes, 1, "the scene kind/identity is projected");
         assert_eq!(rows, vec!["name | value", "alpha | 1"]);
+    }
+
+    #[test]
+    fn scene_text_ceiling_matches_the_scene_admission_ceiling() {
+        assert_eq!(
+            MAX_SCENE_TEXT_BYTES,
+            bitty_rich::scene::SCENE_MAX_RICH_BYTES_PER_TERMINAL,
+            "an admitted scene must be projectable: the a11y text ceiling may not be smaller than SCN-4"
+        );
+    }
+
+    #[test]
+    fn scene_text_projection_accepts_exactly_the_ceiling_and_refuses_one_byte_over() {
+        let at_cap = "x".repeat(MAX_SCENE_TEXT_BYTES);
+        let mut host = UiSnapshotHost::new("window", "shell");
+        host.push_scene_text(SceneKind::Text, 1, &[(0, at_cap.as_str())])
+            .expect("an admitted scene at the SCN-4 ceiling must project");
+        assert_eq!(host.scene_text().len(), 1);
+        assert_eq!(host.scene_text()[0].1.len(), MAX_SCENE_TEXT_BYTES);
+
+        let over = "x".repeat(MAX_SCENE_TEXT_BYTES + 1);
+        assert!(matches!(
+            host.push_scene_text(SceneKind::Text, 2, &[(0, over.as_str())]),
+            Err(SceneTextProjectionError::TextTooLarge {
+                bytes,
+                cap: MAX_SCENE_TEXT_BYTES,
+            }) if bytes == MAX_SCENE_TEXT_BYTES + 1
+        ));
+        assert_eq!(host.scene.len(), 1, "refusal adds no scene node");
+        assert_eq!(host.scene_text().len(), 1, "refusal adds no text row");
     }
 
     #[test]

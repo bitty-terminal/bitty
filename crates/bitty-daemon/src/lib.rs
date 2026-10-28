@@ -71,7 +71,8 @@
 //!   pre-session create-key stores, replay, fingerprint conflict, capacity
 //!   retirement, and the create-key TTL floor (`D-18`).
 //! - [`audit::AuditRing`]: bounded, content-free lifecycle and refusal records
-//!   with stable event ids, injected time, counters, and visible overflow
+//!   with stable event ids, injected time, counters, visible overflow, and the
+//!   optional suppressed-refusal aggregate emitted once per wire budget window
 //!   (`D-16`).
 //! - [`lease::SessionHost`]: observer/controller leases, the observer cap,
 //!   distinct attach ids, lease expiry and renewal, the 256-bit control token
@@ -91,7 +92,7 @@
 //! | Containment identity, signalling, reaping, the production orphan reaper, platform probes and journal ACLs | bitty#2604 | `daemon.orphans.verify` is `Denied/UnsupportedCapability` |
 //! | Terminal content plane, including `session.resize` | bitty#2604 / terminal contract | no `terminal.*` scope is granted; `session.resize` is `Denied/ScopeViolation` |
 //! | Pushing session events on a connection (no subscribe method) | bitty#2602 | `session.status`/`session.list` are the reconciliation reads |
-//! | Per-connection refusal-audit budget aggregation | bitty#2603 follow-up | every refusal is recorded; aggregation is not implemented |
+//! | Per-connection refusal-audit aggregation | bitty#2603 follow-up | wire-level refusals are budgeted and aggregated; method refusals remain one individual record each |
 //! | Conformance corpus and fake-server parity | bitty#2605 | `tests/harness` corpus, fake and real drivers, parity gate; V-07/bitty#2768 and C-04/bitty#2767 are recorded known defects |
 //!
 //! [`bittyd` Session-Host Contract]: https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/bittyd-session-host-contract.md

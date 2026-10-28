@@ -604,6 +604,25 @@ pub fn render_record(record: &AuditRecord) -> Result<Vec<u8>, AuditSinkError> {
             push_field(&mut line, "m", limit.name());
         }
     }
+    if let Some(aggregate) = record.aggregate {
+        push_field(&mut line, "sup", &aggregate.suppressed.to_string());
+        push_field(&mut line, "bl", &aggregate.budget.to_string());
+        let mut histogram = String::new();
+        for entry in aggregate.classes.iter().flatten() {
+            if !histogram.is_empty() {
+                histogram.push(',');
+            }
+            histogram.push_str(entry.code.as_str());
+            histogram.push(':');
+            histogram.push_str(&entry.count.to_string());
+        }
+        if !histogram.is_empty() {
+            push_field(&mut line, "h", &histogram);
+        }
+        if aggregate.other > 0 {
+            push_field(&mut line, "ho", &aggregate.other.to_string());
+        }
+    }
     if let Some(terminal) = record.terminal {
         push_terminal(&mut line, terminal);
     }
@@ -690,7 +709,8 @@ pub const fn reason_spelling(reason: TerminalReason) -> &'static str {
 mod tests {
     use super::*;
     use crate::audit::{
-        AuditAction, AuditActor, AuditCounts, AuditEntry, AuditSession, AuditTarget,
+        AuditAction, AuditActor, AuditAggregate, AuditClassCount, AuditCounts, AuditEntry,
+        AuditSession, AuditTarget, MAX_AGGREGATE_CLASSES,
     };
     use crate::limits::LimitOverride;
     #[cfg(unix)]
@@ -846,6 +866,90 @@ mod tests {
         assert!(text.contains("k=attach"));
         assert!(text.contains("m=max_sessions"));
         assert!(!text.contains('\n'));
+    }
+
+    #[test]
+    fn an_aggregate_line_carries_the_suppressed_count_and_histogram() {
+        let aggregate = AuditAggregate {
+            suppressed: 81,
+            budget: 20,
+            classes: [
+                Some(AuditClassCount {
+                    code: RefusalCode::NotFound,
+                    count: 40,
+                }),
+                Some(AuditClassCount {
+                    code: RefusalCode::RateLimited,
+                    count: 41,
+                }),
+                None,
+                None,
+            ],
+            other: 0,
+        };
+        let mut ring = AuditRing::new(instance(), &Limits::default());
+        ring.record(
+            AuditEntry::new(AuditAction::Wire)
+                .result(AuditResult::Refused(RefusalCode::RateLimited))
+                .aggregate(aggregate),
+            MonotonicMs::from_millis(1),
+        )
+        .expect("append");
+        let line = render_record(ring.oldest().expect("record")).expect("renders");
+        assert!(
+            line.len() <= MAX_RENDERED_LINE_BYTES,
+            "{} bytes",
+            line.len()
+        );
+        let text = String::from_utf8(line).expect("utf-8");
+        assert!(text.contains("a=wire"), "{text}");
+        assert!(text.contains("r=refused c=rate_limited"), "{text}");
+        assert!(text.contains("sup=81"), "{text}");
+        assert!(text.contains("bl=20"), "{text}");
+        assert!(text.contains("h=not_found:40,rate_limited:41"), "{text}");
+        assert!(!text.contains("ho="), "{text}");
+    }
+
+    #[test]
+    fn a_full_aggregate_histogram_still_renders_under_the_line_bound() {
+        let mut codes = RefusalCode::ALL;
+        codes.sort_by_key(|code| std::cmp::Reverse(code.as_str().len()));
+        let mut classes = [None; MAX_AGGREGATE_CLASSES];
+        for (index, code) in codes.iter().take(MAX_AGGREGATE_CLASSES).enumerate() {
+            classes[index] = Some(AuditClassCount {
+                code: *code,
+                count: u32::MAX,
+            });
+        }
+        let aggregate = AuditAggregate {
+            suppressed: u64::MAX,
+            budget: u32::MAX,
+            classes,
+            other: u32::MAX,
+        };
+        let mut ring = AuditRing::new(instance(), &Limits::default());
+        ring.record(
+            AuditEntry::new(AuditAction::Wire)
+                .actor(AuditActor {
+                    peer_uid: Some(u32::MAX),
+                    peer_sid: None,
+                    peer_pid: Some(u32::MAX),
+                    client_id: Some(u64::MAX),
+                    client_correlation_digest: Some([0xab; 16]),
+                })
+                .result(AuditResult::Refused(RefusalCode::RateLimited))
+                .aggregate(aggregate),
+            MonotonicMs::from_millis(u64::MAX),
+        )
+        .expect("append");
+        let line = render_record(ring.oldest().expect("record")).expect("renders");
+        assert!(
+            line.len() <= MAX_RENDERED_LINE_BYTES,
+            "{} bytes",
+            line.len()
+        );
+        let text = String::from_utf8(line).expect("utf-8");
+        assert!(text.contains("ho=4294967295"), "{text}");
     }
 
     #[test]

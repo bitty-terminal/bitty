@@ -48,7 +48,7 @@ running service gives today:
 | cgroup/subreaper containment, signal delivery and reaping, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs | bitty#2604 | `daemon.orphans.verify` is `Denied/UnsupportedCapability`; no orphan is claimed verified |
 | Terminal content plane, including `session.resize` (`terminal.manage`) | bitty#2604 / terminal contract | the daemon grants no `terminal.*` scope, so `session.resize` is `Denied/ScopeViolation` |
 | Pushing session events on a connection (no subscribe method; the event stream owns its own registry) | bitty#2602 | `session.status`/`session.list` are the reconciliation reads; no event frame is sent |
-| Per-connection refusal-audit aggregation for method refusals (`refusal_audit_budget_per_sec`) | bitty#2603 follow-up | every refused method gets one individual record; the wire-level refusal budget is enforced (see below), but the method-refusal histogram is not implemented |
+| Per-connection refusal-audit aggregation | bitty#2603 follow-up | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each |
 | Conformance corpus and fake-server parity | bitty#2605 | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; V-07 (bitty#2768) and C-04 (bitty#2767) are recorded known defects |
 
 Nothing here authorizes autostart, a service file, a TCP listener, or desktop
@@ -310,11 +310,13 @@ bitty#2604 owns that directory and its current-user-only DACL.
 - `AuditRecord` carries a stable `AuditEventId`, an injected `MonotonicMs`,
   the daemon instance, the action, the static result, optional session
   counters, optional authenticated actor facts, the action target, optional
-  refusal counts, and optional terminal classification.
+  refusal counts, optional terminal classification, and the optional
+  suppressed-refusal aggregate (`AuditAggregate`) for a wire budget window.
 - There is no `String`, `Vec`, `Box`, payload, argv, environment, clipboard,
   prompt, transcript, raw `terminal_id`, control token, or caller label field. A create
   or terminal transition uses `AuditTarget::terminal_digest`; a refusal carries
-  its static `RefusalCode` and numeric `AuditCounts` only.
+  its static `RefusalCode` and numeric `AuditCounts` only, and a suppressed
+  refusal is counted in `AuditAggregate` by code, never by frame bytes.
 - The ring holds `audit_file_bytes × audit_segments / AUDIT_RECORD_BYTES`
   records (320 accounted bytes each); the accounted ring bytes are therefore
   capped by the sink budget. Overflow drops the oldest record, counts it in
@@ -330,7 +332,7 @@ bitty#2604 owns that directory and its current-user-only DACL.
   `host_grant.expire`; every grant action targets `AuditTarget::grant`
   (`grant_id`).
 - The ring is the staging buffer; the owner-private rotating file sink and the
-  per-connection refusal budget stay with bitty#2607.
+  per-connection refusal budget live in `audit_sink` and `service::server`.
 
 `handshake::NegotiateResponse` carries the version, capability, and effective
 limit facts. The remaining response fields (`wire_version` (transport-owned),
@@ -675,10 +677,14 @@ Rendered lines carry only closed spellings, ids, digests, and numbers.
 method with its static code and counts; the server loop records one `wire`
 refusal for every envelope, frame, budget, or deadline closure that never
 resolves to a method. Non-closing wire refusals are budgeted per connection at
-`refusal_audit_budget_per_sec` records per second; a rate-limited or malformed
-frame flood therefore cannot rotate the audit segments by itself, at the cost
-of dropping records past the cap (the full histogram is deferred; see the table
-above).
+`refusal_audit_budget_per_sec` records per second. A window that suppresses
+refusals ends with exactly one aggregate `wire` record carrying
+`sup=<suppressed>`, `bl=<budget>`, and a bounded static code histogram
+(`h=code:count,...`, with `ho=<count>` for codes past the
+`MAX_AGGREGATE_CLASSES` cap); a closing connection flushes its pending window
+so no suppression is lost. The aggregate is fixed-size and cannot rotate the
+segments by itself, so a refusal flood stays bounded without becoming
+invisible.
 
 ### Per-frame peer credentials
 
@@ -866,9 +872,12 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
   refusal without a capability oracle plus a real EOF inside the deadline,
   closing refusals (second negotiate, pre-negotiate frame, wire and service
   version), a stopping daemon refusing a pipelined create, the pre-auth byte
-  budget and its aggregated record, the negotiate-deadline record,
-  `SIGTERM`/`SIGINT` drain, endpoint tamper → exit 6, clean stop, and the
-  status-only invocation.
+  budget and its aggregated record, the negotiate-deadline record, the
+  consumed host grant revoke (fresh key and keyed replay), the vacant-control
+  `InvalidControlToken` and its occupied/invisible boundaries, the refusal-burst
+  aggregate with suppressed count and histogram, core-dump hardening
+  (`RLIMIT_CORE` and `/proc/<pid>/mem`), `SIGTERM`/`SIGINT` drain, endpoint
+  tamper → exit 6, clean stop, and the status-only invocation.
 - `tests/frame_credentials.rs` — per-frame credential acceptance across a real
   process boundary and the fd-passing handoff (grandchild's frame refused).
 

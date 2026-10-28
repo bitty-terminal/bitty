@@ -51,7 +51,8 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::audit::{
-    AuditAction, AuditCounts, AuditEntry, AuditResult, AuditSession, AuditTarget, AuditTerminal,
+    AuditAction, AuditAggregate, AuditCounts, AuditEntry, AuditResult, AuditSession, AuditTarget,
+    AuditTerminal,
 };
 use crate::audit_sink::{AuditSink, AuditWriter};
 use crate::codes::RefusalCode;
@@ -553,6 +554,26 @@ impl Service {
         if let Some((actual, limit)) = refusal.counts() {
             entry = entry.counts(AuditCounts::new(actual, limit, None));
         }
+        let _ = self.audit.record(entry, now);
+    }
+
+    /// Record the one aggregate for a wire-refusal budget window (`D-16`).
+    ///
+    /// A window that suppressed at least one refusal gets exactly one `wire`
+    /// record: the suppressed count, the budget, and the bounded static code
+    /// histogram. The record carries no refused frame and no caller label, and
+    /// the aggregate's fixed-size histogram keeps it from rotating the sink
+    /// beyond the budget the next window enforces.
+    pub fn record_wire_aggregate(
+        &mut self,
+        connection: &Connection,
+        aggregate: AuditAggregate,
+        now: MonotonicMs,
+    ) {
+        let entry = AuditEntry::new(AuditAction::Wire)
+            .actor(connection.audit_actor())
+            .result(AuditResult::Refused(RefusalCode::RateLimited))
+            .aggregate(aggregate);
         let _ = self.audit.record(entry, now);
     }
 

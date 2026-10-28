@@ -1118,14 +1118,16 @@ fn an_unnegotiated_connection_cannot_probe_the_method_catalog() {
 }
 
 #[test]
-fn a_wire_refusal_burst_is_budgeted() {
+fn a_wire_refusal_burst_is_budgeted_and_aggregated() {
     let root = TempRoot::new("wire-budget");
     let daemon = Daemon::start(&root);
     let mut client = Client::connect(&root.endpoint());
     assert_eq!(client.negotiate(None)["ok"], true);
 
     // `refusal_audit_budget_per_sec` is 20 at the compiled defaults. A burst of
-    // non-closing wire refusals must not write one record per frame.
+    // non-closing wire refusals must not write one record per frame, and the
+    // frames past the budget must not be invisible: the window ends with one
+    // aggregate carrying the suppressed count and the code histogram.
     let requests: Vec<(&str, Value)> = (0..60).map(|_| ("session.unknown", Value::Null)).collect();
     client.send_batch(&requests);
     for _ in 0..60 {
@@ -1135,11 +1137,24 @@ fn a_wire_refusal_burst_is_budgeted() {
     }
 
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
-    let wire = audit_lines_with(&root, "a=wire r=refused c=not_found");
-    assert!(wire >= 1, "the first refusals are recorded");
-    assert!(
-        wire <= 21,
-        "the per-second budget bounds a 60-frame burst: {wire} records"
+    let (individual, suppressed, aggregates) = wire_audit_totals(&root);
+    assert_eq!(individual, 20, "the budget bounds the individual records");
+    assert_eq!(suppressed, 40, "every suppressed refusal is counted");
+    assert_eq!(aggregates, 1, "one aggregate per window with suppression");
+    assert_eq!(
+        individual as u64 + suppressed,
+        60,
+        "no refusal is invisible"
+    );
+    assert_eq!(
+        audit_lines_with(&root, "a=wire r=refused c=rate_limited"),
+        1,
+        "the aggregate is the wire record with the budget refusal"
+    );
+    assert_eq!(
+        audit_lines_with(&root, "h=not_found:40"),
+        1,
+        "the bounded histogram carries the suppressed code"
     );
 }
 

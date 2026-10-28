@@ -41,7 +41,9 @@ mod unix {
     use bitty_ipc_core::RateLimiter;
     use serde_json::Value;
 
+    use crate::audit::{AuditAggregate, AuditClassCount, MAX_AGGREGATE_CLASSES};
     use crate::audit_sink::{AuditFileWriter, AuditSinkError, default_audit_dir};
+    use crate::codes::RefusalCode;
     use crate::endpoint::{BoundEndpoint, EndpointEnv, EndpointError, open_endpoint};
     use crate::handshake::{ClientId, EffectiveScopes, EndpointKind, ServerIdentity};
     use crate::limits::{LimitId, Limits};
@@ -84,12 +86,20 @@ mod unix {
     /// otherwise write one record per frame; load shedding at the accepted
     /// request rate could rotate both `audit_file_bytes` segments in seconds.
     /// The budget is `refusal_audit_budget_per_sec` records per window;
-    /// records beyond it are dropped until the next window. Method refusals
-    /// still write one individual record through the dispatch path.
+    /// records beyond it are counted and summarized in exactly one aggregate
+    /// record per window (`D-16`), so suppression is observable instead of
+    /// silent. Method refusals still write one individual record through the
+    /// dispatch path.
     #[derive(Debug)]
     struct WireAuditBudget {
         window_start_ms: u64,
         recorded: u32,
+        /// The effective budget for the window, recorded when the first
+        /// refusal is admitted so the aggregate can state it.
+        budget: u32,
+        suppressed: u64,
+        classes: [Option<AuditClassCount>; MAX_AGGREGATE_CLASSES],
+        other: u32,
     }
 
     impl WireAuditBudget {
@@ -97,20 +107,86 @@ mod unix {
             Self {
                 window_start_ms: now_ms,
                 recorded: 0,
+                budget: 0,
+                suppressed: 0,
+                classes: [None; MAX_AGGREGATE_CLASSES],
+                other: 0,
             }
         }
 
-        /// Whether one more wire refusal may be recorded in this window.
-        fn admit(&mut self, now_ms: u64, budget: u32) -> bool {
-            if now_ms.saturating_sub(self.window_start_ms) >= WIRE_AUDIT_WINDOW_MS {
+        /// End the current window when it elapsed, returning its aggregate.
+        ///
+        /// The window starts at the first refusal after an idle period, so a
+        /// burst processed with one loop timestamp is one window. A window
+        /// that suppressed nothing returns `None`; one that suppressed
+        /// refusals returns the single record the sink receives.
+        fn roll(&mut self, now_ms: u64) -> Option<AuditAggregate> {
+            if self.recorded == 0 && self.suppressed == 0 {
                 self.window_start_ms = now_ms;
-                self.recorded = 0;
+                return None;
             }
+            if now_ms.saturating_sub(self.window_start_ms) < WIRE_AUDIT_WINDOW_MS {
+                return None;
+            }
+            let aggregate = self.take_aggregate();
+            self.window_start_ms = now_ms;
+            self.recorded = 0;
+            aggregate
+        }
+
+        /// Close the window now, for a connection that is going away.
+        fn finish(&mut self) -> Option<AuditAggregate> {
+            self.take_aggregate()
+        }
+
+        fn take_aggregate(&mut self) -> Option<AuditAggregate> {
+            let aggregate = (self.suppressed > 0).then_some(AuditAggregate {
+                suppressed: self.suppressed,
+                budget: self.budget,
+                classes: self.classes,
+                other: self.other,
+            });
+            self.suppressed = 0;
+            self.classes = [None; MAX_AGGREGATE_CLASSES];
+            self.other = 0;
+            aggregate
+        }
+
+        /// Whether one more wire refusal may be recorded in this window.
+        fn admit(&mut self, budget: u32) -> bool {
+            self.budget = budget;
             if self.recorded >= budget.max(1) {
                 return false;
             }
             self.recorded += 1;
             true
+        }
+
+        /// Count one refusal the budget suppressed, keeping the histogram
+        /// bounded: codes past [`MAX_AGGREGATE_CLASSES`] go to `other`.
+        fn suppress(&mut self, code: RefusalCode) {
+            self.suppressed = self.suppressed.saturating_add(1);
+            let mut free = None;
+            for (index, slot) in self.classes.iter_mut().enumerate() {
+                match slot {
+                    Some(entry) if entry.code == code => {
+                        entry.count = entry.count.saturating_add(1);
+                        return;
+                    }
+                    Some(_) => {}
+                    None => {
+                        if free.is_none() {
+                            free = Some(index);
+                        }
+                    }
+                }
+            }
+            match free {
+                Some(index) => {
+                    self.classes[index] = Some(AuditClassCount { code, count: 1 });
+                }
+                None => self.other = self.other.saturating_add(1),
+            }
         }
     }
 
@@ -460,11 +536,23 @@ mod unix {
                     }
                 }
             }
+            // A window that suppressed refusals ends with exactly one
+            // aggregate record; a closing connection flushes its pending
+            // window so no suppression is lost. A refused method still gets
+            // its own record through the dispatch path.
+            for peer in &mut peers {
+                let force = peer.closed || peer.close_after_write;
+                flush_wire_audit(peer, &mut service, current, force);
+            }
             peers.retain(|peer| !peer.closed);
 
             if current.as_millis() >= next_tamper {
                 if endpoint.reattest().is_err() {
+                    // The tamper path exits without the normal shutdown loop;
+                    // flush each peer's pending refusal window so the audit
+                    // evidence of a flood survives the exit.
                     for peer in &mut peers {
+                        flush_wire_audit(peer, &mut service, current, true);
                         peer.close();
                     }
                     drop(peers);
@@ -479,7 +567,9 @@ mod unix {
             }
         }
 
+        let final_now = now();
         for peer in &mut peers {
+            flush_wire_audit(peer, &mut service, final_now, true);
             peer.close();
         }
         drop(peers);
@@ -841,20 +931,42 @@ mod unix {
     }
 
     /// Record a non-closing wire refusal within the per-connection budget.
+    ///
+    /// The window rollover is checked first: if the previous window suppressed
+    /// anything, its one aggregate record is written before this refusal (or
+    /// its suppression) is accounted in the new window.
     fn record_floodable_wire(
         peer: &mut PeerIo,
         service: &mut Service,
         refusal: Refusal,
         now: MonotonicMs,
     ) {
+        if let Some(aggregate) = peer.wire_audit.roll(now.as_millis()) {
+            service.record_wire_aggregate(&peer.client, aggregate, now);
+        }
         let budget = u32::try_from(
             service
                 .limits()
                 .effective(LimitId::RefusalAuditBudgetPerSec),
         )
         .unwrap_or(u32::MAX);
-        if peer.wire_audit.admit(now.as_millis(), budget) {
+        if peer.wire_audit.admit(budget) {
             service.record_refusal(&peer.client, crate::audit::AuditAction::Wire, refusal, now);
+        } else {
+            peer.wire_audit.suppress(refusal.audit_code());
+        }
+    }
+
+    /// End one peer's refusal-audit window when it elapsed, or force it for a
+    /// connection that is closing.
+    fn flush_wire_audit(peer: &mut PeerIo, service: &mut Service, now: MonotonicMs, force: bool) {
+        let aggregate = if force {
+            peer.wire_audit.finish()
+        } else {
+            peer.wire_audit.roll(now.as_millis())
+        };
+        if let Some(aggregate) = aggregate {
+            service.record_wire_aggregate(&peer.client, aggregate, now);
         }
     }
 
@@ -928,6 +1040,80 @@ mod unix {
             assert_eq!(
                 peer_timer(true, false, None, 0, 0, 60_000, 5_000, 60_000, false),
                 PeerTimer::Close
+            );
+        }
+
+        #[test]
+        fn a_window_with_suppressed_refusals_emits_one_bounded_aggregate() {
+            use super::{WIRE_AUDIT_WINDOW_MS, WireAuditBudget};
+            use crate::codes::RefusalCode;
+
+            let mut budget = WireAuditBudget::new(0);
+            assert!(budget.admit(2));
+            assert!(budget.admit(2));
+            assert!(!budget.admit(2));
+            budget.suppress(RefusalCode::NotFound);
+            budget.suppress(RefusalCode::NotFound);
+            budget.suppress(RefusalCode::RateLimited);
+            assert!(
+                budget.roll(WIRE_AUDIT_WINDOW_MS - 1).is_none(),
+                "the window is still open"
+            );
+            let aggregate = budget
+                .roll(WIRE_AUDIT_WINDOW_MS)
+                .expect("one aggregate for the closed window");
+            assert_eq!(aggregate.suppressed, 3);
+            assert_eq!(aggregate.budget, 2);
+            assert_eq!(aggregate.other, 0);
+            assert_eq!(
+                aggregate.classes[0].expect("first").code,
+                RefusalCode::NotFound
+            );
+            assert_eq!(aggregate.classes[0].expect("first").count, 2);
+            assert_eq!(
+                aggregate.classes[1].expect("second").code,
+                RefusalCode::RateLimited
+            );
+            assert!(
+                budget.roll(WIRE_AUDIT_WINDOW_MS * 2).is_none(),
+                "only a window with suppression emits"
+            );
+        }
+
+        #[test]
+        fn the_aggregate_histogram_is_capped_and_counts_the_tail() {
+            use super::{MAX_AGGREGATE_CLASSES, WireAuditBudget};
+            use crate::codes::RefusalCode;
+
+            let mut budget = WireAuditBudget::new(0);
+            let codes = [
+                RefusalCode::NotFound,
+                RefusalCode::InvalidRequest,
+                RefusalCode::RateLimited,
+                RefusalCode::InvalidMethod,
+                RefusalCode::VersionMismatch,
+                RefusalCode::AlreadyNegotiated,
+                RefusalCode::LimitExceeded,
+            ];
+            assert!(codes.len() > MAX_AGGREGATE_CLASSES);
+            for code in codes {
+                budget.suppress(code);
+            }
+            let aggregate = budget.finish().expect("aggregate");
+            assert_eq!(aggregate.suppressed, u64::try_from(codes.len()).unwrap());
+            assert_eq!(
+                aggregate.other,
+                u32::try_from(codes.len() - MAX_AGGREGATE_CLASSES).unwrap()
+            );
+            let listed: u32 = aggregate
+                .classes
+                .iter()
+                .flatten()
+                .map(|entry| entry.count)
+                .sum();
+            assert_eq!(
+                listed + aggregate.other,
+                u32::try_from(codes.len()).unwrap()
             );
         }
     }

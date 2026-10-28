@@ -127,6 +127,22 @@ the drift check explicitly, so a registry pin bump that does not regenerate the
 catalog fails there. After moving the pin, run `just catalog-generate` and
 commit the regenerated file.
 
+The digest and the full-file check cannot see a plugin code change whose
+`bitty-plugin.toml` (and therefore `manifest_hash`) stayed the same. The
+freshness gate compares every compiled `pin` with the registry gitlink at a
+revision and is pinned to `origin/main`, so a code-only registry move is
+visible:
+
+```sh
+git -C ../bitty-plugins fetch origin main
+just check-registry-fresh
+```
+
+`just catalog-pins` runs the same check at `BITTY_PLUGINS_REV` (or an explicit
+`--revision`). Run the freshness gate before a release and when the plugin
+registry advances; it is intentionally not part of every PR (`just check`
+stays network-free).
+
 ## Delivery lifecycle
 
 Changes follow the standard lifecycle: GitHub Issue, CarryCtx task, branch or

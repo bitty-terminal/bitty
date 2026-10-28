@@ -112,6 +112,19 @@ def build_registry(root: Path) -> str:
     return revision
 
 
+def advance_gitlink(root: Path, new_pin: str) -> str:
+    """Move the fixture's ``plugins/bar`` gitlink without touching metadata."""
+    run_git(
+        root,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{new_pin},plugins/bar",
+    )
+    run_git(root, "commit", "-q", "-m", "advance plugin pin only")
+    return run_git(root, "rev-parse", "HEAD")
+
+
 @unittest.skipUnless(shutil.which("git"), "git is required")
 class GitRepositoryOverrideTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -194,6 +207,64 @@ class GitRepositoryOverrideTest(unittest.TestCase):
         stale = self.generate(check=True, env=self.polluted_env())
         self.assertEqual(stale.returncode, 1, stale.stdout)
         self.assertIn("is stale", stale.stderr)
+
+    def test_pin_only_registry_change_fails_check_pins(self) -> None:
+        """Issue #2775: a code-only pin move is caught even when the manifest
+        hash (and therefore digest verification) is unchanged."""
+        generated = self.generate()
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+
+        new_pin = "9" * 40
+        advanced = advance_gitlink(self.registry, new_pin)
+
+        # `--check` at the new revision would also fail, but it reports the
+        # whole rendered file. `--check-pins` names the pin that moved.
+        stale = self.run_generator(
+            "--registry",
+            str(self.registry),
+            "--revision",
+            advanced,
+            "--output",
+            str(self.output),
+            "--check-pins",
+        )
+        self.assertEqual(stale.returncode, 1, stale.stdout)
+        self.assertIn("bitty-terminal.bar", stale.stderr)
+        self.assertIn(new_pin, stale.stderr)
+        self.assertIn(GITLINK_PIN, stale.stderr)
+
+        # The same check passes at the revision the catalog was rendered from.
+        current = self.run_generator(
+            "--registry",
+            str(self.registry),
+            "--revision",
+            self.registry_revision,
+            "--output",
+            str(self.output),
+            "--check-pins",
+        )
+        self.assertEqual(current.returncode, 0, current.stderr)
+
+        # Regenerating at the advanced revision clears the drift.
+        regenerated = self.run_generator(
+            "--registry",
+            str(self.registry),
+            "--revision",
+            advanced,
+            "--output",
+            str(self.output),
+        )
+        self.assertEqual(regenerated.returncode, 0, regenerated.stderr)
+        refreshed = self.run_generator(
+            "--registry",
+            str(self.registry),
+            "--revision",
+            advanced,
+            "--output",
+            str(self.output),
+            "--check-pins",
+        )
+        self.assertEqual(refreshed.returncode, 0, refreshed.stderr)
 
     def test_explicit_missing_registry_fails_without_fallback(self) -> None:
         """A requested --registry is authoritative, even if another tree exists."""

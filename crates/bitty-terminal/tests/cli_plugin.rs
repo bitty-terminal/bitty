@@ -2497,7 +2497,7 @@ fn plugin_install_by_official_id_fetches_pin_and_records_registry_source() {
     let calls = transport.calls();
     assert!(calls.contains("fetch"), "{calls}");
     assert!(
-        calls.contains("6af2be11ee3df9f2c4fecbd73408e2c2f70a6b8c"),
+        calls.contains("0fa151395fe9d9d8b3b9dc4ba047eb13fa7b45c4"),
         "{calls}"
     );
     assert!(

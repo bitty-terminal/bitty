@@ -280,6 +280,21 @@ catalog-generate *args:
 catalog-check *args:
     python3 scripts/generate-official-catalog.py --check {{ args }}
 
+# Fail when a compiled catalog pin differs from the registry gitlink at
+# --revision (default BITTY_PLUGINS_REV). Unlike `catalog-check` this ignores
+# SOURCE_REVISION and manifest hashes, so a plugin code-only change whose
+# manifest hash stayed the same is still caught (bitty#2775).
+catalog-pins *args:
+    python3 scripts/generate-official-catalog.py --check-pins {{ args }}
+
+# Freshness gate for the official catalog: compare every compiled pin with the
+# registry's origin/main (`git fetch origin main` first). Catches a registry
+# code change that a manifest-hash digest can never see; run it with
+# `just check-registry-fresh`, not in every PR.
+check-registry-fresh *args:
+    @just catalog-test
+    @just catalog-pins --revision origin/main {{ args }}
+
 # Hermetic generator tests: repository-location `GIT_*` scrubbing, immutable
 # pin rendering, and authoritative explicit-registry resolution. Fixtures are
 # throwaway repositories, so no registry checkout or network access is

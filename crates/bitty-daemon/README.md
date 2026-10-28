@@ -639,8 +639,10 @@ The accepted optional mint fields are enforced, not ignored:
   are `InvalidRequest` with `counts.actual` and `counts.limit`, and the stored
   expiry uses the requested TTL. Omitting the field keeps the compiled default.
 - `observer_correlation_digest` / `client_correlation_digest` accept a bounded
-  hex digest (at most 64 characters; the canonical 32-hex value is the
-  connection's 128-bit `client_correlation_digest`). A bound grant is usable
+  hex digest (at most 64 characters). The canonical 32-hex value is the
+  connection's 128-bit `client_correlation_digest`; a wider value is accepted
+  within the bound and reduced to a distinct 128-bit binding (it can never
+  equal a connection's 128-bit digest). A bound grant is usable
   only from a connection whose correlation digest matches: a mismatch is the
   same static answer as a wrong peer (`Denied/ObserverGrantRequired` at
   observer attach, no scope added at host-grant consume, `Denied/ConsentRequired`

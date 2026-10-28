@@ -779,6 +779,14 @@ pub struct PluginRuntime {
     /// only; mounting and focusing stay host-driven, so the backend carries
     /// no layout authority.
     panel_create_backend: Option<PanelCreateHandler>,
+    /// CTX-1641 (bitty#2785): the Core-owned terminal-slot scene host.
+    ///
+    /// Installed by the composition root before activation and shared with
+    /// every `ui.rich` generation; the host owns the scene panel and the
+    /// admitted scenes, while each generation's services own its handle and
+    /// release it on `clear_ui_blocks`. `None` leaves rich `terminal` mounts
+    /// failing closed with `E_UI_UNAVAILABLE`.
+    ui_scene_backend: Option<Rc<crate::scene_host::SceneHost>>,
     /// CTX-1115: bounded queue of `bitty.panel.set_pinned` intents, drained
     /// by the application each tick
     /// ([`PluginRuntime::drain_panel_pin_requests`]).
@@ -1025,6 +1033,7 @@ impl PluginRuntime {
             ))),
             panel_pin_backend: None,
             panel_create_backend: None,
+            ui_scene_backend: None,
             panel_pin_requests: Rc::new(RefCell::new(PanelPinQueue::new(PANEL_PIN_QUEUE_CAPACITY))),
             fx_requests: Rc::new(RefCell::new(FxPulseQueue::new(FX_PULSE_QUEUE_CAPACITY))),
             image_roots: Vec::new(),
@@ -1556,6 +1565,17 @@ impl PluginRuntime {
     /// like every other panel verb without a host.
     pub fn set_panel_create_backend(&mut self, backend: Option<PanelCreateHandler>) {
         self.panel_create_backend = backend;
+    }
+
+    /// Install the Core-owned terminal-slot scene host (CTX-1641, bitty#2785).
+    ///
+    /// Call before activation: each `ui.rich` generation captures the shared
+    /// host when its services are built, and a generation without the grant
+    /// captures nothing (no surface without the capability). Without a host a
+    /// rich `bitty.ui.mount("terminal", …)` fails closed with
+    /// `E_UI_UNAVAILABLE`, like every other unhosted surface.
+    pub fn set_ui_scene_backend(&mut self, backend: Option<Rc<crate::scene_host::SceneHost>>) {
+        self.ui_scene_backend = backend;
     }
 
     /// Seed the approved wallpaper roots for `bitty.image.read` (CTX-1169,
@@ -2884,6 +2904,12 @@ impl PluginRuntime {
         // they keep failing closed with `E_NOT_IMPLEMENTED` unchanged.
         if panel_create {
             plugin_services.set_panel_create_backend(self.panel_create_backend.clone());
+        }
+        // bitty#2785: the Core-owned terminal-slot scene host, shared only
+        // with `ui.rich` generations. The call-time `ui.rich` gate in
+        // `ui_mount_scene` stays as the second layer.
+        if ui_rich {
+            plugin_services.set_ui_scene_backend(self.ui_scene_backend.clone());
         }
         // CTX-1239 (issue #2101): the `bitty.terminal.submit` intent queue.
         // Shared only with `terminal.input.submit` generations (no queue

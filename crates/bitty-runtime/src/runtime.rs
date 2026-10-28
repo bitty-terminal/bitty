@@ -594,12 +594,20 @@ pub struct Runtime {
     presented_leaf_frames: std::collections::BTreeMap<ViewId, self::present::PresentedLeaf>,
     /// Installed scene host (CTX-1630 / OQ-051).
     ///
-    /// The composition root installs the same [`PanelRuntime`](crate::registry::PanelRuntime)
-    /// that owns the panel scene slots; the present loop asks it for each
-    /// visible leaf's leaf-clipped paint list. `None` is fail-closed: no leaf
-    /// paints a scene and the grid path is unchanged. This is a borrow of the
-    /// one owner, not a second scene store.
-    scene_host: Option<crate::registry::PanelRuntime>,
+    /// The composition root installs a shared handle to the same
+    /// [`PanelRuntime`](crate::registry::PanelRuntime) that owns the panel
+    /// scene slots; the present loop asks it for each visible leaf's
+    /// leaf-clipped paint list. `None` is fail-closed: no leaf paints a
+    /// scene and the grid path is unchanged. The handle is shared with the
+    /// plugin services (`bitty.ui.mount`/`ui.update` attach through it), so
+    /// this is the one scene store, never a second one (CTX-1641).
+    scene_host: Option<std::rc::Rc<std::cell::RefCell<crate::registry::PanelRuntime>>>,
+    /// Scene revision consumed by the last presented frame (CTX-1641).
+    ///
+    /// `PanelRuntime::scene_revision` bumps on every attach/detach/dispose;
+    /// a mismatch at tick time forces one frame, so a plugin mount on a quiet
+    /// grid cannot wait for unrelated grid damage.
+    presented_scene_revision: u64,
     /// Retained scene primitives per visible leaf (CTX-1630).
     ///
     /// A refused paint re-emits the previous primitives for an unchanged
@@ -1997,6 +2005,7 @@ impl Runtime {
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
             scene_host: None,
+            presented_scene_revision: 0,
             presented_scene_frames: std::collections::BTreeMap::new(),
             scene_frame: self::scene_present::SceneFrameReport::default(),
             scene_paint_refusals: 0,
@@ -2299,6 +2308,7 @@ impl Runtime {
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
             scene_host: None,
+            presented_scene_revision: 0,
             presented_scene_frames: std::collections::BTreeMap::new(),
             scene_frame: self::scene_present::SceneFrameReport::default(),
             scene_paint_refusals: 0,

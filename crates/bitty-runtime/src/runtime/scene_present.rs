@@ -2,9 +2,12 @@
 //! Scene composition in the shipped present loop (CTX-1630 / bitty#2760).
 //!
 //! The present loop owns the only live consumer of the OQ-051 scene paint
-//! path. No shipped build installs a scene host or binds panels until
-//! bitty#2785 (host install + `ui.rich` attach), so nothing below runs in a
-//! shipped frame yet; the composition is wired and unit-tested only.
+//! path. The composition root installs the shared [`PanelRuntime`] at startup
+//! ([`Runtime::install_shared_scene_host`]) and `bitty.ui.mount`/`ui.update`
+//! attach scenes through the same handle (CTX-1641 / bitty#2785), so a
+//! shipped frame paints a plugin scene without a test-only host. Image nodes
+//! are still only counted here: forwarding them to the admitted image plane
+//! is a separate OQ-051 slice.
 //!
 //! For every visible leaf the loop asks the installed
 //! [`PanelRuntime`] whether the leaf is a
@@ -173,37 +176,48 @@ impl RetainedScene {
 impl Runtime {
     /// Installs the panel host the present loop consults for scenes.
     ///
-    /// The composition root installs the same [`PanelRuntime`] that owns the
-    /// panel slots (OQ-051); the present loop never creates a second scene
-    /// store. No composition root does this yet (bitty#2785): the app keeps a
-    /// bare `PanelRegistry` with no placements, and every current caller is a
-    /// test. Installing a host forces the next frame so an already painted
-    /// window picks up newly attached scenes.
+    /// Convenience for tests and single-owner callers: wraps `host` in the
+    /// shared handle the composition root uses. Installing a host forces the
+    /// next frame so an already painted window picks up newly attached scenes.
     pub fn install_scene_host(&mut self, host: PanelRuntime) {
+        self.install_shared_scene_host(std::rc::Rc::new(std::cell::RefCell::new(host)));
+    }
+
+    /// Installs the shared panel host the present loop and the plugin
+    /// services both address (CTX-1641 / bitty#2785).
+    ///
+    /// The composition root installs the same [`PanelRuntime`] that owns the
+    /// panel slots (OQ-051) and hands the same `Rc` to
+    /// `bitty.ui.mount`/`ui.update`; the present loop never creates a second
+    /// scene store.
+    pub fn install_shared_scene_host(
+        &mut self,
+        host: std::rc::Rc<std::cell::RefCell<PanelRuntime>>,
+    ) {
         self.scene_host = Some(host);
         self.pending_full_redraw = true;
     }
 
-    /// Borrows the installed panel host, if any.
+    /// Returns the installed shared panel host, if any.
     #[must_use]
-    pub fn scene_host(&self) -> Option<&PanelRuntime> {
-        self.scene_host.as_ref()
+    pub fn scene_host(&self) -> Option<std::rc::Rc<std::cell::RefCell<PanelRuntime>>> {
+        self.scene_host.clone()
     }
 
-    /// Borrows the installed panel host mutably (attach/detach scenes).
+    /// Runs `f` against the installed panel host mutably.
     ///
-    /// A mutable borrow is treated as a possible scene revision: the next
-    /// tick presents a fresh frame even when no PTY or layout state changed.
-    #[must_use]
-    pub fn scene_host_mut(&mut self) -> Option<&mut PanelRuntime> {
-        if self.scene_host.is_some() {
-            self.pending_full_redraw = true;
-        }
-        self.scene_host.as_mut()
+    /// Any mutation is expected to bump [`PanelRuntime::scene_revision`], so
+    /// the next tick presents a fresh frame even when no PTY or layout state
+    /// changed. Returns `None` when no host is installed or the store is
+    /// already borrowed.
+    pub fn with_scene_host_mut<R>(&mut self, f: impl FnOnce(&mut PanelRuntime) -> R) -> Option<R> {
+        let host = self.scene_host.clone()?;
+        let mut host = host.try_borrow_mut().ok()?;
+        Some(f(&mut host))
     }
 
     /// Removes the installed panel host and drops every retained scene.
-    pub fn take_scene_host(&mut self) -> Option<PanelRuntime> {
+    pub fn take_scene_host(&mut self) -> Option<std::rc::Rc<std::cell::RefCell<PanelRuntime>>> {
         self.presented_scene_frames.clear();
         let host = self.scene_host.take();
         if host.is_some() {
@@ -271,7 +285,10 @@ impl Runtime {
             scene_a11y_refusals,
             ..
         } = self;
-        let host = scene_host.as_mut()?;
+        // The store is shared with the plugin services; a borrow held across
+        // this composition (reentrant plugin call) fails closed instead of
+        // panicking, so a leaf simply keeps the grid path for that frame.
+        let mut host = scene_host.as_ref()?.try_borrow_mut().ok()?;
         let panel = host.placement_panel_of(view);
         let Some(panel) = panel.filter(|panel| host.panel_scene(*panel).is_some()) else {
             // A detached or scene-less leaf drops its retained primitives so

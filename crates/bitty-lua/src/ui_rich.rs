@@ -8,12 +8,24 @@
 //!
 //! # Integration status
 //!
-//! [`read_rich_component`] is the v2 reader; `bitty.ui.mount`/`ui.update`
-//! still validate through the v1 `crate::ui::read_component`, and no host
-//! route turns a [`UiRichNode`] into an admitted `Scene` yet. Until that
-//! mount-path slice lands, do not describe the `ui.rich` surface as accepting
-//! these node kinds at runtime; the reader and the `bitty-runtime` bridge
-//! (`bitty_runtime::scene_bridge`) are the mechanism half.
+//! [`read_rich_component`] is the v2 reader for the `terminal` slot
+//! (bitty#2785): `bitty.ui.mount("terminal", node)` and
+//! `bitty.ui.update(handle, node)` read through it and attach the admitted
+//! scene through `bitty_runtime::scene_host::SceneHost` /
+//! `PanelRuntime::attach_panel_scene`. Every other accepted slot keeps the v1
+//! `crate::ui::read_component` vocabulary and the band/overlay registry.
+//!
+//! ```lua
+//! local handle = bitty.ui.mount("terminal", {
+//!   kind = "Block",
+//!   border = { width = 1 },
+//!   child = { kind = "Text", text = "ready" },
+//! })
+//! ```
+//!
+//! `ui.update(handle, tree)` replaces the same scene; suspend/dispose/reload
+//! detaches it. Image nodes are admitted and counted but not yet forwarded to
+//! the image plane (OQ-051 image forwarding is a separate slice).
 //!
 //! # Shape
 //!

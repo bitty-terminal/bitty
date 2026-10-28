@@ -1149,6 +1149,10 @@ fn main() {
             // that resolved name; safe mode reports `None` and never installs
             // the writer anyway.
             config_profile: inspect_context.profile.as_deref(),
+            // bitty#2785: the terminal-slot scene target starts at the
+            // focused leaf so an activation-time `ui.mount("terminal", …)`
+            // has a deterministic route; the tick loop keeps it live.
+            scene_target: runtime.focused_view(),
         },
     );
     let live_snapshot = plugin_session
@@ -1169,6 +1173,15 @@ fn main() {
     let live_history = plugin_session
         .as_ref()
         .map(|session| Rc::clone(&session.history));
+    // bitty#2785: the production panel host and its Core-published scene
+    // target. The app installs the host into the present loop; the plugin
+    // services attach scenes through the same handle.
+    let panel_scene_host = plugin_session
+        .as_ref()
+        .and_then(|session| session.panels.as_ref().map(Rc::clone));
+    let scene_target = plugin_session
+        .as_ref()
+        .map(|session| Rc::clone(&session.scene_target));
     let plugin_runtime_handle = plugin_session.map(|session| session.runtime);
     // Issue #2773: publish the attached runtime's sanitized lifecycle rows for
     // the accepted `bitty.debug/listPlugins` / `getPlugin` inspect methods.
@@ -1349,6 +1362,10 @@ fn main() {
     .with_live_history(live_history)
     // CTX-0892: wire the plugin runtime into the app loop for event delivery.
     .with_plugin_runtime(plugin_runtime_handle)
+    // bitty#2785: install the production panel scene host and publish the
+    // live placement target for the `terminal` slot.
+    .with_panel_scene_host(panel_scene_host)
+    .with_scene_target(scene_target)
     // W-103 S-5 (CTX-0929): latch the safe recovery flag so the composer
     // cutover selects the retained Core path without consulting a VM.
     .with_safe_mode(args.safe);

@@ -14,7 +14,7 @@
 //! `--safe` creates no VM for any non-bundled package. Paths come from the
 //! environment (or `$HOME`), never literals.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -25,7 +25,8 @@ use bitty_runtime::plugin_runtime::{
     QueuedPinRequest, SnapshotSource, TargetSource, TranscriptHistory, WorkspaceAttention,
     WorkspaceInfo, WorkspaceSource,
 };
-use bitty_runtime::registry::{PanelError, PanelRegistry, PanelRegistryConfig, PanelType};
+use bitty_runtime::registry::{PanelError, PanelRegistryConfig, PanelRuntime, PanelType};
+use bitty_runtime::scene_host::SceneHost;
 use bitty_runtime::{TargetAnchorSummary, ViewId, WorkspaceSummary};
 
 /// Environment override for a local-path development plugin root.
@@ -313,6 +314,17 @@ pub(crate) struct PluginSession {
     pub(crate) pin_state: Rc<LivePinState>,
     /// Bounded transcript provider published by the tick loop (CTX-1352).
     pub(crate) history: Rc<TranscriptHistory>,
+    /// The production panel host this session owns (bitty#2785).
+    ///
+    /// The same `PanelRuntime` backs both `bitty.panel.create` and the
+    /// terminal-slot scene path; the app installs this handle into its
+    /// `Runtime` so the present loop reads the attached scenes from the one
+    /// store. `None` when the host could not be constructed, which leaves
+    /// `panel.create` and rich mounts failing closed.
+    pub(crate) panels: Option<Rc<RefCell<PanelRuntime>>>,
+    /// Core-published placement target for the terminal-slot scene
+    /// (bitty#2785): the focused leaf id, refreshed by the app each tick.
+    pub(crate) scene_target: Rc<Cell<Option<ViewId>>>,
 }
 
 /// Live resolved-keymap source for `bitty.keymaps.list()` (issue #2405).
@@ -426,15 +438,18 @@ pub(crate) fn startup_pin_backend(
 /// Synchronous `bitty.panel.create` backend for production startup (CTX-1345).
 ///
 /// Allocates a native (`rich`, `browser`, `helper`, or `canvas`) panel in the
-/// process-owned [`PanelRegistry`] and returns the raw `(id, generation)`
+/// process-owned [`PanelRuntime`] and returns the raw `(id, generation)`
 /// pair the plugin API shapes into `{ id, generation }`. Mounting and
 /// focusing stay host-driven, so the backend carries no layout authority and
 /// creates no PTY: `terminal` (process-spawn authority the `panel.create`
 /// grant never conveys) and unknown types fail closed with `E_DEF_INVALID`.
 /// Registry exhaustion maps to the bounded `E_DEF_LIMIT`; an unservable
-/// registry maps to `E_NOT_IMPLEMENTED`, like the sibling panel verbs.
+/// host maps to `E_NOT_IMPLEMENTED`, like the sibling panel verbs. The same
+/// host is the scene store (`SceneHost`), so a panel created here and a
+/// scene attached through `ui.mount("terminal", …)` share identity and
+/// generation checking.
 pub(crate) fn startup_panel_create_backend(
-    panels: Rc<RefCell<PanelRegistry>>,
+    panels: Rc<RefCell<PanelRuntime>>,
 ) -> PanelCreateHandler {
     Rc::new(move |panel_type| {
         let parsed = PanelType::parse(panel_type).ok_or_else(|| {
@@ -586,6 +601,11 @@ pub(crate) struct StartupSeed<'a> {
     /// and validates against that chain, so it never pins or accepts another
     /// profile's values. `None` means startup loaded no profile.
     pub(crate) config_profile: Option<&'a str>,
+    /// Core-resolved placement target for the terminal-slot scene
+    /// (bitty#2785). The plugin never selects a view: startup seeds the
+    /// focused leaf so `init.lua` mounts have a deterministic route before
+    /// the first tick publishes the live focus.
+    pub(crate) scene_target: Option<ViewId>,
 }
 
 /// Discover and activate installed and development plugins, returning the
@@ -748,21 +768,36 @@ pub(crate) fn discover_with_roots(
             }
         }
     }
-    // CTX-1345: install the production `bitty.panel.create` backend before
-    // activation so panel-creating generations capture a real allocator.
-    // The registry is process-owned and lives as long as the plugin runtime
-    // (the handler owns the only handle); activation still gates the backend
-    // on the `panel.create` grant, and the call-time gate stays as the
-    // second layer. A registry that cannot be constructed leaves the backend
-    // unwired, so granted calls keep failing closed with `E_NOT_IMPLEMENTED`.
-    match PanelRegistry::new(PanelRegistryConfig::default()) {
-        Ok(registry) => runtime.set_panel_create_backend(Some(startup_panel_create_backend(
-            Rc::new(RefCell::new(registry)),
-        ))),
-        Err(error) => crate::logging::warn(|| {
-            format!("bitty: panel registry unavailable, panel.create disabled ({error})")
-        }),
-    }
+    // CTX-1345 / bitty#2785: install the production panel host before
+    // activation so panel-creating generations capture a real allocator and
+    // `ui.rich` generations capture the same store's scene path. The host is
+    // process-owned and lives as long as the plugin runtime; the app installs
+    // the same `Rc` into its `Runtime` for the present loop. Activation still
+    // gates both paths on their grants, and the call-time gates stay as the
+    // second layer. A host that cannot be constructed leaves both backends
+    // unwired, so granted calls keep failing closed.
+    let scene_target = Rc::new(Cell::new(seed.scene_target));
+    let panels = match PanelRuntime::new(PanelRegistryConfig::default()) {
+        Ok(host) => {
+            let panels = Rc::new(RefCell::new(host));
+            runtime
+                .set_panel_create_backend(Some(startup_panel_create_backend(Rc::clone(&panels))));
+            // bitty#2785: the `terminal` slot's scene host shares the same
+            // `PanelRuntime`, so `bitty.ui.mount("terminal", …)` attaches to
+            // the panel the present loop resolves by placement.
+            runtime.set_ui_scene_backend(Some(Rc::new(SceneHost::new(
+                Rc::clone(&panels),
+                Rc::clone(&scene_target),
+            ))));
+            Some(panels)
+        }
+        Err(error) => {
+            crate::logging::warn(|| {
+                format!("bitty: panel host unavailable, panel surfaces disabled ({error})")
+            });
+            None
+        }
+    };
     // CTX-0939 (W-146): disk-backed plugin stores commit through the
     // extracted storage mechanics. Core keeps quotas, validation, and the
     // RC-1 accounting; only the atomic-commit bytes flow through here.
@@ -879,6 +914,8 @@ pub(crate) fn discover_with_roots(
         keymaps,
         pin_state,
         history,
+        panels,
+        scene_target,
     })
 }
 
@@ -1076,6 +1113,7 @@ mod tests {
             inspect: None,
             config_file: None,
             config_profile: None,
+            scene_target: None,
         };
         let session =
             discover_probe(&seed, root, Some(home), None).expect("dev root must yield a session");
@@ -1152,6 +1190,7 @@ mod tests {
             inspect: None,
             config_file: Some(&target),
             config_profile: None,
+            scene_target: None,
         };
         let manifest_bytes = std::fs::read(plugin.join("bitty-plugin.toml")).expect("manifest");
         let manifest =
@@ -1267,6 +1306,7 @@ mod tests {
             inspect: Some(context),
             config_file: None,
             config_profile: None,
+            scene_target: None,
         }
     }
 
@@ -1412,6 +1452,7 @@ mod tests {
             inspect: None,
             config_file: None,
             config_profile: None,
+            scene_target: None,
         };
         let session =
             discover_probe(&seed, root, None, None).expect("dev root must yield a session");
@@ -1606,6 +1647,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
             inspect: None,
             config_file: None,
             config_profile: None,
+            scene_target: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -1837,6 +1879,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
             inspect: None,
             config_file: None,
             config_profile: None,
+            scene_target: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -2002,6 +2045,7 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
             inspect: None,
             config_file: None,
             config_profile: None,
+            scene_target: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -2401,6 +2445,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             inspect: None,
             config_file: None,
             config_profile: None,
+            scene_target: None,
         };
         discover_probe(&seed, root, None, None)
             .expect("dev root must yield a session")
@@ -2462,7 +2507,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         // and return its raw `(id, generation)`; unsupported types allocate
         // nothing.
         let panels = Rc::new(RefCell::new(
-            PanelRegistry::new(PanelRegistryConfig::default()).expect("panel registry"),
+            PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host"),
         ));
         let backend = startup_panel_create_backend(Rc::clone(&panels));
         let (id, generation) = backend("rich").expect("rich allocates");
@@ -2497,6 +2542,333 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             id.parse().expect("numeric panel id"),
             generation.parse().expect("numeric generation"),
         )
+    }
+
+    // ── CTX-1641 (bitty#2785): production scene host + ui.rich attach ───
+
+    const SCENE_PLUGIN_ID: &str = "xuepoo.richscene";
+    const SCENE_PLUGIN_CELL_WIDTH: u32 = 8;
+    const SCENE_PLUGIN_CELL_HEIGHT: u32 = 16;
+    const SCENE_PLUGIN_LINE: &str = "rich-panel-line";
+
+    /// Probe plugin: mounts one v2 rich tree into the `terminal` slot, then
+    /// updates it. `handle` is the generation-owned scene handle the bridge
+    /// returned, so `update` exercises the same route with the real path.
+    const SCENE_PLUGIN: &str = r#"
+local handle = nil
+
+local function mount()
+  local ok, res = pcall(bitty.ui.mount, "terminal", {
+    kind = "Column",
+    children = {
+      {
+        kind = "Block",
+        border = { width = 1 },
+        child = { kind = "Text", text = "rich-panel-line" },
+      },
+      { kind = "Image", placement = 2 },
+    },
+  })
+  if not ok then return "ERR:" .. res.code end
+  handle = res
+  return "OK:" .. tostring(res)
+end
+
+local function update()
+  local ok, res = pcall(bitty.ui.update, handle, {
+    kind = "Text",
+    text = "rich-updated",
+  })
+  if not ok then return "ERR:" .. res.code end
+  return "OK:" .. tostring(res)
+end
+
+bitty.commands.register({ id = "mount", title = "Mount rich scene", run = mount })
+bitty.commands.register({ id = "update", title = "Update rich scene", run = update })
+"#;
+
+    fn write_scene_probe(root: &Path, id: &str) {
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                concat!(
+                    "[plugin]\n",
+                    "id = \"{id}\"\n",
+                    "name = \"Rich scene\"\n",
+                    "version = \"0.1.0\"\n",
+                    "description = \"scene host probe\"\n",
+                    "\n",
+                    "[compat]\n",
+                    "plugin-api = \"^1.0\"\n",
+                    "\n",
+                    "[capabilities]\n",
+                    "ui.rich = true\n",
+                    "\n",
+                    "[lazy]\n",
+                    "commands = [\"{id}:mount\", \"{id}:update\"]\n",
+                    "events = []\n",
+                ),
+                id = id,
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(plugin.join("lua/init.lua"), SCENE_PLUGIN).expect("init");
+    }
+
+    /// Composition root under test: the real plugin discovery/activation path
+    /// plus the same `PanelRuntime`/`SceneHost` install `main` performs.
+    fn scene_probe_app(tag: &str) -> (crate::terminal_app::TerminalApp, Rc<RefCell<PanelRuntime>>) {
+        let root = pin_test_dir(tag);
+        write_scene_probe(&root, SCENE_PLUGIN_ID);
+        let mut config = bitty_runtime::RuntimeConfig {
+            cols: 80,
+            rows: 24,
+            cell_width: SCENE_PLUGIN_CELL_WIDTH,
+            cell_height: SCENE_PLUGIN_CELL_HEIGHT,
+            ..bitty_runtime::RuntimeConfig::default()
+        };
+        // Deterministic headless evidence: no animation phase participates.
+        config.animations.enabled = false;
+        let rt = Runtime::with_deterministic_rasterizer(config).expect("deterministic runtime");
+        let primary = rt.primary_view().expect("primary view");
+        let summaries = rt.workspace_summaries();
+        let leaves = rt.layout().leaf_ids();
+        let pinned = rt.pinned_views();
+        let seed = StartupSeed {
+            workspaces: &summaries,
+            keymaps: &[],
+            targets: &[],
+            leaves: &leaves,
+            pinned: &pinned,
+            image_roots: &[],
+            history_capture: bitty_config::HistoryCaptureConfig::default(),
+            inspect: None,
+            config_file: None,
+            config_profile: None,
+            scene_target: Some(primary),
+        };
+        let session =
+            discover_probe(&seed, root, None, None).expect("dev root must yield a session");
+        let PluginSession {
+            runtime: plugin_runtime,
+            panels,
+            scene_target,
+            ..
+        } = session;
+        let panels = panels.expect("production panel host");
+        let keymaps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let app = crate::terminal_app::TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            keymaps,
+            crate::spawn::SpawnSpec::default(),
+        )
+        .with_plugin_runtime(Some(plugin_runtime))
+        .with_panel_scene_host(Some(Rc::clone(&panels)))
+        .with_scene_target(Some(scene_target));
+        (app, panels)
+    }
+
+    fn scene_surface(runtime: &Runtime, view: ViewId) -> bitty_render::scene::SceneSurface {
+        let frame = runtime
+            .presented_allocations()
+            .iter()
+            .find(|frame| frame.view == view)
+            .expect("leaf was presented");
+        let pad = i32::try_from(runtime.window_padding_physical()).expect("padding fits i32");
+        bitty_render::scene::SceneSurface::new(
+            bitty_render::geometry::RectPx::new(
+                frame.content.x.saturating_add(pad),
+                frame.content.y.saturating_add(pad),
+                frame.content.width,
+                frame.content.height,
+            ),
+            bitty_render::CellMetrics {
+                width: SCENE_PLUGIN_CELL_WIDTH,
+                height: SCENE_PLUGIN_CELL_HEIGHT,
+            },
+        )
+    }
+
+    /// Every changed pixel between two frames, with its coordinates.
+    fn changed_pixels(
+        before: &[u8],
+        after: &[u8],
+        width: usize,
+    ) -> Vec<bitty_render::geometry::RectPx> {
+        assert_eq!(before.len(), after.len(), "frame sizes must match");
+        let mut changed = Vec::new();
+        for (index, (a, b)) in before.iter().zip(after.iter()).enumerate() {
+            if a == b {
+                continue;
+            }
+            let pixel = index / 4;
+            let x = i32::try_from(pixel % width).expect("x fits i32");
+            let y = i32::try_from(pixel / width).expect("y fits i32");
+            changed.push(bitty_render::geometry::RectPx::new(x, y, 1, 1));
+        }
+        changed
+    }
+
+    #[test]
+    fn shipped_composition_root_attaches_and_paints_a_plugin_rich_scene() {
+        let (mut app, panels) = scene_probe_app("scene-paint");
+        let view = app.runtime.focused_view().expect("focused leaf");
+
+        // Baseline frame of the untouched, scene-less leaf.
+        app.drive_tick().expect("baseline frame presents");
+        let baseline_rgba = app.runtime.headless_rgba().expect("baseline rgba");
+        assert_eq!(app.runtime.scene_frame().views, 0);
+
+        // The plugin mounts through the real Lua path; the composition root
+        // owns the host, so this is the shipped route, not a test install.
+        let mounted = {
+            let runtime = app.plugin_runtime.as_mut().expect("plugin runtime");
+            settle_dispatch(runtime, SCENE_PLUGIN_ID, "mount", &[]).into_string("mount")
+        };
+        assert!(
+            mounted.starts_with("OK:"),
+            "the ui.rich mount must attach through the scene host: {mounted}"
+        );
+        let handle: i64 = mounted
+            .strip_prefix("OK:")
+            .expect("OK prefix")
+            .parse()
+            .expect("scene handle");
+        assert!(bitty_runtime::scene_host::is_scene_handle(handle));
+
+        app.drive_tick().expect("scene frame presents");
+        let report = app.runtime.scene_frame().clone();
+        assert_eq!(report.views, 1, "one leaf paints the attached scene");
+        assert!(report.ops > 0, "the paint list carries ops");
+        assert_eq!(
+            report.images, 1,
+            "image nodes stay counted placement references (not forwarded)"
+        );
+        assert_eq!(report.refusals, 0);
+        assert_eq!(report.a11y.len(), 1);
+
+        // Placement resolves to the Core-owned scene panel on the shipped leaf.
+        let panel = panels
+            .borrow()
+            .placement_panel_of(view)
+            .expect("the shipped placement bind resolves");
+        assert_eq!(report.a11y[0].identity, panel.get());
+        assert_eq!(panels.borrow().panel_scene_len(), 1);
+
+        // Bounded damage: every rectangle stays inside the leaf content rect.
+        let surface = scene_surface(&app.runtime, view);
+        assert!(!report.damage.is_empty(), "the scene reports damage");
+        for rect in &report.damage {
+            assert!(
+                surface.rect.contains_rect(rect),
+                "scene damage {rect:?} left the leaf {:?}",
+                surface.rect
+            );
+        }
+
+        // Accessibility parity: the recorded projection equals the paint
+        // list's own lines, re-derived independently from the attached scene.
+        let scene = panels
+            .borrow()
+            .panel_scene(panel)
+            .cloned()
+            .expect("attached scene");
+        let expected = bitty_render::scene::paint_scene(
+            &scene,
+            surface,
+            bitty_render::scene::ScenePaintBudget::default(),
+        )
+        .expect("the same scene paints");
+        let painted: Vec<(u32, String)> = expected
+            .text_lines()
+            .map(|line| (u32::from(line.row), line.text.to_string()))
+            .collect();
+        assert!(
+            painted.iter().any(|(_, text)| text == SCENE_PLUGIN_LINE),
+            "the v2 rich text reaches the paint list: {painted:?}"
+        );
+        assert_eq!(
+            report.a11y[0].lines, painted,
+            "parity evidence must equal the paint list's lines"
+        );
+
+        // Leaf clipping: pixels change only inside the leaf content rect.
+        let scene_rgba = app.runtime.headless_rgba().expect("scene rgba");
+        let width =
+            usize::try_from(app.runtime.surface_extent().expect("surface").width()).expect("width");
+        let changed = changed_pixels(&baseline_rgba, &scene_rgba, width);
+        assert!(!changed.is_empty(), "the scene never reached the frame");
+        for pixel in &changed {
+            assert!(
+                surface.rect.contains_rect(pixel),
+                "scene painted outside its leaf at ({}, {})",
+                pixel.x,
+                pixel.y
+            );
+        }
+
+        // Update keeps the same handle and the same placement.
+        let updated = {
+            let runtime = app.plugin_runtime.as_mut().expect("plugin runtime");
+            settle_dispatch(runtime, SCENE_PLUGIN_ID, "update", &[]).into_string("update")
+        };
+        assert_eq!(updated, "OK:true");
+        app.drive_tick().expect("updated frame presents");
+        assert_eq!(
+            panels
+                .borrow()
+                .panel_scene(panel)
+                .expect("scene retained")
+                .get(bitty_rich::scene::BlockId(handle.unsigned_abs()))
+                .expect("same block identity")
+                .content(),
+            &bitty_rich::scene::SceneNode::Text(bitty_rich::scene::StyledSpan {
+                text: String::from("rich-updated"),
+                bold: false,
+                italic: false,
+            })
+        );
+        let updated_report = app.runtime.scene_frame().clone();
+        assert_eq!(updated_report.views, 1);
+        assert!(
+            updated_report.a11y[0]
+                .lines
+                .iter()
+                .any(|(_, text)| text == "rich-updated"),
+            "the update reaches the frame: {:?}",
+            updated_report.a11y[0].lines
+        );
+
+        // Reload (suspend) clears the scene, the placement bind, and the
+        // Core-owned panel: no stale scene survives the generation.
+        let pid = bitty_plugin_host::manifest::PluginId::new(SCENE_PLUGIN_ID).expect("id");
+        app.plugin_runtime
+            .as_mut()
+            .expect("plugin runtime")
+            .suspend(&pid)
+            .expect("suspend");
+        app.drive_tick().expect("post-suspend frame presents");
+        assert_eq!(
+            app.runtime.scene_frame().views,
+            0,
+            "a suspended generation paints no scene"
+        );
+        assert_eq!(panels.borrow().panel_scene_len(), 0);
+        assert_eq!(panels.borrow().panel_count(), 0);
+        assert!(
+            panels.borrow().placement_panel_of(view).is_none(),
+            "the placement bind leaves with the scene"
+        );
+        let cleared_rgba = app.runtime.headless_rgba().expect("cleared rgba");
+        assert!(
+            changed_pixels(&baseline_rgba, &cleared_rgba, width).is_empty(),
+            "suspending the plugin restores the scene-less leaf pixels"
+        );
     }
 
     // ── bitty#2304: user budget file loading ────────────────────────────

@@ -790,6 +790,10 @@ pub(crate) struct TerminalApp {
     /// completed scrollback lines into its redacted ring. `None` without a
     /// plugin runtime or capture opt-in.
     pub(crate) live_history: Option<std::rc::Rc<bitty_runtime::plugin_runtime::TranscriptHistory>>,
+    /// Core-published placement target for the `terminal` scene slot
+    /// (bitty#2785): the focused leaf id, refreshed every tick before plugin
+    /// work. `None` without a plugin runtime; the plugin never writes it.
+    pub(crate) scene_target: Option<std::rc::Rc<std::cell::Cell<Option<ViewId>>>>,
     /// Plugin runtime (CTX-0892): owns all plugin VMs, delivers events,
     /// dispatches commands. Kept alive by the app loop.
     pub(crate) plugin_runtime: Option<PluginRuntime>,
@@ -932,6 +936,7 @@ impl TerminalApp {
             live_targets: None,
             live_pin_state: None,
             live_history: None,
+            scene_target: None,
             plugin_runtime: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
@@ -981,6 +986,7 @@ impl TerminalApp {
             live_targets: None,
             live_pin_state: None,
             live_history: None,
+            scene_target: None,
             plugin_runtime: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
@@ -1277,6 +1283,38 @@ impl TerminalApp {
     /// tests and plugin-less runs leave it `None`.
     pub(crate) fn with_plugin_runtime(mut self, runtime: Option<PluginRuntime>) -> Self {
         self.plugin_runtime = runtime;
+        self
+    }
+
+    /// Installs the production panel scene host (bitty#2785).
+    ///
+    /// Production startup passes the shared `PanelRuntime` returned by
+    /// [`crate::plugin_runtime::discover_and_activate`]; the present loop
+    /// reads the attached scenes from the one store, and the plugin services
+    /// attach through the same handle. Plugin-less runs and failed host
+    /// construction leave it `None`, which keeps every leaf on the grid path.
+    pub(crate) fn with_panel_scene_host(
+        mut self,
+        host: Option<std::rc::Rc<std::cell::RefCell<bitty_runtime::registry::PanelRuntime>>>,
+    ) -> Self {
+        if let Some(host) = host {
+            self.runtime.install_shared_scene_host(host);
+        }
+        self
+    }
+
+    /// Attaches the Core-published placement target for the `terminal` scene
+    /// slot (bitty#2785).
+    ///
+    /// Production startup passes the handle returned by
+    /// [`crate::plugin_runtime::discover_and_activate`]; [`Self::drive_tick`]
+    /// publishes the live focused leaf before plugin work, so a mount always
+    /// targets the leaf the user is looking at.
+    pub(crate) fn with_scene_target(
+        mut self,
+        target: Option<std::rc::Rc<std::cell::Cell<Option<ViewId>>>>,
+    ) -> Self {
+        self.scene_target = target;
         self
     }
 
@@ -1676,6 +1714,13 @@ impl TerminalApp {
                 }
             },
         );
+        // bitty#2785: publish the live placement target after ctl focus
+        // changes and before any plugin work, so a `ui.mount("terminal", …)`
+        // on this tick lands on the leaf the user is looking at. Core owns
+        // this value; plugins never do.
+        if let Some(target) = self.scene_target.as_ref() {
+            target.set(self.runtime.focused_view());
+        }
         // CTX-0814 (#1397): adopt a live config change that landed on disk
         // before the tick commits, so the presented frame reflects the new
         // presentation values. The watcher is a per-tick poll; without an

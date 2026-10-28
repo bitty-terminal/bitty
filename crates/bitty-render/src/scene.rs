@@ -27,20 +27,20 @@
 //!
 //! # Integration status
 //!
-//! The present composition is wired and unit-tested, but no shipped build
-//! installs a scene host or binds panels until bitty#2785 (host install +
-//! `ui.rich` attach), so no shipped frame paints a `Scene` yet. When a
-//! `PanelRuntime` scene host with placement binds is installed,
-//! `bitty-runtime` resolves a visible panel leaf's content rect, calls
-//! `PanelRuntime::scene_paint_for`, and composes the resulting list into the
-//! frame (CTX-1630). Fills, overlay-seam glyphs, and bounded damage are
-//! produced there; a typed refusal paints nothing and keeps the previous
-//! visible scene. Two preconditions keep a shipped binary from reaching that
-//! path today (bitty#2785): (a) no production owner constructs or installs
-//! such a host, so `placement_panel_of` cannot resolve a leaf and the
-//! runtime's `scene_host` stays `None`; (b) `bitty.ui.mount` still validates
-//! through the v1 reader, so no `ui.rich` mount attaches an admitted `Scene`
-//! to a panel.
+//! The present composition is shipped (CTX-1630 + CTX-1641): the composition
+//! root constructs the `PanelRuntime` scene host, binds its `terminal`-slot
+//! panel to the focused leaf, and installs the shared handle into the runtime
+//! (`bitty#2785`). `bitty.ui.mount("terminal", node)`/`ui.update` read through
+//! the v2 rich reader, admit through `scene_bridge`, and attach with
+//! `PanelRuntime::attach_panel_scene`. `bitty-runtime` then resolves each
+//! visible panel leaf's content rect, calls `PanelRuntime::scene_paint_for`,
+//! and composes the list into the frame. Fills, overlay-seam glyphs, and
+//! bounded damage are produced there; a typed refusal paints nothing and
+//! keeps the previous visible scene.
+//!
+//! What remains open: an image node is admitted and counted
+//! ([`ScenePaint::images`]) but not yet forwarded to the admitted image plane;
+//! OQ-051 image forwarding is a separate slice.
 //!
 //! # Budgets
 //!

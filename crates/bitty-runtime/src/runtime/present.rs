@@ -1866,6 +1866,14 @@ impl Runtime {
         // `PRESENT_SETTLE_MAX` hold budget).
         self.settle_input_at = None;
         self.settle_burst_at = None;
+        // CTX-1641: the frame on screen now reflects the scene revisions it
+        // consumed, so a quiet grid does not present again until the next
+        // attach/detach/dispose.
+        self.presented_scene_revision = self
+            .scene_host
+            .as_ref()
+            .and_then(|host| host.try_borrow().ok().map(|host| host.scene_revision()))
+            .unwrap_or(self.presented_scene_revision);
     }
 
     /// Publishes `allocations` as the frame now on screen.
@@ -3040,6 +3048,17 @@ impl Runtime {
         self.reflow_present_layout(&frames);
 
         let mut pending_full = self.pending_full_redraw;
+        // CTX-1641 (bitty#2785): a plugin scene revision (ui.mount/update,
+        // suspend, dispose) owes one frame even when the grid is quiet. The
+        // shared store is the only scene owner; a borrow conflict leaves the
+        // retained frame in place and the mismatch armed for the next tick.
+        if let Some(host) = self.scene_host.as_ref() {
+            if let Ok(host) = host.try_borrow() {
+                if host.scene_revision() != self.presented_scene_revision {
+                    pending_full = true;
+                }
+            }
+        }
         // Issue #2573: a paint-only invalidation still owes one frame (the
         // drag ghost moved) but must not force the full per-leaf pass. A full
         // invalidation always owns the frame when both flags are armed.

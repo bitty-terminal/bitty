@@ -619,6 +619,54 @@ fn vertical_band_slots_fail_closed_at_mount() {
     assert!(fixture.runtime.ui_blocks().is_empty());
 }
 
+/// bitty#2785 (CTX-1641): the `terminal` slot reads through the v2 rich
+/// reader. Without an installed scene host the mount fails closed with the
+/// accepted runtime code, and the rich-only `Table` kind proving that is the
+/// reader in use (the v1 validator would report `E_UI_COMPONENT_INVALID`
+/// instead). No block is retained either way.
+#[test]
+fn terminal_slot_reads_the_rich_reader_and_fails_closed_without_a_host() {
+    let fixture = Fixture::activate(
+        "terminal-rich-reader",
+        "bitty-featured.uiterminalrich",
+        &["ui.rich"],
+        &[],
+        r#"
+        local function attempt(tree)
+          local ok, err = pcall(bitty.ui.mount, "terminal", tree)
+          return ok, ok and "NONE" or err.code
+        end
+        local table_ok, table_code = attempt({
+          kind = "Table",
+          rows = { { "v2" } },
+        })
+        local text_ok, text_code = attempt({ kind = "Text", text = "v1 shape" })
+        bitty.store.set("table_ok", table_ok)
+        bitty.store.set("table_code", table_code)
+        bitty.store.set("text_ok", text_ok)
+        bitty.store.set("text_code", text_code)
+        return {}
+        "#,
+    );
+    for kind in ["table", "text"] {
+        assert_eq!(
+            store_value(&fixture.runtime, &fixture.id, &format!("{kind}_ok")),
+            Some(LuaValue::Bool(false)),
+            "{kind}: no scene host means fail closed"
+        );
+        assert_eq!(
+            store_value(&fixture.runtime, &fixture.id, &format!("{kind}_code")),
+            Some(LuaValue::String(E_UI_UNAVAILABLE.to_string())),
+            "{kind}: the accepted runtime code names the missing surface"
+        );
+    }
+    fixture
+        .runtime
+        .services(&fixture.id)
+        .expect("services")
+        .with_ui_blocks(|blocks| assert!(blocks.is_empty()));
+}
+
 #[test]
 fn mount_loop_hits_block_budget_fail_closed() {
     let fixture = Fixture::activate_with_wall_budget(

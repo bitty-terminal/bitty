@@ -18,13 +18,19 @@
 //! | `right`      | rejected: no vertical band host in this build          |
 //! | `tabline`    | rejected: reserved for PW-10 panel tabs, not a band surface |
 //! | `overlay`    | Core focusable-overlay host (CTX-0941): retained, not a band surface |
-//! | `terminal`   | rejected: no terminal-attached block host yet          |
+//! | `terminal`   | v2 rich scene host only; the v1 band path is rejected  |
 //!
 //! Rejected slots fail closed at `ui.mount` with the existing v1 code
 //! [`E_UI_UNAVAILABLE`] (class `runtime`, "host has no surface"), after the
 //! capability and claim gates, so a plugin learns the slot is unhosted
 //! instead of rendering nothing. The message names the slot and the reason.
 //! No new code is added to the OQ-056-frozen v1 error vocabulary.
+//!
+//! `terminal` is the one slot with two readers: the v2 rich reader
+//! ([`bitty_lua::ui_rich::read_rich_component`]) and the Core scene host
+//! (`crate::scene_host::SceneHost`, bitty#2785), which attach an admitted
+//! `Scene` to the focused leaf. It is not a band, so this placement table (and
+//! the band routing that consumes it) keeps rejecting the v1 shape.
 //!
 //! Stacking: within one edge, surfaces stack from the window edge inward
 //! (index `0` is outermost) in plugin id byte order; mount order never
@@ -101,8 +107,10 @@ pub const fn ui_slot_placement(slot: UiSlot) -> UiSlotPlacement {
         // block is retained (not a band) and may own the transient input
         // capture through `bitty.ui.overlay.*`.
         UiSlot::Overlay => UiSlotPlacement::Overlay,
+        // bitty#2785: the v2 rich reader + Core scene host serve `terminal`;
+        // the v1 band tree still has no terminal-attached band host.
         UiSlot::Terminal => {
-            UiSlotPlacement::Unsupported("has no terminal-attached block host in this build yet")
+            UiSlotPlacement::Unsupported("has no v1 terminal-attached band host in this build")
         }
     }
 }

@@ -142,6 +142,13 @@ pub struct PanelRuntime {
     /// Entries follow the scene slot lifecycle: replaced on re-attach and
     /// cleared on detach or dispose.
     scene_paints: HashMap<super::panel::PanelId, ScenePaintCache>,
+    /// Monotonic scene-state revision (CTX-1641 / bitty#2785).
+    ///
+    /// Bumped by every entry that changes what a leaf would paint (attach,
+    /// detach, dispose). The present loop compares it with the revision it
+    /// last presented, so a scene mounted by a plugin on a quiet grid still
+    /// owes one frame without a separate wake channel.
+    scene_revision: u64,
 }
 
 /// Per-panel lease binding: the transition kernel plus the validated
@@ -228,7 +235,18 @@ impl PanelRuntime {
             leases: HashMap::new(),
             scenes: HashMap::new(),
             scene_paints: HashMap::new(),
+            scene_revision: 0,
         })
+    }
+
+    /// Monotonic revision of the scene slots this host owns.
+    ///
+    /// Every attach, detach, and dispose bumps it; the present loop presents
+    /// one frame when the value it last presented no longer matches, so a
+    /// plugin scene revision never waits for unrelated grid damage.
+    #[must_use]
+    pub const fn scene_revision(&self) -> u64 {
+        self.scene_revision
     }
 
     /// Borrows the underlying identity/attachment store.
@@ -370,7 +388,9 @@ impl PanelRuntime {
         if result.is_ok() {
             let _ = self.placement.unbind(id);
             self.leases.remove(&id);
-            self.scenes.remove(&id);
+            if self.scenes.remove(&id).is_some() {
+                self.scene_revision = self.scene_revision.saturating_add(1);
+            }
             self.scene_paints.remove(&id);
         }
         result
@@ -994,6 +1014,7 @@ impl PanelRuntime {
         self.registry.panel_state(handle.id, handle.generation)?;
         self.scenes.insert(handle.id, scene);
         self.scene_paints.remove(&handle.id);
+        self.scene_revision = self.scene_revision.saturating_add(1);
         Ok(())
     }
 
@@ -1013,7 +1034,11 @@ impl PanelRuntime {
     /// idempotent: the panel keeps the grid path afterwards.
     pub fn detach_panel_scene(&mut self, id: super::panel::PanelId) -> bool {
         self.scene_paints.remove(&id);
-        self.scenes.remove(&id).is_some()
+        let removed = self.scenes.remove(&id).is_some();
+        if removed {
+            self.scene_revision = self.scene_revision.saturating_add(1);
+        }
+        removed
     }
 
     /// Number of panels with an attached render scene.

@@ -17,8 +17,13 @@ use std::process::{Command, Output};
 const BITTY_BIN: &str = env!("CARGO_BIN_EXE_bitty");
 
 fn run_bitty(args: &[&str]) -> Output {
+    // Isolate store discovery from the developer's installed plugins: the
+    // default `bitty x --help` view now reads the same store as
+    // `bitty plugin list` (bitty#2774).
+    let data_home = std::env::temp_dir().join(format!("bitty-x-empty-data-{}", std::process::id()));
     Command::new(BITTY_BIN)
         .args(args)
+        .env("XDG_DATA_HOME", data_home)
         .output()
         .unwrap_or_else(|err| panic!("spawn {BITTY_BIN:?} {args:?}: {err}"))
 }
@@ -38,6 +43,79 @@ fn x_help_lists_installed_plugins() {
     let text = stdout(&out);
     assert!(text.contains("Installed plugins"), "help: {text}");
     assert!(text.contains("bitty-terminal."), "bundled set: {text}");
+}
+
+#[test]
+fn x_help_and_alias_read_installed_store_plugins() {
+    use bitty_runtime::plugin_runtime::SourceClass;
+    use bitty_runtime::plugin_runtime::resolution::{PluginRecord, write_index};
+
+    // Issue #2774: the discovery view must see the same store as
+    // `bitty plugin list`, not only the bundled catalog.
+    let data_home = std::env::temp_dir().join(format!(
+        "bitty-x-store-{}-{}",
+        std::process::id(),
+        std::line!()
+    ));
+    let _ = std::fs::remove_dir_all(&data_home);
+    let store = data_home.join("bitty").join("plugins");
+    let package = store.join("packages/xuepoo.store/1.0.0");
+    std::fs::create_dir_all(&package).expect("package dirs");
+    std::fs::write(
+        package.join("bitty-plugin.toml"),
+        "[plugin]\nid = \"xuepoo.store\"\nname = \"Store plugin\"\nversion = \"1.0.0\"\n\
+         description = \"installed from the store\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n\
+         [capabilities]\n\n[lazy]\ncommands = [\"xuepoo.store:run\"]\nevents = []\n",
+    )
+    .expect("manifest");
+    write_index(
+        &store,
+        &[PluginRecord {
+            source_class: SourceClass::Registry,
+            plugin_id: "xuepoo.store".to_string(),
+            version: "1.0.0".to_string(),
+            root: "packages/xuepoo.store/1.0.0".to_string(),
+            manifest_hash: "a".repeat(64),
+            content_digest: "b".repeat(64),
+            enabled: true,
+            granted: Vec::new(),
+        }],
+    )
+    .expect("index");
+
+    let run = |args: &[&str]| {
+        Command::new(BITTY_BIN)
+            .args(args)
+            .env("XDG_DATA_HOME", &data_home)
+            .output()
+            .unwrap_or_else(|err| panic!("spawn {args:?}: {err}"))
+    };
+    let help = run(&["x", "--help"]);
+    assert_eq!(help.status.code(), Some(0), "{}", stderr(&help));
+    let text = stdout(&help);
+    assert!(text.contains("xuepoo.store (1.0.0)"), "{text}");
+    assert!(text.contains("xuepoo.store:run"), "{text}");
+
+    let plugin_help = run(&["x", "xuepoo.store", "--help"]);
+    assert_eq!(
+        plugin_help.status.code(),
+        Some(0),
+        "{}",
+        stderr(&plugin_help)
+    );
+    assert!(stdout(&plugin_help).contains("xuepoo.store:run"));
+
+    // The short alias resolves to the store row (extension execution is
+    // still a follow-up, so the route fails closed without running code).
+    let route = run(&["x", "store", "run"]);
+    assert_eq!(route.status.code(), Some(4), "{}", stderr(&route));
+    let message = stderr(&route);
+    assert!(message.contains("xuepoo.store"), "{message}");
+    assert!(
+        message.contains("extension execution is a follow-up"),
+        "{message}"
+    );
+    let _ = std::fs::remove_dir_all(data_home);
 }
 
 #[test]

@@ -800,6 +800,14 @@ fn plugin_external_install_load_run_update_remove_live() {
     let output = run_in(&home, &["plugin", "enable", "xuepoo.external"], None);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert!(load_index(&store).expect("index")[0].enabled);
+    // bitty#2774: the store enable path prints success, not the command it
+    // just ran.
+    let text = stdout(&output);
+    assert!(text.contains("enabled: yes"), "{text}");
+    assert!(
+        !text.contains("enable: bitty plugin enable xuepoo.external"),
+        "{text}"
+    );
     assert_eq!(rt.discover().len(), 1);
     rt.activate(&id).expect("activate");
     assert_eq!(
@@ -1015,8 +1023,11 @@ fn plugin_store_install_and_enable_print_next_steps() {
     let text = stdout(&output);
     assert!(text.contains("enabled"), "{text}");
     assert!(text.contains("Next steps for 'xuepoo.onboard':"), "{text}");
+    // bitty#2774: the store enable path prints success, not the command it
+    // just ran.
+    assert!(text.contains("enabled: yes"), "{text}");
     assert!(
-        text.contains("enable: bitty plugin enable xuepoo.onboard"),
+        !text.contains("enable: bitty plugin enable xuepoo.onboard"),
         "{text}"
     );
     let portable = text.replace('\\', "/");
@@ -2486,7 +2497,7 @@ fn plugin_install_by_official_id_fetches_pin_and_records_registry_source() {
     let calls = transport.calls();
     assert!(calls.contains("fetch"), "{calls}");
     assert!(
-        calls.contains("6af2be11ee3df9f2c4fecbd73408e2c2f70a6b8c"),
+        calls.contains("0fa151395fe9d9d8b3b9dc4ba047eb13fa7b45c4"),
         "{calls}"
     );
     assert!(

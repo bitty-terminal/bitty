@@ -3897,6 +3897,19 @@ impl PluginRuntime {
         entries
     }
 
+    /// Read the sanitized plugin rows published by `Self::sync_debug_view`.
+    ///
+    /// This is the same snapshot `bitty.debug.inspect("plugins")` serves to
+    /// plugins (id, version, stable lifecycle label, generation) plus the
+    /// canonical manifest hash and declared capability ids needed by the
+    /// accepted `bitty.debug/listPlugins` / `getPlugin` result shape (issue
+    /// #2773). It is read-only metadata: no VM, store, settings value, or
+    /// terminal content is touched.
+    #[must_use]
+    pub fn debug_plugins(&self) -> Vec<debug::DebugPlugin> {
+        self.debug_view.borrow().plugins().to_vec()
+    }
+
     /// Deliver an observation/lifecycle event to every active subscriber.
     ///
     /// Returns the number of handler invocations that completed. Bounded and
@@ -4213,11 +4226,18 @@ impl PluginRuntime {
         let mut commands = Vec::new();
         let mut events = Vec::new();
         for (id, entry) in &self.entries {
+            let manifest = &entry.package.manifest;
             plugins.push(debug::DebugPlugin {
                 id: id.as_str().to_string(),
-                version: entry.package.manifest.identity.version.clone(),
+                version: manifest.identity.version.clone(),
                 state: debug::lifecycle_label(&entry.state),
                 generation: entry.generation,
+                manifest_hash: manifest.manifest_hash(),
+                capabilities: manifest
+                    .capabilities
+                    .all_ids()
+                    .map(|ids| ids.into_iter().map(|id| id.as_str().to_string()).collect())
+                    .unwrap_or_default(),
             });
             for command in &entry.registrations.commands {
                 commands.push(debug::DebugCommand {

@@ -64,6 +64,30 @@ libraries, as stated in `src/main.rs`.
   permanently. No Event-Bus exposure of observations, no secret capture,
   version negotiation fails closed (pre-`0.1.0` makes no stability claim).
 
+## Plugin inspect surface (CTX-1634, issue #2773)
+
+- `bitty.debug/listPlugins` and `bitty.debug/getPlugin` are served from a
+  process-wide store that `src/main.rs` publishes once, after the plugin
+  runtime is attached, from the runtime's sanitized `DebugView` rows. The copy
+  is a **one-shot startup snapshot**: the runtime keeps its own view current
+  after every lifecycle transition, but later lazy activation, suspension,
+  disposal, or failure is not re-published here, so the wire row can lag the
+  runtime state. Publishing from the runtime (a transition hook) is the
+  follow-up that would remove the staleness.
+- Registration is not test-mode-only: `build_dispatcher` installs the two
+  handlers on both the test-mode and the default table. The rows stay behind
+  the existing elevated `debug.inspect` / `debug.trace` / `debug.control`
+  scope check, a runtime-less run keeps the typed
+  `PluginRuntimeUnavailable` verdict, and no trace, control, VM, store,
+  settings, or terminal read is added.
+- Rows are normalized to the accepted `PluginSummary` guards before they are
+  stored: only addressable generations (`generation >= 1`) are served, at most
+  256 rows, at most 256 `capabilities` entries per row, and at most 128 bytes
+  per capability id. Declared capability ids can be longer than that bound
+  (for example a long `fs.read:<pattern>`), so unrepresentable ids are omitted
+  rather than truncated; the row stays addressable and the authoritative grant
+  set is served by the grant surfaces, never by this metadata array.
+
 ## Layout
 
 - `Cargo.toml` — binary target `bitty` at `src/main.rs` plus dependencies.

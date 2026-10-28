@@ -253,6 +253,7 @@ mod ipc_serve;
 mod layout_cmd;
 mod logging;
 mod observability;
+mod plugin_ipc;
 mod plugin_runtime;
 mod plus;
 mod prefix_dispatch;
@@ -506,7 +507,11 @@ fn main() {
     // `bitty x --help` lists the installed plugin set (local class, static
     // manifests only, never a plugin VM).
     if args.help && args.x_word && args.x_raw.is_empty() {
-        print!("{}", x::x_help_text());
+        if args.safe {
+            print!("{}", x::x_help_text());
+        } else {
+            print!("{}", x::x_help_text_with_store());
+        }
         std::process::exit(0);
     }
     // `bitty help [cmd]` introspection (issue #1900, CTX-1117, local class).
@@ -613,7 +618,11 @@ fn main() {
                     std::process::exit(0);
                 }
                 Some("x") => {
-                    print!("{}", x::x_help_text());
+                    if args.safe {
+                        print!("{}", x::x_help_text());
+                    } else {
+                        print!("{}", x::x_help_text_with_store());
+                    }
                     std::process::exit(0);
                 }
                 Some("shell-init") => {
@@ -1161,6 +1170,11 @@ fn main() {
         .as_ref()
         .map(|session| Rc::clone(&session.history));
     let plugin_runtime_handle = plugin_session.map(|session| session.runtime);
+    // Issue #2773: publish the attached runtime's sanitized lifecycle rows for
+    // the accepted `bitty.debug/listPlugins` / `getPlugin` inspect methods.
+    // This is a read-only metadata copy; the runtime stays on this thread and
+    // the IPC handlers add no scope, command, trace, or control authority.
+    plugin_ipc::publish(plugin_runtime_handle.as_ref());
 
     // CTX-2254 (bitty#2254): mirror the activated plugin policy state into the
     // runtime's own policy host so the component broker's capability gate sees

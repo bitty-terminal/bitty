@@ -3126,6 +3126,76 @@ pub(crate) fn rows_for_inspect(
     rows_from_state_with_catalog(state, store_root, false).map_err(|failure| failure.message)
 }
 
+/// One installed store plugin as seen by the VM-free discovery surfaces.
+///
+/// `bitty list plugins` and `bitty x` read the same store index and staged
+/// manifests as `bitty plugin list`, so an installed plugin never disappears
+/// from the canonical discovery view. This row carries only display metadata:
+/// no grant, settings value, VM, or plugin code participates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoreDiscoveryRow {
+    /// Store plugin id.
+    pub(crate) id: String,
+    /// Manifest display name (id when the staged body is unreadable).
+    pub(crate) name: String,
+    /// Recorded package version.
+    pub(crate) version: String,
+    /// One-line manifest description.
+    pub(crate) description: String,
+    /// Recorded enabled state.
+    pub(crate) enabled: bool,
+    /// Declared commands from the static manifest.
+    pub(crate) commands: Vec<String>,
+}
+
+/// Read installed store plugins for the VM-free discovery surfaces.
+///
+/// Read-only and fail-soft: a missing store is empty, and an unreadable index
+/// or manifest body is skipped rather than failing the listing or running
+/// plugin code. `bitty plugin list` keeps its strict error handling; discovery
+/// must stay a pure catalog read. The root is explicit so tests and callers
+/// with a resolved data root never read process environment.
+pub(crate) fn store_discovery_rows_at(store_root: Option<&Path>) -> Vec<StoreDiscoveryRow> {
+    let Some(store_root) = store_root else {
+        return Vec::new();
+    };
+    let Ok(records) = load_index(store_root) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<StoreDiscoveryRow> = records
+        .into_iter()
+        .map(|record| {
+            let manifest = read_store_manifest(store_root, &record);
+            let mut commands: Vec<String> = manifest.as_ref().map_or_else(Vec::new, |manifest| {
+                manifest
+                    .lazy
+                    .commands
+                    .iter()
+                    .map(|command| command.id.as_str().to_string())
+                    .collect()
+            });
+            commands.sort();
+            commands.dedup();
+            StoreDiscoveryRow {
+                name: manifest.as_ref().map_or_else(
+                    || record.plugin_id.clone(),
+                    |manifest| manifest.identity.name.clone(),
+                ),
+                description: manifest.as_ref().map_or_else(
+                    || format!("installed from a {} source", record.source_class.as_str()),
+                    |manifest| manifest.identity.description.clone(),
+                ),
+                id: record.plugin_id,
+                version: record.version,
+                enabled: record.enabled,
+                commands,
+            }
+        })
+        .collect();
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
+}
+
 /// Read the store index, mapping any failure to a read-only plugin error.
 fn load_store_index(
     store_root: &Path,
@@ -5549,6 +5619,7 @@ pub fn run_plugin_subcommand(
                             manifest.as_ref(),
                             config_dir.as_deref(),
                             None,
+                            false,
                         );
                     }
                     code
@@ -5583,6 +5654,7 @@ pub fn run_plugin_subcommand(
                                 manifest.as_ref(),
                                 config_dir.as_deref(),
                                 None,
+                                true,
                             );
                         }
                         code
@@ -7302,6 +7374,7 @@ fn install_local_path(
                 manifest.as_ref(),
                 config_dir,
                 Some(&installed_under),
+                false,
             );
             EXIT_OK
         }
@@ -7401,27 +7474,34 @@ fn escape_toml_basic(value: &str) -> String {
 
 /// Render post-install next steps for one plugin (CTX-1268, bitty#2144).
 ///
-/// Data-driven and display-only: the enable command, where the plugin landed,
-/// the canonical Lua settings path, the `config show` pointer, and the
-/// `bitty plugin info <id>` pointer always render; the `config scaffold`
-/// pointer renders only when `has_settings` (the manifest declares at least
-/// one `[settings]` entry), because scaffolding a settings-less manifest
-/// exits without writing anything. Manifest-provided `[hints] next_steps`
-/// lines append when the manifest declares them, otherwise the output stays
-/// clean generic.
+/// Data-driven and display-only: the enable step (or the success line when
+/// the plugin is already enabled), where the plugin landed, the canonical Lua
+/// settings path, the `config show` pointer, and the `bitty plugin info <id>`
+/// pointer always render; the `config scaffold` pointer renders only when
+/// `has_settings` (the manifest declares at least one `[settings]` entry),
+/// because scaffolding a settings-less manifest exits without writing
+/// anything. Manifest-provided `[hints] next_steps` lines append when the
+/// manifest declares them, otherwise the output stays clean generic.
 /// `installed_under` names the store package root for external installs
-/// (`None` for bundled plugins, which ship with bitty). Nothing here grants
-/// authority, writes state, or runs plugin code.
+/// (`None` for bundled plugins, which ship with bitty). `enabled` replaces
+/// the enable command with a success line after a successful enable
+/// (bitty#2774): never tell a script to run the command that just ran.
+/// Nothing here grants authority, writes state, or runs plugin code.
 fn format_next_steps(
     id: &str,
     next_steps: &[String],
     has_settings: bool,
     config_file: Option<&Path>,
     installed_under: Option<&Path>,
+    enabled: bool,
 ) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "Next steps for '{id}':");
-    let _ = writeln!(out, "  enable: bitty plugin enable {id}");
+    if enabled {
+        let _ = writeln!(out, "  enabled: yes");
+    } else {
+        let _ = writeln!(out, "  enable: bitty plugin enable {id}");
+    }
     match installed_under {
         Some(root) => {
             let _ = writeln!(out, "  installed: {}", root.display());
@@ -7498,6 +7578,7 @@ fn write_next_steps(
     manifest: Option<&PluginManifest>,
     config_dir: Option<&Path>,
     installed_under: Option<&Path>,
+    enabled: bool,
 ) {
     let config_file = plugin_config_file_display(config_dir, id);
     let next_steps: &[String] = manifest.map_or(&[], |manifest| &manifest.next_steps);
@@ -7510,7 +7591,8 @@ fn write_next_steps(
             next_steps,
             has_settings,
             config_file.as_deref(),
-            installed_under
+            installed_under,
+            enabled
         )
     );
 }
@@ -7567,6 +7649,7 @@ fn set_store_enabled(
                     manifest.as_ref(),
                     config_dir,
                     installed_under.as_deref(),
+                    enabled,
                 );
             }
             EXIT_OK
@@ -11108,7 +11191,7 @@ mod tests {
     #[test]
     fn next_steps_generic_shape_is_stable() {
         // Golden: no hints, no settings, no config root, bundled install.
-        let text = format_next_steps("xuepoo.demo", &[], false, None, None);
+        let text = format_next_steps("xuepoo.demo", &[], false, None, None, false);
         assert!(text.contains("Next steps for 'xuepoo.demo':"), "{text}");
         assert!(
             text.contains("enable: bitty plugin enable xuepoo.demo"),
@@ -11159,6 +11242,7 @@ mod tests {
             Some(Path::new(
                 "/home/u/.local/share/bitty/plugins/packages/bitty-terminal.bar/0.1.0",
             )),
+            false,
         );
         assert!(
             text.contains("configure: /home/u/.config/bitty/plugins/bitty-terminal.bar.lua"),
@@ -11189,7 +11273,14 @@ mod tests {
     fn next_steps_scaffold_pointer_follows_declared_settings() {
         // #2384: a settings-less manifest gets a softened line, never a
         // pointer at `config scaffold`, which exits 4 without writing.
-        let without = format_next_steps("bitty-terminal.shell-integration", &[], false, None, None);
+        let without = format_next_steps(
+            "bitty-terminal.shell-integration",
+            &[],
+            false,
+            None,
+            None,
+            false,
+        );
         assert!(
             without.contains("scaffold: unavailable (no [settings] declared)"),
             "{without}"
@@ -11200,7 +11291,7 @@ mod tests {
         );
 
         // A manifest that declares settings keeps the actionable pointer.
-        let with_settings = format_next_steps("xuepoo.settings", &[], true, None, None);
+        let with_settings = format_next_steps("xuepoo.settings", &[], true, None, None, false);
         assert!(
             with_settings.contains(
                 "scaffold: bitty plugin config scaffold xuepoo.settings \
@@ -11220,6 +11311,7 @@ mod tests {
             false,
             None,
             None,
+            false,
         );
         assert!(text.contains("hints:"), "{text}");
         assert!(text.contains("- Add `modules = [\"clock\"]`"), "{text}");
@@ -11303,8 +11395,10 @@ mod tests {
             out.contains("Next steps for 'bitty-terminal.shell-integration':"),
             "{out}"
         );
+        // bitty#2774: a successful enable must not print the command again.
+        assert!(out.contains("enabled: yes"), "{out}");
         assert!(
-            out.contains("enable: bitty plugin enable bitty-terminal.shell-integration"),
+            !out.contains("enable: bitty plugin enable bitty-terminal.shell-integration"),
             "{out}"
         );
         let _ = std::fs::remove_dir_all(&dir);

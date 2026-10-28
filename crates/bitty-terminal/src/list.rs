@@ -897,10 +897,46 @@ pub struct PluginInfo {
 ///
 /// Pure: reads `bundled::all_bundled_manifests()` only. Every row reports
 /// `enabled: false` because v1 bundled is staged disabled by default; this
-/// function never reads user config, so it cannot claim otherwise.
+/// function never reads user config, so it cannot claim otherwise. Callers
+/// that want the installed store too use [`list_plugins_with_store`].
 #[must_use]
 pub fn list_plugins() -> Vec<PluginInfo> {
     list_plugins_from_manifests(&bitty_plugin_host::bundled::all_bundled_manifests())
+}
+
+/// Enumerate bundled plus installed store plugins (no VM, read-only).
+///
+/// Issue #2774: `bitty list plugins` must agree with `bitty plugin list`
+/// about what is installed. Store rows come from the same `current.json`
+/// index and staged manifests with display metadata only; a missing or
+/// unreadable store contributes no rows instead of failing the listing.
+/// Bundled ids keep their bundled row.
+#[must_use]
+pub fn list_plugins_with_store() -> Vec<PluginInfo> {
+    list_plugins_with_store_at(crate::plugin_runtime::store_root().as_deref())
+}
+
+/// Store-aware plugin listing against an explicit root (tests and callers
+/// with a resolved data root).
+#[must_use]
+pub fn list_plugins_with_store_at(store_root: Option<&Path>) -> Vec<PluginInfo> {
+    let mut out = list_plugins();
+    for row in crate::plugin::store_discovery_rows_at(store_root) {
+        if out.iter().any(|plugin| plugin.id == row.id) {
+            continue;
+        }
+        out.push(PluginInfo {
+            id: row.id,
+            name: row.name,
+            version: row.version,
+            description: row.description,
+            bundled: false,
+            enabled: row.enabled,
+            commands: row.commands,
+        });
+    }
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
 }
 
 /// Test hook: render plugin rows from an explicit manifest slice (covers the
@@ -2868,7 +2904,14 @@ pub fn run_list_with_effective(
             EXIT_OK
         }
         ListKind::Plugins => {
-            let plugins = list_plugins();
+            // Issue #2774: the canonical discovery view reads the installed
+            // store, matching `bitty plugin list`. `--safe` keeps the pure
+            // bundled catalog and reads no third-party state.
+            let plugins = if safe_mode {
+                list_plugins()
+            } else {
+                list_plugins_with_store()
+            };
             match request.format {
                 ListFormat::Table => {
                     print!("{}", format_plugins_table(&plugins, request.no_color));
@@ -3050,6 +3093,13 @@ pub(crate) fn run_cli(args: &Args) -> i32 {
             run_list_with_effective(&request, &effective, args.safe)
         }
         ListKind::Services => run_list_services(&request, args.safe),
+        // Plugins threads the startup safe flag so `--safe` stays
+        // bundled-only and reads no third-party store.
+        ListKind::Plugins => run_list_with_effective(
+            &request,
+            &bitty_config::EffectiveConfig::default(),
+            args.safe,
+        ),
         _ => run_list(&request),
     }
 }
@@ -3241,6 +3291,56 @@ mod tests {
         assert!(env.contains("\"command\":\"list\""));
         assert!(env.contains("\"ok\":true"));
         assert!(env.contains("\"count\":0"));
+    }
+
+    #[test]
+    fn plugins_store_rows_join_the_canonical_listing() {
+        use bitty_runtime::plugin_runtime::SourceClass;
+        use bitty_runtime::plugin_runtime::resolution::{PluginRecord, write_index};
+
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-list-plugins-store-{}-{}",
+            std::process::id(),
+            std::line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("plugins");
+        let package = store.join("packages/xuepoo.store/1.0.0");
+        std::fs::create_dir_all(&package).expect("package dirs");
+        std::fs::write(
+            package.join("bitty-plugin.toml"),
+            "[plugin]\nid = \"xuepoo.store\"\nname = \"Store plugin\"\nversion = \"1.0.0\"\n\
+             description = \"installed from the store\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n\
+             [capabilities]\n\n[lazy]\ncommands = [\"xuepoo.store:run\"]\nevents = []\n",
+        )
+        .expect("manifest");
+        write_index(
+            &store,
+            &[PluginRecord {
+                source_class: SourceClass::Registry,
+                plugin_id: "xuepoo.store".to_string(),
+                version: "1.0.0".to_string(),
+                root: "packages/xuepoo.store/1.0.0".to_string(),
+                manifest_hash: "a".repeat(64),
+                content_digest: "b".repeat(64),
+                enabled: true,
+                granted: Vec::new(),
+            }],
+        )
+        .expect("index");
+
+        let plugins = list_plugins_with_store_at(Some(&store));
+        let row = plugins
+            .iter()
+            .find(|plugin| plugin.id == "xuepoo.store")
+            .expect("store plugin listed");
+        assert!(!row.bundled);
+        assert!(row.enabled);
+        assert_eq!(row.version, "1.0.0");
+        assert_eq!(row.commands, vec!["xuepoo.store:run".to_string()]);
+        // The safe-mode view stays bundled-only.
+        assert!(!list_plugins().iter().any(|p| p.id == "xuepoo.store"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

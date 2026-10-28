@@ -14,6 +14,7 @@ Output: ``crates/bitty-plugin-host/src/official_catalog.rs`` (checked in).
 Usage:
     scripts/generate-official-catalog.py [--registry DIR] [--output FILE]
     scripts/generate-official-catalog.py --check [--registry DIR]
+    scripts/generate-official-catalog.py --check-pins [--revision REF]
 
 The registry directory is resolved from ``--registry``, then
 ``BITTY_PLUGINS_DIR``, then ``$BITTY_WORKSPACE/bitty-plugins``, then
@@ -22,7 +23,10 @@ worktree-relative sibling. An explicit ``--registry`` or ``BITTY_PLUGINS_DIR``
 is authoritative: when it does not name a usable checkout the command fails
 instead of falling back to another tree. ``--check`` is read-only and exits
 non-zero when the checked-in file differs from a fresh rendering (the strict
-``just check-registry`` gate).
+``just check-registry`` gate). ``--check-pins`` compares only the compiled
+``pin`` fields with the registry gitlinks at ``--revision``; point it at
+``origin/main`` (``just check-registry-fresh``) to catch a plugin code change
+whose manifest hash, and therefore digest verification, stayed unchanged.
 """
 
 from __future__ import annotations
@@ -379,6 +383,87 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
     return text, len(entries), revision
 
 
+COMPILED_ENTRY_RE = re.compile(r"^\s*OfficialPlugin \{$")
+COMPILED_FIELD_RE = {
+    "id": re.compile(r'^\s*id: "((?:[^"\\]|\\.)*)",$'),
+    "repository": re.compile(r'^\s*repository: "((?:[^"\\]|\\.)*)",$'),
+    "pin": re.compile(r'^\s*pin: "([0-9a-f]{40})",$'),
+}
+
+
+def parse_compiled_entries(path: Path) -> list[dict[str, str]]:
+    """Read ``(id, repository, pin)`` from the generated Rust catalog."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise CatalogError(f"cannot read checked-in catalog {path}: {error}") from error
+    entries: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for line in lines:
+        if COMPILED_ENTRY_RE.match(line):
+            current = {}
+            entries.append(current)
+            continue
+        if current is None:
+            continue
+        if line.strip() == "},":
+            current = None
+            continue
+        for field, pattern in COMPILED_FIELD_RE.items():
+            match = pattern.match(line)
+            if match:
+                current[field] = match.group(1)
+    if not entries:
+        raise CatalogError(f"{path}: no OfficialPlugin entries found")
+    for index, entry in enumerate(entries):
+        missing = [field for field in ("id", "repository", "pin") if field not in entry]
+        if missing:
+            raise CatalogError(f"{path}: entry {index} is missing {', '.join(missing)}")
+    return entries
+
+
+def check_pins(registry: Path, revision_arg: str | None, catalog: Path) -> int:
+    """Fail when a compiled pin differs from the registry gitlink at a revision.
+
+    Unlike ``--check`` this ignores ``SOURCE_REVISION`` and unrelated registry
+    metadata, so it can be pointed at ``origin/main`` to detect a registry-side
+    code change whose manifest hash (and therefore digest verification) stayed
+    the same. Issue #2775.
+    """
+    revision = resolve_revision(registry, revision_arg)
+    # The gate reads the local ref (no fetch). Print the compared commit's date
+    # so a stale `origin/main` is visible instead of silently passing.
+    committed = run_git(registry, "show", "-s", "--format=%cI", revision).strip()
+    entries = parse_compiled_entries(catalog)
+    mismatches: list[str] = []
+    for entry in entries:
+        repository = entry["repository"]
+        repo_name = repository.removesuffix(".git").rsplit("/", 1)[-1]
+        expected = pin_for(
+            registry,
+            revision,
+            repo_name,
+            repository,
+            Path(f"<catalog entry {entry['id']}>"),
+        )
+        if entry["pin"] != expected:
+            mismatches.append(
+                f"{entry['id']}: compiled {entry['pin']} != registry {expected}"
+            )
+    if mismatches:
+        raise CatalogError(
+            f"{catalog} pins are stale for {registry} at {revision} "
+            f"(committed {committed}): "
+            + "; ".join(mismatches)
+            + " (run `just catalog-generate` and commit the result)"
+        )
+    print(
+        f"official catalog pins: OK ({len(entries)} entries, registry "
+        f"{revision} committed {committed})"
+    )
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--registry", help="bitty-plugins checkout to read")
@@ -398,11 +483,23 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="fail when the checked-in catalog is stale (no write)",
     )
+    parser.add_argument(
+        "--check-pins",
+        action="store_true",
+        help=(
+            "fail when a compiled pin differs from the registry gitlink at "
+            "--revision (ignores SOURCE_REVISION and manifest hashes)"
+        ),
+    )
     args = parser.parse_args(argv)
     try:
         registry = resolve_registry(args.registry)
-        text, count, revision = render(registry, args.revision, args.source_repository)
         output = Path(args.output)
+        if args.check_pins:
+            if args.check:
+                raise CatalogError("--check and --check-pins are mutually exclusive")
+            return check_pins(registry, args.revision, output)
+        text, count, revision = render(registry, args.revision, args.source_repository)
         if args.check:
             try:
                 existing = output.read_text(encoding="utf-8")

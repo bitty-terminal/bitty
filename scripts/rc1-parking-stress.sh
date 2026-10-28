@@ -30,6 +30,9 @@
 #   RC1_STRESS_ITERATIONS  dispatches per worker (default: 50)
 #   RC1_SUITE_WORKERS      concurrent suite probes (default: 4)
 #   RC1_SUITE_ITERATIONS   suite probe rounds per worker (default: 25)
+#   RC1_STRESS_SUITE_THREADS
+#                          nextest test threads for the real suite pass
+#                          (default: 4, the CI quality-shard width)
 #   RC1_STRESS_SUITES      space-separated test targets for the final pass
 #                          (default: every runtime suite audited by bitty#2800)
 #   RC1_STRESS_SKIP_SUITES set to `1` to run only the two probe harnesses
@@ -44,6 +47,7 @@ workers=${RC1_STRESS_WORKERS:-4}
 iterations=${RC1_STRESS_ITERATIONS:-50}
 suite_workers=${RC1_SUITE_WORKERS:-4}
 suite_iterations=${RC1_SUITE_ITERATIONS:-25}
+suite_threads=${RC1_STRESS_SUITE_THREADS:-4}
 suite_targets=${RC1_STRESS_SUITES:-"plugin_colorscheme plugin_services plugin_workspace plugin_debug plugin_config_manage plugin_ui overlay_capture_api plugin_runtime_loop plugin_settings_file plugin_timers plugin_package command_invoke plugin_runtime plugin_panel_create component_request_surface rc1_resume plugin_keymaps plugin_panel_pin trace_kinds_1828"}
 
 suite_args=()
@@ -96,4 +100,4 @@ if [[ "${RC1_STRESS_SKIP_SUITES:-0}" == "1" ]]; then
   exit 0
 fi
 
-"${scope[@]}" "${pin[@]}" cargo nextest run -p bitty-runtime "${suite_args[@]}" --locked
+"${scope[@]}" "${pin[@]}" cargo nextest run -p bitty-runtime "${suite_args[@]}" -j "$suite_threads" --locked

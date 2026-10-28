@@ -350,3 +350,51 @@ fn leaf_clipping_holds_for_a_scene_much_larger_than_the_leaf() {
         "row overflow is clipped, not painted"
     );
 }
+
+#[test]
+fn clipped_rich_line_projects_only_the_painted_cells() {
+    // A plugin can mount far more text than the leaf holds; the a11y
+    // projection must read the clipped op, never the producer's full string.
+    let full = format!("visible{}{}", "x".repeat(50), "SECRET");
+    let node = UiRichNode::Text {
+        text: full.clone(),
+        bold: false,
+    };
+    let mut scene = bitty_rich::scene::Scene::new();
+    mount(&mut scene, 1, &node);
+    let present = consume_scene_present_at(&scene, surface(), 64);
+    assert!(present.refusal.is_none());
+    let line = present.paint.text_lines().next().expect("one painted line");
+    assert_eq!(line.text, &full[..40], "clipped to the 40-cell leaf width");
+    assert!(!line.text.contains("SECRET"));
+
+    let mut host = UiSnapshotHost::new("window", "panel");
+    host.push_scene_text(SceneKind::Text, 1, &[(u32::from(line.row), line.text)])
+        .expect("bounded scene text");
+    assert_eq!(
+        host.scene_text(),
+        &[(0, full[..40].to_string())],
+        "the accessibility projection carries only painted bytes"
+    );
+}
+
+#[test]
+fn paint_cap_sheds_the_tail_from_the_paint_list_too() {
+    let mut scene = bitty_rich::scene::Scene::new();
+    for id in 1..=8u64 {
+        mount(
+            &mut scene,
+            id,
+            &UiRichNode::Text {
+                text: format!("line {id}"),
+                bold: false,
+            },
+        );
+    }
+    let present = consume_scene_present_at(&scene, surface(), 3);
+    assert!(present.refusal.is_none());
+    assert_eq!(present.block_ids.len(), 3);
+    assert_eq!(present.shed, 5);
+    assert_eq!(present.paint.plain_text(), "line 1\nline 2\nline 3");
+    assert_eq!(present.paint.block_count(), 3);
+}

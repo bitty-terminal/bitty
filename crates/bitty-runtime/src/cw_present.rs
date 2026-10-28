@@ -43,7 +43,7 @@
 //! |---|---|---|
 //! | [`CwHintEngine`] providers | [`CW_PRESENT_MAX_PROVIDERS`] (64) | register fails closed, no eviction |
 //! | provider views | [`CW_PRESENT_MAX_NONTERMINAL_ITEMS`] (64) | [`CwHintProvider::with_views`] returns `None` past the cap |
-//! | scene blocks per plan | [`CW_PRESENT_MAX_SCENE_BLOCKS`] (64) | deterministic shed of the iteration tail, [`ScenePresent::shed`] reports it |
+//! | scene blocks per plan | [`CW_PRESENT_MAX_SCENE_BLOCKS`] (64) | deterministic shed of the iteration tail, [`ScenePresent::shed`] reports it; only the admitted prefix paints |
 //! | scene paint ops per leaf | `SCENE_PAINT_MAX_OPS` (via [`bitty_render::scene`]) | typed refusal, nothing paints |
 //! | non-terminal items | [`CW_PRESENT_MAX_NONTERMINAL_ITEMS`] (64) | saturate + [`NonTerminalPresent::truncated`] |
 //! | hint labels / text | `HINT_TARGET_MAX` / `HINT_TEXT_MAX_BYTES` (via [`HintBatch`]) | shed tail, never an overlay |
@@ -592,7 +592,12 @@ pub struct ScenePresent {
     /// Blocks shed by the paint cap.
     pub shed: usize,
     /// Bounded paint list for the leaf content rect (empty without geometry).
-    pub paint: ScenePaint,
+    ///
+    /// Shared through an [`std::sync::Arc`] so a cached frame hands the same
+    /// allocation to every reader instead of copying every op and text line.
+    /// Only the admitted prefix paints: when [`Self::shed`] is non-zero the
+    /// paint list covers exactly [`Self::block_ids`], never the shed tail.
+    pub paint: std::sync::Arc<ScenePaint>,
     /// Typed refusal when the attached scene exceeded a paint budget.
     ///
     /// `Some` means nothing paints for this leaf this frame: the present path
@@ -609,7 +614,13 @@ impl ScenePresent {
         self.block_ids.len()
     }
 
-    /// True when the plan paints nothing (empty scene or a refusal).
+    /// True when the paint list carries no ops.
+    ///
+    /// Three shapes report `true`: an empty scene, a budget-only projection
+    /// (no leaf geometry, so [`Self::paint`] is empty while `block_ids` may
+    /// not be), and a refused scene ([`Self::refusal`] is `Some`). Read
+    /// `block_ids`/`refusal` to tell them apart; this predicate only answers
+    /// "does this frame paint scene pixels".
     #[must_use]
     pub fn paints_nothing(&self) -> bool {
         self.paint.is_empty()
@@ -645,12 +656,14 @@ pub fn consume_scene_present(scene: &Scene, paint_cap: usize) -> ScenePresent {
 /// Consumes [`Scene`] blocks into a bounded paint list for one leaf (OQ-051).
 ///
 /// Same budget as [`consume_scene_present`], plus the render-path conversion:
-/// [`paint_scene`](bitty_render::scene::paint_scene) lays the scene out inside
-/// `surface` (the compositor-owned
-/// leaf content rect) and returns ops clipped to that rect plus one bounded
-/// invalidation rectangle. An over-budget or over-wide scene refuses with a
-/// typed [`ScenePaintError`] in [`ScenePresent::refusal`] and paints nothing;
-/// nothing is clamped or silently substituted.
+/// [`paint_scene_prefix`](bitty_render::scene::paint_scene_prefix) lays the
+/// admitted prefix inside `surface` (the compositor-owned leaf content rect)
+/// and returns ops clipped to that rect plus one bounded invalidation
+/// rectangle. The shed tail never paints, so the paint list and
+/// [`ScenePresent::block_ids`] always describe the same blocks. An
+/// over-budget or over-wide scene refuses with a typed [`ScenePaintError`] in
+/// [`ScenePresent::refusal`] and paints nothing; nothing is clamped or
+/// silently substituted.
 #[must_use]
 pub fn consume_scene_present_at(
     scene: &Scene,
@@ -658,12 +671,14 @@ pub fn consume_scene_present_at(
     paint_cap: usize,
 ) -> ScenePresent {
     let mut present = consume_scene_present(scene, paint_cap);
-    match bitty_render::scene::paint_scene(
+    let admitted = present.block_ids.len();
+    match bitty_render::scene::paint_scene_prefix(
         scene,
+        admitted,
         surface,
         bitty_render::scene::ScenePaintBudget::default(),
     ) {
-        Ok(paint) => present.paint = paint,
+        Ok(paint) => present.paint = std::sync::Arc::new(paint),
         Err(error) => present.refusal = Some(error),
     }
     present

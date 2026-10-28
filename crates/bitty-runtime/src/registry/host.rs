@@ -34,10 +34,16 @@
 //!   binds a scene to a live panel handle (stale handles fail closed),
 //!   [`PanelRuntime::scene_present_for`] budgets the attached scene for one
 //!   present frame (missing scene yields the empty budget, never a crash),
-//!   and [`PanelRuntime::nonterminal_for_leaf`] maps `Panel`/`Browser`/
-//!   `Rich` leaves to the beyond-grid payload (`Terminal`/`Empty` stay on
-//!   the grid path). The render pipeline consumes this contract through
-//!   [`Runtime::cw_present_plan_for_host`](crate::runtime::Runtime::cw_present_plan_for_host).
+//!   [`PanelRuntime::scene_paint_for`] derives the leaf-clipped paint list
+//!   (CTX-1628), and [`PanelRuntime::nonterminal_for_leaf`] maps
+//!   `Panel`/`Browser`/`Rich` leaves to the beyond-grid payload
+//!   (`Terminal`/`Empty` stay on the grid path).
+//!
+//!   Integration status: this is the host-side contract, not yet composed
+//!   into the shipped present loop. `Runtime::cw_present_plan_for_host` is
+//!   the intended consumer and is exercised by tests only; nothing attaches a
+//!   scene from a plugin mount yet. Do not describe the render pipeline as
+//!   consuming live scenes until that composition slice lands.
 //!
 //! The runtime holds no PTY descriptor, GPU object, or OS window handle;
 //! those remain with `bitty-pty`, `bitty-render`, and `bitty-platform`.
@@ -1046,6 +1052,10 @@ impl PanelRuntime {
     /// scene and geometry are not re-laid out); `None` keeps the budget-only
     /// projection of [`PanelRuntime::scene_present_for`].
     ///
+    /// Only the admitted prefix paints: the same `paint_cap` that sheds
+    /// [`ScenePresent::block_ids`] bounds the paint list, so a leaf never
+    /// draws a block its plan reports as shed.
+    ///
     /// A panel with no attached scene paints nothing. `Terminal`, `Empty`,
     /// `Browser`, and `Rich` leaves paint nothing here: terminal content stays
     /// on the grid path, and browser/rich surfaces carry no host-owned scene
@@ -1068,13 +1078,17 @@ impl PanelRuntime {
         let Some(surface) = surface else {
             return present;
         };
+        let admitted = present.block_ids.len();
         let cache = self.scene_paints.entry(id).or_default();
-        match cache.get_or_paint(
+        match cache.get_or_paint_prefix(
             scene,
+            admitted,
             surface,
             bitty_render::scene::ScenePaintBudget::default(),
         ) {
-            Ok(paint) => present.paint = paint.clone(),
+            // The cache returns the cached `Arc`: a steady-state frame shares
+            // the paint list instead of copying every op and text line.
+            Ok(paint) => present.paint = paint,
             Err(error) => present.refusal = Some(error),
         }
         present
@@ -1494,6 +1508,10 @@ mod tests {
         assert_eq!(host.scene_paints.len(), 1);
         let cached = host.scene_paint_for(content, Some(SURFACE), 64);
         assert_eq!(first.paint, cached.paint);
+        assert!(
+            std::sync::Arc::ptr_eq(&first.paint, &cached.paint),
+            "a cached frame shares the paint allocation; it never copies it"
+        );
 
         host.attach_panel_scene(handle, scene_with_blocks(2))
             .unwrap();
@@ -1525,6 +1543,61 @@ mod tests {
         assert!(present.paint.is_empty());
         assert!(present.refusal.is_none(), "a hidden leaf is not an error");
         assert_eq!(present.block_ids, vec![BlockId(1)]);
+    }
+
+    #[test]
+    fn scene_paint_for_zero_cell_metrics_paints_nothing_instead_of_panicking() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.attach_panel_scene(handle, scene_with_blocks(1))
+            .unwrap();
+        // `CellMetrics` fields are public, so a caller can hand-build a zero
+        // cell the validated constructor refuses.
+        let zero = SceneSurface {
+            rect: SURFACE.rect,
+            cell: bitty_render::CellMetrics {
+                width: 0,
+                height: 0,
+            },
+        };
+        assert_eq!(zero.cols(), 0);
+        assert_eq!(zero.rows(), 0);
+        let present = host.scene_paint_for(ViewContent::Panel(handle.id), Some(zero), 64);
+        assert!(present.paint.is_empty());
+        assert!(present.refusal.is_none(), "a zero cell is not a refusal");
+    }
+
+    #[test]
+    fn scene_paint_for_paints_only_the_admitted_block_prefix() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.attach_panel_scene(handle, scene_with_blocks(8))
+            .unwrap();
+        let content = ViewContent::Panel(handle.id);
+        let present = host.scene_paint_for(content, Some(SURFACE), 3);
+        assert!(present.refusal.is_none());
+        assert_eq!(present.block_ids, vec![BlockId(1), BlockId(2), BlockId(3)]);
+        assert_eq!(present.shed, 5);
+        assert_eq!(
+            present.paint.plain_text(),
+            "block 1\nblock 2\nblock 3",
+            "the shed tail never paints"
+        );
+        assert_eq!(present.paint.block_count(), present.block_ids.len());
+        // The shed tail is also the cached shape: same cap reuses the list,
+        // a wider cap repaints the newly admitted blocks.
+        let cached = host.scene_paint_for(content, Some(SURFACE), 3);
+        assert!(std::sync::Arc::ptr_eq(&present.paint, &cached.paint));
+        let wider = host.scene_paint_for(content, Some(SURFACE), 4);
+        assert_eq!(wider.shed, 4);
+        assert_eq!(
+            wider.paint.plain_text(),
+            "block 1\nblock 2\nblock 3\nblock 4"
+        );
     }
 
     #[test]

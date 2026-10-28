@@ -4386,6 +4386,1005 @@
       ]
     },
     {
+      "id": "V-37",
+      "title": "Grant ttl_ms is positive and bounded by the compiled default; an accepted TTL is stored",
+      "area": "bounds",
+      "decisions": [
+        "D-14",
+        "D-18"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v37-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "session.terminal_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "v37-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller"
+            },
+            "hex_len": {
+              "attach_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "ttl_ms": 0,
+            "idempotency_key": "v37-zero"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Validation",
+            "error_code": "InvalidRequest",
+            "counts": {
+              "actual": 0,
+              "limit": 60000
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "ttl_ms": 60001,
+            "idempotency_key": "v37-over"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Validation",
+            "error_code": "InvalidRequest",
+            "counts": {
+              "actual": 60001,
+              "limit": 60000
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "ttl_ms": 1000,
+            "idempotency_key": "v37-accepted"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session_id": "@session_id",
+              "replayed": false
+            },
+            "present": [
+              "expires_at_ms"
+            ],
+            "hex_len": {
+              "grant_id": 32,
+              "grant": 64
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.host_grant",
+          "params": {
+            "action": "mint",
+            "ttl_ms": 0
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Validation",
+            "error_code": "InvalidRequest",
+            "counts": {
+              "actual": 0,
+              "limit": 300000
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.host_grant",
+          "params": {
+            "action": "mint",
+            "ttl_ms": 300001
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Validation",
+            "error_code": "InvalidRequest",
+            "counts": {
+              "actual": 300001,
+              "limit": 300000
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.host_grant",
+          "params": {
+            "action": "mint",
+            "ttl_ms": 1000
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "expires_at_ms"
+            ],
+            "hex_len": {
+              "grant_id": 32,
+              "grant": 64
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.attach_count": 1
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a zero or over-limit ttl_ms never mints a grant",
+        "a refused ttl_ms never consumes a pending-grant slot or an idempotency key"
+      ]
+    },
+    {
+      "id": "V-38",
+      "title": "A correlation-bound grant is usable only from the matching connection and revoke stays uniform",
+      "area": "grants",
+      "decisions": [
+        "D-07",
+        "D-16"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.host_grant",
+          "params": {
+            "action": "mint",
+            "client_correlation_digest": "2d8df5bfcff4e105755ad9ff7bd6a426"
+          },
+          "capture": {
+            "host_one": "grant"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "grant_id": 32,
+              "grant": 64
+            }
+          }
+        },
+        {
+          "connection": "bound",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "client_correlation": "observer-a",
+            "host_grant": "@host_one"
+          },
+          "expect": {
+            "ok": true,
+            "array": {
+              "scopes": [
+                "session.inspect",
+                "session.host",
+                "session.attach",
+                "session.control",
+                "process.spawn"
+              ]
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.host_grant",
+          "params": {
+            "action": "mint",
+            "client_correlation_digest": "2d8df5bfcff4e105755ad9ff7bd6a426"
+          },
+          "capture": {
+            "host_two": "grant"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "grant_id": 32,
+              "grant": 64
+            }
+          }
+        },
+        {
+          "connection": "wrong",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "client_correlation": "observer-b",
+            "host_grant": "@host_two"
+          },
+          "expect": {
+            "ok": true,
+            "array": {
+              "scopes": [
+                "session.inspect",
+                "session.attach",
+                "session.control",
+                "process.spawn"
+              ]
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v38-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created"
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "session.terminal_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "v38-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller"
+            },
+            "hex_len": {
+              "attach_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "observer_correlation_digest": "2d8df5bfcff4e105755ad9ff7bd6a426",
+            "idempotency_key": "v38-attach-grant"
+          },
+          "capture": {
+            "observer_grant": "grant"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "grant_id": 32,
+              "grant": 64
+            }
+          }
+        },
+        {
+          "connection": "wrong",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@observer_grant"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ObserverGrantRequired"
+          }
+        },
+        {
+          "connection": "right",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "client_correlation": "observer-a"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "right",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@observer_grant"
+          },
+          "capture": {
+            "observer_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "observer"
+            },
+            "hex_len": {
+              "attach_id": 32
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "observer_correlation_digest": "2d8df5bfcff4e105755ad9ff7bd6a426",
+            "idempotency_key": "v38-revoke-grant"
+          },
+          "capture": {
+            "revoke_grant_id": "grant_id"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "grant_id": 32,
+              "grant": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.detach",
+          "params": {
+            "attach_id": "@controller_attach"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "was_attached": true,
+              "revoked": false
+            }
+          }
+        },
+        {
+          "connection": "wrong",
+          "method": "session.grant.revoke",
+          "params": {
+            "grant_id": "@revoke_grant_id",
+            "control_token": "@controller_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "grant_id": "@revoke_grant_id",
+              "revoked": false,
+              "not_active": true
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.grant.revoke",
+          "params": {
+            "grant_id": "@revoke_grant_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "grant_id": "@revoke_grant_id",
+              "revoked": true,
+              "not_active": false
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.grant.revoke",
+          "params": {
+            "grant_id": "@revoke_grant_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "revoked": false,
+              "not_active": true
+            }
+          }
+        },
+        {
+          "connection": "right",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.attach_count": 1
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a mismatched correlation never consumes a grant or adds session.host",
+        "a mismatched correlation never revokes and never reveals that the grant exists",
+        "an observer attachment is not granted without the bound correlation"
+      ]
+    },
+    {
+      "id": "V-39",
+      "title": "A same-write and a partially sent frame behind negotiate are refused and closed",
+      "area": "handshake",
+      "decisions": [
+        "D-11",
+        "D-16"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "fake_skip": "the in-memory fake has no socket batch, so pipelined bytes cannot be expressed",
+      "setup": {
+        "host_grant": false
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "batch",
+          "action": "pipelined_negotiate",
+          "args": {
+            "second": {
+              "method": "daemon.status",
+              "params": {}
+            }
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "AlreadyNegotiated"
+          }
+        },
+        {
+          "connection": "partial",
+          "action": "pipelined_negotiate",
+          "args": {
+            "second": {
+              "method": "daemon.status",
+              "params": {}
+            },
+            "partial_body": 10
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "AlreadyNegotiated"
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": {},
+          "expect": {
+            "ok": true,
+            "result": {
+              "daemon_state": "running"
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a pipelined frame is never served after the handshake",
+        "a partially sent frame tail is never parsed as a fresh request"
+      ]
+    },
+    {
+      "id": "V-40",
+      "title": "A complete frame with an over-long id gets a typed refusal without an echoed id and closes",
+      "area": "handshake",
+      "decisions": [
+        "D-16"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "fake_skip": "the in-memory fake has no frame envelope, so an over-long id cannot be expressed",
+      "setup": {
+        "host_grant": false
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "overlong",
+          "action": "raw_request",
+          "args": {
+            "expect_eof": true,
+            "request": {
+              "v": 1,
+              "id": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+              "method": "daemon.negotiate",
+              "params": {
+                "client_version": {
+                  "major": 1,
+                  "minor": 0
+                }
+              }
+            }
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Validation",
+            "error_code": "InvalidRequest"
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": {},
+          "expect": {
+            "ok": true,
+            "result": {
+              "daemon_state": "running"
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "an over-long id is never echoed",
+        "an over-long-id refusal never leaves the connection open"
+      ]
+    },
+    {
+      "id": "V-41",
+      "title": "Generations and the transfer target accept the canonical spelling and the alias, and refuse ambiguity",
+      "area": "lifecycle",
+      "decisions": [
+        "D-03",
+        "D-18"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v41-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created"
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "session.terminal_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "v41-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller"
+            },
+            "hex_len": {
+              "attach_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "v41-grant"
+          },
+          "capture": {
+            "observer_grant": "grant"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "grant_id": 32,
+              "grant": 64
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@observer_grant"
+          },
+          "capture": {
+            "observer_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "observer"
+            },
+            "hex_len": {
+              "attach_id": 32
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.abort",
+          "params": {
+            "session_id": "@session_id",
+            "reason_class": "cancel",
+            "control_token": "@controller_token",
+            "generation": 0,
+            "expected_generation": 1
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Validation",
+            "error_code": "InvalidRequest"
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.kill",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0,
+            "expected_generation": 1
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Validation",
+            "error_code": "InvalidRequest"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.control.transfer",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0,
+            "idempotency_key": "v41-ambiguous",
+            "target_attach_id": "@observer_attach",
+            "attach_id": "11111111111111111111111111111111"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Validation",
+            "error_code": "InvalidRequest"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.control.transfer",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0,
+            "idempotency_key": "v41-transfer",
+            "target_attach_id": "@observer_attach"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "controller": "@observer_attach",
+              "previous_controller": "@controller_attach",
+              "replayed": false
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.kill",
+          "params": {
+            "session_id": "@session_id",
+            "expected_generation": 0
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "accepted": true,
+              "reason": "operator_abort",
+              "stage": "not_started",
+              "cleanup": "not_started"
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.kill",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Validation",
+            "error_code": "InvalidRequest"
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "terminated"
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "an ambiguous pair of spellings is never resolved by precedence",
+        "a missing generation is never defaulted to zero"
+      ]
+    },
+    {
       "id": "C-01",
       "title": "Instance freshness, session-id non-reuse, and terminal-id uniqueness",
       "area": "identity",

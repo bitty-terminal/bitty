@@ -2,12 +2,15 @@
 //!
 //! The request carries the client version and up to three optional values:
 //!
-//! - `client_correlation`: an audit-only consumer value bounded to 128 bytes
-//!   and valid UTF-8 with no control characters. The daemon hashes it on
-//!   receipt and records only a truncated 128-bit SHA-256 digest as
-//!   `client_correlation_digest`; the raw value is never stored, logged,
-//!   echoed, or evaluated for authorization, and a malformed value is refused
-//!   with `InvalidRequest` rather than normalized (`D-08`).
+//! - `client_correlation`: a consumer value bounded to 128 bytes and valid
+//!   UTF-8 with no control characters. The daemon hashes it on receipt and
+//!   records only a truncated 128-bit SHA-256 digest as
+//!   `client_correlation_digest`; the raw value is never stored, logged, or
+//!   echoed, and a malformed value is refused with `InvalidRequest` rather
+//!   than normalized (`D-08`). The digest is audit metadata and, when a grant
+//!   mint names it, the binding that makes the grant usable only from the
+//!   connection presenting the same correlation (see
+//!   [`GrantCorrelation`]).
 //! - `operator_capability`: the per-boot bearer that requests
 //!   `daemon.inspect` and `daemon.control`. A present but invalid bearer is
 //!   one static `Unauthenticated` refusal that closes the connection; the
@@ -52,16 +55,13 @@ pub const BEARER_HEX_BYTES: usize = 64;
 /// Domain separator for the `client_correlation_digest` hash.
 const CORRELATION_DOMAIN: &[u8] = b"bittyd:client_correlation:v1\0";
 
-/// Maximum characters of a grant correlation digest accepted on the wire.
+/// Characters of a grant correlation digest accepted on the wire.
 ///
 /// The accepted digest is the 128-bit `client_correlation_digest` encoded as
-/// 32 lowercase hex characters; the bound leaves room for a caller that
-/// presents a wider digest without ever echoing the value.
-pub const MAX_GRANT_CORRELATION_HEX: usize = 64;
-
-/// Domain separator for a grant correlation binding that is not already a
-/// 128-bit digest.
-const GRANT_CORRELATION_DOMAIN: &[u8] = b"bittyd:grant-correlation:v1\0";
+/// exactly 32 lowercase hex characters. No other width is accepted: a wider or
+/// shorter value could never equal a connection's 128-bit digest, so accepting
+/// it would mint a grant that is dead on arrival.
+pub const GRANT_CORRELATION_HEX: usize = 32;
 
 /// The accepted transport wire version, echoed in the handshake response.
 ///
@@ -137,7 +137,7 @@ pub enum CorrelationError {
     },
     /// The value contains a control character.
     ControlCharacter,
-    /// A grant correlation digest is not bounded hex.
+    /// A grant correlation digest is not exactly 32 lowercase hex characters.
     Malformed,
 }
 
@@ -153,7 +153,9 @@ impl fmt::Display for CorrelationError {
             Self::ControlCharacter => {
                 formatter.write_str("correlation contains a control character")
             }
-            Self::Malformed => formatter.write_str("correlation digest is not bounded hexadecimal"),
+            Self::Malformed => {
+                formatter.write_str("correlation digest is not 32 lowercase hexadecimal characters")
+            }
         }
     }
 }
@@ -163,49 +165,33 @@ impl std::error::Error for CorrelationError {}
 /// A 128-bit binding between a grant and the consuming connection's
 /// `client_correlation` digest.
 ///
-/// The canonical wire value is the same 32-hex `client_correlation_digest`
-/// that audit records; a wider bounded digest is accepted and reduced to the
-/// same 128-bit binding. The binding is not secret and never carries the raw
-/// correlation value.
+/// The wire value is the same 32-hex `client_correlation_digest` the handshake
+/// records, so a mint can name exactly the digest a later connection presents.
+/// The binding is not secret and never carries the raw correlation value.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct GrantCorrelation {
     binding: [u8; 16],
 }
 
 impl GrantCorrelation {
-    /// Parse a bounded hex digest (at most [`MAX_GRANT_CORRELATION_HEX`]
-    /// characters) into a grant binding.
-    ///
-    /// A 16-byte digest (32 hex characters) binds exactly; any other accepted
-    /// width is domain-separated and truncated to 128 bits, so it can never
-    /// equal a connection's 128-bit digest by accident.
+    /// Parse exactly [`GRANT_CORRELATION_HEX`] lowercase hex characters into a
+    /// grant binding.
     ///
     /// # Errors
     ///
-    /// [`CorrelationError::Malformed`] for an empty, odd-width, over-bound, or
-    /// non-hex value.
+    /// [`CorrelationError::Malformed`] for any other width or a non-lowercase
+    /// hex character.
     pub fn parse(value: &str) -> Result<Self, CorrelationError> {
         let raw = value.as_bytes();
-        if raw.is_empty() || raw.len() > MAX_GRANT_CORRELATION_HEX || raw.len() % 2 != 0 {
+        if raw.len() != GRANT_CORRELATION_HEX {
             return Err(CorrelationError::Malformed);
         }
-        let mut bytes = Vec::with_capacity(raw.len() / 2);
-        for chunk in raw.chunks_exact(2) {
+        let mut binding = [0u8; 16];
+        for (index, chunk) in raw.chunks_exact(2).enumerate() {
             let high = hex_nibble(chunk[0]).ok_or(CorrelationError::Malformed)?;
             let low = hex_nibble(chunk[1]).ok_or(CorrelationError::Malformed)?;
-            bytes.push((high << 4) | low);
+            binding[index] = (high << 4) | low;
         }
-        if bytes.len() == 16 {
-            let mut binding = [0u8; 16];
-            binding.copy_from_slice(&bytes);
-            return Ok(Self { binding });
-        }
-        let mut hasher = Sha256::new();
-        hasher.update(GRANT_CORRELATION_DOMAIN);
-        hasher.update(&bytes);
-        let digest = hasher.finalize();
-        let mut binding = [0u8; 16];
-        binding.copy_from_slice(&digest[..16]);
         Ok(Self { binding })
     }
 
@@ -899,6 +885,52 @@ mod tests {
                 .digest()
         );
         assert_eq!(correlation.digest().len(), 16);
+    }
+
+    #[test]
+    fn a_grant_correlation_digest_is_exactly_32_lowercase_hex() {
+        let digest = ClientCorrelation::parse("observer-a").expect("valid");
+        let hex = hex(&digest.digest());
+        let parsed = GrantCorrelation::parse(&hex).expect("32 lowercase hex");
+        assert_eq!(parsed, GrantCorrelation::from_digest(digest.digest()));
+        assert_eq!(parsed.as_bytes(), &digest.digest());
+        assert_ne!(
+            parsed,
+            GrantCorrelation::from_digest(
+                ClientCorrelation::parse("observer-b")
+                    .expect("valid")
+                    .digest()
+            )
+        );
+
+        // 64 hex characters (a 256-bit digest) can never equal a connection's
+        // 128-bit digest, so it is refused instead of minting a dead grant.
+        assert_eq!(
+            GrantCorrelation::parse(&"ab".repeat(32)).expect_err("64 characters"),
+            CorrelationError::Malformed
+        );
+        assert_eq!(
+            GrantCorrelation::parse(&"a".repeat(GRANT_CORRELATION_HEX - 1))
+                .expect_err("short digest"),
+            CorrelationError::Malformed
+        );
+        assert_eq!(
+            GrantCorrelation::parse(&"a".repeat(GRANT_CORRELATION_HEX + 1))
+                .expect_err("long digest"),
+            CorrelationError::Malformed
+        );
+        assert_eq!(
+            GrantCorrelation::parse(&hex.to_uppercase()).expect_err("uppercase"),
+            CorrelationError::Malformed
+        );
+        assert_eq!(
+            GrantCorrelation::parse(&"zz".repeat(16)).expect_err("non-hex"),
+            CorrelationError::Malformed
+        );
+        assert_eq!(
+            GrantCorrelation::parse("").expect_err("empty"),
+            CorrelationError::Malformed
+        );
     }
 
     #[test]

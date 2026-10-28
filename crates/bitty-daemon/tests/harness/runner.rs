@@ -116,6 +116,25 @@ pub trait Driver {
 
     fn partial_frame(&mut self, connection: &str, declared: u32, body: usize) -> Outcome;
 
+    /// Send one complete raw request envelope, including its own `id`, and
+    /// read the reply. Used where the envelope itself is the subject (an
+    /// over-long `id`) and cannot be built by the typed call path. When
+    /// `expect_eof` is set, the socket must reach EOF after the reply.
+    fn raw_request(&mut self, connection: &str, request: Value, expect_eof: bool) -> Outcome;
+
+    /// Write a `daemon.negotiate` and a second request in one batch, read the
+    /// handshake response and the typed refusal, then require EOF. With
+    /// `partial_body` set, only the leading `4 + partial_body` bytes of the
+    /// second frame are written first and the tail after the refusal, so a
+    /// partially sent frame cannot resume as a fresh request. Returns the
+    /// refusal.
+    fn pipelined_negotiate(
+        &mut self,
+        connection: &str,
+        second: &Value,
+        partial_body: Option<usize>,
+    ) -> Outcome;
+
     /// Replace the instance; every connection is gone afterwards.
     ///
     /// # Errors
@@ -418,6 +437,36 @@ fn execute_action(
             let outcome = driver.partial_frame(connection, declared, body);
             check_expect(&step.expect, &outcome, driver, connection, vars)
                 .map_err(|error| format!("partial_frame: {error}"))
+        }
+        "raw_request" => {
+            let request = step
+                .args
+                .get("request")
+                .cloned()
+                .ok_or_else(|| "raw_request needs args.request".to_owned())?;
+            let expect_eof = step
+                .args
+                .get("expect_eof")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let outcome = driver.raw_request(connection, request, expect_eof);
+            check_expect(&step.expect, &outcome, driver, connection, vars)
+                .map_err(|error| format!("raw_request: {error}"))
+        }
+        "pipelined_negotiate" => {
+            let second = step
+                .args
+                .get("second")
+                .cloned()
+                .ok_or_else(|| "pipelined_negotiate needs args.second".to_owned())?;
+            let partial_body = step
+                .args
+                .get("partial_body")
+                .and_then(Value::as_u64)
+                .map(|body| body as usize);
+            let outcome = driver.pipelined_negotiate(connection, &second, partial_body);
+            check_expect(&step.expect, &outcome, driver, connection, vars)
+                .map_err(|error| format!("pipelined_negotiate: {error}"))
         }
         "audit" => {
             let audit = step

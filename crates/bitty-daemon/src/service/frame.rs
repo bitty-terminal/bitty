@@ -228,16 +228,6 @@ impl PeerFrameReader {
         }
     }
 
-    /// Drop any partially assembled frame and return to a clean header.
-    ///
-    /// Used after a successful handshake: because the reader never reads past
-    /// the end of the current frame, the retained state is empty at that point,
-    /// but the reset makes the no-read-ahead invariant explicit and guarantees
-    /// a partially observed header can never prefix the next frame.
-    pub fn discard_buffered(&mut self) {
-        self.reset_frame();
-    }
-
     fn reset_frame(&mut self) {
         self.header.clear();
         self.declared = None;

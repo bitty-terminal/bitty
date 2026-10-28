@@ -764,15 +764,23 @@ mod unix {
                 return;
             }
             if !was_negotiated && peer.client.is_negotiated() {
-                // No pre-auth pipelining: a frame that arrived in the same
-                // read batch as a successful negotiate is not reordered behind
-                // the handshake. Drop the reader's partial state and every
-                // byte already queued on the socket, then stop reading this
-                // poll iteration. The handshake response is flushed by the
-                // caller before any later request can be sent, so the
-                // connection resumes with fresh frames.
-                peer.reader.discard_buffered();
-                discard_pipelined_input(peer, config);
+                // No pre-auth pipelining (`D-11`): every byte that arrived
+                // before the negotiate response -- a complete frame or a
+                // fragment of one -- is refused and the connection closes.
+                // The queued bytes are never parsed, so a partially sent
+                // second frame can never be resumed and parsed as a fresh
+                // request. The refusal carries no `id` because the tail is
+                // unattributable by construction; the caller flushes it
+                // before the stream closes.
+                if peer.reader.buffered_len() > 0 || input_pending(&peer.stream) {
+                    let refusal = Refusal::denied(RefusalCode::AlreadyNegotiated);
+                    record_floodable_wire(peer, service, refusal, now);
+                    if !reply_without_id(peer, refusal) {
+                        peer.close();
+                        return;
+                    }
+                    peer.retire();
+                }
                 return;
             }
             if peer.close_after_write {
@@ -895,12 +903,13 @@ mod unix {
             // `VersionMismatch` before the handshake gate.
             match wire_version {
                 None => {
+                    // The transport refuses a frame without the wire version
+                    // before the handshake gate, and the refusal is final: a
+                    // later negotiate on the same connection is never served.
                     let refusal = Refusal::invalid_request();
                     record_floodable_wire(peer, service, refusal, now);
                     let keeps_open = reply(peer, &id, Err(refusal));
-                    if negotiate_method {
-                        peer.retire();
-                    }
+                    peer.retire();
                     return keeps_open;
                 }
                 Some(version) if bitty_ipc_api::wire::validate_wire_version(version).is_err() => {
@@ -1036,42 +1045,31 @@ mod unix {
         true
     }
 
-    /// Discard bytes that arrived before the handshake response was written.
+    /// Whether the socket holds at least one unread byte.
     ///
-    /// The frame reader never reads past one frame, so anything still pending
-    /// is in the socket buffer, not in the reader. It is drained here with a
-    /// non-blocking `recv` until `EAGAIN`; the reader has already been reset,
-    /// so the next complete frame starts from a clean header. The pre-auth byte
-    /// budget bounds the drain: a client that sends more than it was allowed
-    /// before the response is retired instead of being served.
-    fn discard_pipelined_input(peer: &mut PeerIo, config: &ServerConfig) {
+    /// The frame reader never reads past the end of the current frame, so
+    /// anything that arrived before the handshake response is still in the
+    /// socket buffer. A single non-blocking `MSG_PEEK` observes it without
+    /// consuming or parsing it, which is what keeps a partial second frame
+    /// from ever becoming a fresh request. EOF and `EAGAIN` both mean nothing
+    /// is queued; an unreadable socket is treated as queued so the caller
+    /// fails closed.
+    fn input_pending(stream: &std::os::unix::net::UnixStream) -> bool {
         use std::os::fd::AsRawFd;
 
         use nix::sys::socket::{MsgFlags, recv};
 
-        let budget = usize::try_from(config.limits.effective(LimitId::PreAuthMaxBytes))
-            .unwrap_or(usize::MAX);
-        let mut discarded = 0usize;
-        let mut buffer = [0u8; 4096];
-        while discarded < budget {
-            let want = buffer.len().min(budget - discarded);
-            match recv(
-                peer.stream.as_raw_fd(),
-                &mut buffer[..want],
-                MsgFlags::MSG_DONTWAIT,
-            ) {
-                Ok(0) => return,
-                Ok(read) => discarded = discarded.saturating_add(read),
-                Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => return,
-                Err(_) => {
-                    peer.close();
-                    return;
-                }
-            }
+        let mut byte = [0u8; 1];
+        match recv(
+            stream.as_raw_fd(),
+            &mut byte,
+            MsgFlags::MSG_PEEK | MsgFlags::MSG_DONTWAIT,
+        ) {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => false,
+            Err(_) => true,
         }
-        // More pipelined bytes than the pre-auth budget: close rather than
-        // leave the tail to be interpreted as a fresh frame.
-        peer.retire();
     }
 
     /// Record a non-closing wire refusal within the per-connection budget.

@@ -724,7 +724,7 @@ fn correlation_digest(correlation: &str) -> String {
 }
 
 #[test]
-fn a_pipelined_request_behind_negotiate_is_discarded() {
+fn a_pipelined_request_behind_negotiate_is_refused() {
     let root = TempRoot::new("pipelined-handshake");
     let daemon = Daemon::start(&root);
     let capability = read_capability(&root);
@@ -744,28 +744,51 @@ fn a_pipelined_request_behind_negotiate_is_discarded() {
     assert_eq!(handshake["id"], ids[0]);
     assert_eq!(handshake["ok"], true, "{handshake}");
 
-    // The pipelined status was sent before the handshake response and must
-    // not be reordered behind it.
-    client
-        .stream
-        .set_read_timeout(Some(Duration::from_millis(400)))
-        .expect("short timeout");
-    let mut header = [0u8; 4];
+    // A frame sent before the handshake response is never served and never
+    // reordered behind the handshake: the tail is refused with a typed frame
+    // whose id is omitted because the queued bytes are not parsed.
+    let refused = client.recv();
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["error"]["class"], "Denied");
+    assert_eq!(refused["error"]["code"], "AlreadyNegotiated");
     assert!(
-        client.stream.read_exact(&mut header).is_err(),
-        "a pipelined request was answered after the handshake"
+        refused.get("id").is_none(),
+        "a pipelined tail is never parsed for an id: {refused}"
     );
-    client
-        .stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("restore timeout");
+    assert_eof(&mut client.stream, Duration::from_secs(2));
 
-    // The connection resumes with fresh frames; the fresh id proves the
-    // response belongs to the post-handshake request.
-    let status = client.call("daemon.status", json!({}));
-    assert_eq!(status["id"], "3", "{status}");
-    assert_eq!(status["ok"], true, "{status}");
-    assert_eq!(status["result"]["daemon_state"], "running");
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn a_partial_pipelined_tail_cannot_resume_as_a_request() {
+    let root = TempRoot::new("pipelined-partial");
+    let daemon = Daemon::start(&root);
+    let mut client = Client::connect(&root.endpoint());
+
+    let negotiate = encode_request(
+        "1",
+        "daemon.negotiate",
+        json!({"client_version": {"major": 1, "minor": 0}}),
+    );
+    let status = encode_request("2", "daemon.status", json!({}));
+    // The wire evidence: negotiate, then the next frame's header and 10 body
+    // bytes, with the remaining 90 bytes sent later.
+    let split = 4 + 10;
+    let mut batch = negotiate;
+    batch.extend_from_slice(&status[..split]);
+    client.stream.write_all(&batch).expect("batch");
+    let _ = client.stream.write_all(&status[split..]);
+
+    let handshake = client.recv();
+    assert_eq!(handshake["id"], "1");
+    assert_eq!(handshake["ok"], true, "{handshake}");
+    let refused = client.recv();
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["error"]["class"], "Denied");
+    assert_eq!(refused["error"]["code"], "AlreadyNegotiated");
+    assert!(refused.get("id").is_none(), "{refused}");
+    assert_eof(&mut client.stream, Duration::from_secs(2));
 
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
 }
@@ -837,6 +860,34 @@ fn an_over_long_correlation_id_gets_a_typed_refusal_and_closes() {
 }
 
 #[test]
+fn a_frame_without_a_wire_version_is_final() {
+    let root = TempRoot::new("missing-v");
+    let daemon = Daemon::start(&root);
+    let mut client = Client::connect(&root.endpoint());
+
+    client.send_raw_frame(json!({
+        "id": "no-version",
+        "method": "session.create",
+        "params": {"kind": "terminal", "idempotency_key": "missing-v"},
+    }));
+    let refused = client.recv();
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["error"]["class"], "Validation");
+    assert_eq!(refused["error"]["code"], "InvalidRequest");
+
+    // The transport refusal is final: a later negotiate on the same
+    // connection is never served.
+    let _ = client.stream.write_all(&encode_request(
+        "2",
+        "daemon.negotiate",
+        json!({"client_version": {"major": 1, "minor": 0}}),
+    ));
+    assert_eof(&mut client.stream, Duration::from_secs(2));
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
 fn grant_ttls_are_positive_and_bounded_by_the_compiled_limits() {
     let root = TempRoot::new("grant-ttl");
     let daemon = Daemon::start(&root);
@@ -856,16 +907,6 @@ fn grant_ttls_are_positive_and_bounded_by_the_compiled_limits() {
         assert_eq!(refused["error"]["counts"]["actual"], ttl);
         assert_eq!(refused["error"]["counts"]["limit"], limit);
     }
-    let over_bound_digest = session.creator.call(
-        "session.grant",
-        json!({
-            "session_id": session.session_id.clone(),
-            "observer_correlation_digest": "a".repeat(66),
-            "idempotency_key": "ttl-digest-over-bound",
-        }),
-    );
-    assert_eq!(over_bound_digest["ok"], false, "{over_bound_digest}");
-    assert_eq!(over_bound_digest["error"]["code"], "InvalidRequest");
     let accepted = session.creator.call(
         "session.grant",
         json!({
@@ -892,6 +933,111 @@ fn grant_ttls_are_positive_and_bounded_by_the_compiled_limits() {
         json!({"action": "mint", "ttl_ms": 1_000}),
     );
     assert_eq!(accepted["ok"], true, "{accepted}");
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn grant_correlation_digests_are_exact_and_method_scoped() {
+    let root = TempRoot::new("grant-digest-shape");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    let mut session = controlled_session(&root, &mut operator, "digest-shape");
+
+    // Exactly 32 lowercase hex is accepted; every other width or case is
+    // `InvalidRequest`, because it could never equal a 128-bit connection
+    // digest and would mint a grant that is dead on arrival.
+    for width in [0usize, 31, 33, 64] {
+        let refused = session.creator.call(
+            "session.grant",
+            json!({
+                "session_id": session.session_id.clone(),
+                "observer_correlation_digest": "a".repeat(width),
+                "idempotency_key": format!("digest-{width}"),
+            }),
+        );
+        assert_eq!(refused["ok"], false, "{width}: {refused}");
+        assert_eq!(refused["error"]["code"], "InvalidRequest", "{width}");
+    }
+    let uppercase = session.creator.call(
+        "session.grant",
+        json!({
+            "session_id": session.session_id.clone(),
+            "observer_correlation_digest": "AB".repeat(16),
+            "idempotency_key": "digest-uppercase",
+        }),
+    );
+    assert_eq!(uppercase["error"]["code"], "InvalidRequest", "{uppercase}");
+    // The host-grant mint takes the client digest, not the observer one.
+    let cross_host = operator.call(
+        "daemon.host_grant",
+        json!({"action": "mint", "observer_correlation_digest": "ab".repeat(16)}),
+    );
+    assert_eq!(cross_host["ok"], false, "{cross_host}");
+    assert_eq!(cross_host["error"]["code"], "InvalidRequest");
+    // The observer mint takes the observer digest, not the client one.
+    let cross_observer = session.creator.call(
+        "session.grant",
+        json!({
+            "session_id": session.session_id.clone(),
+            "client_correlation_digest": "ab".repeat(16),
+            "idempotency_key": "cross-observer",
+        }),
+    );
+    assert_eq!(cross_observer["ok"], false, "{cross_observer}");
+    assert_eq!(cross_observer["error"]["code"], "InvalidRequest");
+
+    // A digest of the right width binds and is accepted.
+    let accepted = session.creator.call(
+        "session.grant",
+        json!({
+            "session_id": session.session_id.clone(),
+            "observer_correlation_digest": correlation_digest("observer-a"),
+            "idempotency_key": "digest-exact",
+        }),
+    );
+    assert_eq!(accepted["ok"], true, "{accepted}");
+
+    // A revoke is keyless by `grant_id`; mint-only fields are refused there.
+    let minted = session.creator.call(
+        "session.grant",
+        json!({"session_id": session.session_id.clone(), "idempotency_key": "digest-revoke"}),
+    );
+    let grant_id = minted["result"]["grant_id"].as_str().expect("grant id");
+    for params in [
+        json!({"grant_id": grant_id, "ttl_ms": 1_000}),
+        json!({"grant_id": grant_id, "observer_correlation_digest": "ab".repeat(16)}),
+        json!({"grant_id": grant_id, "client_correlation_digest": "ab".repeat(16)}),
+    ] {
+        let refused = session.creator.call("session.grant.revoke", params);
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error"]["code"], "InvalidRequest", "{refused}");
+    }
+
+    let over_wide = operator.call(
+        "daemon.host_grant",
+        json!({"action": "mint", "client_correlation_digest": "ab".repeat(32)}),
+    );
+    assert_eq!(over_wide["ok"], false, "{over_wide}");
+    assert_eq!(over_wide["error"]["code"], "InvalidRequest");
+    let host = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    let host_id = host["result"]["grant_id"].as_str().expect("host grant id");
+    for params in [
+        json!({"action": "revoke", "grant_id": host_id, "ttl_ms": 1_000}),
+        json!({"action": "revoke", "grant_id": host_id, "client_correlation_digest": "ab".repeat(16)}),
+        json!({"action": "revoke", "grant_id": host_id, "observer_correlation_digest": "ab".repeat(16)}),
+    ] {
+        let refused = operator.call("daemon.host_grant", params);
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error"]["code"], "InvalidRequest", "{refused}");
+    }
+    let revoked = operator.call(
+        "daemon.host_grant",
+        json!({"action": "revoke", "grant_id": host_id}),
+    );
+    assert_eq!(revoked["result"]["revoked"], true, "{revoked}");
 
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
 }
@@ -1010,13 +1156,16 @@ fn grant_correlation_bindings_gate_consume_attach_and_revoke() {
         "session.grant.revoke",
         json!({"grant_id": grant_id, "control_token": session.controller_token.clone()}),
     );
-    assert_eq!(denied["ok"], false, "{denied}");
-    assert_eq!(denied["error"]["class"], "NotFound");
-    assert_eq!(denied["error"]["code"], "NotFound");
+    // A correlation mismatch is byte-identical to the unknown-grant answer:
+    // the mismatch must not be an existence oracle, and nothing is revoked.
+    assert_eq!(denied["ok"], true, "{denied}");
+    assert_eq!(denied["result"]["grant_id"], grant_id, "{denied}");
+    assert_eq!(denied["result"]["revoked"], false, "{denied}");
+    assert_eq!(denied["result"]["not_active"], true, "{denied}");
 
     // The observer lease itself cannot hold the control relation; a fresh
     // connection with the matching correlation and the vacant-control token
-    // can revoke.
+    // can revoke. It succeeds, proving the stranger's call revoked nothing.
     let mut right_revoke = Client::connect(&root.endpoint());
     assert_eq!(
         right_revoke.negotiate_full(None, None, Some("observer-a"))["ok"],

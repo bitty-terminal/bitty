@@ -1307,6 +1307,11 @@ impl Service {
         fields: Option<&Map<String, Value>>,
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
+        // `observer_correlation_digest` belongs to `session.grant`; a field
+        // for another method is refused instead of silently ignored.
+        if presence(fields, "observer_correlation_digest") {
+            return Err(Refusal::invalid_request());
+        }
         let action = required_string(fields, "action")?;
         let ttl_ms = optional_ttl(
             fields,
@@ -1800,6 +1805,11 @@ impl Service {
         fields: Option<&Map<String, Value>>,
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
+        // `client_correlation_digest` belongs to `daemon.host_grant`; a field
+        // for another method is refused instead of silently ignored.
+        if presence(fields, "client_correlation_digest") {
+            return Err(Refusal::invalid_request());
+        }
         let session_id = parse_session_id(fields)?;
         let key = self.idempotency_key(fields)?;
         let token = optional_control_token(fields)?;
@@ -1954,7 +1964,7 @@ impl Service {
         fields: Option<&Map<String, Value>>,
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
-        // `ttl_ms` and `observer_correlation_digest` are mint fields. They are
+        // `ttl_ms` and both correlation-digest fields are mint-only. They are
         // refused here rather than silently ignored; a revoke matches the
         // stored binding against the acting connection instead.
         if optional_ttl(
@@ -1963,7 +1973,8 @@ impl Service {
             self.limits.effective(LimitId::ObserverGrantTtlMs),
         )?
         .is_some()
-            || optional_grant_correlation(fields, "observer_correlation_digest")?.is_some()
+            || presence(fields, "observer_correlation_digest")
+            || presence(fields, "client_correlation_digest")
         {
             return Err(Refusal::invalid_request());
         }
@@ -1976,17 +1987,29 @@ impl Service {
         // not already hold.
         let retained = self.grants.observer_grant_session_retained(grant_id);
         if let Some(session_id) = retained {
-            // A grant minted for another correlation is indistinguishable
-            // from an invisible grant for a non-operator caller. The operator
-            // path keeps the contract's "operator may revoke any grant"
-            // authority and is not correlation-gated.
+            // A non-operator caller whose correlation does not match the
+            // grant's binding gets exactly the unknown-grant answer, with no
+            // revocation attempted: anything else would turn the 128-bit id
+            // into an existence oracle for the binding. The operator path
+            // keeps the contract's "operator may revoke any grant" authority
+            // and is not correlation-gated.
             if !self.is_operator(connection)
                 && self
                     .grants
                     .observer_grant_correlation(grant_id, connection_correlation(connection))
                     == Some(false)
             {
-                return Err(Refusal::not_found());
+                self.record(
+                    AuditAction::GrantRevoke,
+                    connection,
+                    None,
+                    AuditTarget::grant(*grant_id.as_bytes()),
+                    AuditResult::Ok,
+                    None,
+                    None,
+                    now,
+                );
+                return Ok(not_active_grant(grant_id));
             }
             let token = optional_control_token(fields)?;
             let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
@@ -2026,10 +2049,16 @@ impl Service {
             None,
             now,
         );
+        if outcome == RevokeOutcome::NotActive {
+            // The unknown, swept, and correlation-mismatched cases share one
+            // success descriptor so the response cannot disclose which one it
+            // was.
+            return Ok(not_active_grant(grant_id));
+        }
         Ok(json!({
             "grant_id": grant_id.as_hex(),
-            "revoked": outcome == RevokeOutcome::Revoked,
-            "not_active": outcome == RevokeOutcome::NotActive,
+            "revoked": true,
+            "not_active": false,
         }))
     }
 
@@ -2606,8 +2635,25 @@ fn optional_ttl(
     Ok(Some(ttl))
 }
 
-/// An optional grant correlation digest (bounded hex, at most
-/// [`MAX_GRANT_CORRELATION_HEX`] characters).
+/// The one success descriptor for a revoke that revoked nothing.
+///
+/// An unknown grant id, a swept record, and a correlation mismatch must be
+/// indistinguishable to the caller.
+fn not_active_grant(grant_id: GrantId) -> Value {
+    json!({
+        "grant_id": grant_id.as_hex(),
+        "revoked": false,
+        "not_active": true,
+    })
+}
+
+/// Whether the depth-1 request object carries `key`, whatever its value.
+fn presence(fields: Option<&Map<String, Value>>, key: &str) -> bool {
+    fields.is_some_and(|fields| fields.contains_key(key))
+}
+
+/// An optional grant correlation digest (exactly
+/// [`crate::handshake::GRANT_CORRELATION_HEX`] lowercase hex characters).
 fn optional_grant_correlation(
     fields: Option<&Map<String, Value>>,
     key: &str,

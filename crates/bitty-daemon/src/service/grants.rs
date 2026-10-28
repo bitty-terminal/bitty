@@ -254,9 +254,9 @@ pub struct ConsumedGrant {
 /// The result of a revoke.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevokeOutcome {
-    /// An unconsumed, unexpired grant was revoked.
+    /// A live grant, or a consumed-but-unexpired host grant, was revoked.
     Revoked,
-    /// The grant is unknown, consumed, expired, or already revoked.
+    /// The grant is unknown, consumed (observer), expired, or already revoked.
     NotActive,
 }
 
@@ -622,6 +622,13 @@ impl GrantStore {
     /// `daemon.host_grant` revokes host consent and `session.grant.revoke`
     /// revokes observer grants; a wrong-kind id is `NotActive`, never a
     /// cross-kind revoke.
+    ///
+    /// A host grant stays revocable after it is consumed: the consuming
+    /// connection's create authority is derived from the record, so an
+    /// operator must be able to withdraw it before its TTL. The record itself
+    /// is retained until the TTL (see [`Self::evict_expired`]) so
+    /// [`Self::host_grant_bound`] can answer `false` for the bound connection.
+    /// Observer grants keep the unconsumed-and-unexpired rule.
     pub fn revoke_kind(
         &mut self,
         grant_id: GrantId,
@@ -631,7 +638,12 @@ impl GrantStore {
         let Some(record) = self.grants.get_mut(&grant_id) else {
             return RevokeOutcome::NotActive;
         };
-        if record.kind != kind || !record.is_active(now_ms) {
+        let revocable = record.is_active(now_ms)
+            || (kind == GrantKind::Host
+                && record.consumed
+                && !record.revoked
+                && now_ms < record.expires_at_ms);
+        if record.kind != kind || !revocable {
             return RevokeOutcome::NotActive;
         }
         record.revoked = true;
@@ -864,6 +876,59 @@ mod tests {
         assert_eq!(
             store.revoke_kind(GrantId::generate().expect("entropy"), GrantKind::Host, 12),
             RevokeOutcome::NotActive
+        );
+    }
+
+    #[test]
+    fn a_consumed_host_grant_is_revocable_until_its_ttl() {
+        let mut store = store();
+        let minted = store.mint_host(1000, 10).expect("mint");
+        let expires_at = minted.expires_at_ms;
+        store
+            .consume(&minted.bearer, GrantKind::Host, 1000, None, 11)
+            .expect("consume");
+        assert!(store.host_grant_bound(minted.grant_id, 1000, 12));
+
+        assert_eq!(
+            store.revoke_kind(minted.grant_id, GrantKind::Host, 12),
+            RevokeOutcome::Revoked,
+            "a consumed host grant stays revocable before its TTL"
+        );
+        assert!(
+            !store.host_grant_bound(minted.grant_id, 1000, 12),
+            "the bound connection loses create authority at revoke time"
+        );
+        assert_eq!(store.len(), 1, "the record is retained for the sweep");
+        assert_eq!(
+            store.revoke_kind(minted.grant_id, GrantKind::Host, 12),
+            RevokeOutcome::NotActive,
+            "a second revoke is not active"
+        );
+        assert_eq!(store.evict_expired(expires_at), 1);
+    }
+
+    #[test]
+    fn observer_revoke_keeps_the_unconsumed_rule() {
+        let mut store = store();
+        let minted = store.mint_observer(session(), 1000, 10).expect("mint");
+        let session_id = store
+            .grants
+            .get(&minted.grant_id)
+            .and_then(|record| record.session_id)
+            .expect("session");
+        store
+            .consume(
+                &minted.bearer,
+                GrantKind::Observer,
+                1000,
+                Some(session_id),
+                11,
+            )
+            .expect("consume");
+        assert_eq!(
+            store.revoke_kind(minted.grant_id, GrantKind::Observer, 12),
+            RevokeOutcome::NotActive,
+            "a consumed observer grant is no longer active"
         );
     }
 

@@ -601,6 +601,14 @@ connection's create, every other inactive record is dropped immediately, and
 sweep) so the store cannot grow with total mints. A mint at the total bound is a
 whole `LimitExceeded` refusal and never evicts a live record.
 
+A consumed host grant stays revocable until its TTL: `daemon.host_grant`
+`revoke` marks the record revoked and clears any retained bearer, so the
+consuming connection's next `session.create` — including a keyed replay of a
+key already applied on that connection — is `Denied/ConsentRequired`
+immediately rather than at the 300 s TTL. The record is still retained until
+the TTL so the bound connection sees the false `host_grant_bound` answer.
+Observer grants keep the unconsumed-and-unexpired revoke rule.
+
 ### Dispatch order
 
 `service::dispatch` implements the eleven stages: transport, pre-auth, service

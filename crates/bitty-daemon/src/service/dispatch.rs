@@ -2548,6 +2548,14 @@ mod tests {
     }
 
     fn mint_host_grant(service: &mut Service, operator: &mut Connection, now: u64) -> String {
+        mint_host_grant_pair(service, operator, now).1
+    }
+
+    fn mint_host_grant_pair(
+        service: &mut Service,
+        operator: &mut Connection,
+        now: u64,
+    ) -> (String, String) {
         let result = service
             .dispatch(
                 operator,
@@ -2556,7 +2564,10 @@ mod tests {
                 MonotonicMs::from_millis(now),
             )
             .expect("host grant");
-        result["grant"].as_str().expect("bearer").to_owned()
+        (
+            result["grant_id"].as_str().expect("grant id").to_owned(),
+            result["grant"].as_str().expect("bearer").to_owned(),
+        )
     }
 
     fn create_session(service: &mut Service, connection: &mut Connection, key: &str) -> Value {
@@ -2728,6 +2739,70 @@ mod tests {
             )
             .expect_err("no consent");
         assert_eq!(error.denied_code(), Some(RefusalCode::ConsentRequired));
+    }
+
+    #[test]
+    fn a_consumed_host_grant_revoke_withdraws_create_and_its_replay() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let (grant_id, grant) = mint_host_grant_pair(&mut service, &mut operator, 2);
+
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        let created = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionCreate,
+                &json!({"kind": "terminal", "idempotency_key": "revoke-k1"}),
+                MonotonicMs::from_millis(4),
+            )
+            .expect("create");
+        assert!(created["session"]["session_id"].is_string());
+        assert_eq!(
+            service
+                .host()
+                .snapshots(MonotonicMs::from_millis(4))
+                .count(),
+            1
+        );
+
+        let revoked = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonHostGrant,
+                &json!({"action": "revoke", "grant_id": grant_id}),
+                MonotonicMs::from_millis(5),
+            )
+            .expect("revoke");
+        assert_eq!(revoked["revoked"], true);
+        assert_eq!(revoked["not_active"], false);
+
+        // Both the fresh key and the already-applied key are refused: the
+        // revoke withdraws the create authority before the idempotency store is
+        // consulted, so a keyed replay cannot resurrect a session.
+        for (index, key) in ["revoke-k1", "revoke-k2"].into_iter().enumerate() {
+            let error = service
+                .dispatch(
+                    &mut creator,
+                    ServiceMethod::SessionCreate,
+                    &json!({"kind": "terminal", "idempotency_key": key}),
+                    MonotonicMs::from_millis(6 + index as u64),
+                )
+                .expect_err("no consent");
+            assert_eq!(error.denied_code(), Some(RefusalCode::ConsentRequired));
+        }
+        assert_eq!(
+            service
+                .host()
+                .snapshots(MonotonicMs::from_millis(8))
+                .count(),
+            1,
+            "the refused replay created no second session"
+        );
     }
 
     #[test]

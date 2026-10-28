@@ -236,12 +236,18 @@ mod unix {
             let audit_dir = default_audit_dir().ok_or(ServerError::NoAuditDirectory)?;
             let mut transport_scopes = bitty_ipc_api::scope::ScopeSet::new();
             transport_scopes.insert(bitty_ipc_api::scope::Scope::ProcessSpawn);
+            // The seam exists only in debug builds: a release daemon always
+            // re-attests at the frozen interval, so the variable cannot shorten
+            // production behaviour even if it is present in the environment.
+            #[cfg(debug_assertions)]
             let tamper_interval_ms = std::env::var(TEST_TAMPER_INTERVAL_ENV)
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
                 .map_or(TAMPER_INTERVAL_MS, |value| {
                     value.clamp(1, TAMPER_INTERVAL_MS)
                 });
+            #[cfg(not(debug_assertions))]
+            let tamper_interval_ms = TAMPER_INTERVAL_MS;
             Ok(Self {
                 limits: Limits::default(),
                 endpoint_env: EndpointEnv::from_process(),

@@ -701,6 +701,12 @@ flushes its pending window so no suppression is lost. The aggregate is
 fixed-size and cannot rotate the segments by itself, so a refusal flood stays
 bounded without becoming invisible.
 
+The re-attestation interval is the frozen `TAMPER_INTERVAL_MS` in every release
+build. Debug builds honour `BITTYD_TEST_TAMPER_INTERVAL_MS` (clamped to
+`1..=TAMPER_INTERVAL_MS`) only so the tamper-flush regression test can keep a
+refusal-audit window open across the tamper check; the variable is compiled out
+of release builds and can never lengthen the interval.
+
 ### Per-frame peer credentials
 
 On Linux the accepted socket enables `SO_PASSCRED` before the first read, and

@@ -2193,12 +2193,12 @@ fn op_install(
         let _ = match version_flag {
             Some(version) => writeln!(
                 output,
-                "bitty extension: --yes approved download of '{name}' version {version} from {} (hash-verified against SHA256SUMS and the catalog; unsigned build, TOFU-pinned)",
+                "bitty extension: --yes approved download of '{name}' version {version} from {} (will verify against SHA256SUMS and the catalog before unpacking; unsigned build, TOFU-pinned)",
                 crate::component_seed::BUILTIN_INSTALLER_EGRESS
             ),
             None => writeln!(
                 output,
-                "bitty extension: --yes approved latest-resolution and download of '{name}' ({target}) from {} (hash-verified against SHA256SUMS and the catalog; unsigned build, TOFU-pinned)",
+                "bitty extension: --yes approved latest-resolution and download of '{name}' ({target}) from {} (will verify against SHA256SUMS and the catalog before unpacking; unsigned build, TOFU-pinned)",
                 crate::component_seed::BUILTIN_INSTALLER_EGRESS
             ),
         };

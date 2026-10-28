@@ -58,8 +58,8 @@ use crate::audit_sink::{AuditSink, AuditWriter};
 use crate::codes::RefusalCode;
 use crate::contract::CAPABILITIES;
 use crate::handshake::{
-    ClientCorrelation, DaemonState, HandshakeContext, HandshakeResponse, NegotiateRequest,
-    PeerIdentityFacts, ServerIdentity,
+    ClientCorrelation, DaemonState, GrantCorrelation, HandshakeContext, HandshakeResponse,
+    NegotiateRequest, PeerIdentityFacts, ServerIdentity,
 };
 use crate::idempotency::{
     Admission, AppliedClass, AppliedResult, Fingerprint, IdempotencyKey, IdempotencyRefusal,
@@ -682,12 +682,23 @@ impl Service {
             }
         }
 
+        // The correlation digest is part of the connection's identity binding,
+        // so it is recorded before a host grant is consumed: a grant minted
+        // with `client_correlation_digest` is usable only from the connection
+        // whose digest matches.
+        connection.set_correlation_digest(
+            request
+                .client_correlation
+                .as_ref()
+                .map(ClientCorrelation::digest),
+        );
         if let Some(presented) = request.host_grant.as_ref() {
-            if let Ok(consumed) = self.grants.consume(
+            if let Ok(consumed) = self.grants.consume_to(
                 presented,
                 GrantKind::Host,
                 connection.peer_uid(),
                 None,
+                connection_correlation(connection),
                 now.as_millis(),
             ) {
                 connection
@@ -698,12 +709,6 @@ impl Service {
             }
         }
 
-        connection.set_correlation_digest(
-            request
-                .client_correlation
-                .as_ref()
-                .map(ClientCorrelation::digest),
-        );
         connection.mark_negotiated();
 
         let _ = self.audit.record(
@@ -1303,13 +1308,19 @@ impl Service {
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
         let action = required_string(fields, "action")?;
+        let ttl_ms = optional_ttl(
+            fields,
+            "ttl_ms",
+            self.limits.effective(LimitId::HostGrantTtlMs),
+        )?;
+        let correlation = optional_grant_correlation(fields, "client_correlation_digest")?;
         match action {
             "mint" => {
                 self.recheck(connection, DispatchBoundary::HostGrantMint)?;
                 self.admit()?;
                 let minted = self
                     .grants
-                    .mint_host(connection.peer_uid(), now.as_millis())
+                    .mint_host_with(connection.peer_uid(), correlation, ttl_ms, now.as_millis())
                     .map_err(map_mint)?;
                 self.record(
                     AuditAction::HostGrant,
@@ -1328,6 +1339,13 @@ impl Service {
                 }))
             }
             "revoke" => {
+                // `ttl_ms` and `client_correlation_digest` are mint fields.
+                // Rejecting them on revoke is the no-silent-ignore rule; the
+                // revoke path matches the stored binding against this
+                // operator connection instead.
+                if ttl_ms.is_some() || correlation.is_some() {
+                    return Err(Refusal::invalid_request());
+                }
                 let grant_id = parse_grant_id(fields)?;
                 self.recheck(connection, DispatchBoundary::HostGrantRevoke)?;
                 self.admit()?;
@@ -1375,10 +1393,12 @@ impl Service {
             .host_grant()
             .map(GrantId::from_bytes)
             .ok_or_else(|| Refusal::denied(RefusalCode::ConsentRequired))?;
-        if !self
-            .grants
-            .host_grant_bound(grant_id, connection.peer_uid(), now.as_millis())
-        {
+        if !self.grants.host_grant_bound_to(
+            grant_id,
+            connection.peer_uid(),
+            connection_correlation(connection),
+            now.as_millis(),
+        ) {
             return Err(Refusal::denied(RefusalCode::ConsentRequired));
         }
 
@@ -1698,11 +1718,12 @@ impl Service {
         // Stage 7: a valid single-use grant is the derived authority. Validate
         // before the lease exists so a refused attach does not burn it.
         self.grants
-            .validate(
+            .validate_to(
                 &grant,
                 GrantKind::Observer,
                 connection.peer_uid(),
                 Some(session_id),
+                connection_correlation(connection),
                 now.as_millis(),
             )
             .map_err(|_| Refusal::denied(RefusalCode::ObserverGrantRequired))?;
@@ -1713,11 +1734,12 @@ impl Service {
                 let attach_id = attached.lease.attach_id();
                 if self
                     .grants
-                    .consume(
+                    .consume_to(
                         &grant,
                         GrantKind::Observer,
                         connection.peer_uid(),
                         Some(session_id),
+                        connection_correlation(connection),
                         now.as_millis(),
                     )
                     .is_err()
@@ -1781,6 +1803,12 @@ impl Service {
         let session_id = parse_session_id(fields)?;
         let key = self.idempotency_key(fields)?;
         let token = optional_control_token(fields)?;
+        let ttl_ms = optional_ttl(
+            fields,
+            "ttl_ms",
+            self.limits.effective(LimitId::ObserverGrantTtlMs),
+        )?;
+        let correlation = optional_grant_correlation(fields, "observer_correlation_digest")?;
         let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
         // Contract: a mint for a terminal session is `NotRunning`. This
         // precedes the keyed admission deliberately: the terminal transition
@@ -1794,7 +1822,16 @@ impl Service {
         }
         let _authority =
             self.control_authority(connection, session_id, token.as_ref(), true, now)?;
-        let fingerprint = fingerprint(&["grant", &session_id.as_hex()]);
+        // A keyed duplicate with a different TTL or correlation binding is a
+        // different request, not a descriptor replay: returning the first
+        // grant would silently ignore the accepted optional fields.
+        let ttl_part = ttl_ms.map_or_else(|| "default".to_owned(), |ttl| ttl.to_string());
+        let correlation_part = correlation.map_or_else(
+            || "none".to_owned(),
+            |correlation| crate::handshake::hex(correlation.as_bytes()),
+        );
+        let fingerprint =
+            fingerprint(&["grant", &session_id.as_hex(), &ttl_part, &correlation_part]);
         let request = IdempotentRequest::new(
             key,
             IdempotentMethod::Grant,
@@ -1838,9 +1875,13 @@ impl Service {
                         .complete(reservation, IdempotencyResult::Refused(store_code(error)));
                     return Err(error);
                 }
-                let minted =
-                    self.grants
-                        .mint_observer(session_id, connection.peer_uid(), now.as_millis());
+                let minted = self.grants.mint_observer_with(
+                    session_id,
+                    connection.peer_uid(),
+                    correlation,
+                    ttl_ms,
+                    now.as_millis(),
+                );
                 match minted {
                     Ok(minted) => {
                         // `D-03` counts the observer-grant mint as its own
@@ -1913,6 +1954,19 @@ impl Service {
         fields: Option<&Map<String, Value>>,
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
+        // `ttl_ms` and `observer_correlation_digest` are mint fields. They are
+        // refused here rather than silently ignored; a revoke matches the
+        // stored binding against the acting connection instead.
+        if optional_ttl(
+            fields,
+            "ttl_ms",
+            self.limits.effective(LimitId::ObserverGrantTtlMs),
+        )?
+        .is_some()
+            || optional_grant_correlation(fields, "observer_correlation_digest")?.is_some()
+        {
+            return Err(Refusal::invalid_request());
+        }
         let grant_id = parse_grant_id(fields)?;
         // Stage 7/8 first: a retained record (even one that is consumed,
         // expired, or revoked) still names its session, so the uniform
@@ -1922,6 +1976,18 @@ impl Service {
         // not already hold.
         let retained = self.grants.observer_grant_session_retained(grant_id);
         if let Some(session_id) = retained {
+            // A grant minted for another correlation is indistinguishable
+            // from an invisible grant for a non-operator caller. The operator
+            // path keeps the contract's "operator may revoke any grant"
+            // authority and is not correlation-gated.
+            if !self.is_operator(connection)
+                && self
+                    .grants
+                    .observer_grant_correlation(grant_id, connection_correlation(connection))
+                    == Some(false)
+            {
+                return Err(Refusal::not_found());
+            }
             let token = optional_control_token(fields)?;
             let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
             // `D-03`/terminal rule: a frozen record is read-only and every
@@ -2074,8 +2140,8 @@ impl Service {
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
         let session_id = parse_session_id(fields)?;
-        let target = parse_attach_id(fields)?;
-        let expected_generation = required_u64(fields, "expected_generation")?;
+        let target = parse_target_attach_id(fields)?;
+        let expected_generation = generation_field(fields)?;
         let token = optional_control_token(fields)?;
         let key = self.idempotency_key(fields)?;
         let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
@@ -2186,7 +2252,7 @@ impl Service {
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
         let session_id = parse_session_id(fields)?;
-        let expected_generation = required_u64(fields, "expected_generation")?;
+        let expected_generation = generation_field(fields)?;
         let reason = required_string(fields, "reason_class")?;
         let token = optional_control_token(fields)?;
         let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
@@ -2250,7 +2316,7 @@ impl Service {
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
         let session_id = parse_session_id(fields)?;
-        let expected_generation = required_u64(fields, "expected_generation")?;
+        let expected_generation = generation_field(fields)?;
         let snapshot = self.visible(connection, session_id, None, now)?;
         if snapshot.state.is_terminal() {
             return Ok(json!({
@@ -2476,6 +2542,90 @@ fn parse_attach_id(fields: Option<&Map<String, Value>>) -> Result<AttachId, Refu
     required_string(fields, "attach_id")?
         .parse()
         .map_err(|_| Refusal::invalid_request())
+}
+
+/// The canonical `target_attach_id` with the deprecated `attach_id` alias.
+///
+/// `session.control.transfer` uses `target_attach_id` in the accepted
+/// session-host contract. The old spelling is accepted for one release; both
+/// present with different values is ambiguous and refused rather than guessed.
+fn parse_target_attach_id(fields: Option<&Map<String, Value>>) -> Result<AttachId, Refusal> {
+    let canonical = fields.and_then(|fields| fields.get("target_attach_id"));
+    let alias = fields.and_then(|fields| fields.get("attach_id"));
+    let value = match (canonical, alias) {
+        (Some(canonical), Some(alias)) if canonical != alias => {
+            return Err(Refusal::invalid_request());
+        }
+        (Some(canonical), _) => canonical,
+        (None, Some(alias)) => alias,
+        (None, None) => return Err(Refusal::invalid_request()),
+    };
+    value
+        .as_str()
+        .ok_or_else(Refusal::invalid_request)?
+        .parse()
+        .map_err(|_| Refusal::invalid_request())
+}
+
+/// The canonical `generation` with the deprecated `expected_generation` alias.
+///
+/// `session.abort`, `session.kill`, and `session.control.transfer` use
+/// `generation` in the accepted session-host contract; `session.attach` keeps
+/// `expected_generation`. The old spelling is accepted for one release, and an
+/// ambiguous pair is refused.
+fn generation_field(fields: Option<&Map<String, Value>>) -> Result<u64, Refusal> {
+    let canonical = fields.and_then(|fields| fields.get("generation"));
+    let alias = fields.and_then(|fields| fields.get("expected_generation"));
+    let value = match (canonical, alias) {
+        (Some(canonical), Some(alias)) if canonical != alias => {
+            return Err(Refusal::invalid_request());
+        }
+        (Some(canonical), _) => canonical,
+        (None, Some(alias)) => alias,
+        (None, None) => return Err(Refusal::invalid_request()),
+    };
+    value.as_u64().ok_or_else(Refusal::invalid_request)
+}
+
+/// An optional positive `ttl_ms` no greater than the compiled limit.
+///
+/// Zero and over-limit values are `InvalidRequest` with the observed value and
+/// the compiled bound; a non-integer is `InvalidRequest` without counts.
+fn optional_ttl(
+    fields: Option<&Map<String, Value>>,
+    key: &str,
+    limit_ms: u64,
+) -> Result<Option<u64>, Refusal> {
+    let Some(value) = fields.and_then(|fields| fields.get(key)) else {
+        return Ok(None);
+    };
+    let ttl = value.as_u64().ok_or_else(Refusal::invalid_request)?;
+    if ttl == 0 || ttl > limit_ms {
+        return Err(Refusal::invalid_request().with_counts(ttl, limit_ms));
+    }
+    Ok(Some(ttl))
+}
+
+/// An optional grant correlation digest (bounded hex, at most
+/// [`MAX_GRANT_CORRELATION_HEX`] characters).
+fn optional_grant_correlation(
+    fields: Option<&Map<String, Value>>,
+    key: &str,
+) -> Result<Option<GrantCorrelation>, Refusal> {
+    let Some(value) = fields.and_then(|fields| fields.get(key)) else {
+        return Ok(None);
+    };
+    let raw = value.as_str().ok_or_else(Refusal::invalid_request)?;
+    GrantCorrelation::parse(raw)
+        .map(Some)
+        .map_err(|_| Refusal::invalid_request())
+}
+
+/// The acting connection's correlation binding, when it negotiated one.
+fn connection_correlation(connection: &Connection) -> Option<GrantCorrelation> {
+    connection
+        .correlation_digest()
+        .map(GrantCorrelation::from_digest)
 }
 
 fn parse_grant_id(fields: Option<&Map<String, Value>>) -> Result<GrantId, Refusal> {
@@ -4164,5 +4314,53 @@ mod tests {
             .expect("operator kill");
         assert_eq!(killed["session"]["state"], "terminated");
         assert_eq!(killed["reason"], "operator_abort");
+    }
+
+    #[test]
+    fn deprecated_method_parameter_aliases_are_accepted_and_ambiguity_is_refused() {
+        let canonical = json!({"generation": 1, "target_attach_id": "1".repeat(32)});
+        let fields = canonical.as_object();
+        assert_eq!(generation_field(fields).expect("canonical"), 1);
+        assert_eq!(
+            parse_target_attach_id(fields).expect("canonical").as_hex(),
+            "1".repeat(32)
+        );
+
+        let aliases = json!({
+            "expected_generation": 2,
+            "attach_id": "2".repeat(32),
+        });
+        let fields = aliases.as_object();
+        assert_eq!(generation_field(fields).expect("alias"), 2);
+        assert_eq!(
+            parse_target_attach_id(fields).expect("alias").as_hex(),
+            "2".repeat(32)
+        );
+
+        let ambiguous = json!({
+            "generation": 1,
+            "expected_generation": 2,
+            "target_attach_id": "1".repeat(32),
+            "attach_id": "2".repeat(32),
+        });
+        let fields = ambiguous.as_object();
+        assert_eq!(
+            generation_field(fields).expect_err("ambiguous").kind(),
+            RefusalKind::InvalidRequest
+        );
+        assert_eq!(
+            parse_target_attach_id(fields)
+                .expect_err("ambiguous")
+                .kind(),
+            RefusalKind::InvalidRequest
+        );
+
+        let malformed = json!({"expected_generation": "2"});
+        assert_eq!(
+            generation_field(malformed.as_object())
+                .expect_err("non-integer")
+                .kind(),
+            RefusalKind::InvalidRequest
+        );
     }
 }

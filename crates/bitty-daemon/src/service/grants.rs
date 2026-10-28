@@ -39,7 +39,7 @@ use std::fmt;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::handshake::{SecretBearer, hex};
+use crate::handshake::{GrantCorrelation, SecretBearer, hex};
 use crate::limits::{LimitId, Limits};
 use crate::registry::SessionId;
 
@@ -270,6 +270,9 @@ struct GrantRecord {
     revoked: bool,
     bearer: Option<SecretBearer>,
     digest: [u8; 32],
+    /// Optional `client_correlation_digest`/`observer_correlation_digest`
+    /// binding. `None` keeps the historical uid-only binding.
+    correlation: Option<GrantCorrelation>,
 }
 
 impl GrantRecord {
@@ -279,8 +282,17 @@ impl GrantRecord {
 
     fn accounted_bytes(&self) -> usize {
         // grant id + kind + optional session id + peer uid + expiry + flags +
-        // bearer + digest, with the fixed widths the record actually holds.
-        GRANT_ID_BYTES + 1 + GRANT_ID_BYTES + 4 + 8 + 2 + 32 + 32
+        // bearer + digest + optional 128-bit correlation binding, with the
+        // fixed widths the record actually holds.
+        GRANT_ID_BYTES
+            + 1
+            + self.session_id.map_or(0, |_| GRANT_ID_BYTES)
+            + 4
+            + 8
+            + 2
+            + 32
+            + 32
+            + self.correlation.map_or(0, |_| 16)
     }
 }
 
@@ -379,21 +391,60 @@ impl GrantStore {
     /// grant into the one `Denied/ConsentRequired` at create.
     #[must_use]
     pub fn host_grant_bound(&self, grant_id: GrantId, peer_uid: u32, now_ms: u64) -> bool {
+        self.host_grant_bound_to(grant_id, peer_uid, None, now_ms)
+    }
+
+    /// Whether a consumed host grant still authorizes this peer and
+    /// correlation digest.
+    ///
+    /// A grant with no correlation binding keeps the uid-only rule. A bound
+    /// grant requires the connection's `client_correlation` digest to match,
+    /// so a different connection cannot reuse a grant it learned about.
+    #[must_use]
+    pub fn host_grant_bound_to(
+        &self,
+        grant_id: GrantId,
+        peer_uid: u32,
+        correlation: Option<GrantCorrelation>,
+        now_ms: u64,
+    ) -> bool {
         self.grants.get(&grant_id).is_some_and(|record| {
             record.kind == GrantKind::Host
                 && record.peer_uid == peer_uid
+                && correlation_matches(record.correlation, correlation)
                 && !record.revoked
                 && now_ms < record.expires_at_ms
         })
     }
 
-    /// Mint a host-consent grant bound to `peer_uid`.
+    /// Mint a host-consent grant bound to `peer_uid` with the compiled TTL.
     ///
     /// # Errors
     ///
     /// [`GrantRefusal::Capacity`] when the pending cap is reached;
     /// [`GrantError`] for an entropy, id, or record-size failure.
     pub fn mint_host(&mut self, peer_uid: u32, now_ms: u64) -> Result<MintedGrant, MintError> {
+        self.mint_host_with(peer_uid, None, None, now_ms)
+    }
+
+    /// Mint a host-consent grant with an optional correlation binding and a
+    /// requested TTL.
+    ///
+    /// The TTL is validated by the service against
+    /// [`LimitId::HostGrantTtlMs`] before this call; `None` uses the compiled
+    /// default.
+    ///
+    /// # Errors
+    ///
+    /// [`GrantRefusal::Capacity`] when the pending cap is reached;
+    /// [`GrantError`] for an entropy, id, or record-size failure.
+    pub fn mint_host_with(
+        &mut self,
+        peer_uid: u32,
+        correlation: Option<GrantCorrelation>,
+        ttl_ms: Option<u64>,
+        now_ms: u64,
+    ) -> Result<MintedGrant, MintError> {
         let active = self
             .grants
             .values()
@@ -409,12 +460,14 @@ impl GrantStore {
             GrantKind::Host,
             None,
             peer_uid,
+            correlation,
             now_ms,
-            self.limits.host_ttl_ms,
+            ttl_ms.unwrap_or(self.limits.host_ttl_ms),
         )
     }
 
-    /// Mint an observer grant for one session, bound to `peer_uid`.
+    /// Mint an observer grant for one session, bound to `peer_uid` with the
+    /// compiled TTL.
     ///
     /// # Errors
     ///
@@ -424,6 +477,28 @@ impl GrantStore {
         &mut self,
         session_id: SessionId,
         peer_uid: u32,
+        now_ms: u64,
+    ) -> Result<MintedGrant, MintError> {
+        self.mint_observer_with(session_id, peer_uid, None, None, now_ms)
+    }
+
+    /// Mint an observer grant with an optional correlation binding and a
+    /// requested TTL.
+    ///
+    /// The TTL is validated by the service against
+    /// [`LimitId::ObserverGrantTtlMs`] before this call; `None` uses the
+    /// compiled default.
+    ///
+    /// # Errors
+    ///
+    /// [`GrantRefusal::Capacity`] when the per-session observer cap is reached;
+    /// [`GrantError`] for an entropy, id, or record-size failure.
+    pub fn mint_observer_with(
+        &mut self,
+        session_id: SessionId,
+        peer_uid: u32,
+        correlation: Option<GrantCorrelation>,
+        ttl_ms: Option<u64>,
         now_ms: u64,
     ) -> Result<MintedGrant, MintError> {
         let active = self
@@ -445,8 +520,9 @@ impl GrantStore {
             GrantKind::Observer,
             Some(session_id),
             peer_uid,
+            correlation,
             now_ms,
-            self.limits.observer_ttl_ms,
+            ttl_ms.unwrap_or(self.limits.observer_ttl_ms),
         )
     }
 
@@ -455,6 +531,7 @@ impl GrantStore {
         kind: GrantKind,
         session_id: Option<SessionId>,
         peer_uid: u32,
+        correlation: Option<GrantCorrelation>,
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<MintedGrant, MintError> {
@@ -481,6 +558,7 @@ impl GrantStore {
             revoked: false,
             digest: digest_of(&bearer),
             bearer: Some(bearer.clone()),
+            correlation,
         };
         if record.accounted_bytes() > self.limits.record_bytes {
             return Err(MintError::Error(GrantError::RecordTooLarge));
@@ -512,6 +590,27 @@ impl GrantStore {
         session_id: Option<SessionId>,
         now_ms: u64,
     ) -> Result<GrantId, GrantRefusal> {
+        self.validate_to(bearer, kind, peer_uid, session_id, None, now_ms)
+    }
+
+    /// Validate one grant for a peer and optional connection correlation.
+    ///
+    /// A grant minted with a correlation digest is unusable from any other
+    /// correlation (and from a connection with none), exactly like a
+    /// wrong-peer grant.
+    ///
+    /// # Errors
+    ///
+    /// [`GrantRefusal::Unusable`] when no record matches every binding.
+    pub fn validate_to(
+        &self,
+        bearer: &SecretBearer,
+        kind: GrantKind,
+        peer_uid: u32,
+        session_id: Option<SessionId>,
+        correlation: Option<GrantCorrelation>,
+        now_ms: u64,
+    ) -> Result<GrantId, GrantRefusal> {
         let digest = digest_of(bearer);
         let mut found: Option<&GrantRecord> = None;
         for record in self.grants.values() {
@@ -525,6 +624,7 @@ impl GrantStore {
         if record.kind != kind
             || record.peer_uid != peer_uid
             || record.session_id != session_id
+            || !correlation_matches(record.correlation, correlation)
             || !record.is_active(now_ms)
         {
             return Err(GrantRefusal::Unusable);
@@ -584,6 +684,28 @@ impl GrantStore {
         record.session_id
     }
 
+    /// Whether a retained observer grant's correlation binding accepts the
+    /// acting connection.
+    ///
+    /// - `None`: no retained observer record for the id (the caller's uniform
+    ///   unknown-grant path);
+    /// - `Some(true)`: the grant has no binding, or the connection's
+    ///   correlation digest matches;
+    /// - `Some(false)`: the grant is bound to a different digest and must be
+    ///   treated exactly like an absent grant.
+    #[must_use]
+    pub fn observer_grant_correlation(
+        &self,
+        grant_id: GrantId,
+        correlation: Option<GrantCorrelation>,
+    ) -> Option<bool> {
+        let record = self.grants.get(&grant_id)?;
+        if record.kind != GrantKind::Observer {
+            return None;
+        }
+        Some(correlation_matches(record.correlation, correlation))
+    }
+
     /// Consume one grant.
     ///
     /// The same [`GrantRefusal::Unusable`] is returned for a missing, expired,
@@ -598,6 +720,24 @@ impl GrantStore {
         kind: GrantKind,
         peer_uid: u32,
         session_id: Option<SessionId>,
+        now_ms: u64,
+    ) -> Result<ConsumedGrant, GrantRefusal> {
+        self.consume_to(bearer, kind, peer_uid, session_id, None, now_ms)
+    }
+
+    /// Consume one grant for a peer and optional connection correlation.
+    ///
+    /// # Errors
+    ///
+    /// [`GrantRefusal::Unusable`] when no record matches every binding,
+    /// including a correlation mismatch.
+    pub fn consume_to(
+        &mut self,
+        bearer: &SecretBearer,
+        kind: GrantKind,
+        peer_uid: u32,
+        session_id: Option<SessionId>,
+        correlation: Option<GrantCorrelation>,
         now_ms: u64,
     ) -> Result<ConsumedGrant, GrantRefusal> {
         let digest = digest_of(bearer);
@@ -615,6 +755,7 @@ impl GrantStore {
         if record.kind != kind
             || record.peer_uid != peer_uid
             || record.session_id != session_id
+            || !correlation_matches(record.correlation, correlation)
             || !record.is_active(now_ms)
         {
             return Err(GrantRefusal::Unusable);
@@ -783,6 +924,20 @@ fn digest_of(bearer: &SecretBearer) -> [u8; 32] {
     out
 }
 
+/// Whether a grant's optional binding accepts the acting connection.
+///
+/// No binding keeps the historical uid-only rule; a bound grant requires the
+/// connection's correlation digest to match exactly.
+fn correlation_matches(
+    bound: Option<GrantCorrelation>,
+    connection: Option<GrantCorrelation>,
+) -> bool {
+    match bound {
+        None => true,
+        Some(bound) => connection.is_some_and(|connection| connection == bound),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,6 +968,58 @@ mod tests {
                 .consume(&minted.bearer, GrantKind::Host, 1000, None, 12)
                 .expect_err("consumed"),
             GrantRefusal::Unusable
+        );
+    }
+
+    #[test]
+    fn a_requested_ttl_sets_the_stored_expiry() {
+        let mut store = store();
+        let host = store
+            .mint_host_with(1000, None, Some(1_000), 10)
+            .expect("host mint");
+        assert_eq!(host.expires_at_ms, 1_010);
+        assert!(store.host_grant_active(host.grant_id, 1_009));
+        assert!(!store.host_grant_active(host.grant_id, 1_010));
+
+        let observer = store
+            .mint_observer_with(session(), 1000, None, Some(250), 20)
+            .expect("observer mint");
+        assert_eq!(observer.expires_at_ms, 270);
+    }
+
+    #[test]
+    fn a_correlation_binding_gates_consume_and_validate() {
+        let mut store = store();
+        let binding = GrantCorrelation::parse(&"a1".repeat(16)).expect("binding");
+        let minted = store
+            .mint_observer_with(session(), 1000, Some(binding), None, 10)
+            .expect("mint");
+
+        assert_eq!(
+            store
+                .validate_to(
+                    &minted.bearer,
+                    GrantKind::Observer,
+                    1000,
+                    Some(session()),
+                    Some(GrantCorrelation::parse(&"b2".repeat(16)).expect("other")),
+                    11,
+                )
+                .expect_err("wrong correlation"),
+            GrantRefusal::Unusable
+        );
+        assert_eq!(
+            store
+                .validate_to(
+                    &minted.bearer,
+                    GrantKind::Observer,
+                    1000,
+                    Some(session()),
+                    Some(binding),
+                    11,
+                )
+                .expect("matching correlation"),
+            minted.grant_id
         );
     }
 

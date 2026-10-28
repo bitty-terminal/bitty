@@ -5,7 +5,11 @@
     "session.attach.request_role": "attach_role",
     "session.attach.response_role": "role",
     "session.attach.controller_role": "controller",
-    "session.attach.observer_role": "observer"
+    "session.attach.observer_role": "observer",
+    "session.abort.generation": "generation",
+    "session.kill.generation": "generation",
+    "session.control.transfer.generation": "generation",
+    "session.control.transfer.target_attach_id": "target_attach_id"
   },
   "vectors": [
     {
@@ -595,8 +599,8 @@
           "method": "session.abort",
           "params": {
             "session_id": "@session_id",
-            "expected_generation": 0,
-            "reason_class": "cancel"
+            "reason_class": "cancel",
+            "generation": 0
           },
           "expect": {
             "ok": false,
@@ -1671,8 +1675,8 @@
           "method": "session.abort",
           "params": {
             "session_id": "22222222222222222222222222222222",
-            "expected_generation": 0,
-            "reason_class": "cancel"
+            "reason_class": "cancel",
+            "generation": 0
           },
           "expect": {
             "ok": false,
@@ -1854,9 +1858,9 @@
           "method": "session.abort",
           "params": {
             "session_id": "@session_id",
-            "expected_generation": 0,
             "reason_class": "cancel",
-            "control_token": "@controller_token"
+            "control_token": "@controller_token",
+            "generation": 0
           },
           "expect": {
             "ok": false,
@@ -1981,9 +1985,9 @@
           "method": "session.abort",
           "params": {
             "session_id": "@session_id",
-            "expected_generation": 0,
             "reason_class": "cancel",
-            "control_token": "@controller_token"
+            "control_token": "@controller_token",
+            "generation": 0
           },
           "expect": {
             "ok": true,
@@ -2116,9 +2120,9 @@
           "method": "session.abort",
           "params": {
             "session_id": "@session_id",
-            "expected_generation": 1,
             "reason_class": "cancel",
-            "control_token": "@controller_token"
+            "control_token": "@controller_token",
+            "generation": 1
           },
           "expect": {
             "ok": false,
@@ -3377,9 +3381,9 @@
           "method": "session.abort",
           "params": {
             "session_id": "@session_id",
-            "expected_generation": 0,
             "reason_class": "cancel",
-            "control_token": "@controller_token"
+            "control_token": "@controller_token",
+            "generation": 0
           },
           "fault": "drop_before_reply",
           "expect": {
@@ -3424,8 +3428,8 @@
           "method": "session.abort",
           "params": {
             "session_id": "@session_id",
-            "expected_generation": 0,
-            "reason_class": "operator"
+            "reason_class": "operator",
+            "generation": 0
           },
           "expect": {
             "ok": true,
@@ -3552,9 +3556,9 @@
           "method": "session.abort",
           "params": {
             "session_id": "@session_id",
-            "expected_generation": 0,
             "reason_class": "cancel",
-            "control_token": "@controller_token"
+            "control_token": "@controller_token",
+            "generation": 0
           },
           "expect": {
             "ok": true,
@@ -3771,9 +3775,9 @@
           "method": "session.abort",
           "params": {
             "session_id": "@session_id",
-            "expected_generation": 0,
             "reason_class": "cancel",
-            "control_token": "@controller_token"
+            "control_token": "@controller_token",
+            "generation": 0
           },
           "expect": {
             "ok": true,
@@ -3844,9 +3848,9 @@
           "method": "session.abort",
           "params": {
             "session_id": "@session_id",
-            "expected_generation": 0,
             "reason_class": "timeout",
-            "control_token": "@controller_token"
+            "control_token": "@controller_token",
+            "generation": 0
           },
           "expect": {
             "ok": true,
@@ -4319,9 +4323,9 @@
           "method": "session.abort",
           "params": {
             "session_id": "@session_id",
-            "expected_generation": 0,
             "reason_class": "cancel",
-            "control_token": "@controller_token"
+            "control_token": "@controller_token",
+            "generation": 0
           },
           "capture": {
             "terminal_revision": "session.state_revision"
@@ -5333,9 +5337,9 @@
           "method": "session.control.transfer",
           "params": {
             "session_id": "@session_id",
-            "attach_id": "@observer_attach",
-            "expected_generation": 0,
-            "idempotency_key": "c06-transfer"
+            "idempotency_key": "c06-transfer",
+            "generation": 0,
+            "target_attach_id": "@observer_attach"
           },
           "expect": {
             "ok": true,
@@ -5413,8 +5417,8 @@
           "method": "session.abort",
           "params": {
             "session_id": "@session_id",
-            "expected_generation": 0,
-            "reason_class": "cancel"
+            "reason_class": "cancel",
+            "generation": 0
           },
           "expect": {
             "ok": true,
@@ -5847,10 +5851,10 @@
           "method": "session.control.transfer",
           "params": {
             "session_id": "@session_id",
-            "attach_id": "@observer_attach",
-            "expected_generation": 0,
             "control_token": "@create_token",
-            "idempotency_key": "c09-transfer-stale"
+            "idempotency_key": "c09-transfer-stale",
+            "generation": 0,
+            "target_attach_id": "@observer_attach"
           },
           "expect": {
             "ok": false,
@@ -5863,10 +5867,10 @@
           "method": "session.control.transfer",
           "params": {
             "session_id": "@session_id",
-            "attach_id": "@observer_attach",
-            "expected_generation": 0,
             "control_token": "@controller_token",
-            "idempotency_key": "c09-transfer-current"
+            "idempotency_key": "c09-transfer-current",
+            "generation": 0,
+            "target_attach_id": "@observer_attach"
           },
           "expect": {
             "ok": true,

@@ -1252,7 +1252,7 @@ impl FakeDriver {
                 None,
             );
         };
-        let Some(target) = params.get("attach_id").and_then(Value::as_str) else {
+        let Some(target) = canonical_target_attach(params) else {
             return self.refuse(
                 "session.control.transfer",
                 "Validation",
@@ -1260,7 +1260,7 @@ impl FakeDriver {
                 None,
             );
         };
-        let Some(generation) = params.get("expected_generation").and_then(Value::as_u64) else {
+        let Some(generation) = canonical_generation(params) else {
             return self.refuse(
                 "session.control.transfer",
                 "Validation",
@@ -1337,7 +1337,7 @@ impl FakeDriver {
         let Some(session_id) = params.get("session_id").and_then(Value::as_str) else {
             return self.refuse("session.abort", "Validation", "InvalidRequest", None);
         };
-        let Some(generation) = params.get("expected_generation").and_then(Value::as_u64) else {
+        let Some(generation) = canonical_generation(params) else {
             return self.refuse("session.abort", "Validation", "InvalidRequest", None);
         };
         let reason = params
@@ -1398,10 +1398,7 @@ impl FakeDriver {
         let Some(session_id) = params.get("session_id").and_then(Value::as_str) else {
             return self.refuse("session.kill", "Validation", "InvalidRequest", None);
         };
-        let generation = params
-            .get("expected_generation")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        let generation = canonical_generation(params).unwrap_or(0);
         if !self.session_visible(connection, session_id, None) {
             return self.refuse("session.kill", "NotFound", "NotFound", None);
         }
@@ -1698,5 +1695,29 @@ impl Driver for FakeDriver {
 
     fn finish(&mut self) {
         self.connections.clear();
+    }
+}
+
+/// The canonical `generation` with the deprecated `expected_generation` alias.
+fn canonical_generation(params: &Value) -> Option<u64> {
+    let canonical = params.get("generation").and_then(Value::as_u64);
+    let alias = params.get("expected_generation").and_then(Value::as_u64);
+    match (canonical, alias) {
+        (Some(canonical), Some(alias)) if canonical != alias => None,
+        (Some(canonical), _) => Some(canonical),
+        (None, Some(alias)) => Some(alias),
+        (None, None) => None,
+    }
+}
+
+/// The canonical `target_attach_id` with the deprecated `attach_id` alias.
+fn canonical_target_attach(params: &Value) -> Option<&str> {
+    let canonical = params.get("target_attach_id").and_then(Value::as_str);
+    let alias = params.get("attach_id").and_then(Value::as_str);
+    match (canonical, alias) {
+        (Some(canonical), Some(alias)) if canonical != alias => None,
+        (Some(canonical), _) => Some(canonical),
+        (None, Some(alias)) => Some(alias),
+        (None, None) => None,
     }
 }

@@ -701,6 +701,7 @@ mod unix {
             uid: peer.client.peer_uid(),
             pid: peer.client.peer().identity().pid(),
         };
+        let was_negotiated = peer.client.is_negotiated();
         loop {
             // Pre-authentication: the byte budget covers completed frames *and*
             // the frame being assembled, so a client cannot dribble a full
@@ -737,22 +738,41 @@ mod unix {
                         refusal,
                         now,
                     );
-                    // A complete frame has a correlation id, so the refusal is
-                    // a typed frame; a partial one was refused mid-assembly
-                    // above and can only be audited, never answered. Either
-                    // way, let already-queued bytes drain before the close.
-                    if let Some((id, _, _)) = envelope_correlation(&payload) {
-                        if !reply(peer, &id, Err(refusal)) {
-                            peer.close();
+                    // A complete frame with a usable correlation id gets a
+                    // typed refusal; an over-long id gets the same refusal
+                    // with the id omitted; an unreadable one can only be
+                    // audited. Every path drains before the close.
+                    match envelope_correlation(&payload) {
+                        EnvelopeHead::Parsed { id, .. } => {
+                            if !reply(peer, &id, Err(refusal)) {
+                                peer.close();
+                            }
                         }
-                    } else {
-                        peer.retire();
+                        EnvelopeHead::OverlongId => {
+                            if !reply_without_id(peer, refusal) {
+                                peer.close();
+                            }
+                            peer.retire();
+                        }
+                        EnvelopeHead::Malformed => peer.retire(),
                     }
                     return;
                 }
             }
             if !handle_payload(peer, service, &payload, now, shutting_down) {
                 peer.close();
+                return;
+            }
+            if !was_negotiated && peer.client.is_negotiated() {
+                // No pre-auth pipelining: a frame that arrived in the same
+                // read batch as a successful negotiate is not reordered behind
+                // the handshake. Drop the reader's partial state and every
+                // byte already queued on the socket, then stop reading this
+                // poll iteration. The handshake response is flushed by the
+                // caller before any later request can be sent, so the
+                // connection resumes with fresh frames.
+                peer.reader.discard_buffered();
+                discard_pipelined_input(peer, config);
                 return;
             }
             if peer.close_after_write {
@@ -833,19 +853,43 @@ mod unix {
     ) -> bool {
         use crate::audit::AuditAction;
 
-        let Some((id, method_name, wire_version)) = envelope_correlation(payload) else {
-            // No correlation id can be echoed, so there is no conforming
-            // response; the refusal is still attributed exactly once. Any
-            // earlier response already queued is flushed before the close.
-            service.record_refusal(
-                &peer.client,
-                AuditAction::Wire,
-                Refusal::invalid_request(),
-                now,
-            );
-            peer.retire();
-            return true;
+        let (id, method_name, wire_version) = match envelope_correlation(payload) {
+            EnvelopeHead::Parsed {
+                id,
+                method,
+                version,
+            } => (id, method, version),
+            EnvelopeHead::OverlongId => {
+                // A complete frame with an over-bound `id` is answered with a
+                // typed `InvalidRequest` whose response omits the id, then the
+                // connection retires after the frame drains. Echoing the value
+                // would repeat the bound violation.
+                let refusal = Refusal::invalid_request();
+                service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+                if !reply_without_id(peer, refusal) {
+                    peer.close();
+                    return false;
+                }
+                peer.retire();
+                return true;
+            }
+            EnvelopeHead::Malformed => {
+                // No correlation id can be echoed, so there is no conforming
+                // response; the refusal is still attributed exactly once. Any
+                // earlier response already queued is flushed before the close.
+                service.record_refusal(
+                    &peer.client,
+                    AuditAction::Wire,
+                    Refusal::invalid_request(),
+                    now,
+                );
+                peer.retire();
+                return true;
+            }
         };
+        // Every refused `daemon.negotiate` is final: the refusal frame drains,
+        // then the connection closes. There is no second handshake.
+        let negotiate_method = method_name == crate::contract::NEGOTIATE_METHOD;
         if !peer.client.is_negotiated() {
             // Stage 1 stays first: an unsupported per-frame `v` is
             // `VersionMismatch` before the handshake gate.
@@ -853,7 +897,11 @@ mod unix {
                 None => {
                     let refusal = Refusal::invalid_request();
                     record_floodable_wire(peer, service, refusal, now);
-                    return reply(peer, &id, Err(refusal));
+                    let keeps_open = reply(peer, &id, Err(refusal));
+                    if negotiate_method {
+                        peer.retire();
+                    }
+                    return keeps_open;
                 }
                 Some(version) if bitty_ipc_api::wire::validate_wire_version(version).is_err() => {
                     let refusal = Refusal::version_mismatch();
@@ -876,7 +924,11 @@ mod unix {
         if peer.limiter.check(now.as_millis()).is_err() {
             let refusal = Refusal::denied(crate::codes::RefusalCode::RateLimited);
             record_floodable_wire(peer, service, refusal, now);
-            return reply(peer, &id, Err(refusal));
+            let keeps_open = reply(peer, &id, Err(refusal));
+            if negotiate_method {
+                peer.retire();
+            }
+            return keeps_open;
         }
         let envelope = match RequestEnvelope::parse(payload) {
             Ok(envelope) => envelope,
@@ -886,7 +938,11 @@ mod unix {
                 } else {
                     record_floodable_wire(peer, service, refusal, now);
                 }
-                return reply(peer, &id, Err(refusal));
+                let keeps_open = reply(peer, &id, Err(refusal));
+                if negotiate_method {
+                    peer.retire();
+                }
+                return keeps_open;
             }
         };
         let method = match resolve(&envelope.method) {
@@ -907,10 +963,17 @@ mod unix {
         } else {
             service.dispatch(&mut peer.client, method, &envelope.params, now)
         };
+        let failed = result.is_err();
         if result.is_ok() {
             service.route_deliveries(&mut peer.client);
         }
         let keeps_open = reply(peer, &id, result);
+        if failed && negotiate_method {
+            // A refused negotiate is terminal, including the `InvalidRequest`
+            // produced by `wire::parse_negotiate`. The refusal stays queued and
+            // drains before the stream closes.
+            peer.retire();
+        }
         if service.stop_requested().is_some() {
             *shutting_down = true;
         }
@@ -959,6 +1022,58 @@ mod unix {
         }
     }
 
+    /// Append a refusal whose request `id` could not be echoed.
+    ///
+    /// Returns `false` when the frame cannot be rendered; the caller closes.
+    fn reply_without_id(peer: &mut PeerIo, refusal: Refusal) -> bool {
+        let Ok(payload) = wire::render_error_without_id(refusal) else {
+            return false;
+        };
+        let Ok(bytes) = wire::frame(&payload) else {
+            return false;
+        };
+        peer.output.extend_from_slice(&bytes);
+        true
+    }
+
+    /// Discard bytes that arrived before the handshake response was written.
+    ///
+    /// The frame reader never reads past one frame, so anything still pending
+    /// is in the socket buffer, not in the reader. It is drained here with a
+    /// non-blocking `recv` until `EAGAIN`; the reader has already been reset,
+    /// so the next complete frame starts from a clean header. The pre-auth byte
+    /// budget bounds the drain: a client that sends more than it was allowed
+    /// before the response is retired instead of being served.
+    fn discard_pipelined_input(peer: &mut PeerIo, config: &ServerConfig) {
+        use std::os::fd::AsRawFd;
+
+        use nix::sys::socket::{MsgFlags, recv};
+
+        let budget = usize::try_from(config.limits.effective(LimitId::PreAuthMaxBytes))
+            .unwrap_or(usize::MAX);
+        let mut discarded = 0usize;
+        let mut buffer = [0u8; 4096];
+        while discarded < budget {
+            let want = buffer.len().min(budget - discarded);
+            match recv(
+                peer.stream.as_raw_fd(),
+                &mut buffer[..want],
+                MsgFlags::MSG_DONTWAIT,
+            ) {
+                Ok(0) => return,
+                Ok(read) => discarded = discarded.saturating_add(read),
+                Err(nix::errno::Errno::EAGAIN) | Err(nix::errno::Errno::EINTR) => return,
+                Err(_) => {
+                    peer.close();
+                    return;
+                }
+            }
+        }
+        // More pipelined bytes than the pre-auth budget: close rather than
+        // leave the tail to be interpreted as a fresh frame.
+        peer.retire();
+    }
+
     /// Record a non-closing wire refusal within the per-connection budget.
     ///
     /// The window rollover is checked first: if the previous window suppressed
@@ -999,24 +1114,55 @@ mod unix {
         }
     }
 
+    /// The envelope head the server needs before it validates the grammar or
+    /// resolves the catalog.
+    enum EnvelopeHead {
+        /// A bounded correlation id, method, and optional wire version.
+        Parsed {
+            id: String,
+            method: String,
+            version: Option<u16>,
+        },
+        /// A complete JSON frame whose `id` is over the correlation bound.
+        OverlongId,
+        /// No correlation id can be read (malformed JSON or a missing/empty
+        /// or non-string id).
+        Malformed,
+    }
+
     /// The envelope's correlation id and method name, when they are safe to
     /// echo and compare.
     ///
     /// This is the bounded pre-parse read the stage-2 negotiate gate needs: it
     /// extracts only the two strings the server must know before it validates
-    /// the grammar or resolves the catalog.
-    fn envelope_correlation(payload: &[u8]) -> Option<(String, String, Option<u16>)> {
-        let value: Value = serde_json::from_slice(payload).ok()?;
-        let id = value.get("id")?.as_str()?;
-        if id.is_empty() || id.len() > bitty_ipc_api::wire::MAX_ID_BYTES {
-            return None;
+    /// the grammar or resolves the catalog. An over-long id is distinguished
+    /// from an unreadable frame so the server can answer `InvalidRequest`
+    /// without echoing the value.
+    fn envelope_correlation(payload: &[u8]) -> EnvelopeHead {
+        let Ok(value) = serde_json::from_slice::<Value>(payload) else {
+            return EnvelopeHead::Malformed;
+        };
+        let Some(id) = value.get("id").and_then(Value::as_str) else {
+            return EnvelopeHead::Malformed;
+        };
+        if id.len() > bitty_ipc_api::wire::MAX_ID_BYTES {
+            return EnvelopeHead::OverlongId;
         }
-        let method = value.get("method")?.as_str()?;
+        if id.is_empty() {
+            return EnvelopeHead::Malformed;
+        }
+        let Some(method) = value.get("method").and_then(Value::as_str) else {
+            return EnvelopeHead::Malformed;
+        };
         let version = value
             .get("v")
             .and_then(Value::as_u64)
             .and_then(|version| u16::try_from(version).ok());
-        Some((id.to_owned(), method.to_owned(), version))
+        EnvelopeHead::Parsed {
+            id: id.to_owned(),
+            method: method.to_owned(),
+            version,
+        }
     }
 
     fn server_facts(endpoint: &BoundEndpoint) -> Result<ServerFacts, ServerError> {

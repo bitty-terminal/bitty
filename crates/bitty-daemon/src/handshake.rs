@@ -52,6 +52,17 @@ pub const BEARER_HEX_BYTES: usize = 64;
 /// Domain separator for the `client_correlation_digest` hash.
 const CORRELATION_DOMAIN: &[u8] = b"bittyd:client_correlation:v1\0";
 
+/// Maximum characters of a grant correlation digest accepted on the wire.
+///
+/// The accepted digest is the 128-bit `client_correlation_digest` encoded as
+/// 32 lowercase hex characters; the bound leaves room for a caller that
+/// presents a wider digest without ever echoing the value.
+pub const MAX_GRANT_CORRELATION_HEX: usize = 64;
+
+/// Domain separator for a grant correlation binding that is not already a
+/// 128-bit digest.
+const GRANT_CORRELATION_DOMAIN: &[u8] = b"bittyd:grant-correlation:v1\0";
+
 /// The accepted transport wire version, echoed in the handshake response.
 ///
 /// The value is owned by `bitty-ipc`; this re-export keeps the handshake from
@@ -126,6 +137,8 @@ pub enum CorrelationError {
     },
     /// The value contains a control character.
     ControlCharacter,
+    /// A grant correlation digest is not bounded hex.
+    Malformed,
 }
 
 impl fmt::Display for CorrelationError {
@@ -140,11 +153,83 @@ impl fmt::Display for CorrelationError {
             Self::ControlCharacter => {
                 formatter.write_str("correlation contains a control character")
             }
+            Self::Malformed => formatter.write_str("correlation digest is not bounded hexadecimal"),
         }
     }
 }
 
 impl std::error::Error for CorrelationError {}
+
+/// A 128-bit binding between a grant and the consuming connection's
+/// `client_correlation` digest.
+///
+/// The canonical wire value is the same 32-hex `client_correlation_digest`
+/// that audit records; a wider bounded digest is accepted and reduced to the
+/// same 128-bit binding. The binding is not secret and never carries the raw
+/// correlation value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct GrantCorrelation {
+    binding: [u8; 16],
+}
+
+impl GrantCorrelation {
+    /// Parse a bounded hex digest (at most [`MAX_GRANT_CORRELATION_HEX`]
+    /// characters) into a grant binding.
+    ///
+    /// A 16-byte digest (32 hex characters) binds exactly; any other accepted
+    /// width is domain-separated and truncated to 128 bits, so it can never
+    /// equal a connection's 128-bit digest by accident.
+    ///
+    /// # Errors
+    ///
+    /// [`CorrelationError::Malformed`] for an empty, odd-width, over-bound, or
+    /// non-hex value.
+    pub fn parse(value: &str) -> Result<Self, CorrelationError> {
+        let raw = value.as_bytes();
+        if raw.is_empty() || raw.len() > MAX_GRANT_CORRELATION_HEX || raw.len() % 2 != 0 {
+            return Err(CorrelationError::Malformed);
+        }
+        let mut bytes = Vec::with_capacity(raw.len() / 2);
+        for chunk in raw.chunks_exact(2) {
+            let high = hex_nibble(chunk[0]).ok_or(CorrelationError::Malformed)?;
+            let low = hex_nibble(chunk[1]).ok_or(CorrelationError::Malformed)?;
+            bytes.push((high << 4) | low);
+        }
+        if bytes.len() == 16 {
+            let mut binding = [0u8; 16];
+            binding.copy_from_slice(&bytes);
+            return Ok(Self { binding });
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(GRANT_CORRELATION_DOMAIN);
+        hasher.update(&bytes);
+        let digest = hasher.finalize();
+        let mut binding = [0u8; 16];
+        binding.copy_from_slice(&digest[..16]);
+        Ok(Self { binding })
+    }
+
+    /// The binding of a connection whose `client_correlation_digest` is known.
+    #[must_use]
+    pub const fn from_digest(digest: [u8; 16]) -> Self {
+        Self { binding: digest }
+    }
+
+    /// The 128-bit binding.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 16] {
+        &self.binding
+    }
+}
+
+impl fmt::Debug for GrantCorrelation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("GrantCorrelation")
+            .field(&format_args!("binding={}", hex(&self.binding)))
+            .finish()
+    }
+}
 
 /// A 256-bit bearer value presented on the wire and redacted everywhere else.
 ///

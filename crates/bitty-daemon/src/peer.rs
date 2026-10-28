@@ -342,8 +342,7 @@ impl PeerGuard {
     ///
     /// Test-only: a live pid with a start time that does not match `/proc` is
     /// exactly the recycled-pid condition `recheck` must refuse.
-    #[cfg(test)]
-    #[cfg(unix)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with_forged_start_time(pid: u32, start_time: u64) -> Self {
         let uid = geteuid().as_raw();
         Self {

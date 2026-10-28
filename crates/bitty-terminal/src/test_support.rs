@@ -128,3 +128,45 @@ pub(crate) fn settle_dispatch(
         },
     }
 }
+
+/// Activation wall window for composition-root probes (bitty#2781).
+///
+/// Activation callbacks are slice-only: they do not park, they suspend
+/// fail-closed, so a loaded runner that deschedules the thread for longer than
+/// one RC-1 slice makes `init.lua` fail with `WallClockExceeded` and the plugin
+/// never activates. No resume signal can recover that, so composition-root
+/// probes that assert capability wiring install the documented test-only wall
+/// seam before activation. The window is the documented callback envelope
+/// ([`RC1_CALLBACK_CEILING_MS`]); instruction, memory, and cumulative-callback
+/// budgets keep their production values.
+pub(crate) const HARNESS_ACTIVATION_WALL_MS: u64 = RC1_CALLBACK_CEILING_MS;
+
+thread_local! {
+    /// Scoped activation wall override, read by `discover_with_roots` under
+    /// `#[cfg(test)]` only (production never installs it).
+    static ACTIVATION_WALL_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Reads the scoped harness activation budget (bitty#2781).
+pub(crate) fn harness_activation_wall_ms() -> Option<u64> {
+    ACTIVATION_WALL_MS.with(std::cell::Cell::get)
+}
+
+/// Run `f` with the composition-root activation window widened for the
+/// duration of the call (bitty#2781).
+///
+/// Scoped on purpose: other `discover_with_roots` probes pin park and budget
+/// semantics at the production slice and must not inherit the widened window.
+pub(crate) fn with_harness_activation_wall<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<u64>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ACTIVATION_WALL_MS.with(|cell| cell.set(self.0));
+        }
+    }
+
+    let _restore =
+        Restore(ACTIVATION_WALL_MS.with(|cell| cell.replace(Some(HARNESS_ACTIVATION_WALL_MS))));
+    f()
+}

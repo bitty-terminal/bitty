@@ -30,6 +30,8 @@ use bitty_runtime::plugin_runtime::{
 };
 use bitty_runtime::runtime::bell::BellMode;
 
+mod common;
+
 /// The nine devtools-declared v1 observation kinds
 /// (`bitty-plugin.toml` `[lazy] events` of `bitty-featured.devtools`).
 const DEVTOOLS_EVENTS: &[&str] = &[
@@ -185,6 +187,11 @@ fn tracer_runtime(tag: &str, events: &[&str]) -> (PluginRuntime, PathBuf) {
         settings: Rc::new(MapSettings::default()),
         snapshot: Rc::new(NoSnapshot),
     });
+    // bitty#2781: probe the trace surface, not the wall clock. Raises the
+    // activation/dispatch wall window and the host-call deadline through the
+    // documented test-only seams; parks still settle on the cold-tick resume.
+    rt.set_host_call_deadline_ms(Some(common::HARNESS_HOST_CALL_DEADLINE_MS));
+    rt.set_vm_wall_budget_ms(Some(common::HARNESS_VM_WALL_BUDGET_MS));
     rt.discover();
     for (id, result) in rt.activate_discovered() {
         result.unwrap_or_else(|error| panic!("activate {id}: {error}"));
@@ -194,13 +201,10 @@ fn tracer_runtime(tag: &str, events: &[&str]) -> (PluginRuntime, PathBuf) {
 }
 
 fn run(rt: &mut PluginRuntime, command: &str) -> String {
-    match rt
-        .dispatch_command(&pid(TRACER_ID), command, &[])
-        .unwrap_or_else(|error| panic!("{command}: dispatch failed: {error:?}"))
-    {
-        LuaValue::String(s) => s,
-        other => panic!("{command}: expected string, got {other:?}"),
-    }
+    // bitty#2781: RC-1 charges wall-clock time, so a loaded runner can park a
+    // body that used microseconds of CPU. Settle the documented cold-tick
+    // resume instead of requiring completion inside one default wall window.
+    common::settle_dispatch(rt, &pid(TRACER_ID), command, &[]).expect_string(command)
 }
 
 fn rt() -> Runtime {

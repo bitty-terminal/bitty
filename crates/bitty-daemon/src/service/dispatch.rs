@@ -3186,6 +3186,20 @@ mod tests {
             )
             .expect_err("a stopping daemon refuses new sessions");
         assert_eq!(error.denied_code(), Some(RefusalCode::DaemonStopping));
+
+        // A different connection gets the same answer: the guard is daemon
+        // state, not a property of the connection that stopped it.
+        let mut late = consumer();
+        negotiate_ok(&mut service, &mut late, 13);
+        let error = service
+            .dispatch(
+                &mut late,
+                ServiceMethod::SessionCreate,
+                &json!({"kind": "terminal", "idempotency_key": "late-create"}),
+                MonotonicMs::from_millis(13),
+            )
+            .expect_err("a second connection is refused too");
+        assert_eq!(error.denied_code(), Some(RefusalCode::DaemonStopping));
         assert_eq!(
             service
                 .host()

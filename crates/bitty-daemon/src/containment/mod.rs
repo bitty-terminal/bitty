@@ -63,7 +63,10 @@ pub const MECHANISM_NONE: &str = "none";
 pub const SESSION_CGROUP_PREFIX: &str = "bittyd-";
 
 /// Maximum session cgroup name length.
-pub const SESSION_CGROUP_NAME_MAX: usize = 64;
+///
+/// Fits `bittyd-` plus a 32-hex daemon instance id and a 32-hex session id,
+/// with separators, and stays far below the kernel's 255-byte name bound.
+pub const SESSION_CGROUP_NAME_MAX: usize = 128;
 
 /// Bounded escalation and reaping windows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

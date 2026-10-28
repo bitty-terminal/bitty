@@ -41,7 +41,11 @@ impl GlyphRasterizer for FakeRasterizer {
     }
 
     fn rasterize(&mut self, key: RasterKey) -> Result<Option<GlyphBitmap>, RenderError> {
-        if key.character == ' ' {
+        if key.character == ' ' || key.character == '\u{FFFD}' {
+            // Space and the replacement character both take the seam's
+            // blank/unsupported branch, which skips the glyph without
+            // advancing the column. The parity fixture uses the latter so a
+            // non-space blank is covered.
             return Ok(None);
         }
         let side = u32::from(key.character) % 3 + 6;
@@ -756,7 +760,7 @@ fn paint_scene_prefix_paints_zero_blocks_and_a_shorter_prefix() {
 
 #[test]
 fn clipped_line_keeps_glyph_seam_parity() {
-    let line = format!("abcdef gh{}", "字".repeat(40));
+    let line = format!("abcdef\u{FFFD} gh{}", "字".repeat(40));
     let scene = scene_of(vec![block(1, text(&line))]);
     let paint = paint_scene(&scene, surface(), ScenePaintBudget::default()).expect("paints");
     let painted = paint.text_lines().next().expect("one line");

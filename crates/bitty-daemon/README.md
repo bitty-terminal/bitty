@@ -93,9 +93,13 @@ file, and owns only metadata.
   (`record_lease_mutation` bumps the revision for a transfer that keeps the
   count); `heartbeat` updates last-seen without a revision bump;
   `begin_stopping` and `terminate` apply one revision bump per snapshot-visible
-  transition. A terminal session has no live lease, so the lease layer detaches
-  every lease before it terminates and the frozen record reports no attaches.
-  Counters use checked arithmetic and fail closed.
+  transition. Observer-grant mint, consume, expiry, and revoke are revision
+  bumps owned by the service layer through `note_visible_mutation`: expiry is
+  one bump per affected session per sweep, never one per retired record, and a
+  sweep that retires nothing bumps nothing. A terminal session has no live
+  lease, so the lease layer detaches every lease before it terminates and the
+  frozen record reports no attaches. Counters use checked arithmetic and fail
+  closed.
 - Terminal states are immutable. A terminal record is retained (never live,
   never revived) until `terminal_retention_ms` or
   `max_retained_terminal_records` collects it in deterministic
@@ -615,6 +619,17 @@ connection's create, every other inactive record is dropped immediately, and
 sweep) so the store cannot grow with total mints. A mint at the total bound is a
 whole `LimitExceeded` refusal and never evicts a live record.
 
+Expiry is a snapshot-visible mutation, not just a drop. When the sweep retires
+an observer grant whose TTL lapsed without a consume or a revoke, the owning
+session's `state_revision` advances exactly once — however many of its grants
+expired in the same sweep — with the same monotonic rules as mint, consume, and
+revoke. A sweep that retires nothing, and every later sweep, bumps nothing, so
+the tick is idempotent. The store records the affected sessions as records are
+dropped (including the capacity sweep a mint performs) and the service drains
+that set on each tick, so no eviction path can retire an expired grant without
+reporting it. A terminal session keeps its frozen revision, and a host grant has
+no owning session: neither is bumped, because neither lost session authority.
+
 A consumed host grant stays revocable until its TTL: `daemon.host_grant`
 `revoke` marks the record revoked and clears any retained bearer, so the
 consuming connection's next `session.create` — including a keyed replay of a
@@ -742,9 +757,9 @@ two independent drivers:
 
 - `fake.rs`: an in-process reference server labeled `candidate-not-bittyd` on
   every run. It implements the handshake, create, status, list, attach, detach,
-  grant mint/consume/revoke/transfer, abort, kill, heartbeat, stop, and the
-  closed refusal set over an in-memory transport, with injected time and
-  limits. It never claims a real process.
+  grant mint/consume/revoke/transfer and grant expiry, abort, kill, heartbeat,
+  stop, and the closed refusal set over an in-memory transport, with injected
+  time and limits. It never claims a real process.
 - `real.rs`: the built `bittyd` binary against a throwaway runtime/state root,
   speaking the real `bitty-ipc` v1 frames over the Unix endpoint with
   per-frame credentials. Linux x86_64 is the servable cell in this slice;
@@ -782,7 +797,9 @@ Corpus rules:
 - fault injection covers a transport drop during abort, the pre-auth partial
   frame, the frame bound, the pending grant cap, the attach cap, and an
   instance change (restart); queue pressure with an injected outbound cap is
-  a fake-only row because the served loop has no clock/limit injection point.
+  a fake-only row because the served loop has no clock/limit injection point,
+  and the injected-clock rows (V-06 lease expiry, C-10 grant expiry) are
+  fake-only for the same reason.
 
 Run it with:
 

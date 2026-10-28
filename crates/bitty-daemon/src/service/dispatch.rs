@@ -529,9 +529,23 @@ impl Service {
     ///
     /// The server calls this on its poll tick; a consumed host grant is kept
     /// until its TTL because `host_grant_bound` still needs it, while every
-    /// other inactive record is dropped immediately.
+    /// other inactive record is dropped immediately. An observer grant that
+    /// reached its TTL without being consumed or revoked is a snapshot-visible
+    /// mutation (`D-03`), so each affected session gets exactly one revision
+    /// bump — not one per record — with the same monotonic rules as a revoke.
+    /// A sweep that retires nothing, and every later sweep, bumps nothing, so
+    /// the tick is idempotent.
+    ///
+    /// A bump is skipped for a session that is already terminal (its revision
+    /// is frozen) or has been collected: the grant can no longer grant
+    /// anything, and the sweep must stay non-failing on the loop timer. The
+    /// returned count is the number of dropped records.
     pub fn sweep_grants(&mut self, now: MonotonicMs) -> usize {
-        self.grants.evict_expired(now.as_millis())
+        let dropped = self.grants.evict_expired(now.as_millis());
+        for session_id in self.grants.take_expired_sessions() {
+            let _ = self.host.record_grant_mutation(session_id, now);
+        }
+        dropped
     }
 
     /// Record exactly one refusal that the server loop refuses before a method
@@ -3880,6 +3894,117 @@ mod tests {
             1,
             "the host grant is kept until its TTL"
         );
+    }
+
+    #[test]
+    fn grant_expiry_bumps_the_revision_exactly_once() {
+        // A one-second observer TTL expires the grant while the controller's
+        // default 15-second lease is still live, so only the grant sweep moves
+        // the revision.
+        let limits = Limits::new(&[LimitOverride::new(LimitId::ObserverGrantTtlMs, 1_000)])
+            .expect("valid override");
+        let (mut service, _dir) = service_with(limits);
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 2);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        let created = create_session(&mut service, &mut creator, "expiry-create");
+        let id = session_id(&created);
+        let create_token = created["control_token"].as_str().expect("token").to_owned();
+        service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": id,
+                    "expected_generation": 0,
+                    "control_token": create_token,
+                    "idempotency_key": "expiry-claim",
+                }),
+                MonotonicMs::from_millis(4),
+            )
+            .expect("claim");
+        let minted = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": id, "idempotency_key": "expiry-grant"}),
+                MonotonicMs::from_millis(5),
+            )
+            .expect("mint");
+        assert_eq!(minted["grant_id"].as_str().map(str::len), Some(32));
+        // create, controller attach, and grant mint are the three visible
+        // mutations so far.
+        let before = status_revision(&mut service, &mut creator, &id, 6);
+        assert_eq!(before, 2);
+
+        // The grant is still live one millisecond before its TTL: a sweep
+        // there drops nothing and moves nothing.
+        assert_eq!(service.sweep_grants(MonotonicMs::from_millis(1_003)), 0);
+        assert_eq!(
+            status_revision(&mut service, &mut creator, &id, 1_004),
+            before,
+            "a sweep with no expiry never bumps the revision"
+        );
+
+        // Exactly at the TTL the record is retired and the owning session's
+        // revision advances once. The read that observes it does not bump.
+        let expired = MonotonicMs::from_millis(1_005);
+        assert_eq!(service.sweep_grants(expired), 1, "the expired grant drops");
+        let after = status_revision(&mut service, &mut creator, &id, 1_006);
+        assert_eq!(after, before + 1, "expiry is one visible mutation");
+
+        // A second sweep has nothing to retire and must not bump again.
+        assert_eq!(service.sweep_grants(MonotonicMs::from_millis(1_007)), 0);
+        assert_eq!(
+            status_revision(&mut service, &mut creator, &id, 1_008),
+            after,
+            "the sweep is idempotent"
+        );
+
+        // A keyed replay answers the original grant id without a bearer and
+        // without a revision bump.
+        let replay = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": id, "idempotency_key": "expiry-grant"}),
+                MonotonicMs::from_millis(1_009),
+            )
+            .expect("replay");
+        assert_eq!(replay["grant_id"], minted["grant_id"]);
+        assert_eq!(replay["grant"], Value::Null);
+        assert_eq!(replay["grant_active"], false);
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(
+            status_revision(&mut service, &mut creator, &id, 1_010),
+            after,
+            "a replay and a read never bump the revision"
+        );
+    }
+
+    /// Read the served `state_revision` of one session.
+    fn status_revision(
+        service: &mut Service,
+        creator: &mut Connection,
+        session_id: &str,
+        now: u64,
+    ) -> u64 {
+        service
+            .dispatch(
+                creator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": session_id}),
+                MonotonicMs::from_millis(now),
+            )
+            .expect("status")["session"]["state_revision"]
+            .as_u64()
+            .expect("revision")
     }
 
     #[test]

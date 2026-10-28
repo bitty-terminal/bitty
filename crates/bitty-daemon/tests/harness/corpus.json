@@ -5899,6 +5899,209 @@
       ]
     },
     {
+      "id": "C-10",
+      "title": "An expired observer grant bumps the revision once and never again (injected clock)",
+      "area": "counters",
+      "decisions": [
+        "D-03"
+      ],
+      "drivers": [
+        "fake"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {
+          "observer_grant_ttl_ms": 1000
+        }
+      },
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c10-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0,
+              "replayed": false
+            },
+            "hex_len": {
+              "session.session_id": 32
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "c10-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller",
+              "replayed": false,
+              "session.attach_count": 1
+            },
+            "hex_len": {
+              "attach_id": 32
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c10-grant"
+          },
+          "capture": {
+            "observer_grant_id": "grant_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session_id": "@session_id",
+              "replayed": false
+            },
+            "hex_len": {
+              "grant_id": 32
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state_revision": 2
+            }
+          }
+        },
+        {
+          "action": "advance_clock",
+          "args": {
+            "ms": 1001
+          },
+          "expect": {}
+        },
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state_revision": 3
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state_revision": 3
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c10-grant"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "grant_id": "@observer_grant_id",
+              "grant": null,
+              "grant_active": false,
+              "replayed": true
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state_revision": 3
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state_revision": 3
+            }
+          }
+        }
+      ],
+      "real_skip": "requires-injected-clock (the served loop uses a process monotonic clock)",
+      "forbidden": [
+        "grant expiry bumps the owning session exactly once",
+        "a second sweep over nothing never bumps the revision",
+        "a replay or a read never bumps the revision"
+      ]
+    },
+    {
       "id": "F-01",
       "title": "Injected outbound-queue pressure closes only the offending connection",
       "area": "bounds",

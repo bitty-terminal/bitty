@@ -29,7 +29,7 @@ use harness::real::RealDriver;
 #[test]
 fn corpus_is_well_formed_and_frozen() {
     let corpus = Corpus::load().expect("the embedded corpus parses");
-    assert_eq!(corpus.vectors.len(), 35, "corpus size changed");
+    assert_eq!(corpus.vectors.len(), 36, "corpus size changed");
     for id in [
         "C-01", "C-02", "C-03", "C-04", "C-05", "C-06", "C-07", "C-08",
     ] {
@@ -262,7 +262,7 @@ fn real_conformance_corpus() {
         .collect();
     assert_eq!(
         skipped,
-        ["V-06", "V-33", "F-01"],
+        ["V-06", "V-33", "C-10", "F-01"],
         "only the injected-clock, adapter-owned, and injected-queue vectors skip on Linux"
     );
 }
@@ -366,7 +366,7 @@ fn fake_and_real_parity() {
     assert_eq!(
         not_compared_ids,
         [
-            "V-06", "V-18", "V-33", "C-01", "C-02", "C-03", "C-07", "C-08", "F-01"
+            "V-06", "V-18", "V-33", "C-01", "C-02", "C-03", "C-07", "C-08", "C-10", "F-01"
         ],
         "the parity report changed its not-compared set"
     );

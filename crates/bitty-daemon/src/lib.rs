@@ -2,8 +2,9 @@
 //!
 //! Status: **service loop plus the in-memory state core, the session event
 //! stream, the compiled limits with their idempotency and audit stores, the
-//! endpoint, instance-lock, and peer-trust primitives, and the attach/control
-//! state machine**. This crate fixes the service version, the capability set,
+//! endpoint, instance-lock, and peer-trust primitives, the attach/control
+//! state machine, and Linux process containment with a served orphan
+//! verifier**. This crate fixes the service version, the capability set,
 //! and the version negotiation required by the accepted [`bittyd` Session-Host
 //! Contract]. It implements the registry half of bitty#2601 (server-generated
 //! ids, session records, counters, retention), the bounded orphan journal, the
@@ -81,15 +82,20 @@
 //!   generation-0 cancel intent, the graceful-to-kill stop pipeline, exit
 //!   classification, and the one terminal notice (`D-03`, `D-04`, `D-05`,
 //!   `D-07`, `D-09`, `D-17`, `D-18`).
-//! - [`orphan::OrphanJournal`]: the two-phase bounded orphan journal and the
-//!   exact-identity [`orphan::OrphanReaper`] seam (`D-06`).
+//! - [`orphan::OrphanJournal`]: the two-phase bounded orphan journal, the
+//!   recorded uid and containment identity, and the exact-identity
+//!   [`orphan::OrphanReaper`] seam (`D-06`).
+//! - [`containment`]: the typed cgroup v2 delegation probe, per-session cgroup
+//!   containment, the `PR_SET_CHILD_SUBREAPER` fallback with its `unverified`
+//!   cleanup claim, and typed refusals on every other cell (`D-06`, `D-15`).
+//! - [`orphan::OrphanSupervisor`]: the served `daemon.orphans.verify`
+//!   implementation; counts by class, no pid, idempotent (`D-06`).
 //!
 //! # Deferred, by owning slice
 //!
 //! | Contract area | Owner | Answer today |
 //! | --- | --- | --- |
-//! | Worker spawn and bind | bitty#2604 | `session.create` registers a `created` session; nothing binds generation 1 |
-//! | Containment identity, signalling, reaping, the production orphan reaper, platform probes and journal ACLs | bitty#2604 | `daemon.orphans.verify` is `Denied/UnsupportedCapability` |
+//! | Worker spawn and bind | bitty#2790 | `session.create` still registers a `created` session; containment is ready for the spawn slice |
 //! | Terminal content plane, including `session.resize` | bitty#2604 / terminal contract | no `terminal.*` scope is granted; `session.resize` is `Denied/ScopeViolation` |
 //! | Pushing session events on a connection (no subscribe method) | bitty#2602 | `session.status`/`session.list` are the reconciliation reads |
 //! | Per-connection refusal-audit aggregation | bitty#2603 follow-up | wire-level refusals are budgeted and aggregated; method refusals remain one individual record each |
@@ -97,12 +103,13 @@
 //!
 //! [`bittyd` Session-Host Contract]: https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/bittyd-session-host-contract.md
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod audit;
 pub mod audit_sink;
 pub mod cli;
 pub mod codes;
+pub mod containment;
 pub mod contract;
 pub mod endpoint;
 pub mod events;

@@ -131,11 +131,13 @@ pub enum DispatchBoundary {
     HostGrantRevoke,
     /// `daemon.stop` in any mode.
     DaemonStop,
+    /// `daemon.orphans.verify`.
+    OrphanVerify,
 }
 
 impl DispatchBoundary {
     /// Every privileged boundary in contract order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::CreateSession,
         Self::ControllerAttach,
         Self::Abort,
@@ -147,6 +149,7 @@ impl DispatchBoundary {
         Self::HostGrantMint,
         Self::HostGrantRevoke,
         Self::DaemonStop,
+        Self::OrphanVerify,
     ];
 
     /// The contract method this boundary authorizes.
@@ -163,6 +166,7 @@ impl DispatchBoundary {
             Self::ObserverGrantRevoke => "session.grant.revoke",
             Self::HostGrantMint | Self::HostGrantRevoke => "daemon.host_grant",
             Self::DaemonStop => "daemon.stop",
+            Self::OrphanVerify => "daemon.orphans.verify",
         }
     }
 }
@@ -791,8 +795,8 @@ mod tests {
     fn dispatch_boundaries_are_the_contract_methods() {
         assert_eq!(
             DispatchBoundary::ALL.len(),
-            11,
-            "the nine contract boundaries plus the two host-grant modes"
+            12,
+            "the ten contract boundaries plus the two host-grant modes"
         );
         assert_eq!(DispatchBoundary::CreateSession.method(), "session.create");
         assert_eq!(

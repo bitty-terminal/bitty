@@ -44,10 +44,14 @@ mod unix {
     use crate::audit::{AuditAggregate, AuditClassCount, MAX_AGGREGATE_CLASSES};
     use crate::audit_sink::{AuditFileWriter, AuditSinkError, default_audit_dir};
     use crate::codes::RefusalCode;
-    use crate::endpoint::{BoundEndpoint, EndpointEnv, EndpointError, open_endpoint};
+    use crate::containment::{ContainmentLimits, ContainmentReport};
+    use crate::endpoint::{
+        BoundEndpoint, EndpointEnv, EndpointError, EndpointPaths, open_endpoint,
+    };
     use crate::handshake::{ClientId, EffectiveScopes, EndpointKind, ServerIdentity};
     use crate::limits::{LimitId, Limits};
     use crate::operator::{OperatorError, OperatorStore};
+    use crate::orphan::{ORPHAN_SUBDIR, OrphanOpenError, OrphanSupervisor, journal_limits};
     use crate::registry::MonotonicMs;
     use crate::service::dispatch::{Refusal, ServerFacts, Service, ServiceError, StopMode};
     use crate::service::frame::{FramePeer, PeerFrameReader, enable_credentials};
@@ -287,6 +291,8 @@ mod unix {
         Operator(OperatorError),
         /// The audit sink could not be opened.
         Audit(AuditSinkError),
+        /// The orphan journal could not be opened, or the startup scan failed.
+        Orphan(OrphanOpenError),
         /// The service state could not be constructed.
         Service(ServiceError),
         /// No audit directory can be derived.
@@ -311,6 +317,7 @@ mod unix {
                 Self::Endpoint(error) => write!(formatter, "{error}"),
                 Self::Operator(error) => write!(formatter, "operator capability: {error}"),
                 Self::Audit(error) => write!(formatter, "audit sink: {error}"),
+                Self::Orphan(error) => write!(formatter, "orphan supervision: {error}"),
                 Self::Service(error) => write!(formatter, "service: {error}"),
                 Self::NoAuditDirectory => {
                     formatter.write_str("no XDG_STATE_HOME or HOME for the audit sink")
@@ -422,6 +429,24 @@ mod unix {
         use nix::sys::signalfd::{SfdFlags, SignalFd};
 
         harden_core_dumps()?;
+        // The containment probe and the startup orphan scan run before the
+        // endpoint is bound, so no client can create a session while an earlier
+        // record is still actionable (contract D-06). A refused containment
+        // plan is reported as an unsupported verifier, never as an empty
+        // verified one.
+        let containment = ContainmentReport::probe();
+        let paths = EndpointPaths::resolve(&config.endpoint_env).map_err(ServerError::Endpoint)?;
+        paths.prepare().map_err(ServerError::Endpoint)?;
+        let mut orphans = OrphanSupervisor::open(
+            paths.runtime_dir().join(ORPHAN_SUBDIR),
+            &journal_limits(&config.limits),
+            &containment,
+            ContainmentLimits::from_limits(&config.limits),
+        )
+        .map_err(ServerError::Orphan)?;
+        orphans
+            .verify(MonotonicMs::ZERO)
+            .map_err(|error| ServerError::Orphan(OrphanOpenError::Journal(error)))?;
         let endpoint = open_endpoint(&config.endpoint_env).map_err(|error| match error {
             EndpointError::AlreadyRunning { socket, .. } => ServerError::AlreadyRunning { socket },
             other => ServerError::Endpoint(other),
@@ -430,7 +455,7 @@ mod unix {
             OperatorStore::create_in(endpoint.runtime_dir()).map_err(ServerError::Operator)?;
         let writer =
             AuditFileWriter::open(&config.audit_dir, &config.limits).map_err(ServerError::Audit)?;
-        let mut service = Service::new(config.limits.clone(), operator, Box::new(writer))
+        let mut service = Service::new(config.limits.clone(), operator, Box::new(writer), orphans)
             .map_err(ServerError::Service)?;
         let facts = server_facts(&endpoint)?;
 
@@ -1464,8 +1489,16 @@ mod unix {
             )
             .expect("chmod");
             let operator = OperatorStore::create_in(dir.path()).expect("operator store");
-            let service =
-                Service::new(Limits::default(), operator, Box::new(NullWriter)).expect("service");
+            let service = Service::new(
+                Limits::default(),
+                operator,
+                Box::new(NullWriter),
+                crate::orphan::OrphanSupervisor::unsupported(
+                    crate::platform::PlatformCell::current(),
+                    "test",
+                ),
+            )
+            .expect("service");
             (service, dir)
         }
 

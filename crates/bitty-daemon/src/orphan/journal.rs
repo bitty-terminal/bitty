@@ -3,13 +3,13 @@
 //! The journal is written before a worker can be observed and never contains
 //! argv, environment, working directory, terminal content, or credentials. It
 //! stores exactly the fencing tuple: `session_id`, `generation`, boot id, the
-//! reserved-at time, and — after the spawn returns — the pid, process start
-//! time, and process group.
+//! reserved-at time, the containment identity, and — after the spawn returns —
+//! the pid, process start time, process group, and uid.
 //!
 //! Two phases keep a crash on either side of the spawn defined:
 //!
-//! 1. [`OrphanJournal::reserve`] writes and fsyncs a `reserved` record before
-//!    the spawn syscall.
+//! 1. [`OrphanJournal::reserve`] creates and records the containment identity,
+//!    then writes and fsyncs a `reserved` record before the spawn syscall.
 //! 2. [`OrphanJournal::commit`] fills the exact process identity and fsyncs it
 //!    again before the worker is exposed as bound.
 //!
@@ -17,23 +17,18 @@
 //! after quarantine retention expires, or by explicit operator retirement
 //! (which never signals). Classification compares the boot id first: a
 //! different boot id is unconditionally stale. Within the current boot, a
-//! reserved record with no pid, or an unreadable, absent, reused, or
-//! mismatched process, is quarantined. None of those paths can reach the
-//! reaper.
+//! cgroup record is actionable through its recorded subtree even without a
+//! pid; a subreaper record needs the exact process tuple; and an unreadable,
+//! absent, reused, or mismatched subreaper record is quarantined. Only a
+//! cgroup reaper can return [`ReapResult::Swept`].
 //!
-//! # Deferred to bitty#2604
+//! # Still deferred
 //!
-//! The containment identity (cgroup v2 subtree or subreaper descendant set),
-//! the executable path digest, the grace/kill scheduling of
-//! `orphan_reap_grace_ms`, and the platform reaper implementation are platform
-//! cell concerns. This slice supplies the journal, the exact-match
-//! classification, and the [`OrphanReaper`] seam that receives only a
-//! [`VerifiedOrphan`]. Until a cell supplies a reaper, records stay
-//! quarantined rather than being signalled by pid. On non-Linux cells the boot
-//! id and `/proc` probe are unavailable, so the same conservative
-//! classification applies; the Windows journal inherits the ACL of the
-//! daemon-owned runtime directory (bitty#2604 creates it current-user-only),
-//! while Unix enforces `0700`/`0600` here.
+//! The executable path digest and a native Windows job-object implementation
+//! remain out of this slice; the journal carries no argv or executable path.
+//! On non-Linux cells the boot id and `/proc` probe are unavailable, so every
+//! record is quarantined; Unix enforces `0700`/`0600` here, and the Windows
+//! owner-only runtime directory ACL is owned by the endpoint slice.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -41,6 +36,7 @@ use std::fs;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
+use crate::containment::ContainmentRecord;
 use crate::limits::{LimitId, Limits};
 use crate::registry::{MonotonicMs, SessionId};
 
@@ -66,7 +62,9 @@ pub const ORPHAN_RECORD_RETENTION_MS_DEFAULT: u64 =
 pub const ORPHAN_RECORD_RETENTION_MS_SYSTEM_MAX: u64 =
     LimitId::OrphanRecordRetentionMs.system_max_value();
 
-const JOURNAL_HEADER: &str = "bittyd-orphan 1";
+const JOURNAL_HEADER: &str = "bittyd-orphan 2";
+const LEGACY_JOURNAL_HEADER: &str = "bittyd-orphan 1";
+const MAX_RECORDED_CGROUP_PATH_BYTES: usize = 1024;
 const RECORD_SUFFIX: &str = ".orphan";
 const TEMP_PREFIX: &str = ".tmp-";
 
@@ -289,9 +287,10 @@ pub enum ReapResult {
 /// The signalling seam for exact-identity orphans.
 ///
 /// The journal calls this only with a [`VerifiedOrphan`], which can only be
-/// built after a boot-id, pid, start-time, and process-group match. The
-/// implementation (bitty#2604) terminates the *containment identity*, applies
-/// the graceful-then-kill bound, verifies the identity empty, and returns
+/// built after a boot-id match and either a recorded cgroup subtree or an exact
+/// boot-id, pid, start-time, process-group, and uid match. The implementation
+/// (bitty#2791) terminates the *containment identity*, applies the
+/// graceful-then-kill bound, verifies the identity empty, and returns
 /// [`ReapResult::Swept`] only when that verification succeeds. It must never
 /// fall back to a pid-only kill.
 pub trait OrphanReaper {
@@ -345,10 +344,17 @@ struct OrphanRecord {
     reserved_at: MonotonicMs,
     validated_at: Option<MonotonicMs>,
     identity: Option<ProcessIdentity>,
+    containment: Option<ContainmentRecord>,
 }
 
 impl OrphanRecord {
-    fn reserved(session_id: SessionId, generation: u64, boot_id: BootId, now: MonotonicMs) -> Self {
+    fn reserved(
+        session_id: SessionId,
+        generation: u64,
+        boot_id: BootId,
+        now: MonotonicMs,
+        containment: ContainmentRecord,
+    ) -> Self {
         Self {
             session_id,
             generation,
@@ -357,6 +363,7 @@ impl OrphanRecord {
             reserved_at: now,
             validated_at: None,
             identity: None,
+            containment: Some(containment),
         }
     }
 
@@ -369,6 +376,7 @@ impl OrphanRecord {
             reserved_at: MonotonicMs::ZERO,
             validated_at: Some(MonotonicMs::ZERO),
             identity: None,
+            containment: None,
         }
     }
 
@@ -383,9 +391,11 @@ impl OrphanRecord {
             self.identity
                 .map(|identity| u64::from(identity.process_group().get())),
         );
+        let uid = optional_number(self.identity.map(|identity| u64::from(identity.uid())));
+        let containment = containment_field(self.containment.as_ref())?;
         let validated_at = optional_number(self.validated_at.map(MonotonicMs::as_millis));
         Some(format!(
-            "{JOURNAL_HEADER}\nsession_id {}\ngeneration {}\nclass {}\nboot_id {boot_id}\nreserved_at_ms {}\nvalidated_at_ms {validated_at}\npid {pid}\nstart_time {start_time}\nprocess_group {process_group}\n",
+            "{JOURNAL_HEADER}\nsession_id {}\ngeneration {}\nclass {}\nboot_id {boot_id}\nreserved_at_ms {}\nvalidated_at_ms {validated_at}\ncontainment {containment}\npid {pid}\nstart_time {start_time}\nprocess_group {process_group}\nuid {uid}\n",
             self.session_id,
             self.generation,
             self.class.as_str(),
@@ -405,11 +415,17 @@ impl OrphanRecord {
             Pid::new(u32::MAX).expect("u32::MAX is a valid pid"),
             ProcessStartTime::new(u64::MAX),
             ProcessGroupId::new(u32::MAX).expect("u32::MAX is a valid process group"),
+            u32::MAX,
         );
         let mut worst_case = self.clone();
         worst_case.class = OrphanClass::Unverified;
         worst_case.identity = Some(identity);
         worst_case.validated_at = Some(MonotonicMs::from_millis(u64::MAX));
+        if worst_case.containment.is_none() {
+            worst_case.containment = Some(ContainmentRecord::cgroup(
+                "x".repeat(MAX_RECORDED_CGROUP_PATH_BYTES),
+            ));
+        }
         worst_case
             .encode()
             .map_or(usize::MAX, |encoded| encoded.len())
@@ -421,7 +437,9 @@ impl OrphanRecord {
 
     fn parse_valid(session_id: SessionId, text: &str) -> Option<Self> {
         let mut lines = text.lines();
-        if lines.next() != Some(JOURNAL_HEADER) {
+        let header = lines.next()?;
+        let legacy = header == LEGACY_JOURNAL_HEADER;
+        if !legacy && header != JOURNAL_HEADER {
             return None;
         }
         let encoded_session = field(lines.next()?, "session_id")?;
@@ -437,18 +455,39 @@ impl OrphanRecord {
         if class == OrphanClass::Unverified && validated_at.is_none() {
             validated_at = Some(MonotonicMs::ZERO);
         }
-        let pid = field(lines.next()?, "pid")?;
-        let start_time = field(lines.next()?, "start_time")?;
-        let process_group = field(lines.next()?, "process_group")?;
-        if lines.next().is_some() {
-            return None;
-        }
 
-        let identity = parse_identity(pid, start_time, process_group)?;
-        match (class, identity) {
-            (OrphanClass::Reserved, Some(_)) => return None,
-            (OrphanClass::Committed, None) => return None,
-            _ => {}
+        let (containment, identity) = if legacy {
+            // A version 1 record predates the uid and containment identity and
+            // is therefore unverifiable by construction. It is loaded as a
+            // quarantined record, never signalled.
+            let _pid = field(lines.next()?, "pid")?;
+            let _start_time = field(lines.next()?, "start_time")?;
+            let _process_group = field(lines.next()?, "process_group")?;
+            if lines.next().is_some() {
+                return None;
+            }
+            (None, None)
+        } else {
+            let containment = parse_containment(field(lines.next()?, "containment")?)?;
+            let pid = field(lines.next()?, "pid")?;
+            let start_time = field(lines.next()?, "start_time")?;
+            let process_group = field(lines.next()?, "process_group")?;
+            let uid = field(lines.next()?, "uid")?;
+            if lines.next().is_some() {
+                return None;
+            }
+            (
+                containment,
+                parse_identity(pid, start_time, process_group, uid)?,
+            )
+        };
+
+        if !legacy {
+            match (class, identity) {
+                (OrphanClass::Reserved, Some(_)) => return None,
+                (OrphanClass::Committed, None) => return None,
+                _ => {}
+            }
         }
 
         Some(Self {
@@ -459,8 +498,50 @@ impl OrphanRecord {
             reserved_at,
             validated_at,
             identity,
+            containment,
         })
     }
+}
+
+fn containment_field(containment: Option<&ContainmentRecord>) -> Option<String> {
+    match containment {
+        None => Some("-".to_owned()),
+        Some(ContainmentRecord::Subreaper) => Some("subreaper".to_owned()),
+        Some(ContainmentRecord::Cgroup { path }) => {
+            let text = path.to_str()?;
+            if !valid_recorded_path(text) {
+                return None;
+            }
+            Some(format!("cgroup {text}"))
+        }
+    }
+}
+
+fn parse_containment(value: &str) -> Option<Option<ContainmentRecord>> {
+    if value == "-" {
+        return Some(None);
+    }
+    if value == "subreaper" {
+        return Some(Some(ContainmentRecord::Subreaper));
+    }
+    let path = value.strip_prefix("cgroup ")?;
+    if !valid_recorded_path(path) {
+        return None;
+    }
+    Some(Some(ContainmentRecord::cgroup(path)))
+}
+
+fn valid_recorded_path(path: &str) -> bool {
+    let path = Path::new(path);
+    path.is_absolute()
+        && path.as_os_str().len() <= MAX_RECORDED_CGROUP_PATH_BYTES
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        && !path
+            .to_string_lossy()
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
 }
 
 fn optional_number(value: Option<u64>) -> String {
@@ -481,14 +562,21 @@ fn parse_identity(
     pid: &str,
     start_time: &str,
     process_group: &str,
+    uid: &str,
 ) -> Option<Option<ProcessIdentity>> {
-    if pid == "-" && start_time == "-" && process_group == "-" {
+    if pid == "-" && start_time == "-" && process_group == "-" && uid == "-" {
         return Some(None);
     }
     let pid = Pid::new(pid.parse().ok()?)?;
     let start_time = ProcessStartTime::new(start_time.parse().ok()?);
     let process_group = ProcessGroupId::new(process_group.parse().ok()?)?;
-    Some(Some(ProcessIdentity::new(pid, start_time, process_group)))
+    let uid = uid.parse().ok()?;
+    Some(Some(ProcessIdentity::new(
+        pid,
+        start_time,
+        process_group,
+        uid,
+    )))
 }
 
 fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -509,8 +597,9 @@ enum Disposition {
 /// record or the complete new one, never a partially written identity.
 ///
 /// The caller owns the runtime root and passes this directory path; the
-/// journal checks Unix mode bits but not the owner uid. bitty#2604 owns the
-/// runtime root ownership and the Windows current-user-only DACL.
+/// journal checks Unix mode bits but not the owner uid. The endpoint slice owns
+/// the runtime root ownership, and the Windows current-user-only DACL is part
+/// of the designed named-pipe transport.
 pub struct OrphanJournal {
     directory: PathBuf,
     limits: OrphanJournalLimits,
@@ -532,8 +621,8 @@ impl fmt::Debug for OrphanJournal {
 impl OrphanJournal {
     /// Open (creating if absent) the journal directory and load its records.
     ///
-    /// `boot_id` is the current cell's boot identity; bitty#2604 supplies it
-    /// (Linux callers can use [`BootId::read_system`]).
+    /// `boot_id` is the current cell's boot identity; Linux callers use
+    /// [`BootId::read_system`] through [`crate::orphan::OrphanSupervisor`].
     ///
     /// # Errors
     ///
@@ -587,15 +676,16 @@ impl OrphanJournal {
     /// # Errors
     ///
     /// Refuses when the session already has a record, the journal is full, or
-    /// even the worst-case committed encoding (maximum pid, start-time, and
-    /// process-group widths, plus a later quarantine timestamp) exceeds
-    /// `orphan_record_bytes`. Nothing is written on refusal, so a reservation
+    /// even the worst-case committed encoding (maximum pid, start-time,
+    /// process-group, and uid widths, the recorded containment path, plus a
+    /// later quarantine timestamp) exceeds `orphan_record_bytes`. Nothing is written on refusal, so a reservation
     /// never precedes a spawn unless `commit` can hold any valid identity.
     pub fn reserve(
         &mut self,
         session_id: SessionId,
         generation: u64,
         now: MonotonicMs,
+        containment: ContainmentRecord,
     ) -> Result<(), JournalError> {
         if self.records.contains_key(&session_id) {
             return Err(JournalError::DuplicateRecord);
@@ -606,7 +696,13 @@ impl OrphanJournal {
             });
         }
 
-        let record = OrphanRecord::reserved(session_id, generation, self.boot_id.clone(), now);
+        let record = OrphanRecord::reserved(
+            session_id,
+            generation,
+            self.boot_id.clone(),
+            now,
+            containment,
+        );
         let worst_case = record.worst_case_encoded_bytes();
         if worst_case > self.limits.record_bytes {
             return Err(JournalError::RecordTooLarge {
@@ -829,19 +925,61 @@ fn classify(
         // retirement, or retention removes it.
         return Disposition::Unverified;
     }
-    let Some(identity) = record.identity else {
+    let Some(containment) = record.containment.clone() else {
+        // A record without a containment identity (a version 1 record or a
+        // malformed one) can never be verified or signalled.
         return Disposition::Unverified;
     };
-
-    match probe.observe(identity.pid()) {
-        ProcessObservation::Absent | ProcessObservation::Unreadable => Disposition::Unverified,
-        ProcessObservation::Present {
-            start_time,
-            process_group,
-        } if start_time == identity.start_time() && process_group == identity.process_group() => {
-            Disposition::Exact(VerifiedOrphan::new(record_boot.clone(), identity))
+    match containment {
+        ContainmentRecord::Subreaper => {
+            let Some(identity) = record.identity else {
+                // A reserved subreaper record has no pre-spawn identity; a
+                // crash before the first child was adopted is unverifiable.
+                return Disposition::Unverified;
+            };
+            match probe.observe(identity.pid()) {
+                ProcessObservation::Present {
+                    start_time,
+                    process_group,
+                    uid,
+                } if start_time == identity.start_time()
+                    && process_group == identity.process_group()
+                    && uid == identity.uid() =>
+                {
+                    Disposition::Exact(VerifiedOrphan::new(
+                        record_boot.clone(),
+                        Some(identity),
+                        containment,
+                    ))
+                }
+                ProcessObservation::Absent
+                | ProcessObservation::Unreadable
+                | ProcessObservation::Present { .. } => Disposition::Unverified,
+            }
         }
-        ProcessObservation::Present { .. } => Disposition::Unverified,
+        ContainmentRecord::Cgroup { .. } => {
+            // A cgroup record is actionable through the pre-created subtree
+            // even when the pid is gone or reused. The reaper never signals by
+            // pid; it only passes the exact identity through for the record
+            // when it still matches.
+            let identity = record.identity.filter(|identity| {
+                matches!(
+                    probe.observe(identity.pid()),
+                    ProcessObservation::Present {
+                        start_time,
+                        process_group,
+                        uid,
+                    } if start_time == identity.start_time()
+                        && process_group == identity.process_group()
+                        && uid == identity.uid()
+                )
+            });
+            Disposition::Exact(VerifiedOrphan::new(
+                record_boot.clone(),
+                identity,
+                containment,
+            ))
+        }
     }
 }
 
@@ -1004,7 +1142,16 @@ mod tests {
             Pid::new(pid).expect("positive pid"),
             ProcessStartTime::new(start_time),
             ProcessGroupId::new(group).expect("positive group"),
+            1000,
         )
+    }
+
+    fn containment() -> ContainmentRecord {
+        ContainmentRecord::cgroup("/sys/fs/cgroup/bittyd-test/bittyd-aaaaaaaa")
+    }
+
+    fn subreaper() -> ContainmentRecord {
+        ContainmentRecord::Subreaper
     }
 
     fn limits(
@@ -1084,7 +1231,7 @@ mod tests {
         process: ProcessIdentity,
     ) {
         history
-            .reserve(session_id, 1, MonotonicMs::from_millis(1))
+            .reserve(session_id, 1, MonotonicMs::from_millis(1), subreaper())
             .expect("reserve succeeds");
         history
             .commit(session_id, process)
@@ -1098,7 +1245,7 @@ mod tests {
         let session_id = session(0x01);
 
         history
-            .reserve(session_id, 0, MonotonicMs::from_millis(7))
+            .reserve(session_id, 0, MonotonicMs::from_millis(7), subreaper())
             .expect("reserve succeeds");
 
         assert!(history.contains(session_id));
@@ -1115,6 +1262,8 @@ mod tests {
         assert!(text.contains("pid -"));
         assert!(text.contains("start_time -"));
         assert!(text.contains("process_group -"));
+        assert!(text.contains("uid -"));
+        assert!(text.contains("containment subreaper"));
     }
 
     #[test]
@@ -1156,6 +1305,7 @@ mod tests {
             ProcessObservation::Present {
                 start_time: ProcessStartTime::new(987_654),
                 process_group: ProcessGroupId::new(4242).expect("positive"),
+                uid: 1000,
             },
         );
         let mut reaper = RecordingReaper::new(ReapResult::Swept);
@@ -1172,7 +1322,7 @@ mod tests {
             }
         );
         assert_eq!(reaper.calls.len(), 1);
-        assert_eq!(reaper.calls[0].identity(), process);
+        assert_eq!(reaper.calls[0].identity(), Some(process));
         assert_eq!(reaper.calls[0].boot_id(), &boot(BOOT_A));
         assert!(!history.contains(session_id));
         assert_eq!(history.counts().total(), 0);
@@ -1191,6 +1341,7 @@ mod tests {
             ProcessObservation::Present {
                 start_time: ProcessStartTime::new(101),
                 process_group: ProcessGroupId::new(4242).expect("positive"),
+                uid: 1000,
             },
         );
         let mut reaper = RecordingReaper::new(ReapResult::Swept);
@@ -1231,7 +1382,7 @@ mod tests {
         let mut history = journal_in(&directory);
         let session_id = session(0x06);
         history
-            .reserve(session_id, 0, MonotonicMs::from_millis(1))
+            .reserve(session_id, 0, MonotonicMs::from_millis(1), subreaper())
             .expect("reserve succeeds");
 
         let probe = FakeProbe::with_boot(BOOT_A);
@@ -1294,6 +1445,7 @@ mod tests {
             ProcessObservation::Present {
                 start_time: ProcessStartTime::new(100),
                 process_group: ProcessGroupId::new(4243).expect("positive"),
+                uid: 1000,
             },
         );
         let mut reaper = RecordingReaper::new(ReapResult::Swept);
@@ -1337,14 +1489,14 @@ mod tests {
         )
         .expect("journal opens");
         history
-            .reserve(session(0x0b), 0, MonotonicMs::ZERO)
+            .reserve(session(0x0b), 0, MonotonicMs::ZERO, containment())
             .expect("first reserve succeeds");
         history
-            .reserve(session(0x0c), 0, MonotonicMs::ZERO)
+            .reserve(session(0x0c), 0, MonotonicMs::ZERO, containment())
             .expect("second reserve succeeds");
 
         assert!(matches!(
-            history.reserve(session(0x0d), 0, MonotonicMs::ZERO),
+            history.reserve(session(0x0d), 0, MonotonicMs::ZERO, containment()),
             Err(JournalError::LimitExceeded { limit: 2 })
         ));
         assert_eq!(history.counts().total(), 2);
@@ -1363,7 +1515,7 @@ mod tests {
         .expect("journal opens");
 
         assert!(matches!(
-            history.reserve(session(0x0e), 0, MonotonicMs::ZERO),
+            history.reserve(session(0x0e), 0, MonotonicMs::ZERO, containment()),
             Err(JournalError::RecordTooLarge { limit: 32, .. })
         ));
         assert_eq!(history.counts().total(), 0);
@@ -1375,9 +1527,14 @@ mod tests {
     fn reservation_admits_every_valid_commit_and_rejects_a_lower_bound() {
         let directory = TempDir::new().expect("temp dir");
         let session_id = session(0x17);
-        let worst_case =
-            OrphanRecord::reserved(session_id, 0, boot(BOOT_A), MonotonicMs::from_millis(1))
-                .worst_case_encoded_bytes();
+        let worst_case = OrphanRecord::reserved(
+            session_id,
+            0,
+            boot(BOOT_A),
+            MonotonicMs::from_millis(1),
+            containment(),
+        )
+        .worst_case_encoded_bytes();
         assert!(
             worst_case > 205,
             "the reproduced 205-byte bound must be below the committed worst case"
@@ -1392,7 +1549,7 @@ mod tests {
         )
         .expect("journal opens");
         assert!(matches!(
-            reproduced.reserve(session_id, 0, MonotonicMs::from_millis(1)),
+            reproduced.reserve(session_id, 0, MonotonicMs::from_millis(1), containment()),
             Err(JournalError::RecordTooLarge { limit: 205, .. })
         ));
         assert_eq!(reproduced.counts().total(), 0);
@@ -1409,7 +1566,7 @@ mod tests {
         .expect("journal opens");
         let max_identity = identity(u32::MAX, u64::MAX, u32::MAX);
         boundary
-            .reserve(session_id, 0, MonotonicMs::from_millis(1))
+            .reserve(session_id, 0, MonotonicMs::from_millis(1), containment())
             .expect("worst-case reservation fits");
         boundary
             .commit(session_id, max_identity)
@@ -1428,7 +1585,7 @@ mod tests {
         )
         .expect("journal opens");
         assert!(matches!(
-            too_small.reserve(session_id, 0, MonotonicMs::from_millis(1)),
+            too_small.reserve(session_id, 0, MonotonicMs::from_millis(1), containment()),
             Err(JournalError::RecordTooLarge { limit, .. }) if limit == worst_case - 1
         ));
         assert_eq!(too_small.counts().total(), 0);
@@ -1446,6 +1603,7 @@ mod tests {
             ProcessObservation::Present {
                 start_time: ProcessStartTime::new(100),
                 process_group: ProcessGroupId::new(4242).expect("positive"),
+                uid: 1000,
             },
         );
         let mut reaper = RecordingReaper::new(ReapResult::Unverified);
@@ -1520,6 +1678,7 @@ mod tests {
             ProcessObservation::Present {
                 start_time: ProcessStartTime::new(100),
                 process_group: ProcessGroupId::new(4242).expect("positive"),
+                uid: 1000,
             },
         );
         let report = history
@@ -1583,7 +1742,7 @@ mod tests {
         assert!(reaper.calls.is_empty());
 
         history
-            .reserve(reserved, 0, MonotonicMs::from_millis(11))
+            .reserve(reserved, 0, MonotonicMs::from_millis(11), containment())
             .expect("reserve succeeds");
         assert!(matches!(
             history.retire(reserved),
@@ -1660,11 +1819,16 @@ mod tests {
         let directory = TempDir::new().expect("temp dir");
         let mut history = journal_in(&directory);
         let session_id = session(0x01);
-        reserved_and_committed(&mut history, session_id, identity(4242, 987_654, 4242));
+        history
+            .reserve(session_id, 1, MonotonicMs::from_millis(1), containment())
+            .expect("reserve succeeds");
+        history
+            .commit(session_id, identity(4242, 987_654, 4242))
+            .expect("commit succeeds");
         let text = fs::read_to_string(history.record_path(session_id)).expect("record file");
 
         let expected = format!(
-            "bittyd-orphan 1\nsession_id {session_id}\ngeneration 1\nclass committed\nboot_id {BOOT_A}\nreserved_at_ms 1\nvalidated_at_ms -\npid 4242\nstart_time 987654\nprocess_group 4242\n"
+            "bittyd-orphan 2\nsession_id {session_id}\ngeneration 1\nclass committed\nboot_id {BOOT_A}\nreserved_at_ms 1\nvalidated_at_ms -\ncontainment cgroup /sys/fs/cgroup/bittyd-test/bittyd-aaaaaaaa\npid 4242\nstart_time 987654\nprocess_group 4242\nuid 1000\n"
         );
         assert_eq!(text, expected);
         for forbidden in ["argv", "env", "cwd", "content", "spawn", "SECRET"] {
@@ -1751,7 +1915,7 @@ mod tests {
 
         let session_id = session(0x13);
         history
-            .reserve(session_id, 0, MonotonicMs::ZERO)
+            .reserve(session_id, 0, MonotonicMs::ZERO, containment())
             .expect("reserve succeeds");
         assert_eq!(
             fs::metadata(history.record_path(session_id))
@@ -1773,7 +1937,7 @@ mod tests {
         {
             let mut history = journal_in(&directory);
             history
-                .reserve(session_id, 0, MonotonicMs::ZERO)
+                .reserve(session_id, 0, MonotonicMs::ZERO, containment())
                 .expect("reserve succeeds");
             fs::set_permissions(
                 history.record_path(session_id),

@@ -4,6 +4,7 @@
 //! tests prove the signalling seam is usable without spawning a process and
 //! that unverified records never reach it.
 
+use bitty_daemon::containment::ContainmentRecord;
 use bitty_daemon::orphan::{
     BootId, OrphanCounts, OrphanJournal, OrphanJournalLimits, OrphanReaper, Pid, ProcessGroupId,
     ProcessIdentity, ProcessObservation, ProcessProbe, ProcessStartTime, ReapResult,
@@ -26,7 +27,16 @@ fn identity() -> ProcessIdentity {
         Pid::new(4321).expect("positive pid"),
         ProcessStartTime::new(55_000),
         ProcessGroupId::new(4321).expect("positive group"),
+        1000,
     )
+}
+
+fn subreaper() -> ContainmentRecord {
+    ContainmentRecord::Subreaper
+}
+
+fn cgroup() -> ContainmentRecord {
+    ContainmentRecord::cgroup("/sys/fs/cgroup/bittyd-test/bittyd-aaaaaaaa")
 }
 
 struct FakeProbe {
@@ -45,7 +55,7 @@ impl ProcessProbe for FakeProbe {
 }
 
 struct RecordingReaper {
-    calls: Vec<ProcessIdentity>,
+    calls: Vec<Option<ProcessIdentity>>,
     result: ReapResult,
 }
 
@@ -71,7 +81,7 @@ fn exact_identity_is_the_only_path_to_the_reaper() {
     let mut journal = journal(&directory);
     let session_id = session();
     journal
-        .reserve(session_id, 0, MonotonicMs::from_millis(1))
+        .reserve(session_id, 0, MonotonicMs::from_millis(1), subreaper())
         .expect("reserve");
     journal.commit(session_id, identity()).expect("commit");
     assert_eq!(journal.counts().committed, 1);
@@ -81,6 +91,7 @@ fn exact_identity_is_the_only_path_to_the_reaper() {
         observation: ProcessObservation::Present {
             start_time: ProcessStartTime::new(55_000),
             process_group: ProcessGroupId::new(4321).expect("positive"),
+            uid: 1000,
         },
     };
     let mut reaper = RecordingReaper {
@@ -93,7 +104,7 @@ fn exact_identity_is_the_only_path_to_the_reaper() {
 
     assert_eq!(report.reaped, 1);
     assert_eq!(report.unverified, 0);
-    assert_eq!(reaper.calls, vec![identity()]);
+    assert_eq!(reaper.calls, vec![Some(identity())]);
     assert_eq!(journal.counts().total(), 0);
 }
 
@@ -105,10 +116,10 @@ fn missing_pid_and_reused_pid_never_reach_the_reaper() {
     let reused = SessionId::parse(&"22".repeat(16)).expect("canonical session id");
 
     journal
-        .reserve(reserved, 0, MonotonicMs::from_millis(1))
+        .reserve(reserved, 0, MonotonicMs::from_millis(1), subreaper())
         .expect("reserve");
     journal
-        .reserve(reused, 1, MonotonicMs::from_millis(1))
+        .reserve(reused, 1, MonotonicMs::from_millis(1), subreaper())
         .expect("reserve");
     journal.commit(reused, identity()).expect("commit");
 
@@ -117,6 +128,7 @@ fn missing_pid_and_reused_pid_never_reach_the_reaper() {
         observation: ProcessObservation::Present {
             start_time: ProcessStartTime::new(55_001),
             process_group: ProcessGroupId::new(4321).expect("positive"),
+            uid: 1000,
         },
     };
     let mut reaper = RecordingReaper {
@@ -146,6 +158,59 @@ fn missing_pid_and_reused_pid_never_reach_the_reaper() {
     );
 }
 
+#[test]
+fn a_reserved_cgroup_record_is_actionable_without_a_pid() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut journal = journal(&directory);
+    let session_id = session();
+    journal
+        .reserve(session_id, 0, MonotonicMs::from_millis(1), cgroup())
+        .expect("reserve");
+    let probe = FakeProbe {
+        boot_id: Some(boot()),
+        observation: ProcessObservation::Absent,
+    };
+    let mut reaper = RecordingReaper {
+        calls: Vec::new(),
+        result: ReapResult::Swept,
+    };
+    let report = journal
+        .reap(&probe, &mut reaper, MonotonicMs::from_millis(2))
+        .expect("reap");
+
+    assert_eq!(report.reaped, 1);
+    assert_eq!(reaper.calls.len(), 1);
+    assert_eq!(
+        reaper.calls[0].as_ref().map(|identity| identity.pid()),
+        None,
+        "a reserved record carries no pid and the reaper must not invent one"
+    );
+    assert_eq!(journal.counts().total(), 0);
+}
+
+#[test]
+fn a_reserved_subreaper_record_is_quarantined() {
+    let directory = TempDir::new().expect("temp dir");
+    let mut journal = journal(&directory);
+    let session_id = session();
+    journal
+        .reserve(session_id, 0, MonotonicMs::from_millis(1), subreaper())
+        .expect("reserve");
+    let probe = FakeProbe {
+        boot_id: Some(boot()),
+        observation: ProcessObservation::Absent,
+    };
+    let mut reaper = RecordingReaper {
+        calls: Vec::new(),
+        result: ReapResult::Swept,
+    };
+    let report = journal
+        .reap(&probe, &mut reaper, MonotonicMs::from_millis(2))
+        .expect("reap");
+    assert_eq!(report.unverified, 1);
+    assert!(reaper.calls.is_empty());
+}
+
 #[cfg(unix)]
 #[test]
 fn the_journal_directory_and_record_are_owner_private() {
@@ -155,7 +220,7 @@ fn the_journal_directory_and_record_are_owner_private() {
     let directory = TempDir::new().expect("temp dir");
     let mut journal = journal(&directory);
     journal
-        .reserve(session(), 0, MonotonicMs::from_millis(1))
+        .reserve(session(), 0, MonotonicMs::from_millis(1), subreaper())
         .expect("reserve");
 
     let journal_dir = directory.path().join("journal");
@@ -192,7 +257,7 @@ fn the_record_contains_only_the_fenced_identity() {
     let mut journal = journal(&directory);
     let session_id = session();
     journal
-        .reserve(session_id, 0, MonotonicMs::from_millis(1))
+        .reserve(session_id, 0, MonotonicMs::from_millis(1), subreaper())
         .expect("reserve");
     journal.commit(session_id, identity()).expect("commit");
 
@@ -213,6 +278,8 @@ fn the_record_contains_only_the_fenced_identity() {
         "pid",
         "start_time",
         "process_group",
+        "uid",
+        "containment",
     ] {
         assert!(text.contains(&format!("{key} ")), "missing {key}");
     }

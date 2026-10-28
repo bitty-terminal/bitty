@@ -484,6 +484,25 @@ impl EndpointPaths {
         })
     }
 
+    /// Create and attest the owner-private runtime directory without binding.
+    ///
+    /// The orphan startup scan needs the journal path before the socket is
+    /// bound (contract `D-06`). This performs the same root attestation and
+    /// `0700` directory creation [`open_endpoint`] performs, so the later bind
+    /// is a no-op for the directory and never weakens the endpoint checks.
+    ///
+    /// # Errors
+    ///
+    /// The same root, directory, owner, and mode refusals as
+    /// [`open_endpoint`].
+    pub fn prepare(&self) -> Result<(), EndpointError> {
+        prepare_runtime_dir(
+            &self.runtime_dir,
+            self.runtime_root.as_deref(),
+            getuid().as_raw(),
+        )
+    }
+
     /// The owner-private runtime directory.
     #[must_use]
     pub fn runtime_dir(&self) -> &Path {

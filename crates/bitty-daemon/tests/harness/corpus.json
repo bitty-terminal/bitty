@@ -2239,9 +2239,10 @@
           "method": "daemon.orphans.verify",
           "params": null,
           "expect": {
-            "ok": false,
-            "error_class": "Denied",
-            "error_code": "UnsupportedCapability"
+            "ok": true,
+            "result": {
+              "reaped": 0
+            }
           }
         }
       ],
@@ -5713,7 +5714,7 @@
     },
     {
       "id": "C-03",
-      "title": "Orphan verification is refused while containment is deferred; nothing is adopted",
+      "title": "Orphan verification is served on Linux, reports counts, and is idempotent",
       "area": "orphans",
       "decisions": [
         "D-06"
@@ -5748,9 +5749,29 @@
           "method": "daemon.orphans.verify",
           "params": null,
           "expect": {
-            "ok": false,
-            "error_class": "Denied",
-            "error_code": "UnsupportedCapability"
+            "ok": true,
+            "result": {
+              "reaped": 0,
+              "unverified": 0,
+              "stale": 0,
+              "reserved": 0,
+              "committed": 0
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.orphans.verify",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "reaped": 0,
+              "unverified": 0,
+              "stale": 0,
+              "reserved": 0,
+              "committed": 0
+            }
           }
         }
       ],
@@ -5763,7 +5784,7 @@
             "ok": true,
             "result": {
               "active_sessions": 0,
-              "orphans.verify": "deferred"
+              "orphans.verify": "served"
             }
           }
         },
@@ -5773,9 +5794,9 @@
             "audit": {
               "line_bounds": [
                 {
-                  "needle": "a=daemon.orphans.verify r=refused c=unsupported_capability",
-                  "min": 1,
-                  "max": 1
+                  "needle": "a=daemon.orphans.verify r=ok",
+                  "min": 2,
+                  "max": 2
                 }
               ]
             }
@@ -5783,10 +5804,9 @@
         }
       ],
       "fake_skip": "the fake server has no orphan journal or process",
-      "deferred": "worker spawn and the production orphan reaper are bitty#2604",
       "forbidden": [
-        "no orphan is adopted or claimed verified",
-        "no pid is signalled"
+        "no orphan is adopted or claimed verified without an empty containment identity",
+        "no pid is exposed or signalled"
       ]
     },
     {

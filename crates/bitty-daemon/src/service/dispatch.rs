@@ -38,9 +38,10 @@
 //!
 //! `session.resize` needs `terminal.manage`, a `bitty-ipc` v1 scope the daemon
 //! does not grant in this slice, so it is a typed `Denied/ScopeViolation`.
-//! `daemon.orphans.verify` needs the orphan journal and exact-identity reaper
-//! owned by bitty#2604; it refuses with `Denied/UnsupportedCapability` instead
-//! of pretending an empty verification. Both are recorded in the crate README.
+//! `daemon.orphans.verify` is served on Linux x86_64 from the owner-private
+//! journal and the recorded containment identity; a cell with no accepted
+//! mechanism refuses with `Denied/UnsupportedCapability` instead of pretending
+//! an empty verification. Both are recorded in the crate README.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -71,6 +72,7 @@ use crate::lease::{
 };
 use crate::limits::{LimitId, Limits};
 use crate::operator::{OperatorError, OperatorStore};
+use crate::orphan::OrphanSupervisor;
 use crate::peer::DispatchBoundary;
 use crate::registry::RegistryLimits;
 use crate::registry::{
@@ -404,6 +406,7 @@ pub struct Service {
     limits: Limits,
     audit: AuditSink<Box<dyn AuditWriter>>,
     operator: OperatorStore,
+    orphans: OrphanSupervisor,
     grants: GrantStore,
     create_keys: IdempotencyStore,
     session_keys: BTreeMap<SessionId, IdempotencyStore>,
@@ -439,6 +442,7 @@ impl Service {
         limits: Limits,
         operator: OperatorStore,
         writer: Box<dyn AuditWriter>,
+        orphans: OrphanSupervisor,
     ) -> Result<Self, ServiceError> {
         let host = SessionHost::new(
             RegistryLimits::from_limits(&limits),
@@ -454,6 +458,7 @@ impl Service {
             limits,
             audit,
             operator,
+            orphans,
             create_keys,
             session_keys: BTreeMap::new(),
             create_key_by_session: BTreeMap::new(),
@@ -797,9 +802,7 @@ impl Service {
             ServiceMethod::DaemonStatus => self.daemon_status(now),
             ServiceMethod::DaemonStop => self.daemon_stop(connection, fields, now),
             ServiceMethod::DaemonHostGrant => self.daemon_host_grant(connection, fields, now),
-            ServiceMethod::DaemonOrphansVerify => {
-                Err(Refusal::denied(RefusalCode::UnsupportedCapability))
-            }
+            ServiceMethod::DaemonOrphansVerify => self.daemon_orphans_verify(connection, now),
             ServiceMethod::SessionCreate => self.session_create(connection, fields, now),
             ServiceMethod::SessionStatus => self.session_status(connection, fields, now),
             ServiceMethod::SessionList => self.session_list(connection, now),
@@ -1195,7 +1198,7 @@ impl Service {
             "drain_deadline_ms": self.drain_deadline_ms,
             "tcp_listeners": tcp_listener_count(),
             "limits": limits,
-            "orphans": {"verify": "deferred"},
+            "orphans": self.orphans.status_json(),
         }))
     }
 
@@ -1247,6 +1250,48 @@ impl Service {
             "terminated": terminated,
             "drain_deadline_ms": self.drain_deadline_ms,
         }))
+    }
+
+    /// `daemon.orphans.verify` (`D-06`, `daemon.control`).
+    ///
+    /// Served only when startup selected an enforced containment mechanism and
+    /// opened the owner-private journal. The pass may signal an exact cgroup
+    /// record and quarantines everything it cannot prove; the response carries
+    /// counts by class and never a pid, path, or command.
+    fn daemon_orphans_verify(
+        &mut self,
+        connection: &Connection,
+        now: MonotonicMs,
+    ) -> Result<Value, Refusal> {
+        if !self.orphans.is_served() {
+            return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
+        }
+        self.recheck(connection, DispatchBoundary::OrphanVerify)?;
+        self.admit()?;
+        let report = self
+            .orphans
+            .verify(now)
+            .map_err(|_| Refusal::denied(RefusalCode::Internal))?
+            .ok_or_else(|| Refusal::denied(RefusalCode::UnsupportedCapability))?;
+        let acted = report
+            .reaped
+            .saturating_add(report.unverified)
+            .saturating_add(report.stale);
+        self.record(
+            AuditAction::OrphanVerify,
+            connection,
+            None,
+            AuditTarget::none(),
+            AuditResult::Ok,
+            Some(AuditCounts::new(
+                u64::try_from(acted).unwrap_or(u64::MAX),
+                self.limits.effective(LimitId::MaxOrphanRecords),
+                Some(LimitId::MaxOrphanRecords),
+            )),
+            None,
+            now,
+        );
+        Ok(report.to_json())
     }
 
     /// Terminate every non-terminal session with `cause` and return the count.
@@ -2912,7 +2957,10 @@ mod tests {
         service_with(Limits::default())
     }
 
-    fn service_with(limits: Limits) -> (Service, tempfile::TempDir) {
+    fn service_with_orphans(
+        limits: Limits,
+        orphans: OrphanSupervisor,
+    ) -> (Service, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::set_permissions(
             dir.path(),
@@ -2921,8 +2969,15 @@ mod tests {
         .expect("chmod");
         let operator = OperatorStore::create_in(dir.path()).expect("operator store");
         let (writer, _fail) = TestWriter::new();
-        let service = Service::new(limits, operator, Box::new(writer)).expect("service");
+        let service = Service::new(limits, operator, Box::new(writer), orphans).expect("service");
         (service, dir)
+    }
+
+    fn service_with(limits: Limits) -> (Service, tempfile::TempDir) {
+        service_with_orphans(
+            limits,
+            OrphanSupervisor::unsupported(crate::platform::PlatformCell::current(), "test"),
+        )
     }
 
     fn facts() -> ServerFacts {
@@ -3519,8 +3574,13 @@ mod tests {
         .expect("chmod");
         let operator = OperatorStore::create_in(dir.path()).expect("operator");
         let (writer, fail) = TestWriter::new();
-        let mut service =
-            Service::new(Limits::default(), operator, Box::new(writer)).expect("service");
+        let mut service = Service::new(
+            Limits::default(),
+            operator,
+            Box::new(writer),
+            OrphanSupervisor::unsupported(crate::platform::PlatformCell::current(), "test"),
+        )
+        .expect("service");
         let mut operator_conn = operator_connection(&mut service);
         let grant = mint_host_grant(&mut service, &mut operator_conn, 2);
         let mut creator = consumer();
@@ -3686,7 +3746,7 @@ mod tests {
     }
 
     #[test]
-    fn deferred_methods_return_typed_refusals() {
+    fn an_unsupported_orphan_verifier_is_a_typed_refusal() {
         let (mut service, _dir) = service();
         let mut operator_conn = operator_connection(&mut service);
         let error = service
@@ -3696,7 +3756,7 @@ mod tests {
                 &json!({"action": "verify"}),
                 MonotonicMs::from_millis(2),
             )
-            .expect_err("deferred");
+            .expect_err("unsupported");
         assert_eq!(
             error.denied_code(),
             Some(RefusalCode::UnsupportedCapability)
@@ -3718,6 +3778,56 @@ mod tests {
             service.audit_counters().refusals > refusals,
             "a refused mutation is attributed (D-16)"
         );
+    }
+
+    #[test]
+    fn a_served_orphan_verifier_reports_counts_and_is_idempotent() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("chmod");
+        let report = crate::containment::ContainmentReport::subreaper(
+            crate::platform::PlatformCell::current(),
+            None,
+        );
+        let supervisor = OrphanSupervisor::open(
+            dir.path().join("orphans"),
+            &crate::orphan::OrphanJournalLimits::default(),
+            &report,
+            crate::containment::ContainmentLimits::default(),
+        )
+        .expect("served supervisor");
+        let (mut service, _runtime) = service_with_orphans(Limits::default(), supervisor);
+        let mut operator_conn = operator_connection(&mut service);
+
+        let first = service
+            .dispatch(
+                &mut operator_conn,
+                ServiceMethod::DaemonOrphansVerify,
+                &json!({"action": "verify"}),
+                MonotonicMs::from_millis(2),
+            )
+            .expect("served");
+        assert_eq!(first["reaped"], 0);
+        assert_eq!(first["unverified"], 0);
+        assert_eq!(first["stale"], 0);
+        assert_eq!(first["reserved"], 0);
+        assert_eq!(first["committed"], 0);
+        assert!(
+            !first.to_string().contains("pid"),
+            "verify must not expose a pid"
+        );
+        let second = service
+            .dispatch(
+                &mut operator_conn,
+                ServiceMethod::DaemonOrphansVerify,
+                &json!({"action": "verify"}),
+                MonotonicMs::from_millis(3),
+            )
+            .expect("served again");
+        assert_eq!(second, first, "verify is idempotent");
     }
 
     #[test]

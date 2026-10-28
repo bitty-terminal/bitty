@@ -288,13 +288,7 @@ impl FakeDriver {
             "daemon.status" => self.daemon_status(connection),
             "daemon.stop" => self.daemon_stop(connection, &params),
             "daemon.host_grant" => self.daemon_host_grant(connection, &params),
-            "daemon.orphans.verify" => {
-                if !self.has_scope(connection, "daemon.control") {
-                    self.refuse(method, "Denied", "ScopeViolation", None)
-                } else {
-                    self.refuse(method, "Denied", "UnsupportedCapability", None)
-                }
-            }
+            "daemon.orphans.verify" => self.daemon_orphans_verify(connection),
             "session.create" => self.session_create(connection, &params),
             "session.status" => self.session_status(connection, &params),
             "session.list" => self.session_list(connection),
@@ -617,7 +611,29 @@ impl FakeDriver {
                 "audit_degraded": false,
                 "drain_deadline_ms": Value::Null,
                 "limits": limits,
-                "orphans": {"verify": "deferred"},
+                "orphans": {
+                    "verify": "served",
+                    "mechanism": "fake",
+                    "records": {"reserved": 0, "committed": 0, "unverified": 0},
+                },
+            }),
+        )
+    }
+
+    fn daemon_orphans_verify(&mut self, connection: &str) -> Outcome {
+        if !self.has_scope(connection, "daemon.control") {
+            return self.refuse("daemon.orphans.verify", "Denied", "ScopeViolation", None);
+        }
+        // The fake has no journal and no process; it models the served shape
+        // with an always-empty store and never claims a real reap.
+        self.reply(
+            "daemon.orphans.verify",
+            json!({
+                "reaped": 0,
+                "unverified": 0,
+                "stale": 0,
+                "reserved": 0,
+                "committed": 0,
             }),
         )
     }

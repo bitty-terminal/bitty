@@ -30,7 +30,7 @@
 //! [`crate::events`] (bitty#2602) and wraps the same registry. Deferred to
 //! their owning slices: IPC decoding, scopes, error mapping, `daemon.status`
 //! serialization, and the audit sink writer (bitty#2607), and process
-//! containment or orphan reaping (bitty#2604).
+//! containment or orphan reaping (bitty#2791).
 
 mod id;
 mod session;

@@ -12,6 +12,7 @@
 use std::fmt::Write as _;
 
 use crate::CRATE_VERSION;
+use crate::containment::ContainmentReport;
 use crate::contract::{CAPABILITIES, Capabilities, SERVICE_API_VERSION, ServiceApiVersion};
 
 /// Whether the IPC service loop is installed behind this seam.
@@ -65,7 +66,7 @@ impl std::fmt::Display for EndpointState {
 }
 
 /// Status of the session-host seam.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SeamStatus {
     /// Service version this build would negotiate.
     pub service_api_version: ServiceApiVersion,
@@ -75,18 +76,21 @@ pub struct SeamStatus {
     pub ipc_service: IpcServiceState,
     /// Whether a local endpoint is bound.
     pub endpoint: EndpointState,
+    /// The containment plan this build selected on this cell.
+    pub containment: ContainmentReport,
 }
 
 impl SeamStatus {
     /// The status of this build: the contract version and capability set with
     /// no listener and no endpoint.
     #[must_use]
-    pub const fn current() -> Self {
+    pub fn current() -> Self {
         Self {
             service_api_version: SERVICE_API_VERSION,
             capabilities: CAPABILITIES,
             ipc_service: IpcServiceState::Wired,
             endpoint: EndpointState::Unbound,
+            containment: ContainmentReport::probe(),
         }
     }
 
@@ -121,6 +125,7 @@ impl SeamStatus {
         let _ = writeln!(out, "worker sessions: unsupported (contract D-01)");
         let _ = writeln!(out, "ipc service: {}", self.ipc_service);
         let _ = writeln!(out, "endpoint: {}", self.endpoint);
+        let _ = writeln!(out, "containment: {}", self.containment);
         out
     }
 }
@@ -149,5 +154,6 @@ mod tests {
         assert!(rendered.contains("worker sessions: unsupported"));
         assert!(rendered.contains("ipc service: wired"));
         assert!(rendered.contains("endpoint: none bound"));
+        assert!(rendered.contains("containment: "));
     }
 }

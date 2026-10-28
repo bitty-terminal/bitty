@@ -116,6 +116,19 @@ sed "s/$recorded_digest/$fixture_digest/" "$PATCHES" >"$TMP/PATCHES.fixture.md"
 pass_case "intact recorded patch" \
   "$GATE" --metadata "$TMP/metadata-fixed.json" --lock "$FIXTURES/Cargo.lock.path" \
   --tree "$TMP/tree" --patches "$TMP/PATCHES.fixture.md"
+
+# Every patch row is verified independently: a second patch without its hash
+# row, or with mutated bytes, fails even while patch 1 stays intact.
+grep -v 'Patch 2 SHA-256' "$TMP/PATCHES.fixture.md" >"$TMP/PATCHES.no-patch2-hash.md"
+fail_case "second patch without a hash row" 'no `Patch 2 SHA-256` row' \
+  "$GATE" --metadata "$TMP/metadata-fixed.json" --lock "$FIXTURES/Cargo.lock.path" \
+  --tree "$TMP/tree" --patches "$TMP/PATCHES.no-patch2-hash.md"
+cp -R "$TMP/tree" "$TMP/tree2"
+printf '\n# mutated\n' >>"$TMP/tree2/patches/0002-codeql-null-guards.diff"
+fail_case "mutated second patch" "recorded patch patches/0002-codeql-null-guards.diff" \
+  "$GATE" --metadata "$TMP/metadata-fixed.json" --lock "$FIXTURES/Cargo.lock.path" \
+  --tree "$TMP/tree2" --patches "$TMP/PATCHES.fixture.md"
+
 printf '\n# mutated\n' >>"$TMP/tree/patches/0001-wayland-xdg-suspended-occluded.diff"
 fail_case "mutated recorded patch" "recorded patch" \
   "$GATE" --metadata "$TMP/metadata-fixed.json" --lock "$FIXTURES/Cargo.lock.path" \

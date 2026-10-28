@@ -1,0 +1,25 @@
+diff --git a/src/platform_impl/linux/x11/ime/input_method.rs b/src/platform_impl/linux/x11/ime/input_method.rs
+index 99e25a3f..34646dc2 100644
+--- a/src/platform_impl/linux/x11/ime/input_method.rs
++++ b/src/platform_impl/linux/x11/ime/input_method.rs
+@@ -61,12 +61,14 @@ impl InputMethod {
+ 
+         if !styles.is_null() {
+             // SAFETY: `XGetIMValues` wrote a non-null `XIMStyles` pointer into
+-            // `styles`, so the struct can be read and later freed once.
+-            // `supported_styles` may still be null when the server reports no
+-            // styles; `from_raw_parts` requires a non-null, aligned pointer
+-            // even for a zero-length slice, so an empty slice is used instead.
+-            let count_styles = unsafe { (*styles).count_styles as usize };
+-            let supported_ptr = unsafe { (*styles).supported_styles };
++            // `styles`, so the struct is live and can be copied out by value;
++            // it is freed once below. `supported_styles` may still be null when
++            // the server reports no styles; `from_raw_parts` requires a
++            // non-null, aligned pointer even for a zero-length slice, so an
++            // empty slice is used instead.
++            let styles_copy = unsafe { std::ptr::read(styles) };
++            let count_styles = styles_copy.count_styles as usize;
++            let supported_ptr = styles_copy.supported_styles;
+             let supported_styles: &[XIMStyle] = if count_styles == 0 || supported_ptr.is_null() {
+                 &[]
+             } else {

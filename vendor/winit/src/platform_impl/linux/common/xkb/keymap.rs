@@ -987,7 +987,10 @@ impl XkbKeymap {
                 &mut keysyms,
             );
 
-            if count == 1 {
+            // The Xlib contract returns one keysym at most for a level, but the
+            // count and the out-pointer are independent: guard both so a null
+            // pointer can never be dereferenced.
+            if count == 1 && !keysyms.is_null() {
                 *keysyms
             } else {
                 0

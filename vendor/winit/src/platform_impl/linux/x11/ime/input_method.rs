@@ -59,22 +59,37 @@ impl InputMethod {
         let mut preedit_style = None;
         let mut none_style = None;
 
-        unsafe {
-            std::slice::from_raw_parts((*styles).supported_styles, (*styles).count_styles as _)
-                .iter()
-                .for_each(|style| match *style {
-                    XIM_PREEDIT_STYLE => {
-                        preedit_style = Some(Style::Preedit(*style));
-                    },
-                    XIM_NOTHING_STYLE if preedit_style.is_none() => {
-                        preedit_style = Some(Style::Nothing(*style))
-                    },
-                    XIM_NONE_STYLE => none_style = Some(Style::None(*style)),
-                    _ => (),
-                });
+        if !styles.is_null() {
+            // SAFETY: `XGetIMValues` wrote a non-null `XIMStyles` pointer into
+            // `styles`, so the struct is live and can be copied out by value;
+            // it is freed once below. `supported_styles` may still be null when
+            // the server reports no styles; `from_raw_parts` requires a
+            // non-null, aligned pointer even for a zero-length slice, so an
+            // empty slice is used instead.
+            let styles_copy = unsafe { std::ptr::read(styles) };
+            let count_styles = styles_copy.count_styles as usize;
+            let supported_ptr = styles_copy.supported_styles;
+            let supported_styles: &[XIMStyle] = if count_styles == 0 || supported_ptr.is_null() {
+                &[]
+            } else {
+                unsafe { std::slice::from_raw_parts(supported_ptr, count_styles) }
+            };
 
-            (xconn.xlib.XFree)(styles.cast());
-        };
+            supported_styles.iter().for_each(|style| match *style {
+                XIM_PREEDIT_STYLE => {
+                    preedit_style = Some(Style::Preedit(*style));
+                },
+                XIM_NOTHING_STYLE if preedit_style.is_none() => {
+                    preedit_style = Some(Style::Nothing(*style))
+                },
+                XIM_NONE_STYLE => none_style = Some(Style::None(*style)),
+                _ => (),
+            });
+
+            unsafe {
+                (xconn.xlib.XFree)(styles.cast());
+            }
+        }
 
         if preedit_style.is_none() && none_style.is_none() {
             return None;

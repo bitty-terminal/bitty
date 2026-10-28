@@ -492,12 +492,43 @@ impl std::error::Error for SceneError {}
 /// validated at insertion (SCN-1..5). Incremental updates diff the previous
 /// tree; here we model the store as a bounded map of `RichBlock`s keyed by
 /// `BlockId`. Renderer consumes a snapshot of this store plus damage.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Scene {
     blocks: VecDeque<RichBlock>,
     aggregated_bytes: usize,
     generation: u64,
     next_id: u64,
+    identity: u64,
+}
+
+/// Process-local counter behind [`Scene::identity`].
+///
+/// The value never enters paint output or admission accounting: it exists
+/// only so a per-leaf paint cache can tell two scenes apart when both sit at
+/// the same generation (two fresh scenes that each admitted one block are
+/// both generation `1`).
+static NEXT_SCENE_IDENTITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Allocates the next scene identity (wrapping; collisions require 2^64
+/// allocations and only cost a redundant repaint, never a wrong frame).
+fn next_scene_identity() -> u64 {
+    NEXT_SCENE_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl Clone for Scene {
+    /// A clone is an independent scene: it keeps the blocks, byte
+    /// accounting, generation, and next id, but takes a fresh
+    /// [`Scene::identity`] so a cache keyed on identity cannot serve one
+    /// scene's paint list for the other.
+    fn clone(&self) -> Self {
+        Self {
+            blocks: self.blocks.clone(),
+            aggregated_bytes: self.aggregated_bytes,
+            generation: self.generation,
+            next_id: self.next_id,
+            identity: next_scene_identity(),
+        }
+    }
 }
 
 impl Default for Scene {
@@ -515,7 +546,20 @@ impl Scene {
             aggregated_bytes: 0,
             generation: 0,
             next_id: 1,
+            identity: next_scene_identity(),
         }
+    }
+
+    /// Stable, process-local identity of this scene instance.
+    ///
+    /// Two scenes can share a generation while holding different content
+    /// (both admitted one block, for example). A paint cache that keys only
+    /// on `(generation, geometry)` would serve one scene's list for the
+    /// other; the identity token makes that impossible. It is never painted,
+    /// serialized, or compared for ordering.
+    #[must_use]
+    pub const fn identity(&self) -> u64 {
+        self.identity
     }
 
     /// Number of retained blocks.

@@ -777,7 +777,7 @@ jobs:
           tool: nextest@0.9.145
 
       - name: Run tests under xvfb (X11, nextest ci profile)
-        run: xvfb-run -a cargo nextest run --workspace --locked --profile ci -E 'not binary(=conformance)'
+        run: xvfb-run -a cargo nextest run --workspace --locked --profile ci
 
       - name: Run doctests (X11)
         run: cargo test --workspace --doc --locked
@@ -785,14 +785,11 @@ jobs:
       - name: Run harness=false platform entry points (X11)
         run: xvfb-run -a cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
-      # bitty#2605: the real-service conformance row is excluded from the
-      # nextest step above and named here on this Linux Tier-1 leg. The corpus
-      # records typed skips for the injected-clock and adapter-owned rows; a
-      # fake pass never closes a real row. The parity document compares the two
-      # typed signatures.
-      - name: Run bittyd conformance (real service)
-        run: cargo test -p bitty-daemon --test conformance --locked
-
+      # bitty#2605: the real-service conformance row runs in the nextest step
+      # above on this Linux Tier-1 leg; macOS and Windows keep the same test
+      # for the typed platform-skip path. The corpus records typed skips for
+      # the injected-clock and adapter-owned rows; a fake pass never closes a
+      # real row. The parity document compares the two typed signatures.
       - name: Upload bittyd conformance evidence (linux-x86_64)
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

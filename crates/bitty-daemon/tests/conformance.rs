@@ -13,13 +13,15 @@ mod harness;
 
 use std::collections::BTreeMap;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
-use harness::corpus::{AuditExpect, Corpus, DriverKind};
+use harness::corpus::{AuditExpect, Corpus, DriverKind, Expect};
 use harness::evidence::{self, Evidence};
 use harness::fake::FakeDriver;
-use harness::runner::{Driver, RowStatus, VectorOutcome, run_corpus};
-use harness::runner::{check_audit, known_defect_matches};
+use harness::runner::{
+    Driver, Outcome, Reply, RowStatus, VectorOutcome, check_audit, check_expect,
+    known_defect_matches, run_corpus,
+};
 
 #[cfg(target_os = "linux")]
 use harness::real::RealDriver;
@@ -104,6 +106,71 @@ fn audit_not_contains_resolves_captured_secrets() {
     assert!(
         check_audit(&expect, "a=session.create r=ok", &vars).is_ok(),
         "a clean audit line passes"
+    );
+}
+
+#[test]
+fn not_equal_any_rejects_duplicate_ids() {
+    let corpus = Corpus::load().expect("corpus");
+    let c01 = corpus.vector("C-01").expect("C-01");
+    let third = c01
+        .steps
+        .iter()
+        .find(|step| step.params.get("idempotency_key").and_then(Value::as_str) == Some("c01-c"))
+        .expect("C-01 third create");
+    let mut expect = Expect::default();
+    expect.not_equal_any = third.expect.not_equal_any.clone();
+    assert!(
+        expect.not_equal_any.contains_key("session.session_id")
+            && expect.not_equal_any.contains_key("session.terminal_id"),
+        "C-01 must assert session and terminal id uniqueness"
+    );
+    expect
+        .not_equal_any
+        .retain(|path, _| path == "session.session_id");
+    let mut vars = BTreeMap::new();
+    vars.insert("a_sid".to_owned(), Value::String("a".repeat(32)));
+    vars.insert("b_sid".to_owned(), Value::String("b".repeat(32)));
+    let mut driver = FakeDriver::new();
+    let reply = |id: &str| {
+        Outcome::Reply(Reply {
+            ok: true,
+            result: json!({"session": {"session_id": id}}),
+            error: None,
+        })
+    };
+    assert!(
+        check_expect(
+            &expect,
+            &reply(&"a".repeat(32)),
+            &mut driver,
+            "client",
+            &vars
+        )
+        .is_err(),
+        "a duplicate of the first id must fail"
+    );
+    assert!(
+        check_expect(
+            &expect,
+            &reply(&"b".repeat(32)),
+            &mut driver,
+            "client",
+            &vars
+        )
+        .is_err(),
+        "a duplicate of the second id must fail"
+    );
+    assert!(
+        check_expect(
+            &expect,
+            &reply(&"c".repeat(32)),
+            &mut driver,
+            "client",
+            &vars
+        )
+        .is_ok(),
+        "a distinct id must pass"
     );
 }
 

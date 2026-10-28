@@ -504,7 +504,7 @@ fn check_clock_advance(expect: &Expect) -> Result<(), String> {
     Ok(())
 }
 
-fn check_expect(
+pub fn check_expect(
     expect: &Expect,
     outcome: &Outcome,
     driver: &mut dyn Driver,
@@ -646,6 +646,17 @@ fn check_expect(
             .ok_or_else(|| format!("unknown variable {variable}"))?;
         if actual == expected {
             return Err(format!("{path} equals {variable}"));
+        }
+    }
+    for (path, variables) in &expect.not_equal_any {
+        let actual = path_get(&reply.result, path).ok_or_else(|| format!("missing path {path}"))?;
+        for variable in variables {
+            let expected = vars
+                .get(variable.trim_start_matches('@'))
+                .ok_or_else(|| format!("unknown variable {variable}"))?;
+            if actual == expected {
+                return Err(format!("{path} equals {variable}"));
+            }
         }
     }
     if expect.closed && !driver.expect_eof(connection) {

@@ -489,6 +489,19 @@ mod tests {
         assert!(ContainmentRecord::subreaper().cgroup_path().is_none());
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_non_linux_cell_refuses_with_unsupported_platform() {
+        let report = ContainmentReport::probe();
+        assert_eq!(report.kind(), ContainmentKind::Refused);
+        assert!(!report.is_enforced());
+        assert_eq!(report.cleanup_claim(), "none");
+        assert!(matches!(
+            report.refusal(),
+            Some(ContainmentRefusal::UnsupportedPlatform { cell }) if *cell == report.cell()
+        ));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn the_live_probe_selects_an_enforced_plan_or_a_typed_refusal() {

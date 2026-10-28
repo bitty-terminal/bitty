@@ -547,6 +547,36 @@ fn valid_recorded_path(path: &str) -> bool {
             .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
 }
 
+/// Read boot-relative milliseconds from `/proc/uptime`.
+///
+/// The cgroup/orphan path is Linux-only for serving, but the journal type also
+/// compiles on the refusing cells; there the origin is zero and retention still
+/// works for tests that inject `now`.
+fn boot_uptime_ms() -> u64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let Ok(text) = fs::read_to_string("/proc/uptime") else {
+            return 0;
+        };
+        let Some(seconds) = text.split_whitespace().next() else {
+            return 0;
+        };
+        let Ok(seconds) = seconds.parse::<f64>() else {
+            return 0;
+        };
+        if !seconds.is_finite() || seconds < 0.0 {
+            return 0;
+        }
+        // `/proc/uptime` has centisecond resolution and is stable across
+        // process restarts within one boot.
+        (seconds * 1000.0).round() as u64
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        0
+    }
+}
+
 fn optional_number(value: Option<u64>) -> String {
     value.map_or_else(|| "-".to_owned(), |number| number.to_string())
 }
@@ -607,6 +637,10 @@ pub struct OrphanJournal {
     directory: PathBuf,
     limits: OrphanJournalLimits,
     boot_id: BootId,
+    /// Boot-relative milliseconds at journal open. Quarantine timestamps are
+    /// persisted in boot time, not the process-local [`MonotonicMs`] origin,
+    /// so retention survives a daemon restart within the same boot.
+    boot_origin_ms: u64,
     records: BTreeMap<SessionId, OrphanRecord>,
 }
 
@@ -637,6 +671,15 @@ impl OrphanJournal {
         limits: OrphanJournalLimits,
         boot_id: BootId,
     ) -> Result<Self, JournalError> {
+        Self::open_with_origin(directory, limits, boot_id, boot_uptime_ms())
+    }
+
+    fn open_with_origin(
+        directory: impl Into<PathBuf>,
+        limits: OrphanJournalLimits,
+        boot_id: BootId,
+        boot_origin_ms: u64,
+    ) -> Result<Self, JournalError> {
         let directory = directory.into();
         ensure_private_directory(&directory)?;
         let records = load_records(&directory, limits)?;
@@ -644,8 +687,14 @@ impl OrphanJournal {
             directory,
             limits,
             boot_id,
+            boot_origin_ms,
             records,
         })
+    }
+
+    /// Map a process-local timestamp into boot time for persisted retention.
+    fn boot_time(&self, now: MonotonicMs) -> u64 {
+        self.boot_origin_ms.saturating_add(now.as_millis())
     }
 
     /// The enforced bounds.
@@ -812,14 +861,15 @@ impl OrphanJournal {
     /// Propagates a filesystem failure while removing a record.
     pub fn collect_expired(&mut self, now: MonotonicMs) -> Result<Vec<SessionId>, JournalError> {
         let retention = self.limits.quarantine_retention_ms;
+        let boot_now = self.boot_time(now);
         let expired: Vec<SessionId> = self
             .records
             .values()
             .filter(|record| record.class == OrphanClass::Unverified)
             .filter(|record| {
-                record
-                    .validated_at
-                    .is_some_and(|validated| now.saturating_since(validated) >= retention)
+                record.validated_at.is_some_and(|validated| {
+                    boot_now.saturating_sub(validated.as_millis()) >= retention
+                })
             })
             .map(|record| record.session_id)
             .collect();
@@ -853,7 +903,7 @@ impl OrphanJournal {
     ) -> Result<(), JournalError> {
         record.class = OrphanClass::Unverified;
         if record.validated_at.is_none() {
-            record.validated_at = Some(now);
+            record.validated_at = Some(MonotonicMs::from_millis(self.boot_time(now)));
         }
         if record.boot_id.is_some() {
             self.store(&record)?;
@@ -1659,6 +1709,57 @@ mod tests {
         );
         assert!(!history.contains(session_id));
         assert_eq!(history.counts().total(), 0);
+    }
+
+    #[test]
+    fn quarantine_retention_is_restart_safe_across_process_origins() {
+        let directory = TempDir::new().expect("temp dir");
+        let journal_dir = directory.path().join("journal");
+        let session_id = session(0x1b);
+        {
+            let mut first = OrphanJournal::open_with_origin(
+                journal_dir.clone(),
+                limits(8, ORPHAN_RECORD_BYTES_SYSTEM_MAX, 1000),
+                boot(BOOT_A),
+                1_000,
+            )
+            .expect("first journal");
+            reserved_and_committed(&mut first, session_id, identity(4242, 100, 4242));
+            let absent = FakeProbe::with_boot(BOOT_A).observe(4242, ProcessObservation::Absent);
+            let mut reaper = RecordingReaper::new(ReapResult::Swept);
+            first
+                .reap(&absent, &mut reaper, MonotonicMs::from_millis(100))
+                .expect("quarantine");
+            assert_eq!(first.counts().unverified, 1);
+        }
+
+        // The next process starts later in the same boot. Its process-local
+        // clock is zero again, but the stored quarantine time is boot-relative.
+        let mut later = OrphanJournal::open_with_origin(
+            journal_dir.clone(),
+            limits(8, ORPHAN_RECORD_BYTES_SYSTEM_MAX, 1000),
+            boot(BOOT_A),
+            5_000,
+        )
+        .expect("later journal");
+        assert_eq!(
+            later.collect_expired(MonotonicMs::ZERO).expect("collect"),
+            vec![session_id]
+        );
+
+        // Within the retention window it is retained.
+        let mut soon = OrphanJournal::open_with_origin(
+            journal_dir,
+            limits(8, ORPHAN_RECORD_BYTES_SYSTEM_MAX, 1000),
+            boot(BOOT_A),
+            1_500,
+        )
+        .expect("soon journal");
+        assert!(
+            soon.collect_expired(MonotonicMs::ZERO)
+                .expect("collect")
+                .is_empty()
+        );
     }
 
     #[test]

@@ -165,20 +165,13 @@ fn spawn_cgroup(
     };
     let pid = child.id();
     let Some(identity) = observe_identity(pid) else {
-        let mut child = child;
-        let _ = child.kill();
-        let _ = child.wait();
-        let _ = cgroup.remove();
+        abandon_cgroup_child(child, &cgroup);
         return Err(ContainmentError::IdentityUnavailable);
     };
     match cgroup.verify_member(pid) {
         Ok(()) | Err(CgroupError::Missing) => {}
         Err(_) => {
-            let mut child = child;
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = cgroup.kill_all();
-            let _ = cgroup.remove();
+            abandon_cgroup_child(child, &cgroup);
             return Err(ContainmentError::Cgroup(CgroupError::MembershipMismatch));
         }
     }
@@ -197,8 +190,15 @@ fn spawn_subreaper(_name: &str, command: &mut Command) -> Result<ContainedChild,
     let pid = child.id();
     let Some(identity) = observe_identity(pid) else {
         let mut child = child;
+        // `process_group(0)` makes the child the leader of a fresh group, so
+        // its pgid is its pid and the group cannot be reused while the child
+        // is unreaped. Kill the recorded group, then reap the leader.
+        if let Ok(raw) = i32::try_from(pid) {
+            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(raw), Signal::SIGKILL);
+        }
         let _ = child.kill();
         let _ = child.wait();
+        drain_adopted(pid);
         return Err(ContainmentError::IdentityUnavailable);
     };
     let pgid = identity.process_group();
@@ -208,6 +208,21 @@ fn spawn_subreaper(_name: &str, command: &mut Command) -> Result<ContainedChild,
         identity,
         scope: Scope::Subreaper { pgid },
     })
+}
+
+/// Kill a cgroup child tree and remove its subtree when a post-spawn check
+/// fails. The child has already `exec`ed and may have forked, so a pid-only
+/// kill is not enough: `cgroup.kill` reaches the whole recorded identity, then
+/// a bounded wait lets the empty subtree be removed.
+fn abandon_cgroup_child(mut child: Child, cgroup: &SessionCgroup) {
+    let _ = cgroup.kill_all();
+    let _ = child.kill();
+    let _ = child.wait();
+    let limits = ContainmentLimits::default();
+    let _ = wait_bounded(limits.kill_wait(), limits, || {
+        cgroup.verify_empty().unwrap_or(false)
+    });
+    let _ = cgroup.remove();
 }
 
 fn observe_identity(pid: u32) -> Option<ProcessIdentity> {

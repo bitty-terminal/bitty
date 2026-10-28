@@ -868,6 +868,7 @@ mod tests {
         assert!(!text.contains('\n'));
     }
 
+    /// The aggregate line carries `sup`, `bl`, and the code histogram.
     #[test]
     fn an_aggregate_line_carries_the_suppressed_count_and_histogram() {
         let aggregate = AuditAggregate {
@@ -910,6 +911,7 @@ mod tests {
         assert!(!text.contains("ho="), "{text}");
     }
 
+    /// The worst-case aggregate stays inside the rendered line bound.
     #[test]
     fn a_full_aggregate_histogram_still_renders_under_the_line_bound() {
         let mut codes = RefusalCode::ALL;

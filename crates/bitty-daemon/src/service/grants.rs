@@ -879,6 +879,7 @@ mod tests {
         );
     }
 
+    /// A consumed host grant remains revocable up to its TTL.
     #[test]
     fn a_consumed_host_grant_is_revocable_until_its_ttl() {
         let mut store = store();
@@ -907,6 +908,7 @@ mod tests {
         assert_eq!(store.evict_expired(expires_at), 1);
     }
 
+    /// Observer grants keep the unconsumed revoke rule.
     #[test]
     fn observer_revoke_keeps_the_unconsumed_rule() {
         let mut store = store();

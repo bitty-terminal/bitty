@@ -139,6 +139,7 @@ mod unix {
             self.take_aggregate()
         }
 
+        /// Consume the window's counters into one fixed-size aggregate.
         fn take_aggregate(&mut self) -> Option<AuditAggregate> {
             let aggregate = (self.suppressed > 0).then_some(AuditAggregate {
                 suppressed: self.suppressed,
@@ -190,6 +191,13 @@ mod unix {
         }
     }
 
+    /// Test-only override for the tamper re-attestation interval.
+    ///
+    /// Production always uses [`TAMPER_INTERVAL_MS`]. The override is clamped
+    /// to `1..=TAMPER_INTERVAL_MS` and exists so the tamper-flush regression
+    /// test can keep a refusal-audit window open across the tamper check.
+    const TEST_TAMPER_INTERVAL_ENV: &str = "BITTYD_TEST_TAMPER_INTERVAL_MS";
+
     /// The loop configuration.
     #[derive(Debug, Clone)]
     pub struct ServerConfig {
@@ -210,6 +218,11 @@ mod unix {
         /// authority; when the spawn path lands, `process.spawn` must come from
         /// the executable policy instead of this transport default.
         pub transport_scopes: bitty_ipc_api::scope::ScopeSet,
+        /// How often the loop re-attests the endpoint.
+        ///
+        /// Defaults to [`TAMPER_INTERVAL_MS`]; the test seam above may only
+        /// shorten it, never lengthen it.
+        pub tamper_interval_ms: u64,
     }
 
     impl ServerConfig {
@@ -223,11 +236,18 @@ mod unix {
             let audit_dir = default_audit_dir().ok_or(ServerError::NoAuditDirectory)?;
             let mut transport_scopes = bitty_ipc_api::scope::ScopeSet::new();
             transport_scopes.insert(bitty_ipc_api::scope::Scope::ProcessSpawn);
+            let tamper_interval_ms = std::env::var(TEST_TAMPER_INTERVAL_ENV)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .map_or(TAMPER_INTERVAL_MS, |value| {
+                    value.clamp(1, TAMPER_INTERVAL_MS)
+                });
             Ok(Self {
                 limits: Limits::default(),
                 endpoint_env: EndpointEnv::from_process(),
                 audit_dir,
                 transport_scopes,
+                tamper_interval_ms,
             })
         }
     }
@@ -402,7 +422,7 @@ mod unix {
         let start = Instant::now();
         let now = || MonotonicMs::from_millis(start.elapsed().as_millis() as u64);
         let mut peers: Vec<PeerIo> = Vec::new();
-        let mut next_tamper = TAMPER_INTERVAL_MS;
+        let mut next_tamper = config.tamper_interval_ms;
         let mut next_sweep = GRANT_SWEEP_INTERVAL_MS;
         let mut shutting_down = false;
 
@@ -559,7 +579,9 @@ mod unix {
                     let _ = endpoint.close();
                     return Ok(ServerOutcome::Tampered);
                 }
-                next_tamper = current.as_millis().saturating_add(TAMPER_INTERVAL_MS);
+                next_tamper = current
+                    .as_millis()
+                    .saturating_add(config.tamper_interval_ms);
             }
 
             if service.stop_requested().is_some() {
@@ -1043,6 +1065,7 @@ mod unix {
             );
         }
 
+        /// A closed window with suppression emits exactly one aggregate.
         #[test]
         fn a_window_with_suppressed_refusals_emits_one_bounded_aggregate() {
             use super::{WIRE_AUDIT_WINDOW_MS, WireAuditBudget};
@@ -1080,6 +1103,7 @@ mod unix {
             );
         }
 
+        /// The histogram cap folds the tail into `other`.
         #[test]
         fn the_aggregate_histogram_is_capped_and_counts_the_tail() {
             use super::{MAX_AGGREGATE_CLASSES, WireAuditBudget};
@@ -1147,6 +1171,11 @@ mod unsupported {
         pub audit_dir: PathBuf,
         /// Transport scopes.
         pub transport_scopes: bitty_ipc_api::scope::ScopeSet,
+        /// How often the loop re-attests the endpoint.
+        ///
+        /// Defaults to [`TAMPER_INTERVAL_MS`]; the test seam above may only
+        /// shorten it, never lengthen it.
+        pub tamper_interval_ms: u64,
     }
 
     impl ServerConfig {

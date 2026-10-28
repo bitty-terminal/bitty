@@ -511,10 +511,11 @@ partial response. A refusal that
 `Unauthenticated`, `Denied/AlreadyNegotiated`) keeps its frame queued, stops
 reading, and shuts the stream down only after the queued bytes drain.
 
-The loop never opens a TCP listener. `tests/service_loop.rs` snapshots the
-namespace's `LISTEN` rows in `/proc/net/tcp` and `/proc/net/tcp6` around
-`bittyd start` and fails on any added listener; the daemon is non-dumpable, so
-per-process fd attribution is no longer available to the test.
+The loop never opens a TCP listener. `daemon.status` reports
+`tcp_listeners`, the daemon's self-attested count of its own TCP listening
+sockets from `/proc/self` (`0` expected; `null` outside Linux). The test reads
+that field instead of scanning `/proc/<pid>/fd`, which the non-dumpable daemon
+does not expose; the count is an observability fact, not an authority input.
 
 ### Scopes and method catalog
 
@@ -635,10 +636,17 @@ authority, target, generation, idempotency, effect. Invariants:
   (`daemon.status`, `session.status`, `session.list`, `lease.heartbeat`) and
   the repeat `daemon.stop` keep their own answers;
 - visibility is a live lease, a presented current control token, the operator
-  path, or (for a former leaseholder) the immutable terminal snapshot; a
-  presented token at a live, vacant control that is not current maps to
-  `Denied/InvalidControlToken`, while an occupied, terminal, or unknown target
-  stays the uniform `NotFound` and no refusal echoes the token;
+  path, or (for a former leaseholder) the immutable terminal snapshot;
+- every control method (`session.attach`, `session.grant`,
+  `session.grant.revoke`, `session.detach` on another lease,
+  `session.control.transfer`, and `session.abort` with a control reason) maps
+  a missing, stale, or rotated token at a live, vacant control to
+  `Denied/InvalidControlToken`; an occupied, terminal, or unknown target stays
+  the uniform `NotFound`, no refusal echoes the token, and nothing applies;
+- that control mapping is the contract's named denial-order step 4, not a
+  general visibility widening: `session.status`, `session.list`, and every
+  invisible read keep the uniform `NotFound`, and the mapping requires the
+  method scope and a session id the caller already holds;
 - every privileged effect re-checks the captured peer after authorization and
   before the effect; a failure is `Unauthenticated` and closes the connection;
 - every mutation is admitted by the audit sink first; a degraded sink is
@@ -660,6 +668,10 @@ authority, target, generation, idempotency, effect. Invariants:
 `session.grant.revoke`, `session.detach`, `session.control.transfer`,
 `session.abort`, `session.kill`, `lease.heartbeat`.
 
+`daemon.status` reports the daemon state, active and per-state session counts,
+`audit_degraded`, the drain deadline, the advertised limit triples, the orphan
+placeholder, and `tcp_listeners` (see the service-loop note above).
+
 ### Audit sink
 
 `audit_sink::AuditSink` drains the bounded ring into an owner-private rotating
@@ -676,15 +688,18 @@ Rendered lines carry only closed spellings, ids, digests, and numbers.
 `service::dispatch` records one individual refusal record for every refused
 method with its static code and counts; the server loop records one `wire`
 refusal for every envelope, frame, budget, or deadline closure that never
-resolves to a method. Non-closing wire refusals are budgeted per connection at
+resolves to a method. Only those wire-level refusals are pooled by this budget;
+a refused method still gets one individual record and is never counted in the
+aggregate histogram, so per-method refusal aggregation remains the bitty#2603
+follow-up. Non-closing wire refusals are budgeted per connection at
 `refusal_audit_budget_per_sec` records per second. A window that suppresses
 refusals ends with exactly one aggregate `wire` record carrying
 `sup=<suppressed>`, `bl=<budget>`, and a bounded static code histogram
 (`h=code:count,...`, with `ho=<count>` for codes past the
-`MAX_AGGREGATE_CLASSES` cap); a closing connection flushes its pending window
-so no suppression is lost. The aggregate is fixed-size and cannot rotate the
-segments by itself, so a refusal flood stays bounded without becoming
-invisible.
+`MAX_AGGREGATE_CLASSES` cap); a closing connection or an endpoint-tamper exit
+flushes its pending window so no suppression is lost. The aggregate is
+fixed-size and cannot rotate the segments by itself, so a refusal flood stays
+bounded without becoming invisible.
 
 ### Per-frame peer credentials
 
@@ -874,10 +889,12 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
   version), a stopping daemon refusing a pipelined create, the pre-auth byte
   budget and its aggregated record, the negotiate-deadline record, the
   consumed host grant revoke (fresh key and keyed replay), the vacant-control
-  `InvalidControlToken` and its occupied/invisible boundaries, the refusal-burst
-  aggregate with suppressed count and histogram, core-dump hardening
-  (`RLIMIT_CORE` and `/proc/<pid>/mem`), `SIGTERM`/`SIGINT` drain, endpoint
-  tamper → exit 6, clean stop, and the status-only invocation.
+  `InvalidControlToken` for every control method (stale, missing, occupied,
+  invisible, and post-transfer old/rotated cases), the refusal-burst aggregate
+  with suppressed count and histogram, the tamper-exit aggregate flush,
+  core-dump hardening (`RLIMIT_CORE` and `/proc/<pid>/mem`),
+  `SIGTERM`/`SIGINT` drain, endpoint tamper → exit 6, clean stop, and the
+  status-only invocation.
 - `tests/frame_credentials.rs` — per-frame credential acceptance across a real
   process boundary and the fd-passing handoff (grandchild's frame refused).
 

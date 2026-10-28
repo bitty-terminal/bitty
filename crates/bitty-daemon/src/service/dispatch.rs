@@ -2370,7 +2370,9 @@ impl Counts {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
+// The dispatch tests build a real PeerGuard from /proc; the served loop is
+// Linux-only (D-15), so they do not run on the other tested cells.
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};

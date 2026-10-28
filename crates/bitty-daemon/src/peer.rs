@@ -330,8 +330,7 @@ impl PeerGuard {
     /// Test-only: it captures `SO_PEERCRED` from a socketpair, which reports
     /// the current process, so `recheck` exercises the real `/proc` path and
     /// succeeds for every boundary while the test process is alive.
-    #[cfg(test)]
-    #[cfg(unix)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn for_current_process() -> Self {
         let (stream, other) = UnixStream::pair().expect("socketpair");
         let guard = Self::capture(&stream).expect("capture self");
@@ -783,7 +782,9 @@ mod apple {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
+// The peer guard tests capture the real /proc start time; the served loop is
+// Linux-only (D-15), so they do not run on the other tested cells.
 mod tests {
     use super::*;
 

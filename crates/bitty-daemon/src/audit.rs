@@ -46,8 +46,9 @@
 //!
 //! [`AuditAction`] and [`crate::codes::RefusalCode`] are static vocabularies.
 //! A refused request is representable as [`AuditResult::Refused`] with its
-//! static code plus optional [`AuditCounts`]; it never echoes the refused
-//! bytes.
+//! static code plus optional [`AuditCounts`]; a budget-suppressed refusal is
+//! represented by [`AuditAggregate`] with a bounded static histogram. Neither
+//! echoes the refused bytes.
 //!
 //! # Overflow is visible
 //!
@@ -451,6 +452,43 @@ impl AuditCounts {
     }
 }
 
+/// The maximum number of distinct refusal classes one aggregate record carries.
+///
+/// The cap keeps the rendered line inside
+/// [`MAX_RENDERED_LINE_BYTES`](crate::audit_sink::MAX_RENDERED_LINE_BYTES) with
+/// a fixed-size field: the tail is counted in
+/// [`AuditAggregate::other`] instead of growing the record. The worst case
+/// (four long code spellings, ten-digit counts, and a fully populated actor)
+/// stays inside the 512-byte line bound.
+pub const MAX_AGGREGATE_CLASSES: usize = 4;
+
+/// One `(code, count)` entry in an aggregate record's static histogram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditClassCount {
+    /// The closed refusal code.
+    pub code: RefusalCode,
+    /// How many suppressed refusals carried it.
+    pub count: u32,
+}
+
+/// The aggregate emitted for one refusal-budget window (`D-16`).
+///
+/// A window that suppressed refusals gets exactly one `wire` record carrying
+/// this value: the suppressed count, the budget that caused the suppression,
+/// up to [`MAX_AGGREGATE_CLASSES`] code counts, and the number folded into
+/// `other`. It is `Copy` and fixed-size; there is no per-frame or caller label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuditAggregate {
+    /// Refusals dropped from the sink by the per-window budget.
+    pub suppressed: u64,
+    /// The per-connection budget in effect for the window.
+    pub budget: u32,
+    /// The per-code counts, in first-seen order.
+    pub classes: [Option<AuditClassCount>; MAX_AGGREGATE_CLASSES],
+    /// Suppressed refusals whose code did not fit in `classes`.
+    pub other: u32,
+}
+
 /// The terminal classification on a terminal transition (`D-16`, `D-04`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuditTerminal {
@@ -493,6 +531,8 @@ pub struct AuditEntry {
     pub counts: Option<AuditCounts>,
     /// Terminal classification for a terminal transition.
     pub terminal: Option<AuditTerminal>,
+    /// Suppressed-refusal aggregate for one wire budget window (`D-16`).
+    pub aggregate: Option<AuditAggregate>,
 }
 
 impl AuditEntry {
@@ -508,6 +548,7 @@ impl AuditEntry {
             target: AuditTarget::none(),
             counts: None,
             terminal: None,
+            aggregate: None,
         }
     }
 
@@ -552,6 +593,13 @@ impl AuditEntry {
         self.terminal = Some(terminal);
         self
     }
+
+    /// Set the suppressed-refusal aggregate for a wire budget window.
+    #[must_use]
+    pub const fn aggregate(mut self, aggregate: AuditAggregate) -> Self {
+        self.aggregate = Some(aggregate);
+        self
+    }
 }
 
 /// One immutable audit record.
@@ -583,6 +631,8 @@ pub struct AuditRecord {
     pub counts: Option<AuditCounts>,
     /// Terminal classification for a terminal transition.
     pub terminal: Option<AuditTerminal>,
+    /// Suppressed-refusal aggregate for one wire budget window (`D-16`).
+    pub aggregate: Option<AuditAggregate>,
 }
 
 /// Observable ring counters.
@@ -723,6 +773,7 @@ impl AuditRing {
             target: entry.target,
             counts: entry.counts,
             terminal: entry.terminal,
+            aggregate: entry.aggregate,
         };
         self.records.push_back(record);
         self.counters.appended = self.counters.appended.saturating_add(1);

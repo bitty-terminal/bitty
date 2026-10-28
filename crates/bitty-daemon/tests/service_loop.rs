@@ -10,8 +10,9 @@
 //!   `bittyd` invocation binds nothing;
 //! - a second start returns the typed already-running result and touches
 //!   nothing;
-//! - the daemon never opens a TCP listener (checked through `/proc/<pid>/fd`
-//!   against `/proc/net/tcp` and `/proc/net/tcp6`);
+//! - the daemon never opens a TCP listener (`daemon.status` self-reports
+//!   `tcp_listeners: 0` from the daemon's own `/proc/self` fd table; the
+//!   daemon is non-dumpable, so the test cannot inspect `/proc/<pid>/fd`);
 //! - `daemon.negotiate` authenticates the operator capability and
 //!   `daemon.stop force` shuts the loop down cleanly, removing the socket;
 //! - closing refusals (`VersionMismatch`, `Unauthenticated`,
@@ -93,20 +94,27 @@ struct Daemon {
 
 impl Daemon {
     fn start(root: &TempRoot) -> Self {
+        Self::start_with(root, &[])
+    }
+
+    fn start_with(root: &TempRoot, extra_env: &[(&str, &str)]) -> Self {
         std::fs::create_dir_all(root.runtime()).expect("runtime dir");
         std::fs::set_permissions(root.runtime(), std::fs::Permissions::from_mode(0o700))
             .expect("chmod runtime");
         std::fs::create_dir_all(root.state()).expect("state dir");
-        let child = Command::new(BITTYD)
+        let mut command = Command::new(BITTYD);
+        command
             .arg("start")
             .env("XDG_RUNTIME_DIR", root.runtime())
             .env("XDG_STATE_HOME", root.state())
             .env_remove("BITTYD_ENDPOINT")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn bittyd start");
+            .stderr(Stdio::piped());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let child = command.spawn().expect("spawn bittyd start");
         let daemon = Self { child };
         daemon.wait_for_socket(&root.endpoint());
         daemon
@@ -247,9 +255,104 @@ impl Client {
     }
 }
 
+/// Reads the per-boot operator capability once the daemon has written it.
+///
+/// The endpoint socket appears before the capability file, so a client that can
+/// connect is not yet guaranteed a readable capability. Wait for it with a
+/// bounded startup deadline instead of racing the writer; a missing file after
+/// the deadline is a real failure.
 fn read_capability(root: &TempRoot) -> String {
-    let raw = std::fs::read_to_string(root.capability()).expect("capability file");
-    raw.trim_end_matches('\n').to_owned()
+    const CAPABILITY_READY_TIMEOUT: Duration = Duration::from_secs(5);
+    const CAPABILITY_READY_STEP: Duration = Duration::from_millis(10);
+    let deadline = Instant::now() + CAPABILITY_READY_TIMEOUT;
+    loop {
+        match std::fs::read_to_string(root.capability()) {
+            Ok(raw) => return raw.trim_end_matches('\n').to_owned(),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline =>
+            {
+                std::thread::sleep(CAPABILITY_READY_STEP);
+            }
+            Err(error) => panic!("capability file: {error:?}"),
+        }
+    }
+}
+
+/// One session created with host consent and claimed by a controller.
+struct ControlledSession {
+    creator: Client,
+    session_id: String,
+    create_token: String,
+    controller_token: String,
+    controller_attach: String,
+}
+
+/// Create a session with host consent and claim control with the creator.
+fn controlled_session(root: &TempRoot, operator: &mut Client, label: &str) -> ControlledSession {
+    let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    assert_eq!(minted["ok"], true, "{minted}");
+    let host_grant = minted["result"]["grant"]
+        .as_str()
+        .expect("host grant bearer")
+        .to_owned();
+
+    let mut creator = Client::connect(&root.endpoint());
+    assert_eq!(creator.negotiate_with(None, Some(&host_grant))["ok"], true);
+    let created = creator.call(
+        "session.create",
+        json!({"kind": "terminal", "idempotency_key": format!("{label}-create")}),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    let session_id = created["result"]["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let create_token = created["result"]["control_token"]
+        .as_str()
+        .expect("create token")
+        .to_owned();
+
+    let claimed = creator.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 0,
+            "control_token": create_token,
+            "idempotency_key": format!("{label}-claim"),
+        }),
+    );
+    assert_eq!(claimed["ok"], true, "{claimed}");
+    let controller_attach = claimed["result"]["attach_id"]
+        .as_str()
+        .expect("controller attach")
+        .to_owned();
+    let controller_token = claimed["result"]["control_token"]
+        .as_str()
+        .expect("rotated token")
+        .to_owned();
+
+    ControlledSession {
+        creator,
+        session_id,
+        create_token,
+        controller_token,
+        controller_attach,
+    }
+}
+
+/// Detach the controller's own lease so the control relation is vacant.
+fn vacate_control(creator: &mut Client, controller_attach: &str) {
+    let detached = creator.call("session.detach", json!({"attach_id": controller_attach}));
+    assert_eq!(detached["ok"], true, "{detached}");
+    assert_eq!(detached["result"]["was_attached"], true);
+}
+
+/// Assert the closed vacant-control refusal and its no-token-echo shape.
+fn assert_invalid_control_token(value: &Value) {
+    assert_eq!(value["ok"], false, "{value}");
+    assert_eq!(value["error"]["class"], "Denied", "{value}");
+    assert_eq!(value["error"]["code"], "InvalidControlToken", "{value}");
 }
 
 /// Encode one v1 request as a length-prefixed frame.
@@ -288,37 +391,24 @@ fn audit_lines_with(root: &TempRoot, needle: &str) -> usize {
     log.lines().filter(|line| line.contains(needle)).count()
 }
 
-/// Socket inodes the process holds, plus any of them in a TCP LISTEN row.
-fn tcp_listeners_of_process(pid: u32) -> Vec<String> {
-    let mut owned = Vec::new();
-    for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("process fds") {
-        let entry = entry.expect("fd entry");
-        let target = std::fs::read_link(entry.path()).expect("fd target");
-        if let Some(text) = target.to_str() {
-            if let Some(inode) = text
-                .strip_prefix("socket:[")
-                .and_then(|rest| rest.strip_suffix(']'))
-            {
-                owned.push(inode.to_owned());
-            }
+/// Individual wire refusals, suppressed refusals, and aggregate records.
+fn wire_audit_totals(root: &TempRoot) -> (usize, u64, usize) {
+    let log = std::fs::read_to_string(root.audit_log()).unwrap_or_default();
+    let mut individual = 0;
+    let mut suppressed = 0;
+    let mut aggregates = 0;
+    for line in log.lines().filter(|line| line.contains("a=wire")) {
+        if let Some(value) = line
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("sup="))
+        {
+            aggregates += 1;
+            suppressed += value.parse::<u64>().expect("suppressed count");
+        } else if line.contains("r=refused c=not_found") {
+            individual += 1;
         }
     }
-    let mut listeners = Vec::new();
-    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(content) = std::fs::read_to_string(table) else {
-            continue;
-        };
-        for line in content.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 10 {
-                continue;
-            }
-            if fields[3] == "0A" && owned.iter().any(|inode| inode == fields[9]) {
-                listeners.push(format!("{table}: {}", fields[1]));
-            }
-        }
-    }
-    listeners
+    (individual, suppressed, aggregates)
 }
 
 #[test]
@@ -336,12 +426,6 @@ fn start_serves_the_endpoint_and_never_opens_a_tcp_listener() {
             & 0o777,
         0o700
     );
-    assert!(
-        tcp_listeners_of_process(daemon.pid()).is_empty(),
-        "bittyd must not open a TCP listener: {:?}",
-        tcp_listeners_of_process(daemon.pid())
-    );
-
     let mut client = Client::connect(&socket);
     let response = client.negotiate(None);
     assert_eq!(response["ok"], true, "{response}");
@@ -395,6 +479,10 @@ fn start_serves_the_endpoint_and_never_opens_a_tcp_listener() {
     let status = operator.call("daemon.status", Value::Null);
     assert_eq!(status["ok"], true, "{status}");
     assert_eq!(status["result"]["audit_degraded"], false);
+    assert_eq!(
+        status["result"]["tcp_listeners"], 0,
+        "the daemon reports no TCP listener on its own fd table"
+    );
 
     let stopped = operator.call("daemon.stop", json!({"mode": "force"}));
     assert_eq!(stopped["ok"], true, "{stopped}");
@@ -431,6 +519,38 @@ fn a_second_start_is_a_typed_already_running_result() {
         true
     );
     assert_eq!(daemon.wait().code(), Some(0));
+}
+
+/// Pin `RLIMIT_CORE=0` and the cleared dumpable flag on the real process.
+#[test]
+fn start_disables_core_dumps_and_is_not_dumpable() {
+    let root = TempRoot::new("core-dump");
+    let daemon = Daemon::start(&root);
+
+    // D-16: RLIMIT_CORE is zero for both the soft and hard limit at startup.
+    let limits =
+        std::fs::read_to_string(format!("/proc/{}/limits", daemon.pid())).expect("process limits");
+    let line = limits
+        .lines()
+        .find(|line| line.starts_with("Max core file size"))
+        .expect("Max core file size row");
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(fields[4], "0", "soft core limit: {line}");
+    assert_eq!(fields[5], "0", "hard core limit: {line}");
+
+    // PR_SET_DUMPABLE=0: a same-uid process (this test is the parent) cannot
+    // open the daemon's memory. Without the control this open succeeds, so the
+    // probe discriminates.
+    match std::fs::File::open(format!("/proc/{}/mem", daemon.pid())) {
+        Ok(_) => panic!("a same-uid process must not open a non-dumpable daemon's memory"),
+        Err(error) => assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "expected EACCES from the non-dumpable daemon: {error}"
+        ),
+    }
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
 }
 
 #[test]
@@ -663,6 +783,47 @@ fn endpoint_tamper_exits_six() {
     );
 }
 
+/// A tamper exit keeps the suppressed tail as one aggregate record.
+#[test]
+fn an_endpoint_tamper_flushes_the_pending_refusal_aggregate() {
+    let root = TempRoot::new("tamper-audit");
+    // The test seam shortens the re-attestation interval so the tamper check
+    // lands inside the one-second refusal window; a test-start sleep would
+    // not control the daemon clock and could pass without the flush.
+    let daemon = Daemon::start_with(&root, &[("BITTYD_TEST_TAMPER_INTERVAL_MS", "200")]);
+    let mut client = Client::connect(&root.endpoint());
+    assert_eq!(client.negotiate(None)["ok"], true);
+
+    // 100 wire refusals against the 20-record budget: 80 are suppressed and
+    // must survive the tamper exit as one aggregate.
+    let requests: Vec<(&str, Value)> = (0..100).map(|_| ("session.unknown", Value::Null)).collect();
+    client.send_batch(&requests);
+    for _ in 0..100 {
+        let response = client.recv();
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "NotFound");
+    }
+
+    let socket = root.endpoint();
+    std::fs::remove_file(&socket).expect("remove the bound socket");
+    std::fs::write(&socket, b"not a socket").expect("plant a foreign object");
+    let status = daemon.wait_within(Duration::from_secs(15));
+    assert_eq!(status.code(), Some(6));
+
+    let (individual, suppressed, aggregates) = wire_audit_totals(&root);
+    assert_eq!(individual, 20, "the budget bounds the individual records");
+    assert_eq!(
+        suppressed, 80,
+        "the tamper exit flushes the suppressed tail"
+    );
+    assert_eq!(aggregates, 1, "exactly one aggregate survives the exit");
+    assert_eq!(
+        audit_lines_with(&root, "h=not_found:80"),
+        1,
+        "the aggregate carries the bounded histogram"
+    );
+}
+
 #[test]
 fn the_keyed_attach_and_control_flow_is_reachable_over_the_wire() {
     let root = TempRoot::new("attach-flow");
@@ -791,6 +952,502 @@ fn the_keyed_attach_and_control_flow_is_reachable_over_the_wire() {
     assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
 }
 
+/// A consumed host grant revoke refuses fresh and replayed creates at once.
+#[test]
+fn a_consumed_host_grant_revoke_withdraws_create_before_the_ttl() {
+    let root = TempRoot::new("host-grant-revoke");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    assert_eq!(minted["ok"], true, "{minted}");
+    let grant_id = minted["result"]["grant_id"]
+        .as_str()
+        .expect("grant id")
+        .to_owned();
+    let host_grant = minted["result"]["grant"]
+        .as_str()
+        .expect("host grant bearer")
+        .to_owned();
+
+    let mut creator = Client::connect(&root.endpoint());
+    let handshake = creator.negotiate_with(None, Some(&host_grant));
+    assert_eq!(handshake["ok"], true, "{handshake}");
+    let created = creator.call(
+        "session.create",
+        json!({"kind": "terminal", "idempotency_key": "revoke-k1"}),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+
+    let revoked = operator.call(
+        "daemon.host_grant",
+        json!({"action": "revoke", "grant_id": grant_id}),
+    );
+    assert_eq!(revoked["ok"], true, "{revoked}");
+    assert_eq!(revoked["result"]["revoked"], true, "{revoked}");
+    assert_eq!(revoked["result"]["not_active"], false, "{revoked}");
+
+    // The fresh key and the key already applied on this connection are both
+    // refused: the revoke withdraws the create authority before the keyed
+    // lookup, so the 300 s TTL is not the effective bound and a replay cannot
+    // resurrect the session.
+    for key in ["revoke-k1", "revoke-k2"] {
+        let refused = creator.call(
+            "session.create",
+            json!({"kind": "terminal", "idempotency_key": key}),
+        );
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error"]["class"], "Denied", "{refused}");
+        assert_eq!(refused["error"]["code"], "ConsentRequired", "{refused}");
+    }
+
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+}
+
+/// Pin the vacant-control `InvalidControlToken` and its adjacent boundaries.
+#[test]
+fn a_stale_control_token_at_a_vacant_control_is_invalid_control_token() {
+    let root = TempRoot::new("control-token");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    let host_grant = minted["result"]["grant"]
+        .as_str()
+        .expect("host grant bearer")
+        .to_owned();
+
+    let mut creator = Client::connect(&root.endpoint());
+    assert_eq!(creator.negotiate_with(None, Some(&host_grant))["ok"], true);
+    let created = creator.call(
+        "session.create",
+        json!({"kind": "terminal", "idempotency_key": "ct-create"}),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    let session_id = created["result"]["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let create_token = created["result"]["control_token"]
+        .as_str()
+        .expect("create token")
+        .to_owned();
+
+    let claimed = creator.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 0,
+            "control_token": create_token,
+            "idempotency_key": "ct-claim",
+        }),
+    );
+    assert_eq!(claimed["ok"], true, "{claimed}");
+    assert!(claimed["result"]["attach_id"].is_string(), "{claimed}");
+    let controller_token = claimed["result"]["control_token"]
+        .as_str()
+        .expect("rotated token")
+        .to_owned();
+
+    let grant = creator.call(
+        "session.grant",
+        json!({"session_id": session_id, "idempotency_key": "ct-grant"}),
+    );
+    assert_eq!(grant["ok"], true, "{grant}");
+    let observer_grant = grant["result"]["grant"]
+        .as_str()
+        .expect("observer grant")
+        .to_owned();
+
+    let mut observer = Client::connect(&root.endpoint());
+    assert_eq!(observer.negotiate(None)["ok"], true);
+    let attached = observer.call(
+        "session.attach",
+        json!({
+            "attach_role": "observer",
+            "session_id": session_id,
+            "observer_grant": observer_grant,
+        }),
+    );
+    assert_eq!(attached["ok"], true, "{attached}");
+    let observer_attach = attached["result"]["attach_id"]
+        .as_str()
+        .expect("observer attach")
+        .to_owned();
+
+    let transferred = creator.call(
+        "session.control.transfer",
+        json!({
+            "session_id": session_id,
+            "attach_id": observer_attach,
+            "expected_generation": 0,
+            "idempotency_key": "ct-transfer",
+        }),
+    );
+    assert_eq!(transferred["ok"], true, "{transferred}");
+
+    // The rotated token is delivered only on the target connection's next
+    // response, so read it through the target's own heartbeat.
+    let mut rotated = None;
+    for _ in 0..2 {
+        let heartbeat = observer.call("lease.heartbeat", json!({"attach_id": observer_attach}));
+        if let Some(token) = heartbeat["result"]["control_token"].as_str() {
+            rotated = Some(token.to_owned());
+        }
+    }
+    let rotated = rotated.expect("target-addressed rotated token");
+
+    let mut claimant = Client::connect(&root.endpoint());
+    assert_eq!(claimant.negotiate(None)["ok"], true);
+
+    // Wrong token while another lease holds control: the stale token is not a
+    // visibility relation, so the target stays uniformly `NotFound`.
+    let occupied = claimant.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 0,
+            "control_token": controller_token,
+            "idempotency_key": "ct-occupied",
+        }),
+    );
+    assert_eq!(occupied["ok"], false, "{occupied}");
+    assert_eq!(occupied["error"]["class"], "NotFound", "{occupied}");
+    assert_eq!(occupied["error"]["code"], "NotFound", "{occupied}");
+
+    // The transfer target detaches its own lease: control is vacant and the
+    // rotated token is still current.
+    let detached = observer.call("session.detach", json!({"attach_id": observer_attach}));
+    assert_eq!(detached["ok"], true, "{detached}");
+
+    // The same stale token at the vacant control is the closed contract code,
+    // not the uniform `NotFound`.
+    let stale = claimant.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 0,
+            "control_token": controller_token,
+            "idempotency_key": "ct-stale",
+        }),
+    );
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert_eq!(stale["error"]["class"], "Denied", "{stale}");
+    assert_eq!(stale["error"]["code"], "InvalidControlToken", "{stale}");
+    assert!(
+        !stale.to_string().contains(&controller_token),
+        "the refusal echoes no token"
+    );
+
+    // A truly invisible target is still `NotFound`, never the token code.
+    let unknown_session = "0".repeat(32);
+    let invisible = claimant.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": unknown_session,
+            "expected_generation": 0,
+            "control_token": "1".repeat(64),
+            "idempotency_key": "ct-unknown",
+        }),
+    );
+    assert_eq!(invisible["ok"], false, "{invisible}");
+    assert_eq!(invisible["error"]["class"], "NotFound", "{invisible}");
+    assert_eq!(invisible["error"]["code"], "NotFound", "{invisible}");
+
+    // The valid rotated token claims the vacant control.
+    let reclaimed = claimant.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 0,
+            "control_token": rotated,
+            "idempotency_key": "ct-reclaim",
+        }),
+    );
+    assert_eq!(reclaimed["ok"], true, "{reclaimed}");
+    assert_eq!(reclaimed["result"]["role"], "controller", "{reclaimed}");
+    assert!(reclaimed["result"]["attach_id"].is_string(), "{reclaimed}");
+
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+}
+
+/// Every control method maps a missing/stale token at a vacant control and
+/// keeps the occupied/invisible/post-transfer boundaries.
+#[test]
+fn every_control_method_maps_a_stale_token_at_a_vacant_control() {
+    let root = TempRoot::new("control-methods");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    let ControlledSession {
+        mut creator,
+        session_id,
+        create_token,
+        controller_token,
+        controller_attach,
+    } = controlled_session(&root, &mut operator, "cm");
+    vacate_control(&mut creator, &controller_attach);
+
+    let mut claimant = Client::connect(&root.endpoint());
+    assert_eq!(claimant.negotiate(None)["ok"], true);
+
+    // Missing tokens are the contract's closed code at a vacant control, for
+    // both controller attach and the token-optional control methods.
+    let missing_attach = claimant.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 0,
+            "idempotency_key": "cm-attach-missing",
+        }),
+    );
+    assert_invalid_control_token(&missing_attach);
+    let missing_grant = claimant.call(
+        "session.grant",
+        json!({"session_id": session_id, "idempotency_key": "cm-grant-missing"}),
+    );
+    assert_invalid_control_token(&missing_grant);
+
+    // session.grant
+    let stale = claimant.call(
+        "session.grant",
+        json!({
+            "session_id": session_id,
+            "control_token": create_token,
+            "idempotency_key": "cm-grant-stale",
+        }),
+    );
+    assert_invalid_control_token(&stale);
+    let granted = claimant.call(
+        "session.grant",
+        json!({
+            "session_id": session_id,
+            "control_token": controller_token,
+            "idempotency_key": "cm-grant-ok",
+        }),
+    );
+    assert_eq!(granted["ok"], true, "{granted}");
+    let grant_id = granted["result"]["grant_id"]
+        .as_str()
+        .expect("grant id")
+        .to_owned();
+
+    // session.grant.revoke
+    let stale = claimant.call(
+        "session.grant.revoke",
+        json!({"grant_id": grant_id, "control_token": create_token}),
+    );
+    assert_invalid_control_token(&stale);
+    let revoked = claimant.call(
+        "session.grant.revoke",
+        json!({"grant_id": grant_id, "control_token": controller_token}),
+    );
+    assert_eq!(revoked["ok"], true, "{revoked}");
+    assert_eq!(revoked["result"]["revoked"], true, "{revoked}");
+
+    // session.detach (another lease)
+    let observer_grant = claimant.call(
+        "session.grant",
+        json!({
+            "session_id": session_id,
+            "control_token": controller_token,
+            "idempotency_key": "cm-detach-grant",
+        }),
+    )["result"]["grant"]
+        .as_str()
+        .expect("observer grant")
+        .to_owned();
+    let mut observer = Client::connect(&root.endpoint());
+    assert_eq!(observer.negotiate(None)["ok"], true);
+    let attached = observer.call(
+        "session.attach",
+        json!({
+            "attach_role": "observer",
+            "session_id": session_id,
+            "observer_grant": observer_grant,
+        }),
+    );
+    assert_eq!(attached["ok"], true, "{attached}");
+    let observer_attach = attached["result"]["attach_id"]
+        .as_str()
+        .expect("observer attach")
+        .to_owned();
+    let stale = claimant.call(
+        "session.detach",
+        json!({"attach_id": observer_attach, "control_token": create_token}),
+    );
+    assert_invalid_control_token(&stale);
+    let detached = claimant.call(
+        "session.detach",
+        json!({"attach_id": observer_attach, "control_token": controller_token}),
+    );
+    assert_eq!(detached["ok"], true, "{detached}");
+    assert_eq!(detached["result"]["was_attached"], true, "{detached}");
+
+    // session.control.transfer
+    let target_grant = claimant.call(
+        "session.grant",
+        json!({
+            "session_id": session_id,
+            "control_token": controller_token,
+            "idempotency_key": "cm-transfer-grant",
+        }),
+    )["result"]["grant"]
+        .as_str()
+        .expect("observer grant")
+        .to_owned();
+    let mut target = Client::connect(&root.endpoint());
+    assert_eq!(target.negotiate(None)["ok"], true);
+    let attached = target.call(
+        "session.attach",
+        json!({
+            "attach_role": "observer",
+            "session_id": session_id,
+            "observer_grant": target_grant,
+        }),
+    );
+    assert_eq!(attached["ok"], true, "{attached}");
+    let target_attach = attached["result"]["attach_id"]
+        .as_str()
+        .expect("target attach")
+        .to_owned();
+    let stale = claimant.call(
+        "session.control.transfer",
+        json!({
+            "session_id": session_id,
+            "attach_id": target_attach,
+            "expected_generation": 0,
+            "control_token": create_token,
+            "idempotency_key": "cm-transfer-stale",
+        }),
+    );
+    assert_invalid_control_token(&stale);
+    let transferred = claimant.call(
+        "session.control.transfer",
+        json!({
+            "session_id": session_id,
+            "attach_id": target_attach,
+            "expected_generation": 0,
+            "control_token": controller_token,
+            "idempotency_key": "cm-transfer-ok",
+        }),
+    );
+    assert_eq!(transferred["ok"], true, "{transferred}");
+    assert_eq!(
+        transferred["result"]["controller"], target_attach,
+        "{transferred}"
+    );
+
+    // Read the token rotated onto the transfer target, then detach it to make
+    // control vacant again.
+    let mut rotated = None;
+    for _ in 0..2 {
+        let heartbeat = target.call("lease.heartbeat", json!({"attach_id": target_attach}));
+        if let Some(token) = heartbeat["result"]["control_token"].as_str() {
+            rotated = Some(token.to_owned());
+        }
+    }
+    let rotated = rotated.expect("target-addressed rotated token");
+    let mut post = Client::connect(&root.endpoint());
+    assert_eq!(post.negotiate(None)["ok"], true);
+
+    // While the transfer target still held control, the pre-rotation token was
+    // not a visibility relation: the target stays the uniform NotFound.
+    let occupied = post.call(
+        "session.grant",
+        json!({
+            "session_id": session_id,
+            "control_token": controller_token,
+            "idempotency_key": "cm-occupied",
+        }),
+    );
+    assert_eq!(occupied["ok"], false, "{occupied}");
+    assert_eq!(occupied["error"]["class"], "NotFound", "{occupied}");
+    assert_eq!(occupied["error"]["code"], "NotFound", "{occupied}");
+
+    let detached = target.call("session.detach", json!({"attach_id": target_attach}));
+    assert_eq!(detached["ok"], true, "{detached}");
+
+    // After the target detaches, the pre-transfer token is refused and the
+    // rotated token is accepted.
+    let old = post.call(
+        "session.grant",
+        json!({
+            "session_id": session_id,
+            "control_token": controller_token,
+            "idempotency_key": "cm-post-old",
+        }),
+    );
+    assert_invalid_control_token(&old);
+    let new = post.call(
+        "session.grant",
+        json!({
+            "session_id": session_id,
+            "control_token": rotated,
+            "idempotency_key": "cm-post-new",
+        }),
+    );
+    assert_eq!(new["ok"], true, "{new}");
+
+    // session.abort on a second session: a stale token is the same code and
+    // the current token commits the pre-bind cancel.
+    let ControlledSession {
+        creator: mut second_creator,
+        session_id: second_session,
+        create_token: second_create_token,
+        controller_token: second_controller_token,
+        controller_attach: second_attach,
+    } = controlled_session(&root, &mut operator, "cm-abort");
+    vacate_control(&mut second_creator, &second_attach);
+    let mut abort_claimant = Client::connect(&root.endpoint());
+    assert_eq!(abort_claimant.negotiate(None)["ok"], true);
+    let stale = abort_claimant.call(
+        "session.abort",
+        json!({
+            "session_id": second_session,
+            "expected_generation": 0,
+            "reason_class": "cancel",
+            "control_token": second_create_token,
+        }),
+    );
+    assert_invalid_control_token(&stale);
+    let aborted = abort_claimant.call(
+        "session.abort",
+        json!({
+            "session_id": second_session,
+            "expected_generation": 0,
+            "reason_class": "cancel",
+            "control_token": second_controller_token,
+        }),
+    );
+    assert_eq!(aborted["ok"], true, "{aborted}");
+
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+}
+
 #[test]
 fn an_unnegotiated_connection_cannot_probe_the_method_catalog() {
     let root = TempRoot::new("catalog-gate");
@@ -841,14 +1498,16 @@ fn an_unnegotiated_connection_cannot_probe_the_method_catalog() {
 }
 
 #[test]
-fn a_wire_refusal_burst_is_budgeted() {
+fn a_wire_refusal_burst_is_budgeted_and_aggregated() {
     let root = TempRoot::new("wire-budget");
     let daemon = Daemon::start(&root);
     let mut client = Client::connect(&root.endpoint());
     assert_eq!(client.negotiate(None)["ok"], true);
 
     // `refusal_audit_budget_per_sec` is 20 at the compiled defaults. A burst of
-    // non-closing wire refusals must not write one record per frame.
+    // non-closing wire refusals must not write one record per frame, and the
+    // frames past the budget must not be invisible: the window ends with one
+    // aggregate carrying the suppressed count and the code histogram.
     let requests: Vec<(&str, Value)> = (0..60).map(|_| ("session.unknown", Value::Null)).collect();
     client.send_batch(&requests);
     for _ in 0..60 {
@@ -858,11 +1517,24 @@ fn a_wire_refusal_burst_is_budgeted() {
     }
 
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
-    let wire = audit_lines_with(&root, "a=wire r=refused c=not_found");
-    assert!(wire >= 1, "the first refusals are recorded");
-    assert!(
-        wire <= 21,
-        "the per-second budget bounds a 60-frame burst: {wire} records"
+    let (individual, suppressed, aggregates) = wire_audit_totals(&root);
+    assert_eq!(individual, 20, "the budget bounds the individual records");
+    assert_eq!(suppressed, 40, "every suppressed refusal is counted");
+    assert_eq!(aggregates, 1, "one aggregate per window with suppression");
+    assert_eq!(
+        individual as u64 + suppressed,
+        60,
+        "no refusal is invisible"
+    );
+    assert_eq!(
+        audit_lines_with(&root, "a=wire r=refused c=rate_limited"),
+        1,
+        "the aggregate is the wire record with the budget refusal"
+    );
+    assert_eq!(
+        audit_lines_with(&root, "h=not_found:40"),
+        1,
+        "the bounded histogram carries the suppressed code"
     );
 }
 

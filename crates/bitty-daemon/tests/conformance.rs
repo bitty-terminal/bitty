@@ -29,7 +29,7 @@ use harness::real::RealDriver;
 #[test]
 fn corpus_is_well_formed_and_frozen() {
     let corpus = Corpus::load().expect("the embedded corpus parses");
-    assert_eq!(corpus.vectors.len(), 32, "corpus size changed");
+    assert_eq!(corpus.vectors.len(), 33, "corpus size changed");
     for id in [
         "C-01", "C-02", "C-03", "C-04", "C-05", "C-06", "C-07", "C-08",
     ] {
@@ -356,7 +356,7 @@ fn fake_and_real_parity() {
     let _ = evidence::write_parity(compared, &divergences, &not_compared);
     assert_no_failures(&fake_rows, "fake");
     assert_no_failures(&real_rows, "real");
-    assert_eq!(compared, 21, "the shared passing set changed");
+    assert_eq!(compared, 22, "the shared passing set changed");
     assert!(
         divergences.is_empty(),
         "parity divergences: {divergences:?}"

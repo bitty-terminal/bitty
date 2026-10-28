@@ -64,9 +64,10 @@ zeroize = "1.9"
 # bitty#2604: endpoint, lock, and peer-trust primitives. `nix` is already in
 # the workspace lockfile; features are the minimum this crate uses: `fs`
 # (flock, fcntl), `socket` (SO_PEERCRED / LOCAL_PEER*, the non-blocking stale
-# probe), `user` (uid/gid), `signal` (peer liveness), `process` (pid types).
+# probe), `user` (uid/gid), `signal` (peer liveness), `process` (pid types and
+# the Linux `prctl` dumpable flag), `resource` (`RLIMIT_CORE`), and `uio`.
 # Windows compiles the typed UnsupportedPlatform path and links no nix code.
-nix = { workspace = true, features = ["fs", "poll", "process", "signal", "socket", "uio", "user"] }
+nix = { workspace = true, features = ["fs", "poll", "process", "resource", "signal", "socket", "uio", "user"] }
 
 [dev-dependencies]
 # CTX-1619: temporary journal directories for the orphan-journal tests. The

@@ -48,7 +48,7 @@ running service gives today:
 | cgroup/subreaper containment, signal delivery and reaping, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs | bitty#2604 | `daemon.orphans.verify` is `Denied/UnsupportedCapability`; no orphan is claimed verified |
 | Terminal content plane, including `session.resize` (`terminal.manage`) | bitty#2604 / terminal contract | the daemon grants no `terminal.*` scope, so `session.resize` is `Denied/ScopeViolation` |
 | Pushing session events on a connection (no subscribe method; the event stream owns its own registry) | bitty#2602 | `session.status`/`session.list` are the reconciliation reads; no event frame is sent |
-| Per-connection refusal-audit aggregation for method refusals (`refusal_audit_budget_per_sec`) | bitty#2603 follow-up | every refused method gets one individual record; the wire-level refusal budget is enforced (see below), but the method-refusal histogram is not implemented |
+| Per-connection refusal-audit aggregation | bitty#2603 follow-up | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each |
 | Conformance corpus and fake-server parity | bitty#2605 | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; V-07 (bitty#2768) and C-04 (bitty#2767) are recorded known defects |
 
 Nothing here authorizes autostart, a service file, a TCP listener, or desktop
@@ -310,11 +310,13 @@ bitty#2604 owns that directory and its current-user-only DACL.
 - `AuditRecord` carries a stable `AuditEventId`, an injected `MonotonicMs`,
   the daemon instance, the action, the static result, optional session
   counters, optional authenticated actor facts, the action target, optional
-  refusal counts, and optional terminal classification.
+  refusal counts, optional terminal classification, and the optional
+  suppressed-refusal aggregate (`AuditAggregate`) for a wire budget window.
 - There is no `String`, `Vec`, `Box`, payload, argv, environment, clipboard,
   prompt, transcript, raw `terminal_id`, control token, or caller label field. A create
   or terminal transition uses `AuditTarget::terminal_digest`; a refusal carries
-  its static `RefusalCode` and numeric `AuditCounts` only.
+  its static `RefusalCode` and numeric `AuditCounts` only, and a suppressed
+  refusal is counted in `AuditAggregate` by code, never by frame bytes.
 - The ring holds `audit_file_bytes × audit_segments / AUDIT_RECORD_BYTES`
   records (320 accounted bytes each); the accounted ring bytes are therefore
   capped by the sink budget. Overflow drops the oldest record, counts it in
@@ -330,7 +332,7 @@ bitty#2604 owns that directory and its current-user-only DACL.
   `host_grant.expire`; every grant action targets `AuditTarget::grant`
   (`grant_id`).
 - The ring is the staging buffer; the owner-private rotating file sink and the
-  per-connection refusal budget stay with bitty#2607.
+  per-connection refusal budget live in `audit_sink` and `service::server`.
 
 `handshake::NegotiateResponse` carries the version, capability, and effective
 limit facts. The remaining response fields (`wire_version` (transport-owned),
@@ -472,23 +474,33 @@ privileged dispatches, so each must call `PeerGuard::recheck` with the matching
 ## Service loop (bitty#2607)
 
 `bittyd start` is the only invocation that binds anything. Startup order is
-endpoint (`open_endpoint`), operator capability (`0600` file in the `0700`
-runtime directory), audit sink (`$XDG_STATE_HOME/bitty/audit`, `0700`/`0600`),
-then the single-threaded poll loop. The loop blocks `SIGTERM`/`SIGINT` behind a
-signal fd, so the signal drain runs in the same loop as requests.
+core-dump hardening (`RLIMIT_CORE=0` and `PR_SET_DUMPABLE=0` on Linux, before
+any privileged state exists), endpoint (`open_endpoint`), operator capability
+(`0600` file in the `0700` runtime directory), audit sink
+(`$XDG_STATE_HOME/bitty/audit`, `0700`/`0600`), then the single-threaded poll
+loop. The loop blocks `SIGTERM`/`SIGINT` behind a signal fd, so the signal
+drain runs in the same loop as requests.
 
-| Bound | Source | Behavior |
-| --- | --- | --- |
-| Connection cap | `max_connections_per_endpoint` | the accept path closes a connection above the cap |
-| Request rate and burst | `max_request_rate_per_sec` / `max_request_burst` | the accepted `bitty-ipc` RC-9 token bucket, `Denied/RateLimited` |
-| Frame bound | `max_frame_bytes` | a declared length above the bound closes the connection |
-| Pre-auth budget | `pre_auth_max_bytes` | a connection that sends more before negotiating is closed (completed frames and the frame being assembled count) |
-| Negotiate deadline | `negotiate_timeout_ms` | an unnegotiated connection past the deadline is closed |
-| Idle bound | `transport_idle_ms` | an idle connection is closed |
-| Outbound bound | `max_connection_outbound_bytes` | a response queue above the bound closes the connection |
-| Grant sweep | `GRANT_SWEEP_INTERVAL_MS` (1 s) | retired grant records are swept on the loop timer |
-| Close drain | `CLOSE_DRAIN_TIMEOUT_MS` (1 s) | a retired connection that cannot drain its refusal frame is closed; it never collects a second handshake-timeout record |
-| Tamper interval | `TAMPER_INTERVAL_MS` (5 s) | `BoundEndpoint::reattest`; a failure is exit code 6 |
+| Bound                  | Source                                           | Behavior                                                                                                                |
+| ---------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| Connection cap         | `max_connections_per_endpoint`                   | the accept path closes a connection above the cap                                                                       |
+| Request rate and burst | `max_request_rate_per_sec` / `max_request_burst` | the accepted `bitty-ipc` RC-9 token bucket, `Denied/RateLimited`                                                        |
+| Frame bound            | `max_frame_bytes`                                | a declared length above the bound closes the connection                                                                 |
+| Pre-auth budget        | `pre_auth_max_bytes`                             | a connection that sends more before negotiating is closed (completed frames and the frame being assembled count)        |
+| Negotiate deadline     | `negotiate_timeout_ms`                           | an unnegotiated connection past the deadline is closed                                                                  |
+| Idle bound             | `transport_idle_ms`                              | an idle connection is closed                                                                                            |
+| Outbound bound         | `max_connection_outbound_bytes`                  | a response queue above the bound closes the connection                                                                  |
+| Grant sweep            | `GRANT_SWEEP_INTERVAL_MS` (1 s)                  | retired grant records are swept on the loop timer                                                                       |
+| Close drain            | `CLOSE_DRAIN_TIMEOUT_MS` (1 s)                   | a retired connection that cannot drain its refusal frame is closed; it never collects a second handshake-timeout record |
+| Tamper interval        | `TAMPER_INTERVAL_MS` (5 s)                       | `BoundEndpoint::reattest`; a failure is exit code 6                                                                     |
+
+Process hardening (`D-16`, `T-23`, `P0-AC-026`): on Linux, `bittyd start`
+lowers `RLIMIT_CORE` to zero and clears the dumpable flag
+(`PR_SET_DUMPABLE=0`) before the endpoint is bound and before the operator
+capability is minted; a failure exits `1` rather than serving dumpable. macOS,
+FreeBSD, and Windows never serve in this slice (typed `UnsupportedPlatform`),
+so no cell serves with core dumps enabled. `tests/service_loop.rs` pins both
+controls against the real process (`/proc/<pid>/limits` and `/proc/<pid>/mem`).
 
 A frame-level, byte-budget, or deadline closure is one aggregated `wire` audit
 record (D-16). When the refusal follows a complete envelope the typed refusal
@@ -499,9 +511,11 @@ partial response. A refusal that
 `Unauthenticated`, `Denied/AlreadyNegotiated`) keeps its frame queued, stops
 reading, and shuts the stream down only after the queued bytes drain.
 
-The loop never opens a TCP listener. `tests/service_loop.rs` starts the real
-binary and checks the process's `/proc/<pid>/fd` socket inodes against
-`/proc/net/tcp` and `/proc/net/tcp6` for a `LISTEN` row.
+The loop never opens a TCP listener. `daemon.status` reports
+`tcp_listeners`, the daemon's self-attested count of its own TCP listening
+sockets from `/proc/self` (`0` expected; `null` outside Linux). The test reads
+that field instead of scanning `/proc/<pid>/fd`, which the non-dumpable daemon
+does not expose; the count is an observability fact, not an authority input.
 
 ### Scopes and method catalog
 
@@ -601,6 +615,14 @@ connection's create, every other inactive record is dropped immediately, and
 sweep) so the store cannot grow with total mints. A mint at the total bound is a
 whole `LimitExceeded` refusal and never evicts a live record.
 
+A consumed host grant stays revocable until its TTL: `daemon.host_grant`
+`revoke` marks the record revoked and clears any retained bearer, so the
+consuming connection's next `session.create` — including a keyed replay of a
+key already applied on that connection — is `Denied/ConsentRequired`
+immediately rather than at the 300 s TTL. The record is still retained until
+the TTL so the bound connection sees the false `host_grant_bound` answer.
+Observer grants keep the unconsumed-and-unexpired revoke rule.
+
 ### Dispatch order
 
 `service::dispatch` implements the eleven stages: transport, pre-auth, service
@@ -615,6 +637,16 @@ authority, target, generation, idempotency, effect. Invariants:
   the repeat `daemon.stop` keep their own answers;
 - visibility is a live lease, a presented current control token, the operator
   path, or (for a former leaseholder) the immutable terminal snapshot;
+- every control method (`session.attach`, `session.grant`,
+  `session.grant.revoke`, `session.detach` on another lease,
+  `session.control.transfer`, and `session.abort` with a control reason) maps
+  a missing, stale, or rotated token at a live, vacant control to
+  `Denied/InvalidControlToken`; an occupied, terminal, or unknown target stays
+  the uniform `NotFound`, no refusal echoes the token, and nothing applies;
+- that control mapping is the contract's named denial-order step 4, not a
+  general visibility widening: `session.status`, `session.list`, and every
+  invisible read keep the uniform `NotFound`, and the mapping requires the
+  method scope and a session id the caller already holds;
 - every privileged effect re-checks the captured peer after authorization and
   before the effect; a failure is `Unauthenticated` and closes the connection;
 - every mutation is admitted by the audit sink first; a degraded sink is
@@ -636,6 +668,10 @@ authority, target, generation, idempotency, effect. Invariants:
 `session.grant.revoke`, `session.detach`, `session.control.transfer`,
 `session.abort`, `session.kill`, `lease.heartbeat`.
 
+`daemon.status` reports the daemon state, active and per-state session counts,
+`audit_degraded`, the drain deadline, the advertised limit triples, the orphan
+placeholder, and `tcp_listeners` (see the service-loop note above).
+
 ### Audit sink
 
 `audit_sink::AuditSink` drains the bounded ring into an owner-private rotating
@@ -652,11 +688,24 @@ Rendered lines carry only closed spellings, ids, digests, and numbers.
 `service::dispatch` records one individual refusal record for every refused
 method with its static code and counts; the server loop records one `wire`
 refusal for every envelope, frame, budget, or deadline closure that never
-resolves to a method. Non-closing wire refusals are budgeted per connection at
-`refusal_audit_budget_per_sec` records per second; a rate-limited or malformed
-frame flood therefore cannot rotate the audit segments by itself, at the cost
-of dropping records past the cap (the full histogram is deferred; see the table
-above).
+resolves to a method. Only those wire-level refusals are pooled by this budget;
+a refused method still gets one individual record and is never counted in the
+aggregate histogram, so per-method refusal aggregation remains the bitty#2603
+follow-up. Non-closing wire refusals are budgeted per connection at
+`refusal_audit_budget_per_sec` records per second. A window that suppresses
+refusals ends with exactly one aggregate `wire` record carrying
+`sup=<suppressed>`, `bl=<budget>`, and a bounded static code histogram
+(`h=code:count,...`, with `ho=<count>` for codes past the
+`MAX_AGGREGATE_CLASSES` cap); a closing connection or an endpoint-tamper exit
+flushes its pending window so no suppression is lost. The aggregate is
+fixed-size and cannot rotate the segments by itself, so a refusal flood stays
+bounded without becoming invisible.
+
+The re-attestation interval is the frozen `TAMPER_INTERVAL_MS` in every release
+build. Debug builds honour `BITTYD_TEST_TAMPER_INTERVAL_MS` (clamped to
+`1..=TAMPER_INTERVAL_MS`) only so the tamper-flush regression test can keep a
+refusal-audit window open across the tamper check; the variable is compiled out
+of release builds and can never lengthen the interval.
 
 ### Per-frame peer credentials
 
@@ -844,7 +893,12 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
   refusal without a capability oracle plus a real EOF inside the deadline,
   closing refusals (second negotiate, pre-negotiate frame, wire and service
   version), a stopping daemon refusing a pipelined create, the pre-auth byte
-  budget and its aggregated record, the negotiate-deadline record,
+  budget and its aggregated record, the negotiate-deadline record, the
+  consumed host grant revoke (fresh key and keyed replay), the vacant-control
+  `InvalidControlToken` for every control method (stale, missing, occupied,
+  invisible, and post-transfer old/rotated cases), the refusal-burst aggregate
+  with suppressed count and histogram, the tamper-exit aggregate flush,
+  core-dump hardening (`RLIMIT_CORE` and `/proc/<pid>/mem`),
   `SIGTERM`/`SIGINT` drain, endpoint tamper → exit 6, clean stop, and the
   status-only invocation.
 - `tests/frame_credentials.rs` — per-frame credential acceptance across a real

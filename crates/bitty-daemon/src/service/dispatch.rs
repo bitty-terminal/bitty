@@ -51,7 +51,8 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::audit::{
-    AuditAction, AuditCounts, AuditEntry, AuditResult, AuditSession, AuditTarget, AuditTerminal,
+    AuditAction, AuditAggregate, AuditCounts, AuditEntry, AuditResult, AuditSession, AuditTarget,
+    AuditTerminal,
 };
 use crate::audit_sink::{AuditSink, AuditWriter};
 use crate::codes::RefusalCode;
@@ -556,6 +557,26 @@ impl Service {
         let _ = self.audit.record(entry, now);
     }
 
+    /// Record the one aggregate for a wire-refusal budget window (`D-16`).
+    ///
+    /// A window that suppressed at least one refusal gets exactly one `wire`
+    /// record: the suppressed count, the budget, and the bounded static code
+    /// histogram. The record carries no refused frame and no caller label, and
+    /// the aggregate's fixed-size histogram keeps it from rotating the sink
+    /// beyond the budget the next window enforces.
+    pub fn record_wire_aggregate(
+        &mut self,
+        connection: &Connection,
+        aggregate: AuditAggregate,
+        now: MonotonicMs,
+    ) {
+        let entry = AuditEntry::new(AuditAction::Wire)
+            .actor(connection.audit_actor())
+            .result(AuditResult::Refused(RefusalCode::RateLimited))
+            .aggregate(aggregate);
+        let _ = self.audit.record(entry, now);
+    }
+
     /// How many sessions are non-terminal.
     #[must_use]
     pub fn active_sessions(&self, now: MonotonicMs) -> usize {
@@ -951,6 +972,53 @@ impl Service {
         })
     }
 
+    /// Whether a live session exists with no controller lease.
+    ///
+    /// Control methods consult this through [`Self::control_target`]: it
+    /// distinguishes the contract's `Denied/InvalidControlToken` (a missing,
+    /// stale, or rotated token at a vacant control) from the uniform
+    /// `NotFound` for an unknown, terminal, or otherwise invisible target.
+    fn live_vacant_control(&self, session_id: SessionId, now: MonotonicMs) -> bool {
+        let Some(snapshot) = self.host.snapshot(session_id, now) else {
+            return false;
+        };
+        if snapshot.state.is_terminal() {
+            return false;
+        }
+        self.host
+            .control_view(session_id, now)
+            .is_some_and(|view| view.controller.is_none())
+    }
+
+    /// Resolve visibility for a control method and map the contract's one
+    /// control-relation branch.
+    ///
+    /// A live session with a vacant control answers
+    /// `Denied/InvalidControlToken` when the presented token is missing,
+    /// stale, or rotated; an unknown, terminal, or occupied target keeps the
+    /// uniform `NotFound`. The mapping is the contract's denial-order step 4,
+    /// not a general visibility widening: `session.status` and `session.list`
+    /// keep [`Self::visible`] and never map. The refusal echoes no token and
+    /// applies nothing.
+    fn control_target(
+        &self,
+        connection: &Connection,
+        session_id: SessionId,
+        token: Option<&ControlToken>,
+        now: MonotonicMs,
+    ) -> Result<SessionSnapshot, Refusal> {
+        match self.visible(connection, session_id, token, now) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(refusal)
+                if refusal.kind() == RefusalKind::NotFound
+                    && self.live_vacant_control(session_id, now) =>
+            {
+                Err(Refusal::denied(RefusalCode::InvalidControlToken))
+            }
+            Err(refusal) => Err(refusal),
+        }
+    }
+
     fn control_authority<'a>(
         &self,
         connection: &Connection,
@@ -1106,6 +1174,7 @@ impl Service {
             },
             "audit_degraded": self.audit.is_degraded(),
             "drain_deadline_ms": self.drain_deadline_ms,
+            "tcp_listeners": tcp_listener_count(),
             "limits": limits,
             "orphans": {"verify": "deferred"},
         }))
@@ -1489,9 +1558,15 @@ impl Service {
         }
         let session_id = parse_session_id(fields)?;
         let expected_generation = required_u64(fields, "expected_generation")?;
-        let token = parse_control_token(fields)?;
+        let token = optional_control_token(fields)?;
         let key = self.idempotency_key(fields)?;
-        let snapshot = self.visible(connection, session_id, Some(&token), now)?;
+        let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
+        // A controller claim always needs the token. A missing token is the
+        // contract's `Denied/InvalidControlToken` for a vacant control; a
+        // visible target cannot be claimed without one either.
+        let Some(token) = token else {
+            return Err(Refusal::denied(RefusalCode::InvalidControlToken));
+        };
         check_generation(&snapshot, expected_generation)?;
         let fingerprint = fingerprint(&[
             "attach",
@@ -1675,7 +1750,7 @@ impl Service {
         let session_id = parse_session_id(fields)?;
         let key = self.idempotency_key(fields)?;
         let token = optional_control_token(fields)?;
-        let snapshot = self.visible(connection, session_id, token.as_ref(), now)?;
+        let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
         let _authority =
             self.control_authority(connection, session_id, token.as_ref(), true, now)?;
         let fingerprint = fingerprint(&["grant", &session_id.as_hex()]);
@@ -1786,7 +1861,7 @@ impl Service {
         // not already hold.
         if let Some(session_id) = self.grants.observer_grant_session_retained(grant_id) {
             let token = optional_control_token(fields)?;
-            let _snapshot = self.visible(connection, session_id, token.as_ref(), now)?;
+            let _snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
             let _authority =
                 self.control_authority(connection, session_id, token.as_ref(), true, now)?;
             self.recheck(connection, DispatchBoundary::ObserverGrantRevoke)?;
@@ -1840,7 +1915,7 @@ impl Service {
                 .host
                 .session_for_lease(target)
                 .ok_or_else(Refusal::not_found)?;
-            let _snapshot = self.visible(connection, session_id, token.as_ref(), now)?;
+            let _snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
             self.recheck(connection, DispatchBoundary::DetachOther)?;
         }
         let authority = if own {
@@ -1885,7 +1960,7 @@ impl Service {
         let expected_generation = required_u64(fields, "expected_generation")?;
         let token = optional_control_token(fields)?;
         let key = self.idempotency_key(fields)?;
-        let snapshot = self.visible(connection, session_id, token.as_ref(), now)?;
+        let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
         check_generation(&snapshot, expected_generation)?;
         let authority =
             self.control_authority(connection, session_id, token.as_ref(), false, now)?;
@@ -1996,7 +2071,7 @@ impl Service {
         let expected_generation = required_u64(fields, "expected_generation")?;
         let reason = required_string(fields, "reason_class")?;
         let token = optional_control_token(fields)?;
-        let snapshot = self.visible(connection, session_id, token.as_ref(), now)?;
+        let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
         if snapshot.state.is_terminal() {
             return Ok(json!({
                 "session": session_json(&snapshot),
@@ -2297,11 +2372,6 @@ fn parse_bearer(
         .map_err(|_| Refusal::invalid_request())
 }
 
-fn parse_control_token(fields: Option<&Map<String, Value>>) -> Result<ControlToken, Refusal> {
-    let bearer = parse_bearer(fields, "control_token")?;
-    Ok(ControlToken::from_bytes(*bearer.expose()))
-}
-
 fn optional_control_token(
     fields: Option<&Map<String, Value>>,
 ) -> Result<Option<ControlToken>, Refusal> {
@@ -2312,6 +2382,53 @@ fn optional_control_token(
             Ok(Some(ControlToken::from_bytes(*bearer.expose())))
         }
         None => Ok(None),
+    }
+}
+
+/// Count this process's own TCP listening sockets.
+///
+/// The daemon clears its dumpable flag, so an external same-uid observer
+/// cannot enumerate `/proc/<pid>/fd`; `daemon.status` reports the count the
+/// process can verify about itself from `/proc/self` instead. The scan is
+/// bounded by the process fd table and the namespace TCP tables, and returns
+/// `None` outside Linux or when `/proc/self` is unavailable. It is an
+/// observability fact, never an authority input.
+fn tcp_listener_count() -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut sockets = std::collections::BTreeSet::new();
+        let entries = std::fs::read_dir("/proc/self/fd").ok()?;
+        for entry in entries.flatten() {
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            let Some(text) = target.to_str() else {
+                continue;
+            };
+            if let Some(inode) = text
+                .strip_prefix("socket:[")
+                .and_then(|rest| rest.strip_suffix(']'))
+            {
+                sockets.insert(inode.to_owned());
+            }
+        }
+        let mut count = 0u32;
+        for table in ["/proc/self/net/tcp", "/proc/self/net/tcp6"] {
+            let Ok(content) = std::fs::read_to_string(table) else {
+                return None;
+            };
+            for line in content.lines().skip(1) {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                if fields.len() >= 10 && fields[3] == "0A" && sockets.contains(fields[9]) {
+                    count = count.saturating_add(1);
+                }
+            }
+        }
+        Some(count)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
     }
 }
 
@@ -2548,6 +2665,15 @@ mod tests {
     }
 
     fn mint_host_grant(service: &mut Service, operator: &mut Connection, now: u64) -> String {
+        mint_host_grant_pair(service, operator, now).1
+    }
+
+    /// Mint a host grant and return its non-secret id and bearer.
+    fn mint_host_grant_pair(
+        service: &mut Service,
+        operator: &mut Connection,
+        now: u64,
+    ) -> (String, String) {
         let result = service
             .dispatch(
                 operator,
@@ -2556,7 +2682,10 @@ mod tests {
                 MonotonicMs::from_millis(now),
             )
             .expect("host grant");
-        result["grant"].as_str().expect("bearer").to_owned()
+        (
+            result["grant_id"].as_str().expect("grant id").to_owned(),
+            result["grant"].as_str().expect("bearer").to_owned(),
+        )
     }
 
     fn create_session(service: &mut Service, connection: &mut Connection, key: &str) -> Value {
@@ -2728,6 +2857,71 @@ mod tests {
             )
             .expect_err("no consent");
         assert_eq!(error.denied_code(), Some(RefusalCode::ConsentRequired));
+    }
+
+    /// A consume-then-revoke withdraws both a fresh create and its keyed replay.
+    #[test]
+    fn a_consumed_host_grant_revoke_withdraws_create_and_its_replay() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let (grant_id, grant) = mint_host_grant_pair(&mut service, &mut operator, 2);
+
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        let created = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionCreate,
+                &json!({"kind": "terminal", "idempotency_key": "revoke-k1"}),
+                MonotonicMs::from_millis(4),
+            )
+            .expect("create");
+        assert!(created["session"]["session_id"].is_string());
+        assert_eq!(
+            service
+                .host()
+                .snapshots(MonotonicMs::from_millis(4))
+                .count(),
+            1
+        );
+
+        let revoked = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonHostGrant,
+                &json!({"action": "revoke", "grant_id": grant_id}),
+                MonotonicMs::from_millis(5),
+            )
+            .expect("revoke");
+        assert_eq!(revoked["revoked"], true);
+        assert_eq!(revoked["not_active"], false);
+
+        // Both the fresh key and the already-applied key are refused: the
+        // revoke withdraws the create authority before the idempotency store is
+        // consulted, so a keyed replay cannot resurrect a session.
+        for (index, key) in ["revoke-k1", "revoke-k2"].into_iter().enumerate() {
+            let error = service
+                .dispatch(
+                    &mut creator,
+                    ServiceMethod::SessionCreate,
+                    &json!({"kind": "terminal", "idempotency_key": key}),
+                    MonotonicMs::from_millis(6 + index as u64),
+                )
+                .expect_err("no consent");
+            assert_eq!(error.denied_code(), Some(RefusalCode::ConsentRequired));
+        }
+        assert_eq!(
+            service
+                .host()
+                .snapshots(MonotonicMs::from_millis(8))
+                .count(),
+            1,
+            "the refused replay created no second session"
+        );
     }
 
     #[test]

@@ -337,13 +337,12 @@ jobs:
       # moves an existing test to another shard, so flakes stay reproducible
       # to their shard. Both shards must pass for the job to pass.
       - name: Run tests (nextest, ci profile, shard ${{ matrix.shard }}/2)
-        run: cargo nextest run --workspace --locked --profile ci --partition hash:${{ matrix.shard }}/2
+        run: cargo nextest run --workspace --locked --profile ci --partition hash:${{ matrix.shard }}/2 -E 'not binary(=conformance)'
 
-      # bitty#2605: the fake-server half of the shared conformance corpus. It
-      # runs on every consumer-relevant change (the whole Quality job) and its
-      # evidence is uploaded separately from the real-service row, so a fake
-      # run can never close a real row. Shard 1 only: artifact names are unique
-      # per workflow run.
+      # bitty#2605: the fake-server half of the shared corpus is excluded from
+      # the sharded nextest run above and named here, so shard 1 always
+      # produces the artifact. The real-service row stays in the Linux Tier-1
+      # job; a fake run can never close a real row.
       - name: Run bittyd conformance (fake reference server)
         if: matrix.shard == 1
         run: cargo test -p bitty-daemon --test conformance --locked fake_conformance_corpus
@@ -778,7 +777,7 @@ jobs:
           tool: nextest@0.9.145
 
       - name: Run tests under xvfb (X11, nextest ci profile)
-        run: xvfb-run -a cargo nextest run --workspace --locked --profile ci
+        run: xvfb-run -a cargo nextest run --workspace --locked --profile ci -E 'not binary(=conformance)'
 
       - name: Run doctests (X11)
         run: cargo test --workspace --doc --locked
@@ -786,10 +785,11 @@ jobs:
       - name: Run harness=false platform entry points (X11)
         run: xvfb-run -a cargo test -p bitty-platform --test headless_run --test winit_window --locked
 
-      # bitty#2605: the real-service conformance row runs in the Linux Tier-1
-      # job. The corpus records typed skips for the injected-clock and
-      # adapter-owned rows; a fake pass never closes a real row. The parity
-      # document compares the two typed signatures.
+      # bitty#2605: the real-service conformance row is excluded from the
+      # nextest step above and named here on this Linux Tier-1 leg. The corpus
+      # records typed skips for the injected-clock and adapter-owned rows; a
+      # fake pass never closes a real row. The parity document compares the two
+      # typed signatures.
       - name: Run bittyd conformance (real service)
         run: cargo test -p bitty-daemon --test conformance --locked
 

@@ -1579,6 +1579,10 @@ impl Driver for FakeDriver {
         Ok(self.seeds())
     }
 
+    fn crash(&mut self) -> Result<(), String> {
+        Err("the fake driver cannot crash a real process".to_owned())
+    }
+
     fn advance_clock(&mut self, millis: u64) {
         self.clock_ms = self.clock_ms.saturating_add(millis);
     }

@@ -115,19 +115,38 @@ impl Daemon {
         let mut daemon = Self { child };
         let deadline = Instant::now() + START_BUDGET;
         while Instant::now() < deadline {
-            if root.endpoint().exists() {
+            // Readiness is an accepted connection, not merely a socket path:
+            // a stale file or a listener that cannot accept must not count.
+            if UnixStream::connect(root.endpoint()).is_ok() {
                 return Ok(daemon);
             }
             if daemon.child.try_wait().ok().flatten().is_some() {
                 return Err("bittyd exited before binding".to_owned());
             }
+            // Bounded backoff for process startup; the deadline is the bound.
             std::thread::sleep(Duration::from_millis(10));
         }
+        daemon.kill();
         Err("bittyd did not bind within the startup budget".to_owned())
     }
 
     fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    fn wait_reaped(&mut self, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if Instant::now() < deadline => {
+                    // Bounded backoff for a short-lived CLI; the deadline is
+                    // the hard bound and the child is killed past it.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => return false,
+            }
+        }
     }
 
     fn wait_within(&mut self, budget: Duration) -> Option<i32> {
@@ -136,6 +155,8 @@ impl Daemon {
             match self.child.try_wait() {
                 Ok(Some(status)) => return status.code(),
                 Ok(None) if Instant::now() < deadline => {
+                    // Bounded backoff for a short-lived CLI; the deadline is
+                    // the hard bound and the child is killed past it.
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 _ => return None,
@@ -604,6 +625,8 @@ impl Driver for RealDriver {
             if self.audit_text().contains("unauthenticated") {
                 return Ok(());
             }
+            // The refusal is applied on the service loop's next iteration;
+            // the deadline bounds the settlement, there is no other signal.
             std::thread::sleep(Duration::from_millis(10));
         }
         Err("no peer-exit refusal record".to_owned())
@@ -695,6 +718,21 @@ impl Driver for RealDriver {
         Ok(vars)
     }
 
+    fn crash(&mut self) -> Result<(), String> {
+        let mut daemon = self
+            .daemon
+            .take()
+            .ok_or_else(|| "no daemon to crash".to_owned())?;
+        let pid = daemon.pid();
+        signal(pid, "KILL")?;
+        if !daemon.wait_reaped(STOP_BUDGET) {
+            return Err("the daemon did not exit after SIGKILL".to_owned());
+        }
+        self.clients.clear();
+        self.root = None;
+        Ok(())
+    }
+
     fn advance_clock(&mut self, _millis: u64) {
         // The served loop uses a process monotonic clock; no injection point
         // exists. Vectors that need one are fake-only and record a typed skip.
@@ -754,12 +792,35 @@ impl Driver for RealDriver {
         std::fs::set_permissions(root.runtime(), std::fs::Permissions::from_mode(0o700))
             .map_err(|_| "runtime mode".to_owned())?;
         std::fs::create_dir_all(root.state()).map_err(|_| "state dir".to_owned())?;
-        let output = Command::new(BITTYD)
+        let mut child = Command::new(BITTYD)
             .env("XDG_RUNTIME_DIR", root.runtime())
             .env("XDG_STATE_HOME", root.state())
             .env_remove("BITTYD_ENDPOINT")
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|_| "cannot run bittyd".to_owned())?;
+        let deadline = Instant::now() + START_BUDGET;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if Instant::now() < deadline => {
+                    // Bounded backoff for a short-lived CLI; the deadline is
+                    // the hard bound and the child is killed past it.
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("plain bittyd exceeded the invocation budget".to_owned());
+                }
+                Err(_) => return Err("cannot observe plain bittyd".to_owned()),
+            }
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|_| "cannot read plain bittyd output".to_owned())?;
         if root.endpoint().exists() || root.capability().exists() {
             return Err("plain bittyd created a runtime file".to_owned());
         }

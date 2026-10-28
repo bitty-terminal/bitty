@@ -42,6 +42,12 @@ pub struct KnownDefect {
     pub reason: String,
     /// Drivers whose current behavior still carries the defect.
     pub drivers: Vec<DriverKind>,
+    /// Zero-based step index (across `steps` then `state`) that must fail.
+    pub step: usize,
+    /// Refusal code the failing step must report, when the defect is a refusal.
+    pub code: Option<String>,
+    /// Result path the failing step must name, when the defect is a value.
+    pub path: Option<String>,
 }
 
 /// One vector.
@@ -117,6 +123,7 @@ pub struct Expect {
     pub hex_len: BTreeMap<String, usize>,
     pub distinct: Vec<String>,
     pub not_equal: BTreeMap<String, String>,
+    pub not_equal_any: BTreeMap<String, Vec<String>>,
     pub request_log: Option<RequestLogExpect>,
     pub exit_code: Option<i32>,
     pub stdout_contains: Vec<String>,
@@ -137,6 +144,7 @@ impl Expect {
             || !self.hex_len.is_empty()
             || !self.distinct.is_empty()
             || !self.not_equal.is_empty()
+            || !self.not_equal_any.is_empty()
             || self.request_log.is_some()
             || self.exit_code.is_some()
             || self.file_mode.is_some()
@@ -292,7 +300,10 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
         return Err(fail("no forbidden observations".to_owned()));
     }
     for step in steps.iter().chain(state.iter()) {
-        let setup_action = matches!(step.action.as_deref(), Some("advance_clock" | "restart"));
+        let setup_action = matches!(
+            step.action.as_deref(),
+            Some("advance_clock" | "restart" | "crash")
+        );
         if !setup_action && !step.expect.has_typed_assertion() {
             return Err(fail(format!(
                 "step {:?} has no typed expectation",
@@ -312,10 +323,33 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
                     .collect::<Result<Vec<_>, _>>()?,
                 Some(_) => return Err(fail("known_defect.drivers is not an array".to_owned())),
             };
+            if drivers.is_empty() {
+                return Err(fail("known_defect.drivers is empty".to_owned()));
+            }
+            let step = optional_u64(defect, "step")
+                .map_err(fail)?
+                .ok_or_else(|| fail("known_defect.step is required".to_owned()))?
+                as usize;
+            if step >= steps.len() + state.len() {
+                return Err(fail(format!(
+                    "known_defect.step {step} is outside the {} vector steps",
+                    steps.len() + state.len()
+                )));
+            }
+            let code = optional_string(defect, "code").map_err(fail)?;
+            let path = optional_string(defect, "path").map_err(fail)?;
+            if code.is_none() && path.is_none() {
+                return Err(fail(
+                    "known_defect needs a code or a path for the expected failure".to_owned(),
+                ));
+            }
             Some(KnownDefect {
                 issue: string(defect, "issue").map_err(fail)?,
                 reason: string(defect, "reason").map_err(fail)?,
                 drivers,
+                step,
+                code,
+                path,
             })
         }
     };
@@ -400,6 +434,7 @@ fn parse_expect(value: &Value) -> Result<Expect, String> {
         hex_len: usize_map(value, "hex_len")?,
         distinct: optional_string_array(value, "distinct")?,
         not_equal: string_map(value, "not_equal")?,
+        not_equal_any: string_list_map(value, "not_equal_any")?,
         request_log: None,
         exit_code: optional_i32(value, "exit_code")?,
         stdout_contains: optional_string_array(value, "stdout_contains")?,
@@ -407,10 +442,14 @@ fn parse_expect(value: &Value) -> Result<Expect, String> {
         audit: None,
     };
     if let Some(log) = value.get("request_log") {
-        expect.request_log = Some(RequestLogExpect {
+        let log = RequestLogExpect {
             no_fields: optional_string_array(log, "no_fields")?,
             method_counts: usize_map(log, "method_counts")?,
-        });
+        };
+        if log.no_fields.is_empty() && log.method_counts.is_empty() {
+            return Err("request_log expectation is empty".to_owned());
+        }
+        expect.request_log = Some(log);
     }
     expect.result = normalize_values(expect.result);
     expect.result_min = normalize_values(expect.result_min);
@@ -419,6 +458,7 @@ fn parse_expect(value: &Value) -> Result<Expect, String> {
     expect.min_array_len = normalize_values(expect.min_array_len);
     expect.hex_len = normalize_values(expect.hex_len);
     expect.not_equal = normalize_values(expect.not_equal);
+    expect.not_equal_any = normalize_values(expect.not_equal_any);
     expect.present = expect
         .present
         .iter()
@@ -434,6 +474,9 @@ fn parse_expect(value: &Value) -> Result<Expect, String> {
         .iter()
         .map(|path| normalize_path(path))
         .collect();
+    if expect.error_class.is_some() && expect.error_code.is_none() {
+        return Err("error_class without error_code".to_owned());
+    }
     if let Some(audit) = value.get("audit") {
         let mut line_bounds = Vec::new();
         if let Some(items) = audit.get("line_bounds").and_then(Value::as_array) {
@@ -445,11 +488,18 @@ fn parse_expect(value: &Value) -> Result<Expect, String> {
                 });
             }
         }
-        expect.audit = Some(AuditExpect {
+        let audit = AuditExpect {
             contains: optional_string_array(audit, "contains")?,
             not_contains: optional_string_array(audit, "not_contains")?,
             line_bounds,
-        });
+        };
+        if audit.contains.is_empty()
+            && audit.not_contains.is_empty()
+            && audit.line_bounds.is_empty()
+        {
+            return Err("audit expectation is empty".to_owned());
+        }
+        expect.audit = Some(audit);
     }
     Ok(expect)
 }
@@ -581,6 +631,28 @@ fn usize_map(value: &Value, field: &str) -> Result<BTreeMap<String, usize>, Stri
             .map(|(key, value)| (key, value as usize))
             .collect()
     })
+}
+
+fn string_list_map(value: &Value, field: &str) -> Result<BTreeMap<String, Vec<String>>, String> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(BTreeMap::new()),
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(key, value)| {
+                let values = value
+                    .as_array()
+                    .ok_or_else(|| format!("{field}.{key} is not an array"))?
+                    .iter()
+                    .map(|item| as_string(item, field))
+                    .collect::<Result<Vec<_>, _>>()?;
+                if values.is_empty() {
+                    return Err(format!("{field}.{key} is empty"));
+                }
+                Ok((key.clone(), values))
+            })
+            .collect(),
+        Some(_) => Err(format!("{field} is not an object")),
+    }
 }
 
 fn string_map(value: &Value, field: &str) -> Result<BTreeMap<String, String>, String> {

@@ -556,14 +556,18 @@
             "ok": true,
             "result": {
               "role": "observer",
-              "replayed": false
+              "replayed": false,
+              "session.attach_count": 2
             },
             "hex_len": {
               "attach_id": 32
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         }
       ],
@@ -753,7 +757,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         },
         {
@@ -990,7 +997,9 @@
         "reason": "a repeat detach of a removed lease resolves to NotFound instead of the idempotent not_attached acknowledgement",
         "drivers": [
           "real"
-        ]
+        ],
+        "step": 6,
+        "code": "NotFound"
       },
       "forbidden": [
         "a repeat detach never bumps the revision",
@@ -1141,7 +1150,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         },
         {
@@ -1189,7 +1201,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         },
         {
@@ -1237,7 +1252,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         },
         {
@@ -1285,7 +1303,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         },
         {
@@ -1333,7 +1354,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         },
         {
@@ -1381,7 +1405,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         },
         {
@@ -1429,7 +1456,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         },
         {
@@ -1477,7 +1507,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         },
         {
@@ -1523,6 +1556,32 @@
         }
       ],
       "state": [
+        {
+          "connection": "observer",
+          "method": "lease.heartbeat",
+          "params": {
+            "attach_id": "@attach0"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "attach_id": "@attach0"
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "lease.heartbeat",
+          "params": {
+            "attach_id": "@attach7"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "attach_id": "@attach7"
+            }
+          }
+        },
         {
           "connection": "operator",
           "method": "daemon.negotiate",
@@ -1793,7 +1852,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         },
         {
@@ -2314,11 +2376,12 @@
       "forbidden": [
         "no session is terminated by a refused stop",
         "the daemon does not enter stopping"
-      ]
+      ],
+      "deferred": "CLI stop exit code is not implemented (the CLI has no stop subcommand); the service-level refuse semantics are covered"
     },
     {
       "id": "V-18",
-      "title": "A restart mints a new instance, refuses stale bindings, and starts empty",
+      "title": "A crash and restart mint a new instance, refuse stale bindings, and start empty",
       "area": "restart",
       "decisions": [
         "D-02",
@@ -2406,17 +2469,7 @@
           }
         },
         {
-          "connection": "operator",
-          "method": "daemon.stop",
-          "params": {
-            "mode": "force"
-          },
-          "expect": {
-            "ok": true,
-            "result": {
-              "accepted": true
-            }
-          }
+          "action": "crash"
         },
         {
           "action": "restart"
@@ -2623,7 +2676,8 @@
       "forbidden": [
         "a replay never creates a second session",
         "a conflicting fingerprint never overwrites the remembered result"
-      ]
+      ],
+      "deferred": "request deadline is a supervisor timer without an injection point; idempotent create dedupe is covered"
     },
     {
       "id": "V-22",
@@ -2769,7 +2823,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         },
         {
@@ -3143,7 +3200,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         }
       ],
@@ -3931,6 +3991,14 @@
               "session.session_id": 32,
               "session.terminal_id": 32,
               "control_token": 64
+            },
+            "not_equal_any": {
+              "session.session_id": [
+                "@a_sid"
+              ],
+              "session.terminal_id": [
+                "@a_terminal"
+              ]
             }
           }
         },
@@ -3942,7 +4010,8 @@
             "idempotency_key": "c01-c"
           },
           "capture": {
-            "c_sid": "session.session_id"
+            "c_sid": "session.session_id",
+            "c_terminal": "session.terminal_id"
           },
           "expect": {
             "ok": true,
@@ -3956,6 +4025,16 @@
               "session.session_id": 32,
               "session.terminal_id": 32,
               "control_token": 64
+            },
+            "not_equal_any": {
+              "session.session_id": [
+                "@a_sid",
+                "@b_sid"
+              ],
+              "session.terminal_id": [
+                "@a_terminal",
+                "@b_terminal"
+              ]
             }
           }
         },
@@ -4388,7 +4467,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         },
         {
@@ -4484,7 +4566,9 @@
         "reason": "grant mint, grant consume, and grant revoke do not bump state_revision as D-03 and the service surface require",
         "drivers": [
           "real"
-        ]
+        ],
+        "step": 5,
+        "path": "session.state_revision"
       },
       "forbidden": [
         "a heartbeat never bumps the revision",
@@ -4758,7 +4842,10 @@
             },
             "absent": [
               "control_token"
-            ]
+            ],
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
           }
         },
         {

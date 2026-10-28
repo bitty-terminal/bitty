@@ -11,10 +11,15 @@
 
 mod harness;
 
-use harness::corpus::{Corpus, DriverKind};
+use std::collections::BTreeMap;
+
+use serde_json::Value;
+
+use harness::corpus::{AuditExpect, Corpus, DriverKind};
 use harness::evidence::{self, Evidence};
 use harness::fake::FakeDriver;
 use harness::runner::{Driver, RowStatus, VectorOutcome, run_corpus};
+use harness::runner::{check_audit, known_defect_matches};
 
 #[cfg(target_os = "linux")]
 use harness::real::RealDriver;
@@ -67,6 +72,64 @@ fn corpus_is_well_formed_and_frozen() {
         .map(|vector| vector.id.as_str())
         .collect();
     assert_eq!(known, ["V-07", "C-04"], "known-defect markers changed");
+    let v07 = corpus
+        .vector("V-07")
+        .and_then(|vector| vector.known_defect.as_ref())
+        .expect("V-07 marker");
+    assert_eq!(v07.step, 6);
+    assert_eq!(v07.code.as_deref(), Some("NotFound"));
+    let c04 = corpus
+        .vector("C-04")
+        .and_then(|vector| vector.known_defect.as_ref())
+        .expect("C-04 marker");
+    assert_eq!(c04.step, 5);
+    assert_eq!(c04.path.as_deref(), Some("session.state_revision"));
+}
+
+#[test]
+fn audit_not_contains_resolves_captured_secrets() {
+    let mut vars = BTreeMap::new();
+    vars.insert(
+        "create_token".to_owned(),
+        Value::String("deadbeef".to_owned()),
+    );
+    let expect = AuditExpect {
+        not_contains: vec!["@create_token".to_owned()],
+        ..AuditExpect::default()
+    };
+    assert!(
+        check_audit(&expect, "a=session.create token=deadbeef", &vars).is_err(),
+        "a leaking audit line must fail the vector"
+    );
+    assert!(
+        check_audit(&expect, "a=session.create r=ok", &vars).is_ok(),
+        "a clean audit line passes"
+    );
+}
+
+#[test]
+fn known_defect_must_match_the_recorded_step_and_code() {
+    let corpus = Corpus::load().expect("corpus");
+    let defect = corpus
+        .vector("V-07")
+        .and_then(|vector| vector.known_defect.as_ref())
+        .expect("V-07 marker");
+    let failure = "session.detach: expected ok=true, observed ok=false (NotFound / NotFound)";
+    assert!(known_defect_matches(defect, Some(6), Some(failure)));
+    assert!(
+        !known_defect_matches(defect, Some(5), Some(failure)),
+        "a failure at another step must not be masked"
+    );
+    assert!(
+        !known_defect_matches(defect, Some(6), Some("(StaleGeneration / StaleGeneration)")),
+        "a different refusal code must not be masked"
+    );
+}
+
+#[test]
+fn zero_compared_parity_is_a_skip() {
+    let doc = evidence::render_parity(0, &[], &["cell-not-servable".to_owned()]);
+    assert_eq!(doc["status"], "skip");
 }
 
 #[test]
@@ -80,6 +143,7 @@ fn fake_conformance_corpus() {
         label: evidence::driver_label(DriverKind::Fake),
         facts: &facts,
         corpus_contract: &corpus.contract,
+        frozen: &corpus.frozen,
         rows: &rows,
     };
     let _ = evidence::write(&evidence);
@@ -92,6 +156,16 @@ fn fake_conformance_corpus() {
         rows.iter()
             .all(|row| row.status != RowStatus::Skip || row.skip_reason.is_some()),
         "every fake skip is typed"
+    );
+    let skipped: Vec<&str> = rows
+        .iter()
+        .filter(|row| row.status == RowStatus::Skip)
+        .map(|row| row.id.as_str())
+        .collect();
+    assert_eq!(
+        skipped,
+        ["V-18", "C-01", "C-02", "C-03", "C-07", "C-08"],
+        "the fake suite skips exactly the real-only vectors"
     );
 }
 
@@ -107,6 +181,7 @@ fn real_conformance_corpus() {
         label: evidence::driver_label(DriverKind::Real),
         facts: &facts,
         corpus_contract: &corpus.contract,
+        frozen: &corpus.frozen,
         rows: &rows,
     };
     let _ = evidence::write(&evidence);
@@ -150,6 +225,7 @@ fn real_conformance_corpus() {
             instance_id: String::new(),
             steps: 0,
             signature: Vec::new(),
+            failure_step: None,
             failure: None,
         })
         .collect();
@@ -163,6 +239,7 @@ fn real_conformance_corpus() {
         label: evidence::driver_label(DriverKind::Real),
         facts: &facts,
         corpus_contract: &corpus.contract,
+        frozen: &corpus.frozen,
         rows: &rows,
     };
     let _ = evidence::write(&evidence);
@@ -212,17 +289,21 @@ fn fake_and_real_parity() {
     let _ = evidence::write_parity(compared, &divergences, &not_compared);
     assert_no_failures(&fake_rows, "fake");
     assert_no_failures(&real_rows, "real");
-    assert!(
-        compared >= 20,
-        "parity compared only {compared} shared vectors"
-    );
+    assert_eq!(compared, 21, "the shared passing set changed");
     assert!(
         divergences.is_empty(),
         "parity divergences: {divergences:?}"
     );
-    assert!(
-        !not_compared.is_empty(),
-        "the report names the rows it did not compare"
+    let not_compared_ids: Vec<&str> = not_compared
+        .iter()
+        .map(|entry| entry.split(':').next().unwrap_or(entry))
+        .collect();
+    assert_eq!(
+        not_compared_ids,
+        [
+            "V-06", "V-07", "V-18", "V-33", "C-01", "C-02", "C-03", "C-04", "C-07", "C-08", "F-01"
+        ],
+        "the parity report changed its not-compared set"
     );
 }
 

@@ -40,7 +40,9 @@ never fork expectations.
       "known_defect": {
         "issue": "bitty#2768",
         "reason": "…",
-        "drivers": ["real"]
+        "drivers": ["real"],
+        "step": 6,
+        "code": "NotFound"
       }
     }
   ]
@@ -53,9 +55,12 @@ never fork expectations.
 - `injected` is honored by the fake. The real service uses its process clock and
   compiled limits; a vector that needs injection records a typed real skip.
 - `known_defect.drivers` scopes the marker to the driver that still carries the
-  defect. A marked row is `known-defect` only for those drivers; another driver
-  that passes is a normal pass. A marked row that unexpectedly passes is a
-  failure so the marker cannot rot. Known-defect rows are excluded from parity.
+  defect. `step` is the zero-based index (across `steps` then `state`) that must
+  fail, and `code`/`path` names the expected refusal or result mismatch. A
+  marked row is `known-defect` only when the failure matches that location; a
+  pass, a failure at another step, or a different code is a failure, so a
+  regression cannot hide behind the marker. Known-defect rows are excluded from
+  parity.
 - `forbidden` is required and non-empty: it names the observations the vector
   exists to rule out. A step without a typed expectation is rejected, so a
   vector cannot assert only "no crash".
@@ -89,11 +94,12 @@ to the captured JSON value, and `{{name}}` substitutes inside a string.
 Expectation vocabulary: `ok`, `error_class`, `error_code`, `counts`,
 `closed` (EOF after the reply), `transport` (`"closed"` when no reply arrives),
 `result`, `result_min`, `present`, `absent`, `array` (exact), `array_len`,
-`min_array_len`, `hex_len`, `distinct`, `not_equal`, `request_log`,
+`min_array_len`, `hex_len`, `distinct`, `not_equal`, `not_equal_any`,
+`request_log`,
 `exit_code`, `stdout_contains`, `file_mode`, and `audit`. Paths are relative to
 the response `result`; a leading `result.` is accepted and normalized.
 
-Actions: `restart`, `advance_clock`, `oversized_frame`, `partial_frame`,
+Actions: `restart`, `crash`, `advance_clock`, `oversized_frame`, `partial_frame`,
 `queue_pressure`, `audit`, `file_mode`, `no_tcp_listener`, `daemon_absent`,
 `request_log`, `peer_exit`, and `refusal_burst`. `retry_ms` is the only bounded
 settlement: it re-sends the same request until the typed expectation holds or
@@ -103,9 +109,9 @@ the deadline passes, for an effect the service applies on another connection.
 
 `target/conformance/<cell>.<suite>.json` (`$CARGO_TARGET_DIR` wins) records the
 suite (`fake`, `real`, `parity`), label, cell, version, commit, corpus schema,
-frozen spellings, instance id, capabilities, effective limits, and one row per
-vector with status, skip reason, deferred requirement, known-defect issue,
-instance id, step count, typed signature, and failure. The record contains no
+the corpus `frozen` map, instance id, capabilities, effective limits, and one
+row per vector with status, skip reason, deferred requirement, known-defect
+issue, instance id, step count, typed signature, failure step, and failure. The record contains no
 host path, username, socket path, port, token, or capability value.
 
 `<cell>.parity.json` lists the shared vectors compared and the divergences. A

@@ -123,6 +123,13 @@ pub trait Driver {
     /// A static message when the instance cannot be restarted.
     fn restart(&mut self) -> Result<Vars, String>;
 
+    /// Kill the running instance without a graceful stop.
+    ///
+    /// # Errors
+    ///
+    /// A static message when the instance cannot be killed.
+    fn crash(&mut self) -> Result<(), String>;
+
     fn advance_clock(&mut self, millis: u64);
 
     fn audit_text(&self) -> String;
@@ -164,6 +171,7 @@ pub struct VectorOutcome {
     pub instance_id: String,
     pub steps: usize,
     pub signature: Vec<String>,
+    pub failure_step: Option<usize>,
     pub failure: Option<String>,
 }
 
@@ -219,6 +227,7 @@ pub fn run_vector(vector: &Vector, driver: &mut dyn Driver) -> VectorOutcome {
             instance_id: String::new(),
             steps: 0,
             signature: Vec::new(),
+            failure_step: None,
             failure: None,
         };
     }
@@ -235,6 +244,7 @@ pub fn run_vector(vector: &Vector, driver: &mut dyn Driver) -> VectorOutcome {
         instance_id: String::new(),
         steps: 0,
         signature: Vec::new(),
+        failure_step: None,
         failure: None,
     };
     if row.skip_reason.is_some() {
@@ -257,6 +267,7 @@ pub fn run_vector(vector: &Vector, driver: &mut dyn Driver) -> VectorOutcome {
             Err(error) => {
                 row.status = RowStatus::Fail;
                 row.failure = Some(error);
+                row.failure_step = Some(index);
                 row.signature.push(format!("{index}:error"));
                 break;
             }
@@ -269,7 +280,23 @@ pub fn run_vector(vector: &Vector, driver: &mut dyn Driver) -> VectorOutcome {
         .as_ref()
         .is_some_and(|defect| defect.drivers.contains(&driver.kind()));
     if row.status == RowStatus::Fail && known {
-        row.status = RowStatus::KnownDefect;
+        let defect = vector.known_defect.as_ref().expect("checked");
+        if known_defect_matches(defect, row.failure_step, row.failure.as_deref()) {
+            row.status = RowStatus::KnownDefect;
+        } else {
+            row.failure = Some(format!(
+                "known defect {} expected at step {} ({:?}), observed at {:?}: {}",
+                defect.issue,
+                defect.step,
+                defect
+                    .code
+                    .as_deref()
+                    .or(defect.path.as_deref())
+                    .unwrap_or("?"),
+                row.failure_step,
+                row.failure.as_deref().unwrap_or("no failure")
+            ));
+        }
     } else if row.status == RowStatus::Pass && known {
         row.status = RowStatus::Fail;
         row.failure = Some(format!(
@@ -282,6 +309,24 @@ pub fn run_vector(vector: &Vector, driver: &mut dyn Driver) -> VectorOutcome {
         ));
     }
     row
+}
+
+/// Whether the observed failure is the recorded known defect.
+///
+/// The step is exact; `code` and `path` must appear in the failure text. A
+/// mismatch keeps the row a failure, so a regression at another step cannot be
+/// masked by the marker.
+pub fn known_defect_matches(
+    defect: &crate::harness::corpus::KnownDefect,
+    failure_step: Option<usize>,
+    failure: Option<&str>,
+) -> bool {
+    if failure_step != Some(defect.step) {
+        return false;
+    }
+    let text = failure.unwrap_or_default();
+    defect.code.as_ref().is_none_or(|code| text.contains(code))
+        && defect.path.as_ref().is_none_or(|path| text.contains(path))
 }
 
 fn known_defect_marker(vector: &Vector, driver: DriverKind) -> Option<String> {
@@ -351,6 +396,7 @@ fn execute_action(
             vars.extend(seeded);
             Ok(())
         }
+        "crash" => driver.crash(),
         "advance_clock" => {
             let millis = step
                 .args
@@ -482,6 +528,9 @@ fn check_expect(
                 describe(reply)
             ));
         }
+    }
+    if reply.error.is_some() && !reply.result.is_null() {
+        return Err("an error reply must not carry a result".to_owned());
     }
     if let Some(code) = &expect.error_code {
         let error = reply
@@ -632,15 +681,15 @@ fn mismatch(path: &str, actual: &Value, expected: &Value) -> String {
     format!("result {path} is {actual}, expected {expected}")
 }
 
-fn check_audit(expect: &AuditExpect, text: &str, vars: &Vars) -> Result<(), String> {
+pub fn check_audit(expect: &AuditExpect, text: &str, vars: &Vars) -> Result<(), String> {
     for needle in &expect.contains {
-        let needle = substitute_text(needle, vars);
+        let needle = resolve_needle(needle, vars);
         if !text.contains(&needle) {
             return Err(format!("audit does not contain {needle:?}"));
         }
     }
     for needle in &expect.not_contains {
-        let needle = substitute_text(needle, vars);
+        let needle = resolve_needle(needle, vars);
         if !needle.is_empty() && text.contains(&needle) {
             return Err("audit contains a forbidden value".to_owned());
         }
@@ -736,6 +785,17 @@ pub fn resolve(value: &Value, vars: &Vars) -> Value {
         ),
         other => other.clone(),
     }
+}
+
+/// Resolve one audit needle: an exact `@name` becomes the captured value,
+/// `{{name}}` substitutes inside a longer string.
+fn resolve_needle(text: &str, vars: &Vars) -> String {
+    if let Some(name) = text.strip_prefix('@') {
+        if let Some(value) = vars.get(name).and_then(Value::as_str) {
+            return value.to_owned();
+        }
+    }
+    substitute_text(text, vars)
 }
 
 fn substitute_text(text: &str, vars: &Vars) -> String {

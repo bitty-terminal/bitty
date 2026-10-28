@@ -716,9 +716,10 @@ Corpus rules:
   `role`), and the ambient-authority fields `role`, `auth`, and `scope` stay
   refused;
 - a vector that does not run on a driver carries a typed skip reason;
-- `known_defect` rows (currently V-07/bitty#2768 and C-04/bitty#2767) are
-  excluded from the parity gate, recorded in the evidence, and fail the suite
-  if they unexpectedly pass so the marker cannot rot;
+- `known_defect` rows (currently V-07/bitty#2768 and C-04/bitty#2767) record the
+  exact failing step and code or result path, are excluded from the parity
+  gate, and fail the suite if they pass or fail at another step so the marker
+  cannot rot;
 - fault injection covers a transport drop during abort, the pre-auth partial
   frame, the frame bound, the pending grant cap, the attach cap, and an
   instance change (restart); queue pressure with an injected outbound cap is
@@ -730,10 +731,10 @@ Run it with:
 cargo test -p bitty-daemon --test conformance --locked
 ```
 
-The `Quality gates` job names the fake suite; the Linux Tier-1 job names the
-real suite and uploads `bittyd-conformance-linux-x86_64`. The parity check
-compares the two signatures for every shared, non-known-defect vector and
-fails on any divergence.
+The `Quality gates` job executes the fake suite and uploads its evidence; the
+Linux Tier-1 job executes the real suite and uploads
+`bittyd-conformance-linux-x86_64`. The parity check compares the two signatures
+for every shared, non-known-defect vector and fails on any divergence.
 
 ## CLI
 

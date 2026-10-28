@@ -21,6 +21,7 @@ pub struct Evidence<'a> {
     pub label: &'a str,
     pub facts: &'a ServiceFacts,
     pub corpus_contract: &'a str,
+    pub frozen: &'a std::collections::BTreeMap<String, String>,
     pub rows: &'a [VectorOutcome],
 }
 
@@ -51,6 +52,7 @@ pub fn render(evidence: &Evidence<'_>) -> Value {
             "instance_id": row.instance_id,
             "steps": row.steps,
             "signature": row.signature,
+            "failure_step": row.failure_step,
             "failure": row.failure,
         }));
     }
@@ -63,7 +65,7 @@ pub fn render(evidence: &Evidence<'_>) -> Value {
         "commit": commit(),
         "corpus_contract": evidence.corpus_contract,
         "corpus_schema": crate::harness::corpus::SCHEMA,
-        "frozen": {"session.attach.request_role": "attach_role"},
+        "frozen": evidence.frozen,
         "instance_id": evidence.facts.instance_id,
         "capabilities": evidence.facts.capabilities,
         "limits": evidence.facts.limits,
@@ -141,7 +143,13 @@ pub fn render_parity(compared: usize, divergences: &[String], skipped: &[String]
         "compared": compared,
         "divergences": divergences,
         "not_compared": skipped,
-        "status": if divergences.is_empty() { "pass" } else { "fail" },
+        "status": if !divergences.is_empty() {
+            "fail"
+        } else if compared == 0 {
+            "skip"
+        } else {
+            "pass"
+        },
     })
 }
 

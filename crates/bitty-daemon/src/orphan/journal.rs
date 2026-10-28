@@ -533,7 +533,10 @@ fn parse_containment(value: &str) -> Option<Option<ContainmentRecord>> {
 
 fn valid_recorded_path(path: &str) -> bool {
     let path = Path::new(path);
-    path.is_absolute()
+    // `has_root` not `is_absolute`: a recorded cgroup path is a Linux path,
+    // and this parser also runs on the non-served cells where a leading `/`
+    // has a root but no Windows drive prefix.
+    path.has_root()
         && path.as_os_str().len() <= MAX_RECORDED_CGROUP_PATH_BYTES
         && !path
             .components()

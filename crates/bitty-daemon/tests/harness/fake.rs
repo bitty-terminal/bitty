@@ -1888,25 +1888,104 @@ fn correlation_str(correlation: &Option<String>) -> String {
 }
 
 /// The canonical `generation` with the deprecated `expected_generation` alias.
+///
+/// The raw JSON values are compared before either is converted, matching the
+/// service: a wrongly typed field is still a conflict, so `1` and `"1"` are an
+/// ambiguous pair rather than one usable alias.
 fn canonical_generation(params: &Value) -> Option<u64> {
-    let canonical = params.get("generation").and_then(Value::as_u64);
-    let alias = params.get("expected_generation").and_then(Value::as_u64);
-    match (canonical, alias) {
-        (Some(canonical), Some(alias)) if canonical != alias => None,
-        (Some(canonical), _) => Some(canonical),
-        (None, Some(alias)) => Some(alias),
-        (None, None) => None,
-    }
+    let canonical = params.get("generation");
+    let alias = params.get("expected_generation");
+    let value = match (canonical, alias) {
+        (Some(canonical), Some(alias)) if canonical != alias => return None,
+        (Some(canonical), _) => canonical,
+        (None, Some(alias)) => alias,
+        (None, None) => return None,
+    };
+    value.as_u64()
 }
 
 /// The canonical `target_attach_id` with the deprecated `attach_id` alias.
+///
+/// The raw JSON values are compared before either is converted, matching the
+/// service, so a wrongly typed field cannot be dropped before the conflict
+/// check.
 fn canonical_target_attach(params: &Value) -> Option<&str> {
-    let canonical = params.get("target_attach_id").and_then(Value::as_str);
-    let alias = params.get("attach_id").and_then(Value::as_str);
-    match (canonical, alias) {
-        (Some(canonical), Some(alias)) if canonical != alias => None,
-        (Some(canonical), _) => Some(canonical),
-        (None, Some(alias)) => Some(alias),
-        (None, None) => None,
+    let canonical = params.get("target_attach_id");
+    let alias = params.get("attach_id");
+    let value = match (canonical, alias) {
+        (Some(canonical), Some(alias)) if canonical != alias => return None,
+        (Some(canonical), _) => canonical,
+        (None, Some(alias)) => alias,
+        (None, None) => return None,
+    };
+    value.as_str()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{canonical_generation, canonical_target_attach};
+
+    #[test]
+    fn generation_alias_conflicts_use_the_raw_json_value() {
+        assert_eq!(canonical_generation(&json!({"generation": 1})), Some(1));
+        assert_eq!(
+            canonical_generation(&json!({"expected_generation": 1})),
+            Some(1)
+        );
+        assert_eq!(
+            canonical_generation(&json!({"generation": 1, "expected_generation": 1})),
+            Some(1)
+        );
+        assert_eq!(
+            canonical_generation(&json!({"generation": 1, "expected_generation": 2})),
+            None
+        );
+        assert_eq!(
+            canonical_generation(&json!({"generation": 1, "expected_generation": "1"})),
+            None
+        );
+        assert_eq!(
+            canonical_generation(&json!({"generation": 1, "expected_generation": 1.0})),
+            None
+        );
+        assert_eq!(
+            canonical_generation(&json!({"generation": "1", "expected_generation": 1})),
+            None
+        );
+        assert_eq!(canonical_generation(&json!({})), None);
+    }
+
+    #[test]
+    fn target_attach_alias_conflicts_use_the_raw_json_value() {
+        let target = "1".repeat(32);
+        let other = "2".repeat(32);
+        assert_eq!(
+            canonical_target_attach(&json!({"target_attach_id": &target})),
+            Some(target.as_str())
+        );
+        assert_eq!(
+            canonical_target_attach(&json!({
+                "target_attach_id": &target,
+                "attach_id": &target,
+            })),
+            Some(target.as_str())
+        );
+        assert_eq!(
+            canonical_target_attach(&json!({
+                "target_attach_id": &target,
+                "attach_id": &other,
+            })),
+            None
+        );
+        assert_eq!(
+            canonical_target_attach(&json!({
+                "target_attach_id": &target,
+                "attach_id": 1,
+            })),
+            None
+        );
+        assert_eq!(canonical_target_attach(&json!({})), None);
     }
 }

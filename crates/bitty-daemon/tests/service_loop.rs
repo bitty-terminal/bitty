@@ -836,6 +836,239 @@ fn the_keyed_attach_and_control_flow_is_reachable_over_the_wire() {
 }
 
 #[test]
+fn a_consumed_host_grant_revoke_withdraws_create_before_the_ttl() {
+    let root = TempRoot::new("host-grant-revoke");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    assert_eq!(minted["ok"], true, "{minted}");
+    let grant_id = minted["result"]["grant_id"]
+        .as_str()
+        .expect("grant id")
+        .to_owned();
+    let host_grant = minted["result"]["grant"]
+        .as_str()
+        .expect("host grant bearer")
+        .to_owned();
+
+    let mut creator = Client::connect(&root.endpoint());
+    let handshake = creator.negotiate_with(None, Some(&host_grant));
+    assert_eq!(handshake["ok"], true, "{handshake}");
+    let created = creator.call(
+        "session.create",
+        json!({"kind": "terminal", "idempotency_key": "revoke-k1"}),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+
+    let revoked = operator.call(
+        "daemon.host_grant",
+        json!({"action": "revoke", "grant_id": grant_id}),
+    );
+    assert_eq!(revoked["ok"], true, "{revoked}");
+    assert_eq!(revoked["result"]["revoked"], true, "{revoked}");
+    assert_eq!(revoked["result"]["not_active"], false, "{revoked}");
+
+    // The fresh key and the key already applied on this connection are both
+    // refused: the revoke withdraws the create authority before the keyed
+    // lookup, so the 300 s TTL is not the effective bound and a replay cannot
+    // resurrect the session.
+    for key in ["revoke-k1", "revoke-k2"] {
+        let refused = creator.call(
+            "session.create",
+            json!({"kind": "terminal", "idempotency_key": key}),
+        );
+        assert_eq!(refused["ok"], false, "{refused}");
+        assert_eq!(refused["error"]["class"], "Denied", "{refused}");
+        assert_eq!(refused["error"]["code"], "ConsentRequired", "{refused}");
+    }
+
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+}
+
+#[test]
+fn a_stale_control_token_at_a_vacant_control_is_invalid_control_token() {
+    let root = TempRoot::new("control-token");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    let host_grant = minted["result"]["grant"]
+        .as_str()
+        .expect("host grant bearer")
+        .to_owned();
+
+    let mut creator = Client::connect(&root.endpoint());
+    assert_eq!(creator.negotiate_with(None, Some(&host_grant))["ok"], true);
+    let created = creator.call(
+        "session.create",
+        json!({"kind": "terminal", "idempotency_key": "ct-create"}),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    let session_id = created["result"]["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let create_token = created["result"]["control_token"]
+        .as_str()
+        .expect("create token")
+        .to_owned();
+
+    let claimed = creator.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 0,
+            "control_token": create_token,
+            "idempotency_key": "ct-claim",
+        }),
+    );
+    assert_eq!(claimed["ok"], true, "{claimed}");
+    assert!(claimed["result"]["attach_id"].is_string(), "{claimed}");
+    let controller_token = claimed["result"]["control_token"]
+        .as_str()
+        .expect("rotated token")
+        .to_owned();
+
+    let grant = creator.call(
+        "session.grant",
+        json!({"session_id": session_id, "idempotency_key": "ct-grant"}),
+    );
+    assert_eq!(grant["ok"], true, "{grant}");
+    let observer_grant = grant["result"]["grant"]
+        .as_str()
+        .expect("observer grant")
+        .to_owned();
+
+    let mut observer = Client::connect(&root.endpoint());
+    assert_eq!(observer.negotiate(None)["ok"], true);
+    let attached = observer.call(
+        "session.attach",
+        json!({
+            "attach_role": "observer",
+            "session_id": session_id,
+            "observer_grant": observer_grant,
+        }),
+    );
+    assert_eq!(attached["ok"], true, "{attached}");
+    let observer_attach = attached["result"]["attach_id"]
+        .as_str()
+        .expect("observer attach")
+        .to_owned();
+
+    let transferred = creator.call(
+        "session.control.transfer",
+        json!({
+            "session_id": session_id,
+            "attach_id": observer_attach,
+            "expected_generation": 0,
+            "idempotency_key": "ct-transfer",
+        }),
+    );
+    assert_eq!(transferred["ok"], true, "{transferred}");
+
+    // The rotated token is delivered only on the target connection's next
+    // response, so read it through the target's own heartbeat.
+    let mut rotated = None;
+    for _ in 0..2 {
+        let heartbeat = observer.call("lease.heartbeat", json!({"attach_id": observer_attach}));
+        if let Some(token) = heartbeat["result"]["control_token"].as_str() {
+            rotated = Some(token.to_owned());
+        }
+    }
+    let rotated = rotated.expect("target-addressed rotated token");
+
+    let mut claimant = Client::connect(&root.endpoint());
+    assert_eq!(claimant.negotiate(None)["ok"], true);
+
+    // Wrong token while another lease holds control: the stale token is not a
+    // visibility relation, so the target stays uniformly `NotFound`.
+    let occupied = claimant.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 0,
+            "control_token": controller_token,
+            "idempotency_key": "ct-occupied",
+        }),
+    );
+    assert_eq!(occupied["ok"], false, "{occupied}");
+    assert_eq!(occupied["error"]["class"], "NotFound", "{occupied}");
+    assert_eq!(occupied["error"]["code"], "NotFound", "{occupied}");
+
+    // The transfer target detaches its own lease: control is vacant and the
+    // rotated token is still current.
+    let detached = observer.call("session.detach", json!({"attach_id": observer_attach}));
+    assert_eq!(detached["ok"], true, "{detached}");
+
+    // The same stale token at the vacant control is the closed contract code,
+    // not the uniform `NotFound`.
+    let stale = claimant.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 0,
+            "control_token": controller_token,
+            "idempotency_key": "ct-stale",
+        }),
+    );
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert_eq!(stale["error"]["class"], "Denied", "{stale}");
+    assert_eq!(stale["error"]["code"], "InvalidControlToken", "{stale}");
+    assert!(
+        !stale.to_string().contains(&controller_token),
+        "the refusal echoes no token"
+    );
+
+    // A truly invisible target is still `NotFound`, never the token code.
+    let unknown_session = "0".repeat(32);
+    let invisible = claimant.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": unknown_session,
+            "expected_generation": 0,
+            "control_token": "1".repeat(64),
+            "idempotency_key": "ct-unknown",
+        }),
+    );
+    assert_eq!(invisible["ok"], false, "{invisible}");
+    assert_eq!(invisible["error"]["class"], "NotFound", "{invisible}");
+    assert_eq!(invisible["error"]["code"], "NotFound", "{invisible}");
+
+    // The valid rotated token claims the vacant control.
+    let reclaimed = claimant.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 0,
+            "control_token": rotated,
+            "idempotency_key": "ct-reclaim",
+        }),
+    );
+    assert_eq!(reclaimed["ok"], true, "{reclaimed}");
+    assert_eq!(reclaimed["result"]["role"], "controller", "{reclaimed}");
+    assert!(reclaimed["result"]["attach_id"].is_string(), "{reclaimed}");
+
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+}
+
+#[test]
 fn an_unnegotiated_connection_cannot_probe_the_method_catalog() {
     let root = TempRoot::new("catalog-gate");
     let daemon = Daemon::start(&root);

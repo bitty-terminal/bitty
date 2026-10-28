@@ -951,6 +951,24 @@ impl Service {
         })
     }
 
+    /// Whether a live session exists with no controller lease.
+    ///
+    /// Only controller attach consults this: it distinguishes the contract's
+    /// `Denied/InvalidControlToken` (a presented token at a vacant control)
+    /// from the uniform `NotFound` for an unknown, terminal, or otherwise
+    /// invisible target.
+    fn live_vacant_control(&self, session_id: SessionId, now: MonotonicMs) -> bool {
+        let Some(snapshot) = self.host.snapshot(session_id, now) else {
+            return false;
+        };
+        if snapshot.state.is_terminal() {
+            return false;
+        }
+        self.host
+            .control_view(session_id, now)
+            .is_some_and(|view| view.controller.is_none())
+    }
+
     fn control_authority<'a>(
         &self,
         connection: &Connection,
@@ -1491,7 +1509,22 @@ impl Service {
         let expected_generation = required_u64(fields, "expected_generation")?;
         let token = parse_control_token(fields)?;
         let key = self.idempotency_key(fields)?;
-        let snapshot = self.visible(connection, session_id, Some(&token), now)?;
+        let snapshot = match self.visible(connection, session_id, Some(&token), now) {
+            Ok(snapshot) => snapshot,
+            // A presented token at a live, vacant control is the contract's
+            // `Denied/InvalidControlToken` condition. Visibility refuses first
+            // because a stale token cannot see the session; mapping that one
+            // branch keeps the closed code reachable without turning an
+            // occupied, terminal, or unknown target into a token oracle. The
+            // refusal echoes no token and applies nothing.
+            Err(refusal)
+                if refusal.kind() == RefusalKind::NotFound
+                    && self.live_vacant_control(session_id, now) =>
+            {
+                return Err(Refusal::denied(RefusalCode::InvalidControlToken));
+            }
+            Err(refusal) => return Err(refusal),
+        };
         check_generation(&snapshot, expected_generation)?;
         let fingerprint = fingerprint(&[
             "attach",

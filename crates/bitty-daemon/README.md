@@ -633,7 +633,10 @@ authority, target, generation, idempotency, effect. Invariants:
   (`daemon.status`, `session.status`, `session.list`, `lease.heartbeat`) and
   the repeat `daemon.stop` keep their own answers;
 - visibility is a live lease, a presented current control token, the operator
-  path, or (for a former leaseholder) the immutable terminal snapshot;
+  path, or (for a former leaseholder) the immutable terminal snapshot; a
+  presented token at a live, vacant control that is not current maps to
+  `Denied/InvalidControlToken`, while an occupied, terminal, or unknown target
+  stays the uniform `NotFound` and no refusal echoes the token;
 - every privileged effect re-checks the captured peer after authorization and
   before the effect; a failure is `Unauthenticated` and closes the connection;
 - every mutation is admitted by the audit sink first; a degraded sink is

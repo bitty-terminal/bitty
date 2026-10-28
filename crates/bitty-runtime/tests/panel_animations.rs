@@ -1006,42 +1006,68 @@ fn capacity_refused_bounds_paint_the_committed_end() {
 
 #[test]
 fn retargeting_starts_from_the_currently_painted_bounds() {
-    // CTX-1335 F4: a live gesture update retargets from the painted frame at
-    // that instant, so the next present is continuous (no jump back to the
-    // previous committed start).
+    // CTX-1335 F4: a live update retargets from the painted frame at that
+    // instant, so the next present is continuous (no jump back to the
+    // previous committed start). Pinned through the reparent path: issue
+    // #2789 makes a divider drag paint its per-step commit instead of
+    // interpolating, so resize no longer owns this contract.
     let mut rt = runtime_with(AnimationPolicy::default());
     let start = Instant::now();
     rt.set_container(UiRect::new(0, 0, 80, 24));
     let _ = rt.tick_at(start).expect("baseline presents");
-    rt.set_layout(two_pane_split());
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.34,
+        LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+        LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 24)),
+            LayoutNode::leaf(View::new(ViewId::new(3), 40, 24)),
+        ),
+    ));
     let _ = rt.tick_at(start).expect("split presents");
     let settled = start + Duration::from_millis(200);
     rt.tick_at(settled);
     assert!(rt.tick_at(settled).is_none(), "settled baseline");
 
     let t = Instant::now();
-    rt.handle_cursor_moved(border_cell_pixels(39, 12));
-    rt.handle_mouse_input(press(MouseButton::Left));
-    assert!(rt.update_border_drag_at(border_cell_pixels(45, 12), t));
-    let _ = rt.tick_at(t).expect("first resize present");
+    assert_eq!(
+        rt.workspace_move_focused_to_position_at(2, t)
+            .expect("first reposition"),
+        ViewId::new(1)
+    );
+    let _ = rt.tick_at(t).expect("first move present");
+    let first_target = frame_for(&rt.present_frames(), ViewId::new(1)).frame;
     let mid = t + Duration::from_millis(40);
-    rt.tick_at(mid).expect("resize mid frame presents");
+    rt.tick_at(mid).expect("move mid frame presents");
+    assert_ne!(
+        frame_for(&rt.paint_frames_at(mid), ViewId::new(1)).frame,
+        first_target,
+        "mid tween is not at its target"
+    );
 
+    // A second reposition re-arms the Move entry. Its carried start must be
+    // the painted mid frame, so the present at the same instant is continuous.
     let t2 = mid + Duration::from_millis(1);
-    assert!(rt.update_border_drag_at(border_cell_pixels(51, 12), t2));
     let continuity = frame_for(&rt.paint_frames_at(t2), ViewId::new(1)).frame;
+    assert_eq!(
+        rt.workspace_move_focused_to_position_at(0, t2)
+            .expect("second reposition"),
+        ViewId::new(1)
+    );
+    let target = frame_for(&rt.present_frames(), ViewId::new(1)).frame;
+    assert_ne!(target, first_target, "the second move names another slot");
     let _ = rt.tick_at(t2).expect("retarget present");
     let retargeted = frame_for(&rt.paint_frames_at(t2), ViewId::new(1)).frame;
     assert_eq!(
         retargeted, continuity,
         "retarget must restart from the currently painted bounds"
     );
-    let target = frame_for(&rt.present_frames(), ViewId::new(1)).frame;
     assert_ne!(
         retargeted, target,
         "retargeted tween has not already settled"
     );
-    rt.handle_mouse_input(release(MouseButton::Left));
 }
 
 #[test]

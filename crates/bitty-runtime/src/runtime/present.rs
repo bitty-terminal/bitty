@@ -1868,6 +1868,21 @@ impl Runtime {
         self.settle_burst_at = None;
     }
 
+    /// Publishes `allocations` as the frame now on screen.
+    ///
+    /// Issue #2789: the first present after a content-geometry gesture
+    /// (border-drag divider, Alt+edge float resize) ends the settle
+    /// suppression, so later paints resolve animation bounds normally again.
+    fn publish_presented_allocations(
+        &mut self,
+        allocations: Vec<layout_focus::PresentFrame>,
+        focused: Option<ViewId>,
+    ) {
+        self.last_presented_allocations = allocations;
+        self.last_presented_focus = focused;
+        self.content_geometry_commit_unpresented = false;
+    }
+
     /// Minimum interval between presented frames (CTX-1231, #2093).
     ///
     /// Present-latest coalescing cadence: dirty ticks inside the interval
@@ -3198,8 +3213,7 @@ impl Runtime {
         // Empty layout -> idle (no leaf to present).
         if allocations.is_empty() {
             self.mark_frame_presented(snapshot.generation);
-            self.last_presented_allocations = allocations;
-            self.last_presented_focus = focused;
+            self.publish_presented_allocations(allocations, focused);
             self.pending_full_redraw = false;
             self.pending_paint_redraw = false;
             return None;
@@ -4334,7 +4348,7 @@ impl Runtime {
         self.paint_hyperlink_hover(paint, basis.pad_px, layers);
         self.paint_help_overlay(paint, &basis.view_map, basis.pad_px, layers);
         self.paint_bell_and_notification(paint, basis.pad_px, now, layers);
-        self.paint_scrollbar_overlay(layers);
+        self.paint_scrollbar_overlay(paint, layers);
         self.paint_hint_overlay(paint, basis.pad_px, layers);
     }
 
@@ -5026,13 +5040,22 @@ impl Runtime {
 
     /// CTX-0181 overlay scrollbar thumb (CTX-0474 extraction; body moved
     /// verbatim from `tick_at`).
-    fn paint_scrollbar_overlay(&mut self, layers: &mut FrameLayers) {
+    ///
+    /// `painted` are the frames this present paints (issue #2789): the thumb
+    /// is resolved from the same viewport snapshot as the leaf content, so a
+    /// paint-only geometry transition can never leave the handle floating
+    /// away from the visible panel edge.
+    fn paint_scrollbar_overlay(
+        &mut self,
+        painted: &[layout_focus::PresentFrame],
+        layers: &mut FrameLayers,
+    ) {
         // Overlay scrollbar thumb (CTX-0181): a presentation-only FillRect        // on the focused leaf's right edge, painted above grid content like
         // the selection highlight. Never grid truth: no layout, container,
         // or cell mutation, and `hidden` (default) resolves to no fill.
         // Visibility is latched so `auto` hover/proximity transitions stay
         // headless-observable without screenshots.
-        let scrollbar_now = self.scrollbar_thumb_fill();
+        let scrollbar_now = self.scrollbar_thumb_fill_for(painted);
         let paints = scrollbar_now.is_some();
         if let Some(fill) = scrollbar_now {
             layers.combined_overlay.push(fill);
@@ -6732,8 +6755,7 @@ impl Runtime {
             // Check if we had pending_full but produced no draws (e.g., all zero rects) -> still idle
             // But ensure generation advances for idle detection.
             self.mark_frame_presented(snapshot.generation);
-            self.last_presented_allocations = allocations;
-            self.last_presented_focus = focused;
+            self.publish_presented_allocations(allocations, focused);
             // CTX-1332 C-D4: a no-draw/bookkeeping path publishes no
             // executable origin and does not advance the presented-band
             // identity (the next tick keeps trying to commit a real frame).
@@ -6891,8 +6913,7 @@ impl Runtime {
 
         if !combined_list.needs_draw() {
             self.mark_frame_presented(snapshot.generation);
-            self.last_presented_allocations = allocations;
-            self.last_presented_focus = focused;
+            self.publish_presented_allocations(allocations, focused);
             // CTX-1332 C-D4: a no-draw/bookkeeping path publishes no
             // executable origin and does not advance the presented-band
             // identity (the next tick keeps trying to commit a real frame).
@@ -6979,8 +7000,7 @@ impl Runtime {
             }
         };
         self.mark_frame_presented(snapshot.generation);
-        self.last_presented_allocations = allocations;
-        self.last_presented_focus = focused;
+        self.publish_presented_allocations(allocations, focused);
         // CTX-1630: the scene report and its accessibility projection describe
         // exactly this presented frame. A deferred/failed present keeps the
         // previous report, matching the frame still on screen.

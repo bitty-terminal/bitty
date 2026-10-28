@@ -733,10 +733,11 @@ impl State {
     /// blank rows below the cursor first (CTX-0312), then moves the remaining
     /// oldest rows into scrollback and shifts the grid up. When the viewport
     /// is bottom-full and history exists, growing re-enters the newest
-    /// history rows at the top (blank filler above them when history runs
-    /// out), so a shrink/grow round-trip restores the original content.
-    /// Otherwise growth pads blanks at the bottom and the cursor keeps its
-    /// row, matching how a top-aligned screen grows.
+    /// history rows above the grid and pads any rows the shrink could not
+    /// restore below it (issue #2788: each direction moves padding first and
+    /// content second), so a shrink/grow round-trip restores the original
+    /// content. Otherwise growth pads blanks at the bottom and the cursor
+    /// keeps its row, matching how a top-aligned screen grows.
     ///
     /// Wrap flags travel with every moved row, so logical lines and their
     /// soft-wrap continuations stay coherent across scrollback and grid.

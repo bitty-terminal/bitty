@@ -271,8 +271,9 @@ fn partial_padding_absorb_roundtrips_without_top_blank_rows() {
     let cursor_before = s.cursor().position.row;
     assert_eq!(cursor_before, 10);
 
-    // Shrink to 6: 4 rows of padding are absorbed and 5 content rows move
-    // into scrollback (the mixed case, not a pure absorb or pure push).
+    // Shrink to 6 (18 rows): 13 padding rows are absorbed and 5 content
+    // rows move into scrollback (the mixed case, not a pure absorb or pure
+    // push).
     s.resize(80, 6);
     assert_eq!(s.scrollback_len(), 5);
     assert!(s.check_invariants().is_ok());

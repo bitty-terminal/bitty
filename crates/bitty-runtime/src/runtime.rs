@@ -1063,6 +1063,16 @@ pub struct Runtime {
     /// release. Never starts while Shift is held and never while another
     /// drag is active.
     float_resize: Option<FloatResizeState>,
+    /// A content-geometry gesture committed a layout that is not on screen
+    /// yet (issue #2789).
+    ///
+    /// The gesture predicates clear as soon as the pointer is released, but
+    /// the release can arrive before the event loop presents the last
+    /// committed step. Until that commit paints, the present path keeps
+    /// painting the committed bounds instead of interpolating a settle tween
+    /// from the previously presented frame; a present that publishes the
+    /// allocations clears it.
+    content_geometry_commit_unpresented: bool,
     /// Pending dwell before hover activation moves focus (CTX-0334).
     ///
     /// `Some` only while `mouse.focus_follows_mouse` is enabled with a
@@ -2026,6 +2036,7 @@ impl Runtime {
             tiled_drag: None,
             border_drag: None,
             float_resize: None,
+            content_geometry_commit_unpresented: false,
             hover_pending: None,
             animator: PanelAnimator::new(config.animations),
             fx: FxPulseTracker::new(),
@@ -2327,6 +2338,7 @@ impl Runtime {
             tiled_drag: None,
             border_drag: None,
             float_resize: None,
+            content_geometry_commit_unpresented: false,
             hover_pending: None,
             animator: PanelAnimator::new(config.animations),
             fx: FxPulseTracker::new(),

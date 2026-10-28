@@ -17,6 +17,11 @@
 //! The contract pinned here: a focus-out/focus-in cycle and a bare occlusion
 //! edge never move the focus owner (pane or panel), and the entry re-sync is
 //! position-only — real motion still activates hover focus.
+//!
+//! The focus-owner logic is platform-neutral and pinned on every OS without a
+//! PTY. Only the live-writer assertion spawns a real pane shell (`/bin/sh`),
+//! so that one test carries `#[cfg(unix)]` on top of `require_pty!`; Windows
+//! has ConPTY but no POSIX shell (see `bitty-test-support`).
 
 use std::time::{Duration, Instant};
 
@@ -72,8 +77,43 @@ fn focus_cycle(rt: &mut Runtime) {
     assert!(!rt.handle_platform_event(win(WindowEventKind::Focused(true))));
 }
 
+/// Focus-out then focus-in keeps the focused tiled pane. Platform-neutral:
+/// no PTY, so this is the Windows/Linux/macOS regression gate.
+#[test]
+fn focus_cycle_keeps_the_focused_tiled_pane() {
+    let mut rt = split_runtime(RuntimeConfig::default());
+    assert!(rt.set_focus(PANE));
+    let buffered = rt.pending_input_len();
+
+    focus_cycle(&mut rt);
+
+    assert_eq!(
+        rt.focused_view(),
+        Some(PANE),
+        "focus-out/focus-in must not move the internal focus owner"
+    );
+    assert!(rt.is_window_focused(), "the cycle ends window-focused");
+    // No live writer exists in this headless build, so input is retained in
+    // the headless buffer instead of reporting a delivery; the live writer
+    // route assertion stays in the Unix-only test below.
+    assert!(
+        !rt.push_input_bytes(b"x"),
+        "a session-less focused pane buffers headless"
+    );
+    assert_eq!(
+        rt.pending_input_len(),
+        buffered + 1,
+        "the buffered byte is retained"
+    );
+}
+
 /// Focus-out then focus-in keeps the focused pane, and typing still reaches
 /// that pane's own shell writer.
+///
+/// Unix-only: the live writer requires a POSIX shell (`/bin/sh`); Windows has
+/// ConPTY but no such program, so the platform-neutral test above owns the
+/// focus-owner regression there.
+#[cfg(unix)]
 #[test]
 fn focus_cycle_keeps_the_focused_pane_and_its_input_route() {
     bitty_test_support::require_pty!();

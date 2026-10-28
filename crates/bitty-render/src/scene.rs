@@ -27,19 +27,20 @@
 //!
 //! # Integration status
 //!
-//! The shipped present loop is the live consumer once a scene host exists:
+//! The present composition is wired and unit-tested, but no shipped build
+//! installs a scene host or binds panels until bitty#2785 (host install +
+//! `ui.rich` attach), so no shipped frame paints a `Scene` yet. When a
+//! `PanelRuntime` scene host with placement binds is installed,
 //! `bitty-runtime` resolves a visible panel leaf's content rect, calls
 //! `PanelRuntime::scene_paint_for`, and composes the resulting list into the
 //! frame (CTX-1630). Fills, overlay-seam glyphs, and bounded damage are
 //! produced there; a typed refusal paints nothing and keeps the previous
 //! visible scene. Two preconditions keep a shipped binary from reaching that
-//! path today (bitty#2785): (a) no production owner constructs or installs a
-//! `PanelRuntime` scene host with placement binds, so `placement_panel_of`
-//! cannot resolve a leaf and the runtime's `scene_host` stays `None`; (b)
-//! `bitty.ui.mount` still validates through the v1 reader, so no `ui.rich`
-//! mount attaches an admitted `Scene` to a panel. Until both land no shipped
-//! frame paints a `Scene`. The module itself, the runtime adapter, and the
-//! present composition are no longer test-only.
+//! path today (bitty#2785): (a) no production owner constructs or installs
+//! such a host, so `placement_panel_of` cannot resolve a leaf and the
+//! runtime's `scene_host` stays `None`; (b) `bitty.ui.mount` still validates
+//! through the v1 reader, so no `ui.rich` mount attaches an admitted `Scene`
+//! to a panel.
 //!
 //! # Budgets
 //!

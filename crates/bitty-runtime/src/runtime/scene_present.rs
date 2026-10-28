@@ -2,7 +2,11 @@
 //! Scene composition in the shipped present loop (CTX-1630 / bitty#2760).
 //!
 //! The present loop owns the only live consumer of the OQ-051 scene paint
-//! path. For every visible leaf the loop asks the installed
+//! path. No shipped build installs a scene host or binds panels until
+//! bitty#2785 (host install + `ui.rich` attach), so nothing below runs in a
+//! shipped frame yet; the composition is wired and unit-tested only.
+//!
+//! For every visible leaf the loop asks the installed
 //! [`PanelRuntime`] whether the leaf is a
 //! panel with an attached [`Scene`](bitty_rich::scene::Scene); if so it
 //! derives the bounded, leaf-clipped paint list through
@@ -171,7 +175,9 @@ impl Runtime {
     ///
     /// The composition root installs the same [`PanelRuntime`] that owns the
     /// panel slots (OQ-051); the present loop never creates a second scene
-    /// store. Installing a host forces the next frame so an already painted
+    /// store. No composition root does this yet (bitty#2785): the app keeps a
+    /// bare `PanelRegistry` with no placements, and every current caller is a
+    /// test. Installing a host forces the next frame so an already painted
     /// window picks up newly attached scenes.
     pub fn install_scene_host(&mut self, host: PanelRuntime) {
         self.scene_host = Some(host);

@@ -18,6 +18,33 @@
 //! When no runtime is attached (`--safe` with no store, or a plugin-less run)
 //! the methods keep the pre-existing typed `PluginRuntimeUnavailable` verdict
 //! instead of claiming an empty registry.
+//!
+//! # Publication semantics
+//!
+//! The published copy is a **one-shot startup snapshot**: the binary publishes
+//! the attached runtime once, when it assembles the serve slice. The runtime
+//! keeps its own [`PluginRuntime::debug_plugins`] view current after every
+//! lifecycle transition, but this store is never re-read, so a lazy
+//! activation, suspension, disposal, or failure after startup is visible to
+//! the in-process runtime API and not on the wire. Serving live transitions
+//! means publishing from the runtime (a transition hook) instead of this
+//! binary-side copy.
+//!
+//! Registration is **not test-mode-only**: `build_dispatcher` installs the two
+//! handlers on both the test-mode and the default table. A normal instance
+//! reads the same read-only metadata under the same elevated debug scope, and
+//! a runtime-less run keeps the typed unavailable verdict.
+//!
+//! # Accepted result bounds
+//!
+//! Rows are normalized to the accepted client's `PluginSummary` guards before
+//! they enter the store, so one unrepresentable row can never fail a whole
+//! `listPlugins` call: `generation >= 1`, at most 256 rows, at most 256
+//! `capabilities` entries per row, and at most 128 bytes per capability id.
+//! Addressable generations are the only servable ones (issue #2773 asks for
+//! the activated plugins), and capability ids that exceed the per-entry bound
+//! are omitted rather than truncated because an id must stay exact; the
+//! authoritative grant set is served by the grant surfaces, never by this row.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -28,6 +55,18 @@ use bitty_runtime::plugin_runtime::debug::DebugPlugin;
 
 /// Maximum `pluginId` bytes (accepted client bound).
 const MAX_PLUGIN_ID_BYTES: usize = 128;
+
+/// Maximum rows served by one `listPlugins` result (accepted client
+/// `MAX_PLUGINS`).
+const MAX_SERVED_ROWS: usize = 256;
+
+/// Maximum `capabilities` entries per served row (accepted client
+/// `requireStringArray` item bound).
+const MAX_SERVED_CAPABILITIES: usize = 256;
+
+/// Maximum bytes of one served capability id (accepted client per-entry
+/// bound).
+const MAX_CAPABILITY_BYTES: usize = 128;
 
 /// Published read-only plugin rows plus whether a runtime is attached.
 #[derive(Default)]
@@ -51,6 +90,33 @@ fn lock_store() -> std::sync::MutexGuard<'static, PublishedPlugins> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// Normalize runtime rows to the accepted `PluginSummary` guards.
+///
+/// Only addressable generations are served. `generation == 0` means "before
+/// the first activation", and the runtime publishes a row for every discovered
+/// entry, including entries whose activation rolled back before
+/// `entry.generation += 1` (issue #2773 asks for the activated plugins). Such
+/// a row has no `(pluginId, generation)` resource to address and would fail
+/// the accepted client's `requireGeneration` check for the whole call.
+///
+/// Declared capability ids may exceed the accepted 128-byte per-entry bound (a
+/// capability id is legal up to 512 bytes plus a 1024-byte parameter, for
+/// example `fs.read:<pattern>`), so ids that cannot be represented are omitted
+/// rather than truncated: an id must stay exact, and this array is display
+/// metadata. The authoritative grant set is served by the grant surfaces.
+fn servable_rows(rows: Vec<DebugPlugin>) -> Vec<DebugPlugin> {
+    rows.into_iter()
+        .filter(|row| row.generation >= 1)
+        .take(MAX_SERVED_ROWS)
+        .map(|mut row| {
+            row.capabilities
+                .retain(|capability| capability.len() <= MAX_CAPABILITY_BYTES);
+            row.capabilities.truncate(MAX_SERVED_CAPABILITIES);
+            row
+        })
+        .collect()
+}
+
 /// Publish the attached runtime's sanitized rows (or detach the surface).
 ///
 /// `Some(runtime)` marks the backend attached even when the runtime currently
@@ -62,7 +128,7 @@ pub(crate) fn publish(runtime: Option<&PluginRuntime>) {
     match runtime {
         Some(runtime) => {
             published.attached = true;
-            published.rows = runtime.debug_plugins();
+            published.rows = servable_rows(runtime.debug_plugins());
         }
         None => {
             published.attached = false;
@@ -76,7 +142,7 @@ pub(crate) fn publish(runtime: Option<&PluginRuntime>) {
 pub(crate) fn publish_rows(rows: Vec<DebugPlugin>) {
     let mut published = lock_store();
     published.attached = true;
-    published.rows = rows;
+    published.rows = servable_rows(rows);
 }
 
 /// Register the live plugin-runtime inspect handlers on `dispatcher`.
@@ -150,8 +216,13 @@ fn top_string(params: &str, key: &str) -> Option<String> {
                 'b' => out.push('\u{0008}'),
                 'f' => out.push('\u{000c}'),
                 'u' => {
-                    let hex: String = chars.by_ref().take(4).collect();
-                    let code = u32::from_str_radix(&hex, 16).ok()?;
+                    // Exactly four hex digits, mirroring the accepted
+                    // `bitty-ipc` scanner: a short run is malformed, not a
+                    // smaller code point.
+                    let mut code: u32 = 0;
+                    for _ in 0..4 {
+                        code = code * 16 + chars.next()?.to_digit(16)?;
+                    }
                     out.push(char::from_u32(code)?);
                 }
                 _ => return None,
@@ -372,6 +443,90 @@ mod tests {
         assert!(result.contains("\"state\":\"Suspended\""), "{result}");
         assert!(result.contains("\"manifestHash\":\"sha256:"), "{result}");
         publish(None);
+    }
+
+    #[test]
+    fn unaddressable_and_unrepresentable_rows_are_not_served() {
+        let _serial = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut over_long = row("xuepoo.long", 3, "active");
+        over_long.capabilities = vec![
+            "ui.rich".to_string(),
+            format!("fs.read:{}", "a".repeat(MAX_CAPABILITY_BYTES)),
+        ];
+        publish_rows(vec![
+            row("xuepoo.pending", 0, "disposed"),
+            row("xuepoo.live", 1, "active"),
+            over_long,
+        ]);
+        let server =
+            bitty_ipc::devtools::ServerInfo::new("test".into(), "test.sock".into(), 80, 24);
+        let context =
+            ServeContext::with_granted(&server, bitty_ipc::ScopeSet::single(Scope::DebugInspect));
+        let list = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/listPlugins","version":"1.0"}"#,
+        )
+        .expect("request");
+        let result = handle_list_plugins(&context, &list).expect("listPlugins served");
+        assert!(
+            !result.contains("xuepoo.pending"),
+            "a generation-0 row must not be published: {result}"
+        );
+        assert!(result.contains("xuepoo.live"), "{result}");
+        assert!(
+            result.contains("xuepoo.long"),
+            "a row with an over-long capability id is still addressable: {result}"
+        );
+        assert!(
+            !result.contains("fs.read:"),
+            "an over-long capability id must be omitted: {result}"
+        );
+        assert!(
+            result.contains("\"capabilities\":[\"ui.rich\"]"),
+            "representable capabilities stay: {result}"
+        );
+
+        let get_absent = bitty_ipc::devtools::parse_request(
+            br#"{"id":2,"method":"bitty.debug/getPlugin","version":"1.0","params":{"pluginId":"xuepoo.pending"}}"#,
+        )
+        .expect("request");
+        assert_eq!(
+            handle_get_plugin(&context, &get_absent).expect("getPlugin served"),
+            "null",
+            "a generation-0 id is unknown, not a row"
+        );
+        let get_live = bitty_ipc::devtools::parse_request(
+            br#"{"id":3,"method":"bitty.debug/getPlugin","version":"1.0","params":{"pluginId":"xuepoo.live"}}"#,
+        )
+        .expect("request");
+        assert!(
+            handle_get_plugin(&context, &get_live)
+                .expect("getPlugin served")
+                .contains("\"generation\":1")
+        );
+        publish(None);
+    }
+
+    #[test]
+    fn served_rows_respect_the_client_cardinality_bounds() {
+        let rows = (0..=MAX_SERVED_ROWS)
+            .map(|index| row(&format!("xuepoo.row{index}"), 1, "active"))
+            .collect();
+        let served = servable_rows(rows);
+        assert_eq!(served.len(), MAX_SERVED_ROWS);
+        assert_eq!(served[0].id, "xuepoo.row0");
+        assert_eq!(
+            served[MAX_SERVED_ROWS - 1].id,
+            format!("xuepoo.row{}", MAX_SERVED_ROWS - 1)
+        );
+
+        let mut wide = row("xuepoo.wide", 1, "active");
+        wide.capabilities = (0..=MAX_SERVED_CAPABILITIES)
+            .map(|index| format!("ui.cap{index}"))
+            .collect();
+        let served = servable_rows(vec![wide]);
+        assert_eq!(served[0].capabilities.len(), MAX_SERVED_CAPABILITIES);
     }
 
     #[test]

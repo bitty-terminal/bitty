@@ -294,7 +294,9 @@ fn handle_panel_list(
 /// changes). CTX-1117 (issue #1900): the panel list surface registers
 /// additively with the same `handle_control` queue semantics. Issue #2773:
 /// `listPlugins`/`getPlugin` are backed by the published runtime snapshot
-/// instead of the fail-closed stubs.
+/// instead of the fail-closed stubs, on **both** tables: a normal instance
+/// serves the same read-only rows under the same elevated debug scope, and a
+/// runtime-less run keeps the typed `PluginRuntimeUnavailable` verdict.
 fn build_dispatcher(test_mode: bool) -> Arc<bitty_ipc::devtools::Dispatcher> {
     let mut dispatcher = if test_mode {
         bitty_ipc::devtools::Dispatcher::with_test_mode()
@@ -313,7 +315,8 @@ fn build_dispatcher(test_mode: bool) -> Arc<bitty_ipc::devtools::Dispatcher> {
     }
     // Issue #2773: back the accepted `listPlugins`/`getPlugin` inspect methods
     // with the published runtime snapshot instead of the fail-closed stubs.
-    // Registration is additive: the trace and control plugin methods keep
+    // Registration is additive and applies to both tables (see
+    // `plugin_ipc`'s module docs): the trace and control plugin methods keep
     // their existing behavior, and a plugin-less run keeps the typed
     // `PluginRuntimeUnavailable` verdict.
     if let Err(err) = crate::plugin_ipc::register(&mut dispatcher) {
@@ -1567,11 +1570,16 @@ mod tests {
     }
 
     /// Issue #2773: the test-mode IPC slice must serve the plugin runtime it
-    /// attached before the loop. The fixture activates one real plugin and
-    /// dispatches `bitty.debug/listPlugins` through the production
-    /// `build_dispatcher(true)` table.
+    /// attached before the loop, and only its addressable rows. The fixture
+    /// activates one plugin, then fails a second one against a rejected
+    /// `plugin-budgets.lua` so its generation stays 0, publishes both, and
+    /// dispatches `bitty.debug/listPlugins` / `getPlugin` through the
+    /// production `build_dispatcher` table (both tables serve the same
+    /// read-only snapshot, #2773 F3) with a real attested peer proof.
+    #[cfg(unix)]
     #[test]
-    fn test_mode_list_plugins_returns_the_activated_ids() {
+    fn plugin_inspect_dispatches_the_activated_rows_on_both_tables() {
+        use std::os::unix::net::UnixStream;
         use std::rc::Rc;
 
         use bitty_runtime::plugin_runtime::{
@@ -1597,18 +1605,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let root = dir.join("plugins");
         let id = "xuepoo.ipcprobe";
-        let plugin = root.join(id);
-        std::fs::create_dir_all(plugin.join("lua")).expect("plugin dirs");
-        std::fs::write(
-            plugin.join("bitty-plugin.toml"),
-            format!(
-                "[plugin]\nid = \"{id}\"\nname = \"IPC probe\"\nversion = \"0.1.0\"\n\
-                 description = \"IPC listPlugins fixture\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n\
-                 [capabilities]\nui.rich = true\n"
-            ),
-        )
-        .expect("manifest");
-        std::fs::write(plugin.join("lua/init.lua"), "return {}\n").expect("init");
+        let rejected_id = "xuepoo.ipcprobe2";
+        for plugin_id in [id, rejected_id] {
+            let plugin = root.join(plugin_id);
+            std::fs::create_dir_all(plugin.join("lua")).expect("plugin dirs");
+            std::fs::write(
+                plugin.join("bitty-plugin.toml"),
+                format!(
+                    "[plugin]\nid = \"{plugin_id}\"\nname = \"IPC probe\"\nversion = \"0.1.0\"\n\
+                     description = \"IPC listPlugins fixture\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n\
+                     [capabilities]\nui.rich = true\n"
+                ),
+            )
+            .expect("manifest");
+            std::fs::write(plugin.join("lua/init.lua"), "return {}\n").expect("init");
+        }
         let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
             safe_mode: false,
             data_dir: Some(dir.join("state")),
@@ -1621,33 +1632,69 @@ mod tests {
         runtime.discover();
         let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
         runtime.activate(&pid).expect("activate");
+        // A rejected user budget file fails activation closed before the
+        // generation increments, leaving a discovered entry at generation 0.
+        runtime.set_budget_file_error("line 1: expected a bare non-negative integer");
+        let rejected = bitty_plugin_host::manifest::PluginId::new(rejected_id).expect("valid id");
+        assert!(
+            runtime.activate(&rejected).is_err(),
+            "rejected budgets must fail activation"
+        );
         crate::plugin_ipc::publish(Some(&runtime));
 
-        let dispatcher = build_dispatcher(true);
         let server =
             bitty_ipc::devtools::ServerInfo::new("test".into(), "test.sock".into(), 80, 24);
-        let context = bitty_ipc::devtools::ServeContext::with_granted(
+        let (_client, stream) = UnixStream::pair().expect("socketpair");
+        let mut context = bitty_ipc::devtools::ServeContext::with_granted(
             &server,
             bitty_ipc::ScopeSet::single(bitty_ipc::Scope::DebugInspect),
         );
-        let request = bitty_ipc::devtools::parse_request(
+        let proof = context
+            .bind_connected_stream_current(&stream)
+            .expect("bound peer proof");
+        context.attest_local_peer(&proof.identity());
+        let list = bitty_ipc::devtools::parse_request(
             br#"{"id":1,"method":"bitty.debug/listPlugins","version":"1.0","params":{"generation":null}}"#,
         )
         .expect("request");
-        assert!(
-            dispatcher.contains(bitty_ipc::devtools::METHOD_LIST_PLUGINS),
-            "test-mode slice must register listPlugins"
-        );
-        let result = crate::plugin_ipc::handle_list_plugins(&context, &request).expect("served");
-        assert!(result.contains(id), "activated id missing: {result}");
-        assert!(
-            result.contains("\"state\":\"Activated\""),
-            "activated state missing: {result}"
-        );
-        assert!(
-            result.contains("\"capabilities\":[\"ui.rich\"]"),
-            "manifest capability missing: {result}"
-        );
+        let get_rejected = bitty_ipc::devtools::parse_request(format!(
+            "{{\"id\":2,\"method\":\"bitty.debug/getPlugin\",\"version\":\"1.0\",\"params\":{{\"pluginId\":\"{rejected_id}\"}}}}"
+        )
+        .as_bytes())
+        .expect("request");
+
+        for test_mode in [true, false] {
+            let dispatcher = build_dispatcher(test_mode);
+            assert!(
+                dispatcher.contains(bitty_ipc::devtools::METHOD_LIST_PLUGINS),
+                "table (test mode {test_mode}) must register listPlugins"
+            );
+            assert!(
+                dispatcher.contains(bitty_ipc::devtools::METHOD_GET_PLUGIN),
+                "table (test mode {test_mode}) must register getPlugin"
+            );
+            let result = dispatcher.dispatch(&context, &list).expect("listPlugins");
+            assert!(result.contains(id), "activated id missing: {result}");
+            assert!(
+                result.contains("\"state\":\"Activated\""),
+                "activated state missing: {result}"
+            );
+            assert!(
+                result.contains("\"capabilities\":[\"ui.rich\"]"),
+                "manifest capability missing: {result}"
+            );
+            assert!(
+                !result.contains(rejected_id),
+                "a generation-0 row must not be served: {result}"
+            );
+            assert_eq!(
+                dispatcher
+                    .dispatch(&context, &get_rejected)
+                    .expect("getPlugin"),
+                "null",
+                "a generation-0 id is unknown"
+            );
+        }
 
         crate::plugin_ipc::publish(None);
         let _ = std::fs::remove_dir_all(&dir);

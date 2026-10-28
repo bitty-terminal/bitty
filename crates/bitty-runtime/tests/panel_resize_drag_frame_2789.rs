@@ -144,6 +144,7 @@ fn resize_drag_steps_paint_committed_bounds_and_keep_the_scrollbar_in_sync() {
     let divider_band = i64::from(frame_of(&rt, ViewId::new(2)).frame.x)
         - frame_of(&rt, ViewId::new(1)).frame.right_exclusive();
     assert!(divider_band >= 0, "the fixture tiles left-to-right");
+    let mut previous_left_edge = frame_of(&rt, ViewId::new(1)).frame.right_exclusive();
 
     let mut now = start;
     for step in 1..=6 {
@@ -169,6 +170,12 @@ fn resize_drag_steps_paint_committed_bounds_and_keep_the_scrollbar_in_sync() {
         // so no strip is owned by neither leaf (the historical flash).
         let left = frame_of(&rt, ViewId::new(1));
         let right = frame_of(&rt, ViewId::new(2));
+        let left_edge = left.frame.right_exclusive();
+        assert!(
+            left_edge > previous_left_edge,
+            "step {step}: the divider must move right"
+        );
+        previous_left_edge = left_edge;
         assert!(
             left.content.right_exclusive() <= i64::from(right.content.x),
             "step {step}: panes overlap"

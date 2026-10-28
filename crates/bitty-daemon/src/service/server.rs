@@ -66,6 +66,52 @@ mod unix {
     /// Poll tick; bounds the idle, negotiate, and tamper timers.
     pub const TICK_MS: u16 = 250;
 
+    /// The window of the per-connection wire-refusal audit budget.
+    pub const WIRE_AUDIT_WINDOW_MS: u64 = 1_000;
+
+    /// How long a retired connection may take to drain its refusal frame.
+    ///
+    /// A closing refusal is a single small frame, so one second is generous;
+    /// the deadline keeps a peer that stops reading from holding a connection
+    /// slot (and from being reclassified as an unnegotiated handshake).
+    pub const CLOSE_DRAIN_TIMEOUT_MS: u64 = 1_000;
+
+    /// Per-connection budget for wire-level refusal audit records.
+    ///
+    /// A rate-limited or malformed frame that never resolves to a method would
+    /// otherwise write one record per frame; load shedding at the accepted
+    /// request rate could rotate both `audit_file_bytes` segments in seconds.
+    /// The budget is `refusal_audit_budget_per_sec` records per window;
+    /// records beyond it are dropped until the next window. Method refusals
+    /// still write one individual record through the dispatch path.
+    #[derive(Debug)]
+    struct WireAuditBudget {
+        window_start_ms: u64,
+        recorded: u32,
+    }
+
+    impl WireAuditBudget {
+        fn new(now_ms: u64) -> Self {
+            Self {
+                window_start_ms: now_ms,
+                recorded: 0,
+            }
+        }
+
+        /// Whether one more wire refusal may be recorded in this window.
+        fn admit(&mut self, now_ms: u64, budget: u32) -> bool {
+            if now_ms.saturating_sub(self.window_start_ms) >= WIRE_AUDIT_WINDOW_MS {
+                self.window_start_ms = now_ms;
+                self.recorded = 0;
+            }
+            if self.recorded >= budget.max(1) {
+                return false;
+            }
+            self.recorded += 1;
+            true
+        }
+    }
+
     /// The loop configuration.
     #[derive(Debug, Clone)]
     pub struct ServerConfig {
@@ -180,6 +226,11 @@ mod unix {
         accepted_at_ms: u64,
         last_activity_ms: u64,
         pre_auth_bytes: usize,
+        /// The per-window budget for wire-level refusal records.
+        wire_audit: WireAuditBudget,
+        /// When a retired connection must be closed even if its refusal frame
+        /// has not drained.
+        drain_deadline_ms: Option<u64>,
         /// The last reply was a refusal that closes the connection
         /// (`Refusal::closes_connection`). The queued refusal bytes are flushed
         /// first; reading stops and the stream is shut down only once `output`
@@ -339,6 +390,9 @@ mod unix {
                 }
                 if peer.drained() {
                     peer.close();
+                } else if peer.close_after_write && peer.drain_deadline_ms.is_none() {
+                    peer.drain_deadline_ms =
+                        Some(current.as_millis().saturating_add(CLOSE_DRAIN_TIMEOUT_MS));
                 }
             }
 
@@ -352,25 +406,32 @@ mod unix {
             let idle = config.limits.effective(LimitId::TransportIdleMs);
             let negotiate = config.limits.effective(LimitId::NegotiateTimeoutMs);
             for peer in &mut peers {
-                let age = current.as_millis().saturating_sub(peer.last_activity_ms);
-                let negotiate_deadline = peer.accepted_at_ms.saturating_add(negotiate);
-                let stale_handshake =
-                    !peer.client.is_negotiated() && current.as_millis() >= negotiate_deadline;
-                let idle_expired = age >= idle && !peer.wants_write();
-                if stale_handshake {
-                    // The handshake deadline closes with one typed timeout
-                    // record (the contract's aggregated audit record). There is
-                    // no correlation id for a request that never completed, so
-                    // no response frame can be rendered.
-                    service.record_refusal(
-                        &peer.client,
-                        crate::audit::AuditAction::Wire,
-                        Refusal::timeout(0, negotiate),
-                        current,
-                    );
-                    peer.close();
-                } else if idle_expired {
-                    peer.close();
+                match peer_timer(
+                    peer.client.is_negotiated(),
+                    peer.close_after_write,
+                    peer.drain_deadline_ms,
+                    peer.accepted_at_ms,
+                    peer.last_activity_ms,
+                    current.as_millis(),
+                    negotiate,
+                    idle,
+                    peer.wants_write(),
+                ) {
+                    PeerTimer::Keep => {}
+                    PeerTimer::Close => peer.close(),
+                    PeerTimer::Timeout => {
+                        // The handshake deadline closes with one typed timeout
+                        // record (the contract's aggregated audit record).
+                        // There is no correlation id for a request that never
+                        // completed, so no response frame can be rendered.
+                        service.record_refusal(
+                            &peer.client,
+                            crate::audit::AuditAction::Wire,
+                            Refusal::timeout(0, negotiate),
+                            current,
+                        );
+                        peer.close();
+                    }
                 }
             }
             peers.retain(|peer| !peer.closed);
@@ -401,6 +462,45 @@ mod unix {
             Some(mode) => ServerOutcome::Stopped { mode },
             None => ServerOutcome::Signalled,
         })
+    }
+
+    /// The per-peer timer decision for one loop iteration.
+    ///
+    /// A retired connection is governed only by its drain deadline: it never
+    /// collects a second handshake-timeout record while its refusal frame is
+    /// still queued.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PeerTimer {
+        Keep,
+        Close,
+        Timeout,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn peer_timer(
+        negotiated: bool,
+        close_after_write: bool,
+        drain_deadline_ms: Option<u64>,
+        accepted_at_ms: u64,
+        last_activity_ms: u64,
+        now_ms: u64,
+        negotiate_ms: u64,
+        idle_ms: u64,
+        wants_write: bool,
+    ) -> PeerTimer {
+        if close_after_write {
+            return match drain_deadline_ms {
+                Some(deadline) if now_ms >= deadline => PeerTimer::Close,
+                _ => PeerTimer::Keep,
+            };
+        }
+        if !negotiated && now_ms >= accepted_at_ms.saturating_add(negotiate_ms) {
+            return PeerTimer::Timeout;
+        }
+        if !wants_write && now_ms.saturating_sub(last_activity_ms) >= idle_ms {
+            return PeerTimer::Close;
+        }
+        PeerTimer::Keep
     }
 
     fn accept_peer(
@@ -435,6 +535,8 @@ mod unix {
             accepted_at_ms: now.as_millis(),
             last_activity_ms: now.as_millis(),
             pre_auth_bytes: 0,
+            wire_audit: WireAuditBudget::new(now.as_millis()),
+            drain_deadline_ms: None,
             close_after_write: false,
             closed: false,
         })
@@ -494,7 +596,7 @@ mod unix {
                     // a typed frame; a partial one was refused mid-assembly
                     // above and can only be audited, never answered. Either
                     // way, let already-queued bytes drain before the close.
-                    if let Some(id) = envelope_id(&payload) {
+                    if let Some((id, _, _)) = envelope_correlation(&payload) {
                         if !reply(peer, &id, Err(refusal)) {
                             peer.close();
                         }
@@ -586,7 +688,7 @@ mod unix {
     ) -> bool {
         use crate::audit::AuditAction;
 
-        let Some(id) = envelope_id(payload) else {
+        let Some((id, method_name, wire_version)) = envelope_correlation(payload) else {
             // No correlation id can be echoed, so there is no conforming
             // response; the refusal is still attributed exactly once. Any
             // earlier response already queued is flushed before the close.
@@ -599,15 +701,46 @@ mod unix {
             peer.retire();
             return true;
         };
+        if !peer.client.is_negotiated() {
+            // Stage 1 stays first: an unsupported per-frame `v` is
+            // `VersionMismatch` before the handshake gate.
+            match wire_version {
+                None => {
+                    let refusal = Refusal::invalid_request();
+                    record_floodable_wire(peer, service, refusal, now);
+                    return reply(peer, &id, Err(refusal));
+                }
+                Some(version) if bitty_ipc_api::wire::validate_wire_version(version).is_err() => {
+                    let refusal = Refusal::version_mismatch();
+                    service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+                    return reply(peer, &id, Err(refusal));
+                }
+                Some(_) => {}
+            }
+            // Stage 2, ahead of the rate limiter, the grammar, and the
+            // catalog: an unnegotiated connection may only send
+            // `daemon.negotiate`. It cannot probe the method catalog
+            // (`NotFound`/`InvalidMethod`) and cannot consume a rate budget
+            // before the handshake.
+            if method_name != crate::contract::NEGOTIATE_METHOD {
+                let refusal = Refusal::denied(crate::codes::RefusalCode::AlreadyNegotiated);
+                service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+                return reply(peer, &id, Err(refusal));
+            }
+        }
         if peer.limiter.check(now.as_millis()).is_err() {
             let refusal = Refusal::denied(crate::codes::RefusalCode::RateLimited);
-            service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+            record_floodable_wire(peer, service, refusal, now);
             return reply(peer, &id, Err(refusal));
         }
         let envelope = match RequestEnvelope::parse(payload) {
             Ok(envelope) => envelope,
             Err(refusal) => {
-                service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+                if refusal.closes_connection() {
+                    service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+                } else {
+                    record_floodable_wire(peer, service, refusal, now);
+                }
                 return reply(peer, &id, Err(refusal));
             }
         };
@@ -615,20 +748,15 @@ mod unix {
             MethodResolution::Known(method) => method,
             MethodResolution::Unknown => {
                 let refusal = Refusal::not_found();
-                service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+                record_floodable_wire(peer, service, refusal, now);
                 return reply(peer, &id, Err(refusal));
             }
             MethodResolution::Malformed => {
                 let refusal = Refusal::invalid_method();
-                service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+                record_floodable_wire(peer, service, refusal, now);
                 return reply(peer, &id, Err(refusal));
             }
         };
-        if !peer.client.is_negotiated() && method != ServiceMethod::DaemonNegotiate {
-            let refusal = Refusal::denied(crate::codes::RefusalCode::AlreadyNegotiated);
-            service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
-            return reply(peer, &id, Err(refusal));
-        }
         let result = if method == ServiceMethod::DaemonNegotiate {
             negotiate(peer, service, envelope.params, now)
         } else {
@@ -686,14 +814,42 @@ mod unix {
         }
     }
 
-    /// The envelope's correlation id, when it is safe to echo.
-    fn envelope_id(payload: &[u8]) -> Option<String> {
+    /// Record a non-closing wire refusal within the per-connection budget.
+    fn record_floodable_wire(
+        peer: &mut PeerIo,
+        service: &mut Service,
+        refusal: Refusal,
+        now: MonotonicMs,
+    ) {
+        let budget = u32::try_from(
+            service
+                .limits()
+                .effective(LimitId::RefusalAuditBudgetPerSec),
+        )
+        .unwrap_or(u32::MAX);
+        if peer.wire_audit.admit(now.as_millis(), budget) {
+            service.record_refusal(&peer.client, crate::audit::AuditAction::Wire, refusal, now);
+        }
+    }
+
+    /// The envelope's correlation id and method name, when they are safe to
+    /// echo and compare.
+    ///
+    /// This is the bounded pre-parse read the stage-2 negotiate gate needs: it
+    /// extracts only the two strings the server must know before it validates
+    /// the grammar or resolves the catalog.
+    fn envelope_correlation(payload: &[u8]) -> Option<(String, String, Option<u16>)> {
         let value: Value = serde_json::from_slice(payload).ok()?;
         let id = value.get("id")?.as_str()?;
         if id.is_empty() || id.len() > bitty_ipc_api::wire::MAX_ID_BYTES {
             return None;
         }
-        Some(id.to_owned())
+        let method = value.get("method")?.as_str()?;
+        let version = value
+            .get("v")
+            .and_then(Value::as_u64)
+            .and_then(|version| u16::try_from(version).ok());
+        Some((id.to_owned(), method.to_owned(), version))
     }
 
     fn server_facts(endpoint: &BoundEndpoint) -> Result<ServerFacts, ServerError> {
@@ -711,6 +867,43 @@ mod unix {
             },
             daemon_pid: std::process::id(),
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{PeerTimer, peer_timer};
+
+        #[test]
+        fn a_retired_peer_has_a_bounded_drain_deadline_and_no_second_timeout() {
+            // Retired, drain deadline not reached: keep waiting.
+            assert_eq!(
+                peer_timer(false, true, Some(1_000), 0, 0, 999, 5_000, 60_000, true),
+                PeerTimer::Keep
+            );
+            // Retired past the deadline: close; never the handshake timeout.
+            assert_eq!(
+                peer_timer(false, true, Some(1_000), 0, 0, 1_000, 5_000, 60_000, true),
+                PeerTimer::Close
+            );
+            // Unnegotiated before and past the deadline.
+            assert_eq!(
+                peer_timer(false, false, None, 0, 0, 4_999, 5_000, 60_000, false),
+                PeerTimer::Keep
+            );
+            assert_eq!(
+                peer_timer(false, false, None, 0, 0, 5_000, 5_000, 60_000, false),
+                PeerTimer::Timeout
+            );
+            // Negotiated: idle only when the output queue is drained.
+            assert_eq!(
+                peer_timer(true, false, None, 0, 0, 60_000, 5_000, 60_000, true),
+                PeerTimer::Keep
+            );
+            assert_eq!(
+                peer_timer(true, false, None, 0, 0, 60_000, 5_000, 60_000, false),
+                PeerTimer::Close
+            );
+        }
     }
 }
 

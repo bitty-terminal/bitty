@@ -400,3 +400,64 @@ pub mod params {
             .map_err(|_| Refusal::invalid_request())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn envelope(method: &str, params: Value) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "v": 1,
+            "id": "1",
+            "method": method,
+            "params": params,
+        }))
+        .expect("encode request")
+    }
+
+    #[test]
+    fn a_controller_claim_passes_the_wire_validator() {
+        // `session.attach` carries the role as `attach_role`: a bare `role` key
+        // is an ambient-authority probe and stays refused by the transport
+        // validator (it is not weakened for the daemon).
+        let claim = envelope(
+            "session.attach",
+            json!({
+                "attach_role": "controller",
+                "session_id": "a".repeat(32),
+                "expected_generation": 0,
+                "control_token": "b".repeat(64),
+                "idempotency_key": "claim",
+            }),
+        );
+        let parsed = RequestEnvelope::parse(&claim).expect("attach_role is a service field");
+        assert_eq!(parsed.method, "session.attach");
+        assert_eq!(parsed.params["attach_role"], "controller");
+    }
+
+    #[test]
+    fn an_observer_attach_passes_the_wire_validator() {
+        let observer = envelope(
+            "session.attach",
+            json!({
+                "attach_role": "observer",
+                "session_id": "a".repeat(32),
+                "observer_grant": "c".repeat(64),
+            }),
+        );
+        let parsed = RequestEnvelope::parse(&observer).expect("attach_role is a service field");
+        assert_eq!(parsed.params["attach_role"], "observer");
+    }
+
+    #[test]
+    fn ambient_authority_fields_stay_refused() {
+        for forbidden in ["role", "auth", "scope"] {
+            let legacy = envelope(
+                "session.attach",
+                json!({(forbidden): "controller", "session_id": "a".repeat(32)}),
+            );
+            let error = RequestEnvelope::parse(&legacy).expect_err("ambient field");
+            assert_eq!(error.kind(), RefusalKind::InvalidRequest, "{forbidden}");
+        }
+    }
+}

@@ -48,7 +48,7 @@ running service gives today:
 | cgroup/subreaper containment, signal delivery and reaping, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs | bitty#2604 | `daemon.orphans.verify` is `Denied/UnsupportedCapability`; no orphan is claimed verified |
 | Terminal content plane, including `session.resize` (`terminal.manage`) | bitty#2604 / terminal contract | the daemon grants no `terminal.*` scope, so `session.resize` is `Denied/ScopeViolation` |
 | Pushing session events on a connection (no subscribe method; the event stream owns its own registry) | bitty#2602 | `session.status`/`session.list` are the reconciliation reads; no event frame is sent |
-| Per-connection refusal-audit budget aggregation (`refusal_audit_budget_per_sec`) | bitty#2603 follow-up | every refusal of a mutating method gets one individual record; suppression/aggregation is not implemented |
+| Per-connection refusal-audit aggregation for method refusals (`refusal_audit_budget_per_sec`) | bitty#2603 follow-up | every refused method gets one individual record; the wire-level refusal budget is enforced (see below), but the method-refusal histogram is not implemented |
 | Conformance corpus and fake-server parity | bitty#2605 | not part of this crate |
 
 Nothing here authorizes autostart, a service file, a TCP listener, or desktop
@@ -487,6 +487,7 @@ signal fd, so the signal drain runs in the same loop as requests.
 | Idle bound | `transport_idle_ms` | an idle connection is closed |
 | Outbound bound | `max_connection_outbound_bytes` | a response queue above the bound closes the connection |
 | Grant sweep | `GRANT_SWEEP_INTERVAL_MS` (1 s) | retired grant records are swept on the loop timer |
+| Close drain | `CLOSE_DRAIN_TIMEOUT_MS` (1 s) | a retired connection that cannot drain its refusal frame is closed; it never collects a second handshake-timeout record |
 | Tamper interval | `TAMPER_INTERVAL_MS` (5 s) | `BoundEndpoint::reattest`; a failure is exit code 6 |
 
 A frame-level, byte-budget, or deadline closure is one aggregated `wire` audit
@@ -541,6 +542,11 @@ detaching another connection's lease needs `session.control` or
 view is `daemon.inspect`, while control actions remain `daemon.control` (the
 capability always grants both).
 
+`session.attach` spells the request role `attach_role` (`controller` or
+`observer`); the response keeps `role`. The transport reserves `role`, `auth`,
+and `scope` as ambient-authority fields and refuses any of them at depth 1, so
+the service parameter cannot share those names.
+
 ### Handshake
 
 `daemon.negotiate` is the only pre-authentication method. The request carries
@@ -561,12 +567,19 @@ and `daemon_state`.
 - A `host_grant` that cannot be consumed adds no scope and does not close the
   connection; `session.create` then returns `Denied/ConsentRequired`.
 - A version outside `1.0..=1.0` is `VersionMismatch` and closes. A second
-  negotiate, or any frame before the negotiate response, is
+  negotiate, or any frame read before the negotiate request, is
   `Denied/AlreadyNegotiated` and closes after the refusal frame is flushed.
-  Envelope-level refusals that never resolve to a catalog method (malformed
+  The gate runs after the per-frame wire version and before the rate limiter,
+  the method grammar, and the catalog, so an unnegotiated connection cannot
+  probe which methods exist. A frame that
+  is already in the socket buffer when a successful negotiate is processed is
+  served after the handshake (the server does not discard pipelined bytes);
+  it can never widen the connection's scopes, and there is still exactly one
+  handshake per connection.
+- Envelope-level refusals that never resolve to a catalog method (malformed
   envelope or id, unsupported wire version, unknown or malformed method,
   rate limit before parsing, frame or deadline closure) are one `wire` refusal
-  record each.
+  record each, subject to the per-connection budget below.
 
 ### Grants
 
@@ -633,12 +646,16 @@ retried, so a transient failure neither reorders nor drops the tail; a record
 that cannot be rendered sets `audit_degraded` as well, so `daemon.status`
 cannot report `false` while mutations are refused. The directory chain is not
 followed blindly: each owning directory is attested (no symlink, owned, `0700`
-for the leaf) and created one level at a time. Rendered lines carry only closed
-spellings, ids, digests, and numbers. `service::dispatch` records one
-individual refusal record for every refused method with its static code and
-counts; the server loop records one `wire` refusal for every envelope, frame,
-budget, or deadline closure that never resolves to a method. The per-connection
-suppression budget that aggregates a refusal flood is deferred (see the table
+for the leaf) and created one level at a time, and a fresh account's missing
+state root is created `0700` one level at a time rather than failing startup.
+Rendered lines carry only closed spellings, ids, digests, and numbers.
+`service::dispatch` records one individual refusal record for every refused
+method with its static code and counts; the server loop records one `wire`
+refusal for every envelope, frame, budget, or deadline closure that never
+resolves to a method. Non-closing wire refusals are budgeted per connection at
+`refusal_audit_budget_per_sec` records per second; a rate-limited or malformed
+frame flood therefore cannot rotate the audit segments by itself, at the cost
+of dropping records past the cap (the full histogram is deferred; see the table
 above).
 
 ### Per-frame peer credentials

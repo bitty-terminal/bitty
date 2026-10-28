@@ -664,6 +664,209 @@ fn endpoint_tamper_exits_six() {
 }
 
 #[test]
+fn the_keyed_attach_and_control_flow_is_reachable_over_the_wire() {
+    let root = TempRoot::new("attach-flow");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    assert_eq!(minted["ok"], true, "{minted}");
+    let host_grant = minted["result"]["grant"]
+        .as_str()
+        .expect("host grant bearer")
+        .to_owned();
+
+    let mut creator = Client::connect(&root.endpoint());
+    let handshake = creator.negotiate_with(None, Some(&host_grant));
+    assert_eq!(handshake["ok"], true, "{handshake}");
+
+    // session.create
+    let created = creator.call(
+        "session.create",
+        json!({"kind": "terminal", "idempotency_key": "flow-create"}),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    let session_id = created["result"]["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let create_token = created["result"]["control_token"]
+        .as_str()
+        .expect("create token")
+        .to_owned();
+
+    // (a) controller claim through the real envelope.
+    let claimed = creator.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 0,
+            "control_token": create_token,
+            "idempotency_key": "flow-claim",
+        }),
+    );
+    assert_eq!(claimed["ok"], true, "{claimed}");
+    assert_eq!(claimed["result"]["role"], "controller");
+    let controller_attach = claimed["result"]["attach_id"]
+        .as_str()
+        .expect("controller attach")
+        .to_owned();
+    let controller_token = claimed["result"]["control_token"]
+        .as_str()
+        .expect("rotated token")
+        .to_owned();
+
+    // Consumer mint of an observer grant as the controller.
+    let grant = creator.call(
+        "session.grant",
+        json!({"session_id": session_id, "idempotency_key": "flow-grant"}),
+    );
+    assert_eq!(grant["ok"], true, "{grant}");
+    let observer_grant = grant["result"]["grant"]
+        .as_str()
+        .expect("observer grant")
+        .to_owned();
+    let observer_grant_id = grant["result"]["grant_id"].as_str().expect("grant id");
+
+    // (b) observer attach through the real envelope.
+    let mut observer = Client::connect(&root.endpoint());
+    assert_eq!(observer.negotiate(None)["ok"], true);
+    let attached = observer.call(
+        "session.attach",
+        json!({
+            "attach_role": "observer",
+            "session_id": session_id,
+            "observer_grant": observer_grant,
+        }),
+    );
+    assert_eq!(attached["ok"], true, "{attached}");
+    assert_eq!(attached["result"]["role"], "observer");
+    let observer_attach = attached["result"]["attach_id"]
+        .as_str()
+        .expect("observer attach")
+        .to_owned();
+
+    // session.control.transfer reaches its handler.
+    let transferred = creator.call(
+        "session.control.transfer",
+        json!({
+            "session_id": session_id,
+            "attach_id": observer_attach,
+            "expected_generation": 0,
+            "idempotency_key": "flow-transfer",
+        }),
+    );
+    assert_eq!(transferred["ok"], true, "{transferred}");
+    assert_eq!(transferred["result"]["controller"], observer_attach);
+    assert!(
+        transferred["result"].get("control_token").is_none(),
+        "the requester never receives the target's rotated token"
+    );
+
+    // lease.heartbeat reaches its handler; the rotated token is delivered on
+    // the target connection's next response after routing.
+    let first = observer.call("lease.heartbeat", json!({"attach_id": observer_attach}));
+    assert_eq!(first["ok"], true, "{first}");
+    let second = observer.call("lease.heartbeat", json!({"attach_id": observer_attach}));
+    assert_eq!(second["ok"], true, "{second}");
+    let delivered = second["result"]["control_token"]
+        .as_str()
+        .expect("control-token delivery");
+    assert_ne!(delivered, controller_token);
+
+    // Own-lease session.detach reaches its handler.
+    let detached = observer.call("session.detach", json!({"attach_id": observer_attach}));
+    assert_eq!(detached["ok"], true, "{detached}");
+    assert_eq!(detached["result"]["was_attached"], true);
+    let detached = creator.call("session.detach", json!({"attach_id": controller_attach}));
+    assert_eq!(detached["ok"], true, "{detached}");
+    assert_eq!(observer_grant_id.len(), 32);
+
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+}
+
+#[test]
+fn an_unnegotiated_connection_cannot_probe_the_method_catalog() {
+    let root = TempRoot::new("catalog-gate");
+    let daemon = Daemon::start(&root);
+
+    // A well-formed but unknown method is AlreadyNegotiated, not NotFound: the
+    // stage-2 gate runs before method resolution.
+    let mut unknown = Client::connect(&root.endpoint());
+    let response = unknown.call("session.unknown", Value::Null);
+    assert_eq!(response["ok"], false, "{response}");
+    assert_eq!(response["error"]["code"], "AlreadyNegotiated");
+    assert_eof(&mut unknown.stream, Duration::from_secs(2));
+
+    // A grammar-invalid name is also AlreadyNegotiated, not InvalidMethod.
+    let mut malformed = Client::connect(&root.endpoint());
+    malformed.send_raw_frame(json!({
+        "v": 1,
+        "id": "malformed-1",
+        "method": "Session.Create",
+        "params": Value::Null,
+    }));
+    let response = malformed.recv();
+    assert_eq!(response["ok"], false, "{response}");
+    assert_eq!(response["error"]["code"], "AlreadyNegotiated");
+    assert_eof(&mut malformed.stream, Duration::from_secs(2));
+
+    // Stage 1 stays ahead of the gate: an unsupported wire version is
+    // VersionMismatch even when the method is not the handshake.
+    let mut wrong_version = Client::connect(&root.endpoint());
+    wrong_version.send_raw_frame(json!({
+        "v": 99,
+        "id": "version-1",
+        "method": "session.unknown",
+        "params": Value::Null,
+    }));
+    let response = wrong_version.recv();
+    assert_eq!(response["ok"], false, "{response}");
+    assert_eq!(response["error"]["code"], "VersionMismatch");
+    assert_eof(&mut wrong_version.stream, Duration::from_secs(2));
+
+    // After a successful negotiate the same unknown method is NotFound.
+    let mut client = Client::connect(&root.endpoint());
+    assert_eq!(client.negotiate(None)["ok"], true);
+    let response = client.call("session.unknown", Value::Null);
+    assert_eq!(response["error"]["code"], "NotFound");
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn a_wire_refusal_burst_is_budgeted() {
+    let root = TempRoot::new("wire-budget");
+    let daemon = Daemon::start(&root);
+    let mut client = Client::connect(&root.endpoint());
+    assert_eq!(client.negotiate(None)["ok"], true);
+
+    // `refusal_audit_budget_per_sec` is 20 at the compiled defaults. A burst of
+    // non-closing wire refusals must not write one record per frame.
+    let requests: Vec<(&str, Value)> = (0..60).map(|_| ("session.unknown", Value::Null)).collect();
+    client.send_batch(&requests);
+    for _ in 0..60 {
+        let response = client.recv();
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "NotFound");
+    }
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    let wire = audit_lines_with(&root, "a=wire r=refused c=not_found");
+    assert!(wire >= 1, "the first refusals are recorded");
+    assert!(
+        wire <= 21,
+        "the per-second budget bounds a 60-frame burst: {wire} records"
+    );
+}
+
+#[test]
 fn plain_status_never_binds_and_creates_no_runtime_file() {
     let root = TempRoot::new("status");
     std::fs::create_dir_all(root.runtime()).expect("runtime dir");

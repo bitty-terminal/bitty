@@ -177,7 +177,7 @@ impl AuditFileWriter {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 if parent_metadata.is_none() {
                     let state_root = parent.parent().ok_or(AuditSinkError::UnsafeStorage)?;
-                    attest_state_root(state_root, uid)?;
+                    ensure_state_root(state_root, uid)?;
                     create_private_directory(parent)?;
                 }
                 create_private_directory(dir)?;
@@ -297,16 +297,41 @@ fn attest_private_directory(metadata: &std::fs::Metadata, uid: u32) -> Result<()
     Ok(())
 }
 
-/// Attest the state root above the sink's own chain. It is the caller's XDG
-/// state directory, so a symlink to the real directory is accepted; it must
-/// resolve to a directory owned by this uid.
+/// Ensure the state root above the sink's own chain exists.
+///
+/// A fresh account may have no `$XDG_STATE_HOME` (or `~/.local/state`) yet; the
+/// daemon then creates the missing chain instead of failing startup. The
+/// nearest existing ancestor is the trust anchor: it is the caller's home or
+/// XDG root, so a symlink to the real directory is accepted there, and it must
+/// resolve to a directory owned by this uid. Every missing component below it
+/// is created one level at a time as a real `0700` directory by
+/// [`create_private_directory`], so a symlink is never followed while the chain
+/// is created.
 #[cfg(unix)]
-fn attest_state_root(path: &Path, uid: u32) -> Result<(), AuditSinkError> {
+fn ensure_state_root(path: &Path, uid: u32) -> Result<(), AuditSinkError> {
     use std::os::unix::fs::MetadataExt;
 
-    let metadata = std::fs::metadata(path).map_err(|_| AuditSinkError::UnsafeStorage)?;
-    if !metadata.is_dir() || metadata.uid() != uid {
-        return Err(AuditSinkError::UnsafeStorage);
+    let mut missing = Vec::new();
+    let mut current = path;
+    loop {
+        match std::fs::symlink_metadata(current) {
+            Ok(_) => {
+                let resolved =
+                    std::fs::metadata(current).map_err(|_| AuditSinkError::UnsafeStorage)?;
+                if !resolved.is_dir() || resolved.uid() != uid {
+                    return Err(AuditSinkError::UnsafeStorage);
+                }
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(current.to_path_buf());
+                current = current.parent().ok_or(AuditSinkError::UnsafeStorage)?;
+            }
+            Err(_) => return Err(AuditSinkError::Io),
+        }
+    }
+    for directory in missing.iter().rev() {
+        create_private_directory(directory)?;
     }
     Ok(())
 }
@@ -900,6 +925,27 @@ mod tests {
         for path in [&state, &audit] {
             let metadata = std::fs::symlink_metadata(path).expect("created");
             assert!(metadata.is_dir());
+            assert_eq!(metadata.mode() & 0o777, AUDIT_DIR_MODE);
+            assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        }
+    }
+
+    #[test]
+    fn the_state_root_is_created_when_missing() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        // A fresh account has no `$XDG_STATE_HOME` (or `~/.local/state`). The
+        // sink creates the whole chain, one 0700 directory at a time.
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+        let state = dir.path().join("state");
+        let owned = state.join("bitty");
+        let audit = owned.join("audit");
+        AuditFileWriter::open(&audit, &Limits::default()).expect("create the state chain");
+        for path in [&state, &owned, &audit] {
+            let metadata = std::fs::symlink_metadata(path).expect("created");
+            assert!(metadata.is_dir(), "{} is a directory", path.display());
             assert_eq!(metadata.mode() & 0o777, AUDIT_DIR_MODE);
             assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
         }

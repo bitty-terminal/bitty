@@ -42,7 +42,7 @@
 //! owned by bitty#2604; it refuses with `Denied/UnsupportedCapability` instead
 //! of pretending an empty verification. Both are recorded in the crate README.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 use bitty_ipc_api::error::ErrorClass;
@@ -409,9 +409,21 @@ pub struct Service {
     create_key_by_session: BTreeMap<SessionId, IdempotencyKey>,
     initial_tokens: BTreeMap<SessionId, ControlToken>,
     pending_deliveries: BTreeMap<AttachId, ControlToken>,
+    observer_grant_ids: BTreeMap<SessionId, ObserverGrantIds>,
     state: DaemonState,
     stop_requested: Option<StopMode>,
     drain_deadline_ms: Option<u64>,
+}
+
+/// Full observer-grant ids retained for keyed `session.grant` replays.
+///
+/// The idempotency descriptor keeps only a 64-bit reference; this table keeps
+/// the full 128-bit id while the session is live, in mint order, bounded by the
+/// per-session idempotency key cap.
+#[derive(Debug, Default)]
+struct ObserverGrantIds {
+    ids: BTreeMap<u64, GrantId>,
+    order: VecDeque<u64>,
 }
 
 impl Service {
@@ -446,6 +458,7 @@ impl Service {
             create_key_by_session: BTreeMap::new(),
             initial_tokens: BTreeMap::new(),
             pending_deliveries: BTreeMap::new(),
+            observer_grant_ids: BTreeMap::new(),
             state: DaemonState::Running,
             stop_requested: None,
             drain_deadline_ms: None,
@@ -981,8 +994,42 @@ impl Service {
         }
     }
 
+    /// Remember the full id of an observer grant minted for a keyed request.
+    ///
+    /// `AppliedResult::result_ref` is only the 64-bit prefix and the 128-byte
+    /// idempotency descriptor has no spare bytes for the full 128-bit id, so the
+    /// service keeps this bounded table for the lifetime of the session's
+    /// applied keyed entries: a replay must answer the same `grant_id` even
+    /// after the grant record has been swept or revoked. The table is capped at
+    /// the store's per-session key bound (the most live applied entries the
+    /// store can hold) and is dropped at the terminal transition.
+    fn remember_observer_grant(&mut self, session_id: SessionId, grant_id: GrantId) {
+        let reference = crate::service::grants::ref_of(grant_id.as_bytes());
+        let limit = self
+            .limits
+            .effective_usize(LimitId::MaxIdempotencyKeysPerSession);
+        let entry = self.observer_grant_ids.entry(session_id).or_default();
+        if entry.ids.insert(reference, grant_id).is_none() {
+            entry.order.push_back(reference);
+        }
+        while entry.order.len() > limit {
+            if let Some(oldest) = entry.order.pop_front() {
+                entry.ids.remove(&oldest);
+            }
+        }
+    }
+
+    /// The full id of a previously minted observer grant for this replay.
+    fn remembered_observer_grant(&self, session_id: SessionId, reference: u64) -> Option<GrantId> {
+        self.observer_grant_ids
+            .get(&session_id)
+            .and_then(|entry| entry.ids.get(&reference))
+            .copied()
+    }
+
     fn retire_session(&mut self, session_id: SessionId) {
         self.initial_tokens.remove(&session_id);
+        self.observer_grant_ids.remove(&session_id);
         if let Some(key) = self.create_key_by_session.remove(&session_id) {
             let _ = self.create_keys.mark_control_claimed(key);
         }
@@ -1423,7 +1470,7 @@ impl Service {
         fields: Option<&Map<String, Value>>,
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
-        let role = required_string(fields, "role")?;
+        let role = required_string(fields, "attach_role")?;
         match role {
             "controller" => self.attach_controller(connection, fields, now),
             "observer" => self.attach_observer(connection, fields, now),
@@ -1642,7 +1689,15 @@ impl Service {
         let admission = self.session_store(session_id).begin(request, now);
         match admission {
             Ok(Admission::Replay(IdempotencyResult::Applied(applied))) => {
-                let Some(grant_id) = self.grants.find_by_ref(applied.result_ref) else {
+                // The grant record may have been swept or revoked since the
+                // mint; the applied entry must still replay its original
+                // `grant_id`. The full id is remembered for the entry's
+                // lifetime; `find_by_ref` is the fallback for a record that is
+                // still present.
+                let grant_id = self
+                    .remembered_observer_grant(applied.session_id, applied.result_ref)
+                    .or_else(|| self.grants.find_by_ref(applied.result_ref));
+                let Some(grant_id) = grant_id else {
                     return Err(Refusal::internal());
                 };
                 let bearer =
@@ -1672,6 +1727,7 @@ impl Service {
                         .mint_observer(session_id, connection.peer_uid(), now.as_millis());
                 match minted {
                     Ok(minted) => {
+                        self.remember_observer_grant(session_id, minted.grant_id);
                         let result_ref = crate::service::grants::ref_of(minted.grant_id.as_bytes());
                         let applied = AppliedResult::new(
                             AppliedClass::GrantMinted,
@@ -2382,6 +2438,7 @@ mod tests {
 
     use crate::audit_sink::AuditSinkError;
     use crate::handshake::{ClientId, EffectiveScopes, EndpointKind, SecretBearer};
+    use crate::limits::LimitOverride;
     use crate::peer::PeerGuard;
     use crate::service::scopes::{ServiceScope, ServiceScopeSet};
 
@@ -2421,6 +2478,10 @@ mod tests {
     }
 
     fn service() -> (Service, tempfile::TempDir) {
+        service_with(Limits::default())
+    }
+
+    fn service_with(limits: Limits) -> (Service, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::set_permissions(
             dir.path(),
@@ -2429,7 +2490,7 @@ mod tests {
         .expect("chmod");
         let operator = OperatorStore::create_in(dir.path()).expect("operator store");
         let (writer, _fail) = TestWriter::new();
-        let service = Service::new(Limits::default(), operator, Box::new(writer)).expect("service");
+        let service = Service::new(limits, operator, Box::new(writer)).expect("service");
         (service, dir)
     }
 
@@ -2774,7 +2835,7 @@ mod tests {
                 &mut creator,
                 ServiceMethod::SessionAttach,
                 &json!({
-                    "role": "controller",
+                    "attach_role": "controller",
                     "session_id": id,
                     "expected_generation": 0,
                     "control_token": create_token,
@@ -2820,7 +2881,7 @@ mod tests {
                 &mut observer,
                 ServiceMethod::SessionAttach,
                 &json!({
-                    "role": "observer",
+                    "attach_role": "observer",
                     "session_id": id,
                     "observer_grant": observer_grant,
                 }),
@@ -2836,7 +2897,7 @@ mod tests {
                 &mut observer,
                 ServiceMethod::SessionAttach,
                 &json!({
-                    "role": "observer",
+                    "attach_role": "observer",
                     "session_id": id,
                     "observer_grant": observer_grant,
                 }),
@@ -3261,7 +3322,7 @@ mod tests {
                 &mut creator,
                 ServiceMethod::SessionAttach,
                 &json!({
-                    "role": "controller",
+                    "attach_role": "controller",
                     "session_id": id,
                     "expected_generation": 0,
                     "control_token": create_token,
@@ -3287,7 +3348,7 @@ mod tests {
                 &mut observer,
                 ServiceMethod::SessionAttach,
                 &json!({
-                    "role": "observer",
+                    "attach_role": "observer",
                     "session_id": id,
                     "observer_grant": minted["grant"],
                 }),
@@ -3393,7 +3454,7 @@ mod tests {
                 &mut creator,
                 ServiceMethod::SessionAttach,
                 &json!({
-                    "role": "controller",
+                    "attach_role": "controller",
                     "session_id": id,
                     "expected_generation": 0,
                     "control_token": create_token,
@@ -3420,7 +3481,7 @@ mod tests {
                 &mut observer,
                 ServiceMethod::SessionAttach,
                 &json!({
-                    "role": "observer",
+                    "attach_role": "observer",
                     "session_id": id,
                     "observer_grant": minted["grant"],
                 }),
@@ -3473,7 +3534,7 @@ mod tests {
                 &mut creator,
                 ServiceMethod::SessionAttach,
                 &json!({
-                    "role": "controller",
+                    "attach_role": "controller",
                     "session_id": id,
                     "expected_generation": 0,
                     "control_token": create_token,
@@ -3530,6 +3591,120 @@ mod tests {
         assert_eq!(refusal.class(), ErrorClass::Framing);
         assert_eq!(refusal.counts(), Some((20_000, 8_192)));
         assert!(!refusal.closes_connection(), "the server decides the close");
+    }
+
+    #[test]
+    fn a_keyed_grant_replay_survives_the_grant_sweep() {
+        // A one-second observer TTL lets the sweep retire the record while the
+        // controller's default 15-second lease is still live.
+        let limits = Limits::new(&[LimitOverride::new(LimitId::ObserverGrantTtlMs, 1_000)])
+            .expect("valid override");
+        let (mut service, _dir) = service_with(limits);
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 2);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        let created = create_session(&mut service, &mut creator, "sweep-replay-create");
+        let id = session_id(&created);
+        let create_token = created["control_token"].as_str().expect("token").to_owned();
+        service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": id,
+                    "expected_generation": 0,
+                    "control_token": create_token,
+                    "idempotency_key": "sweep-replay-claim",
+                }),
+                MonotonicMs::from_millis(11),
+            )
+            .expect("claim");
+        let minted = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": id, "idempotency_key": "sweep-replay-grant"}),
+                MonotonicMs::from_millis(12),
+            )
+            .expect("mint");
+        let grant_id = minted["grant_id"].as_str().expect("grant id").to_owned();
+        let bearer = minted["grant"].as_str().expect("bearer").to_owned();
+
+        // Consume it, then sweep past the grant TTL: the record is gone.
+        let mut observer = consumer();
+        negotiate_ok(&mut service, &mut observer, 13);
+        service
+            .dispatch(
+                &mut observer,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "observer",
+                    "session_id": id,
+                    "observer_grant": bearer,
+                }),
+                MonotonicMs::from_millis(14),
+            )
+            .expect("observer attach");
+        let dropped = service.sweep_grants(MonotonicMs::from_millis(1_100));
+        assert!(dropped >= 1, "the expired observer grant is swept");
+        let parsed = GrantId::parse(&grant_id).expect("grant id");
+        assert!(
+            service
+                .grants()
+                .find_by_ref(crate::service::grants::ref_of(parsed.as_bytes()))
+                .is_none(),
+            "the swept record is gone"
+        );
+
+        // The replay still answers the original grant id, with no bearer.
+        let replay = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": id, "idempotency_key": "sweep-replay-grant"}),
+                MonotonicMs::from_millis(1_100),
+            )
+            .expect("replay after the sweep");
+        assert_eq!(replay["grant_id"], grant_id);
+        assert_eq!(replay["grant"], Value::Null);
+        assert_eq!(replay["grant_active"], false);
+        assert_eq!(replay["replayed"], true);
+
+        // A revoked grant that the sweep drops behaves the same way.
+        let second = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": id, "idempotency_key": "sweep-replay-grant-2"}),
+                MonotonicMs::from_millis(1_200),
+            )
+            .expect("second mint");
+        let second_id = second["grant_id"].as_str().expect("grant id").to_owned();
+        service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrantRevoke,
+                &json!({"grant_id": second_id}),
+                MonotonicMs::from_millis(1_201),
+            )
+            .expect("revoke");
+        assert!(service.sweep_grants(MonotonicMs::from_millis(1_201)) >= 1);
+        let replay = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": id, "idempotency_key": "sweep-replay-grant-2"}),
+                MonotonicMs::from_millis(1_202),
+            )
+            .expect("replay after revoke and sweep");
+        assert_eq!(replay["grant_id"], second_id);
+        assert_eq!(replay["grant_active"], false);
     }
 
     #[test]

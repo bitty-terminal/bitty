@@ -174,12 +174,14 @@
 //! and CPU-verifiable. Image nodes stay references: the admitted image plane
 //! keeps owning decode and blit, and this crate adds no second decode seam.
 //!
-//! Integration status: this is a library seam. No shipped frame paints a
-//! `Scene` today — the `bitty-runtime` adapters (`PanelRuntime::scene_paint_for`
-//! and the CW present plan) are exercised by tests only until CTX-1630 wires
-//! the `ui.rich` mount path and the present loop. See the
-//! [`scene`] module's "Integration status" section for the exact remainder;
-//! do not describe the renderer as consuming live scene content before then.
+//! Integration status: the shipped present loop consumes this module. The
+//! `bitty-runtime` present path resolves each visible panel leaf's content
+//! rect and calls `PanelRuntime::scene_paint_for` (CTX-1630), so fills,
+//! overlay-seam glyphs, and bounded damage reach a real frame. The remaining
+//! slice of bitty#2760 is the `ui.rich` mount path: `bitty.ui.mount` still
+//! validates through the v1 reader, so a plugin mount does not yet attach a
+//! `Scene` to its panel in production. Do not describe plugin rich content as
+//! shipping until that mount slice lands.
 //!
 //! # Headless friendliness and what CI does and does not verify
 //!

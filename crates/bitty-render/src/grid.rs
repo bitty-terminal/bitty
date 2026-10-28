@@ -1471,6 +1471,19 @@ impl SnapshotDamage {
         self
     }
 
+    /// Overrides the pixel extent this descriptor clips to (CTX-1630).
+    ///
+    /// [`Self::new`] derives the extent from the snapshot grid. The scene
+    /// path composes window-space pixel rectangles instead, so the present
+    /// loop sets the surface extent explicitly: `plan_frame` then clips the
+    /// scene invalidation to the window rather than to one leaf's grid.
+    /// Grid regions (when any) are unaffected.
+    #[must_use]
+    pub fn with_extent(mut self, extent: ExtentPx) -> Self {
+        self.extent = extent;
+        self
+    }
+
     /// The grid-coordinate regions behind this descriptor (same order;
     /// scrollback entries dropped; scroll motions represented by their
     /// exposed repaint band).

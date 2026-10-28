@@ -27,15 +27,16 @@
 //!
 //! # Integration status
 //!
-//! This module is the render-side consumer of the accepted model as a
-//! *library* seam. The composition root that resolves a live leaf's content
-//! rect and calls [`paint_scene`] from the shipped present loop is not wired
-//! yet: `PanelRuntime::scene_paint_for` in `bitty-runtime` — the intended
-//! adapter — is currently exercised by tests only, together with the CW
-//! present plan that would feed it, and no shipped frame paints a `Scene`
-//! today. Treat the paint path as mechanism-complete and
-//! integration-pending; do not describe the renderer as consuming live scene
-//! content until the composition slice lands.
+//! The shipped present loop is the live consumer: `bitty-runtime` resolves a
+//! visible panel leaf's content rect, calls
+//! `PanelRuntime::scene_paint_for`, and composes the resulting list into the
+//! frame (CTX-1630). Fills, overlay-seam glyphs, and bounded damage are
+//! produced there; a typed refusal paints nothing and keeps the previous
+//! visible scene. What is still pending in bitty#2760 is the `ui.rich` mount
+//! path that attaches an admitted `Scene` to a panel from a plugin mount, so
+//! no live plugin content reaches these slots in production yet. The module
+//! itself, the runtime adapter, and the present composition are no longer
+//! test-only.
 //!
 //! # Budgets
 //!
@@ -522,11 +523,30 @@ impl ScenePaint {
         renderer: &mut GridRenderer<R>,
         list: &mut DrawList,
     ) -> usize {
+        self.append_into(renderer, &mut list.fills, &mut list.glyphs)
+    }
+
+    /// Pushes this list's fills and glyphs into separate frame layers.
+    ///
+    /// The runtime present loop composes a combined frame from per-leaf
+    /// primitive vectors rather than from a per-leaf [`DrawList`], so it
+    /// consumes this entry point instead of synthesizing a throwaway list.
+    /// Semantics are exactly [`Self::append_to`]: text goes through the grid
+    /// renderer's overlay text seam, faux bold adds the same one-pixel pass,
+    /// and image references are counted, never rasterized.
+    ///
+    /// Returns the number of image references skipped.
+    pub fn append_into<R: GlyphRasterizer>(
+        &self,
+        renderer: &mut GridRenderer<R>,
+        fills: &mut Vec<FillRect>,
+        glyphs: &mut Vec<crate::grid::GlyphInstance>,
+    ) -> usize {
         let mut images = 0usize;
         for op in &self.ops {
             match op {
                 ScenePaintOp::Fill { rect, color } => {
-                    list.fills.push(FillRect {
+                    fills.push(FillRect {
                         rect: *rect,
                         color: *color,
                     });
@@ -539,7 +559,7 @@ impl ScenePaint {
                     bold,
                     ..
                 } => {
-                    list.glyphs.extend(renderer.overlay_text_glyphs(
+                    glyphs.extend(renderer.overlay_text_glyphs(
                         text,
                         (rect.x, rect.y),
                         usize::from(*cols),
@@ -548,7 +568,7 @@ impl ScenePaint {
                     if *bold {
                         // Deterministic faux bold: one extra pass one pixel to
                         // the right, bounded by the same `cols` cap.
-                        list.glyphs.extend(renderer.overlay_text_glyphs(
+                        glyphs.extend(renderer.overlay_text_glyphs(
                             text,
                             (rect.x.saturating_add(1), rect.y),
                             usize::from(*cols),

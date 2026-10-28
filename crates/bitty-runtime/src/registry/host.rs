@@ -39,11 +39,13 @@
 //!   `Panel`/`Browser`/`Rich` leaves to the beyond-grid payload
 //!   (`Terminal`/`Empty` stay on the grid path).
 //!
-//!   Integration status: this is the host-side contract, not yet composed
-//!   into the shipped present loop. `Runtime::cw_present_plan_for_host` is
-//!   the intended consumer and is exercised by tests only; nothing attaches a
-//!   scene from a plugin mount yet. Do not describe the render pipeline as
-//!   consuming live scenes until that composition slice lands.
+//!   Integration status: `scene_paint_for` is composed into the shipped
+//!   present loop (`Runtime`'s leaf pass, `runtime::scene_present`, CTX-1630)
+//!   whenever a `PanelRuntime` is installed as the runtime's scene host; the
+//!   plan entry points above remain the host-facing projection. The `ui.rich`
+//!   mount path still does not attach a scene from a plugin mount in
+//!   production, so no live plugin content reaches these slots yet. Do not
+//!   describe plugin rich content as shipped until that mount slice lands.
 //!
 //! The runtime holds no PTY descriptor, GPU object, or OS window handle;
 //! those remain with `bitty-pty`, `bitty-render`, and `bitty-platform`.

@@ -108,8 +108,10 @@ coverage is absent.
   the grid-corner glyph fallback.
 - `src/scene.rs` — scene paint path: an admitted `bitty-rich::scene::Scene`
   becomes a bounded, leaf-clipped paint list (`paint_scene`,
-  `paint_scene_prefix`, `ScenePaintCache`). Library seam only: the runtime
-  adapters are test-only until CTX-1630 wires the present loop, so this module
-  does not paint live content yet.
+  `paint_scene_prefix`, `ScenePaintCache`). The shipped present loop consumes
+  this module through `bitty-runtime` (`Runtime` → `PanelRuntime::scene_paint_for`,
+  CTX-1630): fills, overlay-seam glyphs, and damage compose into the real
+  frame. The `ui.rich` plugin mount path that attaches a scene to a panel is
+  the remaining slice of bitty#2760.
 - `src/error.rs` — owned error types.
 - `tests/` — headless pipeline and seam tests.

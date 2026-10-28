@@ -154,6 +154,7 @@ pub mod pointer;
 pub mod present;
 pub mod pty;
 pub mod resize;
+pub mod scene_present;
 pub mod scrollbar;
 pub mod search;
 pub mod search_host;
@@ -175,6 +176,7 @@ pub use self::fx::{
 pub use self::kitty_file::KittyLocalReadError;
 pub use self::kitty_images::{KittyDisplayOutcome, KittyImageError};
 pub use self::present::{ImeCursorArea, PresentStats};
+pub use self::scene_present::{SCENE_A11Y_KIND, SceneA11yRun, SceneFrameReport};
 pub use self::search_host::{
     ClipboardCaller, HostOpError, SearchHostQuery, SearchResultHandle, SelectionDriveOutcome,
     SelectionHandle, YankOutcome,
@@ -590,6 +592,29 @@ pub struct Runtime {
     /// exhaustion reset. Entries are pruned to the visible allocation set
     /// after every presented frame. See `runtime::present`.
     presented_leaf_frames: std::collections::BTreeMap<ViewId, self::present::PresentedLeaf>,
+    /// Installed scene host (CTX-1630 / OQ-051).
+    ///
+    /// The composition root installs the same [`PanelRuntime`](crate::registry::PanelRuntime)
+    /// that owns the panel scene slots; the present loop asks it for each
+    /// visible leaf's leaf-clipped paint list. `None` is fail-closed: no leaf
+    /// paints a scene and the grid path is unchanged. This is a borrow of the
+    /// one owner, not a second scene store.
+    scene_host: Option<crate::registry::PanelRuntime>,
+    /// Retained scene primitives per visible leaf (CTX-1630).
+    ///
+    /// A refused paint re-emits the previous primitives for an unchanged
+    /// surface/clip/fade/atlas epoch, so a refused revision never clears the
+    /// visible scene. Dropped on detach, geometry drift, atlas reset, and
+    /// when the leaf leaves the visible allocation set.
+    presented_scene_frames: std::collections::BTreeMap<ViewId, self::scene_present::RetainedScene>,
+    /// Scene diagnostics for the last presented frame (CTX-1630).
+    scene_frame: self::scene_present::SceneFrameReport,
+    /// Cumulative typed scene paint refusals (CTX-1630).
+    scene_paint_refusals: u64,
+    /// Last typed scene paint refusal, for attribution (CTX-1630).
+    last_scene_paint_refusal: Option<bitty_render::scene::ScenePaintError>,
+    /// Cumulative accessibility refusals for scene text (CTX-1630).
+    scene_a11y_refusals: u64,
     /// Consecutive frames dropped because the overlay phase reset the glyph
     /// atlas after the leaf pass planned its slots (issue #1409, CTX-0797).
     ///
@@ -1950,6 +1975,12 @@ impl Runtime {
             component_events_dropped: 0,
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
+            scene_host: None,
+            presented_scene_frames: std::collections::BTreeMap::new(),
+            scene_frame: self::scene_present::SceneFrameReport::default(),
+            scene_paint_refusals: 0,
+            last_scene_paint_refusal: None,
+            scene_a11y_refusals: 0,
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
             pending_paint_redraw: false,
@@ -2244,6 +2275,12 @@ impl Runtime {
             component_events_dropped: 0,
             last_presented_generation: u64::MAX,
             presented_leaf_frames: std::collections::BTreeMap::new(),
+            scene_host: None,
+            presented_scene_frames: std::collections::BTreeMap::new(),
+            scene_frame: self::scene_present::SceneFrameReport::default(),
+            scene_paint_refusals: 0,
+            last_scene_paint_refusal: None,
+            scene_a11y_refusals: 0,
             stale_atlas_frame_rejects: 0,
             pending_full_redraw: true,
             pending_paint_redraw: false,

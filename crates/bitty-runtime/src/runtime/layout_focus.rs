@@ -800,9 +800,23 @@ impl Runtime {
     /// (RFC-0002 frame-on-demand: `None` when idle, so the app can sleep).
     /// Fx pulses join the same gate (CTX-1139): a live pulse is a wakeup
     /// source, a completed one schedules nothing.
+    ///
+    /// Reads the wall clock: production callers want "the next frame from
+    /// now". Tests that drive a virtual clock use
+    /// [`Self::animation_deadline_at`] so a loaded runner stalling the thread
+    /// between arming and asserting cannot move the answer (bitty#2781).
     #[must_use]
     pub fn animation_deadline(&self) -> Option<std::time::Instant> {
-        let now = std::time::Instant::now();
+        self.animation_deadline_at(std::time::Instant::now())
+    }
+
+    /// [`Self::animation_deadline`] against an injected clock.
+    ///
+    /// Deterministic twin used by the virtual-clock animation tests: the
+    /// deadline is derived only from the transitions armed at `now`, so
+    /// scheduler delay between arming and querying cannot inflate it.
+    #[must_use]
+    pub fn animation_deadline_at(&self, now: std::time::Instant) -> Option<std::time::Instant> {
         match (self.animator.next_deadline(now), self.fx.next_deadline(now)) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
@@ -812,9 +826,20 @@ impl Runtime {
     }
 
     /// Whether any panel animation or fx pulse is currently active.
+    ///
+    /// Reads the wall clock; virtual-clock tests use
+    /// [`Self::animations_active_at`] (bitty#2781).
     #[must_use]
     pub fn animations_active(&self) -> bool {
-        let now = std::time::Instant::now();
+        self.animations_active_at(std::time::Instant::now())
+    }
+
+    /// [`Self::animations_active`] against an injected clock.
+    ///
+    /// A transition that the virtual clock says has expired is not active,
+    /// regardless of how long the runner stalled the thread since arming.
+    #[must_use]
+    pub fn animations_active_at(&self, now: std::time::Instant) -> bool {
         self.animator.is_active(now) || self.fx.is_active(now)
     }
 

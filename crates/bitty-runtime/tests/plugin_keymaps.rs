@@ -19,6 +19,8 @@ use bitty_runtime::plugin_runtime::{
     EmptySettings, KeymapSource, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
 };
 
+mod common;
+
 struct NoSnapshot;
 
 impl SnapshotSource for NoSnapshot {
@@ -113,13 +115,6 @@ fn pid(id: &str) -> PluginId {
     PluginId::new(id).expect("id")
 }
 
-fn string(value: LuaValue) -> String {
-    match value {
-        LuaValue::String(s) => s,
-        other => panic!("expected a string result, got {other:?}"),
-    }
-}
-
 fn activate_all(rt: &mut PluginRuntime) {
     rt.discover();
     for (id, result) in rt.activate_discovered() {
@@ -195,7 +190,7 @@ fn default_table() -> Vec<ResolvedKeymap> {
 }
 
 fn probe_runtime(capabilities: &[&str]) -> (PluginRuntime, Rc<FixedKeymaps>) {
-    probe_runtime_with_budget(capabilities, None)
+    probe_runtime_with_budget(capabilities, Some(common::HARNESS_VM_WALL_BUDGET_MS))
 }
 
 fn probe_runtime_with_budget(
@@ -213,18 +208,22 @@ fn probe_runtime_with_budget(
     let source = Rc::new(FixedKeymaps::default());
     *source.0.borrow_mut() = default_table();
     let mut rt = runtime(root, Some(source.clone()));
-    // The budget is read while building the VM during activation; setting it
-    // afterwards is a no-op for an already-activated plugin (bitty#2463).
+    // bitty#2781: probe the capability, not the wall clock. Raises only the
+    // wall dimensions through the documented test-only seams.
+    rt.set_host_call_deadline_ms(Some(common::HARNESS_HOST_CALL_DEADLINE_MS));
+    // Activation callbacks are slice-only and cannot be parked, so the wall
+    // seam is installed before activation; a park in a command body is still
+    // settled on the documented cold-tick resume.
     rt.set_vm_wall_budget_ms(wall_budget_ms);
     activate_all(&mut rt);
     (rt, source)
 }
 
 fn run(rt: &mut PluginRuntime, command: &str) -> String {
-    string(
-        rt.dispatch_command(&pid("xuepoo.keymapprobe"), command, &[])
-            .unwrap_or_else(|error| panic!("dispatch {command}: {error}")),
-    )
+    // bitty#2781: RC-1 charges wall-clock time, so a loaded runner can park a
+    // body that used microseconds of CPU. Settle the documented cold-tick
+    // resume instead of requiring completion inside one default wall window.
+    common::settle_dispatch(rt, &pid("xuepoo.keymapprobe"), command, &[]).expect_string(command)
 }
 
 #[test]

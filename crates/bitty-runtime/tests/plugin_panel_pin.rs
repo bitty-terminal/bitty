@@ -20,6 +20,8 @@ use bitty_runtime::plugin_runtime::{
 };
 use bitty_runtime::{LayoutNode, Runtime, SplitAxis, UiRect, View, ViewId};
 
+mod common;
+
 struct NoSnapshot;
 
 impl SnapshotSource for NoSnapshot {
@@ -133,13 +135,6 @@ fn pid(id: &str) -> PluginId {
     PluginId::new(id).expect("id")
 }
 
-fn string(value: LuaValue) -> String {
-    match value {
-        LuaValue::String(s) => s,
-        other => panic!("expected a string result, got {other:?}"),
-    }
-}
-
 fn activate_all(rt: &mut PluginRuntime) {
     rt.discover();
     for (id, result) in rt.activate_discovered() {
@@ -224,15 +219,20 @@ fn probe_runtime(
     }
     let backend = with_backend.then(|| pin_backend(live.clone()));
     let mut rt = runtime(root, backend);
+    // bitty#2781: probe the capability, not the wall clock. Raises only the
+    // host-call and activation/dispatch wall dimensions through the documented
+    // test-only seams; a park is still settled on the cold-tick resume.
+    rt.set_host_call_deadline_ms(Some(common::HARNESS_HOST_CALL_DEADLINE_MS));
+    rt.set_vm_wall_budget_ms(Some(common::HARNESS_VM_WALL_BUDGET_MS));
     activate_all(&mut rt);
     (rt, pid(id), live)
 }
 
 fn run(rt: &mut PluginRuntime, id: &PluginId, command: &str) -> String {
-    string(
-        rt.dispatch_command(id, command, &[])
-            .unwrap_or_else(|error| panic!("dispatch {command}: {error}")),
-    )
+    // bitty#2781: RC-1 charges wall-clock time, so a loaded runner can park a
+    // body that used microseconds of CPU. Settle the documented cold-tick
+    // resume instead of requiring completion inside one default wall window.
+    common::settle_dispatch(rt, id, command, &[]).expect_string(command)
 }
 
 fn live_leaves(live: &Rc<RefCell<Runtime>>) -> Vec<ViewId> {

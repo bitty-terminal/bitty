@@ -697,6 +697,16 @@ pub(crate) fn discover_with_roots(
         settings: Rc::new(EmptySettings),
         snapshot: host_snapshot,
     });
+    // bitty#2781: `#[cfg(test)]` only. Composition-root capability probes
+    // assert plugin wiring, not the activation wall window; activation is
+    // slice-only and cannot be parked, so a descheduled runner leaves the
+    // plugin inactive with no recovery. Production activation keeps the RC-1
+    // slice, and other probes stay at the production window because the
+    // override is scoped by `with_harness_activation_wall`.
+    #[cfg(test)]
+    if let Some(wall_ms) = crate::test_support::harness_activation_wall_ms() {
+        runtime.set_vm_wall_budget_ms(Some(wall_ms));
+    }
     // CTX-1195 (issue #2010): seed the per-plugin user-config root before
     // activation so every generation resolves its canonical
     // `plugins/<owner>.<name>.lua`, unambiguous short alias, or legacy
@@ -950,7 +960,8 @@ mod tests {
         );
     }
 
-    /// Host-call deadline for the composition-root probes (bitty#2432).
+    /// Host-call deadline for the composition-root probes (bitty#2432,
+    /// bitty#2781).
     ///
     /// Production bounds every `bitty.*` call at
     /// [`bitty_lua::DEFAULT_HOST_DEADLINE_MS`] (the RC-1 50 ms slice) on a raw
@@ -958,20 +969,26 @@ mod tests {
     /// test thread mid-call is charged the whole stall. `fs.list` here reads two
     /// seeded files, yet `main` reported
     /// `list: dispatch failed: Vm("runtime error: E_TIMEOUT: host call exceeded
-    /// its deadline")` on a loaded shard (bitty#2432). A synthetic clock cannot
-    /// drive this deadline: the same value is handed to expiry-aware host
-    /// services as a real `Instant` deadline they compare against their own
-    /// `Instant::now()`. So the probe widens only that one dimension (10x, the
-    /// bitty#1744/#1727 treatment); production keeps
-    /// `DEFAULT_HOST_DEADLINE_MS`, and enforcement stays pinned by
-    /// `bitty-lua/tests/host_bridge.rs`.
+    /// its deadline")` on a loaded shard (bitty#2432); `runtime.inspect()` did
+    /// the same in bitty#2781. A synthetic clock cannot drive this deadline:
+    /// the same value is handed to expiry-aware host services as a real
+    /// `Instant` deadline they compare against their own `Instant::now()`.
     ///
-    /// The RC-1 callback wall budget is left at production here because this
-    /// probe is the composition root and activation runs inside
-    /// `discover_with_roots`, before any seam could raise it; a stall long
-    /// enough to trip that budget surfaces as
-    /// `init.lua suspended: WallClockExceeded`, the bitty#2427 class.
-    const HARNESS_HOST_CALL_DEADLINE_MS: u64 = 10 * bitty_lua::DEFAULT_HOST_DEADLINE_MS;
+    /// So the probes widen only that one dimension through the documented
+    /// test-only seam, and to [`bitty_lua::RC1_CALLBACK_CEILING_MS`] rather
+    /// than an arbitrary multiple: that is the documented cumulative wall
+    /// envelope one callback may consume, so a stall long enough to trip this
+    /// deadline also exhausts the callback budget (which stays at production
+    /// values here). Production keeps `DEFAULT_HOST_DEADLINE_MS`, and
+    /// enforcement stays pinned by `bitty-lua/tests/host_bridge.rs` and
+    /// `bitty-lua/tests/host_budget_accounting.rs`.
+    ///
+    /// The RC-1 wall window is raised by [`discover_probe`] before activation
+    /// for the same reason (activation callbacks are slice-only and cannot be
+    /// parked), scoped to that call so probes that pin park semantics keep the
+    /// production slice. A command body that still parks is settled on the
+    /// documented cold-tick resume by [`settle_dispatch`].
+    const HARNESS_HOST_CALL_DEADLINE_MS: u64 = bitty_lua::RC1_CALLBACK_CEILING_MS;
 
     fn fs_list_probe_root(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1060,8 +1077,8 @@ mod tests {
             config_file: None,
             config_profile: None,
         };
-        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], Some(home), None)
-            .expect("dev root must yield a session");
+        let session =
+            discover_probe(&seed, root, Some(home), None).expect("dev root must yield a session");
         let mut runtime = session.runtime;
         // bitty#2432: activation already ran inside `discover_with_roots`, so the
         // deadline is widened on the live VMs (the bridge shares its deadline
@@ -1152,16 +1169,18 @@ mod tests {
             granted: vec!["config.manage".to_string()],
         };
         bitty_runtime::plugin_runtime::write_index(&store, &[record]).expect("store index");
-        let session = discover_with_roots(
-            false,
-            80,
-            24,
-            &seed,
-            Some(store.clone()),
-            Vec::new(),
-            None,
-            Some(config_dir.clone()),
-        )
+        let session = crate::test_support::with_harness_activation_wall(|| {
+            discover_with_roots(
+                false,
+                80,
+                24,
+                &seed,
+                Some(store.clone()),
+                Vec::new(),
+                None,
+                Some(config_dir.clone()),
+            )
+        })
         .expect("store package must yield a session");
         let mut runtime = session.runtime;
         runtime.set_host_call_deadline_ms(Some(HARNESS_HOST_CALL_DEADLINE_MS));
@@ -1251,6 +1270,25 @@ mod tests {
         }
     }
 
+    /// Composition-root discovery for capability probes (bitty#2781).
+    ///
+    /// Wraps [`discover_with_roots`] in the scoped activation wall seam:
+    /// activation callbacks are slice-only and cannot be parked, so a runner
+    /// that deschedules the test thread mid-activation would otherwise leave
+    /// the plugin inactive with no recovery. The probe asserts wiring, not the
+    /// activation window; park and budget semantics stay at production values
+    /// everywhere else because the override is scoped to this call.
+    fn discover_probe(
+        seed: &StartupSeed<'_>,
+        root: PathBuf,
+        fs_home: Option<PathBuf>,
+        settings_dir: Option<PathBuf>,
+    ) -> Option<PluginSession> {
+        crate::test_support::with_harness_activation_wall(|| {
+            discover_with_roots(false, 80, 24, seed, None, vec![root], fs_home, settings_dir)
+        })
+    }
+
     /// Issue #2396 end-to-end: a granted development plugin reads the
     /// cold-path snapshot through `bitty.runtime.inspect()`; the call path
     /// takes no arguments and receives the bounded table.
@@ -1259,10 +1297,15 @@ mod tests {
         let root = inspect_probe_root("inspect");
         let context = inspect_context(false);
         let seed = inspect_seed(&context);
-        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
-            .expect("dev root must yield a session");
+        let session =
+            discover_probe(&seed, root, None, None).expect("dev root must yield a session");
         let mut runtime = session.runtime;
         let plugin_id = bitty_plugin_host::manifest::PluginId::new("xuepoo.inspect").expect("id");
+        // bitty#2781: `runtime.inspect()` walks live state through a host call,
+        // whose deadline covers real wall time (including runner scheduler
+        // delay). Widen only that harness dimension (bitty#2432 treatment) and
+        // settle an RC-1 park on the cold ticks, never a fixed default window.
+        runtime.set_host_call_deadline_ms(Some(HARNESS_HOST_CALL_DEADLINE_MS));
         // bitty #2409: runtime.inspect walks live state, so the probe settles
         // an RC-1 park on the cold ticks instead of assuming one wall window.
         let value = settle_dispatch(&mut runtime, plugin_id.as_str(), "inspect", &[])
@@ -1282,8 +1325,8 @@ mod tests {
         // Runtime is normal mode; the context claims safe mode.
         let context = inspect_context(true);
         let seed = inspect_seed(&context);
-        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
-            .expect("dev root must yield a session");
+        let session =
+            discover_probe(&seed, root, None, None).expect("dev root must yield a session");
         let mut runtime = session.runtime;
         let plugin_id = bitty_plugin_host::manifest::PluginId::new("xuepoo.inspect").expect("id");
         // bitty #2409: a park is settled first, so the terminal refusal under
@@ -1370,15 +1413,18 @@ mod tests {
             config_file: None,
             config_profile: None,
         };
-        let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
-            .expect("dev root must yield a session");
+        let session =
+            discover_probe(&seed, root, None, None).expect("dev root must yield a session");
         let live = Rc::clone(&session.keymaps);
         let mut runtime = session.runtime;
+        // bitty#2781: `keymaps.list` is a read-only host call; the composition
+        // root keeps the production host deadline, so widen only that harness
+        // dimension (bitty#2432 treatment) and settle an RC-1 park on the
+        // documented cold-tick resume instead of assuming one wall window.
+        runtime.set_host_call_deadline_ms(Some(HARNESS_HOST_CALL_DEADLINE_MS));
         let plugin_id = bitty_plugin_host::manifest::PluginId::new("xuepoo.keymaps").expect("id");
         assert_eq!(
-            runtime
-                .dispatch_command(&plugin_id, "list", &[])
-                .expect("dispatch bitty.keymaps.list command"),
+            settle_dispatch(&mut runtime, plugin_id.as_str(), "list", &[]).expect_value("list"),
             LuaValue::String(format!("{}:{}:false", table.len(), table.len())),
         );
         live.publish(&[bitty_config::ResolvedKeymap {
@@ -1388,9 +1434,8 @@ mod tests {
             from_default: true,
         }]);
         assert_eq!(
-            runtime
-                .dispatch_command(&plugin_id, "list", &[])
-                .expect("dispatch after republish"),
+            settle_dispatch(&mut runtime, plugin_id.as_str(), "list", &[])
+                .expect_value("list after republish"),
             LuaValue::String("1:1:false".to_string()),
             "the call reflects the live table, never a cached page"
         );
@@ -2357,7 +2402,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             config_file: None,
             config_profile: None,
         };
-        discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
+        discover_probe(&seed, root, None, None)
             .expect("dev root must yield a session")
             .runtime
     }

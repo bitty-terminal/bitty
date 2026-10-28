@@ -156,6 +156,11 @@ pub enum AuditAction {
     OrphanVerify,
     /// `lease.heartbeat`.
     Heartbeat,
+    /// A wire-level refusal that never resolved to a service method: a frame
+    /// error, the pre-authentication byte budget or deadline, a malformed
+    /// envelope or id, a rate limit before parsing, an unknown or malformed
+    /// method name, or a frame before the negotiate response.
+    Wire,
     /// Audit event label `session.bind` (internal lifecycle step).
     Bind,
     /// Audit event label `session.worker_exit` (internal lifecycle step).
@@ -188,6 +193,7 @@ impl AuditAction {
             Self::Stop => "daemon.stop",
             Self::OrphanVerify => "daemon.orphans.verify",
             Self::Heartbeat => "lease.heartbeat",
+            Self::Wire => "wire",
             Self::Bind => "session.bind",
             Self::WorkerExit => "session.worker_exit",
         }

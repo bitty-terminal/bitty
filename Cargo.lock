@@ -221,6 +221,8 @@ dependencies = [
 name = "bitty-daemon"
 version = "0.0.30"
 dependencies = [
+ "bitty-ipc-api",
+ "bitty-ipc-core",
  "getrandom 0.4.3",
  "nix 0.31.3",
  "serde_json",

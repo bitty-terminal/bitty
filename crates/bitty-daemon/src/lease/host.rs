@@ -1178,6 +1178,54 @@ impl SessionHost {
         }
     }
 
+    /// The session a live or retained lease handle belongs to.
+    ///
+    /// A handle issued to another session is not visible through this lookup;
+    /// the service maps a foreign handle to the uniform `NotFound`. This is the
+    /// lookup `session.detach` and `session.control.transfer` need for a target
+    /// attach id before they build the control relation.
+    #[must_use]
+    pub fn session_for_lease(&self, attach_id: AttachId) -> Option<SessionId> {
+        self.lease_sessions.get(&attach_id).copied()
+    }
+
+    /// Resolve a stored 64-bit result ref to one of a session's lease handles.
+    ///
+    /// The service derives `result_ref` from the first 64 bits of the attach id
+    /// so a keyed replay needs no unbounded reference table. A detached lease
+    /// is gone and yields `None` (the replay reports `not_attached`); two live
+    /// ids sharing 64 bits also yield `None` and the replay fails closed.
+    #[must_use]
+    pub fn find_attach_by_ref(&self, session_id: SessionId, result_ref: u64) -> Option<AttachId> {
+        let state = self.sessions.get(&session_id)?;
+        let mut found = None;
+        for attach_id in state.leases.keys() {
+            let mut prefix = [0u8; 8];
+            prefix.copy_from_slice(&attach_id.as_bytes()[..8]);
+            if u64::from_be_bytes(prefix) == result_ref {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(*attach_id);
+            }
+        }
+        found
+    }
+
+    /// Verify a presented control token without mutating anything.
+    ///
+    /// Visibility for `session.status` and for a reconnect is "holds a live
+    /// lease **or** presents the current token". This read-only check never
+    /// rotates, renews, or retires the token; the effectful paths still verify
+    /// through [`Self::claim_controller`], [`Self::abort`], or
+    /// [`Self::transfer_control`].
+    #[must_use]
+    pub fn verify_control_token(&self, session_id: SessionId, token: &ControlToken) -> bool {
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|state| state.token_matches(token))
+    }
+
     /// Record one controller-authorized resize (`D-03`, `D-09`).
     ///
     /// The PTY resize itself belongs to the content plane; this method

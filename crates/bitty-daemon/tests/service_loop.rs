@@ -1,0 +1,888 @@
+#![cfg(target_os = "linux")]
+
+//! bitty#2607 / CTX-1531: process-level service-loop behavior.
+//!
+//! These tests start the real `bittyd start` binary against a throwaway
+//! `XDG_RUNTIME_DIR` and `XDG_STATE_HOME`, speak the bitty-ipc v1 envelope over
+//! the real Unix socket, and assert:
+//!
+//! - the endpoint is a `0600` socket inside a `0700` directory and a plain
+//!   `bittyd` invocation binds nothing;
+//! - a second start returns the typed already-running result and touches
+//!   nothing;
+//! - the daemon never opens a TCP listener (checked through `/proc/<pid>/fd`
+//!   against `/proc/net/tcp` and `/proc/net/tcp6`);
+//! - `daemon.negotiate` authenticates the operator capability and
+//!   `daemon.stop force` shuts the loop down cleanly, removing the socket;
+//! - closing refusals (`VersionMismatch`, `Unauthenticated`,
+//!   `Denied/AlreadyNegotiated`) flush their refusal frame and then really
+//!   close, checked as an EOF inside the negotiate deadline;
+//! - the handshake advertises only the three baseline `session.*` scopes plus
+//!   `process.spawn`, never an ambient `terminal.*` scope;
+//! - a stopping daemon refuses a pipelined mutation on the same drain;
+//! - the pre-authentication byte budget closes a dribbled frame and writes one
+//!   aggregated audit record;
+//! - `SIGTERM`/`SIGINT` drain to exit `0`, and endpoint tamper exits `6`.
+//!
+//! Linux is the only servable cell in this slice; the test is gated on it.
+
+#![cfg(target_os = "linux")]
+
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+const BITTYD: &str = env!("CARGO_BIN_EXE_bittyd");
+
+static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
+
+struct TempRoot {
+    path: PathBuf,
+}
+
+impl TempRoot {
+    fn new(label: &str) -> Self {
+        let suffix = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "bittyd-loop-{label}-{}-{suffix}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("create temp root");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod 0700");
+        Self { path }
+    }
+
+    fn runtime(&self) -> PathBuf {
+        self.path.join("runtime")
+    }
+
+    fn state(&self) -> PathBuf {
+        self.path.join("state")
+    }
+
+    fn endpoint(&self) -> PathBuf {
+        self.runtime().join("bitty").join("bittyd.sock")
+    }
+
+    fn capability(&self) -> PathBuf {
+        self.runtime().join("bitty").join("bittyd.operator")
+    }
+
+    fn audit_log(&self) -> PathBuf {
+        self.state().join("bitty").join("audit").join("audit.log")
+    }
+}
+
+impl Drop for TempRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+struct Daemon {
+    child: Child,
+}
+
+impl Daemon {
+    fn start(root: &TempRoot) -> Self {
+        std::fs::create_dir_all(root.runtime()).expect("runtime dir");
+        std::fs::set_permissions(root.runtime(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod runtime");
+        std::fs::create_dir_all(root.state()).expect("state dir");
+        let child = Command::new(BITTYD)
+            .arg("start")
+            .env("XDG_RUNTIME_DIR", root.runtime())
+            .env("XDG_STATE_HOME", root.state())
+            .env_remove("BITTYD_ENDPOINT")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn bittyd start");
+        let daemon = Self { child };
+        daemon.wait_for_socket(&root.endpoint());
+        daemon
+    }
+
+    fn wait_for_socket(&self, socket: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if socket.exists() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("bittyd did not bind {} in time", socket.display());
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn wait(mut self) -> std::process::ExitStatus {
+        self.child.wait().expect("wait for bittyd")
+    }
+
+    /// Wait up to `budget` for the daemon to exit, then kill it.
+    fn wait_within(mut self, budget: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("bittyd did not exit within {budget:?}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Send a signal to the daemon this test started (a recorded pid, never a
+/// name- or pattern-based kill).
+fn send_signal(pid: u32, signal: &str) {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .expect("kill the recorded daemon pid");
+    assert!(status.success(), "kill -{signal} {pid} failed");
+}
+
+struct Client {
+    stream: UnixStream,
+    next_id: u64,
+}
+
+impl Client {
+    fn connect(socket: &Path) -> Self {
+        let stream = UnixStream::connect(socket).expect("connect");
+        // Linux attaches SCM_CREDENTIALS on send when the sending socket has
+        // SO_PASSCRED; a client that skips this is refused as Unauthenticated.
+        bitty_daemon::service::frame::enable_credentials(&stream).expect("per-frame credentials");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        Self { stream, next_id: 1 }
+    }
+
+    fn call(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id.to_string();
+        self.next_id += 1;
+        self.stream
+            .write_all(&encode_request(&id, method, params))
+            .expect("write frame");
+        self.recv()
+    }
+
+    /// Queue several requests in one write, so a mutation cannot be processed
+    /// before the stop that precedes it in the same drain.
+    fn send_batch(&mut self, requests: &[(&str, Value)]) -> Vec<String> {
+        let mut frames = Vec::new();
+        let mut ids = Vec::new();
+        for (method, params) in requests {
+            let id = self.next_id.to_string();
+            self.next_id += 1;
+            frames.extend_from_slice(&encode_request(&id, method, params.clone()));
+            ids.push(id);
+        }
+        self.stream.write_all(&frames).expect("write frames");
+        ids
+    }
+
+    fn recv(&mut self) -> Value {
+        let mut header = [0u8; 4];
+        self.stream.read_exact(&mut header).expect("read header");
+        let len = u32::from_be_bytes(header) as usize;
+        let mut payload = vec![0u8; len];
+        self.stream.read_exact(&mut payload).expect("read payload");
+        serde_json::from_slice(&payload).expect("response json")
+    }
+
+    fn negotiate(&mut self, operator_capability: Option<&str>) -> Value {
+        self.negotiate_with(operator_capability, None)
+    }
+
+    fn negotiate_with(
+        &mut self,
+        operator_capability: Option<&str>,
+        host_grant: Option<&str>,
+    ) -> Value {
+        let mut params = json!({"client_version": {"major": 1, "minor": 0}});
+        if let Some(capability) = operator_capability {
+            params["operator_capability"] = Value::String(capability.to_owned());
+        }
+        if let Some(grant) = host_grant {
+            params["host_grant"] = Value::String(grant.to_owned());
+        }
+        self.call("daemon.negotiate", params)
+    }
+
+    /// Write one raw frame (used for a wire version outside the contract).
+    fn send_raw_frame(&mut self, request: Value) {
+        let payload = serde_json::to_vec(&request).expect("encode request");
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        self.stream.write_all(&frame).expect("write frame");
+    }
+}
+
+fn read_capability(root: &TempRoot) -> String {
+    let raw = std::fs::read_to_string(root.capability()).expect("capability file");
+    raw.trim_end_matches('\n').to_owned()
+}
+
+/// Encode one v1 request as a length-prefixed frame.
+fn encode_request(id: &str, method: &str, params: Value) -> Vec<u8> {
+    let request = json!({"v": 1, "id": id, "method": method, "params": params});
+    let payload = serde_json::to_vec(&request).expect("encode request");
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+/// Assert a real EOF arrives within `budget`.
+///
+/// A read timeout is *not* EOF: `WouldBlock`/`TimedOut` panics, so a daemon
+/// that keeps the connection open fails the test instead of passing on the
+/// deadline.
+fn assert_eof(stream: &mut UnixStream, budget: Duration) {
+    stream.set_read_timeout(Some(budget)).expect("read timeout");
+    let mut byte = [0u8; 1];
+    match stream.read(&mut byte) {
+        Ok(0) => {}
+        Ok(read) => panic!("expected EOF within {budget:?}, read {read} bytes"),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+            ) => {}
+        Err(error) => panic!("expected EOF within {budget:?}, got {error:?}"),
+    }
+}
+
+/// Count audit lines carrying `needle`.
+fn audit_lines_with(root: &TempRoot, needle: &str) -> usize {
+    let log = std::fs::read_to_string(root.audit_log()).unwrap_or_default();
+    log.lines().filter(|line| line.contains(needle)).count()
+}
+
+/// Socket inodes the process holds, plus any of them in a TCP LISTEN row.
+fn tcp_listeners_of_process(pid: u32) -> Vec<String> {
+    let mut owned = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("process fds") {
+        let entry = entry.expect("fd entry");
+        let target = std::fs::read_link(entry.path()).expect("fd target");
+        if let Some(text) = target.to_str() {
+            if let Some(inode) = text
+                .strip_prefix("socket:[")
+                .and_then(|rest| rest.strip_suffix(']'))
+            {
+                owned.push(inode.to_owned());
+            }
+        }
+    }
+    let mut listeners = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(content) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 10 {
+                continue;
+            }
+            if fields[3] == "0A" && owned.iter().any(|inode| inode == fields[9]) {
+                listeners.push(format!("{table}: {}", fields[1]));
+            }
+        }
+    }
+    listeners
+}
+
+#[test]
+fn start_serves_the_endpoint_and_never_opens_a_tcp_listener() {
+    let root = TempRoot::new("serve");
+    let daemon = Daemon::start(&root);
+    let socket = root.endpoint();
+    let metadata = std::fs::symlink_metadata(&socket).expect("socket");
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::symlink_metadata(socket.parent().expect("dir"))
+            .expect("dir")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert!(
+        tcp_listeners_of_process(daemon.pid()).is_empty(),
+        "bittyd must not open a TCP listener: {:?}",
+        tcp_listeners_of_process(daemon.pid())
+    );
+
+    let mut client = Client::connect(&socket);
+    let response = client.negotiate(None);
+    assert_eq!(response["ok"], true, "{response}");
+    let result = &response["result"];
+    assert_eq!(result["wire_version"], 1);
+    assert_eq!(result["service_api_version"]["major"], 1);
+    assert_eq!(result["daemon_state"], "running");
+    assert!(result["client_id"].as_str().expect("client id").len() == 32);
+    let scopes = result["scopes"].as_array().expect("scopes");
+    let advertised: Vec<&str> = scopes
+        .iter()
+        .map(|scope| scope.as_str().expect("scope"))
+        .collect();
+    assert_eq!(
+        advertised,
+        [
+            "session.inspect",
+            "session.attach",
+            "session.control",
+            "process.spawn",
+        ],
+        "the baseline is the three session scopes plus process.spawn only"
+    );
+    assert!(!scopes.iter().any(|scope| scope == "session.host"));
+    assert!(!scopes.iter().any(|scope| scope == "daemon.control"));
+    assert!(
+        !scopes.iter().any(|scope| scope
+            .as_str()
+            .is_some_and(|name| name.starts_with("terminal."))),
+        "no ambient terminal content scope is granted"
+    );
+    assert_eq!(result["capabilities"]["worker_sessions"], false);
+    assert_eq!(
+        result["limits"].as_array().expect("limits").len(),
+        bitty_daemon::limits::LIMIT_COUNT
+    );
+
+    // A consumer may not read daemon status.
+    let denied = client.call("daemon.status", Value::Null);
+    assert_eq!(denied["ok"], false);
+    assert_eq!(denied["error"]["code"], "ScopeViolation");
+    assert_eq!(denied["error"]["class"], "Denied");
+
+    // The operator capability opens the operator surface.
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&socket);
+    let response = operator.negotiate(Some(&capability));
+    assert_eq!(response["ok"], true, "{response}");
+    let scopes = response["result"]["scopes"].as_array().expect("scopes");
+    assert!(scopes.iter().any(|scope| scope == "daemon.control"));
+    let status = operator.call("daemon.status", Value::Null);
+    assert_eq!(status["ok"], true, "{status}");
+    assert_eq!(status["result"]["audit_degraded"], false);
+
+    let stopped = operator.call("daemon.stop", json!({"mode": "force"}));
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["result"]["accepted"], true);
+    let status = daemon.wait();
+    assert_eq!(status.code(), Some(0));
+    assert!(!socket.exists(), "the socket is removed on clean shutdown");
+}
+
+#[test]
+fn a_second_start_is_a_typed_already_running_result() {
+    let root = TempRoot::new("second");
+    let daemon = Daemon::start(&root);
+    let output = Command::new(BITTYD)
+        .arg("start")
+        .env("XDG_RUNTIME_DIR", root.runtime())
+        .env("XDG_STATE_HOME", root.state())
+        .env_remove("BITTYD_ENDPOINT")
+        .output()
+        .expect("second start");
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("already running"), "stderr: {stderr}");
+
+    // The first instance still serves.
+    let mut client = Client::connect(&root.endpoint());
+    assert_eq!(client.negotiate(None)["ok"], true);
+
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    assert_eq!(daemon.wait().code(), Some(0));
+}
+
+#[test]
+fn a_failed_operator_capability_is_one_static_refusal_and_closes() {
+    let root = TempRoot::new("auth");
+    let daemon = Daemon::start(&root);
+    let mut client = Client::connect(&root.endpoint());
+    let wrong = "0".repeat(64);
+    let response = client.negotiate(Some(&wrong));
+    assert_eq!(response["ok"], false, "{response}");
+    assert_eq!(response["error"]["code"], "Unauthenticated");
+    assert_eq!(response["error"]["class"], "Unauthenticated");
+    assert_eq!(response["error"]["message"], "authentication failed");
+    assert!(
+        !response["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("bittyd.operator"),
+        "the refusal must not reveal the capability file"
+    );
+    // The connection closed *after* flushing the refusal: a real EOF arrives
+    // well inside the 5 s negotiate deadline (a timeout is a failure).
+    assert_eof(&mut client.stream, Duration::from_secs(2));
+
+    // The daemon is still healthy for a different connection.
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    assert_eq!(daemon.wait().code(), Some(0));
+}
+
+/// Stop the daemon through the operator capability and wait for exit.
+fn stop_cleanly(root: &TempRoot, daemon: Daemon) -> std::process::ExitStatus {
+    let capability = read_capability(root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    daemon.wait_within(Duration::from_secs(10))
+}
+
+#[test]
+fn closing_refusals_flush_the_frame_and_then_close() {
+    let root = TempRoot::new("closing");
+    let daemon = Daemon::start(&root);
+
+    // A second negotiate: the refusal frame is delivered, then EOF.
+    let mut client = Client::connect(&root.endpoint());
+    assert_eq!(client.negotiate(None)["ok"], true);
+    let second = client.call(
+        "daemon.negotiate",
+        json!({"client_version": {"major": 1, "minor": 0}}),
+    );
+    assert_eq!(second["ok"], false);
+    assert_eq!(second["error"]["code"], "AlreadyNegotiated");
+    assert_eq!(second["error"]["class"], "Denied");
+    assert_eof(&mut client.stream, Duration::from_secs(2));
+
+    // A frame before the negotiate response: refused and closed.
+    let mut before = Client::connect(&root.endpoint());
+    let refused = before.call(
+        "session.create",
+        json!({"kind": "terminal", "idempotency_key": "before"}),
+    );
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["error"]["code"], "AlreadyNegotiated");
+    assert_eof(&mut before.stream, Duration::from_secs(2));
+
+    // A service version mismatch: refused and closed.
+    let mut version = Client::connect(&root.endpoint());
+    let mismatch = version.call(
+        "daemon.negotiate",
+        json!({"client_version": {"major": 2, "minor": 0}}),
+    );
+    assert_eq!(mismatch["ok"], false);
+    assert_eq!(mismatch["error"]["code"], "VersionMismatch");
+    assert_eq!(mismatch["error"]["class"], "Validation");
+    assert_eof(&mut version.stream, Duration::from_secs(2));
+
+    // A wire version mismatch: refused and closed.
+    let mut wire = Client::connect(&root.endpoint());
+    wire.send_raw_frame(json!({
+        "v": 99,
+        "id": "wire-1",
+        "method": "daemon.negotiate",
+        "params": {"client_version": {"major": 1, "minor": 0}},
+    }));
+    let refused = wire.recv();
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["error"]["code"], "VersionMismatch");
+    assert_eof(&mut wire.stream, Duration::from_secs(2));
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn a_stopping_daemon_refuses_a_pipelined_create() {
+    let root = TempRoot::new("stopping");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    assert_eq!(minted["ok"], true, "{minted}");
+    let grant = minted["result"]["grant"]
+        .as_str()
+        .expect("host grant bearer")
+        .to_owned();
+
+    // One connection carries both the operator capability (to stop) and the
+    // consumed host grant (to create), so the stop and the create are drained
+    // in one read on one connection.
+    let mut client = Client::connect(&root.endpoint());
+    let response = client.negotiate_with(Some(&capability), Some(&grant));
+    assert_eq!(response["ok"], true, "{response}");
+    let scopes: Vec<&str> = response["result"]["scopes"]
+        .as_array()
+        .expect("scopes")
+        .iter()
+        .map(|scope| scope.as_str().expect("scope"))
+        .collect();
+    assert!(scopes.contains(&"session.host"), "{scopes:?}");
+    assert!(scopes.contains(&"daemon.control"), "{scopes:?}");
+
+    let ids = client.send_batch(&[
+        ("daemon.stop", json!({"mode": "force"})),
+        (
+            "session.create",
+            json!({"kind": "terminal", "idempotency_key": "pipelined"}),
+        ),
+    ]);
+    let stopped = client.recv();
+    let created = client.recv();
+    assert_eq!(stopped["id"], ids[0]);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["result"]["accepted"], true);
+    assert_eq!(stopped["result"]["terminated"], 0);
+    assert_eq!(created["id"], ids[1]);
+    assert_eq!(created["ok"], false, "a stopping daemon creates nothing");
+    assert_eq!(created["error"]["code"], "DaemonStopping");
+    assert_eq!(created["error"]["class"], "Denied");
+
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+    assert_eq!(
+        audit_lines_with(&root, "a=session.create r=refused c=daemon_stopping"),
+        1,
+        "the stopped create is attributed once"
+    );
+}
+
+#[test]
+fn a_pre_authentication_budget_closes_a_dribbled_frame() {
+    let root = TempRoot::new("budget");
+    let daemon = Daemon::start(&root);
+    let mut client = Client::connect(&root.endpoint());
+
+    // Declare a `max_frame_bytes` body and send 20 KiB without negotiating.
+    // The pre-auth budget is 8 KiB, so the daemon refuses mid-assembly.
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&200_000u32.to_be_bytes());
+    frame.extend(std::iter::repeat_n(b'x', 20_000));
+    client.stream.write_all(&frame).expect("dribbled frame");
+    assert_eof(&mut client.stream, Duration::from_secs(2));
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    assert_eq!(
+        audit_lines_with(&root, "a=wire r=refused c=limit_exceeded"),
+        1,
+        "one aggregated record for the budget closure"
+    );
+}
+
+#[test]
+fn an_unnegotiated_connection_past_the_deadline_is_closed_with_one_record() {
+    let root = TempRoot::new("deadline");
+    let daemon = Daemon::start(&root);
+    let mut client = Client::connect(&root.endpoint());
+
+    // `negotiate_timeout_ms` is 5 000 ms at the compiled defaults.
+    std::thread::sleep(Duration::from_millis(5_500));
+    assert_eof(&mut client.stream, Duration::from_secs(3));
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    assert_eq!(
+        audit_lines_with(&root, "a=wire r=refused c=timeout"),
+        1,
+        "one aggregated record for the deadline closure"
+    );
+}
+
+#[test]
+fn sigterm_and_sigint_drain_to_exit_zero() {
+    for signal in ["TERM", "INT"] {
+        let root = TempRoot::new(&format!("signal-{}", signal.to_lowercase()));
+        let daemon = Daemon::start(&root);
+        let mut client = Client::connect(&root.endpoint());
+        assert_eq!(client.negotiate(None)["ok"], true);
+        send_signal(daemon.pid(), signal);
+        let status = daemon.wait_within(Duration::from_secs(10));
+        assert_eq!(status.code(), Some(0), "SIG{signal} drains cleanly");
+        assert!(
+            !root.endpoint().exists(),
+            "the socket is removed after SIG{signal}"
+        );
+    }
+}
+
+#[test]
+fn endpoint_tamper_exits_six() {
+    let root = TempRoot::new("tamper");
+    let daemon = Daemon::start(&root);
+    let socket = root.endpoint();
+
+    // Replace the bound socket object with a regular file. The bounded tamper
+    // interval re-attests the path and must take the exit-6 path.
+    std::fs::remove_file(&socket).expect("remove the bound socket");
+    std::fs::write(&socket, b"not a socket").expect("plant a foreign object");
+
+    let status = daemon.wait_within(Duration::from_secs(15));
+    assert_eq!(
+        status.code(),
+        Some(6),
+        "endpoint tamper is the contract's exit code 6"
+    );
+}
+
+#[test]
+fn the_keyed_attach_and_control_flow_is_reachable_over_the_wire() {
+    let root = TempRoot::new("attach-flow");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    assert_eq!(minted["ok"], true, "{minted}");
+    let host_grant = minted["result"]["grant"]
+        .as_str()
+        .expect("host grant bearer")
+        .to_owned();
+
+    let mut creator = Client::connect(&root.endpoint());
+    let handshake = creator.negotiate_with(None, Some(&host_grant));
+    assert_eq!(handshake["ok"], true, "{handshake}");
+
+    // session.create
+    let created = creator.call(
+        "session.create",
+        json!({"kind": "terminal", "idempotency_key": "flow-create"}),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    let session_id = created["result"]["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let create_token = created["result"]["control_token"]
+        .as_str()
+        .expect("create token")
+        .to_owned();
+
+    // (a) controller claim through the real envelope.
+    let claimed = creator.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 0,
+            "control_token": create_token,
+            "idempotency_key": "flow-claim",
+        }),
+    );
+    assert_eq!(claimed["ok"], true, "{claimed}");
+    assert_eq!(claimed["result"]["role"], "controller");
+    let controller_attach = claimed["result"]["attach_id"]
+        .as_str()
+        .expect("controller attach")
+        .to_owned();
+    let controller_token = claimed["result"]["control_token"]
+        .as_str()
+        .expect("rotated token")
+        .to_owned();
+
+    // Consumer mint of an observer grant as the controller.
+    let grant = creator.call(
+        "session.grant",
+        json!({"session_id": session_id, "idempotency_key": "flow-grant"}),
+    );
+    assert_eq!(grant["ok"], true, "{grant}");
+    let observer_grant = grant["result"]["grant"]
+        .as_str()
+        .expect("observer grant")
+        .to_owned();
+    let observer_grant_id = grant["result"]["grant_id"].as_str().expect("grant id");
+
+    // (b) observer attach through the real envelope.
+    let mut observer = Client::connect(&root.endpoint());
+    assert_eq!(observer.negotiate(None)["ok"], true);
+    let attached = observer.call(
+        "session.attach",
+        json!({
+            "attach_role": "observer",
+            "session_id": session_id,
+            "observer_grant": observer_grant,
+        }),
+    );
+    assert_eq!(attached["ok"], true, "{attached}");
+    assert_eq!(attached["result"]["role"], "observer");
+    let observer_attach = attached["result"]["attach_id"]
+        .as_str()
+        .expect("observer attach")
+        .to_owned();
+
+    // session.control.transfer reaches its handler.
+    let transferred = creator.call(
+        "session.control.transfer",
+        json!({
+            "session_id": session_id,
+            "attach_id": observer_attach,
+            "expected_generation": 0,
+            "idempotency_key": "flow-transfer",
+        }),
+    );
+    assert_eq!(transferred["ok"], true, "{transferred}");
+    assert_eq!(transferred["result"]["controller"], observer_attach);
+    assert!(
+        transferred["result"].get("control_token").is_none(),
+        "the requester never receives the target's rotated token"
+    );
+
+    // lease.heartbeat reaches its handler; the rotated token is delivered on
+    // the target connection's next response after routing.
+    let first = observer.call("lease.heartbeat", json!({"attach_id": observer_attach}));
+    assert_eq!(first["ok"], true, "{first}");
+    let second = observer.call("lease.heartbeat", json!({"attach_id": observer_attach}));
+    assert_eq!(second["ok"], true, "{second}");
+    let delivered = second["result"]["control_token"]
+        .as_str()
+        .expect("control-token delivery");
+    assert_ne!(delivered, controller_token);
+
+    // Own-lease session.detach reaches its handler.
+    let detached = observer.call("session.detach", json!({"attach_id": observer_attach}));
+    assert_eq!(detached["ok"], true, "{detached}");
+    assert_eq!(detached["result"]["was_attached"], true);
+    let detached = creator.call("session.detach", json!({"attach_id": controller_attach}));
+    assert_eq!(detached["ok"], true, "{detached}");
+    assert_eq!(observer_grant_id.len(), 32);
+
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+}
+
+#[test]
+fn an_unnegotiated_connection_cannot_probe_the_method_catalog() {
+    let root = TempRoot::new("catalog-gate");
+    let daemon = Daemon::start(&root);
+
+    // A well-formed but unknown method is AlreadyNegotiated, not NotFound: the
+    // stage-2 gate runs before method resolution.
+    let mut unknown = Client::connect(&root.endpoint());
+    let response = unknown.call("session.unknown", Value::Null);
+    assert_eq!(response["ok"], false, "{response}");
+    assert_eq!(response["error"]["code"], "AlreadyNegotiated");
+    assert_eof(&mut unknown.stream, Duration::from_secs(2));
+
+    // A grammar-invalid name is also AlreadyNegotiated, not InvalidMethod.
+    let mut malformed = Client::connect(&root.endpoint());
+    malformed.send_raw_frame(json!({
+        "v": 1,
+        "id": "malformed-1",
+        "method": "Session.Create",
+        "params": Value::Null,
+    }));
+    let response = malformed.recv();
+    assert_eq!(response["ok"], false, "{response}");
+    assert_eq!(response["error"]["code"], "AlreadyNegotiated");
+    assert_eof(&mut malformed.stream, Duration::from_secs(2));
+
+    // Stage 1 stays ahead of the gate: an unsupported wire version is
+    // VersionMismatch even when the method is not the handshake.
+    let mut wrong_version = Client::connect(&root.endpoint());
+    wrong_version.send_raw_frame(json!({
+        "v": 99,
+        "id": "version-1",
+        "method": "session.unknown",
+        "params": Value::Null,
+    }));
+    let response = wrong_version.recv();
+    assert_eq!(response["ok"], false, "{response}");
+    assert_eq!(response["error"]["code"], "VersionMismatch");
+    assert_eof(&mut wrong_version.stream, Duration::from_secs(2));
+
+    // After a successful negotiate the same unknown method is NotFound.
+    let mut client = Client::connect(&root.endpoint());
+    assert_eq!(client.negotiate(None)["ok"], true);
+    let response = client.call("session.unknown", Value::Null);
+    assert_eq!(response["error"]["code"], "NotFound");
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn a_wire_refusal_burst_is_budgeted() {
+    let root = TempRoot::new("wire-budget");
+    let daemon = Daemon::start(&root);
+    let mut client = Client::connect(&root.endpoint());
+    assert_eq!(client.negotiate(None)["ok"], true);
+
+    // `refusal_audit_budget_per_sec` is 20 at the compiled defaults. A burst of
+    // non-closing wire refusals must not write one record per frame.
+    let requests: Vec<(&str, Value)> = (0..60).map(|_| ("session.unknown", Value::Null)).collect();
+    client.send_batch(&requests);
+    for _ in 0..60 {
+        let response = client.recv();
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "NotFound");
+    }
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    let wire = audit_lines_with(&root, "a=wire r=refused c=not_found");
+    assert!(wire >= 1, "the first refusals are recorded");
+    assert!(
+        wire <= 21,
+        "the per-second budget bounds a 60-frame burst: {wire} records"
+    );
+}
+
+#[test]
+fn plain_status_never_binds_and_creates_no_runtime_file() {
+    let root = TempRoot::new("status");
+    std::fs::create_dir_all(root.runtime()).expect("runtime dir");
+    std::fs::set_permissions(root.runtime(), std::fs::Permissions::from_mode(0o700))
+        .expect("chmod runtime");
+    std::fs::create_dir_all(root.state()).expect("state dir");
+    let output = Command::new(BITTYD)
+        .env("XDG_RUNTIME_DIR", root.runtime())
+        .env("XDG_STATE_HOME", root.state())
+        .env_remove("BITTYD_ENDPOINT")
+        .output()
+        .expect("status");
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ipc service: wired"), "{stdout}");
+    assert!(stdout.contains("endpoint: none bound"), "{stdout}");
+    assert!(!root.endpoint().exists());
+    assert!(!root.capability().exists());
+}

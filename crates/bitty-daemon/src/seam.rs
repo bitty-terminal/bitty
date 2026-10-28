@@ -1,10 +1,9 @@
 //! The explicit not-a-listener seam.
 //!
 //! `bittyd` without arguments prints [`SeamStatus`]. The status is deliberately
-//! a value, not a set of `println!` calls in the binary: the IPC service task
-//! (bitty#2607) replaces the [`IpcServiceState::NotWired`] branch and the
-//! [`EndpointState::Unbound`] branch with the real `bitty-ipc` v1 server loop
-//! and endpoint binding, while the binary and its output stay unchanged.
+//! a value, not a set of `println!` calls in the binary: `bittyd start` runs the
+//! real `bitty-ipc` v1 server loop, while the no-argument form reports the
+//! build's service surface and deliberately binds nothing.
 //!
 //! This module performs no I/O, resolves no endpoint path, reads no
 //! environment variable, and creates no socket file (contract "Endpoint
@@ -18,8 +17,8 @@ use crate::contract::{CAPABILITIES, Capabilities, SERVICE_API_VERSION, ServiceAp
 /// Whether the IPC service loop is installed behind this seam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpcServiceState {
-    /// The `bitty-ipc` v1 server loop has not been wired (bitty#2607).
-    NotWired,
+    /// The `bitty-ipc` v1 server loop is installed (`bittyd start`).
+    Wired,
 }
 
 impl IpcServiceState {
@@ -27,7 +26,7 @@ impl IpcServiceState {
     #[must_use]
     pub const fn is_wired(self) -> bool {
         match self {
-            Self::NotWired => false,
+            Self::Wired => true,
         }
     }
 }
@@ -35,7 +34,7 @@ impl IpcServiceState {
 impl std::fmt::Display for IpcServiceState {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotWired => formatter.write_str("not wired (bitty#2607)"),
+            Self::Wired => formatter.write_str("wired (bitty-ipc v1; bittyd start)"),
         }
     }
 }
@@ -86,7 +85,7 @@ impl SeamStatus {
         Self {
             service_api_version: SERVICE_API_VERSION,
             capabilities: CAPABILITIES,
-            ipc_service: IpcServiceState::NotWired,
+            ipc_service: IpcServiceState::Wired,
             endpoint: EndpointState::Unbound,
         }
     }
@@ -131,10 +130,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seam_has_no_listener_and_no_endpoint() {
+    fn the_status_command_reports_a_wired_service_and_no_endpoint() {
         let status = SeamStatus::current();
-        assert_eq!(status.ipc_service, IpcServiceState::NotWired);
-        assert!(!status.ipc_service.is_wired());
+        assert_eq!(status.ipc_service, IpcServiceState::Wired);
+        assert!(status.ipc_service.is_wired());
         assert_eq!(status.endpoint, EndpointState::Unbound);
         assert!(!status.endpoint.is_bound());
         assert!(!status.endpoint_bound());
@@ -148,7 +147,7 @@ mod tests {
         assert!(rendered.contains("terminal_sessions"));
         assert!(rendered.contains("observer_grants"));
         assert!(rendered.contains("worker sessions: unsupported"));
-        assert!(rendered.contains("ipc service: not wired"));
+        assert!(rendered.contains("ipc service: wired"));
         assert!(rendered.contains("endpoint: none bound"));
     }
 }

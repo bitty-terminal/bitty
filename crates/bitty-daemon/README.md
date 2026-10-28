@@ -16,33 +16,40 @@ The normative service surface is the accepted
 (contract tracked by bitty#2546/#2663); this crate seam is bitty#2606
 (CTX-1616).
 
-## Status: seam plus the in-memory state core, event stream, limits, idempotency, audit, and attach/control state machine
+## Status: service loop, scopes, handshake, grants, audit sink, and peer re-check
 
-This crate fixes the service version, the capability set, and the
-version-negotiation skeleton, implements the registry half of bitty#2601
-(server-generated ids, the in-memory session registry, generation and revision
-counters, retention, and the bounded orphan journal), the event stream of
-bitty#2602 (snapshot plus bounded backlog, revision ordering, per-lease
-routing, control-frame reservation, the terminal-event guarantee, and
-heartbeat/last-seen), the compiled limits and advertised triples of bitty#2603,
-the two bounded idempotency stores, the bounded content-free audit ring, and the
-attach/control half of bitty#2609 (observer and controller leases, the 256-bit
-control token, explicit transfer, detach/revocation, lease expiry, and the
-abort/kill pipeline). It **starts no listener**, binds no endpoint, creates no
-socket file, spawns no worker, signals no process, and serves no IPC method.
-`bittyd` with no arguments still reports the no-endpoint seam and exits 0; the
-state core, the event stream, the limit/idempotency/audit stores, and the lease
-state machine are library surfaces for bitty#2607 to drive.
+This crate fixes the service version, the capability set, and the version
+negotiation, implements the registry half of bitty#2601 (server-generated ids,
+the in-memory session registry, generation and revision counters, retention,
+and the bounded orphan journal), the event stream of bitty#2602 (snapshot plus
+bounded backlog, revision ordering, per-lease routing, control-frame
+reservation, the terminal-event guarantee, and heartbeat/last-seen), the
+compiled limits and advertised triples of bitty#2603, the two bounded
+idempotency stores, the bounded content-free audit ring, the attach/control
+half of bitty#2609, and the bitty#2607 service surface: the `session.*` /
+`daemon.*` scope registry, `daemon.negotiate`, the eleven-stage authorization
+order, host-consent and observer grants, the owner-private audit sink, the
+`bittyd start` admission loop, per-frame `SCM_CREDENTIALS`, and the peer
+re-check at every privileged boundary.
 
-The contract areas that follow are deliberately deferred to their owning
-slices:
+`bittyd start` binds the per-user endpoint (`0700` directory, `0600` socket,
+single-instance lock), mints the per-boot operator capability, accepts up to
+`max_connections_per_endpoint` connections, serves the bitty-ipc v1 envelope,
+and stops on `daemon.stop` or a `SIGTERM`/`SIGINT` drain. Plain `bittyd`
+creates no runtime file, binds no endpoint, and prints the status. The daemon
+still spawns no worker, signals no process, and opens no TCP listener.
 
-| Area                                                                                                                                                                                                                                                    | Owner                |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
-| `bitty-ipc` v1 server loop, peer capture and re-check, scope evaluation, observer-grant consumption, endpoint lock and tamper detection, method dispatch, error mapping, event framing and correlation id, refusal-to-result mapping, audit sink writer | bitty#2607           |
-| Observer-grant store (mint, single-use consume, TTL, peer binding, revoke)                                                                                                                                                                              | bitty#2609 follow-up |
-| Endpoint discovery, cgroup/subreaper containment, signal delivery and reaping, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs                                                                                      | bitty#2604           |
-| Conformance corpus and fake-server parity                                                                                                                                                                                                               | bitty#2605           |
+The contract areas that are deliberately deferred, and the typed answer the
+running service gives today:
+
+| Area | Owner | Answer today |
+| --- | --- | --- |
+| Worker spawn and bind (`session.create` registers a `created` session; nothing binds generation 1) | bitty#2604 | `session.create` returns the `created` snapshot with `generation: 0`; abort/kill/stop complete a pre-bind cancel with `not_started` |
+| cgroup/subreaper containment, signal delivery and reaping, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs | bitty#2604 | `daemon.orphans.verify` is `Denied/UnsupportedCapability`; no orphan is claimed verified |
+| Terminal content plane, including `session.resize` (`terminal.manage`) | bitty#2604 / terminal contract | the daemon grants no `terminal.*` scope, so `session.resize` is `Denied/ScopeViolation` |
+| Pushing session events on a connection (no subscribe method; the event stream owns its own registry) | bitty#2602 | `session.status`/`session.list` are the reconciliation reads; no event frame is sent |
+| Per-connection refusal-audit aggregation for method refusals (`refusal_audit_budget_per_sec`) | bitty#2603 follow-up | every refused method gets one individual record; the wire-level refusal budget is enforced (see below), but the method-refusal histogram is not implemented |
+| Conformance corpus and fake-server parity | bitty#2605 | not part of this crate |
 
 Nothing here authorizes autostart, a service file, a TCP listener, or desktop
 wiring; all four stay out of scope.
@@ -462,18 +469,226 @@ but a controller claim, abort, transfer, detach-other, and operator revoke are
 privileged dispatches, so each must call `PeerGuard::recheck` with the matching
 `DispatchBoundary` before it applies anything.
 
+## Service loop (bitty#2607)
+
+`bittyd start` is the only invocation that binds anything. Startup order is
+endpoint (`open_endpoint`), operator capability (`0600` file in the `0700`
+runtime directory), audit sink (`$XDG_STATE_HOME/bitty/audit`, `0700`/`0600`),
+then the single-threaded poll loop. The loop blocks `SIGTERM`/`SIGINT` behind a
+signal fd, so the signal drain runs in the same loop as requests.
+
+| Bound | Source | Behavior |
+| --- | --- | --- |
+| Connection cap | `max_connections_per_endpoint` | the accept path closes a connection above the cap |
+| Request rate and burst | `max_request_rate_per_sec` / `max_request_burst` | the accepted `bitty-ipc` RC-9 token bucket, `Denied/RateLimited` |
+| Frame bound | `max_frame_bytes` | a declared length above the bound closes the connection |
+| Pre-auth budget | `pre_auth_max_bytes` | a connection that sends more before negotiating is closed (completed frames and the frame being assembled count) |
+| Negotiate deadline | `negotiate_timeout_ms` | an unnegotiated connection past the deadline is closed |
+| Idle bound | `transport_idle_ms` | an idle connection is closed |
+| Outbound bound | `max_connection_outbound_bytes` | a response queue above the bound closes the connection |
+| Grant sweep | `GRANT_SWEEP_INTERVAL_MS` (1 s) | retired grant records are swept on the loop timer |
+| Close drain | `CLOSE_DRAIN_TIMEOUT_MS` (1 s) | a retired connection that cannot drain its refusal frame is closed; it never collects a second handshake-timeout record |
+| Tamper interval | `TAMPER_INTERVAL_MS` (5 s) | `BoundEndpoint::reattest`; a failure is exit code 6 |
+
+A frame-level, byte-budget, or deadline closure is one aggregated `wire` audit
+record (D-16). When the refusal follows a complete envelope the typed refusal
+frame is written and then the connection closes; a closure inside a partial
+frame has no correlation id to echo, so it is audited and closed without a
+partial response. A refusal that
+[`Refusal::closes_connection`](../src/service/dispatch.rs) marks (`VersionMismatch`,
+`Unauthenticated`, `Denied/AlreadyNegotiated`) keeps its frame queued, stops
+reading, and shuts the stream down only after the queued bytes drain.
+
+The loop never opens a TCP listener. `tests/service_loop.rs` starts the real
+binary and checks the process's `/proc/<pid>/fd` socket inodes against
+`/proc/net/tcp` and `/proc/net/tcp6` for a `LISTEN` row.
+
+### Scopes and method catalog
+
+`service::scopes` is the bittyd-owned registry. It reuses the `bitty-ipc-api`
+method grammar, so:
+
+- a malformed name is `InvalidMethod`;
+- a well-formed name outside the catalog is `NotFound` (deny-by-default), and
+  the v1 families stay owned by `bitty-ipc` (a test proves the catalog never
+  redefines one of the 51 v1 methods);
+- the only transport-scope requirement is `session.resize` → `terminal.manage`,
+  and the daemon grants no `terminal.*` scope in this slice.
+
+| Scope | Baseline | Grants |
+| --- | --- | --- |
+| `session.inspect` | yes | metadata status and list of sessions with a live lease |
+| `session.host` | **no** | create a session; only a consumed host grant adds it |
+| `session.attach` | yes | accept an observer grant |
+| `session.control` | yes | control relation actions (claim, grant, abort, transfer, revoke) |
+| `daemon.inspect` | no | operator status and all-session view |
+| `daemon.control` | no | stop, host grants, orphan verify, operator kill |
+
+The connection's transport set is **only** `process.spawn`, the one transport
+scope the daemon catalog evaluates (`session.create`'s two-authority rule). It
+is not the `bitty-ipc` CLI default: the daemon grants no `terminal.*`, `view.*`,
+`config.*`, `plugin.*`, or `debug.*` scope, so the handshake never advertises an
+ambient content scope. The daemon spawns nothing yet, so `process.spawn` has no
+executable to gate; `session.host` consent is the effective create authority.
+When the spawn path lands (bitty#2604), the grant must come from the executable
+policy instead of this transport default. The four create-authority
+combinations are unit-tested: both missing is `ScopeViolation`, consent missing
+with spawn present is `ConsentRequired`, spawn missing with consent present is
+`ScopeViolation`, both present proceeds.
+
+`session.detach` is scope-free when the caller already owns the attach lease;
+detaching another connection's lease needs `session.control` or
+`daemon.control`, decided before the target lookup. The operator all-session
+view is `daemon.inspect`, while control actions remain `daemon.control` (the
+capability always grants both).
+
+`session.attach` spells the request role `attach_role` (`controller` or
+`observer`); the response keeps `role`. The transport reserves `role`, `auth`,
+and `scope` as ambient-authority fields and refuses any of them at depth 1, so
+the service parameter cannot share those names.
+
+### Handshake
+
+`daemon.negotiate` is the only pre-authentication method. The request carries
+`client_version`, optional `client_correlation`, optional
+`operator_capability`, and optional `host_grant`. The response carries
+`wire_version`, `service_api_version`, `daemon_instance_id`, `daemon_pid`,
+`server_identity`, `peer_identity`, `client_id`, `scopes`, `capabilities`,
+`limits` (`{effective, default, system_max}` for every row), `server_monotonic_ms`,
+and `daemon_state`.
+
+- `client_correlation` is ≤ 128 bytes with no control characters, hashed on
+  receipt; only the truncated 128-bit digest is audited and the raw value never
+  survives parsing.
+- A present but invalid `operator_capability` is one static
+  `Unauthenticated` refusal that closes the connection. Verification is an
+  in-memory constant-time compare; the request path never reads the capability
+  file, so a missing file and a wrong bearer are indistinguishable.
+- A `host_grant` that cannot be consumed adds no scope and does not close the
+  connection; `session.create` then returns `Denied/ConsentRequired`.
+- A version outside `1.0..=1.0` is `VersionMismatch` and closes. A second
+  negotiate, or any frame read before the negotiate request, is
+  `Denied/AlreadyNegotiated` and closes after the refusal frame is flushed.
+  The gate runs after the per-frame wire version and before the rate limiter,
+  the method grammar, and the catalog, so an unnegotiated connection cannot
+  probe which methods exist. A frame that
+  is already in the socket buffer when a successful negotiate is processed is
+  served after the handshake (the server does not discard pipelined bytes);
+  it can never widen the connection's scopes, and there is still exactly one
+  handshake per connection.
+- Envelope-level refusals that never resolve to a catalog method (malformed
+  envelope or id, unsupported wire version, unknown or malformed method,
+  rate limit before parsing, frame or deadline closure) are one `wire` refusal
+  record each, subject to the per-connection budget below.
+
+### Grants
+
+`service::grants` holds host-consent and observer grants: 256-bit bearer,
+non-secret 128-bit `grant_id`, peer-uid binding, TTL from `host_grant_ttl_ms` /
+`observer_grant_ttl_ms`, pending caps (`max_pending_host_grants`,
+`max_pending_observer_grants_per_session`), single use, and idempotent revoke
+by `grant_id`. Missing, expired, consumed, revoked, wrong-session, and
+wrong-peer cases are one `Unusable` refusal. The bearer is retained only while
+the grant is live so a keyed `session.grant` replay can return the same
+unconsumed bearer; it is cleared on consume and revoke. A mint at the cap is
+`LimitExceeded`.
+
+The store is bounded by more than the active caps. The server loop sweeps
+retired records on `GRANT_SWEEP_INTERVAL_MS`, a consumed host grant is retained
+until its TTL because `host_grant_bound` still authorizes the consuming
+connection's create, every other inactive record is dropped immediately, and
+`MAX_GRANT_RECORDS` (1,024) is the hard total bound checked at mint (after the
+sweep) so the store cannot grow with total mints. A mint at the total bound is a
+whole `LimitExceeded` refusal and never evicts a live record.
+
+### Dispatch order
+
+`service::dispatch` implements the eleven stages: transport, pre-auth, service
+version/capability, method resolution, per-frame authentication, scope, derived
+authority, target, generation, idempotency, effect. Invariants:
+
+- scope is decided before target lookup, so a caller without the scope learns
+  nothing about whether a target exists;
+- while `daemon_state` is `stopping`, every mutating method is refused
+  `Denied/DaemonStopping` before any stage work; reconciliation reads
+  (`daemon.status`, `session.status`, `session.list`, `lease.heartbeat`) and
+  the repeat `daemon.stop` keep their own answers;
+- visibility is a live lease, a presented current control token, the operator
+  path, or (for a former leaseholder) the immutable terminal snapshot;
+- every privileged effect re-checks the captured peer after authorization and
+  before the effect; a failure is `Unauthenticated` and closes the connection;
+- every mutation is admitted by the audit sink first; a degraded sink is
+  `Denied/Internal` with no state change;
+- keyed methods are `session.create`, controller `session.attach`,
+  `session.grant` mint, and `session.control.transfer`; termination and
+  revocation are keyless and never consult a store; observer attach follows the
+  attached grant text (the grant is validated before the lease and consumed
+  after it, so a replay is `Denied/ObserverGrantRequired`);
+- the rotated control token from a transfer is queued only for the target
+  connection and delivered on that connection's next heartbeat; the requesting
+  response never contains it.
+
+### Served methods
+
+`daemon.negotiate`, `daemon.status`, `daemon.stop` (`refuse`/`drain`/`force`),
+`daemon.host_grant` (`mint`/`revoke`), `session.create`, `session.status`,
+`session.list`, `session.attach` (observer and controller), `session.grant`,
+`session.grant.revoke`, `session.detach`, `session.control.transfer`,
+`session.abort`, `session.kill`, `lease.heartbeat`.
+
+### Audit sink
+
+`audit_sink::AuditSink` drains the bounded ring into an owner-private rotating
+file. `admit_mutation` flushes and syncs before a privileged effect; a failure
+sets `audit_degraded` and refuses with `Denied/Internal` before any state
+changes. A record that fails to append stays queued in event-id order and is
+retried, so a transient failure neither reorders nor drops the tail; a record
+that cannot be rendered sets `audit_degraded` as well, so `daemon.status`
+cannot report `false` while mutations are refused. The directory chain is not
+followed blindly: each owning directory is attested (no symlink, owned, `0700`
+for the leaf) and created one level at a time, and a fresh account's missing
+state root is created `0700` one level at a time rather than failing startup.
+Rendered lines carry only closed spellings, ids, digests, and numbers.
+`service::dispatch` records one individual refusal record for every refused
+method with its static code and counts; the server loop records one `wire`
+refusal for every envelope, frame, budget, or deadline closure that never
+resolves to a method. Non-closing wire refusals are budgeted per connection at
+`refusal_audit_budget_per_sec` records per second; a rate-limited or malformed
+frame flood therefore cannot rotate the audit segments by itself, at the cost
+of dropping records past the cap (the full histogram is deferred; see the table
+above).
+
+### Per-frame peer credentials
+
+On Linux the accepted socket enables `SO_PASSCRED` before the first read, and
+`service::frame::PeerFrameReader` requires `SCM_CREDENTIALS` on every read of
+every frame. A client must also enable `SO_PASSCRED` on its own socket before
+sending (`service::frame::enable_credentials`): the kernel only fills in the
+sending process's credentials for a socket that opted in, and a frame without
+them is refused. Clients that skip it are rejected as `Unauthenticated`, not
+trusted because the connection was authenticated at accept. The first byte of a frame must carry the captured peer's uid and
+pid, every read of the same frame must carry the same credential, and a missing
+credential is `Unauthenticated`. The reader reads the header and then exactly
+the declared payload, so a `recvmsg` cannot span two frames; a descriptor
+passed to another process is attributed to the injecting process's pid and is
+refused. Cells without the mechanism fall back to the captured process
+re-check before every privileged action; the residual is stated, not hidden,
+and those cells are not servable in this slice.
+
 ## CLI
 
 ```text
+bittyd start       # bind the endpoint and serve until daemon.stop or a signal
 bittyd --version   # crate version + contract service API, exit 0
 bittyd --help      # usage, exit 0
-bittyd             # seam status (no endpoint bound), exit 0
+bittyd             # status only: no endpoint bound, no runtime file, exit 0
 bittyd <other>     # usage error, exit 2
 ```
 
-Exit codes 3 through 6 are reserved by the contract for `daemon.stop` modes and
-endpoint tamper. The seam cannot reach them: it hosts no session and binds no
-endpoint.
+Exit codes: `0` success (including "already running", where the desired state
+holds), `1` startup failure before a listener accepted, `2` usage, `6` endpoint
+tamper. `3`, `4`, and `5` are the contract's `daemon.stop` outcome codes; this
+slice has no worker to drain, so a clean stop is `0`.
 
 ## Dependency direction
 
@@ -521,8 +736,23 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
   lease/control/stop state machine, and its closed refusals.
 - `src/orphan/` — process identity probes, the bounded journal, classification,
   and the exact-identity reaper seam.
-- `src/seam.rs` — explicit no-listener/no-endpoint status.
-- `src/cli.rs` — pure argument parsing and rendering, exit codes.
+- `src/operator.rs` — the per-boot operator capability (`0600` file, mint,
+  load, constant-time verify, redacted `Debug`).
+- `src/audit_sink.rs` — the owner-private rotating audit file and the
+  fail-closed admission gate.
+- `src/service/scopes.rs` — the `session.*` / `daemon.*` scope registry and the
+  frozen method catalog.
+- `src/service/wire.rs` — the bounded v1 request/response envelopes and the
+  static parameter helpers.
+- `src/service/protocol.rs` — per-connection client id, effective scopes,
+  leases, and pending control-token delivery.
+- `src/service/grants.rs` — host-consent and observer grants.
+- `src/service/frame.rs` — the per-frame `SCM_CREDENTIALS` reader.
+- `src/service/dispatch.rs` — the eleven-stage authorization order and the
+  closed refusal mapping.
+- `src/service/server.rs` — endpoint admission, limits, signals, and shutdown.
+- `src/seam.rs` — status reporting for the no-argument invocation.
+- `src/cli.rs` — argument parsing, rendering, `start`, and the exit-code map.
 - `src/main.rs` — thin binary entry point.
 - `tests/dependency_direction.rs` — one-way dependency and crate-shape gate.
 - `tests/binary.rs` — `--version`, no-argument seam, no runtime files, usage
@@ -548,6 +778,16 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
 - `tests/peer.rs` — real cross-process peer capture and re-check by
   re-executing the test binary as the connecting child, plus the
   `unshare -Ur` user-namespace refusal.
+- `tests/service_loop.rs` — the real binary: endpoint modes, second-start
+  result, no TCP listener, operator negotiate, the exact baseline scope list,
+  refusal without a capability oracle plus a real EOF inside the deadline,
+  closing refusals (second negotiate, pre-negotiate frame, wire and service
+  version), a stopping daemon refusing a pipelined create, the pre-auth byte
+  budget and its aggregated record, the negotiate-deadline record,
+  `SIGTERM`/`SIGINT` drain, endpoint tamper → exit 6, clean stop, and the
+  status-only invocation.
+- `tests/frame_credentials.rs` — per-frame credential acceptance across a real
+  process boundary and the fd-passing handoff (grandchild's frame refused).
 
 ## Gates
 
@@ -560,7 +800,8 @@ cargo check --workspace --all-targets --locked
 
 `just daemon-seam-test` runs the crate's suite; it is part of `just check`,
 and the workspace `cargo nextest run --workspace` in CI discovers the same
-tests.The endpoint and cross-process peer tests are Linux-gated because Linux
-is the only servable cell in this slice; the macOS and Windows builds compile
-the typed `UnsupportedPlatform` refusal paths and the cross-check gate keeps
-them warning-free.
+tests. The endpoint, service-loop, and cross-process credential tests are
+Linux-gated because Linux is the only servable cell in this slice; the macOS
+and Windows builds compile the typed `UnsupportedPlatform` refusal paths
+(including a `ServerError::UnsupportedPlatform` stub) and the cross-check gate
+keeps them warning-free.

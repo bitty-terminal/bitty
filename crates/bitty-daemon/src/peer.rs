@@ -125,13 +125,17 @@ pub enum DispatchBoundary {
     ObserverGrantMint,
     /// `session.grant.revoke` (observer-grant revocation).
     ObserverGrantRevoke,
+    /// `daemon.host_grant` mint (host-consent grant).
+    HostGrantMint,
+    /// `daemon.host_grant` revoke (host-consent grant).
+    HostGrantRevoke,
     /// `daemon.stop` in any mode.
     DaemonStop,
 }
 
 impl DispatchBoundary {
     /// Every privileged boundary in contract order.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::CreateSession,
         Self::ControllerAttach,
         Self::Abort,
@@ -140,6 +144,8 @@ impl DispatchBoundary {
         Self::DetachOther,
         Self::ObserverGrantMint,
         Self::ObserverGrantRevoke,
+        Self::HostGrantMint,
+        Self::HostGrantRevoke,
         Self::DaemonStop,
     ];
 
@@ -155,6 +161,7 @@ impl DispatchBoundary {
             Self::DetachOther => "session.detach",
             Self::ObserverGrantMint => "session.grant",
             Self::ObserverGrantRevoke => "session.grant.revoke",
+            Self::HostGrantMint | Self::HostGrantRevoke => "daemon.host_grant",
             Self::DaemonStop => "daemon.stop",
         }
     }
@@ -316,6 +323,37 @@ impl PeerGuard {
     /// refusal.
     pub fn recheck(&self, boundary: DispatchBoundary) -> Result<(), PeerError> {
         self.recheck_with(&PlatformProbe, boundary)
+    }
+
+    /// A guard bound to the current test process.
+    ///
+    /// Test-only: it captures `SO_PEERCRED` from a socketpair, which reports
+    /// the current process, so `recheck` exercises the real `/proc` path and
+    /// succeeds for every boundary while the test process is alive.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn for_current_process() -> Self {
+        let (stream, other) = UnixStream::pair().expect("socketpair");
+        let guard = Self::capture(&stream).expect("capture self");
+        drop(other);
+        guard
+    }
+
+    /// A guard whose captured start time is forged.
+    ///
+    /// Test-only: a live pid with a start time that does not match `/proc` is
+    /// exactly the recycled-pid condition `recheck` must refuse.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn with_forged_start_time(pid: u32, start_time: u64) -> Self {
+        let uid = geteuid().as_raw();
+        Self {
+            identity: PeerIdentity {
+                uid,
+                gid: nix::unistd::getegid().as_raw(),
+                pid,
+                start_time: Some(start_time),
+            },
+            expected_uid: uid,
+        }
     }
 
     #[cfg(unix)]
@@ -743,13 +781,19 @@ mod apple {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
+// The peer guard tests capture the real /proc start time; the served loop is
+// Linux-only (D-15), so they do not run on the other tested cells.
 mod tests {
     use super::*;
 
     #[test]
     fn dispatch_boundaries_are_the_contract_methods() {
-        assert_eq!(DispatchBoundary::ALL.len(), 9);
+        assert_eq!(
+            DispatchBoundary::ALL.len(),
+            11,
+            "the nine contract boundaries plus the two host-grant modes"
+        );
         assert_eq!(DispatchBoundary::CreateSession.method(), "session.create");
         assert_eq!(
             DispatchBoundary::ControlTransfer.method(),
@@ -759,10 +803,42 @@ mod tests {
             DispatchBoundary::ObserverGrantRevoke.method(),
             "session.grant.revoke"
         );
+        assert_eq!(
+            DispatchBoundary::HostGrantMint.method(),
+            DispatchBoundary::HostGrantRevoke.method()
+        );
+        assert_eq!(
+            DispatchBoundary::HostGrantMint.method(),
+            "daemon.host_grant"
+        );
         assert_eq!(DispatchBoundary::DaemonStop.to_string(), "daemon.stop");
         for boundary in DispatchBoundary::ALL {
             assert!(boundary.method().contains('.'));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recycled_pid_is_refused_by_the_start_time() {
+        let real = PeerGuard::for_current_process();
+        let start_time = real
+            .identity()
+            .start_time()
+            .expect("Linux exposes a process start time");
+        let forged =
+            PeerGuard::with_forged_start_time(std::process::id(), start_time.saturating_add(1));
+        let error = forged
+            .recheck(DispatchBoundary::CreateSession)
+            .expect_err("a pid with a different start time is a recycled pid");
+        assert!(matches!(
+            error,
+            PeerError::RecheckFailed {
+                boundary: DispatchBoundary::CreateSession,
+                cause: PeerCause::Changed { .. }
+            }
+        ));
+        real.recheck(DispatchBoundary::CreateSession)
+            .expect("the real process still matches");
     }
 
     #[cfg(unix)]

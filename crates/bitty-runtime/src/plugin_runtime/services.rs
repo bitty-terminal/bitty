@@ -4248,7 +4248,9 @@ impl HostServices for PluginServices {
         };
         // Admission runs inside the host first: a refused tree keeps the last
         // good scene attached, so the scene never drops to a partial state.
-        backend.update(handle, node)
+        // Owner and epoch are re-checked inside the host, so a forged handle
+        // can never replace another generation's scene.
+        backend.update(&self.plugin_id, self.ui_epoch.get(), handle, node)
     }
 
     /// Scene scope of a mounted block (issue #2411): only a horizontal band

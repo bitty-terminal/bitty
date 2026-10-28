@@ -1714,13 +1714,6 @@ impl TerminalApp {
                 }
             },
         );
-        // bitty#2785: publish the live placement target after ctl focus
-        // changes and before any plugin work, so a `ui.mount("terminal", …)`
-        // on this tick lands on the leaf the user is looking at. Core owns
-        // this value; plugins never do.
-        if let Some(target) = self.scene_target.as_ref() {
-            target.set(self.runtime.focused_view());
-        }
         // CTX-0814 (#1397): adopt a live config change that landed on disk
         // before the tick commits, so the presented frame reflects the new
         // presentation values. The watcher is a per-tick poll; without an
@@ -1758,6 +1751,13 @@ impl TerminalApp {
         // CTX-0889: apply plugin workspace mutations queued since the last
         // tick before it commits, so the presented frame reflects them.
         self.apply_plugin_workspace_requests();
+        // bitty#2785: publish the live placement target after every queued
+        // focus change and before any plugin work (timers included), so a
+        // `ui.mount("terminal", …)` on this tick lands on the leaf the user
+        // is looking at. Core owns this value; plugins never do.
+        if let Some(target) = self.scene_target.as_ref() {
+            target.set(self.runtime.focused_view());
+        }
         // CTX-1115: apply queued `bitty.panel.set_pinned` intents before
         // present, so the presented frame reflects the pin state.
         self.apply_plugin_pin_requests();

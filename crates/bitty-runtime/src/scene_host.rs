@@ -258,22 +258,28 @@ impl SceneHost {
 
     /// Replaces one attached scene from a validated rich tree.
     ///
-    /// Returns `Ok(false)` for a handle this host no longer owns (stale after
-    /// a release or a remount). The previous scene stays attached when
-    /// admission refuses the new tree.
+    /// Scoped to the owning plugin generation. Returns `Ok(false)` for a
+    /// handle this host no longer owns (stale after a release or a remount)
+    /// or one owned by another generation, so a forged handle can never
+    /// replace another plugin's scene. The previous scene stays attached
+    /// when admission refuses the new tree.
     ///
     /// # Errors
     ///
     /// `E_UI_COMPONENT_INVALID` when the accepted scene admission refuses the
     /// tree (`SCN-1..5`); `E_UI_UNAVAILABLE` when the host panel disappeared
     /// (unreachable while the handle is live).
-    pub fn update(&self, handle: i64, node: &UiRichNode) -> Result<bool, BridgeError> {
+    pub fn update(
+        &self,
+        owner: &str,
+        epoch: u32,
+        handle: i64,
+        node: &UiRichNode,
+    ) -> Result<bool, BridgeError> {
         let state = self.state.borrow();
-        let Some(attached) = state
-            .scenes
-            .iter()
-            .find(|attached| attached.handle == handle)
-        else {
+        let Some(attached) = state.scenes.iter().find(|attached| {
+            attached.handle == handle && attached.owner == owner && attached.epoch == epoch
+        }) else {
             return Ok(false);
         };
         let scene = build_scene(attached.block, &attached.owner, attached.epoch, node)?;
@@ -290,14 +296,14 @@ impl SceneHost {
 
     /// Detaches one scene and releases the panel when this host owned it.
     ///
+    /// Scoped to the owning plugin generation: a foreign or stale handle is a
+    /// no-op, so one plugin can never release another generation's scene.
     /// Idempotent; returns whether a scene was removed.
-    pub fn detach(&self, handle: i64) -> bool {
+    pub fn detach(&self, owner: &str, epoch: u32, handle: i64) -> bool {
         let mut state = self.state.borrow_mut();
-        let Some(position) = state
-            .scenes
-            .iter()
-            .position(|attached| attached.handle == handle)
-        else {
+        let Some(position) = state.scenes.iter().position(|attached| {
+            attached.handle == handle && attached.owner == owner && attached.epoch == epoch
+        }) else {
             return false;
         };
         let attached = state.scenes.remove(position);
@@ -375,12 +381,17 @@ impl SceneHost {
             if let Err(error) = panels.mount_panel(handle.id, handle.generation, view) {
                 // No half-bound panel may outlive the failure: restore the
                 // previous binding when possible, otherwise retire the panel
-                // so the next mount starts clean instead of leaking a record.
+                // and drop its recorded scenes so neither `attach` nor
+                // `view_of` can observe a disposed binding.
                 if panels
                     .mount_panel(handle.id, handle.generation, previous_view)
                     .is_err()
                 {
                     let _ = panels.dispose_panel(handle.id, handle.generation);
+                    state.panel = None;
+                    state
+                        .scenes
+                        .retain(|attached| !(attached.owner == owner && attached.epoch == epoch));
                 }
                 return Err(panel_error("bind the terminal slot scene leaf", error));
             }
@@ -396,9 +407,13 @@ impl SceneHost {
         let handle = panels
             .create_panel(PanelType::Rich, None)
             .map_err(|error| panel_error("create the terminal slot scene panel", error))?;
-        panels
-            .mount_panel(handle.id, handle.generation, view)
-            .map_err(|error| panel_error("bind the terminal slot scene leaf", error))?;
+        if let Err(error) = panels.mount_panel(handle.id, handle.generation, view) {
+            // A create that never bound must not consume a registry record:
+            // a retrying plugin would otherwise exhaust the shared panel
+            // budget (`bitty.panel.create` uses the same host).
+            let _ = panels.dispose_panel(handle.id, handle.generation);
+            return Err(panel_error("bind the terminal slot scene leaf", error));
+        }
         state.panel = Some(HostPanel {
             handle,
             view,
@@ -577,6 +592,37 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_first_bind_disposes_the_new_panel() {
+        let (host, panels, _target) = host();
+        // Occupy the target leaf so the scene host's first bind fails.
+        let other = panels
+            .borrow_mut()
+            .create_panel(PanelType::Helper, None)
+            .expect("other panel");
+        panels
+            .borrow_mut()
+            .mount_panel(other.id, other.generation, ViewId::new(7))
+            .expect("other mounts");
+        let error = host
+            .attach("example.plugin", 1, &text("x"))
+            .expect_err("target leaf is occupied");
+        assert_eq!(error.code, E_SCENE_UNAVAILABLE);
+        assert_eq!(
+            panels.borrow().panel_count(),
+            1,
+            "the failed bind must not leak a registry record"
+        );
+        // Once the leaf is free, a retry succeeds on the same host.
+        panels
+            .borrow_mut()
+            .unmount_panel(other.id, other.generation)
+            .expect("unmount");
+        host.attach("example.plugin", 1, &text("x"))
+            .expect("retry binds");
+        assert_eq!(panels.borrow().panel_count(), 2);
+    }
+
+    #[test]
     fn attach_without_a_target_fails_closed_and_creates_nothing() {
         let (host, panels, target) = host();
         target.set(None);
@@ -609,9 +655,30 @@ mod tests {
         assert_eq!(host.scene_count(), 1);
         assert!(
             !host
-                .update(first, &text("stale"))
+                .update("first.plugin", 1, first, &text("stale"))
                 .expect("stale is not an error")
         );
+        // A foreign generation cannot touch the live scene, even with a
+        // correctly shaped handle.
+        assert!(
+            !host
+                .update("second.plugin", 1, first, &text("stolen"))
+                .expect("foreign is not an error")
+        );
+        assert!(!host.detach("second.plugin", 1, first));
+        let panel = panels
+            .borrow()
+            .placement_panel_of(ViewId::new(7))
+            .expect("placement resolves");
+        let scene = panels
+            .borrow()
+            .panel_scene(panel)
+            .cloned()
+            .expect("scene retained");
+        match scene.iter().next().expect("one block").content() {
+            SceneNode::Text(span) => assert_eq!(span.text, "first again"),
+            other => panic!("unexpected scene content {other:?}"),
+        }
     }
 
     #[test]
@@ -624,7 +691,7 @@ mod tests {
             rows: (0..2048).map(|_| Vec::new()).collect(),
         };
         let error = host
-            .update(handle, &refused)
+            .update("example.plugin", 1, handle, &refused)
             .expect_err("over SCN-1 is refused");
         assert_eq!(error.code, E_SCENE_REFUSED);
         assert!(
@@ -646,7 +713,11 @@ mod tests {
         assert_eq!(panels.borrow().placement_len(), 0);
         assert_eq!(host.scene_count(), 0);
         // A released handle is stale, never aliased onto a new scene.
-        assert!(!host.update(handle, &text("stale")).expect("stale"));
+        assert!(
+            !host
+                .update("example.plugin", 4, handle, &text("stale"))
+                .expect("stale")
+        );
         // The slot is free for the next generation.
         host.attach("example.plugin", 5, &text("next"))
             .expect("re-attaches");
@@ -676,8 +747,9 @@ mod tests {
         let handle = host
             .attach("example.plugin", 1, &text("x"))
             .expect("attaches");
-        assert!(host.detach(handle));
-        assert!(!host.detach(handle));
+        assert!(!host.detach("other.plugin", 1, handle));
+        assert!(host.detach("example.plugin", 1, handle));
+        assert!(!host.detach("example.plugin", 1, handle));
         assert_eq!(panels.borrow().panel_scene_len(), 0);
         assert_eq!(panels.borrow().panel_count(), 0);
         host.attach("other.plugin", 1, &text("y"))

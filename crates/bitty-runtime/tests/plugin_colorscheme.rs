@@ -10,6 +10,8 @@
 //! (temp dirs only, no PTY spawn, no processes or sockets; the symlink case
 //! stays in the unix-gated services unit test).
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -124,13 +126,6 @@ fn pid(id: &str) -> PluginId {
     PluginId::new(id).expect("id")
 }
 
-fn string(value: LuaValue) -> String {
-    match value {
-        LuaValue::String(s) => s,
-        other => panic!("expected a string result, got {other:?}"),
-    }
-}
-
 fn activate_all(rt: &mut PluginRuntime) {
     rt.discover();
     for (id, result) in rt.activate_discovered() {
@@ -139,10 +134,11 @@ fn activate_all(rt: &mut PluginRuntime) {
 }
 
 fn run(rt: &mut PluginRuntime, id: &PluginId, command: &str) -> String {
-    string(
-        rt.dispatch_command(id, command, &[])
-            .unwrap_or_else(|error| panic!("dispatch {command}: {error}")),
-    )
+    // bitty#2781/bitty#2800: RC-1 charges wall-clock time, so a loaded runner
+    // can park a body that used microseconds of CPU. Settle the documented
+    // cold-tick resume instead of requiring completion inside one default
+    // wall window; a park is never surfaced as the command outcome.
+    common::settle_dispatch(rt, id, command, &[]).expect_string(command)
 }
 
 /// Probe plugin: every command reports `OK:<value>` or `ERR:<code>` across
@@ -210,6 +206,11 @@ fn probe_runtime(
         root.clone(),
         vec![wall.parent().expect("parent").to_path_buf()],
     );
+    // bitty#2781/bitty#2800: probe the image/theme contract, not the wall
+    // clock. Activation is slice-only, so the test-only seams are installed
+    // before activation; parks in a command body still settle on the
+    // documented cold-tick resume.
+    common::install_harness_seams(&mut rt);
     activate_all(&mut rt);
     (rt, pid(id), root)
 }

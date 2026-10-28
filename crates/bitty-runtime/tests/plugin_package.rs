@@ -7,6 +7,8 @@
 //! local directory copied by the package manager, and the update proof swaps
 //! the staged version in place.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -102,7 +104,7 @@ fn write_external_source(
 
 fn runtime(store_root: PathBuf, safe_mode: bool, tag: &str) -> PluginRuntime {
     let data = scratch(&format!("state-{tag}"));
-    PluginRuntime::new(PluginRuntimeConfig {
+    let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode,
         data_dir: Some(data),
         store_root: Some(store_root),
@@ -113,7 +115,12 @@ fn runtime(store_root: PathBuf, safe_mode: bool, tag: &str) -> PluginRuntime {
             "version",
             LuaValue::Integer(1),
         )]))),
-    })
+    });
+    // bitty#2781/bitty#2800: the package E2E asserts install/update/reload
+    // semantics, not runner scheduling. Install the test-only wall seams
+    // before discovery; parks still settle on the documented cold tick.
+    common::install_harness_seams(&mut rt);
+    rt
 }
 
 #[test]
@@ -148,7 +155,7 @@ fn external_plugin_install_load_run_update_reload_disable_uninstall() {
     let activated = rt.activate(&id).expect("activate");
     assert_eq!(activated.state, LifecycleState::Active);
     assert_eq!(activated.commands, 1);
-    let greeting = rt.dispatch_command(&id, "greet", &[]).expect("dispatch");
+    let greeting = common::settle_dispatch(&mut rt, &id, "greet", &[]).expect_value("greet");
     assert_eq!(greeting, LuaValue::String("hello v1".to_string()));
 
     // Update to v2 through a second local directory.
@@ -171,7 +178,7 @@ fn external_plugin_install_load_run_update_reload_disable_uninstall() {
     // Reload tears down generation N and activates the new revision.
     let reloaded = rt.reload(&id).expect("reload");
     assert_eq!(reloaded.state, LifecycleState::Active);
-    let greeting = rt.dispatch_command(&id, "greet", &[]).expect("dispatch");
+    let greeting = common::settle_dispatch(&mut rt, &id, "greet", &[]).expect_value("greet");
     assert_eq!(greeting, LuaValue::String("hello v2".to_string()));
 
     // Disable: the desired state flips atomically and discovery skips it.

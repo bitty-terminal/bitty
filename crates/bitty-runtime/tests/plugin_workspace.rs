@@ -6,6 +6,8 @@
 //! probe runs inside a registered command so calls cross the real Lua
 //! bridge and grant snapshot. Headless and Windows-safe (temp dirs only).
 
+mod common;
+
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -85,6 +87,8 @@ fn runtime(root: PathBuf, source: Option<Rc<FixedWorkspaces>>) -> PluginRuntime 
     if let Some(source) = source {
         rt.set_workspace_source(source);
     }
+    // bitty#2781/bitty#2800: probe workspace semantics, not runner speed.
+    common::install_harness_seams(&mut rt);
     rt
 }
 
@@ -143,13 +147,6 @@ events = [{events}]
 
 fn pid(id: &str) -> PluginId {
     PluginId::new(id).expect("id")
-}
-
-fn string(value: LuaValue) -> String {
-    match value {
-        LuaValue::String(s) => s,
-        other => panic!("expected a string result, got {other:?}"),
-    }
 }
 
 fn activate_all(rt: &mut PluginRuntime) {
@@ -275,10 +272,9 @@ fn probe_runtime(capabilities: &[&str]) -> (PluginRuntime, Rc<FixedWorkspaces>) 
 }
 
 fn run(rt: &mut PluginRuntime, command: &str) -> String {
-    string(
-        rt.dispatch_command(&pid("xuepoo.wsprobe"), command, &[])
-            .unwrap_or_else(|error| panic!("dispatch {command}: {error}")),
-    )
+    // bitty#2800: settle a documented RC-1 park instead of requiring the
+    // command to finish inside one wall window.
+    common::settle_dispatch(rt, &pid("xuepoo.wsprobe"), command, &[]).expect_string(command)
 }
 
 #[test]
@@ -471,10 +467,8 @@ fn workspace_events_require_read_grant_and_deliver_identity_only() {
             "{kind} must reach the read-granted subscriber once"
         );
     }
-    let seen = string(
-        rt.dispatch_command(&pid("xuepoo.wslisten"), "seen", &[])
-            .expect("seen"),
-    );
+    let seen = common::settle_dispatch(&mut rt, &pid("xuepoo.wslisten"), "seen", &[])
+        .expect_string("seen");
     let expected: Vec<String> = WORKSPACE_EVENT_KINDS
         .iter()
         .map(|kind| format!("{kind}#7"))

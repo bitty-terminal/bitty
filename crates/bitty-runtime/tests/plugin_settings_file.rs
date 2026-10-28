@@ -20,6 +20,8 @@
 //! - the manifest `[settings]` declaration is what the bridge serves: the
 //!   Lua side observes exactly the declared keys.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -27,7 +29,7 @@ use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::package::{LocalInstallOptions, install_local_dir, set_enabled};
 use bitty_runtime::plugin_runtime::plugin_settings::PluginSettingsDiagnostic;
 use bitty_runtime::plugin_runtime::{
-    ActivationReport, EmptySettings, LifecycleState, LuaValue, PluginRuntime, PluginRuntimeConfig,
+    ActivationReport, EmptySettings, LifecycleState, PluginRuntime, PluginRuntimeConfig,
     SnapshotSource, UnavailableSnapshot,
 };
 
@@ -159,6 +161,8 @@ fn activate_bar_with_report(
         snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
     });
     runtime.set_settings_dir(config_dir);
+    // bitty#2781/bitty#2800: probe the settings contract, not the wall clock.
+    common::install_harness_seams(&mut runtime);
     runtime.discover();
     let id = PluginId::new(BAR_ID).expect("id");
     let report = runtime.activate(&id).expect("bar fixture must activate");
@@ -168,11 +172,9 @@ fn activate_bar_with_report(
 
 fn read_settings(runtime: &mut PluginRuntime) -> String {
     let id = PluginId::new(BAR_ID).expect("id");
-    match runtime.dispatch_command(&id, "read", &[]) {
-        Ok(LuaValue::String(text)) => text,
-        Ok(other) => panic!("read must report a string, got {other:?}"),
-        Err(error) => panic!("read must dispatch: {error:?}"),
-    }
+    // bitty#2800: settle a documented RC-1 park instead of treating it as a
+    // dispatch failure.
+    common::settle_dispatch(runtime, &id, "read", &[]).expect_string("read")
 }
 
 #[test]

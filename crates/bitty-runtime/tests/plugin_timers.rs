@@ -79,6 +79,9 @@ fn runtime(data_dir: PathBuf, roots: Vec<PathBuf>) -> PluginRuntime {
     });
     // Harness headroom for activation only; see `HARNESS_WALL_BUDGET_MS`.
     rt.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
+    // bitty#2800: host calls are charged on their own raw wall clock; widen
+    // that probe-only dimension too.
+    rt.set_host_call_deadline_ms(Some(common::HARNESS_HOST_CALL_DEADLINE_MS));
     rt
 }
 
@@ -232,7 +235,7 @@ fn cancelled_timers_never_fire() {
     rt.discover();
     rt.activate(&id).expect("activate");
     assert!(rt.timer_deadline().is_some());
-    rt.dispatch_command(&id, "stop", &[]).expect("cancel");
+    common::settle_dispatch(&mut rt, &id, "stop", &[]).expect_value("stop");
     // The cancel syncs on the next pump: no wake, no fire.
     assert_eq!(rt.pump_due_timers(), 0);
     assert_eq!(rt.timer_deadline(), None);

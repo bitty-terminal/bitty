@@ -5,6 +5,8 @@
 //! - Command dispatch: registered plugin commands are dispatched via `dispatch_command`.
 //! - UI blocks accessor: mounted UI blocks are retrievable via the read accessor.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -54,7 +56,7 @@ fn runtime(third_party_roots: Vec<PathBuf>, data_dir: PathBuf) -> PluginRuntime 
     settings
         .0
         .insert("retention_days".to_string(), LuaValue::Integer(7));
-    PluginRuntime::new(PluginRuntimeConfig {
+    let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
         data_dir: Some(data_dir),
         store_root: None,
@@ -65,7 +67,10 @@ fn runtime(third_party_roots: Vec<PathBuf>, data_dir: PathBuf) -> PluginRuntime 
             ("version", LuaValue::Integer(1)),
             ("terminal_id", LuaValue::Integer(1)),
         ]))),
-    })
+    });
+    // bitty#2781/bitty#2800: probe event/command wiring, not the wall clock.
+    common::install_harness_seams(&mut rt);
+    rt
 }
 
 /// Write a minimal plugin package under `root/<id>/`.
@@ -139,9 +144,8 @@ return {}
     assert_eq!(delivered, 1, "event must be delivered to 1 subscriber");
 
     // Query the plugin to see if it received the event.
-    let result = rt
-        .dispatch_command(&id, "test.command", &[])
-        .expect("dispatch");
+    let result =
+        common::settle_dispatch(&mut rt, &id, "test.command", &[]).expect_value("test.command");
 
     if let LuaValue::Table(fields) = result {
         let count = fields
@@ -199,9 +203,8 @@ return {}
         assert_eq!(delivered, 1);
     }
 
-    let result = rt
-        .dispatch_command(&id, "test.command", &[])
-        .expect("dispatch");
+    let result =
+        common::settle_dispatch(&mut rt, &id, "test.command", &[]).expect_value("test.command");
 
     if let LuaValue::Table(fields) = result {
         let count = fields
@@ -246,13 +249,13 @@ return {}
     rt.activate(&id).expect("activate");
 
     // Dispatch the command with arguments.
-    let result = rt
-        .dispatch_command(
-            &id,
-            "test.command",
-            &[LuaValue::String("hello".to_string())],
-        )
-        .expect("dispatch");
+    let result = common::settle_dispatch(
+        &mut rt,
+        &id,
+        "test.command",
+        &[LuaValue::String("hello".to_string())],
+    )
+    .expect_value("test.command");
 
     if let LuaValue::Table(fields) = result {
         let result_field = fields

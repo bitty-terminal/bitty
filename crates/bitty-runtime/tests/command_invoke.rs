@@ -111,6 +111,10 @@ fn runtime(roots: Vec<PathBuf>, data_dir: PathBuf) -> PluginRuntime {
     // fixtures still run under production-adjacent budgets. Wall is the sole
     // load-sensitive dimension (bitty#2259, same as bitty#1727/bitty#1744).
     rt.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
+    // bitty#2800: host calls inside a dispatch are charged on their own raw
+    // wall clock; widen that probe-only dimension too, while a park in the
+    // command body still settles on the documented cold-tick resume.
+    rt.set_host_call_deadline_ms(Some(common::HARNESS_HOST_CALL_DEADLINE_MS));
     // W-146: disk-backed stores commit through an injected backend.
     common::install_stub_backend(&mut rt);
     rt
@@ -337,10 +341,10 @@ impl World {
             ("target", LuaValue::String(target.to_string())),
             ("payload", payload),
         ]);
-        let result = self
-            .runtime
-            .dispatch_command(&self.caller.clone(), "go", &[args])
-            .expect("caller go must dispatch");
+        // bitty#2800: the caller body can park at the RC-1 wall budget under
+        // load; settle the documented cold-tick resume, never retry it.
+        let result = common::settle_dispatch(&mut self.runtime, &self.caller, "go", &[args])
+            .expect_value("go");
         match result {
             LuaValue::String(text) => text,
             other => panic!("caller go must report a string, got {other:?}"),
@@ -349,10 +353,8 @@ impl World {
 
     fn go_no_payload(&mut self, target: &str) -> String {
         let args = LuaValue::table([("target", LuaValue::String(target.to_string()))]);
-        let result = self
-            .runtime
-            .dispatch_command(&self.caller.clone(), "go", &[args])
-            .expect("caller go must dispatch");
+        let result = common::settle_dispatch(&mut self.runtime, &self.caller, "go", &[args])
+            .expect_value("go");
         match result {
             LuaValue::String(text) => text,
             other => panic!("caller go must report a string, got {other:?}"),
@@ -396,10 +398,12 @@ fn invoke_command_app_entry_serves_devtools_plugins() {
     let mut world = World::activate("app-entry");
     // The application-layer entry (palette selection / keybinding action)
     // serves the same command with the same contract.
-    let result = world
-        .runtime
-        .invoke_command("bitty-featured.devtools:plugins", &empty_args())
-        .expect("invoke");
+    let result = common::settle_invoke(
+        &mut world.runtime,
+        "bitty-featured.devtools:plugins",
+        &empty_args(),
+    )
+    .expect_value("plugins");
     assert_eq!(result, LuaValue::String("2 plugins active".to_string()));
     let notices = world.runtime.drain_notifications();
     assert_eq!(notices.len(), 1);
@@ -429,10 +433,8 @@ fn list_commands_catalog_serves_active_commands_sorted() {
         ]
     );
     // The Lua bridge serves the same catalog to the palette caller.
-    let result = world
-        .runtime
-        .dispatch_command(&world.caller.clone(), "ls", &[])
-        .expect("caller ls must dispatch");
+    let result = common::settle_dispatch(&mut world.runtime, &world.caller, "ls", &[])
+        .expect_value("caller ls");
     assert_eq!(
         result,
         LuaValue::String("8:bitty-featured.devtools:bad-result".to_string())
@@ -480,10 +482,8 @@ fn undeclared_and_foreign_names_are_refused_without_execution() {
     ] {
         let outcome = world.go_no_payload(target);
         assert_eq!(outcome, "err:E_COMMAND_UNKNOWN", "target {target}");
-        let error = world
-            .runtime
-            .invoke_command(target, &empty_args())
-            .expect_err("app entry must refuse");
+        let error =
+            common::settle_invoke(&mut world.runtime, target, &empty_args()).expect_error(target);
         assert!(
             error.to_string().contains("not registered"),
             "target {target}: {error}"
@@ -510,10 +510,8 @@ fn malformed_names_are_refused_at_both_layers() {
     }
     // The application entry refuses the same shapes without dispatching.
     for target in ["nope", ":plugins", "owner:", "a:b:c"] {
-        let error = world
-            .runtime
-            .invoke_command(target, &empty_args())
-            .expect_err("malformed must fail");
+        let error =
+            common::settle_invoke(&mut world.runtime, target, &empty_args()).expect_error(target);
         assert!(
             error.to_string().contains("owner:command")
                 || error.to_string().contains("not registered"),
@@ -535,13 +533,12 @@ fn args_schema_violation_is_refused_before_execution() {
     let payload = LuaValue::table([("filter", LuaValue::Integer(7))]);
     let outcome = world.go("bitty-featured.devtools:trace-start", payload);
     assert_eq!(outcome, "err:E_COMMAND_INVALID");
-    let error = world
-        .runtime
-        .invoke_command(
-            "bitty-featured.devtools:trace-start",
-            &LuaValue::table([("filter", LuaValue::Integer(7))]),
-        )
-        .expect_err("schema violation must fail");
+    let error = common::settle_invoke(
+        &mut world.runtime,
+        "bitty-featured.devtools:trace-start",
+        &LuaValue::table([("filter", LuaValue::Integer(7))]),
+    )
+    .expect_error("trace-start schema violation");
     assert!(error.to_string().contains("schema"), "got {error}");
     assert!(
         world.runtime.drain_notifications().is_empty(),
@@ -591,28 +588,13 @@ fn runaway_callee_is_contained_and_the_host_serves_on() {
     // The command first parks at the RC-1 wall budget (bitty #2314); the cold
     // pump keeps resuming it until the unchanged instruction budget gives the
     // terminal fail-closed decision.
-    let error = world
-        .runtime
-        .invoke_command("bitty-featured.devtools:runaway", &empty_args())
-        .expect_err("a runaway callee must not complete");
-    let rendered = if error.is_parked() {
-        let mut terminal = None;
-        for _ in 0..200 {
-            let mut completions = world.runtime.pump_parked_commands();
-            if let Some(completion) = completions.pop() {
-                terminal = Some(completion.outcome);
-                break;
-            }
-        }
-        match terminal.expect("runaway must reach a terminal budget decision") {
-            Err(error) => error.to_string(),
-            Ok(value) => panic!("a runaway callee must never return {value:?}"),
-        }
-    } else {
-        // The instruction dimension can win before the first wall window ends;
-        // that terminal suspension is already the fail-closed decision.
-        error.to_string()
-    };
+    let error = common::settle_invoke(
+        &mut world.runtime,
+        "bitty-featured.devtools:runaway",
+        &empty_args(),
+    )
+    .expect_error("runaway");
+    let rendered = error.to_string();
     assert!(
         rendered.contains("InstructionBudgetExceeded") || rendered.contains("WallClockExceeded"),
         "got {rendered}"
@@ -622,10 +604,8 @@ fn runaway_callee_is_contained_and_the_host_serves_on() {
     let again = world.go_no_payload("bitty-featured.devtools:runaway");
     assert!(again.starts_with("err:"), "got {again}");
     // The host and the caller survive: an unrelated command still serves.
-    let listed = world
-        .runtime
-        .dispatch_command(&world.caller.clone(), "ls", &[])
-        .expect("caller ls must dispatch after a callee suspension");
+    let listed = common::settle_dispatch(&mut world.runtime, &world.caller, "ls", &[])
+        .expect_value("caller ls after a callee suspension");
     assert_eq!(
         listed,
         LuaValue::String("8:bitty-featured.devtools:bad-result".to_string())
@@ -641,10 +621,12 @@ fn raising_callee_is_contained_and_the_host_serves_on() {
     let mut world = World::activate("contain-raise");
     let outcome = world.go_no_payload("bitty-featured.devtools:boom");
     assert_eq!(outcome, "err:E_COMMAND_FAILED");
-    let error = world
-        .runtime
-        .invoke_command("bitty-featured.devtools:boom", &empty_args())
-        .expect_err("raising callee must fail");
+    let error = common::settle_invoke(
+        &mut world.runtime,
+        "bitty-featured.devtools:boom",
+        &empty_args(),
+    )
+    .expect_error("boom");
     assert!(error.to_string().contains("boom went off"), "got {error}");
     // The host is intact: the next invocation serves.
     assert_eq!(
@@ -658,10 +640,12 @@ fn result_schema_violation_is_contained() {
     let mut world = World::activate("contain-result");
     let outcome = world.go_no_payload("bitty-featured.devtools:bad-result");
     assert_eq!(outcome, "err:E_COMMAND_INVALID");
-    let error = world
-        .runtime
-        .invoke_command("bitty-featured.devtools:bad-result", &empty_args())
-        .expect_err("mistyped result must fail");
+    let error = common::settle_invoke(
+        &mut world.runtime,
+        "bitty-featured.devtools:bad-result",
+        &empty_args(),
+    )
+    .expect_error("bad-result");
     assert!(error.to_string().contains("result"), "got {error}");
     assert_eq!(
         world.go_no_payload("bitty-featured.devtools:plugins"),
@@ -692,10 +676,12 @@ fn suspended_owner_is_refused_then_serves_after_resume() {
         .expect("suspend");
     let outcome = world.go_no_payload("bitty-featured.devtools:plugins");
     assert_eq!(outcome, "err:E_COMMAND_GONE");
-    let error = world
-        .runtime
-        .invoke_command("bitty-featured.devtools:plugins", &empty_args())
-        .expect_err("suspended must fail");
+    let error = common::settle_invoke(
+        &mut world.runtime,
+        "bitty-featured.devtools:plugins",
+        &empty_args(),
+    )
+    .expect_error("suspended plugin");
     assert!(error.to_string().contains("suspended"), "got {error}");
     world.runtime.resume(&world.owner.clone()).expect("resume");
     assert_eq!(
@@ -708,18 +694,19 @@ fn suspended_owner_is_refused_then_serves_after_resume() {
 fn schemaless_commands_keep_legacy_pass_through() {
     let mut world = World::activate("schemeless");
     // No schemas declared: any single args value passes through untouched.
-    let result = world
-        .runtime
-        .invoke_command(
-            "bitty-featured.devtools:plain",
-            &LuaValue::table([("note", LuaValue::String("hi".to_string()))]),
-        )
-        .expect("schemeless invoke");
+    let result = common::settle_invoke(
+        &mut world.runtime,
+        "bitty-featured.devtools:plain",
+        &LuaValue::table([("note", LuaValue::String("hi".to_string()))]),
+    )
+    .expect_value("schemeless invoke");
     assert_eq!(result, LuaValue::String("plain:hi".to_string()));
-    let result = world
-        .runtime
-        .invoke_command("bitty-featured.devtools:plain", &empty_args())
-        .expect("schemeless empty invoke");
+    let result = common::settle_invoke(
+        &mut world.runtime,
+        "bitty-featured.devtools:plain",
+        &empty_args(),
+    )
+    .expect_value("schemeless empty invoke");
     assert_eq!(result, LuaValue::String("plain:none".to_string()));
 }
 

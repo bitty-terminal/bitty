@@ -66,6 +66,8 @@ fn runtime(roots: Vec<PathBuf>, data_dir: PathBuf) -> PluginRuntime {
         ]))),
     });
     common::install_stub_backend(&mut rt);
+    // bitty#2781/bitty#2800: probe overlay semantics, not runner scheduling.
+    common::install_harness_seams(&mut rt);
     rt
 }
 
@@ -128,6 +130,17 @@ fn plugin_id(id: &str) -> PluginId {
 fn store_value(rt: &PluginRuntime, id: &PluginId, key: &str) -> Option<LuaValue> {
     rt.services(id)
         .and_then(|services| services.with_store(|store| store.get(key)))
+}
+
+/// Run the fixture's `probe` command and settle a documented RC-1 park.
+fn run_probe(fixture: &mut Fixture, key: &str) {
+    common::settle_dispatch(
+        &mut fixture.runtime,
+        &fixture.id,
+        "probe",
+        &[LuaValue::String(key.to_string())],
+    )
+    .expect_value("probe");
 }
 
 struct Fixture {
@@ -209,10 +222,7 @@ fn overlay_lifecycle_spec_acquire_update_poll_release() {
         return {}
         "#,
     );
-    fixture
-        .runtime
-        .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
-        .expect("dispatch");
+    run_probe(&mut fixture, "x");
     let handle = match store_value(&fixture.runtime, &fixture.id, "x_handle") {
         Some(LuaValue::Integer(handle)) => handle,
         other => panic!("spec acquire must return a handle, got {other:?}"),
@@ -288,10 +298,7 @@ fn overlay_budgets_exhaustion_overflow_and_call_ceilings() {
         return {}
         "#,
     );
-    fixture
-        .runtime
-        .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
-        .expect("dispatch");
+    run_probe(&mut fixture, "x");
     let handle = match store_value(&fixture.runtime, &fixture.id, "x_handle") {
         Some(LuaValue::Integer(handle)) => handle,
         other => panic!("acquire must return a handle, got {other:?}"),
@@ -396,10 +403,7 @@ fn capture_guaranteed_release_matrix_restores_input() {
             return {}
             "#,
         );
-        fixture
-            .runtime
-            .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
-            .expect("dispatch");
+        run_probe(&mut fixture, "x");
         let handle = match store_value(&fixture.runtime, &fixture.id, "x_handle") {
             Some(LuaValue::Integer(handle)) => handle,
             other => panic!("acquire must return a handle, got {other:?}"),
@@ -452,10 +456,7 @@ fn capture_guaranteed_release_matrix_restores_input() {
             return {}
             "#,
         );
-        fixture
-            .runtime
-            .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
-            .expect("dispatch");
+        run_probe(&mut fixture, "x");
         let handle = match store_value(&fixture.runtime, &fixture.id, "x_handle") {
             Some(LuaValue::Integer(handle)) => handle,
             other => panic!("acquire must return a handle, got {other:?}"),
@@ -505,10 +506,7 @@ fn capture_guaranteed_release_matrix_restores_input() {
             return {}
             "#,
         );
-        fixture
-            .runtime
-            .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
-            .expect("dispatch");
+        run_probe(&mut fixture, "x");
         assert!(fixture.runtime.push_overlay_input("key", "k"));
         fixture.runtime.dispose(&fixture.id).expect("dispose");
         assert!(
@@ -576,10 +574,7 @@ fn capture_guaranteed_release_matrix_restores_input() {
             return {}
             "#,
         );
-        fixture
-            .runtime
-            .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
-            .expect("dispatch");
+        run_probe(&mut fixture, "x");
         let handle = match store_value(&fixture.runtime, &fixture.id, "x_handle") {
             Some(LuaValue::Integer(handle)) => handle,
             other => panic!("acquire must return a handle, got {other:?}"),
@@ -640,10 +635,7 @@ fn overlay_spec_surface_unmounted_on_expiry() {
         return {}
         "#,
     );
-    fixture
-        .runtime
-        .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
-        .expect("dispatch");
+    run_probe(&mut fixture, "x");
     let handle = match store_value(&fixture.runtime, &fixture.id, "x_handle") {
         Some(LuaValue::Integer(handle)) => handle,
         other => panic!("acquire must return a handle, got {other:?}"),
@@ -669,10 +661,7 @@ fn overlay_spec_surface_unmounted_on_expiry() {
         "expiry unmounts the spec surface: no orphan block survives"
     );
     // The next session starts clean with only its own surface retained.
-    fixture
-        .runtime
-        .dispatch_command(&fixture.id, "probe", &[LuaValue::String("y".to_string())])
-        .expect("dispatch");
+    run_probe(&mut fixture, "y");
     let retained: Vec<_> = fixture
         .runtime
         .ui_blocks()
@@ -748,10 +737,7 @@ fn overlay_released_bus_event_observed_without_poll() {
         .activate(&watcher_id)
         .expect("watcher activates");
     assert_eq!(report.state, LifecycleState::Active);
-    holder
-        .runtime
-        .dispatch_command(&holder.id, "probe", &[LuaValue::String("x".to_string())])
-        .expect("dispatch");
+    run_probe(&mut holder, "x");
     // Mimic the application tick: drain ended sessions and deliver each
     // observation through the event pipeline on the cold path.
     let ended = holder.runtime.drain_overlay_released();
@@ -807,10 +793,7 @@ fn overlay_focus_denied_without_grant_v1_slot_unaffected() {
         return {}
         "#,
     );
-    fixture
-        .runtime
-        .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
-        .expect("dispatch");
+    run_probe(&mut fixture, "x");
     assert_eq!(
         store_value(&fixture.runtime, &fixture.id, "x_mount_ok"),
         Some(LuaValue::Bool(true)),
@@ -889,10 +872,7 @@ fn overlay_input_available_nudge_observed_with_owner_and_depth() {
         .activate(&watcher_id)
         .expect("watcher activates");
     assert_eq!(report.state, LifecycleState::Active);
-    holder
-        .runtime
-        .dispatch_command(&holder.id, "probe", &[LuaValue::String("x".to_string())])
-        .expect("dispatch");
+    run_probe(&mut holder, "x");
     assert!(
         holder.runtime.push_overlay_input("key", "h"),
         "capture holds, input queues"

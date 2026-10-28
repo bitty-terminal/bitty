@@ -1014,6 +1014,17 @@ pub struct Runtime {
     /// the pointer shape can fall back to the platform arrow outside the
     /// window. Read through [`Runtime::cursor_inside_window`].
     cursor_left_window: bool,
+    /// Whether the next `CursorMoved` is the entry re-sync winit synthesizes
+    /// right after `CursorEntered` (issue #2787).
+    ///
+    /// `wl_pointer.enter` pushes `CursorEntered` plus one `CursorMoved` at the
+    /// pointer's current position even when the pointer did not move, so the
+    /// surface re-appearing under a stationary pointer (a Hyprland workspace
+    /// switch-back) would otherwise look like motion and move keyboard focus
+    /// through hover activation. Set on `CursorEntered`, consumed by the next
+    /// motion event; that move still updates the pointer position, the
+    /// scrollbar, and the hover visuals, but never the focus owner.
+    cursor_entry_pending: bool,
     /// Whether the scrollbar painted on the last present (CTX-0181).
     ///
     /// Compared on cursor moves so `auto` hover/proximity transitions
@@ -2009,6 +2020,7 @@ impl Runtime {
             search_result_generation: 0,
             scrollbar_drag: None,
             cursor_left_window: false,
+            cursor_entry_pending: false,
             scrollbar_visible: false,
             alt_drag: None,
             tiled_drag: None,
@@ -2309,6 +2321,7 @@ impl Runtime {
             search_result_generation: 0,
             scrollbar_drag: None,
             cursor_left_window: false,
+            cursor_entry_pending: false,
             scrollbar_visible: false,
             alt_drag: None,
             tiled_drag: None,

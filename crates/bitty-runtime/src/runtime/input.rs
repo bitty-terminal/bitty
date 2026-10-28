@@ -1447,6 +1447,26 @@ impl Runtime {
         self.focused_modes().mouse_tracking.is_some()
     }
 
+    /// Handles the pointer entering the window (issue #2787).
+    ///
+    /// winit pushes `CursorEntered` followed by exactly one `CursorMoved` at
+    /// the pointer's current position, even when the pointer did not move (the
+    /// Wayland backend pushes both from `wl_pointer.enter`). A move after the
+    /// enter that repeats the last position is that re-sync, not user motion,
+    /// so it must not run hover activation: with `focus_follows_mouse` on (the
+    /// default), a Hyprland workspace switch-back re-maps the surface under a
+    /// stationary pointer and the synthetic move would otherwise drag keyboard
+    /// focus to whichever pane sits under the pointer, discarding the pane the
+    /// user left focused. An entry that lands at a new position is real motion
+    /// and still activates the hovered pane.
+    pub(super) fn handle_cursor_entered(&mut self) {
+        self.cursor_entry_pending = true;
+        self.cursor_left_window = false;
+        // Any dwell armed before the pointer left is stale; the entry move is
+        // not motion and must not commit it.
+        self.clear_hover_pending();
+    }
+
     /// Handles cursor movement for drag selection or mouse-tracking motion.
     pub fn handle_cursor_moved(&mut self, pos: CursorPosition) {
         self.handle_cursor_moved_at(pos, std::time::Instant::now());
@@ -1455,6 +1475,16 @@ impl Runtime {
     /// [`Self::handle_cursor_moved`] with an explicit wall clock
     /// (CTX-0334 virtual-clock seam for the hover dwell delay).
     pub fn handle_cursor_moved_at(&mut self, pos: CursorPosition, now: std::time::Instant) {
+        // Issue #2787: the first move after `CursorEntered` is winit's entry
+        // re-sync when it repeats the last position (or when no position is
+        // known yet) — that is what the Wayland backend pushes for
+        // `wl_pointer.enter`, which carries the pointer's position but no user
+        // motion. Consumers below still update (position, scrollbar, hover
+        // visuals); only hover activation is skipped, because a window that
+        // re-appears under a resting pointer must keep the pane the user left
+        // focused.
+        let entry_sync = std::mem::take(&mut self.cursor_entry_pending)
+            && self.last_cursor.is_none_or(|last| last == pos);
         self.last_cursor = Some(pos);
         // CTX-0181: an active thumb drag consumes motion (a selection drag
         // cannot coexist — the press routed exclusively). Otherwise an
@@ -1542,7 +1572,12 @@ impl Runtime {
         // focus (gated by the config flag, default off; Shift suppresses it
         // so Shift+hover selection never steals focus). A positive dwell
         // delay arms a timed pending candidate instead of focusing eagerly.
-        self.hover_focus_at_at(pos, now);
+        // Issue #2787: the entry re-sync is not motion, so it never moves
+        // focus (a window that re-appears under a resting pointer keeps the
+        // pane the user left focused).
+        if !entry_sync {
+            self.hover_focus_at_at(pos, now);
+        }
         // Motion reporting for 1003 (Any) or 1002 drag: encode as motion when
         // capture active. CTX-0532: motion reads the focused pane's modes
         // (primary fallback). CTX-0566: any encoding frames the motion; X10
@@ -1981,6 +2016,10 @@ impl Runtime {
             // held drag itself stays (the pointer may still be down); the
             // next pointer move inside the edge row re-arms the wake.
             self.clear_selection_autoscroll();
+            // Issue #2787: a hover dwell armed before the window lost focus is
+            // pointer state, not a user choice; it must not commit (moving the
+            // internal focus) while the window is away or when it returns.
+            self.clear_hover_pending();
         }
         if self.focused == focused {
             return;

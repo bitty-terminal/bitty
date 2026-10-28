@@ -3836,6 +3836,7 @@ mod tests {
                 | WindowEventKind::MouseInput(_)
                 | WindowEventKind::MouseWheel(_)
                 | WindowEventKind::CursorMoved(_)
+                | WindowEventKind::CursorEntered
                 | WindowEventKind::CursorLeft
                 | WindowEventKind::Ime(_) => {
                     app.runtime.handle_platform_event(PlatformEvent::Window {

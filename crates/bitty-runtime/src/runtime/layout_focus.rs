@@ -855,6 +855,27 @@ impl Runtime {
         self.animator.progress(kind, surface, now)
     }
 
+    /// Whether a pointer gesture currently commits content geometry itself
+    /// (issue #2789).
+    ///
+    /// A border-drag divider and an Alt+edge float resize resolve a new
+    /// layout on every pointer step and reflow the touched panes with it.
+    /// Those gestures paint the committed bounds; only ring chrome fades
+    /// across the step. Alt+drag float *moves* and tiled-drag ghosts are
+    /// paint-only translations and keep their own paths.
+    ///
+    /// The latch stays set after the pointer leaves until a present
+    /// publishes the gesture's last committed frame: a release can arrive
+    /// between the final pointer step and its tick, and turning the
+    /// suppression off first would interpolate a settle tween from the
+    /// previously presented rectangle over the reflowed grid.
+    #[must_use]
+    fn content_geometry_gesture_active(&self) -> bool {
+        self.border_drag_active()
+            || self.float_resize.is_some()
+            || self.content_geometry_commit_unpresented
+    }
+
     /// CTX-1335: painted frames at `now`, with active panel-bounds
     /// interpolation applied.
     ///
@@ -864,7 +885,9 @@ impl Runtime {
     /// a transition. The returned frames differ only in their painted
     /// `frame`/`content` rectangles (and the grid dims derived from them), and
     /// they are exactly the committed logical frames whenever no geometry
-    /// transition is active (instant, reduced-motion, safe, or complete).
+    /// transition is active (instant, reduced-motion, safe, or complete) and
+    /// for the whole of a live content-geometry gesture (issue #2789: a
+    /// border drag or float resize paints its per-step commit).
     #[must_use]
     pub fn paint_frames_at(&self, now: std::time::Instant) -> Vec<PresentFrame> {
         let frames = self.present_frames();
@@ -887,6 +910,17 @@ impl Runtime {
         frames: &[PresentFrame],
         now: std::time::Instant,
     ) -> Option<Vec<PresentFrame>> {
+        // Issue #2789: a live content-geometry gesture (border-drag divider,
+        // Alt+edge float resize) commits one layout per pointer step and the
+        // pane grids reflow with that commit. There is no intermediate
+        // geometry to interpolate: painting a previous step's rectangle
+        // would re-layout the fresh grid into a stale viewport, leaving the
+        // strip beside the moved divider owned by no leaf (the reported
+        // flash) and stranding the scrollbar away from the painted edge.
+        // The per-step commit *is* the motion; paint it directly.
+        if self.content_geometry_gesture_active() {
+            return None;
+        }
         if !self.animator.bounds_active(now) {
             return None;
         }
@@ -1038,6 +1072,10 @@ impl Runtime {
             .map(|frame| (frame.view, *frame))
             .collect();
         let gesture_active = self.animator.earliest_geometry_started(now).is_some();
+        // Issue #2789: a live pointer resize (border-drag divider, Alt+edge
+        // float resize) commits content geometry per step; see
+        // `content_geometry_gesture_active`.
+        let live_resize_gesture = self.content_geometry_gesture_active();
         for frame in allocations {
             let Some(old) = old_by_view.get(&frame.view) else {
                 // A brand-new View uses the open transition, not a bounds
@@ -1075,6 +1113,17 @@ impl Runtime {
             }
             let size_changed =
                 old.frame.width != frame.frame.width || old.frame.height != frame.frame.height;
+            // Issue #2789: a live divider resize has no intermediate
+            // geometry to interpolate. Each pointer step reflows the pane
+            // grids with the committed rectangles, so a tween would paint
+            // the fresh grid into the previous step's viewport. Accepted
+            // open/close/workspace transitions keep their bounds
+            // interpolation; the resize gesture paints the commit and fades
+            // only chrome.
+            if live_resize_gesture {
+                self.animator.cancel_bounds(Some(frame.view));
+                continue;
+            }
             let kind = if size_changed {
                 AnimationKind::Resize
             } else {

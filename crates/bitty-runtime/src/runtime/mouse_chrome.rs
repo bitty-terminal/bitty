@@ -653,6 +653,10 @@ impl Runtime {
                 return false;
             }
             self.set_layout(layout);
+            // Issue #2789: same release race as the border drag — the final
+            // step can commit without a tick, so keep painting the committed
+            // bounds until that frame presents.
+            self.content_geometry_commit_unpresented = true;
             self.trigger_animation(AnimationKind::Resize, Some(resize.leaf), now);
         }
         self.float_resize = Some(FloatResizeState {
@@ -1469,6 +1473,10 @@ impl Runtime {
             // newly committed ratios. Public layout replacements cancel the
             // drag before replacing the tree.
             self.commit_border_drag_layout(next);
+            // Issue #2789: the release can arrive before this step's frame
+            // presents. Latch the unpresented commit so the settle tick paints
+            // it directly instead of interpolating from the previous step.
+            self.content_geometry_commit_unpresented = true;
             // CTX-0967: a live divider move arms the whole-surface resize
             // transition. The ratios commit immediately (terminal content is
             // never interpolated); only Core-owned chrome fades. `None`

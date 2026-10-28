@@ -74,7 +74,27 @@ impl Runtime {
     /// inset (CTX-0223) is added exactly like the present layer's content
     /// translation. No mode gate here — callers apply
     /// [`bitty_ui::scrollbar::is_visible`] with their engagement signal.
+    ///
+    /// Input routing and the public headless seams read the committed
+    /// frames; the present layer resolves through
+    /// [`Self::scrollbar_track_thumb_for`] with the frames it actually
+    /// paints (issue #2789), so geometry transitions never tear the thumb
+    /// away from the visible viewport.
     pub(super) fn scrollbar_track_thumb(&self) -> Option<(ViewId, TrackRect, ThumbSpan)> {
+        self.scrollbar_track_thumb_for(&self.present_frames())
+    }
+
+    /// [`Self::scrollbar_track_thumb`] over an explicit frame snapshot.
+    ///
+    /// The present path passes the painted frames (committed frames with
+    /// any active paint-only geometry transition applied), so the thumb is
+    /// derived from the same viewport snapshot the frame paints. Any other
+    /// caller passes [`Self::present_frames`] and keeps the committed
+    /// geometry that input routes against.
+    pub(super) fn scrollbar_track_thumb_for(
+        &self,
+        frames: &[super::layout_focus::PresentFrame],
+    ) -> Option<(ViewId, TrackRect, ThumbSpan)> {
         use bitty_ui::scrollbar::{TrackSpec, thumb_geometry, track_rect};
         let width = self.scrollbar_width_physical();
         if width == 0 {
@@ -85,7 +105,6 @@ impl Runtime {
         if self.focused_alt_screen_active() {
             return None;
         }
-        let frames = self.present_frames();
         let fid = self
             .focused_view()
             .or_else(|| frames.first().map(|frame| frame.view))?;
@@ -151,15 +170,23 @@ impl Runtime {
     /// paints now. Pure over `&self`: the present layer pushes the fill and
     /// records visibility; grid truth is never touched.
     ///
+    /// `frames` are the frames the caller paints (issue #2789): the present
+    /// layer passes its painted allocations, so the thumb tracks the same
+    /// viewport snapshot as the leaf content. Visibility stays gated by the
+    /// committed engagement signal, which is what input reads.
+    ///
     /// The hue reuses the theme foreground at a translucent alpha — the same
     /// pattern as the cursor overlay (theme cursor hue plus alpha
     /// override) — so the thumb stays legible on any grid content without
     /// introducing a new palette constant.
-    pub(super) fn scrollbar_thumb_fill(&self) -> Option<bitty_render::grid::FillRect> {
+    pub(super) fn scrollbar_thumb_fill_for(
+        &self,
+        frames: &[super::layout_focus::PresentFrame],
+    ) -> Option<bitty_render::grid::FillRect> {
         if !self.scrollbar_should_paint() {
             return None;
         }
-        let (_, track, thumb) = self.scrollbar_track_thumb()?;
+        let (_, track, thumb) = self.scrollbar_track_thumb_for(frames)?;
         // CTX-0355: the thumb follows the resolved theme foreground.
         let mut color = self.config.theme.foreground;
         color[3] = 0x99;
@@ -174,15 +201,37 @@ impl Runtime {
         })
     }
 
-    /// Current scrollbar track in window physical pixels, if any.
+    /// Committed scrollbar track in window physical pixels, if any.
     ///
     /// Headless seam for embedders and tests: `None` when there is nothing
-    /// to scroll or the geometry is degenerate (same resolution the present
-    /// layer paints from — no mode gate, so callers can probe geometry
-    /// independent of visibility).
+    /// to scroll or the geometry is degenerate. This is the committed
+    /// geometry input routes against; the present layer resolves the track
+    /// from the frames it paints (issue #2789), so a paint-only geometry
+    /// transition can paint a track ahead of this value. No mode gate:
+    /// callers can probe geometry independent of visibility.
     #[must_use]
     pub fn scrollbar_track(&self) -> Option<bitty_ui::scrollbar::TrackRect> {
         self.scrollbar_track_thumb().map(|(_, track, _)| track)
+    }
+
+    /// Scrollbar track and thumb as painted at `now`, if any (issue #2789).
+    ///
+    /// Headless seam for embedders and tests, the scrollbar twin of
+    /// [`Self::paint_frames_at`]: it resolves against the same frames the
+    /// present path paints, so a paint-only geometry transition can never
+    /// strand the thumb away from the visible viewport. [`Self::scrollbar_track`]
+    /// keeps reporting the committed geometry that input routes against.
+    #[must_use]
+    pub fn scrollbar_geometry_at(
+        &self,
+        now: std::time::Instant,
+    ) -> Option<(
+        bitty_ui::scrollbar::TrackRect,
+        bitty_ui::scrollbar::ThumbSpan,
+    )> {
+        let frames = self.paint_frames_at(now);
+        self.scrollbar_track_thumb_for(&frames)
+            .map(|(_, track, thumb)| (track, thumb))
     }
 
     /// Whether `pos` hits the currently painted scrollbar thumb/track.

@@ -253,6 +253,49 @@ fn top_aligned_content_roundtrips_without_history_drift() {
     );
 }
 
+/// Issue #2788: a shrink that absorbs part of the unused bottom padding and
+/// scrolls part of the content out must round-trip exactly. The grow restores
+/// the history above the grid and pads the absorbed rows *below* it; filling
+/// that remainder above the pulled block shifted content down on every
+/// shrink/grow cycle, which is what accumulated blank rows at the top of a
+/// Mod+drag-moved pane.
+#[test]
+fn partial_padding_absorb_roundtrips_without_top_blank_rows() {
+    let mut s = State::new();
+    for i in 1..=10 {
+        prints(&mut s, &format!("line-{i:02}"));
+        newline(&mut s);
+    }
+    // 24 rows: 10 content rows plus a cursor row, so 13 rows are padding.
+    let before = physical_rows(&s);
+    let cursor_before = s.cursor().position.row;
+    assert_eq!(cursor_before, 10);
+
+    // Shrink to 6: 4 rows of padding are absorbed and 5 content rows move
+    // into scrollback (the mixed case, not a pure absorb or pure push).
+    s.resize(80, 6);
+    assert_eq!(s.scrollback_len(), 5);
+    assert!(s.check_invariants().is_ok());
+
+    s.resize(80, 24);
+    assert!(s.check_invariants().is_ok());
+    assert_eq!(
+        s.scrollback_len(),
+        0,
+        "the grow must re-enter every pushed row"
+    );
+    assert_eq!(
+        s.cursor().position.row,
+        cursor_before,
+        "the cursor must ride its content back to the original row"
+    );
+    assert_eq!(
+        physical_rows(&s),
+        before,
+        "the shrink/grow round trip must restore every row byte-for-byte"
+    );
+}
+
 #[test]
 fn width_roundtrip_preserves_wrap_boundary_spaces() {
     let mut s = State::new();

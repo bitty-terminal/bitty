@@ -799,28 +799,30 @@ impl State {
             // the cursor keeps its row.
             let used = Self::used_rows(&self.screens.main, main_cursor_row, old_rows);
             if used >= old_rows && !self.scrollback.is_empty() {
+                // Issue #2788: a grow restores history *above* the grid and
+                // pads whatever the shrink absorbed at the *bottom*. The
+                // shrink path above prefers the unused bottom padding before
+                // it scrolls content out, so filling the remainder above the
+                // pulled block would shift content down by exactly that
+                // absorbed padding on every shrink/grow round trip: a
+                // Mod+drag move into a shorter slot and back accumulated
+                // blank rows at the top of the pane. Each direction now
+                // moves padding first and content second.
                 let pull = grow.min(self.scrollback.len());
-                let mut inserted: Vec<(Vec<Cell>, bool)> = Vec::with_capacity(grow);
-                for _ in 0..(grow - pull) {
-                    inserted.push((vec![Cell::erased(*erase); cols], false));
+                let mut pulled: Vec<(Vec<Cell>, bool)> = Vec::with_capacity(pull);
+                for _ in 0..pull {
+                    let line = self.scrollback.pop_back_line().expect("scrollback len");
+                    pulled.push((Vec::from(line.cells), line.wrapped));
                 }
-                if pull > 0 {
-                    let mut pulled: Vec<(Vec<Cell>, bool)> = Vec::with_capacity(pull);
-                    for _ in 0..pull {
-                        let line = self.scrollback.pop_back_line().expect("scrollback len");
-                        pulled.push((Vec::from(line.cells), line.wrapped));
-                    }
-                    pulled.reverse();
-                    inserted.extend(pulled);
-                    if grow > pull {
-                        // Blank filler sits above the pulled block, so the
-                        // line before it no longer continues into a pulled
-                        // row; break the stale soft-wrap chain.
-                        self.scrollback.clear_last_wrap();
-                    }
+                pulled.reverse();
+                self.screens.main.prepend_rows(pulled);
+                if grow > pull {
+                    // The pulled rows sit directly above the grid, so their
+                    // wrap chain stays intact; the un-restored rows pad
+                    // below the grid with the grid's own bottom padding.
+                    self.screens.main.resize(new_rows, cols, erase);
                 }
-                self.screens.main.prepend_rows(inserted);
-                primary_shift = grow as i32;
+                primary_shift = pull as i32;
             } else {
                 // Unused space below the cursor stays below: grow downward.
                 self.screens.main.resize(new_rows, cols, erase);

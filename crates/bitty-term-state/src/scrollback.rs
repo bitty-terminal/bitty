@@ -11,11 +11,10 @@
 //! register and RFC references.
 //!
 //! A pushed line's cells are immutable. The crate-internal exceptions adjust
-//! membership or wrap metadata, never glyph content: `clear_last_wrap` breaks
-//! the newest line's soft-wrap continuation when a height grow inserts blank
-//! filler above re-entered history, `pop_back_line` removes that newest line
-//! when the history re-enters the viewport, and `clear` (the `ED 3` /
-//! `FullReset` exception) removes every retained line.
+//! membership, never glyph content: `pop_back_line` removes the newest line
+//! when the history re-enters the viewport (issue #2788 keeps that block
+//! adjacent to the grid top, so no wrap repair is needed), and `clear` (the
+//! `ED 3` / `FullReset` exception) removes every retained line.
 
 use std::collections::VecDeque;
 
@@ -197,17 +196,6 @@ impl Scrollback {
     /// detached from the live content.
     pub(crate) fn pop_back_line(&mut self) -> Option<ScrollbackLine> {
         self.lines.pop_back()
-    }
-
-    /// Breaks a soft-wrap continuation out of the newest retained line.
-    ///
-    /// Used when a height grow inserts blank filler above rows pulled back
-    /// into the viewport (#2529): the line before the pulled block can no
-    /// longer continue into its new neighbour.
-    pub(crate) fn clear_last_wrap(&mut self) {
-        if let Some(last) = self.lines.back_mut() {
-            last.wrapped = false;
-        }
     }
 
     /// Owned heap retained by this buffer (CTX-1026).

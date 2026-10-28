@@ -3,11 +3,13 @@
 //!
 //! The loop is single-threaded and poll-driven. Startup order is:
 //!
-//! 1. bind and attest the per-user endpoint (`0700` directory, `0600` socket,
+//! 1. apply the `D-16` core-dump controls (`RLIMIT_CORE=0` and
+//!    `PR_SET_DUMPABLE=0` on Linux), before any privileged state exists;
+//! 2. bind and attest the per-user endpoint (`0700` directory, `0600` socket,
 //!    single-instance `flock`);
-//! 2. mint and persist the per-boot operator capability (`0600` file);
-//! 3. open the owner-private audit sink;
-//! 4. block `SIGTERM`/`SIGINT` and create a signal fd, so the same loop that
+//! 3. mint and persist the per-boot operator capability (`0600` file);
+//! 4. open the owner-private audit sink;
+//! 5. block `SIGTERM`/`SIGINT` and create a signal fd, so the same loop that
 //!    serves requests also runs the signal drain without a signal-handler
 //!    hack.
 //!
@@ -190,6 +192,9 @@ mod unix {
         Signals,
         /// A filesystem or socket operation failed.
         Io,
+        /// The Linux core-dump controls (`RLIMIT_CORE`, `PR_SET_DUMPABLE`)
+        /// could not be applied; the daemon refuses to serve dumpable.
+        Hardening,
     }
 
     impl fmt::Display for ServerError {
@@ -209,6 +214,9 @@ mod unix {
                 }
                 Self::Signals => formatter.write_str("signal setup failed"),
                 Self::Io => formatter.write_str("socket or file operation failed"),
+                Self::Hardening => {
+                    formatter.write_str("core-dump hardening failed (RLIMIT_CORE/PR_SET_DUMPABLE)")
+                }
             }
         }
     }
@@ -261,6 +269,23 @@ mod unix {
         }
     }
 
+    /// Apply the `D-16` core-dump controls before any privileged startup step.
+    ///
+    /// `RLIMIT_CORE` is lowered to zero and the Linux dumpable flag is cleared
+    /// before the endpoint is bound and before the operator capability is
+    /// minted, so neither the socket capability file nor a crash artifact can
+    /// capture the in-memory control token or operator capability. Both calls
+    /// are process-wide and are not undone later. A failure refuses startup
+    /// rather than serving dumpable.
+    fn harden_core_dumps() -> Result<(), ServerError> {
+        use nix::sys::prctl;
+        use nix::sys::resource::{Resource, setrlimit};
+
+        setrlimit(Resource::RLIMIT_CORE, 0, 0).map_err(|_| ServerError::Hardening)?;
+        prctl::set_dumpable(false).map_err(|_| ServerError::Hardening)?;
+        Ok(())
+    }
+
     /// Run the service loop until `daemon.stop` or a signal.
     ///
     /// # Errors
@@ -272,6 +297,7 @@ mod unix {
         use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
         use nix::sys::signalfd::{SfdFlags, SignalFd};
 
+        harden_core_dumps()?;
         let endpoint = open_endpoint(&config.endpoint_env).map_err(|error| match error {
             EndpointError::AlreadyRunning { socket, .. } => ServerError::AlreadyRunning { socket },
             other => ServerError::Endpoint(other),

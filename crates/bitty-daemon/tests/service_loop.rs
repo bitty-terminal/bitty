@@ -288,42 +288,52 @@ fn audit_lines_with(root: &TempRoot, needle: &str) -> usize {
     log.lines().filter(|line| line.contains(needle)).count()
 }
 
-/// Socket inodes the process holds, plus any of them in a TCP LISTEN row.
-fn tcp_listeners_of_process(pid: u32) -> Vec<String> {
-    let mut owned = Vec::new();
-    for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("process fds") {
-        let entry = entry.expect("fd entry");
-        let target = std::fs::read_link(entry.path()).expect("fd target");
-        if let Some(text) = target.to_str() {
-            if let Some(inode) = text
-                .strip_prefix("socket:[")
-                .and_then(|rest| rest.strip_suffix(']'))
-            {
-                owned.push(inode.to_owned());
-            }
+/// Individual wire refusals, suppressed refusals, and aggregate records.
+fn wire_audit_totals(root: &TempRoot) -> (usize, u64, usize) {
+    let log = std::fs::read_to_string(root.audit_log()).unwrap_or_default();
+    let mut individual = 0;
+    let mut suppressed = 0;
+    let mut aggregates = 0;
+    for line in log.lines().filter(|line| line.contains("a=wire")) {
+        if let Some(value) = line
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("sup="))
+        {
+            aggregates += 1;
+            suppressed += value.parse::<u64>().expect("suppressed count");
+        } else if line.contains("r=refused c=not_found") {
+            individual += 1;
         }
     }
-    let mut listeners = Vec::new();
+    (individual, suppressed, aggregates)
+}
+
+/// Every LISTEN row in the network namespace, keyed by table and local address.
+///
+/// The daemon is non-dumpable (`PR_SET_DUMPABLE=0`), so `/proc/<pid>/fd` is no
+/// longer readable by the test process and the socket inodes cannot be
+/// attributed to the daemon directly. The difference around startup still
+/// proves that `bittyd start` itself added no TCP listener.
+fn listening_tcp_sockets() -> std::collections::BTreeSet<String> {
+    let mut sockets = std::collections::BTreeSet::new();
     for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
         let Ok(content) = std::fs::read_to_string(table) else {
             continue;
         };
         for line in content.lines().skip(1) {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 10 {
-                continue;
-            }
-            if fields[3] == "0A" && owned.iter().any(|inode| inode == fields[9]) {
-                listeners.push(format!("{table}: {}", fields[1]));
+            if fields.len() >= 10 && fields[3] == "0A" {
+                sockets.insert(format!("{table}:{}", fields[1]));
             }
         }
     }
-    listeners
+    sockets
 }
 
 #[test]
 fn start_serves_the_endpoint_and_never_opens_a_tcp_listener() {
     let root = TempRoot::new("serve");
+    let before = listening_tcp_sockets();
     let daemon = Daemon::start(&root);
     let socket = root.endpoint();
     let metadata = std::fs::symlink_metadata(&socket).expect("socket");
@@ -336,10 +346,13 @@ fn start_serves_the_endpoint_and_never_opens_a_tcp_listener() {
             & 0o777,
         0o700
     );
+    let added: Vec<String> = listening_tcp_sockets()
+        .difference(&before)
+        .cloned()
+        .collect();
     assert!(
-        tcp_listeners_of_process(daemon.pid()).is_empty(),
-        "bittyd must not open a TCP listener: {:?}",
-        tcp_listeners_of_process(daemon.pid())
+        added.is_empty(),
+        "bittyd must not open a TCP listener: {added:?}"
     );
 
     let mut client = Client::connect(&socket);
@@ -431,6 +444,37 @@ fn a_second_start_is_a_typed_already_running_result() {
         true
     );
     assert_eq!(daemon.wait().code(), Some(0));
+}
+
+#[test]
+fn start_disables_core_dumps_and_is_not_dumpable() {
+    let root = TempRoot::new("core-dump");
+    let daemon = Daemon::start(&root);
+
+    // D-16: RLIMIT_CORE is zero for both the soft and hard limit at startup.
+    let limits =
+        std::fs::read_to_string(format!("/proc/{}/limits", daemon.pid())).expect("process limits");
+    let line = limits
+        .lines()
+        .find(|line| line.starts_with("Max core file size"))
+        .expect("Max core file size row");
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    assert_eq!(fields[4], "0", "soft core limit: {line}");
+    assert_eq!(fields[5], "0", "hard core limit: {line}");
+
+    // PR_SET_DUMPABLE=0: a same-uid process (this test is the parent) cannot
+    // open the daemon's memory. Without the control this open succeeds, so the
+    // probe discriminates.
+    match std::fs::File::open(format!("/proc/{}/mem", daemon.pid())) {
+        Ok(_) => panic!("a same-uid process must not open a non-dumpable daemon's memory"),
+        Err(error) => assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "expected EACCES from the non-dumpable daemon: {error}"
+        ),
+    }
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
 }
 
 #[test]

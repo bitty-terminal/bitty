@@ -472,23 +472,33 @@ privileged dispatches, so each must call `PeerGuard::recheck` with the matching
 ## Service loop (bitty#2607)
 
 `bittyd start` is the only invocation that binds anything. Startup order is
-endpoint (`open_endpoint`), operator capability (`0600` file in the `0700`
-runtime directory), audit sink (`$XDG_STATE_HOME/bitty/audit`, `0700`/`0600`),
-then the single-threaded poll loop. The loop blocks `SIGTERM`/`SIGINT` behind a
-signal fd, so the signal drain runs in the same loop as requests.
+core-dump hardening (`RLIMIT_CORE=0` and `PR_SET_DUMPABLE=0` on Linux, before
+any privileged state exists), endpoint (`open_endpoint`), operator capability
+(`0600` file in the `0700` runtime directory), audit sink
+(`$XDG_STATE_HOME/bitty/audit`, `0700`/`0600`), then the single-threaded poll
+loop. The loop blocks `SIGTERM`/`SIGINT` behind a signal fd, so the signal
+drain runs in the same loop as requests.
 
-| Bound | Source | Behavior |
-| --- | --- | --- |
-| Connection cap | `max_connections_per_endpoint` | the accept path closes a connection above the cap |
-| Request rate and burst | `max_request_rate_per_sec` / `max_request_burst` | the accepted `bitty-ipc` RC-9 token bucket, `Denied/RateLimited` |
-| Frame bound | `max_frame_bytes` | a declared length above the bound closes the connection |
-| Pre-auth budget | `pre_auth_max_bytes` | a connection that sends more before negotiating is closed (completed frames and the frame being assembled count) |
-| Negotiate deadline | `negotiate_timeout_ms` | an unnegotiated connection past the deadline is closed |
-| Idle bound | `transport_idle_ms` | an idle connection is closed |
-| Outbound bound | `max_connection_outbound_bytes` | a response queue above the bound closes the connection |
-| Grant sweep | `GRANT_SWEEP_INTERVAL_MS` (1 s) | retired grant records are swept on the loop timer |
-| Close drain | `CLOSE_DRAIN_TIMEOUT_MS` (1 s) | a retired connection that cannot drain its refusal frame is closed; it never collects a second handshake-timeout record |
-| Tamper interval | `TAMPER_INTERVAL_MS` (5 s) | `BoundEndpoint::reattest`; a failure is exit code 6 |
+| Bound                  | Source                                           | Behavior                                                                                                                |
+| ---------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
+| Connection cap         | `max_connections_per_endpoint`                   | the accept path closes a connection above the cap                                                                       |
+| Request rate and burst | `max_request_rate_per_sec` / `max_request_burst` | the accepted `bitty-ipc` RC-9 token bucket, `Denied/RateLimited`                                                        |
+| Frame bound            | `max_frame_bytes`                                | a declared length above the bound closes the connection                                                                 |
+| Pre-auth budget        | `pre_auth_max_bytes`                             | a connection that sends more before negotiating is closed (completed frames and the frame being assembled count)        |
+| Negotiate deadline     | `negotiate_timeout_ms`                           | an unnegotiated connection past the deadline is closed                                                                  |
+| Idle bound             | `transport_idle_ms`                              | an idle connection is closed                                                                                            |
+| Outbound bound         | `max_connection_outbound_bytes`                  | a response queue above the bound closes the connection                                                                  |
+| Grant sweep            | `GRANT_SWEEP_INTERVAL_MS` (1 s)                  | retired grant records are swept on the loop timer                                                                       |
+| Close drain            | `CLOSE_DRAIN_TIMEOUT_MS` (1 s)                   | a retired connection that cannot drain its refusal frame is closed; it never collects a second handshake-timeout record |
+| Tamper interval        | `TAMPER_INTERVAL_MS` (5 s)                       | `BoundEndpoint::reattest`; a failure is exit code 6                                                                     |
+
+Process hardening (`D-16`, `T-23`, `P0-AC-026`): on Linux, `bittyd start`
+lowers `RLIMIT_CORE` to zero and clears the dumpable flag
+(`PR_SET_DUMPABLE=0`) before the endpoint is bound and before the operator
+capability is minted; a failure exits `1` rather than serving dumpable. macOS,
+FreeBSD, and Windows never serve in this slice (typed `UnsupportedPlatform`),
+so no cell serves with core dumps enabled. `tests/service_loop.rs` pins both
+controls against the real process (`/proc/<pid>/limits` and `/proc/<pid>/mem`).
 
 A frame-level, byte-budget, or deadline closure is one aggregated `wire` audit
 record (D-16). When the refusal follows a complete envelope the typed refusal
@@ -499,9 +509,10 @@ partial response. A refusal that
 `Unauthenticated`, `Denied/AlreadyNegotiated`) keeps its frame queued, stops
 reading, and shuts the stream down only after the queued bytes drain.
 
-The loop never opens a TCP listener. `tests/service_loop.rs` starts the real
-binary and checks the process's `/proc/<pid>/fd` socket inodes against
-`/proc/net/tcp` and `/proc/net/tcp6` for a `LISTEN` row.
+The loop never opens a TCP listener. `tests/service_loop.rs` snapshots the
+namespace's `LISTEN` rows in `/proc/net/tcp` and `/proc/net/tcp6` around
+`bittyd start` and fails on any added listener; the daemon is non-dumpable, so
+per-process fd attribution is no longer available to the test.
 
 ### Scopes and method catalog
 

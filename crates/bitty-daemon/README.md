@@ -42,14 +42,14 @@ still spawns no worker, signals no process, and opens no TCP listener.
 The contract areas that are deliberately deferred, and the typed answer the
 running service gives today:
 
-| Area | Owner | Answer today |
-| --- | --- | --- |
-| Worker spawn and bind (`session.create` registers a `created` session; nothing binds generation 1) | bitty#2604 | `session.create` returns the `created` snapshot with `generation: 0`; abort/kill/stop complete a pre-bind cancel with `not_started` |
-| cgroup/subreaper containment, signal delivery and reaping, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs | bitty#2604 | `daemon.orphans.verify` is `Denied/UnsupportedCapability`; no orphan is claimed verified |
-| Terminal content plane, including `session.resize` (`terminal.manage`) | bitty#2604 / terminal contract | the daemon grants no `terminal.*` scope, so `session.resize` is `Denied/ScopeViolation` |
-| Pushing session events on a connection (no subscribe method; the event stream owns its own registry) | bitty#2602 | `session.status`/`session.list` are the reconciliation reads; no event frame is sent |
-| Per-connection refusal-audit aggregation | bitty#2603 follow-up | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each |
-| Conformance corpus and fake-server parity | bitty#2605 | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; V-07 (bitty#2768) and C-04 (bitty#2767) are recorded known defects |
+| Area                                                                                                                                           | Owner                          | Answer today                                                                                                                                                       |
+| ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Worker spawn and bind (`session.create` registers a `created` session; nothing binds generation 1)                                             | bitty#2604                     | `session.create` returns the `created` snapshot with `generation: 0`; abort/kill/stop complete a pre-bind cancel with `not_started`                                |
+| cgroup/subreaper containment, signal delivery and reaping, production orphan reaper, executable path digest, non-Linux probes and Windows ACLs | bitty#2604                     | `daemon.orphans.verify` is `Denied/UnsupportedCapability`; no orphan is claimed verified                                                                           |
+| Terminal content plane, including `session.resize` (`terminal.manage`)                                                                         | bitty#2604 / terminal contract | the daemon grants no `terminal.*` scope, so `session.resize` is `Denied/ScopeViolation`                                                                            |
+| Pushing session events on a connection (no subscribe method; the event stream owns its own registry)                                           | bitty#2602                     | `session.status`/`session.list` are the reconciliation reads; no event frame is sent                                                                               |
+| Per-connection refusal-audit aggregation                                                                                                       | bitty#2603 follow-up           | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each                                                     |
+| Conformance corpus and fake-server parity                                                                                                      | bitty#2605                     | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; every shared vector is compared, with no recorded known defect |
 
 Nothing here authorizes autostart, a service file, a TCP listener, or desktop
 wiring; all four stay out of scope.
@@ -529,14 +529,14 @@ method grammar, so:
 - the only transport-scope requirement is `session.resize` → `terminal.manage`,
   and the daemon grants no `terminal.*` scope in this slice.
 
-| Scope | Baseline | Grants |
-| --- | --- | --- |
-| `session.inspect` | yes | metadata status and list of sessions with a live lease |
-| `session.host` | **no** | create a session; only a consumed host grant adds it |
-| `session.attach` | yes | accept an observer grant |
-| `session.control` | yes | control relation actions (claim, grant, abort, transfer, revoke) |
-| `daemon.inspect` | no | operator status and all-session view |
-| `daemon.control` | no | stop, host grants, orphan verify, operator kill |
+| Scope             | Baseline | Grants                                                           |
+| ----------------- | -------- | ---------------------------------------------------------------- |
+| `session.inspect` | yes      | metadata status and list of sessions with a live lease           |
+| `session.host`    | **no**   | create a session; only a consumed host grant adds it             |
+| `session.attach`  | yes      | accept an observer grant                                         |
+| `session.control` | yes      | control relation actions (claim, grant, abort, transfer, revoke) |
+| `daemon.inspect`  | no       | operator status and all-session view                             |
+| `daemon.control`  | no       | stop, host grants, orphan verify, operator kill                  |
 
 The connection's transport set is **only** `process.spawn`, the one transport
 scope the daemon catalog evaluates (`session.create`'s two-authority rule). It
@@ -621,7 +621,17 @@ consuming connection's next `session.create` — including a keyed replay of a
 key already applied on that connection — is `Denied/ConsentRequired`
 immediately rather than at the 300 s TTL. The record is still retained until
 the TTL so the bound connection sees the false `host_grant_bound` answer.
-Observer grants keep the unconsumed-and-unexpired revoke rule.
+Observer grants keep the unconsumed-and-unexpired revoke rule. A revoke on a
+terminal record is `Denied/NotRunning` before the authority relation is read:
+the record is frozen and nothing can consume the grant, so a former observer
+cannot retire another client's pending grant.
+
+A keyed `session.grant` mint is replayable only while the session record is
+live. The terminal transition retires the session's `D-18` key store
+(`Service::retire_session`), so a later call with the same key is a new request
+against a frozen record and takes `Denied/NotRunning`, not a descriptor replay;
+the idempotent terminal snapshot covers the keyless termination and revocation
+methods, not a keyed mint with no effect left to replay.
 
 ### Dispatch order
 
@@ -765,10 +775,10 @@ Corpus rules:
   `role`), and the ambient-authority fields `role`, `auth`, and `scope` stay
   refused;
 - a vector that does not run on a driver carries a typed skip reason;
-- `known_defect` rows (currently V-07/bitty#2768 and C-04/bitty#2767) record the
-  exact failing step and code or result path, are excluded from the parity
-  gate, and fail the suite if they pass or fail at another step so the marker
-  cannot rot;
+- `known_defect` rows record the exact failing step and code or result path,
+  are excluded from the parity gate, and fail the suite if they pass or fail at
+  another step so the marker cannot rot; the corpus currently carries none
+  (V-07/bitty#2768 and C-04/bitty#2767 were fixed and their markers removed);
 - fault injection covers a transport drop during abort, the pre-auth partial
   frame, the frame bound, the pending grant cap, the attach cap, and an
   instance change (restart); queue pressure with an injected outbound cap is

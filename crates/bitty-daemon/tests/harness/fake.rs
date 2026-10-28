@@ -917,7 +917,7 @@ impl FakeDriver {
         let expires = now + self.limits.effective(LimitId::AttachLeaseTtlMs);
         let session = self.sessions.get_mut(session_id).expect("checked");
         // The contract counts grant consume and attach as two visible
-        // mutations; the current real service bumps only the attach.
+        // mutations, matching the real service's post-consume snapshot bump.
         session.revision += 2;
         session.leases.insert(
             attach.clone(),
@@ -984,6 +984,15 @@ impl FakeDriver {
         let token = params.get("control_token").and_then(Value::as_str);
         if let Err((class, code)) = self.control_visible(connection, session_id, token) {
             return self.refuse("session.grant", class, code, None);
+        }
+        // A terminal record is read-only: a new mint and a keyed repeat both
+        // take the contract's `NotRunning`.
+        if self
+            .sessions
+            .get(session_id)
+            .is_some_and(|session| is_terminal(session.state))
+        {
+            return self.refuse("session.grant", "Denied", "NotRunning", None);
         }
         if let Err((class, code)) = self.control_authority(connection, session_id, token) {
             return self.refuse("session.grant", class, code, None);
@@ -1078,6 +1087,16 @@ impl FakeDriver {
             if let Err((class, code)) = self.control_visible(connection, &session_id, token) {
                 return self.refuse("session.grant.revoke", class, code, None);
             }
+            // A terminal record refuses every mutation with `Denied/NotRunning`
+            // before authority, so a former observer cannot revoke another
+            // client's pending grant on a frozen session.
+            if self
+                .sessions
+                .get(&session_id)
+                .is_some_and(|session| is_terminal(session.state))
+            {
+                return self.refuse("session.grant.revoke", "Denied", "NotRunning", None);
+            }
             if let Err((class, code)) = self.control_authority(connection, &session_id, token) {
                 return self.refuse("session.grant.revoke", class, code, None);
             }
@@ -1164,12 +1183,13 @@ impl FakeDriver {
                     session.controller = None;
                 }
             }
+            let revoked = removed && !own;
             let value = json!({
                 "session": Self::session_json(session),
                 "attach_id": attach,
                 "was_attached": removed,
                 "not_attached": !removed,
-                "revoked": false,
+                "revoked": revoked,
             });
             (removed, value)
         };

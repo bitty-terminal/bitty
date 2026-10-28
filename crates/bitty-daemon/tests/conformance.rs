@@ -29,7 +29,7 @@ use harness::real::RealDriver;
 #[test]
 fn corpus_is_well_formed_and_frozen() {
     let corpus = Corpus::load().expect("the embedded corpus parses");
-    assert_eq!(corpus.vectors.len(), 33, "corpus size changed");
+    assert_eq!(corpus.vectors.len(), 35, "corpus size changed");
     for id in [
         "C-01", "C-02", "C-03", "C-04", "C-05", "C-06", "C-07", "C-08",
     ] {
@@ -73,19 +73,10 @@ fn corpus_is_well_formed_and_frozen() {
         .filter(|vector| vector.known_defect.is_some())
         .map(|vector| vector.id.as_str())
         .collect();
-    assert_eq!(known, ["V-07", "C-04"], "known-defect markers changed");
-    let v07 = corpus
-        .vector("V-07")
-        .and_then(|vector| vector.known_defect.as_ref())
-        .expect("V-07 marker");
-    assert_eq!(v07.step, 6);
-    assert_eq!(v07.code.as_deref(), Some("NotFound"));
-    let c04 = corpus
-        .vector("C-04")
-        .and_then(|vector| vector.known_defect.as_ref())
-        .expect("C-04 marker");
-    assert_eq!(c04.step, 5);
-    assert_eq!(c04.path.as_deref(), Some("session.state_revision"));
+    assert!(
+        known.is_empty(),
+        "a known-defect marker is left in the corpus: {known:?}"
+    );
 }
 
 #[test]
@@ -176,19 +167,26 @@ fn not_equal_any_rejects_duplicate_ids() {
 
 #[test]
 fn known_defect_must_match_the_recorded_step_and_code() {
-    let corpus = Corpus::load().expect("corpus");
-    let defect = corpus
-        .vector("V-07")
-        .and_then(|vector| vector.known_defect.as_ref())
-        .expect("V-07 marker");
+    let defect = harness::corpus::KnownDefect {
+        issue: "bitty#2768".to_owned(),
+        reason: "a repeat detach resolves to NotFound".to_owned(),
+        drivers: vec![DriverKind::Real],
+        step: 6,
+        code: Some("NotFound".to_owned()),
+        path: None,
+    };
     let failure = "session.detach: expected ok=true, observed ok=false (NotFound / NotFound)";
-    assert!(known_defect_matches(defect, Some(6), Some(failure)));
+    assert!(known_defect_matches(&defect, Some(6), Some(failure)));
     assert!(
-        !known_defect_matches(defect, Some(5), Some(failure)),
+        !known_defect_matches(&defect, Some(5), Some(failure)),
         "a failure at another step must not be masked"
     );
     assert!(
-        !known_defect_matches(defect, Some(6), Some("(StaleGeneration / StaleGeneration)")),
+        !known_defect_matches(
+            &defect,
+            Some(6),
+            Some("(StaleGeneration / StaleGeneration)")
+        ),
         "a different refusal code must not be masked"
     );
 }
@@ -356,7 +354,7 @@ fn fake_and_real_parity() {
     let _ = evidence::write_parity(compared, &divergences, &not_compared);
     assert_no_failures(&fake_rows, "fake");
     assert_no_failures(&real_rows, "real");
-    assert_eq!(compared, 22, "the shared passing set changed");
+    assert_eq!(compared, 26, "the shared passing set changed");
     assert!(
         divergences.is_empty(),
         "parity divergences: {divergences:?}"
@@ -368,7 +366,7 @@ fn fake_and_real_parity() {
     assert_eq!(
         not_compared_ids,
         [
-            "V-06", "V-07", "V-18", "V-33", "C-01", "C-02", "C-03", "C-04", "C-07", "C-08", "F-01"
+            "V-06", "V-18", "V-33", "C-01", "C-02", "C-03", "C-07", "C-08", "F-01"
         ],
         "the parity report changed its not-compared set"
     );

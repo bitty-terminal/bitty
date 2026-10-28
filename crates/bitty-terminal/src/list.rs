@@ -898,7 +898,7 @@ pub struct PluginInfo {
 /// Pure: reads `bundled::all_bundled_manifests()` only. Every row reports
 /// `enabled: false` because v1 bundled is staged disabled by default; this
 /// function never reads user config, so it cannot claim otherwise. Callers
-/// that want the installed store too use [`Self::list_plugins_with_store`].
+/// that want the installed store too use [`list_plugins_with_store`].
 #[must_use]
 pub fn list_plugins() -> Vec<PluginInfo> {
     list_plugins_from_manifests(&bitty_plugin_host::bundled::all_bundled_manifests())

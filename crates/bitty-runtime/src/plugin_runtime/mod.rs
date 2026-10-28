@@ -3897,7 +3897,7 @@ impl PluginRuntime {
         entries
     }
 
-    /// Read the sanitized plugin rows published by [`Self::sync_debug_view`].
+    /// Read the sanitized plugin rows published by `Self::sync_debug_view`.
     ///
     /// This is the same snapshot `bitty.debug.inspect("plugins")` serves to
     /// plugins (id, version, stable lifecycle label, generation) plus the

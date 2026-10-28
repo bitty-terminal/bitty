@@ -104,7 +104,7 @@ pub struct XPluginRow {
 /// Read the bundled plugin set from static manifests only.
 ///
 /// Never loads a VM. Callers that also want installed store plugins use
-/// [`Self::installed_plugins_with_store`].
+/// [`installed_plugins_with_store`].
 #[must_use]
 pub fn installed_plugins() -> Vec<XPluginRow> {
     rows_from_manifests(&bitty_plugin_host::bundled::all_bundled_manifests())
@@ -285,7 +285,7 @@ pub fn x_help_text() -> String {
 /// Help text enumerating bundled plus installed store plugins.
 ///
 /// Issue #2774: the default `bitty x --help` view must agree with
-/// `bitty plugin list`; `--safe` keeps [`Self::x_help_text`].
+/// `bitty plugin list`; `--safe` keeps [`x_help_text`].
 #[must_use]
 pub fn x_help_text_with_store() -> String {
     x_help_text_for(&installed_plugins_with_store())

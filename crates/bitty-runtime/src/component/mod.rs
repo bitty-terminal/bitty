@@ -7,6 +7,13 @@
 //! protocol v1 ([`bitty_network_wire`], the only crate Core links from the
 //! bitty-network repository).
 //!
+//! Wire protocol selection is per component family ([`COMPONENT_FAMILIES`],
+//! bitty#2777): `graphics`, `net`, `storage`, and `a11y` speak the shared v1
+//! wire, the `execution` family speaks the `bitty-execution` v2 codec, and
+//! every unlisted name falls back to the strict v1 seam. The install,
+//! inventory, and spawn gates compare a descriptor range with the seam range
+//! that owns the family instead of one global constant.
+//!
 //! Core is the policy authority and the component is mechanism only:
 //!
 //! - [`resolve`] finds `<root>/<name>/current` and
@@ -87,6 +94,7 @@ mod activation;
 mod broker;
 mod descriptor;
 mod env;
+mod family;
 mod grant;
 mod host;
 mod inventory;
@@ -113,6 +121,10 @@ pub use descriptor::{
     executable_file_name, is_obfuscated_source_text, resolve, validate_component_name,
 };
 pub use env::{ComponentEnv, is_allowlisted_env};
+pub use family::{
+    COMPONENT_FAMILIES, ComponentFamily, ComponentHostSeam, DEFAULT_COMPONENT_HOST_SEAM,
+    family_for, family_supports_protocol, seam_for,
+};
 pub use grant::{
     BUILTIN_INSTALLER_EGRESS, BUILTIN_INSTALLER_EGRESS_HOST, BUILTIN_INSTALLER_EGRESS_PORT,
     GrantError, PluginGrant, builtin_installer_egress, is_builtin_installer_egress,

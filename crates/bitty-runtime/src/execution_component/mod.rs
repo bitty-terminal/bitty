@@ -86,11 +86,16 @@ pub use host::ComponentExecutionHost;
 /// Component name (`[a-z][a-z0-9-]{0,31}`) and install directory name.
 pub const EXECUTION_COMPONENT_NAME: &str = "execution";
 
+/// The execution wire protocol version this host speaks, as declared by the
+/// pinned `bitty-execution` codec (one source of truth, no literal here).
+const EXECUTION_COMPONENT_PROTOCOL_VERSION: u16 =
+    bitty_execution::component::protocol::PROTOCOL_VERSION;
+
 /// Lowest execution-component wire protocol version this host speaks.
-pub const EXECUTION_COMPONENT_PROTOCOL_MIN: u16 = 2;
+pub const EXECUTION_COMPONENT_PROTOCOL_MIN: u16 = EXECUTION_COMPONENT_PROTOCOL_VERSION;
 
 /// Highest execution-component wire protocol version this host speaks.
-pub const EXECUTION_COMPONENT_PROTOCOL_MAX: u16 = 2;
+pub const EXECUTION_COMPONENT_PROTOCOL_MAX: u16 = EXECUTION_COMPONENT_PROTOCOL_VERSION;
 
 /// Maximum jobs the component tracks (mirrors the wire `MAX_JOBS`).
 pub const EXECUTION_COMPONENT_MAX_JOBS: usize = bitty_execution::component::protocol::MAX_JOBS;

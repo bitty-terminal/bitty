@@ -680,7 +680,11 @@ descriptor version equal to `--version`, `1 <= protocol min <= max`,
 `executable` equal to `bitty-<name>`, required lowercase-hex `sha256` that
 must match the binary); anything else fails closed before any output is
 written, and the `--output` basename must be `<target>.tar.gz` so the R2 key
-name cannot drift. Each tarball gets a `<target>.tar.gz.sha256` sidecar, and
+name cannot drift. The `protocol` range is the protocol the component
+declares it speaks: Core matches it against the host seam that owns the
+component family (`network-wire-v1` for `graphics`, `net`, `storage`, and
+`a11y`; `execution-v2` for `execution`) and refuses an install whose range
+does not overlap that seam. Each tarball gets a `<target>.tar.gz.sha256` sidecar, and
 the script regenerates the aggregate `SHA256SUMS` over every target tarball
 in the output directory. The `.github/workflows/ci.yml` quality job runs the
 fixture test (`scripts/tests/make-component-dist.test.sh`, also

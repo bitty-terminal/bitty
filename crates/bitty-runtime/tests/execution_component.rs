@@ -546,6 +546,55 @@ fn safe_mode_absent_and_incompatible_installs_fail_closed() {
 }
 
 #[test]
+fn v2_family_seam_accepts_what_the_v1_seam_refuses() {
+    let scratch = Scratch::new("family-seam");
+    install(scratch.path(), None);
+    let seam = bitty_runtime::component::seam_for(
+        bitty_runtime::execution_component::EXECUTION_COMPONENT_NAME,
+    );
+    assert_eq!(
+        (seam.protocol_min(), seam.protocol_max()),
+        (
+            bitty_runtime::execution_component::EXECUTION_COMPONENT_PROTOCOL_MIN,
+            bitty_runtime::execution_component::EXECUTION_COMPONENT_PROTOCOL_MAX,
+        )
+    );
+
+    let error = bitty_runtime::component::resolve_search(
+        Some(scratch.path()),
+        None,
+        bitty_runtime::execution_component::EXECUTION_COMPONENT_NAME,
+    )
+    .expect_err("the shared v1 broker seam must refuse the v2-only descriptor");
+    assert!(
+        matches!(
+            error,
+            bitty_runtime::component::ResolveError::IncompatibleProtocol { min: 2, max: 2, .. }
+        ),
+        "{error:?}"
+    );
+
+    let found = bitty_runtime::component::resolve_search_for_protocol(
+        Some(scratch.path()),
+        None,
+        bitty_runtime::execution_component::EXECUTION_COMPONENT_NAME,
+        seam.protocol_min(),
+    )
+    .expect("the execution family seam accepts the same install");
+    assert_eq!(
+        (
+            found.resolved.descriptor.protocol_min,
+            found.resolved.descriptor.protocol_max
+        ),
+        (2, 2)
+    );
+    // The fixture is the real v2 component: the seam also completes the
+    // handshake that a v1 host cannot.
+    let host = connect(scratch.path());
+    drop(host);
+}
+
+#[test]
 fn v2_handshake_refuses_a_v1_ack() {
     let scratch = Scratch::new("v1-ack");
     install(scratch.path(), Some("v1-ack"));

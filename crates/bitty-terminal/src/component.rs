@@ -37,7 +37,8 @@
 //!   `bitty-component.toml` (name, version, protocol, executable, optional
 //!   `sha256` that must match) plus the executable; a bare `bitty-<name>`
 //!   executable takes its version from required `--version` and the protocol
-//!   range Core supports. The digest is computed, ABI compat is verified
+//!   range of its component family's host seam (v1 by default, v2 for
+//!   `execution`). The digest is computed, ABI compat is verified
 //!   before any mutation, and the executable is published atomically to
 //!   `<user>/<name>/<version>/` with an installed descriptor plus `current`
 //!   (each destination via temp write, fsync, and rename like the
@@ -133,7 +134,7 @@ use bitty_runtime::component::{
     COMPONENT_EXECUTABLE_PREFIX, ComponentDescriptor, ComponentSummary, component_search_roots_for,
     component_state_root_for, data_home_for, discover_components, executable_file_name,
     incompatible_component_hint, read_component_activation_with_state, remove_activation_artifacts,
-    validate_component_name,
+    seam_for, validate_component_name,
 };
 
 // ---------------------------------------------------------------------------
@@ -1170,7 +1171,8 @@ pub fn component_help_text() -> String {
      \x20 /usr/lib/bitty/extensions/ (or platform equivalent) on collision.\n\
      \x20 A tampered user install fails closed without system fallback. Every\n\
      \x20 spawn re-verifies name, version, executable name, protocol range,\n\
-     \x20 and SHA-256; a protocol range excluding Core fails closed.\n\
+     \x20 and SHA-256; a protocol range that excludes the host seam for its\n\
+     \x20 component family fails closed.\n\
      \n\
      authority:\n\
      \x20 No extension code ever runs during any `bitty extension` operation.\n\
@@ -1756,6 +1758,22 @@ fn is_url_operand(source: &str) -> bool {
         || lower.starts_with("registry:")
 }
 
+/// Fail closed when a staged descriptor cannot be served by its family seam.
+///
+/// One source of truth for `add`, the offline install cache, and `install`:
+/// the per-family table selects the host seam (`execution` checks against the
+/// v2 boundary; every other name, including unknown ones, against the shared
+/// v1 wire) and the descriptor range must overlap it.
+fn check_family_protocol(name: &str, min: u16, max: u16) -> Result<(), ComponentFailure> {
+    let seam = seam_for(name);
+    if seam.accepts(min, max) {
+        return Ok(());
+    }
+    Err(ComponentFailure::component(incompatible_component_hint(
+        name, min, max, seam,
+    )))
+}
+
 fn op_add(
     source: &str,
     version_flag: Option<&str>,
@@ -1777,17 +1795,10 @@ fn op_add(
         ));
     };
     let staged = load_staged_source(source, version_flag)?;
-    // ABI-compat check before any mutation: the protocol range must include
-    // Core's wire version, else fail closed without writing files.
-    let core = bitty_runtime::component::PROTOCOL_VERSION;
-    if !(staged.protocol_min..=staged.protocol_max).contains(&core) {
-        return Err(ComponentFailure::component(incompatible_component_hint(
-            &staged.name,
-            staged.protocol_min,
-            staged.protocol_max,
-            core,
-        )));
-    }
+    // ABI-compat check before any mutation: the descriptor must overlap the
+    // protocol range of the host seam that owns its family, else fail closed
+    // without writing files.
+    check_family_protocol(&staged.name, staged.protocol_min, staged.protocol_max)?;
     let summary = install_staged(&staged, user)?;
     // Persist execution placement for later runs (staging only; never executes
     // here). `None` preserves any previous placement.
@@ -1960,8 +1971,8 @@ fn verified_installed_version(user: &Path, name: &str, version: &str) -> Option<
     if descriptor.name != name || descriptor.version != version {
         return None;
     }
-    let core = bitty_runtime::component::PROTOCOL_VERSION;
-    if !(descriptor.protocol_min..=descriptor.protocol_max).contains(&core) {
+    let seam = seam_for(name);
+    if !seam.accepts(descriptor.protocol_min, descriptor.protocol_max) {
         return None;
     }
     let executable = dir.join(executable_file_name(&descriptor.executable));
@@ -2306,15 +2317,7 @@ fn op_install(
     }
     .map_err(|error| seed_failure(&error))?;
     // ABI-compat check before any mutation (same gate as `add`).
-    let core = bitty_runtime::component::PROTOCOL_VERSION;
-    if !(payload.protocol_min..=payload.protocol_max).contains(&core) {
-        return Err(ComponentFailure::component(incompatible_component_hint(
-            &payload.name,
-            payload.protocol_min,
-            payload.protocol_max,
-            core,
-        )));
-    }
+    check_family_protocol(&payload.name, payload.protocol_min, payload.protocol_max)?;
     let verified_digest = payload.tarball_digest.clone();
     let staged = StagedSource {
         name: payload.name.clone(),
@@ -2780,12 +2783,15 @@ fn load_staged_file(
     }
     let executable = format!("{COMPONENT_EXECUTABLE_PREFIX}{name}");
     let executable_bytes = read_executable(path)?;
-    let core = bitty_runtime::component::PROTOCOL_VERSION;
+    // A bare executable carries no source descriptor, so Core writes the
+    // range its family seam implements: v1 for the shared-wire families and
+    // v2 for `execution`.
+    let seam = seam_for(name);
     Ok(StagedSource {
         name: name.to_owned(),
         version: version.to_owned(),
-        protocol_min: core,
-        protocol_max: core,
+        protocol_min: seam.protocol_min(),
+        protocol_max: seam.protocol_max(),
         executable,
         bytes: executable_bytes,
     })
@@ -4274,6 +4280,31 @@ mod tests {
         assert_eq!(code, EXIT_OK, "{stdout}");
         assert!(!stdout.contains("net"), "{stdout}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn family_protocol_gate_is_family_specific() {
+        // Shared-wire families accept v1 and refuse v2.
+        for name in ["graphics", "net", "storage", "a11y"] {
+            assert!(check_family_protocol(name, 1, 1).is_ok(), "{name}");
+            assert!(check_family_protocol(name, 1, 2).is_ok(), "{name}");
+            let error = check_family_protocol(name, 2, 2).expect_err(name);
+            assert!(
+                error.message.contains("network-wire-v1"),
+                "{name}: {error:?}"
+            );
+        }
+        // The execution family is v2-only.
+        assert!(check_family_protocol("execution", 2, 2).is_ok());
+        let error = check_family_protocol("execution", 1, 1).expect_err("execution v1");
+        assert!(error.message.contains("execution-v2"), "{error:?}");
+        // An unlisted family keeps the strict v1 default, not a permissive
+        // fallback to the highest declared version.
+        assert!(check_family_protocol("mystery", 1, 1).is_ok());
+        let error = check_family_protocol("mystery", 2, 2).expect_err("unknown v2");
+        assert!(error.message.contains("network-wire-v1"), "{error:?}");
+        let error = check_family_protocol("mystery", 3, 3).expect_err("unknown v3");
+        assert!(error.message.contains("network-wire-v1"), "{error:?}");
     }
 
     #[test]

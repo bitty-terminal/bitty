@@ -174,6 +174,13 @@
 //! and CPU-verifiable. Image nodes stay references: the admitted image plane
 //! keeps owning decode and blit, and this crate adds no second decode seam.
 //!
+//! Integration status: this is a library seam. No shipped frame paints a
+//! `Scene` today — the `bitty-runtime` adapters (`PanelRuntime::scene_paint_for`
+//! and the CW present plan) are exercised by tests only until CTX-1630 wires
+//! the `ui.rich` mount path and the present loop. See the
+//! [`scene`] module's "Integration status" section for the exact remainder;
+//! do not describe the renderer as consuming live scene content before then.
+//!
 //! # Headless friendliness and what CI does and does not verify
 //!
 //! CI runs on GPU-less Linux runners. Everything in this crate except

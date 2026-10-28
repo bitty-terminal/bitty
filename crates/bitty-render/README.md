@@ -106,5 +106,10 @@ coverage is absent.
   and window attachment helpers.
 - `src/chrome.rs` — shared chrome tokens, the rounded frame paint path, and
   the grid-corner glyph fallback.
+- `src/scene.rs` — scene paint path: an admitted `bitty-rich::scene::Scene`
+  becomes a bounded, leaf-clipped paint list (`paint_scene`,
+  `paint_scene_prefix`, `ScenePaintCache`). Library seam only: the runtime
+  adapters are test-only until CTX-1630 wires the present loop, so this module
+  does not paint live content yet.
 - `src/error.rs` — owned error types.
 - `tests/` — headless pipeline and seam tests.

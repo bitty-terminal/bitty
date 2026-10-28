@@ -31,6 +31,10 @@
 //! editing UX via overlay/capture/submit/editor host operations. No editor
 //! process is spawned and no grid write happens here.
 //!
+//! The CW-06 scene paint slice (`consume_scene_present_at` and
+//! [`ScenePresent::paint`]) is library-only: no shipped frame calls it until
+//! CTX-1630 wires the `ui.rich` mount path and the present loop.
+//!
 //! # Terminal truth
 //!
 //! The only mutation in the system is the caller's [`FoldState`]

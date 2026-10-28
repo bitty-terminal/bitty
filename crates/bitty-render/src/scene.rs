@@ -85,13 +85,15 @@
 //!
 //! # Text
 //!
-//! A text op stores exactly the cells the glyph seam paints: the painter
+//! A text op stores exactly the prefix the glyph seam receives: the painter
 //! clips each `\n`-separated line to the cells that fit the leaf before the
-//! op is recorded, using the same rule as
-//! [`GridRenderer::overlay_text_glyphs`] (one cell per narrow character, two
-//! per wide character, at most one code point per cell). [`ScenePaint::text_lines`],
-//! [`ScenePaint::plain_text`], and the accessibility projection therefore
-//! carry the painted bytes and nothing a plugin appended past the clip edge.
+//! op is recorded, using the same two stops as
+//! [`GridRenderer::overlay_text_glyphs`] (at most `cols` code points, and no
+//! character whose cell advance would cross `cols`; a combining mark has a
+//! zero-cell advance and rides along with its base character).
+//! [`ScenePaint::text_lines`], [`ScenePaint::plain_text`], and the
+//! accessibility projection therefore carry at most the bytes the seam is
+//! given, and nothing a plugin appended past the clip edge.
 //!
 //! `StyledSpan.italic` is carried by the accepted model but is not rendered
 //! here: the grid text seam has no italic pass, and Core never fakes one by
@@ -442,8 +444,10 @@ impl ScenePaint {
 
     /// Bounded invalidation rectangles for this list.
     ///
-    /// Empty when nothing paints; otherwise one rectangle: the painted
-    /// extent intersected with the leaf content rect.
+    /// Empty when nothing paints; otherwise one rectangle: the bounding box
+    /// of the emitted op rectangles intersected with the leaf content rect.
+    /// A text line contributes its reserved cell span, not its glyph ink, so
+    /// the box may cover cells the glyphs leave blank.
     #[must_use]
     pub fn damage(&self) -> &[RectPx] {
         &self.damage
@@ -1386,13 +1390,15 @@ fn line_cells(line: &str) -> usize {
         .sum::<usize>()
 }
 
-/// The prefix of `line` that fits `cols` cells, using the glyph seam's rule.
+/// The prefix of `line` the glyph seam receives for `cols` cells.
 ///
-/// [`GridRenderer::overlay_text_glyphs`] walks code points left to right,
-/// stops after `cols` code points, and stops before a character whose cell
-/// advance would cross `cols`. This mirrors both stops exactly, so a stored
-/// text op is byte-identical to the text the frame paints. Combining marks
-/// (`char_cell_width == 0`) ride along with their base character.
+/// [`GridRenderer::overlay_text_glyphs`] caps the input at `cols` code points
+/// and stops before a character whose cell advance would cross `cols`. This
+/// mirrors both stops, so the stored text op is exactly the prefix passed to
+/// the seam. A combining mark (`char_cell_width == 0`) rides along with its
+/// base character. The seam may then skip blank or unsupported glyphs without
+/// advancing its own column, so a narrower stored prefix is never wrong: the
+/// op and the seam agree on the input, not on per-glyph ink.
 fn visible_prefix(line: &str, cols: u16) -> &str {
     let max = usize::from(cols);
     let mut used = 0usize;

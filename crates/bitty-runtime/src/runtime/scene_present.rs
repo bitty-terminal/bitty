@@ -173,7 +173,9 @@ impl Runtime {
     /// tick presents a fresh frame even when no PTY or layout state changed.
     #[must_use]
     pub fn scene_host_mut(&mut self) -> Option<&mut PanelRuntime> {
-        self.pending_full_redraw = true;
+        if self.scene_host.is_some() {
+            self.pending_full_redraw = true;
+        }
         self.scene_host.as_mut()
     }
 

@@ -541,8 +541,12 @@ containment identity), `P0-AC-023` (child scope limitation), and `ME-05`
 (orphan reaping). The cgroup plan closes `T-21` on the tested cell by fencing
 the tree before the spawn; the fallback leaves the documented double-run
 residual (a crash between the spawn syscall and adoption is quarantined, never
-guessed at). A same-uid owner can still edit their own cgroup and journal,
-which the threat model already places inside the trust boundary. This slice
+guessed at). The reaper only opens a recorded path that is a direct child of
+the current delegated root; a restart under a different parent scope therefore
+quarantines the record instead of guessing, and a stable service scope is
+required for reliable cross-restart reaping. A same-uid owner can still edit
+their own cgroup and journal, which the threat model already places inside the
+trust boundary. This slice
 adds live cgroup evidence on Linux x86_64 but
 **does not mark any control verified**: the worker spawn path does not exist,
 the executable path digest is not recorded, and no native Windows or macOS run

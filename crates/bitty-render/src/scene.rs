@@ -25,6 +25,18 @@
 //!   exceed the accepted `SCN` admission bounds or the paint budgets below.
 //!   Nothing is silently clamped, truncated, or substituted.
 //!
+//! # Integration status
+//!
+//! This module is the render-side consumer of the accepted model as a
+//! *library* seam. The composition root that resolves a live leaf's content
+//! rect and calls [`paint_scene`] from the shipped present loop is not wired
+//! yet: `PanelRuntime::scene_paint_for` in `bitty-runtime` — the intended
+//! adapter — is currently exercised by tests only, together with the CW
+//! present plan that would feed it, and no shipped frame paints a `Scene`
+//! today. Treat the paint path as mechanism-complete and
+//! integration-pending; do not describe the renderer as consuming live scene
+//! content until the composition slice lands.
+//!
 //! # Budgets
 //!
 //! | Budget | Value | Policy |
@@ -36,21 +48,27 @@
 //! | depth per block | `SCENE_MAX_DEPTH` (32) | typed refusal |
 //! | text bytes per frame | `SCENE_MAX_RICH_BYTES_PER_TERMINAL` (2 MiB) | typed refusal |
 //!
-//! The paint list is derived once per `(scene generation, surface)` pair by
-//! [`ScenePaintCache`], so an unchanged scene costs no layout work and no
-//! text copy on the next frame.
+//! The paint list is derived once per `(scene identity, generation, block
+//! prefix, surface, budget)` tuple by [`ScenePaintCache`], so an unchanged
+//! scene costs no layout work and no text copy on the next frame. The scene
+//! identity token keeps two scenes at the same generation from sharing an
+//! entry, and the budget is part of the key so a narrowed or widened budget
+//! re-derives instead of serving a stale success or refusal.
 //!
 //! # Composition and paint order
 //!
 //! A `Scene` is a bounded store of `RichBlock` values. Inside one leaf its
 //! blocks compose top to bottom in scene iteration order; each block's root
-//! subtree lays out with the rules below:
+//! subtree lays out with the rules below. Every node lays out at the size it
+//! measured (`min(measured, remaining)`), so a child never stretches over its
+//! siblings; a `Rule` or `Image` measures the full leaf width and a `Block`
+//! frame ends where its content ends:
 //!
 //! | Node | Layout |
 //! |---|---|
 //! | `Text` / `Unknown` | one content row per `\n`-separated line, width = widest line |
-//! | `Row` | children left to right; height = tallest child |
-//! | `Column` | children top to bottom; width = widest child |
+//! | `Row` | children left to right, each at `min(measured, remaining)`; height = tallest child |
+//! | `Column` | children top to bottom, each at `min(measured, remaining)`; width = widest child |
 //! | `Block` | `border.width` cells of inset on every side around the child |
 //! | `CodeBlock` | one row per content line, plus one header row when `lang` is set |
 //! | `Table` | one row per table row, cells joined with `" \| "` |
@@ -65,10 +83,27 @@
 //! [`ScenePaintOp::Image`] reference and no pixels: the admitted image plane
 //! keeps owning image painting, and this path adds no decode seam.
 //!
-//! [`ScenePaint::damage`] is the painted extent intersected with the leaf
-//! rect — a bounded invalidation rectangle. A scene revision never damages
-//! outside its leaf, and a partial revision never forces a full-screen
-//! repaint.
+//! # Text
+//!
+//! A text op stores exactly the cells the glyph seam paints: the painter
+//! clips each `\n`-separated line to the cells that fit the leaf before the
+//! op is recorded, using the same rule as
+//! [`GridRenderer::overlay_text_glyphs`] (one cell per narrow character, two
+//! per wide character, at most one code point per cell). [`ScenePaint::text_lines`],
+//! [`ScenePaint::plain_text`], and the accessibility projection therefore
+//! carry the painted bytes and nothing a plugin appended past the clip edge.
+//!
+//! `StyledSpan.italic` is carried by the accepted model but is not rendered
+//! here: the grid text seam has no italic pass, and Core never fakes one by
+//! skewing glyphs. Bold keeps the deterministic one-pixel pass.
+//!
+//! [`ScenePaint::damage`] is the bounding box of the emitted op rectangles —
+//! each text line contributes its reserved cell span, not its glyph ink —
+//! intersected with the leaf rect. That is a bounded invalidation rectangle:
+//! a scene revision never damages outside its leaf, and a partial revision
+//! never forces a full-screen repaint. A tighter ink-only rectangle would
+//! save invalidation area but needs per-glyph metrics on a path that is
+//! deliberately headless, so the reserved span stays.
 
 #![forbid(unsafe_code)]
 
@@ -113,6 +148,11 @@ pub const SCENE_PAINT_MAX_BORDER_CELLS: u16 = 8;
 /// inset by `border + content_inset`); `cell` is the live cell geometry.
 /// Cell spans are derived by flooring, so a partially visible last cell is
 /// painted only to the pixel edge of `rect`.
+///
+/// A surface whose cell width or height is zero paints nothing: [`Self::cols`]
+/// and [`Self::rows`] report `0` instead of dividing by zero, so a
+/// hand-built `CellMetrics { width: 0, .. }` (its fields are public) degrades
+/// to an empty frame rather than a panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SceneSurface {
     /// Leaf content rectangle in logical pixels.
@@ -129,18 +169,22 @@ impl SceneSurface {
     }
 
     /// Whole content columns that fit the rect.
+    ///
+    /// `0` for an empty rect or a zero-width cell.
     #[must_use]
     pub fn cols(&self) -> u16 {
-        if self.rect.is_empty() {
+        if self.rect.is_empty() || self.cell.width == 0 {
             return 0;
         }
         u16::try_from(self.rect.width / self.cell.width).unwrap_or(u16::MAX)
     }
 
     /// Whole content rows that fit the rect.
+    ///
+    /// `0` for an empty rect or a zero-height cell.
     #[must_use]
     pub fn rows(&self) -> u16 {
-        if self.rect.is_empty() {
+        if self.rect.is_empty() || self.cell.height == 0 {
             return 0;
         }
         u16::try_from(self.rect.height / self.cell.height).unwrap_or(u16::MAX)
@@ -296,8 +340,10 @@ pub enum ScenePaintOp {
     /// One text line painted left-to-right inside `rect`.
     ///
     /// `rect` is cell-aligned; `cols` is the number of whole cells the line
-    /// may occupy. Rasterization reuses the grid renderer's overlay text
-    /// seam, so the glyphs match cell text exactly.
+    /// may occupy and `text` is already clipped to those cells, so the
+    /// stored text is exactly the glyph-seam input. Rasterization reuses the
+    /// grid renderer's overlay text seam, so the glyphs match cell text
+    /// exactly.
     Text {
         /// Zero-based content row inside the leaf.
         row: u16,
@@ -307,7 +353,8 @@ pub enum ScenePaintOp {
         rect: RectPx,
         /// Whole cells available to the line.
         cols: u16,
-        /// Line text (bounded by the scene text budget).
+        /// Visible line text, clipped to `cols` cells (bounded by the scene
+        /// text budget).
         text: String,
         /// Text color.
         color: Rgba8,
@@ -349,7 +396,9 @@ impl ScenePaintOp {
 /// One painted text line, in paint order.
 ///
 /// The accessibility projection and the plain-text export consume exactly
-/// these lines, so painted and projected text cannot diverge.
+/// these lines, so painted and projected text cannot diverge: the line text
+/// is the clipped cell run the glyph seam receives, never the producer's
+/// full string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SceneTextLine<'a> {
     /// Zero-based content row inside the leaf.
@@ -563,6 +612,44 @@ pub fn paint_scene_with_style(
     budget: ScenePaintBudget,
     style: ScenePaintStyle,
 ) -> Result<ScenePaint, ScenePaintError> {
+    paint_scene_prefix_with_style(scene, scene.len(), surface, budget, style)
+}
+
+/// Paints only the first `max_blocks` blocks of `scene`.
+///
+/// The caller sheds the iteration tail (the present path's `paint_cap`), so
+/// the paint list must cover exactly the blocks it admitted: painting the
+/// whole scene would draw blocks the present plan reports as shed. Budget
+/// refusal still describes the presented scene (`max_blocks` budget and the
+/// aggregated byte budget are checked against the whole scene), so a
+/// partially admitted scene can never paint more than its budget.
+///
+/// # Errors
+///
+/// A [`ScenePaintError`] when the scene exceeds the accepted `SCN` bounds or
+/// the paint budgets.
+pub fn paint_scene_prefix(
+    scene: &Scene,
+    max_blocks: usize,
+    surface: SceneSurface,
+    budget: ScenePaintBudget,
+) -> Result<ScenePaint, ScenePaintError> {
+    paint_scene_prefix_with_style(
+        scene,
+        max_blocks,
+        surface,
+        budget,
+        ScenePaintStyle::default(),
+    )
+}
+
+fn paint_scene_prefix_with_style(
+    scene: &Scene,
+    max_blocks: usize,
+    surface: SceneSurface,
+    budget: ScenePaintBudget,
+    style: ScenePaintStyle,
+) -> Result<ScenePaint, ScenePaintError> {
     if scene.len() > budget.max_blocks {
         return Err(ScenePaintError::BlocksTooMany {
             count: scene.len(),
@@ -597,7 +684,7 @@ pub fn paint_scene_with_style(
     let cols = surface.cols();
     let rows = surface.rows();
     let mut y = 0u16;
-    for block in scene.iter() {
+    for block in scene.iter().take(max_blocks) {
         if y >= rows {
             break;
         }
@@ -624,16 +711,35 @@ pub fn paint_scene_with_style(
     })
 }
 
-/// Paint cache: derives one paint list per `(generation, surface)` pair.
+/// Cache key for one derived paint list.
+///
+/// Every input that can change the output is part of the key: the scene's
+/// identity and generation, how many blocks the caller admitted, the leaf
+/// rect, the cell metrics, and the budget. A budget-only flip (default to
+/// [`ScenePaintBudget::nothing`] and back) therefore re-derives instead of
+/// serving the previous success or refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScenePaintKey {
+    identity: u64,
+    generation: u64,
+    blocks: usize,
+    rect: RectPx,
+    cell: CellMetrics,
+    budget: ScenePaintBudget,
+}
+
+/// Paint cache: derives one paint list per
+/// `(scene identity, generation, block prefix, surface, budget)` tuple.
 ///
 /// The present path caches this per panel slot, so an unchanged scene costs
-/// no layout walk and no text copy. A refusal is cached too: re-presenting
+/// no layout walk and no text copy: the cached list is shared through an
+/// [`std::sync::Arc`], and [`ScenePaintCache::get_or_paint`] hands out a
+/// cheap clone of the same allocation. A refusal is cached too: re-presenting
 /// the same over-budget scene keeps failing closed without re-walking it.
 #[derive(Debug, Clone, Default)]
 pub struct ScenePaintCache {
-    key: Option<(u64, RectPx, CellMetrics)>,
-    paint: ScenePaint,
-    refused: Option<ScenePaintError>,
+    key: Option<ScenePaintKey>,
+    entry: Option<Result<std::sync::Arc<ScenePaint>, ScenePaintError>>,
 }
 
 impl ScenePaintCache {
@@ -643,8 +749,8 @@ impl ScenePaintCache {
         Self::default()
     }
 
-    /// Returns the paint list for `scene`/`surface`, rebuilding only when the
-    /// scene generation or the surface changed.
+    /// Returns the paint list for the whole `scene` on `surface`, rebuilding
+    /// only when a key input changed.
     ///
     /// # Errors
     ///
@@ -655,34 +761,53 @@ impl ScenePaintCache {
         scene: &Scene,
         surface: SceneSurface,
         budget: ScenePaintBudget,
-    ) -> Result<&ScenePaint, ScenePaintError> {
-        let key = (scene.generation(), surface.rect, surface.cell);
-        if self.key != Some(key) {
+    ) -> Result<std::sync::Arc<ScenePaint>, ScenePaintError> {
+        self.get_or_paint_prefix(scene, scene.len(), surface, budget)
+    }
+
+    /// Returns the paint list for the first `max_blocks` blocks of `scene`,
+    /// rebuilding only when a key input changed.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`paint_scene_prefix`].
+    pub fn get_or_paint_prefix(
+        &mut self,
+        scene: &Scene,
+        max_blocks: usize,
+        surface: SceneSurface,
+        budget: ScenePaintBudget,
+    ) -> Result<std::sync::Arc<ScenePaint>, ScenePaintError> {
+        let key = ScenePaintKey {
+            identity: scene.identity(),
+            generation: scene.generation(),
+            blocks: max_blocks,
+            rect: surface.rect,
+            cell: surface.cell,
+            budget,
+        };
+        if self.key != Some(key) || self.entry.is_none() {
             self.key = Some(key);
-            match paint_scene(scene, surface, budget) {
-                Ok(paint) => {
-                    self.paint = paint;
-                    self.refused = None;
-                }
-                Err(error) => {
-                    self.paint = ScenePaint::default();
-                    self.refused = Some(error);
-                }
-            }
+            self.entry = Some(
+                paint_scene_prefix(scene, max_blocks, surface, budget).map(std::sync::Arc::new),
+            );
         }
-        match &self.refused {
-            Some(error) => Err(error.clone()),
-            None => Ok(&self.paint),
-        }
+        // The build above always leaves a result; cloning it clones the
+        // `Arc` (or a small typed error), never the paint payload.
+        self.entry.clone().unwrap_or_else(|| {
+            Err(ScenePaintError::BlocksTooMany {
+                count: scene.len(),
+                cap: budget.max_blocks,
+            })
+        })
     }
 
     /// The cached paint list, if the current key produced one.
     #[must_use]
     pub fn paint(&self) -> Option<&ScenePaint> {
-        if self.refused.is_some() || self.key.is_none() {
-            None
-        } else {
-            Some(&self.paint)
+        match &self.entry {
+            Some(Ok(paint)) => Some(paint),
+            Some(Err(_)) | None => None,
         }
     }
 
@@ -862,12 +987,17 @@ impl Painter {
                         break;
                     }
                     let size = self.measure(child, depth + 1)?;
+                    let available = width - cursor;
+                    // Give the child the size it measured: a `Block` paints its
+                    // border across exactly this extent, so handing it the whole
+                    // remaining width would stretch the frame over its siblings
+                    // and disagree with `measure`.
                     self.paint_node(
                         child,
                         x.saturating_add(cursor),
                         y,
-                        width - cursor,
-                        height,
+                        size.cols.min(available),
+                        size.rows.min(height),
                         depth + 1,
                     )?;
                     cursor = cursor.saturating_add(size.cols);
@@ -880,31 +1010,51 @@ impl Painter {
                     if cursor >= height {
                         break;
                     }
+                    let size = self.measure(child, depth + 1)?;
+                    let available = height - cursor;
                     self.paint_node(
                         child,
                         x,
                         y.saturating_add(cursor),
-                        width,
-                        height - cursor,
+                        size.cols.min(width),
+                        size.rows.min(available),
                         depth + 1,
                     )?;
-                    cursor = cursor.saturating_add(self.measure(child, depth + 1)?.rows);
+                    cursor = cursor.saturating_add(size.rows);
                 }
                 Ok(())
             }
             SceneNode::Block { border, child } => {
                 let inset = border_cells(border.as_ref())?;
-                if inset > 0 {
-                    self.paint_border(x, y, width, height, inset)?;
-                }
+                let inner = self.measure(child, depth + 1)?;
                 let double = inset.saturating_mul(2);
+                // The frame is the block's own measured size, not the clip
+                // window: an edge whose true anchor falls outside the leaf or
+                // outside the extent this node was allocated is dropped by
+                // `paint_border` instead of being drawn on the clip boundary.
+                let frame = Size {
+                    cols: inner.cols.saturating_add(double),
+                    rows: inner.rows.saturating_add(double),
+                };
+                if inset > 0 {
+                    self.paint_border(
+                        x,
+                        y,
+                        frame,
+                        Size {
+                            cols: width,
+                            rows: height,
+                        },
+                        inset,
+                    )?;
+                }
                 if width > double && height > double {
                     self.paint_node(
                         child,
                         x.saturating_add(inset),
                         y.saturating_add(inset),
-                        width - double,
-                        height - double,
+                        (width - double).min(inner.cols),
+                        (height - double).min(inner.rows),
                         depth + 1,
                     )?;
                 }
@@ -1029,7 +1179,7 @@ impl Painter {
         width: u16,
         bold: bool,
     ) -> Result<(), ScenePaintError> {
-        if width == 0 {
+        if width == 0 || self.surface.cell.width == 0 {
             return Ok(());
         }
         let rect = self.cell_rect(x, y, width, 1);
@@ -1040,7 +1190,12 @@ impl Painter {
         if cols == 0 {
             return Ok(());
         }
-        self.text_bytes = self.text_bytes.saturating_add(text.len());
+        // The op is self-describing: it stores the cell run the glyph seam
+        // will paint, never the producer's full line. Accessibility and the
+        // plain-text export read the op, so a plugin cannot paint "OK" and
+        // append invisible text a screen reader would announce.
+        let visible = visible_prefix(text, cols);
+        self.text_bytes = self.text_bytes.saturating_add(visible.len());
         if self.text_bytes > self.budget.max_text_bytes {
             return Err(ScenePaintError::TextTooLarge {
                 bytes: self.text_bytes,
@@ -1052,7 +1207,7 @@ impl Painter {
             col: x,
             rect,
             cols,
-            text: text.to_string(),
+            text: visible.to_string(),
             color: self.style.text,
             bold,
         })
@@ -1062,43 +1217,57 @@ impl Painter {
         &mut self,
         x: u16,
         y: u16,
-        width: u16,
-        height: u16,
+        frame: Size,
+        available: Size,
         inset: u16,
     ) -> Result<(), ScenePaintError> {
-        let rect = self.cell_rect(x, y, width, height);
-        let Some(rect) = rect.intersection(&self.surface.aligned_rect()) else {
+        let full = self.cell_rect(x, y, frame.cols, frame.rows);
+        let aligned = self.surface.aligned_rect();
+        if full.intersection(&aligned).is_none() {
             return Ok(());
-        };
+        }
         let horizontal = u32::from(inset)
             .saturating_mul(self.surface.cell.height)
-            .min(rect.height);
+            .min(full.height);
         let vertical = u32::from(inset)
             .saturating_mul(self.surface.cell.width)
-            .min(rect.width);
+            .min(full.width);
+        // Segments are anchored on the block's true frame, then intersected
+        // with the leaf. Top/left always paint (clipped to the visible part);
+        // the bottom and right edges only paint when the frame actually ends
+        // inside the extent this node was allocated, so a clipped block never
+        // draws its edge on the clip boundary and never bleeds past the
+        // allocation into a sibling.
+        let top = RectPx::new(full.x, full.y, full.width, horizontal);
+        let bottom = RectPx::new(
+            full.x,
+            full.y.saturating_add(saturating_i32_from_u32(
+                full.height.saturating_sub(horizontal),
+            )),
+            full.width,
+            horizontal,
+        );
+        let left = RectPx::new(full.x, full.y, vertical, full.height);
+        let right = RectPx::new(
+            full.x
+                .saturating_add(saturating_i32_from_u32(full.width.saturating_sub(vertical))),
+            full.y,
+            vertical,
+            full.height,
+        );
         let segments = [
-            RectPx::new(rect.x, rect.y, rect.width, horizontal),
-            RectPx::new(
-                rect.x,
-                rect.y.saturating_add(saturating_i32_from_u32(
-                    rect.height.saturating_sub(horizontal),
-                )),
-                rect.width,
-                horizontal,
-            ),
-            RectPx::new(rect.x, rect.y, vertical, rect.height),
-            RectPx::new(
-                rect.x
-                    .saturating_add(saturating_i32_from_u32(rect.width.saturating_sub(vertical))),
-                rect.y,
-                vertical,
-                rect.height,
-            ),
+            Some(top),
+            Some(left),
+            (frame.rows <= available.rows).then_some(bottom),
+            (frame.cols <= available.cols).then_some(right),
         ];
-        for segment in segments {
-            if !segment.is_empty() {
+        for segment in segments.into_iter().flatten() {
+            let Some(clipped) = segment.intersection(&aligned) else {
+                continue;
+            };
+            if !clipped.is_empty() {
                 self.push_op(ScenePaintOp::Fill {
-                    rect: segment,
+                    rect: clipped,
                     color: self.style.rule,
                 })?;
             }
@@ -1215,4 +1384,27 @@ fn line_cells(line: &str) -> usize {
     line.chars()
         .map(|ch| usize::from(char_cell_width(ch)))
         .sum::<usize>()
+}
+
+/// The prefix of `line` that fits `cols` cells, using the glyph seam's rule.
+///
+/// [`GridRenderer::overlay_text_glyphs`] walks code points left to right,
+/// stops after `cols` code points, and stops before a character whose cell
+/// advance would cross `cols`. This mirrors both stops exactly, so a stored
+/// text op is byte-identical to the text the frame paints. Combining marks
+/// (`char_cell_width == 0`) ride along with their base character.
+fn visible_prefix(line: &str, cols: u16) -> &str {
+    let max = usize::from(cols);
+    let mut used = 0usize;
+    for (count, (byte, ch)) in line.char_indices().enumerate() {
+        if count >= max {
+            return &line[..byte];
+        }
+        let advance = usize::from(char_cell_width(ch));
+        if used.saturating_add(advance) > max {
+            return &line[..byte];
+        }
+        used = used.saturating_add(advance);
+    }
+    line
 }

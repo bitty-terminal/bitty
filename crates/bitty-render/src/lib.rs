@@ -162,10 +162,13 @@
 //! `bitty-rich` and produces [`scene::ScenePaint`]: ordered fills, text lines,
 //! and image placement references, all clipped to the leaf content rectangle
 //! the compositor owns. Ops that would fall outside the rect are dropped by
-//! clipping (never painted), and [`scene::ScenePaint::damage`] is the painted
-//! extent intersected with that rect, so a scene revision never damages
-//! outside its leaf. Over-budget scenes are refused with a typed
-//! [`scene::ScenePaintError`]; nothing is clamped or silently substituted.
+//! clipping (never painted), and [`scene::ScenePaint::damage`] is the bounding
+//! box of the emitted op rectangles intersected with that rect, so a scene
+//! revision never damages outside its leaf. Over-budget scenes are refused
+//! with a typed [`scene::ScenePaintError`]; nothing is clamped or silently
+//! substituted. A text op stores exactly the cell run the glyph seam paints
+//! (the stored line is clipped, not just clipped at rasterization), so the
+//! plain-text and accessibility projections read painted bytes only.
 //! Text becomes glyphs through the existing overlay text seam
 //! ([`grid::GridRenderer::overlay_text_glyphs`]), so the path stays headless
 //! and CPU-verifiable. Image nodes stay references: the admitted image plane
@@ -314,7 +317,7 @@ pub use pipeline::UNDERLINE_WGSL;
 pub use scene::{
     SCENE_PAINT_MAX_BORDER_CELLS, SCENE_PAINT_MAX_OPS, ScenePaint, ScenePaintBudget,
     ScenePaintCache, ScenePaintError, ScenePaintOp, ScenePaintStyle, SceneSurface, SceneTextLine,
-    paint_scene, paint_scene_with_style,
+    paint_scene, paint_scene_prefix, paint_scene_with_style,
 };
 pub use shaped::{
     ASCII_PRINTABLE_FIRST, ASCII_PRINTABLE_LAST, CJK_ADVANCE_EPSILON_PX, GRID_ADVANCE_EPSILON_PX,

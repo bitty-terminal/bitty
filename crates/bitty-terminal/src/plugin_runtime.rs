@@ -2587,7 +2587,20 @@ bitty.commands.register({ id = "mount", title = "Mount rich scene", run = mount 
 bitty.commands.register({ id = "update", title = "Update rich scene", run = update })
 "#;
 
-    fn write_scene_probe(root: &Path, id: &str) {
+    /// Probe plugin that mounts its scene during activation, before any app
+    /// tick exists: the seeded placement target must route it, and the first
+    /// presented frame must paint it.
+    const SCENE_AT_INIT: &str = r#"
+bitty.ui.mount("terminal", {
+  kind = "Block",
+  border = { width = 1 },
+  child = { kind = "Text", text = "init-scene-line" },
+})
+"#;
+
+    const SCENE_AT_INIT_ID: &str = "xuepoo.richsceneinit";
+
+    fn write_scene_source(root: &Path, id: &str, source: &str) {
         let plugin = root.join(id);
         std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
         std::fs::write(
@@ -2614,14 +2627,22 @@ bitty.commands.register({ id = "update", title = "Update rich scene", run = upda
             ),
         )
         .expect("manifest");
-        std::fs::write(plugin.join("lua/init.lua"), SCENE_PLUGIN).expect("init");
+        std::fs::write(plugin.join("lua/init.lua"), source).expect("init");
     }
 
     /// Composition root under test: the real plugin discovery/activation path
     /// plus the same `PanelRuntime`/`SceneHost` install `main` performs.
     fn scene_probe_app(tag: &str) -> (crate::terminal_app::TerminalApp, Rc<RefCell<PanelRuntime>>) {
+        scene_app_with_source(tag, SCENE_PLUGIN_ID, SCENE_PLUGIN)
+    }
+
+    fn scene_app_with_source(
+        tag: &str,
+        id: &str,
+        source: &str,
+    ) -> (crate::terminal_app::TerminalApp, Rc<RefCell<PanelRuntime>>) {
         let root = pin_test_dir(tag);
-        write_scene_probe(&root, SCENE_PLUGIN_ID);
+        write_scene_source(&root, id, source);
         let mut config = bitty_runtime::RuntimeConfig {
             cols: 80,
             rows: 24,
@@ -2712,6 +2733,33 @@ bitty.commands.register({ id = "update", title = "Update rich scene", run = upda
             changed.push(bitty_render::geometry::RectPx::new(x, y, 1, 1));
         }
         changed
+    }
+
+    #[test]
+    fn activation_time_rich_mount_paints_the_first_frame() {
+        let _control_queue_guard = crate::ctl::test_control_queue_lock();
+        let (mut app, panels) =
+            scene_app_with_source("scene-at-init", SCENE_AT_INIT_ID, SCENE_AT_INIT);
+        // No command ran: the mount happened inside `init.lua`, before the app
+        // existed, and the seeded placement target routed it.
+        let view = app.runtime.focused_view().expect("focused leaf");
+        app.drive_tick().expect("first frame presents");
+        let report = app.runtime.scene_frame().clone();
+        assert_eq!(report.views, 1);
+        assert!(
+            report.a11y[0]
+                .lines
+                .iter()
+                .any(|(_, text)| text == "init-scene-line"),
+            "the activation-time scene paints: {:?}",
+            report.a11y[0].lines
+        );
+        let panel = panels
+            .borrow()
+            .placement_panel_of(view)
+            .expect("placement resolves");
+        assert_eq!(report.a11y[0].identity, panel.get());
+        assert_eq!(panels.borrow().panel_scene_len(), 1);
     }
 
     #[test]

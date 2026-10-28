@@ -83,6 +83,7 @@ mod stdlib;
 pub mod store;
 pub mod ui;
 pub mod ui_catalog;
+pub mod ui_rich;
 
 pub use config::{
     AnimationsData, ColorsData, ConfigData, ConfigOutcome, DecorationData, FontData, KeymapData,
@@ -126,6 +127,7 @@ pub use ui_catalog::{
     CATALOG_MAX_TEXT_BYTES, CatalogBlock, CatalogEntry, CatalogError, DetailFallbackDescriptor,
     ModalSheetDescriptor, Pill, PillRowDescriptor, Segment, StripDescriptor,
 };
+pub use ui_rich::UiRichNode;
 
 // ── RC budgets (aligned with bitty-plugin-host/src/event.rs) ───────────────
 

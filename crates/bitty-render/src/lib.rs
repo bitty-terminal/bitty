@@ -130,6 +130,9 @@
 //! [`bitty_platform::SurfaceTarget`] via [`gpu::GpuContext::create_surface`],
 //! with `configure`/`resize`/`present` paths), the grid pipeline
 //! ([`grid::GridRenderer`] `Snapshot`/`Damage` -> `DrawList`/`Atlas`),
+//! and the scene paint path ([`scene`]: an admitted `bitty_rich::scene::Scene`
+//! laid out and clipped to a leaf content rect, with a bounded paint list,
+//! one damage rectangle, and the same CPU text seam as cell content),
 //! CPU batch translation ([`batch`]: `DrawList` -> bounded vertex batches +
 //! atlas dirty-region bookkeeping), GPU presentation resources plus WGSL
 //! fill/glyph pipelines (crate-private `pipeline` module, consumed by
@@ -152,6 +155,31 @@
 //! `bitty-platform`'s [`bitty_platform::SurfaceTarget`]; no `wgpu` type leaks
 //! except through that owned wrapper. None of the remaining deferred items may
 //! be described as existing until they land with evidence.
+//!
+//! # Scene paint path (OQ-051, CTX-1628 / bitty#2760)
+//!
+//! [`scene::paint_scene`] consumes the admitted `Scene` model from
+//! `bitty-rich` and produces [`scene::ScenePaint`]: ordered fills, text lines,
+//! and image placement references, all clipped to the leaf content rectangle
+//! the compositor owns. Ops that would fall outside the rect are dropped by
+//! clipping (never painted), and [`scene::ScenePaint::damage`] is the bounding
+//! box of the emitted op rectangles intersected with that rect, so a scene
+//! revision never damages outside its leaf. Over-budget scenes are refused
+//! with a typed [`scene::ScenePaintError`]; nothing is clamped or silently
+//! substituted. A text op stores exactly the cell run the glyph seam paints
+//! (the stored line is clipped, not just clipped at rasterization), so the
+//! plain-text and accessibility projections read painted bytes only.
+//! Text becomes glyphs through the existing overlay text seam
+//! ([`grid::GridRenderer::overlay_text_glyphs`]), so the path stays headless
+//! and CPU-verifiable. Image nodes stay references: the admitted image plane
+//! keeps owning decode and blit, and this crate adds no second decode seam.
+//!
+//! Integration status: this is a library seam. No shipped frame paints a
+//! `Scene` today — the `bitty-runtime` adapters (`PanelRuntime::scene_paint_for`
+//! and the CW present plan) are exercised by tests only until CTX-1630 wires
+//! the `ui.rich` mount path and the present loop. See the
+//! [`scene`] module's "Integration status" section for the exact remainder;
+//! do not describe the renderer as consuming live scene content before then.
 //!
 //! # Headless friendliness and what CI does and does not verify
 //!
@@ -255,6 +283,7 @@ pub mod gpu;
 pub mod grid;
 pub mod hidpi;
 pub(crate) mod pipeline;
+pub mod scene;
 pub mod shaped;
 pub mod telemetry;
 pub mod window;
@@ -292,6 +321,11 @@ pub use hidpi::{
     surface_extent_for_grid,
 };
 pub use pipeline::UNDERLINE_WGSL;
+pub use scene::{
+    SCENE_PAINT_MAX_BORDER_CELLS, SCENE_PAINT_MAX_OPS, ScenePaint, ScenePaintBudget,
+    ScenePaintCache, ScenePaintError, ScenePaintOp, ScenePaintStyle, SceneSurface, SceneTextLine,
+    paint_scene, paint_scene_prefix, paint_scene_with_style,
+};
 pub use shaped::{
     ASCII_PRINTABLE_FIRST, ASCII_PRINTABLE_LAST, CJK_ADVANCE_EPSILON_PX, GRID_ADVANCE_EPSILON_PX,
     GlyphSource, MAX_DYNAMIC_CACHE_ENTRIES, MAX_FACE_BYTES, MAX_LOADED_FACES, MAX_RUN_CACHE_BYTES,

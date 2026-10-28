@@ -16,6 +16,10 @@
 //!   declarative layout, `Scene` composition with SCN-1..5 limits (2048
 //!   nodes/block, 32 depth, 256 KiB text/block, 2 MiB aggregated/terminal,
 //!   64 blocks/terminal), deterministic `BlockId`/`ImageStore` attribution.
+//!   The admitted model is consumed by `bitty-render::scene::paint_scene`
+//!   (CTX-1628 / bitty#2760): the renderer lays the scene out inside a leaf
+//!   content rect and emits a bounded paint list, while validation and
+//!   admission stay here.
 //!
 //! `bitty_term_state::ImageStore` (64 entries, 4096 bytes each) remains as
 //! the legacy terminal-truth placeholder seam; this crate's `image`

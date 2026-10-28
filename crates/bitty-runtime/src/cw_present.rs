@@ -15,7 +15,7 @@
 //! | #982 CW-03 | retired (E-CUT-4, CTX-0968): composer overlay deleted, plugin owns editing UX | — |
 //! | #983 CW-04 | cross-panel hint API, one engine | [`CwHintEngine`] + [`CwHintProvider`] |
 //! | #984 CW-05 | semantic anchor identity + fold persistence | [`SemanticAnchor`] + [`anchor_for_command`] + [`persist_fold_ordinals`] |
-//! | #985 CW-06 | consume rich scene in present | [`consume_scene_present`] + [`ScenePresent`] |
+//! | #985 CW-06 | consume rich scene in present | [`consume_scene_present`] + [`consume_scene_present_at`] + [`ScenePresent`] |
 //! | #990 CW-11 | non-terminal content beyond the grid | [`NonTerminalPresent`] + [`nonterminal_for_content`] |
 //!
 //! # Decision status and live wiring
@@ -31,6 +31,10 @@
 //! editing UX via overlay/capture/submit/editor host operations. No editor
 //! process is spawned and no grid write happens here.
 //!
+//! The CW-06 scene paint slice (`consume_scene_present_at` and
+//! [`ScenePresent::paint`]) is library-only: no shipped frame calls it until
+//! CTX-1630 wires the `ui.rich` mount path and the present loop.
+//!
 //! # Terminal truth
 //!
 //! The only mutation in the system is the caller's [`FoldState`]
@@ -43,7 +47,8 @@
 //! |---|---|---|
 //! | [`CwHintEngine`] providers | [`CW_PRESENT_MAX_PROVIDERS`] (64) | register fails closed, no eviction |
 //! | provider views | [`CW_PRESENT_MAX_NONTERMINAL_ITEMS`] (64) | [`CwHintProvider::with_views`] returns `None` past the cap |
-//! | scene blocks per plan | [`CW_PRESENT_MAX_SCENE_BLOCKS`] (64) | deterministic shed of the iteration tail, [`ScenePresent::shed`] reports it |
+//! | scene blocks per plan | [`CW_PRESENT_MAX_SCENE_BLOCKS`] (64) | deterministic shed of the iteration tail, [`ScenePresent::shed`] reports it; only the admitted prefix paints |
+//! | scene paint ops per leaf | `SCENE_PAINT_MAX_OPS` (via [`bitty_render::scene`]) | typed refusal, nothing paints |
 //! | non-terminal items | [`CW_PRESENT_MAX_NONTERMINAL_ITEMS`] (64) | saturate + [`NonTerminalPresent::truncated`] |
 //! | hint labels / text | `HINT_TARGET_MAX` / `HINT_TEXT_MAX_BYTES` (via [`HintBatch`]) | shed tail, never an overlay |
 //! | hint overlay entries | batch labels 1:1 (via [`HintOverlayPresent`]) | same shed as the batch, zero overlay slots |
@@ -52,6 +57,7 @@
 //!
 //! No I/O, no wall-clock, no randomness, no unsafe.
 
+use bitty_render::scene::{ScenePaint, ScenePaintError};
 use bitty_rich::blocks::{CommandBlock, CommandId, FoldState, hidden_blocks, visible_blocks};
 use bitty_rich::hints::{
     DispatchError, DispatchOutcome, HintAction, HintAnchor, HintBatch, HintKind, HintRegistry,
@@ -571,6 +577,14 @@ impl CwHintEngine {
 // ---------------------------------------------------------------------------
 
 /// Paint-budget view of the rich scene for one present frame (CW-06).
+///
+/// `paint` is the OQ-051 render-path consumption (CTX-1628 / bitty#2760):
+/// the bounded, leaf-clipped paint list for the leaf content rect. A caller
+/// that has no geometry calls [`consume_scene_present`] and gets the budget
+/// with an empty paint list; a caller that presents a leaf calls
+/// [`consume_scene_present_at`] or
+/// [`PanelRuntime::scene_paint_for`](crate::registry::PanelRuntime::scene_paint_for)
+/// and receives both.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScenePresent {
     /// Admitted block ids in scene iteration order.
@@ -581,6 +595,20 @@ pub struct ScenePresent {
     pub text_total: usize,
     /// Blocks shed by the paint cap.
     pub shed: usize,
+    /// Bounded paint list for the leaf content rect (empty without geometry).
+    ///
+    /// Shared through an [`std::sync::Arc`] so a cached frame hands the same
+    /// allocation to every reader instead of copying every op and text line.
+    /// Only the admitted prefix paints: when [`Self::shed`] is non-zero the
+    /// paint list covers exactly [`Self::block_ids`], never the shed tail.
+    pub paint: std::sync::Arc<ScenePaint>,
+    /// Typed refusal when the attached scene exceeded a paint budget.
+    ///
+    /// `Some` means nothing paints for this leaf this frame: the present path
+    /// must keep the previous frame and attribute the diagnostic. The budget
+    /// fields above still describe the admitted scene so a diagnostic can
+    /// name what was refused.
+    pub refusal: Option<ScenePaintError>,
 }
 
 impl ScenePresent {
@@ -588,6 +616,18 @@ impl ScenePresent {
     #[must_use]
     pub fn block_count(&self) -> usize {
         self.block_ids.len()
+    }
+
+    /// True when the paint list carries no ops.
+    ///
+    /// Three shapes report `true`: an empty scene, a budget-only projection
+    /// (no leaf geometry, so [`Self::paint`] is empty while `block_ids` may
+    /// not be), and a refused scene ([`Self::refusal`] is `Some`). Read
+    /// `block_ids`/`refusal` to tell them apart; this predicate only answers
+    /// "does this frame paint scene pixels".
+    #[must_use]
+    pub fn paints_nothing(&self) -> bool {
+        self.paint.is_empty()
     }
 }
 
@@ -598,6 +638,9 @@ impl ScenePresent {
 /// tail deterministically, reporting the count in [`ScenePresent::shed`].
 /// Scene admission bounds (`SCN-1..5`) are enforced at insert time; the
 /// present path only budgets paint work and never re-validates content.
+///
+/// This entry point has no geometry, so [`ScenePresent::paint`] stays empty.
+/// A presenting caller uses [`consume_scene_present_at`].
 #[must_use]
 pub fn consume_scene_present(scene: &Scene, paint_cap: usize) -> ScenePresent {
     let cap = paint_cap.min(CW_PRESENT_MAX_SCENE_BLOCKS);
@@ -611,6 +654,37 @@ pub fn consume_scene_present(scene: &Scene, paint_cap: usize) -> ScenePresent {
         present.block_ids.push(block.id());
     }
     present.shed = scene.len().saturating_sub(present.block_ids.len());
+    present
+}
+
+/// Consumes [`Scene`] blocks into a bounded paint list for one leaf (OQ-051).
+///
+/// Same budget as [`consume_scene_present`], plus the render-path conversion:
+/// [`paint_scene_prefix`](bitty_render::scene::paint_scene_prefix) lays the
+/// admitted prefix inside `surface` (the compositor-owned leaf content rect)
+/// and returns ops clipped to that rect plus one bounded invalidation
+/// rectangle. The shed tail never paints, so the paint list and
+/// [`ScenePresent::block_ids`] always describe the same blocks. An
+/// over-budget or over-wide scene refuses with a typed [`ScenePaintError`] in
+/// [`ScenePresent::refusal`] and paints nothing; nothing is clamped or
+/// silently substituted.
+#[must_use]
+pub fn consume_scene_present_at(
+    scene: &Scene,
+    surface: bitty_render::scene::SceneSurface,
+    paint_cap: usize,
+) -> ScenePresent {
+    let mut present = consume_scene_present(scene, paint_cap);
+    let admitted = present.block_ids.len();
+    match bitty_render::scene::paint_scene_prefix(
+        scene,
+        admitted,
+        surface,
+        bitty_render::scene::ScenePaintBudget::default(),
+    ) {
+        Ok(paint) => present.paint = std::sync::Arc::new(paint),
+        Err(error) => present.refusal = Some(error),
+    }
     present
 }
 

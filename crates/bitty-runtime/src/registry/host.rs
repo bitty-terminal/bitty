@@ -34,10 +34,16 @@
 //!   binds a scene to a live panel handle (stale handles fail closed),
 //!   [`PanelRuntime::scene_present_for`] budgets the attached scene for one
 //!   present frame (missing scene yields the empty budget, never a crash),
-//!   and [`PanelRuntime::nonterminal_for_leaf`] maps `Panel`/`Browser`/
-//!   `Rich` leaves to the beyond-grid payload (`Terminal`/`Empty` stay on
-//!   the grid path). The render pipeline consumes this contract through
-//!   [`Runtime::cw_present_plan_for_host`](crate::runtime::Runtime::cw_present_plan_for_host).
+//!   [`PanelRuntime::scene_paint_for`] derives the leaf-clipped paint list
+//!   (CTX-1628), and [`PanelRuntime::nonterminal_for_leaf`] maps
+//!   `Panel`/`Browser`/`Rich` leaves to the beyond-grid payload
+//!   (`Terminal`/`Empty` stay on the grid path).
+//!
+//!   Integration status: this is the host-side contract, not yet composed
+//!   into the shipped present loop. `Runtime::cw_present_plan_for_host` is
+//!   the intended consumer and is exercised by tests only; nothing attaches a
+//!   scene from a plugin mount yet. Do not describe the render pipeline as
+//!   consuming live scenes until that composition slice lands.
 //!
 //! The runtime holds no PTY descriptor, GPU object, or OS window handle;
 //! those remain with `bitty-pty`, `bitty-render`, and `bitty-platform`.
@@ -60,6 +66,8 @@ use bitty_ui::placement::{Placement, PlacementError};
 use bitty_ui::uitree::UiNodeId;
 
 use std::collections::HashMap;
+
+use bitty_render::scene::{ScenePaintCache, SceneSurface};
 
 use crate::cw_present::{
     NonTerminalPresent, ScenePresent, consume_scene_present, nonterminal_for_content,
@@ -125,6 +133,13 @@ pub struct PanelRuntime {
     /// insert-time bounds. A missing entry is not an error: the render
     /// path budgets the empty scene instead (fail-closed, never a crash).
     scenes: HashMap<super::panel::PanelId, Scene>,
+    /// Derived scene paint caches (OQ-051, CTX-1628 / bitty#2760): at most one
+    /// [`ScenePaintCache`] per panel slot. The cache key is
+    /// `(scene generation, leaf content rect, cell metrics)`, so an unchanged
+    /// scene and geometry cost no layout walk or text copy on the next frame.
+    /// Entries follow the scene slot lifecycle: replaced on re-attach and
+    /// cleared on detach or dispose.
+    scene_paints: HashMap<super::panel::PanelId, ScenePaintCache>,
 }
 
 /// Per-panel lease binding: the transition kernel plus the validated
@@ -210,6 +225,7 @@ impl PanelRuntime {
             routable: RoutableLedger::new(),
             leases: HashMap::new(),
             scenes: HashMap::new(),
+            scene_paints: HashMap::new(),
         })
     }
 
@@ -353,6 +369,7 @@ impl PanelRuntime {
             let _ = self.placement.unbind(id);
             self.leases.remove(&id);
             self.scenes.remove(&id);
+            self.scene_paints.remove(&id);
         }
         result
     }
@@ -974,6 +991,7 @@ impl PanelRuntime {
     ) -> Result<(), PanelError> {
         self.registry.panel_state(handle.id, handle.generation)?;
         self.scenes.insert(handle.id, scene);
+        self.scene_paints.remove(&handle.id);
         Ok(())
     }
 
@@ -992,6 +1010,7 @@ impl PanelRuntime {
     /// Returns `true` when a scene was removed. Detach is always safe and
     /// idempotent: the panel keeps the grid path afterwards.
     pub fn detach_panel_scene(&mut self, id: super::panel::PanelId) -> bool {
+        self.scene_paints.remove(&id);
         self.scenes.remove(&id).is_some()
     }
 
@@ -1023,6 +1042,56 @@ impl PanelRuntime {
             },
             _ => ScenePresent::default(),
         }
+    }
+
+    /// Derives the one-frame scene paint list for a leaf (OQ-051, CTX-1628).
+    ///
+    /// `surface` is the compositor-owned leaf content rect plus live cell
+    /// metrics. `Some` converts the attached scene into a bounded paint list
+    /// clipped to that rect (through the panel's paint cache, so an unchanged
+    /// scene and geometry are not re-laid out); `None` keeps the budget-only
+    /// projection of [`PanelRuntime::scene_present_for`].
+    ///
+    /// Only the admitted prefix paints: the same `paint_cap` that sheds
+    /// [`ScenePresent::block_ids`] bounds the paint list, so a leaf never
+    /// draws a block its plan reports as shed.
+    ///
+    /// A panel with no attached scene paints nothing. `Terminal`, `Empty`,
+    /// `Browser`, and `Rich` leaves paint nothing here: terminal content stays
+    /// on the grid path, and browser/rich surfaces carry no host-owned scene
+    /// slot. A scene that exceeds a paint budget reports the typed refusal in
+    /// [`ScenePresent::refusal`] and paints nothing (fail-closed; nothing is
+    /// clamped).
+    pub fn scene_paint_for(
+        &mut self,
+        content: super::panel::ViewContent,
+        surface: Option<SceneSurface>,
+        paint_cap: usize,
+    ) -> ScenePresent {
+        let super::panel::ViewContent::Panel(id) = content else {
+            return ScenePresent::default();
+        };
+        let Some(scene) = self.scenes.get(&id) else {
+            return ScenePresent::default();
+        };
+        let mut present = consume_scene_present(scene, paint_cap);
+        let Some(surface) = surface else {
+            return present;
+        };
+        let admitted = present.block_ids.len();
+        let cache = self.scene_paints.entry(id).or_default();
+        match cache.get_or_paint_prefix(
+            scene,
+            admitted,
+            surface,
+            bitty_render::scene::ScenePaintBudget::default(),
+        ) {
+            // The cache returns the cached `Arc`: a steady-state frame shares
+            // the paint list instead of copying every op and text line.
+            Ok(paint) => present.paint = paint,
+            Err(error) => present.refusal = Some(error),
+        }
+        present
     }
 
     /// Maps leaf content to its beyond-grid present payload (OQ-051, #990).
@@ -1383,7 +1452,152 @@ mod tests {
             ViewContent::Rich(11),
         ] {
             assert_eq!(host.scene_present_for(content, 64), ScenePresent::default());
+            assert_eq!(
+                host.scene_paint_for(content, Some(SURFACE), 64),
+                ScenePresent::default()
+            );
         }
+    }
+
+    const SURFACE: SceneSurface = SceneSurface {
+        rect: bitty_render::RectPx::new(24, 40, 240, 96),
+        cell: bitty_render::CellMetrics {
+            width: 8,
+            height: 16,
+        },
+    };
+
+    #[test]
+    fn scene_paint_for_paints_attached_scene_inside_the_leaf() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.attach_panel_scene(handle, scene_with_blocks(2))
+            .unwrap();
+        let content = ViewContent::Panel(handle.id);
+        let present = host.scene_paint_for(content, Some(SURFACE), 64);
+        assert!(present.refusal.is_none());
+        assert_eq!(present.block_ids, vec![BlockId(1), BlockId(2)]);
+        assert_eq!(present.paint.plain_text(), "block 1\nblock 2");
+        for op in present.paint.ops() {
+            assert!(
+                SURFACE.rect.contains_rect(&op.rect()),
+                "scene paint must stay inside the leaf content rect"
+            );
+        }
+        for damage in present.paint.damage() {
+            assert!(SURFACE.rect.contains_rect(damage));
+        }
+        // Without a surface the slot keeps the budget-only projection.
+        let budget_only = host.scene_paint_for(content, None, 64);
+        assert!(budget_only.paint.is_empty());
+        assert_eq!(budget_only.block_ids, present.block_ids);
+    }
+
+    #[test]
+    fn scene_paint_cache_follows_scene_lifecycle() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.attach_panel_scene(handle, scene_with_blocks(1))
+            .unwrap();
+        let content = ViewContent::Panel(handle.id);
+        let first = host.scene_paint_for(content, Some(SURFACE), 64);
+        assert_eq!(host.scene_paints.len(), 1);
+        let cached = host.scene_paint_for(content, Some(SURFACE), 64);
+        assert_eq!(first.paint, cached.paint);
+        assert!(
+            std::sync::Arc::ptr_eq(&first.paint, &cached.paint),
+            "a cached frame shares the paint allocation; it never copies it"
+        );
+
+        host.attach_panel_scene(handle, scene_with_blocks(2))
+            .unwrap();
+        assert!(host.scene_paints.is_empty(), "re-attach drops the cache");
+        let replaced = host.scene_paint_for(content, Some(SURFACE), 64);
+        assert_eq!(replaced.paint.plain_text(), "block 1\nblock 2");
+
+        host.detach_panel_scene(handle.id);
+        assert!(host.scene_paints.is_empty());
+        assert_eq!(
+            host.scene_paint_for(content, Some(SURFACE), 64),
+            ScenePresent::default()
+        );
+    }
+
+    #[test]
+    fn scene_paint_for_zero_area_leaf_paints_nothing() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.attach_panel_scene(handle, scene_with_blocks(1))
+            .unwrap();
+        let empty = SceneSurface {
+            rect: bitty_render::RectPx::new(0, 0, 0, 0),
+            cell: SURFACE.cell,
+        };
+        let present = host.scene_paint_for(ViewContent::Panel(handle.id), Some(empty), 64);
+        assert!(present.paint.is_empty());
+        assert!(present.refusal.is_none(), "a hidden leaf is not an error");
+        assert_eq!(present.block_ids, vec![BlockId(1)]);
+    }
+
+    #[test]
+    fn scene_paint_for_zero_cell_metrics_paints_nothing_instead_of_panicking() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.attach_panel_scene(handle, scene_with_blocks(1))
+            .unwrap();
+        // `CellMetrics` fields are public, so a caller can hand-build a zero
+        // cell the validated constructor refuses.
+        let zero = SceneSurface {
+            rect: SURFACE.rect,
+            cell: bitty_render::CellMetrics {
+                width: 0,
+                height: 0,
+            },
+        };
+        assert_eq!(zero.cols(), 0);
+        assert_eq!(zero.rows(), 0);
+        let present = host.scene_paint_for(ViewContent::Panel(handle.id), Some(zero), 64);
+        assert!(present.paint.is_empty());
+        assert!(present.refusal.is_none(), "a zero cell is not a refusal");
+    }
+
+    #[test]
+    fn scene_paint_for_paints_only_the_admitted_block_prefix() {
+        let mut host = runtime();
+        let handle = host
+            .create_panel(PanelType::Rich, Some(workspace()))
+            .unwrap();
+        host.attach_panel_scene(handle, scene_with_blocks(8))
+            .unwrap();
+        let content = ViewContent::Panel(handle.id);
+        let present = host.scene_paint_for(content, Some(SURFACE), 3);
+        assert!(present.refusal.is_none());
+        assert_eq!(present.block_ids, vec![BlockId(1), BlockId(2), BlockId(3)]);
+        assert_eq!(present.shed, 5);
+        assert_eq!(
+            present.paint.plain_text(),
+            "block 1\nblock 2\nblock 3",
+            "the shed tail never paints"
+        );
+        assert_eq!(present.paint.block_count(), present.block_ids.len());
+        // The shed tail is also the cached shape: same cap reuses the list,
+        // a wider cap repaints the newly admitted blocks.
+        let cached = host.scene_paint_for(content, Some(SURFACE), 3);
+        assert!(std::sync::Arc::ptr_eq(&present.paint, &cached.paint));
+        let wider = host.scene_paint_for(content, Some(SURFACE), 4);
+        assert_eq!(wider.shed, 4);
+        assert_eq!(
+            wider.paint.plain_text(),
+            "block 1\nblock 2\nblock 3\nblock 4"
+        );
     }
 
     #[test]

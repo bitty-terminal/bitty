@@ -492,12 +492,43 @@ impl std::error::Error for SceneError {}
 /// validated at insertion (SCN-1..5). Incremental updates diff the previous
 /// tree; here we model the store as a bounded map of `RichBlock`s keyed by
 /// `BlockId`. Renderer consumes a snapshot of this store plus damage.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Scene {
     blocks: VecDeque<RichBlock>,
     aggregated_bytes: usize,
     generation: u64,
     next_id: u64,
+    identity: u64,
+}
+
+/// Process-local counter behind [`Scene::identity`].
+///
+/// The value never enters paint output or admission accounting: it exists
+/// only so a per-leaf paint cache can tell two scenes apart when both sit at
+/// the same generation (two fresh scenes that each admitted one block are
+/// both generation `1`).
+static NEXT_SCENE_IDENTITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Allocates the next scene identity (wrapping; collisions require 2^64
+/// allocations and only cost a redundant repaint, never a wrong frame).
+fn next_scene_identity() -> u64 {
+    NEXT_SCENE_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl Clone for Scene {
+    /// A clone is an independent scene: it keeps the blocks, byte
+    /// accounting, generation, and next id, but takes a fresh
+    /// [`Scene::identity`] so a cache keyed on identity cannot serve one
+    /// scene's paint list for the other.
+    fn clone(&self) -> Self {
+        Self {
+            blocks: self.blocks.clone(),
+            aggregated_bytes: self.aggregated_bytes,
+            generation: self.generation,
+            next_id: self.next_id,
+            identity: next_scene_identity(),
+        }
+    }
 }
 
 impl Default for Scene {
@@ -515,7 +546,20 @@ impl Scene {
             aggregated_bytes: 0,
             generation: 0,
             next_id: 1,
+            identity: next_scene_identity(),
         }
+    }
+
+    /// Stable, process-local identity of this scene instance.
+    ///
+    /// Two scenes can share a generation while holding different content
+    /// (both admitted one block, for example). A paint cache that keys only
+    /// on `(generation, geometry)` would serve one scene's list for the
+    /// other; the identity token makes that impossible. It is never painted,
+    /// serialized, or compared for ordering.
+    #[must_use]
+    pub const fn identity(&self) -> u64 {
+        self.identity
     }
 
     /// Number of retained blocks.
@@ -754,6 +798,35 @@ mod tests {
         assert_eq!(scene.len(), 1);
         assert_eq!(scene.get(id).unwrap().text_bytes(), 5);
         assert_eq!(scene.aggregated_bytes(), 5);
+    }
+
+    #[test]
+    fn clone_is_an_independent_scene_with_its_own_identity() {
+        let mut scene = Scene::new();
+        scene
+            .insert(
+                RichBlock::new(
+                    BlockId(1),
+                    BlockAnchor::Zone(1),
+                    tiny_text("hello"),
+                    ScrollBehavior::Inline,
+                    1,
+                    0,
+                    1,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let clone = scene.clone();
+        // The clone keeps the content and generation it copied...
+        assert_eq!(clone.len(), scene.len());
+        assert_eq!(clone.generation(), scene.generation());
+        assert_eq!(clone.aggregated_bytes(), scene.aggregated_bytes());
+        // ...but it is a distinct scene instance, so a paint cache keyed on
+        // identity can never serve one scene's list for the other.
+        assert_ne!(clone.identity(), scene.identity());
+        // Two `Scene::new()` values are distinct even before any mutation.
+        assert_ne!(Scene::new().identity(), Scene::new().identity());
     }
 
     #[test]
@@ -1199,6 +1272,173 @@ mod tests {
         scene.insert(block).unwrap();
         assert_eq!(scene.len(), 1);
         assert_eq!(scene.get(BlockId(1)).unwrap().text_bytes(), 5);
+    }
+
+    /// CTX-1628 / bitty#2760: a rejected mount must leave the scene byte- and
+    /// allocation-identical, for every `SCN` dimension, across repeated
+    /// attempts. A retrying host therefore cannot grow the store by failing.
+    #[test]
+    fn repeated_over_budget_inserts_do_not_grow_scene_state() {
+        fn observe(scene: &Scene) -> (usize, usize, usize, usize, u64) {
+            (
+                scene.len(),
+                scene.aggregated_bytes(),
+                scene.iter().map(RichBlock::node_count).sum(),
+                scene.iter().map(RichBlock::text_bytes).sum(),
+                scene.generation(),
+            )
+        }
+
+        // SCN-1: node count.
+        let mut scene = Scene::new();
+        scene
+            .insert(
+                RichBlock::new(
+                    BlockId(1),
+                    BlockAnchor::Zone(1),
+                    tiny_text("kept"),
+                    ScrollBehavior::Inline,
+                    1,
+                    0,
+                    1,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let baseline = observe(&scene);
+        let too_many = RichBlock::new_unchecked(
+            BlockId(2),
+            BlockAnchor::Zone(2),
+            many_nodes(SCENE_MAX_NODES_PER_BLOCK + 1),
+            ScrollBehavior::Inline,
+            1,
+            0,
+            2,
+        );
+        for _ in 0..64 {
+            assert!(matches!(
+                scene.insert(too_many.clone()),
+                Err(SceneError::NodesTooMany { .. })
+            ));
+        }
+        assert_eq!(observe(&scene), baseline, "SCN-1 refusal changes nothing");
+
+        // SCN-2: depth.
+        let too_deep = RichBlock::new_unchecked(
+            BlockId(3),
+            BlockAnchor::Zone(3),
+            deep_nodes(SCENE_MAX_DEPTH + 1),
+            ScrollBehavior::Inline,
+            1,
+            0,
+            3,
+        );
+        for _ in 0..64 {
+            assert!(matches!(
+                scene.insert(too_deep.clone()),
+                Err(SceneError::DepthTooDeep { .. })
+            ));
+        }
+        assert_eq!(observe(&scene), baseline, "SCN-2 refusal changes nothing");
+
+        // SCN-3: per-block text bytes.
+        let too_large = RichBlock::new_unchecked(
+            BlockId(4),
+            BlockAnchor::Zone(4),
+            tiny_text(&"a".repeat(SCENE_MAX_TEXT_BYTES_PER_BLOCK + 1)),
+            ScrollBehavior::Inline,
+            1,
+            0,
+            4,
+        );
+        for _ in 0..64 {
+            assert!(matches!(
+                scene.insert(too_large.clone()),
+                Err(SceneError::TextTooLarge { .. })
+            ));
+        }
+        assert_eq!(observe(&scene), baseline, "SCN-3 refusal changes nothing");
+
+        // SCN-5: block count, then SCN-4: aggregated bytes.
+        let mut full = Scene::new();
+        for index in 0..SCENE_MAX_BLOCKS_PER_TERMINAL {
+            full.insert(
+                RichBlock::new(
+                    BlockId(index as u64 + 1),
+                    BlockAnchor::Zone(index as u64),
+                    tiny_text("x"),
+                    ScrollBehavior::Inline,
+                    1,
+                    0,
+                    index as u64,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let full_baseline = observe(&full);
+        let extra = RichBlock::new(
+            BlockId(999),
+            BlockAnchor::Zone(999),
+            tiny_text("y"),
+            ScrollBehavior::Inline,
+            1,
+            0,
+            999,
+        )
+        .unwrap();
+        for _ in 0..64 {
+            assert!(matches!(
+                full.insert(extra.clone()),
+                Err(SceneError::BlocksTooMany { .. })
+            ));
+        }
+        assert_eq!(
+            observe(&full),
+            full_baseline,
+            "SCN-5 refusal changes nothing"
+        );
+
+        let mut aggregate = Scene::new();
+        let text = "a".repeat(SCENE_MAX_TEXT_BYTES_PER_BLOCK);
+        for index in 0..8 {
+            aggregate
+                .insert(
+                    RichBlock::new(
+                        BlockId(index as u64 + 1),
+                        BlockAnchor::Zone(index as u64),
+                        tiny_text(&text),
+                        ScrollBehavior::Inline,
+                        1,
+                        0,
+                        index as u64,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let aggregate_baseline = observe(&aggregate);
+        let extra_small = RichBlock::new(
+            BlockId(99),
+            BlockAnchor::Zone(99),
+            tiny_text("x"),
+            ScrollBehavior::Inline,
+            1,
+            0,
+            99,
+        )
+        .unwrap();
+        for _ in 0..64 {
+            assert!(matches!(
+                aggregate.insert(extra_small.clone()),
+                Err(SceneError::AggregatedTooLarge { .. })
+            ));
+        }
+        assert_eq!(
+            observe(&aggregate),
+            aggregate_baseline,
+            "SCN-4 refusal changes nothing"
+        );
     }
 
     /// SEC-18/R-021: a table of empty strings must press against SCN-1.

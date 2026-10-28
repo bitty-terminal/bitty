@@ -34,7 +34,9 @@
 //! - Names, labels, chrome state: at most 256 characters
 //!   ([`MAX_ACCESSIBLE_NAME_LEN`]).
 //! - Nodes per snapshot: at most 4096
-//!   ([`MAX_SNAPSHOT_NODES`](bitty_a11y::MAX_SNAPSHOT_NODES)).
+//!   ([`MAX_SNAPSHOT_NODES`]).
+//! - Painted scene text: at most [`MAX_SCENE_TEXT_LINES`] lines and
+//!   [`MAX_SCENE_TEXT_BYTES`] bytes per host (CTX-1628).
 //! - Announcement text: at most 256 characters
 //!   ([`MAX_ANNOUNCEMENT_TEXT_LEN`]).
 //! - Pending announcements: at most 8
@@ -61,8 +63,13 @@ use std::time::{Duration, Instant};
 use bitty_a11y::{
     A11yError, AnnouncementKind, ChromeKind, CursorPosition, FocusOwner, HandleMap,
     InteractivePurpose, MAX_ACCESSIBLE_NAME_LEN, MAX_ANNOUNCEMENT_TEXT_LEN,
-    MAX_PENDING_ANNOUNCEMENTS, SceneKind, Snapshot, SnapshotBuilder, SnapshotHost, TextRun,
+    MAX_PENDING_ANNOUNCEMENTS, MAX_SNAPSHOT_NODES, Snapshot, SnapshotBuilder, SnapshotHost,
+    TextRun,
 };
+// Re-exported so Core callers (the runtime scene projection) can name the
+// extension scene vocabulary through this module only; `bitty_a11y` stays
+// named in exactly one Core source file (W-147 fence).
+pub use bitty_a11y::SceneKind;
 use bitty_a11y_component::component::protocol::{
     BOUNDS_UNIT_CHARS, CAPABILITY_MASK, MAX_GRID_COLS, MAX_GRID_ROWS, MAX_TREE_DEPTH,
     PROTOCOL_VERSION, ROLE_NONE, STATE_FOCUSED, STATE_MASK, SURFACE_NONE, SURFACE_OVERLAY,
@@ -124,6 +131,25 @@ const MAX_COMPONENT_PROJECTION_BYTES: usize = 1024 * 1024;
 const MAX_COMPONENT_NODES: usize = 4096;
 const MAX_COMPONENT_PAGES: u32 = 256;
 const DEFAULT_COMPONENT_DEADLINE: Duration = Duration::from_millis(250);
+
+/// Maximum painted scene text lines one host retains (CTX-1628).
+///
+/// Reuses the extension's snapshot node ceiling: a scene never contributes
+/// more text rows than the whole accessibility tree may hold nodes, so the
+/// projection needs no new numeric ceiling.
+pub const MAX_SCENE_TEXT_LINES: usize = MAX_SNAPSHOT_NODES;
+
+/// Maximum painted scene text bytes one host retains (CTX-1628).
+///
+/// Mirrors the accepted `SCN-4` ceiling
+/// (`bitty_rich::scene::SCENE_MAX_RICH_BYTES_PER_TERMINAL`, 2 MiB): an
+/// admitted scene must be projectable, so the accessibility channel may not
+/// hold a smaller ceiling than the paint path or an admitted scene would paint
+/// while the projection refused atomically. `bitty-ui` deliberately takes no
+/// production dependency on `bitty-rich` (W-147 keeps the Core graph small),
+/// so the value is mirrored here and pinned by a test that compares it with
+/// the scene constant.
+pub const MAX_SCENE_TEXT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Default-off component host configuration.
 ///
@@ -781,6 +807,58 @@ pub fn terminal_runs(snapshot: &bitty_term_state::Snapshot) -> Vec<TextRun> {
 }
 
 // ---------------------------------------------------------------------------
+// Scene text projection (CTX-1628)
+// ---------------------------------------------------------------------------
+
+/// Typed refusal from the scene text projection.
+///
+/// The projection is all-or-nothing: a refused contribution adds neither the
+/// scene node nor any text row, so a partially projected scene can never
+/// diverge from what the frame paints.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SceneTextProjectionError {
+    /// More painted lines than [`MAX_SCENE_TEXT_LINES`].
+    LinesTooMany {
+        /// Lines supplied.
+        lines: usize,
+        /// Cap.
+        cap: usize,
+    },
+    /// More painted text bytes than [`MAX_SCENE_TEXT_BYTES`].
+    TextTooLarge {
+        /// Bytes supplied.
+        bytes: usize,
+        /// Cap.
+        cap: usize,
+    },
+    /// The projection would exceed the extension's snapshot node ceiling.
+    NodesTooMany {
+        /// Nodes the projection would produce.
+        nodes: usize,
+        /// Cap.
+        cap: usize,
+    },
+}
+
+impl fmt::Display for SceneTextProjectionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LinesTooMany { lines, cap } => {
+                write!(f, "scene text lines too many: {lines} > {cap}")
+            }
+            Self::TextTooLarge { bytes, cap } => {
+                write!(f, "scene text too large: {bytes} > {cap}")
+            }
+            Self::NodesTooMany { nodes, cap } => {
+                write!(f, "scene projection nodes too many: {nodes} > {cap}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SceneTextProjectionError {}
+
+// ---------------------------------------------------------------------------
 // Snapshot host over real UI state
 // ---------------------------------------------------------------------------
 
@@ -812,6 +890,10 @@ pub struct UiSnapshotHost {
     root_name: String,
     title: String,
     rows: Vec<(u32, String)>,
+    /// Painted scene text lines (CTX-1628), kept separate from terminal rows
+    /// so the projection can prove parity with the paint list and merge into
+    /// the snapshot's text runs only at build time.
+    scene_text: Vec<(u32, String)>,
     cursor_row: u32,
     cursor_col: u32,
     cursor_visible: bool,
@@ -830,6 +912,7 @@ impl UiSnapshotHost {
             root_name: root_name.to_string(),
             title: title.to_string(),
             rows: Vec::new(),
+            scene_text: Vec::new(),
             cursor_row: 0,
             cursor_col: 0,
             cursor_visible: true,
@@ -891,6 +974,92 @@ impl UiSnapshotHost {
     /// Adds a scene node by kind with its producer-assigned identity.
     pub fn push_scene(&mut self, kind: SceneKind, producer_identity: u64) {
         self.scene.push((kind, producer_identity));
+    }
+
+    /// Adds a text-bearing scene node: its kind/identity plus the exact text
+    /// runs the frame paints (CTX-1628).
+    ///
+    /// The pinned accessibility model exposes a scene node as kind + role
+    /// only, so scene text contributes through the same bounded text-run
+    /// channel as terminal rows. `lines` must be the paint list's own lines
+    /// (row ordinal plus text), in paint order: the accessibility tree then
+    /// reads exactly what the frame shows, and a caller cannot substitute a
+    /// different projection.
+    ///
+    /// Bounds are the existing ceilings ([`MAX_SCENE_TEXT_LINES`] =
+    /// [`MAX_SNAPSHOT_NODES`], and [`MAX_SCENE_TEXT_BYTES`] = the accepted
+    /// `SCN-4` scene ceiling, so an admitted scene can always be projected).
+    /// Overflow is refused before any mutation with a typed error: neither
+    /// the scene node nor a text row is added, and the host keeps its
+    /// previous content.
+    ///
+    /// # Attribution limitation
+    ///
+    /// The pinned accessibility model exposes a scene node as kind + identity
+    /// only, so scene lines travel the terminal leaf's text-run channel with
+    /// leaf-local row ordinals. They are not yet positioned next to the scene
+    /// node in tree order, and a row ordinal is a leaf row, not a document
+    /// line; consumers must not infer cross-leaf positions from it. Closing
+    /// that gap needs a positioned text run in the extension model, not a
+    /// Core-side reordering.
+    ///
+    /// # Errors
+    ///
+    /// [`SceneTextProjectionError`] for an over-bound contribution.
+    pub fn push_scene_text(
+        &mut self,
+        kind: SceneKind,
+        producer_identity: u64,
+        lines: &[(u32, &str)],
+    ) -> Result<(), SceneTextProjectionError> {
+        if lines.len() > MAX_SCENE_TEXT_LINES {
+            return Err(SceneTextProjectionError::LinesTooMany {
+                lines: lines.len(),
+                cap: MAX_SCENE_TEXT_LINES,
+            });
+        }
+        let bytes = lines
+            .iter()
+            .map(|(_, text)| text.len())
+            .fold(0usize, usize::saturating_add);
+        if bytes > MAX_SCENE_TEXT_BYTES {
+            return Err(SceneTextProjectionError::TextTooLarge {
+                bytes,
+                cap: MAX_SCENE_TEXT_BYTES,
+            });
+        }
+        // The extension's node budget: root + terminal leaf + runs + chrome +
+        // scene + interactive. Refuse before mutating so the host never holds
+        // a projection the adapter would reject at ingest.
+        let projected = 2usize
+            .saturating_add(self.rows.len())
+            .saturating_add(self.scene_text.len())
+            .saturating_add(lines.len())
+            .saturating_add(self.chrome.len())
+            .saturating_add(self.scene.len())
+            .saturating_add(1)
+            .saturating_add(self.interactive.len());
+        if projected > MAX_SNAPSHOT_NODES {
+            return Err(SceneTextProjectionError::NodesTooMany {
+                nodes: projected,
+                cap: MAX_SNAPSHOT_NODES,
+            });
+        }
+        self.scene.push((kind, producer_identity));
+        for (row, text) in lines {
+            self.scene_text.push((*row, (*text).to_string()));
+        }
+        Ok(())
+    }
+
+    /// Painted scene text lines currently projected, in paint order.
+    ///
+    /// Read-only parity evidence: this is exactly the text the frame paints
+    /// for the scene (same lines, same order), so a caller can assert the
+    /// accessibility projection never diverges from the paint list.
+    #[must_use]
+    pub fn scene_text(&self) -> &[(u32, String)] {
+        &self.scene_text
     }
 
     /// Adds an interactive node with its accessible name and enabled state.
@@ -965,6 +1134,7 @@ impl SnapshotHost for UiSnapshotHost {
         let runs: Vec<TextRun> = self
             .rows
             .iter()
+            .chain(self.scene_text.iter())
             .map(|(row, text)| TextRun {
                 row: *row,
                 text: text.clone(),
@@ -1235,6 +1405,112 @@ mod tests {
             .ingest_host(&host, generation, None)
             .expect("host ingest");
         assert!(adapter.snapshot().is_some());
+    }
+
+    #[test]
+    fn scene_text_projection_carries_kind_identity_and_runs() {
+        let mut host = UiSnapshotHost::new("window", "shell");
+        host.push_scene_text(
+            SceneKind::Table,
+            7,
+            &[(0, "name | value"), (1, "alpha | 1")],
+        )
+        .expect("bounded");
+        let generation = Generation::initial();
+        let mut adapter = bitty_a11y::Adapter::new();
+        adapter
+            .ingest_host(&host, generation, None)
+            .expect("host ingest");
+        let snapshot = adapter.snapshot().expect("snapshot");
+        let mut scenes = 0usize;
+        let mut rows = Vec::new();
+        for handle in snapshot.preorder() {
+            match snapshot.get(handle) {
+                Some(bitty_a11y::NodeView::Scene { kind, .. }) => {
+                    scenes += 1;
+                    assert_eq!(kind, SceneKind::Table);
+                }
+                Some(bitty_a11y::NodeView::TerminalRow { text }) => rows.push((*text).to_string()),
+                _ => {}
+            }
+        }
+        assert_eq!(scenes, 1, "the scene kind/identity is projected");
+        assert_eq!(rows, vec!["name | value", "alpha | 1"]);
+    }
+
+    #[test]
+    fn scene_text_ceiling_matches_the_scene_admission_ceiling() {
+        assert_eq!(
+            MAX_SCENE_TEXT_BYTES,
+            bitty_rich::scene::SCENE_MAX_RICH_BYTES_PER_TERMINAL,
+            "an admitted scene must be projectable: the a11y text ceiling may not be smaller than SCN-4"
+        );
+    }
+
+    #[test]
+    fn scene_text_projection_accepts_exactly_the_ceiling_and_refuses_one_byte_over() {
+        let at_cap = "x".repeat(MAX_SCENE_TEXT_BYTES);
+        let mut host = UiSnapshotHost::new("window", "shell");
+        host.push_scene_text(SceneKind::Text, 1, &[(0, at_cap.as_str())])
+            .expect("an admitted scene at the SCN-4 ceiling must project");
+        assert_eq!(host.scene_text().len(), 1);
+        assert_eq!(host.scene_text()[0].1.len(), MAX_SCENE_TEXT_BYTES);
+
+        let over = "x".repeat(MAX_SCENE_TEXT_BYTES + 1);
+        assert!(matches!(
+            host.push_scene_text(SceneKind::Text, 2, &[(0, over.as_str())]),
+            Err(SceneTextProjectionError::TextTooLarge {
+                bytes,
+                cap: MAX_SCENE_TEXT_BYTES,
+            }) if bytes == MAX_SCENE_TEXT_BYTES + 1
+        ));
+        assert_eq!(host.scene.len(), 1, "refusal adds no scene node");
+        assert_eq!(host.scene_text().len(), 1, "refusal adds no text row");
+    }
+
+    #[test]
+    fn scene_text_projection_refuses_over_bound_contributions_atomically() {
+        let mut host = UiSnapshotHost::new("window", "shell");
+        let too_many = vec![(0u32, "x"); MAX_SCENE_TEXT_LINES + 1];
+        assert!(matches!(
+            host.push_scene_text(SceneKind::Text, 1, &too_many),
+            Err(SceneTextProjectionError::LinesTooMany { .. })
+        ));
+        assert!(host.scene.is_empty(), "no scene node on refusal");
+        assert!(host.scene_text.is_empty(), "no text row on refusal");
+
+        let big = "x".repeat(MAX_SCENE_TEXT_BYTES + 1);
+        assert!(matches!(
+            host.push_scene_text(SceneKind::Text, 1, &[(0, big.as_str())]),
+            Err(SceneTextProjectionError::TextTooLarge { .. })
+        ));
+        assert!(host.scene.is_empty());
+        assert!(host.scene_text.is_empty());
+    }
+
+    #[test]
+    fn scene_text_projection_respects_the_snapshot_node_ceiling() {
+        let mut host = UiSnapshotHost::new("window", "shell");
+        for row in 0..(MAX_SNAPSHOT_NODES - 2) {
+            host.push_row(row as u32, "x");
+        }
+        // Root + terminal leaf + rows + one scene node + one run already
+        // exceeds the ceiling.
+        assert!(matches!(
+            host.push_scene_text(SceneKind::Text, 1, &[(0, "one")]),
+            Err(SceneTextProjectionError::NodesTooMany { .. })
+        ));
+        assert!(host.scene.is_empty());
+        assert_eq!(host.rows.len(), MAX_SNAPSHOT_NODES - 2);
+
+        // One row fewer leaves exactly the two nodes a single-line scene
+        // needs.
+        let mut host = UiSnapshotHost::new("window", "shell");
+        for row in 0..(MAX_SNAPSHOT_NODES - 4) {
+            host.push_row(row as u32, "x");
+        }
+        host.push_scene_text(SceneKind::Text, 2, &[(0, "one")])
+            .expect("last node fits");
     }
 
     #[test]

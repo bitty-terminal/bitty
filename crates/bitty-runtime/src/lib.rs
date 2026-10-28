@@ -213,6 +213,7 @@ pub mod queries;
 pub mod queue;
 pub mod registry;
 pub mod runtime;
+pub mod scene_bridge;
 pub mod workspace;
 
 // Re-export present-path interaction types for the app composition root

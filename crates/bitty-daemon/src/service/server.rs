@@ -196,6 +196,7 @@ mod unix {
     /// Production always uses [`TAMPER_INTERVAL_MS`]. The override is clamped
     /// to `1..=TAMPER_INTERVAL_MS` and exists so the tamper-flush regression
     /// test can keep a refusal-audit window open across the tamper check.
+    #[cfg(debug_assertions)]
     const TEST_TAMPER_INTERVAL_ENV: &str = "BITTYD_TEST_TAMPER_INTERVAL_MS";
 
     /// The loop configuration.

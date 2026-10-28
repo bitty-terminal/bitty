@@ -49,7 +49,7 @@ running service gives today:
 | Terminal content plane, including `session.resize` (`terminal.manage`) | bitty#2604 / terminal contract | the daemon grants no `terminal.*` scope, so `session.resize` is `Denied/ScopeViolation` |
 | Pushing session events on a connection (no subscribe method; the event stream owns its own registry) | bitty#2602 | `session.status`/`session.list` are the reconciliation reads; no event frame is sent |
 | Per-connection refusal-audit aggregation | bitty#2603 follow-up | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each |
-| Conformance corpus and fake-server parity | bitty#2605 | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; V-07 (bitty#2768) and C-04 (bitty#2767) are recorded known defects |
+| Conformance corpus and fake-server parity | bitty#2605 | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; every shared vector is compared, with no recorded known defect |
 
 Nothing here authorizes autostart, a service file, a TCP listener, or desktop
 wiring; all four stay out of scope.
@@ -765,10 +765,10 @@ Corpus rules:
   `role`), and the ambient-authority fields `role`, `auth`, and `scope` stay
   refused;
 - a vector that does not run on a driver carries a typed skip reason;
-- `known_defect` rows (currently V-07/bitty#2768 and C-04/bitty#2767) record the
-  exact failing step and code or result path, are excluded from the parity
-  gate, and fail the suite if they pass or fail at another step so the marker
-  cannot rot;
+- `known_defect` rows record the exact failing step and code or result path,
+  are excluded from the parity gate, and fail the suite if they pass or fail at
+  another step so the marker cannot rot; the corpus currently carries none
+  (V-07/bitty#2768 and C-04/bitty#2767 were fixed and their markers removed);
 - fault injection covers a transport drop during abort, the pre-auth partial
   frame, the frame bound, the pending grant cap, the attach cap, and an
   instance change (restart); queue pressure with an injected outbound cap is

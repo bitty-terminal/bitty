@@ -7,7 +7,8 @@
 //! - the captured [`PeerGuard`] that every privileged dispatch re-checks;
 //! - the effective [`EffectiveScopes`], fixed once negotiation succeeds;
 //! - the connection's live attach leases, so visibility and heartbeat never
-//!   consult another connection's state;
+//!   consult another connection's state, plus a bounded per-connection history
+//!   of handles it detached itself for the idempotent repeat-detach reply;
 //! - a single pending control token per transferred lease, so a transfer
 //!   delivers the rotated token to the target connection and never to the
 //!   requester.
@@ -16,7 +17,7 @@
 //! at `daemon.negotiate`, and the connection has no method that widens its own
 //! scopes (`D-07`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::audit::AuditActor;
 use crate::handshake::{ClientId, EffectiveScopes, PeerIdentityFacts};
@@ -24,6 +25,16 @@ use crate::lease::ControlToken;
 use crate::peer::{DispatchBoundary, PeerGuard, PeerIdentity};
 use crate::registry::{AttachId, SessionId};
 use crate::service::ServiceScope;
+
+/// Detached handles one connection remembers for the idempotent repeat detach
+/// (`L-02`, `V-07`).
+///
+/// The bound is twice the largest attach table (one controller plus the
+/// sixteen-lease observer ceiling) plus headroom, so a full detach and
+/// re-attach cycle fits while a connection cannot grow the history without
+/// bound. The entry names only a handle this connection held and the session it
+/// belonged to; it dies with the session record and never authorizes anything.
+const DETACHED_HANDLE_HISTORY: usize = 64;
 
 /// One authenticated client connection.
 pub struct Connection {
@@ -34,6 +45,7 @@ pub struct Connection {
     correlation_digest: Option<[u8; 16]>,
     host_grant: Option<[u8; 16]>,
     leases: BTreeMap<AttachId, SessionId>,
+    detached: VecDeque<(AttachId, SessionId)>,
     pending_tokens: BTreeMap<AttachId, ControlToken>,
 }
 
@@ -49,6 +61,7 @@ impl Connection {
             correlation_digest: None,
             host_grant: None,
             leases: BTreeMap::new(),
+            detached: VecDeque::new(),
             pending_tokens: BTreeMap::new(),
         }
     }
@@ -160,12 +173,37 @@ impl Connection {
 
     /// Record a lease this connection owns.
     pub(crate) fn register_lease(&mut self, attach_id: AttachId, session_id: SessionId) {
+        self.detached.retain(|(detached, _)| *detached != attach_id);
         self.leases.insert(attach_id, session_id);
     }
 
     /// Remove a lease this connection owned.
+    ///
+    /// A removed handle stays in the bounded history so a repeat detach can
+    /// answer the contract's idempotent `not_attached` acknowledgement
+    /// (`L-02`, `V-07`) instead of the uniform `NotFound`.
     pub(crate) fn forget_lease(&mut self, attach_id: AttachId) {
-        self.leases.remove(&attach_id);
+        if let Some(session_id) = self.leases.remove(&attach_id) {
+            if self.detached.len() == DETACHED_HANDLE_HISTORY {
+                self.detached.pop_front();
+            }
+            self.detached.push_back((attach_id, session_id));
+        }
+    }
+
+    /// The session of a handle this connection detached itself.
+    ///
+    /// `None` for a live lease, a foreign handle, a handle this connection
+    /// never held, and one aged out of the bounded history. The lookup never
+    /// implies liveness: it only names the session the acknowledgement is
+    /// about.
+    #[must_use]
+    pub fn detached_session(&self, attach_id: AttachId) -> Option<SessionId> {
+        self.detached
+            .iter()
+            .rev()
+            .find(|(detached, _)| *detached == attach_id)
+            .map(|(_, session_id)| *session_id)
     }
 
     /// Whether this connection owns `attach_id`.
@@ -221,6 +259,7 @@ impl std::fmt::Debug for Connection {
             .field("scopes", &self.scopes)
             .field("negotiated", &self.negotiated)
             .field("leases", &self.leases.len())
+            .field("detached", &self.detached.len())
             .finish_non_exhaustive()
     }
 }
@@ -266,6 +305,39 @@ mod tests {
         assert_eq!(first.lease_session(attach), Some(session));
         first.forget_lease(attach);
         assert!(!first.owns_lease(attach));
+    }
+
+    #[test]
+    fn a_detached_handle_is_remembered_only_by_its_own_connection_and_within_bound() {
+        let mut first = connection();
+        let second = connection();
+        let session = SessionId::parse(&"1".repeat(32)).expect("session id");
+        let attach = AttachId::parse(&"2".repeat(32)).expect("attach id");
+        first.register_lease(attach, session);
+        first.forget_lease(attach);
+        assert_eq!(first.detached_session(attach), Some(session));
+        assert_eq!(second.detached_session(attach), None);
+        assert_eq!(first.lease_session(attach), None);
+
+        // Re-attaching the same handle (a reissued id) drops the stale entry.
+        first.register_lease(attach, session);
+        assert_eq!(first.detached_session(attach), None);
+
+        // The history is a bounded FIFO: the oldest handle ages out and the
+        // newest still answers the repeat.
+        let mut ids = Vec::new();
+        for seed in 0u8..=u8::try_from(DETACHED_HANDLE_HISTORY).expect("small bound") {
+            let id = AttachId::parse(&format!("{seed:02x}").repeat(16)).expect("attach id");
+            first.register_lease(id, session);
+            first.forget_lease(id);
+            ids.push(id);
+        }
+        assert_eq!(first.detached_session(ids[0]), None);
+        assert_eq!(
+            first.detached_session(*ids.last().expect("one id")),
+            Some(session)
+        );
+        assert!(first.detached.len() <= DETACHED_HANDLE_HISTORY);
     }
 
     #[test]

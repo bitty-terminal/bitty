@@ -992,15 +992,6 @@
           }
         }
       ],
-      "known_defect": {
-        "issue": "bitty#2768",
-        "reason": "a repeat detach of a removed lease resolves to NotFound instead of the idempotent not_attached acknowledgement",
-        "drivers": [
-          "real"
-        ],
-        "step": 6,
-        "code": "NotFound"
-      },
       "forbidden": [
         "a repeat detach never bumps the revision",
         "a repeat detach never re-attaches the lease"
@@ -4561,15 +4552,6 @@
           }
         }
       ],
-      "known_defect": {
-        "issue": "bitty#2767",
-        "reason": "grant mint, grant consume, and grant revoke do not bump state_revision as D-03 and the service surface require",
-        "drivers": [
-          "real"
-        ],
-        "step": 5,
-        "path": "session.state_revision"
-      },
       "forbidden": [
         "a heartbeat never bumps the revision",
         "grant mint, consume, and revoke each bump exactly once"

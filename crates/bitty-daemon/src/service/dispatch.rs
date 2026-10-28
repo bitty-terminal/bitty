@@ -1696,6 +1696,7 @@ impl Service {
         self.admit()?;
         match self.host.attach_observer(session_id, now) {
             Ok(attached) => {
+                let attach_id = attached.lease.attach_id();
                 if self
                     .grants
                     .consume(
@@ -1711,18 +1712,34 @@ impl Service {
                     // lease must never outlive a grant that was not consumed.
                     let _ = self.host.detach(
                         session_id,
-                        attached.lease.attach_id(),
-                        &ControlAuthority::lease(attached.lease.attach_id()),
+                        attach_id,
+                        &ControlAuthority::lease(attach_id),
                         now,
                     );
                     return Err(Refusal::denied(RefusalCode::ObserverGrantRequired));
                 }
-                let attach_id = attached.lease.attach_id();
+                // `D-03`: the grant consume is its own snapshot-visible
+                // mutation, so the attach and the consume each bump once.
+                let session = match self.host.record_grant_mutation(session_id, now) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        // A counter fault must not leave a live lease whose
+                        // consume went unrecorded: drop it as a failed consume
+                        // does.
+                        let _ = self.host.detach(
+                            session_id,
+                            attach_id,
+                            &ControlAuthority::lease(attach_id),
+                            now,
+                        );
+                        return Err(map_lease(error));
+                    }
+                };
                 connection.register_lease(attach_id, session_id);
                 self.record(
                     AuditAction::Attach,
                     connection,
-                    Some(Self::audit_session(&attached.session)),
+                    Some(Self::audit_session(&session)),
                     AuditTarget::attach(*attach_id.as_bytes()),
                     AuditResult::Ok,
                     None,
@@ -1730,7 +1747,7 @@ impl Service {
                     now,
                 );
                 Ok(json!({
-                    "session": session_json(&attached.session),
+                    "session": session_json(&session),
                     "attach_id": attach_id.as_hex(),
                     "role": "observer",
                     "lease_expires_at_ms": attached.lease.expires_at().as_millis(),
@@ -1751,6 +1768,12 @@ impl Service {
         let key = self.idempotency_key(fields)?;
         let token = optional_control_token(fields)?;
         let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
+        // Contract: a mint for a terminal session is `NotRunning`. A terminal
+        // record is immutable, so the mint's revision bump could not be
+        // recorded and the grant would be born unusable.
+        if snapshot.state.is_terminal() {
+            return Err(Refusal::denied(RefusalCode::NotRunning));
+        }
         let _authority =
             self.control_authority(connection, session_id, token.as_ref(), true, now)?;
         let fingerprint = fingerprint(&["grant", &session_id.as_hex()]);
@@ -1802,13 +1825,33 @@ impl Service {
                         .mint_observer(session_id, connection.peer_uid(), now.as_millis());
                 match minted {
                     Ok(minted) => {
+                        // `D-03` counts the observer-grant mint as its own
+                        // snapshot-visible mutation; a counter fault retires
+                        // the grant so nothing observable outlives the lost
+                        // revision.
+                        let recorded = match self.host.record_grant_mutation(session_id, now) {
+                            Ok(recorded) => recorded,
+                            Err(error) => {
+                                let _ = self.grants.revoke_kind(
+                                    minted.grant_id,
+                                    GrantKind::Observer,
+                                    now.as_millis(),
+                                );
+                                let refusal = map_lease(error);
+                                let _ = self.session_store(session_id).complete(
+                                    reservation,
+                                    IdempotencyResult::Refused(store_code(refusal)),
+                                );
+                                return Err(refusal);
+                            }
+                        };
                         self.remember_observer_grant(session_id, minted.grant_id);
                         let result_ref = crate::service::grants::ref_of(minted.grant_id.as_bytes());
                         let applied = AppliedResult::new(
                             AppliedClass::GrantMinted,
                             session_id,
-                            snapshot.generation,
-                            snapshot.state_revision,
+                            recorded.generation,
+                            recorded.state_revision,
                             result_ref,
                             false,
                         );
@@ -1818,7 +1861,7 @@ impl Service {
                         self.record(
                             AuditAction::Grant,
                             connection,
-                            Some(Self::audit_session(&snapshot)),
+                            Some(Self::audit_session(&recorded)),
                             AuditTarget::grant(*minted.grant_id.as_bytes()),
                             AuditResult::Ok,
                             None,
@@ -1859,17 +1902,41 @@ impl Service {
         // An unknown id has no target to look up, so it can only answer
         // `not_active`; the id is 128 bits and reveals nothing the caller did
         // not already hold.
-        if let Some(session_id) = self.grants.observer_grant_session_retained(grant_id) {
+        let retained = self.grants.observer_grant_session_retained(grant_id);
+        let mut frozen = false;
+        if let Some(session_id) = retained {
             let token = optional_control_token(fields)?;
-            let _snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
-            let _authority =
-                self.control_authority(connection, session_id, token.as_ref(), true, now)?;
-            self.recheck(connection, DispatchBoundary::ObserverGrantRevoke)?;
-            self.admit()?;
+            let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
+            if snapshot.state.is_terminal() {
+                // A terminal record is immutable: the revoke can no longer
+                // change a session snapshot and nothing can consume the grant,
+                // so the answer is the idempotent `not_active` no-op. The
+                // visibility relation above is still required; the audit
+                // record below stays the same.
+                frozen = true;
+            } else {
+                let _authority =
+                    self.control_authority(connection, session_id, token.as_ref(), true, now)?;
+                self.recheck(connection, DispatchBoundary::ObserverGrantRevoke)?;
+                self.admit()?;
+            }
         }
-        let outcome = self
-            .grants
-            .revoke_kind(grant_id, GrantKind::Observer, now.as_millis());
+        let outcome = if frozen {
+            RevokeOutcome::NotActive
+        } else {
+            self.grants
+                .revoke_kind(grant_id, GrantKind::Observer, now.as_millis())
+        };
+        if outcome == RevokeOutcome::Revoked {
+            if let Some(session_id) = retained {
+                // `D-03`: the revoke is one snapshot-visible mutation. The
+                // grant is already retired, so a counter fault is fatal rather
+                // than a reason to keep the record active.
+                self.host
+                    .record_grant_mutation(session_id, now)
+                    .map_err(map_lease)?;
+            }
+        }
         self.record(
             AuditAction::GrantRevoke,
             connection,
@@ -1895,10 +1962,19 @@ impl Service {
     ) -> Result<Value, Refusal> {
         let target = parse_attach_id(fields)?;
         let own = connection.owns_lease(target);
+        // A handle this connection detached itself is still its own for the
+        // idempotent repeat (`L-02`, `V-07`, bitty#2768). It needs no
+        // `session.control`, changes nothing, and never resurrects the lease;
+        // the history is per connection and bounded, so a foreign or
+        // never-issued handle keeps the uniform answers below.
+        let repeat = (!own)
+            .then(|| connection.detached_session(target))
+            .flatten();
         // Stage 6, own-lease exception: detecting your own lease needs no
         // scope; detaching another connection's lease needs `session.control`
         // or `daemon.control`. The check stays ahead of the target lookup.
         if !own
+            && repeat.is_none()
             && !(connection.has_service(ServiceScope::SessionControl)
                 || connection.has_service(ServiceScope::DaemonControl))
         {
@@ -1910,6 +1986,28 @@ impl Service {
             session_id = connection
                 .lease_session(target)
                 .ok_or_else(Refusal::not_found)?;
+        } else if let Some(session_id) = repeat {
+            // The contract's duplicate detach: `not_attached`, no revision
+            // change, and no authority relation left to re-check.
+            self.admit()?;
+            let snapshot = self.snapshot(session_id, now)?;
+            self.record(
+                AuditAction::Detach,
+                connection,
+                Some(Self::audit_session(&snapshot)),
+                AuditTarget::attach(*target.as_bytes()),
+                AuditResult::Ok,
+                None,
+                None,
+                now,
+            );
+            return Ok(json!({
+                "session": session_json(&snapshot),
+                "attach_id": target.as_hex(),
+                "was_attached": false,
+                "not_attached": true,
+                "revoked": false,
+            }));
         } else {
             session_id = self
                 .host

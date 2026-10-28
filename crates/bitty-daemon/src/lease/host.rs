@@ -1253,6 +1253,31 @@ impl SessionHost {
         Ok(self.compose_snapshot(snapshot, now))
     }
 
+    /// Record one snapshot-visible observer-grant mutation (`D-03`).
+    ///
+    /// The grant table belongs to the service layer while `state_revision`
+    /// belongs to the session record: an observer-grant mint, consume, and
+    /// revoke each call this once after the grant mutation commits, so the
+    /// revision advances exactly once per mutation. Only `state_revision` and
+    /// `last_seen` change: no lifecycle state, no generation, no attach count,
+    /// and no terminal field. A terminal session refuses the mutation
+    /// ([`LeaseRefusal::NotRunning`]) rather than bumping a frozen revision.
+    ///
+    /// # Errors
+    ///
+    /// Refuses with [`LeaseRefusal::SessionNotFound`] for an unknown session,
+    /// [`LeaseRefusal::NotRunning`] for a terminal one, or
+    /// [`LeaseRefusal::RevisionOverflow`] when the revision would wrap; a
+    /// refusal leaves the record unchanged.
+    pub fn record_grant_mutation(
+        &mut self,
+        session_id: SessionId,
+        now: MonotonicMs,
+    ) -> Result<SessionSnapshot, LeaseRefusal> {
+        let snapshot = self.registry.note_visible_mutation(session_id, now)?;
+        Ok(self.compose_snapshot(snapshot, now))
+    }
+
     /// Remove every lease whose TTL lapsed at `now`.
     ///
     /// The daemon's timer calls this; the returned entries are the exact detach

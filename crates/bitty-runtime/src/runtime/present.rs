@@ -547,6 +547,9 @@ struct CombinedLeaves {
     glyphs: Vec<bitty_render::grid::GlyphInstance>,
     needs_draw: bool,
     cursor: Option<CursorPaint>,
+    /// Scene paint diagnostics and accessibility projection for this frame
+    /// (CTX-1630).
+    scene_report: super::scene_present::SceneFrameReport,
     /// Atlas epoch the glyph slots collected so far were placed at
     /// (issue #1409, CTX-0797).
     ///
@@ -696,7 +699,7 @@ pub(super) fn px_side(value: u32) -> i32 {
 /// would otherwise paint over the upper float. Dropping it extends the same
 /// opaque mechanism to text rows. Empty bounds never occlude: an unmeasurable
 /// glyph stays visible. Bounded to one intersection test per higher float.
-fn glyph_occluded_by_floats(
+pub(super) fn glyph_occluded_by_floats(
     dest: [i32; 2],
     size: [u32; 2],
     occluders: &[bitty_render::geometry::RectPx],
@@ -1791,6 +1794,16 @@ impl Runtime {
     pub fn headless_rgba(&self) -> Option<Vec<u8>> {
         let raw = self.surface.headless_rgba()?;
         Some(raw)
+    }
+
+    /// Frames the last present painted, in paint order (CTX-1630).
+    ///
+    /// The scene path resolves each panel leaf's content rect from this set;
+    /// embedders and tests read the same geometry. Empty before the first
+    /// present.
+    #[must_use]
+    pub fn presented_allocations(&self) -> &[layout_focus::PresentFrame] {
+        &self.last_presented_allocations
     }
 
     /// Plans, records, and presents one frame when damage exists, returning
@@ -3286,6 +3299,73 @@ impl Runtime {
             band_identity,
         })
     }
+    /// Composes one leaf's attached scene into the combined frame (CTX-1630).
+    ///
+    /// The leaf must be a panel with an attached `Scene` in the installed
+    /// [`PanelRuntime`](crate::registry::PanelRuntime); everything else keeps
+    /// the grid path. The scene paint list is clipped to the compositor-owned
+    /// leaf content rect (`origin` + `frame.content`) and composed after that
+    /// leaf's grid primitives: cell fills, overlay-seam glyphs, and image
+    /// placement references. A refused paint keeps the retained primitives for
+    /// an unchanged surface, clip, fade, occluder set, and atlas epoch, and
+    /// advances the attributed refusal counters.
+    ///
+    /// Returns `true` when a scene glyph placement reset the atlas epoch after
+    /// the leaf pass settled, so the caller must rebuild the attempt.
+    #[allow(clippy::too_many_arguments)]
+    fn append_leaf_scene(
+        &mut self,
+        view_id: ViewId,
+        frame: &layout_focus::PresentFrame,
+        origin: (i32, i32),
+        clip: Option<bitty_render::grid::RoundedClip>,
+        fade: f32,
+        higher_floats: &[bitty_render::geometry::RectPx],
+        a11y: &mut bitty_ui::a11y_host::UiSnapshotHost,
+        built: &mut CombinedLeaves,
+    ) -> bool {
+        let surface = bitty_render::scene::SceneSurface::new(
+            bitty_render::geometry::RectPx::new(
+                origin.0,
+                origin.1,
+                frame.content.width,
+                frame.content.height,
+            ),
+            self.live_cell_metrics(),
+        );
+        let refusals = self.scene_paint_refusals;
+        let a11y_refusals = self.scene_a11y_refusals;
+        let Some(scene) =
+            self.compose_leaf_scene(view_id, surface, clip, fade, higher_floats, a11y)
+        else {
+            return false;
+        };
+        if self.scene_paint_refusals != refusals || self.scene_a11y_refusals != a11y_refusals {
+            built.scene_report.refusals = built.scene_report.refusals.saturating_add(1);
+        }
+        // Scene glyphs are placed through the same atlas as the grid. A scene
+        // that exhausts (and therefore resets) it after the leaf pass settled
+        // invalidates every slot already collected, exactly like the grid
+        // renderer's own epoch check below.
+        let epoch = self.renderer.atlas_epoch();
+        if let Some(planned) = built.atlas_epoch {
+            if planned != epoch {
+                return true;
+            }
+        } else {
+            built.atlas_epoch = Some(epoch);
+        }
+        built.fills.extend(scene.fills);
+        built.glyphs.extend(scene.glyphs);
+        built.needs_draw = true;
+        built.scene_report.views = built.scene_report.views.saturating_add(1);
+        built.scene_report.ops = built.scene_report.ops.saturating_add(scene.ops);
+        built.scene_report.images = built.scene_report.images.saturating_add(scene.images);
+        built.scene_report.damage.extend(scene.damage);
+        built.scene_report.a11y.push(scene.run);
+        false
+    }
+
     /// Phase 3 (CTX-0474): build the retryable combined leaf primitive pass.
     ///
     /// Walks every visible allocation, reusing a retained leaf whose origin
@@ -3343,6 +3423,11 @@ impl Runtime {
         let built = loop {
             attempt += 1;
             let mut built = CombinedLeaves::default();
+            // CTX-1630: per-attempt accessibility parity evidence for painted
+            // scenes (a scratch host, not the live tree). Bounds are the
+            // existing host ceilings, shared by every scene in the frame (the
+            // evidence is one tree).
+            let mut scene_a11y = bitty_ui::a11y_host::UiSnapshotHost::new("scene", "scene");
             let evictions_before = self.renderer.atlas_stats().2;
             // Issue #1409 (CTX-0797): set when a leaf planned against a newer
             // atlas epoch than the slots already collected in this attempt.
@@ -3695,6 +3780,22 @@ impl Runtime {
                             built.cursor = None;
                         }
                     }
+                    // CTX-1630: scene content composes above the reused grid
+                    // primitives, so an unchanged leaf still presents a scene
+                    // revision without re-rendering its cells.
+                    if self.append_leaf_scene(
+                        view_id,
+                        frame,
+                        (origin_px_x, origin_px_y),
+                        frame_clip,
+                        fade,
+                        &higher_floats,
+                        &mut scene_a11y,
+                        &mut built,
+                    ) {
+                        stale_epoch = true;
+                        break;
+                    }
                     continue;
                 }
 
@@ -4003,6 +4104,20 @@ impl Runtime {
                         built.glyphs.push(glyph);
                     }
                 }
+                // CTX-1630: the leaf's scene composes above its grid content.
+                if self.append_leaf_scene(
+                    view_id,
+                    frame,
+                    (origin_px_x, origin_px_y),
+                    frame_clip,
+                    fade,
+                    &higher_floats,
+                    &mut scene_a11y,
+                    &mut built,
+                ) {
+                    stale_epoch = true;
+                    break;
+                }
             }
 
             // CTX-1076 (issue #1815): the window background image paints
@@ -4148,6 +4263,7 @@ impl Runtime {
                 // Partial attempt: every slot collected before the reset is
                 // dead, so drop the retained stores and rebuild from scratch.
                 self.presented_leaf_frames.clear();
+                self.presented_scene_frames.clear();
                 full_frame = true;
                 continue;
             }
@@ -4157,12 +4273,16 @@ impl Runtime {
             // Atlas exhaustion reset: every retained slot is dead, so drop the
             // stores and rebuild every leaf against the fresh atlas.
             self.presented_leaf_frames.clear();
+            self.presented_scene_frames.clear();
             full_frame = true;
         };
         // CTX-0386: a retained list is only valid for a leaf visible this
         // frame; a hidden or closed leaf re-renders when it returns.
         self.presented_leaf_frames
             .retain(|id, _| allocations.iter().any(|frame| frame.view == *id));
+        // CTX-1630: same visibility rule for retained scene primitives.
+        let visible: Vec<ViewId> = allocations.iter().map(|frame| frame.view).collect();
+        self.retain_visible_scenes(&visible);
         FrameLayers {
             combined_fills: built.fills,
             combined_rounded: built.rounded,
@@ -4170,6 +4290,7 @@ impl Runtime {
             combined_glyphs: built.glyphs,
             any_needs_draw: built.needs_draw,
             cursor: built.cursor,
+            scene_report: built.scene_report,
             // Issue #1409 (CTX-0797): the epoch the surviving attempt placed
             // its slots at. `built.atlas_epoch` is unset only when no leaf
             // rendered, in which case the live epoch is trivially correct.
@@ -6626,6 +6747,9 @@ impl Runtime {
         let kitty_blits = layers.combined_images.len();
         // CTX-0347: latch the presented background-blit count too.
         let background_blits = layers.combined_backgrounds.len();
+        // CTX-1630: scene diagnostics for this frame, published only when the
+        // frame actually presents.
+        let scene_report = layers.scene_report;
         // CTX-0386: the 1x1 plan probe below is the frame's last renderer
         // call; an atlas exhaustion reset inside it would invalidate every
         // retained slot, so drop the stores afterwards and let the next frame
@@ -6724,6 +6848,38 @@ impl Runtime {
                     plan_extent.height,
                 )];
                 tmp_list.plan.mode = FrameMode::Full;
+                // CTX-1630: scene invalidation enters the same frame
+                // descriptor through `SnapshotDamage::with_extra_regions`, so
+                // one damage model covers grid and scene pixels. The combined
+                // present paints the full surface (`FrameMode::Full`), and a
+                // full-surface dirty rect subsumes every scene rect, so these
+                // regions add no paint work here: they are visible to
+                // accounting and reach the planner only on a partial path,
+                // which reuses this descriptor unchanged. The
+                // `with_extent`/`with_extra_regions` seam test in
+                // `bitty-render/tests/scene_paint.rs` pins both behaviours.
+                if !scene_report.damage.is_empty() {
+                    let descriptor = bitty_render::grid::SnapshotDamage::new(
+                        &snapshot,
+                        &Damage {
+                            generation: current_gen,
+                            regions: Vec::new().into_boxed_slice(),
+                        },
+                        self.live_cell_metrics(),
+                    )
+                    .with_extent(plan_extent)
+                    .with_extra_regions(scene_report.damage.iter().copied());
+                    for rect in bitty_render::frame::plan_frame(&descriptor).dirty_rects {
+                        if !tmp_list
+                            .plan
+                            .dirty_rects
+                            .iter()
+                            .any(|existing| existing.contains_rect(&rect))
+                        {
+                            tmp_list.plan.dirty_rects.push(rect);
+                        }
+                    }
+                }
             }
             tmp_list
         };
@@ -6825,6 +6981,10 @@ impl Runtime {
         self.mark_frame_presented(snapshot.generation);
         self.last_presented_allocations = allocations;
         self.last_presented_focus = focused;
+        // CTX-1630: the scene report and its accessibility projection describe
+        // exactly this presented frame. A deferred/failed present keeps the
+        // previous report, matching the frame still on screen.
+        self.scene_frame = scene_report;
         // CTX-1332 C-D4: eligible publication boundary. Only a frame that
         // actually presented commits its origins as executable.
         self.last_presented_bands = band_identity;
@@ -7015,6 +7175,9 @@ struct FrameLayers {
     combined_images: Vec<bitty_render::grid::ImageBlit>,
     /// Whether any layer contributed draw work this frame.
     any_needs_draw: bool,
+    /// Scene paint diagnostics and accessibility projection for this frame
+    /// (CTX-1630).
+    scene_report: super::scene_present::SceneFrameReport,
     /// Deferred focused-cursor overlay (CTX-0386); drained before overlays.
     cursor: Option<CursorPaint>,
     /// Atlas epoch the leaf glyph slots in `combined_glyphs` were placed at

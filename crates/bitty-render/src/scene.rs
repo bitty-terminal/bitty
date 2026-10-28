@@ -27,15 +27,20 @@
 //!
 //! # Integration status
 //!
-//! This module is the render-side consumer of the accepted model as a
-//! *library* seam. The composition root that resolves a live leaf's content
-//! rect and calls [`paint_scene`] from the shipped present loop is not wired
-//! yet: `PanelRuntime::scene_paint_for` in `bitty-runtime` — the intended
-//! adapter — is currently exercised by tests only, together with the CW
-//! present plan that would feed it, and no shipped frame paints a `Scene`
-//! today. Treat the paint path as mechanism-complete and
-//! integration-pending; do not describe the renderer as consuming live scene
-//! content until the composition slice lands.
+//! The present composition is wired and unit-tested, but no shipped build
+//! installs a scene host or binds panels until bitty#2785 (host install +
+//! `ui.rich` attach), so no shipped frame paints a `Scene` yet. When a
+//! `PanelRuntime` scene host with placement binds is installed,
+//! `bitty-runtime` resolves a visible panel leaf's content rect, calls
+//! `PanelRuntime::scene_paint_for`, and composes the resulting list into the
+//! frame (CTX-1630). Fills, overlay-seam glyphs, and bounded damage are
+//! produced there; a typed refusal paints nothing and keeps the previous
+//! visible scene. Two preconditions keep a shipped binary from reaching that
+//! path today (bitty#2785): (a) no production owner constructs or installs
+//! such a host, so `placement_panel_of` cannot resolve a leaf and the
+//! runtime's `scene_host` stays `None`; (b) `bitty.ui.mount` still validates
+//! through the v1 reader, so no `ui.rich` mount attaches an admitted `Scene`
+//! to a panel.
 //!
 //! # Budgets
 //!
@@ -146,10 +151,13 @@ pub const SCENE_PAINT_MAX_BORDER_CELLS: u16 = 8;
 
 /// The leaf content rectangle a scene paints into.
 ///
-/// `rect` is the compositor-owned content rect in logical pixels (the frame
-/// inset by `border + content_inset`); `cell` is the live cell geometry.
-/// Cell spans are derived by flooring, so a partially visible last cell is
-/// painted only to the pixel edge of `rect`.
+/// `rect` is the compositor-owned content rect in physical (device) pixels —
+/// the rendered frame's pixel space, the same one the draw list and
+/// [`CellMetrics`] use. It is not a logical-point rect, and the present loop
+/// passes `PresentFrame::content` (physical px) rather than a scaled-down
+/// layout rect. `cell` is the live physical cell geometry, so cell spans are
+/// derived by flooring and a partially visible last cell is painted only to
+/// the pixel edge of `rect`.
 ///
 /// A surface whose cell width or height is zero paints nothing: [`Self::cols`]
 /// and [`Self::rows`] report `0` instead of dividing by zero, so a
@@ -157,9 +165,9 @@ pub const SCENE_PAINT_MAX_BORDER_CELLS: u16 = 8;
 /// to an empty frame rather than a panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SceneSurface {
-    /// Leaf content rectangle in logical pixels.
+    /// Leaf content rectangle in physical pixels.
     pub rect: RectPx,
-    /// Live cell geometry.
+    /// Live cell geometry, in the same physical pixel space.
     pub cell: CellMetrics,
 }
 
@@ -334,7 +342,7 @@ impl std::error::Error for ScenePaintError {}
 pub enum ScenePaintOp {
     /// Opaque rectangle (border segment or rule line).
     Fill {
-        /// Cell-aligned rectangle in logical pixels.
+        /// Cell-aligned rectangle in physical pixels (the surface's space).
         rect: RectPx,
         /// Straight-alpha fill color.
         color: Rgba8,
@@ -522,11 +530,30 @@ impl ScenePaint {
         renderer: &mut GridRenderer<R>,
         list: &mut DrawList,
     ) -> usize {
+        self.append_into(renderer, &mut list.fills, &mut list.glyphs)
+    }
+
+    /// Pushes this list's fills and glyphs into separate frame layers.
+    ///
+    /// The runtime present loop composes a combined frame from per-leaf
+    /// primitive vectors rather than from a per-leaf [`DrawList`], so it
+    /// consumes this entry point instead of synthesizing a throwaway list.
+    /// Semantics are exactly [`Self::append_to`]: text goes through the grid
+    /// renderer's overlay text seam, faux bold adds the same one-pixel pass,
+    /// and image references are counted, never rasterized.
+    ///
+    /// Returns the number of image references skipped.
+    pub fn append_into<R: GlyphRasterizer>(
+        &self,
+        renderer: &mut GridRenderer<R>,
+        fills: &mut Vec<FillRect>,
+        glyphs: &mut Vec<crate::grid::GlyphInstance>,
+    ) -> usize {
         let mut images = 0usize;
         for op in &self.ops {
             match op {
                 ScenePaintOp::Fill { rect, color } => {
-                    list.fills.push(FillRect {
+                    fills.push(FillRect {
                         rect: *rect,
                         color: *color,
                     });
@@ -539,7 +566,7 @@ impl ScenePaint {
                     bold,
                     ..
                 } => {
-                    list.glyphs.extend(renderer.overlay_text_glyphs(
+                    glyphs.extend(renderer.overlay_text_glyphs(
                         text,
                         (rect.x, rect.y),
                         usize::from(*cols),
@@ -548,7 +575,7 @@ impl ScenePaint {
                     if *bold {
                         // Deterministic faux bold: one extra pass one pixel to
                         // the right, bounded by the same `cols` cap.
-                        list.glyphs.extend(renderer.overlay_text_glyphs(
+                        glyphs.extend(renderer.overlay_text_glyphs(
                             text,
                             (rect.x.saturating_add(1), rect.y),
                             usize::from(*cols),

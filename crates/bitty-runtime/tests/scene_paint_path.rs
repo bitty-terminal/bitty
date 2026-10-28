@@ -16,13 +16,19 @@ use bitty_render::glyph::{
 use bitty_render::grid::SnapshotDamage;
 use bitty_render::grid::{CellMetrics, DrawList, GridRenderer};
 use bitty_render::scene::{
-    ScenePaintBudget, ScenePaintStyle, SceneSurface, paint_scene, paint_scene_with_style,
+    ScenePaintBudget, ScenePaintError, ScenePaintStyle, SceneSurface, paint_scene,
+    paint_scene_with_style,
 };
 use bitty_render::{ExtentPx, RectPx, frame::plan_frame};
-use bitty_rich::scene::{BlockAnchor, BlockId, SceneError, ScrollBehavior};
+use bitty_rich::scene::{
+    BlockAnchor, BlockId, Border, RichBlock, SceneError, SceneNode, ScrollBehavior, StyledSpan,
+};
 use bitty_runtime::cw_present::consume_scene_present_at;
+use bitty_runtime::registry::{PanelHandle, PanelRegistryConfig, PanelRuntime, PanelType};
 use bitty_runtime::scene_bridge::{RichMount, SceneBridgeError, mount_rich_node};
+use bitty_runtime::{Runtime, RuntimeConfig, SCENE_A11Y_KIND, ViewId};
 use bitty_ui::a11y_host::{SceneKind, UiSnapshotHost};
+use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -397,4 +403,246 @@ fn paint_cap_sheds_the_tail_from_the_paint_list_too() {
     assert_eq!(present.shed, 5);
     assert_eq!(present.paint.plain_text(), "line 1\nline 2\nline 3");
     assert_eq!(present.paint.block_count(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// CTX-1630: the shipped present loop consumes the scene paint path
+// ---------------------------------------------------------------------------
+
+/// Cell geometry the headless present-loop fixtures pin.
+const PRESENT_CELL_WIDTH: u32 = 8;
+/// Cell geometry the headless present-loop fixtures pin.
+const PRESENT_CELL_HEIGHT: u32 = 16;
+
+fn present_runtime() -> Runtime {
+    let mut config = RuntimeConfig {
+        cols: 40,
+        rows: 12,
+        cell_width: PRESENT_CELL_WIDTH,
+        cell_height: PRESENT_CELL_HEIGHT,
+        ..RuntimeConfig::default()
+    };
+    // Deterministic headless evidence: no animation phase, no wall-clock
+    // dependent chrome.
+    config.animations.enabled = false;
+    Runtime::with_deterministic_rasterizer(config).expect("deterministic runtime")
+}
+
+fn text_scene(text: &str) -> bitty_rich::scene::Scene {
+    let mut scene = bitty_rich::scene::Scene::new();
+    scene
+        .insert(
+            RichBlock::new(
+                BlockId(1),
+                BlockAnchor::Zone(1),
+                SceneNode::Text(StyledSpan {
+                    text: text.to_string(),
+                    bold: false,
+                    italic: false,
+                }),
+                ScrollBehavior::Inline,
+                1,
+                1,
+                1,
+            )
+            .expect("block fits SCN-1..3"),
+        )
+        .expect("scene admits the block");
+    scene
+}
+
+/// An admitted block whose paint path refuses: `Border::width` above the
+/// paint bound is not an admission limit, so this scene inserts cleanly and
+/// is only refused when it reaches the paint budget.
+fn over_wide_border_scene() -> bitty_rich::scene::Scene {
+    let mut scene = bitty_rich::scene::Scene::new();
+    scene
+        .insert(
+            RichBlock::new(
+                BlockId(1),
+                BlockAnchor::Zone(1),
+                SceneNode::Block {
+                    border: Some(Border {
+                        width: 9,
+                        color: String::new(),
+                    }),
+                    child: Box::new(SceneNode::Text(StyledSpan {
+                        text: "kept".to_string(),
+                        bold: false,
+                        italic: false,
+                    })),
+                },
+                ScrollBehavior::Inline,
+                1,
+                1,
+                1,
+            )
+            .expect("block fits SCN-1..3"),
+        )
+        .expect("scene admits the block");
+    scene
+}
+
+fn scene_host(view: ViewId, scene: bitty_rich::scene::Scene) -> (PanelRuntime, PanelHandle) {
+    let mut host = PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host");
+    let handle = host
+        .create_panel(PanelType::Rich, None)
+        .expect("rich panel");
+    host.mount_panel(handle.id, handle.generation, view)
+        .expect("panel mounts on the live leaf");
+    host.attach_panel_scene(handle, scene)
+        .expect("scene attaches");
+    (host, handle)
+}
+
+/// The compositor-owned leaf content rect the present loop hands the scene
+/// path: `frame.content` translated by the window padding.
+fn presented_surface(rt: &Runtime, view: ViewId) -> SceneSurface {
+    let frame = rt
+        .presented_allocations()
+        .iter()
+        .find(|frame| frame.view == view)
+        .expect("leaf was presented");
+    let pad = i32::try_from(rt.window_padding_physical()).expect("padding fits i32");
+    SceneSurface::new(
+        RectPx::new(
+            frame.content.x.saturating_add(pad),
+            frame.content.y.saturating_add(pad),
+            frame.content.width,
+            frame.content.height,
+        ),
+        cell(),
+    )
+}
+
+#[test]
+fn present_loop_paints_panel_scene_inside_its_leaf_and_projects_its_text() {
+    let now = Instant::now();
+    let view = ViewId::new(1);
+    let mut baseline = present_runtime();
+    baseline.tick_at(now).expect("baseline frame presents");
+    let baseline_rgba = baseline.headless_rgba().expect("baseline rgba");
+
+    let mut rt = present_runtime();
+    let (host, handle) = scene_host(view, text_scene("scene-line"));
+    rt.install_scene_host(host);
+    let stats = rt.tick_at(now).expect("scene frame presents");
+    assert!(stats.headless);
+    assert!(stats.glyphs > 0, "the scene paints through the text seam");
+
+    // The scene composition is reported as one painted leaf.
+    let report = rt.scene_frame().clone();
+    assert_eq!(report.views, 1);
+    assert!(report.ops > 0);
+    assert_eq!(report.images, 0);
+    assert_eq!(report.refusals, 0);
+    assert_eq!(report.a11y.len(), 1);
+    assert_eq!(report.a11y[0].kind, SCENE_A11Y_KIND);
+    assert_eq!(report.a11y[0].identity, handle.id.get());
+
+    let surface = presented_surface(&rt, view);
+    // Damage never leaves the leaf content rect.
+    assert!(
+        !report.damage.is_empty(),
+        "the painted scene reports damage"
+    );
+    for rect in &report.damage {
+        assert!(
+            surface.rect.contains_rect(rect),
+            "scene damage {rect:?} left the leaf {surface:?}"
+        );
+    }
+
+    // The recorded accessibility projection is per-frame parity evidence: it
+    // must equal the paint list's own lines under the host bounds.
+    let expected = paint_scene(
+        &text_scene("scene-line"),
+        surface,
+        ScenePaintBudget::default(),
+    )
+    .expect("the same scene paints");
+    let painted: Vec<(u32, String)> = expected
+        .text_lines()
+        .map(|line| (u32::from(line.row), line.text.to_string()))
+        .collect();
+    assert!(!painted.is_empty());
+    assert_eq!(
+        report.a11y[0].lines, painted,
+        "parity evidence must equal the paint list's lines"
+    );
+
+    // Pixel evidence: the scene changes pixels only inside its leaf rect.
+    let scene_rgba = rt.headless_rgba().expect("scene rgba");
+    assert_eq!(baseline_rgba.len(), scene_rgba.len());
+    let width = usize::try_from(rt.surface_extent().expect("surface").width()).expect("width");
+    let mut changed_inside = 0usize;
+    for (index, (before, after)) in baseline_rgba.iter().zip(scene_rgba.iter()).enumerate() {
+        if before == after {
+            continue;
+        }
+        let pixel = index / 4;
+        let x = i32::try_from(pixel % width).expect("x fits i32");
+        let y = i32::try_from(pixel / width).expect("y fits i32");
+        assert!(
+            surface.rect.contains_rect(&RectPx::new(x, y, 1, 1)),
+            "scene painted outside its leaf at ({x}, {y})"
+        );
+        changed_inside += 1;
+    }
+    assert!(changed_inside > 0, "the scene never reached the frame");
+}
+
+#[test]
+fn refused_scene_keeps_the_previous_frame_and_attributes_the_refusal() {
+    let now = Instant::now();
+    let view = ViewId::new(1);
+    let mut rt = present_runtime();
+    let (host, handle) = scene_host(view, text_scene("kept"));
+    rt.install_scene_host(host);
+    rt.tick_at(now).expect("first scene frame presents");
+    let first_rgba = rt.headless_rgba().expect("rgba after the accepted frame");
+    let first_report = rt.scene_frame().clone();
+    assert_eq!(first_report.views, 1);
+    assert_eq!(
+        first_report.a11y,
+        vec![bitty_runtime::SceneA11yRun {
+            kind: SCENE_A11Y_KIND,
+            identity: handle.id.get(),
+            lines: vec![(0, "kept".to_string())],
+        }],
+        "the first frame paints and projects the accepted scene"
+    );
+    assert_eq!(rt.scene_paint_refusals(), 0);
+
+    // Re-attach an admitted scene the paint budget refuses. The mount path
+    // accepts it (`Border::width` is not an admission limit); only the paint
+    // path applies `SCENE_PAINT_MAX_BORDER_CELLS`.
+    rt.scene_host_mut()
+        .expect("host installed")
+        .attach_panel_scene(handle, over_wide_border_scene())
+        .expect("scene admitted");
+    let refused_stats = rt
+        .tick_at(now + Duration::from_millis(16))
+        .expect("the retained scene still presents");
+    assert!(
+        refused_stats.glyphs > 0,
+        "the retained scene primitives still paint"
+    );
+
+    assert_eq!(
+        rt.headless_rgba().expect("rgba after the refused frame"),
+        first_rgba,
+        "a refused revision must not replace the previous visible scene"
+    );
+    assert_eq!(
+        rt.scene_frame().a11y,
+        first_report.a11y,
+        "the parity evidence still describes the retained paint list"
+    );
+    assert_eq!(rt.scene_frame().refusals, 1);
+    assert_eq!(rt.scene_paint_refusals(), 1);
+    assert!(matches!(
+        rt.last_scene_paint_refusal(),
+        Some(ScenePaintError::BorderTooWide { width: 9, .. })
+    ));
 }

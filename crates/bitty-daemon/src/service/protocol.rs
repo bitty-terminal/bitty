@@ -32,7 +32,8 @@ use crate::service::ServiceScope;
 /// The bound is twice the largest attach table (one controller plus the
 /// sixteen-lease observer ceiling) plus headroom, so a full detach and
 /// re-attach cycle fits while a connection cannot grow the history without
-/// bound. The entry names only a handle this connection held and the session it
+/// bound. The entry names only a handle this connection detached — its own or
+/// one it revoked with `session.control`/`daemon.control` — and the session it
 /// belonged to; it dies with the session record and never authorizes anything.
 const DETACHED_HANDLE_HISTORY: usize = 64;
 
@@ -184,19 +185,31 @@ impl Connection {
     /// (`L-02`, `V-07`) instead of the uniform `NotFound`.
     pub(crate) fn forget_lease(&mut self, attach_id: AttachId) {
         if let Some(session_id) = self.leases.remove(&attach_id) {
-            if self.detached.len() == DETACHED_HANDLE_HISTORY {
-                self.detached.pop_front();
-            }
-            self.detached.push_back((attach_id, session_id));
+            self.remember_detached(attach_id, session_id);
         }
     }
 
-    /// The session of a handle this connection detached itself.
+    /// Remember a handle this connection successfully detached.
     ///
-    /// `None` for a live lease, a foreign handle, a handle this connection
-    /// never held, and one aged out of the bounded history. The lookup never
-    /// implies liveness: it only names the session the acknowledgement is
-    /// about.
+    /// The acting connection is recorded for its own detach and for a
+    /// controller/operator revocation of another connection's lease, so a
+    /// repeat of either answers `not_attached` rather than `NotFound`
+    /// (`L-02`, `V-07`, bitty#2768). The history is a bounded FIFO and an
+    /// already-present handle moves to the back instead of duplicating.
+    pub(crate) fn remember_detached(&mut self, attach_id: AttachId, session_id: SessionId) {
+        self.detached.retain(|(detached, _)| *detached != attach_id);
+        if self.detached.len() == DETACHED_HANDLE_HISTORY {
+            self.detached.pop_front();
+        }
+        self.detached.push_back((attach_id, session_id));
+    }
+
+    /// The session of a handle this connection detached.
+    ///
+    /// `None` for a live lease, a handle another connection detached without
+    /// this connection acting, one aged out of the bounded history, and any
+    /// handle this connection never touched. The lookup never implies
+    /// liveness: it only names the session the acknowledgement is about.
     #[must_use]
     pub fn detached_session(&self, attach_id: AttachId) -> Option<SessionId> {
         self.detached
@@ -308,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn a_detached_handle_is_remembered_only_by_its_own_connection_and_within_bound() {
+    fn a_detached_handle_is_remembered_only_by_the_acting_connection_and_within_bound() {
         let mut first = connection();
         let second = connection();
         let session = SessionId::parse(&"1".repeat(32)).expect("session id");
@@ -322,6 +335,13 @@ mod tests {
         // Re-attaching the same handle (a reissued id) drops the stale entry.
         first.register_lease(attach, session);
         assert_eq!(first.detached_session(attach), None);
+
+        // A controller/operator revocation of another connection's lease
+        // records the acting connection too, so its repeat is `not_attached`.
+        let foreign = AttachId::parse(&"3".repeat(32)).expect("attach id");
+        first.remember_detached(foreign, session);
+        assert_eq!(first.detached_session(foreign), Some(session));
+        assert_eq!(second.detached_session(foreign), None);
 
         // The history is a bounded FIFO: the oldest handle ages out and the
         // newest still answers the repeat.

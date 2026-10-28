@@ -1768,9 +1768,13 @@ impl Service {
         let key = self.idempotency_key(fields)?;
         let token = optional_control_token(fields)?;
         let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
-        // Contract: a mint for a terminal session is `NotRunning`. A terminal
-        // record is immutable, so the mint's revision bump could not be
-        // recorded and the grant would be born unusable.
+        // Contract: a mint for a terminal session is `NotRunning`. This
+        // precedes the keyed admission deliberately: the terminal transition
+        // retires the session's `D-18` key store, so a second call with the
+        // same key is a new request against a frozen record, not a descriptor
+        // replay. The idempotent terminal snapshot covers the keyless
+        // termination and revocation methods; a keyed mint has no effect left
+        // to replay.
         if snapshot.state.is_terminal() {
             return Err(Refusal::denied(RefusalCode::NotRunning));
         }
@@ -1903,30 +1907,25 @@ impl Service {
         // `not_active`; the id is 128 bits and reveals nothing the caller did
         // not already hold.
         let retained = self.grants.observer_grant_session_retained(grant_id);
-        let mut frozen = false;
         if let Some(session_id) = retained {
             let token = optional_control_token(fields)?;
             let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
+            // `D-03`/terminal rule: a frozen record is read-only and every
+            // mutation is `Denied/NotRunning`, decided before authority so a
+            // former observer cannot revoke another client's pending grant on
+            // a terminal session. There is nothing left to retire: the grant
+            // can never be consumed and the revision is frozen.
             if snapshot.state.is_terminal() {
-                // A terminal record is immutable: the revoke can no longer
-                // change a session snapshot and nothing can consume the grant,
-                // so the answer is the idempotent `not_active` no-op. The
-                // visibility relation above is still required; the audit
-                // record below stays the same.
-                frozen = true;
-            } else {
-                let _authority =
-                    self.control_authority(connection, session_id, token.as_ref(), true, now)?;
-                self.recheck(connection, DispatchBoundary::ObserverGrantRevoke)?;
-                self.admit()?;
+                return Err(Refusal::denied(RefusalCode::NotRunning));
             }
+            let _authority =
+                self.control_authority(connection, session_id, token.as_ref(), true, now)?;
+            self.recheck(connection, DispatchBoundary::ObserverGrantRevoke)?;
+            self.admit()?;
         }
-        let outcome = if frozen {
-            RevokeOutcome::NotActive
-        } else {
-            self.grants
-                .revoke_kind(grant_id, GrantKind::Observer, now.as_millis())
-        };
+        let outcome = self
+            .grants
+            .revoke_kind(grant_id, GrantKind::Observer, now.as_millis());
         if outcome == RevokeOutcome::Revoked {
             if let Some(session_id) = retained {
                 // `D-03`: the revoke is one snapshot-visible mutation. The
@@ -1962,11 +1961,13 @@ impl Service {
     ) -> Result<Value, Refusal> {
         let target = parse_attach_id(fields)?;
         let own = connection.owns_lease(target);
-        // A handle this connection detached itself is still its own for the
-        // idempotent repeat (`L-02`, `V-07`, bitty#2768). It needs no
-        // `session.control`, changes nothing, and never resurrects the lease;
-        // the history is per connection and bounded, so a foreign or
-        // never-issued handle keeps the uniform answers below.
+        // A handle this connection successfully detached — its own, or
+        // another connection's revoked with control authority — is recognised
+        // for the idempotent repeat (`L-02`, `V-07`, bitty#2768). It needs no
+        // `session.control` on the repeat, changes nothing, and never
+        // resurrects the lease; the history is per connection and bounded, so
+        // a handle this connection never touched keeps the uniform answers
+        // below.
         let repeat = (!own)
             .then(|| connection.detached_session(target))
             .flatten();
@@ -2025,6 +2026,11 @@ impl Service {
         match self.host.detach(session_id, target, &authority, now) {
             Ok(detached) => {
                 connection.forget_lease(target);
+                // Record the acting connection for a controller/operator
+                // revocation of another connection's lease too; the target
+                // lookup has already removed it, so only this history can
+                // answer the contract's duplicate detach.
+                connection.remember_detached(target, session_id);
                 self.record(
                     AuditAction::Detach,
                     connection,

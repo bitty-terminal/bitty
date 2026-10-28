@@ -368,6 +368,40 @@ fn operator_revision(operator: &mut Client, session_id: &str) -> u64 {
         .expect("state revision")
 }
 
+/// Mint an observer grant as the controller and attach a fresh observer.
+fn attach_observer(
+    root: &TempRoot,
+    creator: &mut Client,
+    session_id: &str,
+    label: &str,
+) -> (Client, String) {
+    let minted = creator.call(
+        "session.grant",
+        json!({"session_id": session_id, "idempotency_key": format!("{label}-grant")}),
+    );
+    assert_eq!(minted["ok"], true, "{minted}");
+    let grant = minted["result"]["grant"]
+        .as_str()
+        .expect("observer grant")
+        .to_owned();
+    let mut observer = Client::connect(&root.endpoint());
+    assert_eq!(observer.negotiate(None)["ok"], true);
+    let attached = observer.call(
+        "session.attach",
+        json!({
+            "attach_role": "observer",
+            "session_id": session_id,
+            "observer_grant": grant,
+        }),
+    );
+    assert_eq!(attached["ok"], true, "{attached}");
+    let attach_id = attached["result"]["attach_id"]
+        .as_str()
+        .expect("observer attach")
+        .to_owned();
+    (observer, attach_id)
+}
+
 /// Encode one v1 request as a length-prefixed frame.
 fn encode_request(id: &str, method: &str, params: Value) -> Vec<u8> {
     let request = json!({"v": 1, "id": id, "method": method, "params": params});
@@ -1029,6 +1063,109 @@ fn a_repeat_own_detach_is_the_idempotent_not_attached_acknowledgement() {
     assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
 }
 
+/// A controller that detaches another connection's lease records itself for
+/// the repeat: the second call is the contract's `not_attached`
+/// acknowledgement, not `NotFound` (bitty#2768 review).
+#[test]
+fn a_controller_repeat_detach_of_a_foreign_handle_is_not_attached() {
+    let root = TempRoot::new("controller-repeat-detach");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    let ControlledSession {
+        mut creator,
+        session_id,
+        ..
+    } = controlled_session(&root, &mut operator, "controller-repeat");
+    let (mut observer, observer_attach) =
+        attach_observer(&root, &mut creator, &session_id, "controller-repeat");
+    let revision = operator_revision(&mut operator, &session_id);
+
+    let revoked = creator.call("session.detach", json!({"attach_id": observer_attach}));
+    assert_eq!(revoked["ok"], true, "{revoked}");
+    assert_eq!(revoked["result"]["was_attached"], true, "{revoked}");
+    assert_eq!(revoked["result"]["revoked"], true, "{revoked}");
+    assert_eq!(revoked["result"]["attach_id"], observer_attach.as_str());
+    assert_eq!(operator_revision(&mut operator, &session_id), revision + 1);
+
+    for _ in 0..2 {
+        let repeat = creator.call("session.detach", json!({"attach_id": observer_attach}));
+        assert_eq!(repeat["ok"], true, "{repeat}");
+        assert_eq!(repeat["result"]["was_attached"], false, "{repeat}");
+        assert_eq!(repeat["result"]["not_attached"], true, "{repeat}");
+        assert_eq!(repeat["result"]["revoked"], false, "{repeat}");
+        assert_eq!(repeat["result"]["attach_id"], observer_attach.as_str());
+        assert_eq!(repeat["result"]["session"]["attach_count"], 1, "{repeat}");
+        assert_eq!(
+            repeat["result"]["session"]["state_revision"],
+            revision + 1,
+            "{repeat}"
+        );
+        assert_eq!(operator_revision(&mut operator, &session_id), revision + 1);
+    }
+
+    // The revocation removed the target lease; the handle is not revived.
+    let heartbeat = observer.call("lease.heartbeat", json!({"attach_id": observer_attach}));
+    assert_eq!(heartbeat["ok"], false, "{heartbeat}");
+    assert_eq!(heartbeat["error"]["code"], "NotFound", "{heartbeat}");
+
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+}
+
+/// An operator that revokes another connection's lease records itself for the
+/// repeat exactly as a controller does.
+#[test]
+fn an_operator_repeat_detach_of_a_foreign_handle_is_not_attached() {
+    let root = TempRoot::new("operator-repeat-detach");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    let ControlledSession {
+        mut creator,
+        session_id,
+        ..
+    } = controlled_session(&root, &mut operator, "operator-repeat");
+    let (mut observer, observer_attach) =
+        attach_observer(&root, &mut creator, &session_id, "operator-repeat");
+    let revision = operator_revision(&mut operator, &session_id);
+
+    let revoked = operator.call("session.detach", json!({"attach_id": observer_attach}));
+    assert_eq!(revoked["ok"], true, "{revoked}");
+    assert_eq!(revoked["result"]["was_attached"], true, "{revoked}");
+    assert_eq!(revoked["result"]["revoked"], true, "{revoked}");
+    assert_eq!(operator_revision(&mut operator, &session_id), revision + 1);
+
+    for _ in 0..2 {
+        let repeat = operator.call("session.detach", json!({"attach_id": observer_attach}));
+        assert_eq!(repeat["ok"], true, "{repeat}");
+        assert_eq!(repeat["result"]["was_attached"], false, "{repeat}");
+        assert_eq!(repeat["result"]["not_attached"], true, "{repeat}");
+        assert_eq!(repeat["result"]["revoked"], false, "{repeat}");
+        assert_eq!(
+            repeat["result"]["session"]["state_revision"],
+            revision + 1,
+            "{repeat}"
+        );
+        assert_eq!(operator_revision(&mut operator, &session_id), revision + 1);
+    }
+
+    let heartbeat = observer.call("lease.heartbeat", json!({"attach_id": observer_attach}));
+    assert_eq!(heartbeat["ok"], false, "{heartbeat}");
+    assert_eq!(heartbeat["error"]["code"], "NotFound", "{heartbeat}");
+
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+}
+
 /// Grant mint, observer-grant consume, and revoke each bump `state_revision`
 /// exactly once (bitty#2767, corpus `C-04`); heartbeats and keyed replays never
 /// do.
@@ -1136,9 +1273,9 @@ fn grant_mint_consume_and_revoke_each_bump_the_state_revision() {
     assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
 }
 
-/// A terminal session refuses an observer-grant mint with `NotRunning` and
-/// answers a revoke with the idempotent `not_active` no-op, so no revision is
-/// recorded on a frozen record.
+/// A terminal session refuses an observer-grant mint — including a keyed
+/// repeat — with `NotRunning`, and refuses a revoke the same way instead of
+/// answering the idempotent `not_active` no-op.
 #[test]
 fn a_grant_on_a_terminal_session_is_not_running_and_revokes_nothing() {
     let root = TempRoot::new("terminal-grant");
@@ -1181,22 +1318,105 @@ fn a_grant_on_a_terminal_session_is_not_running_and_revokes_nothing() {
         terminal_revision
     );
 
-    let mint = creator.call(
-        "session.grant",
-        json!({"session_id": session_id, "idempotency_key": "term-mint-2"}),
-    );
-    assert_eq!(mint["ok"], false, "{mint}");
-    assert_eq!(mint["error"]["class"], "Denied", "{mint}");
-    assert_eq!(mint["error"]["code"], "NotRunning", "{mint}");
+    // The terminal transition retires the session's key store, so the same
+    // key is a new request on a frozen record, not a `D-18` replay.
+    for key in ["term-mint-2", "term-mint-1"] {
+        let mint = creator.call(
+            "session.grant",
+            json!({"session_id": session_id, "idempotency_key": key}),
+        );
+        assert_eq!(mint["ok"], false, "{mint}");
+        assert_eq!(mint["error"]["class"], "Denied", "{mint}");
+        assert_eq!(mint["error"]["code"], "NotRunning", "{mint}");
+        assert_eq!(
+            operator_revision(&mut operator, &session_id),
+            terminal_revision
+        );
+    }
+
+    let revoked = creator.call("session.grant.revoke", json!({"grant_id": pending_id}));
+    assert_eq!(revoked["ok"], false, "{revoked}");
+    assert_eq!(revoked["error"]["class"], "Denied", "{revoked}");
+    assert_eq!(revoked["error"]["code"], "NotRunning", "{revoked}");
     assert_eq!(
         operator_revision(&mut operator, &session_id),
         terminal_revision
     );
 
-    let revoked = creator.call("session.grant.revoke", json!({"grant_id": pending_id}));
-    assert_eq!(revoked["ok"], true, "{revoked}");
-    assert_eq!(revoked["result"]["revoked"], false, "{revoked}");
-    assert_eq!(revoked["result"]["not_active"], true, "{revoked}");
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+}
+
+/// A former observer cannot revoke another client's pending grant once the
+/// session is terminal: the mutation is `Denied/NotRunning` before the
+/// authority relation, and the frozen revision does not change.
+#[test]
+fn a_former_observer_cannot_revoke_a_grant_on_a_terminal_session() {
+    let root = TempRoot::new("terminal-observer-revoke");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    let ControlledSession {
+        mut creator,
+        session_id,
+        controller_token,
+        ..
+    } = controlled_session(&root, &mut operator, "terminal-observer-revoke");
+
+    let observer_grant = creator.call(
+        "session.grant",
+        json!({"session_id": session_id, "idempotency_key": "term-observer-mint"}),
+    );
+    assert_eq!(observer_grant["ok"], true, "{observer_grant}");
+    let observer_grant = observer_grant["result"]["grant"]
+        .as_str()
+        .expect("observer grant")
+        .to_owned();
+    let mut observer = Client::connect(&root.endpoint());
+    assert_eq!(observer.negotiate(None)["ok"], true);
+    let attached = observer.call(
+        "session.attach",
+        json!({
+            "attach_role": "observer",
+            "session_id": session_id,
+            "observer_grant": observer_grant,
+        }),
+    );
+    assert_eq!(attached["ok"], true, "{attached}");
+
+    // A grant minted for another client stays pending across the transition.
+    let pending = creator.call(
+        "session.grant",
+        json!({"session_id": session_id, "idempotency_key": "term-observer-pending"}),
+    );
+    assert_eq!(pending["ok"], true, "{pending}");
+    let pending_id = pending["result"]["grant_id"]
+        .as_str()
+        .expect("pending grant id")
+        .to_owned();
+
+    let aborted = creator.call(
+        "session.abort",
+        json!({
+            "session_id": session_id,
+            "expected_generation": 0,
+            "reason_class": "cancel",
+            "control_token": controller_token,
+        }),
+    );
+    assert_eq!(aborted["ok"], true, "{aborted}");
+    let terminal_revision = aborted["result"]["session"]["state_revision"]
+        .as_u64()
+        .expect("terminal revision");
+
+    let revoked = observer.call("session.grant.revoke", json!({"grant_id": pending_id}));
+    assert_eq!(revoked["ok"], false, "{revoked}");
+    assert_eq!(revoked["error"]["class"], "Denied", "{revoked}");
+    assert_eq!(revoked["error"]["code"], "NotRunning", "{revoked}");
     assert_eq!(
         operator_revision(&mut operator, &session_id),
         terminal_revision

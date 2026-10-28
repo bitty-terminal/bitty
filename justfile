@@ -202,6 +202,14 @@ test-support-gate:
 daemon-seam-test:
     cargo test -p bitty-daemon --locked
 
+# bitty#2605 / CTX-1631: the shared bittyd conformance harness. One corpus runs
+# against the in-process reference fake (`candidate-not-bittyd`) and the built
+# binary; evidence lands under `target/conformance/`. `daemon-seam-test`
+# already includes the integration binary, so this recipe names the harness for
+# local runs without duplicating `just check`.
+daemon-conformance:
+    cargo test -p bitty-daemon --test conformance --locked
+
 # CTX-1605: `winit` is a patched path dependency (`vendor/winit`). If the
 # requirement or the lock ever resolve back to crates.io, cargo only warns that
 # the patch "was not used in the crate graph": the build stays green and the

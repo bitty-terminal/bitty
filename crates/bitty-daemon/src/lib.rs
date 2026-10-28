@@ -92,7 +92,7 @@
 //! | Terminal content plane, including `session.resize` | bitty#2604 / terminal contract | no `terminal.*` scope is granted; `session.resize` is `Denied/ScopeViolation` |
 //! | Pushing session events on a connection (no subscribe method) | bitty#2602 | `session.status`/`session.list` are the reconciliation reads |
 //! | Per-connection refusal-audit budget aggregation | bitty#2603 follow-up | every refusal is recorded; aggregation is not implemented |
-//! | Conformance corpus and fake-server parity | bitty#2605 | not part of this crate |
+//! | Conformance corpus and fake-server parity | bitty#2605 | `tests/harness` corpus, fake and real drivers, parity gate; V-07/bitty#2768 and C-04/bitty#2767 are recorded known defects |
 //!
 //! [`bittyd` Session-Host Contract]: https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/bittyd-session-host-contract.md
 

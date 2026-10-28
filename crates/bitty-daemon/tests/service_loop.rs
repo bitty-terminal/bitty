@@ -760,8 +760,10 @@ fn a_pipelined_request_behind_negotiate_is_discarded() {
         .set_read_timeout(Some(Duration::from_secs(10)))
         .expect("restore timeout");
 
-    // The connection resumes with fresh frames.
+    // The connection resumes with fresh frames; the fresh id proves the
+    // response belongs to the post-handshake request.
     let status = client.call("daemon.status", json!({}));
+    assert_eq!(status["id"], "3", "{status}");
     assert_eq!(status["ok"], true, "{status}");
     assert_eq!(status["result"]["daemon_state"], "running");
 

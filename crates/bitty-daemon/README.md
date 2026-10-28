@@ -522,10 +522,11 @@ enforced plan and opened the journal. The claim is exact and bounded:
   journal changes nothing.
 
 The startup scan completes before the daemon binds its endpoint (`D-06`):
-startup resolves and attests the `0700` runtime directory with
-`EndpointPaths::prepare`, opens the journal, reaps or quarantines every
-actionable record, and only then calls `open_endpoint`. No client can create or
-observe a session while an earlier record is actionable.
+startup calls `endpoint::prepare_endpoint` (resolve, attest, and take the
+single-instance lock), opens the journal, reaps or quarantines every actionable
+record, and only then binds the socket through `PreparedEndpoint::bind`. The
+lock is held across the scan, so two starts cannot reap the same journal, and no
+client can connect while an earlier record is actionable.
 
 Every other cell (including macOS and Windows) returns
 `Denied/UnsupportedCapability`; `daemon.status` reports

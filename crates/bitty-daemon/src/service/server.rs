@@ -45,9 +45,7 @@ mod unix {
     use crate::audit_sink::{AuditFileWriter, AuditSinkError, default_audit_dir};
     use crate::codes::RefusalCode;
     use crate::containment::{ContainmentLimits, ContainmentReport};
-    use crate::endpoint::{
-        BoundEndpoint, EndpointEnv, EndpointError, EndpointPaths, open_endpoint,
-    };
+    use crate::endpoint::{BoundEndpoint, EndpointEnv, EndpointError, prepare_endpoint};
     use crate::handshake::{ClientId, EffectiveScopes, EndpointKind, ServerIdentity};
     use crate::limits::{LimitId, Limits};
     use crate::operator::{OperatorError, OperatorStore};
@@ -435,10 +433,12 @@ mod unix {
         // plan is reported as an unsupported verifier, never as an empty
         // verified one.
         let containment = ContainmentReport::probe();
-        let paths = EndpointPaths::resolve(&config.endpoint_env).map_err(ServerError::Endpoint)?;
-        paths.prepare().map_err(ServerError::Endpoint)?;
+        let prepared = prepare_endpoint(&config.endpoint_env).map_err(|error| match error {
+            EndpointError::AlreadyRunning { socket, .. } => ServerError::AlreadyRunning { socket },
+            other => ServerError::Endpoint(other),
+        })?;
         let mut orphans = OrphanSupervisor::open(
-            paths.runtime_dir().join(ORPHAN_SUBDIR),
+            prepared.runtime_dir().join(ORPHAN_SUBDIR),
             &journal_limits(&config.limits),
             &containment,
             ContainmentLimits::from_limits(&config.limits),
@@ -447,10 +447,7 @@ mod unix {
         orphans
             .verify(MonotonicMs::ZERO)
             .map_err(|error| ServerError::Orphan(OrphanOpenError::Journal(error)))?;
-        let endpoint = open_endpoint(&config.endpoint_env).map_err(|error| match error {
-            EndpointError::AlreadyRunning { socket, .. } => ServerError::AlreadyRunning { socket },
-            other => ServerError::Endpoint(other),
-        })?;
+        let endpoint = prepared.bind().map_err(ServerError::Endpoint)?;
         let operator =
             OperatorStore::create_in(endpoint.runtime_dir()).map_err(ServerError::Operator)?;
         let writer =

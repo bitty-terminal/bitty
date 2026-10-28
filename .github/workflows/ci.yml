@@ -353,7 +353,10 @@ jobs:
         with:
           name: bittyd-conformance-fake
           path: target/conformance/linux-x86_64.fake.json
-          if-no-files-found: error
+          # The run step can be skipped by an earlier failure; the missing
+          # artifact must not turn that into a second, misleading failure. The
+          # test step itself still fails the job when the corpus fails.
+          if-no-files-found: ignore
           retention-days: 7
 
       # CTX-1332 (issue #2213): the cold-delivery phase/origin/fence suites are
@@ -794,11 +797,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
+          # See the fake upload above: a skipped run step must not fail here.
           name: bittyd-conformance-linux-x86_64
           path: |
             target/conformance/linux-x86_64.real.json
             target/conformance/linux-x86_64.parity.json
-          if-no-files-found: error
+          if-no-files-found: ignore
           retention-days: 7
 
       # #2561: report the budget before the bench build and fail with an

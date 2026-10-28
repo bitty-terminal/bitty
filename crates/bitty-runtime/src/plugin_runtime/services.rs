@@ -1015,7 +1015,7 @@ impl UiBlock {
 /// Bounded per-generation block registry (`SCN-4`/`SCN-5` numbers).
 ///
 /// Handles are opaque, generation-owned integers encoded as
-/// `(epoch << 32) | counter`: the registry lives inside one [`PluginServices`]
+/// `(epoch << 33) | counter`: the registry lives inside one [`PluginServices`]
 /// and the runtime pins `epoch` to the activation generation, so a handle from
 /// a suspended, reloaded, or disposed generation is foreign to the next one
 /// and `update` reports `false` instead of touching another generation's
@@ -1042,18 +1042,22 @@ pub struct UiBlocks {
 
 /// Bits of the handle reserved for the generation epoch.
 ///
-/// The epoch sits above bit 32, and bit 32 itself is reserved as the
+/// The epoch occupies bits 33..=62, so bit 32 is free to stay clear as the
 /// terminal-slot scene discriminator (`bitty` CTX-1641): this registry never
-/// sets it, so a v1 band handle can never be mistaken for a rich scene handle
-/// by `ui.update`. Capped at 30 so every composed `i64` handle stays positive
-/// (the surface types handles as opaque integers).
+/// sets bit 32, so a v1 band handle can never be mistaken for a rich scene
+/// handle by `ui.update`. Thirty bits is exactly the width that still keeps
+/// the sign bit (63) clear, so every composed `i64` handle is positive (the
+/// surface types handles as opaque integers); an epoch above `2^30 - 1` is
+/// masked rather than shifted into the sign bit. The epoch is the activation
+/// generation counter, so exhausting that bound needs `2^30` activations of
+/// one plugin: the mask is a representation bound, not a lifecycle guarantee.
 const UI_HANDLE_EPOCH_BITS: u32 = 30;
 
 /// Mask selecting the generation epoch bits of a handle.
 const UI_HANDLE_EPOCH_MASK: u32 = (1 << UI_HANDLE_EPOCH_BITS) - 1;
 
-/// Position of the epoch field; bit 32 stays clear for the scene
-/// discriminator.
+/// Position of the epoch field: bits 0..=31 hold the counter and bit 32 is the
+/// scene discriminator, so the epoch starts at 33.
 const UI_HANDLE_EPOCH_SHIFT: u32 = 33;
 
 impl Default for UiBlocks {
@@ -7805,6 +7809,29 @@ mod tests {
             "the next generation's own handle must still serve"
         );
         second.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
+    }
+
+    /// PR #2799 review F3: the epoch field is 30 bits at shift 33, which is
+    /// exactly the width that leaves bit 63 (sign) clear. The largest
+    /// representable epoch must still compose a positive handle that never
+    /// sets the scene discriminator.
+    #[test]
+    fn composed_handles_stay_positive_at_the_epoch_bound() {
+        let mut blocks = UiBlocks::new();
+        blocks.set_epoch(u32::MAX);
+        let handle = blocks.next_handle().expect("handle");
+        assert!(
+            handle > 0,
+            "an unmasked 30-bit epoch would overflow the sign bit"
+        );
+        assert_eq!(
+            handle & (1 << 32),
+            0,
+            "a v1 band handle never sets the scene discriminator"
+        );
+        // Masking `u32::MAX` yields the all-ones 30-bit epoch field.
+        let epoch = i64::from(UI_HANDLE_EPOCH_MASK);
+        assert_eq!(handle, (epoch << UI_HANDLE_EPOCH_SHIFT) | 1);
     }
 
     #[test]

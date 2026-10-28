@@ -46,6 +46,15 @@
 //! one). The owner releases the slot when its scene detaches or its
 //! generation ends.
 //!
+//! # Target binding
+//!
+//! Core republishes the focused leaf into the shared target cell every tick,
+//! but the host reads that cell only when a mount runs
+//! ([`SceneHost::attach`]): `ui.update` and the present loop keep the binding
+//! the last mount resolved. A focus change therefore moves the scene on the
+//! owning generation's next mount, not on the tick that moved focus; nothing
+//! here polls the cell, so there is no per-tick re-bind and no timer.
+//!
 //! # Budgets
 //!
 //! `SCN-1..3` are enforced by the reader and [`Scene::insert`], `SCN-4` by the
@@ -90,7 +99,13 @@ pub const UI_HANDLE_SCENE_BIT: i64 = 1 << 32;
 /// Epoch field position shared by both handle minters.
 const UI_HANDLE_EPOCH_SHIFT: u32 = 33;
 
-/// Epoch field width shared by both handle minters (bit 63 stays clear).
+/// Epoch field width shared by both handle minters.
+///
+/// The epoch occupies bits 33..=62, so bit 32 stays free for
+/// [`UI_HANDLE_SCENE_BIT`] and bit 63 (the sign bit) stays clear: every
+/// composed handle is positive. An epoch above `2^30 - 1` is masked instead of
+/// shifting into the sign bit; the epoch is the activation generation counter,
+/// so that bound needs `2^30` activations of one plugin.
 const UI_HANDLE_EPOCH_BITS: u32 = 30;
 
 /// Mask selecting the epoch bits of a UI handle.
@@ -180,8 +195,10 @@ impl SceneHost {
     /// Builds the one scene host over the shared panel runtime.
     ///
     /// `target` is the placement slot Core publishes every tick (the focused
-    /// leaf id). The plugin never writes it: a mount with no live target
-    /// fails closed.
+    /// leaf id). Only [`Self::attach`] reads it, so a focus change moves the
+    /// panel on this generation's next mount, not on the tick that moved
+    /// focus. The plugin never writes it: a mount with no live target fails
+    /// closed.
     #[must_use]
     pub fn new(panels: Rc<RefCell<PanelRuntime>>, target: Rc<Cell<Option<ViewId>>>) -> Self {
         Self {
@@ -559,6 +576,23 @@ mod tests {
             panels,
             target,
         )
+    }
+
+    /// PR #2799 review F3: the scene handle shares the v1 30-bit epoch field
+    /// at shift 33, so the sign bit and the scene discriminator keep their
+    /// meaning even at the largest representable epoch.
+    #[test]
+    fn scene_handles_stay_positive_at_the_epoch_bound() {
+        for epoch in [1, 1 << 29, u32::MAX] {
+            let handle = scene_handle(epoch, 1);
+            assert!(handle > 0, "epoch {epoch} must keep the sign bit clear");
+            assert!(is_scene_handle(handle), "epoch {epoch} keeps the scene bit");
+            let expected_epoch = i64::from(epoch) & UI_HANDLE_EPOCH_MASK;
+            assert_eq!(
+                handle,
+                UI_HANDLE_SCENE_BIT | (expected_epoch << UI_HANDLE_EPOCH_SHIFT) | 1
+            );
+        }
     }
 
     #[test]

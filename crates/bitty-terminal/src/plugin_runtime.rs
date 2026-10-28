@@ -2590,15 +2590,45 @@ bitty.commands.register({ id = "update", title = "Update rich scene", run = upda
     /// Probe plugin that mounts its scene during activation, before any app
     /// tick exists: the seeded placement target must route it, and the first
     /// presented frame must paint it.
+    ///
+    /// The dev manifest declares `mount`/`update` as lazy commands, and
+    /// activation fails closed when a declared command is never registered, so
+    /// the probe registers both. A mount-then-fail generation is covered by
+    /// `failed_activation_releases_the_mounted_scene_and_frees_the_slot`
+    /// instead: this probe must only ever paint from a **live** generation.
     const SCENE_AT_INIT: &str = r#"
 bitty.ui.mount("terminal", {
   kind = "Block",
   border = { width = 1 },
   child = { kind = "Text", text = "init-scene-line" },
 })
+
+bitty.commands.register({
+  id = "mount",
+  title = "Mount rich scene",
+  run = function() return "OK" end,
+})
+bitty.commands.register({
+  id = "update",
+  title = "Update rich scene",
+  run = function() return "OK" end,
+})
 "#;
 
     const SCENE_AT_INIT_ID: &str = "xuepoo.richsceneinit";
+
+    /// Probe plugin that mounts into the `terminal` slot during `init.lua` and
+    /// then fails activation: the mounted scene must not survive the rollback.
+    const SCENE_ROLLBACK_ID: &str = "xuepoo.richscenerollback";
+
+    const SCENE_ROLLBACK_FAILS: &str = r#"
+bitty.ui.mount("terminal", {
+  kind = "Block",
+  border = { width = 1 },
+  child = { kind = "Text", text = "doomed-scene-line" },
+})
+error("activation fails after mounting the terminal slot scene")
+"#;
 
     fn write_scene_source(root: &Path, id: &str, source: &str) {
         let plugin = root.join(id);
@@ -2642,6 +2672,16 @@ bitty.ui.mount("terminal", {
         source: &str,
     ) -> (crate::terminal_app::TerminalApp, Rc<RefCell<PanelRuntime>>) {
         let root = pin_test_dir(tag);
+        scene_app_at_root(root, id, source)
+    }
+
+    /// Same composition root over a caller-provided plugin root, so a test can
+    /// rewrite one generation's `init.lua` between activations.
+    fn scene_app_at_root(
+        root: PathBuf,
+        id: &str,
+        source: &str,
+    ) -> (crate::terminal_app::TerminalApp, Rc<RefCell<PanelRuntime>>) {
         write_scene_source(&root, id, source);
         let mut config = bitty_runtime::RuntimeConfig {
             cols: 80,
@@ -2740,6 +2780,19 @@ bitty.ui.mount("terminal", {
         let _control_queue_guard = crate::ctl::test_control_queue_lock();
         let (mut app, panels) =
             scene_app_with_source("scene-at-init", SCENE_AT_INIT_ID, SCENE_AT_INIT);
+        // The mount is evidence from a live generation, never from a
+        // rolled-back one (PR #2799 review F1).
+        let id = bitty_plugin_host::manifest::PluginId::new(SCENE_AT_INIT_ID).expect("id");
+        assert!(
+            matches!(
+                app.plugin_runtime
+                    .as_ref()
+                    .expect("plugin runtime")
+                    .state(&id),
+                Some(bitty_runtime::plugin_runtime::LifecycleState::Active)
+            ),
+            "the activation-time mount must come from an active generation"
+        );
         // No command ran: the mount happened inside `init.lua`, before the app
         // existed, and the seeded placement target routed it.
         let view = app.runtime.focused_view().expect("focused leaf");
@@ -2759,6 +2812,68 @@ bitty.ui.mount("terminal", {
             .placement_panel_of(view)
             .expect("placement resolves");
         assert_eq!(report.a11y[0].identity, panel.get());
+        assert_eq!(panels.borrow().panel_scene_len(), 1);
+    }
+
+    #[test]
+    fn failed_activation_releases_the_mounted_scene_and_frees_the_slot() {
+        // PR #2799 review F1: a generation that mounts during `init.lua` and
+        // then fails activation must release the scene host slot. Before the
+        // rollback released its UI blocks, the dead scene stayed attached: the
+        // next frame painted it, the panel kept the dead owner/epoch, and every
+        // later mount failed `E_UI_UNAVAILABLE` for the process lifetime.
+        let _control_queue_guard = crate::ctl::test_control_queue_lock();
+        let root = pin_test_dir("scene-rollback");
+        let (mut app, panels) =
+            scene_app_at_root(root.clone(), SCENE_ROLLBACK_ID, SCENE_ROLLBACK_FAILS);
+        let id = bitty_plugin_host::manifest::PluginId::new(SCENE_ROLLBACK_ID).expect("id");
+        assert!(
+            matches!(
+                app.plugin_runtime
+                    .as_ref()
+                    .expect("plugin runtime")
+                    .state(&id),
+                Some(bitty_runtime::plugin_runtime::LifecycleState::Failed(_))
+            ),
+            "the probe generation must fail activation"
+        );
+        app.drive_tick().expect("first frame presents");
+        assert_eq!(
+            app.runtime.scene_frame().views,
+            0,
+            "a failed generation's scene must not paint"
+        );
+        assert_eq!(
+            panels.borrow().panel_count(),
+            0,
+            "rollback must not keep the failed generation's scene panel"
+        );
+        assert_eq!(panels.borrow().panel_scene_len(), 0);
+        assert_eq!(panels.borrow().placement_len(), 0);
+
+        // A second generation of the same plugin must find the slot free.
+        write_scene_source(&root, SCENE_ROLLBACK_ID, SCENE_AT_INIT);
+        crate::test_support::with_harness_activation_wall(|| {
+            app.plugin_runtime
+                .as_mut()
+                .expect("plugin runtime")
+                .activate(&id)
+        })
+        .expect("a second generation must mount after the rollback");
+        app.drive_tick().expect("second frame presents");
+        let scene = app.runtime.scene_frame().clone();
+        assert_eq!(
+            scene.views, 1,
+            "the second generation's scene paints on the live slot"
+        );
+        assert!(
+            scene.a11y[0]
+                .lines
+                .iter()
+                .any(|(_, text)| text == "init-scene-line"),
+            "the recovery scene paints: {:?}",
+            scene.a11y[0].lines
+        );
         assert_eq!(panels.borrow().panel_scene_len(), 1);
     }
 

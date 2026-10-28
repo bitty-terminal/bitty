@@ -4313,6 +4313,16 @@ impl PluginRuntime {
         if let Some(entry) = self.entries.get_mut(id) {
             entry.state = LifecycleState::Failed(message);
             entry.vm = None;
+            // bitty#2785: release the generation's UI blocks -- including the
+            // terminal-slot scene and its Core-owned panel -- before dropping
+            // the services that address them. A scene mounted during
+            // `init.lua` would otherwise stay attached to `SceneHost`: the
+            // dead generation would keep painting, the panel would keep its
+            // dead owner/epoch, and every later mount would fail
+            // `E_UI_UNAVAILABLE` for the process lifetime.
+            if let Some(services) = entry.services.as_ref() {
+                services.clear_ui_blocks();
+            }
             entry.services = None;
             entry.budgets = None;
         }

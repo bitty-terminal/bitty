@@ -52,6 +52,7 @@
 #![forbid(unsafe_code)]
 
 use std::fmt::Write as _;
+use std::path::Path;
 
 use crate::cli::Args;
 use crate::cmd::{MAX_CMD_ARGS_BYTES, validate_qualified_id};
@@ -100,13 +101,44 @@ pub struct XPluginRow {
     pub commands: Vec<String>,
 }
 
-/// Read the installed plugin set from static manifests only.
+/// Read the bundled plugin set from static manifests only.
 ///
-/// Today the installed set is the bundled catalog; user-installed entries
-/// join this function when the package manager lands. Never loads a VM.
+/// Never loads a VM. Callers that also want installed store plugins use
+/// [`Self::installed_plugins_with_store`].
 #[must_use]
 pub fn installed_plugins() -> Vec<XPluginRow> {
     rows_from_manifests(&bitty_plugin_host::bundled::all_bundled_manifests())
+}
+
+/// Read the bundled plus installed store plugin set (no VM).
+///
+/// Issue #2774: `bitty x --help` and alias resolution must see the same store
+/// as `bitty plugin list`; store rows carry id, version, and declared command
+/// names only. A missing or unreadable store contributes no rows.
+#[must_use]
+pub fn installed_plugins_with_store() -> Vec<XPluginRow> {
+    installed_plugins_with_store_at(crate::plugin_runtime::store_root().as_deref())
+}
+
+/// Store-aware row set against an explicit root (tests and callers with a
+/// resolved data root).
+#[must_use]
+pub fn installed_plugins_with_store_at(store_root: Option<&Path>) -> Vec<XPluginRow> {
+    let mut rows = installed_plugins();
+    for row in crate::plugin::store_discovery_rows_at(store_root) {
+        if rows.iter().any(|plugin| plugin.id == row.id) {
+            continue;
+        }
+        let short = row.id.rsplit('.').next().unwrap_or(&row.id).to_string();
+        rows.push(XPluginRow {
+            id: row.id,
+            short,
+            version: row.version,
+            commands: row.commands,
+        });
+    }
+    rows.sort_by(|a, b| a.id.cmp(&b.id));
+    rows
 }
 
 /// Test hook: build rows from an explicit manifest slice (covers collisions
@@ -244,9 +276,22 @@ pub fn x_usage() -> String {
     String::from("Usage: bitty x <publisher>.<name> <command> [args] [--format table|json|jsonl]")
 }
 
-/// Help text enumerating the installed plugin set (`--help` path).
+/// Help text enumerating the bundled plugin set (`--help` path, safe mode).
 #[must_use]
 pub fn x_help_text() -> String {
+    x_help_text_for(&installed_plugins())
+}
+
+/// Help text enumerating bundled plus installed store plugins.
+///
+/// Issue #2774: the default `bitty x --help` view must agree with
+/// `bitty plugin list`; `--safe` keeps [`Self::x_help_text`].
+#[must_use]
+pub fn x_help_text_with_store() -> String {
+    x_help_text_for(&installed_plugins_with_store())
+}
+
+fn x_help_text_for(rows: &[XPluginRow]) -> String {
     let mut out = String::from(
         "bitty x — qualified plugin namespace (extension, no VM load)\n\
          \n\
@@ -260,11 +305,10 @@ pub fn x_help_text() -> String {
          \n\
          Installed plugins:\n",
     );
-    let rows = installed_plugins();
     if rows.is_empty() {
         out.push_str("  (none)\n");
     } else {
-        for row in &rows {
+        for row in rows {
             let _ = write!(out, "  {} ({})", row.id, row.version);
             if row.commands.is_empty() {
                 out.push('\n');
@@ -468,8 +512,13 @@ pub fn format_x_error_envelope(kind: &str, code: &str, message: &str) -> String 
 /// (exit 8). Table diagnostics go to stderr; json/jsonl emit the ok:false
 /// envelope on stdout plus the diagnostic on stderr.
 pub fn run_x(request: &XRequest) -> i32 {
-    let rows = installed_plugins();
-    match resolve_plugin(&request.plugin, &rows) {
+    run_x_with_rows(request, &installed_plugins())
+}
+
+/// Execute a validated request against explicit rows (store-aware default,
+/// bundled-only in safe mode).
+pub(crate) fn run_x_with_rows(request: &XRequest, rows: &[XPluginRow]) -> i32 {
+    match resolve_plugin(&request.plugin, rows) {
         XResolve::Collision(claimants) => {
             let message = format!(
                 "bitty x: short alias {:?} is claimed by several plugins ({}) — \
@@ -577,14 +626,26 @@ pub(crate) fn run_cli(args: &Args) -> i32 {
     };
     match parse_x_request(&args.x_raw, pre) {
         Err(XParseError::Help) => {
-            print!("{}", x_help_text());
+            // Issue #2774: the default discovery view reads the same store as
+            // `bitty plugin list`; `--safe` keeps the bundled set.
+            if args.safe {
+                print!("{}", x_help_text());
+            } else {
+                print!("{}", x_help_text_with_store());
+            }
             EXIT_OK
         }
         Err(err) => {
             eprintln!("{}", err.message());
             EXIT_USAGE
         }
-        Ok(request) => run_x(&request),
+        Ok(request) => {
+            if args.safe {
+                run_x(&request)
+            } else {
+                run_x_with_rows(&request, &installed_plugins_with_store())
+            }
+        }
     }
 }
 
@@ -655,6 +716,58 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), rows.len(), "no duplicate rows");
+    }
+
+    #[test]
+    fn installed_set_joins_store_rows_and_keeps_safe_mode_bundled_only() {
+        use bitty_runtime::plugin_runtime::SourceClass;
+        use bitty_runtime::plugin_runtime::resolution::{PluginRecord, write_index};
+
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-x-store-{}-{}",
+            std::process::id(),
+            std::line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = dir.join("plugins");
+        let package = store.join("packages/xuepoo.store/1.0.0");
+        std::fs::create_dir_all(&package).expect("package dirs");
+        std::fs::write(
+            package.join("bitty-plugin.toml"),
+            "[plugin]\nid = \"xuepoo.store\"\nname = \"Store plugin\"\nversion = \"1.0.0\"\n\
+             description = \"installed from the store\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n\
+             [capabilities]\n\n[lazy]\ncommands = [\"xuepoo.store:run\"]\nevents = []\n",
+        )
+        .expect("manifest");
+        write_index(
+            &store,
+            &[PluginRecord {
+                source_class: SourceClass::Registry,
+                plugin_id: "xuepoo.store".to_string(),
+                version: "1.0.0".to_string(),
+                root: "packages/xuepoo.store/1.0.0".to_string(),
+                manifest_hash: "a".repeat(64),
+                content_digest: "b".repeat(64),
+                enabled: true,
+                granted: Vec::new(),
+            }],
+        )
+        .expect("index");
+
+        let rows = installed_plugins_with_store_at(Some(&store));
+        let row = rows
+            .iter()
+            .find(|row| row.id == "xuepoo.store")
+            .expect("store plugin row");
+        assert_eq!(row.short, "store");
+        assert_eq!(row.version, "1.0.0");
+        assert_eq!(row.commands, vec!["xuepoo.store:run".to_string()]);
+        assert!(matches!(
+            resolve_plugin("xuepoo.store", &rows),
+            XResolve::Found(_)
+        ));
+        assert!(!installed_plugins().iter().any(|r| r.id == "xuepoo.store"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -49,6 +49,15 @@ fn run_bitty_isolated(args: &[&str]) -> Output {
     out
 }
 
+/// Isolated data home so plugin listings never read the developer's store.
+fn isolated_data_home(tag: &str) -> (std::path::PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("bitty-list-data-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let value = dir.to_string_lossy().to_string();
+    (dir, value)
+}
+
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
@@ -242,7 +251,8 @@ fn list_themes_catalog_exposes_30_and_categories() {
 
 #[test]
 fn list_plugins_table_contains_bundled() {
-    let output = run_bitty(&["list", "plugins"], &[]);
+    let (data_home, data_home_str) = isolated_data_home("table");
+    let output = run_bitty(&["list", "plugins"], &[("XDG_DATA_HOME", &data_home_str)]);
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -259,11 +269,16 @@ fn list_plugins_table_contains_bundled() {
         !text.contains("bitty-terminal.workspace"),
         "retired workspace must not list, got {text:?}"
     );
+    let _ = std::fs::remove_dir_all(data_home);
 }
 
 #[test]
 fn list_plugins_json_count_is_one() {
-    let output = run_bitty(&["list", "plugins", "--format", "json"], &[]);
+    let (data_home, data_home_str) = isolated_data_home("json");
+    let output = run_bitty(
+        &["list", "plugins", "--format", "json"],
+        &[("XDG_DATA_HOME", &data_home_str)],
+    );
     assert_eq!(output.status.code(), Some(0));
     let doc = parse_stdout_json(&stdout(&output));
     assert!(doc.contains("\"kind\":\"plugins\""));
@@ -279,6 +294,66 @@ fn list_plugins_json_count_is_one() {
     assert!(!doc.contains("bitty-terminal.mail-panel"));
     assert!(!doc.contains("bitty-terminal.browser-panel"));
     assert!(!doc.contains("bitty-terminal.project"));
+    let _ = std::fs::remove_dir_all(data_home);
+}
+
+#[test]
+fn list_plugins_reads_installed_store() {
+    use bitty_runtime::plugin_runtime::SourceClass;
+    use bitty_runtime::plugin_runtime::resolution::{PluginRecord, write_index};
+
+    // Issue #2774: `bitty list plugins` must see the same store as
+    // `bitty plugin list`, not only the bundled catalog.
+    let (data_home, data_home_str) = isolated_data_home("store");
+    let store = data_home.join("bitty").join("plugins");
+    let package = store.join("packages/xuepoo.store/1.0.0");
+    std::fs::create_dir_all(&package).expect("package dirs");
+    std::fs::write(
+        package.join("bitty-plugin.toml"),
+        "[plugin]\nid = \"xuepoo.store\"\nname = \"Store plugin\"\nversion = \"1.0.0\"\n\
+         description = \"installed from the store\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n\
+         [capabilities]\n\n[lazy]\ncommands = [\"xuepoo.store:run\"]\nevents = []\n",
+    )
+    .expect("manifest");
+    write_index(
+        &store,
+        &[PluginRecord {
+            source_class: SourceClass::Registry,
+            plugin_id: "xuepoo.store".to_string(),
+            version: "1.0.0".to_string(),
+            root: "packages/xuepoo.store/1.0.0".to_string(),
+            manifest_hash: "a".repeat(64),
+            content_digest: "b".repeat(64),
+            enabled: true,
+            granted: Vec::new(),
+        }],
+    )
+    .expect("index");
+
+    let output = run_bitty(
+        &["list", "plugins", "--format", "json"],
+        &[("XDG_DATA_HOME", &data_home_str)],
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let doc = parse_stdout_json(&stdout(&output));
+    assert!(doc.contains("\"count\":2"), "count: {:?}", doc.text());
+    assert!(doc.contains("xuepoo.store"), "{:?}", doc.text());
+    assert!(doc.contains("\"enabled\":true"), "{:?}", doc.text());
+
+    // `--safe` keeps the bundled-only catalog and reads no store state.
+    let safe = run_bitty(
+        &["--safe", "list", "plugins", "--format", "json"],
+        &[("XDG_DATA_HOME", &data_home_str)],
+    );
+    assert_eq!(safe.status.code(), Some(0), "{}", stderr(&safe));
+    let safe_doc = parse_stdout_json(&stdout(&safe));
+    assert!(
+        safe_doc.contains("\"count\":1"),
+        "safe count: {:?}",
+        safe_doc.text()
+    );
+    assert!(!safe_doc.contains("xuepoo.store"), "{:?}", safe_doc.text());
+    let _ = std::fs::remove_dir_all(data_home);
 }
 
 #[test]

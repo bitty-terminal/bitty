@@ -507,7 +507,11 @@ fn main() {
     // `bitty x --help` lists the installed plugin set (local class, static
     // manifests only, never a plugin VM).
     if args.help && args.x_word && args.x_raw.is_empty() {
-        print!("{}", x::x_help_text());
+        if args.safe {
+            print!("{}", x::x_help_text());
+        } else {
+            print!("{}", x::x_help_text_with_store());
+        }
         std::process::exit(0);
     }
     // `bitty help [cmd]` introspection (issue #1900, CTX-1117, local class).
@@ -614,7 +618,11 @@ fn main() {
                     std::process::exit(0);
                 }
                 Some("x") => {
-                    print!("{}", x::x_help_text());
+                    if args.safe {
+                        print!("{}", x::x_help_text());
+                    } else {
+                        print!("{}", x::x_help_text_with_store());
+                    }
                     std::process::exit(0);
                 }
                 Some("shell-init") => {

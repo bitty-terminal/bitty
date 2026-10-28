@@ -292,7 +292,9 @@ fn handle_panel_list(
 /// normal instances keep the default table. Issue #1520: the consent/revoke
 /// surface registers on both tables (additive-only; no existing method
 /// changes). CTX-1117 (issue #1900): the panel list surface registers
-/// additively with the same `handle_control` queue semantics.
+/// additively with the same `handle_control` queue semantics. Issue #2773:
+/// `listPlugins`/`getPlugin` are backed by the published runtime snapshot
+/// instead of the fail-closed stubs.
 fn build_dispatcher(test_mode: bool) -> Arc<bitty_ipc::devtools::Dispatcher> {
     let mut dispatcher = if test_mode {
         bitty_ipc::devtools::Dispatcher::with_test_mode()
@@ -307,6 +309,16 @@ fn build_dispatcher(test_mode: bool) -> Arc<bitty_ipc::devtools::Dispatcher> {
     if let Err(err) = dispatcher.register(crate::ctl::METHOD_LIST_PANELS, handle_panel_list) {
         crate::logging::warn(|| {
             format!("bitty: panel list unavailable: {err} (serving without it)")
+        });
+    }
+    // Issue #2773: back the accepted `listPlugins`/`getPlugin` inspect methods
+    // with the published runtime snapshot instead of the fail-closed stubs.
+    // Registration is additive: the trace and control plugin methods keep
+    // their existing behavior, and a plugin-less run keeps the typed
+    // `PluginRuntimeUnavailable` verdict.
+    if let Err(err) = crate::plugin_ipc::register(&mut dispatcher) {
+        crate::logging::warn(|| {
+            format!("bitty: plugin inspect surface unavailable: {err} (serving without it)")
         });
     }
     Arc::new(dispatcher)
@@ -1552,5 +1564,92 @@ mod tests {
         drop(client);
         let stats = handle.join().unwrap().unwrap();
         assert_eq!(stats.requests, 1);
+    }
+
+    /// Issue #2773: the test-mode IPC slice must serve the plugin runtime it
+    /// attached before the loop. The fixture activates one real plugin and
+    /// dispatches `bitty.debug/listPlugins` through the production
+    /// `build_dispatcher(true)` table.
+    #[test]
+    fn test_mode_list_plugins_returns_the_activated_ids() {
+        use std::rc::Rc;
+
+        use bitty_runtime::plugin_runtime::{
+            BridgeError, EmptySettings, LuaValue, PluginRuntime, PluginRuntimeConfig,
+            SnapshotSource,
+        };
+
+        struct StaticSnapshot;
+        impl SnapshotSource for StaticSnapshot {
+            fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
+                Ok(LuaValue::Nil)
+            }
+        }
+
+        let _serial = crate::plugin_ipc::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-ipc-plugin-{}-{}",
+            std::process::id(),
+            std::line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("plugins");
+        let id = "xuepoo.ipcprobe";
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("plugin dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"IPC probe\"\nversion = \"0.1.0\"\n\
+                 description = \"IPC listPlugins fixture\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n\
+                 [capabilities]\nui.rich = true\n"
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(plugin.join("lua/init.lua"), "return {}\n").expect("init");
+        let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
+            safe_mode: false,
+            data_dir: Some(dir.join("state")),
+            store_root: None,
+            bundled_roots: Vec::new(),
+            third_party_roots: vec![root],
+            settings: Rc::new(EmptySettings),
+            snapshot: Rc::new(StaticSnapshot),
+        });
+        runtime.discover();
+        let pid = bitty_plugin_host::manifest::PluginId::new(id).expect("valid id");
+        runtime.activate(&pid).expect("activate");
+        crate::plugin_ipc::publish(Some(&runtime));
+
+        let dispatcher = build_dispatcher(true);
+        let server =
+            bitty_ipc::devtools::ServerInfo::new("test".into(), "test.sock".into(), 80, 24);
+        let context = bitty_ipc::devtools::ServeContext::with_granted(
+            &server,
+            bitty_ipc::ScopeSet::single(bitty_ipc::Scope::DebugInspect),
+        );
+        let request = bitty_ipc::devtools::parse_request(
+            br#"{"id":1,"method":"bitty.debug/listPlugins","version":"1.0","params":{"generation":null}}"#,
+        )
+        .expect("request");
+        assert!(
+            dispatcher.contains(bitty_ipc::devtools::METHOD_LIST_PLUGINS),
+            "test-mode slice must register listPlugins"
+        );
+        let result = crate::plugin_ipc::handle_list_plugins(&context, &request).expect("served");
+        assert!(result.contains(id), "activated id missing: {result}");
+        assert!(
+            result.contains("\"state\":\"Activated\""),
+            "activated state missing: {result}"
+        );
+        assert!(
+            result.contains("\"capabilities\":[\"ui.rich\"]"),
+            "manifest capability missing: {result}"
+        );
+
+        crate::plugin_ipc::publish(None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

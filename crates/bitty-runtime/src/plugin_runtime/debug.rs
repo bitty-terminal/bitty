@@ -94,6 +94,10 @@ pub struct DebugPlugin {
     pub state: &'static str,
     /// Activation generation (0 before the first activation).
     pub generation: u32,
+    /// Canonical manifest hash (`sha256` hex over the manifest body).
+    pub manifest_hash: String,
+    /// Capabilities the manifest requests, sorted.
+    pub capabilities: Vec<String>,
 }
 
 /// One command registration row of the [`DebugView`].
@@ -1138,12 +1142,16 @@ mod tests {
                     version: "1.0.0".to_string(),
                     state: lifecycle_label(&LifecycleState::Failed("secret /path".to_string())),
                     generation: 2,
+                    manifest_hash: "b".repeat(64),
+                    capabilities: vec!["ui.rich".to_string()],
                 },
                 DebugPlugin {
                     id: "a.p".to_string(),
                     version: "0.1.0".to_string(),
                     state: lifecycle_label(&LifecycleState::Active),
                     generation: 1,
+                    manifest_hash: "a".repeat(64),
+                    capabilities: Vec::new(),
                 },
             ],
             Vec::new(),

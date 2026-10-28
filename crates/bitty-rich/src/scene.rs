@@ -801,6 +801,35 @@ mod tests {
     }
 
     #[test]
+    fn clone_is_an_independent_scene_with_its_own_identity() {
+        let mut scene = Scene::new();
+        scene
+            .insert(
+                RichBlock::new(
+                    BlockId(1),
+                    BlockAnchor::Zone(1),
+                    tiny_text("hello"),
+                    ScrollBehavior::Inline,
+                    1,
+                    0,
+                    1,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let clone = scene.clone();
+        // The clone keeps the content and generation it copied...
+        assert_eq!(clone.len(), scene.len());
+        assert_eq!(clone.generation(), scene.generation());
+        assert_eq!(clone.aggregated_bytes(), scene.aggregated_bytes());
+        // ...but it is a distinct scene instance, so a paint cache keyed on
+        // identity can never serve one scene's list for the other.
+        assert_ne!(clone.identity(), scene.identity());
+        // Two `Scene::new()` values are distinct even before any mutation.
+        assert_ne!(Scene::new().identity(), Scene::new().identity());
+    }
+
+    #[test]
     fn scn1_nodes_per_block_enforced() {
         // Build a block with 2049 nodes (exceeds 2048)
         let nodes = SCENE_MAX_NODES_PER_BLOCK + 1;

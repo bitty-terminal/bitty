@@ -13,7 +13,7 @@ use bitty_render::glyph::{
 use bitty_render::grid::{CellMetrics, DrawList, GridRenderer, SnapshotDamage};
 use bitty_render::scene::{
     SCENE_PAINT_MAX_BORDER_CELLS, SCENE_PAINT_MAX_OPS, ScenePaintBudget, ScenePaintCache,
-    ScenePaintError, ScenePaintOp, SceneSurface, paint_scene,
+    ScenePaintError, ScenePaintOp, SceneSurface, paint_scene, paint_scene_prefix,
 };
 use bitty_render::{ExtentPx, RectPx, frame::plan_frame};
 use bitty_rich::image::PlacementId;
@@ -721,8 +721,42 @@ fn clipped_text_lines_store_only_the_painted_cells() {
 }
 
 #[test]
+fn paint_scene_prefix_paints_zero_blocks_and_a_shorter_prefix() {
+    let scene = scene_of(vec![
+        block(1, text("one")),
+        block(2, text("two")),
+        block(3, text("three")),
+    ]);
+    // `max_blocks = 0` is a legal request for an empty paint list, not a
+    // refusal: the caller admitted nothing.
+    let none = paint_scene_prefix(&scene, 0, surface(), ScenePaintBudget::default())
+        .expect("a zero prefix paints nothing");
+    assert!(none.is_empty());
+    assert_eq!(none.block_count(), 0);
+    assert!(none.damage().is_empty());
+    assert_eq!(none.generation(), scene.generation());
+
+    // A prefix shorter than the scene paints exactly those blocks, in order.
+    let first = paint_scene_prefix(&scene, 2, surface(), ScenePaintBudget::default())
+        .expect("prefix paints");
+    assert_eq!(first.plain_text(), "one\ntwo");
+    assert_eq!(first.block_count(), 2);
+    assert_eq!(
+        first.ops().len(),
+        2,
+        "only the two admitted text ops are emitted"
+    );
+
+    // A prefix longer than the scene clamps to the scene.
+    let all = paint_scene_prefix(&scene, 99, surface(), ScenePaintBudget::default())
+        .expect("whole scene paints");
+    assert_eq!(all.plain_text(), "one\ntwo\nthree");
+    assert_eq!(all.block_count(), 3);
+}
+
+#[test]
 fn clipped_line_keeps_glyph_seam_parity() {
-    let line = format!("abcdef{}", "字".repeat(40));
+    let line = format!("abcdef gh{}", "字".repeat(40));
     let scene = scene_of(vec![block(1, text(&line))]);
     let paint = paint_scene(&scene, surface(), ScenePaintBudget::default()).expect("paints");
     let painted = paint.text_lines().next().expect("one line");
@@ -850,6 +884,41 @@ fn cache_distinguishes_scenes_at_the_same_generation() {
             .plain_text(),
         "second",
         "a different scene at the same generation repaints"
+    );
+}
+
+#[test]
+fn cache_distinguishes_a_mutated_clone_at_the_same_generation() {
+    let mut original = scene_of(vec![block(1, text("start"))]);
+    let mut cloned = original.clone();
+    original
+        .replace_content(BlockId(1), text("original"))
+        .expect("replace fits");
+    cloned
+        .replace_content(BlockId(1), text("cloned"))
+        .expect("replace fits");
+    assert_eq!(
+        original.generation(),
+        cloned.generation(),
+        "both mutations land on the same generation"
+    );
+    assert_ne!(original.identity(), cloned.identity());
+
+    let mut cache = ScenePaintCache::new();
+    assert_eq!(
+        cache
+            .get_or_paint(&original, surface(), ScenePaintBudget::default())
+            .expect("paints the original")
+            .plain_text(),
+        "original"
+    );
+    assert_eq!(
+        cache
+            .get_or_paint(&cloned, surface(), ScenePaintBudget::default())
+            .expect("paints the clone")
+            .plain_text(),
+        "cloned",
+        "a cloned scene at the same generation never serves the original's list"
     );
 }
 

@@ -255,9 +255,27 @@ impl Client {
     }
 }
 
+/// Reads the per-boot operator capability once the daemon has written it.
+///
+/// The endpoint socket appears before the capability file, so a client that can
+/// connect is not yet guaranteed a readable capability. Wait for it with a
+/// bounded startup deadline instead of racing the writer; a missing file after
+/// the deadline is a real failure.
 fn read_capability(root: &TempRoot) -> String {
-    let raw = std::fs::read_to_string(root.capability()).expect("capability file");
-    raw.trim_end_matches('\n').to_owned()
+    const CAPABILITY_READY_TIMEOUT: Duration = Duration::from_secs(5);
+    const CAPABILITY_READY_STEP: Duration = Duration::from_millis(10);
+    let deadline = Instant::now() + CAPABILITY_READY_TIMEOUT;
+    loop {
+        match std::fs::read_to_string(root.capability()) {
+            Ok(raw) => return raw.trim_end_matches('\n').to_owned(),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline =>
+            {
+                std::thread::sleep(CAPABILITY_READY_STEP);
+            }
+            Err(error) => panic!("capability file: {error:?}"),
+        }
+    }
 }
 
 /// One session created with host consent and claimed by a controller.

@@ -25,22 +25,30 @@
 //!
 //! A typed [`ScenePaintError`] paints nothing for that leaf. The previously
 //! presented scene primitives are re-emitted verbatim when the leaf surface,
-//! clip, and fade still match, so a refused revision never replaces the
-//! visible scene with a partial or clamped one. The refusal is attributed to
-//! the runtime counters and diagnostic. A scene text projection that exceeds
-//! the accessibility bounds is refused the same way: nothing paints and
-//! nothing is projected, so the accessibility tree cannot diverge from the
-//! frame.
+//! clip, fade, occluder set, and atlas epoch still match, so a refused revision
+//! never replaces the visible scene with a partial or clamped one. The refusal
+//! is attributed to the runtime counters and diagnostic. A scene text
+//! projection that exceeds the accessibility bounds is refused the same way:
+//! nothing paints and nothing is projected, so the parity evidence cannot
+//! diverge from the paint list.
 //!
 //! # Accessibility
 //!
-//! The painted lines are exactly the paint list's own
-//! [`ScenePaint::text_lines`], pushed through
-//! [`UiSnapshotHost::push_scene_text`]. A panel scene is composed vertically
-//! into one [`SceneKind::Column`] node whose identity is the panel id, so
-//! the projection carries the scene kind/identity plus the clipped bytes the
-//! frame paints, in paint order. Existing host bounds apply unchanged; the
-//! whole contribution is refused when it would exceed them.
+//! The recorded projection is per-frame **parity evidence**, not the window's
+//! live accessibility tree. The present loop creates one scratch
+//! [`UiSnapshotHost`] per frame, pushes the paint list's own
+//! [`ScenePaint::text_lines`] through [`UiSnapshotHost::push_scene_text`], and
+//! records the result in [`SceneFrameReport::a11y`]. A panel scene is composed
+//! vertically into one [`SceneKind::Column`] node whose identity is the panel
+//! id, so the evidence carries the scene kind/identity plus the clipped text
+//! the paint list holds, in paint order. Existing host bounds apply unchanged;
+//! the whole contribution is refused when it would exceed them.
+//!
+//! The projection is built from the paint list before float occlusion filters
+//! the glyph layer, and that ordering is deliberate: occlusion is visual, so
+//! text hidden behind a higher float still belongs in the projection. Parity
+//! evidence therefore compares projected lines with painted *lines*, not with
+//! surviving glyph count, and the scratch host is dropped with the frame.
 //!
 //! No GPU object, decode seam, or renderer handle crosses this module: it
 //! consumes owned paint data and the shared CPU text seam only.
@@ -62,18 +70,20 @@ use crate::registry::{PanelRuntime, ViewContent};
 /// order.
 pub const SCENE_A11Y_KIND: SceneKind = SceneKind::Column;
 
-/// One painted scene's accessibility projection (CTX-1630).
+/// One painted scene's per-frame accessibility parity evidence (CTX-1630).
 ///
 /// `lines` is exactly the paint list's own text, in paint order, after the
 /// [`UiSnapshotHost::push_scene_text`] bounds were applied. `identity` is the
-/// producer-assigned panel id.
+/// producer-assigned panel id. This is evidence recorded in
+/// [`SceneFrameReport`], not a node published to the window's live
+/// accessibility tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SceneA11yRun {
     /// Accessibility scene kind.
     pub kind: SceneKind,
     /// Producer-assigned scene identity (the panel id).
     pub identity: u64,
-    /// Painted lines: leaf-local row ordinal plus the clipped text.
+    /// Projected lines: leaf-local row ordinal plus the clipped text.
     pub lines: Vec<(u32, String)>,
 }
 
@@ -94,7 +104,10 @@ pub struct SceneFrameReport {
     pub damage: Vec<RectPx>,
     /// Typed paint refusals observed while composing this frame.
     pub refusals: usize,
-    /// Accessibility projection of the same painted scenes.
+    /// Per-frame accessibility parity evidence for the same painted scenes.
+    ///
+    /// Recorded from a scratch [`UiSnapshotHost`], not published to the live
+    /// tree: it proves the projected text matches the paint list's text.
     pub a11y: Vec<SceneA11yRun>,
 }
 
@@ -110,7 +123,7 @@ pub(super) struct LeafScene {
     pub ops: usize,
     /// Image placement references reserved.
     pub images: usize,
-    /// Accessibility projection of the same lines.
+    /// Accessibility parity evidence of the same lines.
     pub run: SceneA11yRun,
 }
 
@@ -118,14 +131,18 @@ pub(super) struct LeafScene {
 ///
 /// Reused verbatim when a later paint for the same leaf is refused, so the
 /// refused revision keeps the previous visible scene instead of clearing it.
-/// Entries are valid only for the exact surface, clip, fade, and atlas epoch
-/// they were composed against; any drift drops them (the caller re-renders
-/// the leaf normally on the next accepted revision).
+/// Entries are valid only for the exact surface, clip, fade, occluder set, and
+/// atlas epoch they were composed against; any drift drops them (the caller
+/// re-renders the leaf normally on the next accepted revision). The occluder
+/// set is part of the key because the retained glyphs were already filtered
+/// against it: re-emitting them under a different float stack could paint a
+/// now-occluded glyph over a higher float.
 #[derive(Debug, Clone)]
 pub(super) struct RetainedScene {
     surface: SceneSurface,
     clip: Option<RoundedClip>,
     fade: u32,
+    occluders: Vec<RectPx>,
     atlas_epoch: u64,
     fills: Vec<FillRect>,
     glyphs: Vec<GlyphInstance>,
@@ -225,9 +242,10 @@ impl Runtime {
     ///
     /// `surface` is the compositor-owned leaf content rect in the same pixel
     /// space as the frame (`frame.content` translated by the window padding)
-    /// plus the live cell metrics. `a11y` is the frame-local projection host;
-    /// it is pushed only after the paint list exists, so the projection and
-    /// the frame always describe the same lines.
+    /// plus the live cell metrics. `a11y` is the frame-local scratch projection
+    /// host used for parity evidence; it is pushed only after the paint list
+    /// exists, so the evidence and the paint list always describe the same
+    /// text.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn compose_leaf_scene(
         &mut self,
@@ -265,6 +283,7 @@ impl Runtime {
             retained.surface == surface
                 && retained.clip == clip
                 && retained.fade == fade.to_bits()
+                && retained.occluders == occluders
                 && retained.atlas_epoch == renderer.atlas_epoch()
         });
         if let Some(error) = present.refusal {
@@ -277,6 +296,10 @@ impl Runtime {
             return None;
         }
         let paint: &ScenePaint = &present.paint;
+        // Parity evidence only (see the module's Accessibility section): the
+        // scratch host receives the paint list's text before float occlusion
+        // filters the glyph layer, because occlusion is visual and the node
+        // text stays exposed. Bounds are the existing host ceilings.
         let before = a11y.scene_text().len();
         let lines: Vec<(u32, &str)> = paint
             .text_lines()
@@ -334,6 +357,7 @@ impl Runtime {
                 surface,
                 clip,
                 fade: fade.to_bits(),
+                occluders: occluders.to_vec(),
                 atlas_epoch: renderer.atlas_epoch(),
                 fills: leaf.fills.clone(),
                 glyphs: leaf.glyphs.clone(),
@@ -355,10 +379,10 @@ impl Runtime {
 
 /// Re-emits the previously presented scene for a refused revision.
 ///
-/// The retained lines re-enter the frame's accessibility projection first, so
-/// the tree still describes exactly the retained pixels. If even the retained
-/// contribution no longer fits the host bounds, nothing paints: the projection
-/// and the frame stay identical.
+/// The retained lines re-enter the parity evidence first, so the recorded text
+/// still matches the retained paint list. If even the retained contribution no
+/// longer fits the host bounds, nothing paints: evidence and paint list stay
+/// equally empty.
 fn retain_presented(
     retained: Option<&RetainedScene>,
     a11y: &mut UiSnapshotHost,

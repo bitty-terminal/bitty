@@ -553,7 +553,8 @@ fn present_loop_paints_panel_scene_inside_its_leaf_and_projects_its_text() {
         );
     }
 
-    // The accessibility projection is exactly the paint list's own lines.
+    // The recorded accessibility projection is per-frame parity evidence: it
+    // must equal the paint list's own lines under the host bounds.
     let expected = paint_scene(
         &text_scene("scene-line"),
         surface,
@@ -567,7 +568,7 @@ fn present_loop_paints_panel_scene_inside_its_leaf_and_projects_its_text() {
     assert!(!painted.is_empty());
     assert_eq!(
         report.a11y[0].lines, painted,
-        "projected lines must equal painted lines"
+        "parity evidence must equal the paint list's lines"
     );
 
     // Pixel evidence: the scene changes pixels only inside its leaf rect.
@@ -636,7 +637,7 @@ fn refused_scene_keeps_the_previous_frame_and_attributes_the_refusal() {
     assert_eq!(
         rt.scene_frame().a11y,
         first_report.a11y,
-        "the accessibility tree still describes the visible scene"
+        "the parity evidence still describes the retained paint list"
     );
     assert_eq!(rt.scene_frame().refusals, 1);
     assert_eq!(rt.scene_paint_refusals(), 1);

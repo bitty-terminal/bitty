@@ -6,6 +6,7 @@
 //! scenes are refused atomically instead of being silently clamped.
 
 use bitty_render::error::RenderError;
+use bitty_render::frame::FrameMode;
 use bitty_render::glyph::{
     BitmapFormat, FontId, FontQuery, FontStyle, GlyphBitmap, GlyphMetrics, GlyphRasterizer,
     RasterKey,
@@ -408,6 +409,70 @@ fn scene_damage_enters_the_frame_planner_without_leaving_the_leaf() {
     );
     for rect in &plan.dirty_rects {
         assert!(extent.contains_rect(rect));
+    }
+}
+
+/// Pins the descriptor seam the present loop relies on (CTX-1630):
+/// `SnapshotDamage::new` derives the extent from the grid, so the loop
+/// overrides it with the window extent (`with_extent`) before merging scene
+/// rects (`with_extra_regions`).
+///
+/// A **partial** plan consumes the merged scene rects and clips them to the
+/// window. The **full** frame the combined present paints today subsumes every
+/// scene rect in one full-surface rectangle, which is why the merged regions
+/// add no paint work on that path; the planner only benefits from them once a
+/// partial path consumes the same descriptor.
+#[test]
+fn scene_damage_seam_clips_to_the_window_and_is_subsumed_by_a_full_frame() {
+    let scene = scene_of(vec![block(1, text("hello"))]);
+    let paint = paint_scene(&scene, surface(), ScenePaintBudget::default()).expect("paints");
+    let scene_rect = paint.damage()[0];
+    let window = ExtentPx::new(800, 600);
+    // Inside the window, outside the snapshot grid extent derived by `new`
+    // (`State::new()` is smaller than 800x600): only `with_extent` keeps it.
+    let beyond_grid = RectPx::new(700, 500, 16, 16);
+    // Outside the window entirely: the planner must clip it away.
+    let outside_window = RectPx::new(900, 650, 32, 32);
+    let descriptor = || {
+        SnapshotDamage::new(
+            &bitty_term_state::State::new().snapshot(),
+            &bitty_term_state::Damage {
+                generation: 0,
+                regions: Vec::new().into_boxed_slice(),
+            },
+            cell(),
+        )
+        .with_extent(window)
+        .with_extra_regions([scene_rect, beyond_grid, outside_window])
+    };
+
+    let partial = plan_frame(&descriptor());
+    assert_eq!(partial.mode, FrameMode::Partial);
+    assert_eq!(partial.extent, window, "the explicit window extent wins");
+    assert!(
+        partial.dirty_rects.contains(&scene_rect),
+        "the scene rect reaches a partial plan unchanged"
+    );
+    assert!(
+        partial.dirty_rects.contains(&beyond_grid),
+        "damage past the grid extent survives the window extent"
+    );
+    assert!(
+        !partial.dirty_rects.contains(&outside_window),
+        "damage outside the window is clipped away"
+    );
+    for rect in &partial.dirty_rects {
+        assert!(window.contains_rect(rect));
+    }
+
+    let full = plan_frame(&descriptor().with_full_redraw());
+    assert_eq!(full.mode, FrameMode::Full);
+    assert_eq!(full.dirty_rects, vec![RectPx::full(&window)]);
+    for rect in paint.damage() {
+        assert!(
+            full.dirty_rects[0].contains_rect(rect),
+            "a full frame already covers every scene rect"
+        );
     }
 }
 

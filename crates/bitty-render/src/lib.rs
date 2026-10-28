@@ -174,14 +174,18 @@
 //! and CPU-verifiable. Image nodes stay references: the admitted image plane
 //! keeps owning decode and blit, and this crate adds no second decode seam.
 //!
-//! Integration status: the shipped present loop consumes this module. The
+//! Integration status: the composition is wired; the producer is not. The
 //! `bitty-runtime` present path resolves each visible panel leaf's content
 //! rect and calls `PanelRuntime::scene_paint_for` (CTX-1630), so fills,
-//! overlay-seam glyphs, and bounded damage reach a real frame. The remaining
-//! slice of bitty#2760 is the `ui.rich` mount path: `bitty.ui.mount` still
-//! validates through the v1 reader, so a plugin mount does not yet attach a
-//! `Scene` to its panel in production. Do not describe plugin rich content as
-//! shipping until that mount slice lands.
+//! overlay-seam glyphs, and bounded damage compose into a frame once a scene
+//! host is installed. Two preconditions keep that from happening in a shipped
+//! binary today: (a) no production owner constructs or installs a
+//! `PanelRuntime` scene host with placement binds — `Runtime::install_scene_host`
+//! has test callers only, and the app keeps a bare `PanelRegistry` with no
+//! placements, so `placement_panel_of` cannot resolve a leaf; (b)
+//! `bitty.ui.mount` still validates through the v1 reader, so no `ui.rich`
+//! mount attaches a `Scene` to its panel. Until both land, no shipped frame
+//! paints a `Scene`; do not describe plugin rich content as shipping.
 //!
 //! # Headless friendliness and what CI does and does not verify
 //!

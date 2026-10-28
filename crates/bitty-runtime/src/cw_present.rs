@@ -31,13 +31,19 @@
 //! editing UX via overlay/capture/submit/editor host operations. No editor
 //! process is spawned and no grid write happens here.
 //!
-//! The CW-06 scene paint path is live in the shipped present loop: the
-//! `bitty-runtime` leaf pass calls
+//! The CW-06 scene paint path is composed into the shipped present loop, but
+//! no shipped binary reaches it yet: the `bitty-runtime` leaf pass calls
 //! [`PanelRuntime::scene_paint_for`](crate::registry::PanelRuntime::scene_paint_for)
 //! with the compositor-owned content rect and composes the paint list into the
-//! frame (CTX-1630). [`consume_scene_present_at`] stays the geometry-carrying
-//! helper for callers outside that loop, and [`ScenePresent::refusal`] is the
-//! fail-closed signal both paths honour.
+//! frame (CTX-1630) only when a `PanelRuntime` scene host is installed. Two
+//! preconditions keep that from happening today (bitty#2785): (a) no
+//! production owner constructs or installs a `PanelRuntime` scene host with
+//! placement binds, so `placement_panel_of` cannot resolve a leaf; (b)
+//! `bitty.ui.mount` still validates through the v1 reader, so no `ui.rich`
+//! mount attaches a scene. Until both land, no shipped frame paints a `Scene`.
+//! [`consume_scene_present_at`] stays the geometry-carrying helper for callers
+//! outside that loop, and [`ScenePresent::refusal`] is the fail-closed signal
+//! both paths honour.
 //!
 //! # Terminal truth
 //!

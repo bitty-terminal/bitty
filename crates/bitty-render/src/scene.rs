@@ -27,16 +27,19 @@
 //!
 //! # Integration status
 //!
-//! The shipped present loop is the live consumer: `bitty-runtime` resolves a
-//! visible panel leaf's content rect, calls
+//! The shipped present loop is the live consumer once a scene host exists:
+//! `bitty-runtime` resolves a visible panel leaf's content rect, calls
 //! `PanelRuntime::scene_paint_for`, and composes the resulting list into the
 //! frame (CTX-1630). Fills, overlay-seam glyphs, and bounded damage are
 //! produced there; a typed refusal paints nothing and keeps the previous
-//! visible scene. What is still pending in bitty#2760 is the `ui.rich` mount
-//! path that attaches an admitted `Scene` to a panel from a plugin mount, so
-//! no live plugin content reaches these slots in production yet. The module
-//! itself, the runtime adapter, and the present composition are no longer
-//! test-only.
+//! visible scene. Two preconditions keep a shipped binary from reaching that
+//! path today (bitty#2785): (a) no production owner constructs or installs a
+//! `PanelRuntime` scene host with placement binds, so `placement_panel_of`
+//! cannot resolve a leaf and the runtime's `scene_host` stays `None`; (b)
+//! `bitty.ui.mount` still validates through the v1 reader, so no `ui.rich`
+//! mount attaches an admitted `Scene` to a panel. Until both land no shipped
+//! frame paints a `Scene`. The module itself, the runtime adapter, and the
+//! present composition are no longer test-only.
 //!
 //! # Budgets
 //!
@@ -147,10 +150,13 @@ pub const SCENE_PAINT_MAX_BORDER_CELLS: u16 = 8;
 
 /// The leaf content rectangle a scene paints into.
 ///
-/// `rect` is the compositor-owned content rect in logical pixels (the frame
-/// inset by `border + content_inset`); `cell` is the live cell geometry.
-/// Cell spans are derived by flooring, so a partially visible last cell is
-/// painted only to the pixel edge of `rect`.
+/// `rect` is the compositor-owned content rect in physical (device) pixels —
+/// the rendered frame's pixel space, the same one the draw list and
+/// [`CellMetrics`] use. It is not a logical-point rect, and the present loop
+/// passes `PresentFrame::content` (physical px) rather than a scaled-down
+/// layout rect. `cell` is the live physical cell geometry, so cell spans are
+/// derived by flooring and a partially visible last cell is painted only to
+/// the pixel edge of `rect`.
 ///
 /// A surface whose cell width or height is zero paints nothing: [`Self::cols`]
 /// and [`Self::rows`] report `0` instead of dividing by zero, so a
@@ -158,9 +164,9 @@ pub const SCENE_PAINT_MAX_BORDER_CELLS: u16 = 8;
 /// to an empty frame rather than a panic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SceneSurface {
-    /// Leaf content rectangle in logical pixels.
+    /// Leaf content rectangle in physical pixels.
     pub rect: RectPx,
-    /// Live cell geometry.
+    /// Live cell geometry, in the same physical pixel space.
     pub cell: CellMetrics,
 }
 
@@ -335,7 +341,7 @@ impl std::error::Error for ScenePaintError {}
 pub enum ScenePaintOp {
     /// Opaque rectangle (border segment or rule line).
     Fill {
-        /// Cell-aligned rectangle in logical pixels.
+        /// Cell-aligned rectangle in physical pixels (the surface's space).
         rect: RectPx,
         /// Straight-alpha fill color.
         color: Rgba8,

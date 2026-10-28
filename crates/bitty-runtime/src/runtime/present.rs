@@ -3307,7 +3307,8 @@ impl Runtime {
     /// leaf content rect (`origin` + `frame.content`) and composed after that
     /// leaf's grid primitives: cell fills, overlay-seam glyphs, and image
     /// placement references. A refused paint keeps the retained primitives for
-    /// an unchanged surface and advances the attributed refusal counters.
+    /// an unchanged surface, clip, fade, occluder set, and atlas epoch, and
+    /// advances the attributed refusal counters.
     ///
     /// Returns `true` when a scene glyph placement reset the atlas epoch after
     /// the leaf pass settled, so the caller must rebuild the attempt.
@@ -3422,9 +3423,10 @@ impl Runtime {
         let built = loop {
             attempt += 1;
             let mut built = CombinedLeaves::default();
-            // CTX-1630: per-attempt accessibility projection for painted
-            // scenes. Bounds are the existing host ceilings, shared by every
-            // scene in the frame (the projection is one tree).
+            // CTX-1630: per-attempt accessibility parity evidence for painted
+            // scenes (a scratch host, not the live tree). Bounds are the
+            // existing host ceilings, shared by every scene in the frame (the
+            // evidence is one tree).
             let mut scene_a11y = bitty_ui::a11y_host::UiSnapshotHost::new("scene", "scene");
             let evictions_before = self.renderer.atlas_stats().2;
             // Issue #1409 (CTX-0797): set when a leaf planned against a newer
@@ -6849,10 +6851,13 @@ impl Runtime {
                 // CTX-1630: scene invalidation enters the same frame
                 // descriptor through `SnapshotDamage::with_extra_regions`, so
                 // one damage model covers grid and scene pixels. The combined
-                // present paints the full surface (`FrameMode::Full`), so the
-                // regions are already covered here; they stay in the plan for
-                // accounting and for a future partial planner that consumes
-                // the same descriptor unchanged.
+                // present paints the full surface (`FrameMode::Full`), and a
+                // full-surface dirty rect subsumes every scene rect, so these
+                // regions add no paint work here: they are visible to
+                // accounting and reach the planner only on a partial path,
+                // which reuses this descriptor unchanged. The
+                // `with_extent`/`with_extra_regions` seam test in
+                // `bitty-render/tests/scene_paint.rs` pins both behaviours.
                 if !scene_report.damage.is_empty() {
                     let descriptor = bitty_render::grid::SnapshotDamage::new(
                         &snapshot,

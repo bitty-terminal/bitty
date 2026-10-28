@@ -151,26 +151,36 @@ impl AuditFileWriter {
     /// a symlink, the wrong type, owned by another user, or does not carry the
     /// contract mode; [`AuditSinkError::Io`] for a filesystem failure.
     pub fn open(dir: &Path, limits: &Limits) -> Result<Self, AuditSinkError> {
-        use std::fs::{DirBuilder, OpenOptions, Permissions};
-        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+        use std::fs::{OpenOptions, Permissions};
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
         let uid = nix::unistd::geteuid().as_raw();
-        match std::fs::symlink_metadata(dir) {
+        // Attest the chain, not just the leaf: `dir` is
+        // `<state>/bitty/audit`, and a symlink or foreign-owned `bitty`
+        // intermediate would otherwise redirect the sink. Missing components
+        // are created one level at a time; `create_dir_all` is deliberately
+        // not used because it follows an existing symlink or foreign
+        // intermediate. The state root above our two levels is attested as an
+        // existing directory owned by this uid (it is the caller's XDG root and
+        // may itself be a symlink to the real state directory).
+        let parent = dir.parent().ok_or(AuditSinkError::UnsafeStorage)?;
+        let parent_metadata = match std::fs::symlink_metadata(parent) {
             Ok(metadata) => {
-                if metadata.file_type().is_symlink()
-                    || !metadata.is_dir()
-                    || metadata.uid() != uid
-                    || metadata.mode() & 0o777 != AUDIT_DIR_MODE
-                {
-                    return Err(AuditSinkError::UnsafeStorage);
-                }
+                attest_owned_directory(&metadata, uid)?;
+                Some(metadata)
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(AuditSinkError::Io),
+        };
+        match std::fs::symlink_metadata(dir) {
+            Ok(metadata) => attest_private_directory(&metadata, uid)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut builder = DirBuilder::new();
-                builder.recursive(true).mode(AUDIT_DIR_MODE);
-                builder.create(dir).map_err(|_| AuditSinkError::Io)?;
-                std::fs::set_permissions(dir, Permissions::from_mode(AUDIT_DIR_MODE))
-                    .map_err(|_| AuditSinkError::Io)?;
+                if parent_metadata.is_none() {
+                    let state_root = parent.parent().ok_or(AuditSinkError::UnsafeStorage)?;
+                    attest_state_root(state_root, uid)?;
+                    create_private_directory(parent)?;
+                }
+                create_private_directory(dir)?;
             }
             Err(_) => return Err(AuditSinkError::Io),
         }
@@ -251,6 +261,79 @@ impl AuditFileWriter {
     fn segment_path(&self, index: usize) -> PathBuf {
         self.dir.join(format!("audit.{index}.log"))
     }
+}
+
+/// Attest an existing intermediate directory that is part of the sink's own
+/// chain: a real directory (never a symlink), owned by `uid`, and not writable
+/// by group or other users. A foreign or writable intermediate could redirect
+/// or replace the sink.
+#[cfg(unix)]
+fn attest_owned_directory(metadata: &std::fs::Metadata, uid: u32) -> Result<(), AuditSinkError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(AuditSinkError::UnsafeStorage);
+    }
+    Ok(())
+}
+
+/// Attest the sink's own directory: the intermediate rules plus the exact
+/// `0700` contract mode.
+#[cfg(unix)]
+fn attest_private_directory(metadata: &std::fs::Metadata, uid: u32) -> Result<(), AuditSinkError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o777 != AUDIT_DIR_MODE
+    {
+        return Err(AuditSinkError::UnsafeStorage);
+    }
+    Ok(())
+}
+
+/// Attest the state root above the sink's own chain. It is the caller's XDG
+/// state directory, so a symlink to the real directory is accepted; it must
+/// resolve to a directory owned by this uid.
+#[cfg(unix)]
+fn attest_state_root(path: &Path, uid: u32) -> Result<(), AuditSinkError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::metadata(path).map_err(|_| AuditSinkError::UnsafeStorage)?;
+    if !metadata.is_dir() || metadata.uid() != uid {
+        return Err(AuditSinkError::UnsafeStorage);
+    }
+    Ok(())
+}
+
+/// Create one sink directory with the exact `0700` mode and attest the result.
+///
+/// Creation is one level at a time so a symlink that appeared in an
+/// intermediate component cannot be followed into another directory.
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> Result<(), AuditSinkError> {
+    use std::fs::{DirBuilder, Permissions};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let uid = nix::unistd::geteuid().as_raw();
+    let mut builder = DirBuilder::new();
+    builder.mode(AUDIT_DIR_MODE);
+    builder.create(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            AuditSinkError::UnsafeStorage
+        } else {
+            AuditSinkError::Io
+        }
+    })?;
+    std::fs::set_permissions(path, Permissions::from_mode(AUDIT_DIR_MODE))
+        .map_err(|_| AuditSinkError::Io)?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| AuditSinkError::Io)?;
+    attest_private_directory(&metadata, uid)
 }
 
 #[cfg(unix)]
@@ -406,7 +489,17 @@ impl<W: AuditWriter> AuditSink<W> {
                 self.retry.extend(self.ring.drain(FLUSH_BATCH));
             }
             while let Some(record) = self.retry.front().copied() {
-                let line = render_record(&record)?;
+                let line = match render_record(&record) {
+                    Ok(line) => line,
+                    Err(error) => {
+                        // A record that cannot be rendered is a structural
+                        // sink failure: the mutation gate must fail closed and
+                        // `daemon.status` must report `audit_degraded`, never
+                        // `false` while mutations are refused.
+                        self.degraded = true;
+                        return Err(error);
+                    }
+                };
                 match self.writer.append_line(&line) {
                     Ok(()) => {
                         self.retry.pop_front();
@@ -772,6 +865,44 @@ mod tests {
             total <= 4_096 * 2 + MAX_RENDERED_LINE_BYTES as u64,
             "bounded by segments plus one line: {total}"
         );
+    }
+
+    #[test]
+    fn a_symlinked_intermediate_is_refused_before_creation() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).expect("real dir");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let link = dir.path().join("link");
+        symlink(&real, &link).expect("symlink");
+
+        let error = AuditFileWriter::open(&link.join("audit"), &Limits::default())
+            .expect_err("a symlinked intermediate must be refused");
+        assert_eq!(error, AuditSinkError::UnsafeStorage);
+        assert!(
+            !real.join("audit").exists(),
+            "nothing may be created through the link"
+        );
+    }
+
+    #[test]
+    fn the_owned_directory_chain_is_created_with_0700() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod");
+        let state = dir.path().join("bitty");
+        let audit = state.join("audit");
+        AuditFileWriter::open(&audit, &Limits::default()).expect("create the chain");
+        for path in [&state, &audit] {
+            let metadata = std::fs::symlink_metadata(path).expect("created");
+            assert!(metadata.is_dir());
+            assert_eq!(metadata.mode() & 0o777, AUDIT_DIR_MODE);
+            assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        }
     }
 
     #[test]

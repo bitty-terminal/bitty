@@ -55,6 +55,12 @@ pub enum FrameError {
         /// The declared length.
         actual: usize,
     },
+    /// The pre-authentication assembly budget would be exceeded by a frame
+    /// that has not completed yet.
+    BudgetExceeded {
+        /// The enforced budget.
+        limit: usize,
+    },
     /// A socket operation failed.
     Io,
 }
@@ -67,6 +73,10 @@ impl fmt::Display for FrameError {
             Self::FrameTooLarge { limit, actual } => write!(
                 formatter,
                 "frame declares {actual} bytes, above the {limit}-byte bound"
+            ),
+            Self::BudgetExceeded { limit } => write!(
+                formatter,
+                "pre-authentication frame assembly exceeds the {limit}-byte budget"
             ),
             Self::Io => formatter.write_str("socket read failed"),
         }
@@ -81,6 +91,9 @@ impl From<FrameError> for crate::service::dispatch::Refusal {
             FrameError::Unauthenticated => crate::service::dispatch::Refusal::unauthenticated(),
             FrameError::FrameTooLarge { limit, actual } => {
                 crate::service::dispatch::Refusal::limit_exceeded(limit as u64, actual as u64)
+            }
+            FrameError::BudgetExceeded { limit } => {
+                crate::service::dispatch::Refusal::limit_exceeded(limit as u64, limit as u64 + 1)
             }
             FrameError::Closed | FrameError::Io => crate::service::dispatch::Refusal::internal(),
         }
@@ -123,12 +136,34 @@ impl PeerFrameReader {
     ///
     /// [`FrameError::Closed`] on EOF, [`FrameError::Unauthenticated`] for a
     /// missing, foreign, or changed credential, [`FrameError::FrameTooLarge`]
-    /// for an over-bound declared length, and [`FrameError::Io`] for a socket
-    /// failure.
+    /// for an over-bound declared length, [`FrameError::BudgetExceeded`] when
+    /// `cap` is exceeded, and [`FrameError::Io`] for a socket failure.
     pub fn read(
         &mut self,
         stream: &UnixStream,
         expected: FramePeer,
+    ) -> Result<Option<Vec<u8>>, FrameError> {
+        self.read_capped(stream, expected, None)
+    }
+
+    /// Read one complete frame payload with an optional assembly cap.
+    ///
+    /// `cap` bounds the bytes retained for a frame that has not completed yet,
+    /// so the pre-authentication state machine can stop a client that dribbles
+    /// a `max_frame_bytes` body before `daemon.negotiate`. The reader never
+    /// buffers more than `cap` bytes: a read that would cross it is refused
+    /// with [`FrameError::BudgetExceeded`] and the partial frame is dropped. A
+    /// frame that completes within the cap is returned normally.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read`], plus [`FrameError::BudgetExceeded`] when the retained
+    /// assembly would exceed `cap`.
+    pub fn read_capped(
+        &mut self,
+        stream: &UnixStream,
+        expected: FramePeer,
+        cap: Option<usize>,
     ) -> Result<Option<Vec<u8>>, FrameError> {
         loop {
             let want = match self.declared {
@@ -138,14 +173,35 @@ impl PeerFrameReader {
             if want == 0 {
                 return Ok(Some(self.finish_frame()));
             }
+            let want = match cap {
+                Some(cap) => {
+                    let buffered = self.buffered_len();
+                    if buffered >= cap {
+                        self.reset_frame();
+                        return Err(FrameError::BudgetExceeded { limit: cap });
+                    }
+                    // Read at most one byte past the cap so the crossing is
+                    // observed without allocating the rest of a declared
+                    // `max_frame_bytes` body.
+                    want.min(cap - buffered + 1)
+                }
+                None => want,
+            };
             let Some((bytes, credentials)) = read_some(stream, want)? else {
                 return Ok(None);
             };
             if !credentials_match(expected, self.peer, credentials) {
+                self.reset_frame();
                 return Err(FrameError::Unauthenticated);
             }
             if let Some(observed) = credentials {
                 self.peer = Some(observed);
+            }
+            if let Some(cap) = cap {
+                if self.buffered_len() + bytes.len() > cap {
+                    self.reset_frame();
+                    return Err(FrameError::BudgetExceeded { limit: cap });
+                }
             }
             if self.declared.is_none() {
                 self.header.extend_from_slice(&bytes);
@@ -157,18 +213,26 @@ impl PeerFrameReader {
                         self.header[3],
                     ]) as usize;
                     if declared > MAX_FRAME_BYTES {
+                        self.reset_frame();
                         return Err(FrameError::FrameTooLarge {
                             limit: MAX_FRAME_BYTES,
                             actual: declared,
                         });
                     }
-                    self.body = Vec::with_capacity(declared);
+                    self.body = Vec::with_capacity(declared.min(cap.unwrap_or(declared)));
                     self.declared = Some(declared);
                 }
             } else {
                 self.body.extend_from_slice(&bytes);
             }
         }
+    }
+
+    fn reset_frame(&mut self) {
+        self.header.clear();
+        self.declared = None;
+        self.body = Vec::new();
+        self.peer = None;
     }
 
     fn finish_frame(&mut self) -> Vec<u8> {
@@ -374,6 +438,43 @@ mod tests {
         client.write_all(&frame[3..]).expect("rest");
         let complete = reader.read(&server, expected).expect("frame");
         assert_eq!(complete.as_deref(), Some(payload.as_slice()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pre_authentication_budget_caps_frame_assembly() {
+        use std::io::Write as _;
+
+        let (server, mut client) = UnixStream::pair().expect("socketpair");
+        enable_credentials(&client).expect("sender credentials");
+        server.set_nonblocking(true).expect("nonblocking");
+        let mut reader = PeerFrameReader::new();
+        let expected = FramePeer {
+            uid: nix::unistd::geteuid().as_raw(),
+            pid: std::process::id(),
+        };
+
+        // A frame within the cap completes normally.
+        let payload = b"ok";
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(payload);
+        client.write_all(&frame).expect("small frame");
+        let complete = reader
+            .read_capped(&server, expected, Some(64))
+            .expect("within the budget");
+        assert_eq!(complete.as_deref(), Some(payload.as_slice()));
+
+        // A declared `max_frame_bytes` body that dribbles past the cap is
+        // refused; the reader never retains more than the cap.
+        client
+            .write_all(&(MAX_FRAME_BYTES as u32).to_be_bytes())
+            .expect("large header");
+        client.write_all(&[b'x'; 256]).expect("dribbled body");
+        let error = reader
+            .read_capped(&server, expected, Some(64))
+            .expect_err("budget exceeded");
+        assert_eq!(error, FrameError::BudgetExceeded { limit: 64 });
     }
 
     #[cfg(target_os = "linux")]

@@ -54,6 +54,15 @@ mod unix {
     /// How often the loop re-attests the endpoint.
     pub const TAMPER_INTERVAL_MS: u64 = 5_000;
 
+    /// How often the loop sweeps retired grant records.
+    ///
+    /// Grants expire on the `Deadline` stage, so the sweep is a memory bound,
+    /// not an authorization input: a lagging record still fails the TTL check in
+    /// `host_grant_bound`/`validate`. One second bounds the retained set to one
+    /// second of retired records past the TTL without paying an O(store) sweep
+    /// on every request wakeup.
+    pub const GRANT_SWEEP_INTERVAL_MS: u64 = 1_000;
+
     /// Poll tick; bounds the idle, negotiate, and tamper timers.
     pub const TICK_MS: u16 = 250;
 
@@ -69,12 +78,13 @@ mod unix {
         pub audit_dir: PathBuf,
         /// Transport scopes granted to every same-user connection.
         ///
-        /// In this slice it is the `bitty-ipc` CLI default plus `process.spawn`:
-        /// the daemon spawns no worker yet (bitty#2604 owns the spawn path and its
-        /// executable allowlist), so `process.spawn` gates nothing here and
-        /// `session.host` consent remains the effective create authority. When the
-        /// spawn path lands, the grant must come from the executable policy
-        /// instead of this transport default.
+        /// Only `process.spawn` is granted: it is the one transport scope the
+        /// daemon catalog evaluates (`session.create`'s two-authority rule).
+        /// The daemon grants no `terminal.*`, `view.*`, `config.*`, `plugin.*`,
+        /// or `debug.*` scope, so the handshake never advertises an ambient
+        /// content scope. `session.host` consent remains the effective create
+        /// authority; when the spawn path lands, `process.spawn` must come from
+        /// the executable policy instead of this transport default.
         pub transport_scopes: bitty_ipc_api::scope::ScopeSet,
     }
 
@@ -87,7 +97,7 @@ mod unix {
         /// `HOME` is usable; the daemon refuses to run with an unwritten sink.
         pub fn from_process() -> Result<Self, ServerError> {
             let audit_dir = default_audit_dir().ok_or(ServerError::NoAuditDirectory)?;
-            let mut transport_scopes = bitty_ipc_api::scope::ScopeSet::cli_default();
+            let mut transport_scopes = bitty_ipc_api::scope::ScopeSet::new();
             transport_scopes.insert(bitty_ipc_api::scope::Scope::ProcessSpawn);
             Ok(Self {
                 limits: Limits::default(),
@@ -170,12 +180,27 @@ mod unix {
         accepted_at_ms: u64,
         last_activity_ms: u64,
         pre_auth_bytes: usize,
+        /// The last reply was a refusal that closes the connection
+        /// (`Refusal::closes_connection`). The queued refusal bytes are flushed
+        /// first; reading stops and the stream is shut down only once `output`
+        /// drains.
+        close_after_write: bool,
         closed: bool,
     }
 
     impl PeerIo {
         fn wants_write(&self) -> bool {
             !self.closed && !self.output.is_empty()
+        }
+
+        /// Stop reading and close after the queued bytes are written.
+        fn retire(&mut self) {
+            self.close_after_write = true;
+        }
+
+        /// Whether a retired connection has nothing left to write.
+        fn drained(&self) -> bool {
+            self.close_after_write && self.output.is_empty()
         }
 
         fn close(&mut self) {
@@ -225,6 +250,7 @@ mod unix {
         let now = || MonotonicMs::from_millis(start.elapsed().as_millis() as u64);
         let mut peers: Vec<PeerIo> = Vec::new();
         let mut next_tamper = TAMPER_INTERVAL_MS;
+        let mut next_sweep = GRANT_SWEEP_INTERVAL_MS;
         let mut shutting_down = false;
 
         loop {
@@ -301,7 +327,9 @@ mod unix {
                     .get(index)
                     .copied()
                     .unwrap_or_else(nix::poll::PollFlags::empty);
-                if ready.contains(nix::poll::PollFlags::POLLIN) {
+                // A retired connection has already refused; no further frame is
+                // read, only the queued refusal bytes are flushed.
+                if !peer.close_after_write && ready.contains(nix::poll::PollFlags::POLLIN) {
                     read_peer(peer, &mut service, &config, current, &mut shutting_down);
                 }
                 if !peer.closed
@@ -309,6 +337,16 @@ mod unix {
                 {
                     flush_peer(peer);
                 }
+                if peer.drained() {
+                    peer.close();
+                }
+            }
+
+            // Retired grant records are swept on the loop's own timer, so the
+            // store is bounded by its caps, not by how long the daemon runs.
+            if current.as_millis() >= next_sweep {
+                let _ = service.sweep_grants(current);
+                next_sweep = current.as_millis().saturating_add(GRANT_SWEEP_INTERVAL_MS);
             }
 
             let idle = config.limits.effective(LimitId::TransportIdleMs);
@@ -319,7 +357,19 @@ mod unix {
                 let stale_handshake =
                     !peer.client.is_negotiated() && current.as_millis() >= negotiate_deadline;
                 let idle_expired = age >= idle && !peer.wants_write();
-                if stale_handshake || idle_expired {
+                if stale_handshake {
+                    // The handshake deadline closes with one typed timeout
+                    // record (the contract's aggregated audit record). There is
+                    // no correlation id for a request that never completed, so
+                    // no response frame can be rendered.
+                    service.record_refusal(
+                        &peer.client,
+                        crate::audit::AuditAction::Wire,
+                        Refusal::timeout(0, negotiate),
+                        current,
+                    );
+                    peer.close();
+                } else if idle_expired {
                     peer.close();
                 }
             }
@@ -385,6 +435,7 @@ mod unix {
             accepted_at_ms: now.as_millis(),
             last_activity_ms: now.as_millis(),
             pre_auth_bytes: 0,
+            close_after_write: false,
             closed: false,
         })
     }
@@ -396,31 +447,68 @@ mod unix {
         now: MonotonicMs,
         shutting_down: &mut bool,
     ) {
+        if peer.close_after_write {
+            return;
+        }
         let expected = FramePeer {
             uid: peer.client.peer_uid(),
             pid: peer.client.peer().identity().pid(),
         };
         loop {
-            let payload = match peer.reader.read(&peer.stream, expected) {
+            // Pre-authentication: the byte budget covers completed frames *and*
+            // the frame being assembled, so a client cannot dribble a full
+            // `max_frame_bytes` body before negotiating. After negotiation the
+            // frame bound alone applies.
+            let cap = if peer.client.is_negotiated() {
+                None
+            } else {
+                let budget = usize::try_from(config.limits.effective(LimitId::PreAuthMaxBytes))
+                    .unwrap_or(usize::MAX);
+                Some(budget.saturating_sub(peer.pre_auth_bytes))
+            };
+            let payload = match peer.reader.read_capped(&peer.stream, expected, cap) {
                 Ok(Some(payload)) => payload,
                 Ok(None) => return,
-                Err(_) => {
-                    peer.close();
+                Err(error) => {
+                    refuse_frame_closure(peer, service, error, now);
                     return;
                 }
             };
             peer.last_activity_ms = now.as_millis();
             peer.pre_auth_bytes = peer.pre_auth_bytes.saturating_add(4 + payload.len());
-            if !peer.client.is_negotiated()
-                && peer.pre_auth_bytes
-                    > usize::try_from(config.limits.effective(LimitId::PreAuthMaxBytes))
-                        .unwrap_or(usize::MAX)
-            {
-                peer.close();
-                return;
+            if !peer.client.is_negotiated() {
+                let budget = usize::try_from(config.limits.effective(LimitId::PreAuthMaxBytes))
+                    .unwrap_or(usize::MAX);
+                if peer.pre_auth_bytes > budget {
+                    let refusal = Refusal::limit_exceeded(
+                        u64::try_from(budget).unwrap_or(u64::MAX),
+                        u64::try_from(peer.pre_auth_bytes).unwrap_or(u64::MAX),
+                    );
+                    service.record_refusal(
+                        &peer.client,
+                        crate::audit::AuditAction::Wire,
+                        refusal,
+                        now,
+                    );
+                    // A complete frame has a correlation id, so the refusal is
+                    // a typed frame; a partial one was refused mid-assembly
+                    // above and can only be audited, never answered. Either
+                    // way, let already-queued bytes drain before the close.
+                    if let Some(id) = envelope_id(&payload) {
+                        if !reply(peer, &id, Err(refusal)) {
+                            peer.close();
+                        }
+                    } else {
+                        peer.retire();
+                    }
+                    return;
+                }
             }
             if !handle_payload(peer, service, &payload, now, shutting_down) {
                 peer.close();
+                return;
+            }
+            if peer.close_after_write {
                 return;
             }
             if peer.output.len()
@@ -431,6 +519,41 @@ mod unix {
                 return;
             }
         }
+    }
+
+    /// Attribute and close a frame-level failure.
+    ///
+    /// A frame that never completed carries no correlation id, so no
+    /// conforming response envelope can be rendered; the refusal is still
+    /// recorded once (D-16) and the connection closes. A failure after a
+    /// complete frame is answered by `handle_payload` instead.
+    fn refuse_frame_closure(
+        peer: &mut PeerIo,
+        service: &mut Service,
+        error: crate::service::frame::FrameError,
+        now: MonotonicMs,
+    ) {
+        use crate::service::frame::FrameError;
+
+        let refusal = match error {
+            FrameError::Closed | FrameError::Io => {
+                peer.close();
+                return;
+            }
+            FrameError::Unauthenticated => Refusal::unauthenticated(),
+            FrameError::FrameTooLarge { limit, actual } => Refusal::limit_exceeded(
+                u64::try_from(limit).unwrap_or(u64::MAX),
+                u64::try_from(actual).unwrap_or(u64::MAX),
+            ),
+            FrameError::BudgetExceeded { limit } => Refusal::limit_exceeded(
+                u64::try_from(limit).unwrap_or(u64::MAX),
+                u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1),
+            ),
+        };
+        service.record_refusal(&peer.client, crate::audit::AuditAction::Wire, refusal, now);
+        // Stop reading but let any already-queued response drain before the
+        // stream closes; `retire` closes immediately when nothing is queued.
+        peer.retire();
     }
 
     fn flush_peer(peer: &mut PeerIo) {
@@ -461,33 +584,50 @@ mod unix {
         now: MonotonicMs,
         shutting_down: &mut bool,
     ) -> bool {
+        use crate::audit::AuditAction;
+
         let Some(id) = envelope_id(payload) else {
-            return false;
+            // No correlation id can be echoed, so there is no conforming
+            // response; the refusal is still attributed exactly once. Any
+            // earlier response already queued is flushed before the close.
+            service.record_refusal(
+                &peer.client,
+                AuditAction::Wire,
+                Refusal::invalid_request(),
+                now,
+            );
+            peer.retire();
+            return true;
         };
         if peer.limiter.check(now.as_millis()).is_err() {
-            return reply(
-                peer,
-                &id,
-                Err(Refusal::denied(crate::codes::RefusalCode::RateLimited)),
-            );
+            let refusal = Refusal::denied(crate::codes::RefusalCode::RateLimited);
+            service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+            return reply(peer, &id, Err(refusal));
         }
         let envelope = match RequestEnvelope::parse(payload) {
             Ok(envelope) => envelope,
-            Err(refusal) => return reply(peer, &id, Err(refusal)),
+            Err(refusal) => {
+                service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+                return reply(peer, &id, Err(refusal));
+            }
         };
         let method = match resolve(&envelope.method) {
             MethodResolution::Known(method) => method,
-            MethodResolution::Unknown => return reply(peer, &id, Err(Refusal::not_found())),
-            MethodResolution::Malformed => return reply(peer, &id, Err(Refusal::invalid_method())),
+            MethodResolution::Unknown => {
+                let refusal = Refusal::not_found();
+                service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+                return reply(peer, &id, Err(refusal));
+            }
+            MethodResolution::Malformed => {
+                let refusal = Refusal::invalid_method();
+                service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+                return reply(peer, &id, Err(refusal));
+            }
         };
         if !peer.client.is_negotiated() && method != ServiceMethod::DaemonNegotiate {
-            return reply(
-                peer,
-                &id,
-                Err(Refusal::denied(
-                    crate::codes::RefusalCode::AlreadyNegotiated,
-                )),
-            );
+            let refusal = Refusal::denied(crate::codes::RefusalCode::AlreadyNegotiated);
+            service.record_refusal(&peer.client, AuditAction::Wire, refusal, now);
+            return reply(peer, &id, Err(refusal));
         }
         let result = if method == ServiceMethod::DaemonNegotiate {
             negotiate(peer, service, envelope.params, now)
@@ -517,7 +657,16 @@ mod unix {
     }
 
     /// Append a rendered response. Returns `false` when the connection must close.
+    ///
+    /// A refusal that [`Refusal::closes_connection`] sets the retire flag: the
+    /// refusal bytes stay queued, reading stops, and the server loop shuts the
+    /// stream down only after `output` drains. The bytes are never dropped by
+    /// closing first.
     fn reply(peer: &mut PeerIo, id: &str, result: Result<Value, Refusal>) -> bool {
+        let closes = result
+            .as_ref()
+            .err()
+            .is_some_and(|refusal| refusal.closes_connection());
         let rendered = match result {
             Ok(value) => wire::render_success(id, &value),
             Err(refusal) => wire::render_error(id, refusal),
@@ -528,6 +677,9 @@ mod unix {
         match wire::frame(&payload) {
             Ok(bytes) => {
                 peer.output.extend_from_slice(&bytes);
+                if closes {
+                    peer.retire();
+                }
                 true
             }
             Err(_) => false,

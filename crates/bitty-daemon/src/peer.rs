@@ -281,7 +281,8 @@ pub struct PeerGuard {
 }
 
 impl PeerGuard {
-    /// Capture and authenticate the connected peer before parsing any request.    ///
+    /// Capture and authenticate the connected peer before parsing any request.
+    ///
     /// The argument is the accepted, connected [`UnixStream`], not a generic
     /// descriptor: `SO_PEERCRED` on a *listening* socket reports the daemon's
     /// own pid/uid/gid, so an `AsFd` API would let a caller "authenticate" the

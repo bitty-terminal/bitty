@@ -316,7 +316,10 @@ impl Refusal {
             RefusalKind::Timeout { .. } => ErrorClass::Timeout,
             RefusalKind::VersionMismatch => ErrorClass::Validation,
             RefusalKind::Unauthenticated => ErrorClass::Unauthenticated,
-            RefusalKind::LimitExceeded { .. } => ErrorClass::Denied,
+            // `LimitExceeded` is a transport/validation class in the frozen
+            // taxonomy, never a `Denied/<code>`: `denied/LimitExceeded` would
+            // name a code outside the closed `Denied` set (D-07/D-14).
+            RefusalKind::LimitExceeded { .. } => ErrorClass::Framing,
             RefusalKind::Internal => ErrorClass::Internal,
         }
     }
@@ -508,6 +511,38 @@ impl Service {
         &self.grants
     }
 
+    /// Drop retired grant records so the store cannot grow with total mints.
+    ///
+    /// The server calls this on its poll tick; a consumed host grant is kept
+    /// until its TTL because `host_grant_bound` still needs it, while every
+    /// other inactive record is dropped immediately.
+    pub fn sweep_grants(&mut self, now: MonotonicMs) -> usize {
+        self.grants.evict_expired(now.as_millis())
+    }
+
+    /// Record exactly one refusal that the server loop refuses before a method
+    /// is resolved (envelope, frame, budget, or deadline closure).
+    ///
+    /// The dispatch path records its own refusals; this is the attribution for
+    /// the transport stages that never reach a handler, so every refusal has
+    /// one audit record and no path can suppress it.
+    pub fn record_refusal(
+        &mut self,
+        connection: &Connection,
+        action: AuditAction,
+        refusal: Refusal,
+        now: MonotonicMs,
+    ) {
+        let mut entry = AuditEntry::new(action)
+            .actor(connection.audit_actor())
+            .result(AuditResult::Refused(refusal.audit_code()))
+            .target(AuditTarget::none());
+        if let Some((actual, limit)) = refusal.counts() {
+            entry = entry.counts(AuditCounts::new(actual, limit, None));
+        }
+        let _ = self.audit.record(entry, now);
+    }
+
     /// How many sessions are non-terminal.
     #[must_use]
     pub fn active_sessions(&self, now: MonotonicMs) -> usize {
@@ -567,7 +602,9 @@ impl Service {
         now: MonotonicMs,
     ) -> Result<HandshakeResponse, Refusal> {
         if connection.is_negotiated() {
-            return Err(Refusal::denied(RefusalCode::AlreadyNegotiated));
+            let refusal = Refusal::denied(RefusalCode::AlreadyNegotiated);
+            self.record_refusal(connection, AuditAction::Negotiate, refusal, now);
+            return Err(refusal);
         }
         let negotiated = match crate::handshake::negotiate(request, &self.limits) {
             Ok(negotiated) => negotiated,
@@ -656,14 +693,7 @@ impl Service {
         if let Err(refusal) = result {
             // D-16: a refusal is attributed. The per-connection suppression
             // budget/aggregation is a tracked follow-up (README).
-            let mut entry = AuditEntry::new(method.audit_action())
-                .actor(connection.audit_actor())
-                .result(AuditResult::Refused(refusal.audit_code()))
-                .target(AuditTarget::none());
-            if let Some((actual, limit)) = refusal.counts() {
-                entry = entry.counts(AuditCounts::new(actual, limit, None));
-            }
-            let _ = self.audit.record(entry, now);
+            self.record_refusal(connection, method.audit_action(), refusal, now);
         }
         result
     }
@@ -679,17 +709,28 @@ impl Service {
         if method == ServiceMethod::DaemonNegotiate {
             return Err(Refusal::denied(RefusalCode::AlreadyNegotiated));
         }
+        // Stage 2: a stopping daemon serves reads only. The contract's
+        // `daemon_state: stopping` means new sessions are refused, and a
+        // draining daemon must not apply any other mutation either. A repeat
+        // `daemon.stop` is exempt so it keeps its own `Denied/DaemonStopping`
+        // answer from the handler.
+        if self.state != DaemonState::Running
+            && method != ServiceMethod::DaemonStop
+            && method.is_mutating()
+        {
+            return Err(Refusal::denied(RefusalCode::DaemonStopping));
+        }
         // Stage 3: capability.
         if let Some(capability) = method.capability() {
             if !CAPABILITIES.is_enabled(capability) {
                 return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
             }
         }
-        // Stage 6: scope, before any target lookup. Create and attach have
-        // mode-specific scope rules and run them inside their handlers.
+        // Stage 6: scope, before any target lookup. Create, attach, and detach
+        // have mode-specific scope rules and run them inside their handlers.
         if method == ServiceMethod::SessionCreate {
             self.check_create_scope(connection)?;
-        } else if method != ServiceMethod::SessionAttach {
+        } else if method != ServiceMethod::SessionAttach && method != ServiceMethod::SessionDetach {
             self.check_scope(connection, method)?;
         }
         let fields = object(params)?;
@@ -838,8 +879,21 @@ impl Service {
             .ok_or_else(Refusal::not_found)
     }
 
+    /// Whether the connection holds the operator control capability
+    /// (`daemon.control`).
+    ///
+    /// This is the authority for control actions and the operator stop path; the
+    /// all-session *view* is a distinct `daemon.inspect` right (see
+    /// [`Self::has_operator_view`]). The operator capability always adds both,
+    /// so splitting them changes no privilege, only which scope is spelled.
     fn is_operator(&self, connection: &Connection) -> bool {
         connection.has_service(ServiceScope::DaemonControl)
+    }
+
+    /// Whether the connection holds the operator all-session view
+    /// (`daemon.inspect`).
+    fn has_operator_view(&self, connection: &Connection) -> bool {
+        connection.has_service(ServiceScope::DaemonInspect)
     }
 
     fn visible(
@@ -850,7 +904,8 @@ impl Service {
         now: MonotonicMs,
     ) -> Result<SessionSnapshot, Refusal> {
         let snapshot = self.snapshot(session_id, now)?;
-        if self.is_operator(connection) || self.holds_live_lease(connection, session_id, now) {
+        if self.has_operator_view(connection) || self.holds_live_lease(connection, session_id, now)
+        {
             return Ok(snapshot);
         }
         // A connection that held a lease on this session may read the immutable
@@ -1354,7 +1409,7 @@ impl Service {
             .host
             .snapshots(now)
             .filter(|snapshot| {
-                self.is_operator(connection)
+                self.has_operator_view(connection)
                     || self.holds_live_lease(connection, snapshot.session_id, now)
             })
             .map(|snapshot| session_json(&snapshot))
@@ -1667,22 +1722,20 @@ impl Service {
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
         let grant_id = parse_grant_id(fields)?;
-        let Some(session_id) = self
-            .grants
-            .observer_grant_session(grant_id, now.as_millis())
-        else {
-            return Ok(json!({
-                "grant_id": grant_id.as_hex(),
-                "revoked": false,
-                "not_active": true,
-            }));
-        };
-        let token = optional_control_token(fields)?;
-        let _snapshot = self.visible(connection, session_id, token.as_ref(), now)?;
-        let _authority =
-            self.control_authority(connection, session_id, token.as_ref(), true, now)?;
-        self.recheck(connection, DispatchBoundary::ObserverGrantRevoke)?;
-        self.admit()?;
+        // Stage 7/8 first: a retained record (even one that is consumed,
+        // expired, or revoked) still names its session, so the uniform
+        // visibility and authority stages run before `not_active` is reported.
+        // An unknown id has no target to look up, so it can only answer
+        // `not_active`; the id is 128 bits and reveals nothing the caller did
+        // not already hold.
+        if let Some(session_id) = self.grants.observer_grant_session_retained(grant_id) {
+            let token = optional_control_token(fields)?;
+            let _snapshot = self.visible(connection, session_id, token.as_ref(), now)?;
+            let _authority =
+                self.control_authority(connection, session_id, token.as_ref(), true, now)?;
+            self.recheck(connection, DispatchBoundary::ObserverGrantRevoke)?;
+            self.admit()?;
+        }
         let outcome = self
             .grants
             .revoke_kind(grant_id, GrantKind::Observer, now.as_millis());
@@ -1711,6 +1764,15 @@ impl Service {
     ) -> Result<Value, Refusal> {
         let target = parse_attach_id(fields)?;
         let own = connection.owns_lease(target);
+        // Stage 6, own-lease exception: detecting your own lease needs no
+        // scope; detaching another connection's lease needs `session.control`
+        // or `daemon.control`. The check stays ahead of the target lookup.
+        if !own
+            && !(connection.has_service(ServiceScope::SessionControl)
+                || connection.has_service(ServiceScope::DaemonControl))
+        {
+            return Err(Refusal::denied(RefusalCode::ScopeViolation));
+        }
         let token = optional_control_token(fields)?;
         let session_id;
         if own {
@@ -2486,6 +2548,7 @@ mod tests {
         let (mut service, _dir) = service();
         let mut connection = consumer();
         negotiate_ok(&mut service, &mut connection, 1);
+        let refusals = service.audit_counters().refusals;
         let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0));
         let error = service
             .negotiate(
@@ -2497,6 +2560,10 @@ mod tests {
             .expect_err("second negotiate");
         assert_eq!(error.denied_code(), Some(RefusalCode::AlreadyNegotiated));
         assert!(error.closes_connection());
+        assert!(
+            service.audit_counters().refusals > refusals,
+            "a second negotiate is attributed (D-16)"
+        );
     }
 
     #[test]
@@ -3080,6 +3147,373 @@ mod tests {
             service.audit_counters().refusals > refusals,
             "a refused mutation is attributed (D-16)"
         );
+    }
+
+    #[test]
+    fn a_stopping_daemon_refuses_mutations_and_still_serves_reads() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 2);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        let created = create_session(&mut service, &mut creator, "stopping-create");
+        let id = session_id(&created);
+
+        let stopped = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonStop,
+                &json!({"mode": "force"}),
+                MonotonicMs::from_millis(12),
+            )
+            .expect("force");
+        assert_eq!(stopped["accepted"], true);
+        let before = service
+            .host()
+            .snapshots(MonotonicMs::from_millis(13))
+            .count();
+
+        let error = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionCreate,
+                &json!({"kind": "terminal", "idempotency_key": "after-stop"}),
+                MonotonicMs::from_millis(13),
+            )
+            .expect_err("a stopping daemon refuses new sessions");
+        assert_eq!(error.denied_code(), Some(RefusalCode::DaemonStopping));
+        assert_eq!(
+            service
+                .host()
+                .snapshots(MonotonicMs::from_millis(13))
+                .count(),
+            before,
+            "a refused create applies nothing"
+        );
+
+        let error = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonStop,
+                &json!({"mode": "force"}),
+                MonotonicMs::from_millis(14),
+            )
+            .expect_err("already stopping");
+        assert_eq!(error.denied_code(), Some(RefusalCode::DaemonStopping));
+
+        // Reconciliation reads still serve the stopping state.
+        let status = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonStatus,
+                &Value::Null,
+                MonotonicMs::from_millis(15),
+            )
+            .expect("status");
+        assert_eq!(status["daemon_state"], "stopping");
+        let terminal = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": id}),
+                MonotonicMs::from_millis(15),
+            )
+            .expect("status read");
+        assert_eq!(terminal["session"]["state"], "terminated");
+    }
+
+    #[test]
+    fn an_own_lease_detach_needs_no_session_control_scope() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 2);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        let created = create_session(&mut service, &mut creator, "detach-create");
+        let id = session_id(&created);
+        let create_token = created["control_token"].as_str().expect("token").to_owned();
+        let claimed = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "role": "controller",
+                    "session_id": id,
+                    "expected_generation": 0,
+                    "control_token": create_token,
+                    "idempotency_key": "detach-attach",
+                }),
+                MonotonicMs::from_millis(11),
+            )
+            .expect("claim");
+        let controller_attach = claimed["attach_id"].as_str().expect("attach").to_owned();
+        let minted = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": id, "idempotency_key": "detach-grant"}),
+                MonotonicMs::from_millis(12),
+            )
+            .expect("observer grant");
+
+        let mut observer = consumer();
+        negotiate_ok(&mut service, &mut observer, 13);
+        let attached = service
+            .dispatch(
+                &mut observer,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "role": "observer",
+                    "session_id": id,
+                    "observer_grant": minted["grant"],
+                }),
+                MonotonicMs::from_millis(14),
+            )
+            .expect("observer attach");
+        let observer_attach = attached["attach_id"].as_str().expect("attach");
+        observer
+            .scopes_mut()
+            .service
+            .remove(ServiceScope::SessionControl);
+
+        // The caller's own lease is scope-free.
+        let detached = service
+            .dispatch(
+                &mut observer,
+                ServiceMethod::SessionDetach,
+                &json!({"attach_id": observer_attach}),
+                MonotonicMs::from_millis(15),
+            )
+            .expect("own detach");
+        assert_eq!(detached["was_attached"], true);
+
+        // Another connection's lease still needs session.control or
+        // daemon.control, decided before the target lookup.
+        let mut stranger = consumer();
+        stranger
+            .scopes_mut()
+            .service
+            .remove(ServiceScope::SessionControl);
+        negotiate_ok(&mut service, &mut stranger, 16);
+        let error = service
+            .dispatch(
+                &mut stranger,
+                ServiceMethod::SessionDetach,
+                &json!({"attach_id": controller_attach}),
+                MonotonicMs::from_millis(17),
+            )
+            .expect_err("no control scope");
+        assert_eq!(error.denied_code(), Some(RefusalCode::ScopeViolation));
+    }
+
+    #[test]
+    fn the_operator_all_session_view_is_daemon_inspect() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 2);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        create_session(&mut service, &mut creator, "view-create");
+
+        // daemon.inspect without daemon.control is enough for the operator
+        // all-session view, and not enough for a control action.
+        let mut inspector = connection(
+            ServiceScopeSet::baseline().with(ServiceScope::DaemonInspect),
+            true,
+        );
+        negotiate_ok(&mut service, &mut inspector, 4);
+        let listed = service
+            .dispatch(
+                &mut inspector,
+                ServiceMethod::SessionList,
+                &Value::Null,
+                MonotonicMs::from_millis(5),
+            )
+            .expect("operator view");
+        assert_eq!(
+            listed["sessions"].as_array().expect("sessions").len(),
+            1,
+            "daemon.inspect sees every session"
+        );
+        let error = service
+            .dispatch(
+                &mut inspector,
+                ServiceMethod::SessionKill,
+                &json!({"session_id": "a".repeat(32), "expected_generation": 0}),
+                MonotonicMs::from_millis(6),
+            )
+            .expect_err("daemon.control is required");
+        assert_eq!(error.denied_code(), Some(RefusalCode::ScopeViolation));
+    }
+
+    #[test]
+    fn grant_revoke_runs_the_visibility_check_before_not_active() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 2);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        let created = create_session(&mut service, &mut creator, "revoke-create");
+        let id = session_id(&created);
+        let create_token = created["control_token"].as_str().expect("token").to_owned();
+        service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "role": "controller",
+                    "session_id": id,
+                    "expected_generation": 0,
+                    "control_token": create_token,
+                    "idempotency_key": "revoke-attach",
+                }),
+                MonotonicMs::from_millis(11),
+            )
+            .expect("claim");
+        let minted = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": id, "idempotency_key": "revoke-grant"}),
+                MonotonicMs::from_millis(12),
+            )
+            .expect("observer grant");
+        let grant_id = minted["grant_id"].as_str().expect("grant id").to_owned();
+
+        // Consume the grant so the record is inactive but still retained.
+        let mut observer = consumer();
+        negotiate_ok(&mut service, &mut observer, 13);
+        service
+            .dispatch(
+                &mut observer,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "role": "observer",
+                    "session_id": id,
+                    "observer_grant": minted["grant"],
+                }),
+                MonotonicMs::from_millis(14),
+            )
+            .expect("observer attach");
+
+        // A caller that cannot see the session learns nothing about the grant.
+        let mut stranger = consumer();
+        negotiate_ok(&mut service, &mut stranger, 15);
+        let error = service
+            .dispatch(
+                &mut stranger,
+                ServiceMethod::SessionGrantRevoke,
+                &json!({"grant_id": grant_id}),
+                MonotonicMs::from_millis(16),
+            )
+            .expect_err("no visibility");
+        assert_eq!(error.kind(), RefusalKind::NotFound);
+
+        // The controller runs the uniform stages and then sees `not_active`.
+        let revoked = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrantRevoke,
+                &json!({"grant_id": grant_id}),
+                MonotonicMs::from_millis(17),
+            )
+            .expect("uniform stages pass");
+        assert_eq!(revoked["not_active"], true);
+        assert_eq!(revoked["revoked"], false);
+    }
+
+    #[test]
+    fn the_service_sweep_drops_retired_grants() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 2);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        let created = create_session(&mut service, &mut creator, "sweep-create");
+        let id = session_id(&created);
+        let create_token = created["control_token"].as_str().expect("token").to_owned();
+        service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "role": "controller",
+                    "session_id": id,
+                    "expected_generation": 0,
+                    "control_token": create_token,
+                    "idempotency_key": "sweep-attach",
+                }),
+                MonotonicMs::from_millis(11),
+            )
+            .expect("claim");
+        service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": id, "idempotency_key": "sweep-grant"}),
+                MonotonicMs::from_millis(12),
+            )
+            .expect("observer grant");
+        assert_eq!(service.grants().len(), 2, "host and observer records");
+        let dropped = service.sweep_grants(MonotonicMs::from_millis(13));
+        assert_eq!(dropped, 0, "live records are never swept");
+        assert_eq!(service.grants().len(), 2);
+
+        // Revoke the observer grant: it is retired immediately and the next
+        // sweep drops it, while the host record stays until its TTL.
+        let minted = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": id, "idempotency_key": "sweep-grant"}),
+                MonotonicMs::from_millis(14),
+            )
+            .expect("replay");
+        let grant_id = minted["grant_id"].as_str().expect("grant id").to_owned();
+        service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrantRevoke,
+                &json!({"grant_id": grant_id}),
+                MonotonicMs::from_millis(15),
+            )
+            .expect("revoke");
+        let dropped = service.sweep_grants(MonotonicMs::from_millis(16));
+        assert_eq!(dropped, 1, "a revoked observer grant is retired");
+        assert_eq!(
+            service.grants().len(),
+            1,
+            "the host grant is kept until its TTL"
+        );
+    }
+
+    #[test]
+    fn a_limit_exceeded_refusal_uses_the_framing_class() {
+        let refusal = Refusal::limit_exceeded(8_192, 20_000);
+        assert_eq!(refusal.code(), "LimitExceeded");
+        assert_eq!(refusal.class(), ErrorClass::Framing);
+        assert_eq!(refusal.counts(), Some((20_000, 8_192)));
+        assert!(!refusal.closes_connection(), "the server decides the close");
     }
 
     #[test]

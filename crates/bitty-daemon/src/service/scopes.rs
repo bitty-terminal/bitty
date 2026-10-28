@@ -393,6 +393,9 @@ impl ServiceMethod {
             Self::SessionGrant | Self::SessionGrantRevoke => {
                 ScopeRequirement::Service(&SESSION_CONTROL_OR_OPERATOR)
             }
+            // The requirement applies to detaching *another* connection's
+            // lease; detaching one the caller already owns needs no scope, and
+            // the handler enforces that split before the target lookup.
             Self::SessionDetach => ScopeRequirement::Service(&SESSION_CONTROL_OR_OPERATOR),
             Self::SessionControlTransfer | Self::SessionAbort => {
                 ScopeRequirement::Service(&SESSION_CONTROL)

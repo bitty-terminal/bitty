@@ -13,7 +13,16 @@
 //! - the daemon never opens a TCP listener (checked through `/proc/<pid>/fd`
 //!   against `/proc/net/tcp` and `/proc/net/tcp6`);
 //! - `daemon.negotiate` authenticates the operator capability and
-//!   `daemon.stop force` shuts the loop down cleanly, removing the socket.
+//!   `daemon.stop force` shuts the loop down cleanly, removing the socket;
+//! - closing refusals (`VersionMismatch`, `Unauthenticated`,
+//!   `Denied/AlreadyNegotiated`) flush their refusal frame and then really
+//!   close, checked as an EOF inside the negotiate deadline;
+//! - the handshake advertises only the three baseline `session.*` scopes plus
+//!   `process.spawn`, never an ambient `terminal.*` scope;
+//! - a stopping daemon refuses a pipelined mutation on the same drain;
+//! - the pre-authentication byte budget closes a dribbled frame and writes one
+//!   aggregated audit record;
+//! - `SIGTERM`/`SIGINT` drain to exit `0`, and endpoint tamper exits `6`.
 //!
 //! Linux is the only servable cell in this slice; the test is gated on it.
 
@@ -66,6 +75,10 @@ impl TempRoot {
     fn capability(&self) -> PathBuf {
         self.runtime().join("bitty").join("bittyd.operator")
     }
+
+    fn audit_log(&self) -> PathBuf {
+        self.state().join("bitty").join("audit").join("audit.log")
+    }
 }
 
 impl Drop for TempRoot {
@@ -117,6 +130,22 @@ impl Daemon {
     fn wait(mut self) -> std::process::ExitStatus {
         self.child.wait().expect("wait for bittyd")
     }
+
+    /// Wait up to `budget` for the daemon to exit, then kill it.
+    fn wait_within(mut self, budget: Duration) -> std::process::ExitStatus {
+        let deadline = Instant::now() + budget;
+        loop {
+            if let Some(status) = self.child.try_wait().expect("try_wait") {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("bittyd did not exit within {budget:?}");
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
 }
 
 impl Drop for Daemon {
@@ -126,6 +155,17 @@ impl Drop for Daemon {
             let _ = self.child.wait();
         }
     }
+}
+
+/// Send a signal to the daemon this test started (a recorded pid, never a
+/// name- or pattern-based kill).
+fn send_signal(pid: u32, signal: &str) {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .expect("kill the recorded daemon pid");
+    assert!(status.success(), "kill -{signal} {pid} failed");
 }
 
 struct Client {
@@ -148,13 +188,25 @@ impl Client {
     fn call(&mut self, method: &str, params: Value) -> Value {
         let id = self.next_id.to_string();
         self.next_id += 1;
-        let request = json!({"v": 1, "id": id, "method": method, "params": params});
-        let payload = serde_json::to_vec(&request).expect("encode request");
-        let mut frame = Vec::with_capacity(4 + payload.len());
-        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-        frame.extend_from_slice(&payload);
-        self.stream.write_all(&frame).expect("write frame");
+        self.stream
+            .write_all(&encode_request(&id, method, params))
+            .expect("write frame");
         self.recv()
+    }
+
+    /// Queue several requests in one write, so a mutation cannot be processed
+    /// before the stop that precedes it in the same drain.
+    fn send_batch(&mut self, requests: &[(&str, Value)]) -> Vec<String> {
+        let mut frames = Vec::new();
+        let mut ids = Vec::new();
+        for (method, params) in requests {
+            let id = self.next_id.to_string();
+            self.next_id += 1;
+            frames.extend_from_slice(&encode_request(&id, method, params.clone()));
+            ids.push(id);
+        }
+        self.stream.write_all(&frames).expect("write frames");
+        ids
     }
 
     fn recv(&mut self) -> Value {
@@ -167,17 +219,73 @@ impl Client {
     }
 
     fn negotiate(&mut self, operator_capability: Option<&str>) -> Value {
+        self.negotiate_with(operator_capability, None)
+    }
+
+    fn negotiate_with(
+        &mut self,
+        operator_capability: Option<&str>,
+        host_grant: Option<&str>,
+    ) -> Value {
         let mut params = json!({"client_version": {"major": 1, "minor": 0}});
         if let Some(capability) = operator_capability {
             params["operator_capability"] = Value::String(capability.to_owned());
         }
+        if let Some(grant) = host_grant {
+            params["host_grant"] = Value::String(grant.to_owned());
+        }
         self.call("daemon.negotiate", params)
+    }
+
+    /// Write one raw frame (used for a wire version outside the contract).
+    fn send_raw_frame(&mut self, request: Value) {
+        let payload = serde_json::to_vec(&request).expect("encode request");
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        self.stream.write_all(&frame).expect("write frame");
     }
 }
 
 fn read_capability(root: &TempRoot) -> String {
     let raw = std::fs::read_to_string(root.capability()).expect("capability file");
     raw.trim_end_matches('\n').to_owned()
+}
+
+/// Encode one v1 request as a length-prefixed frame.
+fn encode_request(id: &str, method: &str, params: Value) -> Vec<u8> {
+    let request = json!({"v": 1, "id": id, "method": method, "params": params});
+    let payload = serde_json::to_vec(&request).expect("encode request");
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&payload);
+    frame
+}
+
+/// Assert a real EOF arrives within `budget`.
+///
+/// A read timeout is *not* EOF: `WouldBlock`/`TimedOut` panics, so a daemon
+/// that keeps the connection open fails the test instead of passing on the
+/// deadline.
+fn assert_eof(stream: &mut UnixStream, budget: Duration) {
+    stream.set_read_timeout(Some(budget)).expect("read timeout");
+    let mut byte = [0u8; 1];
+    match stream.read(&mut byte) {
+        Ok(0) => {}
+        Ok(read) => panic!("expected EOF within {budget:?}, read {read} bytes"),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::UnexpectedEof
+            ) => {}
+        Err(error) => panic!("expected EOF within {budget:?}, got {error:?}"),
+    }
+}
+
+/// Count audit lines carrying `needle`.
+fn audit_lines_with(root: &TempRoot, needle: &str) -> usize {
+    let log = std::fs::read_to_string(root.audit_log()).unwrap_or_default();
+    log.lines().filter(|line| line.contains(needle)).count()
 }
 
 /// Socket inodes the process holds, plus any of them in a TCP LISTEN row.
@@ -243,9 +351,28 @@ fn start_serves_the_endpoint_and_never_opens_a_tcp_listener() {
     assert_eq!(result["daemon_state"], "running");
     assert!(result["client_id"].as_str().expect("client id").len() == 32);
     let scopes = result["scopes"].as_array().expect("scopes");
-    assert!(scopes.iter().any(|scope| scope == "session.inspect"));
+    let advertised: Vec<&str> = scopes
+        .iter()
+        .map(|scope| scope.as_str().expect("scope"))
+        .collect();
+    assert_eq!(
+        advertised,
+        [
+            "session.inspect",
+            "session.attach",
+            "session.control",
+            "process.spawn",
+        ],
+        "the baseline is the three session scopes plus process.spawn only"
+    );
     assert!(!scopes.iter().any(|scope| scope == "session.host"));
     assert!(!scopes.iter().any(|scope| scope == "daemon.control"));
+    assert!(
+        !scopes.iter().any(|scope| scope
+            .as_str()
+            .is_some_and(|name| name.starts_with("terminal."))),
+        "no ambient terminal content scope is granted"
+    );
     assert_eq!(result["capabilities"]["worker_sessions"], false);
     assert_eq!(
         result["limits"].as_array().expect("limits").len(),
@@ -324,9 +451,9 @@ fn a_failed_operator_capability_is_one_static_refusal_and_closes() {
             .contains("bittyd.operator"),
         "the refusal must not reveal the capability file"
     );
-    // The connection closed; the next read sees EOF.
-    let mut header = [0u8; 4];
-    assert_eq!(client.stream.read(&mut header).unwrap_or(0), 0);
+    // The connection closed *after* flushing the refusal: a real EOF arrives
+    // well inside the 5 s negotiate deadline (a timeout is a failure).
+    assert_eof(&mut client.stream, Duration::from_secs(2));
 
     // The daemon is still healthy for a different connection.
     let capability = read_capability(&root);
@@ -337,6 +464,203 @@ fn a_failed_operator_capability_is_one_static_refusal_and_closes() {
         true
     );
     assert_eq!(daemon.wait().code(), Some(0));
+}
+
+/// Stop the daemon through the operator capability and wait for exit.
+fn stop_cleanly(root: &TempRoot, daemon: Daemon) -> std::process::ExitStatus {
+    let capability = read_capability(root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    assert_eq!(
+        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
+        true
+    );
+    daemon.wait_within(Duration::from_secs(10))
+}
+
+#[test]
+fn closing_refusals_flush_the_frame_and_then_close() {
+    let root = TempRoot::new("closing");
+    let daemon = Daemon::start(&root);
+
+    // A second negotiate: the refusal frame is delivered, then EOF.
+    let mut client = Client::connect(&root.endpoint());
+    assert_eq!(client.negotiate(None)["ok"], true);
+    let second = client.call(
+        "daemon.negotiate",
+        json!({"client_version": {"major": 1, "minor": 0}}),
+    );
+    assert_eq!(second["ok"], false);
+    assert_eq!(second["error"]["code"], "AlreadyNegotiated");
+    assert_eq!(second["error"]["class"], "Denied");
+    assert_eof(&mut client.stream, Duration::from_secs(2));
+
+    // A frame before the negotiate response: refused and closed.
+    let mut before = Client::connect(&root.endpoint());
+    let refused = before.call(
+        "session.create",
+        json!({"kind": "terminal", "idempotency_key": "before"}),
+    );
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["error"]["code"], "AlreadyNegotiated");
+    assert_eof(&mut before.stream, Duration::from_secs(2));
+
+    // A service version mismatch: refused and closed.
+    let mut version = Client::connect(&root.endpoint());
+    let mismatch = version.call(
+        "daemon.negotiate",
+        json!({"client_version": {"major": 2, "minor": 0}}),
+    );
+    assert_eq!(mismatch["ok"], false);
+    assert_eq!(mismatch["error"]["code"], "VersionMismatch");
+    assert_eq!(mismatch["error"]["class"], "Validation");
+    assert_eof(&mut version.stream, Duration::from_secs(2));
+
+    // A wire version mismatch: refused and closed.
+    let mut wire = Client::connect(&root.endpoint());
+    wire.send_raw_frame(json!({
+        "v": 99,
+        "id": "wire-1",
+        "method": "daemon.negotiate",
+        "params": {"client_version": {"major": 1, "minor": 0}},
+    }));
+    let refused = wire.recv();
+    assert_eq!(refused["ok"], false);
+    assert_eq!(refused["error"]["code"], "VersionMismatch");
+    assert_eof(&mut wire.stream, Duration::from_secs(2));
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn a_stopping_daemon_refuses_a_pipelined_create() {
+    let root = TempRoot::new("stopping");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    assert_eq!(minted["ok"], true, "{minted}");
+    let grant = minted["result"]["grant"]
+        .as_str()
+        .expect("host grant bearer")
+        .to_owned();
+
+    // One connection carries both the operator capability (to stop) and the
+    // consumed host grant (to create), so the stop and the create are drained
+    // in one read on one connection.
+    let mut client = Client::connect(&root.endpoint());
+    let response = client.negotiate_with(Some(&capability), Some(&grant));
+    assert_eq!(response["ok"], true, "{response}");
+    let scopes: Vec<&str> = response["result"]["scopes"]
+        .as_array()
+        .expect("scopes")
+        .iter()
+        .map(|scope| scope.as_str().expect("scope"))
+        .collect();
+    assert!(scopes.contains(&"session.host"), "{scopes:?}");
+    assert!(scopes.contains(&"daemon.control"), "{scopes:?}");
+
+    let ids = client.send_batch(&[
+        ("daemon.stop", json!({"mode": "force"})),
+        (
+            "session.create",
+            json!({"kind": "terminal", "idempotency_key": "pipelined"}),
+        ),
+    ]);
+    let stopped = client.recv();
+    let created = client.recv();
+    assert_eq!(stopped["id"], ids[0]);
+    assert_eq!(stopped["ok"], true, "{stopped}");
+    assert_eq!(stopped["result"]["accepted"], true);
+    assert_eq!(stopped["result"]["terminated"], 0);
+    assert_eq!(created["id"], ids[1]);
+    assert_eq!(created["ok"], false, "a stopping daemon creates nothing");
+    assert_eq!(created["error"]["code"], "DaemonStopping");
+    assert_eq!(created["error"]["class"], "Denied");
+
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+    assert_eq!(
+        audit_lines_with(&root, "a=session.create r=refused c=daemon_stopping"),
+        1,
+        "the stopped create is attributed once"
+    );
+}
+
+#[test]
+fn a_pre_authentication_budget_closes_a_dribbled_frame() {
+    let root = TempRoot::new("budget");
+    let daemon = Daemon::start(&root);
+    let mut client = Client::connect(&root.endpoint());
+
+    // Declare a `max_frame_bytes` body and send 20 KiB without negotiating.
+    // The pre-auth budget is 8 KiB, so the daemon refuses mid-assembly.
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&200_000u32.to_be_bytes());
+    frame.extend(std::iter::repeat_n(b'x', 20_000));
+    client.stream.write_all(&frame).expect("dribbled frame");
+    assert_eof(&mut client.stream, Duration::from_secs(2));
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    assert_eq!(
+        audit_lines_with(&root, "a=wire r=refused c=limit_exceeded"),
+        1,
+        "one aggregated record for the budget closure"
+    );
+}
+
+#[test]
+fn an_unnegotiated_connection_past_the_deadline_is_closed_with_one_record() {
+    let root = TempRoot::new("deadline");
+    let daemon = Daemon::start(&root);
+    let mut client = Client::connect(&root.endpoint());
+
+    // `negotiate_timeout_ms` is 5 000 ms at the compiled defaults.
+    std::thread::sleep(Duration::from_millis(5_500));
+    assert_eof(&mut client.stream, Duration::from_secs(3));
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    assert_eq!(
+        audit_lines_with(&root, "a=wire r=refused c=timeout"),
+        1,
+        "one aggregated record for the deadline closure"
+    );
+}
+
+#[test]
+fn sigterm_and_sigint_drain_to_exit_zero() {
+    for signal in ["TERM", "INT"] {
+        let root = TempRoot::new(&format!("signal-{}", signal.to_lowercase()));
+        let daemon = Daemon::start(&root);
+        let mut client = Client::connect(&root.endpoint());
+        assert_eq!(client.negotiate(None)["ok"], true);
+        send_signal(daemon.pid(), signal);
+        let status = daemon.wait_within(Duration::from_secs(10));
+        assert_eq!(status.code(), Some(0), "SIG{signal} drains cleanly");
+        assert!(
+            !root.endpoint().exists(),
+            "the socket is removed after SIG{signal}"
+        );
+    }
+}
+
+#[test]
+fn endpoint_tamper_exits_six() {
+    let root = TempRoot::new("tamper");
+    let daemon = Daemon::start(&root);
+    let socket = root.endpoint();
+
+    // Replace the bound socket object with a regular file. The bounded tamper
+    // interval re-attests the path and must take the exit-6 path.
+    std::fs::remove_file(&socket).expect("remove the bound socket");
+    std::fs::write(&socket, b"not a socket").expect("plant a foreign object");
+
+    let status = daemon.wait_within(Duration::from_secs(15));
+    assert_eq!(
+        status.code(),
+        Some(6),
+        "endpoint tamper is the contract's exit code 6"
+    );
 }
 
 #[test]

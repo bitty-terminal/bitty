@@ -27,7 +27,11 @@
 //!   `not_active` result, never a refusal;
 //! - the pending caps (`max_pending_host_grants` and
 //!   `max_pending_observer_grants_per_session`) are whole refusals mapped to
-//!   `LimitExceeded`; a mint never evicts a live grant.
+//!   `LimitExceeded`; a mint never evicts a live grant;
+//! - retired records are swept on the server tick (and opportunistically at
+//!   mint), host grants stay until their TTL so a consumed consent still
+//!   authorizes its connection's create, and [`MAX_GRANT_RECORDS`] is the hard
+//!   total bound that keeps the store independent of total mints.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -44,6 +48,25 @@ const GRANT_DIGEST_DOMAIN: &[u8] = b"bittyd/grant-bearer/v1\0";
 
 /// Bytes in a grant id (128 bits).
 pub const GRANT_ID_BYTES: usize = 16;
+
+/// Hard cap on the total number of retained grant records, active or retired.
+///
+/// The per-kind caps (`max_pending_host_grants`,
+/// `max_pending_observer_grants_per_session`) count **active** records only, so
+/// a create/terminate or mint/consume cycle would otherwise leave a retired
+/// record behind forever and grow the store with total mints instead of with
+/// the caps. The total bound is the backstop that makes the store's memory
+/// independent of how long the daemon runs.
+///
+/// Rationale for the value: the largest legitimate simultaneous population is
+/// `max_pending_host_grants` (8 at the compiled maximum) plus one observer
+/// grant per attach slot across every live session
+/// (`max_sessions × max_pending_observer_grants_per_session` = 64 × 8 = 512),
+/// then the same number of records retired during one TTL window while the
+/// sweep catches up. `1_024` covers that with headroom and stays far below any
+/// memory concern (a record is under 200 bytes). A mint at the bound is a whole
+/// `LimitExceeded` refusal; the store never evicts a live record to make room.
+pub const MAX_GRANT_RECORDS: usize = 1_024;
 
 /// A non-secret grant identity (`D-16`).
 ///
@@ -424,6 +447,17 @@ impl GrantStore {
         now_ms: u64,
         ttl_ms: u64,
     ) -> Result<MintedGrant, MintError> {
+        // Retired records are swept before the total bound is checked, so only
+        // records that are still needed for a live authorization can refuse the
+        // mint. The sweep never drops an active record or a host grant that has
+        // not reached its TTL.
+        self.evict_expired(now_ms);
+        if self.grants.len() >= MAX_GRANT_RECORDS {
+            return Err(MintError::Refused(GrantRefusal::Capacity {
+                kind,
+                limit: MAX_GRANT_RECORDS,
+            }));
+        }
         let grant_id = GrantId::generate().map_err(MintError::Error)?;
         let bearer = mint_bearer().map_err(MintError::Error)?;
         let record = GrantRecord {
@@ -522,6 +556,23 @@ impl GrantStore {
         record.session_id
     }
 
+    /// The session a stored observer grant names, including a record that is
+    /// already consumed, expired, or revoked but is still retained for the
+    /// sweep.
+    ///
+    /// `session.grant.revoke` uses this to run the uniform visibility and
+    /// authority stages before it reports `not_active`, so an id the caller
+    /// already holds cannot skip those stages. `None` when no record exists or
+    /// the record is a host grant.
+    #[must_use]
+    pub fn observer_grant_session_retained(&self, grant_id: GrantId) -> Option<SessionId> {
+        let record = self.grants.get(&grant_id)?;
+        if record.kind != GrantKind::Observer {
+            return None;
+        }
+        record.session_id
+    }
+
     /// Consume one grant.
     ///
     /// The same [`GrantRefusal::Unusable`] is returned for a missing, expired,
@@ -608,10 +659,20 @@ impl GrantStore {
         record.bearer.clone()
     }
 
-    /// Drop records that can no longer be used or replayed.
+    /// Drop records that can no longer be used, replayed, or checked.
+    ///
+    /// A host grant is retained until its `expires_at_ms` even after it is
+    /// consumed or revoked: `host_grant_bound` must still answer the create on
+    /// the connection that consumed it, and a sweep that followed
+    /// `GrantRecord::is_active` would revoke live consent mid-connection. Every
+    /// other record is dropped as soon as it is inactive (consumed, revoked, or
+    /// expired); the TTL is still the outer bound for all of them.
     pub fn evict_expired(&mut self, now_ms: u64) -> usize {
         let before = self.grants.len();
-        self.grants.retain(|_, record| record.is_active(now_ms));
+        self.grants.retain(|_, record| match record.kind {
+            GrantKind::Host => now_ms < record.expires_at_ms,
+            GrantKind::Observer => record.is_active(now_ms),
+        });
         before - self.grants.len()
     }
 }
@@ -845,10 +906,70 @@ mod tests {
     #[test]
     fn eviction_drops_retired_records() {
         let mut store = store();
-        let minted = store.mint_host(1000, 10).expect("mint");
-        store.revoke_kind(minted.grant_id, GrantKind::Host, 11);
+        let minted = store.mint_observer(session(), 1000, 10).expect("mint");
+        let revoked = store.revoke_kind(minted.grant_id, GrantKind::Observer, 11);
+        assert_eq!(revoked, RevokeOutcome::Revoked);
         assert_eq!(store.evict_expired(12), 1);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn a_sweep_keeps_a_consumed_host_grant_until_its_ttl() {
+        let mut store = store();
+        let minted = store.mint_host(1000, 10).expect("mint");
+        let expires_at = minted.expires_at_ms;
+        store
+            .consume(&minted.bearer, GrantKind::Host, 1000, None, 11)
+            .expect("consume");
+
+        // The consuming connection's create still needs the consumed record.
+        assert_eq!(store.evict_expired(12), 0);
+        assert!(store.host_grant_bound(minted.grant_id, 1000, 12));
+
+        // Exactly at the TTL the record is no longer needed and is dropped.
+        assert_eq!(store.evict_expired(expires_at), 1);
+        assert!(store.is_empty());
+        assert!(!store.host_grant_bound(minted.grant_id, 1000, expires_at));
+    }
+
+    #[test]
+    fn the_total_record_bound_refuses_a_mint_and_never_evicts_a_live_grant() {
+        let mut store = store();
+        let mut minted = Vec::new();
+        // The active pending caps are far below the total bound, so the total
+        // bound is reachable only through retained records: consume each host
+        // grant and mint the next one while the consumed records live.
+        // `evict_expired` at mint drops nothing before the TTL, so the store
+        // grows to the hard cap.
+        for index in 0..MAX_GRANT_RECORDS {
+            let grant = store
+                .mint_host(1000, 10)
+                .unwrap_or_else(|error| panic!("mint {index} within the bound: {error}"));
+            let consumed = store.consume(&grant.bearer, GrantKind::Host, 1000, None, 11);
+            assert!(consumed.is_ok());
+            minted.push(grant);
+        }
+        assert_eq!(store.len(), MAX_GRANT_RECORDS);
+        // Every record is consumed, so the active host cap is not what
+        // refuses: the total bound is.
+        assert!(matches!(
+            store.mint_host(1000, 12),
+            Err(MintError::Refused(GrantRefusal::Capacity {
+                kind: GrantKind::Host,
+                limit: MAX_GRANT_RECORDS
+            }))
+        ));
+        assert_eq!(
+            store.len(),
+            MAX_GRANT_RECORDS,
+            "a refusal never evicts a retained record"
+        );
+
+        // One second after the TTL the sweep clears the retired records and a
+        // mint is admissible again.
+        let expires_at = minted[0].expires_at_ms;
+        assert_eq!(store.evict_expired(expires_at), MAX_GRANT_RECORDS);
+        assert!(store.mint_host(1000, expires_at).is_ok());
     }
 
     #[test]

@@ -606,18 +606,18 @@ and `daemon_state`.
   the method grammar, and the catalog, so an unnegotiated connection cannot
   probe which methods exist.
 - **No pre-auth pipelining.** After a successful `daemon.negotiate`, any byte
-  already queued on the socket — a complete frame or a fragment of one — is
-  refused with a typed `Denied/AlreadyNegotiated` frame and the connection
-  closes after that frame drains. A single non-blocking `MSG_PEEK` decides;
-  the queued bytes are never read, parsed, or resumed, so a partially sent
-  second frame cannot become a fresh request and no pipelined method is ever
-  served after the handshake. The same rule governs the handshake response
-  itself: reading stays closed until the response has fully drained, and a
-  byte already queued at that moment is refused the same way, so a frame that
-  arrives between the peek and the completed flush cannot be served either.
-  The refusal omits `id` because the tail is
-  unattributable without parsing it (the second no-`id` contract exception
-  above); a client that pipelined must reconnect.
+  already queued before the response's first byte is written — a complete
+  frame or a fragment of one — is refused with a typed
+  `Denied/AlreadyNegotiated` frame and the connection closes after that frame
+  drains. A single non-blocking `MSG_PEEK` at that decision point decides; the
+  queued bytes are never read, parsed, or resumed, so a partially sent second
+  frame cannot become a fresh request and no pipelined method is ever served
+  after the handshake. A byte that arrives after the response write begins is
+  a post-handshake frame, parsed only after negotiation completes, so a client
+  that writes its next request as soon as it reads the handshake is served
+  normally. The refusal omits `id` because the tail is unattributable without
+  parsing it (the second no-`id` contract exception above); a client that
+  pipelined must reconnect.
 - **A failed handshake is final.** `VersionMismatch`, `Unauthenticated`, and
   every refusal of a `daemon.negotiate` request — including the
   `InvalidRequest` produced by a malformed negotiate payload or a refused

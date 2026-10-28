@@ -349,11 +349,13 @@ mod unix {
         close_after_write: bool,
         /// A successful `daemon.negotiate` response is still queued.
         ///
-        /// The client cannot have seen the handshake before its last byte is
-        /// written, so reading stays closed until `output` drains; the loop
-        /// re-checks the socket at that point and refuses any byte that raced
-        /// the flush (`D-11`) instead of serving it as a post-handshake
-        /// request.
+        /// The pre-handshake decision already ran when that response was
+        /// queued and its first byte had not been written; bytes observed
+        /// there are refused and the peer retires. This flag only keeps
+        /// reading closed until `output` drains, so a byte that arrives after
+        /// the response write begins is parsed as a post-handshake frame only
+        /// once negotiation is visibly complete. Clearing it never inspects
+        /// input.
         handshake_flush_gate: bool,
         closed: bool,
     }
@@ -366,9 +368,10 @@ mod unix {
         /// Whether the loop may read another frame from this peer now.
         ///
         /// A retired connection only drains; a negotiated connection whose
-        /// handshake response is still queued must not read, because a frame
-        /// that arrives in that window was sent before the client could have
-        /// seen the handshake.
+        /// handshake response is still queued does not read yet. That window is
+        /// not a refusal boundary: the pre-write decision already ran, and the
+        /// first written response byte makes everything that follows a
+        /// post-handshake frame.
         fn reads_input(&self) -> bool {
             !self.closed && !self.close_after_write && !self.handshake_flush_gate
         }
@@ -542,12 +545,12 @@ mod unix {
                 {
                     flush_peer(peer);
                 }
-                // The handshake becomes visible to the client only when its
-                // last byte is written, so this is the one point where a byte
-                // that raced the flush is still attributable to the
-                // pre-handshake window. Decide it here, not on a later read.
+                // The handshake response is fully written, so reading may
+                // resume. The pre-handshake decision already ran when the
+                // response was queued; nothing queued from here on is a
+                // pipelined tail.
                 if peer.handshake_flush_gate && !peer.closed && peer.output.is_empty() {
-                    finish_handshake_flush(peer, &mut service, current);
+                    finish_handshake_flush(peer);
                 }
                 if peer.drained() {
                     peer.close();
@@ -797,23 +800,26 @@ mod unix {
                 return;
             }
             if !was_negotiated && peer.client.is_negotiated() {
-                // No pre-auth pipelining (`D-11`): every byte that arrived
-                // before the negotiate response -- a complete frame or a
-                // fragment of one -- is refused and the connection closes.
-                // The queued bytes are never parsed, so a partially sent
-                // second frame can never be resumed and parsed as a fresh
-                // request. The refusal carries no `id` because the tail is
-                // unattributable by construction; the caller flushes it
-                // before the stream closes.
-                if peer.reader.buffered_len() > 0 || input_pending(&peer.stream) {
-                    refuse_pre_handshake_tail(peer, service, now);
+                // No pre-auth pipelining (`D-11`): the negotiate response is
+                // queued here, but its first byte has not been written yet.
+                // This peek is the whole decision boundary -- every byte
+                // queued now arrived before the client could see the
+                // handshake, so a complete frame or a fragment of one is
+                // refused as a whole and the connection closes. The queued
+                // bytes are never parsed, so a partially sent second frame
+                // can never be resumed and parsed as a fresh request. The
+                // refusal carries no `id` because the tail is unattributable
+                // by construction; the caller flushes it before the stream
+                // closes.
+                if refuse_queued_pre_handshake_tail(peer, service, now) {
                     return;
                 }
-                // Nothing is queued yet, but the handshake response is still
-                // in `output`. Reading stays closed until it fully drains:
-                // a frame that arrives after this peek but before the client
-                // can see the handshake is refused at that point instead of
-                // being served as a fresh request on the next iteration.
+                // Nothing was queued at the boundary. Reading stays closed
+                // until the response drains only so the client sees the
+                // handshake before any post-handshake reply; the gate then
+                // clears without a second peek. A client may legitimately
+                // write its next frame as soon as it reads the response, and
+                // on localhost that byte is often already queued by then.
                 peer.handshake_flush_gate = !peer.output.is_empty();
                 return;
             }
@@ -830,12 +836,36 @@ mod unix {
         }
     }
 
+    /// Refuse a tail that is already queued at the handshake decision point.
+    ///
+    /// The caller runs this once per connection: after the negotiate response
+    /// is queued, before its first byte is written. That instant is the whole
+    /// boundary between a pre-handshake tail and a post-handshake frame; a
+    /// byte that arrives later belongs to the negotiated connection.
+    ///
+    /// Returns `true` when the peer was retired and the caller must return.
+    fn refuse_queued_pre_handshake_tail(
+        peer: &mut PeerIo,
+        service: &mut Service,
+        now: MonotonicMs,
+    ) -> bool {
+        if peer.reader.buffered_len() == 0 && !input_pending(&peer.stream) {
+            return false;
+        }
+        refuse_pre_handshake_tail(peer, service, now);
+        true
+    }
+
     /// Refuse a tail that arrived before the client could see the handshake.
     ///
     /// The queued bytes are never parsed, so the request is unattributable by
     /// construction and the refusal omits `id`. Reading stops and the stream is
     /// shut down only after the refusal frame drains.
     fn refuse_pre_handshake_tail(peer: &mut PeerIo, service: &mut Service, now: MonotonicMs) {
+        // Drop anything the frame reader assembled: the tail is refused as a
+        // whole, and the reset makes the "never resumed" property structural
+        // instead of relying on `retire` stopping every later read.
+        peer.reader = PeerFrameReader::new();
         let refusal = Refusal::denied(RefusalCode::AlreadyNegotiated);
         record_floodable_wire(peer, service, refusal, now);
         if !reply_without_id(peer, refusal) {
@@ -845,18 +875,14 @@ mod unix {
         peer.retire();
     }
 
-    /// Decide the post-negotiate read gate once the handshake response drains.
+    /// End the post-negotiate read gate once the handshake response drains.
     ///
-    /// The client cannot have received the handshake before its last byte is
-    /// written, so a byte already queued at this instant was sent inside the
-    /// pre-handshake window and is refused exactly like a pipelined tail. A
-    /// well-behaved client cannot have received and answered within the same
-    /// flush. With the socket quiet, the gate clears and reading resumes.
-    fn finish_handshake_flush(peer: &mut PeerIo, service: &mut Service, now: MonotonicMs) {
-        if peer.reader.buffered_len() > 0 || input_pending(&peer.stream) {
-            refuse_pre_handshake_tail(peer, service, now);
-            return;
-        }
+    /// The refusal decision belongs to the single pre-write peek that ran when
+    /// the response was queued; this is not a second boundary. By the time the
+    /// last response byte is written, a byte the client sent after reading the
+    /// handshake is a normal post-handshake frame, so the gate clears without
+    /// inspecting or refusing anything. Reading resumes on the next poll.
+    fn finish_handshake_flush(peer: &mut PeerIo) {
         peer.handshake_flush_gate = false;
     }
 
@@ -1111,13 +1137,13 @@ mod unix {
 
     /// Whether the socket holds at least one unread byte.
     ///
-    /// The frame reader never reads past the end of the current frame, so
-    /// anything that arrived before the handshake response is still in the
-    /// socket buffer. A single non-blocking `MSG_PEEK` observes it without
-    /// consuming or parsing it, which is what keeps a partial second frame
-    /// from ever becoming a fresh request. EOF and `EAGAIN` both mean nothing
-    /// is queued; an unreadable socket is treated as queued so the caller
-    /// fails closed.
+    /// Called only at the handshake decision point. The frame reader never
+    /// reads past the end of the current frame, so a tail that arrived with
+    /// the negotiate request is still in the socket buffer. A single
+    /// non-blocking `MSG_PEEK` observes it without consuming or parsing it,
+    /// which is what keeps a partial second frame from ever becoming a fresh
+    /// request. EOF and `EAGAIN` both mean nothing is queued; an unreadable
+    /// socket is treated as queued so the caller fails closed.
     fn input_pending(stream: &std::os::unix::net::UnixStream) -> bool {
         use std::os::fd::AsRawFd;
 
@@ -1251,7 +1277,10 @@ mod unix {
 
         use bitty_ipc_core::RateLimiter;
 
-        use super::{PeerIo, PeerTimer, WireAuditBudget, finish_handshake_flush, peer_timer};
+        use super::{
+            PeerIo, PeerTimer, WireAuditBudget, finish_handshake_flush, peer_timer,
+            refuse_queued_pre_handshake_tail,
+        };
         use crate::audit_sink::{AuditSinkError, AuditWriter};
         use crate::handshake::{ClientId, EffectiveScopes, EndpointKind, ServerIdentity};
         use crate::limits::Limits;
@@ -1371,10 +1400,11 @@ mod unix {
             );
         }
 
-        /// A `PeerIo` whose handshake response has just drained.
+        /// A `PeerIo` with the handshake response still queued.
         ///
-        /// `output` holds the handshake bytes until the test drains it, so the
-        /// gate is exercised exactly where the loop calls it.
+        /// `output` holds the handshake bytes until the test drains it, so both
+        /// the pre-write decision and the drain gate are exercised exactly where
+        /// the loop calls them.
         fn gated_peer() -> (PeerIo, UnixStream) {
             let (stream, client) = UnixStream::pair().expect("socketpair");
             stream.set_nonblocking(true).expect("non-blocking");
@@ -1447,18 +1477,22 @@ mod unix {
             serde_json::from_slice(&output[4..]).expect("refusal json")
         }
 
-        /// A byte that raced the handshake flush is refused without an id and
-        /// the peer retires, so it can never be served as a fresh request.
+        /// A byte queued before the response's first byte is a pipelined tail:
+        /// refused without an id, never parsed, and the peer retires.
         #[test]
-        fn a_byte_queued_when_the_handshake_drains_is_refused_without_an_id() {
+        fn a_byte_queued_before_the_response_is_written_is_refused_without_an_id() {
             let (mut service, _dir) = test_service();
             let (mut peer, mut client) = gated_peer();
-            peer.output.clear(); // the flush drained the handshake response
-            client.write_all(b"\x00").expect("racing byte");
+            peer.output.clear(); // isolate the refusal from the handshake bytes
+            client.write_all(b"\x00").expect("pre-response byte");
 
-            finish_handshake_flush(&mut peer, &mut service, MonotonicMs::from_millis(1));
+            assert!(refuse_queued_pre_handshake_tail(
+                &mut peer,
+                &mut service,
+                MonotonicMs::from_millis(1),
+            ));
 
-            assert!(peer.close_after_write, "the raced tail retires the peer");
+            assert!(peer.close_after_write, "the tail retires the peer");
             assert!(!peer.reads_input(), "a retired peer never reads again");
             let refusal = framed_refusal(&peer.output);
             assert_eq!(refusal["ok"], false, "{refusal}");
@@ -1466,23 +1500,46 @@ mod unix {
             assert_eq!(refusal["error"]["code"], "AlreadyNegotiated", "{refusal}");
             assert!(
                 refusal.get("id").is_none(),
-                "a raced tail is never parsed for an id: {refusal}"
+                "a pre-response tail is never parsed for an id: {refusal}"
             );
         }
 
-        /// A quiet drain clears the gate and resumes normal reading.
+        /// A quiet socket at the pre-write decision point is not a tail: the
+        /// handshake proceeds and no refusal is queued.
         #[test]
-        fn a_quiet_handshake_drain_clears_the_gate() {
+        fn a_quiet_socket_at_the_decision_point_does_not_refuse() {
             let (mut service, _dir) = test_service();
             let (mut peer, _client) = gated_peer();
-            peer.output.clear(); // the flush drained the handshake response
 
-            finish_handshake_flush(&mut peer, &mut service, MonotonicMs::from_millis(1));
+            assert!(!refuse_queued_pre_handshake_tail(
+                &mut peer,
+                &mut service,
+                MonotonicMs::from_millis(1),
+            ));
+
+            assert!(!peer.close_after_write);
+            assert!(peer.handshake_flush_gate, "the caller still gates reads");
+            assert_eq!(peer.output, b"handshake", "nothing is appended");
+        }
+
+        /// A byte already queued when the handshake response drains is a
+        /// post-handshake frame: the pre-write peek was the only boundary, so
+        /// the gate clears without a refusal and reading resumes.
+        #[test]
+        fn a_byte_queued_when_the_handshake_drains_is_a_post_handshake_frame() {
+            let (mut peer, mut client) = gated_peer();
+            peer.output.clear(); // the flush drained the handshake response
+            client.write_all(b"\x00").expect("post-handshake byte");
+
+            finish_handshake_flush(&mut peer);
 
             assert!(!peer.handshake_flush_gate);
-            assert!(peer.reads_input());
-            assert!(!peer.close_after_write);
-            assert!(peer.output.is_empty(), "a quiet drain writes nothing");
+            assert!(
+                !peer.close_after_write,
+                "a post-handshake byte never retires the peer"
+            );
+            assert!(peer.reads_input(), "reading resumes once the gate clears");
+            assert!(peer.output.is_empty(), "the gate writes no refusal");
         }
     }
 }

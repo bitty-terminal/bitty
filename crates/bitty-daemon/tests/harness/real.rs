@@ -319,10 +319,38 @@ impl RealDriver {
         }
     }
 
+    /// Reads the per-boot operator capability once the daemon has written it.
+    ///
+    /// The endpoint socket appears before the capability file, and the file is
+    /// created empty before the 64-hex token is written, so neither the socket
+    /// nor a first successful read is a readiness signal. Retry until the exact
+    /// canonical value is present, with a bounded startup deadline; anything
+    /// else after the deadline stays a setup error.
     fn read_capability(root: &Root) -> Result<String, String> {
-        std::fs::read_to_string(root.capability())
-            .map(|text| text.trim_end_matches('\n').to_owned())
-            .map_err(|_| "cannot read the operator capability".to_owned())
+        const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        const READY_STEP: std::time::Duration = std::time::Duration::from_millis(10);
+        fn canonical(text: &str) -> bool {
+            let trimmed = text.trim_end_matches('\n');
+            trimmed.len() == 64 && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }
+        let deadline = std::time::Instant::now() + READY_TIMEOUT;
+        loop {
+            match std::fs::read_to_string(root.capability()) {
+                Ok(text) if canonical(&text) => {
+                    return Ok(text.trim_end_matches('\n').to_owned());
+                }
+                Ok(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(READY_STEP);
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(READY_STEP);
+                }
+                _ => return Err("cannot read the operator capability".to_owned()),
+            }
+        }
     }
 
     fn start(&mut self, label: &str, host_grant: bool) -> Result<(), String> {

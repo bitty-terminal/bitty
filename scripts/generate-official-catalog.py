@@ -431,6 +431,9 @@ def check_pins(registry: Path, revision_arg: str | None, catalog: Path) -> int:
     the same. Issue #2775.
     """
     revision = resolve_revision(registry, revision_arg)
+    # The gate reads the local ref (no fetch). Print the compared commit's date
+    # so a stale `origin/main` is visible instead of silently passing.
+    committed = run_git(registry, "show", "-s", "--format=%cI", revision).strip()
     entries = parse_compiled_entries(catalog)
     mismatches: list[str] = []
     for entry in entries:
@@ -449,11 +452,15 @@ def check_pins(registry: Path, revision_arg: str | None, catalog: Path) -> int:
             )
     if mismatches:
         raise CatalogError(
-            f"{catalog} pins are stale for {registry} at {revision}: "
+            f"{catalog} pins are stale for {registry} at {revision} "
+            f"(committed {committed}): "
             + "; ".join(mismatches)
             + " (run `just catalog-generate` and commit the result)"
         )
-    print(f"official catalog pins: OK ({len(entries)} entries, registry {revision})")
+    print(
+        f"official catalog pins: OK ({len(entries)} entries, registry "
+        f"{revision} committed {committed})"
+    )
     return 0
 
 

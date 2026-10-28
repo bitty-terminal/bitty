@@ -288,8 +288,10 @@ catalog-pins *args:
     python3 scripts/generate-official-catalog.py --check-pins {{ args }}
 
 # Freshness gate for the official catalog: compare every compiled pin with the
-# registry's origin/main (`git fetch origin main` first). Catches a registry
-# code change that a manifest-hash digest can never see; run it with
+# registry's `origin/main` ref. The gate does not fetch — refresh the checkout
+# first (`git -C <bitty-plugins> fetch origin main`); it prints the compared
+# commit and its date so a stale ref is visible. Catches a registry code change
+# that a manifest-hash digest can never see; run it with
 # `just check-registry-fresh`, not in every PR.
 check-registry-fresh *args:
     @just catalog-test

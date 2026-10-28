@@ -4,8 +4,16 @@
 //! fixes the `SceneNode` gallery (text, rows, columns, blocks, images, code
 //! blocks, tables, lists, rules) and its `SCN-1..5` bounds. The band surface
 //! (`crate::ui::UiNode`) stays the closed v1 vocabulary; this module is the
-//! **rich** vocabulary a `ui.rich` mount may use, so a plugin that owns rich
-//! content never has to express it as a character grid.
+//! **rich** vocabulary the accepted scene model can express.
+//!
+//! # Integration status
+//!
+//! [`read_rich_component`] is the v2 reader; `bitty.ui.mount`/`ui.update`
+//! still validate through the v1 `crate::ui::read_component`, and no host
+//! route turns a [`UiRichNode`] into an admitted `Scene` yet. Until that
+//! mount-path slice lands, do not describe the `ui.rich` surface as accepting
+//! these node kinds at runtime; the reader and the `bitty-runtime` bridge
+//! (`bitty_runtime::scene_bridge`) are the mechanism half.
 //!
 //! # Shape
 //!

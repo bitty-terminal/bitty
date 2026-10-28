@@ -295,10 +295,20 @@ impl ComponentDescriptor {
         })
     }
 
-    /// Whether the descriptor's protocol range includes Core's version.
+    /// Whether the descriptor's protocol range includes the shared v1 wire.
+    ///
+    /// This answers only the v1 question. Component gates must compare
+    /// against the family's host seam ([`Self::supports_seam`]), because
+    /// `execution` legitimately speaks v2.
     #[must_use]
     pub fn supports_core_protocol(&self) -> bool {
         (self.protocol_min..=self.protocol_max).contains(&PROTOCOL_VERSION)
+    }
+
+    /// Whether the descriptor range and `seam`'s range share a version.
+    #[must_use]
+    pub fn supports_seam(&self, seam: super::family::ComponentHostSeam) -> bool {
+        seam.accepts(self.protocol_min, self.protocol_max)
     }
 }
 
@@ -359,12 +369,14 @@ pub enum ResolveError {
         /// Version in the descriptor.
         found: String,
     },
-    /// The descriptor protocol range excludes Core's protocol version.
+    /// The descriptor protocol range excludes the requested wire protocol.
     IncompatibleProtocol {
         /// Descriptor minimum.
         min: u16,
         /// Descriptor maximum.
         max: u16,
+        /// The host-seam protocol version resolution requested.
+        protocol: u16,
     },
     /// The executable or version directory is not a regular file or
     /// directory (for example a symlink).
@@ -406,9 +418,9 @@ impl fmt::Display for ResolveError {
                     "descriptor version '{found}' differs from current '{current}'"
                 )
             }
-            ResolveError::IncompatibleProtocol { min, max } => write!(
+            ResolveError::IncompatibleProtocol { min, max, protocol } => write!(
                 f,
-                "component protocol range [{min}, {max}] excludes core protocol {PROTOCOL_VERSION}"
+                "component protocol range [{min}, {max}] excludes the requested wire protocol {protocol}"
             ),
             ResolveError::NotRegular { path } => {
                 write!(f, "{} is not a regular file or directory", path.display())
@@ -498,6 +510,7 @@ pub fn resolve_with_protocol(
         return Err(ResolveError::IncompatibleProtocol {
             min: descriptor.protocol_min,
             max: descriptor.protocol_max,
+            protocol,
         });
     }
 
@@ -678,6 +691,35 @@ mod tests {
         assert_eq!(descriptor.version, "0.1.0");
         assert_eq!((descriptor.protocol_min, descriptor.protocol_max), (1, 1));
         assert!(descriptor.supports_core_protocol());
+    }
+
+    #[test]
+    fn seam_support_follows_the_declared_range() {
+        use crate::component::ComponentHostSeam;
+        let v1 = ComponentDescriptor::parse(&text("net", "0.1.0", "[1, 1]", "bitty-net", DIGEST))
+            .expect("valid v1");
+        assert!(v1.supports_seam(ComponentHostSeam::NetworkWireV1));
+        assert!(!v1.supports_seam(ComponentHostSeam::ExecutionV2));
+        let v2 = ComponentDescriptor::parse(&text(
+            "execution",
+            "0.1.0",
+            "[2, 2]",
+            "bitty-execution",
+            DIGEST,
+        ))
+        .expect("valid v2");
+        assert!(v2.supports_seam(ComponentHostSeam::ExecutionV2));
+        assert!(!v2.supports_seam(ComponentHostSeam::NetworkWireV1));
+        let wide = ComponentDescriptor::parse(&text(
+            "execution",
+            "0.1.0",
+            "[1, 2]",
+            "bitty-execution",
+            DIGEST,
+        ))
+        .expect("valid wide range");
+        assert!(wide.supports_seam(ComponentHostSeam::NetworkWireV1));
+        assert!(wide.supports_seam(ComponentHostSeam::ExecutionV2));
     }
 
     #[test]

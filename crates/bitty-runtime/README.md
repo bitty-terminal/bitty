@@ -37,8 +37,12 @@ diagram lives in `src/lib.rs`.
   requests by id, stops the process after 60 s idle (stdin close, 2 s
   grace, then a kill of the recorded child only), and turns a crash into
   `component_lost` for in-flight requests with a 1 s to 30 s restart
-  backoff (5 crashes in 5 minutes make it unavailable until restart). Every
-  request carries the plugin id and the grant computed from the granted
+  backoff (5 crashes in 5 minutes make it unavailable until restart). Wire
+  protocol selection is per component family (`src/component/family.rs`):
+  `graphics`, `net`, `storage`, and `a11y` use the shared v1 wire, the
+  `execution` family is hosted by `src/execution_component/` on the
+  `bitty-execution` v2 codec, and unlisted names keep the strict v1 default.
+  Every request carries the plugin id and the grant computed from the granted
   `network.connect:*` capabilities intersected with the manifest
   `[[network.egress]]` entries. The Lua-facing request surface and process
   sandboxing are follow-ups; nothing calls the broker from Lua yet. The

@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::descriptor::{ComponentDescriptor, ResolveError, resolve, validate_component_name};
+use super::family::{ComponentHostSeam, family_supports_protocol};
 use super::{
     COMPONENT_CURRENT_FILE, COMPONENT_DESCRIPTOR_FILE, COMPONENT_DESCRIPTOR_MAX_BYTES,
     COMPONENT_EXECUTABLE_PREFIX,
@@ -107,6 +108,10 @@ pub struct SearchedComponent {
 /// system tier; any other user error (invalid `current`, digest mismatch,
 /// ABI incompatibility) fails closed without consulting the system tier so
 /// a tampered user install cannot silently fall back.
+///
+/// Resolution uses the shared v1 wire, the default family seam. A caller
+/// whose family speaks another protocol must use
+/// [`resolve_search_for_protocol`].
 pub fn resolve_search(
     user_root: Option<&Path>,
     system_root: Option<&Path>,
@@ -144,6 +149,12 @@ pub fn resolve_search(
 }
 
 /// Resolve `name` with user-over-system priority for an explicit protocol.
+///
+/// This is the family seam entry point: callers pass the protocol the host
+/// seam implementing that family speaks (see [`super::family::seam_for`]).
+/// The `execution` host resolves `[2, 2]` through this function while the
+/// shared v1 broker keeps using [`resolve_search`] and refuses the same
+/// descriptor.
 pub fn resolve_search_for_protocol(
     user_root: Option<&Path>,
     system_root: Option<&Path>,
@@ -193,8 +204,8 @@ pub struct InstalledVersion {
     pub protocol_min: u16,
     /// Descriptor protocol range.
     pub protocol_max: u16,
-    /// Whether the protocol range includes Core's wire version
-    /// (ABI-compat check before activation).
+    /// Whether the protocol range overlaps the host seam range that owns this
+    /// component family (ABI-compat check before activation).
     pub compatible: bool,
     /// Descriptor-recorded SHA-256 of the executable (issue #2396).
     ///
@@ -285,11 +296,24 @@ pub fn missing_component_hint(name: &str) -> String {
 }
 
 /// Actionable hint for an ABI-incompatible extension.
+///
+/// The hint names the component family's host seam and the protocol range that
+/// seam implements, so a v2 family (`execution`) is not reported as if it had
+/// to speak the shared v1 wire.
 #[must_use]
-pub fn incompatible_component_hint(name: &str, min: u16, max: u16, core: u16) -> String {
+pub fn incompatible_component_hint(
+    name: &str,
+    min: u16,
+    max: u16,
+    seam: ComponentHostSeam,
+) -> String {
     format!(
-        "extension '{name}' protocol range [{min}, {max}] excludes core protocol {core}; \
-         install a compatible build with `bitty extension install {name} --version <X.Y.Z>` or `bitty extension add <path>`"
+        "extension '{name}' protocol range [{min}, {max}] excludes the {} host seam \
+         protocol [{}, {}]; install a compatible build with \
+         `bitty extension install {name} --version <X.Y.Z>` or `bitty extension add <path>`",
+        seam.label(),
+        seam.protocol_min(),
+        seam.protocol_max(),
     )
 }
 
@@ -427,7 +451,11 @@ fn list_versions(root: &Path, name: &str, source: ComponentSource) -> Vec<Instal
             executable_path,
             protocol_min: descriptor.protocol_min,
             protocol_max: descriptor.protocol_max,
-            compatible: descriptor.supports_core_protocol(),
+            compatible: family_supports_protocol(
+                name,
+                descriptor.protocol_min,
+                descriptor.protocol_max,
+            ),
             sha256: descriptor.sha256.clone(),
         });
     }
@@ -645,8 +673,74 @@ mod tests {
             matches!(error, ResolveError::IncompatibleProtocol { .. }),
             "protocol mismatch must deny activation: {error:?}"
         );
-        let hint = incompatible_component_hint("net", 99, 99, crate::component::PROTOCOL_VERSION);
+        let hint = incompatible_component_hint("net", 99, 99, crate::component::seam_for("net"));
         assert!(hint.contains("bitty extension add"), "{hint}");
+        assert!(hint.contains("network-wire-v1"), "{hint}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn compatible_follows_the_family_seam() {
+        let base = scratch("family-compat");
+        let user = base.join("user");
+        install_version(&user, "graphics", "0.0.24", "[1, 1]");
+        install_version(&user, "net", "0.0.1", "[2, 2]");
+        install_version(&user, "execution", "0.0.1", "[2, 2]");
+        install_version(&user, "mystery", "0.0.1", "[2, 2]");
+        set_current(&user, "graphics", "0.0.24");
+        set_current(&user, "net", "0.0.1");
+        set_current(&user, "execution", "0.0.1");
+        set_current(&user, "mystery", "0.0.1");
+
+        let all = discover_components(Some(&user), None);
+        let compatible = |name: &str| {
+            all.iter()
+                .find(|entry| entry.name == name)
+                .unwrap_or_else(|| panic!("{name} must be listed"))
+                .versions[0]
+                .compatible
+        };
+        assert!(compatible("graphics"), "v1 family keeps the shared wire");
+        assert!(compatible("execution"), "execution is the v2 family");
+        assert!(
+            !compatible("net"),
+            "a v2-only descriptor cannot be served by the v1 net seam"
+        );
+        assert!(
+            !compatible("mystery"),
+            "an unknown family defaults to the strict v1 seam"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn resolve_search_for_protocol_selects_the_v2_family() {
+        let base = scratch("v2-family");
+        let user = base.join("user");
+        install_version(&user, "execution", "0.0.1", "[2, 2]");
+        set_current(&user, "execution", "0.0.1");
+
+        let error = resolve_search(Some(&user), None, "execution").expect_err("v1 seam refuses");
+        assert!(
+            matches!(
+                error,
+                ResolveError::IncompatibleProtocol {
+                    min: 2,
+                    max: 2,
+                    protocol: 1
+                }
+            ),
+            "{error:?}"
+        );
+        let found = resolve_search_for_protocol(
+            Some(&user),
+            None,
+            "execution",
+            crate::component::seam_for("execution").protocol_min(),
+        )
+        .expect("v2 seam accepts");
+        assert_eq!(found.resolved.descriptor.protocol_min, 2);
+        assert_eq!(found.resolved.descriptor.protocol_max, 2);
         let _ = std::fs::remove_dir_all(&base);
     }
 

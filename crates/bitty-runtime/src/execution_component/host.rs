@@ -187,21 +187,20 @@ impl ComponentExecutionHost {
         if config.safe_mode {
             return Err(ComponentError::SafeMode);
         }
+        // The execution family selects its own seam (v2) from the shared
+        // per-family table; the generic broker keeps the strict v1 default.
+        let seam = crate::component::seam_for(EXECUTION_COMPONENT_NAME);
         let searched = resolve_search_for_protocol(
             config.user_root.as_deref(),
             config.system_root.as_deref(),
             EXECUTION_COMPONENT_NAME,
-            EXECUTION_COMPONENT_PROTOCOL_MIN,
+            seam.protocol_min(),
         )
         .map_err(map_resolve_error)?;
         let resolved = searched.resolved;
-        // `resolve` already checks the descriptor against the shared
-        // `bitty-network-wire` protocol version (currently 1); the execution
-        // protocol is independently v2. The explicit range check below keeps
-        // this boundary honest if either codec ever moves.
-        if resolved.descriptor.protocol_min > EXECUTION_COMPONENT_PROTOCOL_MAX
-            || resolved.descriptor.protocol_max < EXECUTION_COMPONENT_PROTOCOL_MIN
-        {
+        // Keep this boundary honest if either the codec or the family table
+        // ever moves: the descriptor must overlap the seam range.
+        if !resolved.descriptor.supports_seam(seam) {
             return Err(ComponentError::Incompatible {
                 min: resolved.descriptor.protocol_min,
                 max: resolved.descriptor.protocol_max,
@@ -1400,7 +1399,7 @@ fn map_resolve_error(error: ResolveError) -> ComponentError {
         ResolveError::NoRoot => ComponentError::NotInstalled {
             name: EXECUTION_COMPONENT_NAME.to_owned(),
         },
-        ResolveError::IncompatibleProtocol { min, max } => {
+        ResolveError::IncompatibleProtocol { min, max, .. } => {
             ComponentError::Incompatible { min, max }
         }
         other => ComponentError::UnsafeInstall {

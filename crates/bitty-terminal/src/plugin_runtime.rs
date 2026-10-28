@@ -2716,6 +2716,10 @@ bitty.commands.register({ id = "update", title = "Update rich scene", run = upda
 
     #[test]
     fn shipped_composition_root_attaches_and_paints_a_plugin_rich_scene() {
+        // `drive_tick` drains the process-global control queue; hold the
+        // shared test guard so a concurrent ctl socket test never loses its
+        // request to this app's drain (CTX-1641).
+        let _control_queue_guard = crate::ctl::test_control_queue_lock();
         let (mut app, panels) = scene_probe_app("scene-paint");
         let view = app.runtime.focused_view().expect("focused leaf");
 

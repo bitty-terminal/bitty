@@ -46,7 +46,7 @@ mod subreaper;
 #[cfg(target_os = "linux")]
 pub use self::cgroup::{CGROUP2_MOUNT, CgroupError, CgroupRefusal, CgroupRoot, SessionCgroup};
 #[cfg(target_os = "linux")]
-pub use self::child::{CleanupOutcome, ContainedChild, spawn};
+pub use self::child::{CleanupOutcome, ContainedChild, ContainmentError, spawn};
 #[cfg(target_os = "linux")]
 pub use self::subreaper::{SubreaperGuard, SubreaperRefusal};
 

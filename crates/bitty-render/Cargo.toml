@@ -23,6 +23,11 @@ sw-fallback = []
 # ADR-0003 dependency rule 3: bitty-render consumes only the public
 # Snapshot/Damage render surface of bitty-term-state, never grid internals.
 bitty-term-state = { version = "0.0.30", path = "../bitty-term-state" }
+# CTX-1628 (bitty#2760): the renderer consumes the admitted `Scene` snapshot
+# (Rich Presentation RFC renderer contract). `bitty-rich` is a presentation
+# model crate with no render/GPU edge, so the one-way render -> rich direction
+# stays acyclic: `bitty-rich` never depends on `bitty-render`.
+bitty-rich = { version = "0.0.30", path = "../bitty-rich" }
 # ADR-0003/ADR-0004 platform seam: GpuContext consumes the owned SurfaceTarget
 # produced by bitty-platform without leaking winit types.
 bitty-platform = { version = "0.0.30", path = "../bitty-platform" }

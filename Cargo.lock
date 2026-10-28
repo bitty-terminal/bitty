@@ -389,6 +389,7 @@ version = "0.0.30"
 dependencies = [
  "bitty-config",
  "bitty-platform",
+ "bitty-rich",
  "bitty-term-state",
  "bitty-vt",
  "crossfont",

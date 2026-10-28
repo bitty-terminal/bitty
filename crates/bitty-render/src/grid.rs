@@ -1457,6 +1457,20 @@ impl SnapshotDamage {
         self
     }
 
+    /// Unions extra pixel-domain damage into this descriptor (CTX-1628).
+    ///
+    /// The scene path reports a bounded invalidation rectangle per revision
+    /// ([`crate::scene::ScenePaint::damage`]). Appending it here keeps one
+    /// damage model for the frame planner: the regions enter the same
+    /// [`crate::frame::plan_frame`] coalescing pass as grid damage, and the
+    /// planner still clips to the surface extent. Callers are responsible for
+    /// the scene invariant that a rectangle never leaves its leaf rect.
+    #[must_use]
+    pub fn with_extra_regions(mut self, regions: impl IntoIterator<Item = RectPx>) -> Self {
+        self.pixel_regions.extend(regions);
+        self
+    }
+
     /// The grid-coordinate regions behind this descriptor (same order;
     /// scrollback entries dropped; scroll motions represented by their
     /// exposed repaint band).

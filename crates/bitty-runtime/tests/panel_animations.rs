@@ -78,7 +78,13 @@ fn open_transition_presents_bounded_frames_then_idles() {
     rt.set_layout(two_pane_split());
     let opened = rt.tick_at(start).expect("open must present the split");
     assert!(opened.headless);
-    assert!(rt.animations_active(), "open animation must be active");
+    // The virtual clock, not `Instant::now()`: a loaded runner stalling the
+    // thread between the tick and the assert must not read the transition as
+    // already expired (bitty#2781).
+    assert!(
+        rt.animations_active_at(start),
+        "open animation must be active"
+    );
     assert_eq!(
         rt.animation_progress(AnimationKind::Open, Some(ViewId::new(2)), start),
         Some(0.0)
@@ -103,9 +109,9 @@ fn open_transition_presents_bounded_frames_then_idles() {
         rt.tick_at(end).is_some(),
         "final frame commits the end state"
     );
-    assert!(!rt.animations_active(), "open must complete");
+    assert!(!rt.animations_active_at(end), "open must complete");
     assert!(rt.tick_at(end).is_none(), "idle after open completes");
-    assert_eq!(rt.animation_deadline(), None, "no deadline when idle");
+    assert_eq!(rt.animation_deadline_at(end), None, "no deadline when idle");
 }
 
 #[test]
@@ -198,7 +204,7 @@ fn configured_open_duration_is_honored_not_the_default() {
     // Still active well past the 150 ms default.
     let past_default = start + Duration::from_millis(200);
     assert!(
-        rt.animations_active(),
+        rt.animations_active_at(past_default),
         "configured 500 ms open must outlive the 150 ms default"
     );
     assert!(
@@ -334,14 +340,22 @@ fn animation_deadline_is_bounded_and_clears_on_completion() {
     let _ = rt.tick_at(start);
     rt.set_layout(two_pane_split());
     rt.tick_at(start).expect("open presents");
-    let deadline = rt.animation_deadline().expect("active deadline");
+    // Query on the same virtual clock `tick_at` armed the transition with.
+    // The wall-clock `animation_deadline()` folds in "now + frame interval"
+    // and reads as beyond the accepted duration when a loaded CI scheduler
+    // stalls this thread between arming and the assertion (bitty#2781).
+    let deadline = rt.animation_deadline_at(start).expect("active deadline");
     assert!(
         deadline <= start + Duration::from_millis(150),
         "deadline must never exceed the accepted duration"
     );
     let end = start + Duration::from_millis(150);
     rt.tick_at(end);
-    assert_eq!(rt.animation_deadline(), None, "idle clears the deadline");
+    assert_eq!(
+        rt.animation_deadline_at(end),
+        None,
+        "idle clears the deadline"
+    );
 }
 
 #[test]
@@ -386,19 +400,19 @@ fn open_then_close_is_bounded_and_num_surfaces_capped() {
     assert!(rt.tick_at(start).is_none());
     rt.set_layout(two_pane_split());
     let _ = rt.tick_at(start).expect("split presents");
-    assert!(rt.animations_active());
+    assert!(rt.animations_active_at(start));
     // Let the open transition finish before collapsing so this test isolates
     // the close transition timing.
     let open_end = start + Duration::from_millis(150);
     rt.tick_at(open_end);
-    assert!(!rt.animations_active(), "open completes first");
+    assert!(!rt.animations_active_at(open_end), "open completes first");
     // Collapse back to a single leaf: the removed View starts a close.
     rt.set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
     let _ = rt.tick_at(open_end).expect("close presents");
-    assert!(rt.animations_active(), "close must be active");
+    assert!(rt.animations_active_at(open_end), "close must be active");
     let end = open_end + Duration::from_millis(120);
     rt.tick_at(end);
-    assert!(!rt.animations_active(), "close must expire by 120 ms");
+    assert!(!rt.animations_active_at(end), "close must expire by 120 ms");
     assert!(rt.tick_at(end).is_none());
 }
 
@@ -412,12 +426,15 @@ fn workspaces_switch_arms_workspace_transition() {
     rt.workspace_new().expect("new workspace");
     let _ = rt.tick_at(start).expect("workspace switch presents");
     assert!(
-        rt.animations_active(),
+        rt.animations_active_at(start),
         "workspace transition must be active"
     );
     let end = start + Duration::from_millis(200);
     rt.tick_at(end);
-    assert!(!rt.animations_active(), "workspace must expire by 200 ms");
+    assert!(
+        !rt.animations_active_at(end),
+        "workspace must expire by 200 ms"
+    );
 }
 
 #[test]
@@ -544,7 +561,7 @@ fn terminal_grid_is_never_interpolated() {
     let _ = rt.tick_at(start);
     rt.set_layout(two_pane_split());
     rt.tick_at(start).expect("open presents");
-    assert!(rt.animations_active());
+    assert!(rt.animations_active_at(start));
     rt.handle_pty_bytes(b"\x1b[2;1HGRID-TRUTH");
     let snap = rt.snapshot();
     let row: String = snap
@@ -1540,7 +1557,7 @@ fn terminal_grid_is_never_interpolated_during_move() {
     let t = Instant::now();
     rt.workspace_move_focused_to_position_at(1, t)
         .expect("reposition must succeed");
-    assert!(rt.animations_active(), "move must be active");
+    assert!(rt.animations_active_at(t), "move must be active");
     rt.handle_pty_bytes(b"\x1b[2;1HMOVE-TRUTH");
     let snap = rt.snapshot();
     let row: String = snap

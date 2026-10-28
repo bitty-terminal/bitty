@@ -413,7 +413,13 @@ impl FakeDriver {
         self.reply("daemon.negotiate", value)
     }
 
-    /// Detach every lease past its TTL, one revision bump per detach.
+    /// Detach every lease past its TTL and retire every grant past its TTL.
+    ///
+    /// A lease detach is one revision bump each. An observer grant that reaches
+    /// its TTL without being consumed or revoked is one bump for its session,
+    /// however many of its grants expired in the same sweep (`D-03`); a
+    /// consumed or revoked record was already accounted for by its own bump,
+    /// and a host grant is daemon-level consent with no owning session.
     fn sweep_expired(&mut self) {
         let now = self.now();
         let mut expired = Vec::new();
@@ -440,6 +446,30 @@ impl FakeDriver {
                     conn.leases.remove(&attach);
                 }
                 self.deliveries.remove(&attach);
+            }
+        }
+
+        // Retired records leave the table; only a TTL lapse is a visible
+        // mutation. The deduplicated set keeps the bump at one per session.
+        let retired: Vec<String> = self
+            .grants
+            .iter()
+            .filter(|(_, grant)| grant.expires_ms <= now)
+            .map(|(bearer, _)| bearer.clone())
+            .collect();
+        let mut expired_sessions = BTreeSet::new();
+        for bearer in retired {
+            if let Some(grant) = self.grants.remove(&bearer) {
+                if grant.kind == "observer" && !grant.consumed && !grant.revoked {
+                    expired_sessions.insert(grant.session);
+                }
+            }
+        }
+        for session_id in expired_sessions {
+            if let Some(session) = self.sessions.get_mut(&session_id) {
+                if !is_terminal(session.state) {
+                    session.revision += 1;
+                }
             }
         }
     }
@@ -1025,21 +1055,31 @@ impl FakeDriver {
         let key = format!("grant:{session_id}:{key}");
         if let Some((id, _)) = self.create_keys.get(&key) {
             let id = id.clone();
-            if let Some(bearer) = self
+            // The record may have been retired by the sweep. The key still
+            // remembers the id, so the replay answers the original grant with
+            // no bearer and no revision bump, exactly as the daemon does.
+            let bearer = self
                 .grants
                 .iter()
                 .find(|(_, grant)| grant.id == id)
-                .map(|(bearer, _)| bearer.clone())
-            {
-                let value = json!({
+                .map(|(bearer, _)| bearer.clone());
+            let value = match bearer {
+                Some(bearer) => json!({
                     "grant_id": id,
                     "grant": bearer,
                     "grant_active": !self.grants[&bearer].consumed,
                     "session_id": session_id,
                     "replayed": true,
-                });
-                return self.reply("session.grant", value);
-            }
+                }),
+                None => json!({
+                    "grant_id": id,
+                    "grant": Value::Null,
+                    "grant_active": false,
+                    "session_id": session_id,
+                    "replayed": true,
+                }),
+            };
+            return self.reply("session.grant", value);
         }
         let id = self.mint_id();
         let bearer = self.mint_token();

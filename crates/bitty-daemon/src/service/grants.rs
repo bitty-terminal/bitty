@@ -33,7 +33,7 @@
 //!   authorizes its connection's create, and [`MAX_GRANT_RECORDS`] is the hard
 //!   total bound that keeps the store independent of total mints.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use sha2::{Digest, Sha256};
@@ -327,6 +327,16 @@ impl GrantLimits {
 pub struct GrantStore {
     limits: GrantLimits,
     grants: BTreeMap<GrantId, GrantRecord>,
+    /// Sessions whose observer grant stopped being usable because its TTL
+    /// lapsed, and whose revision the owner still has to advance.
+    ///
+    /// The store cannot reach the registry, so the drop and the revision bump
+    /// are split: any eviction path that retires a grant by expiry records the
+    /// session here, and [`Self::take_expired_sessions`] hands the deduplicated
+    /// set to the service, which applies exactly one bump per session. The set
+    /// is bounded by the record cap, so a deferred bump costs no more memory
+    /// than the records it describes.
+    expired_sessions: BTreeSet<SessionId>,
 }
 
 impl GrantStore {
@@ -336,6 +346,7 @@ impl GrantStore {
         Self {
             limits: GrantLimits::from_limits(limits),
             grants: BTreeMap::new(),
+            expired_sessions: BTreeSet::new(),
         }
     }
 
@@ -679,13 +690,52 @@ impl GrantStore {
     /// `GrantRecord::is_active` would revoke live consent mid-connection. Every
     /// other record is dropped as soon as it is inactive (consumed, revoked, or
     /// expired); the TTL is still the outer bound for all of them.
+    ///
+    /// Dropping an observer grant **because its TTL lapsed** is a
+    /// snapshot-visible mutation (`D-03`): the session it authorized lost
+    /// authority even though nobody revoked it. Those sessions are recorded by
+    /// [`Self::take_expired_sessions`] so the service advances each revision
+    /// once, whatever eviction path retired the record. A record that was
+    /// already consumed or revoked changed nothing at eviction time, and a host
+    /// grant is daemon-level consent with no owning session, so neither is
+    /// reported.
+    ///
+    /// Returns the number of dropped records.
     pub fn evict_expired(&mut self, now_ms: u64) -> usize {
-        let before = self.grants.len();
-        self.grants.retain(|_, record| match record.kind {
-            GrantKind::Host => now_ms < record.expires_at_ms,
-            GrantKind::Observer => record.is_active(now_ms),
+        let Self {
+            grants,
+            expired_sessions,
+            ..
+        } = self;
+        let before = grants.len();
+        grants.retain(|_, record| {
+            if record.kind == GrantKind::Observer
+                && !record.consumed
+                && !record.revoked
+                && now_ms >= record.expires_at_ms
+            {
+                if let Some(session_id) = record.session_id {
+                    expired_sessions.insert(session_id);
+                }
+            }
+            match record.kind {
+                GrantKind::Host => now_ms < record.expires_at_ms,
+                GrantKind::Observer => record.is_active(now_ms),
+            }
         });
-        before - self.grants.len()
+        before - grants.len()
+    }
+
+    /// Take the sessions whose observer grant expired since the last call.
+    ///
+    /// Each session appears at most once no matter how many of its grants
+    /// expired, so the caller applies exactly one revision bump. The store is
+    /// left with an empty set: a second call after no new expiry returns an
+    /// empty vector, which keeps the sweep idempotent.
+    pub fn take_expired_sessions(&mut self) -> Vec<SessionId> {
+        std::mem::take(&mut self.expired_sessions)
+            .into_iter()
+            .collect()
     }
 }
 
@@ -978,6 +1028,79 @@ mod tests {
         assert_eq!(revoked, RevokeOutcome::Revoked);
         assert_eq!(store.evict_expired(12), 1);
         assert!(store.is_empty());
+        assert!(
+            store.take_expired_sessions().is_empty(),
+            "a revoke already bumped the revision; the drop is not an expiry"
+        );
+    }
+
+    /// Expiry reports each owning session once, however many grants it had.
+    #[test]
+    fn an_expired_sweep_reports_each_session_once() {
+        let limits = Limits::new(&[LimitOverride::new(
+            LimitId::MaxPendingObserverGrantsPerSession,
+            2,
+        )])
+        .expect("valid override");
+        let mut store = GrantStore::new(&limits);
+        let first = session();
+        let second = SessionId::parse(&"3".repeat(32)).expect("session id");
+        let one = store.mint_observer(first, 1000, 10).expect("mint");
+        store.mint_observer(first, 1000, 10).expect("second grant");
+        store
+            .mint_observer(second, 1000, 10)
+            .expect("other session");
+
+        // Before the TTL nothing is dropped and nothing is reported.
+        assert_eq!(store.evict_expired(9), 0);
+        assert!(store.take_expired_sessions().is_empty());
+
+        // At the TTL all three records are dropped and each session appears
+        // once, regardless of how many of its grants expired.
+        assert_eq!(store.evict_expired(one.expires_at_ms), 3);
+        assert_eq!(store.take_expired_sessions(), vec![first, second]);
+        assert!(
+            store.take_expired_sessions().is_empty(),
+            "the drain is a take, so a repeat sweep reports nothing"
+        );
+    }
+
+    /// A consumed or revoked observer grant is already accounted for.
+    #[test]
+    fn a_consumed_or_revoked_grant_is_not_reported_as_an_expiry() {
+        let mut store = store();
+        let session_id = session();
+        let consumed = store.mint_observer(session_id, 1000, 10).expect("mint");
+        let revoked = store.mint_observer(session_id, 1000, 10).expect("mint");
+        store
+            .consume(
+                &consumed.bearer,
+                GrantKind::Observer,
+                1000,
+                Some(session_id),
+                11,
+            )
+            .expect("consume");
+        assert_eq!(
+            store.revoke_kind(revoked.grant_id, GrantKind::Observer, 11),
+            RevokeOutcome::Revoked
+        );
+
+        assert_eq!(store.len(), 2, "both records are retained before the TTL");
+        assert_eq!(store.evict_expired(consumed.expires_at_ms), 2);
+        assert!(
+            store.take_expired_sessions().is_empty(),
+            "the consume and revoke bumps already reported these records"
+        );
+    }
+
+    /// A host grant has no owning session to bump.
+    #[test]
+    fn host_grant_expiry_reports_no_session() {
+        let mut store = store();
+        let minted = store.mint_host(1000, 10).expect("mint");
+        assert_eq!(store.evict_expired(minted.expires_at_ms), 1);
+        assert!(store.take_expired_sessions().is_empty());
     }
 
     #[test]

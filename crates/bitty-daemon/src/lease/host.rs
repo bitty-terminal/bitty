@@ -1256,12 +1256,14 @@ impl SessionHost {
     /// Record one snapshot-visible observer-grant mutation (`D-03`).
     ///
     /// The grant table belongs to the service layer while `state_revision`
-    /// belongs to the session record: an observer-grant mint, consume, and
-    /// revoke each call this once after the grant mutation commits, so the
-    /// revision advances exactly once per mutation. Only `state_revision` and
-    /// `last_seen` change: no lifecycle state, no generation, no attach count,
-    /// and no terminal field. A terminal session refuses the mutation
-    /// ([`LeaseRefusal::NotRunning`]) rather than bumping a frozen revision.
+    /// belongs to the session record: an observer-grant mint, consume, expiry,
+    /// and revoke each call this once after the grant mutation commits, so the
+    /// revision advances exactly once per mutation. An expiry sweep that
+    /// retires several grants of one session calls this once for that session,
+    /// not once per record. Only `state_revision` and `last_seen` change: no
+    /// lifecycle state, no generation, no attach count, and no terminal field.
+    /// A terminal session refuses the mutation ([`LeaseRefusal::NotRunning`])
+    /// rather than bumping a frozen revision.
     ///
     /// # Errors
     ///

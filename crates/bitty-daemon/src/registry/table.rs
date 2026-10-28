@@ -708,8 +708,8 @@ impl SessionRegistry {
     /// Record one snapshot-visible mutation owned by another layer (`D-03`).
     ///
     /// `D-03` lists control claim, control transfer, control vacancy, controller
-    /// resize, observer-grant mint/consume/revoke, and lease revocation as
-    /// revision bumps. Their authority lives in the lease layer (bitty#2609)
+    /// resize, observer-grant mint/consume/expiry/revoke, and lease revocation
+    /// as revision bumps. Their authority lives in the lease layer (bitty#2609)
     /// while the counter belongs to the session record, so the lease layer
     /// applies the mutation and then records the single revision bump here.
     /// Only `state_revision` and `last_seen` change: no lifecycle state, no

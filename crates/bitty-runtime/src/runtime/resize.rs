@@ -916,9 +916,16 @@ impl Runtime {
                     self.handle_cursor_moved(pos);
                     false
                 }
+                WindowEventKind::CursorEntered => {
+                    self.handle_cursor_entered();
+                    false
+                }
                 WindowEventKind::CursorLeft => {
                     // Cursor left window: end drag if active (deterministic).
                     self.end_selection_drag_in_place();
+                    // Issue #2787: a pending entry sync belongs to the surface
+                    // the pointer just left; the next enter delivers its own.
+                    self.cursor_entry_pending = false;
                     // CTX-0181: leaving the window ends a thumb drag and
                     // disengages auto-hide (tracked separately from
                     // `last_cursor`, whose selection-path meaning is kept).

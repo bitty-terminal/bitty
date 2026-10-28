@@ -1608,7 +1608,7 @@ impl Runtime {
     /// Dwell-delay-aware hover activation (CTX-0334 virtual-clock seam).
     ///
     /// No-op unless [`crate::config::RuntimeConfig::focus_follows_mouse`]
-    /// is set (default off preserves click-to-focus) and Shift is released
+    /// is set (default on) and Shift is released
     /// (Shift forces the selection path). Hover over gap/padding bands
     /// (the present hit-test yields `None` there) keeps focus and clears
     /// any pending dwell. The hover owner resolves in present paint order
@@ -1620,7 +1620,11 @@ impl Runtime {
     /// [`Self::apply_hover_deadline`] commits it once `now` reaches the
     /// deadline. Moving to a different candidate re-arms the dwell clock.
     pub(super) fn hover_focus_at_at(&mut self, pos: CursorPosition, now: Instant) {
-        if !self.config.focus_follows_mouse || self.shift_pressed {
+        // Issue #2787: a window that does not own the keyboard never moves its
+        // own focus owner from pointer state. Without this, an unfocused window
+        // under the pointer (compositor focus-follows-mouse off) would drift
+        // from the pane the user left focused before focus ever returns.
+        if !self.focused || !self.config.focus_follows_mouse || self.shift_pressed {
             self.hover_pending = None;
             return;
         }
@@ -1670,7 +1674,7 @@ impl Runtime {
         let Some(pending) = self.hover_pending else {
             return;
         };
-        if !self.config.focus_follows_mouse || self.shift_pressed {
+        if !self.focused || !self.config.focus_follows_mouse || self.shift_pressed {
             self.hover_pending = None;
             return;
         }

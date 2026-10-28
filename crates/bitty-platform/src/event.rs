@@ -512,6 +512,15 @@ pub enum WindowEventKind {
     MouseWheel(ScrollDelta),
     /// The cursor moved within the window.
     CursorMoved(CursorPosition),
+    /// The cursor entered the window.
+    ///
+    /// winit follows this with exactly one
+    /// [`CursorMoved`](WindowEventKind::CursorMoved) at the pointer's current
+    /// position, even when the pointer did not move (the Wayland backend pushes
+    /// both from `wl_pointer.enter`). That move is a position re-sync, not user
+    /// motion: consumers that act on motion must treat the first move after this
+    /// event as an entry sync (issue #2787).
+    CursorEntered,
     /// The cursor left the window.
     CursorLeft,
     /// The user or system asked to close the window; the handler decides
@@ -652,6 +661,7 @@ pub(crate) fn translate_window_event(event: WindowEvent) -> Option<WindowEventKi
             map_mouse_wheel(delta).map(WindowEventKind::MouseWheel)
         }
         WindowEvent::CursorMoved { position, .. } => map_cursor_moved(position.x, position.y),
+        WindowEvent::CursorEntered { .. } => Some(WindowEventKind::CursorEntered),
         WindowEvent::CursorLeft { .. } => Some(WindowEventKind::CursorLeft),
         WindowEvent::ModifiersChanged(mods) => Some(map_modifiers_changed(mods)),
         WindowEvent::Ime(ime) => map_ime(ime).map(WindowEventKind::Ime),
@@ -1080,6 +1090,12 @@ mod tests {
                 position: PhysicalPosition::new(-1.0, 3.5),
             }),
             Some(WindowEventKind::CursorMoved(CursorPosition::new(-1.0, 3.5)))
+        );
+        assert_eq!(
+            translate_window_event(WindowEvent::CursorEntered {
+                device_id: DUMMY_DEVICE
+            }),
+            Some(WindowEventKind::CursorEntered)
         );
         assert_eq!(
             translate_window_event(WindowEvent::CursorLeft {

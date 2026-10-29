@@ -2967,6 +2967,23 @@ fn containment_settle_timeout(limits: ContainmentLimits) -> Duration {
     limits.kill_wait() + Duration::from_millis(u64::from(bitty_daemon::service::server::TICK_MS))
 }
 
+/// Whether `pid` is still a running process.
+///
+/// An absent `/proc` entry means the process is gone. A `Z` (or `X`) state
+/// means it is already dead and only its exit status is outstanding, which
+/// belongs to whichever subreaper adopted it; in a container that is often the
+/// container init rather than this daemon, so a `/proc` entry alone cannot
+/// distinguish "still running" from "already killed".
+fn process_is_live(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => match stat.rsplit_once(')') {
+            Some((_, rest)) => !matches!(rest.split_whitespace().next(), Some("Z" | "X")),
+            None => true,
+        },
+        Err(_) => false,
+    }
+}
+
 /// Poll step for the settle wait, matching `wait_for_worker_state`'s 25 ms
 /// step; the daemon itself supervises on one 250 ms tick.
 const CONTAINMENT_SETTLE_STEP: Duration = Duration::from_millis(25);
@@ -3086,10 +3103,14 @@ fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
             }
         }
         // The subreaper plan has no subtree to read, so the recorded pid is the
-        // only containment evidence; keep the `/proc` poll with the same bound.
+        // only containment evidence. The signal is the assertion: a live
+        // descendant is a leak, while a zombie is a killed process whose reap
+        // belongs to whichever subreaper adopted it (in a container that is
+        // often the container init, not this daemon), so a `/proc` entry alone
+        // cannot distinguish "still running" from "already dead".
         bitty_daemon::containment::MECHANISM_SUBREAPER => {
             let deadline = Instant::now() + containment_settle_timeout(settle);
-            while Path::new(&format!("/proc/{descendant}")).exists() {
+            while process_is_live(descendant) {
                 assert!(
                     Instant::now() < deadline,
                     "descendant {descendant} survived the worker exit"

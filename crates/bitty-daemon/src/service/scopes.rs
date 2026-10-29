@@ -435,9 +435,9 @@ impl ServiceMethod {
             Self::SessionGrantRevoke => Some(DispatchBoundary::ObserverGrantRevoke),
             Self::DaemonHostGrant => Some(DispatchBoundary::HostGrantMint),
             Self::DaemonStop => Some(DispatchBoundary::DaemonStop),
+            Self::DaemonOrphansVerify => Some(DispatchBoundary::OrphanVerify),
             Self::DaemonNegotiate
             | Self::DaemonStatus
-            | Self::DaemonOrphansVerify
             | Self::SessionStatus
             | Self::SessionList
             | Self::SessionResize
@@ -466,9 +466,9 @@ impl ServiceMethod {
                 DispatchBoundary::HostGrantRevoke,
             ],
             Self::DaemonStop => &[DispatchBoundary::DaemonStop],
+            Self::DaemonOrphansVerify => &[DispatchBoundary::OrphanVerify],
             Self::DaemonNegotiate
             | Self::DaemonStatus
-            | Self::DaemonOrphansVerify
             | Self::SessionStatus
             | Self::SessionList
             | Self::SessionResize

@@ -153,8 +153,11 @@ pub enum AuditAction {
     DaemonInspect,
     /// `daemon.stop`.
     Stop,
-    /// `daemon.orphans.verify`.
+    /// `daemon.orphans.verify` with `action: verify` (the default).
     OrphanVerify,
+    /// Audit event label `daemon.orphans.retire` (the retire action of the
+    /// `daemon.orphans.verify` method).
+    OrphanRetire,
     /// `lease.heartbeat`.
     Heartbeat,
     /// A wire-level refusal that never resolved to a service method: a frame
@@ -193,6 +196,7 @@ impl AuditAction {
             Self::DaemonInspect => "daemon.inspect",
             Self::Stop => "daemon.stop",
             Self::OrphanVerify => "daemon.orphans.verify",
+            Self::OrphanRetire => "daemon.orphans.retire",
             Self::Heartbeat => "lease.heartbeat",
             Self::Wire => "wire",
             Self::Bind => "session.bind",

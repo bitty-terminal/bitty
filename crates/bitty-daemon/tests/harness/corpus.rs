@@ -59,6 +59,9 @@ pub struct Vector {
     pub decisions: Vec<String>,
     pub drivers: Vec<DriverKind>,
     pub host_grant: bool,
+    /// A journal record the driver seeds before starting the daemon.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub orphan_record: Option<String>,
     pub injected: Injected,
     pub steps: Vec<Step>,
     pub state: Vec<Step>,
@@ -261,6 +264,15 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
         Some(Value::Bool(flag)) => *flag,
         Some(_) => return Err(fail("setup.host_grant is not a boolean".to_owned())),
     };
+    let orphan_record = match setup.get("orphan_record") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value == "quarantined" => Some(value.clone()),
+        Some(_) => {
+            return Err(fail(
+                "setup.orphan_record is not a supported seed".to_owned(),
+            ));
+        }
+    };
     let injected = match value.get("injected") {
         None | Some(Value::Null) => Injected::default(),
         Some(injected) => {
@@ -360,6 +372,7 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
         decisions,
         drivers,
         host_grant,
+        orphan_record,
         injected,
         steps,
         state,

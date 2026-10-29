@@ -11,7 +11,7 @@
 //! Leases drive the derived attach count through [`SessionRegistry::attach`]
 //! and [`SessionRegistry::detach`] (bitty#2609 owns lease authority); the IPC
 //! service (bitty#2607) owns request decoding and error mapping; platform
-//! cells (bitty#2604) own process containment.
+//! cells (bitty#2791) own process containment.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

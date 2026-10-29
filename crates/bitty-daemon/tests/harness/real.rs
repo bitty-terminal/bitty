@@ -84,6 +84,11 @@ impl Root {
     fn audit_dir(&self) -> PathBuf {
         self.state().join("bitty").join("audit")
     }
+
+    /// The owner-private orphan journal directory the daemon opens.
+    fn orphans(&self) -> PathBuf {
+        self.runtime().join("bitty").join("orphans")
+    }
 }
 
 impl Drop for Root {
@@ -358,9 +363,15 @@ impl RealDriver {
         }
     }
 
-    fn start(&mut self, label: &str, host_grant: bool) -> Result<(), String> {
+    fn start(
+        &mut self,
+        label: &str,
+        host_grant: bool,
+        orphan_record: Option<&str>,
+    ) -> Result<(), String> {
         self.stop();
         let root = Root::new(label);
+        seed_orphan_record(&root, orphan_record)?;
         let daemon = Daemon::start(&root)?;
         self.operator_capability = Self::read_capability(&root)?;
         self.needs_host_grant = host_grant;
@@ -535,7 +546,11 @@ impl Driver for RealDriver {
     }
 
     fn prepare(&mut self, vector: &Vector) -> Result<Vars, String> {
-        self.start(&vector.id.to_lowercase(), vector.host_grant)?;
+        self.start(
+            &vector.id.to_lowercase(),
+            vector.host_grant,
+            vector.orphan_record.as_deref(),
+        )?;
         let mut vars = Vars::new();
         vars.insert(
             "operator_capability".to_owned(),
@@ -833,7 +848,7 @@ impl Driver for RealDriver {
     fn restart(&mut self) -> Result<Vars, String> {
         let needs_host_grant = self.needs_host_grant;
         self.stop();
-        self.start("restart", needs_host_grant)?;
+        self.start("restart", needs_host_grant, None)?;
         let mut vars = Vars::new();
         vars.insert(
             "operator_capability".to_owned(),
@@ -974,6 +989,52 @@ impl Drop for RealDriver {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Session id the seeded quarantined record uses.
+///
+/// The vector names the same literal in `record_id`; the value is a canonical
+/// 32-hex id so it round-trips through the journal record path.
+const SEEDED_RECORD_ID: &str = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+
+/// Seed one crash-left journal record before the daemon starts.
+///
+/// The record is a same-boot, reserved, subreaper record: the daemon cannot
+/// prove a pre-spawn identity for the fallback, so the startup scan quarantines
+/// it as `unverified` (contract `D-06`), retains it, and never signals it. A
+/// malformed placeholder would expire immediately once the recorded origin is
+/// older than the retention window, so the seed is a real encoded record. The
+/// directory and file use the owner-private modes the journal enforces, so the
+/// seed survives the startup scan rather than failing the open.
+fn seed_orphan_record(root: &Root, seed: Option<&str>) -> Result<(), String> {
+    let Some("quarantined") = seed else {
+        return Ok(());
+    };
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|_| "cannot read the boot id".to_owned())?
+        .trim()
+        .to_owned();
+    let directory = root.orphans();
+    std::fs::create_dir_all(&directory)
+        .map_err(|_| "cannot create the orphan journal".to_owned())?;
+    // The daemon refuses a runtime directory that is not owner-private, so
+    // every directory this seed creates before startup gets 0700.
+    for path in [
+        root.runtime(),
+        root.runtime().join("bitty"),
+        directory.clone(),
+    ] {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| "cannot chmod the orphan journal".to_owned())?;
+    }
+    let record = format!(
+        "bittyd-orphan 2\nsession_id {SEEDED_RECORD_ID}\ngeneration 0\nclass reserved\nboot_id {boot_id}\nreserved_at_ms 1\nvalidated_at_ms -\ncontainment subreaper\npid -\nstart_time -\nprocess_group -\nuid -\n"
+    );
+    let path = directory.join(format!("{SEEDED_RECORD_ID}.orphan"));
+    std::fs::write(&path, record).map_err(|_| "cannot seed the quarantined record".to_owned())?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|_| "cannot chmod the seeded record".to_owned())?;
+    Ok(())
 }
 
 /// Socket inodes the process holds, plus any of them in a TCP LISTEN row.

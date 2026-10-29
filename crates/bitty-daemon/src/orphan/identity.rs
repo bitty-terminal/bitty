@@ -2,13 +2,13 @@
 //!
 //! A record is actionable only when the daemon can prove the exact process it
 //! recorded is still that process. The identity is `(boot_id, pid, process
-//! start time, process group)`; a bare pid is never enough. `BootId` fences a
-//! reboot, the start time fences pid reuse, and the process group is part of
-//! the recorded tuple even though a group-only check is never sufficient for a
-//! verified `swept` (bitty#2604 owns the containment identity).
+//! start time, process group, uid)`; a bare pid is never enough. `BootId`
+//! fences a reboot, the start time fences pid reuse, the uid fences a process
+//! that changed ownership, and the containment identity (recorded separately
+//! by the journal) fences the whole tree.
 //!
 //! Linux reads `/proc`; other platform cells return `Unreadable` (and no boot
-//! id) until bitty#2604 supplies their probes. This module does not signal.
+//! id) and therefore quarantine every record. This module does not signal.
 
 use std::fmt;
 use std::num::NonZeroU32;
@@ -52,8 +52,8 @@ impl BootId {
 
     /// Read the Linux kernel boot id.
     ///
-    /// Returns `None` on failure or on a platform cell that has no probe yet
-    /// (bitty#2604 owns it). A journal must not open with a guessed value.
+    /// Returns `None` on failure or on a platform cell that has no probe. A
+    /// journal must not open with a guessed value.
     #[must_use]
     pub fn read_system() -> Option<Self> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -155,6 +155,7 @@ pub struct ProcessIdentity {
     pid: Pid,
     start_time: ProcessStartTime,
     process_group: ProcessGroupId,
+    uid: u32,
 }
 
 impl ProcessIdentity {
@@ -164,11 +165,13 @@ impl ProcessIdentity {
         pid: Pid,
         start_time: ProcessStartTime,
         process_group: ProcessGroupId,
+        uid: u32,
     ) -> Self {
         Self {
             pid,
             start_time,
             process_group,
+            uid,
         }
     }
 
@@ -189,6 +192,12 @@ impl ProcessIdentity {
     pub const fn process_group(self) -> ProcessGroupId {
         self.process_group
     }
+
+    /// The recorded process uid.
+    #[must_use]
+    pub const fn uid(self) -> u32 {
+        self.uid
+    }
 }
 
 /// What a probe observes for one pid right now.
@@ -196,12 +205,14 @@ impl ProcessIdentity {
 pub enum ProcessObservation {
     /// The pid does not exist.
     Absent,
-    /// The pid exists with an observable start time and process group.
+    /// The pid exists with an observable start time, process group, and uid.
     Present {
         /// Current start time.
         start_time: ProcessStartTime,
         /// Current process group.
         process_group: ProcessGroupId,
+        /// Current process uid.
+        uid: u32,
     },
     /// The pid exists but its stat could not be read or parsed.
     Unreadable,
@@ -219,21 +230,33 @@ pub trait ProcessProbe {
     fn observe(&self, pid: Pid) -> ProcessObservation;
 }
 
-/// An orphan whose boot id, pid, start time, and process group all matched.
+/// An orphan whose boot id matched and whose containment identity may be
+/// verified.
 ///
 /// Construction is private to the journal: this is the only value an
 /// [`crate::orphan::OrphanReaper`] can be asked to terminate, which is what
 /// makes "never signal an unverified record" structural rather than a calling
-/// convention.
+/// convention. The identity is `None` for a reserved cgroup record (no pid was
+/// committed) or a pid-reuse case; the reaper acts on the recorded containment
+/// identity and never on a reused pid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedOrphan {
     boot_id: BootId,
-    identity: ProcessIdentity,
+    identity: Option<ProcessIdentity>,
+    containment: crate::containment::ContainmentRecord,
 }
 
 impl VerifiedOrphan {
-    pub(crate) fn new(boot_id: BootId, identity: ProcessIdentity) -> Self {
-        Self { boot_id, identity }
+    pub(crate) fn new(
+        boot_id: BootId,
+        identity: Option<ProcessIdentity>,
+        containment: crate::containment::ContainmentRecord,
+    ) -> Self {
+        Self {
+            boot_id,
+            identity,
+            containment,
+        }
     }
 
     /// The matched boot id.
@@ -242,10 +265,16 @@ impl VerifiedOrphan {
         &self.boot_id
     }
 
-    /// The matched process tuple.
+    /// The matched process tuple, when the recorded pid still matched.
     #[must_use]
-    pub const fn identity(&self) -> ProcessIdentity {
+    pub const fn identity(&self) -> Option<ProcessIdentity> {
         self.identity
+    }
+
+    /// The recorded containment identity.
+    #[must_use]
+    pub const fn containment(&self) -> &crate::containment::ContainmentRecord {
+        &self.containment
     }
 }
 
@@ -254,8 +283,8 @@ impl VerifiedOrphan {
 /// On macOS, Windows, and other cells [`ProcessProbe::boot_id`] returns `None`
 /// and [`ProcessProbe::observe`] returns
 /// [`ProcessObservation::Unreadable`]. Those cells therefore quarantine every
-/// record and never signal until bitty#2604 supplies their platform probe; the
-/// daemon reports them as unverified rather than guessing.
+/// record and never signal; the daemon reports them as unverified rather than
+/// guessing.
 #[derive(Debug, Clone, Default)]
 pub struct SystemProbe {
     boot_id: Option<BootId>,
@@ -277,28 +306,58 @@ impl ProcessProbe for SystemProbe {
     }
 
     fn observe(&self, pid: Pid) -> ProcessObservation {
-        observe_system(pid)
+        observe(pid)
     }
 }
 
+/// Observe one process's exact identity facts without signalling it.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn observe_system(pid: Pid) -> ProcessObservation {
-    let path = format!("{PROC_ROOT}/{}/stat", pid.get());
-    match std::fs::read_to_string(path) {
-        Ok(stat) => parse_proc_stat(&stat).map_or(ProcessObservation::Unreadable, |identity| {
-            ProcessObservation::Present {
-                start_time: identity.0,
-                process_group: identity.1,
-            }
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProcessObservation::Absent,
-        Err(_) => ProcessObservation::Unreadable,
+pub(crate) fn observe(pid: Pid) -> ProcessObservation {
+    let stat_path = format!("{PROC_ROOT}/{}/stat", pid.get());
+    let stat = match std::fs::read_to_string(stat_path) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ProcessObservation::Absent;
+        }
+        Err(_) => return ProcessObservation::Unreadable,
+    };
+    let Some((start_time, process_group)) = parse_proc_stat(&stat) else {
+        return ProcessObservation::Unreadable;
+    };
+    let status_path = format!("{PROC_ROOT}/{}/status", pid.get());
+    let status = match std::fs::read_to_string(status_path) {
+        Ok(status) => status,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ProcessObservation::Absent;
+        }
+        Err(_) => return ProcessObservation::Unreadable,
+    };
+    let Some(uid) = parse_proc_uid(&status) else {
+        return ProcessObservation::Unreadable;
+    };
+    ProcessObservation::Present {
+        start_time,
+        process_group,
+        uid,
     }
 }
 
+/// Observe is Linux-only; other cells have no `/proc` probe in this slice.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn observe_system(_pid: Pid) -> ProcessObservation {
+pub(crate) fn observe(_pid: Pid) -> ProcessObservation {
     ProcessObservation::Unreadable
+}
+
+/// Parse the real uid line from `/proc/<pid>/status`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn parse_proc_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_ascii_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// Parse `/proc/<pid>/stat` for the process group and start time.
@@ -388,10 +447,11 @@ mod tests {
         assert_eq!(ProcessGroupId::new(0), None);
         let pid = Pid::new(1234).expect("positive");
         let group = ProcessGroupId::new(1234).expect("positive");
-        let identity = ProcessIdentity::new(pid, ProcessStartTime::new(99), group);
+        let identity = ProcessIdentity::new(pid, ProcessStartTime::new(99), group, 1000);
         assert_eq!(identity.pid(), pid);
         assert_eq!(identity.start_time().get(), 99);
         assert_eq!(identity.process_group(), group);
+        assert_eq!(identity.uid(), 1000);
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -407,14 +467,25 @@ mod tests {
             ProcessObservation::Present {
                 start_time,
                 process_group,
+                uid,
             } => {
                 assert!(start_time.get() > 0);
                 assert!(process_group.get() > 0);
+                assert_eq!(uid, nix::unistd::geteuid().as_raw());
             }
             other => panic!("current process must be observable, got {other:?}"),
         }
 
         let absent_pid = Pid::new(u32::MAX).expect("positive");
         assert_eq!(probe.observe(absent_pid), ProcessObservation::Absent);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn proc_status_parser_reads_the_real_uid() {
+        let status = "Name:\tbittyd\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(parse_proc_uid(status), Some(1000));
+        assert_eq!(parse_proc_uid("Name:\tbittyd\n"), None);
+        assert_eq!(parse_proc_uid("Uid:\tnotanumber\n"), None);
     }
 }

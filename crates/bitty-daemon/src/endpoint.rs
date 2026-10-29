@@ -660,6 +660,50 @@ impl Drop for BoundEndpoint {
     }
 }
 
+/// A resolved and locked endpoint that has not bound its socket yet.
+///
+/// This is the `D-06` startup seam: the daemon resolves and attests the
+/// runtime directory, takes the single-instance lock, runs the orphan scan,
+/// and only then calls [`PreparedEndpoint::bind`]. Holding the lock during the
+/// scan keeps two concurrent starts from reaping the same journal, and binding
+/// after it means no client can connect while a record is actionable.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct PreparedEndpoint {
+    paths: EndpointPaths,
+    uid: u32,
+    lock: Flock<File>,
+}
+
+#[cfg(unix)]
+impl PreparedEndpoint {
+    /// The attested owner-private runtime directory.
+    #[must_use]
+    pub fn runtime_dir(&self) -> &Path {
+        self.paths.runtime_dir()
+    }
+
+    /// Bind, attest, and return the listening endpoint.
+    ///
+    /// # Errors
+    ///
+    /// The stale-endpoint, tamper, and `Io` refusals of [`open_endpoint`].
+    pub fn bind(self) -> Result<BoundEndpoint, EndpointError> {
+        clear_stale_socket(&self.paths.socket, self.uid)?;
+        let (listener, identity) = bind_endpoint(&self.paths.socket, self.uid)?;
+        let bound = BoundEndpoint {
+            listener,
+            paths: self.paths,
+            identity,
+            uid: self.uid,
+            closed: false,
+            _lock: self.lock,
+        };
+        bound.reattest()?;
+        Ok(bound)
+    }
+}
+
 /// The stub endpoint value on platforms without an accepted transport.
 ///
 /// [`open_endpoint`] never returns this value: every non-Unix target refuses
@@ -667,6 +711,13 @@ impl Drop for BoundEndpoint {
 #[cfg(not(unix))]
 #[derive(Debug)]
 pub struct BoundEndpoint {
+    _private: (),
+}
+
+/// The stub prepared endpoint on platforms without an accepted transport.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct PreparedEndpoint {
     _private: (),
 }
 
@@ -690,6 +741,19 @@ pub fn open_endpoint(env: &EndpointEnv) -> Result<BoundEndpoint, EndpointError> 
     open_endpoint_for_cell(PlatformCell::current(), env)
 }
 
+/// Resolve, attest, and lock the endpoint without binding it.
+///
+/// Used by the daemon startup path so the orphan scan runs under the
+/// single-instance lock and before any client can connect (`D-06`).
+///
+/// # Errors
+///
+/// The path, runtime-root, `AlreadyRunning`, tamper, and `Io` refusals of
+/// [`open_endpoint`].
+pub fn prepare_endpoint(env: &EndpointEnv) -> Result<PreparedEndpoint, EndpointError> {
+    prepare_endpoint_for_cell(PlatformCell::current(), env)
+}
+
 fn open_endpoint_for_cell(
     cell: PlatformCell,
     env: &EndpointEnv,
@@ -707,22 +771,32 @@ fn open_endpoint_for_cell(
 
 #[cfg(unix)]
 fn open_unix(env: &EndpointEnv) -> Result<BoundEndpoint, EndpointError> {
+    prepare_endpoint_for_cell(PlatformCell::current(), env)?.bind()
+}
+
+#[cfg(unix)]
+fn prepare_endpoint_for_cell(
+    cell: PlatformCell,
+    env: &EndpointEnv,
+) -> Result<PreparedEndpoint, EndpointError> {
+    if !matches!(cell.transport(), EndpointTransport::UnixSocket)
+        || !cell.peer_mechanism().provides_start_time()
+    {
+        return Err(EndpointError::UnsupportedPlatform { cell });
+    }
     let paths = EndpointPaths::resolve(env)?;
     let uid = getuid().as_raw();
     prepare_runtime_dir(&paths.runtime_dir, paths.runtime_root.as_deref(), uid)?;
     let lock = acquire_instance_lock(&paths, uid)?;
-    clear_stale_socket(&paths.socket, uid)?;
-    let (listener, identity) = bind_endpoint(&paths.socket, uid)?;
-    let bound = BoundEndpoint {
-        listener,
-        paths: paths.clone(),
-        identity,
-        uid,
-        closed: false,
-        _lock: lock,
-    };
-    bound.reattest()?;
-    Ok(bound)
+    Ok(PreparedEndpoint { paths, uid, lock })
+}
+
+#[cfg(not(unix))]
+fn prepare_endpoint_for_cell(
+    cell: PlatformCell,
+    _env: &EndpointEnv,
+) -> Result<PreparedEndpoint, EndpointError> {
+    Err(EndpointError::UnsupportedPlatform { cell })
 }
 
 #[cfg(not(unix))]
@@ -1272,6 +1346,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path).expect("create scratch dir");
         path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_holds_the_single_instance_lock_until_bind() {
+        let root = scratch_dir("prepare");
+        let env = EndpointEnv::new(Some(root.into_os_string()), None);
+        let prepared = prepare_endpoint(&env).expect("prepare");
+        let second = prepare_endpoint(&env).expect_err("the lock is held across the scan");
+        assert!(
+            matches!(second, EndpointError::AlreadyRunning { .. }),
+            "unexpected second prepare: {second}"
+        );
+        let bound = prepared.bind().expect("bind after the scan");
+        drop(bound);
+        prepare_endpoint(&env).expect("the lock is released with the bound endpoint");
     }
 
     #[test]

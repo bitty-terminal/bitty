@@ -46,7 +46,11 @@ mod subreaper;
 #[cfg(target_os = "linux")]
 pub use self::cgroup::{CGROUP2_MOUNT, CgroupError, CgroupRefusal, CgroupRoot, SessionCgroup};
 #[cfg(target_os = "linux")]
-pub use self::child::{CleanupOutcome, ContainedChild, ContainmentError, spawn};
+pub use self::child::{
+    CleanupOutcome, ContainedChild, ContainmentError, SessionMode, spawn, spawn_with,
+};
+#[cfg(target_os = "linux")]
+pub(crate) use self::linux_sys::establish_controlling_terminal;
 #[cfg(target_os = "linux")]
 pub use self::subreaper::{SubreaperGuard, SubreaperRefusal};
 

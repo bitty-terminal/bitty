@@ -3,8 +3,9 @@
 //! Status: **service loop plus the in-memory state core, the session event
 //! stream, the compiled limits with their idempotency and audit stores, the
 //! endpoint, instance-lock, and peer-trust primitives, the attach/control
-//! state machine, and Linux process containment with a served orphan
-//! verifier**. This crate fixes the service version, the capability set,
+//! state machine, Linux process containment with a served orphan verifier,
+//! and the worker spawn/bind and resize content plane**. This crate fixes the
+//! service version, the capability set,
 //! and the version negotiation required by the accepted [`bittyd` Session-Host
 //! Contract]. It implements the registry half of bitty#2601 (server-generated
 //! ids, session records, counters, retention), the bounded orphan journal, the
@@ -28,12 +29,15 @@
 //! - [`service::server`]: the `bittyd start` admission loop, limits, signals,
 //!   and shutdown;
 //! - [`operator`] and [`audit_sink`]: the per-boot operator capability and the
-//!   fail-closed audit writer.
+//!   fail-closed audit writer;
+//! - [`spawn`]: the bounded `session.create` spawn specification;
+//! - [`worker`]: the worker pool, PTY supervision, generation bind, and resize.
 //!
 //! `bittyd start` binds the per-user endpoint, mints the operator capability,
 //! serves the bitty-ipc v1 envelope, and stops on `daemon.stop` or a signal.
-//! It still spawns no worker, signals no process, and opens no TCP listener.
-//! Plain `bittyd` prints status and creates no runtime file.
+//! It spawns a worker only on a served cell and only inside a recorded
+//! containment identity, signals nothing outside that identity, and opens no
+//! TCP listener. Plain `bittyd` prints status and creates no runtime file.
 //!
 //! # Ownership and dependency direction
 //!
@@ -47,11 +51,11 @@
 //!
 //! # Frozen here
 //!
-//! - [`contract::SERVICE_API_VERSION`]: service API `1.0` with minimum client
+//! - [`contract::SERVICE_API_VERSION`]: service API `1.1` with minimum client
 //!   minor `0` (contract D-11).
 //! - [`contract::CAPABILITIES`]: `terminal_sessions`, `worker_sessions`
-//!   (false), `events`, `observer_grants`, `control_transfer`,
-//!   `idempotent_mutations`.
+//!   (compiled for the cell and narrowed to the probed containment plan),
+//!   `events`, `observer_grants`, `control_transfer`, `idempotent_mutations`.
 //! - [`contract::NEGOTIATE_METHOD`] and [`handshake::negotiate`]: the
 //!   `daemon.negotiate` version, capability, and effective-limits half of the
 //!   handshake.
@@ -95,8 +99,8 @@
 //!
 //! | Contract area | Owner | Answer today |
 //! | --- | --- | --- |
-//! | Worker spawn and bind | bitty#2790 | `session.create` still registers a `created` session; containment is ready for the spawn slice |
-//! | Terminal content plane, including `session.resize` | bitty#2604 / terminal contract | no `terminal.*` scope is granted; `session.resize` is `Denied/ScopeViolation` |
+//! | Terminal-session PTY spawn and content plane | bitty#2604 follow-up | `session.create kind: worker` spawns and binds generation 1 on a served cell; a terminal-session create still registers `created` without a process |
+//! | Worker rebind/restart and executable policy | bitty#2790 follow-up | a restarted daemon does not re-attach a worker; the executable allowlist is not enforced |
 //! | Pushing session events on a connection (no subscribe method) | bitty#2602 | `session.status`/`session.list` are the reconciliation reads |
 //! | Per-connection refusal-audit aggregation | bitty#2603 follow-up | wire-level refusals are budgeted and aggregated; method refusals remain one individual record each |
 //! | Conformance corpus and fake-server parity | bitty#2605 | `tests/harness` corpus, fake and real drivers, parity gate; every shared vector is compared, with no recorded known defect |
@@ -124,6 +128,8 @@ pub mod platform;
 pub mod registry;
 pub mod seam;
 pub mod service;
+pub mod spawn;
+pub mod worker;
 
 /// Crate version reported by `bittyd --version`, from Cargo metadata.
 pub const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");

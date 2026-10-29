@@ -58,6 +58,13 @@ pub struct Vector {
     pub area: String,
     pub decisions: Vec<String>,
     pub drivers: Vec<DriverKind>,
+    /// Capabilities the served cell must advertise for this vector to run.
+    ///
+    /// A driver whose negotiated capability set lacks one of these records a
+    /// typed `cell-not-servable` skip instead of failing the vector: a real
+    /// cell whose containment probe selected no mechanism refuses the worker
+    /// path, while the reference fake always models a served worker cell.
+    pub requires: Vec<String>,
     pub host_grant: bool,
     /// A journal record the driver seeds before starting the daemon.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -258,6 +265,18 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
     if drivers.is_empty() {
         return Err(fail("no driver".to_owned()));
     }
+    let requires = match value.get("requires") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| fail("requires entry is not a string".to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(fail("requires is not an array".to_owned())),
+    };
     let setup = object(value, "setup").map_err(fail)?;
     let host_grant = match setup.get("host_grant") {
         None | Some(Value::Null) => false,
@@ -371,6 +390,7 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
         area,
         decisions,
         drivers,
+        requires,
         host_grant,
         orphan_record,
         injected,

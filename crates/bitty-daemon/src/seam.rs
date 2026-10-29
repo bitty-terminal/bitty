@@ -124,7 +124,15 @@ impl SeamStatus {
             .collect::<Vec<_>>()
             .join(", ");
         let _ = writeln!(out, "capabilities: {enabled}");
-        let _ = writeln!(out, "worker sessions: unsupported (contract D-01)");
+        let worker = if self.capabilities.worker_sessions {
+            // This is the compiled build truth: a status command must not
+            // probe the host, so it cannot name the startup plan. The served
+            // daemon narrows the bit to that plan before it advertises.
+            "compiled (served cells; a refused startup plan disables it)"
+        } else {
+            "unsupported (not served on this cell)"
+        };
+        let _ = writeln!(out, "worker sessions: {worker}");
         let _ = writeln!(out, "ipc service: {}", self.ipc_service);
         let _ = writeln!(out, "endpoint: {}", self.endpoint);
         let _ = writeln!(out, "containment: {}", self.containment);
@@ -150,10 +158,13 @@ mod tests {
     fn rendered_status_names_the_seam_explicitly() {
         let rendered = SeamStatus::current().render();
         assert!(rendered.contains("session-host seam"));
-        assert!(rendered.contains("service API: 1.0 (accepted client range 1.0..=1.0)"));
+        assert!(rendered.contains("service API: 1.1 (accepted client range 1.0..=1.1)"));
         assert!(rendered.contains("terminal_sessions"));
         assert!(rendered.contains("observer_grants"));
-        assert!(rendered.contains("worker sessions: unsupported"));
+        assert_eq!(
+            rendered.contains("worker sessions: compiled"),
+            crate::worker::WORKER_SESSIONS_SERVED
+        );
         assert!(rendered.contains("ipc service: wired"));
         assert!(rendered.contains("endpoint: none bound"));
         assert!(rendered.contains("containment: "));

@@ -30,7 +30,7 @@
 //! record is quarantined; Unix enforces `0700`/`0600` here, and the Windows
 //! owner-only runtime directory ACL is owned by the endpoint slice.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::{self, Write as _};
@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 use crate::containment::ContainmentRecord;
 use crate::limits::{LimitId, Limits};
-use crate::registry::{MonotonicMs, SessionId};
+use crate::registry::{CleanupClass, MonotonicMs, SessionId};
 
 use super::identity::{
     BootId, Pid, ProcessGroupId, ProcessIdentity, ProcessObservation, ProcessProbe,
@@ -825,11 +825,38 @@ impl OrphanJournal {
         reaper: &mut dyn OrphanReaper,
         now: MonotonicMs,
     ) -> Result<ReapReport, JournalError> {
+        self.reap_excluding(probe, reaper, now, &BTreeSet::new())
+    }
+
+    /// Run one pass while skipping records owned by a supervised session.
+    ///
+    /// A committed record for a bound session is not an orphan: its identity is
+    /// the supervision handle the service still owns, and signalling it from a
+    /// reconcile read would kill a running worker. The startup scan has no
+    /// registry and passes an empty set; the served on-demand path passes
+    /// exactly the sessions whose worker handle is still live in the pool. A
+    /// terminal record is exit cleanup, not supervision, so it is never in
+    /// that set: its record must be classified and quarantined, never skipped.
+    /// A skipped record keeps its stored class untouched.
+    ///
+    /// # Errors
+    ///
+    /// The same failures as [`Self::reap`].
+    pub fn reap_excluding(
+        &mut self,
+        probe: &dyn ProcessProbe,
+        reaper: &mut dyn OrphanReaper,
+        now: MonotonicMs,
+        live: &BTreeSet<SessionId>,
+    ) -> Result<ReapReport, JournalError> {
         let probe_boot = probe.boot_id();
         let session_ids: Vec<SessionId> = self.records.keys().copied().collect();
         let mut report = ReapReport::default();
 
         for session_id in session_ids {
+            if live.contains(&session_id) {
+                continue;
+            }
             let Some(record) = self.records.get(&session_id).cloned() else {
                 continue;
             };
@@ -905,6 +932,33 @@ impl OrphanJournal {
             return Err(JournalError::NotQuarantined);
         }
         self.remove(session_id)
+    }
+
+    /// Settle the record of a worker whose terminal transition was recorded.
+    ///
+    /// The cleanup class is the contract's own classification: `not_started`
+    /// (nothing was spawned) and `swept` (the whole cgroup subtree verified
+    /// empty and was removed) release the slot; `unverified` keeps the record
+    /// as a quarantine so an unprovable tree is never silently forgotten. A
+    /// missing record is a no-op, so the caller can settle twice without an
+    /// error.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a journal rewrite or removal failure.
+    pub fn settle(
+        &mut self,
+        session_id: SessionId,
+        cleanup: CleanupClass,
+        now: MonotonicMs,
+    ) -> Result<(), JournalError> {
+        match cleanup {
+            CleanupClass::NotStarted | CleanupClass::Swept => self.remove(session_id),
+            CleanupClass::Unverified => match self.records.get(&session_id).cloned() {
+                Some(record) => self.quarantine(record, now),
+                None => Ok(()),
+            },
+        }
     }
 
     fn quarantine(
@@ -1357,6 +1411,71 @@ mod tests {
     }
 
     #[test]
+    fn a_live_session_record_is_never_handed_to_the_reaper() {
+        let directory = TempDir::new().expect("temp dir");
+        let mut history = journal_in(&directory);
+        let session_id = session(0x13);
+        let process = identity(4242, 987_654, 4242);
+        reserved_and_committed(&mut history, session_id, process);
+
+        let probe = FakeProbe::with_boot(BOOT_A).observe(
+            4242,
+            ProcessObservation::Present {
+                start_time: ProcessStartTime::new(987_654),
+                process_group: ProcessGroupId::new(4242).expect("positive"),
+                uid: 1000,
+            },
+        );
+        let mut reaper = RecordingReaper::new(ReapResult::Swept);
+        let live = BTreeSet::from([session_id]);
+        let report = history
+            .reap_excluding(&probe, &mut reaper, MonotonicMs::from_millis(10), &live)
+            .expect("reap succeeds");
+
+        assert_eq!(report, ReapReport::default());
+        assert!(reaper.calls.is_empty(), "a live identity is not an orphan");
+        assert_eq!(history.counts().committed, 1, "the record is untouched");
+
+        // Without the live exclusion the same record is reaped, proving the
+        // skip is the guard and not a classification change.
+        let report = history
+            .reap(&probe, &mut reaper, MonotonicMs::from_millis(11))
+            .expect("reap succeeds");
+        assert_eq!(report.reaped, 1);
+
+        // A terminal record is exit cleanup, not supervision: the service no
+        // longer holds a worker handle for it, so it is not in the exclusion
+        // set and the same identity is classified rather than skipped. A
+        // subreaper record that cannot be proven whole is quarantined, never
+        // signalled a second time.
+        let terminal = session(0x23);
+        reserved_and_committed(&mut history, terminal, process);
+        history
+            .settle(
+                terminal,
+                CleanupClass::Unverified,
+                MonotonicMs::from_millis(12),
+            )
+            .expect("terminal settle");
+        reaper.calls.clear();
+        let report = history
+            .reap_excluding(
+                &probe,
+                &mut reaper,
+                MonotonicMs::from_millis(13),
+                &BTreeSet::new(),
+            )
+            .expect("reap succeeds");
+        assert_eq!(report.unverified, 1, "the terminal record is classified");
+        assert_eq!(report.reaped, 0);
+        assert!(
+            reaper.calls.is_empty(),
+            "a quarantined terminal record is never signalled"
+        );
+        assert_eq!(history.counts().unverified, 1);
+    }
+
+    #[test]
     fn exact_identity_match_is_reaped_and_removed() {
         let directory = TempDir::new().expect("temp dir");
         let mut history = journal_in(&directory);
@@ -1376,7 +1495,6 @@ mod tests {
         let report = history
             .reap(&probe, &mut reaper, MonotonicMs::from_millis(10))
             .expect("reap succeeds");
-
         assert_eq!(
             report,
             ReapReport {

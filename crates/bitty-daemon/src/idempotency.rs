@@ -439,6 +439,14 @@ pub enum IdempotencyResult {
     Applied(AppliedResult),
     /// The original call refused with a static code and applied nothing.
     Refused(RefusalCode),
+    /// The original call hit a bound before it applied anything; replay
+    /// answers the same `Framing/LimitExceeded` with the same counts.
+    Limited {
+        /// The observed value.
+        actual: u64,
+        /// The enforced bound.
+        limit: u64,
+    },
 }
 
 impl IdempotencyResult {
@@ -454,6 +462,7 @@ impl IdempotencyResult {
         match self {
             Self::Applied(_) => None,
             Self::Refused(code) => Some(code),
+            Self::Limited { .. } => Some(RefusalCode::LimitExceeded),
         }
     }
 }
@@ -993,7 +1002,9 @@ impl IdempotencyStore {
         }
 
         let retirement = match result {
-            IdempotencyResult::Refused(_) => Retirement::Refused,
+            IdempotencyResult::Refused(_) | IdempotencyResult::Limited { .. } => {
+                Retirement::Refused
+            }
             IdempotencyResult::Applied(_) => Retirement::Live,
         };
         entry.state = EntryState::Complete { result, retirement };

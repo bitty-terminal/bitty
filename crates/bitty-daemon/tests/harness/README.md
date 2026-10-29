@@ -29,6 +29,7 @@ never fork expectations.
       "area": "handshake",
       "decisions": ["D-08"],
       "drivers": ["fake", "real"],
+      "requires": ["worker_sessions"],
       "setup": { "host_grant": false },
       "injected": { "clock_ms": 0, "limits": {} },
       "steps": [],
@@ -52,6 +53,12 @@ never fork expectations.
 - `drivers` names the drivers that must run the vector. A driver that does not
   run it must have a `real_skip`/`fake_skip` reason; the row is recorded as a
   typed skip, never a pass.
+- `requires` names capabilities the served cell must advertise for the vector
+  to run. A driver whose negotiated capability set lacks one records the typed
+  `cell-not-servable: <capability>` skip after preparation, so a real Linux cell
+  whose containment probe selected no mechanism never fails the worker vectors
+  it cannot serve. The reference fake models a served worker cell and always
+  advertises `worker_sessions`.
 - `injected` is honored by the fake. The real service uses its process clock and
   compiled limits; a vector that needs injection records a typed real skip.
 - `known_defect.drivers` scopes the marker to the driver that still carries the

@@ -29,7 +29,7 @@ use bitty_ipc_api::wire::{
     validate_no_ambient_auth, validate_response_envelope, validate_wire_version,
 };
 
-use crate::contract::{CAPABILITIES, ClientVersion};
+use crate::contract::ClientVersion;
 use crate::handshake::{
     ACCEPTED_WIRE_VERSION, ClientCorrelation, HandshakeResponse, NegotiateRequest, SecretBearer,
 };
@@ -260,7 +260,8 @@ pub fn parse_negotiate(params: &Value) -> Result<NegotiateRequest, Refusal> {
 /// Always `Ok`; the signature stays `Result` so a future field with a fallible
 /// encoding does not change the server call site.
 pub fn handshake_value(response: &HandshakeResponse) -> Result<Value, Refusal> {
-    let capabilities: Map<String, Value> = CAPABILITIES
+    let capabilities: Map<String, Value> = response
+        .capabilities
         .all()
         .into_iter()
         .map(|(name, enabled)| (name.to_owned(), Value::Bool(enabled)))

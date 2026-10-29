@@ -20,12 +20,14 @@ pub const NEGOTIATE_METHOD: &str = "daemon.negotiate";
 /// First accepted service-contract major version (`D-11`): the v0.2.0 slice.
 pub const SERVICE_API_MAJOR: u16 = 1;
 
-/// First accepted service-contract minor version (`D-11`).
+/// Current service-contract minor version (`D-11`).
 ///
 /// `1.1` is the additive worker slice (bitty#2790): `session.create` with
-/// `kind: worker` and a served `session.resize`. A `1.0` client remains in the
-/// accepted range because `min_client_minor` is `0`.
-pub const SERVICE_API_MINOR: u16 = 1;
+/// `kind: worker` and a served `session.resize`. `1.2` serves the accepted
+/// session and daemon metadata fields (bitty#2806) as optional response keys,
+/// so no existing field changes meaning and a `1.0` or `1.1` client remains in
+/// the accepted range because `min_client_minor` is `0`.
+pub const SERVICE_API_MINOR: u16 = 2;
 
 /// Lowest client minor the server accepts for [`SERVICE_API_MAJOR`] (`D-11`:
 /// `min_client_minor` starts at `0` for `1.0`).
@@ -142,7 +144,7 @@ impl ServiceApiVersion {
             && client.minor <= self.minor
     }
 
-    /// The accepted client range, for diagnostics (`1.0..=1.1`).
+    /// The accepted client range, for diagnostics (`1.0..=1.2`).
     #[must_use]
     pub fn client_range(self) -> String {
         format!(
@@ -219,11 +221,11 @@ mod tests {
     #[test]
     fn service_version_matches_the_accepted_contract() {
         assert_eq!(SERVICE_API_MAJOR, 1);
-        assert_eq!(SERVICE_API_MINOR, 1);
+        assert_eq!(SERVICE_API_MINOR, 2);
         assert_eq!(MIN_CLIENT_MINOR, 0);
-        assert_eq!(SERVICE_API_VERSION, ServiceApiVersion::new(1, 1, 0));
-        assert_eq!(SERVICE_API_VERSION.to_string(), "1.1");
-        assert_eq!(SERVICE_API_VERSION.client_range(), "1.0..=1.1");
+        assert_eq!(SERVICE_API_VERSION, ServiceApiVersion::new(1, 2, 0));
+        assert_eq!(SERVICE_API_VERSION.to_string(), "1.2");
+        assert_eq!(SERVICE_API_VERSION.client_range(), "1.0..=1.2");
     }
 
     #[test]
@@ -233,7 +235,8 @@ mod tests {
         assert!(!server.accepts(ClientVersion::new(0, 0)));
         assert!(!server.accepts(ClientVersion::new(2, 0)));
         assert!(server.accepts(ClientVersion::new(1, 1)));
-        assert!(!server.accepts(ClientVersion::new(1, 2)));
+        assert!(server.accepts(ClientVersion::new(1, 2)));
+        assert!(!server.accepts(ClientVersion::new(1, 3)));
 
         let wider = ServiceApiVersion::new(1, 4, 2);
         assert!(!wider.accepts(ClientVersion::new(1, 1)));

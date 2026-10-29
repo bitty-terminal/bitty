@@ -58,7 +58,9 @@ mod unix {
     use crate::operator::{OperatorError, OperatorStore};
     use crate::orphan::{ORPHAN_SUBDIR, OrphanOpenError, OrphanSupervisor, journal_limits};
     use crate::registry::MonotonicMs;
-    use crate::service::dispatch::{Refusal, ServerFacts, Service, ServiceError, StopMode};
+    use crate::service::dispatch::{
+        DaemonFacts, Refusal, ServerFacts, Service, ServiceError, StopMode,
+    };
     use crate::service::frame::{FramePeer, PeerFrameReader, enable_credentials};
     use crate::service::protocol::Connection;
     use crate::service::scopes::{MethodResolution, ServiceMethod, ServiceScopeSet, resolve};
@@ -546,15 +548,19 @@ mod unix {
             OperatorStore::create_in(endpoint.runtime_dir()).map_err(ServerError::Operator)?;
         let writer =
             AuditFileWriter::open(&config.audit_dir, &config.limits).map_err(ServerError::Audit)?;
+        let facts = server_facts(&endpoint)?;
+        // The admission loop's monotonic clock starts at the origin below, so
+        // the daemon's uptime is the request clock minus this origin.
+        let daemon = DaemonFacts::new(facts.daemon_pid, MonotonicMs::ZERO);
         let mut service = Service::new(
             config.limits.clone(),
             operator,
             Box::new(writer),
             orphans,
             containment.clone(),
+            daemon,
         )
         .map_err(ServerError::Service)?;
-        let facts = server_facts(&endpoint)?;
 
         let mut mask = SigSet::empty();
         mask.add(Signal::SIGTERM);
@@ -1603,7 +1609,7 @@ mod unix {
         use crate::operator::OperatorStore;
         use crate::peer::PeerGuard;
         use crate::registry::MonotonicMs;
-        use crate::service::dispatch::{ServerFacts, Service};
+        use crate::service::dispatch::{DaemonFacts, ServerFacts, Service};
         use crate::service::frame::PeerFrameReader;
         use crate::service::protocol::Connection;
         use crate::service::scopes::{ServiceMethod, ServiceScope, ServiceScopeSet};
@@ -1964,6 +1970,7 @@ mod unix {
                 crate::containment::ContainmentReport::unprobed(
                     crate::platform::PlatformCell::current(),
                 ),
+                DaemonFacts::new(std::process::id(), MonotonicMs::ZERO),
             )
             .expect("service");
             (service, dir, audit)

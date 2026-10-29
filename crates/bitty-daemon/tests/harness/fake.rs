@@ -43,6 +43,13 @@ const BASELINE: [&str; 5] = [
 /// instead (Linux only in this slice).
 const FAKE_WORKER_SESSIONS: bool = true;
 
+/// The peer identity the reference cell models (`peer_identity`).
+const FAKE_PEER_UID: u32 = 1000;
+const FAKE_PEER_PID: u32 = 4242;
+
+/// The observational daemon pid the reference cell models.
+const FAKE_DAEMON_PID: u32 = 4242;
+
 /// The fake server driver.
 pub struct FakeDriver {
     limits: Limits,
@@ -97,6 +104,10 @@ struct FakeSession {
     generation: u64,
     revision: u64,
     controller: Option<String>,
+    /// Unconsumed, unrevoked, unexpired observer grants for this session
+    /// (`D-09`; bitty#2806). The terminal transition clears it, exactly as the
+    /// served snapshot clamps a terminal session to zero.
+    pending_grants: u16,
     token: String,
     initial_token: Option<String>,
     leases: BTreeMap<String, FakeLease>,
@@ -416,7 +427,7 @@ impl FakeDriver {
             .get("client_version")
             .and_then(|value| value.get("minor"))
             .and_then(Value::as_u64);
-        if major != Some(1) || !matches!(minor, Some(0 | 1)) {
+        if major != Some(1) || !matches!(minor, Some(0..=2)) {
             let outcome = self.refuse("daemon.negotiate", "Validation", "VersionMismatch", None);
             self.connection(connection).closed = true;
             return outcome;
@@ -480,33 +491,7 @@ impl FakeDriver {
             }
         }
         let client_id = self.mint_id();
-        let mut scopes: Vec<String> = [
-            "session.inspect",
-            "session.host",
-            "session.attach",
-            "session.control",
-            "daemon.inspect",
-            "daemon.control",
-            "terminal.manage",
-            "process.spawn",
-        ]
-        .into_iter()
-        .filter(|scope| self.has_scope(connection, scope))
-        .map(str::to_owned)
-        .collect();
-        // The service-scope catalog order, then the transport scopes, exactly
-        // as `EffectiveScopes::names` renders them.
-        scopes.sort_by_key(|scope| match scope.as_str() {
-            "session.inspect" => 0,
-            "session.host" => 1,
-            "session.attach" => 2,
-            "session.control" => 3,
-            "daemon.inspect" => 4,
-            "daemon.control" => 5,
-            "terminal.manage" => 6,
-            "process.spawn" => 7,
-            _ => 8,
-        });
+        let scopes = self.connection_scopes(connection);
         let limits: Vec<Value> = LimitId::ALL
             .into_iter()
             .map(|limit| {
@@ -525,16 +510,16 @@ impl FakeDriver {
             .collect();
         let value = json!({
             "wire_version": 1,
-            "service_api_version": {"major": 1, "minor": 1, "min_client_minor": 0},
+            "service_api_version": {"major": 1, "minor": 2, "min_client_minor": 0},
             "daemon_instance_id": self.instance,
-            "daemon_pid": 4242,
+            "daemon_pid": FAKE_DAEMON_PID,
             "server_identity": {
-                "uid": 1000,
+                "uid": FAKE_PEER_UID,
                 "endpoint_kind": "unix_socket",
-                "endpoint_owner": 1000,
+                "endpoint_owner": FAKE_PEER_UID,
                 "endpoint_mode": 384,
             },
-            "peer_identity": {"uid": 1000, "pid": 4242, "start_time": 1},
+            "peer_identity": {"uid": FAKE_PEER_UID, "pid": FAKE_PEER_PID, "start_time": 1},
             "client_id": client_id,
             "scopes": scopes,
             "capabilities": capabilities,
@@ -593,6 +578,9 @@ impl FakeDriver {
         for bearer in retired {
             if let Some(grant) = self.grants.remove(&bearer) {
                 if grant.kind == "observer" && !grant.consumed && !grant.revoked {
+                    if let Some(session) = self.sessions.get_mut(&grant.session) {
+                        session.pending_grants = session.pending_grants.saturating_sub(1);
+                    }
                     expired_sessions.insert(grant.session);
                 }
             }
@@ -604,6 +592,39 @@ impl FakeDriver {
                 }
             }
         }
+    }
+
+    /// The connection's effective scope names in the served order.
+    ///
+    /// The service-scope catalog order, then the transport scopes, exactly as
+    /// `EffectiveScopes::names` renders them.
+    fn connection_scopes(&self, connection: &str) -> Vec<String> {
+        let mut scopes: Vec<String> = [
+            "session.inspect",
+            "session.host",
+            "session.attach",
+            "session.control",
+            "daemon.inspect",
+            "daemon.control",
+            "terminal.manage",
+            "process.spawn",
+        ]
+        .into_iter()
+        .filter(|scope| self.has_scope(connection, scope))
+        .map(str::to_owned)
+        .collect();
+        scopes.sort_by_key(|scope| match scope.as_str() {
+            "session.inspect" => 0,
+            "session.host" => 1,
+            "session.attach" => 2,
+            "session.control" => 3,
+            "daemon.inspect" => 4,
+            "daemon.control" => 5,
+            "terminal.manage" => 6,
+            "process.spawn" => 7,
+            _ => 8,
+        });
+        scopes
     }
 
     fn has_scope(&self, connection: &str, scope: &str) -> bool {
@@ -671,6 +692,8 @@ impl FakeDriver {
             "state_revision": session.revision,
             "attach_count": session.leases.len(),
             "attached": !session.leases.is_empty(),
+            "controller_present": session.controller.is_some(),
+            "pending_observer_grants": session.pending_grants,
             "created_at_ms": session.created_ms,
             "last_seen_ms": session.last_seen_ms,
         });
@@ -686,6 +709,7 @@ impl FakeDriver {
             return self.refuse("daemon.status", "Denied", "ScopeViolation", None);
         }
         let active = self.active_sessions();
+        let uptime_ms = self.now();
         let limits: Vec<Value> = LimitId::ALL
             .into_iter()
             .map(|limit| {
@@ -710,12 +734,20 @@ impl FakeDriver {
                     "terminal": self.sessions.len() - active,
                 },
                 "audit_degraded": false,
+                "daemon_pid": FAKE_DAEMON_PID,
+                "uptime_ms": uptime_ms,
                 "drain_deadline_ms": Value::Null,
                 "limits": limits,
                 "orphans": {
                     "verify": "served",
                     "mechanism": "fake",
-                    "records": {"reserved": 0, "committed": 0, "unverified": 0},
+                    "records": {
+                        "reserved": 0,
+                        "committed": 0,
+                        "unverified": 0,
+                        "reaped": 0,
+                        "stale": 0,
+                    },
                 },
             }),
         )
@@ -1041,6 +1073,7 @@ impl FakeDriver {
             generation: u64::from(bound_worker),
             revision: u64::from(bound_worker),
             controller: None,
+            pending_grants: 0,
             token: token.clone(),
             initial_token: Some(token.clone()),
             leases: BTreeMap::new(),
@@ -1173,7 +1206,20 @@ impl FakeDriver {
                             .is_some_and(|lease| lease.expires_ms > now)
                     })
             })
-            .map(Self::session_json)
+            .map(|session| {
+                let mut value = Self::session_json(session);
+                // `D-09`: only the operator all-session view carries the owner
+                // peer, and only the two numeric facts.
+                if operator {
+                    if let Some(map) = value.as_object_mut() {
+                        map.insert(
+                            "owner".to_owned(),
+                            json!({"uid": FAKE_PEER_UID, "pid": FAKE_PEER_PID}),
+                        );
+                    }
+                }
+                value
+            })
             .collect();
         self.reply("session.list", json!({"sessions": sessions}))
     }
@@ -1220,6 +1266,8 @@ impl FakeDriver {
         let attach = self.mint_id();
         let rotated = self.mint_token();
         let expires = self.now() + self.limits.effective(LimitId::AttachLeaseTtlMs);
+        let scopes = self.connection_scopes(connection);
+        let server_ms = self.now();
         let session = self.sessions.get_mut(session_id).expect("checked");
         session.revision += 1;
         session.controller = Some(attach.clone());
@@ -1239,6 +1287,8 @@ impl FakeDriver {
             "lease_expires_at_ms": expires,
             "control_token": rotated,
             "replayed": false,
+            "scopes": scopes,
+            "server_monotonic_ms": server_ms,
         });
         {
             let revision = self.sessions[session_id].revision;
@@ -1294,8 +1344,13 @@ impl FakeDriver {
         if let Some(grant) = self.grants.get_mut(bearer) {
             grant.consumed = true;
         }
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.pending_grants = session.pending_grants.saturating_sub(1);
+        }
         let attach = self.mint_id();
         let expires = now + self.limits.effective(LimitId::AttachLeaseTtlMs);
+        let scopes = self.connection_scopes(connection);
+        let server_ms = self.now();
         let session = self.sessions.get_mut(session_id).expect("checked");
         // The contract counts grant consume and attach as two visible
         // mutations, matching the real service's post-consume snapshot bump.
@@ -1313,6 +1368,8 @@ impl FakeDriver {
             "role": "observer",
             "lease_expires_at_ms": expires,
             "replayed": false,
+            "scopes": scopes,
+            "server_monotonic_ms": server_ms,
         });
         {
             let revision = self.sessions[session_id].revision;
@@ -1485,6 +1542,7 @@ impl FakeDriver {
         );
         self.grant_keys.insert(key, (id.clone(), fingerprint));
         if let Some(session) = self.sessions.get_mut(session_id) {
+            session.pending_grants = session.pending_grants.saturating_add(1);
             session.revision += 1;
         }
         self.reply(
@@ -1558,6 +1616,7 @@ impl FakeDriver {
                 grant.revoked = true;
                 if active {
                     if let Some(session) = self.sessions.get_mut(&session_id) {
+                        session.pending_grants = session.pending_grants.saturating_sub(1);
                         session.revision += 1;
                     }
                 }
@@ -1874,6 +1933,7 @@ impl FakeDriver {
             "attach_id": attach,
             "lease_expires_at_ms": expires,
             "control_token": token,
+            "server_monotonic_ms": self.now(),
         });
         self.reply("lease.heartbeat", value)
     }
@@ -1895,6 +1955,7 @@ impl FakeDriver {
             session.revision += 1;
         }
         session.controller = None;
+        session.pending_grants = 0;
         session.initial_token = None;
         session.state = "terminated";
         session.terminal_reason = Some(reason);

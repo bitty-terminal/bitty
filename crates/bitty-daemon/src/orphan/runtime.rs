@@ -107,6 +107,14 @@ pub struct OrphanRuntime {
     mechanism: ContainmentKind,
     fallback_reason: Option<String>,
     containment_limits: crate::containment::ContainmentLimits,
+    /// Records this daemon instance reaped after a verified sweep.
+    ///
+    /// The journal removes a reaped record, so the stored counts cannot
+    /// express it; this is a process-lifetime counter reset by a restart, and
+    /// it never claims a record that a previous instance settled.
+    reaped_total: u64,
+    /// Records this daemon instance discarded as stale (foreign boot id).
+    stale_total: u64,
 }
 
 impl fmt::Debug for OrphanRuntime {
@@ -135,6 +143,8 @@ impl OrphanRuntime {
             mechanism: report.kind(),
             fallback_reason: report.fallback_reason().map(ToOwned::to_owned),
             containment_limits,
+            reaped_total: 0,
+            stale_total: 0,
         })
     }
 
@@ -199,6 +209,14 @@ impl OrphanRuntime {
         self.reaper.set_deadline(None);
         let pass = pass?;
         let _expired = self.journal.collect_expired(now)?;
+        // Count only after the pass fully settled, so a failed rewrite or
+        // removal never advances a lifetime counter.
+        self.reaped_total = self
+            .reaped_total
+            .saturating_add(u64::try_from(pass.reaped).unwrap_or(u64::MAX));
+        self.stale_total = self
+            .stale_total
+            .saturating_add(u64::try_from(pass.stale).unwrap_or(u64::MAX));
         Ok(OrphanVerifyReport::from_pass(pass, self.journal.counts()))
     }
 
@@ -273,6 +291,18 @@ impl OrphanRuntime {
         self.journal.counts()
     }
 
+    /// Records this daemon instance reaped after a verified sweep.
+    #[must_use]
+    pub const fn reaped_total(&self) -> u64 {
+        self.reaped_total
+    }
+
+    /// Records this daemon instance discarded as stale.
+    #[must_use]
+    pub const fn stale_total(&self) -> u64 {
+        self.stale_total
+    }
+
     /// The enforced containment mechanism.
     #[must_use]
     pub const fn mechanism(&self) -> ContainmentKind {
@@ -295,6 +325,8 @@ impl OrphanRuntime {
                 "reserved": self.journal.counts().reserved,
                 "committed": self.journal.counts().committed,
                 "unverified": self.journal.counts().unverified,
+                "reaped": self.reaped_total,
+                "stale": self.stale_total,
             },
         })
     }
@@ -599,6 +631,13 @@ mod tests {
         assert_eq!(report.reaped, 0);
         assert_eq!(report.unverified, 0);
         assert_eq!(runtime.counts().total(), 0);
+        // The removed record is still accountable since this instance started,
+        // so `daemon.status` can report the class (`D-06`; bitty#2806).
+        assert_eq!(runtime.stale_total(), 1);
+        assert_eq!(runtime.reaped_total(), 0);
+        let status = runtime.status_json();
+        assert_eq!(status["records"]["stale"], 1);
+        assert_eq!(status["records"]["reaped"], 0);
     }
 
     #[test]
@@ -709,6 +748,11 @@ mod tests {
         let report = runtime.verify(MonotonicMs::from_millis(2)).expect("verify");
         assert_eq!(report.reaped, 1);
         assert_eq!(report.unverified, 0);
+        assert_eq!(runtime.reaped_total(), 1);
+        assert_eq!(runtime.status_json()["records"]["reaped"], 1);
+        // A second pass reaps nothing and must not double-count.
+        runtime.verify(MonotonicMs::from_millis(3)).expect("verify");
+        assert_eq!(runtime.reaped_total(), 1);
     }
 
     #[test]
@@ -721,5 +765,9 @@ mod tests {
         }
         assert!(status.contains("\"verify\":\"served\""));
         assert!(status.contains("subreaper_fallback"));
+        let value: Value = serde_json::from_str(&status).expect("status json");
+        for class in ["reserved", "committed", "unverified", "reaped", "stale"] {
+            assert_eq!(value["records"][class], 0, "class {class}");
+        }
     }
 }

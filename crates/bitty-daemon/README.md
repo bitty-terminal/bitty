@@ -56,6 +56,16 @@ The long-running synchronous handlers (`session.create`, `daemon.orphans.verify`
 keep their own advertised timers and are documented as exempt; see
 [Request deadline](#request-deadline-bitty2805).
 
+bitty#2806 serves the session and daemon metadata fields the accepted contract
+names but `1.1` left unserved: controller presence and the bounded pending
+observer-grant count on every session object, the owner peer (uid and pid only)
+in the operator all-session view, effective lease scopes and the server clock on
+`session.attach`, the server clock on `lease.heartbeat`, and `daemon_pid`,
+uptime, and every orphan class in `daemon.status`. The additions are optional
+response keys in service `1.2`, so no existing field changes meaning and `1.0`
+and `1.1` clients stay accepted. See
+[Served metadata fields](#served-metadata-fields-bitty2806).
+
 `bittyd start` binds the per-user endpoint (`0700` directory, `0600` socket,
 single-instance lock), mints the per-boot operator capability, opens the
 owner-private orphan journal, runs the startup containment scan, accepts up to
@@ -77,7 +87,7 @@ running service gives today:
 | Worker rebind and restart across generations                                               | bitty#2790 follow-up           | a worker binds generation 1 exactly once; a terminal record is never revived and no automatic restart exists                                                       |
 | Executable allowlist for worker `argv[0]`                                                  | bitty#2790 / security corpus   | any executable reachable under the daemon user is accepted; no allowlist or digest policy is enforced yet                                                          |
 | Executable path digest in the orphan record; native Windows job-object reaper              | bitty#2791 follow-up           | no executable path is recorded; Windows and macOS keep the typed `UnsupportedPlatform` refusal                                                                     |
-| Per-connection event backlog counters in `daemon.status`; a shed-able observability class  | bitty#2806                     | delivery is served on the Linux cell (`events: true`); no shed-able class exists and no status counter is served                                                   |
+| Per-connection event backlog counters in `daemon.status`; a shed-able observability class  | bitty#2792 follow-up           | delivery is served on the Linux cell (`events: true`); `daemon.status` serves pid, uptime, and orphan classes (bitty#2806); no backlog counter or shed-able class  |
 | Post-handshake request deadline (`request_timeout_ms` is advertised, not enforced)         | bitty#2805                     | the negotiate deadline is the only `Timeout` emission today; the advertised limit alone changes nothing                                                            |
 | Per-connection refusal-audit aggregation                                                   | bitty#2603 follow-up           | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each                                                     |
 | Conformance corpus and fake-server parity                                                  | bitty#2605                     | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; every shared vector is compared, with no recorded known defect |
@@ -94,8 +104,8 @@ of the service surface.
 
 | Item                 | Value                                                                                                                                                                         | Where                                                       |
 | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| Service API version  | `{major: 1, minor: 1}`                                                                                                                                                        | `contract::SERVICE_API_VERSION`                             |
-| Minimum client minor | `0` (`1.0..=1.1` accepted)                                                                                                                                                    | `contract::MIN_CLIENT_MINOR`                                |
+| Service API version  | `{major: 1, minor: 2}`                                                                                                                                                        | `contract::SERVICE_API_VERSION`                             |
+| Minimum client minor | `0` (`1.0..=1.2` accepted)                                                                                                                                                    | `contract::MIN_CLIENT_MINOR`                                |
 | Capabilities         | `terminal_sessions`, `events`, `observer_grants`, `control_transfer`, `idempotent_mutations` enabled; `worker_sessions` compiled for the cell and narrowed to the probed plan | `contract::CAPABILITIES`, `worker::sessions_served`         |
 | Handshake method     | `daemon.negotiate`                                                                                                                                                            | `contract::NEGOTIATE_METHOD`                                |
 | Negotiation rule     | same major, client minor in `[min_client_minor, server_minor]`; every other case is `VersionMismatch` before any operation                                                    | `handshake::negotiate`                                      |
@@ -486,9 +496,9 @@ per-session stream cannot disagree. Source: contract `D-10`, `D-12`, `D-14`,
 - `last_worker_seen_at` is absent: a terminal session has no supervision liveness
   signal, so the stream reports none.
 - The compiled `D-14` table advertises these caps as
-  `{effective, default, system_max}`; `daemon.status` queue/backlog counters
-  arrive with bitty#2806, and bitty#2605 adds the V-21, V-23, C-04, and C-06
-  corpus vectors against a real transport.
+  `{effective, default, system_max}`; per-connection queue/backlog counters in
+  `daemon.status` remain a follow-up, and bitty#2605 adds the V-21, V-23, C-04,
+  and C-06 corpus vectors against a real transport.
 
 ## Endpoint and peer trust (bitty#2604)
 
@@ -928,7 +938,7 @@ and `daemon_state`.
   file, so a missing file and a wrong bearer are indistinguishable.
 - A `host_grant` that cannot be consumed adds no scope and does not close the
   connection; `session.create` then returns `Denied/ConsentRequired`.
-- A version outside `1.0..=1.1` is `VersionMismatch` and closes. A second
+- A version outside `1.0..=1.2` is `VersionMismatch` and closes. A second
   negotiate, or any frame read before the negotiate request, is
   `Denied/AlreadyNegotiated` and closes after the refusal frame is flushed.
   The gate runs after the per-frame wire version and before the rate limiter,
@@ -1087,8 +1097,33 @@ authority, target, generation, idempotency, effect. Invariants:
 `session.abort`, `session.kill`, `lease.heartbeat`.
 
 `daemon.status` reports the daemon state, active and per-state session counts,
-`audit_degraded`, the drain deadline, the advertised limit triples, the orphan
-placeholder, and `tcp_listeners` (see the service-loop note above).
+`audit_degraded`, `daemon_pid`, `uptime_ms`, the drain deadline, the advertised
+limit triples, the orphan object with its five class counts, and
+`tcp_listeners` (see the service-loop note above).
+
+### Served metadata fields (bitty#2806)
+
+Service `1.2` adds optional response keys only. Every existing key keeps its
+meaning and shape, and a `1.0` or `1.1` client that ignores unknown fields keeps
+working.
+
+| Method                                    | Added key(s)                                                                  | Rule                                                                                                                                                                                                                                |
+| ----------------------------------------- | ----------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| every method returning a `session` object | `controller_present` (bool), `pending_observer_grants` (u16)                  | presence only: the controller's `attach_id` is never served. The count is bounded by `max_pending_observer_grants_per_session`; a terminal session serves `0` for both because no lease or grant it still stores can be used.       |
+| `session.list` operator view              | `owner: {uid, pid}`                                                           | only with `daemon.inspect`, and only as the two numeric facts captured at create. An ordinary view omits the key (omit, never `null`); no path, argv, gid, or start time is retained or served. `session.status` never carries it.  |
+| `session.attach` fresh success            | `scopes` (array)                                                              | the connection's effective lease scopes: the same service-then-transport names and order as the handshake `scopes`. A keyed controller replay does not re-assert them.                                                              |
+| `session.attach` every success            | `server_monotonic_ms` (u64)                                                   | the server clock at the request; a replay carries it too.                                                                                                                                                                           |
+| `session.attach` event-opted connection   | `backlog`, `backlog_truncated`, `earliest_revision`                           | already delivered by bitty#2792; absent when the connection did not opt into pushed events.                                                                                                                                         |
+| `lease.heartbeat`                         | `server_monotonic_ms` (u64)                                                   | the same clock as `lease_expires_at_ms`; the singular `attach_id` request form is unchanged.                                                                                                                                        |
+| `daemon.status`                           | `daemon_pid` (u32), `uptime_ms` (u64), `orphans.records.reaped`/`stale` (u64) | `daemon_pid` is observational only. `uptime_ms` is `now - daemon start` on the server monotonic clock. The journal removes a reaped or stale record, so those two fields are this instance's cumulative counts, not stored classes. |
+
+No addition serves terminal text, PTY bytes, a content handle, another
+session's fields, or caller bytes. A count is a count, never a grant id or
+bearer; the owner object is numeric facts only. The contract rows this revision
+can close are the `session.status`/`session.list` controller-presence and
+pending-grant rows, the operator owner-peer row, the `session.attach` lease-scope
+row (the backlog row was already delivered by bitty#2792), the heartbeat
+`server_monotonic_ms` row, and the `daemon_pid`/uptime and orphan-class rows.
 
 ### Audit sink
 
@@ -1205,6 +1240,10 @@ Corpus rules:
   are excluded from the parity gate, and fail the suite if they pass or fail at
   another step so the marker cannot rot; the corpus currently carries none
   (V-07/bitty#2768 and C-04/bitty#2767 were fixed and their markers removed);
+- `C-17` pins the additive `1.2` metadata on both drivers: controller
+  presence and the pending-grant count (mint, consume, and post-terminal), the
+  operator-only owner peer, attach scopes and server clock, the heartbeat
+  clock, and the daemon pid, uptime, and orphan-class keys;
 - fault injection covers a transport drop during abort, the pre-auth partial
   frame, the frame bound, the pending grant cap, the attach cap, and an
   instance change (restart); queue pressure with an injected outbound cap is

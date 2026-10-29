@@ -8759,6 +8759,342 @@
         "a request timeout never omits the request id or the enforced bound",
         "a later request on the same connection is never refused because an earlier one timed out"
       ]
+    },
+    {
+      "id": "C-17",
+      "title": "Session and daemon metadata fields are served as additive 1.2 keys",
+      "area": "metadata",
+      "decisions": [
+        "D-06",
+        "D-09",
+        "D-10",
+        "D-12"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 2
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "service_api_version.minor": 2
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c17-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.controller_present": false,
+              "session.pending_observer_grants": 0
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "c17-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "scopes",
+              "server_monotonic_ms",
+              "lease_expires_at_ms"
+            ],
+            "array": {
+              "scopes": [
+                "session.inspect",
+                "session.host",
+                "session.attach",
+                "session.control",
+                "terminal.manage",
+                "process.spawn"
+              ]
+            },
+            "result": {
+              "session.controller_present": true,
+              "session.pending_observer_grants": 0,
+              "role": "controller"
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c17-grant"
+          },
+          "capture": {
+            "grant": "grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "absent": [
+              "session.owner"
+            ],
+            "result": {
+              "session.controller_present": true,
+              "session.pending_observer_grants": 1,
+              "session.attached": true
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 2
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@grant"
+          },
+          "capture": {
+            "observer_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "scopes",
+              "server_monotonic_ms"
+            ],
+            "array": {
+              "scopes": [
+                "session.inspect",
+                "session.attach",
+                "session.control",
+                "terminal.manage",
+                "process.spawn"
+              ]
+            },
+            "result": {
+              "session.pending_observer_grants": 0,
+              "role": "observer"
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.controller_present": true,
+              "session.pending_observer_grants": 0,
+              "session.attach_count": 2
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "lease.heartbeat",
+          "params": {
+            "attach_id": "@controller_attach"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "server_monotonic_ms",
+              "lease_expires_at_ms"
+            ],
+            "result_min": {
+              "server_monotonic_ms": 0,
+              "lease_expires_at_ms": 0
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.list",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "array_len": {
+              "sessions": 1
+            },
+            "present": [
+              "sessions.0.owner.uid",
+              "sessions.0.owner.pid",
+              "sessions.0.controller_present"
+            ],
+            "result": {
+              "sessions.0.pending_observer_grants": 0,
+              "sessions.0.controller_present": true
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.list",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "array_len": {
+              "sessions": 1
+            },
+            "absent": [
+              "sessions.0.owner"
+            ],
+            "result": {
+              "sessions.0.controller_present": true
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "present": [
+              "daemon_pid",
+              "uptime_ms",
+              "orphans.records.reserved",
+              "orphans.records.committed",
+              "orphans.records.unverified",
+              "orphans.records.reaped",
+              "orphans.records.stale"
+            ],
+            "result_min": {
+              "uptime_ms": 0,
+              "orphans.records.reserved": 0,
+              "orphans.records.reaped": 0,
+              "orphans.records.stale": 0
+            },
+            "result": {
+              "orphans.verify": "served"
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.abort",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0,
+            "reason_class": "cancel"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "terminated",
+              "session.controller_present": false,
+              "session.pending_observer_grants": 0
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "terminated",
+              "session.controller_present": false,
+              "session.pending_observer_grants": 0
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "sessions.terminal": 1,
+              "active_sessions": 0
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "no owner peer outside the operator all-session view",
+        "no owner path, command line, argv, or content in any response",
+        "no attach id is exposed as controller presence",
+        "no terminal session serves a pending grant count"
+      ]
     }
   ]
 }

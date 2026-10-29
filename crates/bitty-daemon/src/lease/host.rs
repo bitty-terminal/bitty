@@ -2169,12 +2169,15 @@ impl SessionHost {
     /// request instant (`R-S18`). A session without a lease table is terminal
     /// or already collected: its count is zero.
     fn compose_snapshot(&self, mut snapshot: SessionSnapshot, now: MonotonicMs) -> SessionSnapshot {
-        let count = self
-            .sessions
-            .get(&snapshot.session_id)
-            .map_or(0, |state| state.live_attach_count(now));
+        let state = self.sessions.get(&snapshot.session_id);
+        let count = state.map_or(0, |state| state.live_attach_count(now));
         snapshot.attach_count = count;
         snapshot.attached = count > 0;
+        // Presence only (`D-09`): the controller's handle is never served, so a
+        // status read cannot become an attach-id oracle. An expired controller
+        // awaiting the sweep is not present, exactly like `attach_count`.
+        snapshot.controller_present =
+            state.is_some_and(|state| state.live_controller(now).is_some());
         snapshot
     }
 

@@ -5,19 +5,170 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.31] - 2026-10-29
+
+### Added
+
+- **Plugin scenes paint in a shipped build (`CTX-1628`, `CTX-1630`,
+  `CTX-1641`; bitty#2762, bitty#2784, bitty#2785):** the composition root
+  builds the one OQ-051 `PanelRuntime` scene host, binds its Core-owned Rich
+  panel to the focused leaf, and installs the shared handle into `Runtime`, so
+  the present loop paints admitted `Scene`s instead of test-only structures.
+  `bitty.ui.mount("terminal", node)` and `ui.update` attach through the v2
+  rich reader under `SCN-1..5` admission; suspend, dispose, and reload release
+  the scene, the placement bind, and the panel, and update/detach match
+  handle, owner, and epoch, so a foreign generation can never replace or
+  release another plugin's scene. Paint stays bounded: an over-budget scene
+  refuses with a typed `ScenePaintError` and keeps the previous primitives
+  rather than clamping, and the accessibility projection carries exactly the
+  painted bytes. Image nodes remain counted placement references; forwarding
+  them to the image plane stays open under OQ-051.
+- **`bittyd` serves the bitty-ipc v1 contract (`CTX-1531`, `CTX-1632`,
+  `CTX-1633`, `CTX-1637`; bitty#2761, bitty#2770, bitty#2776, bitty#2786):**
+  0.0.30 carried the contract, registry, event stream, limits, endpoint, and
+  lease slices but served no method. `bittyd start` now binds the per-user
+  endpoint (`0700` directory, `0600` socket, single-instance lock), mints the
+  per-boot operator capability, and serves up to
+  `max_connections_per_endpoint` connections with deny-by-default
+  `session.*`/`daemon.*` scopes, host and observer grants, the eleven-stage
+  authorization order, a content-free owner-private audit sink, and per-frame
+  `SCM_CREDENTIALS` on Linux. The four P1 defects from the P0 evidence
+  campaign are fixed (a consumed host grant is revocable before its TTL, core
+  dumps are disabled with `RLIMIT_CORE=0` and `PR_SET_DUMPABLE=0`, a vacant
+  control answers `Denied/InvalidControlToken`, and suppressed wire refusals
+  aggregate into one record), a repeated `session.detach` is idempotent
+  instead of `NotFound`, and grant mint, consume, expiry, and revoke each bump
+  `state_revision`. Plain `bittyd` stays a status command with no runtime
+  file.
+- **Enforced containment and orphan verification (`CTX-1642`, bitty#2791):**
+  on Linux x86_64 a per-session cgroup v2 subtree is created before the spawn
+  and the child joins it from the single documented `pre_exec` seam, so a
+  descendant cannot be born outside the identity. `SIGTERM` goes through a
+  pidfd to every member, the subreaper leader is held through the grace
+  window, `cgroup.kill` escalates after `orphan_reap_grace_ms`, and `swept`
+  requires an empty `cgroup.procs`, `populated 0`, and a removed subtree; the
+  subreaper fallback always reports `unverified` and never claims a sweep,
+  macOS and Windows keep the typed `UnsupportedPlatform` refusal, and a Linux
+  host with neither mechanism refuses the spawn rather than downgrading
+  silently. `daemon.orphans.verify` takes `action` (`verify` by default, or
+  `retire` with a bounded `record_id`): retire removes exactly one quarantined
+  record, never signals or adopts, refuses reserved or committed records as
+  `Denied/InvalidRequest` and unknown ids as `NotFound`, and audits
+  `daemon.orphans.retire`. The startup scan completes under the
+  single-instance lock before the endpoint binds, and one on-demand pass is
+  capped by a total deadline.
+- **bittyd IPC contract conformance (`CTX-1640`, bitty#2664):** the security
+  sign-off deviations are closed. Any byte queued when `daemon.negotiate`
+  succeeds is refused `Denied/AlreadyNegotiated` and the connection closes; a
+  failed handshake and a pre-negotiate frame without a wire version are final;
+  grant `ttl_ms` is bounded by the compiled host/observer TTL; correlation
+  digests bind to the 128-bit digest the mint names (exactly 32 lowercase hex
+  characters); cross-method fields and mint-only fields on revokes are
+  `InvalidRequest`; a keyed mint with a different TTL or digest is
+  `Denied/IdempotencyConflict`; and the canonical `generation` /
+  `target_attach_id` spellings are served, with the pre-freeze names accepted
+  as deprecated aliases for one release.
+- **Shared bittyd conformance harness (`CTX-1631`, bitty#2605):** one
+  machine-readable corpus (`bittyd-conformance-corpus/1`), an in-process fake
+  labeled `candidate-not-bittyd`, a real-service driver over real `bitty-ipc`
+  v1 frames with per-frame credentials, a typed parity gate over the shared
+  vectors, and per-vector evidence uploaded as a CI artifact. Every vector
+  carries typed expectations, and a vector that exposes a defect is recorded
+  as a known defect with a tracked issue instead of a weaker assertion.
+- **Per-family component wire protocol (`CTX-1635`, bitty#2777):**
+  `bitty_runtime::component::family` selects the protocol range per component
+  family (`network-wire-v1` for graphics, net, storage, and a11y;
+  `execution-v2` for execution) instead of comparing every manifest with one
+  global constant. Unknown families and unlisted versions still fail closed
+  with `ResolveError::IncompatibleProtocol`, and the install gate, offline
+  cache, bare-executable staging, and `extension list` ABI column read the
+  same table.
+
+### Changed
+
+- **Plugin surfaces read one store (`CTX-1634`, bitty#2773, bitty#2774,
+  bitty#2775):** `--test-mode` publishes sanitized lifecycle rows (id,
+  version, generation, state, manifest hash, declared capabilities) to a
+  process-wide read-only store, and `bitty.debug/listPlugins` / `getPlugin`
+  serve them normalized to addressable generations and bounded rows;
+  `bitty list plugins`, `bitty x --help`, `bitty help x`, and alias
+  resolution read the same store index and manifests as `bitty plugin list`.
+  `bitty plugin enable` prints `enabled: yes` instead of repeating the
+  command. `bitty-terminal.bar` moves to `0fa15139` with `BITTY_PLUGINS_REV`
+  at registry `98f8a06`, and `--check-pins` / `just check-registry-fresh`
+  compares the compiled pins with the registry gitlinks.
+
+### Fixed
+
+- **Focus survives window focus loss and pointer re-entry (#2787,
+  `CTX-1639`):** winit's Wayland backend synthesizes one `CursorMoved` at the
+  resting pointer position for every `wl_pointer.enter`, and
+  `mouse.focus_follows_mouse` (on, 0 ms dwell) focused the pane under the
+  pointer on a Hyprland workspace switch-back. `CursorEntered` is now
+  translated, and a synthesized move that repeats the last position is an
+  entry re-sync that updates the pointer, scrollbar, and hover visuals but
+  never runs hover activation; hover activation also no-ops while the window
+  does not own the keyboard, and a focus loss drops any armed dwell.
+- **Panel move and resize regressions (#2788, #2789, `CTX-1638`):** the
+  `resize_height_only` grow inserted blank filler above the re-entered history
+  while the shrink absorbed it below, so moving a pane into a shorter slot and
+  back accumulated blank rows at the top; grow now pads below and the round
+  trip is exact in cells, cursor row, and scrollback. A live content-geometry
+  gesture now paints its per-step commit for the whole gesture, so the
+  reflowed grid no longer flashes the previous step's bounds and the overlay
+  scrollbar is resolved from the same painted frame as the leaf content.
+- **RC-1 wall-budget parking is deterministic under load (#2781, #2800):** the
+  budget charged off-CPU time as plugin work, so a stalled thread parked with
+  no work done and a completed host call was discarded as `E_TIMEOUT`; the
+  measured pre-fix failure rate on a loaded 4-vCPU cgroup was 10.7%. Every
+  result-asserting runtime dispatch now settles on the documented cold tick or
+  injects the wall seam, the park/resume and budget-drain suites keep the
+  production 50 ms budget, and a sibling stress suite replays the affected
+  command shapes under load.
+- **Install consent no longer claims a completed verification (#2772):** the
+  `--yes` consent lines now say the download "will verify against SHA256SUMS
+  and the catalog before unpacking", matching consent → catalog resolution →
+  download → dual-digest order instead of claiming a check that had not run.
+- **Conformance uploads no longer fail a skipped job (#2779):** a skipped
+  conformance test step no longer turns its `if: always()` artifact upload
+  into a second, misleading failure; evidence still uploads whenever it
+  exists.
+
+### Security
+
+- **Two vendored-winit null-pointer paths are guarded (#2759, `CTX-1626`):**
+  `InputMethod::new` no longer calls `slice::from_raw_parts` on a null
+  `supported_styles` when the X server reports no styles, and
+  `first_keysym_by_level` requires a non-null out-pointer before dereferencing.
+  Both are patch `0002-codeql-null-guards.diff` in the recorded vendor set,
+  `PATCHES.md` records the origin (local hardening, not upstream) and the new
+  tree digest, and `scripts/check-vendored-winit.sh` now verifies every patch
+  row against its recorded hash.
+
+### Deferred
+
+- `bittyd` worker spawn, bind, and `session.resize` behind `session.create`
+  generation 1 (#2790), event wire delivery (#2792), the advertised
+  `request_timeout_ms` request deadline (#2803, #2805), and the accepted
+  session and daemon metadata fields (#2806) stay open; the served loop
+  answers each with a typed refusal.
+- The RC-1 harness nits from the #2795 review (#2797), the keyboard
+  `resize_split` interpolated-bounds follow-up (#2798), and the
+  bitty-daemon README/owner-table alignment (#2804) remain open.
+
 ## [0.0.30] - 2026-10-28
 
 ### Added
 
 - **iTerm2 OSC 1337 inline images (`CTX-1590`, bitty#2217):** `OSC 1337 ;
-  File=` PNG images now store, place, and paint through the Kitty seam, with
+File=` PNG images now store, place, and paint through the Kitty seam, with
   the cursor advanced past the span (`C=0`) as `imgcat` does. Requests are
   capped before decode (4 MiB base64 wire, 3 MiB decoded, 16,777,216 px);
   fourteen refusal reasons plus an `iterm2_refused` counter keep rejected
   requests inert, `bitty inspect protocol iterm2-inline-images` reports the
   subset, and sixel stays refused.
 - **Named profiles from the CLI (`CTX-1589`, bitty#2449):** `bitty config
-  profile create|clone|rename|delete|list|show|use|get|set|path`, with
+profile create|clone|rename|delete|list|show|use|get|set|path`, with
   `--json` on every state-reporting verb. Names keep a fixed grammar
   (`default` reserved) and symlinks are refused; writes are atomic and
   validated against the merged user layer plus candidate chain. `set`
@@ -27,7 +178,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   extended grapheme cluster is now one layout unit — cursor, backspace,
   selection, and paint step by cluster — with UAX #29 / UAX #11 properties
   generated from pinned UCD 18.0.0 snapshots. `terminal.ambiguous_width =
-  narrow|wide` (default `narrow`, restart required) applies East Asian
+narrow|wide` (default `narrow`, restart required) applies East Asian
   Ambiguous width.
 - **Paint-time Unicode BiDi foundation (UAX #9) (`CTX-1612`, bitty#1766):**
   logical lines resolve through `unicode-bidi` 0.3.18 (MIT OR Apache-2.0,
@@ -374,13 +525,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   headless frame regressions compare each close frame with an instant-delete
   reference in `catppuccin-mocha` and `github-light`.
 
- **Nix build with patched workspace crates (#2591):** `nix build .#bitty`
-  failed in the `bitty-deps` derivation because crane's dummy source replaced
-  `crates/bitty-pty`/`crates/bitty-plugin-host` with empty stubs while the
-  external `bitty-execution` dependency resolves those crates through the
-  workspace `[patch]` table. The flake now builds a single real-source
-  derivation (`cargoArtifacts = null`), and `just nix-patch-test` fails if
-  dummy-source caching returns while those patch paths exist.
+**Nix build with patched workspace crates (#2591):** `nix build .#bitty`
+failed in the `bitty-deps` derivation because crane's dummy source replaced
+`crates/bitty-pty`/`crates/bitty-plugin-host` with empty stubs while the
+external `bitty-execution` dependency resolves those crates through the
+workspace `[patch]` table. The flake now builds a single real-source
+derivation (`cargoArtifacts = null`), and `just nix-patch-test` fails if
+dummy-source caching returns while those patch paths exist.
 
 - **Stall-watchdog delivery hardening (#2560):** report delivery now records
   every outcome (`delivered`, `helper-failed`, `timed-out`, `spawn-failed`,

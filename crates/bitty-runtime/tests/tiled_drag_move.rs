@@ -175,6 +175,9 @@ fn motion_tracks_preview_live_without_mutating() {
 fn release_commits_edge_insert_at_balanced_ratio_without_selection() {
     let mut rt = make_runtime();
     rt.set_layout(two_pane());
+    // Establish the pre-drag presented frame: the first present after
+    // startup arms no geometry transition.
+    let _ = rt.tick_at(std::time::Instant::now());
     rt.handle_cursor_moved(cell_pixels(10, 12));
     rt.handle_key_event(named_key(NamedKey::Alt, PressState::Pressed));
     rt.handle_mouse_input(press(MouseButton::Left));
@@ -193,11 +196,23 @@ fn release_commits_edge_insert_at_balanced_ratio_without_selection() {
             true
         )))
     );
+    let released_at = std::time::Instant::now();
     rt.handle_mouse_input(release(MouseButton::Left));
     assert!(!rt.tiled_drag_active(), "release must end the drag");
     assert!(
         !rt.is_selection_dragging() && !rt.has_selection(),
         "release must not desync into a selection commit (no selection was started)"
+    );
+    // Issue #2798: the drop reflows the reparented leaf on this tick, so the
+    // frames that follow the release paint the committed rectangles. The
+    // ghost already showed the drop; interpolating from the pre-drag rect
+    // would paint the fresh grid into a stale viewport.
+    let mid = released_at + std::time::Duration::from_millis(40);
+    rt.tick_at(mid).expect("drop presents");
+    assert_eq!(
+        rt.paint_frames_at(mid),
+        rt.present_frames(),
+        "a committed drop must paint its reflow immediately"
     );
     // Source re-parented beside the target; focus stayed on the dragged pane.
     assert_eq!(rt.focused_view(), Some(ViewId::new(1)));

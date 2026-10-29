@@ -1072,10 +1072,27 @@ impl Runtime {
             .map(|frame| (frame.view, *frame))
             .collect();
         let gesture_active = self.animator.earliest_geometry_started(now).is_some();
-        // Issue #2789: a live pointer resize (border-drag divider, Alt+edge
-        // float resize) commits content geometry per step; see
-        // `content_geometry_gesture_active`.
+        // Issues #2789/#2798: a content-geometry commit (live pointer resize,
+        // border-drag step, keyboard resize) reflows the pane grids with the
+        // rectangles it commits; see `content_geometry_gesture_active`.
         let live_resize_gesture = self.content_geometry_gesture_active();
+        if live_resize_gesture {
+            // Issue #2789 (PR #2796 review follow-up): while the commit is
+            // suppressed, every presented surface paints its committed
+            // frame, so every bounds tween is hidden — not only the tweens
+            // on panes this commit resized. Cancel them all (rings keep
+            // fading) or an unchanged pane's old tween resumes after the
+            // latch clears and jumps back to an intermediate rectangle.
+            let mut surfaces: Vec<ViewId> = allocations.iter().map(|frame| frame.view).collect();
+            surfaces.extend(
+                self.last_presented_allocations
+                    .iter()
+                    .map(|frame| frame.view),
+            );
+            for surface in surfaces {
+                self.animator.cancel_bounds(Some(surface));
+            }
+        }
         for frame in allocations {
             let Some(old) = old_by_view.get(&frame.view) else {
                 // A brand-new View uses the open transition, not a bounds
@@ -1102,13 +1119,13 @@ impl Runtime {
                 self.animator.cancel_bounds(Some(frame.view));
                 continue;
             }
-            if !accepted_transition
-                && !gesture_active
-                && self
-                    .animator
-                    .interpolated_bounds(Some(frame.view), now)
-                    .is_none()
-            {
+            // No accepted transition of its own and no geometry transition
+            // is armed, so this is a bare layout install or appearance
+            // reflow: its reflowed grid paints immediately. Drop any stale
+            // tween on this surface instead of retargeting it onto the
+            // commit.
+            if !accepted_transition && !gesture_active {
+                self.animator.cancel_bounds(Some(frame.view));
                 continue;
             }
             let size_changed =
@@ -1116,12 +1133,10 @@ impl Runtime {
             // Issue #2789: a live divider resize has no intermediate
             // geometry to interpolate. Each pointer step reflows the pane
             // grids with the committed rectangles, so a tween would paint
-            // the fresh grid into the previous step's viewport. Accepted
-            // open/close/workspace transitions keep their bounds
-            // interpolation; the resize gesture paints the commit and fades
-            // only chrome.
+            // the fresh grid into the previous step's viewport. Issue #2798:
+            // a keyboard resize commits the same way. Bounds were cancelled
+            // above; the resize paints the commit and fades only chrome.
             if live_resize_gesture {
-                self.animator.cancel_bounds(Some(frame.view));
                 continue;
             }
             let kind = if size_changed {
@@ -2851,6 +2866,22 @@ impl Runtime {
     /// (CTX-0790/#1435 scrollback preservation).
     pub fn set_layout(&mut self, layout: LayoutNode) {
         self.replace_layout(layout, None);
+    }
+
+    /// Replaces the owned layout and paints its committed content bounds on
+    /// the next present (issues #2789, #2798).
+    ///
+    /// [`Self::set_layout`] reflows every leaf grid with the new tree on the
+    /// same tick, so a frame that also interpolates the changed rectangles
+    /// paints the fresh grid into a stale viewport. Callers whose layout
+    /// change is itself the motion (a keyboard `resize_split` step, the
+    /// pointer commits above) install the tree through this funnel: the next
+    /// present paints the committed rectangles exactly once and from then on
+    /// only Core-owned chrome fades. Accepted open/close/workspace
+    /// transitions keep the interpolating [`Self::set_layout`] path.
+    pub fn set_layout_committed(&mut self, layout: LayoutNode) {
+        self.replace_layout(layout, None);
+        self.content_geometry_commit_unpresented = true;
     }
 
     /// Replaces the owned layout because leaf `closed` was explicitly closed.

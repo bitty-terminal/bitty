@@ -416,10 +416,10 @@ impl WorkerPool {
                             worker.kill_sent = true;
                         }
                     }
-                    if let Some(status) = worker.exit
-                        && let Some(cleanup) = worker.sweep(now, kill_wait_ms)
-                    {
-                        terminal = Some((observation(status), cleanup));
+                    if let Some(status) = worker.exit {
+                        if let Some(cleanup) = worker.sweep(now, kill_wait_ms) {
+                            terminal = Some((observation(status), cleanup));
+                        }
                     }
                 } else {
                     // Collected before its worker settled: terminate the tree
@@ -432,12 +432,13 @@ impl WorkerPool {
                 // draining): keep the handle for the next tick.
                 continue;
             }
-            if let Some((observation, cleanup)) = terminal
-                && let Ok(Termination::Completed(_)) =
+            if let Some((observation, cleanup)) = terminal {
+                if let Ok(Termination::Completed(_)) =
                     host.record_termination(session_id, observation, cleanup, now)
-            {
-                let _ = orphans.settle(session_id, cleanup, now);
-                finished.push(session_id);
+                {
+                    let _ = orphans.settle(session_id, cleanup, now);
+                    finished.push(session_id);
+                }
             }
             if let Some(cleanup) = collected {
                 let _ = orphans.settle(session_id, cleanup, now);

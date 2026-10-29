@@ -560,7 +560,7 @@ impl Driver for RealDriver {
         if let Some(grant) = &self.host_grant {
             vars.insert("host_grant".to_owned(), Value::String(grant.clone()));
         }
-        cell_vars(&mut vars);
+        cell_vars(&mut vars, bitty_daemon::worker::WORKER_SESSIONS_SERVED);
         Ok(vars)
     }
 
@@ -859,7 +859,7 @@ impl Driver for RealDriver {
         if let Some(grant) = &self.host_grant {
             vars.insert("host_grant".to_owned(), Value::String(grant.clone()));
         }
-        cell_vars(&mut vars);
+        cell_vars(&mut vars, bitty_daemon::worker::WORKER_SESSIONS_SERVED);
         Ok(vars)
     }
 

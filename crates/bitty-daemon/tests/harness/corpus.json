@@ -110,7 +110,7 @@
       ],
       "forbidden": [
         "no operator scope without the operator capability",
-        "no terminal.* or view.* ambient scope",
+        "no ambient view.*, config.*, plugin.*, or debug.* scope; process.spawn and terminal.manage are the explicit transport grants",
         "no control token, grant bearer, or capability value in the handshake"
       ]
     },

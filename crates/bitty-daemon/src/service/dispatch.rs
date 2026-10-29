@@ -60,7 +60,7 @@ use crate::audit::{
 use crate::audit_sink::{AuditSink, AuditWriter};
 use crate::codes::RefusalCode;
 use crate::containment::ContainmentReport;
-use crate::contract::CAPABILITIES;
+use crate::contract::{CAPABILITIES, Capabilities};
 use crate::handshake::{
     ClientCorrelation, DaemonState, GrantCorrelation, HandshakeContext, HandshakeResponse,
     NegotiateRequest, PeerIdentityFacts, ServerIdentity,
@@ -91,7 +91,7 @@ use crate::service::wire::params::{
     instance_field, object, required_string, required_u64, string_field,
 };
 use crate::spawn::{SpawnSpec, SpawnSpecError, resize_dimension};
-use crate::worker::{ResizeError, WORKER_SESSIONS_SERVED, WorkerPool, WorkerSpawnError};
+use crate::worker::{ResizeError, WorkerPool, WorkerSpawnError};
 
 /// The `daemon.stop` mode (`D-05`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -499,6 +499,20 @@ impl Service {
         self.host.instance_id()
     }
 
+    /// The capability set this probed daemon advertises.
+    ///
+    /// The build's [`CAPABILITIES`] are the contract target set; the worker
+    /// bit is narrowed to the plan the startup probe actually selected. A
+    /// Linux cell whose cgroup and subreaper probes both failed cannot contain
+    /// a worker tree, so it must not advertise `worker_sessions` and every
+    /// worker create is `Denied/UnsupportedCapability`.
+    #[must_use]
+    pub fn capabilities(&self) -> Capabilities {
+        let mut capabilities = CAPABILITIES;
+        capabilities.worker_sessions = crate::worker::sessions_served(&self.containment);
+        capabilities
+    }
+
     /// The effective limits for this run.
     #[must_use]
     pub const fn limits(&self) -> &Limits {
@@ -588,8 +602,12 @@ impl Service {
     /// worker; the only bounded work is the containment sweep after an exit was
     /// already observed.
     pub fn supervise(&mut self, now: MonotonicMs) {
-        self.workers
+        let finished = self
+            .workers
             .supervise(&mut self.host, &mut self.orphans, now);
+        for session_id in finished {
+            self.retire_session(session_id, now);
+        }
     }
 
     /// Record exactly one refusal that the server loop refuses before a method
@@ -767,6 +785,7 @@ impl Service {
             peer_identity: PeerIdentityFacts::from_peer(&connection.peer().identity()),
             client_id: connection.client_id(),
             scopes: connection.scopes().clone(),
+            capabilities: self.capabilities(),
             limits: negotiated.limits,
             server_monotonic_ms: now.as_millis(),
             daemon_state: self.state,
@@ -1158,8 +1177,15 @@ impl Service {
             .copied()
     }
 
-    fn retire_session(&mut self, session_id: SessionId) {
-        self.workers.forget(session_id);
+    /// Retire the service-side state of one session.
+    ///
+    /// A live worker handle is terminated and its journal record settled
+    /// before the stores are dropped: a retire must never leak a running
+    /// worker, even when a caller reached here without a prior stop.
+    fn retire_session(&mut self, session_id: SessionId, now: MonotonicMs) {
+        if let Some(cleanup) = self.workers.forget(session_id) {
+            let _ = self.orphans.settle(session_id, cleanup, now);
+        }
         self.initial_tokens.remove(&session_id);
         self.observer_grant_ids.remove(&session_id);
         if let Some(key) = self.create_key_by_session.remove(&session_id) {
@@ -1323,12 +1349,13 @@ impl Service {
         match action {
             OrphanAction::Verify => {
                 // A bound worker's committed record is a supervision handle,
-                // not an orphan. The on-demand pass skips every session this
-                // host still supervises so a reconcile read never signals a
-                // running worker; a terminal record is exit cleanup and stays
-                // visible so an unprovable tree is quarantined. The startup
-                // scan (no registry) skips nothing.
-                let live: BTreeSet<SessionId> = self.host.supervised_session_ids(now).collect();
+                // not an orphan. The on-demand pass skips exactly the sessions
+                // this pool still holds a live worker handle for, so a
+                // reconcile read never signals a running worker. A terminal
+                // record is exit cleanup: it has no live handle, so its record
+                // stays visible and an unprovable tree is quarantined. The
+                // startup scan (no registry, no pool) skips nothing.
+                let live: BTreeSet<SessionId> = self.workers.session_ids().into_iter().collect();
                 let report = self
                     .orphans
                     .verify_on_demand_excluding(now, &live)
@@ -1421,7 +1448,7 @@ impl Service {
                         .complete_pre_bind_cancel(session_id, CleanupClass::NotStarted, now)
                 {
                     terminated = terminated.saturating_add(1);
-                    self.retire_session(session_id);
+                    self.retire_session(session_id, now);
                     let _ = self.audit.record(
                         AuditEntry::new(AuditAction::Stop)
                             .result(AuditResult::Ok)
@@ -1461,7 +1488,7 @@ impl Service {
                 .workers
                 .terminate(session_id)
                 .unwrap_or(CleanupClass::Unverified);
-            self.workers.forget(session_id);
+            let _ = self.workers.forget(session_id);
             let _ = self.orphans.settle(session_id, cleanup, now);
             if let Ok(Termination::Completed(notice)) = self.host.record_termination(
                 session_id,
@@ -1470,7 +1497,7 @@ impl Service {
                 now,
             ) {
                 terminated = terminated.saturating_add(1);
-                self.retire_session(session_id);
+                self.retire_session(session_id, now);
                 let _ = self.audit.record(
                     AuditEntry::new(AuditAction::Stop)
                         .result(AuditResult::Ok)
@@ -1581,8 +1608,10 @@ impl Service {
             "terminal" => SessionKind::Terminal,
             "worker" => {
                 // The frozen order: after the stage-6 create-scope check and
-                // before the stage-7 host-grant liveness re-check.
-                if !WORKER_SESSIONS_SERVED {
+                // before the stage-7 host-grant liveness re-check. The plan the
+                // startup probe selected is the serve truth, so a Linux cell
+                // that selected no mechanism refuses here too.
+                if !self.capabilities().worker_sessions {
                     return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
                 }
                 SessionKind::Worker
@@ -1646,6 +1675,9 @@ impl Service {
                 self.create_replay(connection, &snapshot, applied.control_claimed, now)
             }
             Ok(Admission::Replay(IdempotencyResult::Refused(code))) => Err(Refusal::denied(code)),
+            Ok(Admission::Replay(IdempotencyResult::Limited { actual, limit })) => {
+                Err(Refusal::limit_exceeded(limit, actual))
+            }
             Ok(Admission::Execute(reservation)) => {
                 if let Err(error) = self
                     .recheck(connection, DispatchBoundary::CreateSession)
@@ -1682,10 +1714,9 @@ impl Service {
                                 let _ = self.host.discard_created(session_id);
                                 self.initial_tokens.remove(&session_id);
                                 self.create_key_by_session.remove(&session_id);
-                                let _ = self.create_keys.complete(
-                                    reservation,
-                                    IdempotencyResult::Refused(store_code(refusal)),
-                                );
+                                let _ = self
+                                    .create_keys
+                                    .complete(reservation, store_result(refusal));
                                 self.record(
                                     AuditAction::Create,
                                     connection,
@@ -1761,10 +1792,11 @@ impl Service {
     /// The sequence is the contract's two-phase journal: reserve the record
     /// with the pre-spawn containment identity, spawn under that identity,
     /// commit the observed identity, then bind generation `1`. A spawn failure
-    /// terminalizes the record as `failed/spawn_failed` with `not_started`
-    /// cleanup and settles the journal, so the create still answers the
-    /// accepted result shape. Only a journal capacity refusal returns `Err`,
-    /// and the caller rolls the whole create back.
+    /// terminalizes the record as `failed/spawn_failed` with the cleanup class
+    /// the plan could prove (`not_started` before a child existed, `swept` or
+    /// `unverified` after one did) and settles the journal, so the create still
+    /// answers the accepted result shape. Only a journal capacity refusal
+    /// returns `Err`, and the caller rolls the whole create back.
     fn start_worker(
         &mut self,
         session_id: SessionId,
@@ -1794,11 +1826,17 @@ impl Service {
                         .settle(session_id, CleanupClass::NotStarted, now);
                     return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
                 }
-                Err(WorkerSpawnError::Spawn) => {
+                Err(WorkerSpawnError::NotStarted) => {
                     let _ = self
                         .orphans
                         .settle(session_id, CleanupClass::NotStarted, now);
                     return self.spawn_failed(session_id, CleanupClass::NotStarted, now);
+                }
+                Err(WorkerSpawnError::Cleanup(cleanup)) => {
+                    // A child existed and was terminated before the error
+                    // returned; report the class the plan could prove.
+                    let _ = self.orphans.settle(session_id, cleanup, now);
+                    return self.spawn_failed(session_id, cleanup, now);
                 }
             };
         if self.orphans.commit(session_id, identity).is_err() {
@@ -1806,7 +1844,7 @@ impl Service {
                 .workers
                 .terminate(session_id)
                 .unwrap_or(CleanupClass::Unverified);
-            self.workers.forget(session_id);
+            let _ = self.workers.forget(session_id);
             let _ = self.orphans.settle(session_id, cleanup, now);
             return self.spawn_failed(session_id, cleanup, now);
         }
@@ -1817,7 +1855,7 @@ impl Service {
                     .workers
                     .terminate(session_id)
                     .unwrap_or(CleanupClass::Unverified);
-                self.workers.forget(session_id);
+                let _ = self.workers.forget(session_id);
                 let _ = self.orphans.settle(session_id, cleanup, now);
                 self.spawn_failed(session_id, cleanup, now)
             }
@@ -1838,7 +1876,7 @@ impl Service {
             now,
         ) {
             Ok(Termination::Completed(notice)) => {
-                self.retire_session(session_id);
+                self.retire_session(session_id, now);
                 Ok(notice.session)
             }
             Ok(Termination::AlreadyTerminal { session }) => Ok(session),
@@ -1853,7 +1891,9 @@ impl Service {
         control_claimed: bool,
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
-        let token = if control_claimed {
+        // A terminal session never exposes a claimable token, even on a keyed
+        // replay of the create that produced it.
+        let token = if control_claimed || snapshot.state.is_terminal() {
             None
         } else {
             self.initial_tokens
@@ -1970,6 +2010,9 @@ impl Service {
                 }))
             }
             Ok(Admission::Replay(IdempotencyResult::Refused(code))) => Err(Refusal::denied(code)),
+            Ok(Admission::Replay(IdempotencyResult::Limited { actual, limit })) => {
+                Err(Refusal::limit_exceeded(limit, actual))
+            }
             Ok(Admission::Execute(reservation)) => {
                 if let Err(error) = self
                     .recheck(connection, DispatchBoundary::ControllerAttach)
@@ -2209,6 +2252,9 @@ impl Service {
                 }))
             }
             Ok(Admission::Replay(IdempotencyResult::Refused(code))) => Err(Refusal::denied(code)),
+            Ok(Admission::Replay(IdempotencyResult::Limited { actual, limit })) => {
+                Err(Refusal::limit_exceeded(limit, actual))
+            }
             Ok(Admission::Execute(reservation)) => {
                 if let Err(error) = self
                     .recheck(connection, DispatchBoundary::ObserverGrantMint)
@@ -2539,6 +2585,9 @@ impl Service {
                 }))
             }
             Ok(Admission::Replay(IdempotencyResult::Refused(code))) => Err(Refusal::denied(code)),
+            Ok(Admission::Replay(IdempotencyResult::Limited { actual, limit })) => {
+                Err(Refusal::limit_exceeded(limit, actual))
+            }
             Ok(Admission::Execute(reservation)) => {
                 if let Err(error) = self
                     .recheck(connection, DispatchBoundary::ControlTransfer)
@@ -2621,10 +2670,11 @@ impl Service {
         let rows =
             resize_dimension(required_u64(fields, "rows")?).map_err(map_spawn_spec_refusal)?;
 
-        let snapshot = self
-            .host
-            .snapshot(session_id, now)
-            .ok_or_else(Refusal::not_found)?;
+        // Resolve visibility before any generation or state fence: an unleased
+        // non-operator with a leaked id gets the uniform `NotFound`, never a
+        // `StaleGeneration` oracle that echoes the revision counter. A caller
+        // that can see the session keeps the frozen order below.
+        let snapshot = self.visible(connection, session_id, None, now)?;
         check_generation(&snapshot, generation)?;
         if snapshot.state.is_terminal() {
             return Err(Refusal::denied(RefusalCode::NotRunning));
@@ -2783,15 +2833,18 @@ impl Service {
                 "not_running": true,
             })),
             StopOutcome::PreBindCancel(accepted) => {
-                // No worker exists in this slice, so the generation-0 cancel
-                // completes in the same request with `not_started` cleanup.
+                // Only a generation-0 record reaches this branch: a worker
+                // binds generation 1 before it is exposed, and a failed spawn
+                // terminalizes at generation 0 with no handle. No worker exists
+                // for this session, so the cancel completes in the same request
+                // with `not_started` cleanup.
                 let terminated = self
                     .host
                     .complete_pre_bind_cancel(session_id, CleanupClass::NotStarted, now)
                     .map_err(map_lease)?;
                 let snapshot = match terminated {
                     Termination::Completed(notice) => {
-                        self.retire_session(session_id);
+                        self.retire_session(session_id, now);
                         let terminal = Some(AuditTerminal {
                             state: notice.session.state,
                             reason: notice.reason,
@@ -2954,7 +3007,21 @@ fn fingerprint(parts: &[&str]) -> Fingerprint {
 }
 
 fn store_code(refusal: Refusal) -> RefusalCode {
-    refusal.denied_code().unwrap_or(RefusalCode::Internal)
+    refusal.audit_code()
+}
+
+/// The idempotency result to store for a refused create.
+///
+/// A bound breach keeps its class and counts, so a keyed replay answers the
+/// same `Framing/LimitExceeded` instead of collapsing into `Denied/Internal`.
+fn store_result(refusal: Refusal) -> IdempotencyResult {
+    match refusal.kind() {
+        RefusalKind::Denied(code) => IdempotencyResult::Refused(code),
+        RefusalKind::LimitExceeded { limit, actual } => {
+            IdempotencyResult::Limited { actual, limit }
+        }
+        _ => IdempotencyResult::Refused(refusal.audit_code()),
+    }
 }
 
 /// Map a bounded spawn-specification refusal to its wire refusal.
@@ -3342,6 +3409,20 @@ mod tests {
         limits: Limits,
         orphans: OrphanSupervisor,
     ) -> (Service, tempfile::TempDir) {
+        service_with_containment(
+            limits,
+            orphans,
+            crate::containment::ContainmentReport::unprobed(
+                crate::platform::PlatformCell::current(),
+            ),
+        )
+    }
+
+    fn service_with_containment(
+        limits: Limits,
+        orphans: OrphanSupervisor,
+        containment: crate::containment::ContainmentReport,
+    ) -> (Service, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::set_permissions(
             dir.path(),
@@ -3350,16 +3431,8 @@ mod tests {
         .expect("chmod");
         let operator = OperatorStore::create_in(dir.path()).expect("operator store");
         let (writer, _fail, _lines) = TestWriter::new();
-        let service = Service::new(
-            limits,
-            operator,
-            Box::new(writer),
-            orphans,
-            crate::containment::ContainmentReport::unprobed(
-                crate::platform::PlatformCell::current(),
-            ),
-        )
-        .expect("service");
+        let service = Service::new(limits, operator, Box::new(writer), orphans, containment)
+            .expect("service");
         (service, dir)
     }
 
@@ -3746,8 +3819,10 @@ mod tests {
             .expect_err("refused");
         assert_eq!(error.denied_code(), Some(RefusalCode::ScopeViolation));
 
-        // Create scope passes, so the next authority is consent (on the served
-        // cell) or the typed capability refusal (everywhere else).
+        // Create scope passes; the handler's next check in this test service
+        // is the serve truth. The service was built with an unprobed plan,
+        // which is `Refused`, so the worker path is the typed capability
+        // refusal before consent is even considered.
         let mut allowed = connection(
             ServiceScopeSet::baseline().with(ServiceScope::SessionHost),
             true,
@@ -3768,11 +3843,7 @@ mod tests {
             .expect_err("refused");
         assert_eq!(
             error.denied_code(),
-            Some(if crate::worker::WORKER_SESSIONS_SERVED {
-                RefusalCode::ConsentRequired
-            } else {
-                RefusalCode::UnsupportedCapability
-            })
+            Some(RefusalCode::UnsupportedCapability)
         );
         assert_eq!(
             service
@@ -3782,6 +3853,191 @@ mod tests {
             0,
             "neither refusal creates a record"
         );
+    }
+
+    #[test]
+    fn a_refused_containment_plan_never_advertises_or_serves_workers() {
+        let cell = crate::platform::PlatformCell::current();
+        let report = crate::containment::ContainmentReport::refused(
+            cell,
+            crate::containment::ContainmentRefusal::NotProbed,
+        );
+        let (mut service, _dir) = service_with_containment(
+            Limits::default(),
+            OrphanSupervisor::unsupported(cell, "test"),
+            report,
+        );
+        assert!(
+            !service.capabilities().worker_sessions,
+            "a refused plan serves no worker tree"
+        );
+
+        let mut creator = connection(
+            ServiceScopeSet::baseline().with(ServiceScope::SessionHost),
+            true,
+        );
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0));
+        let response = service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(1))
+            .expect("negotiate");
+        assert!(
+            !response.capabilities.worker_sessions,
+            "the handshake must not advertise a worker path the plan refuses"
+        );
+
+        let error = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionCreate,
+                &json!({
+                    "kind": "worker",
+                    "idempotency_key": "worker-refused-plan",
+                    "argv": ["/bin/true"],
+                    "cwd": "/",
+                }),
+                MonotonicMs::from_millis(2),
+            )
+            .expect_err("refused plan");
+        assert_eq!(
+            error.denied_code(),
+            Some(RefusalCode::UnsupportedCapability)
+        );
+        assert_eq!(
+            service
+                .host()
+                .snapshots(MonotonicMs::from_millis(3))
+                .count(),
+            0,
+            "the refusal creates no record"
+        );
+    }
+
+    #[test]
+    fn a_journal_capacity_refusal_replays_its_stored_class_and_code() {
+        use crate::containment::{ContainmentLimits, ContainmentRecord};
+        use crate::orphan::OrphanJournalLimits;
+
+        let limits = Limits::new(&[LimitOverride::new(LimitId::MaxOrphanRecords, 1)])
+            .expect("journal capacity limits");
+        let cell = crate::platform::PlatformCell::current();
+        let report = crate::containment::ContainmentReport::subreaper(cell, None);
+        let journal_dir = tempfile::tempdir().expect("journal dir");
+        std::fs::set_permissions(
+            journal_dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("chmod");
+        let supervisor = OrphanSupervisor::open(
+            journal_dir.path().join("orphans"),
+            &OrphanJournalLimits::from_limits(&limits),
+            &report,
+            ContainmentLimits::default(),
+        )
+        .expect("served supervisor");
+        let (mut service, _dir) = service_with_containment(limits, supervisor, report);
+
+        // Occupy the single journal slot so the next worker create cannot
+        // reserve its pre-spawn record.
+        let occupied = SessionId::parse(&"7".repeat(32)).expect("session id");
+        service
+            .orphans
+            .reserve(
+                occupied,
+                1,
+                MonotonicMs::from_millis(2),
+                ContainmentRecord::subreaper(),
+            )
+            .expect("occupy the journal");
+
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 2);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        let params = json!({
+            "kind": "worker",
+            "idempotency_key": "journal-capacity",
+            "argv": ["/bin/true"],
+            "cwd": "/",
+        });
+
+        let first = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionCreate,
+                &params,
+                MonotonicMs::from_millis(4),
+            )
+            .expect_err("the journal is full");
+        assert_eq!(
+            first.kind(),
+            RefusalKind::LimitExceeded {
+                limit: 1,
+                actual: 1
+            }
+        );
+        assert_eq!(first.code(), "LimitExceeded");
+        assert_eq!(first.class(), bitty_ipc_api::error::ErrorClass::Framing);
+
+        // The keyed replay answers the stored class and code, not a collapsed
+        // `Denied/Internal`.
+        let replay = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionCreate,
+                &params,
+                MonotonicMs::from_millis(5),
+            )
+            .expect_err("the replay stays refused");
+        assert_eq!(replay, first);
+        assert_eq!(replay.code(), "LimitExceeded");
+    }
+
+    #[test]
+    fn a_served_containment_plan_advertises_workers_before_consent() {
+        if !crate::worker::WORKER_SESSIONS_SERVED {
+            return;
+        }
+        let cell = crate::platform::PlatformCell::current();
+        let report = crate::containment::ContainmentReport::subreaper(cell, None);
+        let (mut service, _dir) = service_with_containment(
+            Limits::default(),
+            OrphanSupervisor::unsupported(cell, "test"),
+            report,
+        );
+        assert!(service.capabilities().worker_sessions);
+
+        let mut creator = connection(
+            ServiceScopeSet::baseline().with(ServiceScope::SessionHost),
+            true,
+        );
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0));
+        let response = service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(1))
+            .expect("negotiate");
+        assert!(
+            response.capabilities.worker_sessions,
+            "an enforced plan advertises the worker path"
+        );
+
+        // The served cell still gates the create on consent before the spec.
+        let error = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionCreate,
+                &json!({
+                    "kind": "worker",
+                    "idempotency_key": "worker-no-consent",
+                    "argv": ["/bin/true"],
+                    "cwd": "/",
+                }),
+                MonotonicMs::from_millis(2),
+            )
+            .expect_err("no host grant");
+        assert_eq!(error.denied_code(), Some(RefusalCode::ConsentRequired));
     }
 
     #[test]
@@ -4290,6 +4546,9 @@ mod tests {
     /// settled before the on-demand verify pass. The registry retains the
     /// terminal record, and that retained record must never hide the
     /// quarantine: an unprovable tree stays quarantined, exactly once.
+    ///
+    /// The only skip is a live worker handle, so a bound record without one is
+    /// classified rather than protected by its registry row.
     #[test]
     fn a_worker_exit_quarantines_before_the_verify_pass_while_the_record_is_retained() {
         use crate::containment::{ContainmentLimits, ContainmentRecord};
@@ -4398,24 +4657,29 @@ mod tests {
         );
         assert_eq!(verified["committed"], 0);
         assert_eq!(verified["reserved"], 0);
+        assert!(
+            service.workers.session_ids().is_empty(),
+            "a terminal session keeps no live worker handle"
+        );
 
-        // The one case the verifier skips is a session whose worker is still
-        // bound. A reserved subreaper record has no identity to signal, so a
-        // regression quarantines it instead of killing a live process.
-        let live_id = SessionId::parse(&session_id(&create_session(
+        // The exclusion set is exactly the live worker pool, never the
+        // registry. A bound, non-terminal record with no worker handle is not
+        // supervision: its reserved containment identity is unverifiable, so a
+        // verify pass must quarantine it. A registry-based skip would hide it.
+        let idle_id = SessionId::parse(&session_id(&create_session(
             &mut service,
             &mut creator,
-            "still-running",
+            "bound-without-worker",
         )))
         .expect("session id");
         service
             .host_mut()
-            .bind(live_id, MonotonicMs::from_millis(15))
+            .bind(idle_id, MonotonicMs::from_millis(15))
             .expect("bind");
         service
             .orphans
             .reserve(
-                live_id,
+                idle_id,
                 1,
                 MonotonicMs::from_millis(15),
                 ContainmentRecord::subreaper(),
@@ -4430,10 +4694,13 @@ mod tests {
             )
             .expect("served");
         assert_eq!(
-            again["unverified"], 1,
-            "a supervised record is never classified"
+            again["unverified"], 2,
+            "a bound record without a worker handle is classified, never skipped"
         );
-        assert_eq!(again["reserved"], 1, "a bound session keeps its record");
+        assert_eq!(
+            again["reserved"], 0,
+            "the unverifiable reserved record is quarantined, not protected"
+        );
     }
 
     #[test]

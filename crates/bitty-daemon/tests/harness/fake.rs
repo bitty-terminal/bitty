@@ -34,6 +34,14 @@ const BASELINE: [&str; 5] = [
     "process.spawn",
 ];
 
+/// Whether the reference cell models a served worker plane.
+///
+/// The fake is the contract reference, not a mirror of the host: it serves the
+/// worker create/resize surface on every platform, so it must advertise that
+/// surface on every platform too. The real driver seeds the compiled cell truth
+/// instead (Linux only in this slice).
+const FAKE_WORKER_SESSIONS: bool = true;
+
 /// The fake server driver.
 pub struct FakeDriver {
     limits: Limits,
@@ -156,6 +164,18 @@ impl FakeDriver {
         Ok(())
     }
 
+    /// The advertised value of one capability for this reference cell.
+    ///
+    /// The worker bit is fixed to the modeled served cell; every other bit is
+    /// the compiled contract value.
+    fn capability(name: &str, enabled: bool) -> bool {
+        if name == "worker_sessions" {
+            FAKE_WORKER_SESSIONS
+        } else {
+            enabled
+        }
+    }
+
     fn facts_now(&self) -> ServiceFacts {
         ServiceFacts {
             instance_id: self.instance.clone(),
@@ -164,7 +184,7 @@ impl FakeDriver {
             capabilities: CAPABILITIES
                 .all()
                 .into_iter()
-                .map(|(name, enabled)| (name.to_owned(), enabled))
+                .map(|(name, enabled)| (name.to_owned(), Self::capability(name, enabled)))
                 .collect(),
             limits: LimitId::ALL
                 .into_iter()
@@ -182,7 +202,7 @@ impl FakeDriver {
         if let Some(grant) = &self.host_grant {
             vars.insert("host_grant".to_owned(), Value::String(grant.clone()));
         }
-        cell_vars(&mut vars);
+        cell_vars(&mut vars, FAKE_WORKER_SESSIONS);
         vars
     }
 
@@ -427,7 +447,7 @@ impl FakeDriver {
         let capabilities: BTreeMap<String, bool> = CAPABILITIES
             .all()
             .into_iter()
-            .map(|(name, enabled)| (name.to_owned(), enabled))
+            .map(|(name, enabled)| (name.to_owned(), Self::capability(name, enabled)))
             .collect();
         let value = json!({
             "wire_version": 1,
@@ -989,6 +1009,12 @@ impl FakeDriver {
         if !sized("cols") || !sized("rows") {
             return self.refuse("session.resize", "Validation", "InvalidRequest", None);
         }
+        // The uniform `NotFound` for a caller that can neither see the session
+        // through the operator view nor hold a live lease on it: resize is not
+        // an existence or revision oracle.
+        if !self.session_visible(connection, session_id, None) {
+            return self.refuse("session.resize", "NotFound", "NotFound", None);
+        }
         let Some(session) = self.sessions.get(session_id) else {
             return self.refuse("session.resize", "NotFound", "NotFound", None);
         };
@@ -1022,9 +1048,19 @@ impl FakeDriver {
         if session.kind != "worker" || session.state != "running" {
             return self.refuse("session.resize", "Denied", "NotRunning", None);
         }
+        // `record_resize` renews the controller lease, so the fake must move
+        // the same expiry a real resize does.
+        let ttl = self.limits.effective(LimitId::AttachLeaseTtlMs);
+        let controller = session.controller.clone();
         let session = self.sessions.get_mut(session_id).expect("checked");
         session.revision += 1;
         session.last_seen_ms = now;
+        if let Some(lease) = controller
+            .as_ref()
+            .and_then(|attach| session.leases.get_mut(attach))
+        {
+            lease.expires_ms = now + ttl;
+        }
         let value = Self::session_json(session);
         self.reply("session.resize", json!({"session": value}))
     }

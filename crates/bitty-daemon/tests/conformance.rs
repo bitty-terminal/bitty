@@ -101,24 +101,24 @@ fn audit_not_contains_resolves_captured_secrets() {
 }
 
 #[test]
-fn cell_vars_seed_an_absolute_cwd_and_the_compiled_worker_capability() {
-    let mut vars = BTreeMap::new();
-    harness::runner::cell_vars(&mut vars);
-    assert_eq!(
-        vars.get("worker_sessions"),
-        Some(&Value::Bool(
-            bitty_daemon::contract::CAPABILITIES.is_enabled("worker_sessions")
-        )),
-        "the handshake vector must assert the capability this cell compiles"
-    );
-    let cwd = vars
-        .get("cwd")
-        .and_then(Value::as_str)
-        .expect("a seeded cwd");
-    assert!(
-        std::path::Path::new(cwd).is_absolute(),
-        "the seeded cwd {cwd} must be absolute on this cell"
-    );
+fn cell_vars_seed_an_absolute_cwd_and_the_driver_cell_capability() {
+    for served in [true, false] {
+        let mut vars = BTreeMap::new();
+        harness::runner::cell_vars(&mut vars, served);
+        assert_eq!(
+            vars.get("worker_sessions"),
+            Some(&Value::Bool(served)),
+            "the handshake vector must assert the capability the driver models"
+        );
+        let cwd = vars
+            .get("cwd")
+            .and_then(Value::as_str)
+            .expect("a seeded cwd");
+        assert!(
+            std::path::Path::new(cwd).is_absolute(),
+            "the seeded cwd {cwd} must be absolute on this cell"
+        );
+    }
 }
 
 #[test]
@@ -224,6 +224,11 @@ fn fake_conformance_corpus() {
     let mut driver = FakeDriver::new();
     let rows = run_corpus(&corpus, &mut driver);
     let facts = driver.facts();
+    assert_eq!(
+        facts.capabilities.get("worker_sessions"),
+        Some(&true),
+        "the fake is the reference for a served worker cell"
+    );
     let evidence = Evidence {
         suite: "fake",
         label: evidence::driver_label(DriverKind::Fake),

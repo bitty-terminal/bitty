@@ -50,6 +50,8 @@ pub use self::child::{
     CleanupOutcome, ContainedChild, ContainmentError, SessionMode, spawn, spawn_with,
 };
 #[cfg(target_os = "linux")]
+pub(crate) use self::linux_sys::establish_controlling_terminal;
+#[cfg(target_os = "linux")]
 pub use self::subreaper::{SubreaperGuard, SubreaperRefusal};
 
 /// Stable diagnostic name of the cgroup v2 plan.

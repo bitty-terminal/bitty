@@ -630,6 +630,12 @@ pub struct HandshakeContext {
     /// Effective scopes, already including any consumed grant and operator
     /// capability effect.
     pub scopes: EffectiveScopes,
+    /// The capabilities this probed server process advertises.
+    ///
+    /// A build's [`crate::contract::CAPABILITIES`] are the contract target
+    /// set; the served daemon narrows `worker_sessions` to the containment
+    /// plan its startup probe selected.
+    pub capabilities: Capabilities,
     /// Effective limits for this run.
     pub limits: Limits,
     /// The server monotonic clock at handshake.
@@ -651,7 +657,7 @@ impl HandshakeResponse {
             peer_identity: context.peer_identity,
             client_id: context.client_id,
             scopes: context.scopes,
-            capabilities: CAPABILITIES,
+            capabilities: context.capabilities,
             limits: context.limits,
             server_monotonic_ms: context.server_monotonic_ms,
             daemon_state: context.daemon_state,
@@ -669,6 +675,10 @@ pub struct NegotiateResponse {
     /// Server service version and accepted client range.
     pub service_api_version: ServiceApiVersion,
     /// Capabilities fixed for the connection.
+    ///
+    /// This is the compiled build set; the served daemon narrows
+    /// `worker_sessions` to its startup containment plan when it builds the
+    /// [`HandshakeResponse`].
     pub capabilities: Capabilities,
     /// Every effective bound and its compiled default and ceiling (`D-14`).
     pub limits: Limits,
@@ -1040,6 +1050,7 @@ mod tests {
             },
             client_id: ClientId::generate().expect("entropy"),
             scopes: EffectiveScopes::new(),
+            capabilities: CAPABILITIES,
             limits: Limits::default(),
             server_monotonic_ms: 7,
             daemon_state: DaemonState::Running,

@@ -612,20 +612,6 @@ impl SessionHost {
             .map(move |snapshot| self.compose_snapshot(snapshot, now))
     }
 
-    /// The sessions this host still supervises: a bound worker in a
-    /// non-terminal state.
-    ///
-    /// The orphan verifier uses this set to skip records it must not signal.
-    /// A terminal record is exit cleanup, not supervision: its containment
-    /// identity is already being settled, so it must never be skipped. A
-    /// `created` record has no worker and therefore no journal record; a
-    /// `stopping` record is still supervised until the terminal transition.
-    pub fn supervised_session_ids(&self, now: MonotonicMs) -> impl Iterator<Item = SessionId> + '_ {
-        self.snapshots(now)
-            .filter(|snapshot| !snapshot.state.is_terminal() && snapshot.generation > 0)
-            .map(|snapshot| snapshot.session_id)
-    }
-
     /// The non-secret control summary, or `None` for an unknown session.
     #[must_use]
     pub fn control_view(&self, session_id: SessionId, now: MonotonicMs) -> Option<ControlView> {

@@ -177,24 +177,17 @@ pub trait Driver {
 
 /// Seed the variables a corpus vector needs to stay cell-independent.
 ///
-/// `worker_sessions` is the compiled capability of this cell, so a handshake
-/// vector asserts what the service must advertise instead of a Unix-only
-/// surface on Windows or macOS. `cwd` is an absolute directory the host really
-/// has: the spawn contract requires an absolute path, and `"/"` is not
-/// absolute on Windows.
-pub fn cell_vars(vars: &mut Vars) {
-    vars.insert(
-        "worker_sessions".to_owned(),
-        Value::Bool(bitty_daemon::contract::CAPABILITIES.is_enabled("worker_sessions")),
-    );
+/// `worker_sessions` is the served capability of the cell the driver models, so
+/// a handshake vector asserts what that driver must advertise instead of a
+/// Linux-only surface on Windows or macOS. The fake models a served reference
+/// cell and passes `true`; the real driver passes the compiled cell truth.
+/// `cwd` is an absolute directory the host really has: the spawn contract
+/// requires an absolute path, and `"/"` is not absolute on Windows.
+pub fn cell_vars(vars: &mut Vars, worker_sessions: bool) {
+    vars.insert("worker_sessions".to_owned(), Value::Bool(worker_sessions));
     vars.insert(
         "cwd".to_owned(),
-        Value::String(
-            std::env::temp_dir()
-                .to_str()
-                .expect("a UTF-8 temp dir")
-                .to_owned(),
-        ),
+        Value::String(std::env::temp_dir().to_string_lossy().into_owned()),
     );
 }
 

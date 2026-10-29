@@ -45,14 +45,18 @@ pub const CAPABILITY_NAMES: [&str; 6] = [
     "idempotent_mutations",
 ];
 
-/// The explicit capability set this build advertises.
+/// The explicit capability set this build can advertise.
 ///
 /// `worker_sessions` is compiled from [`crate::worker::WORKER_SESSIONS_SERVED`]:
-/// `true` only on the Linux cell that actually serves the worker spawn path,
-/// `false` everywhere else, where `session.create` with `kind: worker` is the
-/// typed `Denied/UnsupportedCapability`. The other capabilities are the
-/// contract target set; `events` stays `true` even though no event frame is
-/// pushed in this slice (bitty#2792 owns the delivered event wire).
+/// `true` only on the Linux cell that can serve the worker spawn path, `false`
+/// everywhere else. A served daemon additionally narrows the bit to the
+/// containment plan its startup probe selected
+/// ([`crate::worker::sessions_served`]): a Linux cell whose cgroup and
+/// subreaper probes both failed advertises `false` and answers
+/// `session.create` with `kind: worker` as `Denied/UnsupportedCapability`. The
+/// other capabilities are the contract target set; `events` stays `true` even
+/// though no event frame is pushed in this slice (bitty#2792 owns the delivered
+/// event wire).
 pub const CAPABILITIES: Capabilities = Capabilities {
     terminal_sessions: true,
     worker_sessions: crate::worker::WORKER_SESSIONS_SERVED,

@@ -54,8 +54,8 @@
 //! - [`contract::SERVICE_API_VERSION`]: service API `1.1` with minimum client
 //!   minor `0` (contract D-11).
 //! - [`contract::CAPABILITIES`]: `terminal_sessions`, `worker_sessions`
-//!   (compiled from the served cell), `events`, `observer_grants`,
-//!   `control_transfer`, `idempotent_mutations`.
+//!   (compiled for the cell and narrowed to the probed containment plan),
+//!   `events`, `observer_grants`, `control_transfer`, `idempotent_mutations`.
 //! - [`contract::NEGOTIATE_METHOD`] and [`handshake::negotiate`]: the
 //!   `daemon.negotiate` version, capability, and effective-limits half of the
 //!   handshake.

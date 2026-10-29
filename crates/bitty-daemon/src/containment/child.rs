@@ -44,14 +44,37 @@ static LIVE_CHILDREN: LazyLock<Mutex<BTreeSet<u32>>> =
 pub enum ContainmentError {
     /// The probe selected no mechanism.
     Refused(ContainmentRefusal),
-    /// The cgroup plan failed.
+    /// The cgroup plan failed before a child existed.
     Cgroup(CgroupError),
     /// The subreaper fallback is unavailable.
     Subreaper(SubreaperRefusal),
-    /// `spawn` itself failed.
+    /// `spawn` itself failed; no child was created.
     Spawn(io::Error),
-    /// The child's `/proc` identity could not be observed.
-    IdentityUnavailable,
+    /// The child's `/proc` identity could not be observed. The child existed
+    /// and was terminated; the carried class is what the cleanup could prove
+    /// (`unverified` for the process-group plan).
+    IdentityUnavailable(CleanupClass),
+    /// The child ran but was outside the session's cgroup subtree. The child
+    /// existed and was terminated; the carried class is what the cleanup could
+    /// prove (`swept` or `unverified`).
+    Uncontained(CleanupClass),
+}
+
+impl ContainmentError {
+    /// The cleanup class observed while the failed spawn was abandoned.
+    ///
+    /// A refusal, a pre-fork failure, or an unavailable mechanism started
+    /// nothing ([`CleanupClass::NotStarted`]); a failure after the fork
+    /// reports what the plan could prove about the child it killed.
+    #[must_use]
+    pub const fn cleanup(&self) -> CleanupClass {
+        match self {
+            Self::Refused(_) | Self::Cgroup(_) | Self::Subreaper(_) | Self::Spawn(_) => {
+                CleanupClass::NotStarted
+            }
+            Self::IdentityUnavailable(cleanup) | Self::Uncontained(cleanup) => *cleanup,
+        }
+    }
 }
 
 impl fmt::Display for ContainmentError {
@@ -61,9 +84,16 @@ impl fmt::Display for ContainmentError {
             Self::Cgroup(error) => write!(formatter, "cgroup containment failed: {error}"),
             Self::Subreaper(error) => write!(formatter, "subreaper unavailable: {error}"),
             Self::Spawn(error) => write!(formatter, "spawn failed: {error}"),
-            Self::IdentityUnavailable => {
-                formatter.write_str("spawned child identity could not be observed")
-            }
+            Self::IdentityUnavailable(cleanup) => write!(
+                formatter,
+                "spawned child identity could not be observed; cleanup {}",
+                cleanup.as_str()
+            ),
+            Self::Uncontained(cleanup) => write!(
+                formatter,
+                "spawned child escaped the session cgroup; cleanup {}",
+                cleanup.as_str()
+            ),
         }
     }
 }
@@ -199,14 +229,14 @@ fn spawn_cgroup(
     };
     let pid = child.id();
     let Some(identity) = observe_identity(pid) else {
-        abandon_cgroup_child(child, &cgroup, limits);
-        return Err(ContainmentError::IdentityUnavailable);
+        let cleanup = abandon_cgroup_child(child, &cgroup, limits);
+        return Err(ContainmentError::IdentityUnavailable(cleanup));
     };
     match cgroup.verify_member(pid) {
         Ok(()) | Err(CgroupError::Missing) => {}
         Err(_) => {
-            abandon_cgroup_child(child, &cgroup, limits);
-            return Err(ContainmentError::Cgroup(CgroupError::MembershipMismatch));
+            let cleanup = abandon_cgroup_child(child, &cgroup, limits);
+            return Err(ContainmentError::Uncontained(cleanup));
         }
     }
     remember_child(pid);
@@ -239,7 +269,11 @@ fn spawn_subreaper(
         let _ = child.kill();
         let _ = child.wait();
         drain_adopted(pid);
-        return Err(ContainmentError::IdentityUnavailable);
+        // A process group can never prove a whole tree, so the fallback
+        // reports `unverified` even after this cleanup.
+        return Err(ContainmentError::IdentityUnavailable(
+            CleanupClass::Unverified,
+        ));
     };
     let pgid = identity.process_group();
     remember_child(pid);
@@ -254,7 +288,14 @@ fn spawn_subreaper(
 /// fails. The child has already `exec`ed and may have forked, so a pid-only
 /// kill is not enough: `cgroup.kill` reaches the whole recorded identity, then
 /// a bounded wait lets the empty subtree be removed.
-fn abandon_cgroup_child(mut child: Child, cgroup: &SessionCgroup, limits: ContainmentLimits) {
+///
+/// Returns the cleanup class the attempt could prove: `swept` only when the
+/// subtree verified empty and was removed, `unverified` otherwise.
+fn abandon_cgroup_child(
+    mut child: Child,
+    cgroup: &SessionCgroup,
+    limits: ContainmentLimits,
+) -> CleanupClass {
     let _ = cgroup.kill_all();
     let _ = child.kill();
     let _ = child.wait();
@@ -262,10 +303,12 @@ fn abandon_cgroup_child(mut child: Child, cgroup: &SessionCgroup, limits: Contai
         cgroup.verify_empty().unwrap_or(false)
     });
     // Only an empty subtree can be removed, and only a successful removal
-    // leaves nothing behind. A populated subtree is reported through the
-    // spawn error; it is never removed while members remain.
-    if empty {
-        let _ = cgroup.remove();
+    // leaves nothing behind. A populated subtree is reported as unverified; it
+    // is never removed while members remain.
+    if empty && cgroup.remove().is_ok() {
+        CleanupClass::Swept
+    } else {
+        CleanupClass::Unverified
     }
 }
 
@@ -345,6 +388,42 @@ impl ContainedChild {
     /// Propagates a wait failure.
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
         self.child.try_wait()
+    }
+
+    /// Whether the direct child has exited, without reaping it.
+    ///
+    /// `waitid(WNOWAIT)` peeks at the exit status and leaves the child a
+    /// zombie. A zombie keeps its pid, and therefore its process-group id,
+    /// reserved, so the recorded group can still be signalled after a natural
+    /// exit without racing a reused id. [`Self::try_wait`] then reaps it.
+    #[must_use]
+    pub fn leader_exited(&self) -> bool {
+        use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+
+        let Ok(pid) = i32::try_from(self.child.id()) else {
+            return false;
+        };
+        matches!(
+            waitid(
+                Id::Pid(nix::unistd::Pid::from_raw(pid)),
+                WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+            ),
+            Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..))
+        )
+    }
+
+    /// Drain the recorded group and adopted members after the leader was
+    /// reaped.
+    ///
+    /// The cgroup plan reaches its members through the subtree, so there is
+    /// nothing to drain there. The subreaper fallback waits on the recorded
+    /// process group and adopts the leader's reparented descendants; both are
+    /// drained without blocking.
+    pub fn drain_recorded(&self) {
+        if let Scope::Subreaper { pgid } = &self.scope {
+            drain_group(pgid.get());
+            drain_adopted(self.identity.pid().get());
+        }
     }
 
     /// Send a signal to the whole recorded identity without waiting.
@@ -658,6 +737,29 @@ fn wait_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_post_spawn_failure_keeps_the_observed_cleanup_class() {
+        assert_eq!(
+            ContainmentError::Spawn(io::Error::from(io::ErrorKind::NotFound)).cleanup(),
+            CleanupClass::NotStarted,
+            "a fork failure started nothing"
+        );
+        assert_eq!(
+            ContainmentError::Refused(ContainmentRefusal::NotProbed).cleanup(),
+            CleanupClass::NotStarted
+        );
+        assert_eq!(
+            ContainmentError::IdentityUnavailable(CleanupClass::Unverified).cleanup(),
+            CleanupClass::Unverified,
+            "a child existed and the fallback cannot prove a whole tree"
+        );
+        assert_eq!(
+            ContainmentError::Uncontained(CleanupClass::Swept).cleanup(),
+            CleanupClass::Swept,
+            "a verified-empty subtree is the observed class"
+        );
+    }
 
     #[test]
     fn an_abandoned_child_is_killed_and_its_subtree_removed() {

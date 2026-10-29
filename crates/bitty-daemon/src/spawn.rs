@@ -1,7 +1,7 @@
 //! Bounded spawn-specification parsing for `session.create` (contract
 //! `D-01`, `D-14`; bitty#2790).
 //!
-//! The spawn specification is the eight-field subset the accepted contract
+//! The spawn specification is the six-field subset the accepted contract
 //! fixes: `argv`, `env`, `cwd`, `cols`, `rows`, and `term` (bitty-ipc
 //! `session.create`). It is parsed here, bounded here, and never logged,
 //! audited, or echoed: the service layer hashes it into the idempotency
@@ -324,21 +324,20 @@ mod tests {
         SpawnSpec::parse(Some(&fields(value)), &Limits::default())
     }
 
-    /// A directory the host itself reports as absolute.
+    /// A platform-absolute fixture for the `cwd` field.
     ///
     /// The contract requires an absolute `cwd`, and `"/"` is not absolute on
-    /// Windows, so the tests derive the value from the host instead of
-    /// hardcoding a Unix root.
-    fn absolute_cwd() -> String {
-        std::env::temp_dir()
-            .to_str()
-            .expect("a UTF-8 temp dir")
-            .to_owned()
+    /// Windows. The fixture names the root of the cell under test as a literal
+    /// rather than deriving it from the environment, so the test cannot depend
+    /// on a runner-specific temp directory.
+    fn absolute_cwd() -> &'static str {
+        if cfg!(windows) { r"C:\" } else { "/" }
     }
 
     #[test]
     fn a_minimal_spec_takes_the_documented_defaults() {
         let cwd = absolute_cwd();
+        assert!(std::path::Path::new(cwd).is_absolute(), "{cwd}");
         let parsed = spec(json!({
             "argv": ["/bin/true"],
             "cwd": cwd,
@@ -346,7 +345,7 @@ mod tests {
         .expect("valid");
         assert_eq!(parsed.argv(), ["/bin/true"]);
         assert!(parsed.env().is_empty());
-        assert_eq!(parsed.cwd(), &PathBuf::from(&cwd));
+        assert_eq!(parsed.cwd(), &PathBuf::from(cwd));
         assert_eq!(parsed.cols(), TERM_COLS_DEFAULT);
         assert_eq!(parsed.rows(), TERM_ROWS_DEFAULT);
         assert_eq!(parsed.term(), TERM_DEFAULT);

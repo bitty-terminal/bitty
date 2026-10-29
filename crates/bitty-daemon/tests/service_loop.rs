@@ -19,7 +19,8 @@
 //!   `Denied/AlreadyNegotiated`) flush their refusal frame and then really
 //!   close, checked as an EOF inside the negotiate deadline;
 //! - the handshake advertises only the three baseline `session.*` scopes plus
-//!   `process.spawn`, never an ambient `terminal.*` scope;
+//!   the explicit `terminal.manage` and `process.spawn` transport grants, never
+//!   an ambient `view.*` content scope;
 //! - a frame written after the handshake is read is served, while a frame
 //!   queued before the response is refused and closed;
 //! - a stopping daemon refuses a pipelined mutation on the same drain;
@@ -2551,7 +2552,7 @@ fn plain_status_never_binds_and_creates_no_runtime_file() {
 
 /// Create a worker with host consent on a fresh connection.
 ///
-/// The spawn specification is the bounded eight-field subset; the helper keeps
+/// The spawn specification is the bounded six-field subset; the helper keeps
 /// one successful shape so a test only varies what it asserts.
 fn create_worker(
     root: &TempRoot,
@@ -2776,6 +2777,24 @@ fn worker_resize_requires_the_controller_lease_and_bumps_the_revision() {
         "an observer resize changes nothing"
     );
 
+    // A same-user connection with neither the operator view nor a live lease
+    // gets the uniform NotFound: resize is not an existence or revision
+    // oracle.
+    let mut stranger = Client::connect(&root.endpoint());
+    assert_eq!(stranger.negotiate(None)["ok"], true);
+    let hidden = stranger.call(
+        "session.resize",
+        json!({"session_id": session_id, "generation": 1, "cols": 80, "rows": 24}),
+    );
+    assert_eq!(hidden["ok"], false, "{hidden}");
+    assert_eq!(hidden["error"]["class"], "NotFound");
+    assert_eq!(hidden["error"]["code"], "NotFound");
+    assert_eq!(
+        operator_session(&mut operator, &session_id)["state_revision"],
+        before,
+        "a hidden resize changes nothing"
+    );
+
     // Control is still held by the original controller after the refusal.
     let still = creator.call(
         "session.resize",
@@ -2841,7 +2860,7 @@ fn a_worker_exit_is_recorded_once_with_its_containment_cleanup() {
     let mut operator = Client::connect(&root.endpoint());
     assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
 
-    let (_creator, created) = create_worker(
+    let (mut creator, created) = create_worker(
         &root,
         &mut operator,
         "exit",
@@ -2889,6 +2908,76 @@ fn a_worker_exit_is_recorded_once_with_its_containment_cleanup() {
     let again = operator_session(&mut operator, &session_id);
     assert_eq!(again["state"], exited["state"]);
     assert_eq!(again["state_revision"], exited["state_revision"]);
+
+    // The terminal transition retired the create token, so a keyed replay of
+    // the create returns the same terminal record without a claimable token.
+    let replay = creator.call(
+        "session.create",
+        json!({
+            "kind": "worker",
+            "idempotency_key": "exit-create",
+            "argv": ["/bin/sh", "-c", "exit 7"],
+            "cwd": "/",
+            "cols": 100,
+            "rows": 30,
+            "env": ["BITTYD_WORKER_TEST=1"],
+            "term": "xterm-256color",
+        }),
+    );
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert!(
+        replay["result"]["control_token"].is_null(),
+        "a terminal replay exposes no claimable token"
+    );
+    assert_eq!(replay["result"]["session"]["state"], exited["state"]);
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
+    let root = TempRoot::new("worker-descendant");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    // The shell leaves a background descendant in its process group and then
+    // exits. A reap-before-signal path would drop the group id before the kill
+    // and leak the descendant.
+    let pid_file = root.path.join("descendant.pid");
+    let (_creator, created) = create_worker(
+        &root,
+        &mut operator,
+        "descendant",
+        json!([
+            "/bin/sh",
+            "-c",
+            "sleep 60 & echo $! > \"$1\"; exit 3",
+            "bittyd-worker",
+            pid_file.to_str().expect("a UTF-8 temp path"),
+        ]),
+    );
+    let session_id = created["result"]["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let exited = wait_for_worker_state(&mut operator, &session_id, &["exited", "failed"]);
+    assert_eq!(exited["terminal_reason"], "worker_exit");
+
+    let descendant: u32 = std::fs::read_to_string(&pid_file)
+        .expect("the shell wrote the descendant pid")
+        .trim()
+        .parse()
+        .expect("a pid");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Path::new(&format!("/proc/{descendant}")).exists() {
+        assert!(
+            Instant::now() < deadline,
+            "descendant {descendant} survived the worker exit"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
 }

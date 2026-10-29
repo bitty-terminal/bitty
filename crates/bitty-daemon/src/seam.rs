@@ -125,7 +125,10 @@ impl SeamStatus {
             .join(", ");
         let _ = writeln!(out, "capabilities: {enabled}");
         let worker = if self.capabilities.worker_sessions {
-            "served (worker-spawn cell)"
+            // This is the compiled build truth: a status command must not
+            // probe the host, so it cannot name the startup plan. The served
+            // daemon narrows the bit to that plan before it advertises.
+            "compiled (served cells; a refused startup plan disables it)"
         } else {
             "unsupported (not served on this cell)"
         };
@@ -159,7 +162,7 @@ mod tests {
         assert!(rendered.contains("terminal_sessions"));
         assert!(rendered.contains("observer_grants"));
         assert_eq!(
-            rendered.contains("worker sessions: served"),
+            rendered.contains("worker sessions: compiled"),
             crate::worker::WORKER_SESSIONS_SERVED
         );
         assert!(rendered.contains("ipc service: wired"));

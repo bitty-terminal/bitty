@@ -833,11 +833,11 @@ impl OrphanJournal {
     /// A committed record for a bound session is not an orphan: its identity is
     /// the supervision handle the service still owns, and signalling it from a
     /// reconcile read would kill a running worker. The startup scan has no
-    /// registry and passes an empty set; the served on-demand path passes every
-    /// session whose worker is still bound and non-terminal. A session in exit
-    /// cleanup is never in that set: its record must be classified and
-    /// quarantined, never skipped. A skipped record keeps its stored class
-    /// untouched.
+    /// registry and passes an empty set; the served on-demand path passes
+    /// exactly the sessions whose worker handle is still live in the pool. A
+    /// terminal record is exit cleanup, not supervision, so it is never in
+    /// that set: its record must be classified and quarantined, never skipped.
+    /// A skipped record keeps its stored class untouched.
     ///
     /// # Errors
     ///
@@ -1442,6 +1442,37 @@ mod tests {
             .reap(&probe, &mut reaper, MonotonicMs::from_millis(11))
             .expect("reap succeeds");
         assert_eq!(report.reaped, 1);
+
+        // A terminal record is exit cleanup, not supervision: the service no
+        // longer holds a worker handle for it, so it is not in the exclusion
+        // set and the same identity is classified rather than skipped. A
+        // subreaper record that cannot be proven whole is quarantined, never
+        // signalled a second time.
+        let terminal = session(0x23);
+        reserved_and_committed(&mut history, terminal, process);
+        history
+            .settle(
+                terminal,
+                CleanupClass::Unverified,
+                MonotonicMs::from_millis(12),
+            )
+            .expect("terminal settle");
+        reaper.calls.clear();
+        let report = history
+            .reap_excluding(
+                &probe,
+                &mut reaper,
+                MonotonicMs::from_millis(13),
+                &BTreeSet::new(),
+            )
+            .expect("reap succeeds");
+        assert_eq!(report.unverified, 1, "the terminal record is classified");
+        assert_eq!(report.reaped, 0);
+        assert!(
+            reaper.calls.is_empty(),
+            "a quarantined terminal record is never signalled"
+        );
+        assert_eq!(history.counts().unverified, 1);
     }
 
     #[test]

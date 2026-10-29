@@ -23,9 +23,10 @@
 //! journal, and capability descriptors are all opened close-on-exec by their
 //! owners.
 //!
-//! The worker path is served on Linux only (`worker_sessions` is compiled from
-//! the same cell truth). Every other platform returns the typed
-//! [`WorkerSpawnError::Unsupported`] and advertises `worker_sessions: false`.
+//! The worker path is served on Linux only, and only when the startup
+//! containment probe selected an enforced plan. Every other platform or a
+//! `Refused` plan returns the typed [`WorkerSpawnError::Unsupported`] and
+//! advertises `worker_sessions: false`.
 
 #![allow(unsafe_code)]
 
@@ -39,8 +40,6 @@ use std::io;
 use std::io::Read as _;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsFd as _, AsRawFd as _};
-#[cfg(target_os = "linux")]
-use std::os::unix::process::CommandExt as _;
 #[cfg(target_os = "linux")]
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -62,29 +61,50 @@ use crate::registry::{LifecycleState, MonotonicMs};
 #[cfg(target_os = "linux")]
 use crate::spawn::SpawnSpec;
 
-/// Whether this build serves the worker spawn path.
+/// Whether this build serves the worker spawn path at all.
 ///
 /// The value is compiled from the platform cell, exactly like the containment
 /// plan: Linux enforces a whole-tree identity (cgroup v2 or the subreaper
-/// fallback), while every other cell refuses at startup. `worker_sessions` in
-/// the handshake is compiled from this constant, so a build can never advertise
-/// a worker path it does not serve.
+/// fallback), while every other cell refuses at startup. The served harness is
+/// additionally narrowed by [`sessions_served`] from the plan this process
+/// actually probed, so a Linux cell whose probe selected no mechanism neither
+/// advertises nor serves a worker.
 pub const WORKER_SESSIONS_SERVED: bool = cfg!(target_os = "linux");
+
+/// Whether this compiled cell and the probed containment plan serve workers.
+///
+/// A [`ContainmentKind::Refused`] plan has no whole-tree identity, so the
+/// worker path is the typed `Denied/UnsupportedCapability` and the handshake
+/// must not advertise `worker_sessions`. The startup probe selects the plan
+/// once; every worker decision reads this same truth.
+#[must_use]
+pub fn sessions_served(report: &ContainmentReport) -> bool {
+    WORKER_SESSIONS_SERVED && report.kind() != ContainmentKind::Refused
+}
 
 /// Why a worker spawn was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerSpawnError {
     /// This cell does not serve the worker path.
     Unsupported,
-    /// The PTY, the child, or the containment membership check failed.
-    Spawn,
+    /// The spawn failed before any child existed; nothing needs cleanup.
+    NotStarted,
+    /// A child existed and its cleanup was observed (`swept` or `unverified`).
+    Cleanup(CleanupClass),
 }
 
 impl std::fmt::Display for WorkerSpawnError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unsupported => formatter.write_str("worker sessions are not served on this cell"),
-            Self::Spawn => formatter.write_str("worker spawn failed"),
+            Self::NotStarted => formatter.write_str("worker spawn failed before any child existed"),
+            Self::Cleanup(cleanup) => {
+                write!(
+                    formatter,
+                    "worker spawn failed; cleanup {}",
+                    cleanup.as_str()
+                )
+            }
         }
     }
 }
@@ -143,6 +163,8 @@ struct Worker {
     term_sent: bool,
     /// Whether `SIGKILL` was already sent (deadline or natural-exit cleanup).
     kill_sent: bool,
+    /// Whether a bounded terminate already settled this handle.
+    settled: bool,
     /// Bytes drained from the PTY. Content is discarded in this slice because
     /// no content read method is served; the counter proves the plane drains.
     drained_bytes: u64,
@@ -219,14 +241,32 @@ impl WorkerPool {
         }
     }
 
+    /// The sessions this pool still holds a live worker handle for.
+    ///
+    /// This is the only set the on-demand orphan verifier may skip: a session
+    /// with no worker handle has nothing to protect, even while its terminal
+    /// record is retained for reads.
+    #[must_use]
+    pub fn session_ids(&self) -> Vec<crate::registry::SessionId> {
+        #[cfg(target_os = "linux")]
+        {
+            self.workers.keys().copied().collect()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Vec::new()
+        }
+    }
+
     /// Spawn one worker and retain its handle. Returns the observed identity.
     ///
     /// # Errors
     ///
-    /// [`WorkerSpawnError::Unsupported`] on a non-served cell, or
-    /// [`WorkerSpawnError::Spawn`] when the PTY, the child, or the containment
-    /// membership check fails. A failed spawn leaves no child running and no
-    /// pool entry.
+    /// [`WorkerSpawnError::Unsupported`] on a non-served cell,
+    /// [`WorkerSpawnError::NotStarted`] when the PTY or the fork failed before
+    /// any child existed, or [`WorkerSpawnError::Cleanup`] with the class the
+    /// plan could prove after terminating a child that did exist. A failed
+    /// spawn leaves no child running and no pool entry.
     #[cfg(target_os = "linux")]
     pub fn spawn(
         &mut self,
@@ -237,17 +277,29 @@ impl WorkerPool {
     ) -> Result<crate::orphan::identity::ProcessIdentity, WorkerSpawnError> {
         let name = cgroup_name(instance, session_id);
         let mut pty = PtyCommand::build(spec)?;
-        let master = pty.master.take().ok_or(WorkerSpawnError::Spawn)?;
-        let child = spawn_with(
+        let master = pty.master.take().ok_or(WorkerSpawnError::NotStarted)?;
+        let mut child = match spawn_with(
             report,
             &name,
             &mut pty.command,
             self.limits,
             SessionMode::NewSession,
-        )
-        .map_err(|_| WorkerSpawnError::Spawn)?;
+        ) {
+            Ok(child) => child,
+            Err(error) => {
+                return Err(match error.cleanup() {
+                    CleanupClass::NotStarted => WorkerSpawnError::NotStarted,
+                    cleanup => WorkerSpawnError::Cleanup(cleanup),
+                });
+            }
+        };
         let identity = child.identity();
-        set_nonblocking(master.as_raw_fd()).map_err(|_| WorkerSpawnError::Spawn)?;
+        if set_nonblocking(master.as_raw_fd()).is_err() {
+            // The child exists and is already contained: terminate it before
+            // the handle is dropped, and report what the cleanup could prove.
+            let cleanup = child.terminate(self.limits).class();
+            return Err(WorkerSpawnError::Cleanup(cleanup));
+        }
         self.workers.insert(
             session_id,
             Worker {
@@ -257,6 +309,7 @@ impl WorkerPool {
                 exit_seen_ms: None,
                 term_sent: false,
                 kill_sent: false,
+                settled: false,
                 drained_bytes: 0,
             },
         );
@@ -311,69 +364,87 @@ impl WorkerPool {
     /// This is the poll-loop entry point: no call waits for a running worker.
     /// The terminal transition is recorded once the containment identity is
     /// settled (`swept`) or the bounded kill window expires (`unverified`).
+    ///
+    /// Returns the sessions whose terminal transition this pass recorded, so
+    /// the service can retire the per-session stores the same tick. A worker
+    /// handle is never dropped while its child may still run: a session
+    /// collected before its worker settled is terminated and its journal
+    /// record settled first.
     #[cfg(target_os = "linux")]
     pub fn supervise(
         &mut self,
         host: &mut SessionHost,
         orphans: &mut OrphanSupervisor,
         now: MonotonicMs,
-    ) {
+    ) -> Vec<SessionId> {
+        let mut finished = Vec::new();
         let kill_wait_ms = u64::try_from(self.limits.kill_wait().as_millis()).unwrap_or(u64::MAX);
         let session_ids: Vec<SessionId> = self.workers.keys().copied().collect();
         for session_id in session_ids {
-            let Some(worker) = self.workers.get_mut(&session_id) else {
-                continue;
-            };
-            worker.drain();
-            if worker.exit.is_none() {
-                if let Ok(Some(status)) = worker.child.try_wait() {
-                    worker.exit = Some(status);
-                    worker.exit_seen_ms = Some(now.as_millis());
-                    // A worker that exited may have left descendants. The
-                    // whole recorded identity is signalled, never a pid.
-                    worker.child.signal(Signal::SIGKILL);
-                    worker.kill_sent = true;
-                }
-            }
-            let Some(snapshot) = host.snapshot(session_id, now) else {
-                // Collected before its worker settled: nothing to terminate.
-                self.workers.remove(&session_id);
-                continue;
-            };
-            if snapshot.state == LifecycleState::Stopping {
-                let Some(stop) = host.stop_view(session_id, now) else {
+            let mut collected: Option<CleanupClass> = None;
+            let mut terminal: Option<(ExitObservation, CleanupClass)> = None;
+            {
+                let Some(worker) = self.workers.get_mut(&session_id) else {
                     continue;
                 };
-                if !worker.term_sent {
-                    worker.child.signal(Signal::SIGTERM);
-                    worker.term_sent = true;
-                }
-                if !worker.kill_sent && now.as_millis() >= stop.deadline.as_millis() {
+                worker.drain();
+                if worker.exit.is_none() && worker.child.leader_exited() {
+                    // The leader is an unreaped zombie: its pid, and therefore
+                    // the recorded process-group id, cannot be reused. Signal
+                    // the recorded identity now, before the reap, so a
+                    // descendant that ignored the leader's exit is still in
+                    // the recorded group when the kill lands.
                     worker.child.signal(Signal::SIGKILL);
                     worker.kill_sent = true;
+                    if let Ok(Some(status)) = worker.child.try_wait() {
+                        worker.exit = Some(status);
+                        worker.exit_seen_ms = Some(now.as_millis());
+                        worker.child.drain_recorded();
+                    }
+                }
+                if let Some(snapshot) = host.snapshot(session_id, now) {
+                    if worker.exit.is_none() && snapshot.state == LifecycleState::Stopping {
+                        let Some(stop) = host.stop_view(session_id, now) else {
+                            continue;
+                        };
+                        if !worker.term_sent {
+                            worker.child.signal(Signal::SIGTERM);
+                            worker.term_sent = true;
+                        }
+                        if !worker.kill_sent && now.as_millis() >= stop.deadline.as_millis() {
+                            worker.child.signal(Signal::SIGKILL);
+                            worker.kill_sent = true;
+                        }
+                    }
+                    if let Some(status) = worker.exit
+                        && let Some(cleanup) = worker.sweep(now, kill_wait_ms)
+                    {
+                        terminal = Some((observation(status), cleanup));
+                    }
+                } else {
+                    // Collected before its worker settled: terminate the tree
+                    // and settle the record; nothing is left to record.
+                    collected = Some(worker.child.terminate(self.limits).class());
                 }
             }
-            let Some(status) = worker.exit else {
+            if terminal.is_none() && collected.is_none() {
+                // The worker is still running (or its killed subtree is still
+                // draining): keep the handle for the next tick.
                 continue;
-            };
-            let Some(cleanup) = worker.sweep(now, kill_wait_ms) else {
-                continue;
-            };
-            let observation = match status.code() {
-                Some(code) => ExitObservation::Exited {
-                    code: u8::try_from(code.clamp(0, 255)).unwrap_or(255),
-                },
-                None => ExitObservation::Signalled {
-                    signal: signal_number(status).unwrap_or(1),
-                },
-            };
-            if let Ok(Termination::Completed(_)) =
-                host.record_termination(session_id, observation, cleanup, now)
+            }
+            if let Some((observation, cleanup)) = terminal
+                && let Ok(Termination::Completed(_)) =
+                    host.record_termination(session_id, observation, cleanup, now)
             {
+                let _ = orphans.settle(session_id, cleanup, now);
+                finished.push(session_id);
+            }
+            if let Some(cleanup) = collected {
                 let _ = orphans.settle(session_id, cleanup, now);
             }
             self.workers.remove(&session_id);
         }
+        finished
     }
 
     /// Non-served cells have no workers to supervise.
@@ -383,7 +454,8 @@ impl WorkerPool {
         _host: &mut crate::lease::SessionHost,
         _orphans: &mut crate::orphan::OrphanSupervisor,
         _now: crate::registry::MonotonicMs,
-    ) {
+    ) -> Vec<crate::registry::SessionId> {
+        Vec::new()
     }
 
     /// Terminate one worker immediately with a bounded escalation.
@@ -392,9 +464,10 @@ impl WorkerPool {
     /// tick. The terminal transition is recorded by the caller.
     #[cfg(target_os = "linux")]
     pub fn terminate(&mut self, session_id: SessionId) -> Option<CleanupClass> {
-        self.workers
-            .get_mut(&session_id)
-            .map(|worker| worker.child.terminate(self.limits).class())
+        self.workers.get_mut(&session_id).map(|worker| {
+            worker.settled = true;
+            worker.child.terminate(self.limits).class()
+        })
     }
 
     /// Non-served cells have no worker to terminate.
@@ -403,15 +476,28 @@ impl WorkerPool {
         None
     }
 
-    /// Drop the handle of a session the registry already terminalized.
+    /// Drop a worker handle that is being retired.
+    ///
+    /// A handle whose leader may still run is terminated before it is dropped,
+    /// so retiring a session can never leak a live worker. Returns the cleanup
+    /// class when this call had to terminate a live handle, so the caller can
+    /// settle its journal record; `None` when the handle was already settled or
+    /// absent.
     #[cfg(target_os = "linux")]
-    pub fn forget(&mut self, session_id: SessionId) {
-        self.workers.remove(&session_id);
+    pub fn forget(&mut self, session_id: SessionId) -> Option<CleanupClass> {
+        let mut worker = self.workers.remove(&session_id)?;
+        if worker.settled || worker.child.leader_exited() {
+            worker.child.drain_recorded();
+            return None;
+        }
+        Some(worker.child.terminate(self.limits).class())
     }
 
     /// Drop the handle of a session the registry already terminalized.
     #[cfg(not(target_os = "linux"))]
-    pub fn forget(&mut self, _session_id: crate::registry::SessionId) {}
+    pub fn forget(&mut self, _session_id: crate::registry::SessionId) -> Option<CleanupClass> {
+        None
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -465,10 +551,11 @@ impl PtyCommand {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let pty = nix::pty::openpty(Some(&winsize), None).map_err(|_| WorkerSpawnError::Spawn)?;
+        let pty =
+            nix::pty::openpty(Some(&winsize), None).map_err(|_| WorkerSpawnError::NotStarted)?;
         let master = File::from(pty.master);
         let slave = pty.slave;
-        set_cloexec(master.as_raw_fd()).map_err(|_| WorkerSpawnError::Spawn)?;
+        set_cloexec(master.as_raw_fd()).map_err(|_| WorkerSpawnError::NotStarted)?;
         let stdin = Stdio::from(dup_file(&slave)?);
         let stdout = Stdio::from(dup_file(&slave)?);
         let stderr = Stdio::from(dup_file(&slave)?);
@@ -488,18 +575,9 @@ impl PtyCommand {
         command.stdin(stdin);
         command.stdout(stdout);
         command.stderr(stderr);
-        // SAFETY: the closure runs between fork and exec and calls only
-        // `setsid(2)` plus `ioctl(TIOCSCTTY)` on fd 0. No allocation, no lock,
-        // and no Rust data structure is touched.
-        unsafe {
-            command.pre_exec(move || {
-                nix::unistd::setsid().map_err(io::Error::from)?;
-                if nix::libc::ioctl(0, nix::libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        // The child establishes the session and takes the PTY slave as its
+        // controlling terminal inside the one documented syscall seam.
+        crate::containment::establish_controlling_terminal(&mut command);
         Ok(Self {
             command,
             master: Some(master),
@@ -516,7 +594,7 @@ fn dup_file(slave: &std::os::fd::OwnedFd) -> Result<File, WorkerSpawnError> {
     let borrowed: BorrowedFd<'_> = slave.as_fd();
     nix::unistd::dup(borrowed)
         .map(File::from)
-        .map_err(|_| WorkerSpawnError::Spawn)
+        .map_err(|_| WorkerSpawnError::NotStarted)
 }
 
 #[cfg(target_os = "linux")]
@@ -574,4 +652,17 @@ fn signal_number(status: ExitStatus) -> Option<u32> {
     status
         .signal()
         .and_then(|signal| u32::try_from(signal).ok())
+}
+
+/// Reduce one exit status to the observation the lease layer records.
+#[cfg(target_os = "linux")]
+fn observation(status: ExitStatus) -> ExitObservation {
+    match status.code() {
+        Some(code) => ExitObservation::Exited {
+            code: u8::try_from(code.clamp(0, 255)).unwrap_or(255),
+        },
+        None => ExitObservation::Signalled {
+            signal: signal_number(status).unwrap_or(1),
+        },
+    }
 }

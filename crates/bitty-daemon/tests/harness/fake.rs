@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use bitty_daemon::contract::CAPABILITIES;
 use bitty_daemon::handshake::{ClientCorrelation, GrantCorrelation, hex};
 use bitty_daemon::limits::{LimitId, LimitOverride, Limits};
+use bitty_daemon::spawn::{SpawnSpec, SpawnSpecError};
 
 use crate::harness::corpus::{DriverKind, Vector};
 use crate::harness::evidence;
@@ -24,10 +25,11 @@ use crate::harness::runner::{
     Driver, ErrorReply, ExitObservation, Outcome, Reply, RequestRecord, ServiceFacts, Vars,
 };
 
-const BASELINE: [&str; 4] = [
+const BASELINE: [&str; 5] = [
     "session.inspect",
     "session.attach",
     "session.control",
+    "terminal.manage",
     "process.spawn",
 ];
 
@@ -68,6 +70,7 @@ struct FakeConn {
 
 struct FakeSession {
     id: String,
+    kind: &'static str,
     terminal_id: String,
     state: &'static str,
     generation: u64,
@@ -297,7 +300,7 @@ impl FakeDriver {
             "session.grant.revoke" => self.session_grant_revoke(connection, &params),
             "session.detach" => self.session_detach(connection, &params),
             "session.control.transfer" => self.session_transfer(connection, &params),
-            "session.resize" => self.refuse(method, "Denied", "ScopeViolation", None),
+            "session.resize" => self.session_resize(connection, &params),
             "session.abort" => self.session_abort(connection, &params),
             "session.kill" => self.session_kill(connection, &params),
             "lease.heartbeat" => self.lease_heartbeat(connection, &params),
@@ -321,7 +324,7 @@ impl FakeDriver {
             .get("client_version")
             .and_then(|value| value.get("minor"))
             .and_then(Value::as_u64);
-        if major != Some(1) || minor != Some(0) {
+        if major != Some(1) || !matches!(minor, Some(0 | 1)) {
             let outcome = self.refuse("daemon.negotiate", "Validation", "VersionMismatch", None);
             self.connection(connection).closed = true;
             return outcome;
@@ -388,6 +391,7 @@ impl FakeDriver {
             "session.control",
             "daemon.inspect",
             "daemon.control",
+            "terminal.manage",
             "process.spawn",
         ]
         .into_iter()
@@ -403,8 +407,9 @@ impl FakeDriver {
             "session.control" => 3,
             "daemon.inspect" => 4,
             "daemon.control" => 5,
-            "process.spawn" => 6,
-            _ => 7,
+            "terminal.manage" => 6,
+            "process.spawn" => 7,
+            _ => 8,
         });
         let limits: Vec<Value> = LimitId::ALL
             .into_iter()
@@ -424,7 +429,7 @@ impl FakeDriver {
             .collect();
         let value = json!({
             "wire_version": 1,
-            "service_api_version": {"major": 1, "minor": 0, "min_client_minor": 0},
+            "service_api_version": {"major": 1, "minor": 1, "min_client_minor": 0},
             "daemon_instance_id": self.instance,
             "daemon_pid": 4242,
             "server_identity": {
@@ -563,7 +568,7 @@ impl FakeDriver {
     fn session_json(session: &FakeSession) -> Value {
         let mut value = json!({
             "session_id": session.id,
-            "kind": "terminal",
+            "kind": session.kind,
             "terminal_id": session.terminal_id,
             "state": session.state,
             "generation": session.generation,
@@ -858,10 +863,10 @@ impl FakeDriver {
             .get("kind")
             .and_then(Value::as_str)
             .unwrap_or("terminal");
-        if kind == "worker" {
-            return self.refuse("session.create", "Denied", "UnsupportedCapability", None);
-        }
-        if kind != "terminal" {
+        // The frozen handler order: kind, consent, then the bounded spawn
+        // specification. The fake models the served cell: a worker create
+        // binds generation 1 without a process.
+        if !matches!(kind, "terminal" | "worker") {
             return self.refuse("session.create", "Validation", "InvalidRequest", None);
         }
         let bound = self
@@ -878,11 +883,33 @@ impl FakeDriver {
         if !bound {
             return self.refuse("session.create", "Denied", "ConsentRequired", None);
         }
+        let spec = if kind == "worker" {
+            match SpawnSpec::parse(params.as_object(), &self.limits) {
+                Ok(spec) => Some(spec),
+                Err(SpawnSpecError::Invalid) => {
+                    return self.refuse("session.create", "Validation", "InvalidRequest", None);
+                }
+                Err(SpawnSpecError::Limit { limit, actual }) => {
+                    return self.refuse(
+                        "session.create",
+                        "Framing",
+                        "LimitExceeded",
+                        Some((actual, limit)),
+                    );
+                }
+            }
+        } else {
+            None
+        };
         let Some(key) = params.get("idempotency_key").and_then(Value::as_str) else {
             return self.refuse("session.create", "Validation", "InvalidRequest", None);
         };
         let terminal_id = params.get("terminal_id").and_then(Value::as_str);
-        let fingerprint = format!("{kind}:{}", terminal_id.unwrap_or(""));
+        // The spawn digest is the only form of argv/env/cwd the store keeps.
+        let fingerprint = match &spec {
+            Some(spec) => format!("{kind}:{}:{}", terminal_id.unwrap_or(""), spec.digest()),
+            None => format!("{kind}:{}", terminal_id.unwrap_or("")),
+        };
         if let Some((remembered, session_id)) = self.create_keys.get(key) {
             if remembered == &fingerprint {
                 if let Some(session) = self.sessions.get(session_id) {
@@ -909,12 +936,14 @@ impl FakeDriver {
         }
         let token = self.mint_token();
         let now = self.now();
+        let bound_worker = spec.is_some();
         let session = FakeSession {
             id: id.clone(),
+            kind: if bound_worker { "worker" } else { "terminal" },
             terminal_id,
-            state: "created",
-            generation: 0,
-            revision: 0,
+            state: if bound_worker { "running" } else { "created" },
+            generation: u64::from(bound_worker),
+            revision: u64::from(bound_worker),
             controller: None,
             token: token.clone(),
             initial_token: Some(token.clone()),
@@ -933,6 +962,69 @@ impl FakeDriver {
         });
         self.sessions.insert(id, session);
         self.reply("session.create", value)
+    }
+
+    /// `session.resize` in the fake mirrors the served worker content plane:
+    /// controller lease, generation fence, and one revision bump. A terminal
+    /// session is still registry-only, so a bound terminal has no PTY and
+    /// answers `NotRunning` after authority passes.
+    fn session_resize(&mut self, connection: &str, params: &Value) -> Outcome {
+        if !self.has_scope(connection, "terminal.manage") {
+            return self.refuse("session.resize", "Denied", "ScopeViolation", None);
+        }
+        let Some(session_id) = params.get("session_id").and_then(Value::as_str) else {
+            return self.refuse("session.resize", "Validation", "InvalidRequest", None);
+        };
+        let Some(generation) = params.get("generation").and_then(Value::as_u64) else {
+            return self.refuse("session.resize", "Validation", "InvalidRequest", None);
+        };
+        let sized = |key: &str| {
+            params
+                .get(key)
+                .and_then(Value::as_u64)
+                .is_some_and(|value| (1..=1000).contains(&value))
+        };
+        if !sized("cols") || !sized("rows") {
+            return self.refuse("session.resize", "Validation", "InvalidRequest", None);
+        }
+        let Some(session) = self.sessions.get(session_id) else {
+            return self.refuse("session.resize", "NotFound", "NotFound", None);
+        };
+        if session.generation != generation {
+            return self.refuse(
+                "session.resize",
+                "Denied",
+                "StaleGeneration",
+                Some((session.generation, session.revision)),
+            );
+        }
+        if is_terminal(session.state) {
+            return self.refuse("session.resize", "Denied", "NotRunning", None);
+        }
+        if session.state == "stopping" {
+            return self.refuse("session.resize", "Denied", "SessionStopping", None);
+        }
+        let now = self.now();
+        let controller = session.controller.clone();
+        let authorized = controller.as_ref().is_some_and(|attach| {
+            self.conn(connection)
+                .is_some_and(|conn| conn.leases.contains(attach))
+                && session
+                    .leases
+                    .get(attach)
+                    .is_some_and(|lease| lease.role == "controller" && lease.expires_ms > now)
+        });
+        if !authorized {
+            return self.refuse("session.resize", "Denied", "ControllerRequired", None);
+        }
+        if session.kind != "worker" || session.state != "running" {
+            return self.refuse("session.resize", "Denied", "NotRunning", None);
+        }
+        let session = self.sessions.get_mut(session_id).expect("checked");
+        session.revision += 1;
+        session.last_seen_ms = now;
+        let value = Self::session_json(session);
+        self.reply("session.resize", json!({"session": value}))
     }
 
     fn session_status(&mut self, connection: &str, params: &Value) -> Outcome {

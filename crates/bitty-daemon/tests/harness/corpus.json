@@ -50,10 +50,10 @@
             "result": {
               "wire_version": 1,
               "service_api_version.major": 1,
-              "service_api_version.minor": 0,
+              "service_api_version.minor": 1,
               "service_api_version.min_client_minor": 0,
               "daemon_state": "running",
-              "capabilities.worker_sessions": false,
+              "capabilities.worker_sessions": true,
               "capabilities.terminal_sessions": true,
               "capabilities.events": true,
               "capabilities.observer_grants": true,
@@ -69,6 +69,7 @@
                 "session.inspect",
                 "session.attach",
                 "session.control",
+                "terminal.manage",
                 "process.spawn"
               ]
             },
@@ -154,7 +155,7 @@
           "params": {
             "client_version": {
               "major": 1,
-              "minor": 1
+              "minor": 2
             }
           },
           "expect": {
@@ -262,7 +263,7 @@
     },
     {
       "id": "V-03",
-      "title": "Worker sessions are disabled and a worker create is typed unsupported",
+      "title": "A worker create needs create scope, consent, and a known kind in the frozen order",
       "area": "handshake",
       "decisions": [
         "D-01"
@@ -292,8 +293,38 @@
           "expect": {
             "ok": true,
             "result": {
-              "capabilities.worker_sessions": false
+              "capabilities.worker_sessions": true
             }
+          }
+        },
+        {
+          "connection": "stranger",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "stranger",
+          "method": "session.create",
+          "params": {
+            "kind": "worker",
+            "idempotency_key": "worker-no-consent",
+            "argv": [
+              "/bin/true"
+            ],
+            "cwd": "/"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ConsentRequired"
           }
         },
         {
@@ -301,12 +332,25 @@
           "method": "session.create",
           "params": {
             "kind": "worker",
-            "idempotency_key": "worker-1"
+            "idempotency_key": "worker-no-spec"
           },
           "expect": {
             "ok": false,
-            "error_class": "Denied",
-            "error_code": "UnsupportedCapability"
+            "error_class": "Validation",
+            "error_code": "InvalidRequest"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "daemon",
+            "idempotency_key": "worker-bad-kind"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Validation",
+            "error_code": "InvalidRequest"
           }
         }
       ],
@@ -351,8 +395,9 @@
         }
       ],
       "forbidden": [
-        "no worker session record",
-        "no child process or PTY is created"
+        "no worker session record is created by a refused create",
+        "consent is refused before a spawn specification is parsed",
+        "the advertised worker bit matches the served spawn path"
       ]
     },
     {
@@ -2212,12 +2257,13 @@
           "params": {
             "session_id": "33333333333333333333333333333333",
             "cols": 120,
-            "rows": 40
+            "rows": 40,
+            "generation": 0
           },
           "expect": {
             "ok": false,
-            "error_class": "Denied",
-            "error_code": "ScopeViolation"
+            "error_class": "NotFound",
+            "error_code": "NotFound"
           }
         },
         {
@@ -4687,6 +4733,7 @@
                 "session.host",
                 "session.attach",
                 "session.control",
+                "terminal.manage",
                 "process.spawn"
               ]
             }
@@ -4728,6 +4775,7 @@
                 "session.inspect",
                 "session.attach",
                 "session.control",
+                "terminal.manage",
                 "process.spawn"
               ]
             }
@@ -5383,6 +5431,401 @@
       "forbidden": [
         "an ambiguous pair of spellings is never resolved by precedence",
         "a missing generation is never defaulted to zero"
+      ]
+    },
+    {
+      "id": "V-42",
+      "title": "A worker binds generation one and only the controller lease resizes the content plane",
+      "area": "worker",
+      "decisions": [
+        "D-01",
+        "D-03"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "worker",
+            "idempotency_key": "v42-create",
+            "argv": [
+              "/bin/sleep",
+              "60"
+            ],
+            "cwd": "/",
+            "cols": 100,
+            "rows": 30,
+            "env": [
+              "BITTYD_WORKER_TEST=1"
+            ],
+            "term": "xterm-256color"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.kind": "worker",
+              "session.state": "running",
+              "session.generation": 1,
+              "session.state_revision": 1,
+              "session.attach_count": 0,
+              "replayed": false
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 1,
+            "control_token": "@create_token",
+            "idempotency_key": "v42-claim"
+          },
+          "capture": {
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller",
+              "session.generation": 1,
+              "session.state_revision": 2
+            },
+            "hex_len": {
+              "attach_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.resize",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "cols": 120,
+            "rows": 40
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.kind": "worker",
+              "session.state": "running",
+              "session.generation": 1,
+              "session.state_revision": 3
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.resize",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0,
+            "cols": 80,
+            "rows": 24
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "StaleGeneration"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.resize",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "cols": 0,
+            "rows": 24
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Validation",
+            "error_code": "InvalidRequest"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "v42-observer"
+          },
+          "capture": {
+            "observer_grant": "grant"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "grant_id": 32,
+              "grant": 64
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@observer_grant"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "observer",
+              "session.generation": 1
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.resize",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "cols": 90,
+            "rows": 30
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ControllerRequired"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.resize",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "cols": 100,
+            "rows": 30
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1,
+              "session.state_revision": 7
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.kind": "worker",
+              "session.state": "running",
+              "session.generation": 1,
+              "session.attach_count": 2,
+              "session.state_revision": 7
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a worker is exposed as running before its spawn succeeds",
+        "an observer resizes the PTY or bumps the revision",
+        "a stale generation mutates the content plane",
+        "the content plane is served without a revocable controller lease"
+      ]
+    },
+    {
+      "id": "V-43",
+      "title": "A failed worker spawn terminalizes without a bound generation or journal record",
+      "area": "worker",
+      "decisions": [
+        "D-01",
+        "D-06"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "fake_skip": "the fake has no process or PTY spawn plane",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "worker",
+            "idempotency_key": "v43-create",
+            "argv": [
+              "/nonexistent/bittyd-worker-probe"
+            ],
+            "cwd": "/"
+          },
+          "capture": {
+            "session_id": "session.session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.kind": "worker",
+              "session.state": "failed",
+              "session.terminal_reason": "spawn_failed",
+              "session.cleanup": "not_started",
+              "session.generation": 0,
+              "control_token": null
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.orphans.verify",
+          "params": {
+            "action": "verify"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "reserved": 0,
+              "committed": 0
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "active_sessions": 0,
+              "sessions.running": 0,
+              "sessions.terminal": 1
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.kind": "worker",
+              "session.state": "failed",
+              "session.terminal_reason": "spawn_failed",
+              "session.cleanup": "not_started",
+              "session.generation": 0
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a failed spawn leaves a reserved or committed journal record",
+        "a failed spawn binds generation one",
+        "a failed spawn returns a claimable control token"
       ]
     },
     {
@@ -6323,12 +6766,13 @@
           "params": {
             "session_id": "44444444444444444444444444444444",
             "cols": 80,
-            "rows": 24
+            "rows": 24,
+            "generation": 0
           },
           "expect": {
             "ok": false,
-            "error_class": "Denied",
-            "error_code": "ScopeViolation"
+            "error_class": "NotFound",
+            "error_code": "NotFound"
           }
         },
         {

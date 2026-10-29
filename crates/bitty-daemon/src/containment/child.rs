@@ -122,9 +122,36 @@ pub fn spawn(
     command: &mut Command,
     limits: ContainmentLimits,
 ) -> Result<ContainedChild, ContainmentError> {
+    spawn_with(report, name, command, limits, SessionMode::ProcessGroup)
+}
+
+/// How the spawned child relates to its process group and session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionMode {
+    /// The daemon puts the child in a fresh process group
+    /// (`setpgid(0, 0)`), which is the fallback containment identity.
+    ProcessGroup,
+    /// The caller's `pre_exec` establishes a new session (`setsid`), so the
+    /// child is already a session and process-group leader. Used by the PTY
+    /// spawn path, where `setsid` must run before `setpgid`.
+    NewSession,
+}
+
+/// Spawn with an explicit [`SessionMode`].
+///
+/// # Errors
+///
+/// The same refusals as [`spawn`].
+pub fn spawn_with(
+    report: &ContainmentReport,
+    name: &str,
+    command: &mut Command,
+    limits: ContainmentLimits,
+    mode: SessionMode,
+) -> Result<ContainedChild, ContainmentError> {
     match report.kind() {
-        ContainmentKind::CgroupV2 => spawn_cgroup(report, name, command, limits),
-        ContainmentKind::Subreaper => spawn_subreaper(name, command),
+        ContainmentKind::CgroupV2 => spawn_cgroup(report, name, command, limits, mode),
+        ContainmentKind::Subreaper => spawn_subreaper(name, command, mode),
         ContainmentKind::Refused => Err(ContainmentError::Refused(
             report
                 .refusal()
@@ -141,6 +168,7 @@ fn spawn_cgroup(
     name: &str,
     command: &mut Command,
     limits: ContainmentLimits,
+    mode: SessionMode,
 ) -> Result<ContainedChild, ContainmentError> {
     let Some(root_path) = report.cgroup_root() else {
         return Err(ContainmentError::Cgroup(CgroupError::Missing));
@@ -159,7 +187,9 @@ fn spawn_cgroup(
             return Err(error.into());
         }
     };
-    command.process_group(0);
+    if mode == SessionMode::ProcessGroup {
+        command.process_group(0);
+    }
     let child = match linux_sys::spawn_into_cgroup(command, procs) {
         Ok(child) => child,
         Err(error) => {
@@ -187,9 +217,15 @@ fn spawn_cgroup(
     })
 }
 
-fn spawn_subreaper(_name: &str, command: &mut Command) -> Result<ContainedChild, ContainmentError> {
+fn spawn_subreaper(
+    _name: &str,
+    command: &mut Command,
+    mode: SessionMode,
+) -> Result<ContainedChild, ContainmentError> {
     SubreaperGuard::enable().map_err(ContainmentError::Subreaper)?;
-    command.process_group(0);
+    if mode == SessionMode::ProcessGroup {
+        command.process_group(0);
+    }
     let child = command.spawn()?;
     let pid = child.id();
     let Some(identity) = observe_identity(pid) else {
@@ -297,6 +333,78 @@ impl ContainedChild {
     /// Propagates a `try_wait` failure other than an already-reaped child.
     pub fn has_exited(&mut self) -> io::Result<bool> {
         self.child.try_wait().map(|status| status.is_some())
+    }
+
+    /// Non-blocking wait: the exit status once the direct child has exited.
+    ///
+    /// The recorded containment identity outlives this call; a descendant that
+    /// outlives the leader is still terminated by [`Self::terminate`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates a wait failure.
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Send a signal to the whole recorded identity without waiting.
+    ///
+    /// This is the graceful/kill step of a supervision loop that must not
+    /// block. A cgroup plan reaches every member; the subreaper fallback sends
+    /// through the pidfd and the recorded process group only while the recorded
+    /// leader identity still matches, so a reused pid or group is never
+    /// signalled. Returns how many recorded targets received the signal.
+    pub fn signal(&self, signal: Signal) -> usize {
+        match &self.scope {
+            Scope::Cgroup(cgroup) => cgroup.signal_members(signal).map_or(0, |pids| pids.len()),
+            Scope::Subreaper { pgid } => {
+                if !identity_matches(self.identity) {
+                    return 0;
+                }
+                let mut signalled = 0;
+                if let Ok(pidfd) = PidFd::open(self.identity.pid().get()) {
+                    if pidfd.send_signal(signal).is_ok() {
+                        signalled += 1;
+                    }
+                }
+                if let Ok(raw) = i32::try_from(pgid.get()) {
+                    if nix::sys::signal::killpg(nix::unistd::Pid::from_raw(raw), signal).is_ok() {
+                        signalled += 1;
+                    }
+                }
+                signalled
+            }
+        }
+    }
+
+    /// Settle the containment identity after the direct child was reaped.
+    ///
+    /// Returns `Some(cleanup)` once the plan can classify the whole tree:
+    /// `swept` when the cgroup subtree is empty and removed, `unverified` for
+    /// the subreaper fallback (a process group never proves a whole tree), and
+    /// `None` while a killed cgroup subtree still has members. Never waits.
+    #[must_use]
+    pub fn sweep_if_empty(&mut self) -> Option<CleanupOutcome> {
+        match &mut self.scope {
+            Scope::Cgroup(cgroup) => match cgroup.verify_empty() {
+                Ok(true) => Some(if cgroup.remove().is_ok() {
+                    CleanupOutcome {
+                        class: CleanupClass::Swept,
+                        signalled: 0,
+                    }
+                } else {
+                    CleanupOutcome {
+                        class: CleanupClass::Unverified,
+                        signalled: 0,
+                    }
+                }),
+                Ok(false) | Err(_) => None,
+            },
+            Scope::Subreaper { .. } => Some(CleanupOutcome {
+                class: CleanupClass::Unverified,
+                signalled: 0,
+            }),
+        }
     }
 
     /// Terminate the whole recorded identity with a bounded escalation.

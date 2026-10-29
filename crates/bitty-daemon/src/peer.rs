@@ -133,11 +133,13 @@ pub enum DispatchBoundary {
     DaemonStop,
     /// `daemon.orphans.verify`.
     OrphanVerify,
+    /// Controller-only `session.resize`.
+    Resize,
 }
 
 impl DispatchBoundary {
     /// Every privileged boundary in contract order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::CreateSession,
         Self::ControllerAttach,
         Self::Abort,
@@ -150,6 +152,7 @@ impl DispatchBoundary {
         Self::HostGrantRevoke,
         Self::DaemonStop,
         Self::OrphanVerify,
+        Self::Resize,
     ];
 
     /// The contract method this boundary authorizes.
@@ -167,6 +170,7 @@ impl DispatchBoundary {
             Self::HostGrantMint | Self::HostGrantRevoke => "daemon.host_grant",
             Self::DaemonStop => "daemon.stop",
             Self::OrphanVerify => "daemon.orphans.verify",
+            Self::Resize => "session.resize",
         }
     }
 }
@@ -795,8 +799,8 @@ mod tests {
     fn dispatch_boundaries_are_the_contract_methods() {
         assert_eq!(
             DispatchBoundary::ALL.len(),
-            12,
-            "the ten contract boundaries plus the two host-grant modes"
+            13,
+            "the contract boundaries plus the two host-grant modes"
         );
         assert_eq!(DispatchBoundary::CreateSession.method(), "session.create");
         assert_eq!(

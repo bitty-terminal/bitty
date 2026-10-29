@@ -761,7 +761,10 @@ mod tests {
         .expect("1.0 is accepted");
         assert_eq!(response.service_api_version, SERVICE_API_VERSION);
         assert_eq!(response.capabilities, CAPABILITIES);
-        assert!(!response.capabilities.worker_sessions);
+        assert_eq!(
+            response.capabilities.worker_sessions,
+            crate::worker::WORKER_SESSIONS_SERVED
+        );
         assert_eq!(
             response.limits.effective(LimitId::MaxSessions),
             LimitId::MaxSessions.default_value()
@@ -798,14 +801,14 @@ mod tests {
                 server: SERVICE_API_VERSION,
             }
         );
-        assert!(error.to_string().contains("1.0..=1.0"));
+        assert!(error.to_string().contains("1.0..=1.1"));
     }
 
     #[test]
     fn negotiate_refuses_a_minor_outside_the_accepted_range() {
         assert!(
             negotiate(
-                &NegotiateRequest::new(ClientVersion::new(1, 1)),
+                &NegotiateRequest::new(ClientVersion::new(1, 2)),
                 &Limits::default()
             )
             .is_err()

@@ -18,8 +18,8 @@ use std::fmt;
 
 use super::id::{DaemonInstanceId, Entropy, ID_GENERATION_ATTEMPTS, OsEntropy, SessionId};
 use super::session::{
-    CleanupClass, LifecycleState, MonotonicMs, OwnerPeer, SessionRecord, SessionSnapshot,
-    TerminalId, TerminalOutcome, TerminalReason,
+    CleanupClass, LifecycleState, MonotonicMs, OwnerPeer, SessionKind, SessionRecord,
+    SessionSnapshot, TerminalId, TerminalOutcome, TerminalReason,
 };
 use crate::limits::{LimitId, Limits};
 
@@ -486,6 +486,25 @@ impl SessionRegistry {
         request: CreateSession,
         now: MonotonicMs,
     ) -> Result<SessionSnapshot, RegistryRefusal> {
+        self.create_kind(request, SessionKind::Terminal, now)
+    }
+
+    /// Register a new session of `kind` in `created` at generation and
+    /// revision `0`.
+    ///
+    /// The kind is metadata only here: the service layer has already refused
+    /// an unsupported kind and owns the spawn that follows. Every bound and
+    /// refusal rule is identical to [`Self::create`].
+    ///
+    /// # Errors
+    ///
+    /// Same whole refusals as [`Self::create`].
+    pub fn create_kind(
+        &mut self,
+        request: CreateSession,
+        kind: SessionKind,
+        now: MonotonicMs,
+    ) -> Result<SessionSnapshot, RegistryRefusal> {
         if self.live.len() >= self.limits.max_sessions {
             return Err(RegistryRefusal::MaxSessions {
                 limit: self.limits.max_sessions,
@@ -507,7 +526,8 @@ impl SessionRegistry {
         };
 
         let session_id = self.generate_session_id()?;
-        let record = SessionRecord::new(session_id, terminal_id, request.owner_peer, now);
+        let record =
+            SessionRecord::new_kind(session_id, kind, terminal_id, request.owner_peer, now);
         let bytes = record.record_bytes();
         if bytes > self.limits.session_record_bytes {
             return Err(RegistryRefusal::SessionRecordTooLarge {
@@ -519,6 +539,31 @@ impl SessionRegistry {
         let snapshot = record.snapshot();
         self.live.insert(session_id, record);
         Ok(snapshot)
+    }
+
+    /// Remove a `created`, unbound record whose worker was never spawned.
+    ///
+    /// This is a whole rollback for a create that failed before any bind: the
+    /// service loop is single-threaded, so no request can observe the record
+    /// between its insertion and this call. A record in any other state, or one
+    /// with a bound generation, is left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an unknown session or any record that is not `created` at
+    /// generation `0`; nothing is removed on a refusal.
+    pub fn discard_created(&mut self, session_id: SessionId) -> Result<(), RegistryRefusal> {
+        let Some(record) = self.live.get(&session_id) else {
+            return Err(RegistryRefusal::NotFound);
+        };
+        if record.state != LifecycleState::Created || record.generation != 0 {
+            return Err(RegistryRefusal::InvalidTransition {
+                from: record.state,
+                to: LifecycleState::Failed,
+            });
+        }
+        self.live.remove(&session_id);
+        Ok(())
     }
 
     /// Bind the first (and, in v0.2.0, only) worker to a `created` session.

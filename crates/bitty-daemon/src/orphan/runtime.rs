@@ -169,9 +169,29 @@ impl OrphanRuntime {
         now: MonotonicMs,
         budget: Option<Duration>,
     ) -> Result<OrphanVerifyReport, JournalError> {
+        self.verify_within_excluding(now, budget, &std::collections::BTreeSet::new())
+    }
+
+    /// Run one pass while skipping records of live sessions.
+    ///
+    /// The served service owns those identities; a reconcile read must never
+    /// signal a bound worker. The startup scan has no registry and skips
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// The same failures as [`Self::verify_within`].
+    pub fn verify_within_excluding(
+        &mut self,
+        now: MonotonicMs,
+        budget: Option<Duration>,
+        live: &std::collections::BTreeSet<SessionId>,
+    ) -> Result<OrphanVerifyReport, JournalError> {
         self.reaper
             .set_deadline(budget.map(|budget| std::time::Instant::now() + budget));
-        let pass = self.journal.reap(&self.probe, &mut self.reaper, now);
+        let pass = self
+            .journal
+            .reap_excluding(&self.probe, &mut self.reaper, now, live);
         // Clear the pass bound on every path; a failed pass must not leave a
         // stale deadline on the reaper for the next caller.
         self.reaper.set_deadline(None);
@@ -199,6 +219,50 @@ impl OrphanRuntime {
     pub fn retire(&mut self, record: SessionId) -> Result<OrphanCounts, JournalError> {
         self.journal.retire(record)?;
         Ok(self.journal.counts())
+    }
+
+    /// Settle the record of a worker the service just terminated.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a journal rewrite or removal failure.
+    pub fn settle(
+        &mut self,
+        session_id: SessionId,
+        cleanup: crate::registry::CleanupClass,
+        now: MonotonicMs,
+    ) -> Result<(), JournalError> {
+        self.journal.settle(session_id, cleanup, now)
+    }
+
+    /// Reserve the pre-spawn journal record.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a full journal, an oversized record, a duplicate record, or
+    /// a filesystem failure.
+    pub fn reserve(
+        &mut self,
+        session_id: SessionId,
+        generation: u64,
+        now: MonotonicMs,
+        containment: crate::containment::ContainmentRecord,
+    ) -> Result<(), JournalError> {
+        self.journal
+            .reserve(session_id, generation, now, containment)
+    }
+
+    /// Commit the observed identity after the spawn returned.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an unknown/committed record or a filesystem failure.
+    pub fn commit(
+        &mut self,
+        session_id: SessionId,
+        identity: crate::orphan::identity::ProcessIdentity,
+    ) -> Result<(), JournalError> {
+        self.journal.commit(session_id, identity)
     }
 
     /// Current stored counts.
@@ -323,10 +387,25 @@ impl OrphanSupervisor {
         &mut self,
         now: MonotonicMs,
     ) -> Result<Option<OrphanVerifyReport>, JournalError> {
+        self.verify_on_demand_excluding(now, &std::collections::BTreeSet::new())
+    }
+
+    /// Run one on-demand pass while skipping the records of live sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns `None` for an unsupported cell and propagates a journal failure.
+    pub fn verify_on_demand_excluding(
+        &mut self,
+        now: MonotonicMs,
+        live: &std::collections::BTreeSet<SessionId>,
+    ) -> Result<Option<OrphanVerifyReport>, JournalError> {
         match self {
             Self::Served(runtime) => {
                 let budget = runtime.pass_budget();
-                runtime.verify_within(now, Some(budget)).map(Some)
+                runtime
+                    .verify_within_excluding(now, Some(budget), live)
+                    .map(Some)
             }
             Self::Unsupported { .. } => Ok(None),
         }
@@ -341,6 +420,63 @@ impl OrphanSupervisor {
         match self {
             Self::Served(runtime) => runtime.retire(record).map(Some),
             Self::Unsupported { .. } => Ok(None),
+        }
+    }
+
+    /// Settle the journal record of a worker after its terminal transition.
+    ///
+    /// An unsupported cell has no journal, so this is a no-op there.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a journal rewrite or removal failure.
+    pub fn settle(
+        &mut self,
+        session_id: SessionId,
+        cleanup: crate::registry::CleanupClass,
+        now: MonotonicMs,
+    ) -> Result<(), JournalError> {
+        match self {
+            Self::Served(runtime) => runtime.settle(session_id, cleanup, now),
+            Self::Unsupported { .. } => Ok(()),
+        }
+    }
+
+    /// Reserve the pre-spawn journal record.
+    ///
+    /// An unsupported cell has no journal and no worker path, so this is a
+    /// no-op there.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a full journal, an oversized record, a duplicate record, or
+    /// a filesystem failure.
+    pub fn reserve(
+        &mut self,
+        session_id: SessionId,
+        generation: u64,
+        now: MonotonicMs,
+        containment: crate::containment::ContainmentRecord,
+    ) -> Result<(), JournalError> {
+        match self {
+            Self::Served(runtime) => runtime.reserve(session_id, generation, now, containment),
+            Self::Unsupported { .. } => Ok(()),
+        }
+    }
+
+    /// Commit the observed identity after the spawn returned.
+    ///
+    /// # Errors
+    ///
+    /// Propagates an unknown/committed record or a filesystem failure.
+    pub fn commit(
+        &mut self,
+        session_id: SessionId,
+        identity: crate::orphan::identity::ProcessIdentity,
+    ) -> Result<(), JournalError> {
+        match self {
+            Self::Served(runtime) => runtime.commit(session_id, identity),
+            Self::Unsupported { .. } => Ok(()),
         }
     }
 

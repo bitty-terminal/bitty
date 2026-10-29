@@ -436,11 +436,11 @@ impl ServiceMethod {
             Self::DaemonHostGrant => Some(DispatchBoundary::HostGrantMint),
             Self::DaemonStop => Some(DispatchBoundary::DaemonStop),
             Self::DaemonOrphansVerify => Some(DispatchBoundary::OrphanVerify),
+            Self::SessionResize => Some(DispatchBoundary::Resize),
             Self::DaemonNegotiate
             | Self::DaemonStatus
             | Self::SessionStatus
             | Self::SessionList
-            | Self::SessionResize
             | Self::LeaseHeartbeat => None,
         }
     }
@@ -467,11 +467,11 @@ impl ServiceMethod {
             ],
             Self::DaemonStop => &[DispatchBoundary::DaemonStop],
             Self::DaemonOrphansVerify => &[DispatchBoundary::OrphanVerify],
+            Self::SessionResize => &[DispatchBoundary::Resize],
             Self::DaemonNegotiate
             | Self::DaemonStatus
             | Self::SessionStatus
             | Self::SessionList
-            | Self::SessionResize
             | Self::LeaseHeartbeat => &[],
         }
     }

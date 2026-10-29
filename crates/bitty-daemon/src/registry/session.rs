@@ -29,13 +29,17 @@ pub const TERMINAL_ID_MAX_BYTES: usize =
 /// keeps a peer descriptor from becoming a content channel.
 pub const MAX_OWNER_PEER_BYTES: usize = 256;
 
-/// Session kind. `worker` stays disabled in every v0.2.0 build (`D-01`), so the
-/// registry only admits terminal sessions; the service layer refuses a worker
-/// kind before it reaches this type.
+/// Session kind (`D-01`).
+///
+/// A `worker` record is only minted where the worker spawn path is served
+/// (Linux, bitty#2790); the service layer refuses `kind: worker` on every other
+/// cell before it reaches this type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionKind {
     /// A terminal session backed by one worker PTY.
     Terminal,
+    /// A consumer worker process hosted under containment.
+    Worker,
 }
 
 impl SessionKind {
@@ -44,6 +48,7 @@ impl SessionKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Terminal => "terminal",
+            Self::Worker => "worker",
         }
     }
 }
@@ -586,16 +591,17 @@ pub(crate) struct SessionRecord {
 }
 
 impl SessionRecord {
-    /// A fresh `created` record at revision and generation `0`.
-    pub(crate) fn new(
+    /// A fresh `created` record of an explicit kind.
+    pub(crate) fn new_kind(
         session_id: SessionId,
+        kind: SessionKind,
         terminal_id: TerminalId,
         owner_peer: Option<OwnerPeer>,
         now: MonotonicMs,
     ) -> Self {
         Self {
             session_id,
-            kind: SessionKind::Terminal,
+            kind,
             terminal_id,
             state: LifecycleState::Created,
             generation: 0,
@@ -848,8 +854,9 @@ mod tests {
 
     #[test]
     fn snapshot_derives_attached_from_the_attach_count() {
-        let record = SessionRecord::new(
+        let record = SessionRecord::new_kind(
             SessionId::parse("00000000000000000000000000000000").expect("canonical"),
+            SessionKind::Terminal,
             TerminalId::supplied("term").expect("valid"),
             None,
             MonotonicMs::ZERO,
@@ -865,14 +872,16 @@ mod tests {
 
     #[test]
     fn record_bytes_include_the_identifier_and_peer_payload() {
-        let short = SessionRecord::new(
+        let short = SessionRecord::new_kind(
             SessionId::parse("11111111111111111111111111111111").expect("canonical"),
+            SessionKind::Terminal,
             TerminalId::supplied("a").expect("valid"),
             None,
             MonotonicMs::ZERO,
         );
-        let long = SessionRecord::new(
+        let long = SessionRecord::new_kind(
             SessionId::parse("22222222222222222222222222222222").expect("canonical"),
+            SessionKind::Terminal,
             TerminalId::supplied(&"a".repeat(TERMINAL_ID_MAX_BYTES)).expect("valid"),
             Some(OwnerPeer::new(&[7u8; MAX_OWNER_PEER_BYTES]).expect("bounded")),
             MonotonicMs::ZERO,

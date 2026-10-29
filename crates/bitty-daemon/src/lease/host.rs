@@ -699,15 +699,57 @@ impl SessionHost {
         request: CreateSession,
         now: MonotonicMs,
     ) -> Result<CreatedSession, LeaseRefusal> {
+        self.create_kind(request, crate::registry::SessionKind::Terminal, now)
+    }
+
+    /// Create a session of an explicit kind.
+    ///
+    /// Identity, token, and refusal behavior are identical to [`Self::create`];
+    /// `kind` is metadata that the service layer has already authorized.
+    ///
+    /// # Errors
+    ///
+    /// The same refusals as [`Self::create`].
+    pub fn create_kind(
+        &mut self,
+        request: CreateSession,
+        kind: crate::registry::SessionKind,
+        now: MonotonicMs,
+    ) -> Result<CreatedSession, LeaseRefusal> {
         let control_token = self.mint_token()?;
         let digest = ControlTokenDigest::of(&control_token);
-        let session = self.registry.create(request, now)?;
+        let session = self.registry.create_kind(request, kind, now)?;
         self.sessions
             .insert(session.session_id, SessionLeaseState::new(digest));
         Ok(CreatedSession {
             session: self.compose_snapshot(session, now),
             control_token,
         })
+    }
+
+    /// Roll back a `created` session whose worker was never spawned.
+    ///
+    /// The caller proves nothing was bound: only a generation-`0`, `created`,
+    /// lease-free record can be discarded. The service loop is single-threaded,
+    /// so no other request can observe the record between create and this
+    /// rollback.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an unknown session, a bound generation, a non-`created` state,
+    /// or any registered lease. Nothing is removed on a refusal.
+    pub fn discard_created(&mut self, session_id: SessionId) -> Result<(), LeaseRefusal> {
+        let Some(state) = self.sessions.get(&session_id) else {
+            return Err(LeaseRefusal::SessionNotFound);
+        };
+        if !state.leases.is_empty() {
+            return Err(LeaseRefusal::NotRunning {
+                state: LifecycleState::Created,
+            });
+        }
+        self.registry.discard_created(session_id)?;
+        self.sessions.remove(&session_id);
+        Ok(())
     }
 
     /// Bind the first (and only) worker to a `created` session.

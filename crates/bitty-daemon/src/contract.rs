@@ -21,7 +21,11 @@ pub const NEGOTIATE_METHOD: &str = "daemon.negotiate";
 pub const SERVICE_API_MAJOR: u16 = 1;
 
 /// First accepted service-contract minor version (`D-11`).
-pub const SERVICE_API_MINOR: u16 = 0;
+///
+/// `1.1` is the additive worker slice (bitty#2790): `session.create` with
+/// `kind: worker` and a served `session.resize`. A `1.0` client remains in the
+/// accepted range because `min_client_minor` is `0`.
+pub const SERVICE_API_MINOR: u16 = 1;
 
 /// Lowest client minor the server accepts for [`SERVICE_API_MAJOR`] (`D-11`:
 /// `min_client_minor` starts at `0` for `1.0`).
@@ -41,16 +45,17 @@ pub const CAPABILITY_NAMES: [&str; 6] = [
     "idempotent_mutations",
 ];
 
-/// The explicit capability set the v0.2.0 surface advertises.
+/// The explicit capability set this build advertises.
 ///
-/// `worker_sessions` stays `false` in every v0.2.0 build (`D-01`): a worker
-/// kind must be refused with `UnsupportedCapability`, and enabling it needs an
-/// ADR 0019 amendment plus a dedicated security review. The other capabilities
-/// are the contract target set; they become observable only when the IPC
-/// service task (bitty#2607) serves the handshake.
+/// `worker_sessions` is compiled from [`crate::worker::WORKER_SESSIONS_SERVED`]:
+/// `true` only on the Linux cell that actually serves the worker spawn path,
+/// `false` everywhere else, where `session.create` with `kind: worker` is the
+/// typed `Denied/UnsupportedCapability`. The other capabilities are the
+/// contract target set; `events` stays `true` even though no event frame is
+/// pushed in this slice (bitty#2792 owns the delivered event wire).
 pub const CAPABILITIES: Capabilities = Capabilities {
     terminal_sessions: true,
-    worker_sessions: false,
+    worker_sessions: crate::worker::WORKER_SESSIONS_SERVED,
     events: true,
     observer_grants: true,
     control_transfer: true,
@@ -125,7 +130,7 @@ impl ServiceApiVersion {
             && client.minor <= self.minor
     }
 
-    /// The accepted client range, for diagnostics (`1.0..=1.0`).
+    /// The accepted client range, for diagnostics (`1.0..=1.1`).
     #[must_use]
     pub fn client_range(self) -> String {
         format!(
@@ -202,11 +207,11 @@ mod tests {
     #[test]
     fn service_version_matches_the_accepted_contract() {
         assert_eq!(SERVICE_API_MAJOR, 1);
-        assert_eq!(SERVICE_API_MINOR, 0);
+        assert_eq!(SERVICE_API_MINOR, 1);
         assert_eq!(MIN_CLIENT_MINOR, 0);
-        assert_eq!(SERVICE_API_VERSION, ServiceApiVersion::new(1, 0, 0));
-        assert_eq!(SERVICE_API_VERSION.to_string(), "1.0");
-        assert_eq!(SERVICE_API_VERSION.client_range(), "1.0..=1.0");
+        assert_eq!(SERVICE_API_VERSION, ServiceApiVersion::new(1, 1, 0));
+        assert_eq!(SERVICE_API_VERSION.to_string(), "1.1");
+        assert_eq!(SERVICE_API_VERSION.client_range(), "1.0..=1.1");
     }
 
     #[test]
@@ -215,7 +220,8 @@ mod tests {
         assert!(server.accepts(ClientVersion::new(1, 0)));
         assert!(!server.accepts(ClientVersion::new(0, 0)));
         assert!(!server.accepts(ClientVersion::new(2, 0)));
-        assert!(!server.accepts(ClientVersion::new(1, 1)));
+        assert!(server.accepts(ClientVersion::new(1, 1)));
+        assert!(!server.accepts(ClientVersion::new(1, 2)));
 
         let wider = ServiceApiVersion::new(1, 4, 2);
         assert!(!wider.accepts(ClientVersion::new(1, 1)));
@@ -241,30 +247,34 @@ mod tests {
     }
 
     #[test]
-    fn worker_sessions_stay_disabled_and_terminal_sessions_enabled() {
+    fn worker_sessions_follow_the_served_cell_and_terminal_sessions_are_enabled() {
         assert_eq!(
             CAPABILITIES,
             Capabilities {
                 terminal_sessions: true,
-                worker_sessions: false,
+                worker_sessions: crate::worker::WORKER_SESSIONS_SERVED,
                 events: true,
                 observer_grants: true,
                 control_transfer: true,
                 idempotent_mutations: true,
             }
         );
-        assert_eq!(
-            CAPABILITIES.enabled_names().collect::<Vec<_>>(),
-            vec![
-                "terminal_sessions",
-                "events",
-                "observer_grants",
-                "control_transfer",
-                "idempotent_mutations",
-            ]
-        );
+        let mut enabled = vec!["terminal_sessions"];
+        if crate::worker::WORKER_SESSIONS_SERVED {
+            enabled.push("worker_sessions");
+        }
+        enabled.extend([
+            "events",
+            "observer_grants",
+            "control_transfer",
+            "idempotent_mutations",
+        ]);
+        assert_eq!(CAPABILITIES.enabled_names().collect::<Vec<_>>(), enabled);
         assert!(CAPABILITIES.is_enabled("terminal_sessions"));
-        assert!(!CAPABILITIES.is_enabled("worker_sessions"));
+        assert_eq!(
+            CAPABILITIES.is_enabled("worker_sessions"),
+            crate::worker::WORKER_SESSIONS_SERVED
+        );
         assert!(!CAPABILITIES.is_enabled("unknown_capability"));
     }
 }

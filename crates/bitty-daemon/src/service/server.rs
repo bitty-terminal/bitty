@@ -239,6 +239,11 @@ mod unix {
             let audit_dir = default_audit_dir().ok_or(ServerError::NoAuditDirectory)?;
             let mut transport_scopes = bitty_ipc_api::scope::ScopeSet::new();
             transport_scopes.insert(bitty_ipc_api::scope::Scope::ProcessSpawn);
+            // bitty#2790: `session.resize` is authorized by the v1
+            // `terminal.manage` scope, granted per connection at negotiate as
+            // the frozen revision class requires. The controller-lease check
+            // still gates the effect; the scope alone resizes nothing.
+            transport_scopes.insert(bitty_ipc_api::scope::Scope::TerminalManage);
             // The seam exists only in debug builds: a release daemon always
             // re-attests at the frozen interval, so the variable cannot shorten
             // production behaviour even if it is present in the environment.
@@ -452,8 +457,14 @@ mod unix {
             OperatorStore::create_in(endpoint.runtime_dir()).map_err(ServerError::Operator)?;
         let writer =
             AuditFileWriter::open(&config.audit_dir, &config.limits).map_err(ServerError::Audit)?;
-        let mut service = Service::new(config.limits.clone(), operator, Box::new(writer), orphans)
-            .map_err(ServerError::Service)?;
+        let mut service = Service::new(
+            config.limits.clone(),
+            operator,
+            Box::new(writer),
+            orphans,
+            containment.clone(),
+        )
+        .map_err(ServerError::Service)?;
         let facts = server_facts(&endpoint)?;
 
         let mut mask = SigSet::empty();
@@ -588,6 +599,10 @@ mod unix {
                 let _ = service.sweep_grants(current);
                 next_sweep = current.as_millis().saturating_add(GRANT_SWEEP_INTERVAL_MS);
             }
+
+            // Worker PTYs are drained and exits recorded on every tick. This
+            // path never waits for a running worker.
+            service.supervise(current);
 
             let idle = config.limits.effective(LimitId::TransportIdleMs);
             let negotiate = config.limits.effective(LimitId::NegotiateTimeoutMs);
@@ -1493,6 +1508,9 @@ mod unix {
                 crate::orphan::OrphanSupervisor::unsupported(
                     crate::platform::PlatformCell::current(),
                     "test",
+                ),
+                crate::containment::ContainmentReport::unprobed(
+                    crate::platform::PlatformCell::current(),
                 ),
             )
             .expect("service");

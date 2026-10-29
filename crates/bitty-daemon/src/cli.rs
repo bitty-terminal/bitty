@@ -15,8 +15,8 @@
 //! Exit codes: `0` success (including "already running", where the desired
 //! state already holds), `1` internal failure before a listener accepted,
 //! `2` usage, `6` endpoint tamper. Codes `3`, `4`, and `5` are the contract's
-//! `daemon.stop` outcome codes; this slice has no worker to drain, so a clean
-//! stop is `0`.
+//! `daemon.stop` outcome codes; a running worker is terminated inside its
+//! containment identity before the exit, so a clean stop is `0`.
 //!
 //! Parsing and rendering are pure so the behavior is testable without spawning
 //! the process; [`run`] writes the rendered strings, runs the service for
@@ -303,7 +303,7 @@ mod tests {
         assert_eq!(result.exit_code, EXIT_OK);
         assert!(result.stderr.is_empty());
         assert!(result.stdout.contains(CRATE_VERSION));
-        assert!(result.stdout.contains("service API 1.0"));
+        assert!(result.stdout.contains("service API 1.1"));
     }
 
     #[test]

@@ -36,14 +36,16 @@
 //!
 //! # Deliberate deferrals
 //!
-//! `session.resize` needs `terminal.manage`, a `bitty-ipc` v1 scope the daemon
-//! does not grant in this slice, so it is a typed `Denied/ScopeViolation`.
-//! `daemon.orphans.verify` is served on Linux x86_64 from the owner-private
-//! journal and the recorded containment identity; a cell with no accepted
-//! mechanism refuses with `Denied/UnsupportedCapability` instead of pretending
-//! an empty verification. Both are recorded in the crate README.
+//! `session.resize` is served for a bound worker under the negotiate-time
+//! `terminal.manage` transport grant and the current controller lease; no
+//! content read, write, or subscribe method exists yet, and a terminal session
+//! (registry-only in this slice) has no PTY to resize. `daemon.orphans.verify`
+//! is served on Linux x86_64 from the owner-private journal and the recorded
+//! containment identity; a cell with no accepted mechanism refuses with
+//! `Denied/UnsupportedCapability` instead of pretending an empty verification.
+//! Both are recorded in the crate README.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use bitty_ipc_api::error::ErrorClass;
@@ -57,6 +59,7 @@ use crate::audit::{
 };
 use crate::audit_sink::{AuditSink, AuditWriter};
 use crate::codes::RefusalCode;
+use crate::containment::ContainmentReport;
 use crate::contract::CAPABILITIES;
 use crate::handshake::{
     ClientCorrelation, DaemonState, GrantCorrelation, HandshakeContext, HandshakeResponse,
@@ -77,7 +80,7 @@ use crate::peer::DispatchBoundary;
 use crate::registry::RegistryLimits;
 use crate::registry::{
     AttachId, CleanupClass, DaemonInstanceId, LifecycleState, MonotonicMs, OwnerPeer,
-    RegistryRefusal, SessionId, SessionSnapshot, TerminalId,
+    RegistryRefusal, SessionId, SessionKind, SessionSnapshot, TerminalId,
 };
 use crate::service::grants::{
     GrantId, GrantKind, GrantRefusal, GrantStore, MintError, RevokeOutcome,
@@ -87,6 +90,8 @@ use crate::service::scopes::{ScopeRequirement, ServiceMethod, ServiceScope};
 use crate::service::wire::params::{
     instance_field, object, required_string, required_u64, string_field,
 };
+use crate::spawn::{SpawnSpec, SpawnSpecError, resize_dimension};
+use crate::worker::{ResizeError, WORKER_SESSIONS_SERVED, WorkerPool, WorkerSpawnError};
 
 /// The `daemon.stop` mode (`D-05`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,6 +421,10 @@ pub struct Service {
     audit: AuditSink<Box<dyn AuditWriter>>,
     operator: OperatorStore,
     orphans: OrphanSupervisor,
+    /// The containment plan probed once at startup; every worker spawn uses it.
+    containment: ContainmentReport,
+    /// Live worker handles, drained and supervised on the poll tick.
+    workers: WorkerPool,
     grants: GrantStore,
     create_keys: IdempotencyStore,
     session_keys: BTreeMap<SessionId, IdempotencyStore>,
@@ -452,6 +461,7 @@ impl Service {
         operator: OperatorStore,
         writer: Box<dyn AuditWriter>,
         orphans: OrphanSupervisor,
+        containment: ContainmentReport,
     ) -> Result<Self, ServiceError> {
         let host = SessionHost::new(
             RegistryLimits::from_limits(&limits),
@@ -461,6 +471,7 @@ impl Service {
         let create_keys = IdempotencyStore::create(&limits);
         let instance_id = host.instance_id();
         let audit = AuditSink::new(instance_id, &limits, writer);
+        let workers = WorkerPool::new(&limits);
         Ok(Self {
             host,
             grants: GrantStore::new(&limits),
@@ -468,6 +479,8 @@ impl Service {
             audit,
             operator,
             orphans,
+            containment,
+            workers,
             create_keys,
             session_keys: BTreeMap::new(),
             create_key_by_session: BTreeMap::new(),
@@ -560,6 +573,23 @@ impl Service {
             let _ = self.host.record_grant_mutation(session_id, now);
         }
         dropped
+    }
+
+    /// The live worker pool (read-only access for adapters and tests).
+    #[must_use]
+    pub const fn workers(&self) -> &WorkerPool {
+        &self.workers
+    }
+
+    /// Drain worker PTYs, supervise exits and stop deadlines, and record every
+    /// terminal transition once.
+    ///
+    /// The server calls this on its poll tick. It never waits for a running
+    /// worker; the only bounded work is the containment sweep after an exit was
+    /// already observed.
+    pub fn supervise(&mut self, now: MonotonicMs) {
+        self.workers
+            .supervise(&mut self.host, &mut self.orphans, now);
     }
 
     /// Record exactly one refusal that the server loop refuses before a method
@@ -824,7 +854,7 @@ impl Service {
             ServiceMethod::SessionControlTransfer => {
                 self.session_control_transfer(connection, fields, now)
             }
-            ServiceMethod::SessionResize => Err(Refusal::denied(RefusalCode::ScopeViolation)),
+            ServiceMethod::SessionResize => self.session_resize(connection, fields, now),
             ServiceMethod::SessionAbort => self.session_abort(connection, fields, now),
             ServiceMethod::SessionKill => self.session_kill(connection, fields, now),
             ServiceMethod::LeaseHeartbeat => self.lease_heartbeat(connection, fields, now),
@@ -1129,6 +1159,7 @@ impl Service {
     }
 
     fn retire_session(&mut self, session_id: SessionId) {
+        self.workers.forget(session_id);
         self.initial_tokens.remove(&session_id);
         self.observer_grant_ids.remove(&session_id);
         if let Some(key) = self.create_key_by_session.remove(&session_id) {
@@ -1291,9 +1322,18 @@ impl Service {
         self.admit()?;
         match action {
             OrphanAction::Verify => {
+                // A bound worker's committed record is a supervision handle,
+                // not an orphan. The on-demand pass skips every session this
+                // registry still owns so a reconcile read never signals a
+                // running worker; the startup scan (no registry) skips nothing.
+                let live: BTreeSet<SessionId> = self
+                    .host
+                    .snapshots(now)
+                    .map(|snapshot| snapshot.session_id)
+                    .collect();
                 let report = self
                     .orphans
-                    .verify_on_demand(now)
+                    .verify_on_demand_excluding(now, &live)
                     .map_err(|_| Refusal::denied(RefusalCode::Internal))?
                     .ok_or_else(|| Refusal::denied(RefusalCode::UnsupportedCapability))?;
                 let acted = report
@@ -1369,9 +1409,48 @@ impl Service {
             let Ok(snapshot) = self.snapshot(session_id, now) else {
                 continue;
             };
-            if snapshot.state != LifecycleState::Created {
+            if snapshot.state == LifecycleState::Created {
+                let generation = snapshot.generation;
+                if self
+                    .host
+                    .operator_stop(session_id, generation, cause, now)
+                    .is_err()
+                {
+                    continue;
+                }
+                if let Ok(Termination::Completed(notice)) =
+                    self.host
+                        .complete_pre_bind_cancel(session_id, CleanupClass::NotStarted, now)
+                {
+                    terminated = terminated.saturating_add(1);
+                    self.retire_session(session_id);
+                    let _ = self.audit.record(
+                        AuditEntry::new(AuditAction::Stop)
+                            .result(AuditResult::Ok)
+                            .session(AuditSession {
+                                session_id,
+                                generation: notice.session.generation,
+                                state_revision: notice.session.state_revision,
+                            })
+                            .target(AuditTarget::session(session_id))
+                            .terminal(AuditTerminal {
+                                state: notice.session.state,
+                                reason: notice.reason,
+                                exit: notice.exit,
+                                cleanup: notice.cleanup,
+                            }),
+                        now,
+                    );
+                }
                 continue;
             }
+            if snapshot.state != LifecycleState::Running
+                && snapshot.state != LifecycleState::Stopping
+            {
+                continue;
+            }
+            // A bound session is stopped through the same reason pipeline, and
+            // the owned worker tree is terminated before the terminal record.
             let generation = snapshot.generation;
             if self
                 .host
@@ -1380,10 +1459,18 @@ impl Service {
             {
                 continue;
             }
-            if let Ok(Termination::Completed(notice)) =
-                self.host
-                    .complete_pre_bind_cancel(session_id, CleanupClass::NotStarted, now)
-            {
+            let cleanup = self
+                .workers
+                .terminate(session_id)
+                .unwrap_or(CleanupClass::Unverified);
+            self.workers.forget(session_id);
+            let _ = self.orphans.settle(session_id, cleanup, now);
+            if let Ok(Termination::Completed(notice)) = self.host.record_termination(
+                session_id,
+                crate::lease::ExitObservation::DaemonTerminated,
+                cleanup,
+                now,
+            ) {
                 terminated = terminated.saturating_add(1);
                 self.retire_session(session_id);
                 let _ = self.audit.record(
@@ -1492,14 +1579,18 @@ impl Service {
         fields: Option<&Map<String, Value>>,
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
-        let kind = string_field(fields, "kind")?.unwrap_or("terminal");
-        match kind {
-            "terminal" => {}
+        let kind = match string_field(fields, "kind")?.unwrap_or("terminal") {
+            "terminal" => SessionKind::Terminal,
             "worker" => {
-                return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
+                // The frozen order: after the stage-6 create-scope check and
+                // before the stage-7 host-grant liveness re-check.
+                if !WORKER_SESSIONS_SERVED {
+                    return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
+                }
+                SessionKind::Worker
             }
             _ => return Err(Refusal::invalid_request()),
-        }
+        };
         // Stage 7: the consumed host consent must still be live.
         let grant_id = connection
             .host_grant()
@@ -1514,6 +1605,17 @@ impl Service {
             return Err(Refusal::denied(RefusalCode::ConsentRequired));
         }
 
+        // A worker create reads and validates the whole bounded spawn
+        // specification before the idempotency admission and before any
+        // process exists. A terminal create stays registry-only in this slice
+        // and ignores those fields as unknown.
+        let spawn = match kind {
+            SessionKind::Worker => {
+                Some(SpawnSpec::parse(fields, &self.limits).map_err(map_spawn_spec_refusal)?)
+            }
+            SessionKind::Terminal => None,
+        };
+
         let terminal_id = match string_field(fields, "terminal_id")? {
             Some(value) => {
                 Some(TerminalId::supplied(value).map_err(|_| Refusal::invalid_request())?)
@@ -1522,10 +1624,16 @@ impl Service {
         };
         let digest = terminal_digest(terminal_id.as_ref());
         let key = self.idempotency_key(fields)?;
+        // The spawn digest is the only form of argv/env/cwd the store keeps; a
+        // different specification under the same key is a fingerprint conflict.
+        let spec_digest = spawn
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), SpawnSpec::digest);
         let fingerprint = fingerprint(&[
             "create",
-            kind,
+            kind.as_str(),
             terminal_id.as_ref().map(TerminalId::as_str).unwrap_or(""),
+            spec_digest.as_str(),
         ]);
         let request = IdempotentRequest::new(
             key,
@@ -1552,11 +1660,12 @@ impl Service {
                 }
                 let owner_peer = OwnerPeer::new(&connection.peer_uid().to_be_bytes())
                     .map_err(|_| Refusal::internal())?;
-                let created = self.host.create(
+                let created = self.host.create_kind(
                     crate::registry::CreateSession {
                         terminal_id,
                         owner_peer: Some(owner_peer),
                     },
+                    kind,
                     now,
                 );
                 match created {
@@ -1565,11 +1674,38 @@ impl Service {
                         self.initial_tokens
                             .insert(session_id, created.control_token);
                         self.create_key_by_session.insert(session_id, key);
+                        let started = self.start_worker(session_id, spawn.as_ref(), now);
+                        let snapshot = match started {
+                            Ok(snapshot) => snapshot,
+                            Err(refusal) => {
+                                // A pre-spawn failure leaves no child and no
+                                // reserved journal record: roll the created
+                                // record back whole and answer the refusal.
+                                let _ = self.host.discard_created(session_id);
+                                self.initial_tokens.remove(&session_id);
+                                self.create_key_by_session.remove(&session_id);
+                                let _ = self.create_keys.complete(
+                                    reservation,
+                                    IdempotencyResult::Refused(store_code(refusal)),
+                                );
+                                self.record(
+                                    AuditAction::Create,
+                                    connection,
+                                    None,
+                                    AuditTarget::terminal_digest(digest),
+                                    AuditResult::Refused(store_code(refusal)),
+                                    None,
+                                    None,
+                                    now,
+                                );
+                                return Err(refusal);
+                            }
+                        };
                         let applied = AppliedResult::new(
                             AppliedClass::Created,
                             session_id,
-                            created.session.generation,
-                            created.session.state_revision,
+                            snapshot.generation,
+                            snapshot.state_revision,
                             0,
                             false,
                         );
@@ -1579,19 +1715,22 @@ impl Service {
                         self.record(
                             AuditAction::Create,
                             connection,
-                            Some(Self::audit_session(&created.session)),
+                            Some(Self::audit_session(&snapshot)),
                             AuditTarget::terminal_digest(digest),
                             AuditResult::Ok,
                             None,
                             None,
                             now,
                         );
-                        let token = self
-                            .initial_tokens
-                            .get(&session_id)
-                            .map(|token| crate::handshake::hex(token.expose_secret()));
+                        let token = if snapshot.state.is_terminal() {
+                            None
+                        } else {
+                            self.initial_tokens
+                                .get(&session_id)
+                                .map(|token| crate::handshake::hex(token.expose_secret()))
+                        };
                         Ok(json!({
-                            "session": session_json(&created.session),
+                            "session": session_json(&snapshot),
                             "control_token": token,
                             "replayed": false,
                         }))
@@ -1616,6 +1755,96 @@ impl Service {
                 }
             }
             Err(error) => Err(map_idempotency(error)),
+        }
+    }
+
+    /// Spawn and bind the worker for a just-created session.
+    ///
+    /// The sequence is the contract's two-phase journal: reserve the record
+    /// with the pre-spawn containment identity, spawn under that identity,
+    /// commit the observed identity, then bind generation `1`. A spawn failure
+    /// terminalizes the record as `failed/spawn_failed` with `not_started`
+    /// cleanup and settles the journal, so the create still answers the
+    /// accepted result shape. Only a journal capacity refusal returns `Err`,
+    /// and the caller rolls the whole create back.
+    fn start_worker(
+        &mut self,
+        session_id: SessionId,
+        spawn: Option<&SpawnSpec>,
+        now: MonotonicMs,
+    ) -> Result<SessionSnapshot, Refusal> {
+        let Some(spec) = spawn else {
+            return self
+                .host
+                .snapshot(session_id, now)
+                .ok_or_else(Refusal::internal);
+        };
+        let record =
+            crate::worker::planned_record(&self.containment, self.instance_id(), session_id);
+        self.orphans
+            .reserve(session_id, 0, now, record)
+            .map_err(map_journal_refusal)?;
+        let identity =
+            match self
+                .workers
+                .spawn(&self.containment, self.instance_id(), session_id, spec)
+            {
+                Ok(identity) => identity,
+                Err(WorkerSpawnError::Unsupported) => {
+                    let _ = self
+                        .orphans
+                        .settle(session_id, CleanupClass::NotStarted, now);
+                    return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
+                }
+                Err(WorkerSpawnError::Spawn) => {
+                    let _ = self
+                        .orphans
+                        .settle(session_id, CleanupClass::NotStarted, now);
+                    return self.spawn_failed(session_id, CleanupClass::NotStarted, now);
+                }
+            };
+        if self.orphans.commit(session_id, identity).is_err() {
+            let cleanup = self
+                .workers
+                .terminate(session_id)
+                .unwrap_or(CleanupClass::Unverified);
+            self.workers.forget(session_id);
+            let _ = self.orphans.settle(session_id, cleanup, now);
+            return self.spawn_failed(session_id, cleanup, now);
+        }
+        match self.host.bind(session_id, now) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(_) => {
+                let cleanup = self
+                    .workers
+                    .terminate(session_id)
+                    .unwrap_or(CleanupClass::Unverified);
+                self.workers.forget(session_id);
+                let _ = self.orphans.settle(session_id, cleanup, now);
+                self.spawn_failed(session_id, cleanup, now)
+            }
+        }
+    }
+
+    /// Record the terminal `spawn_failed` transition of an unbound worker.
+    fn spawn_failed(
+        &mut self,
+        session_id: SessionId,
+        cleanup: CleanupClass,
+        now: MonotonicMs,
+    ) -> Result<SessionSnapshot, Refusal> {
+        match self.host.record_termination(
+            session_id,
+            crate::lease::ExitObservation::SpawnFailed,
+            cleanup,
+            now,
+        ) {
+            Ok(Termination::Completed(notice)) => {
+                self.retire_session(session_id);
+                Ok(notice.session)
+            }
+            Ok(Termination::AlreadyTerminal { session }) => Ok(session),
+            Err(_) => Err(Refusal::internal()),
         }
     }
 
@@ -2381,6 +2610,68 @@ impl Service {
         }
     }
 
+    fn session_resize(
+        &mut self,
+        connection: &mut Connection,
+        fields: Option<&Map<String, Value>>,
+        now: MonotonicMs,
+    ) -> Result<Value, Refusal> {
+        let session_id = parse_session_id(fields)?;
+        let generation = required_u64(fields, "generation")?;
+        let cols =
+            resize_dimension(required_u64(fields, "cols")?).map_err(map_spawn_spec_refusal)?;
+        let rows =
+            resize_dimension(required_u64(fields, "rows")?).map_err(map_spawn_spec_refusal)?;
+
+        let snapshot = self
+            .host
+            .snapshot(session_id, now)
+            .ok_or_else(Refusal::not_found)?;
+        check_generation(&snapshot, generation)?;
+        if snapshot.state.is_terminal() {
+            return Err(Refusal::denied(RefusalCode::NotRunning));
+        }
+        if snapshot.state == LifecycleState::Stopping {
+            return Err(Refusal::denied(RefusalCode::SessionStopping));
+        }
+        // Stage 7: the caller must hold the current controller lease. Any other
+        // lease on the session (an observer, or a connection with no lease) is
+        // the one typed `ControllerRequired`; an observer never resizes.
+        let view = self
+            .host
+            .control_view(session_id, now)
+            .ok_or_else(Refusal::not_found)?;
+        let attach = connection.leases().find_map(|(attach, owned)| {
+            (owned == session_id && view.controller == Some(attach)).then_some(attach)
+        });
+        let Some(attach) = attach else {
+            return Err(Refusal::denied(RefusalCode::ControllerRequired));
+        };
+        self.recheck(connection, DispatchBoundary::Resize)?;
+        self.admit()?;
+        // Apply to the owned PTY first: a content-plane failure must not bump
+        // the revision.
+        match self.workers.resize(session_id, cols, rows) {
+            Ok(()) => {}
+            Err(ResizeError::NotBound) => {
+                return Err(Refusal::denied(RefusalCode::NotRunning));
+            }
+            Err(ResizeError::Pty) => return Err(Refusal::internal()),
+        }
+        let resized = self.host.record_resize(attach, now).map_err(map_lease)?;
+        self.record(
+            AuditAction::Resize,
+            connection,
+            Some(Self::audit_session(&resized)),
+            AuditTarget::session(session_id),
+            AuditResult::Ok,
+            None,
+            None,
+            now,
+        );
+        Ok(json!({"session": session_json(&resized)}))
+    }
+
     fn session_abort(
         &mut self,
         connection: &mut Connection,
@@ -2666,6 +2957,32 @@ fn fingerprint(parts: &[&str]) -> Fingerprint {
 
 fn store_code(refusal: Refusal) -> RefusalCode {
     refusal.denied_code().unwrap_or(RefusalCode::Internal)
+}
+
+/// Map a bounded spawn-specification refusal to its wire refusal.
+fn map_spawn_spec_refusal(error: SpawnSpecError) -> Refusal {
+    match error {
+        SpawnSpecError::Invalid => Refusal::invalid_request(),
+        SpawnSpecError::Limit { limit, actual } => Refusal::limit_exceeded(limit, actual),
+    }
+}
+
+/// Map a journal reservation refusal to its wire refusal.
+///
+/// A full journal and an oversized record are `LimitExceeded` before any
+/// spawn; every other journal failure is a bare internal fault.
+fn map_journal_refusal(error: JournalError) -> Refusal {
+    match error {
+        JournalError::LimitExceeded { limit } => Refusal::limit_exceeded(
+            u64::try_from(limit).unwrap_or(u64::MAX),
+            u64::try_from(limit).unwrap_or(u64::MAX),
+        ),
+        JournalError::RecordTooLarge { bytes, limit } => Refusal::limit_exceeded(
+            u64::try_from(limit).unwrap_or(u64::MAX),
+            u64::try_from(bytes).unwrap_or(u64::MAX),
+        ),
+        _ => Refusal::internal(),
+    }
 }
 
 fn parse_session_id(fields: Option<&Map<String, Value>>) -> Result<SessionId, Refusal> {
@@ -3035,7 +3352,16 @@ mod tests {
         .expect("chmod");
         let operator = OperatorStore::create_in(dir.path()).expect("operator store");
         let (writer, _fail, _lines) = TestWriter::new();
-        let service = Service::new(limits, operator, Box::new(writer), orphans).expect("service");
+        let service = Service::new(
+            limits,
+            operator,
+            Box::new(writer),
+            orphans,
+            crate::containment::ContainmentReport::unprobed(
+                crate::platform::PlatformCell::current(),
+            ),
+        )
+        .expect("service");
         (service, dir)
     }
 
@@ -3155,7 +3481,7 @@ mod tests {
             )
             .expect("accepted");
         assert_eq!(response.wire_version, 1);
-        assert_eq!(response.service_api_version.to_string(), "1.0");
+        assert_eq!(response.service_api_version.to_string(), "1.1");
         assert_eq!(response.scopes.service, ServiceScopeSet::baseline());
         assert_eq!(response.daemon_pid, std::process::id());
         assert_eq!(response.peer_identity.pid, std::process::id());
@@ -3394,6 +3720,69 @@ mod tests {
                 .snapshots(MonotonicMs::from_millis(3))
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn worker_create_is_gated_by_create_scope_before_kind_and_consent() {
+        let (mut service, _dir) = service();
+        // Stage 6 runs before the handler: a connection without
+        // `process.spawn` is `ScopeViolation` even though a worker handler
+        // would answer `UnsupportedCapability` on a non-served cell.
+        let mut scopes = ServiceScopeSet::baseline();
+        scopes.insert(ServiceScope::SessionHost);
+        let mut blind = connection(scopes, false);
+        negotiate_ok(&mut service, &mut blind, 1);
+        let error = service
+            .dispatch(
+                &mut blind,
+                ServiceMethod::SessionCreate,
+                &json!({
+                    "kind": "worker",
+                    "idempotency_key": "worker-scope",
+                    "argv": ["/bin/true"],
+                    "cwd": "/",
+                }),
+                MonotonicMs::from_millis(2),
+            )
+            .expect_err("refused");
+        assert_eq!(error.denied_code(), Some(RefusalCode::ScopeViolation));
+
+        // Create scope passes, so the next authority is consent (on the served
+        // cell) or the typed capability refusal (everywhere else).
+        let mut allowed = connection(
+            ServiceScopeSet::baseline().with(ServiceScope::SessionHost),
+            true,
+        );
+        negotiate_ok(&mut service, &mut allowed, 1);
+        let error = service
+            .dispatch(
+                &mut allowed,
+                ServiceMethod::SessionCreate,
+                &json!({
+                    "kind": "worker",
+                    "idempotency_key": "worker-consent",
+                    "argv": ["/bin/true"],
+                    "cwd": "/",
+                }),
+                MonotonicMs::from_millis(2),
+            )
+            .expect_err("refused");
+        assert_eq!(
+            error.denied_code(),
+            Some(if crate::worker::WORKER_SESSIONS_SERVED {
+                RefusalCode::ConsentRequired
+            } else {
+                RefusalCode::UnsupportedCapability
+            })
+        );
+        assert_eq!(
+            service
+                .host()
+                .snapshots(MonotonicMs::from_millis(3))
+                .count(),
+            0,
+            "neither refusal creates a record"
         );
     }
 
@@ -3645,6 +4034,9 @@ mod tests {
             operator,
             Box::new(writer),
             OrphanSupervisor::unsupported(crate::platform::PlatformCell::current(), "test"),
+            crate::containment::ContainmentReport::unprobed(
+                crate::platform::PlatformCell::current(),
+            ),
         )
         .expect("service");
         let mut operator_conn = operator_connection(&mut service);

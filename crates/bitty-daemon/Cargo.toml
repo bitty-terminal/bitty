@@ -67,7 +67,7 @@ zeroize = "1.9"
 # probe), `user` (uid/gid), `signal` (peer liveness), `process` (pid types and
 # the Linux `prctl` dumpable flag), `resource` (`RLIMIT_CORE`), and `uio`.
 # Windows compiles the typed UnsupportedPlatform path and links no nix code.
-nix = { workspace = true, features = ["fs", "poll", "process", "resource", "signal", "socket", "uio", "user"] }
+nix = { workspace = true, features = ["fs", "poll", "process", "resource", "signal", "socket", "term", "uio", "user"] }
 
 [dev-dependencies]
 # CTX-1619: temporary journal directories for the orphan-journal tests. The

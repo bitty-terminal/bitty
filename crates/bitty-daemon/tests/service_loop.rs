@@ -506,9 +506,10 @@ fn start_serves_the_endpoint_and_never_opens_a_tcp_listener() {
             "session.inspect",
             "session.attach",
             "session.control",
+            "terminal.manage",
             "process.spawn",
         ],
-        "the baseline is the three session scopes plus process.spawn only"
+        "the baseline is the three session scopes plus terminal.manage and process.spawn"
     );
     assert!(
         !scopes
@@ -517,12 +518,13 @@ fn start_serves_the_endpoint_and_never_opens_a_tcp_listener() {
     );
     assert!(!scopes.iter().any(|scope| scope == "daemon.control"));
     assert!(
-        !scopes.iter().any(|scope| scope
-            .as_str()
-            .is_some_and(|name| name.starts_with("terminal."))),
-        "no ambient terminal content scope is granted"
+        advertised.contains(&"terminal.manage"),
+        "the content-plane scope is granted at negotiate"
     );
-    assert_eq!(result["capabilities"]["worker_sessions"], false);
+    assert_eq!(
+        result["capabilities"]["worker_sessions"],
+        bitty_daemon::worker::WORKER_SESSIONS_SERVED
+    );
     assert_eq!(
         result["limits"].as_array().expect("limits").len(),
         bitty_daemon::limits::LIMIT_COUNT
@@ -2543,4 +2545,406 @@ fn plain_status_never_binds_and_creates_no_runtime_file() {
     assert!(stdout.contains("endpoint: none bound"), "{stdout}");
     assert!(!root.endpoint().exists());
     assert!(!root.capability().exists());
+}
+
+// ── worker spawn/bind, generation 1, and `session.resize` (bitty#2790) ──────
+
+/// Create a worker with host consent on a fresh connection.
+///
+/// The spawn specification is the bounded eight-field subset; the helper keeps
+/// one successful shape so a test only varies what it asserts.
+fn create_worker(
+    root: &TempRoot,
+    operator: &mut Client,
+    label: &str,
+    argv: Value,
+) -> (Client, Value) {
+    let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    assert_eq!(minted["ok"], true, "{minted}");
+    let host_grant = minted["result"]["grant"]
+        .as_str()
+        .expect("host grant bearer")
+        .to_owned();
+    let mut creator = Client::connect(&root.endpoint());
+    assert_eq!(creator.negotiate_with(None, Some(&host_grant))["ok"], true);
+    let created = creator.call(
+        "session.create",
+        json!({
+            "kind": "worker",
+            "idempotency_key": format!("{label}-create"),
+            "argv": argv,
+            "cwd": "/",
+            "cols": 100,
+            "rows": 30,
+            "env": ["BITTYD_WORKER_TEST=1"],
+            "term": "xterm-256color",
+        }),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    (creator, created)
+}
+
+/// Read one session through the operator view.
+fn operator_session(operator: &mut Client, session_id: &str) -> Value {
+    let status = operator.call("session.status", json!({"session_id": session_id}));
+    assert_eq!(status["ok"], true, "{status}");
+    status["result"]["session"].clone()
+}
+
+/// Poll the operator view until the session reaches one of `states`.
+fn wait_for_worker_state(operator: &mut Client, session_id: &str, states: &[&str]) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let session = operator_session(operator, session_id);
+        let state = session["state"].as_str().unwrap_or("");
+        if states.contains(&state) {
+            return session;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker never reached {states:?}: {session}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn a_worker_create_binds_generation_one_and_keeps_its_journal_record_while_live() {
+    let root = TempRoot::new("worker-bind");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    let (mut creator, created) =
+        create_worker(&root, &mut operator, "bind", json!(["/bin/sleep", "60"]));
+    let session = &created["result"]["session"];
+    assert_eq!(session["kind"], "worker");
+    assert_eq!(session["state"], "running");
+    assert_eq!(session["generation"], 1, "the worker binds generation one");
+    assert_eq!(session["state_revision"], 1);
+    assert_eq!(session["attach_count"], 0);
+    assert_eq!(created["result"]["replayed"], false);
+    let token = created["result"]["control_token"]
+        .as_str()
+        .expect("create token");
+    assert_eq!(token.len(), 64);
+    let session_id = session["session_id"].as_str().expect("session id");
+
+    // The same key and the same specification replay the bound record without
+    // spawning a second worker.
+    let replay = creator.call(
+        "session.create",
+        json!({
+            "kind": "worker",
+            "idempotency_key": "bind-create",
+            "argv": ["/bin/sleep", "60"],
+            "cwd": "/",
+            "cols": 100,
+            "rows": 30,
+            "env": ["BITTYD_WORKER_TEST=1"],
+            "term": "xterm-256color",
+        }),
+    );
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert_eq!(replay["result"]["replayed"], true);
+    assert_eq!(replay["result"]["session"]["session_id"], session_id);
+    assert_eq!(replay["result"]["session"]["generation"], 1);
+
+    // A different spawn specification under the same key is a conflict, never
+    // a descriptor replay.
+    let conflict = creator.call(
+        "session.create",
+        json!({
+            "kind": "worker",
+            "idempotency_key": "bind-create",
+            "argv": ["/bin/sleep", "61"],
+            "cwd": "/",
+        }),
+    );
+    assert_eq!(conflict["ok"], false, "{conflict}");
+    assert_eq!(conflict["error"]["code"], "IdempotencyConflict");
+
+    // The bound session still owns its committed journal record. A reconcile
+    // read must skip it: the live worker is not an orphan.
+    let verified = operator.call("daemon.orphans.verify", json!({"action": "verify"}));
+    assert_eq!(verified["ok"], true, "{verified}");
+    assert_eq!(verified["result"]["committed"], 1);
+    assert_eq!(verified["result"]["reserved"], 0);
+    let after = operator_session(&mut operator, session_id);
+    assert_eq!(after["state"], "running", "{after}");
+    assert_eq!(
+        after["state_revision"], 1,
+        "the reconcile read changes nothing"
+    );
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn worker_resize_requires_the_controller_lease_and_bumps_the_revision() {
+    let root = TempRoot::new("worker-resize");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    let (mut creator, created) =
+        create_worker(&root, &mut operator, "resize", json!(["/bin/sleep", "60"]));
+    let session_id = created["result"]["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    // The controller lease is the authority for the content plane.
+    let claimed = creator.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 1,
+            "control_token": created["result"]["control_token"],
+            "idempotency_key": "resize-claim",
+        }),
+    );
+    assert_eq!(claimed["ok"], true, "{claimed}");
+    assert_eq!(claimed["result"]["session"]["generation"], 1);
+
+    let resized = creator.call(
+        "session.resize",
+        json!({"session_id": session_id, "generation": 1, "cols": 120, "rows": 40}),
+    );
+    assert_eq!(resized["ok"], true, "{resized}");
+    assert_eq!(resized["result"]["session"]["state"], "running");
+    assert_eq!(resized["result"]["session"]["generation"], 1);
+    assert_eq!(
+        resized["result"]["session"]["state_revision"], 3,
+        "attach then resize bump the revision exactly once each"
+    );
+
+    // A stale generation is refused before the content plane is touched.
+    let stale = creator.call(
+        "session.resize",
+        json!({"session_id": session_id, "generation": 0, "cols": 80, "rows": 24}),
+    );
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert_eq!(stale["error"]["class"], "Denied");
+    assert_eq!(stale["error"]["code"], "StaleGeneration");
+    assert_eq!(
+        operator_session(&mut operator, &session_id)["state_revision"],
+        3,
+        "a stale resize changes nothing"
+    );
+
+    // A zero or over-bound dimension is a malformed request.
+    for (cols, rows) in [(0, 24), (80, 0), (1001, 24), (80, 1001)] {
+        let invalid = creator.call(
+            "session.resize",
+            json!({"session_id": session_id, "generation": 1, "cols": cols, "rows": rows}),
+        );
+        assert_eq!(invalid["ok"], false, "{invalid}");
+        assert_eq!(invalid["error"]["code"], "InvalidRequest");
+    }
+    let unknown = creator.call(
+        "session.resize",
+        json!({
+            "session_id": "33333333333333333333333333333333",
+            "generation": 1,
+            "cols": 80,
+            "rows": 24,
+        }),
+    );
+    assert_eq!(unknown["ok"], false, "{unknown}");
+    assert_eq!(unknown["error"]["code"], "NotFound");
+
+    // An observer holds a lease but never control; resize is the typed
+    // controller-only refusal and changes no revision.
+    let (mut observer, _attach) = attach_observer(&root, &mut creator, &session_id, "resize");
+    let before = operator_session(&mut operator, &session_id)["state_revision"]
+        .as_u64()
+        .expect("revision");
+    let refused = observer.call(
+        "session.resize",
+        json!({"session_id": session_id, "generation": 1, "cols": 90, "rows": 30}),
+    );
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["error"]["class"], "Denied");
+    assert_eq!(refused["error"]["code"], "ControllerRequired");
+    assert_eq!(
+        operator_session(&mut operator, &session_id)["state_revision"],
+        before,
+        "an observer resize changes nothing"
+    );
+
+    // Control is still held by the original controller after the refusal.
+    let still = creator.call(
+        "session.resize",
+        json!({"session_id": session_id, "generation": 1, "cols": 100, "rows": 30}),
+    );
+    assert_eq!(still["ok"], true, "{still}");
+    assert_eq!(still["result"]["session"]["state_revision"], before + 1);
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn a_failed_worker_spawn_leaves_no_journal_record_or_bound_session() {
+    let root = TempRoot::new("worker-spawn-fail");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    let (_creator, created) = create_worker(
+        &root,
+        &mut operator,
+        "spawn-fail",
+        json!(["/nonexistent/bittyd-worker-probe"]),
+    );
+    let session = &created["result"]["session"];
+    assert_eq!(session["kind"], "worker");
+    assert_eq!(session["state"], "failed");
+    assert_eq!(session["terminal_reason"], "spawn_failed");
+    assert_eq!(session["cleanup"], "not_started");
+    assert_eq!(session["generation"], 0, "a failed spawn never binds");
+    assert_eq!(
+        created["result"]["control_token"],
+        Value::Null,
+        "a failed session has no claimable control"
+    );
+    let session_id = session["session_id"].as_str().expect("session id");
+
+    // No reserved or committed record survives the failure.
+    let verified = operator.call("daemon.orphans.verify", json!({"action": "verify"}));
+    assert_eq!(verified["ok"], true, "{verified}");
+    assert_eq!(verified["result"]["reserved"], 0);
+    assert_eq!(verified["result"]["committed"], 0);
+
+    // The failed record is visible as a terminal worker, not as a running one.
+    let failed = operator_session(&mut operator, session_id);
+    assert_eq!(failed["state"], "failed");
+    assert_eq!(failed["terminal_reason"], "spawn_failed");
+    let status = operator.call("daemon.status", Value::Null);
+    assert_eq!(status["ok"], true, "{status}");
+    assert_eq!(status["result"]["active_sessions"], 0);
+    assert_eq!(status["result"]["sessions"]["running"], 0);
+    assert_eq!(status["result"]["sessions"]["terminal"], 1);
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn a_worker_exit_is_recorded_once_with_its_containment_cleanup() {
+    let root = TempRoot::new("worker-exit");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    let (_creator, created) = create_worker(
+        &root,
+        &mut operator,
+        "exit",
+        json!(["/bin/sh", "-c", "exit 7"]),
+    );
+    let session_id = created["result"]["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+
+    let exited = wait_for_worker_state(&mut operator, &session_id, &["exited", "failed"]);
+    assert_eq!(exited["terminal_reason"], "worker_exit");
+    assert_eq!(exited["generation"], 1);
+    assert_eq!(exited["kind"], "worker");
+
+    // The cleanup class is the mechanism's truthful claim: a cgroup subtree is
+    // swept and its journal record removed; the subreaper fallback can never
+    // prove a whole tree and quarantines the record instead.
+    let status = operator.call("daemon.status", Value::Null);
+    let mechanism = status["result"]["orphans"]["mechanism"]
+        .as_str()
+        .expect("mechanism");
+    let verified = operator.call("daemon.orphans.verify", json!({"action": "verify"}));
+    assert_eq!(verified["ok"], true, "{verified}");
+    match mechanism {
+        "cgroup_v2" => {
+            assert_eq!(exited["cleanup"], "swept");
+            assert_eq!(verified["result"]["committed"], 0);
+            assert_eq!(verified["result"]["reserved"], 0);
+            assert_eq!(verified["result"]["unverified"], 0);
+        }
+        "subreaper_fallback" => {
+            assert_eq!(exited["cleanup"], "unverified");
+            assert_eq!(verified["result"]["committed"], 0);
+            assert_eq!(verified["result"]["reserved"], 0);
+            assert_eq!(
+                verified["result"]["unverified"], 1,
+                "an unprovable tree stays quarantined, never silently forgotten"
+            );
+        }
+        other => panic!("unexpected mechanism {other}"),
+    }
+
+    // A second read is stable: the terminal transition is recorded once.
+    let again = operator_session(&mut operator, &session_id);
+    assert_eq!(again["state"], exited["state"]);
+    assert_eq!(again["state_revision"], exited["state_revision"]);
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn worker_create_refuses_without_consent_and_before_an_invalid_kind() {
+    let root = TempRoot::new("worker-consent");
+    let daemon = Daemon::start(&root);
+    let mut client = Client::connect(&root.endpoint());
+    assert_eq!(client.negotiate(None)["ok"], true, "no host grant");
+
+    // The connection holds `process.spawn` but no `session.host`: consent is
+    // the refusal, not a capability one.
+    let consent = client.call(
+        "session.create",
+        json!({
+            "kind": "worker",
+            "idempotency_key": "consent-worker",
+            "argv": ["/bin/sleep", "60"],
+            "cwd": "/",
+        }),
+    );
+    assert_eq!(consent["ok"], false, "{consent}");
+    assert_eq!(consent["error"]["class"], "Denied");
+    assert_eq!(consent["error"]["code"], "ConsentRequired");
+
+    // An unknown kind is gated the same way: create scope first.
+    let unknown = client.call(
+        "session.create",
+        json!({"kind": "daemon", "idempotency_key": "unknown-kind"}),
+    );
+    assert_eq!(unknown["ok"], false, "{unknown}");
+    assert_eq!(unknown["error"]["code"], "ConsentRequired");
+
+    // With create authority, the unknown kind itself is malformed.
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    assert_eq!(minted["ok"], true, "{minted}");
+    let host_grant = minted["result"]["grant"]
+        .as_str()
+        .expect("host grant bearer")
+        .to_owned();
+    let mut creator = Client::connect(&root.endpoint());
+    assert_eq!(creator.negotiate_with(None, Some(&host_grant))["ok"], true);
+    let malformed = creator.call(
+        "session.create",
+        json!({"kind": "daemon", "idempotency_key": "unknown-kind"}),
+    );
+    assert_eq!(malformed["ok"], false, "{malformed}");
+    assert_eq!(malformed["error"]["code"], "InvalidRequest");
+
+    let status = operator.call("daemon.status", Value::Null);
+    assert_eq!(status["result"]["active_sessions"], 0);
+    assert_eq!(status["result"]["sessions"]["created"], 0);
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
 }

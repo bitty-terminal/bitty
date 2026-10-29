@@ -156,8 +156,9 @@ impl OrphanRuntime {
     /// The on-demand method uses [`Self::pass_budget`] so a request cannot hold
     /// the single-threaded service loop for the full per-record window on every
     /// remaining record. Every record is still examined; a record whose wait is
-    /// clamped stays quarantined, is counted in the returned report, and is
-    /// retried by the next pass. The pass is idempotent.
+    /// clamped is deferred, keeps its `reserved`/`committed` class, and is
+    /// retried by the next pass. A pass is idempotent once no record is
+    /// deferred.
     ///
     /// # Errors
     ///

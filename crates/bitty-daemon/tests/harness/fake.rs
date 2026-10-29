@@ -624,10 +624,20 @@ impl FakeDriver {
         if !self.has_scope(connection, "daemon.control") {
             return self.refuse("daemon.orphans.verify", "Denied", "ScopeViolation", None);
         }
-        let action = params
-            .get("action")
-            .and_then(Value::as_str)
-            .unwrap_or("verify");
+        let action = match params.get("action") {
+            None | Some(Value::Null) => "verify",
+            Some(Value::String(action)) => action.as_str(),
+            // Match the served parser: a present non-string `action` is a
+            // validation refusal, never the default verify.
+            Some(_) => {
+                return self.refuse(
+                    "daemon.orphans.verify",
+                    "Validation",
+                    "InvalidRequest",
+                    None,
+                );
+            }
+        };
         let action = match action {
             "verify" => "verify",
             "retire" => "retire",
@@ -648,7 +658,12 @@ impl FakeDriver {
                 .get("record_id")
                 .and_then(Value::as_str)
                 .is_some_and(|record| {
-                    record.len() == 32 && record.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    // Session ids are canonical lowercase hex; uppercase is
+                    // not a known record on the served parser either.
+                    record.len() == 32
+                        && record
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                 });
             if !known {
                 return self.refuse(

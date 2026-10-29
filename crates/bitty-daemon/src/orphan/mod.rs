@@ -12,7 +12,8 @@
 //!
 //! [`OrphanSupervisor`] is the served production surface behind
 //! `daemon.orphans.verify`. It reports counts by class and never a pid, and it
-//! is idempotent: a second pass with the same journal changes nothing.
+//! is idempotent once every examined record is swept or quarantined; a record
+//! deferred by the pass budget is retried by the next pass.
 //!
 //! Still out of this slice: the executable path digest and a native Windows
 //! job-object reaper (designed, typed refusal). The journal never claims a

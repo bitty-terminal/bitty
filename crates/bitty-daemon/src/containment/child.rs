@@ -394,10 +394,16 @@ fn term_subreaper(
     if let Ok(raw) = i32::try_from(pgid.get()) {
         let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(raw), Signal::SIGKILL);
     }
+    // Reap the recorded group, including adopted zombies, until the group id
+    // is free or the kill window ends. A zombie keeps its process-group id
+    // reserved, so an empty group proves the recorded tree was reaped, not
+    // merely killed. The group was minted for this session by
+    // `process_group(0)`, so no other session's child is waited on here.
     let _ = wait_bounded(limits.kill_wait(), limits, || {
-        matches!(child.try_wait(), Ok(Some(_)) | Err(_))
+        drain_group(pgid.get());
+        drain_adopted(pid.get());
+        !group_has_members(pgid.get())
     });
-    drain_adopted(pid.get());
     // A process group is never a whole-tree proof.
     CleanupOutcome {
         class: CleanupClass::Unverified,
@@ -418,6 +424,39 @@ fn leader_running(pid: u32) -> bool {
         return false;
     };
     !matches!(rest.trim_start().chars().next(), Some('Z' | 'X' | 'x'))
+}
+
+/// Reap every child in one recorded process group without blocking.
+///
+/// The group is the recorded identity, minted for this session; only its
+/// members are waited on. `WNOHANG` returns `StillAlive` when a member is
+/// still running, so the caller's bounded loop decides how long to wait.
+fn drain_group(pgid: u32) {
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+
+    let Ok(raw) = i32::try_from(pgid) else {
+        return;
+    };
+    loop {
+        match waitpid(nix::unistd::Pid::from_raw(-raw), Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::StillAlive)
+            | Ok(WaitStatus::Stopped(..))
+            | Ok(WaitStatus::Continued(_))
+            | Ok(WaitStatus::PtraceEvent(..))
+            | Ok(WaitStatus::PtraceSyscall(_))
+            | Err(_) => break,
+            Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => {}
+        }
+    }
+}
+
+/// Whether the recorded process group still has any member, including a
+/// zombie. Signal 0 only checks existence; it never delivers anything.
+fn group_has_members(pgid: u32) -> bool {
+    let Ok(raw) = i32::try_from(pgid) else {
+        return false;
+    };
+    nix::sys::signal::killpg(nix::unistd::Pid::from_raw(raw), None).is_ok()
 }
 
 fn identity_matches(identity: ProcessIdentity) -> bool {

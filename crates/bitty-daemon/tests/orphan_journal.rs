@@ -10,6 +10,7 @@ use bitty_daemon::orphan::{
     ProcessIdentity, ProcessObservation, ProcessProbe, ProcessStartTime, ReapResult,
 };
 use bitty_daemon::registry::{MonotonicMs, SessionId};
+use std::collections::VecDeque;
 use tempfile::TempDir;
 
 const BOOT: &str = "33333333-3333-4333-8333-333333333333";
@@ -66,6 +67,20 @@ impl OrphanReaper for RecordingReaper {
     }
 }
 
+/// A reaper whose answers are scripted per call, so one pass can defer and
+/// the next can complete the same record.
+struct SequencedReaper {
+    results: VecDeque<ReapResult>,
+    calls: usize,
+}
+
+impl OrphanReaper for SequencedReaper {
+    fn reap(&mut self, _orphan: &bitty_daemon::orphan::VerifiedOrphan) -> ReapResult {
+        self.calls += 1;
+        self.results.pop_front().unwrap_or(ReapResult::Unverified)
+    }
+}
+
 fn journal(directory: &TempDir) -> OrphanJournal {
     OrphanJournal::open(
         directory.path().join("journal"),
@@ -106,6 +121,62 @@ fn exact_identity_is_the_only_path_to_the_reaper() {
     assert_eq!(report.unverified, 0);
     assert_eq!(reaper.calls, vec![Some(identity())]);
     assert_eq!(journal.counts().total(), 0);
+}
+
+#[test]
+fn a_deferred_record_keeps_its_class_and_is_retried() {
+    let directory = TempDir::new().expect("temp dir");
+    let session_id = session();
+    {
+        let mut journal = journal(&directory);
+        journal
+            .reserve(session_id, 0, MonotonicMs::from_millis(1), subreaper())
+            .expect("reserve");
+        journal.commit(session_id, identity()).expect("commit");
+    }
+
+    let probe = FakeProbe {
+        boot_id: Some(boot()),
+        observation: ProcessObservation::Present {
+            start_time: ProcessStartTime::new(55_000),
+            process_group: ProcessGroupId::new(4321).expect("positive"),
+            uid: 1000,
+        },
+    };
+    let mut reaper = SequencedReaper {
+        results: VecDeque::from([ReapResult::Deferred, ReapResult::Swept]),
+        calls: 0,
+    };
+
+    {
+        let mut journal = journal(&directory);
+        let first = journal
+            .reap(&probe, &mut reaper, MonotonicMs::from_millis(2))
+            .expect("first pass");
+        assert_eq!(first.reaped, 0);
+        assert_eq!(first.unverified, 0);
+        assert_eq!(
+            journal.counts(),
+            OrphanCounts {
+                reserved: 0,
+                committed: 1,
+                unverified: 0
+            },
+            "a deferral must not quarantine the record"
+        );
+    }
+
+    // The committed class is persisted, not only held in memory.
+    let mut reopened = journal(&directory);
+    assert_eq!(reopened.counts().committed, 1);
+
+    let second = reopened
+        .reap(&probe, &mut reaper, MonotonicMs::from_millis(3))
+        .expect("second pass");
+    assert_eq!(second.reaped, 1);
+    assert_eq!(second.unverified, 0);
+    assert_eq!(reaper.calls, 2, "the deferred record was retried");
+    assert_eq!(reopened.counts().total(), 0);
 }
 
 #[test]

@@ -96,6 +96,11 @@ impl SystemOrphanReaper {
         if cgroup.verify_empty().unwrap_or(false) {
             return swept(cgroup.remove());
         }
+        // An expired budget before any signal leaves the record actionable:
+        // the next pass retries it instead of quarantining it unexamined.
+        if self.deadline_expired() {
+            return ReapResult::Deferred;
+        }
 
         let _ = cgroup.signal_members(Signal::SIGTERM);
         if wait_empty(
@@ -106,6 +111,12 @@ impl SystemOrphanReaper {
         ) {
             return swept(cgroup.remove());
         }
+        // Exhausted during the graceful window: escalating through
+        // `cgroup.kill` here could outlive the pass budget, so defer instead.
+        if self.deadline_expired() {
+            return ReapResult::Deferred;
+        }
+
         let _ = cgroup.kill_all();
         if wait_empty(
             &cgroup,
@@ -115,7 +126,19 @@ impl SystemOrphanReaper {
         ) {
             return swept(cgroup.remove());
         }
+        // Only a kill window that actually elapsed unclamped proves the
+        // record unverified. A clamped final wait is deferred, not
+        // quarantined.
+        if self.deadline_expired() {
+            return ReapResult::Deferred;
+        }
         ReapResult::Unverified
+    }
+
+    /// Whether the current pass budget is exhausted.
+    fn deadline_expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
     }
 }
 
@@ -206,6 +229,60 @@ mod tests {
             ProcessGroupId::new(1).expect("group"),
             0,
         )
+    }
+
+    #[test]
+    fn an_exhausted_pass_budget_defers_a_populated_cgroup() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let path = directory.path().join("bittyd-test-deferred");
+        std::fs::create_dir(&path).expect("session cgroup");
+        std::fs::write(
+            path.join("cgroup.procs"),
+            format!("{}\n", std::process::id()),
+        )
+        .expect("cgroup.procs");
+        std::fs::write(path.join("cgroup.events"), "populated 1\n").expect("cgroup.events");
+        let root = CgroupRoot::from_test_parts(
+            directory.path().to_path_buf(),
+            std::path::PathBuf::from("bittyd-test-root"),
+        );
+        let limits = ContainmentLimits::new(Duration::from_millis(10), Duration::from_millis(200));
+        let mut reaper = SystemOrphanReaper::with_root(root, limits);
+        reaper.set_deadline(Some(Instant::now()));
+        let orphan = VerifiedOrphan::new(boot(), None, ContainmentRecord::cgroup(path.as_path()));
+        assert_eq!(reaper.reap(&orphan), ReapResult::Deferred);
+        assert!(
+            !path.join("cgroup.kill").exists(),
+            "an expired budget must not escalate"
+        );
+    }
+
+    #[test]
+    fn a_budget_exhausted_in_the_kill_window_defers_instead_of_quarantining() {
+        let directory = tempfile::TempDir::new().expect("temp dir");
+        let path = directory.path().join("bittyd-test-deferred");
+        std::fs::create_dir(&path).expect("session cgroup");
+        std::fs::write(
+            path.join("cgroup.procs"),
+            format!("{}\n", std::process::id()),
+        )
+        .expect("cgroup.procs");
+        std::fs::write(path.join("cgroup.events"), "populated 1\n").expect("cgroup.events");
+        let root = CgroupRoot::from_test_parts(
+            directory.path().to_path_buf(),
+            std::path::PathBuf::from("bittyd-test-root"),
+        );
+        // The graceful window is zero, so the reaper escalates immediately;
+        // the kill window is then clamped by the remaining budget.
+        let limits = ContainmentLimits::new(Duration::ZERO, Duration::from_millis(500));
+        let mut reaper = SystemOrphanReaper::with_root(root, limits);
+        reaper.set_deadline(Some(Instant::now() + Duration::from_millis(200)));
+        let orphan = VerifiedOrphan::new(boot(), None, ContainmentRecord::cgroup(path.as_path()));
+        assert_eq!(reaper.reap(&orphan), ReapResult::Deferred);
+        assert!(
+            path.join("cgroup.kill").exists(),
+            "the escalation window was entered before the budget expired"
+        );
     }
 
     #[test]

@@ -18,7 +18,8 @@ use bitty_daemon::containment::{
     ContainmentRefusal, ContainmentReport, spawn,
 };
 use bitty_daemon::orphan::{
-    BootId, OrphanJournal, OrphanJournalLimits, OrphanSupervisor, ProcessProbe, SystemProbe,
+    BootId, OrphanJournal, OrphanJournalLimits, OrphanSupervisor, ProcessProbe, SystemOrphanReaper,
+    SystemProbe,
 };
 use bitty_daemon::platform::PlatformCell;
 use bitty_daemon::registry::{CleanupClass, MonotonicMs, SessionId};
@@ -108,7 +109,10 @@ fn a_child_that_ignores_sigterm_is_contained_and_killed() {
     assert!(alive(pid));
     let outcome = child.terminate(limits());
     assert_cleanup(&report, outcome);
-    assert!(wait_reaped(pid), "the SIGTERM-ignoring child survived");
+    assert!(
+        wait_reaped(pid),
+        "the SIGTERM-ignoring child was not reaped"
+    );
 }
 
 #[test]
@@ -133,7 +137,7 @@ fn a_forked_grandchild_is_contained() {
 
     let outcome = child.terminate(limits());
     assert_cleanup(&report, outcome);
-    assert!(wait_reaped(pid), "the parent survived containment");
+    assert!(wait_reaped(pid), "the parent was not reaped");
     assert!(wait_gone(grandchild), "the forked grandchild escaped");
 }
 
@@ -230,8 +234,8 @@ fn the_subreaper_fallback_kills_a_descendant_that_ignores_sigterm() {
     assert_eq!(outcome.class(), CleanupClass::Unverified);
     assert!(wait_reaped(pid), "the leader was not reaped");
     assert!(
-        wait_gone(descendant),
-        "the SIGTERM-ignoring descendant escaped the recorded group"
+        wait_reaped(descendant),
+        "the SIGTERM-ignoring descendant was not reaped"
     );
 }
 
@@ -361,6 +365,131 @@ fn a_refused_plan_spawns_nothing() {
     command.arg("30");
     let error = spawn(&report, &name(), &mut command, limits()).expect_err("refused");
     assert!(error.to_string().contains("containment refused"));
+}
+
+#[test]
+fn a_short_on_demand_budget_defers_one_record_and_the_next_pass_reaps_it() {
+    let report = ContainmentReport::probe();
+    let Some(root) = report.cgroup_root() else {
+        eprintln!("cgroup unavailable; typed skip");
+        return;
+    };
+    // The first record's subtree is already gone, so it completes without a
+    // wait even under an exhausted budget.
+    let absent_path = root.join(name());
+    // The second record's subtree holds a live orphan and needs the full
+    // escalation window the short budget does not grant.
+    let live_path = root.join(name());
+    std::fs::create_dir(&live_path).expect("session cgroup");
+    let mut orphan = Command::new("sleep").arg("30").spawn().expect("orphan");
+    let orphan_pid = orphan.id();
+    std::fs::write(live_path.join("cgroup.procs"), format!("{orphan_pid}\n"))
+        .expect("join orphan to cgroup");
+    let probe = SystemProbe::new();
+    let bitty_daemon::orphan::ProcessObservation::Present {
+        start_time,
+        process_group,
+        uid,
+    } = probe.observe(bitty_daemon::orphan::Pid::new(orphan_pid).expect("pid"))
+    else {
+        let _ = orphan.kill();
+        let _ = orphan.wait();
+        panic!("orphan must be observable");
+    };
+    let identity = bitty_daemon::orphan::ProcessIdentity::new(
+        bitty_daemon::orphan::Pid::new(orphan_pid).expect("pid"),
+        start_time,
+        process_group,
+        uid,
+    );
+
+    let directory = tempfile::tempdir().expect("temp dir");
+    let journal_dir = directory.path().join("orphans");
+    let absent = SessionId::parse(&"10".repeat(16)).expect("session");
+    let live = SessionId::parse(&"20".repeat(16)).expect("session");
+    {
+        let mut journal = OrphanJournal::open(
+            journal_dir.clone(),
+            OrphanJournalLimits::default(),
+            BootId::read_system().expect("boot id"),
+        )
+        .expect("journal");
+        journal
+            .reserve(
+                absent,
+                0,
+                MonotonicMs::from_millis(1),
+                ContainmentRecord::cgroup(&absent_path),
+            )
+            .expect("reserve");
+        journal.commit(absent, identity).expect("commit");
+        journal
+            .reserve(
+                live,
+                0,
+                MonotonicMs::from_millis(1),
+                ContainmentRecord::cgroup(&live_path),
+            )
+            .expect("reserve");
+        journal.commit(live, identity).expect("commit");
+    }
+
+    let mut journal = OrphanJournal::open(
+        journal_dir.clone(),
+        OrphanJournalLimits::default(),
+        BootId::read_system().expect("boot id"),
+    )
+    .expect("journal");
+    let mut reaper = SystemOrphanReaper::new(&report, limits());
+    // An exhausted on-demand budget: the absent record still sweeps, the live
+    // record must be deferred rather than quarantined.
+    reaper.set_deadline(Some(Instant::now()));
+    let first = journal
+        .reap(
+            &SystemProbe::new(),
+            &mut reaper,
+            MonotonicMs::from_millis(2),
+        )
+        .expect("first pass");
+    assert_eq!(first.reaped, 1);
+    assert_eq!(first.unverified, 0);
+    assert_eq!(first.stale, 0);
+    assert_eq!(
+        journal.counts().committed,
+        1,
+        "the deferred record keeps its committed class"
+    );
+    assert_eq!(journal.counts().unverified, 0);
+    assert!(alive(orphan_pid), "a deferred record must not be signalled");
+    assert!(live_path.exists(), "a deferred subtree is left for retry");
+
+    // The class survives on disk, not only in memory.
+    {
+        let reopened = OrphanJournal::open(
+            journal_dir,
+            OrphanJournalLimits::default(),
+            BootId::read_system().expect("boot id"),
+        )
+        .expect("reopen");
+        assert_eq!(reopened.counts().committed, 1);
+        assert_eq!(reopened.counts().unverified, 0);
+    }
+
+    // The next pass has the full window and completes the deferred record.
+    reaper.set_deadline(None);
+    let second = journal
+        .reap(
+            &SystemProbe::new(),
+            &mut reaper,
+            MonotonicMs::from_millis(3),
+        )
+        .expect("second pass");
+    assert_eq!(second.reaped, 1);
+    assert_eq!(second.unverified, 0);
+    assert!(!live_path.exists(), "the retried subtree was not removed");
+    assert!(wait_gone(orphan_pid), "the retried orphan was not killed");
+    let _ = orphan.wait();
+    assert_eq!(journal.counts().total(), 0);
 }
 
 #[test]

@@ -3897,7 +3897,7 @@ mod tests {
     }
 
     #[test]
-    fn a_served_orphan_retire_removes_only_a_quarantined_record_and_is_audited() {
+    fn a_served_orphan_retire_removes_only_a_quarantined_record() {
         use crate::orphan::{
             BootId, OrphanJournal, OrphanJournalLimits, Pid, ProcessIdentity, ProcessObservation,
             ProcessProbe, SystemProbe,

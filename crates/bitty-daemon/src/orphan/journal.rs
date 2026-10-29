@@ -282,6 +282,11 @@ pub enum ReapResult {
     Swept,
     /// The reaper could not verify the whole identity.
     Unverified,
+    /// The pass budget expired before the reaper could finish this record.
+    ///
+    /// The record is neither swept nor disproved: the journal must keep its
+    /// current class so the next pass retries it instead of quarantining it.
+    Deferred,
 }
 
 /// The signalling seam for exact-identity orphans.
@@ -292,7 +297,8 @@ pub enum ReapResult {
 /// (bitty#2791) terminates the *containment identity*, applies the
 /// graceful-then-kill bound, verifies the identity empty, and returns
 /// [`ReapResult::Swept`] only when that verification succeeds. It must never
-/// fall back to a pid-only kill.
+/// fall back to a pid-only kill. When a caller-imposed pass budget expires
+/// first, it returns [`ReapResult::Deferred`] so the record can be retried.
 pub trait OrphanReaper {
     /// Terminate and verify one matched orphan.
     fn reap(&mut self, orphan: &VerifiedOrphan) -> ReapResult;
@@ -806,8 +812,9 @@ impl OrphanJournal {
     /// * different boot id -> stale, discarded, never signalled;
     /// * reserved (no pid), absent pid, unreadable start time, pid reuse, or a
     ///   process-group mismatch -> quarantined, never signalled;
-    /// * exact identity -> `reaper`; a verified sweep removes the record, and
-    ///   anything else stays quarantined.
+    /// * exact identity -> `reaper`; a verified sweep removes the record,
+    ///   anything else stays quarantined, and a pass-budget deferral keeps its
+    ///   current class for the next pass.
     ///
     /// # Errors
     ///
@@ -844,6 +851,10 @@ impl OrphanJournal {
                         self.quarantine(record, now)?;
                         report.unverified += 1;
                     }
+                    // The pass budget expired before this record finished.
+                    // Keep its stored class untouched so a later pass retries
+                    // it; quarantining here would retire it permanently.
+                    ReapResult::Deferred => {}
                 },
             }
         }

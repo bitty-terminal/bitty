@@ -524,7 +524,8 @@ enforced plan and opened the journal. The method takes an optional `action`:
     reported as `unverified`, never claimed verified;
   - the response is counts by class (`reaped`, `unverified`, `stale`,
     `reserved`, `committed`) with no pid, path, or command, and a second call
-    on the same journal changes nothing.
+    on the same journal changes nothing unless the first call deferred a record
+    under its pass budget.
 - `retire` removes exactly one quarantined record named by its bounded
   `record_id` (the recorded session id, 32 canonical hex characters). It never
   signals, never adopts, and never touches a reserved or committed record
@@ -542,8 +543,9 @@ client can connect while an earlier record is actionable. The startup scan is a
 full pass; an on-demand pass is bounded by one `orphan_reap_grace_ms` plus one
 kill window (`ContainmentLimits::pass_budget`), so a journal full of live
 orphans cannot hold the single-threaded service loop for the full per-record
-window on every record. Every wait is clamped to the remaining budget; a record
-whose wait is clamped stays in its current class, is counted in the response,
+window on every record. Every wait is clamped to the remaining budget; a
+record whose wait is clamped is deferred: it keeps its `reserved`/`committed`
+class (visible in the response counts), is never quarantined for the expiry,
 and is retried by the next call.
 
 Every other cell (including macOS and Windows) returns

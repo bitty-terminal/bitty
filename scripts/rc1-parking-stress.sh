@@ -13,9 +13,12 @@
 #
 # It then replays the capability-suite command shapes from bitty#2800 through
 # `rc1_suite_parking_stress`, and finally runs the real runtime suites named in
-# `RC1_STRESS_SUITES` under the same burners. Suites that deliberately pin the
-# production 50 ms budget (`rc1_resume`, `plugin_budgets`) stay in the list:
-# their park assertions must keep passing.
+# `RC1_STRESS_SUITES` under the same burners. `rc1_resume` stays in the default
+# list because it deliberately pins the production 50 ms budget: its park
+# assertions must keep passing under load. `plugin_budgets` is audited on the
+# same production budgets but is not in the default load pass: its tests drain
+# every park to a terminal instruction/wall decision, so load pressure would
+# only add activation-window exposure without exercising its assertions.
 #
 # Environment:
 #   RC1_STRESS_CPUS        CPU list to pin burners and the harness to, so a

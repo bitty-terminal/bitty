@@ -146,23 +146,35 @@ fn activate_bar(root: PathBuf, config_dir: Option<PathBuf>) -> PluginRuntime {
     runtime
 }
 
+/// Build a settings probe with the documented test-only wall seams installed
+/// (bitty#2781/bitty#2800): this suite asserts the settings contract, never
+/// how long a loaded runner needed to schedule activation or a host call.
+/// Activation callbacks are slice-only, so the seam must be in place before
+/// `discover`/`activate`. Callers discover and activate afterwards.
+fn bar_runtime(config: PluginRuntimeConfig, config_dir: Option<PathBuf>) -> PluginRuntime {
+    let mut runtime = PluginRuntime::new(config);
+    runtime.set_settings_dir(config_dir);
+    common::install_harness_seams(&mut runtime);
+    runtime
+}
+
 fn activate_bar_with_report(
     root: PathBuf,
     config_dir: Option<PathBuf>,
 ) -> (PluginRuntime, ActivationReport) {
     let data = temp_dir("data");
-    let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
-        safe_mode: false,
-        data_dir: Some(data),
-        store_root: None,
-        bundled_roots: Vec::new(),
-        third_party_roots: vec![root],
-        settings: Rc::new(EmptySettings),
-        snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
-    });
-    runtime.set_settings_dir(config_dir);
-    // bitty#2781/bitty#2800: probe the settings contract, not the wall clock.
-    common::install_harness_seams(&mut runtime);
+    let mut runtime = bar_runtime(
+        PluginRuntimeConfig {
+            safe_mode: false,
+            data_dir: Some(data),
+            store_root: None,
+            bundled_roots: Vec::new(),
+            third_party_roots: vec![root],
+            settings: Rc::new(EmptySettings),
+            snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
+        },
+        config_dir,
+    );
     runtime.discover();
     let id = PluginId::new(BAR_ID).expect("id");
     let report = runtime.activate(&id).expect("bar fixture must activate");
@@ -224,16 +236,18 @@ fn canonical_lua_shadow_diagnostic_surfaces_on_activation() {
     )
     .expect("canonical");
 
-    let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
-        safe_mode: false,
-        data_dir: Some(temp_dir("data-canonical-shadow")),
-        store_root: None,
-        bundled_roots: Vec::new(),
-        third_party_roots: vec![root],
-        settings: Rc::new(EmptySettings),
-        snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
-    });
-    runtime.set_settings_dir(Some(config));
+    let mut runtime = bar_runtime(
+        PluginRuntimeConfig {
+            safe_mode: false,
+            data_dir: Some(temp_dir("data-canonical-shadow")),
+            store_root: None,
+            bundled_roots: Vec::new(),
+            third_party_roots: vec![root],
+            settings: Rc::new(EmptySettings),
+            snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
+        },
+        Some(config),
+    );
     runtime.discover();
     let id = PluginId::new(BAR_ID).expect("id");
     runtime.activate(&id).expect("bar fixture must activate");
@@ -312,16 +326,18 @@ fn short_alias_fails_closed_when_registry_has_error_candidate() {
     std::fs::create_dir_all(&plugins).expect("plugins dir");
     std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
 
-    let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
-        safe_mode: false,
-        data_dir: Some(temp_dir("data-alias-error-candidate")),
-        store_root: None,
-        bundled_roots: Vec::new(),
-        third_party_roots: vec![root, error_root],
-        settings: Rc::new(EmptySettings),
-        snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
-    });
-    runtime.set_settings_dir(Some(config));
+    let mut runtime = bar_runtime(
+        PluginRuntimeConfig {
+            safe_mode: false,
+            data_dir: Some(temp_dir("data-alias-error-candidate")),
+            store_root: None,
+            bundled_roots: Vec::new(),
+            third_party_roots: vec![root, error_root],
+            settings: Rc::new(EmptySettings),
+            snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
+        },
+        Some(config),
+    );
     let results = runtime.discover();
     assert!(results.iter().any(|(_, result)| result.is_err()));
     let id = PluginId::new(BAR_ID).expect("id");
@@ -346,16 +362,18 @@ fn short_alias_fails_closed_in_safe_mode_with_configured_store() {
     )
     .expect("external settings");
 
-    let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
-        safe_mode: true,
-        data_dir: Some(temp_dir("data-safe-mode-configured-store")),
-        store_root: Some(store),
-        bundled_roots: vec![root],
-        third_party_roots: Vec::new(),
-        settings: Rc::new(EmptySettings),
-        snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
-    });
-    runtime.set_settings_dir(Some(config));
+    let mut runtime = bar_runtime(
+        PluginRuntimeConfig {
+            safe_mode: true,
+            data_dir: Some(temp_dir("data-safe-mode-configured-store")),
+            store_root: Some(store),
+            bundled_roots: vec![root],
+            third_party_roots: Vec::new(),
+            settings: Rc::new(EmptySettings),
+            snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
+        },
+        Some(config),
+    );
     runtime.discover();
     let id = PluginId::new(BAR_ID).expect("id");
     runtime
@@ -397,16 +415,18 @@ fn short_alias_fails_closed_for_disabled_installed_collision() {
     std::fs::create_dir_all(&plugins).expect("plugins dir");
     std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
 
-    let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
-        safe_mode: false,
-        data_dir: Some(temp_dir("data-disabled-installed-collision")),
-        store_root: Some(store),
-        bundled_roots: Vec::new(),
-        third_party_roots: vec![root],
-        settings: Rc::new(EmptySettings),
-        snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
-    });
-    runtime.set_settings_dir(Some(config));
+    let mut runtime = bar_runtime(
+        PluginRuntimeConfig {
+            safe_mode: false,
+            data_dir: Some(temp_dir("data-disabled-installed-collision")),
+            store_root: Some(store),
+            bundled_roots: Vec::new(),
+            third_party_roots: vec![root],
+            settings: Rc::new(EmptySettings),
+            snapshot: Rc::new(UnavailableSnapshot) as Rc<dyn SnapshotSource>,
+        },
+        Some(config),
+    );
     let results = runtime.discover();
     assert_eq!(
         results.len(),

@@ -34,6 +34,14 @@
 //!   is exposed for `bitty plugin doctor` via `Runtime::plugin_side_dropped`
 //!   and `Runtime::plugin_total_dropped`. The side queue never holds hot-path
 //!   objects (no GPU/window/PTY handles, no Lua VM).
+//! - **Daemon session attach seam (bitty#2729):** [`attach::AttachSeam`] is
+//!   the bounded Core binding-lifecycle half of the accepted multiplexer
+//!   decision. It binds a window/panel to a daemon-hosted session view, routes
+//!   metadata-only lease events to that binding, and releases on window close,
+//!   session termination, or daemon stop. `bittyd` stays the sole writer of
+//!   session, lease, and attach-count truth; [`attach::SessionHost`] is the
+//!   port the future consumer-side client implements. The seam adds no IPC
+//!   method and no scope, and exposes no terminal content.
 //! - Platform `Resized` events flow through
 //!   [`Runtime::handle_platform_event`] -> [`Runtime::handle_resize`], which
 //!   reconfigures the surface extent, the layout container, and PTY window
@@ -199,6 +207,7 @@ pub mod ai_helper;
 #[cfg(feature = "publication-control")]
 pub mod ai_publication_launch;
 pub mod ai_request;
+pub mod attach;
 pub mod component;
 pub mod config;
 pub mod cw_present;

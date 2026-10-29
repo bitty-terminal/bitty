@@ -95,6 +95,39 @@ diagram lives in `src/lib.rs`.
   by CTX-0918. This crate keeps the generic Panel Runtime mechanism
   (`registry/`) plus the recorded Core slices above.
 
+## Session attach/detach seam (bitty#2729, CTX-1655)
+
+`src/attach.rs` is the Core half of the accepted
+[Multiplexer Decision](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/multiplexer-decision.md)
+(Option C). It is a bounded **binding-lifecycle** seam over the accepted
+[`bittyd` Session-Host Contract](https://github.com/bitty-terminal/bitty-terminal-docs/blob/main/specifications/bittyd-session-host-contract.md)
+(`D-09`, `D-10`, `D-14`): a Core consumer binds a window and panel to a session
+view, receives metadata-only lease events routed to that binding, and releases
+it again. It adds no IPC method, no `session.*` scope, and no transport.
+
+| Layer                            | Owns                                                                                                                                                                                               | Does not own                                                                                              |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| Core seam (`attach::AttachSeam`) | Local binding lifecycle, one binding per `(window, session)`, the per-window cap, idempotent attach/detach, per-lease event routing, release on window close, session termination, and daemon stop | Session, lease, attach-count, control, or last-seen truth; terminal content; naming or persistence policy |
+| `bittyd`                         | Session registry, leases, control and observer roles, attach count, generations, last-seen, and every `session.attach`/`session.detach` decision; it is the sole writer                            | Window/panel binding state, extension UI, persistence policy                                              |
+| Extension (bitty#2730)           | Session naming, ordering, organization, persistence timing, restore policy, and the session UI                                                                                                     | The Core binding table, the lease, the PTY, or the snapshot codec                                         |
+| Remote                           | Nothing yet: ADR 0008 and ADR 0019 defer remote attach to a separate accepted trust-boundary ADR                                                                                                   | Any local scope or transport                                                                              |
+
+`attach::SessionHost` is the transport-agnostic port the future consumer-side
+`bittyd` client implements; this tree has no such adapter yet, so the slice
+does not claim an end-to-end attachment. The seam never holds a control token,
+observer grant, PTY descriptor, grid, scrollback, or terminal text: credentials
+are borrowed for one call, and `SessionEvent` is a fixed-size metadata record.
+A control-transfer frame is delivered as metadata, but this lifecycle slice
+does not store the rotated control token or change the binding role; a future
+Core control path must re-claim through the daemon client.
+
+Bounds: one live binding per `(window, session)`, at most
+`MAX_BINDINGS_PER_WINDOW` (16) per window with an 8 default, and one bounded
+queue per binding (256 events / 64 KiB). Every v0.2.0 frame is a control frame,
+so a full queue closes the lease with `TerminalEventLost` rather than shedding
+it. A failed or refused detach still removes the local binding; the refusal is
+returned in the release receipt, so no local lease record leaks.
+
 ## Layout
 
 - `Cargo.toml` — package metadata and workspace-internal dependencies.
@@ -109,6 +142,11 @@ diagram lives in `src/lib.rs`.
   `src/runtime/band_slots.rs` is the single host placement policy for the v1
   `bitty.ui.mount` slots (shared by the mount gate and chrome band routing).
 - `src/queue.rs` — bounded cold-path event queue.
+- `src/attach.rs` — bounded Core attach/detach binding seam for daemon-hosted
+  sessions (bitty#2729): per-window binding table, idempotent attach/detach,
+  metadata-only per-lease event routing, and release on window close, session
+  termination, or daemon stop. Host port for the future consumer-side
+  `bittyd` client; no IPC method or scope is added here.
 - `src/registry.rs` and `src/registry/` — command and panel registries.
 - `src/execution.rs` and `src/execution/` — execution supervisor
   (`CTX-0511` foundation + `CTX-0513` delivery + `CTX-0514` capability-scoped

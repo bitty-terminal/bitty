@@ -23,7 +23,7 @@
 
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command};
 
@@ -65,6 +65,25 @@ pub(crate) fn set_cloexec(file: &File) -> io::Result<()> {
     fcntl(file, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
         .map(|_| ())
         .map_err(io::Error::from)
+}
+
+/// Duplicate `fd` with close-on-exec set atomically.
+///
+/// `dup(2)` clears the flag on the copy and `dup2(2)` clears it on the
+/// target, so a `dup` followed by `F_SETFD` leaves a window in which a
+/// concurrently forked child can inherit the copy. `F_DUPFD_CLOEXEC` closes
+/// that window: the returned descriptor never exists without the flag.
+///
+/// # Errors
+///
+/// Returns the `fcntl(2)` error.
+pub(crate) fn dup_cloexec<Fd: AsFd>(fd: Fd) -> io::Result<File> {
+    use nix::fcntl::{FcntlArg, fcntl};
+
+    let raw = fcntl(fd, FcntlArg::F_DUPFD_CLOEXEC(0)).map_err(io::Error::from)?;
+    // SAFETY: `F_DUPFD_CLOEXEC` returned a fresh descriptor owned by this
+    // call and not referenced anywhere else.
+    Ok(File::from(unsafe { OwnedFd::from_raw_fd(raw) }))
 }
 
 /// Set non-blocking I/O on `file`.
@@ -211,11 +230,14 @@ mod tests {
 
     #[test]
     fn the_pty_child_leads_its_session_and_owns_the_controlling_terminal() {
+        let _pty = crate::containment::test_lock::lock();
         let pty = nix::pty::openpty(None, None).expect("pty");
         let mut master = File::from(pty.master);
-        let slave = pty.slave;
-        let stdin = Stdio::from(slave.try_clone().expect("slave clone"));
-        let stdout = Stdio::from(slave.try_clone().expect("slave clone"));
+        set_cloexec(&master).expect("master close-on-exec");
+        let slave = File::from(pty.slave);
+        let stdin = Stdio::from(dup_cloexec(&slave).expect("slave dup"));
+        let stdout = Stdio::from(dup_cloexec(&slave).expect("slave dup"));
+        set_cloexec(&slave).expect("slave close-on-exec");
         let stderr = Stdio::from(slave);
         let mut command = Command::new("/bin/sh");
         command

@@ -19,9 +19,9 @@
 //!
 //! The child never inherits the daemon environment or a daemon descriptor:
 //! the environment is exactly the explicit spawn specification, stdio is the
-//! PTY slave only, the master is close-on-exec, and the listener, audit,
-//! journal, and capability descriptors are all opened close-on-exec by their
-//! owners.
+//! PTY slave only with close-on-exec duplicates, the master is close-on-exec,
+//! and the listener, audit, journal, and capability descriptors are all
+//! opened close-on-exec by their owners.
 //!
 //! The worker path is served on Linux only, and only when the startup
 //! containment probe selected an enforced plan. Every other platform or a
@@ -36,8 +36,6 @@ use std::fs::File;
 use std::io;
 #[cfg(target_os = "linux")]
 use std::io::Read as _;
-#[cfg(target_os = "linux")]
-use std::os::fd::AsFd as _;
 #[cfg(target_os = "linux")]
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -575,8 +573,12 @@ impl PtyCommand {
         let pty =
             nix::pty::openpty(Some(&winsize), None).map_err(|_| WorkerSpawnError::NotStarted)?;
         let master = File::from(pty.master);
-        let slave = pty.slave;
+        let slave = File::from(pty.slave);
         crate::containment::set_cloexec(&master).map_err(|_| WorkerSpawnError::NotStarted)?;
+        // The slave is dropped after the duplicates, and it must never be
+        // inherited either: keep the parent handle close-on-exec while the
+        // child's stdio is built from close-on-exec copies.
+        crate::containment::set_cloexec(&slave).map_err(|_| WorkerSpawnError::NotStarted)?;
         let stdin = Stdio::from(dup_file(&slave)?);
         let stdout = Stdio::from(dup_file(&slave)?);
         let stderr = Stdio::from(dup_file(&slave)?);
@@ -607,13 +609,13 @@ impl PtyCommand {
 }
 
 #[cfg(target_os = "linux")]
-fn dup_file(slave: &std::os::fd::OwnedFd) -> Result<File, WorkerSpawnError> {
-    // `openpty` descriptors are not close-on-exec; the duplicates handed to
-    // stdio are dup2'ed onto 0/1/2 in the child (which clears CLOEXEC) and
-    // dropped in the parent.
-    nix::unistd::dup(slave.as_fd())
-        .map(File::from)
-        .map_err(|_| WorkerSpawnError::NotStarted)
+fn dup_file(slave: &File) -> Result<File, WorkerSpawnError> {
+    // `openpty` descriptors are not close-on-exec. The child `dup2`s these
+    // copies onto 0/1/2 (which clears CLOEXEC on the target), but the copies
+    // themselves must not survive `exec`: duplicate them already
+    // close-on-exec so the worker inherits only stdio and never an extra
+    // slave handle.
+    crate::containment::dup_cloexec(slave).map_err(|_| WorkerSpawnError::NotStarted)
 }
 
 #[cfg(target_os = "linux")]
@@ -651,14 +653,26 @@ mod tests {
 
     /// Spawn one live worker through the production path.
     fn spawn_test_worker(limits: &Limits, argv: &[&str]) -> (WorkerPool, SessionId) {
+        spawn_test_worker_with_env(limits, argv, &[])
+    }
+
+    /// Spawn one live worker with an explicit child environment.
+    fn spawn_test_worker_with_env(
+        limits: &Limits,
+        argv: &[&str],
+        env: &[&str],
+    ) -> (WorkerPool, SessionId) {
         let report = ContainmentReport::probe();
-        let fields = json!({ "argv": argv, "cwd": "/" })
+        let fields = json!({ "argv": argv, "env": env, "cwd": "/" })
             .as_object()
             .expect("a JSON object")
             .clone();
         let spec = SpawnSpec::parse(Some(&fields), limits).expect("a valid spawn spec");
         let session = SessionId::parse("0000000000000000000000000000c4d1").expect("a session id");
         let mut pool = WorkerPool::new(limits);
+        // Serialized with the other PTY tests so no concurrent `openpty`
+        // descriptor can be inherited by this worker's fork.
+        let _pty = crate::containment::test_lock::lock();
         pool.spawn(
             &report,
             DaemonInstanceId::generate().expect("an instance id"),
@@ -725,6 +739,134 @@ mod tests {
             (DRAIN_BUDGET_BYTES * 2) as u64,
             "the next tick must resume the queued producer"
         );
+
+        let _ = pool.terminate(session);
+    }
+
+    /// The child-side half of [`the_child_fd_table_is_exactly_the_pty_stdio`].
+    ///
+    /// The fd-table test spawns this same test binary as a worker with
+    /// `BITTY_FD_TABLE_PROBE=1` and `--ignored`; the child then reports the
+    /// descriptors that survived `exec` on its PTY stdout. The `read_dir`
+    /// handle is the probe's own transient descriptor and is skipped; every
+    /// other entry is inherited state.
+    #[test]
+    #[ignore = "child probe spawned by the_child_fd_table_is_exactly_the_pty_stdio"]
+    fn fd_table_probe() {
+        if std::env::var_os("BITTY_FD_TABLE_PROBE").is_none() {
+            return;
+        }
+
+        let own_table = format!("/proc/{}/fd", std::process::id());
+        let mut fds = Vec::new();
+        for entry in std::fs::read_dir(&own_table).expect("the probe fd table") {
+            let entry = entry.expect("a probe fd entry");
+            let fd: u32 = entry
+                .file_name()
+                .to_str()
+                .expect("an fd name")
+                .parse()
+                .expect("a numeric fd");
+            let target = std::fs::read_link(entry.path()).expect("an fd target");
+            if target == std::path::Path::new(&own_table) {
+                continue;
+            }
+            fds.push((fd, target));
+        }
+        fds.sort();
+
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "FD_TABLE_BEGIN").expect("the probe marker");
+        for (fd, target) in fds {
+            writeln!(stdout, "FD_TABLE {fd} {}", target.display()).expect("a probe fd line");
+        }
+        writeln!(stdout, "FD_TABLE_END").expect("the probe end marker");
+        stdout.flush().expect("flush the probe table");
+    }
+
+    #[test]
+    fn the_child_fd_table_is_exactly_the_pty_stdio() {
+        let limits = Limits::default();
+        let exe = std::env::current_exe().expect("the test binary");
+        let argv = [
+            exe.to_str().expect("a UTF-8 test binary path"),
+            "--exact",
+            "worker::tests::fd_table_probe",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ];
+        let (mut pool, session) =
+            spawn_test_worker_with_env(&limits, &argv, &["BITTY_FD_TABLE_PROBE=1"]);
+
+        // The probe runs after `exec` in the worker itself, so its table is
+        // the inherited state and not the parent's or the dynamic loader's
+        // transient handles. No helper process and no new wire surface is
+        // involved.
+        let master = &mut pool
+            .workers
+            .get_mut(&session)
+            .expect("the bound worker")
+            .master;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            match master.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    output.extend_from_slice(&chunk[..read]);
+                    if String::from_utf8_lossy(&output).contains("FD_TABLE_END") {
+                        break;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the fd-table probe did not finish: {}",
+                        String::from_utf8_lossy(&output)
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                // Linux reports EIO on the master once the last slave closes.
+                Err(error) if error.raw_os_error() == Some(nix::errno::Errno::EIO as i32) => break,
+                Err(error) => panic!("read the worker PTY: {error}"),
+            }
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("FD_TABLE_END"),
+            "the fd-table probe did not report a complete table: {text}"
+        );
+
+        let mut fds: Vec<(u32, String)> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("FD_TABLE "))
+            .map(|rest| {
+                let (fd, target) = rest.split_once(' ').expect("a probe fd line");
+                (fd.parse().expect("a numeric fd"), target.to_owned())
+            })
+            .collect();
+        fds.sort();
+
+        let numbers: Vec<u32> = fds.iter().map(|(fd, _)| *fd).collect();
+        assert_eq!(
+            numbers,
+            vec![0, 1, 2],
+            "the worker inherited descriptors beyond stdio: {fds:?}\n{text}"
+        );
+        let slave = &fds[0].1;
+        assert!(
+            slave.starts_with("/dev/pts/"),
+            "worker stdio must be a PTY slave: {fds:?}\n{text}"
+        );
+        for (fd, target) in &fds {
+            assert_eq!(
+                target, slave,
+                "fd {fd} does not point at the stdio PTY slave: {fds:?}\n{text}"
+            );
+        }
 
         let _ = pool.terminate(session);
     }

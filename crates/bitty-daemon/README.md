@@ -725,7 +725,11 @@ idempotency store keeps only its domain-separated digest.
 
 The PTY is single-owner. The child is spawned with `setsid` plus
 `TIOCSCTTY`, the master is close-on-exec and non-blocking, and stdio is the
-slave only. `worker.rs` drains the master on every poll tick, checks the
+slave only: the three stdio descriptors are `F_DUPFD_CLOEXEC` copies from the
+syscall seam, so the worker starts with an fd table of exactly 0/1/2 on the
+slave and no inherited duplicate survives `exec`
+(`worker::tests::the_child_fd_table_is_exactly_the_pty_stdio` probes that table
+from the child). `worker.rs` drains the master on every poll tick, checks the
 leader's exit without reaping it (`waitid` with `WNOWAIT`), signals the recorded
 identity while the unreaped zombie still reserves its process-group id, then
 reaps the leader and drains the recorded group. It never blocks the service

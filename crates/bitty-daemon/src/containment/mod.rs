@@ -53,10 +53,33 @@ pub use self::child::{
 };
 #[cfg(target_os = "linux")]
 pub(crate) use self::linux_sys::{
-    establish_controlling_terminal, resize_pty, set_cloexec, set_nonblocking,
+    dup_cloexec, establish_controlling_terminal, resize_pty, set_cloexec, set_nonblocking,
 };
 #[cfg(target_os = "linux")]
 pub use self::subreaper::{SubreaperGuard, SubreaperRefusal};
+
+/// Test-only serialization for PTY creation and spawn.
+///
+/// `openpty` returns descriptors without close-on-exec, and a `fork` in a
+/// concurrent test can inherit them for the brief window before they are
+/// flagged or dropped. Tests that create a PTY and then spawn hold this lock,
+/// so an exact child-descriptor assertion cannot observe another test's
+/// transient handles.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_lock {
+    use std::sync::{Mutex, MutexGuard};
+
+    /// Serializes PTY creation plus the spawn that follows it.
+    static PTY_SPAWN: Mutex<()> = Mutex::new(());
+
+    /// Acquire the PTY spawn lock, ignoring poisoning: a panicking test must
+    /// not make every later test fail on the lock instead of its own behavior.
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        PTY_SPAWN
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
 
 /// Stable diagnostic name of the cgroup v2 plan.
 pub const MECHANISM_CGROUP_V2: &str = "cgroup_v2";

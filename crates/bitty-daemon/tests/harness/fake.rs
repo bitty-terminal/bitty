@@ -175,10 +175,13 @@ impl FakeDriver {
     /// The worker bit is fixed to the modeled served cell; every other bit is
     /// the compiled contract value.
     fn capability(name: &str, enabled: bool) -> bool {
-        if name == "worker_sessions" {
-            FAKE_WORKER_SESSIONS
-        } else {
-            enabled
+        match name {
+            "worker_sessions" => FAKE_WORKER_SESSIONS,
+            // The reference fake models the served event wire on every host:
+            // it derives the stream from revisions, so it is not tied to the
+            // build's admission loop. A real cell keeps the compiled bit.
+            "events" => true,
+            _ => enabled,
         }
     }
 

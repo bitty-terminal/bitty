@@ -14,12 +14,12 @@
 //!   module never reads a capability table, a manifest, or a plugin handle. A
 //!   mount that has not passed the `ui.rich` gate must not reach it.
 //!
-//!   Integration status: that mount path is not wired yet — `bitty.ui.mount`
-//!   still routes through the v1 validator, so [`mount_rich_node`] is
-//!   currently exercised by tests only. The mount-path slice owns creating
-//!   the `Scene`, calling this bridge, and attaching it through
-//!   `PanelRuntime::attach_panel_scene`; until then no live plugin content
-//!   reaches this conversion.
+//!   The shipped caller is [`SceneHost`](crate::scene_host::SceneHost)
+//!   (CTX-1641 / bitty#2785): `bitty.ui.mount("terminal", …)` and `ui.update`
+//!   read through the `ui.rich` reader, and the host attaches the tree this
+//!   bridge admits with `PanelRuntime::attach_panel_scene`. The bridge owns
+//!   only the conversion; the host owns the panel identity, the placement
+//!   bind, and release.
 //! - **Admission stays in `bitty-rich`.** [`mount_rich_node`] inserts through
 //!   [`Scene::insert`], so `SCN-1..5` are validated at the same trust boundary
 //!   as every other rich block. A bridge conversion never bypasses a limit.

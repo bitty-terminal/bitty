@@ -52,6 +52,7 @@ use phodopus::{
 use crate::keymaps::{KeymapPage, KeymapQuery};
 use crate::runtime_inspect::RuntimeInspectSnapshot;
 use crate::ui::{UiNode, UiSceneScope, UiSlot, component_invalid, read_component};
+use crate::ui_rich::{UiRichNode, read_rich_component};
 use crate::{LuaVm, SuspendReason, VmError};
 
 /// Version of the host bridge line exposed as `bitty.api_version`.
@@ -1652,6 +1653,70 @@ pub trait HostServices {
         }
         self.ui_update(handle, component)
     }
+
+    /// Whether `handle` addresses a scene mounted through the v2 rich
+    /// `bitty.ui.mount("terminal", …)` path (bitty#2785).
+    ///
+    /// The answer is a property of the handle's encoding, not of the live
+    /// table, so a released or stale scene handle still routes `ui.update`
+    /// through the rich reader and then reports its documented `Ok(false)`
+    /// instead of turning into a parse error.
+    fn ui_is_scene_handle(&self, _handle: i64) -> bool {
+        false
+    }
+
+    /// Mount one validated rich tree into the terminal-attached scene slot.
+    ///
+    /// The bridge reads the value with the v2 rich reader; the implementation
+    /// owns the `ui.rich` gate, the Core-owned scene host panel, `SCN-1..5`
+    /// admission, and the generation-owned handle. A host without a scene
+    /// host fails closed with [`E_UI_UNAVAILABLE`] (no new code).
+    fn ui_mount_scene(&self, _slot: &str, _node: &UiRichNode) -> Result<i64, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no terminal-attached scene surface",
+        ))
+    }
+
+    /// Expiry-aware [`HostServices::ui_mount_scene`] (CTX-0464 contract).
+    fn ui_mount_scene_with_expiry(
+        &self,
+        slot: &str,
+        node: &UiRichNode,
+        expiry: Instant,
+    ) -> Result<i64, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_mount_scene(slot, node)
+    }
+
+    /// Replace one attached terminal-slot scene from a validated rich tree.
+    ///
+    /// Returns `Ok(false)` for a stale or foreign handle; admission refusals
+    /// are typed errors and leave the previous scene attached.
+    fn ui_update_scene(&self, _handle: i64, _node: &UiRichNode) -> Result<bool, BridgeError> {
+        Err(BridgeError::new(
+            "runtime",
+            E_UI_UNAVAILABLE,
+            "host has no terminal-attached scene surface",
+        ))
+    }
+
+    /// Expiry-aware [`HostServices::ui_update_scene`] (CTX-0464 contract).
+    fn ui_update_scene_with_expiry(
+        &self,
+        handle: i64,
+        node: &UiRichNode,
+        expiry: Instant,
+    ) -> Result<bool, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        self.ui_update_scene(handle, node)
+    }
+
     /// Claim the Core-owned exclusive focusable-overlay input capture for one
     /// transient interaction (CTX-0941, v2 scope of OQ-056).
     ///
@@ -5955,14 +6020,33 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     UiSlot::Top | UiSlot::Bottom => UiSceneScope::Band,
                     _ => UiSceneScope::Unanchored,
                 };
-                let component = read_component(stack.get(1), scope).map_err(|e| e.to_error(ctx))?;
-                let handle = state
-                    .bounded_mutation(|expiry| {
-                        state
-                            .services
-                            .ui_mount_with_expiry(&slot, &component, expiry)
-                    })
-                    .map_err(|e| e.to_error(ctx))?;
+                // bitty#2785: `terminal` is the terminal-attached scene slot,
+                // so its value is read with the v2 rich reader (the accepted
+                // `SceneNode` gallery) and attached through the Core scene
+                // host. Every other slot keeps the v1 band/overlay reader and
+                // registry unchanged.
+                let handle = if ui_slot == UiSlot::Terminal {
+                    let node = read_rich_component(stack.get(1)).map_err(|e| e.to_error(ctx))?;
+                    state
+                        .bounded_mutation(|expiry| {
+                            state.services.ui_mount_scene_with_expiry(
+                                ui_slot.as_str(),
+                                &node,
+                                expiry,
+                            )
+                        })
+                        .map_err(|e| e.to_error(ctx))?
+                } else {
+                    let component =
+                        read_component(stack.get(1), scope).map_err(|e| e.to_error(ctx))?;
+                    state
+                        .bounded_mutation(|expiry| {
+                            state
+                                .services
+                                .ui_mount_with_expiry(&slot, &component, expiry)
+                        })
+                        .map_err(|e| e.to_error(ctx))?
+                };
                 stack.replace(ctx, Value::Integer(handle));
                 Ok(CallbackReturn::Return)
             }
@@ -5989,18 +6073,34 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                 // An unresolvable handle (stale/foreign) keeps the documented
                 // `Ok(false)` contract: validate permissively and let the
                 // host's `ui_update` report it, never a parse error.
-                let scope = state
-                    .services
-                    .ui_scene_scope(handle)
-                    .unwrap_or(UiSceneScope::Band);
-                let component = read_component(stack.get(1), scope).map_err(|e| e.to_error(ctx))?;
-                let updated = state
-                    .bounded_mutation(|expiry| {
-                        state
-                            .services
-                            .ui_update_with_expiry(handle, &component, expiry)
-                    })
-                    .map_err(|e| e.to_error(ctx))?;
+                //
+                // bitty#2785: a scene handle (identified by its encoding, so
+                // a released handle keeps the same path) is read with the v2
+                // rich reader and updated through the Core scene host.
+                let updated = if state.services.ui_is_scene_handle(handle) {
+                    let node = read_rich_component(stack.get(1)).map_err(|e| e.to_error(ctx))?;
+                    state
+                        .bounded_mutation(|expiry| {
+                            state
+                                .services
+                                .ui_update_scene_with_expiry(handle, &node, expiry)
+                        })
+                        .map_err(|e| e.to_error(ctx))?
+                } else {
+                    let scope = state
+                        .services
+                        .ui_scene_scope(handle)
+                        .unwrap_or(UiSceneScope::Band);
+                    let component =
+                        read_component(stack.get(1), scope).map_err(|e| e.to_error(ctx))?;
+                    state
+                        .bounded_mutation(|expiry| {
+                            state
+                                .services
+                                .ui_update_with_expiry(handle, &component, expiry)
+                        })
+                        .map_err(|e| e.to_error(ctx))?
+                };
                 stack.replace(ctx, Value::Boolean(updated));
                 Ok(CallbackReturn::Return)
             }

@@ -196,6 +196,21 @@ pub(crate) fn run_cli(args: &Args) -> i32 {
 #[cfg(test)]
 mod tests;
 
+/// Serial guard for the process-global control queue in tests (CTX-0179).
+///
+/// The queue is process-wide while every test thread owns its own `Runtime`,
+/// so a test that drives the app tick loop concurrently with a ctl test can
+/// drain a request the ctl test enqueued. Both sides hold this one guard:
+/// `ctl` socket tests around their enqueue/drain window, and app-level tests
+/// that call `TerminalApp::drive_tick` (which drains the queue).
+#[cfg(test)]
+pub(crate) fn test_control_queue_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub use apply::{drain_global_control_queue_with, method_mutates_layout};
 pub use client::{
     CtlIpcOutcome, ResolvedTarget, ctl_roundtrip, list_live_instances, resolve_ctl_target,

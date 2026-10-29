@@ -6,8 +6,8 @@
 //! The fold and hint methods below are live-path consumers of the
 //! evidence-only [`crate::cw_present`] candidates; the present-plan
 //! derivations below remain the host-facing library surface, while the
-//! shipped present loop consumes the scene paint path directly once a scene
-//! host is installed (CTX-1630, see Integration status).
+//! shipped present loop consumes the scene paint path directly through the
+//! installed shared scene host (CTX-1630/CTX-1641, see Integration status).
 //!
 //! - issue #980 (CW-01): [`Runtime::cw_fold_apply`] +
 //!   [`Runtime::cw_fold_projection`] call [`crate::cw_present::apply_fold_action`]
@@ -36,9 +36,9 @@
 //!   `Terminal`/`Empty` leaves never leave the grid path. The present loop
 //!   consumes the same slots through
 //!   [`PanelRuntime::scene_paint_for`](crate::registry::PanelRuntime::scene_paint_for)
-//!   and paints them once a scene host is installed (`runtime::scene_present`,
-//!   CTX-1630); no shipped build installs one until bitty#2785, so this plan
-//!   entry point remains the summary/projection surface;
+//!   and paints them through the installed scene host (`runtime::scene_present`,
+//!   CTX-1630/CTX-1641); this plan entry point remains the summary/projection
+//!   surface;
 //! - issue #990 (CW-11): the same derivation carries the beyond-grid
 //!   payload for `Panel`/`Browser`/`Rich` leaves through the plan's
 //!   `nonterminal` field
@@ -54,14 +54,12 @@
 //! [`Runtime::cw_present_plan_for_host`]) remain the host-facing projection and
 //! are exercised by tests only; the shipped present loop does not consume the
 //! plan — it consumes the scene paint path through
-//! [`Runtime::install_scene_host`] and `runtime::scene_present` (CTX-1630)
-//! once a scene host with placement binds is installed. No shipped build
-//! installs a scene host or binds panels until bitty#2785 (host install +
-//! `ui.rich` attach), so no shipped frame paints a `Scene` yet:
-//! `Runtime::install_scene_host` has test callers only, the app keeps a bare
-//! `PanelRegistry` with no placements, and `bitty.ui.mount` still routes
-//! through the v1 validator, so no plugin mount attaches a scene. Do not
-//! describe plugin rich content as shipping before both land.
+//! [`Runtime::install_shared_scene_host`] and `runtime::scene_present`
+//! (CTX-1630/CTX-1641). The composition root constructs the shared
+//! `PanelRuntime`, binds its scene panel to the focused leaf, and installs it;
+//! `bitty.ui.mount("terminal", …)`/`ui.update` attach admitted scenes to that
+//! panel (bitty#2785). Image nodes are admitted and counted only; forwarding
+//! them to the image plane remains a separate OQ-051 slice.
 //!
 //! Headless, bounded, presentation-only: the grid, scrollback, PTY, GPU,
 //! and filesystem are never touched here. Grid truth stays with `State`.
@@ -487,10 +485,10 @@ impl Runtime {
     /// PanelRuntime-owned scene contract (issues #985/#990).
     ///
     /// Test-only projection: the shipped present loop paints scenes through
-    /// `PanelRuntime::scene_paint_for` (CTX-1630, `runtime::scene_present`)
-    /// once a scene host is installed — no shipped build installs one until
-    /// bitty#2785 — while this entry point summarizes the same slots for
-    /// future host consumers. Same frame as
+    /// `PanelRuntime::scene_paint_for` (CTX-1630/CTX-1641,
+    /// `runtime::scene_present`) through the composition-root-installed shared
+    /// host, while this entry point summarizes the same slots for future host
+    /// consumers. Same frame as
     /// [`Runtime::cw_present_plan`], except the leaf scene
     /// resolves through `host` (the OQ-051 option-A owner) instead of a
     /// caller-supplied [`Scene`]: `Panel` leaves budget their attached

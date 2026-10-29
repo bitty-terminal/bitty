@@ -110,14 +110,12 @@ coverage is absent.
   becomes a bounded, leaf-clipped paint list (`paint_scene`,
   `paint_scene_prefix`, `ScenePaintCache`). The shipped present loop consumes
   this module through `bitty-runtime` (`Runtime` → `PanelRuntime::scene_paint_for`,
-  CTX-1630) once a scene host with placement binds is installed: fills,
-  overlay-seam glyphs, and damage compose into the real frame. The composition
-  is wired and unit-tested, but no shipped build installs a scene host or
-  binds panels until bitty#2785 (host install + `ui.rich` attach), so no
-  shipped frame paints a `Scene` yet: (a) no production owner constructs or
-  installs a `PanelRuntime` scene host with placement binds
-  (`install_scene_host` has test callers only; the app keeps a bare
-  `PanelRegistry` with no placements), and (b) `bitty.ui.mount` still
-  validates through the v1 reader, so no `ui.rich` mount attaches a scene.
+  CTX-1630): fills, overlay-seam glyphs, and damage compose into the real
+  frame. Since CTX-1641 (bitty#2785) a shipped build installs the shared scene
+  host at composition time and routes `bitty.ui.mount("terminal", …)` /
+  `ui.update` through the `ui.rich` reader into an attached scene, so a
+  mounted plugin scene does paint. Image nodes stay placement references: this
+  module resolves no pixels for them, and forwarding them to the admitted
+  image plane is a separate slice.
 - `src/error.rs` — owned error types.
 - `tests/` — headless pipeline and seam tests.

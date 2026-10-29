@@ -2765,17 +2765,12 @@ fn control_enqueue_wakes_then_drains_without_render_tick() {
 // No new IPC methods are added here (out of scope).
 
 /// Serial guard for the process-global control queue + automation stores.
-#[cfg(unix)]
-fn wm_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
+///
+/// Shared with app-level tests that call `TerminalApp::drive_tick`, which
+/// drains the same process-global queue (CTX-1641).
 #[cfg(unix)]
 fn hold_wm_lock() -> std::sync::MutexGuard<'static, ()> {
-    wm_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::ctl::test_control_queue_lock()
 }
 
 /// Short temp socket path (macOS SUN_LEN: payload < 100 bytes).

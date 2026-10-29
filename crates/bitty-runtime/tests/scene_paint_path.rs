@@ -617,9 +617,8 @@ fn refused_scene_keeps_the_previous_frame_and_attributes_the_refusal() {
     // Re-attach an admitted scene the paint budget refuses. The mount path
     // accepts it (`Border::width` is not an admission limit); only the paint
     // path applies `SCENE_PAINT_MAX_BORDER_CELLS`.
-    rt.scene_host_mut()
+    rt.with_scene_host_mut(|host| host.attach_panel_scene(handle, over_wide_border_scene()))
         .expect("host installed")
-        .attach_panel_scene(handle, over_wide_border_scene())
         .expect("scene admitted");
     let refused_stats = rt
         .tick_at(now + Duration::from_millis(16))

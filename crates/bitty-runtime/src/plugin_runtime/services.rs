@@ -1015,7 +1015,7 @@ impl UiBlock {
 /// Bounded per-generation block registry (`SCN-4`/`SCN-5` numbers).
 ///
 /// Handles are opaque, generation-owned integers encoded as
-/// `(epoch << 32) | counter`: the registry lives inside one [`PluginServices`]
+/// `(epoch << 33) | counter`: the registry lives inside one [`PluginServices`]
 /// and the runtime pins `epoch` to the activation generation, so a handle from
 /// a suspended, reloaded, or disposed generation is foreign to the next one
 /// and `update` reports `false` instead of touching another generation's
@@ -1040,13 +1040,25 @@ pub struct UiBlocks {
     aggregated_retained_bytes: usize,
 }
 
-/// Bits of the handle reserved for the generation epoch. Capped at 31 so every
-/// composed `i64` handle stays positive (the surface types handles as opaque
-/// integers; positivity is diagnostic only).
-const UI_HANDLE_EPOCH_BITS: u32 = 31;
+/// Bits of the handle reserved for the generation epoch.
+///
+/// The epoch occupies bits 33..=62, so bit 32 is free to stay clear as the
+/// terminal-slot scene discriminator (`bitty` CTX-1641): this registry never
+/// sets bit 32, so a v1 band handle can never be mistaken for a rich scene
+/// handle by `ui.update`. Thirty bits is exactly the width that still keeps
+/// the sign bit (63) clear, so every composed `i64` handle is positive (the
+/// surface types handles as opaque integers); an epoch above `2^30 - 1` is
+/// masked rather than shifted into the sign bit. The epoch is the activation
+/// generation counter, so exhausting that bound needs `2^30` activations of
+/// one plugin: the mask is a representation bound, not a lifecycle guarantee.
+const UI_HANDLE_EPOCH_BITS: u32 = 30;
 
 /// Mask selecting the generation epoch bits of a handle.
 const UI_HANDLE_EPOCH_MASK: u32 = (1 << UI_HANDLE_EPOCH_BITS) - 1;
+
+/// Position of the epoch field: bits 0..=31 hold the counter and bit 32 is the
+/// scene discriminator, so the epoch starts at 33.
+const UI_HANDLE_EPOCH_SHIFT: u32 = 33;
 
 impl Default for UiBlocks {
     fn default() -> Self {
@@ -1094,7 +1106,7 @@ impl UiBlocks {
             ));
         }
         let epoch = i64::from(self.epoch & UI_HANDLE_EPOCH_MASK);
-        Ok((epoch << 32) | i64::from(self.next_counter))
+        Ok((epoch << UI_HANDLE_EPOCH_SHIFT) | i64::from(self.next_counter))
     }
 
     /// Number of retained blocks.
@@ -1859,6 +1871,20 @@ pub struct PluginServices {
     spawn_backend: RefCell<Option<SpawnHandler>>,
     ui_access: RefCell<UiAccess>,
     ui_blocks: RefCell<UiBlocks>,
+    /// Core-owned `terminal`-slot scene host (bitty#2785).
+    ///
+    /// Installed only for `ui.rich` generations; absent means a rich mount
+    /// fails closed with `E_UI_UNAVAILABLE`, exactly like every other verb
+    /// without a host. The host owns the scene panel, the admitted scenes,
+    /// and their handles; this generation only calls it and releases its own
+    /// scenes through `clear_ui_blocks`.
+    ui_scene_backend: RefCell<Option<Rc<crate::scene_host::SceneHost>>>,
+    /// Activation generation this registry mints handles for (`set_ui_epoch`).
+    ///
+    /// The scene host takes it as the block's attribution generation and as
+    /// the release key on `clear_ui_blocks`, so a reload can never release the
+    /// next generation's scene.
+    ui_epoch: Cell<u32>,
     overlay_capture: RefCell<Option<Rc<RefCell<OverlayCapture>>>>,
     /// Runtime-shared presentation-only overlay session (CTX-1431, #2406).
     ///
@@ -2120,6 +2146,8 @@ impl PluginServices {
             spawn_backend: RefCell::new(None),
             ui_access: RefCell::new(UiAccess::default()),
             ui_blocks: RefCell::new(UiBlocks::new()),
+            ui_scene_backend: RefCell::new(None),
+            ui_epoch: Cell::new(0),
             overlay_capture: RefCell::new(None),
             presentation_overlay: RefCell::new(None),
             overlay_peers: RefCell::new(None),
@@ -2530,7 +2558,18 @@ impl PluginServices {
     /// the generation's `init.lua` runs, so handles minted by different
     /// generations never collide.
     pub fn set_ui_epoch(&self, epoch: u32) {
+        self.ui_epoch.set(epoch);
         self.ui_blocks.borrow_mut().set_epoch(epoch);
+    }
+
+    /// Attach the Core-owned terminal-slot scene host (bitty#2785).
+    ///
+    /// Installed only for `ui.rich` generations; without it a rich
+    /// `bitty.ui.mount("terminal", …)` keeps failing closed with
+    /// `E_UI_UNAVAILABLE`. The call-time `ui.rich` gate stays as the second
+    /// layer.
+    pub fn set_ui_scene_backend(&self, backend: Option<Rc<crate::scene_host::SceneHost>>) {
+        *self.ui_scene_backend.borrow_mut() = backend;
     }
 
     /// Attach the runtime-shared focusable-overlay capture switch (CTX-0941).
@@ -3110,6 +3149,13 @@ impl PluginServices {
     /// covered: the whole registry (including every recorded spec handle)
     /// is dropped, so no orphan survives unload or crash.
     pub fn clear_ui_blocks(&self) {
+        // bitty#2785: the generation's terminal-slot scene leaves with its
+        // blocks. The scene host detaches the scene and disposes the
+        // Core-owned panel, so neither a stale scene nor a placement bind
+        // survives suspend, dispose, crash, or reload.
+        if let Some(backend) = self.ui_scene_backend.borrow().clone() {
+            backend.release_owner(&self.plugin_id, self.ui_epoch.get());
+        }
         self.ui_blocks.borrow_mut().clear();
         self.spec_overlay_handles.borrow_mut().clear();
     }
@@ -4141,6 +4187,74 @@ impl HostServices for PluginServices {
         self.ui_blocks
             .borrow_mut()
             .mount(ui_slot, component.clone())
+    }
+
+    /// Mount one validated rich tree into the `terminal`-attached scene slot
+    /// (bitty#2785).
+    ///
+    /// Admission order: the call/claim gates run first, then the accepted
+    /// scene admission (`SCN-1..5`) inside the Core scene host, then the
+    /// generation-owned handle is recorded. A refused tree leaves the
+    /// previous scene attached and mints nothing.
+    fn ui_mount_scene(&self, slot: &str, node: &bitty_lua::UiRichNode) -> Result<i64, BridgeError> {
+        let Some(ui_slot) = UiSlot::parse(slot) else {
+            return Err(bitty_lua::ui::component_invalid(format!(
+                "unknown UI slot '{slot}'"
+            )));
+        };
+        if ui_slot != UiSlot::Terminal {
+            return Err(BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                format!("slot '{ui_slot}' has no rich scene surface"),
+            ));
+        }
+        if !self.ui_access.borrow().rich {
+            return Err(BridgeError::capability_denied("ui.rich"));
+        }
+        let backend = self.ui_scene_backend.borrow().clone().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "host has no terminal-attached scene surface",
+            )
+        })?;
+        // A generation owns one terminal-slot scene: the host replaces the
+        // previous scene atomically after admission and invalidates its
+        // handle, so the slot's panel and handle space stay bounded by
+        // generations, not by mount count.
+        backend.attach(&self.plugin_id, self.ui_epoch.get(), node)
+    }
+
+    /// Whether `handle` is encoded as a terminal-slot scene handle.
+    ///
+    /// The tag lives in the handle value, so a released handle still routes
+    /// through the rich reader and then reports `Ok(false)` instead of
+    /// becoming a parse error for the v1 reader.
+    fn ui_is_scene_handle(&self, handle: i64) -> bool {
+        crate::scene_host::is_scene_handle(handle)
+    }
+
+    /// Replace one terminal-slot scene from a validated rich tree.
+    fn ui_update_scene(
+        &self,
+        handle: i64,
+        node: &bitty_lua::UiRichNode,
+    ) -> Result<bool, BridgeError> {
+        if !self.ui_access.borrow().rich {
+            return Err(BridgeError::capability_denied("ui.rich"));
+        }
+        if !crate::scene_host::is_scene_handle(handle) {
+            return Ok(false);
+        }
+        let Some(backend) = self.ui_scene_backend.borrow().clone() else {
+            return Ok(false);
+        };
+        // Admission runs inside the host first: a refused tree keeps the last
+        // good scene attached, so the scene never drops to a partial state.
+        // Owner and epoch are re-checked inside the host, so a forged handle
+        // can never replace another generation's scene.
+        backend.update(&self.plugin_id, self.ui_epoch.get(), handle, node)
     }
 
     /// Scene scope of a mounted block (issue #2411): only a horizontal band
@@ -7695,6 +7809,29 @@ mod tests {
             "the next generation's own handle must still serve"
         );
         second.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
+    }
+
+    /// PR #2799 review F3: the epoch field is 30 bits at shift 33, which is
+    /// exactly the width that leaves bit 63 (sign) clear. The largest
+    /// representable epoch must still compose a positive handle that never
+    /// sets the scene discriminator.
+    #[test]
+    fn composed_handles_stay_positive_at_the_epoch_bound() {
+        let mut blocks = UiBlocks::new();
+        blocks.set_epoch(u32::MAX);
+        let handle = blocks.next_handle().expect("handle");
+        assert!(
+            handle > 0,
+            "an unmasked 30-bit epoch would overflow the sign bit"
+        );
+        assert_eq!(
+            handle & (1 << 32),
+            0,
+            "a v1 band handle never sets the scene discriminator"
+        );
+        // Masking `u32::MAX` yields the all-ones 30-bit epoch field.
+        let epoch = i64::from(UI_HANDLE_EPOCH_MASK);
+        assert_eq!(handle, (epoch << UI_HANDLE_EPOCH_SHIFT) | 1);
     }
 
     #[test]

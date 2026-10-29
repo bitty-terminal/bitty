@@ -43,6 +43,11 @@ path is Linux-only, and `worker_sessions` is compiled from the cell truth and
 narrowed to the containment plan the startup probe selected, so a daemon can
 never advertise a spawn path it does not serve.
 
+bitty#2792 adds the delivered event wire: an opted-in connection receives
+per-lease event frames on the negotiated socket, drained from the bounded
+queues and written after the response they follow. It is the last deferred wire
+slice; see [Pushed event wire](#pushed-event-wire-bitty2792).
+
 `bittyd start` binds the per-user endpoint (`0700` directory, `0600` socket,
 single-instance lock), mints the per-boot operator capability, opens the
 owner-private orphan journal, runs the startup containment scan, accepts up to

@@ -341,9 +341,13 @@ fn animation_deadline_is_bounded_and_clears_on_completion() {
     rt.set_layout(two_pane_split());
     rt.tick_at(start).expect("open presents");
     // Query on the same virtual clock `tick_at` armed the transition with.
-    // The wall-clock `animation_deadline()` folds in "now + frame interval"
-    // and reads as beyond the accepted duration when a loaded CI scheduler
-    // stalls this thread between arming and the assertion (bitty#2781).
+    // `next_deadline` is bounded by the transition end, so a loaded CI
+    // scheduler that stalls this thread between arming and the assertion
+    // cannot push the deadline past the accepted duration: once the stall
+    // outlasts the transition, `animation_deadline()` reads `None` because
+    // nothing is active (before that it already collapses onto the end).
+    // That `None` is the observed failure mode (bitty#2781), not an
+    // over-duration deadline.
     let deadline = rt.animation_deadline_at(start).expect("active deadline");
     assert!(
         deadline <= start + Duration::from_millis(150),

@@ -1066,7 +1066,8 @@ Corpus rules:
   instead of failing the vector;
 - cell-dependent values are seeded variables, never literals: `@worker_sessions`
   is the served capability of the cell a driver models (the reference fake
-  models a served worker cell; the real driver seeds the compiled cell truth)
+  models a served worker cell; the real driver seeds the readiness probe's
+  served-cell answer)
   and `@cwd` is a directory the host reports as absolute, so the corpus never
   asserts a Linux-only capability or a Unix root path on Windows or macOS;
 - `known_defect` rows record the exact failing step and code or result path,

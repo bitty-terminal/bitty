@@ -1,7 +1,8 @@
 //! The single documented Linux syscall seam for containment (bitty#2791).
 //!
-//! Everything this module needs that safe `std`/`nix` does not wrap lives here
-//! and nowhere else:
+//! The process-spawn and pidfd calls that safe `std`/`nix` does not wrap live
+//! here; the remaining raw calls (`TIOCSWINSZ` resize, `BorrowedFd` wrappers) are
+//! documented in `worker.rs`:
 //!
 //! - `Command::pre_exec` plus one `write(2)` of the child's own pid into a
 //!   pre-opened `cgroup.procs` descriptor, so the child enters its session

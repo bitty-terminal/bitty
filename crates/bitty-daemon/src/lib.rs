@@ -94,8 +94,9 @@
 //!   cleanup claim, and typed refusals on every other cell (`D-06`, `D-15`).
 //! - [`orphan::OrphanSupervisor`]: the served `daemon.orphans.verify`
 //!   implementation; counts by class, no pid, idempotent (`D-06`).
-//! - [`content`]: the bounded terminal byte buffer, the hex codec, and the
-//!   content-frame budget (`D-10`, `D-14`).
+//! - [`content`]: the bounded terminal byte buffer, the hex codec, the
+//!   content-frame budget, and the envelope-ready `session_content` frame
+//!   (`D-10`, `D-14`).
 //!
 //! A `session.create kind: terminal` with the bounded spawn specification
 //! spawns through the same contained path as `kind: worker` and binds

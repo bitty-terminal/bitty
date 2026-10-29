@@ -18,9 +18,9 @@
 //! - closing refusals (`VersionMismatch`, `Unauthenticated`,
 //!   `Denied/AlreadyNegotiated`) flush their refusal frame and then really
 //!   close, checked as an EOF inside the negotiate deadline;
-//! - the handshake advertises only the three baseline `session.*` scopes plus
-//!   the explicit `terminal.manage` and `process.spawn` transport grants, never
-//!   an ambient `view.*` content scope;
+//! - the handshake advertises only the baseline `session.*` scopes plus the
+//!   explicit `terminal.manage`, `terminal.inspect`, `terminal.input`, and
+//!   `process.spawn` transport grants, never an ambient `view.*` content scope;
 //! - a frame written after the handshake is read is served, while a frame
 //!   queued before the response is refused and closed;
 //! - a stopping daemon refuses a pipelined mutation on the same drain;
@@ -3875,6 +3875,7 @@ mod event_wire {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut seen = Vec::new();
+        let mut sequence = 0u64;
         while !seen.windows(9).any(|window| window == b"subscribe") {
             assert!(
                 Instant::now() < deadline,
@@ -3888,8 +3889,41 @@ mod event_wire {
             assert_eq!(event["session_id"], session_id, "{event}");
             assert_eq!(event["attach_id"], attach_id, "{event}");
             assert_eq!(event["generation"], 1, "{event}");
-            seen.extend(decode_content(event["data"].as_str().expect("content hex")));
+            assert_eq!(event["terminal"], false, "{event}");
+            assert_eq!(
+                event["instance_id"].as_str().map(str::len),
+                Some(32),
+                "content frames carry the daemon instance: {event}"
+            );
+            assert!(
+                event["revision"].as_u64().is_some(),
+                "content frames carry the current state revision: {event}"
+            );
+            assert_eq!(
+                event["sequence"].as_u64(),
+                Some(sequence),
+                "content frames are ordered by their per-subscription sequence: {event}"
+            );
+            sequence += 1;
+            assert!(
+                event["buffered_bytes"].as_u64().is_some(),
+                "content frames carry the remaining buffer count: {event}"
+            );
+            let data = event["data"].as_str().expect("content hex");
+            assert!(
+                data.bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "content is lowercase hex: {event}"
+            );
+            for forbidden in ["pid", "path", "argv", "cwd", "env", "token"] {
+                assert!(
+                    event.get(forbidden).is_none(),
+                    "a content frame must not carry {forbidden}: {event}"
+                );
+            }
+            seen.extend(decode_content(data));
         }
+        assert!(sequence >= 1, "at least one content frame was observed");
 
         // The terminal event ends the subscription: no content frame follows.
         let killed = operator.call(
@@ -3909,6 +3943,103 @@ mod event_wire {
             event = recv_event(&mut creator);
         }
         assert_eq!(event["terminal"], true, "{event}");
+
+        assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    }
+
+    #[test]
+    fn terminal_content_is_scoped_to_the_subscribed_session() {
+        let root = TempRoot::new("events-content-scope");
+        let daemon = Daemon::start(&root);
+        let capability = read_capability(&root);
+        let mut operator = Client::connect(&root.endpoint());
+        assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+        let (mut first, _) = event_consumer(&root, &mut operator, "scope-a");
+        let (first_id, first_attach, _, _) = create_and_claim(&mut first, "scope-a");
+        let (mut second, _) = event_consumer(&root, &mut operator, "scope-b");
+        let (second_id, second_attach, _, _) = create_and_claim(&mut second, "scope-b");
+        assert_ne!(first_id, second_id);
+
+        // The first controller's authority stops at its own session: a foreign
+        // session id is the uniform NotFound, never a controller oracle.
+        for (method, params) in [
+            (
+                "session.read",
+                json!({"session_id": second_id, "generation": 1}),
+            ),
+            (
+                "session.write",
+                json!({"session_id": second_id, "generation": 1, "data": "00"}),
+            ),
+            (
+                "session.subscribe",
+                json!({"session_id": second_id, "generation": 1}),
+            ),
+        ] {
+            let refused = first.call(method, params);
+            assert_eq!(refused["ok"], false, "{method}: {refused}");
+            assert_eq!(refused["error"]["code"], "NotFound", "{method}: {refused}");
+        }
+
+        for (client, session_id) in [(&mut first, &first_id), (&mut second, &second_id)] {
+            let subscribed = client.call(
+                "session.subscribe",
+                json!({"session_id": session_id, "generation": 1}),
+            );
+            assert_eq!(subscribed["ok"], true, "{subscribed}");
+        }
+
+        // A marker written to the first session is delivered only on the
+        // first connection and only under the first session's ids.
+        let marker = b"first-session-only";
+        let encoded: String = marker.iter().map(|byte| format!("{byte:02x}")).collect();
+        let written = first.call(
+            "session.write",
+            json!({"session_id": first_id, "generation": 1, "data": encoded}),
+        );
+        assert_eq!(written["ok"], true, "{written}");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while !seen.windows(marker.len()).any(|window| window == marker) {
+            assert!(
+                Instant::now() < deadline,
+                "the first subscription never observed its own content: {seen:?}"
+            );
+            let event = recv_event(&mut first);
+            if event["kind"] != "session_content" {
+                assert_eq!(event["kind"], "session_state", "{event}");
+                continue;
+            }
+            assert_eq!(event["session_id"], first_id, "{event}");
+            assert_eq!(event["attach_id"], first_attach, "{event}");
+            assert_ne!(event["session_id"], second_id, "{event}");
+            assert_ne!(event["attach_id"], second_attach, "{event}");
+            seen.extend(decode_content(event["data"].as_str().expect("content hex")));
+        }
+
+        // The second subscription never receives the first session's bytes,
+        // even across that session's terminal transition.
+        let killed = operator.call(
+            "session.kill",
+            json!({"session_id": second_id, "generation": 1}),
+        );
+        assert_eq!(killed["ok"], true, "{killed}");
+        let mut frames = 0;
+        loop {
+            let event = recv_event(&mut second);
+            assert_ne!(
+                event["kind"], "session_content",
+                "a foreign session's content reached the second subscription: {event}"
+            );
+            assert_ne!(event["session_id"], first_id, "{event}");
+            frames += 1;
+            assert!(frames <= 16, "the second session never terminalized");
+            if event["kind"] == "session_terminal" {
+                break;
+            }
+        }
 
         assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
     }

@@ -330,11 +330,13 @@ pub fn render_event(id: &str, event: &Event) -> Result<Vec<u8>, Refusal> {
 /// Render one pushed terminal-content frame as a complete wire frame.
 ///
 /// The shape is the event envelope plus a `session_content` event:
-/// `{"v":1,"id":...,"event":{"kind":"session_content","session_id":...,
-/// "attach_id":...,"generation":...,"sequence":...,"data":"<hex>",
-/// "buffered_bytes":...}}`. The raw bytes are lowercase hex, so every byte
-/// value survives JSON. No pid, path, argv, environment, or audit text is
-/// present.
+/// `{"v":1,"id":...,"event":{"kind":"session_content","instance_id":...,
+/// "session_id":...,"attach_id":...,"generation":...,"revision":...,
+/// "terminal":false,"sequence":...,"data":"<hex>","buffered_bytes":...}}`.
+/// The envelope facts match every other event (`D-10`); `sequence` orders
+/// content because taking bytes from the buffer does not advance the session
+/// revision. The raw bytes are lowercase hex, so every byte value survives
+/// JSON. No pid, path, argv, environment, or audit text is present.
 ///
 /// # Errors
 ///
@@ -345,9 +347,12 @@ pub fn render_content_event(id: &str, content: &ContentFrame) -> Result<Vec<u8>,
         "id": id,
         "event": {
             "kind": CONTENT_EVENT_KIND,
+            "instance_id": content.instance_id.as_hex(),
             "session_id": content.session_id.as_hex(),
             "attach_id": content.attach_id.as_hex(),
             "generation": content.generation,
+            "revision": content.revision,
+            "terminal": false,
             "sequence": content.sequence,
             "data": crate::content::encode_hex(&content.data),
             "buffered_bytes": content.buffered_bytes,
@@ -618,9 +623,11 @@ mod tests {
     #[test]
     fn a_full_content_frame_stays_inside_the_transport_frame_bound() {
         let frame = crate::content::ContentFrame {
+            instance_id: crate::registry::DaemonInstanceId::generate().expect("instance id"),
             session_id: crate::registry::SessionId::parse(&"a".repeat(32)).expect("session id"),
             attach_id: crate::registry::AttachId::parse(&"b".repeat(32)).expect("attach id"),
             generation: 1,
+            revision: 42,
             sequence: u64::MAX,
             data: vec![0xff; crate::content::CONTENT_FRAME_BYTES],
             buffered_bytes: usize::MAX,
@@ -631,6 +638,44 @@ mod tests {
             "the encoded frame reserve must cover the worst case: {} bytes",
             bytes.len()
         );
+    }
+
+    #[test]
+    fn a_content_frame_carries_the_frozen_event_envelope() {
+        let frame = crate::content::ContentFrame {
+            instance_id: crate::registry::DaemonInstanceId::generate().expect("instance id"),
+            session_id: crate::registry::SessionId::parse(&"a".repeat(32)).expect("session id"),
+            attach_id: crate::registry::AttachId::parse(&"b".repeat(32)).expect("attach id"),
+            generation: 7,
+            revision: 11,
+            sequence: 3,
+            data: b"\x00hi\xff".to_vec(),
+            buffered_bytes: 9,
+        };
+        let payload = render_content_event("evt-1", &frame).expect("render");
+        let frame_bytes = payload.len();
+        assert_eq!(
+            u32::from_be_bytes(payload[..4].try_into().expect("header")) as usize,
+            frame_bytes - 4,
+            "the frame header length covers the payload"
+        );
+        let value: Value = serde_json::from_slice(&payload[4..]).expect("json");
+        assert_eq!(value["event"]["kind"], "session_content");
+        assert_eq!(value["event"]["instance_id"], frame.instance_id.as_hex());
+        assert_eq!(value["event"]["session_id"], frame.session_id.as_hex());
+        assert_eq!(value["event"]["attach_id"], frame.attach_id.as_hex());
+        assert_eq!(value["event"]["generation"], 7);
+        assert_eq!(value["event"]["revision"], 11);
+        assert_eq!(value["event"]["terminal"], false);
+        assert_eq!(value["event"]["sequence"], 3);
+        assert_eq!(value["event"]["data"], "006869ff");
+        assert_eq!(value["event"]["buffered_bytes"], 9);
+        for forbidden in ["pid", "path", "argv", "env", "cwd", "token"] {
+            assert!(
+                value["event"].get(forbidden).is_none(),
+                "a content frame must not carry {forbidden}: {value}"
+            );
+        }
     }
 
     #[test]

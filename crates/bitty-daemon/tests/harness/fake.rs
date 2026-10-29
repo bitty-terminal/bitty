@@ -50,6 +50,14 @@ const FAKE_WORKER_SESSIONS: bool = true;
 const FAKE_PEER_UID: u32 = 1000;
 const FAKE_PEER_PID: u32 = 4242;
 
+/// The modeled terminal input window.
+///
+/// The fake models the contract's partial-write and `ChannelFull` branches,
+/// not a kernel buffer size: this is small enough that one maximal content
+/// write is accepted partially and the next write is refused, without a
+/// multi-megabyte corpus payload.
+const FAKE_INPUT_BYTES: usize = 4096;
+
 /// The observational daemon pid the reference cell models.
 const FAKE_DAEMON_PID: u32 = 4242;
 
@@ -123,6 +131,21 @@ struct FakeSession {
     /// Simulated terminal output retained for `session.read` and the content
     /// event wire. The fake models an echo terminal, not a PTY.
     content: Vec<u8>,
+    /// Bytes the modeled terminal input window can still accept.
+    ///
+    /// The reference fake models the contract's partial-write and
+    /// `ChannelFull` branches, not a kernel buffer size: the window is small
+    /// enough that a maximal content write is accepted partially and a
+    /// following write is the typed backpressure refusal. A content read
+    /// models the child consuming the echoed input and re-opens the window.
+    input_remaining: usize,
+    /// The next content-frame sequence the subscription would hand out.
+    ///
+    /// The fake does not model the asynchronous event wire (the real-only
+    /// `requires-real-pty` vectors cover it), so this stays at zero here; the
+    /// field exists so a repeat subscribe returns the tracked value instead of
+    /// a second hard-coded zero.
+    subscription_sequence: u64,
     /// Whether the controller subscribed on an event-opted connection.
     subscribed: bool,
 }
@@ -1092,6 +1115,8 @@ impl FakeDriver {
             id: id.clone(),
             kind,
             content: Vec::new(),
+            input_remaining: FAKE_INPUT_BYTES,
+            subscription_sequence: 0,
             subscribed: false,
             terminal_id,
             state: if bound { "running" } else { "created" },
@@ -1287,6 +1312,9 @@ impl FakeDriver {
             .min(self.sessions[&session_id].content.len());
         let session = self.sessions.get_mut(&session_id).expect("checked");
         let data: Vec<u8> = session.content.drain(..take).collect();
+        // The modeled child consumed the input that produced this output, so
+        // the bounded input window re-opens by the drained count.
+        session.input_remaining = (session.input_remaining + data.len()).min(FAKE_INPUT_BYTES);
         let buffered = session.content.len();
         let generation = session.generation;
         self.reply(
@@ -1331,8 +1359,14 @@ impl FakeDriver {
         if let Err(error) = self.content_target(connection, &session_id, generation) {
             return self.content_refusal("session.write", error);
         }
-        let accepted = data.len();
+        let attempted = data.len();
+        let window = self.sessions[&session_id].input_remaining;
+        if window == 0 {
+            return self.refuse("session.write", "Denied", "ChannelFull", None);
+        }
+        let accepted = attempted.min(window);
         let session = self.sessions.get_mut(&session_id).expect("checked");
+        session.input_remaining -= accepted;
         // Echo the input, as the line discipline does for a live terminal.
         let room = CONTENT_FRAME_BYTES.saturating_sub(session.content.len());
         session.content.extend(&data[..accepted.min(room)]);
@@ -1343,8 +1377,8 @@ impl FakeDriver {
                 "session_id": session_id,
                 "generation": generation,
                 "accepted": accepted,
-                "remaining": 0,
-                "backpressure": false,
+                "remaining": attempted - accepted,
+                "backpressure": accepted < attempted,
             }),
         )
     }
@@ -1370,6 +1404,7 @@ impl FakeDriver {
         let already = session.subscribed;
         session.subscribed = true;
         let generation = session.generation;
+        let sequence = session.subscription_sequence;
         self.reply(
             "session.subscribe",
             json!({
@@ -1377,7 +1412,7 @@ impl FakeDriver {
                 "generation": generation,
                 "subscribed": true,
                 "already_subscribed": already,
-                "sequence": 0,
+                "sequence": sequence,
             }),
         )
     }
@@ -2175,6 +2210,8 @@ impl FakeDriver {
             "not_started"
         });
         session.content.clear();
+        session.input_remaining = 0;
+        session.subscription_sequence = 0;
         session.subscribed = false;
         session.last_seen_ms = now;
         session.revision += 1;
@@ -2522,9 +2559,130 @@ fn canonical_target_attach(params: &Value) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::json;
 
-    use super::{FakeDriver, canonical_generation, canonical_target_attach};
+    use super::{
+        FAKE_INPUT_BYTES, FakeConn, FakeDriver, FakeLease, FakeSession, canonical_generation,
+        canonical_target_attach,
+    };
+    use crate::harness::runner::Outcome;
+
+    /// One live fake terminal with a controller lease on `creator`.
+    fn fake_terminal() -> (FakeDriver, String) {
+        let mut fake = FakeDriver::new();
+        fake.instance = "11".repeat(16);
+        let id = fake.mint_id();
+        let attach = fake.mint_id();
+        let token = fake.mint_token();
+        let now = fake.now();
+        let mut leases = BTreeMap::new();
+        leases.insert(
+            attach.clone(),
+            FakeLease {
+                role: "controller",
+                expires_ms: now + 60_000,
+            },
+        );
+        let terminal_id = fake.mint_id();
+        fake.sessions.insert(
+            id.clone(),
+            FakeSession {
+                id: id.clone(),
+                kind: "terminal",
+                terminal_id,
+                state: "running",
+                generation: 1,
+                revision: 2,
+                controller: Some(attach.clone()),
+                pending_grants: 0,
+                token,
+                initial_token: None,
+                leases,
+                created_ms: now,
+                last_seen_ms: now,
+                terminal_reason: None,
+                cleanup: None,
+                content: Vec::new(),
+                input_remaining: FAKE_INPUT_BYTES,
+                subscription_sequence: 0,
+                subscribed: false,
+            },
+        );
+        let mut conn = FakeConn {
+            negotiated: true,
+            events: true,
+            ..FakeConn::default()
+        };
+        for scope in ["session.inspect", "terminal.inspect", "terminal.input"] {
+            conn.scopes.insert(scope.to_owned());
+        }
+        conn.leases.insert(attach);
+        fake.connections.insert("creator".to_owned(), conn);
+        (fake, id)
+    }
+
+    fn reply(outcome: Outcome) -> serde_json::Value {
+        match outcome {
+            Outcome::Reply(reply) => {
+                assert!(reply.ok, "unexpected refusal: {:?}", reply.error);
+                reply.result
+            }
+            Outcome::Closed => panic!("the fake closed the connection"),
+        }
+    }
+
+    #[test]
+    fn the_reference_fake_models_partial_writes_and_channel_full() {
+        let (mut fake, id) = fake_terminal();
+        let write = |data: String| json!({"session_id": id, "generation": 1, "data": data});
+
+        let partial =
+            reply(fake.session_write("creator", &write("ab".repeat(FAKE_INPUT_BYTES + 1))));
+        assert_eq!(partial["accepted"], FAKE_INPUT_BYTES);
+        assert_eq!(partial["remaining"], 1);
+        assert_eq!(partial["backpressure"], true);
+
+        let full = fake.session_write("creator", &write("00".to_owned()));
+        match full {
+            Outcome::Reply(reply) => {
+                assert!(!reply.ok);
+                let error = reply.error.expect("error");
+                assert_eq!(error.class, "Denied");
+                assert_eq!(error.code, "ChannelFull");
+            }
+            Outcome::Closed => panic!("the fake closed the connection"),
+        }
+
+        // A content read models the child consuming the echoed input and
+        // re-opens the bounded window.
+        let read = reply(fake.session_read(
+            "creator",
+            &json!({"session_id": id, "generation": 1, "max_bytes": FAKE_INPUT_BYTES}),
+        ));
+        assert_eq!(read["bytes"], FAKE_INPUT_BYTES);
+        let after = reply(fake.session_write("creator", &write("00".to_owned())));
+        assert_eq!(after["accepted"], 1);
+        assert_eq!(after["backpressure"], false);
+    }
+
+    #[test]
+    fn a_repeat_subscribe_returns_the_tracked_sequence() {
+        let (mut fake, id) = fake_terminal();
+        fake.sessions
+            .get_mut(&id)
+            .expect("session")
+            .subscription_sequence = 3;
+        let params = json!({"session_id": id, "generation": 1});
+        let first = reply(fake.session_subscribe("creator", &params));
+        assert_eq!(first["subscribed"], true);
+        assert_eq!(first["already_subscribed"], false);
+        assert_eq!(first["sequence"], 3);
+        let repeat = reply(fake.session_subscribe("creator", &params));
+        assert_eq!(repeat["already_subscribed"], true);
+        assert_eq!(repeat["sequence"], 3, "a repeat never resets the sequence");
+    }
 
     #[test]
     fn generation_alias_conflicts_use_the_raw_json_value() {

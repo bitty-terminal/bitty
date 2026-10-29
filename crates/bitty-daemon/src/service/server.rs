@@ -278,13 +278,14 @@ mod unix {
         pub audit_dir: PathBuf,
         /// Transport scopes granted to every same-user connection.
         ///
-        /// Two transport scopes are granted: `process.spawn` is the one the
+        /// Four transport scopes are granted: `process.spawn` is the one the
         /// daemon catalog evaluates for `session.create`'s two-authority rule,
-        /// and `terminal.manage` is the negotiated grant `session.resize`
-        /// requires. The scope alone resizes nothing: the current controller
-        /// lease for the target generation still gates the effect. The daemon
-        /// grants no `view.*`, `config.*`, `plugin.*`, or `debug.*` scope, so
-        /// the handshake never advertises an ambient content scope.
+        /// `terminal.manage` is the negotiated grant `session.resize` requires,
+        /// and `terminal.inspect`/`terminal.input` gate read/subscribe and
+        /// write. A scope alone never authorizes anything: the current
+        /// controller lease for the target generation still gates the effect.
+        /// The daemon grants no `view.*`, `config.*`, `plugin.*`, or `debug.*`
+        /// scope, so the handshake never advertises an ambient content scope.
         /// `session.host` consent remains the effective create authority; the
         /// transport `process.spawn` grant is the current compatibility grant
         /// and the executable-allowlist follow-up must move it to the

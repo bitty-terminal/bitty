@@ -655,8 +655,9 @@ impl SessionHost {
     /// handle is [`LeaseRefusal::NotAttached`]. The caller still checks the
     /// `session.inspect` scope and, for terminal content, `terminal.inspect`,
     /// plus the event-subscription rules (bitty#2607 / bitty#2792). This is
-    /// read-only and never renews the lease; the heartbeat or a controller
-    /// content operation does.
+    /// read-only and never renews the lease; only
+    /// [`SessionHost::heartbeat`] renews it, so a controller that reads
+    /// content while idle must keep heartbeating.
     ///
     /// # Errors
     ///

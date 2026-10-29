@@ -8,8 +8,9 @@
 //! - `session.read` pulls bytes synchronously (bounded by
 //!   [`CONTENT_FRAME_BYTES`]);
 //! - `session.subscribe` pushes [`ContentFrame`]s on the negotiated event
-//!   connection (one frame per delivery pass, also bounded by
-//!   [`CONTENT_FRAME_BYTES`]).
+//!   connection (each frame is bounded by [`CONTENT_FRAME_BYTES`]; one delivery
+//!   pass drains as many whole frames as the connection's reserved outbound
+//!   room allows).
 //!
 //! Consumption is single-owner: whichever path takes bytes first removes them,
 //! so a client uses a pull loop or a subscription, never both expecting the
@@ -31,14 +32,15 @@
 //! # What a frame never carries
 //!
 //! No pid, executable path, cwd, environment, argv, token, or audit text.
-//! Content frames carry only the session id, generation, sequence, raw bytes,
-//! and the current buffered-byte count.
+//! Content frames carry the frozen event envelope fact (`instance_id`,
+//! `revision`, and a constant `terminal: false`) plus the session id,
+//! generation, sequence, raw bytes, and the current buffered-byte count.
 
 use std::collections::VecDeque;
 use std::fmt;
 
 use crate::limits::LimitId;
-use crate::registry::{AttachId, SessionId};
+use crate::registry::{AttachId, DaemonInstanceId, SessionId};
 
 /// Raw terminal bytes one content frame may carry.
 ///
@@ -131,11 +133,6 @@ impl ContentBuffer {
         let take = max_bytes.min(self.bytes.len());
         self.bytes.drain(..take).collect()
     }
-
-    /// Discard every buffered byte.
-    pub fn clear(&mut self) {
-        self.bytes.clear();
-    }
 }
 
 impl Default for ContentBuffer {
@@ -155,20 +152,47 @@ impl fmt::Debug for ContentBuffer {
 }
 
 /// One pushed content frame, ready for the wire renderer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The frame carries the frozen event envelope facts so it can share the
+/// negotiated event connection with the metadata events (`D-10`): the daemon
+/// instance, the session's `state_revision` at emission, and a constant
+/// `terminal: false`. Content ordering remains the per-subscription
+/// `sequence`, because taking bytes from the buffer does not advance the
+/// snapshot revision.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ContentFrame {
+    /// The daemon instance that emitted the frame.
+    pub instance_id: DaemonInstanceId,
     /// The session the bytes belong to.
     pub session_id: SessionId,
     /// The controller lease that owns the subscription.
     pub attach_id: AttachId,
     /// The fenced worker generation.
     pub generation: u64,
+    /// The session's `state_revision` when the frame was taken.
+    pub revision: u64,
     /// Per-subscription frame sequence, starting at zero.
     pub sequence: u64,
     /// Raw terminal bytes, never interpreted by the daemon.
     pub data: Vec<u8>,
     /// Bytes still buffered after this frame was taken.
     pub buffered_bytes: usize,
+}
+
+impl fmt::Debug for ContentFrame {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ContentFrame")
+            .field("instance_id", &self.instance_id)
+            .field("session_id", &self.session_id)
+            .field("attach_id", &self.attach_id)
+            .field("generation", &self.generation)
+            .field("revision", &self.revision)
+            .field("sequence", &self.sequence)
+            .field("data_bytes", &self.data.len())
+            .field("buffered_bytes", &self.buffered_bytes)
+            .finish()
+    }
 }
 
 /// Why a hex-encoded content field was refused.

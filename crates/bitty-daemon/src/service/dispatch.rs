@@ -512,6 +512,18 @@ struct ContentSubscription {
     sequence: u64,
 }
 
+/// Which liveness-checked host entry point a content request uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentAccess {
+    /// A read-only content operation (`session.read`, `session.subscribe`):
+    /// a live lease of either role passes the host check, and the controller
+    /// relation below still decides whether the lease may receive content.
+    Read,
+    /// A controller-only content operation (`session.write`): the host refuses
+    /// an observer lease with `ControllerRequired`.
+    Control,
+}
+
 impl Service {
     /// Build the service over one daemon lifetime.
     ///
@@ -871,9 +883,11 @@ impl Service {
                 continue;
             }
             frame = Some(ContentFrame {
+                instance_id: self.instance_id(),
                 session_id: subscription.session_id,
                 attach_id: *attach_id,
                 generation: subscription.generation,
+                revision: snapshot.state_revision,
                 sequence: subscription.sequence,
                 data: read.data,
                 buffered_bytes: read.buffered_bytes,
@@ -3380,18 +3394,27 @@ impl Service {
         Ok(json!({"session": self.session_json(&resized, now)}))
     }
 
-    /// Resolve a content request's session, generation, and controller lease.
+    /// Resolve a content request's session, generation, controller lease, and
+    /// live content plane.
     ///
     /// A terminal is the only content-plane owner; a worker is a service
     /// process. Content is controller-only in this slice: an observer lease,
     /// even with `terminal.inspect`, is refused `Denied/ControllerRequired`, so
     /// observation never becomes a content grant. A terminal record is
     /// read-only after exit and serves no content at all.
+    ///
+    /// The lease is validated through the host's liveness-checked entry points
+    /// rather than a second copy of the expiry rule, and the worker pool must
+    /// report a live content plane. A registry-only terminal and a worker whose
+    /// leader exited before the poll tick recorded the terminal transition both
+    /// answer `Denied/NotRunning`, so `session.subscribe` cannot claim a
+    /// subscription that can never deliver a frame.
     fn content_target(
         &self,
         connection: &Connection,
         session_id: SessionId,
         generation: u64,
+        access: ContentAccess,
         now: MonotonicMs,
     ) -> Result<(SessionSnapshot, AttachId), Refusal> {
         let snapshot = self.visible(connection, session_id, None, now)?;
@@ -3415,6 +3438,14 @@ impl Service {
         let Some(attach) = attach else {
             return Err(Refusal::denied(RefusalCode::ControllerRequired));
         };
+        match access {
+            ContentAccess::Read => self.host.authorize_content_read(attach, now),
+            ContentAccess::Control => self.host.authorize_controller(attach, now),
+        }
+        .map_err(map_lease)?;
+        if !self.workers.content_ready(session_id) {
+            return Err(Refusal::denied(RefusalCode::NotRunning));
+        }
         Ok((snapshot, attach))
     }
 
@@ -3439,7 +3470,8 @@ impl Service {
                 requested,
             ));
         }
-        let (snapshot, _attach) = self.content_target(connection, session_id, generation, now)?;
+        let (snapshot, _attach) =
+            self.content_target(connection, session_id, generation, ContentAccess::Read, now)?;
         self.recheck(connection, DispatchBoundary::ContentPlane)?;
         let Some(read) = self.workers.read(session_id, max_bytes) else {
             return Err(Refusal::denied(RefusalCode::NotRunning));
@@ -3480,7 +3512,13 @@ impl Service {
         if data.is_empty() {
             return Err(Refusal::invalid_request());
         }
-        let (snapshot, _attach) = self.content_target(connection, session_id, generation, now)?;
+        let (snapshot, _attach) = self.content_target(
+            connection,
+            session_id,
+            generation,
+            ContentAccess::Control,
+            now,
+        )?;
         self.recheck(connection, DispatchBoundary::ContentPlane)?;
         self.admit()?;
         match self.workers.write(session_id, &data) {
@@ -3517,7 +3555,8 @@ impl Service {
         // Authority first: an observer is refused for control even when its
         // connection did not opt into the event wire. A controller without the
         // opt-in then gets the typed capability refusal.
-        let (snapshot, attach) = self.content_target(connection, session_id, generation, now)?;
+        let (snapshot, attach) =
+            self.content_target(connection, session_id, generation, ContentAccess::Read, now)?;
         if !connection.events_enabled() {
             return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
         }
@@ -4431,6 +4470,51 @@ mod tests {
         )
     }
 
+    /// A connection with an explicit transport-scope set.
+    fn connection_with_transport(
+        scopes: ServiceScopeSet,
+        transport: &[TransportScope],
+    ) -> Connection {
+        let mut effective = EffectiveScopes {
+            service: scopes,
+            transport: ScopeSet::new(),
+        };
+        for scope in transport {
+            effective.transport.insert(*scope);
+        }
+        Connection::new(
+            ClientId::generate().expect("entropy"),
+            PeerGuard::for_current_process(),
+            effective,
+        )
+    }
+
+    /// A consumer connection with every terminal transport grant.
+    fn content_consumer() -> Connection {
+        connection_with_transport(
+            ServiceScopeSet::baseline(),
+            &[
+                TransportScope::ProcessSpawn,
+                TransportScope::TerminalManage,
+                TransportScope::TerminalInspect,
+                TransportScope::TerminalInput,
+            ],
+        )
+    }
+
+    /// An operator connection with every terminal transport grant.
+    fn content_operator() -> Connection {
+        connection_with_transport(
+            ServiceScopeSet::all(),
+            &[
+                TransportScope::ProcessSpawn,
+                TransportScope::TerminalManage,
+                TransportScope::TerminalInspect,
+                TransportScope::TerminalInput,
+            ],
+        )
+    }
+
     fn consumer() -> Connection {
         connection(ServiceScopeSet::baseline(), true)
     }
@@ -4528,6 +4612,17 @@ mod tests {
         connection: &mut Connection,
         key: &str,
     ) -> Value {
+        create_spawned_session_with(service, connection, key, json!(["/bin/cat"]))
+    }
+
+    /// Create one terminal through the served `session.create` path with an
+    /// explicit argv.
+    fn create_spawned_session_with(
+        service: &mut Service,
+        connection: &mut Connection,
+        key: &str,
+        argv: Value,
+    ) -> Value {
         service
             .dispatch(
                 connection,
@@ -4535,7 +4630,7 @@ mod tests {
                 &json!({
                     "kind": "terminal",
                     "idempotency_key": key,
-                    "argv": ["/bin/cat"],
+                    "argv": argv,
                     "cwd": "/",
                 }),
                 MonotonicMs::from_millis(10),
@@ -4592,6 +4687,44 @@ mod tests {
             )
             .expect("claim");
         (creator, id, claimed)
+    }
+
+    /// Create a spawned terminal through the served wire path and claim its
+    /// controller lease.
+    fn spawned_controller_session(
+        service: &mut Service,
+        operator: &mut Connection,
+        label: &str,
+        argv: Value,
+        events: bool,
+    ) -> (Connection, String, String) {
+        let grant = mint_host_grant(service, operator, 2);
+        let mut creator = content_consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"))
+            .with_events(events);
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        let created = create_spawned_session_with(service, &mut creator, label, argv);
+        let id = session_id(&created);
+        let token = created["control_token"].as_str().expect("token").to_owned();
+        let claimed = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": id,
+                    "expected_generation": 1,
+                    "control_token": token,
+                    "idempotency_key": format!("{label}-claim"),
+                }),
+                MonotonicMs::from_millis(11),
+            )
+            .expect("claim");
+        let attach = claimed["attach_id"].as_str().expect("attach id").to_owned();
+        (creator, id, attach)
     }
 
     #[test]
@@ -7332,5 +7465,428 @@ mod tests {
             !service.pending_frames.contains_key(&observer_attach),
             "a closed connection drops its pending final frames"
         );
+    }
+
+    fn content_request(method: ServiceMethod, session_id: &str, generation: u64) -> Value {
+        let mut params = json!({"session_id": session_id, "generation": generation});
+        if method == ServiceMethod::SessionWrite {
+            params["data"] = json!("00");
+        }
+        params
+    }
+
+    #[test]
+    fn content_authority_requires_a_controller_lease_and_the_terminal_scopes() {
+        let (mut service, _dir) = spawn_service();
+        let mut operator = content_operator();
+        negotiate_ok(&mut service, &mut operator, 1);
+        let (mut creator, id, _attach) = spawned_controller_session(
+            &mut service,
+            &mut operator,
+            "content-authority",
+            json!(["/bin/cat"]),
+            false,
+        );
+
+        // No lease and no operator view: every content method is the uniform
+        // NotFound, never a controller or revision oracle.
+        let mut stranger = content_consumer();
+        negotiate_ok(&mut service, &mut stranger, 20);
+        for method in [
+            ServiceMethod::SessionRead,
+            ServiceMethod::SessionWrite,
+            ServiceMethod::SessionSubscribe,
+        ] {
+            let error = service
+                .dispatch(
+                    &mut stranger,
+                    method,
+                    &content_request(method, &id, 1),
+                    MonotonicMs::from_millis(21),
+                )
+                .expect_err("unleased content");
+            assert!(
+                matches!(error.kind(), RefusalKind::NotFound),
+                "{method:?}: {error:?}"
+            );
+        }
+
+        // The operator view makes the session visible but grants no control.
+        for method in [
+            ServiceMethod::SessionRead,
+            ServiceMethod::SessionWrite,
+            ServiceMethod::SessionSubscribe,
+        ] {
+            let error = service
+                .dispatch(
+                    &mut operator,
+                    method,
+                    &content_request(method, &id, 1),
+                    MonotonicMs::from_millis(22),
+                )
+                .expect_err("operator without a lease");
+            assert_eq!(
+                error.denied_code(),
+                Some(RefusalCode::ControllerRequired),
+                "{method:?}"
+            );
+        }
+
+        // An observer lease never becomes a content grant.
+        let minted = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": id, "idempotency_key": "content-authority-grant"}),
+                MonotonicMs::from_millis(23),
+            )
+            .expect("grant");
+        let observer_grant = minted["grant"].as_str().expect("grant").to_owned();
+        let mut observer = content_consumer();
+        negotiate_ok(&mut service, &mut observer, 24);
+        service
+            .dispatch(
+                &mut observer,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "observer",
+                    "session_id": id,
+                    "observer_grant": observer_grant,
+                }),
+                MonotonicMs::from_millis(25),
+            )
+            .expect("observer attach");
+        for method in [
+            ServiceMethod::SessionRead,
+            ServiceMethod::SessionWrite,
+            ServiceMethod::SessionSubscribe,
+        ] {
+            let error = service
+                .dispatch(
+                    &mut observer,
+                    method,
+                    &content_request(method, &id, 1),
+                    MonotonicMs::from_millis(26),
+                )
+                .expect_err("observer content");
+            assert_eq!(
+                error.denied_code(),
+                Some(RefusalCode::ControllerRequired),
+                "{method:?}"
+            );
+        }
+
+        // A controller lease without the terminal transport grants is still a
+        // ScopeViolation: the lease never substitutes for the scope.
+        let grant = mint_host_grant(&mut service, &mut operator, 27);
+        let mut unscoped = connection(ServiceScopeSet::baseline(), true);
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(
+                &mut unscoped,
+                &request,
+                facts(),
+                MonotonicMs::from_millis(28),
+            )
+            .expect("negotiate");
+        let created = create_spawned_session_with(
+            &mut service,
+            &mut unscoped,
+            "content-unscoped",
+            json!(["/bin/cat"]),
+        );
+        let unscoped_id = session_id(&created);
+        let token = created["control_token"].as_str().expect("token").to_owned();
+        service
+            .dispatch(
+                &mut unscoped,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": unscoped_id,
+                    "expected_generation": 1,
+                    "control_token": token,
+                    "idempotency_key": "content-unscoped-claim",
+                }),
+                MonotonicMs::from_millis(29),
+            )
+            .expect("claim");
+        for method in [
+            ServiceMethod::SessionRead,
+            ServiceMethod::SessionWrite,
+            ServiceMethod::SessionSubscribe,
+        ] {
+            let error = service
+                .dispatch(
+                    &mut unscoped,
+                    method,
+                    &content_request(method, &unscoped_id, 1),
+                    MonotonicMs::from_millis(30),
+                )
+                .expect_err("missing terminal scope");
+            assert_eq!(
+                error.denied_code(),
+                Some(RefusalCode::ScopeViolation),
+                "{method:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_parent_failures_are_isolated() {
+        let (mut service, _dir) = spawn_service();
+        let mut operator = content_operator();
+        negotiate_ok(&mut service, &mut operator, 1);
+        let (mut creator, id, _attach) = spawned_controller_session(
+            &mut service,
+            &mut operator,
+            "content-parent",
+            json!(["/bin/cat"]),
+            false,
+        );
+
+        // Generation is a hard fence before the content plane.
+        let stale = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionRead,
+                &content_request(ServiceMethod::SessionRead, &id, 0),
+                MonotonicMs::from_millis(20),
+            )
+            .expect_err("stale generation");
+        assert_eq!(stale.denied_code(), Some(RefusalCode::StaleGeneration));
+
+        // The event opt-in is checked after authority and before the
+        // subscription is recorded.
+        let no_opt_in = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionSubscribe,
+                &content_request(ServiceMethod::SessionSubscribe, &id, 1),
+                MonotonicMs::from_millis(21),
+            )
+            .expect_err("no event opt-in");
+        assert_eq!(
+            no_opt_in.denied_code(),
+            Some(RefusalCode::UnsupportedCapability)
+        );
+
+        // A registry-only terminal has no live worker: authority passes, the
+        // content plane does not.
+        let registry_only = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionCreate,
+                &json!({"kind": "terminal", "idempotency_key": "content-registry-only"}),
+                MonotonicMs::from_millis(22),
+            )
+            .expect("registry-only create");
+        let registry_id = session_id(&registry_only);
+        let token = registry_only["control_token"]
+            .as_str()
+            .expect("token")
+            .to_owned();
+        service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": registry_id,
+                    "expected_generation": 0,
+                    "control_token": token,
+                    "idempotency_key": "content-registry-only-claim",
+                }),
+                MonotonicMs::from_millis(23),
+            )
+            .expect("registry-only claim");
+        for method in [
+            ServiceMethod::SessionRead,
+            ServiceMethod::SessionWrite,
+            ServiceMethod::SessionSubscribe,
+        ] {
+            let error = service
+                .dispatch(
+                    &mut creator,
+                    method,
+                    &content_request(method, &registry_id, 0),
+                    MonotonicMs::from_millis(24),
+                )
+                .expect_err("registry-only content");
+            assert_eq!(
+                error.denied_code(),
+                Some(RefusalCode::NotRunning),
+                "{method:?}"
+            );
+        }
+
+        // A worker that died between ticks is refused before the terminal
+        // transition, even though the registry still reports `running`.
+        let (mut dying, dying_id, _) = spawned_controller_session(
+            &mut service,
+            &mut operator,
+            "content-dying",
+            json!(["/bin/sh", "-c", "exit 0"]),
+            false,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while service
+            .workers
+            .content_ready(SessionId::parse(&dying_id).expect("session id"))
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the dying worker was never observed as exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let still_running = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": dying_id}),
+                MonotonicMs::from_millis(25),
+            )
+            .expect("status");
+        assert_eq!(still_running["session"]["state"], "running");
+        let error = service
+            .dispatch(
+                &mut dying,
+                ServiceMethod::SessionSubscribe,
+                &content_request(ServiceMethod::SessionSubscribe, &dying_id, 1),
+                MonotonicMs::from_millis(26),
+            )
+            .expect_err("dead-before-transition subscribe");
+        assert_eq!(error.denied_code(), Some(RefusalCode::NotRunning));
+    }
+
+    #[test]
+    fn content_bounds_refuse_before_touching_the_plane() {
+        let (mut service, _dir) = spawn_service();
+        let mut operator = content_operator();
+        negotiate_ok(&mut service, &mut operator, 1);
+        let (mut creator, id, _attach) = spawned_controller_session(
+            &mut service,
+            &mut operator,
+            "content-bounds",
+            json!(["/bin/cat"]),
+            false,
+        );
+
+        let zero = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionRead,
+                &json!({"session_id": id, "generation": 1, "max_bytes": 0}),
+                MonotonicMs::from_millis(20),
+            )
+            .expect_err("zero max_bytes");
+        assert_eq!(zero.kind(), RefusalKind::InvalidRequest);
+
+        let over = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionRead,
+                &json!({
+                    "session_id": id,
+                    "generation": 1,
+                    "max_bytes": u64::try_from(CONTENT_FRAME_BYTES + 1).unwrap_or(u64::MAX),
+                }),
+                MonotonicMs::from_millis(21),
+            )
+            .expect_err("over max_bytes");
+        assert!(
+            matches!(
+                over.kind(),
+                RefusalKind::LimitExceeded { limit, actual }
+                    if limit == CONTENT_FRAME_BYTES as u64
+                        && actual == (CONTENT_FRAME_BYTES + 1) as u64
+            ),
+            "{over:?}"
+        );
+
+        // The hex bound is checked before the decoded vector is allocated, so
+        // an oversized write never reaches the PTY or the worker pool.
+        let oversized = "00".repeat(CONTENT_FRAME_BYTES + 1);
+        let refused = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionWrite,
+                &json!({"session_id": id, "generation": 1, "data": oversized}),
+                MonotonicMs::from_millis(22),
+            )
+            .expect_err("oversized write");
+        assert!(
+            matches!(
+                refused.kind(),
+                RefusalKind::LimitExceeded { limit, actual }
+                    if limit == CONTENT_FRAME_BYTES as u64
+                        && actual == (CONTENT_FRAME_BYTES + 1) as u64
+            ),
+            "{refused:?}"
+        );
+
+        // The plane is untouched and still serves a bounded read.
+        let live = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionRead,
+                &content_request(ServiceMethod::SessionRead, &id, 1),
+                MonotonicMs::from_millis(23),
+            )
+            .expect("live read");
+        assert_eq!(live["bytes"], 0);
+    }
+
+    #[test]
+    fn a_controller_of_one_session_cannot_reach_another() {
+        let (mut service, _dir) = spawn_service();
+        let mut operator = content_operator();
+        negotiate_ok(&mut service, &mut operator, 1);
+        let (mut first, first_id, _) = spawned_controller_session(
+            &mut service,
+            &mut operator,
+            "content-isolation-a",
+            json!(["/bin/cat"]),
+            false,
+        );
+        let (_second, second_id, _) = spawned_controller_session(
+            &mut service,
+            &mut operator,
+            "content-isolation-b",
+            json!(["/bin/cat"]),
+            false,
+        );
+
+        for method in [
+            ServiceMethod::SessionRead,
+            ServiceMethod::SessionWrite,
+            ServiceMethod::SessionSubscribe,
+        ] {
+            let error = service
+                .dispatch(
+                    &mut first,
+                    method,
+                    &content_request(method, &second_id, 1),
+                    MonotonicMs::from_millis(30),
+                )
+                .expect_err("foreign session");
+            assert!(
+                matches!(error.kind(), RefusalKind::NotFound),
+                "{method:?}: {error:?}"
+            );
+        }
+
+        // The first controller still reaches its own session.
+        let own = service
+            .dispatch(
+                &mut first,
+                ServiceMethod::SessionRead,
+                &content_request(ServiceMethod::SessionRead, &first_id, 1),
+                MonotonicMs::from_millis(31),
+            )
+            .expect("own session");
+        assert_eq!(own["session_id"], first_id);
     }
 }

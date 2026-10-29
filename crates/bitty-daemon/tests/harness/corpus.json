@@ -9783,6 +9783,19 @@
             "error_class": "Denied",
             "error_code": "NotRunning"
           }
+        },
+        {
+          "connection": "creator",
+          "method": "session.subscribe",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "NotRunning"
+          }
         }
       ],
       "state": [
@@ -9804,6 +9817,7 @@
       ],
       "forbidden": [
         "a registry-only terminal owns a PTY or content plane",
+        "a registry-only terminal cannot start a subscription",
         "the compatibility path skips consent or the create-key store",
         "a content method invents a generation for an unbound terminal"
       ]

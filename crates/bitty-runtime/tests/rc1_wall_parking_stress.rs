@@ -11,12 +11,13 @@
 //! Two properties are pinned here:
 //!
 //! - [`forced_park_settles_on_the_documented_cold_tick`] (always run) injects
-//!   a deterministic slow tick: eight host calls that each charge 10 ms of
-//!   wall time, far past the production 50 ms slice and far below the 5250 ms
-//!   callback ceiling. The shared `settle_dispatch` helper must complete the
-//!   body exactly once on the documented resume signal. The pre-bitty#2781
-//!   probes dispatched once and treated `Parked` as a failure, so this test
-//!   fails deterministically under the old timing.
+//!   a deterministic slow tick: `FORCED_PARK_TICKS` host calls that each
+//!   charge `FORCED_PARK_TICK_MS` of wall time — twice the production 50 ms
+//!   slice in total and far below the 5250 ms callback ceiling. The shared
+//!   `settle_dispatch` helper must complete the body exactly once on the
+//!   documented resume signal. The pre-bitty#2781 probes dispatched once and
+//!   treated `Parked` as a failure, so this test fails deterministically under
+//!   the old timing.
 //! - [`load_harness_raw_dispatch_fails_on_any_park`] and
 //!   [`load_harness_settled_dispatch_survives_the_load`] (`#[ignore]`, driven
 //!   by `scripts/rc1-parking-stress.sh`) run the cheapest realistic probe from
@@ -39,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use bitty_config::ResolvedKeymap;
 use bitty_lua::keymaps::KEYMAP_LIST_CALLS_PER_SECOND;
-use bitty_lua::{BridgeError, LuaValue};
+use bitty_lua::{BridgeError, LuaValue, RC1_WALL_CLOCK_BUDGET_MS};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
     EmptySettings, KeymapSource, PluginRuntime, PluginRuntimeConfig, SnapshotSource,
@@ -56,6 +57,22 @@ const DEFAULT_WORKERS: usize = 4;
 
 /// Iterations per worker. Enough for a stable rate without a long campaign.
 const DEFAULT_ITERATIONS: usize = 50;
+
+/// Wall time one forced-park host call charges.
+///
+/// A fifth of the production RC-1 slice keeps each call far inside the 50 ms
+/// host-call deadline, so the command crosses the slice over several calls
+/// instead of one oversized one.
+const FORCED_PARK_TICK_MS: u64 = RC1_WALL_CLOCK_BUDGET_MS / 5;
+
+/// Charged host time the forced-park command spends: twice the production
+/// slice, so the park is guaranteed on any runner, loaded or idle, and still
+/// far below the 5250 ms callback ceiling.
+const FORCED_PARK_CHARGE_MS: u64 = 2 * RC1_WALL_CLOCK_BUDGET_MS;
+
+/// Host calls the forced-park command makes, derived so the command charges
+/// exactly `FORCED_PARK_CHARGE_MS`.
+const FORCED_PARK_TICKS: u64 = FORCED_PARK_CHARGE_MS / FORCED_PARK_TICK_MS;
 
 fn temp_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -83,12 +100,13 @@ impl KeymapSource for FixedKeymaps {
     }
 }
 
-/// Host snapshot charged 10 ms of real wall time per call (slow-tick seam).
+/// Host snapshot charged `FORCED_PARK_TICK_MS` of real wall time per call
+/// (slow-tick seam).
 struct SlowSnapshot;
 
 impl SnapshotSource for SlowSnapshot {
     fn snapshot(&self, _scope: &str) -> Result<LuaValue, BridgeError> {
-        std::thread::sleep(Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(FORCED_PARK_TICK_MS));
         Ok(LuaValue::table([("version", LuaValue::Integer(1))]))
     }
 }
@@ -101,7 +119,7 @@ bitty.commands.register({ id = "list", title = "List", run = function()
   return "total:" .. page.total .. ":entries:" .. #page.entries
 end })
 bitty.commands.register({ id = "slow", title = "Slow", run = function()
-  for _ = 1, 8 do
+  for _ = 1, @FORCED_PARK_TICKS@ do
     pcall(bitty.terminal.snapshot, { scope = "semantic" })
   end
   runs = runs + 1
@@ -111,6 +129,14 @@ bitty.commands.register({ id = "runs", title = "Runs", run = function()
   return tostring(runs)
 end })
 "#;
+
+/// `INIT_SRC` with the derived forced-park loop bound substituted in.
+///
+/// The Lua body cannot read Rust constants, so the host-call count is a
+/// placeholder replaced from `FORCED_PARK_TICKS` rather than a literal.
+fn init_src() -> String {
+    INIT_SRC.replace("@FORCED_PARK_TICKS@", &FORCED_PARK_TICKS.to_string())
+}
 
 fn write_plugin(root: &Path) {
     let plugin = root.join(PROBE_ID);
@@ -138,7 +164,7 @@ events = []
         ),
     )
     .expect("manifest");
-    std::fs::write(plugin.join("lua/init.lua"), INIT_SRC).expect("init");
+    std::fs::write(plugin.join("lua/init.lua"), init_src()).expect("init");
 }
 
 /// One isolated runtime over a fresh plugin package.
@@ -200,9 +226,10 @@ impl Drop for World {
 /// Deterministic regression: an injected slow tick parks the callback, and
 /// the documented cold-tick resume completes the body exactly once.
 ///
-/// The 80 ms of charged host time is 1.6x the production 50 ms slice and
-/// 1/65 of the 5250 ms callback ceiling, so the park is guaranteed on any
-/// runner, loaded or idle, without widening or shrinking any budget.
+/// The charged host time is `FORCED_PARK_TICKS` x `FORCED_PARK_TICK_MS` —
+/// twice the production 50 ms slice and a fraction of the 5250 ms callback
+/// ceiling — so the park is guaranteed on any runner, loaded or idle, without
+/// widening or shrinking any budget.
 #[test]
 fn forced_park_settles_on_the_documented_cold_tick() {
     let mut world = World::activate("forced-park", false, false);
@@ -211,7 +238,9 @@ fn forced_park_settles_on_the_documented_cold_tick() {
     let resume_ticks = first.resume_ticks;
     assert!(
         parked,
-        "80 ms of charged host time must park at the 50 ms RC-1 slice"
+        "{} ms of charged host time ({}x the {RC1_WALL_CLOCK_BUDGET_MS} ms RC-1 slice) must park",
+        FORCED_PARK_CHARGE_MS,
+        FORCED_PARK_CHARGE_MS / RC1_WALL_CLOCK_BUDGET_MS,
     );
     assert_eq!(
         first.expect_string("slow"),

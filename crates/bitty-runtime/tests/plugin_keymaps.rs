@@ -360,8 +360,10 @@ fn per_generation_budget_stops_a_call_flood() {
     let (mut rt, source) = probe_runtime(&["runtime.keymaps.read"]);
     // Two-row pages keep each dispatch tiny, and the 20 calls are split
     // across 20 separate dispatches: every call is its own VM slice, so the
-    // probe never approaches the production 50 ms RC-1 wall. The host call
-    // budget is per generation, so it still spans all dispatches.
+    // probe never approaches the 5250 ms harness wall it runs with
+    // (`common::HARNESS_VM_WALL_BUDGET_MS`, the callback envelope), not the
+    // production 50 ms RC-1 slice. The host call budget is per generation, so
+    // it still spans all dispatches.
     *source.0.borrow_mut() = vec![
         ResolvedKeymap {
             chord: Chord::parse("alt+h").expect("chord"),

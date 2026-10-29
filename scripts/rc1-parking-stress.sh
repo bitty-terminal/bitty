@@ -5,11 +5,19 @@
 # the duration and prints the measured parking rate plus the clean/parked
 # wall-time distributions.
 #
-# Two modes run back to back:
-#   raw      - production budgets, one dispatch: fails on any park or host-call
-#              timeout (the pre-bitty#2781 probe behaviour);
+# Contract (bitty#2797): the two probe modes are separate nextest invocations
+# with opposite expectations, because nextest runs whatever a filter selects
+# concurrently and the raw probe is supposed to fail:
+#   raw      - production budgets, one dispatch: expected failure. The
+#              pre-bitty#2781 probe behaviour is to park (or hit a host-call
+#              timeout) under the load, so the run must exit non-zero *and*
+#              report a park; the script asserts that and keeps going instead
+#              of letting the non-zero status abort it;
 #   settled  - documented cold-tick resume plus the harness host-call deadline:
 #              must pass under the same load (the fix).
+# The script exits 0 only when the raw probe failed with a park AND the settled
+# probe passed. A raw pass, a raw failure without a park, or a settled failure
+# is a contract violation and exits non-zero.
 #
 # It then replays the capability-suite command shapes from bitty#2800 through
 # `rc1_suite_parking_stress`, and finally runs the real runtime suites named in
@@ -88,10 +96,39 @@ done
 echo "rc1-parking-stress: cpus=${RC1_STRESS_CPUS:-all} quota=${RC1_STRESS_CPU_QUOTA:-none} burners=$burners workers=$workers iterations=$iterations"
 
 cd "$repo_root"
-"${scope[@]}" "${pin[@]}" env \
+
+# Contract 1 (bitty#2797): the raw probe is the reproduction, so it must fail
+# with a park. Capture the status and output, assert both, and never let the
+# expected non-zero status abort the script.
+set +e
+raw_output=$("${scope[@]}" "${pin[@]}" env \
   RC1_STRESS_WORKERS="$workers" RC1_STRESS_ITERATIONS="$iterations" \
   cargo nextest run -p bitty-runtime --test rc1_wall_parking_stress \
-  --run-ignored only -E 'test(load_harness_)' --nocapture
+  --run-ignored only -E 'test(=load_harness_raw_dispatch_fails_on_any_park)' \
+  --nocapture 2>&1)
+raw_status=$?
+set -e
+printf '%s\n' "$raw_output"
+
+if [[ "$raw_status" -eq 0 ]]; then
+  echo "rc1-parking-stress: contract violation: raw probe passed; it must fail on a park" >&2
+  exit 1
+fi
+if [[ "$raw_output" != *"Parked at the RC-1 wall budget"* ]]; then
+  echo "rc1-parking-stress: contract violation: raw probe failed (status $raw_status) without a park" >&2
+  exit 1
+fi
+echo "rc1-parking-stress: raw probe failed with a park as designed (status $raw_status)"
+
+# Contract 2 (bitty#2797): the settled probe must pass under the same load.
+if ! "${scope[@]}" "${pin[@]}" env \
+  RC1_STRESS_WORKERS="$workers" RC1_STRESS_ITERATIONS="$iterations" \
+  cargo nextest run -p bitty-runtime --test rc1_wall_parking_stress \
+  --run-ignored only -E 'test(=load_harness_settled_dispatch_survives_the_load)' \
+  --nocapture; then
+  echo "rc1-parking-stress: contract violation: settled probe failed" >&2
+  exit 1
+fi
 
 "${scope[@]}" "${pin[@]}" env \
   RC1_SUITE_WORKERS="$suite_workers" RC1_SUITE_ITERATIONS="$suite_iterations" \

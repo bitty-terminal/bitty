@@ -709,7 +709,7 @@ pub(crate) fn discover_with_roots(
     let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode,
         data_dir,
-        store_root,
+        store_root: store_root.clone(),
         // No application-shipped bundle root exists in this slice; genuine
         // first-party catalogs arrive with the packaging follow-up.
         bundled_roots: Vec::new(),
@@ -754,12 +754,13 @@ pub(crate) fn discover_with_roots(
     // layers.
     if !safe_mode {
         if let (Some(target), Some(config_dir)) = (seed.config_file, settings_dir.as_deref()) {
-            if let Some(writer) = crate::profile::UserLayerConfigWriter::new(
+            if let Some(backend) = crate::config_manage::AppConfigManage::new(
                 config_dir.to_path_buf(),
                 target.to_path_buf(),
                 seed.config_profile.map(str::to_string),
+                store_root.clone(),
             ) {
-                runtime.set_config_write_backend(Some(Rc::new(writer)));
+                runtime.set_config_write_backend(Some(Rc::new(backend)));
             } else {
                 crate::logging::warn(|| {
                     "bitty: config.manage target is outside the user config root; writes disabled"

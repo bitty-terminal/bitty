@@ -849,6 +849,15 @@ pub fn load_plugin_settings_with_plugins(
     .0
 }
 
+/// Plain-config VM limits used by the production loader: the standard RC-1
+/// budgets with the plugin-file byte ceiling as the source cap.
+fn plugin_config_limits() -> PlainConfigLimits {
+    PlainConfigLimits {
+        source_bytes: bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES,
+        ..PlainConfigLimits::default()
+    }
+}
+
 /// Load settings and retain host diagnostics for the runtime observability
 /// path. This is intentionally crate-private: the public loader keeps the
 /// established [`LoadedPluginSettings`] layout source-compatible.
@@ -858,6 +867,26 @@ pub(crate) fn load_plugin_settings_with_plugins_and_diagnostics(
     declared: &[SettingDecl],
     base: Option<&dyn SettingsSource>,
     discovered_ids: Option<&[String]>,
+) -> (LoadedPluginSettings, Vec<PluginSettingsDiagnostic>) {
+    load_plugin_settings_with_plugins_and_diagnostics_and_limits(
+        config_dir,
+        plugin_id,
+        declared,
+        base,
+        discovered_ids,
+        plugin_config_limits(),
+    )
+}
+
+/// Testable loader core: production passes [`plugin_config_limits`], unit
+/// tests pass a budget that does not depend on host scheduling.
+fn load_plugin_settings_with_plugins_and_diagnostics_and_limits(
+    config_dir: Option<&Path>,
+    plugin_id: &str,
+    declared: &[SettingDecl],
+    base: Option<&dyn SettingsSource>,
+    discovered_ids: Option<&[String]>,
+    limits: PlainConfigLimits,
 ) -> (LoadedPluginSettings, Vec<PluginSettingsDiagnostic>) {
     let (paths, mut path_diagnostics) =
         match (config_dir, plugin_file::valid_plugin_file_id(plugin_id)) {
@@ -928,10 +957,6 @@ pub(crate) fn load_plugin_settings_with_plugins_and_diagnostics(
         None => (None, None),
     };
     if let Some(bytes) = lua_bytes {
-        let limits = PlainConfigLimits {
-            source_bytes: bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES,
-            ..PlainConfigLimits::default()
-        };
         let lua_result = ConfigLuaVm::with_limits(plugin_id, limits)
             .map_err(|error| error.to_string())
             .and_then(|mut vm| {
@@ -1011,8 +1036,100 @@ pub(crate) fn load_plugin_settings_with_plugins_and_diagnostics(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
     use bitty_plugin_host::manifest::{SettingDecl, SettingDefault, SettingKind};
+
+    /// Per-test temp root.
+    ///
+    /// `process::id()` alone is not enough: libtest runs tests as threads in
+    /// one process, and nextest can recycle a pid after an earlier process
+    /// left its root behind. The monotonic counter makes every root unique,
+    /// and the drop guard removes it even when an assertion panics.
+    struct TestRoot {
+        path: PathBuf,
+    }
+
+    impl TestRoot {
+        fn new(tag: &str) -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "bitty-plugin-settings-{tag}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        fn plugins(&self) -> PathBuf {
+            self.path.join("plugins")
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Wall budget for unit tests that assert resolution, not budget
+    /// enforcement.
+    ///
+    /// The production 50 ms RC-1 budget counts raw wall time, so a test
+    /// thread descheduled under CI load can trip it and fail closed to
+    /// defaults. A budget far beyond any plausible scheduler stall keeps the
+    /// precedence assertions deterministic while leaving the production
+    /// limit untouched.
+    const TEST_WALL_BUDGET_MS: u64 = 60_000;
+
+    fn test_limits() -> PlainConfigLimits {
+        PlainConfigLimits {
+            source_bytes: bitty_config::plugin_file::MAX_PLUGIN_FILE_BYTES,
+            wall_budget_ms: TEST_WALL_BUDGET_MS,
+            ..PlainConfigLimits::default()
+        }
+    }
+
+    fn load_with_plugins_for_test(
+        config_dir: Option<&Path>,
+        plugin_id: &str,
+        declared: &[SettingDecl],
+        base: Option<&dyn SettingsSource>,
+        discovered_ids: Option<&[String]>,
+    ) -> LoadedPluginSettings {
+        load_with_plugins_and_diagnostics_for_test(
+            config_dir,
+            plugin_id,
+            declared,
+            base,
+            discovered_ids,
+        )
+        .0
+    }
+
+    fn load_with_plugins_and_diagnostics_for_test(
+        config_dir: Option<&Path>,
+        plugin_id: &str,
+        declared: &[SettingDecl],
+        base: Option<&dyn SettingsSource>,
+        discovered_ids: Option<&[String]>,
+    ) -> (LoadedPluginSettings, Vec<PluginSettingsDiagnostic>) {
+        load_plugin_settings_with_plugins_and_diagnostics_and_limits(
+            config_dir,
+            plugin_id,
+            declared,
+            base,
+            discovered_ids,
+            test_limits(),
+        )
+    }
 
     /// Bar-fidelity declarations (mirrors the host-side contract test).
     fn bar_decls() -> Vec<SettingDecl> {
@@ -1235,24 +1352,16 @@ mod tests {
 
     #[test]
     fn selected_file_distinguishes_canonical_alias_and_legacy() {
-        let dir = std::env::temp_dir().join(format!(
-            "bitty-plugin-settings-selected-{}",
-            std::process::id()
-        ));
-        let plugins = dir.join("plugins");
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = TestRoot::new("selected");
+        let dir = root.path();
+        let plugins = root.plugins();
         std::fs::create_dir_all(&plugins).expect("temp dir");
         let ids = vec!["xuepoo.bar".to_string()];
 
         std::fs::write(plugins.join("xuepoo.bar.lua"), b"return { show = false }\n")
             .expect("canonical");
-        let loaded = load_plugin_settings_with_plugins(
-            Some(&dir),
-            "xuepoo.bar",
-            &bar_decls(),
-            None,
-            Some(&ids),
-        );
+        let loaded =
+            load_with_plugins_for_test(Some(dir), "xuepoo.bar", &bar_decls(), None, Some(&ids));
         assert_eq!(
             loaded.selected_file.as_ref().map(|file| file.kind),
             Some(PluginConfigKind::CanonicalLua)
@@ -1261,13 +1370,8 @@ mod tests {
 
         std::fs::remove_file(plugins.join("xuepoo.bar.lua")).expect("remove canonical");
         std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
-        let loaded = load_plugin_settings_with_plugins(
-            Some(&dir),
-            "xuepoo.bar",
-            &bar_decls(),
-            None,
-            Some(&ids),
-        );
+        let loaded =
+            load_with_plugins_for_test(Some(dir), "xuepoo.bar", &bar_decls(), None, Some(&ids));
         assert_eq!(
             loaded.selected_file.as_ref().map(|file| file.kind),
             Some(PluginConfigKind::AliasLua)
@@ -1275,13 +1379,8 @@ mod tests {
 
         std::fs::remove_file(plugins.join("bar.lua")).expect("remove alias");
         std::fs::write(plugins.join("xuepoo.bar.toml"), b"show = false\n").expect("legacy");
-        let loaded = load_plugin_settings_with_plugins(
-            Some(&dir),
-            "xuepoo.bar",
-            &bar_decls(),
-            None,
-            Some(&ids),
-        );
+        let loaded =
+            load_with_plugins_for_test(Some(dir), "xuepoo.bar", &bar_decls(), None, Some(&ids));
         assert_eq!(
             loaded.selected_file.as_ref().map(|file| file.kind),
             Some(PluginConfigKind::LegacyToml)
@@ -1289,24 +1388,18 @@ mod tests {
         assert_eq!(loaded.layers.get("show"), Some(&SettingLayer::UserFile));
 
         std::fs::remove_file(plugins.join("xuepoo.bar.toml")).expect("remove legacy");
-        let loaded = load_plugin_settings_with_plugins(
-            Some(&dir),
-            "xuepoo.bar",
-            &bar_decls(),
-            None,
-            Some(&ids),
-        );
+        let loaded =
+            load_with_plugins_for_test(Some(dir), "xuepoo.bar", &bar_decls(), None, Some(&ids));
         assert!(loaded.selected_file.is_none());
         assert_eq!(
             loaded.layers.get("show"),
             Some(&SettingLayer::ManifestDefault)
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn config_paths_fail_closed_for_unsafe_ids_and_alias_collisions() {
-        let dir = Path::new("/tmp/config");
+        let dir = Path::new("config");
         assert!(plugin_config_paths(dir, "../escape", None).is_none());
         let paths = plugin_config_paths(dir, "xuepoo.bar", Some(&["other.bar".to_string()]))
             .expect("valid id");
@@ -1323,31 +1416,25 @@ mod tests {
 
     #[test]
     fn malformed_file_falls_back_wholesale_with_diagnostic() {
-        let dir =
-            std::env::temp_dir().join(format!("bitty-plugin-settings-{}", std::process::id()));
-        let plugins = dir.join("plugins");
+        let root = TestRoot::new("malformed");
+        let plugins = root.plugins();
         std::fs::create_dir_all(&plugins).expect("temp dir");
         std::fs::write(
             plugins.join("xuepoo.broken.toml"),
             b"[capabilities]\nui.rich = true\n",
         )
         .expect("fixture");
-        let loaded = load_plugin_settings(Some(&dir), "xuepoo.broken", &bar_decls(), None);
+        let loaded = load_plugin_settings(Some(root.path()), "xuepoo.broken", &bar_decls(), None);
         // Every key serves the shipped default; the failure is recorded.
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
         assert!(loaded.file_error.is_some());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_reads_file_absent_is_not_an_error() {
-        let dir = std::env::temp_dir().join(format!(
-            "bitty-plugin-settings-absent-{}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let loaded = load_plugin_settings(Some(&dir), "xuepoo.gone", &bar_decls(), None);
+        let root = TestRoot::new("absent");
+        std::fs::create_dir_all(root.path()).expect("temp dir");
+        let loaded = load_plugin_settings(Some(root.path()), "xuepoo.gone", &bar_decls(), None);
         assert_eq!(
             loaded.source.get("edge"),
             Some(LuaValue::String("bottom".to_string()))
@@ -1358,38 +1445,33 @@ mod tests {
         let loaded = load_plugin_settings(None, "xuepoo.gone", &bar_decls(), None);
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
         assert!(loaded.file_error.is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_applies_well_formed_file() {
-        let dir =
-            std::env::temp_dir().join(format!("bitty-plugin-settings-good-{}", std::process::id()));
-        let plugins = dir.join("plugins");
+        let root = TestRoot::new("good");
+        let plugins = root.plugins();
         std::fs::create_dir_all(&plugins).expect("temp dir");
         std::fs::write(
             plugins.join("bitty-terminal.bar.toml"),
             b"show = false\nmodules = [\"clock\"]\n",
         )
         .expect("fixture");
-        let loaded = load_plugin_settings(Some(&dir), "bitty-terminal.bar", &bar_decls(), None);
+        let loaded =
+            load_plugin_settings(Some(root.path()), "bitty-terminal.bar", &bar_decls(), None);
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(false)));
         assert_eq!(
             loaded.source.get("modules"),
             Some(LuaValue::array(vec![LuaValue::String("clock".to_string())]))
         );
         assert!(loaded.file_error.is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn lua_canonical_wins_over_toml_and_alias() {
-        let dir = std::env::temp_dir().join(format!(
-            "bitty-plugin-settings-lua-precedence-{}",
-            std::process::id()
-        ));
-        let plugins = dir.join("plugins");
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = TestRoot::new("lua-precedence");
+        let dir = root.path();
+        let plugins = root.plugins();
         std::fs::create_dir_all(&plugins).expect("temp dir");
         std::fs::write(plugins.join("xuepoo.bar.toml"), b"show = true\n").expect("toml");
         std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
@@ -1399,8 +1481,8 @@ mod tests {
         )
         .expect("canonical");
         let ids = vec!["xuepoo.bar".to_string()];
-        let (loaded, diagnostics) = load_plugin_settings_with_plugins_and_diagnostics(
-            Some(&dir),
+        let (loaded, diagnostics) = load_with_plugins_and_diagnostics_for_test(
+            Some(dir),
             "xuepoo.bar",
             &bar_decls(),
             None,
@@ -1409,7 +1491,9 @@ mod tests {
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
         assert_eq!(
             loaded.source.get("edge"),
-            Some(LuaValue::String("top".to_string()))
+            Some(LuaValue::String("top".to_string())),
+            "file_error={:?}",
+            loaded.file_error
         );
         assert!(loaded.file_error.is_none());
         assert_eq!(
@@ -1418,31 +1502,22 @@ mod tests {
                 alias: "bar".to_string()
             }]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn unique_alias_applies_and_collisions_disable_it() {
-        let dir = std::env::temp_dir().join(format!(
-            "bitty-plugin-settings-lua-alias-{}",
-            std::process::id()
-        ));
-        let plugins = dir.join("plugins");
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = TestRoot::new("lua-alias");
+        let dir = root.path();
+        let plugins = root.plugins();
         std::fs::create_dir_all(&plugins).expect("temp dir");
         std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
         let unique = vec!["xuepoo.bar".to_string()];
-        let loaded = load_plugin_settings_with_plugins(
-            Some(&dir),
-            "xuepoo.bar",
-            &bar_decls(),
-            None,
-            Some(&unique),
-        );
+        let loaded =
+            load_with_plugins_for_test(Some(dir), "xuepoo.bar", &bar_decls(), None, Some(&unique));
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(false)));
         let collision = vec!["xuepoo.bar".to_string(), "other.bar".to_string()];
-        let (loaded, diagnostics) = load_plugin_settings_with_plugins_and_diagnostics(
-            Some(&dir),
+        let (loaded, diagnostics) = load_with_plugins_and_diagnostics_for_test(
+            Some(dir),
             "xuepoo.bar",
             &bar_decls(),
             None,
@@ -1457,22 +1532,18 @@ mod tests {
                 claimants: 2,
             }]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn invalid_lua_does_not_fall_through_to_toml() {
-        let dir = std::env::temp_dir().join(format!(
-            "bitty-plugin-settings-lua-invalid-{}",
-            std::process::id()
-        ));
-        let plugins = dir.join("plugins");
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = TestRoot::new("lua-invalid");
+        let dir = root.path();
+        let plugins = root.plugins();
         std::fs::create_dir_all(&plugins).expect("temp dir");
         std::fs::write(plugins.join("xuepoo.bar.lua"), b"return io\n").expect("lua");
         std::fs::write(plugins.join("xuepoo.bar.toml"), b"show = false\n").expect("toml");
-        let (loaded, _diagnostics) = load_plugin_settings_with_plugins_and_diagnostics(
-            Some(&dir),
+        let (loaded, _diagnostics) = load_with_plugins_and_diagnostics_for_test(
+            Some(dir),
             "xuepoo.bar",
             &bar_decls(),
             None,
@@ -1480,25 +1551,21 @@ mod tests {
         );
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
         assert!(loaded.file_error.is_some());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn lua_declared_keys_and_types_are_strictly_filtered() {
-        let dir = std::env::temp_dir().join(format!(
-            "bitty-plugin-settings-lua-types-{}",
-            std::process::id()
-        ));
-        let plugins = dir.join("plugins");
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = TestRoot::new("lua-types");
+        let dir = root.path();
+        let plugins = root.plugins();
         std::fs::create_dir_all(&plugins).expect("temp dir");
         std::fs::write(
             plugins.join("xuepoo.bar.lua"),
             b"return { show = 'bad', edge = 'top', name_max_chars = 3.5, hidden = true }\n",
         )
         .expect("lua");
-        let (loaded, diagnostics) = load_plugin_settings_with_plugins_and_diagnostics(
-            Some(&dir),
+        let (loaded, diagnostics) = load_with_plugins_and_diagnostics_for_test(
+            Some(dir),
             "xuepoo.bar",
             &bar_decls(),
             None,
@@ -1518,46 +1585,37 @@ mod tests {
             diagnostics,
             vec![PluginSettingsDiagnostic::DroppedEntries { count: 3 }]
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn unsafe_plugin_id_never_constructs_a_config_path() {
-        let dir = std::env::temp_dir().join(format!(
-            "bitty-plugin-settings-lua-path-{}",
-            std::process::id()
-        ));
-        let plugins = dir.join("plugins");
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = TestRoot::new("lua-path");
+        let plugins = root.plugins();
         std::fs::create_dir_all(&plugins).expect("temp dir");
         std::fs::write(plugins.join("escape.lua"), b"return { show = false }\n").expect("lua");
-        let loaded = load_plugin_settings(Some(&dir), "../escape", &bar_decls(), None);
+        let loaded = load_plugin_settings(Some(root.path()), "../escape", &bar_decls(), None);
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
         assert!(loaded.file_error.is_none());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn config_loader_rejects_symlink_directory_and_fifo() {
-        let dir = std::env::temp_dir().join(format!(
-            "bitty-plugin-settings-lua-file-types-{}",
-            std::process::id()
-        ));
-        let plugins = dir.join("plugins");
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = TestRoot::new("lua-file-types");
+        let dir = root.path();
+        let plugins = root.plugins();
         std::fs::create_dir_all(&plugins).expect("temp dir");
 
         let target = plugins.join("target.lua");
         std::fs::write(&target, b"return { show = false }\n").expect("target");
         std::os::unix::fs::symlink(&target, plugins.join("xuepoo.bar.lua")).expect("symlink");
-        let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
+        let loaded = load_plugin_settings(Some(dir), "xuepoo.bar", &bar_decls(), None);
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
         assert!(loaded.file_error.is_some());
 
         std::fs::remove_file(plugins.join("xuepoo.bar.lua")).expect("remove symlink");
         std::fs::create_dir(plugins.join("xuepoo.bar.lua")).expect("directory");
-        let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
+        let loaded = load_plugin_settings(Some(dir), "xuepoo.bar", &bar_decls(), None);
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
         assert!(loaded.file_error.is_some());
 
@@ -1572,51 +1630,36 @@ mod tests {
                 rustix::fs::Mode::from_raw_mode(0o600),
             )
             .expect("fifo");
-            let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
+            let loaded = load_plugin_settings(Some(dir), "xuepoo.bar", &bar_decls(), None);
             assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
             assert!(loaded.file_error.is_some());
             std::fs::remove_file(&fifo).expect("remove fifo");
         }
 
         std::os::unix::fs::symlink(&target, plugins.join("xuepoo.bar.toml")).expect("toml symlink");
-        let loaded = load_plugin_settings(Some(&dir), "xuepoo.bar", &bar_decls(), None);
+        let loaded = load_plugin_settings(Some(dir), "xuepoo.bar", &bar_decls(), None);
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
         assert!(loaded.file_error.is_some());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn aliases_fail_closed_without_a_complete_unique_registry() {
-        let dir = std::env::temp_dir().join(format!(
-            "bitty-plugin-settings-lua-alias-registry-{}",
-            std::process::id()
-        ));
-        let plugins = dir.join("plugins");
-        let _ = std::fs::remove_dir_all(&dir);
+        let root = TestRoot::new("lua-alias-registry");
+        let dir = root.path();
+        let plugins = root.plugins();
         std::fs::create_dir_all(&plugins).expect("temp dir");
         std::fs::write(plugins.join("bar.lua"), b"return { show = false }\n").expect("alias");
 
         for ids in [None, Some(&[][..]), Some(&["other.bar".to_string()][..])] {
-            let loaded = load_plugin_settings_with_plugins(
-                Some(&dir),
-                "xuepoo.bar",
-                &bar_decls(),
-                None,
-                ids,
-            );
+            let loaded =
+                load_with_plugins_for_test(Some(dir), "xuepoo.bar", &bar_decls(), None, ids);
             assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
             assert!(loaded.file_error.is_none());
         }
         let invalid = ["xuepoo.bar".to_string(), "bad/id".to_string()];
-        let loaded = load_plugin_settings_with_plugins(
-            Some(&dir),
-            "xuepoo.bar",
-            &bar_decls(),
-            None,
-            Some(&invalid),
-        );
+        let loaded =
+            load_with_plugins_for_test(Some(dir), "xuepoo.bar", &bar_decls(), None, Some(&invalid));
         assert_eq!(loaded.source.get("show"), Some(LuaValue::Bool(true)));
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -380,7 +380,7 @@ pub(crate) fn profile_dir_from(
 /// Reads at most `entry_limit` directory entries and stops after
 /// `name_limit` validated names. Returns the names sorted and de-duplicated,
 /// plus whether a bound cut the scan short.
-fn scan_names(
+pub(crate) fn scan_names(
     dir: &Path,
     entry_limit: usize,
     name_limit: usize,
@@ -809,6 +809,18 @@ fn validate_prospective_selector(
         ),
         &merged.effective,
     )
+}
+
+/// Validate a prospective selector for the `config.manage` writer and map
+/// the CLI-shaped refusal onto the path-free write class.
+pub(crate) fn validate_prospective_selector_for_write(
+    dir: &Path,
+    name: &str,
+    selector: &Path,
+    selector_bytes: &str,
+) -> Result<(), ConfigWriteFailure> {
+    validate_prospective_selector(dir, name, selector, selector_bytes)
+        .map_err(|_| ConfigWriteFailure::Invalid)
 }
 
 /// `bitty config profile create NAME`.
@@ -1363,8 +1375,9 @@ fn referencing_profiles(dir: &Path, target: &str) -> Vec<String> {
 /// first, then the persisted selector (the startup order).
 fn active_profile_name(args: &Args) -> Option<String> {
     let env = std::env::var("BITTY_PROFILE").ok();
-    bitty_config::file::resolve_profile_request(args.profile.as_deref(), env.as_deref())
-        .or_else(|| selector_profile_name(args))
+    let request =
+        bitty_config::file::resolve_profile_request(args.profile.as_deref(), env.as_deref());
+    effective_profile_name(request.as_deref(), selector_profile_name(args))
 }
 
 /// Profile named by the persisted `init.lua` selector only.
@@ -1375,10 +1388,18 @@ fn selector_profile_name(args: &Args) -> Option<String> {
         bitty_config_env.as_deref(),
     );
     let probed = bitty_config::file::probe_config_path(explicit.as_deref())?;
-    if !probed.path.exists() {
+    selector_profile_from_path(&probed.path)
+}
+
+/// Profile named by one already-resolved selector file.
+///
+/// Shared by the CLI and the `config.manage` profile backend so both read the
+/// persisted selection through the same strict loader.
+pub(crate) fn selector_profile_from_path(path: &Path) -> Option<String> {
+    if !path.exists() {
         return None;
     }
-    let layer = bitty_config::file::load_user_layer(&probed.path).ok()?;
+    let layer = bitty_config::file::load_user_layer(path).ok()?;
     layer.plan.selector.map(|selector| selector.profile)
 }
 
@@ -2732,7 +2753,7 @@ fn new_profile_lua(name: &str) -> String {
 
 /// How `set` renders one CLI value into Lua source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FieldKind {
+pub(crate) enum FieldKind {
     /// Double-quoted string (schema validates enums and ranges).
     Text,
     /// Non-negative integer literal (`u32` schema fields).
@@ -2747,13 +2768,13 @@ enum FieldKind {
 
 /// One documented dotted schema path supported by `get`/`set`.
 #[derive(Debug)]
-struct SchemaField {
+pub(crate) struct SchemaField {
     /// Canonical dotted key (same spelling `config check` prints).
-    path: &'static str,
+    pub(crate) path: &'static str,
     /// Lua literal kind accepted by `set`.
-    kind: FieldKind,
+    pub(crate) kind: FieldKind,
     /// Effective-value getter over the typed schema.
-    get: fn(&bitty_config::EffectiveConfig) -> ConfigValue,
+    pub(crate) get: fn(&bitty_config::EffectiveConfig) -> ConfigValue,
 }
 
 /// Keys `config profile show` prints (kept from CTX-1404 for compatibility).
@@ -3103,7 +3124,7 @@ fn get_session_restore(e: &bitty_config::EffectiveConfig) -> ConfigValue {
 }
 
 /// Catalog entry for one canonical path (internal, key list is trusted).
-fn schema_field_entry(path: &str) -> Option<&'static SchemaField> {
+pub(crate) fn schema_field_entry(path: &str) -> Option<&'static SchemaField> {
     SCHEMA_FIELDS.iter().find(|field| field.path == path)
 }
 
@@ -3750,7 +3771,7 @@ fn is_ident(byte: u8) -> bool {
 /// string: a long-bracket value is valid Lua but not editable by this
 /// byte-preserving rewrite, so the function refuses (`None`) instead of
 /// reporting a switch it did not make.
-fn rewrite_selector_profile(content: &str, new_profile: &str) -> Option<String> {
+pub(crate) fn rewrite_selector_profile(content: &str, new_profile: &str) -> Option<String> {
     let bytes = content.as_bytes();
     let mut assignments = 0usize;
     let mut rewritable: Option<(usize, usize)> = None;
@@ -4099,7 +4120,10 @@ fn log_config_refusal(plugin_id: &str, key: &str, target: &Path, failure: Config
 /// single-leaf edit shows one removed and one inserted line. Over the preview
 /// line/byte bound the change is refused rather than truncated: the user can
 /// never approve bytes they cannot see in full.
-fn bounded_line_diff(previous: &str, updated: &str) -> Result<String, ConfigWriteFailure> {
+pub(crate) fn bounded_line_diff(
+    previous: &str,
+    updated: &str,
+) -> Result<String, ConfigWriteFailure> {
     use bitty_runtime::plugin_runtime::{
         CONFIG_PREVIEW_MAX_LINES, CONFIG_PREVIEW_MAX_RENDERED_BYTES,
     };
@@ -4173,20 +4197,32 @@ fn parse_user_plan(
     Ok(bitty_config::LayeredPlan::new(source, plan))
 }
 
+/// Startup profile precedence: the one-launch request wins over the user
+/// layer's own persisted selector.
+///
+/// This is the single precedence rule shared by startup, the `config.manage`
+/// reads (`config.get`, `profiles.list`), and the user-layer writer. Reading
+/// or validating against the selector while startup runs
+/// `--profile`/`BITTY_PROFILE` would report (and accept) a different
+/// profile's values than the running app loaded.
+pub(crate) fn effective_profile_name(
+    active_profile: Option<&str>,
+    selector: Option<String>,
+) -> Option<String> {
+    active_profile.map(str::to_string).or(selector)
+}
+
 /// Profile the next launch loads: the one-launch request wins over the user
 /// layer's own selector, matching startup resolution.
-///
-/// CTX-1613 review: seeding or validating against the selector while startup
-/// runs `--profile`/`BITTY_PROFILE` would pin (and accept) a different
-/// profile's values, changing settings the user never saw approved.
-fn resolved_profile_name(
+pub(crate) fn resolved_profile_name(
     user: Option<&bitty_config::LayeredPlan>,
     active_profile: Option<&str>,
 ) -> Option<String> {
-    active_profile.map(str::to_string).or_else(|| {
+    effective_profile_name(
+        active_profile,
         user.and_then(|layer| layer.plan.selector.as_ref())
-            .map(|selector| selector.profile.clone())
-    })
+            .map(|selector| selector.profile.clone()),
+    )
 }
 
 /// Merge a candidate user layer over its active profile chain without

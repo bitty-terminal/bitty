@@ -9789,6 +9789,19 @@ fn init_write_new_refuse_force_backup_idempotent() {
         std::fs::read_to_string(&target).expect("read back"),
         content
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&target)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a fresh init config is owner-only, got {mode:o}"
+        );
+    }
 
     // Re-run without --force refuses and leaves the file untouched.
     let err = write_init_config(&target, &content, false).expect_err("must refuse");
@@ -9816,6 +9829,23 @@ fn init_write_new_refuse_force_backup_idempotent() {
         std::fs::read_to_string(&backup).expect("backup bytes"),
         content
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        for path in [&target, &backup] {
+            let mode = std::fs::metadata(path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "'{}' is owner-only, got {mode:o}",
+                path.display()
+            );
+        }
+    }
     assert_eq!(
         std::fs::read_to_string(&target).expect("new bytes"),
         updated_content

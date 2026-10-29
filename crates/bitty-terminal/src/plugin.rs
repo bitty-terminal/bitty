@@ -1281,7 +1281,7 @@ impl PluginState {
         self.records.get_mut(id)
     }
 
-    fn insert(&mut self, id: String, record: PluginRecord) {
+    pub(crate) fn insert(&mut self, id: String, record: PluginRecord) {
         self.records.insert(id, record);
     }
 
@@ -1821,11 +1821,11 @@ fn is_lower_hex(value: &str, len: usize) -> bool {
 
 /// One dispatch failure with its stable exit code and envelope class.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PluginFailure {
+pub(crate) struct PluginFailure {
     exit: i32,
     class: &'static str,
-    code: &'static str,
-    message: String,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 impl PluginFailure {
@@ -3124,6 +3124,50 @@ pub(crate) fn rows_for_inspect(
     store_root: Option<&Path>,
 ) -> Result<Vec<PluginRow>, String> {
     rows_from_state_with_catalog(state, store_root, false).map_err(|failure| failure.message)
+}
+
+/// Load the managed ledger for the `config.manage` read/write surface.
+///
+/// The caller maps the returned diagnostic into a path-free failure class;
+/// this string is host-log material only.
+pub(crate) fn load_state_for_config_manage(path: &Path) -> Result<PluginState, PluginFailure> {
+    load_state(path)
+}
+
+/// Save the managed ledger through the CLI's atomic writer.
+///
+/// The returned string is host-log material only; the plugin-visible error is
+/// a path-free class chosen by the caller.
+pub(crate) fn save_state_for_config_manage(
+    path: &Path,
+    state: &PluginState,
+) -> Result<(), PluginFailure> {
+    save_state(path, state).map(|_| ())
+}
+
+/// Apply one enable/disable to a managed ledger record, re-checking the
+/// bundled manifest pin and granted capabilities exactly like `bitty plugin
+/// enable`/`disable`.
+pub(crate) fn set_managed_enabled(
+    state: &mut PluginState,
+    id: &str,
+    enabled: bool,
+) -> Result<bool, PluginFailure> {
+    resolve_plugin_id(id)?;
+    let result = if enabled {
+        op_enable(state, id)
+    } else {
+        op_disable(state, id)
+    };
+    result.map(|output| output.changed)
+}
+
+/// Build plugin rows for `config.manage`'s bounded `plugins.list`.
+pub(crate) fn rows_for_config_manage(
+    state: &PluginState,
+    store_root: Option<&Path>,
+) -> Result<Vec<PluginRow>, PluginFailure> {
+    rows_from_state_with_catalog(state, store_root, false)
 }
 
 /// One installed store plugin as seen by the VM-free discovery surfaces.

@@ -18,9 +18,12 @@ use std::rc::Rc;
 use bitty_lua::{BridgeError, LuaValue};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
-    ConfigApplyOutcome, ConfigChange, ConfigPreviewRendering, ConfigWriteBackend,
-    ConfigWriteFailure, EmptySettings, PluginRecord, PluginRuntime, PluginRuntimeConfig,
-    SnapshotSource, SourceClass, candidate_digest, content_digest, manifest_toml, write_index,
+    ConfigApplyOutcome, ConfigChange, ConfigPreviewRendering, ConfigReadFailure, ConfigReadValue,
+    ConfigSourceLabel, ConfigSourceList, ConfigSourceRow, ConfigValueRow, ConfigWriteBackend,
+    ConfigWriteFailure, EmptySettings, PluginEnabledRendering, PluginList, PluginListRow,
+    PluginRecord, PluginRuntime, PluginRuntimeConfig, ProfileList, ProfileListRow,
+    ProfileUseRendering, SnapshotSource, SourceClass, candidate_digest, content_digest,
+    manifest_toml, write_index,
 };
 
 struct NoSnapshot;
@@ -40,6 +43,116 @@ struct RecordingBackend {
 }
 
 impl ConfigWriteBackend for RecordingBackend {
+    fn config_get(&self, _plugin_id: &str, key: &str) -> Result<ConfigValueRow, ConfigReadFailure> {
+        Ok(ConfigValueRow {
+            key: key.to_string(),
+            value: ConfigReadValue::Text(String::from("catppuccin")),
+            source: ConfigSourceLabel::User,
+            redacted: false,
+        })
+    }
+
+    fn config_sources(&self, _plugin_id: &str) -> Result<ConfigSourceList, ConfigReadFailure> {
+        Ok(ConfigSourceList {
+            rows: vec![
+                ConfigSourceRow {
+                    key: String::from("appearance.theme"),
+                    source: ConfigSourceLabel::User,
+                },
+                ConfigSourceRow {
+                    key: String::from("window.padding"),
+                    source: ConfigSourceLabel::Default,
+                },
+            ],
+            truncated: false,
+        })
+    }
+
+    fn plugins_list(&self, _plugin_id: &str) -> Result<PluginList, ConfigReadFailure> {
+        Ok(PluginList {
+            rows: vec![PluginListRow {
+                id: String::from("owner.plugin"),
+                enabled: true,
+                managed: true,
+                source: String::from("bundled"),
+                version: String::from("1.0.0"),
+            }],
+            truncated: false,
+        })
+    }
+
+    fn profiles_list(&self, _plugin_id: &str) -> Result<ProfileList, ConfigReadFailure> {
+        Ok(ProfileList {
+            rows: vec![
+                ProfileListRow {
+                    name: String::from("default"),
+                    active: true,
+                },
+                ProfileListRow {
+                    name: String::from("work"),
+                    active: false,
+                },
+            ],
+            active: Some(String::from("default")),
+            truncated: false,
+        })
+    }
+
+    fn preview_plugin_enabled(
+        &self,
+        _plugin_id: &str,
+        id: &str,
+        enabled: bool,
+    ) -> Result<PluginEnabledRendering, ConfigWriteFailure> {
+        let rendered = format!("plugins.{id}.enabled = {enabled}");
+        Ok(PluginEnabledRendering {
+            changed_keys: vec![format!("plugins.{id}.enabled")],
+            candidate_digest: candidate_digest(rendered.as_bytes()),
+            rendered,
+        })
+    }
+
+    fn apply_plugin_enabled(
+        &self,
+        _plugin_id: &str,
+        id: &str,
+        enabled: bool,
+        expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        let rendered = format!("plugins.{id}.enabled = {enabled}");
+        if candidate_digest(rendered.as_bytes()) != expected_candidate_digest {
+            return Err(ConfigWriteFailure::Stale);
+        }
+        Ok(ConfigApplyOutcome::Applied)
+    }
+
+    fn preview_profile_use(
+        &self,
+        _plugin_id: &str,
+        name: &str,
+    ) -> Result<ProfileUseRendering, ConfigWriteFailure> {
+        let rendered = format!("profile = \"{name}\"");
+        Ok(ProfileUseRendering {
+            changed_keys: vec![String::from("profile")],
+            candidate_digest: candidate_digest(rendered.as_bytes()),
+            rendered,
+            changed: true,
+        })
+    }
+
+    fn apply_profile_use(
+        &self,
+        _plugin_id: &str,
+        name: &str,
+        expected_candidate_digest: &str,
+    ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+        let rendered = format!("profile = \"{name}\"");
+        if candidate_digest(rendered.as_bytes()) != expected_candidate_digest {
+            return Err(ConfigWriteFailure::Stale);
+        }
+        Ok(ConfigApplyOutcome::Applied)
+    }
+
     fn preview(
         &self,
         _plugin_id: &str,
@@ -245,12 +358,77 @@ bitty.commands.register({ id = "bad", title = "Bad shapes", run = function()
     errcode(function() return bitty.config.set("appearance.theme", "catppuccin", "deadbeef") end),
   }, ",")
 end })
+
+bitty.commands.register({ id = "get", title = "Get", run = function()
+  local ok, row = pcall(bitty.config.get, "appearance.theme")
+  if not ok then return "ERR:" .. row.code end
+  return row.key .. "|" .. row.value .. "|" .. row.kind .. "|" .. row.source .. "|" .. tostring(row.redacted)
+end })
+bitty.commands.register({ id = "sources", title = "Sources", run = function()
+  local ok, rows = pcall(bitty.config.sources)
+  if not ok then return "ERR:" .. rows.code end
+  return rows.count .. "|" .. rows.rows[1].key .. "|" .. rows.rows[1].source .. "|" .. tostring(rows.truncated)
+end })
+bitty.commands.register({ id = "plugins", title = "Plugins", run = function()
+  local ok, rows = pcall(bitty.plugins.list)
+  if not ok then return "ERR:" .. rows.code end
+  return rows.count .. "|" .. rows.rows[1].id .. "|" .. tostring(rows.rows[1].enabled) .. "|" .. tostring(rows.rows[1].managed) .. "|" .. rows.rows[1].source .. "|" .. rows.rows[1].version
+end })
+bitty.commands.register({ id = "profiles", title = "Profiles", run = function()
+  local ok, rows = pcall(bitty.profiles.list)
+  if not ok then return "ERR:" .. rows.code end
+  return rows.active .. "|" .. rows.count .. "|" .. rows.rows[1].name .. "|" .. tostring(rows.rows[1].active)
+end })
+bitty.commands.register({ id = "enable", title = "Enable", run = function()
+  local ok, p = pcall(bitty.config.preview_enabled, "owner.plugin", true)
+  if not ok then return "ERR:" .. p.code end
+  local applied, out = pcall(bitty.config.set_enabled, "owner.plugin", true, p.digest)
+  if not applied then return "ERR:" .. out.code end
+  return p.rendered .. "|" .. p.keys[1] .. "|" .. tostring(p.changed) .. "|" .. tostring(out.changed) .. "|" .. out.reload
+end })
+bitty.commands.register({ id = "enable_replay", title = "Enable replay", run = function()
+  local ok, p = pcall(bitty.config.preview_enabled, "owner.plugin", true)
+  if not ok then return "ERR:" .. p.code end
+  pcall(bitty.config.set_enabled, "owner.plugin", true, p.digest)
+  local again_ok, again = pcall(bitty.config.set_enabled, "owner.plugin", true, p.digest)
+  if again_ok then return "REPLAYED" end
+  return again.code
+end })
+bitty.commands.register({ id = "use", title = "Use", run = function()
+  local ok, p = pcall(bitty.profiles.preview_use, "work")
+  if not ok then return "ERR:" .. p.code end
+  local applied, out = pcall(bitty.profiles.use, "work", p.digest)
+  if not applied then return "ERR:" .. out.code end
+  return p.rendered .. "|" .. p.keys[1] .. "|" .. out.active .. "|" .. tostring(out.changed) .. "|" .. tostring(out.pending_restart)
+end })
+bitty.commands.register({ id = "use_replay", title = "Use replay", run = function()
+  local ok, p = pcall(bitty.profiles.preview_use, "work")
+  if not ok then return "ERR:" .. p.code end
+  pcall(bitty.profiles.use, "work", p.digest)
+  local again_ok, again = pcall(bitty.profiles.use, "work", p.digest)
+  if again_ok then return "REPLAYED" end
+  return again.code
+end })
+bitty.commands.register({ id = "deny", title = "Deny", run = function()
+  return table.concat({
+    errcode(function() return bitty.config.get("appearance.theme") end),
+    errcode(function() return bitty.config.sources() end),
+    errcode(function() return bitty.plugins.list() end),
+    errcode(function() return bitty.profiles.list() end),
+    errcode(function() return bitty.config.preview_enabled("owner.plugin", true) end),
+    errcode(function() return bitty.profiles.preview_use("work") end),
+  }, ",")
+end })
+
 bitty.commands.register({ id = "keys", title = "Bad keys", run = function()
   return table.concat({
     errcode(function() return bitty.config.preview("terminal.shell", "/bin/sh") end),
     errcode(function() return bitty.config.preview("/etc/bitty/init.lua", "x") end),
     errcode(function() return bitty.config.preview("../../init", "x") end),
     errcode(function() return bitty.config.preview("appearance", "x") end),
+    errcode(function() return bitty.config.preview("history.capture.transcript", true) end),
+    errcode(function() return bitty.config.get("history.capture.transcript") end),
+    errcode(function() return bitty.config.get("history.capture.commands") end),
   }, ",")
 end })
 "##;
@@ -264,6 +442,15 @@ const PROBE_COMMANDS: &[&str] = &[
     "keys",
     "digest",
     "apply_digest",
+    "get",
+    "sources",
+    "plugins",
+    "profiles",
+    "enable",
+    "enable_replay",
+    "use",
+    "use_replay",
+    "deny",
 ];
 
 /// Granted store package: a recorded grant is the only way a plugin receives
@@ -410,7 +597,8 @@ fn no_path_or_command_key_is_addressable() {
     let (mut rt, backend) = granted_runtime();
     assert_eq!(
         run(&mut rt, "keys"),
-        "ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY"
+        "ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,\
+ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY"
     );
     assert!(
         backend.calls.borrow().is_empty(),
@@ -440,4 +628,51 @@ fn granted_generation_without_a_backend_fails_closed() {
         "no writable layer is a typed unavailable, not a generic not-implemented"
     );
     assert_eq!(run(&mut rt, "apply"), "ERR:E_CONFIG_UNAVAILABLE");
+}
+
+#[test]
+fn read_verbs_cross_the_wire_with_logical_sources() {
+    let (mut rt, _backend) = granted_runtime();
+    assert_eq!(
+        run(&mut rt, "get"),
+        "appearance.theme|catppuccin|text|user|false"
+    );
+    assert_eq!(run(&mut rt, "sources"), "2|appearance.theme|user|false");
+    assert_eq!(
+        run(&mut rt, "plugins"),
+        "1|owner.plugin|true|true|bundled|1.0.0"
+    );
+    assert_eq!(run(&mut rt, "profiles"), "default|2|default|true");
+}
+
+#[test]
+fn enable_and_profile_use_are_token_bound_over_the_wire() {
+    let (mut rt, _backend) = granted_runtime();
+    assert_eq!(
+        run(&mut rt, "enable"),
+        "plugins.owner.plugin.enabled = true|plugins.owner.plugin.enabled|true|true|restart"
+    );
+    assert_eq!(run(&mut rt, "enable_replay"), "E_CONFIG_APPROVAL_REQUIRED");
+    assert_eq!(
+        run(&mut rt, "use"),
+        "profile = \"work\"|profile|work|true|true"
+    );
+    assert_eq!(run(&mut rt, "use_replay"), "E_CONFIG_APPROVAL_REQUIRED");
+}
+
+#[test]
+fn ungranted_generation_denies_every_new_verb() {
+    let root = temp_dir("dev-none-manage");
+    write_plugin(&root, "xuepoo.configprobe", &[], PROBE_COMMANDS, PROBE);
+    let mut rt = runtime(None, Some(root.clone()), None);
+    rt.discover();
+    for (id, result) in rt.activate_discovered() {
+        result.unwrap_or_else(|error| panic!("activate {id}: {error}"));
+    }
+    assert_eq!(
+        run(&mut rt, "deny"),
+        "ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED,\
+ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED,ERR:E_CAPABILITY_DENIED"
+    );
+    let _ = std::fs::remove_dir_all(root);
 }

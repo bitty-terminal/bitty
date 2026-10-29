@@ -488,9 +488,11 @@ impl ServiceMethod {
     #[must_use]
     pub const fn request_deadline_exemption(self) -> Option<&'static str> {
         match self {
-            Self::SessionCreate => {
-                Some("synchronous worker spawn/bind is bounded by spawn_bind_timeout_ms")
-            }
+            Self::DaemonStop => Some(
+                "the synchronous stop terminates every live session before it answers; each \
+                 bound worker costs at most abort_grace_ms + kill_wait and the pool is capped \
+                 by max_sessions",
+            ),
             Self::DaemonOrphansVerify => {
                 Some("on-demand orphan verification is bounded by the containment pass budget")
             }
@@ -651,7 +653,7 @@ mod tests {
             .filter(|method| method.request_deadline_exemption().is_some())
             .map(ServiceMethod::name)
             .collect();
-        assert_eq!(exempt, ["daemon.orphans.verify", "session.create"]);
+        assert_eq!(exempt, ["daemon.stop", "daemon.orphans.verify"]);
     }
 
     #[test]

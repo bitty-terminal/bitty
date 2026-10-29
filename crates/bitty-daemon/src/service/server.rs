@@ -94,9 +94,11 @@ mod unix {
     /// The conformance real driver needs a request to complete past the
     /// effective bound without waiting on a wall clock: it lowers
     /// `request_timeout_ms` and advances the completion stamp for one named
-    /// method. Both values are read once per process. A shipped binary does
-    /// not enable the feature, so production behavior cannot be changed by the
-    /// environment.
+    /// method. Both values are read once per process. The feature is test-only
+    /// (no release workflow enables it); this build does not additionally gate
+    /// on `debug_assertions` because a local `opt-level` override already
+    /// clears that cfg, which would silently disable the seam the conformance
+    /// driver depends on.
     #[cfg(feature = "test-seams")]
     mod test_seams {
         use std::sync::OnceLock;
@@ -322,8 +324,8 @@ mod unix {
             #[cfg(not(debug_assertions))]
             let tamper_interval_ms = TAMPER_INTERVAL_MS;
             // The conformance real driver lowers the request bound through the
-            // `test-seams` feature; a shipped binary uses the compiled
-            // default.
+            // debug-only `test-seams` feature; a shipped binary uses the
+            // compiled default.
             #[cfg(feature = "test-seams")]
             let limits = test_seams::request_timeout_override()
                 .and_then(|value| {
@@ -1184,10 +1186,10 @@ mod unix {
 
     /// The completion stamp for one dispatched request.
     ///
-    /// Production returns the loop clock unchanged. The `test-seams` feature
-    /// advances it for one named method so the real driver can exercise the
-    /// over-bound branch without a wall-clock wait; a shipped binary compiles
-    /// the seam out.
+    /// Production returns the loop clock unchanged. A debug build with the
+    /// `test-seams` feature advances it for one named method so the real driver
+    /// can exercise the over-bound branch without a wall-clock wait; a shipped
+    /// binary compiles the seam out.
     fn request_completed_at(method: ServiceMethod, completed: MonotonicMs) -> MonotonicMs {
         #[cfg(feature = "test-seams")]
         {
@@ -1352,11 +1354,19 @@ mod unix {
                     // The handler already ran. A successful result may have
                     // queued events or a target control token; route those,
                     // then replace the late result with the typed refusal.
+                    // A failed handler already recorded its own refusal in
+                    // `dispatch`, so only a late success gets the `Timeout`
+                    // record; one request never produces two audit records.
                     // The connection stays open; only this request times out.
                     if result.is_ok() {
                         service.route_deliveries(&mut peer.client);
+                        service.record_refusal(
+                            &peer.client,
+                            method.audit_action(),
+                            refusal,
+                            completed,
+                        );
                     }
-                    service.record_refusal(&peer.client, method.audit_action(), refusal, completed);
                     Err(refusal)
                 }
                 None => result,
@@ -1579,6 +1589,7 @@ mod unix {
 
         use std::cell::RefCell;
         use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
 
         use serde_json::{Value, json};
 
@@ -1743,13 +1754,13 @@ mod unix {
             );
             assert!(
                 request_timeout(
-                    ServiceMethod::SessionCreate,
+                    ServiceMethod::DaemonStop,
                     admitted,
                     MonotonicMs::from_millis(10_000),
                     100,
                 )
                 .is_none(),
-                "session.create keeps its spawn bound"
+                "daemon.stop keeps its synchronous termination bound"
             );
         }
 
@@ -1905,11 +1916,15 @@ mod unix {
             (peer, client)
         }
 
-        /// An audit writer that keeps the unit test off the filesystem.
-        struct NullWriter;
+        /// An audit writer that keeps the rendered lines for assertions.
+        struct RecordingWriter(Arc<Mutex<Vec<String>>>);
 
-        impl AuditWriter for NullWriter {
-            fn append_line(&mut self, _line: &[u8]) -> Result<(), AuditSinkError> {
+        impl AuditWriter for RecordingWriter {
+            fn append_line(&mut self, line: &[u8]) -> Result<(), AuditSinkError> {
+                self.0
+                    .lock()
+                    .expect("audit lock")
+                    .push(String::from_utf8_lossy(line).into_owned());
                 Ok(())
             }
 
@@ -1923,6 +1938,13 @@ mod unix {
         }
 
         fn test_service_with(limits: Limits) -> (Service, tempfile::TempDir) {
+            let (service, dir, _audit) = test_service_recording(limits);
+            (service, dir)
+        }
+
+        fn test_service_recording(
+            limits: Limits,
+        ) -> (Service, tempfile::TempDir, Arc<Mutex<Vec<String>>>) {
             let dir = tempfile::tempdir().expect("temp dir");
             std::fs::set_permissions(
                 dir.path(),
@@ -1930,10 +1952,11 @@ mod unix {
             )
             .expect("chmod");
             let operator = OperatorStore::create_in(dir.path()).expect("operator store");
+            let audit = Arc::new(Mutex::new(Vec::new()));
             let service = Service::new(
                 limits,
                 operator,
-                Box::new(NullWriter),
+                Box::new(RecordingWriter(Arc::clone(&audit))),
                 crate::orphan::OrphanSupervisor::unsupported(
                     crate::platform::PlatformCell::current(),
                     "test",
@@ -1943,7 +1966,7 @@ mod unix {
                 ),
             )
             .expect("service");
-            (service, dir)
+            (service, dir, audit)
         }
 
         /// A negotiated peer whose scopes are fixed before dispatch.

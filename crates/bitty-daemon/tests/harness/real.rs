@@ -506,9 +506,13 @@ impl RealDriver {
             version: bitty_daemon::CRATE_VERSION.to_owned(),
             capabilities,
             limits,
+            // The seam is present exactly when this run injected it: the
+            // driver sets the override variables for the vector and passes
+            // them to the daemon, so the flag tracks the run rather than a
+            // cargo cfg that the test crate cannot observe reliably.
             seams: std::collections::BTreeMap::from([(
                 "request_deadline_seam".to_owned(),
-                cfg!(feature = "test-seams"),
+                cfg!(feature = "test-seams") && self.request_timeout_ms.is_some(),
             )]),
         })
     }

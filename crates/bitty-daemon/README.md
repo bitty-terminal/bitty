@@ -808,11 +808,12 @@ completion drops it, so there is no wakeup, no per-request thread, and no timer
 leak between requests. The single-threaded loop cannot preempt a synchronous
 handler, so a method whose handler can legitimately block past the bound keeps
 its own timer and is exempt from conversion
-(`ServiceMethod::request_deadline_exemption`): `session.create` (worker
-spawn/bind, `spawn_bind_timeout_ms`) and `daemon.orphans.verify` (the
-containment pass budget). `daemon.stop drain` is not exempt because the stop
-response is immediate; the drain runs on the loop after the response and is
-bounded by `drain_grace_ms`. `session.abort`/`session.kill` wait at most
+(`ServiceMethod::request_deadline_exemption`): `daemon.stop` (it terminates
+every live session before it answers; each bound worker costs at most
+`abort_grace_ms + kill_wait` and the pool is capped by `max_sessions`) and
+`daemon.orphans.verify` (the containment pass budget). `session.create` is not
+exempt: its synchronous spawn/bind completes within the bounded cleanup, under
+the default request bound. `session.abort`/`session.kill` wait at most
 `abort_grace_ms` plus the kill window, under the default request bound, and are
 not exempt.
 
@@ -1186,7 +1187,8 @@ Corpus rules:
   carry `Timeout` with `request_id` and `timeout_ms`, and a later `session.list`
   on the same connection must succeed. The fake advances its injected clock;
   the real driver uses the `test-seams` feature (enabled by
-  `just daemon-conformance`) and records a typed
+  `just daemon-conformance`; the feature is test-only and no release workflow
+  enables it) and records a typed
   `cell-not-servable: request_deadline_seam` skip without it;
 - cell-dependent values are seeded variables, never literals: `@worker_sessions`
   is the served capability of the cell a driver models (the reference fake

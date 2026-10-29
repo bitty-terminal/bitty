@@ -23,6 +23,13 @@
 //! the idle bound (`transport_idle_ms`) are the compiled `D-14` values; none is
 //! a hardcoded second copy.
 //!
+//! A connection that opted in with `"events": true` at `daemon.negotiate`
+//! receives pushed event frames on the same socket, after the response they
+//! follow, drained from the bounded per-lease queues (`D-10`; bitty#2792). A
+//! full outbound buffer stops the drain instead of growing memory, and a lease
+//! queue that cannot accept a control frame closes that lease with
+//! `TerminalEventLost`.
+//!
 //! `daemon.stop` (or a signal) sets the stop request; the loop finishes the
 //! current responses, closes every connection, removes the socket only while
 //! the path still names this process's object, and returns the outcome the CLI
@@ -371,6 +378,13 @@ mod unix {
         /// once negotiation is visibly complete. Clearing it never inspects
         /// input.
         handshake_flush_gate: bool,
+        /// Per-connection event correlation counter (`D-10`).
+        ///
+        /// The id is server-chosen, unique per connection, bounded, and never
+        /// a client value; it is not durable and never echoed from a request.
+        /// Event ids live in the reserved `evt-` namespace, so they cannot
+        /// collide with a client request id that does not use that prefix.
+        event_sequence: u64,
         closed: bool,
     }
 
@@ -493,8 +507,19 @@ mod unix {
 
         loop {
             let current = now();
-            if shutting_down && peers.iter().all(|peer| !peer.wants_write()) {
-                break;
+            if shutting_down {
+                // A drain announcement and the terminal frames it precedes are
+                // queued, not written. Move them into the outbound buffers
+                // before deciding the shutdown is complete, so the guarantee
+                // survives the last iteration.
+                for peer in &mut peers {
+                    if !peer.closed && !peer.close_after_write {
+                        deliver_events(peer, &mut service, &config);
+                    }
+                }
+                if peers.iter().all(|peer| !peer.wants_write()) {
+                    break;
+                }
             }
             let mut poll_fds = Vec::with_capacity(peers.len() + 2);
             poll_fds.push(nix::poll::PollFd::new(
@@ -577,6 +602,13 @@ mod unix {
                 if peer.reads_input() && ready.contains(nix::poll::PollFlags::POLLIN) {
                     read_peer(peer, &mut service, &config, current, &mut shutting_down);
                 }
+                // Pushed events are written after the response they follow, on
+                // every iteration: a frame queued for this connection by
+                // another connection's dispatch (a drain, a terminal) is
+                // delivered without waiting for new input.
+                if !peer.closed && !peer.close_after_write {
+                    deliver_events(peer, &mut service, &config);
+                }
                 if !peer.closed
                     && (ready.contains(nix::poll::PollFlags::POLLOUT) || peer.wants_write())
                 {
@@ -594,6 +626,15 @@ mod unix {
                 } else if peer.close_after_write && peer.drain_deadline_ms.is_none() {
                     peer.drain_deadline_ms =
                         Some(current.as_millis().saturating_add(CLOSE_DRAIN_TIMEOUT_MS));
+                }
+                // A lease the bounded queue could not serve closes its
+                // connection; the client reconciles with `session.status`
+                // (`D-10`). The lease is already gone from the service.
+                if !peer.closed && !service.take_closed_leases_for(&peer.client).is_empty() {
+                    peer.retire();
+                }
+                if peer.closed {
+                    service.close_connection_leases(&peer.client, current);
                 }
             }
 
@@ -623,7 +664,17 @@ mod unix {
                     peer.wants_write(),
                 ) {
                     PeerTimer::Keep => {}
-                    PeerTimer::Close => peer.close(),
+                    PeerTimer::Close => {
+                        // Terminal-event guarantee: a terminal transition for a
+                        // held lease is written before the idle close, and the
+                        // stream is shut down only once those bytes drain.
+                        deliver_events(peer, &mut service, &config);
+                        if peer.wants_write() {
+                            peer.retire();
+                        } else {
+                            peer.close();
+                        }
+                    }
                     PeerTimer::Timeout => {
                         // The handshake deadline closes with one typed timeout
                         // record (the contract's aggregated audit record).
@@ -674,8 +725,11 @@ mod unix {
 
         let final_now = now();
         for peer in &mut peers {
+            deliver_events(peer, &mut service, &config);
+            flush_peer(peer);
             flush_wire_audit(peer, &mut service, final_now, true);
             peer.close();
+            service.close_connection_leases(&peer.client, final_now);
         }
         drop(peers);
         let _ = endpoint.close();
@@ -760,6 +814,7 @@ mod unix {
             drain_deadline_ms: None,
             close_after_write: false,
             handshake_flush_gate: false,
+            event_sequence: 0,
             closed: false,
         })
     }
@@ -838,6 +893,13 @@ mod unix {
             }
             if !handle_payload(peer, service, &payload, now, shutting_down) {
                 peer.close();
+                return;
+            }
+            // Event frames ride the same connection, after the response they
+            // belong to. The response is already queued, so a control frame
+            // never preempts it (`D-10`).
+            deliver_events(peer, service, config);
+            if peer.closed {
                 return;
             }
             if !was_negotiated && peer.client.is_negotiated() {
@@ -960,6 +1022,67 @@ mod unix {
         // Stop reading but let any already-queued response drain before the
         // stream closes; `retire` closes immediately when nothing is queued.
         peer.retire();
+    }
+
+    /// Append every pending pushed-event frame to the connection's output.
+    ///
+    /// Frames the service queued for a lease that is leaving are written first
+    /// (its older events in order, then the target-only `lease_revoked`), then
+    /// the queues of every lease this connection holds. When the outbound
+    /// buffer already holds `max_connection_outbound_bytes`, nothing is drained:
+    /// the bounded per-lease queues absorb the pressure and the lease is closed
+    /// with `TerminalEventLost` rather than growing memory here.
+    fn deliver_events(peer: &mut PeerIo, service: &mut Service, config: &ServerConfig) {
+        let cap = usize::try_from(config.limits.effective(LimitId::MaxConnectionOutboundBytes))
+            .unwrap_or(usize::MAX);
+        if peer.output.len() >= cap {
+            return;
+        }
+        // A lease's final frames are addressed to the connection that holds it;
+        // this pass routes them to that connection and never to a requester.
+        service.route_final_frames(&mut peer.client);
+        let pending = peer.client.take_pending_frames();
+        // A connection that did not opt in at negotiate never receives an
+        // event frame, including a lease's final frame; it reconciles with
+        // `session.status` instead.
+        if !peer.client.events_enabled() {
+            return;
+        }
+        for event in &pending {
+            if !push_event(peer, event, cap) {
+                return;
+            }
+        }
+        if peer.close_after_write {
+            return;
+        }
+        // Drain one frame at a time: a full outbound buffer leaves the rest of
+        // the lease queue intact for the next pass instead of dropping a
+        // batch, and the terminal pin is released only for the frame actually
+        // handed to the transport.
+        while let Some(event) = service.drain_next_event(&peer.client) {
+            if !push_event(peer, &event, cap) {
+                return;
+            }
+            service.ack_terminal(&event);
+        }
+    }
+
+    /// Render and append one event frame. Closes the connection when the frame
+    /// cannot fit the outbound bound or the frame layer refuses it.
+    fn push_event(peer: &mut PeerIo, event: &crate::events::Event, cap: usize) -> bool {
+        peer.event_sequence = peer.event_sequence.wrapping_add(1);
+        let id = format!("evt-{}", peer.event_sequence);
+        let Ok(bytes) = wire::render_event(&id, event) else {
+            peer.close();
+            return false;
+        };
+        if peer.output.len().saturating_add(bytes.len()) > cap {
+            peer.close();
+            return false;
+        }
+        peer.output.extend_from_slice(&bytes);
+        true
     }
 
     fn flush_peer(peer: &mut PeerIo) {
@@ -1479,6 +1602,7 @@ mod unix {
                 drain_deadline_ms: None,
                 close_after_write: false,
                 handshake_flush_gate: true,
+                event_sequence: 0,
                 closed: false,
             };
             (peer, client)

@@ -30,6 +30,7 @@ use bitty_ipc_api::wire::{
 };
 
 use crate::contract::ClientVersion;
+use crate::events::{Event, EventDetail};
 use crate::handshake::{
     ACCEPTED_WIRE_VERSION, ClientCorrelation, HandshakeResponse, NegotiateRequest, SecretBearer,
 };
@@ -250,7 +251,74 @@ pub fn parse_negotiate(params: &Value) -> Result<NegotiateRequest, Refusal> {
         request = request
             .with_host_grant(SecretBearer::parse(raw).map_err(|_| Refusal::invalid_request())?);
     }
+    if let Some(value) = map.get("events") {
+        let requested = value.as_bool().ok_or_else(Refusal::invalid_request)?;
+        request = request.with_events(requested);
+    }
     Ok(request)
+}
+
+/// Render one pushed session event as the `event` object of a wire frame.
+///
+/// The frozen envelope fields (`D-10`) are always present. `detail` is added
+/// only when the kind carries a payload, so `control_transfer` names the two
+/// leases and `daemon_stopping` carries its deadline; a kind with no payload
+/// has no `detail` key at all. `terminal_marker` carries `state`, `reason`,
+/// and `cleanup`; the terminal `exit` information is a recorded `1.2`
+/// narrowing (the contract notes own the follow-up).
+pub fn event_value(event: &Event) -> Value {
+    let mut value = json!({
+        "kind": event.kind.as_str(),
+        "instance_id": event.instance_id.as_hex(),
+        "session_id": event.session_id.as_hex(),
+        "attach_id": event.attach_id.map(|attach_id| attach_id.as_hex()),
+        "revision": event.revision,
+        "terminal": event.is_terminal(),
+    });
+    if let Value::Object(object) = &mut value {
+        match event.detail {
+            EventDetail::None => {}
+            EventDetail::ControlTransfer { from, to } => {
+                object.insert(
+                    "detail".to_owned(),
+                    json!({"from": from.as_hex(), "to": to.as_hex()}),
+                );
+            }
+            EventDetail::DaemonStopping { deadline_ms } => {
+                object.insert("detail".to_owned(), json!({"deadline_ms": deadline_ms}));
+            }
+        }
+        if let Some(marker) = event.terminal {
+            object.insert(
+                "terminal_marker".to_owned(),
+                json!({
+                    "state": marker.state.as_str(),
+                    "reason": marker.reason.as_str(),
+                    "cleanup": marker.cleanup.as_str(),
+                }),
+            );
+        }
+    }
+    value
+}
+
+/// Render one pushed session event as a complete wire frame.
+///
+/// The frame is `{"v": 1, "id": <server correlation>, "event": {...}}`. The
+/// correlation id is chosen by the server per connection and is never a client
+/// value (`D-10`).
+///
+/// # Errors
+///
+/// Returns [`Refusal::internal`] when the payload exceeds the frame bound.
+pub fn render_event(id: &str, event: &Event) -> Result<Vec<u8>, Refusal> {
+    let payload = json!({
+        "v": ACCEPTED_WIRE_VERSION,
+        "id": id,
+        "event": event_value(event),
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(|_| Refusal::internal())?;
+    frame(&bytes)
 }
 
 /// Render the complete handshake response as a JSON value.

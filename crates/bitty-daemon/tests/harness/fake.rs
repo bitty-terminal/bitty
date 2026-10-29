@@ -74,6 +74,12 @@ struct FakeConn {
     pending: BTreeMap<String, String>,
     /// The 32-hex `client_correlation_digest` this connection negotiated.
     correlation: Option<String>,
+    /// The client asked for pushed events at negotiate (`D-10`).
+    events: bool,
+    /// Last revision handed to the client per lease. The reference fake models
+    /// the stream by revision instead of queueing: the wire rule is one event
+    /// per revision, in order, routed per lease.
+    event_cursor: BTreeMap<String, u64>,
     closed: bool,
 }
 
@@ -169,10 +175,13 @@ impl FakeDriver {
     /// The worker bit is fixed to the modeled served cell; every other bit is
     /// the compiled contract value.
     fn capability(name: &str, enabled: bool) -> bool {
-        if name == "worker_sessions" {
-            FAKE_WORKER_SESSIONS
-        } else {
-            enabled
+        match name {
+            "worker_sessions" => FAKE_WORKER_SESSIONS,
+            // The reference fake models the served event wire on every host:
+            // it derives the stream from revisions, so it is not tied to the
+            // build's admission loop. A real cell keeps the compiled bit.
+            "events" => true,
+            _ => enabled,
         }
     }
 
@@ -382,6 +391,10 @@ impl FakeDriver {
             conn.negotiated = true;
             conn.scopes = BASELINE.iter().map(|scope| (*scope).to_owned()).collect();
             conn.correlation = correlation.clone();
+            conn.events = params
+                .get("events")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             if operator {
                 conn.scopes.insert("daemon.inspect".to_owned());
                 conn.scopes.insert("daemon.control".to_owned());
@@ -1166,7 +1179,12 @@ impl FakeDriver {
             "control_token": rotated,
             "replayed": false,
         });
-        self.connection(connection).leases.insert(attach);
+        {
+            let revision = self.sessions[session_id].revision;
+            let conn = self.connection(connection);
+            conn.leases.insert(attach.clone());
+            conn.event_cursor.insert(attach, revision);
+        }
         self.reply("session.attach", value)
     }
 
@@ -1235,7 +1253,12 @@ impl FakeDriver {
             "lease_expires_at_ms": expires,
             "replayed": false,
         });
-        self.connection(connection).leases.insert(attach);
+        {
+            let revision = self.sessions[session_id].revision;
+            let conn = self.connection(connection);
+            conn.leases.insert(attach.clone());
+            conn.event_cursor.insert(attach, revision);
+        }
         self.reply("session.attach", value)
     }
 
@@ -1989,6 +2012,49 @@ impl Driver for FakeDriver {
         Outcome::Closed
     }
 
+    fn read_events(&mut self, connection: &str, count: usize) -> Result<Vec<Value>, String> {
+        let Some(conn) = self.conn(connection) else {
+            return Err("unknown connection".to_owned());
+        };
+        if !conn.events {
+            return Err("connection did not opt in to events".to_owned());
+        }
+        let leases: Vec<String> = conn.leases.iter().cloned().collect();
+        let mut cursors = conn.event_cursor.clone();
+        let instance = self.instance.clone();
+        let mut events = Vec::new();
+        for attach in leases {
+            let Some(session) = self
+                .sessions
+                .values()
+                .find(|session| session.leases.contains_key(&attach))
+            else {
+                continue;
+            };
+            let cursor = cursors.get(&attach).copied().unwrap_or(0);
+            for revision in cursor.saturating_add(1)..=session.revision {
+                let terminal = is_terminal(session.state) && revision == session.revision;
+                events.push(json!({
+                    "kind": if terminal { "session_terminal" } else { "session_state" },
+                    "instance_id": instance,
+                    "session_id": session.id,
+                    "attach_id": attach,
+                    "revision": revision,
+                    "terminal": terminal,
+                }));
+            }
+            cursors.insert(attach, session.revision);
+        }
+        if events.len() != count {
+            return Err(format!(
+                "fake has {} queued events, expected {count}",
+                events.len()
+            ));
+        }
+        self.connection(connection).event_cursor = cursors;
+        Ok(events)
+    }
+
     fn restart(&mut self) -> Result<Vars, String> {
         self.instance = self.mint_id();
         self.operator_capability = self.mint_token();
@@ -2120,7 +2186,7 @@ fn canonical_target_attach(params: &Value) -> Option<&str> {
 mod tests {
     use serde_json::json;
 
-    use super::{canonical_generation, canonical_target_attach};
+    use super::{FakeDriver, canonical_generation, canonical_target_attach};
 
     #[test]
     fn generation_alias_conflicts_use_the_raw_json_value() {
@@ -2182,5 +2248,14 @@ mod tests {
             None
         );
         assert_eq!(canonical_target_attach(&json!({})), None);
+    }
+
+    #[test]
+    fn the_reference_cell_advertises_the_served_event_wire_on_every_host() {
+        // The fake derives events from revisions, so its capability is not
+        // tied to the build's admission loop. This is the cross-platform
+        // guard for V-01/C-14, which assert `capabilities.events: true`.
+        assert!(FakeDriver::capability("events", false));
+        assert!(FakeDriver::capability("worker_sessions", false));
     }
 }

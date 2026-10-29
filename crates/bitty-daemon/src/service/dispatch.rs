@@ -61,6 +61,11 @@ use crate::audit_sink::{AuditSink, AuditWriter};
 use crate::codes::RefusalCode;
 use crate::containment::ContainmentReport;
 use crate::contract::{CAPABILITIES, Capabilities};
+use crate::events::{
+    Event, EventBus, EventDetail, EventKind, EventLimits, LeaseClose, MAX_ATTACH_KEYS_PER_SESSION,
+    MAX_EVENT_BACKLOG_BYTES, MAX_EVENT_BACKLOG_EVENTS, MAX_LEASE_QUEUE_BYTES,
+    MAX_LEASE_QUEUE_EVENTS, ReplaySlice, TerminalMarker,
+};
 use crate::handshake::{
     ClientCorrelation, DaemonState, GrantCorrelation, HandshakeContext, HandshakeResponse,
     NegotiateRequest, PeerIdentityFacts, ServerIdentity,
@@ -432,6 +437,17 @@ pub struct Service {
     initial_tokens: BTreeMap<SessionId, ControlToken>,
     pending_deliveries: BTreeMap<AttachId, ControlToken>,
     observer_grant_ids: BTreeMap<SessionId, ObserverGrantIds>,
+    /// Bounded per-session ring and per-lease queues for the pushed event wire
+    /// (bitty#2792).
+    events: EventBus,
+    /// Sessions a handler mutated during the current dispatch.
+    touched: Vec<SessionId>,
+    /// Leases the bounded queue could not serve; the transport closes the
+    /// owning connection after the response drains.
+    closed_leases: Vec<LeaseClose>,
+    /// Final frames addressed to a lease, routed to the connection that owns
+    /// it on the next delivery pass (the requester never receives them).
+    pending_frames: BTreeMap<AttachId, Vec<Event>>,
     state: DaemonState,
     stop_requested: Option<StopMode>,
     drain_deadline_ms: Option<u64>,
@@ -472,6 +488,7 @@ impl Service {
         let instance_id = host.instance_id();
         let audit = AuditSink::new(instance_id, &limits, writer);
         let workers = WorkerPool::new(&limits);
+        let events = EventBus::new(instance_id, event_limits(&limits));
         Ok(Self {
             host,
             grants: GrantStore::new(&limits),
@@ -487,6 +504,10 @@ impl Service {
             initial_tokens: BTreeMap::new(),
             pending_deliveries: BTreeMap::new(),
             observer_grant_ids: BTreeMap::new(),
+            events,
+            touched: Vec::new(),
+            closed_leases: Vec::new(),
+            pending_frames: BTreeMap::new(),
             state: DaemonState::Running,
             stop_requested: None,
             drain_deadline_ms: None,
@@ -505,7 +526,9 @@ impl Service {
     /// bit is narrowed to the plan the startup probe actually selected. A
     /// Linux cell whose cgroup and subreaper probes both failed cannot contain
     /// a worker tree, so it must not advertise `worker_sessions` and every
-    /// worker create is `Denied/UnsupportedCapability`.
+    /// worker create is `Denied/UnsupportedCapability`. The `events` bit is
+    /// compiled from [`crate::contract::EVENTS_SERVED`] and is never narrowed
+    /// per run: delivery either exists in this build's loop or it does not.
     #[must_use]
     pub fn capabilities(&self) -> Capabilities {
         let mut capabilities = CAPABILITIES;
@@ -584,8 +607,11 @@ impl Service {
     pub fn sweep_grants(&mut self, now: MonotonicMs) -> usize {
         let dropped = self.grants.evict_expired(now.as_millis());
         for session_id in self.grants.take_expired_sessions() {
-            let _ = self.host.record_grant_mutation(session_id, now);
+            if self.host.record_grant_mutation(session_id, now).is_ok() {
+                self.touch(session_id);
+            }
         }
+        self.flush_events(now);
         dropped
     }
 
@@ -606,6 +632,10 @@ impl Service {
             .workers
             .supervise(&mut self.host, &mut self.orphans, now);
         for session_id in finished {
+            // The exit is already recorded, so the terminal event is reserved
+            // before the service-side state is retired.
+            self.touch(session_id);
+            self.flush_events(now);
             self.retire_session(session_id, now);
         }
     }
@@ -695,6 +725,270 @@ impl Service {
         routed
     }
 
+    /// Route final frames to the connection that owns their lease.
+    ///
+    /// A revoked lease's last frame belongs to the target connection, never to
+    /// the requester's response. The delivery pass runs for every connection on
+    /// the poll tick, so the target receives it without new input.
+    pub fn route_final_frames(&mut self, connection: &mut Connection) -> usize {
+        let mut routed = 0;
+        let targets: Vec<AttachId> = self.pending_frames.keys().copied().collect();
+        for attach_id in targets {
+            if !connection.owns_lease(attach_id) {
+                continue;
+            }
+            if let Some(frames) = self.pending_frames.remove(&attach_id) {
+                connection.queue_frames(frames);
+                routed += 1;
+            }
+        }
+        routed
+    }
+
+    /// Take the event frames queued for the leases this connection holds.
+    ///
+    /// The transport writes them after the current response, so a control frame
+    /// never preempts the response it belongs to. Draining is the handoff
+    /// point: a drained terminal frame counts as observed, which releases the
+    /// pin for that lease (`D-10`).
+    pub fn drain_events(&mut self, connection: &Connection) -> Vec<Event> {
+        let mut drained = Vec::new();
+        while let Some(event) = self.drain_next_event(connection) {
+            self.ack_terminal(&event);
+            drained.push(event);
+        }
+        drained
+    }
+
+    /// Take the next queued event for any lease this connection holds.
+    ///
+    /// One frame at a time keeps a full outbound buffer from discarding the
+    /// rest of a drained batch. The caller acknowledges a terminal frame with
+    /// [`Self::ack_terminal`] only after handing it to the transport.
+    pub fn drain_next_event(&mut self, connection: &Connection) -> Option<Event> {
+        for (attach_id, session_id) in connection.leases() {
+            if let Some(event) = self.events.drain_next(session_id, attach_id) {
+                return Some(event);
+            }
+        }
+        None
+    }
+
+    /// Release the pinned terminal frame for the lease a routed event names.
+    pub fn ack_terminal(&mut self, event: &Event) {
+        if event.kind != EventKind::SessionTerminal {
+            return;
+        }
+        if let Some(attach_id) = event.attach_id {
+            self.events.ack_terminal(event.session_id, attach_id);
+        }
+    }
+
+    /// Whether one lease still has a queued event frame.
+    #[must_use]
+    pub fn has_pending_event(&self, session_id: SessionId, attach_id: AttachId) -> bool {
+        self.events.has_pending(session_id, attach_id)
+    }
+
+    /// Register a new lease with the event bus and return its replay window.
+    ///
+    /// A live session is registered at create, so a missing bus entry is an
+    /// internal invariant failure. The host lease is detached and the request
+    /// refused instead of silently serving a lease that can never receive a
+    /// frame.
+    fn attach_event_stream(
+        &mut self,
+        session_id: SessionId,
+        attach_id: AttachId,
+        now: MonotonicMs,
+    ) -> Result<ReplaySlice, Refusal> {
+        if !self.events.attach(session_id, attach_id) {
+            let _ = self.host.detach(
+                session_id,
+                attach_id,
+                &ControlAuthority::lease(attach_id),
+                now,
+            );
+            return Err(Refusal::internal());
+        }
+        Ok(self.events.replay(session_id, attach_id))
+    }
+
+    /// Leases of this connection whose bounded queue could not accept a
+    /// control frame.
+    ///
+    /// The transport closes the owning connection after the response drains;
+    /// the client reconciles with `session.status` (`D-10`). Other connections'
+    /// pending closes are left in place.
+    pub fn take_closed_leases_for(&mut self, connection: &Connection) -> Vec<LeaseClose> {
+        let mut taken = Vec::new();
+        self.closed_leases.retain(|close| {
+            if connection.owns_lease(close.attach_id) {
+                taken.push(*close);
+                false
+            } else {
+                true
+            }
+        });
+        taken
+    }
+
+    /// Release every lease a disconnecting connection held.
+    ///
+    /// A live session gets its one `session_state` detach event, so the
+    /// remaining leases and `session.status` stay consistent; a retained
+    /// terminal record is read-only and only the stream state is released.
+    pub fn close_connection_leases(&mut self, connection: &Connection, now: MonotonicMs) {
+        let leases: Vec<(AttachId, SessionId)> = connection.leases().collect();
+        for (attach_id, session_id) in &leases {
+            if self.host.session_for_lease(*attach_id).is_some() {
+                // A disconnect detaches the connection's own lease, so the
+                // controller token stays reclaimable (`D-09`). Only an
+                // operator revocation retires it.
+                if let Ok(detached) = self.host.detach(
+                    *session_id,
+                    *attach_id,
+                    &ControlAuthority::lease(*attach_id),
+                    now,
+                ) {
+                    if detached.was_attached {
+                        self.record(
+                            AuditAction::Detach,
+                            connection,
+                            Some(Self::audit_session(&detached.session)),
+                            AuditTarget::attach(*attach_id.as_bytes()),
+                            AuditResult::Ok,
+                            None,
+                            None,
+                            now,
+                        );
+                    }
+                }
+                self.touch(*session_id);
+            }
+            self.events.detach(*session_id, *attach_id);
+            // A final frame addressed to this lease can never be delivered
+            // once its connection is gone; the map is unbounded and attach ids
+            // are never reused.
+            self.pending_frames.remove(attach_id);
+        }
+        self.flush_events(now);
+        for (_, session_id) in &leases {
+            self.maybe_forget_events(*session_id, now);
+        }
+    }
+
+    /// Record that a handler mutated one session.
+    fn touch(&mut self, session_id: SessionId) {
+        if !self.touched.contains(&session_id) {
+            self.touched.push(session_id);
+        }
+    }
+
+    /// Emit one event now, at an exact revision, to the leases attached at this
+    /// instant.
+    ///
+    /// Used where the handler must control the order relative to its own lease
+    /// bookkeeping (an attach emits to the leases that already existed, then
+    /// registers the new one so the replay is its single copy).
+    fn emit_now(
+        &mut self,
+        session_id: SessionId,
+        revision: u64,
+        kind: EventKind,
+        detail: EventDetail,
+        terminal: Option<TerminalMarker>,
+        now: MonotonicMs,
+    ) {
+        let Ok(emission) = self
+            .events
+            .emit(session_id, revision, kind, detail, terminal, now)
+        else {
+            return;
+        };
+        for close in emission.closed {
+            self.close_lease_now(session_id, close, now);
+        }
+    }
+
+    /// Close one lease whose bounded queue could not accept a control frame.
+    fn close_lease_now(&mut self, session_id: SessionId, close: LeaseClose, now: MonotonicMs) {
+        if self.host.session_for_lease(close.attach_id).is_some() {
+            // A queue-overflow close is not an operator revocation: detach the
+            // lease itself so a controller token stays reclaimable.
+            let _ = self.host.detach(
+                session_id,
+                close.attach_id,
+                &ControlAuthority::lease(close.attach_id),
+                now,
+            );
+        }
+        self.events.detach(session_id, close.attach_id);
+        self.pending_frames.remove(&close.attach_id);
+        self.closed_leases.push(close);
+        self.touch(session_id);
+        self.maybe_forget_events(session_id, now);
+    }
+
+    /// Emit one event per revision the handlers advanced but did not report.
+    ///
+    /// The registry revision is authoritative: a handler only has to say which
+    /// session it mutated. A revision the handler reported with a specific kind
+    /// or detail wins; any other gap is a plain `session_state`, and the last
+    /// revision of a terminal snapshot is the pinned `session_terminal`.
+    fn flush_events(&mut self, now: MonotonicMs) {
+        let mut queue: VecDeque<SessionId> =
+            std::mem::take(&mut self.touched).into_iter().collect();
+        let max_steps = queue.len().saturating_mul(8).saturating_add(64);
+        let mut steps = 0usize;
+        while let Some(session_id) = queue.pop_front() {
+            steps += 1;
+            if steps > max_steps {
+                break;
+            }
+            let Some(snapshot) = self.host.snapshot(session_id, now) else {
+                continue;
+            };
+            let target = snapshot.state_revision;
+            let Some(current) = self.events.revision(session_id) else {
+                continue;
+            };
+            if current >= target {
+                continue;
+            }
+            let marker = TerminalMarker::from_snapshot(&snapshot);
+            let mut closed = Vec::new();
+            for revision in (current + 1)..=target {
+                let (kind, terminal) = match marker {
+                    Some(marker) if revision == target => {
+                        (EventKind::SessionTerminal, Some(marker))
+                    }
+                    _ => (EventKind::SessionState, None),
+                };
+                match self
+                    .events
+                    .emit(session_id, revision, kind, EventDetail::None, terminal, now)
+                {
+                    Ok(emission) => closed.extend(emission.closed),
+                    Err(()) => break,
+                }
+            }
+            for close in closed {
+                self.close_lease_now(session_id, close, now);
+                if !queue.contains(&session_id) {
+                    queue.push_back(session_id);
+                }
+            }
+        }
+    }
+
+    /// The bounded event state, for unit tests and status counters.
+    #[cfg(all(test, target_os = "linux"))]
+    #[must_use]
+    pub(crate) const fn events(&self) -> &EventBus {
+        &self.events
+    }
+
     /// Negotiate one connection.
     ///
     /// # Errors
@@ -754,6 +1048,20 @@ impl Service {
                 .as_ref()
                 .map(ClientCorrelation::digest),
         );
+
+        // Step 6: a request for a capability this cell does not serve is a
+        // typed refusal, never a silent connection that never receives a
+        // frame. Refuse before consuming the single-use host grant: a
+        // capability refusal must not mutate on the way out.
+        if request.events {
+            if !self.capabilities().events {
+                let refusal = Refusal::denied(RefusalCode::UnsupportedCapability);
+                self.record_refusal(connection, AuditAction::Negotiate, refusal, now);
+                return Err(refusal);
+            }
+            connection.mark_events(true);
+        }
+
         if let Some(presented) = request.host_grant.as_ref() {
             if let Ok(consumed) = self.grants.consume_to(
                 presented,
@@ -806,10 +1114,19 @@ impl Service {
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
         let result = self.dispatch_inner(connection, method, params, now);
-        if let Err(refusal) = result {
-            // D-16: a refusal is attributed. The per-connection suppression
-            // budget/aggregation is a tracked follow-up (README).
-            self.record_refusal(connection, method.audit_action(), refusal, now);
+        match &result {
+            Err(refusal) => {
+                // D-16: a refusal is attributed. The per-connection suppression
+                // budget/aggregation is a tracked follow-up (README).
+                self.record_refusal(connection, method.audit_action(), *refusal, now);
+            }
+            Ok(_) => {
+                // Emit the events for every revision the handler advanced
+                // before the response is rendered, so a client that reads the
+                // new revision from the result already has the frame reserved
+                // (`D-10`).
+                self.flush_events(now);
+            }
         }
         result
     }
@@ -888,7 +1205,12 @@ impl Service {
     /// A refusal here is an invariant failure; the process still exits.
     pub fn signal_stop(&mut self, now: MonotonicMs) -> Result<Value, Refusal> {
         self.state = DaemonState::Stopping;
+        let deadline = now
+            .as_millis()
+            .saturating_add(self.limits.effective(LimitId::DrainGraceMs));
+        self.publish_daemon_stopping(deadline, now);
         let terminated = self.terminate_all(DaemonStopCause::HostShutdown, now);
+        self.flush_events(now);
         self.stop_requested = Some(StopMode::Drain);
         Ok(json!({
             "accepted": true,
@@ -896,6 +1218,33 @@ impl Service {
             "terminated": terminated,
             "reason": "host_shutdown",
         }))
+    }
+
+    /// Queue the daemon-scoped `daemon_stopping` control frame on every live
+    /// lease (`D-05`, `D-10`).
+    ///
+    /// The frame carries the drain deadline and never bumps a revision: it is a
+    /// daemon announcement, not a session mutation. It is queued before any
+    /// terminal event so a draining client sees the reason before the close.
+    fn publish_daemon_stopping(&mut self, deadline_ms: u64, now: MonotonicMs) {
+        let sessions: Vec<SessionId> = self
+            .host
+            .snapshots(now)
+            .filter(|snapshot| !snapshot.state.is_terminal())
+            .map(|snapshot| snapshot.session_id)
+            .collect();
+        for session_id in sessions {
+            if let Ok(emission) = self.events.emit_scoped(
+                session_id,
+                EventKind::DaemonStopping,
+                EventDetail::DaemonStopping { deadline_ms },
+                now,
+            ) {
+                for close in emission.closed {
+                    self.close_lease_now(session_id, close, now);
+                }
+            }
+        }
     }
 
     // ── stage helpers ───────────────────────────────────────────────────────
@@ -1203,6 +1552,31 @@ impl Service {
         for attach in targets {
             self.pending_deliveries.remove(&attach);
         }
+        self.maybe_forget_events(session_id, now);
+    }
+
+    /// Drop a session's delivery state once no lease can still receive a frame.
+    ///
+    /// A live session keeps its ring when its last lease disconnects: a
+    /// reattach must replay the retained revisions (`D-10`). Only a retired or
+    /// collected session may drop the entry. A retired terminal record keeps
+    /// its per-lease queues (and the pinned terminal event) until the last
+    /// holding connection drains or closes, so the terminal-event guarantee
+    /// survives the record leaving the registry.
+    fn maybe_forget_events(&mut self, session_id: SessionId, now: MonotonicMs) {
+        if !self.events.leases(session_id).is_empty() {
+            return;
+        }
+        let live = self
+            .host
+            .snapshot(session_id, now)
+            .is_some_and(|snapshot| !snapshot.state.is_terminal());
+        if live {
+            return;
+        }
+        for close in self.events.remove(session_id) {
+            self.closed_leases.push(close);
+        }
     }
 
     fn session_store(&mut self, session_id: SessionId) -> &mut IdempotencyStore {
@@ -1298,8 +1672,12 @@ impl Service {
                 now.as_millis()
                     .saturating_add(self.limits.effective(LimitId::DrainGraceMs)),
             );
+            if let Some(deadline) = self.drain_deadline_ms {
+                self.publish_daemon_stopping(deadline, now);
+            }
         }
         let terminated = self.terminate_all(DaemonStopCause::DaemonStop, now);
+        self.flush_events(now);
         self.stop_requested = Some(mode);
         self.record(
             AuditAction::Stop,
@@ -1448,6 +1826,11 @@ impl Service {
                         .complete_pre_bind_cancel(session_id, CleanupClass::NotStarted, now)
                 {
                     terminated = terminated.saturating_add(1);
+                    // The terminal event is reserved before the record is
+                    // retired, so a client either receives it or is closed with
+                    // `TerminalEventLost` (`D-10`).
+                    self.touch(session_id);
+                    self.flush_events(now);
                     self.retire_session(session_id, now);
                     let _ = self.audit.record(
                         AuditEntry::new(AuditAction::Stop)
@@ -1497,6 +1880,8 @@ impl Service {
                 now,
             ) {
                 terminated = terminated.saturating_add(1);
+                self.touch(session_id);
+                self.flush_events(now);
                 self.retire_session(session_id, now);
                 let _ = self.audit.record(
                     AuditEntry::new(AuditAction::Stop)
@@ -1701,17 +2086,27 @@ impl Service {
                 match created {
                     Ok(created) => {
                         let session_id = created.session.session_id;
+                        self.events.register(session_id);
                         self.initial_tokens
                             .insert(session_id, created.control_token);
                         self.create_key_by_session.insert(session_id, key);
                         let started = self.start_worker(session_id, spawn.as_ref(), now);
                         let snapshot = match started {
-                            Ok(snapshot) => snapshot,
+                            Ok(snapshot) => {
+                                // A worker bind is a snapshot-visible revision
+                                // before any lease exists, so the ring must
+                                // hold its event for the first attach replay.
+                                if snapshot.state_revision > 0 {
+                                    self.touch(session_id);
+                                }
+                                snapshot
+                            }
                             Err(refusal) => {
                                 // A pre-spawn failure leaves no child and no
                                 // reserved journal record: roll the created
                                 // record back whole and answer the refusal.
                                 let _ = self.host.discard_created(session_id);
+                                self.events.remove(session_id);
                                 self.initial_tokens.remove(&session_id);
                                 self.create_key_by_session.remove(&session_id);
                                 let _ = self
@@ -2029,6 +2424,25 @@ impl Service {
                 {
                     Ok(claimed) => {
                         let attach_id = claimed.lease.attach_id();
+                        // The attaching lease receives this event through its
+                        // replay, so it is emitted to the leases that already
+                        // existed before the new queue is registered.
+                        self.touch(session_id);
+                        self.flush_events(now);
+                        let replay = if connection.events_enabled() {
+                            match self.attach_event_stream(session_id, attach_id, now) {
+                                Ok(replay) => Some(replay),
+                                Err(refusal) => {
+                                    let _ = self.session_store(session_id).complete(
+                                        reservation,
+                                        IdempotencyResult::Refused(store_code(refusal)),
+                                    );
+                                    return Err(refusal);
+                                }
+                            }
+                        } else {
+                            None
+                        };
                         connection.register_lease(attach_id, session_id);
                         let result_ref = crate::service::grants::ref_of(attach_id.as_bytes());
                         let applied = AppliedResult::new(
@@ -2054,14 +2468,20 @@ impl Service {
                             now,
                         );
                         let rotated = crate::handshake::hex(claimed.control_token.expose_secret());
-                        Ok(json!({
+                        let mut result = json!({
                             "session": session_json(&claimed.session),
                             "attach_id": attach_id.as_hex(),
                             "role": "controller",
                             "lease_expires_at_ms": claimed.lease.expires_at().as_millis(),
                             "control_token": rotated,
                             "replayed": false,
-                        }))
+                        });
+                        attach_replay_fields(
+                            &mut result,
+                            replay.as_ref(),
+                            self.limits.effective_usize(LimitId::MaxLeaseQueueBytes),
+                        );
+                        Ok(result)
                     }
                     Err(error) => {
                         let refusal = map_lease(error);
@@ -2153,6 +2573,16 @@ impl Service {
                         return Err(map_lease(error));
                     }
                 };
+                // Both revisions (attach, then the grant consume) are emitted
+                // before the new lease registers, so its single copy is the
+                // replay below.
+                self.touch(session_id);
+                self.flush_events(now);
+                let replay = if connection.events_enabled() {
+                    Some(self.attach_event_stream(session_id, attach_id, now)?)
+                } else {
+                    None
+                };
                 connection.register_lease(attach_id, session_id);
                 self.record(
                     AuditAction::Attach,
@@ -2164,13 +2594,19 @@ impl Service {
                     None,
                     now,
                 );
-                Ok(json!({
+                let mut result = json!({
                     "session": session_json(&session),
                     "attach_id": attach_id.as_hex(),
                     "role": "observer",
                     "lease_expires_at_ms": attached.lease.expires_at().as_millis(),
                     "replayed": false,
-                }))
+                });
+                attach_replay_fields(
+                    &mut result,
+                    replay.as_ref(),
+                    self.limits.effective_usize(LimitId::MaxLeaseQueueBytes),
+                );
+                Ok(result)
             }
             Err(error) => Err(map_lease(error)),
         }
@@ -2295,6 +2731,7 @@ impl Service {
                             }
                         };
                         self.remember_observer_grant(session_id, minted.grant_id);
+                        self.touch(session_id);
                         let result_ref = crate::service::grants::ref_of(minted.grant_id.as_bytes());
                         let applied = AppliedResult::new(
                             AppliedClass::GrantMinted,
@@ -2417,6 +2854,7 @@ impl Service {
                 self.host
                     .record_grant_mutation(session_id, now)
                     .map_err(map_lease)?;
+                self.touch(session_id);
             }
         }
         self.record(
@@ -2514,12 +2952,49 @@ impl Service {
         self.admit()?;
         match self.host.detach(session_id, target, &authority, now) {
             Ok(detached) => {
+                // The target's lease disappears from the delivery state, so
+                // its queued frames are handed to the connection first: older
+                // events in order, then the target-only `lease_revoked` frame
+                // when control revoked it. Survivors get the canonical
+                // `session_state` below.
+                let mut finals = self.events.drain(session_id, target);
+                if detached.revoked {
+                    finals.push(Event {
+                        instance_id: self.instance_id(),
+                        session_id,
+                        attach_id: Some(target),
+                        revision: detached.session.state_revision,
+                        kind: EventKind::LeaseRevoked,
+                        terminal: None,
+                        detail: EventDetail::None,
+                        emitted_at: now,
+                    });
+                }
+                if !finals.is_empty() {
+                    if connection.owns_lease(target) {
+                        // A self-detach keeps its own frames on its connection.
+                        connection.queue_frames(finals);
+                    } else {
+                        // Another connection's lease: route on its next
+                        // delivery pass, never on the requester's response.
+                        self.pending_frames.insert(target, finals);
+                    }
+                }
+                self.events.detach(session_id, target);
                 connection.forget_lease(target);
                 // Record the acting connection for a controller/operator
                 // revocation of another connection's lease too; the target
                 // lookup has already removed it, so only this history can
                 // answer the contract's duplicate detach.
                 connection.remember_detached(target, session_id);
+                self.emit_now(
+                    session_id,
+                    detached.session.state_revision,
+                    EventKind::SessionState,
+                    EventDetail::None,
+                    None,
+                    now,
+                );
                 self.record(
                     AuditAction::Detach,
                     connection,
@@ -2625,6 +3100,24 @@ impl Service {
                         if let Ok(token) = delivery.take_for(controller) {
                             self.pending_deliveries.insert(controller, token);
                         }
+                        // The `control_transfer` frame names both leases and
+                        // goes to every attached lease of the session; it is a
+                        // control frame and is never shed (`D-10`).
+                        let detail = transferred.previous_controller.map_or(
+                            EventDetail::None,
+                            |previous_controller| EventDetail::ControlTransfer {
+                                from: previous_controller,
+                                to: controller,
+                            },
+                        );
+                        self.emit_now(
+                            session_id,
+                            transferred.session.state_revision,
+                            EventKind::ControlTransfer,
+                            detail,
+                            None,
+                            now,
+                        );
                         self.record(
                             AuditAction::Transfer,
                             connection,
@@ -2707,6 +3200,7 @@ impl Service {
             Err(ResizeError::Pty) => return Err(Refusal::internal()),
         }
         let resized = self.host.record_resize(attach, now).map_err(map_lease)?;
+        self.touch(session_id);
         self.record(
             AuditAction::Resize,
             connection,
@@ -2844,6 +3338,8 @@ impl Service {
                     .map_err(map_lease)?;
                 let snapshot = match terminated {
                     Termination::Completed(notice) => {
+                        self.touch(session_id);
+                        self.flush_events(now);
                         self.retire_session(session_id, now);
                         let terminal = Some(AuditTerminal {
                             state: notice.session.state,
@@ -2874,6 +3370,9 @@ impl Service {
                 }))
             }
             StopOutcome::Accepted(accepted) => {
+                // The session is stopping, not terminal: the terminal event
+                // arrives with the worker exit (`supervise`).
+                self.touch(session_id);
                 self.record(
                     action,
                     connection,
@@ -2971,6 +3470,61 @@ fn session_json(snapshot: &SessionSnapshot) -> Value {
     value
 }
 
+/// Add the optional attach replay keys (`D-10`, bitty#2792).
+///
+/// The ring is served whole: a `1.0` attach request carries no cursor, and a
+/// reconnect deduplicates by `(session_id, revision, kind)`. `backlog_truncated`
+/// plus `earliest_revision` state a gap explicitly instead of serving a partial
+/// history. A pinned terminal event that is no longer in the ring is appended
+/// last, so the reconnect still receives the one frame the guarantee promises.
+fn attach_replay_fields(result: &mut Value, replay: Option<&ReplaySlice>, max_bytes: usize) {
+    let Some(replay) = replay else {
+        return;
+    };
+    // The replay is bounded by the effective lease-queue byte cap so a full
+    // ring can never push the response frame past `max_frame_bytes`. The
+    // newest events win: a client that needs older history reconciles with
+    // `session.status`.
+    let mut events: Vec<&Event> = replay.events.iter().collect();
+    if let Some(terminal) = replay.terminal_event.as_ref() {
+        events.push(terminal);
+    }
+    let mut kept: Vec<&Event> = Vec::new();
+    let mut bytes = 0usize;
+    let mut truncated = replay.backlog_truncated;
+    for event in events.iter().rev() {
+        let size = crate::service::wire::event_value(event).to_string().len();
+        if bytes.saturating_add(size) > max_bytes && !kept.is_empty() {
+            truncated = true;
+            break;
+        }
+        bytes = bytes.saturating_add(size);
+        kept.push(event);
+    }
+    kept.reverse();
+    let earliest_revision = if truncated {
+        kept.first().map(|event| event.revision)
+    } else {
+        replay.earliest_revision
+    };
+    let Some(object) = result.as_object_mut() else {
+        return;
+    };
+    object.insert(
+        "backlog".to_owned(),
+        Value::Array(
+            kept.iter()
+                .map(|event| crate::service::wire::event_value(event))
+                .collect(),
+        ),
+    );
+    object.insert("backlog_truncated".to_owned(), Value::Bool(truncated));
+    object.insert(
+        "earliest_revision".to_owned(),
+        earliest_revision.map_or(Value::Null, |revision| json!(revision)),
+    );
+}
+
 fn check_generation(snapshot: &SessionSnapshot, expected: u64) -> Result<(), Refusal> {
     if snapshot.generation == expected {
         Ok(())
@@ -3008,6 +3562,30 @@ fn fingerprint(parts: &[&str]) -> Fingerprint {
 
 fn store_code(refusal: Refusal) -> RefusalCode {
     refusal.audit_code()
+}
+
+/// The compiled event bounds for this run.
+///
+/// Every value comes from the `D-14` table, so a configuration override that
+/// the limits layer accepted is the same number the queues enforce. A value the
+/// event layer refuses is a compiled-constant mismatch, which the unit tests
+/// pin; the fallback keeps the service startup path infallible.
+fn event_limits(limits: &Limits) -> EventLimits {
+    EventLimits::new(
+        usize::try_from(limits.effective(LimitId::MaxEventBacklogEvents))
+            .unwrap_or(MAX_EVENT_BACKLOG_EVENTS),
+        usize::try_from(limits.effective(LimitId::MaxEventBacklogBytes))
+            .unwrap_or(MAX_EVENT_BACKLOG_BYTES),
+        usize::try_from(limits.effective(LimitId::MaxLeaseQueueEvents))
+            .unwrap_or(MAX_LEASE_QUEUE_EVENTS),
+        usize::try_from(limits.effective(LimitId::MaxLeaseQueueBytes))
+            .unwrap_or(MAX_LEASE_QUEUE_BYTES),
+        usize::try_from(limits.effective(LimitId::MaxAttachesPerSession))
+            .unwrap_or(crate::events::MAX_ATTACHES_PER_SESSION_DEFAULT),
+        limits.effective(LimitId::AttachLeaseTtlMs),
+        MAX_ATTACH_KEYS_PER_SESSION,
+    )
+    .unwrap_or_else(|_| EventLimits::default())
 }
 
 /// The idempotency result to store for a refused create.
@@ -5546,6 +6124,307 @@ mod tests {
                 .expect_err("non-integer")
                 .kind(),
             RefusalKind::InvalidRequest
+        );
+    }
+
+    /// A connection that opts in at negotiate is tracked; one that does not is
+    /// never queued a frame (`D-10`, bitty#2792).
+    #[test]
+    fn only_an_event_opted_connection_is_queued_events() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 1);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"))
+            .with_events(true);
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(2))
+            .expect("negotiate");
+        assert!(creator.events_enabled());
+
+        let created = create_session(&mut service, &mut creator, "events-create");
+        let session = session_id(&created);
+        let attach = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": session,
+                    "expected_generation": 0,
+                    "control_token": created["control_token"],
+                    "idempotency_key": "events-claim",
+                }),
+                MonotonicMs::from_millis(11),
+            )
+            .expect("attach");
+        assert!(attach["attach_id"].is_string());
+        assert_eq!(attach["backlog_truncated"], false);
+        assert_eq!(
+            attach["backlog"].as_array().map(Vec::len),
+            Some(1),
+            "the attach revision is replayed to the new lease"
+        );
+
+        let mut plain = consumer();
+        negotiate_ok(&mut service, &mut plain, 12);
+        assert!(!plain.events_enabled());
+        assert!(service.drain_events(&plain).is_empty());
+    }
+
+    /// A lease whose bounded queue cannot accept the next control frame is
+    /// closed with `TerminalEventLost` instead of growing memory (`D-10`).
+    #[test]
+    fn a_stalled_lease_queue_is_closed_with_terminal_event_lost() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 1);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"))
+            .with_events(true);
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(2))
+            .expect("negotiate");
+
+        let created = create_session(&mut service, &mut creator, "stall-create");
+        let session = session_id(&created);
+        let claimed = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": session,
+                    "expected_generation": 0,
+                    "control_token": created["control_token"],
+                    "idempotency_key": "stall-claim",
+                }),
+                MonotonicMs::from_millis(11),
+            )
+            .expect("attach");
+        let attach_id = claimed["attach_id"].as_str().expect("attach id").to_owned();
+        let token = claimed["control_token"].as_str().expect("token").to_owned();
+        let parsed = AttachId::parse(&attach_id).expect("attach id");
+
+        // Nothing drains this connection: each mint/revoke pair advances the
+        // revision twice, so the bounded lease queue is the only backpressure.
+        let mut closed = Vec::new();
+        for index in 0..200 {
+            let minted = service
+                .dispatch(
+                    &mut creator,
+                    ServiceMethod::SessionGrant,
+                    &json!({
+                        "session_id": session,
+                        "idempotency_key": format!("stall-grant-{index}"),
+                        "control_token": token,
+                    }),
+                    MonotonicMs::from_millis(20 + index),
+                )
+                .expect("mint");
+            let grant_id = minted["grant_id"].as_str().expect("grant id").to_owned();
+            let _ = service.dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrantRevoke,
+                &json!({"grant_id": grant_id, "control_token": token}),
+                MonotonicMs::from_millis(21 + index),
+            );
+            closed = service.take_closed_leases_for(&creator);
+            if !closed.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(closed.len(), 1, "exactly the stalled lease is closed");
+        assert_eq!(closed[0].attach_id, parsed);
+        assert_eq!(
+            closed[0].reason,
+            crate::events::LeaseCloseReason::TerminalEventLost
+        );
+        assert!(
+            !service.has_pending_event(SessionId::parse(&session).expect("session id"), parsed),
+            "the closed lease keeps no queue"
+        );
+        // The session is still live and its snapshot still reconciles.
+        let status = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": session}),
+                MonotonicMs::from_millis(400),
+            )
+            .expect("status");
+        assert_eq!(status["session"]["attach_count"], 0);
+    }
+
+    /// The terminal event is reserved before the terminal state is readable
+    /// (`D-10`), and a heartbeat never queues one (`D-12`).
+    #[test]
+    fn a_terminal_transition_pins_one_event_per_lease() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 1);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"))
+            .with_events(true);
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(2))
+            .expect("negotiate");
+
+        let created = create_session(&mut service, &mut creator, "terminal-create");
+        let session = session_id(&created);
+        let parsed = SessionId::parse(&session).expect("session id");
+        let claimed = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": session,
+                    "expected_generation": 0,
+                    "control_token": created["control_token"],
+                    "idempotency_key": "terminal-claim",
+                }),
+                MonotonicMs::from_millis(11),
+            )
+            .expect("attach");
+        let attach_id =
+            AttachId::parse(claimed["attach_id"].as_str().expect("attach id")).expect("attach id");
+        let _ = service.drain_events(&creator);
+
+        let aborted = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAbort,
+                &json!({
+                    "session_id": session,
+                    "reason_class": "cancel",
+                    "generation": 0,
+                    "control_token": claimed["control_token"],
+                }),
+                MonotonicMs::from_millis(12),
+            )
+            .expect("abort");
+        assert_eq!(aborted["accepted"], true);
+        let events = service.drain_events(&creator);
+        let terminal: Vec<&Event> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::SessionTerminal)
+            .collect();
+        assert_eq!(terminal.len(), 1, "one terminal event per revision");
+        assert_eq!(
+            terminal[0].revision,
+            aborted["session"]["state_revision"]
+                .as_u64()
+                .expect("revision"),
+            "the terminal event carries the terminal revision"
+        );
+        assert!(terminal[0].terminal.is_some(), "the marker is present");
+        assert!(
+            events
+                .windows(2)
+                .all(|pair| pair[0].revision < pair[1].revision),
+            "revision order is strict"
+        );
+        assert!(service.events().terminalized(parsed));
+        assert!(
+            !service.events().terminal_pending(parsed, attach_id),
+            "handing the frame to the transport releases the pin"
+        );
+        // A heartbeat after the terminal transition queues nothing.
+        let _ = service.dispatch(
+            &mut creator,
+            ServiceMethod::LeaseHeartbeat,
+            &json!({"attach_id": attach_id.as_hex()}),
+            MonotonicMs::from_millis(13),
+        );
+        assert!(service.drain_events(&creator).is_empty());
+    }
+
+    /// A final frame addressed to a connection that closes before its next
+    /// delivery pass is dropped with the connection, never retained forever.
+    #[test]
+    fn closing_a_connection_drops_its_pending_final_frames() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 1);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(2))
+            .expect("negotiate");
+
+        let created = create_session(&mut service, &mut creator, "pending-create");
+        let session = session_id(&created);
+        let claimed = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": session,
+                    "expected_generation": 0,
+                    "control_token": created["control_token"],
+                    "idempotency_key": "pending-claim",
+                }),
+                MonotonicMs::from_millis(11),
+            )
+            .expect("attach");
+        let controller_token = claimed["control_token"].as_str().expect("token").to_owned();
+        let minted = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": session, "idempotency_key": "pending-grant"}),
+                MonotonicMs::from_millis(12),
+            )
+            .expect("grant");
+        let grant = minted["grant"].as_str().expect("observer grant").to_owned();
+
+        let mut observer = consumer();
+        negotiate_ok(&mut service, &mut observer, 13);
+        let attached = service
+            .dispatch(
+                &mut observer,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "observer",
+                    "session_id": session,
+                    "observer_grant": grant,
+                }),
+                MonotonicMs::from_millis(14),
+            )
+            .expect("observer attach");
+        let observer_attach =
+            AttachId::parse(attached["attach_id"].as_str().expect("attach id")).expect("attach id");
+
+        // The controller revokes the observer's lease; its final frame is
+        // routed on the observer's next delivery pass.
+        let _ = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionDetach,
+                &json!({
+                    "attach_id": observer_attach.as_hex(),
+                    "control_token": controller_token,
+                }),
+                MonotonicMs::from_millis(15),
+            )
+            .expect("revoke");
+        assert!(
+            service.pending_frames.contains_key(&observer_attach),
+            "the revoked lease's final frame is pending"
+        );
+
+        // The observer disconnects before that pass. The entry must not
+        // outlive the connection that could receive it.
+        service.close_connection_leases(&observer, MonotonicMs::from_millis(16));
+        assert!(
+            !service.pending_frames.contains_key(&observer_attach),
+            "a closed connection drops its pending final frames"
         );
     }
 }

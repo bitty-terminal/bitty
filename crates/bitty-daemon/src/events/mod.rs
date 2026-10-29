@@ -5,8 +5,13 @@
 //!
 //! The stream is in memory only. It starts no listener, serializes nothing, and
 //! holds no terminal content: the wire envelope, the server-generated
-//! per-connection correlation id, and the JSON framing are bitty#2607's, and
-//! lease authority (control tokens, roles, observer grants) is bitty#2609's.
+//! per-connection correlation id, and the JSON framing live in
+//! `service::wire` and `service::server`, and lease authority (control tokens,
+//! roles, observer grants) is bitty#2609's.
+//!
+//! `bus` is the delivery half the served loop uses: the same bounds and
+//! policy applied to the daemon's own session truth, drained onto the
+//! negotiated connection by the poll loop (bitty#2792).
 //!
 //! # Compiled caps
 //!
@@ -55,9 +60,11 @@ pub mod event;
 pub mod limits;
 
 mod backlog;
+mod bus;
 mod lease;
 mod stream;
 
+pub(crate) use self::bus::{EventBus, ReplaySlice};
 pub use self::event::{
     ATTACH_KEY_MAX_BYTES, AttachKey, AttachKeyError, Event, EventDetail, EventKind, TerminalMarker,
 };

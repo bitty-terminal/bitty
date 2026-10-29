@@ -313,6 +313,12 @@ pub struct NegotiateRequest {
     pub operator_capability: Option<SecretBearer>,
     /// Optional single-use host-consent grant.
     pub host_grant: Option<SecretBearer>,
+    /// Whether the client asked for pushed session events on this connection.
+    ///
+    /// Absent is `false`: a `1.0` client never receives a frame it did not
+    /// request, so the additive field preserves the `1.0` behavior. A request
+    /// on a cell that does not serve delivery is refused typed at negotiate.
+    pub events: bool,
 }
 
 impl NegotiateRequest {
@@ -324,6 +330,7 @@ impl NegotiateRequest {
             client_correlation: None,
             operator_capability: None,
             host_grant: None,
+            events: false,
         }
     }
 
@@ -345,6 +352,13 @@ impl NegotiateRequest {
     #[must_use]
     pub fn with_host_grant(mut self, grant: SecretBearer) -> Self {
         self.host_grant = Some(grant);
+        self
+    }
+
+    /// Ask for pushed session events on this connection.
+    #[must_use]
+    pub const fn with_events(mut self, events: bool) -> Self {
+        self.events = events;
         self
     }
 }

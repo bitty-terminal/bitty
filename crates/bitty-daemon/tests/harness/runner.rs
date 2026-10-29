@@ -135,6 +135,17 @@ pub trait Driver {
         partial_body: Option<usize>,
     ) -> Outcome;
 
+    /// Read `count` pushed event frames from one connection.
+    ///
+    /// A frame is an event only when it carries `event` and no `ok`; a reply
+    /// on that connection is a failure, so an implementation that never pushes
+    /// cannot pass by returning the response.
+    ///
+    /// # Errors
+    ///
+    /// A static message when the connection closes or a frame is not an event.
+    fn read_events(&mut self, connection: &str, count: usize) -> Result<Vec<Value>, String>;
+
     /// Replace the instance; every connection is gone afterwards.
     ///
     /// # Errors
@@ -591,6 +602,67 @@ fn execute_action(
                 .as_ref()
                 .ok_or_else(|| "request_log action without expect.request_log".to_owned())?;
             check_request_log(expect, &driver.requests())
+        }
+        "read_events" => {
+            let count = arg_usize(step, "count")?;
+            let events = driver.read_events(connection, count)?;
+            if events.len() != count {
+                return Err(format!("read {} events, expected {count}", events.len()));
+            }
+            // `args.events` gives one expectation object per frame, in order;
+            // `expect.result` is the fallback applied to every frame.
+            let per_event = step.args.get("events").and_then(Value::as_array);
+            for (index, event) in events.iter().enumerate() {
+                let per_event_assertions: BTreeMap<String, Value> =
+                    match per_event.and_then(|events| events.get(index)) {
+                        Some(value) => value
+                            .as_object()
+                            .ok_or_else(|| format!("args.events[{index}] is not an object"))?
+                            .iter()
+                            .map(|(path, expected)| (path.clone(), expected.clone()))
+                            .collect(),
+                        None => BTreeMap::new(),
+                    };
+                let assertions: &BTreeMap<String, Value> = if per_event.is_some() {
+                    &per_event_assertions
+                } else {
+                    &step.expect.result
+                };
+                for (path, expected) in assertions {
+                    let actual = path_get(event, path)
+                        .ok_or_else(|| format!("event {index} has no {path:?}: {event}"))?;
+                    let expected = resolve(expected, vars);
+                    if actual != &expected {
+                        return Err(mismatch(
+                            &format!("event[{index}].{path}"),
+                            actual,
+                            &expected,
+                        ));
+                    }
+                }
+                for (path, other) in &step.expect.not_equal {
+                    let actual = path_get(event, path)
+                        .ok_or_else(|| format!("event {index} has no {path:?}: {event}"))?;
+                    let other = resolve_needle(other, vars);
+                    if actual.as_str() == Some(other.as_str()) {
+                        return Err(format!("event[{index}].{path} must differ from {other:?}"));
+                    }
+                }
+                for path in &step.expect.present {
+                    if !has_field(event, path) {
+                        return Err(format!("event {index} is missing {path:?}"));
+                    }
+                }
+                for path in &step.expect.absent {
+                    if has_field(event, path) {
+                        return Err(format!("event {index} carries forbidden {path:?}"));
+                    }
+                }
+            }
+            if step.expect.closed && !driver.expect_eof(connection) {
+                return Err("the connection did not close after the events".to_owned());
+            }
+            Ok(())
         }
         other => Err(format!("unknown action {other:?}")),
     }

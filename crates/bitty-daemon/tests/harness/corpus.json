@@ -7827,6 +7827,853 @@
         "the service survives and accepts a new handshake",
         "no unread response is mistaken for a mutation result"
       ]
+    },
+    {
+      "id": "C-12",
+      "title": "A pushed event follows its response and revisions are delivered in order",
+      "area": "events",
+      "decisions": [
+        "D-10"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "fake_skip": "requires-real-event-wire (the reference fake synthesizes events after the call returns)",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant",
+            "events": true
+          },
+          "capture": {
+            "instance_id": "daemon_instance_id"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c12-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "c12-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller",
+              "replayed": false
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c12-grant"
+          },
+          "capture": {
+            "grant_id": "grant_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "replayed": false
+            }
+          }
+        },
+        {
+          "action": "read_events",
+          "connection": "creator",
+          "args": {
+            "count": 1
+          },
+          "expect": {
+            "result": {
+              "kind": "session_state",
+              "revision": 2,
+              "session_id": "@session_id",
+              "attach_id": "@controller_attach",
+              "instance_id": "@instance_id",
+              "terminal": false
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant.revoke",
+          "params": {
+            "grant_id": "@grant_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "revoked": true
+            }
+          }
+        },
+        {
+          "action": "read_events",
+          "connection": "creator",
+          "args": {
+            "count": 1
+          },
+          "expect": {
+            "result": {
+              "kind": "session_state",
+              "revision": 3,
+              "attach_id": "@controller_attach",
+              "terminal": false
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state_revision": 3,
+              "session.attach_count": 1
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "an event frame never preempts the response it follows",
+        "revisions are delivered in order with no gap and no renumbering",
+        "the envelope is v1 with a server-chosen id and the frozen event fields"
+      ]
+    },
+    {
+      "id": "C-13",
+      "title": "Each lease receives only its own copy of a pushed event",
+      "area": "events",
+      "decisions": [
+        "D-10"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant",
+            "events": true
+          },
+          "capture": {
+            "instance_id": "daemon_instance_id"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c13-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "c13-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c13-grant"
+          },
+          "capture": {
+            "grant": "grant",
+            "grant_id": "grant_id"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "action": "read_events",
+          "connection": "creator",
+          "args": {
+            "count": 1
+          },
+          "expect": {
+            "result": {
+              "revision": 2,
+              "attach_id": "@controller_attach"
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "events": true
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@grant"
+          },
+          "capture": {
+            "observer_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "observer"
+            },
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
+          }
+        },
+        {
+          "action": "read_events",
+          "connection": "creator",
+          "args": {
+            "count": 2
+          },
+          "expect": {
+            "result": {
+              "kind": "session_state",
+              "attach_id": "@controller_attach"
+            },
+            "not_equal": {
+              "attach_id": "@observer_attach"
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c13-grant-2"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "action": "read_events",
+          "connection": "creator",
+          "args": {
+            "count": 1
+          },
+          "expect": {
+            "result": {
+              "kind": "session_state",
+              "revision": 5,
+              "attach_id": "@controller_attach"
+            },
+            "not_equal": {
+              "attach_id": "@observer_attach"
+            }
+          }
+        },
+        {
+          "action": "read_events",
+          "connection": "observer",
+          "args": {
+            "count": 1
+          },
+          "expect": {
+            "result": {
+              "kind": "session_state",
+              "revision": 5,
+              "attach_id": "@observer_attach"
+            },
+            "not_equal": {
+              "attach_id": "@controller_attach"
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state_revision": 5,
+              "session.attach_count": 2
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a lease never receives a copy addressed to another lease",
+        "an observer copy names the observer's own attach id"
+      ]
+    },
+    {
+      "id": "C-14",
+      "title": "A connection without the event opt-in receives no event frame",
+      "area": "events",
+      "decisions": [
+        "D-10"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "capabilities.events": true
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c14-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "c14-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "absent": [
+              "backlog",
+              "backlog_truncated",
+              "earliest_revision"
+            ]
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c14-grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state_revision": 2
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state_revision": 2
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "no event frame is written to a connection that did not opt in",
+        "the capability still advertises the served surface"
+      ]
+    },
+    {
+      "id": "C-15",
+      "title": "The terminal transition is pushed with its marker before the record is read",
+      "area": "events",
+      "decisions": [
+        "D-10"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "fake_skip": "requires-real-event-wire (the reference fake models events by revision and detaches the lease at termination)",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant",
+            "events": true
+          },
+          "capture": {
+            "instance_id": "daemon_instance_id"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c15-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "c15-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.abort",
+          "params": {
+            "session_id": "@session_id",
+            "reason_class": "cancel",
+            "generation": 0,
+            "control_token": "@controller_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "accepted": true,
+              "reason": "consumer_cancel"
+            }
+          }
+        },
+        {
+          "action": "read_events",
+          "connection": "creator",
+          "args": {
+            "count": 2,
+            "events": [
+              {
+                "kind": "session_state",
+                "revision": 2,
+                "attach_id": "@controller_attach",
+                "terminal": false
+              },
+              {
+                "kind": "session_terminal",
+                "revision": 3,
+                "attach_id": "@controller_attach",
+                "terminal": true,
+                "terminal_marker.state": "terminated",
+                "terminal_marker.reason": "consumer_cancel",
+                "terminal_marker.cleanup": "not_started"
+              }
+            ]
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "terminated",
+              "session.state_revision": 3
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a terminal transition is never silently shed",
+        "the terminal frame carries the terminal marker"
+      ]
+    },
+    {
+      "id": "C-16",
+      "title": "A revoked lease receives its final frame on its own connection",
+      "area": "events",
+      "decisions": [
+        "D-09",
+        "D-10"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "fake_skip": "requires-real-event-wire (the reference fake has no per-connection final frame)",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "host_grant": "@host_grant",
+            "events": true
+          },
+          "capture": {
+            "instance_id": "daemon_instance_id"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "c16-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "c16-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "present": [
+              "backlog",
+              "backlog_truncated",
+              "earliest_revision"
+            ]
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "c16-grant"
+          },
+          "capture": {
+            "grant": "grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "action": "read_events",
+          "connection": "creator",
+          "args": {
+            "count": 1
+          },
+          "expect": {
+            "result": {
+              "revision": 2
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "events": true
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@grant"
+          },
+          "capture": {
+            "observer_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "action": "read_events",
+          "connection": "creator",
+          "args": {
+            "count": 2
+          },
+          "expect": {
+            "result": {
+              "kind": "session_state",
+              "attach_id": "@controller_attach"
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.detach",
+          "params": {
+            "attach_id": "@observer_attach"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "revoked": true
+            }
+          }
+        },
+        {
+          "action": "read_events",
+          "connection": "observer",
+          "args": {
+            "count": 1
+          },
+          "expect": {
+            "result": {
+              "kind": "lease_revoked",
+              "attach_id": "@observer_attach"
+            }
+          }
+        },
+        {
+          "action": "read_events",
+          "connection": "creator",
+          "args": {
+            "count": 1
+          },
+          "expect": {
+            "result": {
+              "kind": "session_state",
+              "attach_id": "@controller_attach"
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.attach_count": 1
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a revoked lease never receives a survivor's frame",
+        "the final frame is routed to the revoked lease's own connection, not the requester's response"
+      ]
     }
   ]
 }

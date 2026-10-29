@@ -101,7 +101,6 @@
 //! | --- | --- | --- |
 //! | Terminal-session PTY spawn and content plane | bitty#2604 follow-up | `session.create kind: worker` spawns and binds generation 1 on a served cell; a terminal-session create still registers `created` without a process |
 //! | Worker rebind/restart and executable policy | bitty#2790 follow-up | a restarted daemon does not re-attach a worker; the executable allowlist is not enforced |
-//! | Pushing session events on a connection (no subscribe method) | bitty#2602 | `session.status`/`session.list` are the reconciliation reads |
 //! | Per-connection refusal-audit aggregation | bitty#2603 follow-up | wire-level refusals are budgeted and aggregated; method refusals remain one individual record each |
 //! | Conformance corpus and fake-server parity | bitty#2605 | `tests/harness` corpus, fake and real drivers, parity gate; every shared vector is compared, with no recorded known defect |
 //!

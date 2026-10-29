@@ -1,8 +1,7 @@
 //! The single documented Linux syscall seam for containment (bitty#2791).
 //!
-//! The process-spawn and pidfd calls that safe `std`/`nix` does not wrap live
-//! here; the remaining raw calls (`TIOCSWINSZ` resize, `BorrowedFd` wrappers) are
-//! documented in `worker.rs`:
+//! The process-spawn, pidfd, descriptor-flag, and PTY calls that safe
+//! `std`/`nix` does not wrap live here:
 //!
 //! - `Command::pre_exec` plus one `write(2)` of the child's own pid into a
 //!   pre-opened `cgroup.procs` descriptor, so the child enters its session
@@ -11,12 +10,14 @@
 //!   worker is a session and process-group leader whose controlling terminal
 //!   is the PTY slave on fd 0;
 //! - `pidfd_open(2)` and `pidfd_send_signal(2)`, so an orphan reap pins the
-//!   exact process and cannot signal a reused pid.
+//!   exact process and cannot signal a reused pid;
+//! - `ioctl(TIOCSWINSZ)` plus the `fcntl(2)` descriptor flags the PTY owner
+//!   needs (close-on-exec and non-blocking).
 //!
-//! All three are async-signal-safe syscalls. The `pre_exec` closures allocate
-//! nothing and touch no lock: one formats the pid into a stack buffer and calls
-//! `write`, the other calls `setsid` and `ioctl`. A failure aborts the exec and
-//! surfaces as a spawn error.
+//! All calls are async-signal-safe or descriptor-local. The `pre_exec`
+//! closures allocate nothing and touch no lock: one formats the pid into a
+//! stack buffer and calls `write`, the other calls `setsid` and `ioctl`. A
+//! failure aborts the exec and surfaces as a spawn error.
 
 #![allow(unsafe_code)]
 
@@ -51,6 +52,61 @@ pub(crate) fn establish_controlling_terminal(command: &mut Command) {
             Ok(())
         });
     }
+}
+
+/// Set close-on-exec on `file`.
+///
+/// # Errors
+///
+/// Returns the `fcntl(2)` error.
+pub(crate) fn set_cloexec(file: &File) -> io::Result<()> {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+
+    fcntl(file, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
+        .map(|_| ())
+        .map_err(io::Error::from)
+}
+
+/// Set non-blocking I/O on `file`.
+///
+/// # Errors
+///
+/// Returns the `fcntl(2)` error.
+pub(crate) fn set_nonblocking(file: &File) -> io::Result<()> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+
+    let flags = fcntl(file, FcntlArg::F_GETFL).map_err(io::Error::from)?;
+    let flags = OFlag::from_bits_truncate(flags);
+    fcntl(file, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
+        .map(|_| ())
+        .map_err(io::Error::from)
+}
+
+/// Apply a terminal geometry to the PTY master.
+///
+/// # Errors
+///
+/// Returns the `ioctl(2)` error (`ENOTTY` for a non-terminal descriptor).
+pub(crate) fn resize_pty(master: &File, cols: u16, rows: u16) -> io::Result<()> {
+    let winsize = nix::pty::Winsize {
+        ws_row: rows,
+        ws_col: cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: `master` is an open descriptor owned by the caller for the
+    // duration of the call, and `winsize` is a valid `struct winsize`.
+    let result = unsafe {
+        nix::libc::ioctl(
+            master.as_raw_fd(),
+            nix::libc::TIOCSWINSZ as _,
+            &winsize as *const nix::pty::Winsize,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Spawn `command` with its pid already written into `procs`.

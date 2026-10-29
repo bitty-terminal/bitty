@@ -28,8 +28,6 @@
 //! `Refused` plan returns the typed [`WorkerSpawnError::Unsupported`] and
 //! advertises `worker_sessions: false`.
 
-#![allow(unsafe_code)]
-
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 #[cfg(target_os = "linux")]
@@ -39,7 +37,7 @@ use std::io;
 #[cfg(target_os = "linux")]
 use std::io::Read as _;
 #[cfg(target_os = "linux")]
-use std::os::fd::{AsFd as _, AsRawFd as _};
+use std::os::fd::AsFd as _;
 #[cfg(target_os = "linux")]
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -70,6 +68,16 @@ use crate::spawn::SpawnSpec;
 /// actually probed, so a Linux cell whose probe selected no mechanism neither
 /// advertises nor serves a worker.
 pub const WORKER_SESSIONS_SERVED: bool = cfg!(target_os = "linux");
+
+/// Bytes one worker's PTY may hand the poll loop in a single tick.
+///
+/// The bound is one transport `max_chunk_bytes`, the largest content unit the
+/// service forwards in a frame. A worker that writes continuously is drained
+/// for at most one chunk per pass, so it cannot hold the single-threaded
+/// service loop inside one session's `read`; the remaining bytes stay queued
+/// in the PTY buffer as backpressure and are drained on later ticks.
+pub const DRAIN_BUDGET_BYTES: usize =
+    crate::limits::LimitId::MaxChunkBytes.default_value() as usize;
 
 /// Whether this compiled cell and the probed containment plan serve workers.
 ///
@@ -294,7 +302,7 @@ impl WorkerPool {
             }
         };
         let identity = child.identity();
-        if set_nonblocking(master.as_raw_fd()).is_err() {
+        if crate::containment::set_nonblocking(&master).is_err() {
             // The child exists and is already contained: terminate it before
             // the handle is dropped, and report what the cleanup could prove.
             let cleanup = child.terminate(self.limits).class();
@@ -341,7 +349,7 @@ impl WorkerPool {
     #[cfg(target_os = "linux")]
     pub fn resize(&self, session_id: SessionId, cols: u16, rows: u16) -> Result<(), ResizeError> {
         let worker = self.workers.get(&session_id).ok_or(ResizeError::NotBound)?;
-        resize_fd(worker.master.as_raw_fd(), cols, rows).map_err(|_| ResizeError::Pty)
+        crate::containment::resize_pty(&worker.master, cols, rows).map_err(|_| ResizeError::Pty)
     }
 
     /// Non-served cells have no content plane.
@@ -484,18 +492,22 @@ impl WorkerPool {
 
     /// Drop a worker handle that is being retired.
     ///
-    /// A handle whose leader may still run is terminated before it is dropped,
-    /// so retiring a session can never leak a live worker. Returns the cleanup
-    /// class when this call had to terminate a live handle, so the caller can
-    /// settle its journal record; `None` when the handle was already settled or
-    /// absent.
+    /// A handle that is not already settled is terminated with the bounded
+    /// escalation and reaped before it is dropped, so retiring a session can
+    /// never leak a live worker or leave an exited leader as an unreaped
+    /// zombie. Returns the cleanup class when this call had to settle the
+    /// handle, so the caller can settle its journal record; `None` when the
+    /// handle was already settled or absent.
     #[cfg(target_os = "linux")]
     pub fn forget(&mut self, session_id: SessionId) -> Option<CleanupClass> {
         let mut worker = self.workers.remove(&session_id)?;
-        if worker.settled || worker.child.leader_exited() {
-            worker.child.drain_recorded();
+        if worker.settled {
             return None;
         }
+        // `terminate` reaps the leader (`try_wait`) and drains the recorded
+        // identity. That is also the required path for a leader that already
+        // exited: a cgroup-scope zombie has no `drain_recorded` work, and
+        // dropping the handle without a wait would leak it.
         Some(worker.child.terminate(self.limits).class())
     }
 
@@ -510,11 +522,14 @@ impl WorkerPool {
 impl Worker {
     fn drain(&mut self) {
         let mut buffer = [0u8; 4096];
-        loop {
-            match self.master.read(&mut buffer) {
+        let mut budget = DRAIN_BUDGET_BYTES;
+        while budget > 0 {
+            let want = budget.min(buffer.len());
+            match self.master.read(&mut buffer[..want]) {
                 Ok(0) => break,
                 Ok(read) => {
                     self.drained_bytes = self.drained_bytes.saturating_add(read as u64);
+                    budget -= read;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -561,7 +576,7 @@ impl PtyCommand {
             nix::pty::openpty(Some(&winsize), None).map_err(|_| WorkerSpawnError::NotStarted)?;
         let master = File::from(pty.master);
         let slave = pty.slave;
-        set_cloexec(master.as_raw_fd()).map_err(|_| WorkerSpawnError::NotStarted)?;
+        crate::containment::set_cloexec(&master).map_err(|_| WorkerSpawnError::NotStarted)?;
         let stdin = Stdio::from(dup_file(&slave)?);
         let stdout = Stdio::from(dup_file(&slave)?);
         let stderr = Stdio::from(dup_file(&slave)?);
@@ -593,63 +608,12 @@ impl PtyCommand {
 
 #[cfg(target_os = "linux")]
 fn dup_file(slave: &std::os::fd::OwnedFd) -> Result<File, WorkerSpawnError> {
-    use std::os::fd::BorrowedFd;
     // `openpty` descriptors are not close-on-exec; the duplicates handed to
     // stdio are dup2'ed onto 0/1/2 in the child (which clears CLOEXEC) and
     // dropped in the parent.
-    let borrowed: BorrowedFd<'_> = slave.as_fd();
-    nix::unistd::dup(borrowed)
+    nix::unistd::dup(slave.as_fd())
         .map(File::from)
         .map_err(|_| WorkerSpawnError::NotStarted)
-}
-
-#[cfg(target_os = "linux")]
-fn set_cloexec(fd: std::os::fd::RawFd) -> io::Result<()> {
-    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
-    use std::os::fd::BorrowedFd;
-    // SAFETY: `fd` is an owned descriptor of this process for the duration of
-    // the call.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    fcntl(borrowed, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))
-        .map(|_| ())
-        .map_err(io::Error::from)
-}
-
-#[cfg(target_os = "linux")]
-fn set_nonblocking(fd: std::os::fd::RawFd) -> io::Result<()> {
-    use nix::fcntl::{FcntlArg, OFlag, fcntl};
-    use std::os::fd::BorrowedFd;
-    // SAFETY: `fd` is an owned descriptor of this process for the duration of
-    // the call.
-    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-    let flags = fcntl(borrowed, FcntlArg::F_GETFL).map_err(io::Error::from)?;
-    let flags = OFlag::from_bits_truncate(flags);
-    fcntl(borrowed, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))
-        .map(|_| ())
-        .map_err(io::Error::from)
-}
-
-#[cfg(target_os = "linux")]
-fn resize_fd(fd: std::os::fd::RawFd, cols: u16, rows: u16) -> io::Result<()> {
-    let winsize = nix::pty::Winsize {
-        ws_row: rows,
-        ws_col: cols,
-        ws_xpixel: 0,
-        ws_ypixel: 0,
-    };
-    // SAFETY: `fd` is the owned PTY master of the worker; `winsize` is a valid
-    // `struct winsize` for the duration of the call.
-    let result = unsafe {
-        nix::libc::ioctl(
-            fd,
-            nix::libc::TIOCSWINSZ as _,
-            &winsize as *const nix::pty::Winsize,
-        )
-    };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -670,5 +634,98 @@ fn observation(status: ExitStatus) -> ExitObservation {
         None => ExitObservation::Signalled {
             signal: signal_number(status).unwrap_or(1),
         },
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+    use std::time::{Duration, Instant};
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::containment::ContainmentReport;
+    use crate::limits::Limits;
+    use crate::registry::{DaemonInstanceId, SessionId};
+
+    /// Spawn one live worker through the production path.
+    fn spawn_test_worker(limits: &Limits, argv: &[&str]) -> (WorkerPool, SessionId) {
+        let report = ContainmentReport::probe();
+        let fields = json!({ "argv": argv, "cwd": "/" })
+            .as_object()
+            .expect("a JSON object")
+            .clone();
+        let spec = SpawnSpec::parse(Some(&fields), limits).expect("a valid spawn spec");
+        let session = SessionId::parse("0000000000000000000000000000c4d1").expect("a session id");
+        let mut pool = WorkerPool::new(limits);
+        pool.spawn(
+            &report,
+            DaemonInstanceId::generate().expect("an instance id"),
+            session,
+            &spec,
+        )
+        .expect("the test worker must spawn");
+        (pool, session)
+    }
+
+    #[test]
+    fn forget_reaps_a_leader_that_already_exited() {
+        let limits = Limits::default();
+        let (mut pool, session) = spawn_test_worker(&limits, &["/bin/sh", "-c", "exit 0"]);
+        let pid = pool.workers[&session].child.identity().pid().get();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pool.workers[&session].child.leader_exited() {
+            assert!(Instant::now() < deadline, "the worker leader did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The leader is an unreaped zombie at this point. Forgetting it must
+        // settle the handle through the bounded terminate path, which reaps
+        // it, rather than dropping the handle without a wait.
+        let cleanup = pool.forget(session);
+        assert!(
+            cleanup.is_some(),
+            "an exited but unreaped leader still needs settlement"
+        );
+        assert!(
+            std::fs::metadata(format!("/proc/{pid}")).is_err(),
+            "the forgotten leader {pid} must be reaped, not left as a zombie"
+        );
+    }
+
+    #[test]
+    fn one_tick_drains_at_most_the_budget_and_resumes_next_tick() {
+        let limits = Limits::default();
+        let (mut pool, session) = spawn_test_worker(&limits, &["/bin/sleep", "60"]);
+
+        // A producer that is already over budget when the tick starts. A
+        // regular file is used instead of a PTY or pipe so the queued volume is
+        // deterministic: the test proves the drain loop stops at the budget
+        // instead of relying on a kernel buffer size.
+        let mut master = tempfile::tempfile().expect("a temporary producer");
+        master
+            .write_all(&vec![b'x'; DRAIN_BUDGET_BYTES * 4])
+            .expect("fill the over-budget producer");
+        master
+            .seek(SeekFrom::Start(0))
+            .expect("rewind the producer");
+
+        let worker = pool.workers.get_mut(&session).expect("the bound worker");
+        worker.master = master;
+        worker.drain();
+        assert_eq!(
+            worker.drained_bytes, DRAIN_BUDGET_BYTES as u64,
+            "one tick must stop at the per-worker byte budget"
+        );
+        worker.drain();
+        assert_eq!(
+            worker.drained_bytes,
+            (DRAIN_BUDGET_BYTES * 2) as u64,
+            "the next tick must resume the queued producer"
+        );
+
+        let _ = pool.terminate(session);
     }
 }

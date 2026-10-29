@@ -739,9 +739,14 @@ could prove (`not_started` before a child existed, `swept` or `unverified` after
 one did), settles the journal record, and returns the normal create shape with a
 `null` token.
 
-Recorded worker-pool follow-ups (bitty#2809): `WorkerPool::forget` does not yet
-reap a leader-exited cgroup handle, the per-tick PTY drain has no byte budget,
-and the resize ioctl still sits in `worker.rs` outside the syscall seam.
+`WorkerPool::forget` terminates a handle that is not already settled with the
+same bounded escalation and reaps its leader before dropping it, so retiring a
+session can never leave a live worker or an unreaped zombie. The per-tick PTY
+drain is capped at `worker::DRAIN_BUDGET_BYTES` (one transport chunk), so a
+continuously writing worker cannot hold the service loop; the rest stays
+queued in the PTY buffer as backpressure and is drained on the next tick. The
+resize ioctl and the descriptor-flag helpers live in `containment/linux_sys.rs`,
+the single FFI seam.
 
 `session.resize` requires `terminal.manage` (granted to every connection at
 negotiate, alongside `process.spawn`) and the **current controller lease** for

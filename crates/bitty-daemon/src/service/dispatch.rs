@@ -1324,13 +1324,11 @@ impl Service {
             OrphanAction::Verify => {
                 // A bound worker's committed record is a supervision handle,
                 // not an orphan. The on-demand pass skips every session this
-                // registry still owns so a reconcile read never signals a
-                // running worker; the startup scan (no registry) skips nothing.
-                let live: BTreeSet<SessionId> = self
-                    .host
-                    .snapshots(now)
-                    .map(|snapshot| snapshot.session_id)
-                    .collect();
+                // host still supervises so a reconcile read never signals a
+                // running worker; a terminal record is exit cleanup and stays
+                // visible so an unprovable tree is quarantined. The startup
+                // scan (no registry) skips nothing.
+                let live: BTreeSet<SessionId> = self.host.supervised_session_ids(now).collect();
                 let report = self
                     .orphans
                     .verify_on_demand_excluding(now, &live)
@@ -4286,6 +4284,156 @@ mod tests {
             )
             .expect("served again");
         assert_eq!(second, first, "verify is idempotent");
+    }
+
+    /// CI order: the worker exit is recorded and its containment cleanup is
+    /// settled before the on-demand verify pass. The registry retains the
+    /// terminal record, and that retained record must never hide the
+    /// quarantine: an unprovable tree stays quarantined, exactly once.
+    #[test]
+    fn a_worker_exit_quarantines_before_the_verify_pass_while_the_record_is_retained() {
+        use crate::containment::{ContainmentLimits, ContainmentRecord};
+        use crate::lease::ExitObservation;
+        use crate::orphan::{
+            OrphanJournalLimits, Pid, ProcessIdentity, ProcessObservation, ProcessProbe,
+            SystemProbe,
+        };
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("chmod");
+        let report = crate::containment::ContainmentReport::subreaper(
+            crate::platform::PlatformCell::current(),
+            None,
+        );
+        let supervisor = OrphanSupervisor::open(
+            dir.path().join("orphans"),
+            &OrphanJournalLimits::default(),
+            &report,
+            ContainmentLimits::default(),
+        )
+        .expect("served supervisor");
+        let (mut service, _runtime) = service_with_orphans(Limits::default(), supervisor);
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 2);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+
+        // The spawn path reserves and commits the journal record, then binds.
+        let exited_id = SessionId::parse(&session_id(&create_session(
+            &mut service,
+            &mut creator,
+            "exit-before-verify",
+        )))
+        .expect("session id");
+        let pid = Pid::new(std::process::id()).expect("pid");
+        let ProcessObservation::Present {
+            start_time,
+            process_group,
+            uid,
+        } = SystemProbe::new().observe(pid)
+        else {
+            panic!("the test process must be observable");
+        };
+        service
+            .orphans
+            .reserve(
+                exited_id,
+                1,
+                MonotonicMs::from_millis(11),
+                ContainmentRecord::subreaper(),
+            )
+            .expect("reserve");
+        service
+            .orphans
+            .commit(
+                exited_id,
+                ProcessIdentity::new(pid, start_time, process_group, uid),
+            )
+            .expect("commit");
+        service
+            .host_mut()
+            .bind(exited_id, MonotonicMs::from_millis(12))
+            .expect("bind");
+
+        // The supervisor's exit path, in the order `WorkerPool::supervise`
+        // uses it: the terminal transition is recorded, the unprovable cleanup
+        // class quarantines the record.
+        service
+            .host_mut()
+            .record_termination(
+                exited_id,
+                ExitObservation::Exited { code: 7 },
+                CleanupClass::Unverified,
+                MonotonicMs::from_millis(13),
+            )
+            .expect("terminal transition");
+        service
+            .orphans
+            .settle(
+                exited_id,
+                CleanupClass::Unverified,
+                MonotonicMs::from_millis(13),
+            )
+            .expect("settle");
+
+        let verified = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonOrphansVerify,
+                &json!({"action": "verify"}),
+                MonotonicMs::from_millis(14),
+            )
+            .expect("served");
+        assert_eq!(
+            verified["unverified"], 1,
+            "a retained terminal session must never hide its quarantined record"
+        );
+        assert_eq!(verified["committed"], 0);
+        assert_eq!(verified["reserved"], 0);
+
+        // The one case the verifier skips is a session whose worker is still
+        // bound. A reserved subreaper record has no identity to signal, so a
+        // regression quarantines it instead of killing a live process.
+        let live_id = SessionId::parse(&session_id(&create_session(
+            &mut service,
+            &mut creator,
+            "still-running",
+        )))
+        .expect("session id");
+        service
+            .host_mut()
+            .bind(live_id, MonotonicMs::from_millis(15))
+            .expect("bind");
+        service
+            .orphans
+            .reserve(
+                live_id,
+                1,
+                MonotonicMs::from_millis(15),
+                ContainmentRecord::subreaper(),
+            )
+            .expect("reserve");
+        let again = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonOrphansVerify,
+                &json!({"action": "verify"}),
+                MonotonicMs::from_millis(16),
+            )
+            .expect("served");
+        assert_eq!(
+            again["unverified"], 1,
+            "a supervised record is never classified"
+        );
+        assert_eq!(again["reserved"], 1, "a bound session keeps its record");
     }
 
     #[test]

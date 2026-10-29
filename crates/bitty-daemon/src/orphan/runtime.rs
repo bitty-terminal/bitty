@@ -172,11 +172,12 @@ impl OrphanRuntime {
         self.verify_within_excluding(now, budget, &std::collections::BTreeSet::new())
     }
 
-    /// Run one pass while skipping records of live sessions.
+    /// Run one pass while skipping records of supervised sessions.
     ///
     /// The served service owns those identities; a reconcile read must never
-    /// signal a bound worker. The startup scan has no registry and skips
-    /// nothing.
+    /// signal a bound worker. The caller passes only sessions whose worker is
+    /// still bound and non-terminal, never one in exit cleanup. The startup
+    /// scan has no registry and skips nothing.
     ///
     /// # Errors
     ///

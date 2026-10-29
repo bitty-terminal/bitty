@@ -828,13 +828,16 @@ impl OrphanJournal {
         self.reap_excluding(probe, reaper, now, &BTreeSet::new())
     }
 
-    /// Run one pass while skipping records owned by a live session.
+    /// Run one pass while skipping records owned by a supervised session.
     ///
     /// A committed record for a bound session is not an orphan: its identity is
     /// the supervision handle the service still owns, and signalling it from a
     /// reconcile read would kill a running worker. The startup scan has no
     /// registry and passes an empty set; the served on-demand path passes every
-    /// live session id. A skipped record keeps its stored class untouched.
+    /// session whose worker is still bound and non-terminal. A session in exit
+    /// cleanup is never in that set: its record must be classified and
+    /// quarantined, never skipped. A skipped record keeps its stored class
+    /// untouched.
     ///
     /// # Errors
     ///

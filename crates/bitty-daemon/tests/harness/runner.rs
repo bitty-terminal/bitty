@@ -175,6 +175,29 @@ pub trait Driver {
     fn finish(&mut self);
 }
 
+/// Seed the variables a corpus vector needs to stay cell-independent.
+///
+/// `worker_sessions` is the compiled capability of this cell, so a handshake
+/// vector asserts what the service must advertise instead of a Unix-only
+/// surface on Windows or macOS. `cwd` is an absolute directory the host really
+/// has: the spawn contract requires an absolute path, and `"/"` is not
+/// absolute on Windows.
+pub fn cell_vars(vars: &mut Vars) {
+    vars.insert(
+        "worker_sessions".to_owned(),
+        Value::Bool(bitty_daemon::contract::CAPABILITIES.is_enabled("worker_sessions")),
+    );
+    vars.insert(
+        "cwd".to_owned(),
+        Value::String(
+            std::env::temp_dir()
+                .to_str()
+                .expect("a UTF-8 temp dir")
+                .to_owned(),
+        ),
+    );
+}
+
 /// One row of the evidence file.
 #[derive(Debug, Clone)]
 pub struct VectorOutcome {

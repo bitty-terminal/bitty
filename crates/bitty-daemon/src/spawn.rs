@@ -324,16 +324,29 @@ mod tests {
         SpawnSpec::parse(Some(&fields(value)), &Limits::default())
     }
 
+    /// A directory the host itself reports as absolute.
+    ///
+    /// The contract requires an absolute `cwd`, and `"/"` is not absolute on
+    /// Windows, so the tests derive the value from the host instead of
+    /// hardcoding a Unix root.
+    fn absolute_cwd() -> String {
+        std::env::temp_dir()
+            .to_str()
+            .expect("a UTF-8 temp dir")
+            .to_owned()
+    }
+
     #[test]
     fn a_minimal_spec_takes_the_documented_defaults() {
+        let cwd = absolute_cwd();
         let parsed = spec(json!({
             "argv": ["/bin/true"],
-            "cwd": "/",
+            "cwd": cwd,
         }))
         .expect("valid");
         assert_eq!(parsed.argv(), ["/bin/true"]);
         assert!(parsed.env().is_empty());
-        assert_eq!(parsed.cwd(), &PathBuf::from("/"));
+        assert_eq!(parsed.cwd(), &PathBuf::from(&cwd));
         assert_eq!(parsed.cols(), TERM_COLS_DEFAULT);
         assert_eq!(parsed.rows(), TERM_ROWS_DEFAULT);
         assert_eq!(parsed.term(), TERM_DEFAULT);
@@ -341,17 +354,18 @@ mod tests {
 
     #[test]
     fn missing_and_malformed_fields_are_refused() {
+        let cwd = absolute_cwd();
         for value in [
-            json!({"cwd": "/"}),
-            json!({"argv": [], "cwd": "/"}),
-            json!({"argv": [1], "cwd": "/"}),
+            json!({"cwd": cwd}),
+            json!({"argv": [], "cwd": cwd}),
+            json!({"argv": [1], "cwd": cwd}),
             json!({"argv": ["a"], "cwd": "relative"}),
-            json!({"argv": ["a"], "cwd": "/", "env": ["no-equals"]}),
-            json!({"argv": ["a"], "cwd": "/", "env": ["=value"]}),
-            json!({"argv": ["a"], "cwd": "/", "cols": 0}),
-            json!({"argv": ["a"], "cwd": "/", "rows": 1001}),
-            json!({"argv": ["a\0b"], "cwd": "/"}),
-            json!({"argv": ["a"], "cwd": "/", "term": ""}),
+            json!({"argv": ["a"], "cwd": cwd, "env": ["no-equals"]}),
+            json!({"argv": ["a"], "cwd": cwd, "env": ["=value"]}),
+            json!({"argv": ["a"], "cwd": cwd, "cols": 0}),
+            json!({"argv": ["a"], "cwd": cwd, "rows": 1001}),
+            json!({"argv": ["a\0b"], "cwd": cwd}),
+            json!({"argv": ["a"], "cwd": cwd, "term": ""}),
         ] {
             assert_eq!(spec(value.clone()), Err(SpawnSpecError::Invalid), "{value}");
         }
@@ -360,6 +374,7 @@ mod tests {
     #[test]
     fn every_count_and_byte_bound_is_refused_with_its_limit() {
         let limits = Limits::default();
+        let cwd = absolute_cwd();
         let argv = vec![
             "a".to_owned();
             usize::try_from(limits.effective(LimitId::MaxSpawnArgvEntries),)
@@ -367,7 +382,7 @@ mod tests {
                 + 1
         ];
         assert!(matches!(
-            SpawnSpec::parse(Some(&fields(json!({"argv": argv, "cwd": "/"}))), &limits),
+            SpawnSpec::parse(Some(&fields(json!({"argv": argv, "cwd": cwd}))), &limits),
             Err(SpawnSpecError::Limit { .. })
         ));
 
@@ -375,7 +390,7 @@ mod tests {
             usize::try_from(limits.effective(LimitId::MaxSpawnFieldBytes)).expect("bound") + 1,
         );
         assert!(matches!(
-            spec(json!({"argv": [field], "cwd": "/"})),
+            spec(json!({"argv": [field], "cwd": cwd})),
             Err(SpawnSpecError::Limit { .. })
         ));
     }
@@ -383,21 +398,23 @@ mod tests {
     #[test]
     fn the_whole_spec_bound_dominates_the_per_field_bounds() {
         let limits = Limits::default();
+        let cwd = absolute_cwd();
         let field = usize::try_from(limits.effective(LimitId::MaxSpawnFieldBytes)).expect("bound");
         let total = usize::try_from(limits.effective(LimitId::MaxSpawnSpecBytes)).expect("bound");
         let entries = (total / field) + 2;
         let argv = vec!["a".repeat(field); entries];
         assert!(matches!(
-            SpawnSpec::parse(Some(&fields(json!({"argv": argv, "cwd": "/"}))), &limits),
+            SpawnSpec::parse(Some(&fields(json!({"argv": argv, "cwd": cwd}))), &limits),
             Err(SpawnSpecError::Limit { .. })
         ));
     }
 
     #[test]
     fn a_different_specification_has_a_different_digest() {
-        let one = spec(json!({"argv": ["/bin/sh", "-c", "true"], "cwd": "/"})).expect("valid");
-        let two = spec(json!({"argv": ["/bin/sh", "-c", "false"], "cwd": "/"})).expect("valid");
-        let three = spec(json!({"argv": ["/bin/sh", "-c", "true"], "cwd": "/", "env": ["A=B"]}))
+        let cwd = absolute_cwd();
+        let one = spec(json!({"argv": ["/bin/sh", "-c", "true"], "cwd": cwd})).expect("valid");
+        let two = spec(json!({"argv": ["/bin/sh", "-c", "false"], "cwd": cwd})).expect("valid");
+        let three = spec(json!({"argv": ["/bin/sh", "-c", "true"], "cwd": cwd, "env": ["A=B"]}))
             .expect("valid");
         assert_ne!(one.digest(), two.digest());
         assert_ne!(one.digest(), three.digest());

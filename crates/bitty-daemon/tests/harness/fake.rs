@@ -23,6 +23,7 @@ use crate::harness::corpus::{DriverKind, Vector};
 use crate::harness::evidence;
 use crate::harness::runner::{
     Driver, ErrorReply, ExitObservation, Outcome, Reply, RequestRecord, ServiceFacts, Vars,
+    cell_vars,
 };
 
 const BASELINE: [&str; 5] = [
@@ -181,6 +182,7 @@ impl FakeDriver {
         if let Some(grant) = &self.host_grant {
             vars.insert("host_grant".to_owned(), Value::String(grant.clone()));
         }
+        cell_vars(&mut vars);
         vars
     }
 

@@ -53,7 +53,7 @@
               "service_api_version.minor": 1,
               "service_api_version.min_client_minor": 0,
               "daemon_state": "running",
-              "capabilities.worker_sessions": true,
+              "capabilities.worker_sessions": "@worker_sessions",
               "capabilities.terminal_sessions": true,
               "capabilities.events": true,
               "capabilities.observer_grants": true,
@@ -293,7 +293,7 @@
           "expect": {
             "ok": true,
             "result": {
-              "capabilities.worker_sessions": true
+              "capabilities.worker_sessions": "@worker_sessions"
             }
           }
         },
@@ -319,7 +319,7 @@
             "argv": [
               "/bin/true"
             ],
-            "cwd": "/"
+            "cwd": "@cwd"
           },
           "expect": {
             "ok": false,
@@ -5491,7 +5491,7 @@
               "/bin/sleep",
               "60"
             ],
-            "cwd": "/",
+            "cwd": "@cwd",
             "cols": 100,
             "rows": 30,
             "env": [
@@ -5744,7 +5744,7 @@
             "argv": [
               "/nonexistent/bittyd-worker-probe"
             ],
-            "cwd": "/"
+            "cwd": "@cwd"
           },
           "capture": {
             "session_id": "session.session_id"

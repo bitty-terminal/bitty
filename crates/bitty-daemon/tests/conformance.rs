@@ -101,6 +101,27 @@ fn audit_not_contains_resolves_captured_secrets() {
 }
 
 #[test]
+fn cell_vars_seed_an_absolute_cwd_and_the_compiled_worker_capability() {
+    let mut vars = BTreeMap::new();
+    harness::runner::cell_vars(&mut vars);
+    assert_eq!(
+        vars.get("worker_sessions"),
+        Some(&Value::Bool(
+            bitty_daemon::contract::CAPABILITIES.is_enabled("worker_sessions")
+        )),
+        "the handshake vector must assert the capability this cell compiles"
+    );
+    let cwd = vars
+        .get("cwd")
+        .and_then(Value::as_str)
+        .expect("a seeded cwd");
+    assert!(
+        std::path::Path::new(cwd).is_absolute(),
+        "the seeded cwd {cwd} must be absolute on this cell"
+    );
+}
+
+#[test]
 fn not_equal_any_rejects_duplicate_ids() {
     let corpus = Corpus::load().expect("corpus");
     let c01 = corpus.vector("C-01").expect("C-01");

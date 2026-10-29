@@ -20,6 +20,7 @@ use crate::harness::corpus::{DriverKind, Vector};
 use crate::harness::evidence;
 use crate::harness::runner::{
     Driver, ErrorReply, ExitObservation, Outcome, Reply, RequestRecord, ServiceFacts, Vars,
+    cell_vars,
 };
 
 const BITTYD: &str = env!("CARGO_BIN_EXE_bittyd");
@@ -559,6 +560,7 @@ impl Driver for RealDriver {
         if let Some(grant) = &self.host_grant {
             vars.insert("host_grant".to_owned(), Value::String(grant.clone()));
         }
+        cell_vars(&mut vars);
         Ok(vars)
     }
 
@@ -857,6 +859,7 @@ impl Driver for RealDriver {
         if let Some(grant) = &self.host_grant {
             vars.insert("host_grant".to_owned(), Value::String(grant.clone()));
         }
+        cell_vars(&mut vars);
         Ok(vars)
     }
 

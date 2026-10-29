@@ -659,9 +659,11 @@ the target generation. Then:
   revision; on success `state_revision` advances exactly once and the
   controller lease renews.
 
-A daemon-level `daemon.orphans.verify` pass skips every session id the registry
-still owns, so a reconcile read never signals a live worker; the startup scan
-has no registry and skips nothing.
+A daemon-level `daemon.orphans.verify` pass skips every session whose worker is
+still bound and non-terminal, so a reconcile read never signals a live worker. A
+terminal record is exit cleanup, not supervision: its journal record stays
+visible so an unprovable tree is quarantined instead of silently skipped. The
+startup scan has no registry and skips nothing.
 
 ## Service loop (bitty#2607)
 
@@ -1046,6 +1048,10 @@ Corpus rules:
   `role`), and the ambient-authority fields `role`, `auth`, and `scope` stay
   refused;
 - a vector that does not run on a driver carries a typed skip reason;
+- cell-dependent values are seeded variables, never literals: `@worker_sessions`
+  is the compiled capability of the running cell and `@cwd` is a directory the
+  host reports as absolute, so the corpus never asserts a Linux-only capability
+  or a Unix root path on Windows or macOS;
 - `known_defect` rows record the exact failing step and code or result path,
   are excluded from the parity gate, and fail the suite if they pass or fail at
   another step so the marker cannot rot; the corpus currently carries none

@@ -18,6 +18,13 @@
 //! | 10 | Idempotency on keyed methods | `Denied/IdempotencyConflict`, `Denied/IdempotencyCapacity` |
 //! | 11 | Peer re-check, effect, revision, attribution, typed result | `Denied/Internal`, `Internal`, or the result |
 //!
+//! The post-handshake request deadline is a supervisor bound, not an
+//! authorization stage: [`crate::service::server`] stamps dispatch admission
+//! and replaces an over-bound completion with [`RefusalKind::Timeout`] carrying
+//! the effective bound. The wire renderer echoes the request envelope `id` as
+//! `error.request_id`; the refusal is audited with the method's action and
+//! never closes the connection.
+//!
 //! Rules that this module enforces structurally:
 //!
 //! - scope is decided before target lookup, so a caller without the scope
@@ -169,8 +176,6 @@ pub enum RefusalKind {
     InvalidRequest,
     /// A request deadline.
     Timeout {
-        /// The request id that timed out.
-        request_id: u64,
         /// The enforced bound.
         timeout_ms: u64,
     },
@@ -263,13 +268,14 @@ impl Refusal {
     }
 
     /// A request-deadline refusal.
+    ///
+    /// The refusal carries only the enforced bound. The wire renderer echoes
+    /// the request envelope `id` as `error.request_id`, so the audit path
+    /// stays `Copy` and never stores caller text.
     #[must_use]
-    pub const fn timeout(request_id: u64, timeout_ms: u64) -> Self {
+    pub const fn timeout(timeout_ms: u64) -> Self {
         Self {
-            kind: RefusalKind::Timeout {
-                request_id,
-                timeout_ms,
-            },
+            kind: RefusalKind::Timeout { timeout_ms },
             counts: None,
         }
     }

@@ -89,6 +89,62 @@ mod unix {
     /// slot (and from being reclassified as an unnegotiated handshake).
     pub const CLOSE_DRAIN_TIMEOUT_MS: u64 = 1_000;
 
+    /// Test-only request-deadline seams (`test-seams` feature).
+    ///
+    /// The conformance real driver needs a request to complete past the
+    /// effective bound without waiting on a wall clock: it lowers
+    /// `request_timeout_ms` and advances the completion stamp for one named
+    /// method. Both values are read once per process. The feature is test-only
+    /// (no release workflow enables it); this build does not additionally gate
+    /// on `debug_assertions` because a local `opt-level` override already
+    /// clears that cfg, which would silently disable the seam the conformance
+    /// driver depends on.
+    #[cfg(feature = "test-seams")]
+    mod test_seams {
+        use std::sync::OnceLock;
+
+        /// Largest accepted completion offset, so a stray environment value
+        /// cannot mask a real failure for minutes.
+        pub const MAX_REQUEST_DEADLINE_OFFSET_MS: u64 = 60_000;
+
+        const REQUEST_TIMEOUT_ENV: &str = "BITTYD_TEST_REQUEST_TIMEOUT_MS";
+        const REQUEST_DEADLINE_OFFSET_ENV: &str = "BITTYD_TEST_REQUEST_DEADLINE_OFFSET_MS";
+        const REQUEST_DEADLINE_METHOD_ENV: &str = "BITTYD_TEST_REQUEST_DEADLINE_METHOD";
+
+        /// The effective `request_timeout_ms` override, when one is set.
+        pub fn request_timeout_override() -> Option<u64> {
+            std::env::var(REQUEST_TIMEOUT_ENV)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+        }
+
+        /// The completion-stamp offset for one method.
+        pub fn request_deadline_offset(method: &str) -> u64 {
+            struct Config {
+                offset_ms: u64,
+                method: Option<String>,
+            }
+
+            static CONFIG: OnceLock<Config> = OnceLock::new();
+            let config = CONFIG.get_or_init(|| Config {
+                offset_ms: std::env::var(REQUEST_DEADLINE_OFFSET_ENV)
+                    .ok()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(0)
+                    .min(MAX_REQUEST_DEADLINE_OFFSET_MS),
+                method: std::env::var(REQUEST_DEADLINE_METHOD_ENV).ok(),
+            });
+            if config.offset_ms == 0 {
+                return 0;
+            }
+            match config.method.as_deref() {
+                Some(name) if name == method => config.offset_ms,
+                Some(_) => 0,
+                None => config.offset_ms,
+            }
+        }
+    }
+
     /// Per-connection budget for wire-level refusal audit records.
     ///
     /// A rate-limited or malformed frame that never resolves to a method would
@@ -267,8 +323,23 @@ mod unix {
                 });
             #[cfg(not(debug_assertions))]
             let tamper_interval_ms = TAMPER_INTERVAL_MS;
+            // The conformance real driver lowers the request bound through the
+            // debug-only `test-seams` feature; a shipped binary uses the
+            // compiled default.
+            #[cfg(feature = "test-seams")]
+            let limits = test_seams::request_timeout_override()
+                .and_then(|value| {
+                    Limits::new(&[crate::limits::LimitOverride::new(
+                        LimitId::RequestTimeoutMs,
+                        value,
+                    )])
+                    .ok()
+                })
+                .unwrap_or_default();
+            #[cfg(not(feature = "test-seams"))]
+            let limits = Limits::default();
             Ok(Self {
-                limits: Limits::default(),
+                limits,
                 endpoint_env: EndpointEnv::from_process(),
                 audit_dir,
                 transport_scopes,
@@ -600,7 +671,14 @@ mod unix {
                 // A retired connection has already refused, and a negotiated
                 // one waits for its handshake response to drain; neither reads.
                 if peer.reads_input() && ready.contains(nix::poll::PollFlags::POLLIN) {
-                    read_peer(peer, &mut service, &config, current, &mut shutting_down);
+                    read_peer(
+                        peer,
+                        &mut service,
+                        &config,
+                        current,
+                        &mut shutting_down,
+                        &now,
+                    );
                 }
                 // Pushed events are written after the response they follow, on
                 // every iteration: a frame queued for this connection by
@@ -683,7 +761,7 @@ mod unix {
                         service.record_refusal(
                             &peer.client,
                             crate::audit::AuditAction::Wire,
-                            Refusal::timeout(0, negotiate),
+                            Refusal::timeout(negotiate),
                             current,
                         );
                         peer.close();
@@ -825,6 +903,7 @@ mod unix {
         config: &ServerConfig,
         now: MonotonicMs,
         shutting_down: &mut bool,
+        clock: &dyn Fn() -> MonotonicMs,
     ) {
         if peer.close_after_write {
             return;
@@ -891,7 +970,7 @@ mod unix {
                     return;
                 }
             }
-            if !handle_payload(peer, service, &payload, now, shutting_down) {
+            if !handle_payload(peer, service, &payload, now, shutting_down, clock) {
                 peer.close();
                 return;
             }
@@ -1105,6 +1184,47 @@ mod unix {
         }
     }
 
+    /// The completion stamp for one dispatched request.
+    ///
+    /// Production returns the loop clock unchanged. A debug build with the
+    /// `test-seams` feature advances it for one named method so the real driver
+    /// can exercise the over-bound branch without a wall-clock wait; a shipped
+    /// binary compiles the seam out.
+    fn request_completed_at(method: ServiceMethod, completed: MonotonicMs) -> MonotonicMs {
+        #[cfg(feature = "test-seams")]
+        {
+            MonotonicMs::from_millis(
+                completed
+                    .as_millis()
+                    .saturating_add(test_seams::request_deadline_offset(method.name())),
+            )
+        }
+        #[cfg(not(feature = "test-seams"))]
+        {
+            let _ = method;
+            completed
+        }
+    }
+
+    /// The post-handshake request-deadline verdict.
+    ///
+    /// A method with a documented exemption is never converted; every other
+    /// method is compared at completion. The comparison is `>=` so a
+    /// completion exactly at the bound is expired, matching the accepted
+    /// deadline rule. The deadline is a local admission stamp, not a timer
+    /// armed in the poll set, so completion cancels it with no wakeup.
+    fn request_timeout(
+        method: ServiceMethod,
+        admitted: MonotonicMs,
+        completed: MonotonicMs,
+        bound_ms: u64,
+    ) -> Option<Refusal> {
+        if method.request_deadline_exemption().is_some() {
+            return None;
+        }
+        (completed.saturating_since(admitted) >= bound_ms).then(|| Refusal::timeout(bound_ms))
+    }
+
     /// Handle one frame payload. Returns `false` when the connection must close.
     fn handle_payload(
         peer: &mut PeerIo,
@@ -1112,6 +1232,7 @@ mod unix {
         payload: &[u8],
         now: MonotonicMs,
         shutting_down: &mut bool,
+        clock: &dyn Fn() -> MonotonicMs,
     ) -> bool {
         use crate::audit::AuditAction;
 
@@ -1224,7 +1345,32 @@ mod unix {
         let result = if method == ServiceMethod::DaemonNegotiate {
             negotiate(peer, service, envelope.params, now)
         } else {
-            service.dispatch(&mut peer.client, method, &envelope.params, now)
+            let bound = service.limits().effective(LimitId::RequestTimeoutMs);
+            let admitted = clock();
+            let result = service.dispatch(&mut peer.client, method, &envelope.params, admitted);
+            let completed = request_completed_at(method, clock());
+            match request_timeout(method, admitted, completed, bound) {
+                Some(refusal) => {
+                    // The handler already ran. A successful result may have
+                    // queued events or a target control token; route those,
+                    // then replace the late result with the typed refusal.
+                    // A failed handler already recorded its own refusal in
+                    // `dispatch`, so only a late success gets the `Timeout`
+                    // record; one request never produces two audit records.
+                    // The connection stays open; only this request times out.
+                    if result.is_ok() {
+                        service.route_deliveries(&mut peer.client);
+                        service.record_refusal(
+                            &peer.client,
+                            method.audit_action(),
+                            refusal,
+                            completed,
+                        );
+                    }
+                    Err(refusal)
+                }
+                None => result,
+            }
         };
         let failed = result.is_err();
         if result.is_ok() {
@@ -1441,20 +1587,182 @@ mod unix {
 
         use bitty_ipc_core::RateLimiter;
 
+        use std::cell::RefCell;
+        use std::collections::VecDeque;
+        use std::sync::{Arc, Mutex};
+
+        use serde_json::{Value, json};
+
         use super::{
-            PeerIo, PeerTimer, WireAuditBudget, finish_handshake_flush, peer_timer,
-            refuse_queued_pre_handshake_tail,
+            PeerIo, PeerTimer, WireAuditBudget, finish_handshake_flush, handle_payload, peer_timer,
+            refuse_queued_pre_handshake_tail, request_timeout,
         };
         use crate::audit_sink::{AuditSinkError, AuditWriter};
         use crate::handshake::{ClientId, EffectiveScopes, EndpointKind, ServerIdentity};
-        use crate::limits::Limits;
+        use crate::limits::{LimitId, LimitOverride, Limits};
         use crate::operator::OperatorStore;
         use crate::peer::PeerGuard;
         use crate::registry::MonotonicMs;
         use crate::service::dispatch::{ServerFacts, Service};
         use crate::service::frame::PeerFrameReader;
         use crate::service::protocol::Connection;
-        use crate::service::scopes::ServiceScopeSet;
+        use crate::service::scopes::{ServiceMethod, ServiceScope, ServiceScopeSet};
+
+        #[test]
+        fn a_request_past_the_bound_is_a_typed_timeout_with_its_id_and_bound() {
+            let (mut service, _dir) = test_service_with(timeout_limits(100));
+            let (mut peer, _client) = negotiated_peer(ServiceScopeSet::baseline());
+            let clock = ScriptedClock::new(&[1_000, 1_200]);
+            let mut shutting_down = false;
+
+            assert!(handle_payload(
+                &mut peer,
+                &mut service,
+                &request("req-7", "session.list"),
+                MonotonicMs::from_millis(1_000),
+                &mut shutting_down,
+                &|| clock.now(),
+            ));
+
+            let response = response(&peer);
+            assert_eq!(response["id"], "req-7");
+            assert_eq!(response["ok"], false);
+            assert_eq!(response["error"]["class"], "Timeout");
+            assert_eq!(response["error"]["code"], "Timeout");
+            assert_eq!(response["error"]["request_id"], "req-7");
+            assert_eq!(response["error"]["timeout_ms"], 100);
+            assert!(!peer.close_after_write, "a timeout never retires the peer");
+            assert!(!peer.closed, "a timeout never closes the connection");
+            assert_eq!(
+                clock.remaining(),
+                0,
+                "completion consumes the deadline; no timer remains armed"
+            );
+        }
+
+        #[test]
+        fn a_request_within_the_bound_is_served_unchanged() {
+            let (mut service, _dir) = test_service_with(timeout_limits(100));
+            let (mut peer, _client) = negotiated_peer(ServiceScopeSet::baseline());
+            let clock = ScriptedClock::new(&[1_000, 1_050, 2_000, 2_050]);
+            let mut shutting_down = false;
+
+            for (id, now) in [("req-1", 1_000), ("req-2", 2_000)] {
+                assert!(handle_payload(
+                    &mut peer,
+                    &mut service,
+                    &request(id, "session.list"),
+                    MonotonicMs::from_millis(now),
+                    &mut shutting_down,
+                    &|| clock.now(),
+                ));
+                let response = response(&peer);
+                assert_eq!(response["id"], id);
+                assert_eq!(response["ok"], true, "{response}");
+                assert_eq!(response["result"]["sessions"], json!([]));
+                peer.output.clear();
+            }
+            assert_eq!(
+                clock.remaining(),
+                0,
+                "each completion cancels its own deadline"
+            );
+        }
+
+        #[test]
+        fn the_connection_serves_the_next_request_after_a_timeout() {
+            let (mut service, _dir) = test_service_with(timeout_limits(100));
+            let (mut peer, _client) = negotiated_peer(ServiceScopeSet::baseline());
+            let clock = ScriptedClock::new(&[1_000, 1_200, 2_000, 2_050]);
+            let mut shutting_down = false;
+
+            assert!(handle_payload(
+                &mut peer,
+                &mut service,
+                &request("slow", "session.list"),
+                MonotonicMs::from_millis(1_000),
+                &mut shutting_down,
+                &|| clock.now(),
+            ));
+            let timed_out = response(&peer);
+            assert_eq!(timed_out["error"]["code"], "Timeout");
+            assert!(!peer.closed);
+            peer.output.clear();
+
+            assert!(handle_payload(
+                &mut peer,
+                &mut service,
+                &request("fast", "session.list"),
+                MonotonicMs::from_millis(2_000),
+                &mut shutting_down,
+                &|| clock.now(),
+            ));
+            let served = response(&peer);
+            assert_eq!(served["id"], "fast");
+            assert_eq!(served["ok"], true, "{served}");
+            assert!(!peer.closed);
+        }
+
+        #[test]
+        fn an_exempt_method_is_never_converted_to_timeout() {
+            let (mut service, _dir) = test_service_with(timeout_limits(100));
+            let scopes = ServiceScopeSet::baseline().with(ServiceScope::DaemonControl);
+            let (mut peer, _client) = negotiated_peer(scopes);
+            let clock = ScriptedClock::new(&[1_000, 10_000]);
+            let mut shutting_down = false;
+
+            assert!(handle_payload(
+                &mut peer,
+                &mut service,
+                &request("req-9", "daemon.orphans.verify"),
+                MonotonicMs::from_millis(1_000),
+                &mut shutting_down,
+                &|| clock.now(),
+            ));
+
+            let response = response(&peer);
+            assert_eq!(response["error"]["class"], "Denied");
+            assert_eq!(response["error"]["code"], "UnsupportedCapability");
+            assert_ne!(
+                response["error"]["class"], "Timeout",
+                "the documented exemption keeps its own timer"
+            );
+        }
+
+        #[test]
+        fn the_deadline_expires_at_the_bound_and_skips_exempt_methods() {
+            let admitted = MonotonicMs::from_millis(1_000);
+            assert!(
+                request_timeout(
+                    ServiceMethod::SessionList,
+                    admitted,
+                    MonotonicMs::from_millis(1_099),
+                    100,
+                )
+                .is_none()
+            );
+            let refusal = request_timeout(
+                ServiceMethod::SessionList,
+                admitted,
+                MonotonicMs::from_millis(1_100),
+                100,
+            )
+            .expect("a completion exactly at the bound expires");
+            assert_eq!(
+                refusal.kind(),
+                crate::service::dispatch::RefusalKind::Timeout { timeout_ms: 100 }
+            );
+            assert!(
+                request_timeout(
+                    ServiceMethod::DaemonStop,
+                    admitted,
+                    MonotonicMs::from_millis(10_000),
+                    100,
+                )
+                .is_none(),
+                "daemon.stop keeps its synchronous termination bound"
+            );
+        }
 
         #[test]
         fn a_retired_peer_has_a_bounded_drain_deadline_and_no_second_timeout() {
@@ -1608,11 +1916,15 @@ mod unix {
             (peer, client)
         }
 
-        /// An audit writer that keeps the unit test off the filesystem.
-        struct NullWriter;
+        /// An audit writer that keeps the rendered lines for assertions.
+        struct RecordingWriter(Arc<Mutex<Vec<String>>>);
 
-        impl AuditWriter for NullWriter {
-            fn append_line(&mut self, _line: &[u8]) -> Result<(), AuditSinkError> {
+        impl AuditWriter for RecordingWriter {
+            fn append_line(&mut self, line: &[u8]) -> Result<(), AuditSinkError> {
+                self.0
+                    .lock()
+                    .expect("audit lock")
+                    .push(String::from_utf8_lossy(line).into_owned());
                 Ok(())
             }
 
@@ -1622,6 +1934,17 @@ mod unix {
         }
 
         fn test_service() -> (Service, tempfile::TempDir) {
+            test_service_with(Limits::default())
+        }
+
+        fn test_service_with(limits: Limits) -> (Service, tempfile::TempDir) {
+            let (service, dir, _audit) = test_service_recording(limits);
+            (service, dir)
+        }
+
+        fn test_service_recording(
+            limits: Limits,
+        ) -> (Service, tempfile::TempDir, Arc<Mutex<Vec<String>>>) {
             let dir = tempfile::tempdir().expect("temp dir");
             std::fs::set_permissions(
                 dir.path(),
@@ -1629,10 +1952,11 @@ mod unix {
             )
             .expect("chmod");
             let operator = OperatorStore::create_in(dir.path()).expect("operator store");
+            let audit = Arc::new(Mutex::new(Vec::new()));
             let service = Service::new(
-                Limits::default(),
+                limits,
                 operator,
-                Box::new(NullWriter),
+                Box::new(RecordingWriter(Arc::clone(&audit))),
                 crate::orphan::OrphanSupervisor::unsupported(
                     crate::platform::PlatformCell::current(),
                     "test",
@@ -1642,7 +1966,64 @@ mod unix {
                 ),
             )
             .expect("service");
-            (service, dir)
+            (service, dir, audit)
+        }
+
+        /// A negotiated peer whose scopes are fixed before dispatch.
+        fn negotiated_peer(scopes: ServiceScopeSet) -> (PeerIo, UnixStream) {
+            let (mut peer, client) = gated_peer();
+            peer.output.clear();
+            peer.handshake_flush_gate = false;
+            peer.client.mark_negotiated();
+            peer.client.scopes_mut().service = scopes;
+            (peer, client)
+        }
+
+        /// A deterministic admission/completion clock.
+        struct ScriptedClock {
+            times: RefCell<VecDeque<u64>>,
+        }
+
+        impl ScriptedClock {
+            fn new(times: &[u64]) -> Self {
+                Self {
+                    times: RefCell::new(times.iter().copied().collect()),
+                }
+            }
+
+            fn now(&self) -> MonotonicMs {
+                MonotonicMs::from_millis(
+                    self.times.borrow_mut().pop_front().expect(
+                        "the request must read exactly one admission and one completion stamp",
+                    ),
+                )
+            }
+
+            fn remaining(&self) -> usize {
+                self.times.borrow().len()
+            }
+        }
+
+        fn request(id: &str, method: &str) -> Vec<u8> {
+            serde_json::to_vec(&json!({
+                "v": 1,
+                "id": id,
+                "method": method,
+                "params": {},
+            }))
+            .expect("request envelope")
+        }
+
+        fn response(peer: &PeerIo) -> Value {
+            let header: [u8; 4] = peer.output[..4].try_into().expect("frame header");
+            let len = usize::try_from(u32::from_be_bytes(header)).expect("frame length");
+            assert_eq!(peer.output.len(), 4 + len, "one complete frame");
+            serde_json::from_slice(&peer.output[4..]).expect("response json")
+        }
+
+        fn timeout_limits(bound_ms: u64) -> Limits {
+            Limits::new(&[LimitOverride::new(LimitId::RequestTimeoutMs, bound_ms)])
+                .expect("request timeout override")
         }
 
         /// The one framed refusal rendered into an otherwise empty queue.

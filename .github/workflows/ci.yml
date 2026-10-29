@@ -347,6 +347,13 @@ jobs:
         if: matrix.shard == 1
         run: cargo test -p bitty-daemon --test conformance --locked fake_conformance_corpus
 
+      # bitty#2805: the real-service row (V-44 request deadline) needs the
+      # debug-only `test-seams` feature, which the sharded run above does not
+      # enable. Without this step only the fake gates the feature.
+      - name: Run bittyd conformance (real service)
+        if: matrix.shard == 1
+        run: cargo test -p bitty-daemon --test conformance --features test-seams --locked
+
       - name: Upload bittyd conformance evidence (fake)
         if: always() && matrix.shard == 1
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

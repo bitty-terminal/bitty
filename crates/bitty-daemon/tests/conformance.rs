@@ -29,7 +29,7 @@ use harness::real::RealDriver;
 #[test]
 fn corpus_is_well_formed_and_frozen() {
     let corpus = Corpus::load().expect("the embedded corpus parses");
-    assert_eq!(corpus.vectors.len(), 49, "corpus size changed");
+    assert_eq!(corpus.vectors.len(), 50, "corpus size changed");
     for id in [
         "C-01", "C-02", "C-03", "C-04", "C-05", "C-06", "C-07", "C-08", "C-12", "C-13", "C-14",
         "C-15", "C-16",
@@ -44,6 +44,11 @@ fn corpus_is_well_formed_and_frozen() {
             "{id} must skip on a cell that does not serve workers"
         );
     }
+    assert_eq!(
+        corpus.vector("V-44").expect("timeout vector").requires,
+        ["request_deadline_seam"],
+        "the real request-deadline vector must skip when the test seam is absent"
+    );
     for vector in &corpus.vectors {
         assert!(
             !vector.forbidden.is_empty(),
@@ -403,13 +408,18 @@ fn fake_and_real_parity() {
         "V-06", "V-18", "V-33", "V-39", "V-40", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07",
         "C-08", "C-10", "C-12", "F-01", "C-15", "C-16",
     ];
+    if !cfg!(feature = "test-seams") {
+        // Without the real seam V-44 is a fake-only row: the real driver
+        // records the typed `cell-not-servable: request_deadline_seam` skip.
+        expected_not_compared.push("V-44");
+    }
     let expected_compared = if real_serves_workers {
-        32
+        if cfg!(feature = "test-seams") { 33 } else { 32 }
     } else {
         // A refused containment plan skips the worker vectors on the real
         // driver; the fake still models a served cell.
         expected_not_compared.extend(["V-03", "V-42"]);
-        30
+        if cfg!(feature = "test-seams") { 31 } else { 30 }
     };
     expected_not_compared.sort_unstable();
     assert_eq!(

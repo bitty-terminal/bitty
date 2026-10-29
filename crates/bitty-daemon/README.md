@@ -49,6 +49,13 @@ queues and written after the response they follow. This closes the deferred
 event wire; the terminal-session content plane remains deferred. See
 [Pushed event wire](#pushed-event-wire-bitty2792).
 
+bitty#2805 adds the post-handshake request deadline: a request that completes
+past the effective `request_timeout_ms` is answered with the typed `Timeout`
+class carrying its envelope id and the bound, and the connection keeps serving.
+The long-running synchronous handlers (`session.create`, `daemon.orphans.verify`)
+keep their own advertised timers and are documented as exempt; see
+[Request deadline](#request-deadline-bitty2805).
+
 `bittyd start` binds the per-user endpoint (`0700` directory, `0600` socket,
 single-instance lock), mints the per-boot operator capability, opens the
 owner-private orphan journal, runs the startup containment scan, accepts up to
@@ -75,8 +82,10 @@ running service gives today:
 | Per-connection refusal-audit aggregation                                                   | bitty#2603 follow-up           | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each                                                     |
 | Conformance corpus and fake-server parity                                                  | bitty#2605                     | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; every shared vector is compared, with no recorded known defect |
 
-Nothing here authorizes autostart, a service file, a TCP listener, or desktop
-wiring; all four stay out of scope.
+The post-handshake request deadline is **not** in this table: it is served by
+the loop (see [Request deadline](#request-deadline-bitty2805)). Nothing here
+authorizes autostart, a service file, a TCP listener, or desktop wiring; all
+four stay out of scope.
 
 ## Frozen contract values
 
@@ -762,11 +771,56 @@ drain runs in the same loop as requests.
 | Frame bound            | `max_frame_bytes`                                | a declared length above the bound closes the connection                                                                 |
 | Pre-auth budget        | `pre_auth_max_bytes`                             | a connection that sends more before negotiating is closed (completed frames and the frame being assembled count)        |
 | Negotiate deadline     | `negotiate_timeout_ms`                           | an unnegotiated connection past the deadline is closed                                                                  |
+| Request deadline       | `request_timeout_ms`                             | a post-handshake request past the bound is answered `Timeout` with its id and bound; the connection stays open          |
 | Idle bound             | `transport_idle_ms`                              | an idle connection is closed                                                                                            |
 | Outbound bound         | `max_connection_outbound_bytes`                  | a response queue above the bound closes the connection                                                                  |
 | Grant sweep            | `GRANT_SWEEP_INTERVAL_MS` (1 s)                  | retired grant records are swept on the loop timer                                                                       |
 | Close drain            | `CLOSE_DRAIN_TIMEOUT_MS` (1 s)                   | a retired connection that cannot drain its refusal frame is closed; it never collects a second handshake-timeout record |
 | Tamper interval        | `TAMPER_INTERVAL_MS` (5 s)                       | `BoundEndpoint::reattest`; a failure is exit code 6                                                                     |
+
+### Request deadline (bitty#2805)
+
+The loop stamps a request when dispatch admits it and compares the stamp when
+dispatch returns, using the effective `request_timeout_ms` (never the negotiate
+deadline). A completion at or past the bound is answered with the accepted
+`Timeout` class:
+
+```json
+{
+  "v": 1,
+  "id": "<request id>",
+  "ok": false,
+  "error": {
+    "class": "Timeout",
+    "code": "Timeout",
+    "message": "request deadline exceeded",
+    "request_id": "<request id>",
+    "timeout_ms": 10000
+  }
+}
+```
+
+`request_id` echoes the request envelope `id`; `timeout_ms` is the effective
+bound. The refusal is audited once with the method's action and the static
+`Timeout` code. It never closes the connection: later requests on the same
+connection are served normally, and only the timed-out request is refused. A
+timed-out mutation's outcome is unknown, so the client reconciles with
+`session.status` and retries only with the same idempotency key and the current
+generation (`D-13`).
+
+The deadline is a local admission stamp, not a timer armed in the poll set:
+completion drops it, so there is no wakeup, no per-request thread, and no timer
+leak between requests. The single-threaded loop cannot preempt a synchronous
+handler, so a method whose handler can legitimately block past the bound keeps
+its own timer and is exempt from conversion
+(`ServiceMethod::request_deadline_exemption`): `daemon.stop` (it terminates
+every live session before it answers; each bound worker costs at most
+`abort_grace_ms + kill_wait` and the pool is capped by `max_sessions`) and
+`daemon.orphans.verify` (the containment pass budget). `session.create` is not
+exempt: its synchronous spawn/bind completes within the bounded cleanup, under
+the default request bound. `session.abort`/`session.kill` wait at most
+`abort_grace_ms` plus the kill window, under the default request bound, and are
+not exempt.
 
 Process hardening (`D-16`, `T-23`, `P0-AC-026`): on Linux, `bittyd start`
 lowers `RLIMIT_CORE` to zero and clears the dumpable flag
@@ -1132,6 +1186,15 @@ Corpus rules:
   vector that needs a served capability declares `requires`; a driver whose
   negotiated capability set lacks it records a typed `cell-not-servable` skip
   instead of failing the vector;
+- `V-44` pins the post-handshake request deadline: `request_timeout_ms` is
+  lowered to 100 ms, `daemon.status` is given a simulated 250 ms handler
+  through `injected.handler_delay_ms`/`handler_delay_method`, the refusal must
+  carry `Timeout` with `request_id` and `timeout_ms`, and a later `session.list`
+  on the same connection must succeed. The fake advances its injected clock;
+  the real driver uses the `test-seams` feature (enabled by
+  `just daemon-conformance`; the feature is test-only and no release workflow
+  enables it) and records a typed
+  `cell-not-servable: request_deadline_seam` skip without it;
 - cell-dependent values are seeded variables, never literals: `@worker_sessions`
   is the served capability of the cell a driver models (the reference fake
   models a served worker cell; the real driver seeds the readiness probe's

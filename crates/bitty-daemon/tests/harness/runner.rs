@@ -15,6 +15,9 @@ pub struct ErrorReply {
     pub class: String,
     pub code: String,
     pub counts: Option<(u64, u64)>,
+    /// Extra typed fields carried by the error object (`request_id`,
+    /// `timeout_ms`, ...), excluding `class`, `code`, `message`, and `counts`.
+    pub fields: BTreeMap<String, Value>,
 }
 
 /// One successful or refused reply.
@@ -42,6 +45,8 @@ pub struct ServiceFacts {
     pub version: String,
     pub capabilities: BTreeMap<String, bool>,
     pub limits: BTreeMap<String, u64>,
+    /// Harness-only seams the driver can use, never advertised on the wire.
+    pub seams: BTreeMap<String, bool>,
 }
 
 /// One request the driver actually sent.
@@ -332,11 +337,10 @@ pub fn run_vector(vector: &Vector, driver: &mut dyn Driver) -> VectorOutcome {
     // failure: a real Linux cell whose containment probe selected no mechanism
     // refuses the worker path, while the reference fake models a served cell.
     let facts = driver.facts();
-    if let Some(missing) = vector
-        .requires
-        .iter()
-        .find(|capability| facts.capabilities.get(*capability).copied() != Some(true))
-    {
+    if let Some(missing) = vector.requires.iter().find(|requirement| {
+        facts.capabilities.get(*requirement).copied() != Some(true)
+            && facts.seams.get(*requirement).copied() != Some(true)
+    }) {
         row.status = RowStatus::Skip;
         row.skip_reason = Some(format!("cell-not-servable: {missing}"));
         driver.finish();
@@ -730,6 +734,21 @@ pub fn check_expect(
                     "expected counts {actual}/{limit}, observed {:?}",
                     error.counts
                 ));
+            }
+        }
+        for (path, expected) in &expect.error_fields {
+            let expected = resolve(expected, vars);
+            let actual = error
+                .fields
+                .get(path)
+                .ok_or_else(|| format!("missing error field {path}"))?;
+            if actual != &expected {
+                return Err(mismatch(path, actual, &expected));
+            }
+        }
+        for path in &expect.error_present {
+            if error.fields.get(path).is_none_or(Value::is_null) {
+                return Err(format!("missing error field {path}"));
             }
         }
     }

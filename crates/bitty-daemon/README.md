@@ -372,8 +372,9 @@ Windows job-object reaper remains designed-not-implemented (bitty#2791).
 limit facts. The remaining response fields (`wire_version` (transport-owned),
 `daemon_instance_id`, `daemon_pid`, `server_identity`, `peer_identity`,
 `client_id`, `scopes`, `server_monotonic_ms`, `daemon_state`) and the optional
-request fields (`client_correlation`, `operator_capability`, `host_grant`,
-`events`) are listed in the module docs and arrive with bitty#2601/#2607.
+request fields (`client_correlation`, `operator_capability`, `host_grant`) are
+listed in the module docs and arrive with bitty#2601/#2607; `events` is served
+by this slice (see [Pushed event wire](#pushed-event-wire-bitty2792)).
 `client_correlation` is bounded to 128 bytes of valid UTF-8 with no control
 characters and is recorded only as a truncated 128-bit SHA-256 digest (`D-08`);
 `operator_capability` and `host_grant` stay out of this crate until the slice
@@ -1244,8 +1245,9 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
   error.
 - `tests/registry.rs` — public registry lifecycle, ids, refusals, limits.
 - `tests/service_loop.rs` (`event_wire`) — real-socket delivery: response-first
-  ordering, per-lease routing, the terminal marker, disconnect cleanup, the
-  opt-out, and the attach replay.
+  ordering, per-lease routing, the terminal marker, control-transfer detail,
+  disconnect cleanup and replay retention, controller-token reclaim, the
+  opt-out, the attach replay, a truncated ring, and the kill terminal.
 - `tests/events.rs` — public stream behavior: revision ordering, replay and
   truncation boundaries, the terminal guarantee, control frames, heartbeat
   memory stability, and the seeded 10,000-operation no-loss audit.

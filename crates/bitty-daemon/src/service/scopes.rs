@@ -476,6 +476,28 @@ impl ServiceMethod {
         }
     }
 
+    /// The static reason this method is exempt from the post-handshake
+    /// request deadline, when its synchronous handler can legitimately block
+    /// past `request_timeout_ms`.
+    ///
+    /// The deadline is stamped when dispatch admits the request and compared
+    /// when dispatch returns. The loop is single-threaded, so the check cannot
+    /// preempt a handler; a method with a larger advertised timer is governed
+    /// by that timer instead of being converted into a `Timeout` after its
+    /// effect. Every other method is bounded by the request deadline.
+    #[must_use]
+    pub const fn request_deadline_exemption(self) -> Option<&'static str> {
+        match self {
+            Self::SessionCreate => {
+                Some("synchronous worker spawn/bind is bounded by spawn_bind_timeout_ms")
+            }
+            Self::DaemonOrphansVerify => {
+                Some("on-demand orphan verification is bounded by the containment pass budget")
+            }
+            _ => None,
+        }
+    }
+
     /// The capability that gates this method family, when one does.
     #[must_use]
     pub const fn capability(self) -> Option<&'static str> {
@@ -620,6 +642,16 @@ mod tests {
                 "daemon.control",
             ]
         );
+    }
+
+    #[test]
+    fn only_the_documented_methods_are_exempt_from_the_request_deadline() {
+        let exempt: Vec<&str> = ServiceMethod::ALL
+            .into_iter()
+            .filter(|method| method.request_deadline_exemption().is_some())
+            .map(ServiceMethod::name)
+            .collect();
+        assert_eq!(exempt, ["daemon.orphans.verify", "session.create"]);
     }
 
     #[test]

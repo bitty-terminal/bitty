@@ -8674,6 +8674,91 @@
         "a revoked lease never receives a survivor's frame",
         "the final frame is routed to the revoked lease's own connection, not the requester's response"
       ]
+    },
+    {
+      "id": "V-44",
+      "title": "A post-handshake request past request_timeout_ms is a typed Timeout and the connection keeps serving",
+      "area": "timeout",
+      "decisions": [
+        "D-13"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "requires": [
+        "request_deadline_seam"
+      ],
+      "setup": {
+        "host_grant": false
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {
+          "request_timeout_ms": 100
+        },
+        "handler_delay_ms": 250,
+        "handler_delay_method": "daemon.status"
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": false,
+            "error_class": "Timeout",
+            "error_code": "Timeout",
+            "error_present": [
+              "request_id",
+              "timeout_ms"
+            ],
+            "error_fields": {
+              "timeout_ms": 100
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.list",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "sessions": []
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.list",
+          "params": null,
+          "expect": {
+            "ok": true
+          }
+        }
+      ],
+      "forbidden": [
+        "a request timeout never closes the connection",
+        "a request timeout never omits the request id or the enforced bound",
+        "a later request on the same connection is never refused because an earlier one timed out"
+      ]
     }
   ]
 }

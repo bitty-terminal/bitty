@@ -93,11 +93,17 @@ impl Vector {
     }
 }
 
-/// Injected time and limits.
+/// Injected time, limits, and handler delay.
 #[derive(Debug, Clone, Default)]
 pub struct Injected {
     pub clock_ms: u64,
     pub limits: BTreeMap<String, u64>,
+    /// Simulated handler time for one method, used by the request-deadline
+    /// vector. The fake advances its clock; the real driver uses the
+    /// debug-only completion-stamp seam.
+    pub handler_delay_ms: u64,
+    /// The method whose handler takes [`Self::handler_delay_ms`].
+    pub handler_delay_method: Option<String>,
 }
 
 /// One corpus step: a call or a driver action.
@@ -120,6 +126,10 @@ pub struct Expect {
     pub error_class: Option<String>,
     pub error_code: Option<String>,
     pub error_counts: Option<(u64, u64)>,
+    /// Extra error-object fields the refusal must carry exactly.
+    pub error_fields: BTreeMap<String, Value>,
+    /// Error-object fields that must be present and non-null.
+    pub error_present: Vec<String>,
     pub retry_ms: u64,
     pub closed: bool,
     pub transport_closed: bool,
@@ -146,6 +156,8 @@ impl Expect {
     fn has_typed_assertion(&self) -> bool {
         self.ok.is_some()
             || self.error_code.is_some()
+            || !self.error_fields.is_empty()
+            || !self.error_present.is_empty()
             || self.transport_closed
             || !self.result.is_empty()
             || !self.present.is_empty()
@@ -307,7 +319,17 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
                     limits.insert(name.clone(), limit);
                 }
             }
-            Injected { clock_ms, limits }
+            let handler_delay_ms = optional_u64(injected, "handler_delay_ms")
+                .map_err(fail)?
+                .unwrap_or(0);
+            let handler_delay_method =
+                optional_string(injected, "handler_delay_method").map_err(fail)?;
+            Injected {
+                clock_ms,
+                limits,
+                handler_delay_ms,
+                handler_delay_method,
+            }
         }
     };
     let steps = array(value, "steps")
@@ -462,6 +484,8 @@ fn parse_expect(value: &Value) -> Result<Expect, String> {
                     .ok_or_else(|| "counts.limit is required".to_owned())?,
             )),
         },
+        error_fields: value_map(value, "error_fields")?,
+        error_present: optional_string_array(value, "error_present")?,
         retry_ms: optional_u64(value, "retry_ms")?.unwrap_or(0),
         closed: optional_bool(value, "closed")?.unwrap_or(false),
         transport_closed: optional_string(value, "transport")?.as_deref() == Some("closed"),
@@ -517,6 +541,11 @@ fn parse_expect(value: &Value) -> Result<Expect, String> {
         .collect();
     if expect.error_class.is_some() && expect.error_code.is_none() {
         return Err("error_class without error_code".to_owned());
+    }
+    if (!expect.error_fields.is_empty() || !expect.error_present.is_empty())
+        && expect.error_code.is_none()
+    {
+        return Err("error_fields or error_present without error_code".to_owned());
     }
     if let Some(audit) = value.get("audit") {
         let mut line_bounds = Vec::new();

@@ -13,6 +13,14 @@ categories = ["command-line-utilities"]
 # implemented and reviewed (bitty#2606, ADR 0019).
 publish = false
 
+[features]
+# Test-only request-deadline seam for the conformance real driver: it lowers
+# the effective `request_timeout_ms` and advances the completion stamp for one
+# named method so a real request can cross the bound without a wall-clock
+# wait. Never enable this feature in a shipped binary; the dedicated
+# `daemon-conformance` recipe enables it for the real vector.
+test-seams = []
+
 [lints]
 workspace = true
 

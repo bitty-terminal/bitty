@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use bitty_daemon::contract::CAPABILITIES;
 use bitty_daemon::handshake::{ClientCorrelation, GrantCorrelation, hex};
 use bitty_daemon::limits::{LimitId, LimitOverride, Limits};
+use bitty_daemon::service::ServiceMethod;
 use bitty_daemon::spawn::{SpawnSpec, SpawnSpecError};
 
 use crate::harness::corpus::{DriverKind, Vector};
@@ -63,6 +64,11 @@ pub struct FakeDriver {
     requests: Vec<RequestRecord>,
     audit: Vec<String>,
     facts: ServiceFacts,
+    /// Simulated handler time for one method (the request-deadline vector).
+    handler_delay_ms: u64,
+    handler_delay_method: Option<String>,
+    /// Per-connection request sequence for the timeout `request_id` shape.
+    request_seq: u64,
 }
 
 #[derive(Default)]
@@ -139,6 +145,9 @@ impl FakeDriver {
             requests: Vec::new(),
             audit: Vec::new(),
             facts: ServiceFacts::default(),
+            handler_delay_ms: 0,
+            handler_delay_method: None,
+            request_seq: 0,
         }
     }
 
@@ -165,6 +174,9 @@ impl FakeDriver {
         self.detached.clear();
         self.requests.clear();
         self.audit.clear();
+        self.handler_delay_ms = vector.injected.handler_delay_ms;
+        self.handler_delay_method = vector.injected.handler_delay_method.clone();
+        self.request_seq = 0;
         self.host_grant = self.needs_host_grant.then(|| self.mint_host_grant());
         self.facts = self.facts_now();
         Ok(())
@@ -199,6 +211,7 @@ impl FakeDriver {
                 .into_iter()
                 .map(|limit| (limit.name().to_owned(), self.limits.effective(limit)))
                 .collect(),
+            seams: BTreeMap::from([("request_deadline_seam".to_owned(), true)]),
         }
     }
 
@@ -290,8 +303,52 @@ impl FakeDriver {
                 class: class.to_owned(),
                 code: code.to_owned(),
                 counts,
+                fields: BTreeMap::new(),
             }),
         })
+    }
+
+    /// The request-deadline refusal with the envelope-id echo and the bound.
+    fn refuse_timeout(&mut self, bound: u64) -> Outcome {
+        self.audit_line("request", "refused c=Timeout");
+        Outcome::Reply(Reply {
+            ok: false,
+            result: Value::Null,
+            error: Some(ErrorReply {
+                class: "Timeout".to_owned(),
+                code: "Timeout".to_owned(),
+                counts: None,
+                fields: BTreeMap::from([
+                    (
+                        "request_id".to_owned(),
+                        Value::String(self.request_seq.to_string()),
+                    ),
+                    ("timeout_ms".to_owned(), json!(bound)),
+                ]),
+            }),
+        })
+    }
+
+    /// Model one handler that takes longer than the effective request bound.
+    fn handler_delay(&mut self, method: &str) -> Option<Outcome> {
+        if self.handler_delay_ms == 0 {
+            return None;
+        }
+        let applies = match self.handler_delay_method.as_deref() {
+            Some(name) => name == method,
+            None => true,
+        };
+        if !applies {
+            return None;
+        }
+        self.clock_ms = self.clock_ms.saturating_add(self.handler_delay_ms);
+        let bound = self.limits.effective(LimitId::RequestTimeoutMs);
+        if ServiceMethod::from_name(method)
+            .is_some_and(|method| method.request_deadline_exemption().is_some())
+        {
+            return None;
+        }
+        (self.handler_delay_ms >= bound).then(|| self.refuse_timeout(bound))
     }
 
     fn call_inner(&mut self, connection: &str, method: &str, params: Value) -> Outcome {
@@ -313,6 +370,10 @@ impl FakeDriver {
         if !self.conn(connection).is_some_and(|conn| conn.negotiated) {
             let outcome = self.refuse(method, "Denied", "AlreadyNegotiated", None);
             self.connection(connection).closed = true;
+            return outcome;
+        }
+        self.request_seq = self.request_seq.saturating_add(1);
+        if let Some(outcome) = self.handler_delay(method) {
             return outcome;
         }
         if !well_formed(method) {

@@ -26,8 +26,8 @@
 //! - [`service::frame`]: per-frame `SCM_CREDENTIALS` on Linux;
 //! - [`service::dispatch`]: the eleven-stage authorization order and the
 //!   closed refusal mapping;
-//! - [`service::server`]: the `bittyd start` admission loop, limits, signals,
-//!   and shutdown;
+//! - [`service::server`]: the `bittyd start` admission loop, limits, the
+//!   post-handshake request deadline, signals, and shutdown;
 //! - [`operator`] and [`audit_sink`]: the per-boot operator capability and the
 //!   fail-closed audit writer;
 //! - [`spawn`]: the bounded `session.create` spawn specification;

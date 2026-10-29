@@ -132,7 +132,7 @@ pub fn render_success(id: &str, result: &Value) -> Result<Vec<u8>, Refusal> {
 ///
 /// Returns [`Refusal::internal`] when the error cannot be encoded.
 pub fn render_error(id: &str, refusal: Refusal) -> Result<Vec<u8>, Refusal> {
-    let error = error_object(refusal);
+    let error = error_object(refusal, Some(id));
     let payload = serde_json::to_vec(&json!({
         "v": ACCEPTED_WIRE_VERSION,
         "id": id,
@@ -157,7 +157,7 @@ pub fn render_error(id: &str, refusal: Refusal) -> Result<Vec<u8>, Refusal> {
 /// Returns [`Refusal::internal`] when the error cannot be encoded or the
 /// response envelope exceeds the frame/depth bound.
 pub fn render_error_without_id(refusal: Refusal) -> Result<Vec<u8>, Refusal> {
-    let error = error_object(refusal);
+    let error = error_object(refusal, None);
     let payload = serde_json::to_vec(&json!({
         "v": ACCEPTED_WIRE_VERSION,
         "ok": false,
@@ -173,7 +173,11 @@ pub fn render_error_without_id(refusal: Refusal) -> Result<Vec<u8>, Refusal> {
 }
 
 /// The static error object shared by both response shapes.
-fn error_object(refusal: Refusal) -> Value {
+///
+/// `request_id` is the envelope correlation value, echoed only when the
+/// renderer has one. A `Timeout` always carries the bound; a no-`id` renderer
+/// (an unparseable frame) omits the correlation value it cannot attribute.
+fn error_object(refusal: Refusal, request_id: Option<&str>) -> Value {
     let mut error = Map::new();
     error.insert(
         "class".to_owned(),
@@ -190,12 +194,13 @@ fn error_object(refusal: Refusal) -> Value {
             json!({"actual": actual, "limit": limit}),
         );
     }
-    if let RefusalKind::Timeout {
-        request_id,
-        timeout_ms,
-    } = refusal.kind()
-    {
-        error.insert("request_id".to_owned(), json!(request_id));
+    if let RefusalKind::Timeout { timeout_ms } = refusal.kind() {
+        if let Some(request_id) = request_id {
+            error.insert(
+                "request_id".to_owned(),
+                Value::String(request_id.to_owned()),
+            );
+        }
         error.insert("timeout_ms".to_owned(), json!(timeout_ms));
     }
     Value::Object(error)
@@ -549,6 +554,34 @@ mod tests {
         );
         let parsed = RequestEnvelope::parse(&observer).expect("attach_role is a service field");
         assert_eq!(parsed.params["attach_role"], "observer");
+    }
+
+    #[test]
+    fn a_timeout_refusal_echoes_the_request_id_and_the_bound() {
+        let payload = render_error("req-7", Refusal::timeout(100)).expect("render");
+        let value: Value = serde_json::from_slice(&payload).expect("timeout json");
+        assert_eq!(value["v"], 1);
+        assert_eq!(value["id"], "req-7");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["class"], "Timeout");
+        assert_eq!(value["error"]["code"], "Timeout");
+        assert_eq!(value["error"]["request_id"], "req-7");
+        assert_eq!(value["error"]["timeout_ms"], 100);
+        assert!(
+            value["error"].get("counts").is_none(),
+            "a request timeout carries the id and bound, not counts"
+        );
+    }
+
+    #[test]
+    fn a_timeout_without_a_correlation_id_omits_the_request_id() {
+        let payload = render_error_without_id(Refusal::timeout(100)).expect("render");
+        let value: Value = serde_json::from_slice(&payload).expect("timeout json");
+        assert_eq!(value["error"]["timeout_ms"], 100);
+        assert!(
+            value["error"].get("request_id").is_none(),
+            "an unattributable frame must not invent a request id"
+        );
     }
 
     #[test]

@@ -42,6 +42,10 @@ pub struct RealDriver {
     host_grant: Option<String>,
     needs_host_grant: bool,
     next_id: u64,
+    /// The request-deadline injection the current vector asked for.
+    request_timeout_ms: Option<u64>,
+    handler_delay_ms: u64,
+    handler_delay_method: Option<String>,
 }
 
 struct Root {
@@ -103,19 +107,24 @@ struct Daemon {
 }
 
 impl Daemon {
-    fn start(root: &Root) -> Result<Self, String> {
+    fn start(root: &Root, extra_env: &[(&str, String)]) -> Result<Self, String> {
         std::fs::create_dir_all(root.runtime()).map_err(|_| "runtime dir".to_owned())?;
         std::fs::set_permissions(root.runtime(), std::fs::Permissions::from_mode(0o700))
             .map_err(|_| "runtime mode".to_owned())?;
         std::fs::create_dir_all(root.state()).map_err(|_| "state dir".to_owned())?;
-        let child = Command::new(BITTYD)
+        let mut command = Command::new(BITTYD);
+        command
             .arg("start")
             .env("XDG_RUNTIME_DIR", root.runtime())
             .env("XDG_STATE_HOME", root.state())
             .env_remove("BITTYD_ENDPOINT")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let child = command
             .spawn()
             .map_err(|_| "cannot spawn bittyd".to_owned())?;
         let mut daemon = Self { child };
@@ -321,6 +330,17 @@ fn reply_from(value: Value) -> Reply {
                 counts.get("limit")?.as_u64()?,
             ))
         }),
+        fields: error
+            .as_object()
+            .map(|map| {
+                map.iter()
+                    .filter(|(key, _)| {
+                        !matches!(key.as_str(), "class" | "code" | "message" | "counts")
+                    })
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default(),
     });
     Reply { ok, result, error }
 }
@@ -333,6 +353,7 @@ fn transport_failure(code: &str) -> Outcome {
             class: "Harness".to_owned(),
             code: code.to_owned(),
             counts: None,
+            fields: std::collections::BTreeMap::new(),
         }),
     })
 }
@@ -349,6 +370,9 @@ impl RealDriver {
             host_grant: None,
             needs_host_grant: false,
             next_id: 1,
+            request_timeout_ms: None,
+            handler_delay_ms: 0,
+            handler_delay_method: None,
         }
     }
 
@@ -395,7 +419,24 @@ impl RealDriver {
         self.stop();
         let root = Root::new(label);
         seed_orphan_record(&root, orphan_record)?;
-        let daemon = Daemon::start(&root)?;
+        // The conformance request-deadline vector lowers the bound and
+        // simulates one slow handler through the `test-seams` feature. The
+        // values are ignored by a shipped binary; `just daemon-conformance`
+        // enables the feature.
+        let mut extra_env = Vec::new();
+        if let Some(timeout_ms) = self.request_timeout_ms {
+            extra_env.push(("BITTYD_TEST_REQUEST_TIMEOUT_MS", timeout_ms.to_string()));
+        }
+        if self.handler_delay_ms > 0 {
+            extra_env.push((
+                "BITTYD_TEST_REQUEST_DEADLINE_OFFSET_MS",
+                self.handler_delay_ms.to_string(),
+            ));
+            if let Some(method) = &self.handler_delay_method {
+                extra_env.push(("BITTYD_TEST_REQUEST_DEADLINE_METHOD", method.clone()));
+            }
+        }
+        let daemon = Daemon::start(&root, &extra_env)?;
         self.operator_capability = Self::read_capability(&root)?;
         self.needs_host_grant = host_grant;
         self.host_grant = None;
@@ -465,6 +506,10 @@ impl RealDriver {
             version: bitty_daemon::CRATE_VERSION.to_owned(),
             capabilities,
             limits,
+            seams: std::collections::BTreeMap::from([(
+                "request_deadline_seam".to_owned(),
+                cfg!(feature = "test-seams"),
+            )]),
         })
     }
 
@@ -602,6 +647,9 @@ impl Driver for RealDriver {
     }
 
     fn prepare(&mut self, vector: &Vector) -> Result<Vars, String> {
+        self.request_timeout_ms = vector.injected.limits.get("request_timeout_ms").copied();
+        self.handler_delay_ms = vector.injected.handler_delay_ms;
+        self.handler_delay_method = vector.injected.handler_delay_method.clone();
         self.start(
             &vector.id.to_lowercase(),
             vector.host_grant,

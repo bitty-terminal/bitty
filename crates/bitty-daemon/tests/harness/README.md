@@ -58,9 +58,15 @@ never fork expectations.
   `cell-not-servable: <capability>` skip after preparation, so a real Linux cell
   whose containment probe selected no mechanism never fails the worker vectors
   it cannot serve. The reference fake models a served worker cell and always
-  advertises `worker_sessions`.
+  advertises `worker_sessions`. A harness seam (`request_deadline_seam`) is
+  resolved through the driver's `seams` map, never the wire handshake.
 - `injected` is honored by the fake. The real service uses its process clock and
-  compiled limits; a vector that needs injection records a typed real skip.
+  compiled limits; a vector that needs injection records a typed real skip. The
+  request-deadline vector is the exception: `handler_delay_ms` and
+  `handler_delay_method` plus a `request_timeout_ms` limit are honored by the
+  real driver through the `test-seams` feature, which `just daemon-conformance`
+  enables. Without the feature the real row records
+  `cell-not-servable: request_deadline_seam`.
 - `known_defect.drivers` scopes the marker to the driver that still carries the
   defect. `step` is the zero-based index (across `steps` then `state`) that must
   fail, and `code`/`path` names the expected refusal or result mismatch. A
@@ -99,6 +105,8 @@ to the captured JSON value, and `{{name}}` substitutes inside a string.
 ```
 
 Expectation vocabulary: `ok`, `error_class`, `error_code`, `counts`,
+`error_fields` (extra error-object fields by exact value), `error_present`
+(extra error-object fields that must be present and non-null),
 `closed` (EOF after the reply), `transport` (`"closed"` when no reply arrives),
 `result`, `result_min`, `present`, `absent`, `array` (exact), `array_len`,
 `min_array_len`, `hex_len`, `distinct`, `not_equal`, `not_equal_any`,

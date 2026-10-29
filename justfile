@@ -206,9 +206,11 @@ daemon-seam-test:
 # against the in-process reference fake (`candidate-not-bittyd`) and the built
 # binary; evidence lands under `target/conformance/`. `daemon-seam-test`
 # already includes the integration binary, so this recipe names the harness for
-# local runs without duplicating `just check`.
+# local runs without duplicating `just check`. The `test-seams` feature enables
+# the test-only request-deadline injection the real V-44 row needs; without it
+# that row records the typed `cell-not-servable: request_deadline_seam` skip.
 daemon-conformance:
-    cargo test -p bitty-daemon --test conformance --locked
+    cargo test -p bitty-daemon --test conformance --features test-seams --locked
 
 # CTX-1605: `winit` is a patched path dependency (`vendor/winit`). If the
 # requirement or the lock ever resolve back to crates.io, cargo only warns that

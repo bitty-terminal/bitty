@@ -352,7 +352,7 @@ jobs:
       # enable. Without this step only the fake gates the feature.
       - name: Run bittyd conformance (real service)
         if: matrix.shard == 1
-        run: just daemon-conformance
+        run: cargo test -p bitty-daemon --test conformance --features test-seams --locked
 
       - name: Upload bittyd conformance evidence (fake)
         if: always() && matrix.shard == 1

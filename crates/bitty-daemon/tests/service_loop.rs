@@ -3313,6 +3313,42 @@ mod event_wire {
     }
 
     #[test]
+    fn a_drain_announcement_reaches_the_held_lease_before_the_terminal() {
+        let root = TempRoot::new("events-drain");
+        let daemon = Daemon::start(&root);
+        let capability = read_capability(&root);
+        let mut operator = Client::connect(&root.endpoint());
+        assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+        let (mut creator, _) = event_consumer(&root, &mut operator, "drain");
+        let (session_id, attach_id, _, _) = create_and_claim(&mut creator, "drain");
+
+        let stopped = operator.call("daemon.stop", json!({"mode": "drain"}));
+        assert_eq!(stopped["ok"], true, "{stopped}");
+
+        // `daemon_stopping` is a daemon-scoped control frame: it carries the
+        // deadline, names the lease, and precedes the terminal transition.
+        let stopping = recv_event(&mut creator);
+        assert_eq!(stopping["kind"], "daemon_stopping", "{stopping}");
+        assert_eq!(stopping["attach_id"], attach_id, "{stopping}");
+        assert!(
+            stopping["detail"]["deadline_ms"].as_u64().is_some(),
+            "the drain deadline is carried: {stopping}"
+        );
+
+        let mut event = recv_event(&mut creator);
+        while event["kind"] != "session_terminal" {
+            assert_eq!(event["kind"], "session_state", "{event}");
+            event = recv_event(&mut creator);
+        }
+        assert_eq!(event["terminal"], true, "{event}");
+        assert_eq!(event["attach_id"], attach_id, "{event}");
+        assert_eq!(event["session_id"], session_id, "{event}");
+
+        assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+    }
+
+    #[test]
     fn a_disconnect_releases_the_lease_and_notifies_the_survivor() {
         let root = TempRoot::new("events-disconnect");
         let daemon = Daemon::start(&root);

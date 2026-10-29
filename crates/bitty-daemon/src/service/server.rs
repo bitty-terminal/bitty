@@ -505,8 +505,19 @@ mod unix {
 
         loop {
             let current = now();
-            if shutting_down && peers.iter().all(|peer| !peer.wants_write()) {
-                break;
+            if shutting_down {
+                // A drain announcement and the terminal frames it precedes are
+                // queued, not written. Move them into the outbound buffers
+                // before deciding the shutdown is complete, so the guarantee
+                // survives the last iteration.
+                for peer in &mut peers {
+                    if !peer.closed && !peer.close_after_write {
+                        deliver_events(peer, &mut service, &config);
+                    }
+                }
+                if peers.iter().all(|peer| !peer.wants_write()) {
+                    break;
+                }
             }
             let mut poll_fds = Vec::with_capacity(peers.len() + 2);
             poll_fds.push(nix::poll::PollFd::new(

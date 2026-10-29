@@ -2020,8 +2020,8 @@ impl Service {
 
         // A worker create reads and validates the whole bounded spawn
         // specification before the idempotency admission and before any
-        // process exists. A terminal create stays registry-only in this slice
-        // and ignores those fields as unknown.
+        // process exists. A terminal create follows the frozen contract's
+        // `session.create` row and ignores those fields as unknown.
         let spawn = match kind {
             SessionKind::Worker => {
                 Some(SpawnSpec::parse(fields, &self.limits).map_err(map_spawn_spec_refusal)?)

@@ -239,6 +239,7 @@ mod component_host;
 mod component_seed;
 mod composer_owner;
 mod config_cli;
+mod config_manage;
 mod config_reload;
 mod consent;
 mod crash_report;

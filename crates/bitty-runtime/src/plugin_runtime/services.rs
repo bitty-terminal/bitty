@@ -55,11 +55,15 @@ use bitty_plugin_host::{
 };
 
 use super::config_write::{
-    CONFIG_PREVIEW_MAX_KEYS, CONFIG_PREVIEW_MAX_RENDERED_BYTES, CONFIG_SET_MAX_RENDERED_BYTES,
-    CONFIG_SET_MAX_WALL_MS, ConfigApplyOutcome, ConfigChange, ConfigPreviewRendering,
-    ConfigPreviewToken, ConfigSetOutcome, ConfigSettingValue, ConfigWriteBackend, ConfigWriteGate,
-    approval_digest, check_result_rows, config_backend_error, config_key_error, config_unavailable,
-    writable_setting,
+    CONFIG_GET_MAX_VALUE_BYTES, CONFIG_LIST_MAX_STRING_BYTES, CONFIG_PREVIEW_MAX_KEYS,
+    CONFIG_PREVIEW_MAX_RENDERED_BYTES, CONFIG_SET_MAX_RENDERED_BYTES, CONFIG_SET_MAX_WALL_MS,
+    ConfigApplyOutcome, ConfigApprovalTarget, ConfigChange, ConfigManageToken,
+    ConfigPreviewRendering, ConfigPreviewToken, ConfigReadValue, ConfigSetOutcome,
+    ConfigSettingValue, ConfigSourceList, ConfigValueRow, ConfigWriteBackend, ConfigWriteGate,
+    PluginList, ProfileList, approval_digest, check_list_bounds, check_manage_rendering,
+    check_result_rows, config_backend_error, config_invalid_request, config_key_error,
+    config_limit_exceeded, config_read_error, config_unavailable, list_row_bytes,
+    manage_approval_digest, redact_config_value, writable_setting,
 };
 use super::history::{
     HISTORY_GRANT_SCOPE_CACHE_MAX, HISTORY_RATE_WINDOW, HistoryProvider, history_caps,
@@ -3530,6 +3534,87 @@ fn config_approval_mismatch() -> BridgeError {
     )
 }
 
+/// Typed missing-approval refusal for the manage writes.
+fn config_approval_required(verb: &str) -> BridgeError {
+    BridgeError::new(
+        "runtime",
+        "E_CONFIG_APPROVAL_REQUIRED",
+        format!("{verb} requires a fresh preview token for this exact change"),
+    )
+}
+
+/// Validate a qualified plugin id before any backend call.
+fn validate_manage_plugin_id(id: &str) -> Result<(), BridgeError> {
+    if id.is_empty() || id.len() > CONFIG_LIST_MAX_STRING_BYTES {
+        return Err(config_invalid_request("plugin id must be 1..128 bytes"));
+    }
+    if id.chars().any(char::is_control) {
+        return Err(config_invalid_request(
+            "plugin id must not contain control characters",
+        ));
+    }
+    if id.trim() != id {
+        return Err(config_invalid_request(
+            "plugin id must not have surrounding whitespace",
+        ));
+    }
+    PluginId::new(id)
+        .map(|_| ())
+        .map_err(|_| config_invalid_request("plugin id is not a qualified plugin id"))
+}
+
+/// Validate a profile name before any backend call.
+fn validate_manage_profile_name(name: &str) -> Result<(), BridgeError> {
+    if name.len() > CONFIG_LIST_MAX_STRING_BYTES {
+        return Err(config_invalid_request(
+            "profile name exceeds its byte bound",
+        ));
+    }
+    let canonical = bitty_config::file::validate_profile_name(name)
+        .map_err(|_| config_invalid_request("profile name is invalid"))?;
+    if canonical != name {
+        return Err(config_invalid_request(
+            "profile name must not have surrounding whitespace",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate the lowercase SHA-256 approval digest shape.
+fn validate_manage_digest(digest: &str) -> Result<(), BridgeError> {
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(config_approval_mismatch());
+    }
+    Ok(())
+}
+
+/// Validate one bounded list string and reject path-shaped display data.
+fn validate_list_string(label: &str, value: &str) -> Result<(), BridgeError> {
+    if value.is_empty() {
+        return Err(config_invalid_request(&format!(
+            "{label} must be non-empty"
+        )));
+    }
+    if value.len() > CONFIG_LIST_MAX_STRING_BYTES {
+        return Err(config_limit_exceeded(&format!("{label} exceeds 128 bytes")));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(config_invalid_request(&format!(
+            "{label} has control characters"
+        )));
+    }
+    if value.contains('/') || value.contains('\\') || value.contains("..") {
+        return Err(config_invalid_request(&format!(
+            "{label} must not contain a path"
+        )));
+    }
+    Ok(())
+}
+
 /// Inherent `config.manage` core (CTX-1613, bitty#2393).
 ///
 /// Split from the [`HostServices`] impl so tests can inject a start
@@ -3620,8 +3705,10 @@ impl PluginServices {
         let digest = approval_digest(&self.plugin_id, &change, &rendering);
         self.config_gate.borrow_mut().issue(
             digest.clone(),
-            change.key(),
-            change.value().clone(),
+            ConfigApprovalTarget::Setting {
+                key: change.key(),
+                value: change.value().clone(),
+            },
             rendering.candidate_digest,
         );
         Ok(ConfigPreviewToken {
@@ -3686,11 +3773,13 @@ impl PluginServices {
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }
-        let Some(candidate_digest) =
-            self.config_gate
-                .borrow_mut()
-                .consume(digest, change.key(), change.value())
-        else {
+        let Some(candidate_digest) = self.config_gate.borrow_mut().consume(
+            digest,
+            &ConfigApprovalTarget::Setting {
+                key: change.key(),
+                value: change.value().clone(),
+            },
+        ) else {
             return Err(BridgeError::new(
                 "runtime",
                 "E_CONFIG_APPROVAL_REQUIRED",
@@ -3732,6 +3821,440 @@ impl PluginServices {
             Instant::now() + Duration::from_millis(CONFIG_SET_MAX_WALL_MS),
         )
     }
+
+    /// Admit one read call before any backend work.
+    ///
+    /// A read admits its call slot first, so a slow or failing backend still
+    /// consumes the call budget. Result bytes are charged after validation.
+    fn config_admit(&self, started: Instant) -> Result<(), BridgeError> {
+        if started.elapsed() > Duration::from_millis(CONFIG_SET_MAX_WALL_MS) {
+            return Err(config_limit_exceeded(
+                "config.manage exceeded its 10 ms authorization budget",
+            ));
+        }
+        if !self.config_gate.borrow_mut().admit(Instant::now()) {
+            return Err(config_limit_exceeded(
+                "config.manage exceeded 16 calls per second",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Charge one validated read result's bytes (the call is already spent).
+    fn config_charge_result_bytes(
+        &self,
+        started: Instant,
+        bytes: usize,
+    ) -> Result<(), BridgeError> {
+        if started.elapsed() > Duration::from_millis(CONFIG_SET_MAX_WALL_MS) {
+            return Err(config_limit_exceeded(
+                "config.manage exceeded its 10 ms authorization budget",
+            ));
+        }
+        if !self
+            .config_gate
+            .borrow_mut()
+            .charge_bytes(Instant::now(), bytes)
+        {
+            return Err(config_limit_exceeded(
+                "config.manage exceeded 4096 bytes per second",
+            ));
+        }
+        Ok(())
+    }
+
+    fn config_backend_or_unavailable(&self) -> Result<Rc<dyn ConfigWriteBackend>, BridgeError> {
+        self.config_backend
+            .borrow()
+            .clone()
+            .ok_or_else(config_unavailable)
+    }
+
+    /// `bitty.config.get`: one allowlisted typed value plus logical source.
+    fn config_get(&self, key: &str) -> Result<ConfigValueRow, BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        let setting = writable_setting(key).ok_or_else(config_key_error)?;
+        let backend = self.config_backend_or_unavailable()?;
+        self.config_admit(started)?;
+        let row = backend
+            .config_get(&self.plugin_id, setting.key)
+            .map_err(config_read_error)?;
+        if row.key != setting.key {
+            return Err(config_invalid_request(
+                "config.get returned a key outside the request",
+            ));
+        }
+        if row.value.wire_bytes() > CONFIG_GET_MAX_VALUE_BYTES {
+            return Err(config_limit_exceeded(
+                "config.get value exceeds its byte bound",
+            ));
+        }
+        if !row.source.is_bounded() {
+            return Err(config_limit_exceeded(
+                "config.get source label exceeds its byte bound",
+            ));
+        }
+        let (value, redacted) = redact_config_value(setting.key, row.value);
+        let row = ConfigValueRow {
+            value,
+            redacted,
+            ..row
+        };
+        let bytes = row.key.len() + row.value.wire_bytes() + row.source.as_wire().len();
+        self.config_charge_result_bytes(started, bytes)?;
+        Ok(row)
+    }
+
+    /// `bitty.config.sources`: bounded logical attribution for the allowlist.
+    fn config_sources(&self) -> Result<ConfigSourceList, BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        let backend = self.config_backend_or_unavailable()?;
+        self.config_admit(started)?;
+        let mut list = backend
+            .config_sources(&self.plugin_id)
+            .map_err(config_read_error)?;
+        list.rows.sort_by(|left, right| left.key.cmp(&right.key));
+        list.rows.dedup_by(|left, right| left.key == right.key);
+        for row in &list.rows {
+            if writable_setting(&row.key).is_none() {
+                return Err(config_invalid_request(
+                    "config.sources returned a key outside the allowlist",
+                ));
+            }
+            if !row.source.is_bounded() {
+                return Err(config_limit_exceeded(
+                    "config.sources label exceeds its byte bound",
+                ));
+            }
+        }
+        let bytes = list
+            .rows
+            .iter()
+            .map(|row| list_row_bytes(&[&row.key, &row.source.as_wire()]))
+            .sum();
+        check_list_bounds(list.rows.len(), bytes)?;
+        self.config_charge_result_bytes(started, bytes)?;
+        Ok(list)
+    }
+
+    /// `bitty.plugins.list`: bounded plugin rows without grants or paths.
+    fn plugins_list(&self) -> Result<PluginList, BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        let backend = self.config_backend_or_unavailable()?;
+        self.config_admit(started)?;
+        let mut list = backend
+            .plugins_list(&self.plugin_id)
+            .map_err(config_read_error)?;
+        list.rows.sort_by(|left, right| left.id.cmp(&right.id));
+        list.rows.dedup_by(|left, right| left.id == right.id);
+        for row in &list.rows {
+            validate_list_string("plugins.list id", &row.id)?;
+            validate_list_string("plugins.list source", &row.source)?;
+            validate_list_string("plugins.list version", &row.version)?;
+        }
+        let bytes = list
+            .rows
+            .iter()
+            .map(|row| list_row_bytes(&[&row.id, &row.source, &row.version]))
+            .sum();
+        check_list_bounds(list.rows.len(), bytes)?;
+        self.config_charge_result_bytes(started, bytes)?;
+        Ok(list)
+    }
+
+    /// `bitty.profiles.list`: bounded validated names plus the active marker.
+    fn profiles_list(&self) -> Result<ProfileList, BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        let backend = self.config_backend_or_unavailable()?;
+        self.config_admit(started)?;
+        let mut list = backend
+            .profiles_list(&self.plugin_id)
+            .map_err(config_read_error)?;
+        list.rows.sort_by(|left, right| left.name.cmp(&right.name));
+        list.rows.dedup_by(|left, right| left.name == right.name);
+        for row in &list.rows {
+            bitty_config::file::validate_profile_name(&row.name)
+                .map_err(|_| config_invalid_request("profiles.list returned an invalid name"))?;
+        }
+        if let Some(active) = &list.active {
+            bitty_config::file::validate_profile_name(active)
+                .map_err(|_| config_invalid_request("profiles.list returned an invalid name"))?;
+            if active.len() > CONFIG_LIST_MAX_STRING_BYTES {
+                return Err(config_limit_exceeded(
+                    "profiles.list name exceeds its byte bound",
+                ));
+            }
+        }
+        let bytes = list
+            .rows
+            .iter()
+            .map(|row| list_row_bytes(&[&row.name]))
+            .sum();
+        check_list_bounds(list.rows.len(), bytes)?;
+        self.config_charge_result_bytes(started, bytes)?;
+        Ok(list)
+    }
+
+    /// `bitty.config.preview_enabled`: render the exact ledger change.
+    fn config_preview_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<ConfigManageToken, BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        validate_manage_plugin_id(id)?;
+        self.config_charge(started, id.len() + 8)?;
+        let backend = self.config_backend_or_unavailable()?;
+        let rendering = backend
+            .preview_plugin_enabled(&self.plugin_id, id, enabled)
+            .map_err(|failure| config_backend_error(failure, id))?;
+        check_manage_rendering(
+            &rendering.changed_keys,
+            &rendering.rendered,
+            &rendering.candidate_digest,
+        )?;
+        let target = ConfigApprovalTarget::PluginEnabled {
+            id: id.to_string(),
+            enabled,
+        };
+        let digest = manage_approval_digest(
+            &self.plugin_id,
+            &target,
+            &rendering.candidate_digest,
+            &rendering.changed_keys,
+        );
+        self.config_gate
+            .borrow_mut()
+            .issue(digest.clone(), target, rendering.candidate_digest);
+        Ok(ConfigManageToken {
+            digest,
+            rendered: rendering.rendered,
+            changed: !rendering.changed_keys.is_empty(),
+            changed_keys: rendering.changed_keys,
+        })
+    }
+
+    /// `bitty.config.set_enabled`: apply one approved ledger change.
+    fn config_set_enabled_with_expiry(
+        &self,
+        id: &str,
+        enabled: bool,
+        digest: &str,
+        started: Instant,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        self.config_authorize()?;
+        validate_manage_plugin_id(id)?;
+        validate_manage_digest(digest)?;
+        self.config_charge(started, id.len() + 8)?;
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let target = ConfigApprovalTarget::PluginEnabled {
+            id: id.to_string(),
+            enabled,
+        };
+        let Some(candidate_digest) = self.config_gate.borrow_mut().consume(digest, &target) else {
+            return Err(config_approval_required("config.set_enabled"));
+        };
+        let backend = self.config_backend_or_unavailable()?;
+        match backend.apply_plugin_enabled(&self.plugin_id, id, enabled, &candidate_digest) {
+            Ok(ConfigApplyOutcome::Applied) => Ok((true, "auto")),
+            Ok(ConfigApplyOutcome::Unchanged) => Ok((false, "none")),
+            Err(failure) => Err(config_backend_error(failure, id)),
+        }
+    }
+
+    #[cfg(test)]
+    fn config_set_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+        digest: &str,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        self.config_set_enabled_with_expiry(
+            id,
+            enabled,
+            digest,
+            Instant::now(),
+            Instant::now() + Duration::from_millis(CONFIG_SET_MAX_WALL_MS),
+        )
+    }
+
+    /// `bitty.profiles.preview_use`: render the exact selector change.
+    fn profiles_preview_use(&self, name: &str) -> Result<ConfigManageToken, BridgeError> {
+        self.config_authorize()?;
+        let started = Instant::now();
+        validate_manage_profile_name(name)?;
+        self.config_charge(started, name.len() + 8)?;
+        let backend = self.config_backend_or_unavailable()?;
+        let rendering = backend
+            .preview_profile_use(&self.plugin_id, name)
+            .map_err(|failure| config_backend_error(failure, name))?;
+        check_manage_rendering(
+            &rendering.changed_keys,
+            &rendering.rendered,
+            &rendering.candidate_digest,
+        )?;
+        let target = ConfigApprovalTarget::ProfileUse {
+            name: name.to_string(),
+        };
+        let digest = manage_approval_digest(
+            &self.plugin_id,
+            &target,
+            &rendering.candidate_digest,
+            &rendering.changed_keys,
+        );
+        self.config_gate
+            .borrow_mut()
+            .issue(digest.clone(), target, rendering.candidate_digest);
+        Ok(ConfigManageToken {
+            digest,
+            rendered: rendering.rendered,
+            changed: rendering.changed,
+            changed_keys: rendering.changed_keys,
+        })
+    }
+
+    /// `bitty.profiles.use`: apply one approved selector change.
+    fn profiles_use_with_expiry(
+        &self,
+        name: &str,
+        digest: &str,
+        started: Instant,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        self.config_authorize()?;
+        validate_manage_profile_name(name)?;
+        validate_manage_digest(digest)?;
+        self.config_charge(started, name.len() + 8)?;
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        let target = ConfigApprovalTarget::ProfileUse {
+            name: name.to_string(),
+        };
+        let Some(candidate_digest) = self.config_gate.borrow_mut().consume(digest, &target) else {
+            return Err(config_approval_required("profiles.use"));
+        };
+        let backend = self.config_backend_or_unavailable()?;
+        match backend.apply_profile_use(&self.plugin_id, name, &candidate_digest) {
+            Ok(ConfigApplyOutcome::Applied) => Ok((true, "auto")),
+            Ok(ConfigApplyOutcome::Unchanged) => Ok((false, "none")),
+            Err(failure) => Err(config_backend_error(failure, name)),
+        }
+    }
+
+    #[cfg(test)]
+    fn profiles_use(&self, name: &str, digest: &str) -> Result<(bool, &'static str), BridgeError> {
+        self.profiles_use_with_expiry(
+            name,
+            digest,
+            Instant::now(),
+            Instant::now() + Duration::from_millis(CONFIG_SET_MAX_WALL_MS),
+        )
+    }
+}
+
+/// Wire shape for one `config.get` row.
+fn config_value_row_value(row: &ConfigValueRow) -> LuaValue {
+    let value = match &row.value {
+        ConfigReadValue::Absent => LuaValue::Nil,
+        ConfigReadValue::Text(text) => LuaValue::String(text.clone()),
+        ConfigReadValue::Integer(value) => LuaValue::Integer(i64::from(*value)),
+        ConfigReadValue::Number(value) => LuaValue::Number(f64::from(*value)),
+        ConfigReadValue::Bool(value) => LuaValue::Bool(*value),
+    };
+    LuaValue::table([
+        ("key", LuaValue::String(row.key.clone())),
+        (
+            "found",
+            LuaValue::Bool(!matches!(&row.value, ConfigReadValue::Absent)),
+        ),
+        ("value", value),
+        ("kind", LuaValue::String(row.value.kind().to_string())),
+        ("source", LuaValue::String(row.source.as_wire())),
+        ("redacted", LuaValue::Bool(row.redacted)),
+    ])
+}
+
+/// Wire shape for one `config.sources` result.
+fn config_sources_value(list: &ConfigSourceList) -> LuaValue {
+    LuaValue::table([
+        (
+            "rows",
+            LuaValue::array(
+                list.rows
+                    .iter()
+                    .map(|row| {
+                        LuaValue::table([
+                            ("key", LuaValue::String(row.key.clone())),
+                            ("source", LuaValue::String(row.source.as_wire())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("count", LuaValue::Integer(list.rows.len() as i64)),
+        ("truncated", LuaValue::Bool(list.truncated)),
+    ])
+}
+
+/// Wire shape for one `plugins.list` result.
+fn plugin_list_value(list: &PluginList) -> LuaValue {
+    LuaValue::table([
+        (
+            "rows",
+            LuaValue::array(
+                list.rows
+                    .iter()
+                    .map(|row| {
+                        LuaValue::table([
+                            ("id", LuaValue::String(row.id.clone())),
+                            ("enabled", LuaValue::Bool(row.enabled)),
+                            ("source", LuaValue::String(row.source.clone())),
+                            ("version", LuaValue::String(row.version.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("count", LuaValue::Integer(list.rows.len() as i64)),
+        ("truncated", LuaValue::Bool(list.truncated)),
+    ])
+}
+
+/// Wire shape for one `profiles.list` result.
+fn profile_list_value(list: &ProfileList) -> LuaValue {
+    LuaValue::table([
+        (
+            "rows",
+            LuaValue::array(
+                list.rows
+                    .iter()
+                    .map(|row| {
+                        LuaValue::table([
+                            ("name", LuaValue::String(row.name.clone())),
+                            ("active", LuaValue::Bool(row.active)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        (
+            "active",
+            list.active
+                .as_ref()
+                .map_or(LuaValue::Nil, |name| LuaValue::String(name.clone())),
+        ),
+        ("count", LuaValue::Integer(list.rows.len() as i64)),
+        ("truncated", LuaValue::Bool(list.truncated)),
+    ])
 }
 
 impl HostServices for PluginServices {
@@ -3799,6 +4322,72 @@ impl HostServices for PluginServices {
             expiry,
         )?;
         Ok((outcome.applied, outcome.reload))
+    }
+
+    fn config_get(&self, key: &str) -> Result<LuaValue, BridgeError> {
+        let row = PluginServices::config_get(self, key)?;
+        Ok(config_value_row_value(&row))
+    }
+
+    fn config_sources(&self) -> Result<LuaValue, BridgeError> {
+        let list = PluginServices::config_sources(self)?;
+        Ok(config_sources_value(&list))
+    }
+
+    fn plugins_list(&self) -> Result<LuaValue, BridgeError> {
+        let list = PluginServices::plugins_list(self)?;
+        Ok(plugin_list_value(&list))
+    }
+
+    fn profiles_list(&self) -> Result<LuaValue, BridgeError> {
+        let list = PluginServices::profiles_list(self)?;
+        Ok(profile_list_value(&list))
+    }
+
+    fn config_preview_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<(String, String, Vec<String>), BridgeError> {
+        let token = PluginServices::config_preview_enabled(self, id, enabled)?;
+        Ok((token.digest, token.rendered, token.changed_keys))
+    }
+
+    fn config_set_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        PluginServices::config_set_enabled_with_expiry(
+            self,
+            id,
+            enabled,
+            digest,
+            Instant::now(),
+            expiry,
+        )
+    }
+
+    fn profiles_preview_use(
+        &self,
+        name: &str,
+    ) -> Result<(String, String, Vec<String>, bool), BridgeError> {
+        let token = PluginServices::profiles_preview_use(self, name)?;
+        Ok((token.digest, token.rendered, token.changed_keys, true))
+    }
+
+    fn profiles_use(
+        &self,
+        name: &str,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str, bool), BridgeError> {
+        let (changed, reload) =
+            PluginServices::profiles_use_with_expiry(self, name, digest, Instant::now(), expiry)?;
+        // A no-op switch changes no table, so it needs no restart marker.
+        Ok((changed, reload, changed))
     }
 
     fn env_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
@@ -5703,6 +6292,13 @@ mod tests {
         ClickArg, ClickCommand, UI_CLICK_MAX_ARGS, UI_MAX_NODES, UI_MAX_TEXT_BYTES,
     };
     use std::time::Duration;
+
+    use crate::plugin_runtime::{
+        CONFIG_LIST_MAX_ROWS, CONFIG_LIST_MAX_STRING_BYTES, CONFIG_REDACTED_VALUE,
+        CONFIG_SET_CALLS_PER_SECOND, ConfigReadFailure, ConfigSourceLabel, ConfigSourceList,
+        ConfigSourceRow, ConfigValueRow, ConfigWriteFailure, PluginEnabledRendering, PluginList,
+        PluginListRow, ProfileList, ProfileListRow, ProfileUseRendering,
+    };
 
     fn services() -> PluginServices {
         PluginServices::new(
@@ -10285,6 +10881,531 @@ mod tests {
             E_UI_NOT_OWNER
         );
     }
+    /// Backend for the CTX-1647 read/manage verbs.
+    struct RecordingManageBackend {
+        value: RefCell<ConfigReadValue>,
+        source: ConfigSourceLabel,
+        plugin_rows: RefCell<Vec<PluginListRow>>,
+        profile_rows: RefCell<Vec<ProfileListRow>>,
+        read_failure: Option<ConfigReadFailure>,
+        enabled_calls: RefCell<Vec<(String, bool, String)>>,
+        profile_calls: RefCell<Vec<(String, String)>>,
+        nonce: Cell<u32>,
+        stale: Cell<bool>,
+        outcome: ConfigApplyOutcome,
+        profile_changed: bool,
+    }
+
+    impl RecordingManageBackend {
+        fn new() -> Rc<Self> {
+            Rc::new(Self {
+                value: RefCell::new(ConfigReadValue::Text(String::from("catppuccin"))),
+                source: ConfigSourceLabel::User,
+                plugin_rows: RefCell::new(vec![PluginListRow {
+                    id: String::from("owner.plugin"),
+                    enabled: true,
+                    source: String::from("bundled"),
+                    version: String::from("1.0.0"),
+                }]),
+                profile_rows: RefCell::new(vec![
+                    ProfileListRow {
+                        name: String::from("default"),
+                        active: true,
+                    },
+                    ProfileListRow {
+                        name: String::from("work"),
+                        active: false,
+                    },
+                ]),
+                read_failure: None,
+                enabled_calls: RefCell::new(Vec::new()),
+                profile_calls: RefCell::new(Vec::new()),
+                nonce: Cell::new(0),
+                stale: Cell::new(false),
+                outcome: ConfigApplyOutcome::Applied,
+                profile_changed: true,
+            })
+        }
+
+        fn rendering(&self, label: &str) -> (String, String) {
+            let candidate = format!("{label}\0nonce={}", self.nonce.get());
+            (
+                format!("{label} = true"),
+                bitty_package::integrity::sha256_hex(candidate.as_bytes()),
+            )
+        }
+    }
+
+    impl ConfigWriteBackend for RecordingManageBackend {
+        fn preview(
+            &self,
+            _plugin_id: &str,
+            _change: &ConfigChange,
+        ) -> Result<ConfigPreviewRendering, ConfigWriteFailure> {
+            Err(ConfigWriteFailure::Unavailable)
+        }
+
+        fn apply(
+            &self,
+            _plugin_id: &str,
+            _change: &ConfigChange,
+            _expected: &str,
+        ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+            Err(ConfigWriteFailure::Unavailable)
+        }
+
+        fn config_get(
+            &self,
+            _plugin_id: &str,
+            key: &str,
+        ) -> Result<ConfigValueRow, ConfigReadFailure> {
+            if let Some(failure) = self.read_failure {
+                return Err(failure);
+            }
+            Ok(ConfigValueRow {
+                key: key.to_string(),
+                value: self.value.borrow().clone(),
+                source: self.source.clone(),
+                redacted: false,
+            })
+        }
+
+        fn config_sources(&self, _plugin_id: &str) -> Result<ConfigSourceList, ConfigReadFailure> {
+            if let Some(failure) = self.read_failure {
+                return Err(failure);
+            }
+            Ok(ConfigSourceList {
+                rows: vec![
+                    ConfigSourceRow {
+                        key: String::from("appearance.theme"),
+                        source: ConfigSourceLabel::User,
+                    },
+                    ConfigSourceRow {
+                        key: String::from("window.padding"),
+                        source: ConfigSourceLabel::Default,
+                    },
+                ],
+                truncated: false,
+            })
+        }
+
+        fn plugins_list(&self, _plugin_id: &str) -> Result<PluginList, ConfigReadFailure> {
+            if let Some(failure) = self.read_failure {
+                return Err(failure);
+            }
+            Ok(PluginList {
+                rows: self.plugin_rows.borrow().clone(),
+                truncated: false,
+            })
+        }
+
+        fn profiles_list(&self, _plugin_id: &str) -> Result<ProfileList, ConfigReadFailure> {
+            if let Some(failure) = self.read_failure {
+                return Err(failure);
+            }
+            Ok(ProfileList {
+                rows: self.profile_rows.borrow().clone(),
+                active: Some(String::from("default")),
+                truncated: false,
+            })
+        }
+
+        fn preview_plugin_enabled(
+            &self,
+            _plugin_id: &str,
+            id: &str,
+            enabled: bool,
+        ) -> Result<PluginEnabledRendering, ConfigWriteFailure> {
+            let (rendered, candidate_digest) = self.rendering(&format!("{id}.{enabled}"));
+            Ok(PluginEnabledRendering {
+                changed_keys: vec![format!("plugins.{id}.enabled")],
+                rendered,
+                candidate_digest,
+            })
+        }
+
+        fn apply_plugin_enabled(
+            &self,
+            _plugin_id: &str,
+            id: &str,
+            enabled: bool,
+            expected_candidate_digest: &str,
+        ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+            self.enabled_calls.borrow_mut().push((
+                id.to_string(),
+                enabled,
+                expected_candidate_digest.to_string(),
+            ));
+            if self.stale.get() {
+                return Err(ConfigWriteFailure::Stale);
+            }
+            let (_, candidate_digest) = self.rendering(&format!("{id}.{enabled}"));
+            if candidate_digest != expected_candidate_digest {
+                return Err(ConfigWriteFailure::Stale);
+            }
+            Ok(self.outcome)
+        }
+
+        fn preview_profile_use(
+            &self,
+            _plugin_id: &str,
+            name: &str,
+        ) -> Result<ProfileUseRendering, ConfigWriteFailure> {
+            let (rendered, candidate_digest) = self.rendering(name);
+            Ok(ProfileUseRendering {
+                changed_keys: if self.profile_changed {
+                    vec![String::from("profile")]
+                } else {
+                    Vec::new()
+                },
+                rendered,
+                candidate_digest,
+                changed: self.profile_changed,
+            })
+        }
+
+        fn apply_profile_use(
+            &self,
+            _plugin_id: &str,
+            name: &str,
+            expected_candidate_digest: &str,
+        ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
+            self.profile_calls
+                .borrow_mut()
+                .push((name.to_string(), expected_candidate_digest.to_string()));
+            if self.stale.get() {
+                return Err(ConfigWriteFailure::Stale);
+            }
+            let (_, candidate_digest) = self.rendering(name);
+            if candidate_digest != expected_candidate_digest {
+                return Err(ConfigWriteFailure::Stale);
+            }
+            Ok(self.outcome)
+        }
+    }
+
+    fn manage_services(backend: Rc<RecordingManageBackend>) -> PluginServices {
+        let services = services();
+        services.set_config_access(true);
+        services.set_config_write_backend(Some(backend));
+        services
+    }
+
+    #[test]
+    fn read_verbs_require_the_recorded_manage_grant() {
+        let denied = services();
+        for error in [
+            denied
+                .config_get("appearance.theme")
+                .expect_err("get denied"),
+            denied.config_sources().expect_err("sources denied"),
+            denied.plugins_list().expect_err("plugins denied"),
+            denied.profiles_list().expect_err("profiles denied"),
+        ] {
+            assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        }
+        // A read grant never implies `config.manage`.
+        let read_only = services();
+        read_only.set_runtime_inspect(true, Some(RuntimeInspectSnapshot::default()));
+        assert_eq!(
+            read_only
+                .config_get("appearance.theme")
+                .expect_err("read never implies manage")
+                .code,
+            "E_CAPABILITY_DENIED"
+        );
+    }
+
+    #[test]
+    fn read_verbs_return_typed_rows_and_logical_sources() {
+        let backend = RecordingManageBackend::new();
+        let services = manage_services(Rc::clone(&backend));
+        let row = services.config_get("appearance.theme").expect("get");
+        assert_eq!(row.key, "appearance.theme");
+        assert_eq!(row.value, ConfigReadValue::Text(String::from("catppuccin")));
+        assert_eq!(row.source, ConfigSourceLabel::User);
+        assert_eq!(row.source.as_wire(), "user");
+
+        let sources = services.config_sources().expect("sources");
+        assert_eq!(sources.rows.len(), 2);
+        assert!(sources.rows.iter().all(|row| row.source.as_wire() != "/"));
+        assert!(
+            sources
+                .rows
+                .iter()
+                .any(|row| row.key == "window.padding" && row.source == ConfigSourceLabel::Default)
+        );
+
+        let plugins = services.plugins_list().expect("plugins");
+        assert_eq!(plugins.rows[0].id, "owner.plugin");
+        assert!(plugins.rows[0].enabled);
+
+        let profiles = services.profiles_list().expect("profiles");
+        assert_eq!(profiles.active.as_deref(), Some("default"));
+        assert!(
+            profiles
+                .rows
+                .iter()
+                .any(|row| row.name == "work" && !row.active)
+        );
+    }
+
+    #[test]
+    fn read_calls_are_admitted_before_the_backend_even_when_they_fail() {
+        let mut backend = RecordingManageBackend::new();
+        Rc::get_mut(&mut backend).expect("unique").read_failure = Some(ConfigReadFailure::Io);
+        let services = manage_services(backend);
+        for _ in 0..CONFIG_SET_CALLS_PER_SECOND {
+            assert_eq!(
+                services
+                    .config_get("appearance.theme")
+                    .expect_err("backend read fails")
+                    .code,
+                "E_CONFIG_IO"
+            );
+        }
+        assert_eq!(
+            services
+                .config_get("appearance.theme")
+                .expect_err("call budget spent by failed reads")
+                .code,
+            "E_DEF_LIMIT"
+        );
+    }
+
+    #[test]
+    fn config_get_redacts_secret_shaped_values() {
+        let backend = RecordingManageBackend::new();
+        *backend.value.borrow_mut() =
+            ConfigReadValue::Text(String::from("ghp_0123456789abcdefghijklmnopqrstuvwxyz"));
+        let services = manage_services(backend);
+        let row = services.config_get("appearance.theme").expect("get");
+        assert!(row.redacted, "a provider token is redacted");
+        assert_eq!(
+            row.value,
+            ConfigReadValue::Text(String::from(CONFIG_REDACTED_VALUE))
+        );
+    }
+
+    #[test]
+    fn read_verbs_enforce_row_and_string_bounds() {
+        let backend = RecordingManageBackend::new();
+        backend.plugin_rows.borrow_mut().clear();
+        for index in 0..CONFIG_LIST_MAX_ROWS + 1 {
+            backend.plugin_rows.borrow_mut().push(PluginListRow {
+                id: format!("owner.plugin{index}"),
+                enabled: true,
+                source: String::from("bundled"),
+                version: String::from("1.0.0"),
+            });
+        }
+        let services = manage_services(backend);
+        assert_eq!(
+            services.plugins_list().expect_err("over rows").code,
+            "E_DEF_LIMIT"
+        );
+
+        let backend = RecordingManageBackend::new();
+        backend.plugin_rows.borrow_mut()[0].id = "x".repeat(CONFIG_LIST_MAX_STRING_BYTES + 1);
+        let services = manage_services(backend);
+        assert_eq!(
+            services.plugins_list().expect_err("over string").code,
+            "E_DEF_LIMIT"
+        );
+
+        let backend = RecordingManageBackend::new();
+        *backend.value.borrow_mut() =
+            ConfigReadValue::Text("x".repeat(CONFIG_GET_MAX_VALUE_BYTES + 1));
+        let services = manage_services(backend);
+        assert_eq!(
+            services
+                .config_get("appearance.theme")
+                .expect_err("over value")
+                .code,
+            "E_DEF_LIMIT"
+        );
+
+        let backend = RecordingManageBackend::new();
+        backend.profile_rows.borrow_mut()[0].name = String::from("../escape");
+        let services = manage_services(backend);
+        assert_eq!(
+            services.profiles_list().expect_err("bad name").code,
+            "E_CONFIG_INVALID"
+        );
+    }
+
+    #[test]
+    fn enable_preview_is_token_bound_and_one_shot() {
+        let backend = RecordingManageBackend::new();
+        let services = manage_services(Rc::clone(&backend));
+        let preview = services
+            .config_preview_enabled("owner.plugin", true)
+            .expect("preview");
+        assert_eq!(preview.changed_keys, vec!["plugins.owner.plugin.enabled"]);
+        assert_eq!(preview.digest.len(), 64);
+        assert!(
+            backend.enabled_calls.borrow().is_empty(),
+            "preview never writes"
+        );
+
+        let (changed, reload) = services
+            .config_set_enabled("owner.plugin", true, &preview.digest)
+            .expect("apply");
+        assert!(changed);
+        assert_eq!(reload, "auto");
+        assert_eq!(backend.enabled_calls.borrow().len(), 1);
+
+        let replay = services
+            .config_set_enabled("owner.plugin", true, &preview.digest)
+            .expect_err("replay refused");
+        assert_eq!(replay.code, "E_CONFIG_APPROVAL_REQUIRED");
+        assert_eq!(backend.enabled_calls.borrow().len(), 1, "one write");
+
+        // A token minted for one id cannot authorize another.
+        let preview = services
+            .config_preview_enabled("owner.plugin", true)
+            .expect("preview");
+        let error = services
+            .config_set_enabled("owner.other", true, &preview.digest)
+            .expect_err("wrong id");
+        assert_eq!(error.code, "E_CONFIG_APPROVAL_REQUIRED");
+    }
+
+    #[test]
+    fn profile_use_preview_is_token_bound_and_one_shot() {
+        let backend = RecordingManageBackend::new();
+        let services = manage_services(Rc::clone(&backend));
+        let preview = services.profiles_preview_use("work").expect("preview");
+        assert_eq!(preview.changed_keys, vec!["profile"]);
+        assert!(preview.changed);
+        let (changed, reload) = services
+            .profiles_use("work", &preview.digest)
+            .expect("apply");
+        assert!(changed);
+        assert_eq!(reload, "auto");
+        assert_eq!(backend.profile_calls.borrow().len(), 1);
+
+        let replay = services
+            .profiles_use("work", &preview.digest)
+            .expect_err("replay refused");
+        assert_eq!(replay.code, "E_CONFIG_APPROVAL_REQUIRED");
+        let error = services
+            .profiles_use("default", &preview.digest)
+            .expect_err("wrong profile");
+        assert_eq!(error.code, "E_CONFIG_APPROVAL_REQUIRED");
+    }
+
+    #[test]
+    fn profile_preview_reports_a_no_op_as_unchanged() {
+        let mut backend = RecordingManageBackend::new();
+        let unique = Rc::get_mut(&mut backend).expect("unique");
+        unique.profile_changed = false;
+        unique.outcome = ConfigApplyOutcome::Unchanged;
+        let services = manage_services(backend);
+        let preview = services.profiles_preview_use("work").expect("preview");
+        assert!(!preview.changed, "a no-op preview reports changed = false");
+        assert!(preview.changed_keys.is_empty());
+        let (changed, reload) = services
+            .profiles_use("work", &preview.digest)
+            .expect("apply");
+        assert!(!changed);
+        assert_eq!(reload, "none");
+    }
+
+    #[test]
+    fn manage_writes_refuse_malformed_ids_names_and_digests() {
+        let backend = RecordingManageBackend::new();
+        let services = manage_services(Rc::clone(&backend));
+        for id in ["", "../escape", "owner/plugin", "owner.plugin\n"] {
+            assert_eq!(
+                services
+                    .config_preview_enabled(id, true)
+                    .expect_err("bad id")
+                    .code,
+                "E_CONFIG_INVALID",
+                "{id}"
+            );
+        }
+        for name in ["", "../escape", "work.lua", "work\n"] {
+            assert_eq!(
+                services
+                    .profiles_preview_use(name)
+                    .expect_err("bad name")
+                    .code,
+                "E_CONFIG_INVALID",
+                "{name}"
+            );
+        }
+        let preview = services
+            .config_preview_enabled("owner.plugin", true)
+            .expect("preview");
+        for digest in ["deadbeef", &preview.digest.to_uppercase()] {
+            assert_eq!(
+                services
+                    .config_set_enabled("owner.plugin", true, digest)
+                    .expect_err("bad digest")
+                    .code,
+                "E_CONFIG_APPROVAL_MISMATCH"
+            );
+        }
+        assert!(backend.enabled_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn manage_surface_is_denied_in_safe_mode() {
+        let backend = RecordingManageBackend::new();
+        let services = manage_services(Rc::clone(&backend));
+        let preview = services
+            .config_preview_enabled("owner.plugin", true)
+            .expect("preview before safe mode");
+        services.set_safe_mode(true);
+        for error in [
+            services.config_get("appearance.theme").expect_err("get"),
+            services.config_sources().expect_err("sources"),
+            services.plugins_list().expect_err("plugins"),
+            services.profiles_list().expect_err("profiles"),
+            services
+                .config_preview_enabled("owner.plugin", true)
+                .expect_err("preview"),
+            services
+                .config_set_enabled("owner.plugin", true, &preview.digest)
+                .expect_err("set_enabled"),
+            services
+                .profiles_preview_use("work")
+                .expect_err("preview use"),
+            services
+                .profiles_use("work", &"0".repeat(64))
+                .expect_err("use"),
+        ] {
+            assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        }
+        assert!(backend.enabled_calls.borrow().is_empty());
+        assert!(backend.profile_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn manage_read_failures_are_path_free() {
+        for (failure, code, class) in [
+            (
+                ConfigReadFailure::Unavailable,
+                "E_CONFIG_UNAVAILABLE",
+                "runtime",
+            ),
+            (ConfigReadFailure::Invalid, "E_CONFIG_INVALID", "validation"),
+            (ConfigReadFailure::Unsafe, "E_CONFIG_UNSAFE", "io"),
+            (ConfigReadFailure::Io, "E_CONFIG_IO", "io"),
+        ] {
+            let mut backend = RecordingManageBackend::new();
+            Rc::get_mut(&mut backend).expect("unique").read_failure = Some(failure);
+            let services = manage_services(backend);
+            let error = services
+                .config_get("appearance.theme")
+                .expect_err("refused");
+            assert_eq!(error.code, code);
+            assert_eq!(error.class, class);
+            assert!(!error.message.contains('/') && !error.message.contains('~'));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -11405,6 +12526,7 @@ mod history_tests {
             "appearance",
             "Appearance.Theme",
             "appearance.theme ",
+            "history.capture.transcript",
         ] {
             let error = services
                 .config_preview(key, &theme_text("catppuccin"))

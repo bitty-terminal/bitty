@@ -1262,6 +1262,87 @@ pub trait HostServices {
         let _ = (key, value, digest, expiry);
         Err(BridgeError::not_implemented("bitty.config.set"))
     }
+    /// Read one allowlisted effective value plus logical source attribution
+    /// for `bitty.config.get` (CTX-1647, bitty#2393).
+    ///
+    /// Returns a bounded table `{ key, found, value, kind, source, redacted }`.
+    /// `source` is a logical label (`default`, `user`, `plugin:<id>`, `env`),
+    /// never a host path. The default fails closed.
+    fn config_get(&self, key: &str) -> Result<LuaValue, BridgeError> {
+        let _ = key;
+        Err(BridgeError::not_implemented("bitty.config.get"))
+    }
+    /// Read bounded logical attribution for `bitty.config.sources`.
+    ///
+    /// Returns `{ rows = { { key, source }, ... }, count, truncated }`.
+    /// The default fails closed.
+    fn config_sources(&self) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::not_implemented("bitty.config.sources"))
+    }
+    /// List bounded plugin rows for `bitty.plugins.list`.
+    ///
+    /// Returns `{ rows = { { id, enabled, source, version }, ... }, count,
+    /// truncated }` with no grants and no paths. The default fails closed.
+    fn plugins_list(&self) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::not_implemented("bitty.plugins.list"))
+    }
+    /// List bounded profiles for `bitty.profiles.list`.
+    ///
+    /// Returns `{ rows = { { name, active }, ... }, active, count, truncated }`.
+    /// The default fails closed.
+    fn profiles_list(&self) -> Result<LuaValue, BridgeError> {
+        Err(BridgeError::not_implemented("bitty.profiles.list"))
+    }
+    /// Render one managed plugin enable/disable candidate for
+    /// `bitty.config.preview_enabled` (CTX-1647).
+    ///
+    /// Returns `(digest, rendered, changed_keys)`. The default fails closed.
+    fn config_preview_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<(String, String, Vec<String>), BridgeError> {
+        let _ = (id, enabled);
+        Err(BridgeError::not_implemented("bitty.config.preview_enabled"))
+    }
+    /// Apply one approved plugin enable/disable for
+    /// `bitty.config.set_enabled` (CTX-1647).
+    ///
+    /// Returns `(changed, reload)`. The default fails closed.
+    fn config_set_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str), BridgeError> {
+        let _ = (id, enabled, digest, expiry);
+        Err(BridgeError::not_implemented("bitty.config.set_enabled"))
+    }
+    /// Render one profile-switch candidate for `bitty.profiles.preview_use`
+    /// (CTX-1647).
+    ///
+    /// Returns `(digest, rendered, changed_keys, changed)`. The default fails
+    /// closed.
+    fn profiles_preview_use(
+        &self,
+        name: &str,
+    ) -> Result<(String, String, Vec<String>, bool), BridgeError> {
+        let _ = name;
+        Err(BridgeError::not_implemented("bitty.profiles.preview_use"))
+    }
+    /// Apply one approved profile switch for `bitty.profiles.use` (CTX-1647).
+    ///
+    /// Returns `(changed, reload, pending_restart)`. The default fails closed.
+    fn profiles_use(
+        &self,
+        name: &str,
+        digest: &str,
+        expiry: Instant,
+    ) -> Result<(bool, &'static str, bool), BridgeError> {
+        let _ = (name, digest, expiry);
+        Err(BridgeError::not_implemented("bitty.profiles.use"))
+    }
     /// Read one host environment variable for `bitty.env.get` (CTX-0330).
     ///
     /// Host-mediated and grant-gated: the implementation must return
@@ -6854,6 +6935,352 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         )
         .expect("config table accepts 'set'");
 
+    // CTX-1647 (bitty#2393): the bounded read query. All four verbs require
+    // the recorded `config.manage` grant (enforced host-side), return typed
+    // tables, and never expose a path or a secret-shaped value.
+    config
+        .set(
+            ctx,
+            "get",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(1), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "config.get takes exactly one argument",
+                        )
+                        .to_error(ctx));
+                    }
+                    let key = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(key)) => key,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_KEY",
+                                "config.get key must be a dotted setting string",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let row = state
+                        .bounded(|_expiry| state.services.config_get(&key))
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, row.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("config table accepts 'get'");
+    config
+        .set(
+            ctx,
+            "sources",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(0), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "config.sources takes no arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let rows = state
+                        .bounded(|_expiry| state.services.config_sources())
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, rows.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("config table accepts 'sources'");
+    config
+        .set(
+            ctx,
+            "preview_enabled",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(2), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "config.preview_enabled takes exactly two arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let id = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(id)) => id,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "config.preview_enabled id must be a qualified plugin id",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let enabled = match LuaValue::from_lua(stack.get(1), state.limits) {
+                        Ok(LuaValue::Bool(enabled)) => enabled,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "config.preview_enabled enabled must be a boolean",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let (digest, rendered, keys) = state
+                        .bounded(|_expiry| state.services.config_preview_enabled(&id, enabled))
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("digest", LuaValue::String(digest)),
+                            ("rendered", LuaValue::String(rendered)),
+                            (
+                                "keys",
+                                LuaValue::array(keys.into_iter().map(LuaValue::String).collect()),
+                            ),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("config table accepts 'preview_enabled'");
+    config
+        .set(
+            ctx,
+            "set_enabled",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(3), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "config.set_enabled takes exactly three arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let id = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(id)) => id,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "config.set_enabled id must be a qualified plugin id",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let enabled = match LuaValue::from_lua(stack.get(1), state.limits) {
+                        Ok(LuaValue::Bool(enabled)) => enabled,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "config.set_enabled enabled must be a boolean",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let digest = match LuaValue::from_lua(stack.get(2), state.limits) {
+                        Ok(LuaValue::String(digest)) => digest,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_APPROVAL_MISMATCH",
+                                "config.set_enabled approval must be the digest from config.preview_enabled",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let (changed, reload) = state
+                        .bounded_mutation(|expiry| {
+                            state
+                                .services
+                                .config_set_enabled(&id, enabled, &digest, expiry)
+                        })
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("changed", LuaValue::Bool(changed)),
+                            ("reload", LuaValue::String(reload.to_string())),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("config table accepts 'set_enabled'");
+
+    // CTX-1647: bounded plugin and profile reads plus the token-bound
+    // profile switch. They live beside `config` because they are part of the
+    // same recorded `config.manage` grant.
+    let plugins = Table::new(&ctx);
+    plugins
+        .set(
+            ctx,
+            "list",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(0), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "plugins.list takes no arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let rows = state
+                        .bounded(|_expiry| state.services.plugins_list())
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, rows.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("plugins table accepts 'list'");
+    let profiles = Table::new(&ctx);
+    profiles
+        .set(
+            ctx,
+            "list",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(0), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "profiles.list takes no arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let rows = state
+                        .bounded(|_expiry| state.services.profiles_list())
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(ctx, rows.to_lua(ctx));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("profiles table accepts 'list'");
+    profiles
+        .set(
+            ctx,
+            "preview_use",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(1), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "profiles.preview_use takes exactly one argument",
+                        )
+                        .to_error(ctx));
+                    }
+                    let name = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(name)) => name,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "profiles.preview_use name must be a profile name",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let (digest, rendered, keys, changed) = state
+                        .bounded(|_expiry| state.services.profiles_preview_use(&name))
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("digest", LuaValue::String(digest)),
+                            ("rendered", LuaValue::String(rendered)),
+                            (
+                                "keys",
+                                LuaValue::array(keys.into_iter().map(LuaValue::String).collect()),
+                            ),
+                            ("changed", LuaValue::Bool(changed)),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("profiles table accepts 'preview_use'");
+    profiles
+        .set(
+            ctx,
+            "use",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    if !matches!(stack.get(2), Value::Nil) {
+                        return Err(BridgeError::new(
+                            "validation",
+                            "E_DEF_INVALID",
+                            "profiles.use takes exactly two arguments",
+                        )
+                        .to_error(ctx));
+                    }
+                    let name = match LuaValue::from_lua(stack.get(0), state.limits) {
+                        Ok(LuaValue::String(name)) => name,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_INVALID",
+                                "profiles.use name must be a profile name",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let digest = match LuaValue::from_lua(stack.get(1), state.limits) {
+                        Ok(LuaValue::String(digest)) => digest,
+                        _ => {
+                            return Err(BridgeError::new(
+                                "validation",
+                                "E_CONFIG_APPROVAL_MISMATCH",
+                                "profiles.use approval must be the digest from profiles.preview_use",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let (changed, reload, pending_restart) = state
+                        .bounded_mutation(|expiry| {
+                            state.services.profiles_use(&name, &digest, expiry)
+                        })
+                        .map_err(|error| error.to_error(ctx))?;
+                    stack.replace(
+                        ctx,
+                        LuaValue::table([
+                            ("active", LuaValue::String(name)),
+                            ("changed", LuaValue::Bool(changed)),
+                            ("reload", LuaValue::String(reload.to_string())),
+                            ("pending_restart", LuaValue::Bool(pending_restart)),
+                        ])
+                        .to_lua(ctx),
+                    );
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("profiles table accepts 'use'");
+
     let root = Table::new(&ctx);
     root.set(ctx, "api_version", API_VERSION)
         .expect("root accepts api_version");
@@ -6908,6 +7335,10 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
         .expect("root accepts runtime");
     root.set(ctx, "config", readonly_table(ctx, config))
         .expect("root accepts config");
+    root.set(ctx, "plugins", readonly_table(ctx, plugins))
+        .expect("root accepts plugins");
+    root.set(ctx, "profiles", readonly_table(ctx, profiles))
+        .expect("root accepts profiles");
     root.set(ctx, "component", readonly_table(ctx, component))
         .expect("root accepts component");
     Value::Table(readonly_table(ctx, root))

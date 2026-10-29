@@ -84,14 +84,22 @@ pub use component_requests::{
     QueuedComponentRequest, broker_request, outcome_value,
 };
 pub use config_write::{
+    CONFIG_GET_MAX_VALUE_BYTES, CONFIG_LIST_BYTES_PER_SECOND, CONFIG_LIST_CALLS_PER_SECOND,
+    CONFIG_LIST_MAX_BYTES, CONFIG_LIST_MAX_ROWS, CONFIG_LIST_MAX_STRING_BYTES,
     CONFIG_PREVIEW_MAX_KEYS, CONFIG_PREVIEW_MAX_LINES, CONFIG_PREVIEW_MAX_RENDERED_BYTES,
-    CONFIG_SET_APPROVAL_DOMAIN, CONFIG_SET_BYTES_PER_SECOND, CONFIG_SET_CALLS_PER_SECOND,
-    CONFIG_SET_MAX_KEY_BYTES, CONFIG_SET_MAX_OUTSTANDING_PREVIEWS, CONFIG_SET_MAX_RENDERED_BYTES,
-    CONFIG_SET_MAX_ROWS, CONFIG_SET_MAX_VALUE_BYTES, CONFIG_SET_MAX_WALL_MS,
-    CONFIG_SET_RATE_WINDOW, CONFIG_WRITABLE_SETTINGS, ConfigApplyOutcome, ConfigChange,
-    ConfigPreviewRendering, ConfigPreviewToken, ConfigSetOutcome, ConfigSettingKey,
-    ConfigSettingValue, ConfigValueKind, ConfigWriteBackend, ConfigWriteFailure, ConfigWriteGate,
-    approval_digest, approval_preimage, candidate_digest, writable_setting,
+    CONFIG_REDACTED_VALUE, CONFIG_SET_APPROVAL_DOMAIN, CONFIG_SET_BYTES_PER_SECOND,
+    CONFIG_SET_CALLS_PER_SECOND, CONFIG_SET_MAX_KEY_BYTES, CONFIG_SET_MAX_OUTSTANDING_PREVIEWS,
+    CONFIG_SET_MAX_RENDERED_BYTES, CONFIG_SET_MAX_ROWS, CONFIG_SET_MAX_VALUE_BYTES,
+    CONFIG_SET_MAX_WALL_MS, CONFIG_SET_RATE_WINDOW, CONFIG_WRITABLE_SETTINGS, ConfigApplyOutcome,
+    ConfigApprovalTarget, ConfigChange, ConfigManageToken, ConfigPreviewRendering,
+    ConfigPreviewToken, ConfigReadFailure, ConfigReadValue, ConfigSetOutcome, ConfigSettingKey,
+    ConfigSettingValue, ConfigSourceLabel, ConfigSourceList, ConfigSourceRow, ConfigValueKind,
+    ConfigValueRow, ConfigWriteBackend, ConfigWriteFailure, ConfigWriteGate,
+    PluginEnabledRendering, PluginList, PluginListRow, ProfileList, ProfileListRow,
+    ProfileUseRendering, approval_digest, approval_preimage, candidate_digest, check_list_bounds,
+    check_manage_rendering, config_invalid_request, config_limit_exceeded, config_read_error,
+    list_row_bytes, manage_approval_digest, redact_config_value, secret_shaped_config_key,
+    writable_setting,
 };
 pub use fs::{
     FakeFileSystem, FileSystem, NativeFileSystem, STALE_TEMP_AGE_SECS, clean_temp_siblings,
@@ -1609,11 +1617,15 @@ impl PluginRuntime {
         self.theme_persist_backend = backend;
     }
 
-    /// Install the durable user-layer backend for `config.set` (CTX-1613,
-    /// bitty#2393). Call before activation: only `config.manage` generations
-    /// capture the current backend, and `None` leaves granted calls failing
-    /// closed with `E_CONFIG_UNAVAILABLE`. Deterministic failure can be injected
-    /// through the [`ConfigWriteBackend`] implementation.
+    /// Install the application backend for the `config.manage` family
+    /// (CTX-1613 / CTX-1647, bitty#2393). It serves the bounded read query
+    /// (`config.get`, `config.sources`, `plugins.list`, `profiles.list`) and
+    /// the token-bound writes (`config.set`, `config.set_enabled`,
+    /// `profiles.use`). Call before activation: only `config.manage`
+    /// generations capture the current backend, and `None` leaves granted
+    /// calls failing closed with `E_CONFIG_UNAVAILABLE`. Deterministic
+    /// failure can be injected through the [`ConfigWriteBackend`]
+    /// implementation.
     pub fn set_config_write_backend(&mut self, backend: Option<Rc<dyn ConfigWriteBackend>>) {
         self.config_write_backend = backend;
     }

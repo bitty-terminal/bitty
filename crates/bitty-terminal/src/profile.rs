@@ -202,7 +202,7 @@ impl ProfileVerb {
 
 /// A failed profile command: stable code, message, and process exit code.
 #[derive(Debug)]
-struct Failure {
+pub(crate) struct Failure {
     /// Envelope `error.code`.
     code: &'static str,
     /// User-facing one-line (bounded) diagnostic.
@@ -380,7 +380,7 @@ pub(crate) fn profile_dir_from(
 /// Reads at most `entry_limit` directory entries and stops after
 /// `name_limit` validated names. Returns the names sorted and de-duplicated,
 /// plus whether a bound cut the scan short.
-fn scan_names(
+pub(crate) fn scan_names(
     dir: &Path,
     entry_limit: usize,
     name_limit: usize,
@@ -762,7 +762,7 @@ fn use_result(name: &str, selector: &Path, changed: bool, backup: Option<&Path>)
 /// (`appearance.theme`, background images, keymaps). Checking only the target
 /// profile chain let `use` activate a selector that `config check` then
 /// rejected (for example `appearance = { theme = "local:missing" }`).
-fn validate_prospective_selector(
+pub(crate) fn validate_prospective_selector(
     dir: &Path,
     name: &str,
     selector: &Path,
@@ -1375,10 +1375,18 @@ fn selector_profile_name(args: &Args) -> Option<String> {
         bitty_config_env.as_deref(),
     );
     let probed = bitty_config::file::probe_config_path(explicit.as_deref())?;
-    if !probed.path.exists() {
+    selector_profile_from_path(&probed.path)
+}
+
+/// Profile named by one already-resolved selector file.
+///
+/// Shared by the CLI and the `config.manage` profile backend so both read the
+/// persisted selection through the same strict loader.
+pub(crate) fn selector_profile_from_path(path: &Path) -> Option<String> {
+    if !path.exists() {
         return None;
     }
-    let layer = bitty_config::file::load_user_layer(&probed.path).ok()?;
+    let layer = bitty_config::file::load_user_layer(path).ok()?;
     layer.plan.selector.map(|selector| selector.profile)
 }
 
@@ -2732,7 +2740,7 @@ fn new_profile_lua(name: &str) -> String {
 
 /// How `set` renders one CLI value into Lua source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FieldKind {
+pub(crate) enum FieldKind {
     /// Double-quoted string (schema validates enums and ranges).
     Text,
     /// Non-negative integer literal (`u32` schema fields).
@@ -2747,13 +2755,13 @@ enum FieldKind {
 
 /// One documented dotted schema path supported by `get`/`set`.
 #[derive(Debug)]
-struct SchemaField {
+pub(crate) struct SchemaField {
     /// Canonical dotted key (same spelling `config check` prints).
-    path: &'static str,
+    pub(crate) path: &'static str,
     /// Lua literal kind accepted by `set`.
-    kind: FieldKind,
+    pub(crate) kind: FieldKind,
     /// Effective-value getter over the typed schema.
-    get: fn(&bitty_config::EffectiveConfig) -> ConfigValue,
+    pub(crate) get: fn(&bitty_config::EffectiveConfig) -> ConfigValue,
 }
 
 /// Keys `config profile show` prints (kept from CTX-1404 for compatibility).
@@ -3103,7 +3111,7 @@ fn get_session_restore(e: &bitty_config::EffectiveConfig) -> ConfigValue {
 }
 
 /// Catalog entry for one canonical path (internal, key list is trusted).
-fn schema_field_entry(path: &str) -> Option<&'static SchemaField> {
+pub(crate) fn schema_field_entry(path: &str) -> Option<&'static SchemaField> {
     SCHEMA_FIELDS.iter().find(|field| field.path == path)
 }
 
@@ -3750,7 +3758,7 @@ fn is_ident(byte: u8) -> bool {
 /// string: a long-bracket value is valid Lua but not editable by this
 /// byte-preserving rewrite, so the function refuses (`None`) instead of
 /// reporting a switch it did not make.
-fn rewrite_selector_profile(content: &str, new_profile: &str) -> Option<String> {
+pub(crate) fn rewrite_selector_profile(content: &str, new_profile: &str) -> Option<String> {
     let bytes = content.as_bytes();
     let mut assignments = 0usize;
     let mut rewritable: Option<(usize, usize)> = None;
@@ -4099,7 +4107,10 @@ fn log_config_refusal(plugin_id: &str, key: &str, target: &Path, failure: Config
 /// single-leaf edit shows one removed and one inserted line. Over the preview
 /// line/byte bound the change is refused rather than truncated: the user can
 /// never approve bytes they cannot see in full.
-fn bounded_line_diff(previous: &str, updated: &str) -> Result<String, ConfigWriteFailure> {
+pub(crate) fn bounded_line_diff(
+    previous: &str,
+    updated: &str,
+) -> Result<String, ConfigWriteFailure> {
     use bitty_runtime::plugin_runtime::{
         CONFIG_PREVIEW_MAX_LINES, CONFIG_PREVIEW_MAX_RENDERED_BYTES,
     };

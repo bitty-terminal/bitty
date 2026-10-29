@@ -16,7 +16,7 @@ The normative service surface is the accepted
 (contract tracked by bitty#2546/#2663); this crate seam is bitty#2606
 (CTX-1616).
 
-## Status: service loop, worker spawn, content plane, scopes, and grants
+## Status: service loop, terminal sessions, content plane, scopes, and grants
 
 This crate fixes the service version, the capability set, and the version
 negotiation, implements the registry half of bitty#2601 (server-generated ids,
@@ -32,22 +32,30 @@ order, host-consent and observer grants, the owner-private audit sink, the
 `bittyd start` admission loop, per-frame `SCM_CREDENTIALS`, and the peer
 re-check at every privileged boundary.
 
-bitty#2790 adds the worker half: `session.create` with `kind: worker` parses
-its bounded spawn specification, reserves the two-phase journal record, spawns
-through the selected containment plan into the per-session identity, commits
-the observed identity, and binds generation 1 before the session is exposed as
-running. `session.resize` is served for a bound worker under the negotiate-time
-`terminal.manage` transport grant and the current controller lease; it applies
-the geometry to the PTY and bumps `state_revision` exactly once. The worker
-path is Linux-only, and `worker_sessions` is compiled from the cell truth and
-narrowed to the containment plan the startup probe selected, so a daemon can
-never advertise a spawn path it does not serve.
+bitty#2790 adds the process half and the terminal content plane. A
+`session.create` with `kind: worker`, or `kind: terminal` plus a bounded spawn
+specification, parses that specification, reserves the two-phase journal
+record, spawns through the selected containment plan into the per-session
+identity, commits the observed identity, and binds generation 1 before the
+session is exposed as running. A terminal create without a spawn specification
+keeps the `1.2` registry-only shape (`created`, generation 0, no content
+plane) for metadata-only clients. Both kinds share one spawn implementation;
+the kind decides only whether the bound PTY owns a terminal content plane.
+`session.resize`, `session.read`, `session.write`, and `session.subscribe` are
+served for a bound terminal under the negotiate-time terminal scopes and the
+current controller lease. The spawn path is Linux-only, and `worker_sessions`
+is compiled from the cell truth and narrowed to the containment plan the
+startup probe selected, so a daemon can never advertise a path it does not
+serve.
 
 bitty#2792 adds the delivered event wire: an opted-in connection receives
 per-lease event frames on the negotiated socket, drained from the bounded
-queues and written after the response they follow. This closes the deferred
-event wire; the terminal-session content plane remains deferred. See
-[Pushed event wire](#pushed-event-wire-bitty2792).
+queues and written after the response they follow. The terminal content plane
+adds `session_content` frames on the same wire for a subscribed controller;
+content is shed-free by leaving it in the bounded session buffer when the
+connection cannot take a whole frame. See
+[Pushed event wire](#pushed-event-wire-bitty2792) and
+[Terminal content plane](#terminal-content-plane-bitty2790).
 
 bitty#2805 adds the post-handshake request deadline: a request that completes
 past the effective `request_timeout_ms` is answered with the typed `Timeout`
@@ -63,7 +71,7 @@ in the operator all-session view, effective lease scopes and the server clock on
 `session.attach`, the server clock on `lease.heartbeat`, and `daemon_pid`,
 uptime, and every orphan class in `daemon.status`. The additions are optional
 response keys in service `1.2`, so no existing field changes meaning and `1.0`
-and `1.1` clients stay accepted. See
+through `1.2` clients stay accepted. See
 [Served metadata fields](#served-metadata-fields-bitty2806).
 
 `bittyd start` binds the per-user endpoint (`0700` directory, `0600` socket,
@@ -80,17 +88,17 @@ before its terminal record is written.
 The contract areas that are deliberately deferred, and the typed answer the
 running service gives today:
 
-| Area                                                                                       | Owner                          | Answer today                                                                                                                                                       |
-| ------------------------------------------------------------------------------------------ | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Terminal-session PTY spawn and content plane                                               | bitty#2790 / terminal contract | the frozen contract's `session.create` row defines the registry-only `kind: terminal` answer; only `kind: worker` spawns a PTY today                               |
-| Worker content reads/writes (`session.resize` is served; no stream or input method exists) | bitty#2790 / terminal contract | `session.resize` applies to the worker PTY and bumps the revision; no content read, write, or subscribe method is served                                           |
-| Worker rebind and restart across generations                                               | bitty#2790 follow-up           | a worker binds generation 1 exactly once; a terminal record is never revived and no automatic restart exists                                                       |
-| Executable allowlist for worker `argv[0]`                                                  | bitty#2790 / security corpus   | any executable reachable under the daemon user is accepted; no allowlist or digest policy is enforced yet                                                          |
-| Executable path digest in the orphan record; native Windows job-object reaper              | bitty#2791 follow-up           | no executable path is recorded; Windows and macOS keep the typed `UnsupportedPlatform` refusal                                                                     |
-| Per-connection event backlog counters in `daemon.status`; a shed-able observability class  | bitty#2792 follow-up           | delivery is served on the Linux cell (`events: true`); `daemon.status` serves pid, uptime, and orphan classes (bitty#2806); no backlog counter or shed-able class  |
-| Post-handshake request deadline (`request_timeout_ms` is advertised, not enforced)         | bitty#2805                     | the negotiate deadline is the only `Timeout` emission today; the advertised limit alone changes nothing                                                            |
-| Per-connection refusal-audit aggregation                                                   | bitty#2603 follow-up           | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each                                                     |
-| Conformance corpus and fake-server parity                                                  | bitty#2605                     | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; every shared vector is compared, with no recorded known defect |
+| Area                                                                                      | Owner                        | Answer today                                                                                                                                                                       |
+| ----------------------------------------------------------------------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Terminal content authority for observers                                                  | terminal contract follow-up  | content is controller-only in this slice: an observer with `terminal.inspect` is refused `Denied/ControllerRequired`; a future revision may define an explicit observer read grant |
+| Worker-kind content plane                                                                 | bitty#2790 follow-up         | a worker is a service process: `session.resize` applies to its PTY, while `session.read`/`write`/`subscribe` answer `Denied/NotRunning`                                            |
+| Worker rebind and restart across generations                                              | bitty#2790 follow-up         | a worker binds generation 1 exactly once; a terminal record is never revived and no automatic restart exists                                                                       |
+| Executable allowlist for worker `argv[0]`                                                 | bitty#2790 / security corpus | any executable reachable under the daemon user is accepted; no allowlist or digest policy is enforced yet                                                                          |
+| Executable path digest in the orphan record; native Windows job-object reaper             | bitty#2791 follow-up         | no executable path is recorded; Windows and macOS keep the typed `UnsupportedPlatform` refusal                                                                                     |
+| Per-connection event backlog counters in `daemon.status`; a shed-able observability class | bitty#2792 follow-up         | delivery is served on the Linux cell (`events: true`); `daemon.status` serves pid, uptime, and orphan classes (bitty#2806); no backlog counter or shed-able class                  |
+| Post-handshake request deadline (`request_timeout_ms` is advertised, not enforced)        | bitty#2805                   | the negotiate deadline is the only `Timeout` emission today; the advertised limit alone changes nothing                                                                            |
+| Per-connection refusal-audit aggregation                                                  | bitty#2603 follow-up         | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each                                                                     |
+| Conformance corpus and fake-server parity                                                 | bitty#2605                   | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; every shared vector is compared, with no recorded known defect                 |
 
 The post-handshake request deadline is **not** in this table: it is served by
 the loop (see [Request deadline](#request-deadline-bitty2805)). Nothing here
@@ -104,8 +112,8 @@ of the service surface.
 
 | Item                 | Value                                                                                                                                                                         | Where                                                       |
 | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| Service API version  | `{major: 1, minor: 2}`                                                                                                                                                        | `contract::SERVICE_API_VERSION`                             |
-| Minimum client minor | `0` (`1.0..=1.2` accepted)                                                                                                                                                    | `contract::MIN_CLIENT_MINOR`                                |
+| Service API version  | `{major: 1, minor: 3}`                                                                                                                                                        | `contract::SERVICE_API_VERSION`                             |
+| Minimum client minor | `0` (`1.0..=1.3` accepted)                                                                                                                                                    | `contract::MIN_CLIENT_MINOR`                                |
 | Capabilities         | `terminal_sessions`, `events`, `observer_grants`, `control_transfer`, `idempotent_mutations` enabled; `worker_sessions` compiled for the cell and narrowed to the probed plan | `contract::CAPABILITIES`, `worker::sessions_served`         |
 | Handshake method     | `daemon.negotiate`                                                                                                                                                            | `contract::NEGOTIATE_METHOD`                                |
 | Negotiation rule     | same major, client minor in `[min_client_minor, server_minor]`; every other case is `VersionMismatch` before any operation                                                    | `handshake::negotiate`                                      |
@@ -117,7 +125,11 @@ non-served cell or a Linux cell whose probe selected no mechanism advertises
 `worker_sessions: false` and answers a worker create with
 `Denied/UnsupportedCapability`; a served daemon advertises `true` and gates the
 same call by `process.spawn`, `session.host` consent, a live host grant, and the
-bounded spawn specification. `events` is compiled from `contract::EVENTS_SERVED`
+bounded spawn specification. A terminal create that supplies a spawn
+specification uses the same gate and answers `Denied/UnsupportedCapability`
+where the plan cannot enforce containment; a terminal create without a
+specification is the registry-only compatibility shape and needs no containment
+plan. `events` is compiled from `contract::EVENTS_SERVED`
 and is `true` exactly where the admission loop serves pushed frames (the Linux
 Unix-socket cell); every other cell advertises `false` and refuses a negotiate
 that asks for delivery with `Denied/UnsupportedCapability`. Do not read any bit
@@ -451,7 +463,10 @@ Source: contract `D-10`; the frozen envelope is restated in
   deduplicates by `(session_id, revision, kind)`.
 - **Opt-out.** A connection that does not opt in receives no frame of any kind,
   including a lease's final frame, and its attach result carries no replay keys.
-- There is no subscribe method in `1.x`; events ride the negotiated connection.
+- Session metadata events need no subscribe method; they ride the negotiated
+  connection. Terminal content is the exception: `session.subscribe` (service
+  `1.3`) opts a controller lease in to `session_content` frames on the same
+  connection.
 
 ## Event stream (bitty#2792)
 
@@ -693,14 +708,16 @@ Tests must not be read as a cross-cell claim.
 ## Worker spawn, generation 1, and resize (bitty#2790)
 
 `session.create` takes an optional `kind` (`terminal` by default). A worker
-create is the only path that spawns a process. Its order is frozen and
-observable:
+create always spawns; a terminal create spawns when it supplies the bounded
+spawn specification and otherwise keeps the `1.2` registry-only shape. The
+order is frozen and observable:
 
 1. stage 6 (transport and service scope) runs in the dispatcher before the
    handler: a connection without `process.spawn` is `Denied/ScopeViolation`
    even when `session.host` is present;
-2. the handler rejects an unknown `kind` as `InvalidRequest`, and on a
-   non-served cell refuses `kind: worker` with `Denied/UnsupportedCapability`;
+2. the handler rejects an unknown `kind` as `InvalidRequest`; a worker create
+   on a non-served cell, or a terminal create with a spawn specification whose
+   containment plan cannot enforce it, is `Denied/UnsupportedCapability`;
 3. stage 7 requires `session.host` (a consumed, live host grant), otherwise
    `Denied/ConsentRequired`;
 4. the bounded spawn specification parses; a malformed field is
@@ -731,8 +748,10 @@ child marks every other descriptor close-on-exec just before `exec`, including
 descriptors the parent already held. The worker therefore starts with an fd
 table of exactly 0/1/2 on the slave, whatever the daemon or a test harness had
 open (`worker::tests::the_child_fd_table_is_exactly_the_pty_stdio` probes that
-table from the child). `worker.rs` drains the master on every poll tick, checks the
-leader's exit without reaping it (`waitid` with `WNOWAIT`), signals the recorded
+table from the child). `worker.rs` drains the master on every poll tick into
+the per-session bounded content buffer (terminal kind) or discards it (worker
+kind), checks the leader's exit without reaping it (`waitid` with `WNOWAIT`),
+signals the recorded
 identity while the unreaped zombie still reserves its process-group id, then
 reaps the leader and drains the recorded group. It never blocks the service
 loop for a running worker. On exit it signals the recorded identity once (not
@@ -748,9 +767,12 @@ one did), settles the journal record, and returns the normal create shape with a
 `WorkerPool::forget` terminates a handle that is not already settled with the
 same bounded escalation and reaps its leader before dropping it, so retiring a
 session can never leave a live worker or an unreaped zombie. The per-tick PTY
-drain is capped at `worker::DRAIN_BUDGET_BYTES` (one transport chunk), so a
-continuously writing worker cannot hold the service loop; the rest stays
-queued in the PTY buffer as backpressure and is drained on the next tick. The
+drain is capped at `worker::DRAIN_BUDGET_BYTES` (one transport chunk) divided
+across the live workers, so a continuously writing session cannot hold the
+service loop; the rest stays queued in the PTY buffer as backpressure and is
+drained on the next tick. A terminal's buffer is capped at
+`content::CONTENT_BUFFER_BYTES`; a full buffer stops the drain, so a slow
+reader applies terminal backpressure instead of growing memory. The
 resize ioctl and the descriptor-flag helpers live in `containment/linux_sys.rs`,
 the single FFI seam.
 
@@ -759,8 +781,8 @@ negotiate, alongside `process.spawn`) and the **current controller lease** for
 the target generation. Then:
 
 - a stale generation is `Denied/StaleGeneration` and changes nothing;
-- a stopped or terminal session is `Denied/SessionStopping` or
-  `Denied/NotRunning`;
+- a stopping or terminal session is `Denied/SessionStopping` or
+  `Denied/NotRunning`; a registry-only terminal is `Denied/NotRunning`;
 - an observer lease holder is the typed `Denied/ControllerRequired`, while a
   caller with neither the operator view nor a live lease gets the uniform
   `NotFound` and no existence or revision oracle;
@@ -774,6 +796,52 @@ running worker. A terminal record is exit cleanup, not supervision: it has no
 live handle, so its journal record stays visible and an unprovable tree is
 quarantined instead of silently skipped. The startup scan has no registry and
 skips nothing.
+
+## Terminal content plane (bitty#2790)
+
+A bound terminal owns the content plane; a worker process does not. Three
+methods serve it, all controller-only in this slice:
+
+| Method              | Scope              | Shape                                                                     |
+| ------------------- | ------------------ | ------------------------------------------------------------------------- |
+| `session.read`      | `terminal.inspect` | `{session_id, generation, max_bytes?}` → `{data, bytes, buffered_bytes}`  |
+| `session.write`     | `terminal.input`   | `{session_id, generation, data}` → `{accepted, remaining, backpressure}`  |
+| `session.subscribe` | `terminal.inspect` | `{session_id, generation}` → `{subscribed, already_subscribed, sequence}` |
+
+`data` is lowercase hex in both directions, so every byte value survives JSON
+without a second wire type. `max_bytes` is optional and capped at
+`content::CONTENT_FRAME_BYTES` (one quarter of `max_chunk_bytes`); a larger
+value is `Framing/LimitExceeded`, zero is `InvalidRequest`. A read is
+non-blocking: an empty buffer is a successful zero-byte read. A write never
+queues in the daemon: a partial PTY write reports its accepted count and
+`backpressure: true`, and a full PTY input buffer is the typed
+`Denied/ChannelFull` with nothing written.
+
+`session.subscribe` additionally requires a connection that negotiated
+`events: true`; a non-opted controller gets `Denied/UnsupportedCapability`.
+Subscribed frames ride the negotiated event connection as
+`{"kind":"session_content","session_id","attach_id","generation","sequence",
+"data","buffered_bytes"}`. The server reserves
+`content::CONTENT_FRAME_ENCODED_MAX` outbound room before taking a frame, so a
+frame is either queued whole or left in the session buffer for a later pass; a
+slow reader never causes a drop or an unbounded queue. The sequence starts at
+zero per subscription and only advances for a frame actually handed to the
+transport.
+
+The generation is a hard fence on all three methods. A terminal record after
+exit is read-only metadata: every content method answers `Denied/NotRunning`,
+the subscription is removed at the terminal transition, and no content frame
+follows the `session_terminal` event. Bytes still buffered at that transition
+are discarded; the terminal event is the reconciliation point, and the child
+has already stopped producing. An observer lease, even one holding
+`terminal.inspect`, is refused `Denied/ControllerRequired`: the observer grant
+never becomes a content grant. Detach, revocation, expiry, control transfer,
+and connection close all remove the subscription; a disconnected subscriber
+releases the lease but never kills the terminal process.
+
+Success is not audited (content methods are high-volume and their bytes must
+never enter audit); a refusal is the normal static refusal record with no
+content, path, pid, argv, environment, or token.
 
 ## Service loop (bitty#2607)
 
@@ -880,28 +948,34 @@ method grammar, so:
 - a well-formed name outside the catalog is `NotFound` (deny-by-default), and
   the v1 families stay owned by `bitty-ipc` (a test proves the catalog never
   redefines one of the 51 v1 methods);
-- the only transport-scope requirement is `session.resize` → `terminal.manage`,
-  and the daemon grants `terminal.manage` and `process.spawn` at negotiate;
+- the transport-scope requirements are `session.resize` → `terminal.manage`,
+  `session.read`/`session.subscribe` → `terminal.inspect`, and
+  `session.write` → `terminal.input`; the daemon grants all three terminal
+  scopes plus `process.spawn` at negotiate;
 - a connection with neither `process.spawn` nor `session.host` is
   `Denied/ScopeViolation`, `process.spawn` without `session.host` is
   `Denied/ConsentRequired`, and `session.host` without `process.spawn` is
   `Denied/ScopeViolation`.
 
-| Scope             | Baseline | Grants                                                           |
-| ----------------- | -------- | ---------------------------------------------------------------- |
-| `session.inspect` | yes      | metadata status and list of sessions with a live lease           |
-| `session.host`    | **no**   | create a session; only a consumed host grant adds it             |
-| `session.attach`  | yes      | accept an observer grant                                         |
-| `session.control` | yes      | control relation actions (claim, grant, abort, transfer, revoke) |
-| `terminal.manage` | yes      | resize the content plane, still gated by the controller lease    |
-| `daemon.inspect`  | no       | operator status and all-session view                             |
-| `daemon.control`  | no       | stop, host grants, orphan verify, operator kill                  |
+| Scope              | Baseline | Grants                                                           |
+| ------------------ | -------- | ---------------------------------------------------------------- |
+| `session.inspect`  | yes      | metadata status and list of sessions with a live lease           |
+| `session.host`     | **no**   | create a session; only a consumed host grant adds it             |
+| `session.attach`   | yes      | accept an observer grant                                         |
+| `session.control`  | yes      | control relation actions (claim, grant, abort, transfer, revoke) |
+| `terminal.inspect` | yes      | read and subscribe to terminal output, still controller-gated    |
+| `terminal.input`   | yes      | write terminal input, still controller-gated                     |
+| `terminal.manage`  | yes      | resize the content plane, still gated by the controller lease    |
+| `daemon.inspect`   | no       | operator status and all-session view                             |
+| `daemon.control`   | no       | stop, host grants, orphan verify, operator kill                  |
 
-The connection's transport set is `process.spawn` plus `terminal.manage`. They
-are not the `bitty-ipc` CLI defaults: the daemon grants no `view.*`, `config.*`,
-`plugin.*`, or `debug.*` scope, so the handshake never advertises an ambient
-content surface. `terminal.manage` never authorizes by itself: a resize is
-still refused unless the caller holds the controller lease for that generation.
+The connection's transport set is `process.spawn` plus `terminal.inspect`,
+`terminal.input`, and `terminal.manage`. They are not the `bitty-ipc` CLI
+defaults: the daemon grants no `view.*`, `config.*`, `plugin.*`, or `debug.*`
+scope, so the handshake never advertises an ambient content surface. A
+terminal scope never authorizes by itself: a resize, read, write, or subscribe
+is still refused unless the caller holds the controller lease for that
+generation, and an observer lease is never promoted by the scope.
 When the executable-policy grant lands, `process.spawn` must come from it
 instead of this transport default. The create-authority combinations are
 unit-tested: both missing is `ScopeViolation`, consent missing with spawn
@@ -949,7 +1023,7 @@ and `daemon_state`.
   file, so a missing file and a wrong bearer are indistinguishable.
 - A `host_grant` that cannot be consumed adds no scope and does not close the
   connection; `session.create` then returns `Denied/ConsentRequired`.
-- A version outside `1.0..=1.2` is `VersionMismatch` and closes. A second
+- A version outside `1.0..=1.3` is `VersionMismatch` and closes. A second
   negotiate, or any frame read before the negotiate request, is
   `Denied/AlreadyNegotiated` and closes after the refusal frame is flushed.
   The gate runs after the per-frame wire version and before the rate limiter,
@@ -1105,6 +1179,7 @@ authority, target, generation, idempotency, effect. Invariants:
 `daemon.host_grant` (`mint`/`revoke`), `session.create`, `session.status`,
 `session.list`, `session.attach` (observer and controller), `session.grant`,
 `session.grant.revoke`, `session.detach`, `session.control.transfer`,
+`session.resize`, `session.read`, `session.write`, `session.subscribe`,
 `session.abort`, `session.kill`, `lease.heartbeat`.
 
 `daemon.status` reports the daemon state, active and per-state session counts,
@@ -1115,8 +1190,10 @@ cell), and
 
 ### Served metadata fields (bitty#2806)
 
-Service `1.2` adds optional response keys only. Every existing key keeps its
-meaning and shape, and a `1.0` or `1.1` client that ignores unknown fields keeps
+Service `1.2` adds optional response keys only. Service `1.3` adds three
+methods and two transport grants (`terminal.inspect` and `terminal.input`;
+`terminal.manage` already existed). Every existing key keeps its meaning and
+shape, and a `1.0` through `1.2` client that ignores unknown fields keeps
 working.
 
 | Method                                    | Added key(s)                                                                  | Rule                                                                                                                                                                                                                                                                                                                                                                                                            |
@@ -1198,8 +1275,9 @@ two independent drivers:
 - `fake.rs`: an in-process reference server labeled `candidate-not-bittyd` on
   every run. It implements the handshake, create, status, list, attach, detach,
   grant mint/consume/revoke/transfer and grant expiry, abort, kill, heartbeat,
-  stop, and the closed refusal set over an in-memory transport, with injected
-  time and limits. It never claims a real process.
+  stop, resize, the content methods over a simulated echo terminal, and the
+  closed refusal set over an in-memory transport, with injected time and
+  limits. It never claims a real process or a real PTY.
 - `real.rs`: the built `bittyd` binary against a throwaway runtime/state root,
   speaking the real `bitty-ipc` v1 frames over the Unix endpoint with
   per-frame credentials. Linux x86_64 is the servable cell in this slice;
@@ -1256,6 +1334,13 @@ Corpus rules:
   presence and the pending-grant count (mint, consume, and post-terminal), the
   operator-only owner peer, attach scopes and server clock, the heartbeat
   clock, and the daemon pid, uptime, and orphan-class keys;
+- `V-45`–`V-48` pin the terminal content plane on both drivers: a terminal
+  create with a spawn specification binds generation 1 and serves bounded
+  read/write; an observer lease is `ControllerRequired`; a non-opted
+  connection cannot subscribe; and a registry-only terminal keeps the `1.2`
+  `created`/generation-0 shape with no content plane. `V-49` is real-only: a
+  spawned terminal delivers a `session_content` frame on the event wire over
+  the real PTY; the fake records the typed `requires-real-pty` skip;
 - fault injection covers a transport drop during abort, the pre-auth partial
   frame, the frame bound, the pending grant cap, the attach cap, and an
   instance change (restart); queue pressure with an injected outbound cap is
@@ -1339,8 +1424,11 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
   and the exact-identity reaper seam.
 - `src/spawn.rs` — the bounded `session.create` spawn specification, its
   field/count/whole-spec limits, and the domain-separated digest.
-- `src/worker.rs` — the worker pool: PTY spawn through containment, generation
-  binding, non-blocking drain/supervision, resize, and journal settlement.
+- `src/worker.rs` — the process pool: contained PTY spawn, kind-aware
+  generation binding, non-blocking drain/supervision, resize, content helper
+  access, and journal settlement.
+- `src/content.rs` — the bounded terminal byte buffer, the hex codec, the
+  content-frame budget, and the `session_content` event spelling.
 - `src/operator.rs` — the per-boot operator capability (`0600` file, mint,
   load, constant-time verify, redacted `Debug`).
 - `src/audit_sink.rs` — the owner-private rotating audit file and the
@@ -1366,7 +1454,10 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
 - `tests/service_loop.rs` (`event_wire`) — real-socket delivery: response-first
   ordering, per-lease routing, the terminal marker, control-transfer detail,
   disconnect cleanup and replay retention, controller-token reclaim, the
-  opt-out, the attach replay, a truncated ring, and the kill terminal.
+  opt-out, the attach replay, a truncated ring, the kill terminal, terminal
+  content read/write/subscribe, the observer refusal, the event opt-in refusal,
+  the generation fence, typed write backpressure, subscriber disconnect
+  cleanup, and content-free audit.
 - `tests/events.rs` — public stream behavior: revision ordering, replay and
   truncation boundaries, the terminal guarantee, control frames, heartbeat
   memory stability, and the seeded 10,000-operation no-loss audit.

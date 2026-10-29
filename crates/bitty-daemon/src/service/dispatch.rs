@@ -43,11 +43,13 @@
 //!
 //! # Deliberate deferrals
 //!
-//! `session.resize` is served for a bound worker under the negotiate-time
+//! `session.resize` is served for any bound session under the negotiate-time
 //! `terminal.manage` transport grant and the current controller lease
-//! (bitty#2790); no content read, write, or subscribe method exists yet, and a
-//! terminal session has no PTY to resize (the frozen contract's
-//! `session.create` row defines the registry-only `kind: terminal` answer).
+//! (bitty#2790). `session.read`, `session.write`, and `session.subscribe`
+//! serve the terminal content plane under `terminal.inspect`/`terminal.input`
+//! and the same controller lease; a worker is a service process with no
+//! terminal content plane. A terminal create without a spawn specification
+//! keeps the `1.2` registry-only answer.
 //! `daemon.orphans.verify` is served on Linux x86_64 from the owner-private
 //! journal and the recorded containment identity (bitty#2791); a cell with no
 //! accepted mechanism refuses with `Denied/UnsupportedCapability` instead of
@@ -68,6 +70,7 @@ use crate::audit::{
 use crate::audit_sink::{AuditSink, AuditWriter};
 use crate::codes::RefusalCode;
 use crate::containment::ContainmentReport;
+use crate::content::{CONTENT_FRAME_BYTES, ContentFrame};
 use crate::contract::{CAPABILITIES, Capabilities};
 use crate::events::{
     Event, EventBus, EventDetail, EventKind, EventLimits, LeaseClose, MAX_ATTACH_KEYS_PER_SESSION,
@@ -101,7 +104,7 @@ use crate::service::grants::{
 use crate::service::protocol::Connection;
 use crate::service::scopes::{ScopeRequirement, ServiceMethod, ServiceScope};
 use crate::service::wire::params::{
-    instance_field, object, required_string, required_u64, string_field,
+    instance_field, object, required_string, required_u64, string_field, u64_field,
 };
 use crate::spawn::{SpawnSpec, SpawnSpecError, resize_dimension};
 use crate::worker::{ResizeError, WorkerPool, WorkerSpawnError};
@@ -476,6 +479,9 @@ pub struct Service {
     /// Final frames addressed to a lease, routed to the connection that owns
     /// it on the next delivery pass (the requester never receives them).
     pending_frames: BTreeMap<AttachId, Vec<Event>>,
+    /// One live terminal content subscription per controller lease
+    /// (bitty#2790). The map is bounded by the live controller leases.
+    content_subscriptions: BTreeMap<AttachId, ContentSubscription>,
     state: DaemonState,
     stop_requested: Option<StopMode>,
     drain_deadline_ms: Option<u64>,
@@ -492,6 +498,18 @@ pub struct Service {
 struct ObserverGrantIds {
     ids: BTreeMap<u64, GrantId>,
     order: VecDeque<u64>,
+}
+
+/// One connection's live terminal output subscription.
+///
+/// Keyed by the controller lease, because only the controller may subscribe.
+/// The subscription stores no bytes: content stays in the session's bounded
+/// [`crate::content::ContentBuffer`] until a delivery pass takes a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentSubscription {
+    session_id: SessionId,
+    generation: u64,
+    sequence: u64,
 }
 
 impl Service {
@@ -539,6 +557,7 @@ impl Service {
             touched: Vec::new(),
             closed_leases: Vec::new(),
             pending_frames: BTreeMap::new(),
+            content_subscriptions: BTreeMap::new(),
             state: DaemonState::Running,
             stop_requested: None,
             drain_deadline_ms: None,
@@ -806,6 +825,72 @@ impl Service {
         None
     }
 
+    /// Take the next content frame for a subscribed connection.
+    ///
+    /// A subscription is valid only while the connection still owns the
+    /// controller lease, the session is a running terminal of the subscribed
+    /// generation, and the session is not stopping. Any failed condition drops
+    /// the subscription and returns no frame; a terminal transition therefore
+    /// ends content delivery without a content frame after the terminal event.
+    /// The caller reserves outbound room for [`crate::content::CONTENT_FRAME_ENCODED_MAX`]
+    /// before calling, so a returned frame always fits.
+    pub fn drain_next_content(
+        &mut self,
+        connection: &Connection,
+        now: MonotonicMs,
+    ) -> Option<ContentFrame> {
+        let mut stale: Vec<AttachId> = Vec::new();
+        let mut frame = None;
+        for (attach_id, subscription) in &self.content_subscriptions {
+            if !connection.owns_lease(*attach_id) {
+                continue;
+            }
+            let Some(snapshot) = self.host.snapshot(subscription.session_id, now) else {
+                stale.push(*attach_id);
+                continue;
+            };
+            let valid = snapshot.kind == SessionKind::Terminal
+                && snapshot.generation == subscription.generation
+                && snapshot.state == LifecycleState::Running
+                && self
+                    .host
+                    .control_view(subscription.session_id, now)
+                    .is_some_and(|view| view.controller == Some(*attach_id));
+            if !valid {
+                stale.push(*attach_id);
+                continue;
+            }
+            let Some(read) = self
+                .workers
+                .read(subscription.session_id, CONTENT_FRAME_BYTES)
+            else {
+                stale.push(*attach_id);
+                continue;
+            };
+            if read.data.is_empty() {
+                continue;
+            }
+            frame = Some(ContentFrame {
+                session_id: subscription.session_id,
+                attach_id: *attach_id,
+                generation: subscription.generation,
+                sequence: subscription.sequence,
+                data: read.data,
+                buffered_bytes: read.buffered_bytes,
+            });
+            break;
+        }
+        for attach_id in stale {
+            self.content_subscriptions.remove(&attach_id);
+        }
+        if let Some(frame) = &frame {
+            if let Some(subscription) = self.content_subscriptions.get_mut(&frame.attach_id) {
+                subscription.sequence = subscription.sequence.saturating_add(1);
+            }
+        }
+        frame
+    }
+
     /// Release the pinned terminal frame for the lease a routed event names.
     pub fn ack_terminal(&mut self, event: &Event) {
         if event.kind != EventKind::SessionTerminal {
@@ -899,6 +984,7 @@ impl Service {
                 self.touch(*session_id);
             }
             self.events.detach(*session_id, *attach_id);
+            self.content_subscriptions.remove(attach_id);
             // A final frame addressed to this lease can never be delivered
             // once its connection is gone; the map is unbounded and attach ids
             // are never reused.
@@ -1223,6 +1309,9 @@ impl Service {
                 self.session_control_transfer(connection, fields, now)
             }
             ServiceMethod::SessionResize => self.session_resize(connection, fields, now),
+            ServiceMethod::SessionRead => self.session_read(connection, fields, now),
+            ServiceMethod::SessionWrite => self.session_write(connection, fields, now),
+            ServiceMethod::SessionSubscribe => self.session_subscribe(connection, fields, now),
             ServiceMethod::SessionAbort => self.session_abort(connection, fields, now),
             ServiceMethod::SessionKill => self.session_kill(connection, fields, now),
             ServiceMethod::LeaseHeartbeat => self.lease_heartbeat(connection, fields, now),
@@ -1567,6 +1656,9 @@ impl Service {
         if let Some(cleanup) = self.workers.forget(session_id) {
             let _ = self.orphans.settle(session_id, cleanup, now);
         }
+        // No content frame may follow the terminal transition.
+        self.content_subscriptions
+            .retain(|_, subscription| subscription.session_id != session_id);
         self.initial_tokens.remove(&session_id);
         self.observer_grant_ids.remove(&session_id);
         if let Some(key) = self.create_key_by_session.remove(&session_id) {
@@ -2037,6 +2129,14 @@ impl Service {
             }
             _ => return Err(Refusal::invalid_request()),
         };
+        // A terminal or worker that will spawn needs the contained PTY plan.
+        // The check stays after `kind` and before consent, matching the frozen
+        // worker order and avoiding a malformed-spec oracle on a refused cell.
+        let wants_spawn = kind == SessionKind::Worker
+            || fields.is_some_and(|values| values.get("argv").is_some());
+        if wants_spawn && !self.capabilities().worker_sessions {
+            return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
+        }
         // Stage 7: the consumed host consent must still be live.
         let grant_id = connection
             .host_grant()
@@ -2051,16 +2151,14 @@ impl Service {
             return Err(Refusal::denied(RefusalCode::ConsentRequired));
         }
 
-        // A worker create reads and validates the whole bounded spawn
-        // specification before the idempotency admission and before any
-        // process exists. A terminal create follows the frozen contract's
-        // `session.create` row and ignores those fields as unknown.
-        let spawn = match kind {
-            SessionKind::Worker => {
-                Some(SpawnSpec::parse(fields, &self.limits).map_err(map_spawn_spec_refusal)?)
-            }
-            SessionKind::Terminal => None,
-        };
+        // A worker create always needs the bounded spawn specification. A
+        // terminal create spawns when the client supplies `argv`; without one
+        // it keeps the 1.2 registry-only record (no process, PTY, or content
+        // plane) so a metadata-only client is not broken by the 1.3 addition.
+        // Both paths share the same parser, containment, consent, and bind.
+        let spawn = wants_spawn
+            .then(|| SpawnSpec::parse(fields, &self.limits).map_err(map_spawn_spec_refusal))
+            .transpose()?;
 
         let terminal_id = match string_field(fields, "terminal_id")? {
             Some(value) => {
@@ -2124,7 +2222,13 @@ impl Service {
                         self.initial_tokens
                             .insert(session_id, created.control_token);
                         self.create_key_by_session.insert(session_id, key);
-                        let started = self.start_worker(session_id, spawn.as_ref(), now);
+                        let started = match spawn.as_ref() {
+                            Some(spec) => self.start_worker(session_id, kind, spec, now),
+                            None => self
+                                .host
+                                .snapshot(session_id, now)
+                                .ok_or_else(Refusal::internal),
+                        };
                         let snapshot = match started {
                             Ok(snapshot) => {
                                 // A worker bind is a snapshot-visible revision
@@ -2216,7 +2320,11 @@ impl Service {
         }
     }
 
-    /// Spawn and bind the worker for a just-created session.
+    /// Spawn and bind the process for a just-created session.
+    ///
+    /// Both kinds use this one contained spawn path. Kind decides content
+    /// semantics, not the mechanism: a terminal owns the PTY content plane, a
+    /// worker is a service process with no terminal content plane.
     ///
     /// The sequence is the contract's two-phase journal: reserve the record
     /// with the pre-spawn containment identity, spawn under that identity,
@@ -2229,45 +2337,42 @@ impl Service {
     fn start_worker(
         &mut self,
         session_id: SessionId,
-        spawn: Option<&SpawnSpec>,
+        kind: SessionKind,
+        spawn: &SpawnSpec,
         now: MonotonicMs,
     ) -> Result<SessionSnapshot, Refusal> {
-        let Some(spec) = spawn else {
-            return self
-                .host
-                .snapshot(session_id, now)
-                .ok_or_else(Refusal::internal);
-        };
         let record =
             crate::worker::planned_record(&self.containment, self.instance_id(), session_id);
         self.orphans
             .reserve(session_id, 0, now, record)
             .map_err(map_journal_refusal)?;
-        let identity =
-            match self
-                .workers
-                .spawn(&self.containment, self.instance_id(), session_id, spec)
-            {
-                Ok(identity) => identity,
-                Err(WorkerSpawnError::Unsupported) => {
-                    let _ = self
-                        .orphans
-                        .settle(session_id, CleanupClass::NotStarted, now);
-                    return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
-                }
-                Err(WorkerSpawnError::NotStarted) => {
-                    let _ = self
-                        .orphans
-                        .settle(session_id, CleanupClass::NotStarted, now);
-                    return self.spawn_failed(session_id, CleanupClass::NotStarted, now);
-                }
-                Err(WorkerSpawnError::Cleanup(cleanup)) => {
-                    // A child existed and was terminated before the error
-                    // returned; report the class the plan could prove.
-                    let _ = self.orphans.settle(session_id, cleanup, now);
-                    return self.spawn_failed(session_id, cleanup, now);
-                }
-            };
+        let identity = match self.workers.spawn(
+            &self.containment,
+            self.instance_id(),
+            session_id,
+            spawn,
+            kind,
+        ) {
+            Ok(identity) => identity,
+            Err(WorkerSpawnError::Unsupported) => {
+                let _ = self
+                    .orphans
+                    .settle(session_id, CleanupClass::NotStarted, now);
+                return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
+            }
+            Err(WorkerSpawnError::NotStarted) => {
+                let _ = self
+                    .orphans
+                    .settle(session_id, CleanupClass::NotStarted, now);
+                return self.spawn_failed(session_id, CleanupClass::NotStarted, now);
+            }
+            Err(WorkerSpawnError::Cleanup(cleanup)) => {
+                // A child existed and was terminated before the error
+                // returned; report the class the plan could prove.
+                let _ = self.orphans.settle(session_id, cleanup, now);
+                return self.spawn_failed(session_id, cleanup, now);
+            }
+        };
         if self.orphans.commit(session_id, identity).is_err() {
             let cleanup = self
                 .workers
@@ -2320,8 +2425,8 @@ impl Service {
         control_claimed: bool,
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
-        // A terminal session never exposes a claimable token, even on a keyed
-        // replay of the create that produced it.
+        // A terminal record is read-only after exit and never exposes a
+        // claimable token; a live terminal replay keeps the create token.
         let token = if control_claimed || snapshot.state.is_terminal() {
             None
         } else {
@@ -3037,6 +3142,7 @@ impl Service {
                 }
                 self.events.detach(session_id, target);
                 connection.forget_lease(target);
+                self.content_subscriptions.remove(&target);
                 // Record the acting connection for a controller/operator
                 // revocation of another connection's lease too; the target
                 // lookup has already removed it, so only this history can
@@ -3138,6 +3244,11 @@ impl Service {
                     Ok(transferred) => {
                         let controller = transferred.controller;
                         let delivery = transferred.delivery;
+                        // Control moved: the old controller can no longer
+                        // receive terminal content.
+                        if let Some(previous) = transferred.previous_controller {
+                            self.content_subscriptions.remove(&previous);
+                        }
                         let result_ref = crate::service::grants::ref_of(controller.as_bytes());
                         let applied = AppliedResult::new(
                             AppliedClass::Transferred,
@@ -3267,6 +3378,179 @@ impl Service {
             now,
         );
         Ok(json!({"session": self.session_json(&resized, now)}))
+    }
+
+    /// Resolve a content request's session, generation, and controller lease.
+    ///
+    /// A terminal is the only content-plane owner; a worker is a service
+    /// process. Content is controller-only in this slice: an observer lease,
+    /// even with `terminal.inspect`, is refused `Denied/ControllerRequired`, so
+    /// observation never becomes a content grant. A terminal record is
+    /// read-only after exit and serves no content at all.
+    fn content_target(
+        &self,
+        connection: &Connection,
+        session_id: SessionId,
+        generation: u64,
+        now: MonotonicMs,
+    ) -> Result<(SessionSnapshot, AttachId), Refusal> {
+        let snapshot = self.visible(connection, session_id, None, now)?;
+        check_generation(&snapshot, generation)?;
+        if snapshot.state.is_terminal() {
+            return Err(Refusal::denied(RefusalCode::NotRunning));
+        }
+        if snapshot.state == LifecycleState::Stopping {
+            return Err(Refusal::denied(RefusalCode::SessionStopping));
+        }
+        if snapshot.kind != SessionKind::Terminal {
+            return Err(Refusal::denied(RefusalCode::NotRunning));
+        }
+        let view = self
+            .host
+            .control_view(session_id, now)
+            .ok_or_else(Refusal::not_found)?;
+        let attach = connection.leases().find_map(|(attach, owned)| {
+            (owned == session_id && view.controller == Some(attach)).then_some(attach)
+        });
+        let Some(attach) = attach else {
+            return Err(Refusal::denied(RefusalCode::ControllerRequired));
+        };
+        Ok((snapshot, attach))
+    }
+
+    /// `session.read`: pull bounded output from the terminal content buffer.
+    fn session_read(
+        &mut self,
+        connection: &mut Connection,
+        fields: Option<&Map<String, Value>>,
+        now: MonotonicMs,
+    ) -> Result<Value, Refusal> {
+        let session_id = parse_session_id(fields)?;
+        let generation = required_u64(fields, "generation")?;
+        let requested = u64_field(fields, "max_bytes")?.unwrap_or(CONTENT_FRAME_BYTES as u64);
+        if requested == 0 {
+            return Err(Refusal::invalid_request());
+        }
+        let max_bytes = usize::try_from(requested)
+            .map_err(|_| Refusal::limit_exceeded(CONTENT_FRAME_BYTES as u64, requested))?;
+        if max_bytes > CONTENT_FRAME_BYTES {
+            return Err(Refusal::limit_exceeded(
+                CONTENT_FRAME_BYTES as u64,
+                requested,
+            ));
+        }
+        let (snapshot, _attach) = self.content_target(connection, session_id, generation, now)?;
+        self.recheck(connection, DispatchBoundary::ContentPlane)?;
+        let Some(read) = self.workers.read(session_id, max_bytes) else {
+            return Err(Refusal::denied(RefusalCode::NotRunning));
+        };
+        Ok(json!({
+            "session_id": session_id.as_hex(),
+            "generation": snapshot.generation,
+            "data": crate::content::encode_hex(&read.data),
+            "bytes": read.data.len(),
+            "buffered_bytes": read.buffered_bytes,
+        }))
+    }
+
+    /// `session.write`: write controller input to the owned PTY.
+    ///
+    /// A full PTY input buffer is the typed `Denied/ChannelFull`; a partial
+    /// write returns the accepted count and `backpressure: true`, so the caller
+    /// retries only the remaining tail. The daemon keeps no write queue.
+    fn session_write(
+        &mut self,
+        connection: &mut Connection,
+        fields: Option<&Map<String, Value>>,
+        now: MonotonicMs,
+    ) -> Result<Value, Refusal> {
+        let session_id = parse_session_id(fields)?;
+        let generation = required_u64(fields, "generation")?;
+        let encoded = required_string(fields, "data")?;
+        let data =
+            crate::content::decode_hex(encoded, CONTENT_FRAME_BYTES).map_err(
+                |error| match error {
+                    crate::content::HexError::Invalid => Refusal::invalid_request(),
+                    crate::content::HexError::Limit { limit, actual } => Refusal::limit_exceeded(
+                        u64::try_from(limit).unwrap_or(u64::MAX),
+                        u64::try_from(actual).unwrap_or(u64::MAX),
+                    ),
+                },
+            )?;
+        if data.is_empty() {
+            return Err(Refusal::invalid_request());
+        }
+        let (snapshot, _attach) = self.content_target(connection, session_id, generation, now)?;
+        self.recheck(connection, DispatchBoundary::ContentPlane)?;
+        self.admit()?;
+        match self.workers.write(session_id, &data) {
+            crate::worker::ContentWrite::Accepted {
+                accepted,
+                attempted,
+            } => Ok(json!({
+                "session_id": session_id.as_hex(),
+                "generation": snapshot.generation,
+                "accepted": accepted,
+                "remaining": attempted.saturating_sub(accepted),
+                "backpressure": accepted < attempted,
+            })),
+            crate::worker::ContentWrite::Backpressure { .. } => {
+                Err(Refusal::denied(RefusalCode::ChannelFull))
+            }
+            crate::worker::ContentWrite::Closed => Err(Refusal::denied(RefusalCode::NotRunning)),
+        }
+    }
+
+    /// `session.subscribe`: deliver terminal output frames on the event wire.
+    ///
+    /// The connection must have opted into pushed events at negotiate and must
+    /// hold the current controller lease. A repeated subscribe for the same
+    /// session and generation is idempotent and does not reset the sequence.
+    fn session_subscribe(
+        &mut self,
+        connection: &mut Connection,
+        fields: Option<&Map<String, Value>>,
+        now: MonotonicMs,
+    ) -> Result<Value, Refusal> {
+        let session_id = parse_session_id(fields)?;
+        let generation = required_u64(fields, "generation")?;
+        // Authority first: an observer is refused for control even when its
+        // connection did not opt into the event wire. A controller without the
+        // opt-in then gets the typed capability refusal.
+        let (snapshot, attach) = self.content_target(connection, session_id, generation, now)?;
+        if !connection.events_enabled() {
+            return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
+        }
+        self.recheck(connection, DispatchBoundary::ContentPlane)?;
+        let already = self
+            .content_subscriptions
+            .get(&attach)
+            .is_some_and(|subscription| {
+                subscription.session_id == session_id
+                    && subscription.generation == snapshot.generation
+            });
+        let sequence = if already {
+            self.content_subscriptions
+                .get(&attach)
+                .map_or(0, |subscription| subscription.sequence)
+        } else {
+            self.content_subscriptions.insert(
+                attach,
+                ContentSubscription {
+                    session_id,
+                    generation: snapshot.generation,
+                    sequence: 0,
+                },
+            );
+            0
+        };
+        Ok(json!({
+            "session_id": session_id.as_hex(),
+            "generation": snapshot.generation,
+            "subscribed": true,
+            "already_subscribed": already,
+            "sequence": sequence,
+        }))
     }
 
     fn session_abort(
@@ -4197,15 +4481,76 @@ mod tests {
         )
     }
 
-    fn create_session(service: &mut Service, connection: &mut Connection, key: &str) -> Value {
+    /// Create a registry-only fixture session for tests that exercise lease,
+    /// grant, and lifecycle behavior without a PTY child.
+    ///
+    /// This is a unit-test fixture over the same registry entry point the
+    /// create handler uses; it is deliberately not a second wire path. Tests
+    /// that exercise `session.create` itself call
+    /// [`create_spawned_session`].
+    fn create_session(service: &mut Service, connection: &mut Connection, _key: &str) -> Value {
+        let now = MonotonicMs::from_millis(10);
+        let owner_peer = Some(OwnerPeer::new(
+            connection.peer_uid(),
+            connection.peer().identity().pid(),
+        ));
+        let created = service
+            .host
+            .create_kind(
+                crate::registry::CreateSession {
+                    terminal_id: None,
+                    owner_peer,
+                },
+                SessionKind::Terminal,
+                now,
+            )
+            .expect("fixture create");
+        let session_id = created.session.session_id;
+        service.events.register(session_id);
+        let token = crate::handshake::hex(created.control_token.expose_secret());
+        service
+            .initial_tokens
+            .insert(session_id, created.control_token);
+        let snapshot = service
+            .host
+            .snapshot(session_id, now)
+            .expect("fixture snapshot");
+        json!({
+            "session": service.session_json(&snapshot, now),
+            "control_token": token,
+            "replayed": false,
+        })
+    }
+
+    /// Create one terminal through the served `session.create` path.
+    fn create_spawned_session(
+        service: &mut Service,
+        connection: &mut Connection,
+        key: &str,
+    ) -> Value {
         service
             .dispatch(
                 connection,
                 ServiceMethod::SessionCreate,
-                &json!({"kind": "terminal", "idempotency_key": key}),
+                &json!({
+                    "kind": "terminal",
+                    "idempotency_key": key,
+                    "argv": ["/bin/cat"],
+                    "cwd": "/",
+                }),
                 MonotonicMs::from_millis(10),
             )
-            .expect("create")
+            .expect("spawned create")
+    }
+
+    /// A service whose containment plan serves the spawn path.
+    fn spawn_service() -> (Service, tempfile::TempDir) {
+        let cell = crate::platform::PlatformCell::current();
+        service_with_containment(
+            Limits::default(),
+            OrphanSupervisor::unsupported(cell, "test"),
+            crate::containment::ContainmentReport::probe(),
+        )
     }
 
     fn session_id(value: &Value) -> String {
@@ -4263,7 +4608,7 @@ mod tests {
             )
             .expect("accepted");
         assert_eq!(response.wire_version, 1);
-        assert_eq!(response.service_api_version.to_string(), "1.2");
+        assert_eq!(response.service_api_version.to_string(), "1.3");
         assert_eq!(response.scopes.service, ServiceScopeSet::baseline());
         assert_eq!(response.daemon_pid, std::process::id());
         assert_eq!(response.peer_identity.pid, std::process::id());
@@ -4405,7 +4750,7 @@ mod tests {
     /// A consume-then-revoke withdraws both a fresh create and its keyed replay.
     #[test]
     fn a_consumed_host_grant_revoke_withdraws_create_and_its_replay() {
-        let (mut service, _dir) = service();
+        let (mut service, _dir) = spawn_service();
         let mut operator = operator_connection(&mut service);
         let (grant_id, grant) = mint_host_grant_pair(&mut service, &mut operator, 2);
 
@@ -4419,7 +4764,7 @@ mod tests {
             .dispatch(
                 &mut creator,
                 ServiceMethod::SessionCreate,
-                &json!({"kind": "terminal", "idempotency_key": "revoke-k1"}),
+                &json!({"kind": "terminal", "idempotency_key": "revoke-k1", "argv": ["/bin/cat"], "cwd": "/"}),
                 MonotonicMs::from_millis(4),
             )
             .expect("create");
@@ -4451,7 +4796,7 @@ mod tests {
                 .dispatch(
                     &mut creator,
                     ServiceMethod::SessionCreate,
-                    &json!({"kind": "terminal", "idempotency_key": key}),
+                    &json!({"kind": "terminal", "idempotency_key": key, "argv": ["/bin/cat"], "cwd": "/"}),
                     MonotonicMs::from_millis(6 + index as u64),
                 )
                 .expect_err("no consent");
@@ -4785,7 +5130,7 @@ mod tests {
 
     #[test]
     fn the_full_control_flow_is_reachable_and_keyed() {
-        let (mut service, _dir) = service();
+        let (mut service, _dir) = spawn_service();
         let mut operator = operator_connection(&mut service);
         let grant = mint_host_grant(&mut service, &mut operator, 2);
 
@@ -4796,15 +5141,15 @@ mod tests {
             .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
             .expect("negotiate");
 
-        let created = create_session(&mut service, &mut creator, "create-1");
+        let created = create_spawned_session(&mut service, &mut creator, "create-1");
         let id = session_id(&created);
-        assert_eq!(created["session"]["state"], "created");
-        assert_eq!(created["session"]["generation"], 0);
+        assert_eq!(created["session"]["state"], "running");
+        assert_eq!(created["session"]["generation"], 1);
         let create_token = created["control_token"].as_str().expect("token").to_owned();
 
         // A duplicate create with the same key replays the same session and
         // the same token while the token is unclaimed.
-        let replay = create_session(&mut service, &mut creator, "create-1");
+        let replay = create_spawned_session(&mut service, &mut creator, "create-1");
         assert_eq!(session_id(&replay), id);
         assert_eq!(
             replay["control_token"].as_str(),
@@ -4820,7 +5165,7 @@ mod tests {
                 &json!({
                     "attach_role": "controller",
                     "session_id": id,
-                    "expected_generation": 0,
+                    "expected_generation": 1,
                     "control_token": create_token,
                     "idempotency_key": "attach-1",
                 }),
@@ -4832,7 +5177,7 @@ mod tests {
         assert_ne!(controller_token, create_token);
 
         // A post-claim duplicate create returns no token.
-        let replay = create_session(&mut service, &mut creator, "create-1");
+        let replay = create_spawned_session(&mut service, &mut creator, "create-1");
         assert!(replay["control_token"].is_null());
 
         // Mint an observer grant as the controller.
@@ -4900,7 +5245,7 @@ mod tests {
                 &json!({
                     "session_id": id,
                     "attach_id": observer_attach,
-                    "expected_generation": 0,
+                    "expected_generation": 1,
                     "idempotency_key": "transfer-1",
                 }),
                 MonotonicMs::from_millis(16),
@@ -4942,7 +5287,7 @@ mod tests {
                 ServiceMethod::SessionAbort,
                 &json!({
                     "session_id": id,
-                    "expected_generation": 0,
+                    "expected_generation": 1,
                     "reason_class": "cancel",
                 }),
                 MonotonicMs::from_millis(19),
@@ -4950,38 +5295,79 @@ mod tests {
             .expect_err("not controller");
         assert_eq!(error.denied_code(), Some(RefusalCode::ControllerRequired));
 
-        // The new controller aborts; the created session completes not_started.
+        // The new controller aborts; the bound worker enters `stopping` and
+        // the terminal transition is the supervisor's next pass.
         let aborted = service
             .dispatch(
                 &mut observer,
                 ServiceMethod::SessionAbort,
                 &json!({
                     "session_id": id,
-                    "expected_generation": 0,
+                    "expected_generation": 1,
                     "reason_class": "cancel",
                 }),
                 MonotonicMs::from_millis(20),
             )
             .expect("abort");
-        assert_eq!(aborted["session"]["state"], "terminated");
-        assert_eq!(aborted["session"]["terminal_reason"], "consumer_cancel");
-        assert_eq!(aborted["cleanup"], "not_started");
+        assert_eq!(aborted["accepted"], true);
+        assert_eq!(aborted["session"]["state"], "stopping");
+        assert_eq!(aborted["reason"], "consumer_cancel");
 
-        // A terminal session is read-only and a repeat returns the snapshot.
+        // A repeat cancel while the same stop is pending is idempotent: the
+        // session remains stopping and no second terminal transition is made.
         let repeat = service
             .dispatch(
                 &mut observer,
                 ServiceMethod::SessionAbort,
                 &json!({
                     "session_id": id,
-                    "expected_generation": 0,
+                    "expected_generation": 1,
                     "reason_class": "cancel",
                 }),
                 MonotonicMs::from_millis(21),
             )
-            .expect("terminal snapshot");
-        assert_eq!(repeat["not_running"], true);
-        assert_eq!(repeat["session"]["state"], "terminated");
+            .expect("repeat cancel");
+        assert_eq!(repeat["accepted"], true);
+        assert_eq!(repeat["session"]["state"], "stopping");
+    }
+
+    #[test]
+    fn a_spawned_terminal_create_binds_generation_one_and_replays() {
+        let (mut service, _dir) = spawn_service();
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 2);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+
+        let created = create_spawned_session(&mut service, &mut creator, "terminal-create");
+        assert_eq!(created["session"]["kind"], "terminal");
+        assert_eq!(created["session"]["state"], "running");
+        assert_eq!(created["session"]["generation"], 1);
+        assert_eq!(created["replayed"], false);
+        let id = session_id(&created);
+        let token = created["control_token"].as_str().expect("token").to_owned();
+
+        let replay = create_spawned_session(&mut service, &mut creator, "terminal-create");
+        assert_eq!(session_id(&replay), id);
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["control_token"].as_str(), Some(token.as_str()));
+        assert_eq!(replay["session"]["generation"], 1);
+
+        // The direct unit fixture drops the service without a wire stop; the
+        // pool's drop guard terminates the child, and `terminate` gives the
+        // test a deterministic cleanup assertion.
+        assert!(
+            service
+                .workers
+                .contains(SessionId::parse(&id).expect("session id"))
+        );
+        let _ = service
+            .workers
+            .terminate(SessionId::parse(&id).expect("session id"));
     }
 
     #[test]
@@ -4999,9 +5385,7 @@ mod tests {
             operator,
             Box::new(writer),
             OrphanSupervisor::unsupported(crate::platform::PlatformCell::current(), "test"),
-            crate::containment::ContainmentReport::unprobed(
-                crate::platform::PlatformCell::current(),
-            ),
+            crate::containment::ContainmentReport::probe(),
             DaemonFacts::new(std::process::id(), MonotonicMs::ZERO),
         )
         .expect("service");
@@ -5019,7 +5403,7 @@ mod tests {
             .dispatch(
                 &mut creator,
                 ServiceMethod::SessionCreate,
-                &json!({"kind": "terminal", "idempotency_key": "degraded"}),
+                &json!({"kind": "terminal", "idempotency_key": "degraded", "argv": ["/bin/cat"], "cwd": "/"}),
                 MonotonicMs::from_millis(4),
             )
             .expect_err("audit degraded");
@@ -5041,7 +5425,7 @@ mod tests {
             .dispatch(
                 &mut creator,
                 ServiceMethod::SessionCreate,
-                &json!({"kind": "terminal", "idempotency_key": "degraded"}),
+                &json!({"kind": "terminal", "idempotency_key": "degraded", "argv": ["/bin/cat"], "cwd": "/"}),
                 MonotonicMs::from_millis(5),
             )
             .expect_err("the refused key replays its refusal");
@@ -5052,11 +5436,11 @@ mod tests {
             .dispatch(
                 &mut creator,
                 ServiceMethod::SessionCreate,
-                &json!({"kind": "terminal", "idempotency_key": "degraded-retry"}),
+                &json!({"kind": "terminal", "idempotency_key": "degraded-retry", "argv": ["/bin/cat"], "cwd": "/"}),
                 MonotonicMs::from_millis(6),
             )
             .expect("created after recovery");
-        assert_eq!(created["session"]["state"], "created");
+        assert_eq!(created["session"]["state"], "running");
         assert!(!service.audit_degraded());
     }
 

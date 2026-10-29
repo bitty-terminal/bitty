@@ -313,6 +313,13 @@ mod unix {
             // the frozen revision class requires. The controller-lease check
             // still gates the effect; the scope alone resizes nothing.
             transport_scopes.insert(bitty_ipc_api::scope::Scope::TerminalManage);
+            // The terminal content plane reuses the v1 terminal scopes:
+            // `terminal.inspect` gates read/subscribe, `terminal.input` gates
+            // writable input. Both stay controller-lease-gated; the scope alone
+            // reads or writes nothing, and an observer lease never receives
+            // content.
+            transport_scopes.insert(bitty_ipc_api::scope::Scope::TerminalInspect);
+            transport_scopes.insert(bitty_ipc_api::scope::Scope::TerminalInput);
             // The seam exists only in debug builds: a release daemon always
             // re-attests at the frozen interval, so the variable cannot shorten
             // production behaviour even if it is present in the environment.
@@ -591,7 +598,7 @@ mod unix {
                 // survives the last iteration.
                 for peer in &mut peers {
                     if !peer.closed && !peer.close_after_write {
-                        deliver_events(peer, &mut service, &config);
+                        deliver_events(peer, &mut service, &config, current);
                     }
                 }
                 if peers.iter().all(|peer| !peer.wants_write()) {
@@ -691,7 +698,7 @@ mod unix {
                 // another connection's dispatch (a drain, a terminal) is
                 // delivered without waiting for new input.
                 if !peer.closed && !peer.close_after_write {
-                    deliver_events(peer, &mut service, &config);
+                    deliver_events(peer, &mut service, &config, current);
                 }
                 if !peer.closed
                     && (ready.contains(nix::poll::PollFlags::POLLOUT) || peer.wants_write())
@@ -752,7 +759,7 @@ mod unix {
                         // Terminal-event guarantee: a terminal transition for a
                         // held lease is written before the idle close, and the
                         // stream is shut down only once those bytes drain.
-                        deliver_events(peer, &mut service, &config);
+                        deliver_events(peer, &mut service, &config, current);
                         if peer.wants_write() {
                             peer.retire();
                         } else {
@@ -809,7 +816,7 @@ mod unix {
 
         let final_now = now();
         for peer in &mut peers {
-            deliver_events(peer, &mut service, &config);
+            deliver_events(peer, &mut service, &config, final_now);
             flush_peer(peer);
             flush_wire_audit(peer, &mut service, final_now, true);
             peer.close();
@@ -983,7 +990,7 @@ mod unix {
             // Event frames ride the same connection, after the response they
             // belong to. The response is already queued, so a control frame
             // never preempts it (`D-10`).
-            deliver_events(peer, service, config);
+            deliver_events(peer, service, config, now);
             if peer.closed {
                 return;
             }
@@ -1117,7 +1124,12 @@ mod unix {
     /// buffer already holds `max_connection_outbound_bytes`, nothing is drained:
     /// the bounded per-lease queues absorb the pressure and the lease is closed
     /// with `TerminalEventLost` rather than growing memory here.
-    fn deliver_events(peer: &mut PeerIo, service: &mut Service, config: &ServerConfig) {
+    fn deliver_events(
+        peer: &mut PeerIo,
+        service: &mut Service,
+        config: &ServerConfig,
+        now: MonotonicMs,
+    ) {
         let cap = usize::try_from(config.limits.effective(LimitId::MaxConnectionOutboundBytes))
             .unwrap_or(usize::MAX);
         if peer.output.len() >= cap {
@@ -1151,6 +1163,42 @@ mod unix {
             }
             service.ack_terminal(&event);
         }
+        // Terminal content rides after the control frames for the same
+        // connection. Reserve the worst-case encoded frame first, so a frame
+        // is either queued whole or left in the bounded session buffer for the
+        // next pass; a slow reader never forces a drop or an unbounded queue.
+        while peer
+            .output
+            .len()
+            .saturating_add(crate::content::CONTENT_FRAME_ENCODED_MAX)
+            <= cap
+        {
+            let Some(frame) = service.drain_next_content(&peer.client, now) else {
+                break;
+            };
+            if !push_content(peer, &frame, cap) {
+                return;
+            }
+        }
+    }
+
+    /// Render and append one terminal-content frame.
+    ///
+    /// The caller has already reserved [`crate::content::CONTENT_FRAME_ENCODED_MAX`],
+    /// so a failure here is an internal invariant and closes the connection.
+    fn push_content(peer: &mut PeerIo, frame: &crate::content::ContentFrame, cap: usize) -> bool {
+        peer.event_sequence = peer.event_sequence.wrapping_add(1);
+        let id = format!("evt-{}", peer.event_sequence);
+        let Ok(bytes) = wire::render_content_event(&id, frame) else {
+            peer.close();
+            return false;
+        };
+        if peer.output.len().saturating_add(bytes.len()) > cap {
+            peer.close();
+            return false;
+        }
+        peer.output.extend_from_slice(&bytes);
+        true
     }
 
     /// Render and append one event frame. Closes the connection when the frame

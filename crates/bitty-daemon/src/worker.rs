@@ -1,8 +1,10 @@
-//! Worker spawn, PTY ownership, and non-blocking supervision (contract
-//! `D-01`, `D-03`, `D-04`, `D-06`; bitty#2790).
+//! Session process spawn, PTY ownership, and non-blocking supervision
+//! (contract `D-01`, `D-03`, `D-04`, `D-06`; bitty#2790).
 //!
-//! A worker is spawned exactly once, under the containment plan the daemon
-//! probed at startup, with a single-owner PTY:
+//! One session process is spawned exactly once, under the containment plan the
+//! daemon probed at startup, with a single-owner PTY. A terminal kind owns the
+//! content plane; a worker kind is a service process whose PTY is used for
+//! resize only:
 //!
 //! 1. the caller reserves the orphan-journal record with the pre-spawn
 //!    containment identity ([`planned_record`]);
@@ -39,7 +41,7 @@ use std::fs::File;
 #[cfg(target_os = "linux")]
 use std::io;
 #[cfg(target_os = "linux")]
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 #[cfg(target_os = "linux")]
 use std::process::{Command, ExitStatus, Stdio};
 
@@ -52,32 +54,37 @@ use crate::containment::{
 #[cfg(target_os = "linux")]
 use crate::containment::{ContainmentLimits, SessionMode, spawn_with};
 #[cfg(target_os = "linux")]
+use crate::content::ContentBuffer;
+#[cfg(target_os = "linux")]
 use crate::lease::{ExitObservation, SessionHost, Termination};
 #[cfg(target_os = "linux")]
 use crate::orphan::OrphanSupervisor;
 use crate::registry::{CleanupClass, DaemonInstanceId, SessionId};
 #[cfg(target_os = "linux")]
-use crate::registry::{LifecycleState, MonotonicMs};
+use crate::registry::{LifecycleState, MonotonicMs, SessionKind};
 #[cfg(target_os = "linux")]
 use crate::spawn::SpawnSpec;
 
-/// Whether this build serves the worker spawn path at all.
+/// Whether this build serves the contained spawn path at all.
 ///
 /// The value is compiled from the platform cell, exactly like the containment
 /// plan: Linux enforces a whole-tree identity (cgroup v2 or the subreaper
 /// fallback), while every other cell refuses at startup. The served harness is
 /// additionally narrowed by [`sessions_served`] from the plan this process
 /// actually probed, so a Linux cell whose probe selected no mechanism neither
-/// advertises nor serves a worker.
+/// advertises nor serves a worker or a terminal spawn. The capability name
+/// stays `worker_sessions` because it gates the worker kind; a terminal create
+/// that supplies a spawn specification uses the same cell truth.
 pub const WORKER_SESSIONS_SERVED: bool = cfg!(target_os = "linux");
 
 /// Bytes one worker's PTY may hand the poll loop in a single tick.
 ///
 /// The bound is one transport `max_chunk_bytes`, the largest content unit the
-/// service forwards in a frame. A worker that writes continuously is drained
-/// for at most one chunk per pass, so it cannot hold the single-threaded
-/// service loop inside one session's `read`; the remaining bytes stay queued
-/// in the PTY buffer as backpressure and are drained on later ticks.
+/// service forwards in a frame. The per-tick budget is divided across the live
+/// workers, so one continuously writing session cannot starve the others or
+/// hold the single-threaded service loop inside one session's `read`. The
+/// remaining bytes stay queued in the PTY buffer as backpressure and are
+/// drained on later ticks.
 pub const DRAIN_BUDGET_BYTES: usize =
     crate::limits::LimitId::MaxChunkBytes.default_value() as usize;
 
@@ -130,6 +137,42 @@ pub enum ResizeError {
     Pty,
 }
 
+/// One bounded pull of terminal output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentRead {
+    /// Raw bytes taken from the session buffer.
+    pub data: Vec<u8>,
+    /// Bytes still buffered after the pull.
+    pub buffered_bytes: usize,
+}
+
+/// The result of writing terminal input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentWrite {
+    /// The PTY accepted `accepted` bytes; `remaining` bytes were not written
+    /// (`remaining > 0` means the caller should retry the tail).
+    Accepted {
+        /// Bytes accepted by the PTY.
+        accepted: usize,
+        /// Bytes the caller attempted.
+        attempted: usize,
+    },
+    /// The PTY input buffer is full and accepted nothing.
+    Backpressure {
+        /// Bytes the caller attempted.
+        attempted: usize,
+    },
+    /// The worker has exited (or the PTY is gone); nothing was written.
+    Closed,
+}
+
+/// Why a content read found no live terminal plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentError {
+    /// The session has no live worker (unbound, worker-kind, or terminal).
+    NotRunning,
+}
+
 /// The pre-spawn containment identity, derived from ids only.
 ///
 /// The name is never caller text: it is the compiled prefix plus the instance
@@ -175,8 +218,11 @@ struct Worker {
     kill_sent: bool,
     /// Whether a bounded terminate already settled this handle.
     settled: bool,
-    /// Bytes drained from the PTY. Content is discarded in this slice because
-    /// no content read method is served; the counter proves the plane drains.
+    /// Whether this kind owns a terminal content plane (`kind: terminal`).
+    content_enabled: bool,
+    /// Bounded PTY output retained for `session.read` / `session.subscribe`.
+    content: ContentBuffer,
+    /// Bytes drained from the PTY over the handle's lifetime.
     drained_bytes: u64,
 }
 
@@ -197,6 +243,24 @@ impl std::fmt::Debug for WorkerPool {
             .debug_struct("WorkerPool")
             .field("served", &WORKER_SESSIONS_SERVED)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        // A pool that is dropped while a handle is still live (an abnormal
+        // service teardown, a test fixture) must not leak a child. The bounded
+        // terminate path reaps the leader and drains the recorded identity.
+        #[cfg(target_os = "linux")]
+        {
+            let session_ids: Vec<SessionId> = self.workers.keys().copied().collect();
+            for session_id in session_ids {
+                if let Some(mut worker) = self.workers.remove(&session_id) {
+                    worker.settled = true;
+                    let _ = worker.child.terminate(self.limits);
+                }
+            }
+        }
     }
 }
 
@@ -284,6 +348,7 @@ impl WorkerPool {
         instance: DaemonInstanceId,
         session_id: SessionId,
         spec: &SpawnSpec,
+        kind: SessionKind,
     ) -> Result<crate::orphan::identity::ProcessIdentity, WorkerSpawnError> {
         let name = cgroup_name(instance, session_id);
         let mut pty = PtyCommand::build(spec)?;
@@ -320,6 +385,8 @@ impl WorkerPool {
                 term_sent: false,
                 kill_sent: false,
                 settled: false,
+                content_enabled: kind == SessionKind::Terminal,
+                content: ContentBuffer::new(),
                 drained_bytes: 0,
             },
         );
@@ -338,6 +405,7 @@ impl WorkerPool {
         _instance: crate::registry::DaemonInstanceId,
         _session_id: crate::registry::SessionId,
         _spec: &crate::spawn::SpawnSpec,
+        _kind: crate::registry::SessionKind,
     ) -> Result<crate::orphan::identity::ProcessIdentity, WorkerSpawnError> {
         Err(WorkerSpawnError::Unsupported)
     }
@@ -369,6 +437,59 @@ impl WorkerPool {
         Err(ResizeError::NotBound)
     }
 
+    /// Take buffered terminal output for `session.read` / `session.subscribe`.
+    ///
+    /// Returns `None` when this session owns no live terminal content plane: an
+    /// unbound session, a worker-kind session (a service process, not a
+    /// terminal), or a handle removed after exit. A live terminal with an empty
+    /// buffer is `Some` with zero bytes, so the caller can distinguish "no data
+    /// yet" from "not running".
+    #[cfg(target_os = "linux")]
+    pub fn read(&mut self, session_id: SessionId, max_bytes: usize) -> Option<ContentRead> {
+        let worker = self.workers.get_mut(&session_id)?;
+        if !worker.content_enabled || worker.exit.is_some() {
+            return None;
+        }
+        let data = worker.content.pop(max_bytes);
+        Some(ContentRead {
+            data,
+            buffered_bytes: worker.content.len(),
+        })
+    }
+
+    /// Non-served cells have no terminal content plane.
+    #[cfg(not(target_os = "linux"))]
+    pub fn read(
+        &mut self,
+        _session_id: crate::registry::SessionId,
+        _max_bytes: usize,
+    ) -> Option<ContentRead> {
+        None
+    }
+
+    /// Write terminal input to the owned PTY, never blocking.
+    ///
+    /// A full PTY input buffer is [`ContentWrite::Backpressure`] with nothing
+    /// written; a partial write is [`ContentWrite::Accepted`] with the caller's
+    /// remaining tail. The daemon keeps no write queue, so a slow child cannot
+    /// grow memory or stall the poll loop.
+    #[cfg(target_os = "linux")]
+    pub fn write(&mut self, session_id: SessionId, data: &[u8]) -> ContentWrite {
+        let Some(worker) = self.workers.get_mut(&session_id) else {
+            return ContentWrite::Closed;
+        };
+        if !worker.content_enabled || worker.exit.is_some() {
+            return ContentWrite::Closed;
+        }
+        classify_write(worker.master.write(data), data.len())
+    }
+
+    /// Non-served cells have no writable content plane.
+    #[cfg(not(target_os = "linux"))]
+    pub fn write(&mut self, _session_id: crate::registry::SessionId, _data: &[u8]) -> ContentWrite {
+        ContentWrite::Closed
+    }
+
     /// Drain every worker's PTY and supervise exits and stop deadlines.
     ///
     /// This is the poll-loop entry point: no call waits for a running worker.
@@ -395,6 +516,14 @@ impl WorkerPool {
         // never adopts one and this finds nothing.
         crate::containment::drain_adopted_children();
         let session_ids: Vec<SessionId> = self.workers.keys().copied().collect();
+        // One bounded tick budget shared across every live worker. Dividing it
+        // evenly keeps a continuously writing session from starving the rest;
+        // an unused share is not redistributed, so the total never exceeds one
+        // `max_chunk_bytes` per pass.
+        let per_worker_budget = DRAIN_BUDGET_BYTES
+            .checked_div(session_ids.len().max(1))
+            .unwrap_or(DRAIN_BUDGET_BYTES)
+            .clamp(1, DRAIN_BUDGET_BYTES);
         for session_id in session_ids {
             let mut collected: Option<CleanupClass> = None;
             let mut terminal: Option<(ExitObservation, CleanupClass)> = None;
@@ -402,7 +531,7 @@ impl WorkerPool {
                 let Some(worker) = self.workers.get_mut(&session_id) else {
                     continue;
                 };
-                worker.drain();
+                worker.drain(per_worker_budget);
                 if worker.exit.is_none() && worker.child.leader_exited() {
                     // The leader is an unreaped zombie: its pid, and therefore
                     // the recorded process-group id, cannot be reused. Signal
@@ -520,17 +649,54 @@ impl WorkerPool {
     }
 }
 
+/// Classify one non-blocking PTY write result.
+///
+/// `Ok(0)`, `WouldBlock`, and `Interrupted` are the backpressure paths: nothing
+/// was accepted, so the caller gets the typed `ChannelFull` refusal and retries
+/// later. A partial `Ok(n)` is a success with the caller's tail; any other
+/// error means the PTY is gone.
+#[cfg(target_os = "linux")]
+fn classify_write(result: io::Result<usize>, attempted: usize) -> ContentWrite {
+    match result {
+        Ok(0) => ContentWrite::Backpressure { attempted },
+        Ok(accepted) => ContentWrite::Accepted {
+            accepted,
+            attempted,
+        },
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) =>
+        {
+            ContentWrite::Backpressure { attempted }
+        }
+        Err(_) => ContentWrite::Closed,
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl Worker {
-    fn drain(&mut self) {
+    fn drain(&mut self, mut budget: usize) {
         let mut buffer = [0u8; 4096];
-        let mut budget = DRAIN_BUDGET_BYTES;
         while budget > 0 {
-            let want = budget.min(buffer.len());
+            if self.content_enabled && self.content.is_full() {
+                // The reader is behind: leave the remainder in the PTY so the
+                // child sees terminal backpressure instead of unbounded memory
+                // growth inside the daemon.
+                break;
+            }
+            let want = budget
+                .min(buffer.len())
+                .min(self.content.remaining_capacity().max(1));
             match self.master.read(&mut buffer[..want]) {
                 Ok(0) => break,
                 Ok(read) => {
                     self.drained_bytes = self.drained_bytes.saturating_add(read as u64);
+                    if self.content_enabled {
+                        let accepted = self.content.push(&buffer[..read]);
+                        debug_assert_eq!(accepted, read, "the drain bound respects the buffer cap");
+                    }
                     budget -= read;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -652,26 +818,46 @@ fn observation(status: ExitStatus) -> ExitObservation {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use std::io::{Seek as _, SeekFrom, Write as _};
+    use std::io::{Seek as _, SeekFrom};
     use std::time::{Duration, Instant};
 
     use serde_json::json;
 
     use super::*;
     use crate::containment::ContainmentReport;
+    use crate::content::CONTENT_FRAME_BYTES;
     use crate::limits::Limits;
-    use crate::registry::{DaemonInstanceId, SessionId};
+    use crate::registry::{DaemonInstanceId, SessionId, SessionKind};
 
-    /// Spawn one live worker through the production path.
+    /// Spawn one live terminal worker through the production path.
     fn spawn_test_worker(limits: &Limits, argv: &[&str]) -> (WorkerPool, SessionId) {
-        spawn_test_worker_with_env(limits, argv, &[])
+        spawn_test_worker_for(limits, argv, SessionKind::Terminal)
     }
 
-    /// Spawn one live worker with an explicit child environment.
+    /// Spawn one live terminal worker with an explicit child environment.
     fn spawn_test_worker_with_env(
         limits: &Limits,
         argv: &[&str],
         env: &[&str],
+    ) -> (WorkerPool, SessionId) {
+        spawn_test_worker_env_for(limits, argv, env, SessionKind::Terminal)
+    }
+
+    /// Spawn one live worker of `kind` through the production path.
+    fn spawn_test_worker_for(
+        limits: &Limits,
+        argv: &[&str],
+        kind: SessionKind,
+    ) -> (WorkerPool, SessionId) {
+        spawn_test_worker_env_for(limits, argv, &[], kind)
+    }
+
+    /// Spawn one live worker of `kind` with an explicit child environment.
+    fn spawn_test_worker_env_for(
+        limits: &Limits,
+        argv: &[&str],
+        env: &[&str],
+        kind: SessionKind,
     ) -> (WorkerPool, SessionId) {
         let report = ContainmentReport::probe();
         let fields = json!({ "argv": argv, "env": env, "cwd": "/" })
@@ -689,6 +875,7 @@ mod tests {
             DaemonInstanceId::generate().expect("an instance id"),
             session,
             &spec,
+            kind,
         )
         .expect("the test worker must spawn");
         (pool, session)
@@ -721,7 +908,7 @@ mod tests {
     }
 
     #[test]
-    fn one_tick_drains_at_most_the_budget_and_resumes_next_tick() {
+    fn one_tick_drains_at_most_the_budget_and_resumes_after_a_read() {
         let limits = Limits::default();
         let (mut pool, session) = spawn_test_worker(&limits, &["/bin/sleep", "60"]);
 
@@ -739,16 +926,30 @@ mod tests {
 
         let worker = pool.workers.get_mut(&session).expect("the bound worker");
         worker.master = master;
-        worker.drain();
+        worker.drain(DRAIN_BUDGET_BYTES);
         assert_eq!(
             worker.drained_bytes, DRAIN_BUDGET_BYTES as u64,
             "one tick must stop at the per-worker byte budget"
         );
-        worker.drain();
+        assert_eq!(
+            worker.content.len(),
+            crate::content::CONTENT_BUFFER_BYTES,
+            "the tick fills the bounded content buffer"
+        );
+        // The buffer is full, so a second tick makes no progress: that is the
+        // terminal backpressure path, not unbounded buffering.
+        worker.drain(DRAIN_BUDGET_BYTES);
+        assert_eq!(worker.drained_bytes, DRAIN_BUDGET_BYTES as u64);
+
+        // A reader that takes half the buffer re-opens exactly that much for
+        // the next tick; the tick still stops at the budget.
+        let read = worker.content.pop(CONTENT_FRAME_BYTES);
+        assert_eq!(read.len(), CONTENT_FRAME_BYTES);
+        worker.drain(DRAIN_BUDGET_BYTES);
         assert_eq!(
             worker.drained_bytes,
-            (DRAIN_BUDGET_BYTES * 2) as u64,
-            "the next tick must resume the queued producer"
+            (DRAIN_BUDGET_BYTES + CONTENT_FRAME_BYTES) as u64,
+            "the next tick must resume the queued producer after a read"
         );
 
         let _ = pool.terminate(session);
@@ -885,6 +1086,78 @@ mod tests {
             );
         }
 
+        let _ = pool.terminate(session);
+    }
+
+    #[test]
+    fn a_zero_or_blocked_write_is_the_typed_backpressure_path() {
+        assert_eq!(
+            classify_write(Ok(0), 8),
+            ContentWrite::Backpressure { attempted: 8 }
+        );
+        assert_eq!(
+            classify_write(Err(io::Error::from(io::ErrorKind::WouldBlock)), 8),
+            ContentWrite::Backpressure { attempted: 8 }
+        );
+        assert_eq!(
+            classify_write(Err(io::Error::from(io::ErrorKind::Interrupted)), 8),
+            ContentWrite::Backpressure { attempted: 8 }
+        );
+        assert_eq!(
+            classify_write(Ok(3), 8),
+            ContentWrite::Accepted {
+                accepted: 3,
+                attempted: 8
+            }
+        );
+        assert_eq!(
+            classify_write(Err(io::Error::from(io::ErrorKind::BrokenPipe)), 8),
+            ContentWrite::Closed
+        );
+    }
+
+    #[test]
+    fn terminal_content_round_trips_through_read_and_write() {
+        let limits = Limits::default();
+        let (mut pool, session) = spawn_test_worker(&limits, &["/bin/cat"]);
+
+        match pool.write(session, b"hello\n") {
+            ContentWrite::Accepted { accepted, .. } => assert_eq!(accepted, 6),
+            other => panic!("the PTY must accept the small write: {other:?}"),
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while !seen.windows(7).any(|window| window == b"hello\r\n") {
+            assert!(
+                Instant::now() < deadline,
+                "the PTY did not echo the input; seen {seen:?}"
+            );
+            pool.workers
+                .get_mut(&session)
+                .expect("the live worker")
+                .drain(4096);
+            if let Some(read) = pool.read(session, 64) {
+                seen.extend_from_slice(&read.data);
+            } else {
+                panic!("the live terminal must have a content plane");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let _ = pool.terminate(session);
+    }
+
+    #[test]
+    fn a_worker_kind_has_no_terminal_content_plane() {
+        let limits = Limits::default();
+        let (mut pool, session) =
+            spawn_test_worker_for(&limits, &["/bin/cat"], SessionKind::Worker);
+        assert!(pool.read(session, 16).is_none());
+        assert_eq!(
+            pool.write(session, b"x"),
+            ContentWrite::Closed,
+            "a service worker is not a terminal content owner"
+        );
         let _ = pool.terminate(session);
     }
 }

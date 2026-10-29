@@ -4,8 +4,8 @@
 //! stream, the compiled limits with their idempotency and audit stores, the
 //! endpoint, instance-lock, and peer-trust primitives, the attach/control
 //! state machine, Linux process containment with a served orphan verifier,
-//! and the worker spawn/bind and resize content plane**. This crate fixes the
-//! service version, the capability set,
+//! the process spawn/bind path, and the terminal content plane**. This crate
+//! fixes the service version, the capability set,
 //! and the version negotiation required by the accepted [`bittyd` Session-Host
 //! Contract]. It implements the registry half of bitty#2601 (server-generated
 //! ids, session records, counters, retention), the bounded orphan journal, the
@@ -51,7 +51,7 @@
 //!
 //! # Frozen here
 //!
-//! - [`contract::SERVICE_API_VERSION`]: service API `1.2` with minimum client
+//! - [`contract::SERVICE_API_VERSION`]: service API `1.3` with minimum client
 //!   minor `0` (contract D-11).
 //! - [`contract::CAPABILITIES`]: `terminal_sessions`, `worker_sessions`
 //!   (compiled for the cell and narrowed to the probed containment plan),
@@ -94,12 +94,22 @@
 //!   cleanup claim, and typed refusals on every other cell (`D-06`, `D-15`).
 //! - [`orphan::OrphanSupervisor`]: the served `daemon.orphans.verify`
 //!   implementation; counts by class, no pid, idempotent (`D-06`).
+//! - [`content`]: the bounded terminal byte buffer, the hex codec, and the
+//!   content-frame budget (`D-10`, `D-14`).
+//!
+//! A `session.create kind: terminal` with the bounded spawn specification
+//! spawns through the same contained path as `kind: worker` and binds
+//! generation 1; without a specification it keeps the `1.2` registry-only
+//! `created` shape. `session.read`, `session.write`, and `session.subscribe`
+//! serve the terminal content plane under the controller lease; a worker is a
+//! service process and has no terminal content plane.
 //!
 //! # Deferred, by owning slice
 //!
 //! | Contract area | Owner | Answer today |
 //! | --- | --- | --- |
-//! | Terminal-session PTY spawn and content plane | bitty#2790 follow-up | `session.create kind: worker` spawns and binds generation 1 on a served cell; a terminal-session create still registers `created` without a process |
+//! | Terminal content authority for observers | contract follow-up | content is controller-only; an observer with `terminal.inspect` is `Denied/ControllerRequired` |
+//! | Worker-kind content reads/writes | bitty#2790 follow-up | a worker owns a PTY for resize only; content methods answer `Denied/NotRunning` |
 //! | Worker rebind/restart and executable policy | bitty#2790 follow-up | a restarted daemon does not re-attach a worker; the executable allowlist is not enforced |
 //! | Per-connection refusal-audit aggregation | bitty#2603 follow-up | wire-level refusals are budgeted and aggregated; method refusals remain one individual record each |
 //! | Conformance corpus and fake-server parity | bitty#2605 | `tests/harness` corpus, fake and real drivers, parity gate; every shared vector is compared, with no recorded known defect |
@@ -113,6 +123,7 @@ pub mod audit_sink;
 pub mod cli;
 pub mod codes;
 pub mod containment;
+pub mod content;
 pub mod contract;
 pub mod endpoint;
 pub mod events;

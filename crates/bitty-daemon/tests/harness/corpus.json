@@ -50,7 +50,7 @@
             "result": {
               "wire_version": 1,
               "service_api_version.major": 1,
-              "service_api_version.minor": 2,
+              "service_api_version.minor": 3,
               "service_api_version.min_client_minor": 0,
               "daemon_state": "running",
               "capabilities.worker_sessions": "@worker_sessions",
@@ -69,6 +69,8 @@
                 "session.inspect",
                 "session.attach",
                 "session.control",
+                "terminal.inspect",
+                "terminal.input",
                 "terminal.manage",
                 "process.spawn"
               ]
@@ -155,7 +157,7 @@
           "params": {
             "client_version": {
               "major": 1,
-              "minor": 3
+              "minor": 4
             }
           },
           "expect": {
@@ -4736,6 +4738,8 @@
                 "session.host",
                 "session.attach",
                 "session.control",
+                "terminal.inspect",
+                "terminal.input",
                 "terminal.manage",
                 "process.spawn"
               ]
@@ -4778,6 +4782,8 @@
                 "session.inspect",
                 "session.attach",
                 "session.control",
+                "terminal.inspect",
+                "terminal.input",
                 "terminal.manage",
                 "process.spawn"
               ]
@@ -8795,7 +8801,7 @@
           "expect": {
             "ok": true,
             "result": {
-              "service_api_version.minor": 2
+              "service_api_version.minor": 3
             }
           }
         },
@@ -8858,6 +8864,8 @@
                 "session.host",
                 "session.attach",
                 "session.control",
+                "terminal.inspect",
+                "terminal.input",
                 "terminal.manage",
                 "process.spawn"
               ]
@@ -8936,6 +8944,8 @@
                 "session.inspect",
                 "session.attach",
                 "session.control",
+                "terminal.inspect",
+                "terminal.input",
                 "terminal.manage",
                 "process.spawn"
               ]
@@ -9094,6 +9104,881 @@
         "no owner path, command line, argv, or content in any response",
         "no attach id is exposed as controller presence",
         "no terminal session serves a pending grant count"
+      ]
+    },
+    {
+      "id": "V-45",
+      "title": "A terminal create with a spawn specification binds generation one and serves bounded input",
+      "area": "content",
+      "decisions": [
+        "D-01",
+        "D-03"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v45-create",
+            "argv": [
+              "/bin/cat"
+            ],
+            "cwd": "@cwd",
+            "cols": 100,
+            "rows": 30
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.kind": "terminal",
+              "session.state": "running",
+              "session.generation": 1,
+              "session.state_revision": 1,
+              "session.attach_count": 0,
+              "replayed": false
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 1,
+            "control_token": "@create_token",
+            "idempotency_key": "v45-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller",
+              "session.generation": 1,
+              "session.state_revision": 2
+            },
+            "hex_len": {
+              "attach_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.read",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session_id": "@session_id",
+              "generation": 1,
+              "bytes": 0,
+              "data": "",
+              "buffered_bytes": 0
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.read",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "StaleGeneration"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.write",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "data": "6869"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session_id": "@session_id",
+              "generation": 1,
+              "accepted": 2,
+              "remaining": 0,
+              "backpressure": false
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.kind": "terminal",
+              "session.state": "running",
+              "session.generation": 1,
+              "session.attach_count": 1,
+              "session.state_revision": 2
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a spawned terminal is exposed before generation 1 binds",
+        "a content read or write skips the generation fence",
+        "a worker-only create path is reused for a terminal"
+      ],
+      "requires": [
+        "worker_sessions"
+      ]
+    },
+    {
+      "id": "V-46",
+      "title": "Terminal content is controller-only: an observer lease is never a content grant",
+      "area": "content",
+      "decisions": [
+        "D-07",
+        "D-09"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v46-create",
+            "argv": [
+              "/bin/cat"
+            ],
+            "cwd": "@cwd"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 1,
+            "control_token": "@create_token",
+            "idempotency_key": "v46-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller"
+            },
+            "hex_len": {
+              "attach_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.grant",
+          "params": {
+            "session_id": "@session_id",
+            "idempotency_key": "v46-grant"
+          },
+          "capture": {
+            "observer_grant": "grant"
+          },
+          "expect": {
+            "ok": true,
+            "hex_len": {
+              "grant_id": 32,
+              "grant": 64
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            }
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "observer",
+            "session_id": "@session_id",
+            "observer_grant": "@observer_grant"
+          },
+          "capture": {
+            "observer_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "observer"
+            }
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.read",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ControllerRequired"
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.write",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "data": "00"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ControllerRequired"
+          }
+        },
+        {
+          "connection": "observer",
+          "method": "session.subscribe",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "ControllerRequired"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.read",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "bytes": 0
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.attach_count": 2,
+              "session.generation": 1
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "an observer reads or writes terminal content",
+        "the observer grant itself grants content",
+        "a content refusal echoes bytes"
+      ],
+      "requires": [
+        "worker_sessions"
+      ]
+    },
+    {
+      "id": "V-47",
+      "title": "A terminal subscription requires the event opt-in and the controller lease",
+      "area": "content",
+      "decisions": [
+        "D-10",
+        "D-07"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v47-create",
+            "argv": [
+              "/bin/cat"
+            ],
+            "cwd": "@cwd"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 1,
+            "control_token": "@create_token",
+            "idempotency_key": "v47-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller"
+            },
+            "hex_len": {
+              "attach_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.subscribe",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "UnsupportedCapability"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.subscribe",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "StaleGeneration"
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a connection that did not opt in receives a content frame",
+        "an observer or stale generation starts a subscription",
+        "subscription succeeds without a live controller lease"
+      ],
+      "requires": [
+        "worker_sessions"
+      ]
+    },
+    {
+      "id": "V-48",
+      "title": "A registry-only terminal create keeps the 1.2 shape and serves no content",
+      "area": "content",
+      "decisions": [
+        "D-01",
+        "D-18"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v48-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.kind": "terminal",
+              "session.state": "created",
+              "session.generation": 0,
+              "session.state_revision": 0
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "session.terminal_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.read",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "NotFound",
+            "error_code": "NotFound"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.write",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0,
+            "data": "00"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "NotFound",
+            "error_code": "NotFound"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "v48-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller",
+              "session.state_revision": 1
+            },
+            "hex_len": {
+              "attach_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.read",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 0
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "NotRunning"
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0,
+              "session.attach_count": 1
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a registry-only terminal owns a PTY or content plane",
+        "the compatibility path skips consent or the create-key store",
+        "a content method invents a generation for an unbound terminal"
+      ]
+    },
+    {
+      "id": "V-49",
+      "title": "A spawned terminal delivers content frames on the event wire",
+      "area": "content",
+      "decisions": [
+        "D-10",
+        "D-04"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "fake_skip": "requires-real-pty (the reference fake models an echo buffer, not the asynchronous event wire)",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "host_grant": "@host_grant",
+            "events": true
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v49-create",
+            "argv": [
+              "/bin/cat"
+            ],
+            "cwd": "@cwd"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 1,
+            "control_token": "@create_token",
+            "idempotency_key": "v49-claim"
+          },
+          "capture": {
+            "controller_attach": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller"
+            },
+            "hex_len": {
+              "attach_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.subscribe",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "subscribed": true,
+              "already_subscribed": false
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.write",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "data": "6869"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "accepted": 2,
+              "backpressure": false
+            }
+          }
+        },
+        {
+          "action": "read_events",
+          "connection": "creator",
+          "args": {
+            "count": 1
+          },
+          "expect": {
+            "result": {
+              "kind": "session_content",
+              "generation": 1,
+              "session_id": "@session_id",
+              "attach_id": "@controller_attach"
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "creator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "running",
+              "session.generation": 1
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "content frames are not ordered on the negotiated connection",
+        "a content frame carries a pid, path, argv, or environment",
+        "the fake claims real PTY evidence"
+      ],
+      "requires": [
+        "worker_sessions"
       ]
     }
   ]

@@ -194,7 +194,7 @@ impl Client {
         // SO_PASSCRED; a client that skips this is refused as Unauthenticated.
         bitty_daemon::service::frame::enable_credentials(&stream).expect("per-frame credentials");
         stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("read timeout");
         Self { stream, next_id: 1 }
     }
@@ -318,7 +318,12 @@ fn controlled_session(root: &TempRoot, operator: &mut Client, label: &str) -> Co
     assert_eq!(creator.negotiate_with(None, Some(&host_grant))["ok"], true);
     let created = creator.call(
         "session.create",
-        json!({"kind": "terminal", "idempotency_key": format!("{label}-create")}),
+        json!({
+            "kind": "terminal",
+            "idempotency_key": format!("{label}-create"),
+            "argv": ["/bin/cat"],
+            "cwd": "/",
+        }),
     );
     assert_eq!(created["ok"], true, "{created}");
     let session_id = created["result"]["session"]["session_id"]
@@ -335,7 +340,7 @@ fn controlled_session(root: &TempRoot, operator: &mut Client, label: &str) -> Co
         json!({
             "attach_role": "controller",
             "session_id": session_id,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "control_token": create_token,
             "idempotency_key": format!("{label}-claim"),
         }),
@@ -384,6 +389,31 @@ fn operator_revision(operator: &mut Client, session_id: &str) -> u64 {
     status["result"]["session"]["state_revision"]
         .as_u64()
         .expect("state revision")
+}
+
+/// Wait for the supervisor's terminal transition and return the frozen
+/// snapshot.
+///
+/// A bound terminal process stops asynchronously: `session.abort` answers
+/// `accepted` in `stopping`, and the terminal transition lands on a later
+/// `supervise` pass after the contained tree is settled.
+fn wait_for_terminal(operator: &mut Client, session_id: &str) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let status = operator.call("session.status", json!({"session_id": session_id}));
+        assert_eq!(status["ok"], true, "{status}");
+        let state = status["result"]["session"]["state"]
+            .as_str()
+            .expect("session state");
+        if matches!(state, "exited" | "failed" | "terminated") {
+            return status["result"]["session"].clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the terminal transition never landed: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 /// Mint an observer grant as the controller and attach a fresh observer.
@@ -510,10 +540,12 @@ fn start_serves_the_endpoint_and_never_opens_a_tcp_listener() {
             "session.inspect",
             "session.attach",
             "session.control",
+            "terminal.inspect",
+            "terminal.input",
             "terminal.manage",
             "process.spawn",
         ],
-        "the baseline is the three session scopes plus terminal.manage and process.spawn"
+        "the baseline is the three session scopes plus the three terminal scopes and process.spawn"
     );
     assert!(
         !scopes
@@ -690,7 +722,7 @@ fn closing_refusals_flush_the_frame_and_then_close() {
     let mut before = Client::connect(&root.endpoint());
     let refused = before.call(
         "session.create",
-        json!({"kind": "terminal", "idempotency_key": "before"}),
+        json!({"kind": "terminal", "idempotency_key": "before", "argv": ["/bin/cat"], "cwd": "/"}),
     );
     assert_eq!(refused["ok"], false);
     assert_eq!(refused["error"]["code"], "AlreadyNegotiated");
@@ -1247,7 +1279,7 @@ fn a_stopping_daemon_refuses_a_pipelined_create() {
         ("daemon.stop", json!({"mode": "force"})),
         (
             "session.create",
-            json!({"kind": "terminal", "idempotency_key": "pipelined"}),
+            json!({"kind": "terminal", "idempotency_key": "pipelined", "argv": ["/bin/cat"], "cwd": "/"}),
         ),
     ]);
     let stopped = client.recv();
@@ -1407,7 +1439,7 @@ fn the_keyed_attach_and_control_flow_is_reachable_over_the_wire() {
     // session.create
     let created = creator.call(
         "session.create",
-        json!({"kind": "terminal", "idempotency_key": "flow-create"}),
+        json!({"kind": "terminal", "idempotency_key": "flow-create", "argv": ["/bin/cat"], "cwd": "/"}),
     );
     assert_eq!(created["ok"], true, "{created}");
     let session_id = created["result"]["session"]["session_id"]
@@ -1425,7 +1457,7 @@ fn the_keyed_attach_and_control_flow_is_reachable_over_the_wire() {
         json!({
             "attach_role": "controller",
             "session_id": session_id,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "control_token": create_token,
             "idempotency_key": "flow-claim",
         }),
@@ -1477,7 +1509,7 @@ fn the_keyed_attach_and_control_flow_is_reachable_over_the_wire() {
         json!({
             "session_id": session_id,
             "attach_id": observer_attach,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "idempotency_key": "flow-transfer",
         }),
     );
@@ -1530,17 +1562,17 @@ fn a_repeat_own_detach_is_the_idempotent_not_attached_acknowledgement() {
         controller_attach,
         ..
     } = controlled_session(&root, &mut operator, "repeat");
-    assert_eq!(operator_revision(&mut operator, &session_id), 1);
+    assert_eq!(operator_revision(&mut operator, &session_id), 2);
 
     let detached = creator.call("session.detach", json!({"attach_id": controller_attach}));
     assert_eq!(detached["ok"], true, "{detached}");
     assert_eq!(detached["result"]["was_attached"], true, "{detached}");
     assert_eq!(detached["result"]["not_attached"], false, "{detached}");
     assert_eq!(
-        detached["result"]["session"]["state_revision"], 2,
+        detached["result"]["session"]["state_revision"], 3,
         "{detached}"
     );
-    assert_eq!(operator_revision(&mut operator, &session_id), 2);
+    assert_eq!(operator_revision(&mut operator, &session_id), 3);
 
     // The repeat is idempotent for as long as the connection remembers the
     // handle: the same acknowledgement, the same revision, and no lease.
@@ -1552,8 +1584,8 @@ fn a_repeat_own_detach_is_the_idempotent_not_attached_acknowledgement() {
         assert_eq!(repeat["result"]["revoked"], false, "{repeat}");
         assert_eq!(repeat["result"]["attach_id"], controller_attach.as_str());
         assert_eq!(repeat["result"]["session"]["attach_count"], 0, "{repeat}");
-        assert_eq!(repeat["result"]["session"]["state_revision"], 2, "{repeat}");
-        assert_eq!(operator_revision(&mut operator, &session_id), 2);
+        assert_eq!(repeat["result"]["session"]["state_revision"], 3, "{repeat}");
+        assert_eq!(operator_revision(&mut operator, &session_id), 3);
     }
 
     // No resurrection: the handle names no live lease, so a heartbeat is the
@@ -1696,8 +1728,8 @@ fn grant_mint_consume_and_revoke_each_bump_the_state_revision() {
         session_id,
         ..
     } = controlled_session(&root, &mut operator, "grant-revision");
-    // create -> 0, controller attach -> 1.
-    assert_eq!(operator_revision(&mut operator, &session_id), 1);
+    // bind -> 1, controller attach -> 2.
+    assert_eq!(operator_revision(&mut operator, &session_id), 2);
 
     let minted = creator.call(
         "session.grant",
@@ -1709,7 +1741,7 @@ fn grant_mint_consume_and_revoke_each_bump_the_state_revision() {
         .expect("observer grant")
         .to_owned();
     // The mint is its own snapshot-visible mutation.
-    assert_eq!(operator_revision(&mut operator, &session_id), 2);
+    assert_eq!(operator_revision(&mut operator, &session_id), 3);
 
     let mut observer = Client::connect(&root.endpoint());
     assert_eq!(observer.negotiate(None)["ok"], true);
@@ -1725,10 +1757,10 @@ fn grant_mint_consume_and_revoke_each_bump_the_state_revision() {
     // The consume and the attach each bump once, and the reply carries the
     // post-mutation snapshot.
     assert_eq!(
-        attached["result"]["session"]["state_revision"], 4,
+        attached["result"]["session"]["state_revision"], 5,
         "{attached}"
     );
-    assert_eq!(operator_revision(&mut operator, &session_id), 4);
+    assert_eq!(operator_revision(&mut operator, &session_id), 5);
     let observer_attach = attached["result"]["attach_id"]
         .as_str()
         .expect("observer attach")
@@ -1737,7 +1769,7 @@ fn grant_mint_consume_and_revoke_each_bump_the_state_revision() {
     // A heartbeat is never a mutation.
     let heartbeat = observer.call("lease.heartbeat", json!({"attach_id": observer_attach}));
     assert_eq!(heartbeat["ok"], true, "{heartbeat}");
-    assert_eq!(operator_revision(&mut operator, &session_id), 4);
+    assert_eq!(operator_revision(&mut operator, &session_id), 5);
 
     // A keyed replay of the consumed mint changes nothing either.
     let replay = creator.call(
@@ -1746,9 +1778,9 @@ fn grant_mint_consume_and_revoke_each_bump_the_state_revision() {
     );
     assert_eq!(replay["ok"], true, "{replay}");
     assert_eq!(replay["result"]["replayed"], true, "{replay}");
-    assert_eq!(operator_revision(&mut operator, &session_id), 4);
+    assert_eq!(operator_revision(&mut operator, &session_id), 5);
 
-    // Mint -> 5, revoke -> 6, and a second revoke is the idempotent no-op.
+    // Mint -> 6, revoke -> 7, and a second revoke is the idempotent no-op.
     let pending = creator.call(
         "session.grant",
         json!({"session_id": session_id, "idempotency_key": "gr-mint-2"}),
@@ -1758,28 +1790,28 @@ fn grant_mint_consume_and_revoke_each_bump_the_state_revision() {
         .as_str()
         .expect("grant id")
         .to_owned();
-    assert_eq!(operator_revision(&mut operator, &session_id), 5);
+    assert_eq!(operator_revision(&mut operator, &session_id), 6);
 
     let revoked = creator.call("session.grant.revoke", json!({"grant_id": pending_id}));
     assert_eq!(revoked["ok"], true, "{revoked}");
     assert_eq!(revoked["result"]["revoked"], true, "{revoked}");
     assert_eq!(revoked["result"]["not_active"], false, "{revoked}");
-    assert_eq!(operator_revision(&mut operator, &session_id), 6);
+    assert_eq!(operator_revision(&mut operator, &session_id), 7);
 
     let again = creator.call("session.grant.revoke", json!({"grant_id": pending_id}));
     assert_eq!(again["ok"], true, "{again}");
     assert_eq!(again["result"]["revoked"], false, "{again}");
     assert_eq!(again["result"]["not_active"], true, "{again}");
-    assert_eq!(operator_revision(&mut operator, &session_id), 6);
+    assert_eq!(operator_revision(&mut operator, &session_id), 7);
 
     // The detach still lands as one ordered bump after the grant mutations.
     let detached = observer.call("session.detach", json!({"attach_id": observer_attach}));
     assert_eq!(detached["ok"], true, "{detached}");
     assert_eq!(
-        detached["result"]["session"]["state_revision"], 7,
+        detached["result"]["session"]["state_revision"], 8,
         "{detached}"
     );
-    assert_eq!(operator_revision(&mut operator, &session_id), 7);
+    assert_eq!(operator_revision(&mut operator, &session_id), 8);
 
     assert_eq!(
         operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
@@ -1819,13 +1851,15 @@ fn a_grant_on_a_terminal_session_is_not_running_and_revokes_nothing() {
         "session.abort",
         json!({
             "session_id": session_id,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "reason_class": "cancel",
             "control_token": controller_token,
         }),
     );
     assert_eq!(aborted["ok"], true, "{aborted}");
-    let terminal_revision = aborted["result"]["session"]["state_revision"]
+    assert_eq!(aborted["result"]["accepted"], true, "{aborted}");
+    let terminal = wait_for_terminal(&mut operator, &session_id);
+    let terminal_revision = terminal["state_revision"]
         .as_u64()
         .expect("terminal revision");
     assert_eq!(
@@ -1918,13 +1952,14 @@ fn a_former_observer_cannot_revoke_a_grant_on_a_terminal_session() {
         "session.abort",
         json!({
             "session_id": session_id,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "reason_class": "cancel",
             "control_token": controller_token,
         }),
     );
     assert_eq!(aborted["ok"], true, "{aborted}");
-    let terminal_revision = aborted["result"]["session"]["state_revision"]
+    let terminal = wait_for_terminal(&mut operator, &session_id);
+    let terminal_revision = terminal["state_revision"]
         .as_u64()
         .expect("terminal revision");
 
@@ -1969,7 +2004,7 @@ fn a_consumed_host_grant_revoke_withdraws_create_before_the_ttl() {
     assert_eq!(handshake["ok"], true, "{handshake}");
     let created = creator.call(
         "session.create",
-        json!({"kind": "terminal", "idempotency_key": "revoke-k1"}),
+        json!({"kind": "terminal", "idempotency_key": "revoke-k1", "argv": ["/bin/cat"], "cwd": "/"}),
     );
     assert_eq!(created["ok"], true, "{created}");
 
@@ -1988,7 +2023,7 @@ fn a_consumed_host_grant_revoke_withdraws_create_before_the_ttl() {
     for key in ["revoke-k1", "revoke-k2"] {
         let refused = creator.call(
             "session.create",
-            json!({"kind": "terminal", "idempotency_key": key}),
+            json!({"kind": "terminal", "idempotency_key": key, "argv": ["/bin/cat"], "cwd": "/"}),
         );
         assert_eq!(refused["ok"], false, "{refused}");
         assert_eq!(refused["error"]["class"], "Denied", "{refused}");
@@ -2020,7 +2055,7 @@ fn a_stale_control_token_at_a_vacant_control_is_invalid_control_token() {
     assert_eq!(creator.negotiate_with(None, Some(&host_grant))["ok"], true);
     let created = creator.call(
         "session.create",
-        json!({"kind": "terminal", "idempotency_key": "ct-create"}),
+        json!({"kind": "terminal", "idempotency_key": "ct-create", "argv": ["/bin/cat"], "cwd": "/"}),
     );
     assert_eq!(created["ok"], true, "{created}");
     let session_id = created["result"]["session"]["session_id"]
@@ -2037,7 +2072,7 @@ fn a_stale_control_token_at_a_vacant_control_is_invalid_control_token() {
         json!({
             "attach_role": "controller",
             "session_id": session_id,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "control_token": create_token,
             "idempotency_key": "ct-claim",
         }),
@@ -2080,7 +2115,7 @@ fn a_stale_control_token_at_a_vacant_control_is_invalid_control_token() {
         json!({
             "session_id": session_id,
             "attach_id": observer_attach,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "idempotency_key": "ct-transfer",
         }),
     );
@@ -2107,7 +2142,7 @@ fn a_stale_control_token_at_a_vacant_control_is_invalid_control_token() {
         json!({
             "attach_role": "controller",
             "session_id": session_id,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "control_token": controller_token,
             "idempotency_key": "ct-occupied",
         }),
@@ -2128,7 +2163,7 @@ fn a_stale_control_token_at_a_vacant_control_is_invalid_control_token() {
         json!({
             "attach_role": "controller",
             "session_id": session_id,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "control_token": controller_token,
             "idempotency_key": "ct-stale",
         }),
@@ -2148,7 +2183,7 @@ fn a_stale_control_token_at_a_vacant_control_is_invalid_control_token() {
         json!({
             "attach_role": "controller",
             "session_id": unknown_session,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "control_token": "1".repeat(64),
             "idempotency_key": "ct-unknown",
         }),
@@ -2163,7 +2198,7 @@ fn a_stale_control_token_at_a_vacant_control_is_invalid_control_token() {
         json!({
             "attach_role": "controller",
             "session_id": session_id,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "control_token": rotated,
             "idempotency_key": "ct-reclaim",
         }),
@@ -2208,7 +2243,7 @@ fn every_control_method_maps_a_stale_token_at_a_vacant_control() {
         json!({
             "attach_role": "controller",
             "session_id": session_id,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "idempotency_key": "cm-attach-missing",
         }),
     );
@@ -2327,7 +2362,7 @@ fn every_control_method_maps_a_stale_token_at_a_vacant_control() {
         json!({
             "session_id": session_id,
             "attach_id": target_attach,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "control_token": create_token,
             "idempotency_key": "cm-transfer-stale",
         }),
@@ -2338,7 +2373,7 @@ fn every_control_method_maps_a_stale_token_at_a_vacant_control() {
         json!({
             "session_id": session_id,
             "attach_id": target_attach,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "control_token": controller_token,
             "idempotency_key": "cm-transfer-ok",
         }),
@@ -2416,7 +2451,7 @@ fn every_control_method_maps_a_stale_token_at_a_vacant_control() {
         "session.abort",
         json!({
             "session_id": second_session,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "reason_class": "cancel",
             "control_token": second_create_token,
         }),
@@ -2426,7 +2461,7 @@ fn every_control_method_maps_a_stale_token_at_a_vacant_control() {
         "session.abort",
         json!({
             "session_id": second_session,
-            "expected_generation": 0,
+            "expected_generation": 1,
             "reason_class": "cancel",
             "control_token": second_controller_token,
         }),
@@ -2805,6 +2840,297 @@ fn worker_resize_requires_the_controller_lease_and_bumps_the_revision() {
     );
     assert_eq!(still["ok"], true, "{still}");
     assert_eq!(still["result"]["session"]["state_revision"], before + 1);
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+/// Decode a lowercase-hex content field.
+fn decode_content(text: &str) -> Vec<u8> {
+    assert!(text.len() % 2 == 0, "content hex must be even: {text}");
+    text.as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let digit = |byte: u8| match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'a'..=b'f' => byte - b'a' + 10,
+                other => panic!("non-hex content byte {other}"),
+            };
+            (digit(pair[0]) << 4) | digit(pair[1])
+        })
+        .collect()
+}
+
+/// Create one terminal process with a caller-supplied argv, claim control, and
+/// return the creator connection plus the create result.
+fn create_terminal_process(
+    root: &TempRoot,
+    operator: &mut Client,
+    label: &str,
+    argv: Value,
+) -> (Client, Value) {
+    let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    assert_eq!(minted["ok"], true, "{minted}");
+    let host_grant = minted["result"]["grant"]
+        .as_str()
+        .expect("host grant bearer")
+        .to_owned();
+    let mut creator = Client::connect(&root.endpoint());
+    assert_eq!(creator.negotiate_with(None, Some(&host_grant))["ok"], true);
+    let created = creator.call(
+        "session.create",
+        json!({
+            "kind": "terminal",
+            "idempotency_key": format!("{label}-create"),
+            "argv": argv,
+            "cwd": "/",
+            "cols": 100,
+            "rows": 30,
+        }),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    let session_id = created["result"]["session"]["session_id"]
+        .as_str()
+        .expect("session id");
+    let claimed = creator.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 1,
+            "control_token": created["result"]["control_token"],
+            "idempotency_key": format!("{label}-claim"),
+        }),
+    );
+    assert_eq!(claimed["ok"], true, "{claimed}");
+    (creator, created)
+}
+
+#[test]
+fn terminal_content_reads_writes_and_refuses_observers_and_terminal_records() {
+    let root = TempRoot::new("content-rw");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    let ControlledSession {
+        mut creator,
+        session_id,
+        ..
+    } = controlled_session(&root, &mut operator, "content-rw");
+
+    // An empty buffer is a successful read, not an error.
+    let empty = creator.call(
+        "session.read",
+        json!({"session_id": session_id, "generation": 1}),
+    );
+    assert_eq!(empty["ok"], true, "{empty}");
+    assert_eq!(empty["result"]["bytes"], 0);
+    assert_eq!(empty["result"]["data"], "");
+
+    // A controller write reaches the PTY; `cat` echoes it back through the
+    // terminal, and the read observes the echoed bytes.
+    let write = creator.call(
+        "session.write",
+        json!({
+            "session_id": session_id,
+            "generation": 1,
+            "data": "68656c6c6f0a",
+        }),
+    );
+    assert_eq!(write["ok"], true, "{write}");
+    assert_eq!(write["result"]["accepted"], 6);
+    assert_eq!(write["result"]["backpressure"], false);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = Vec::new();
+    while !seen.windows(5).any(|window| window == b"hello") {
+        assert!(
+            Instant::now() < deadline,
+            "the terminal content read never observed the echo: {seen:?}"
+        );
+        let read = creator.call(
+            "session.read",
+            json!({"session_id": session_id, "generation": 1, "max_bytes": 4096}),
+        );
+        assert_eq!(read["ok"], true, "{read}");
+        seen.extend(decode_content(
+            read["result"]["data"].as_str().expect("content hex"),
+        ));
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The generation is a hard fence.
+    let stale = creator.call(
+        "session.read",
+        json!({"session_id": session_id, "generation": 0}),
+    );
+    assert_eq!(stale["ok"], false, "{stale}");
+    assert_eq!(stale["error"]["code"], "StaleGeneration");
+
+    // A bound terminal owns the same PTY resize plane as a bound worker.
+    let resized = creator.call(
+        "session.resize",
+        json!({"session_id": session_id, "generation": 1, "cols": 120, "rows": 40}),
+    );
+    assert_eq!(resized["ok"], true, "{resized}");
+    assert_eq!(resized["result"]["session"]["state"], "running");
+    assert_eq!(resized["result"]["session"]["generation"], 1);
+
+    // An observer lease is never a content grant.
+    let (mut observer, _attach) =
+        attach_observer(&root, &mut creator, &session_id, "content-observer");
+    for (method, params) in [
+        (
+            "session.read",
+            json!({"session_id": session_id, "generation": 1}),
+        ),
+        (
+            "session.write",
+            json!({"session_id": session_id, "generation": 1, "data": "00"}),
+        ),
+        (
+            "session.subscribe",
+            json!({"session_id": session_id, "generation": 1}),
+        ),
+    ] {
+        let refused = observer.call(method, params);
+        assert_eq!(refused["ok"], false, "{method}: {refused}");
+        assert_eq!(refused["error"]["class"], "Denied", "{method}: {refused}");
+        assert_eq!(
+            refused["error"]["code"], "ControllerRequired",
+            "{method}: {refused}"
+        );
+    }
+
+    // Content never enters audit even when the bytes are a recognizable
+    // marker; only lifecycle/refusal records are written.
+    let marker = "audit-marker-1656";
+    let marker_write = creator.call(
+        "session.write",
+        json!({
+            "session_id": session_id,
+            "generation": 1,
+            "data": "61756469742d6d61726b65722d31363536",
+        }),
+    );
+    assert_eq!(marker_write["ok"], true, "{marker_write}");
+
+    // A terminal record serves no content after the exit.
+    let aborted = creator.call(
+        "session.abort",
+        json!({
+            "session_id": session_id,
+            "expected_generation": 1,
+            "reason_class": "cancel",
+        }),
+    );
+    assert_eq!(aborted["ok"], true, "{aborted}");
+    wait_for_terminal(&mut operator, &session_id);
+    for (method, params) in [
+        (
+            "session.read",
+            json!({"session_id": session_id, "generation": 1}),
+        ),
+        (
+            "session.write",
+            json!({"session_id": session_id, "generation": 1, "data": "00"}),
+        ),
+        (
+            "session.subscribe",
+            json!({"session_id": session_id, "generation": 1}),
+        ),
+    ] {
+        let refused = creator.call(method, params);
+        assert_eq!(refused["ok"], false, "{method}: {refused}");
+        assert_eq!(
+            refused["error"]["code"], "NotRunning",
+            "{method}: {refused}"
+        );
+    }
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    let audit = std::fs::read_to_string(root.audit_log()).unwrap_or_default();
+    assert!(
+        !audit.contains(marker),
+        "terminal content entered the audit log"
+    );
+    assert!(
+        !audit.contains("68656c6c6f"),
+        "encoded terminal content entered the audit log"
+    );
+}
+
+#[test]
+fn terminal_write_backpressure_reports_the_partial_tail() {
+    let root = TempRoot::new("content-pressure");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    // `sleep` never reads stdin. The line discipline accepts only a slice of a
+    // maximal content chunk, so the daemon reports the accepted prefix and the
+    // caller's remaining tail instead of lying about a complete write.
+    let (mut creator, created) = create_terminal_process(
+        &root,
+        &mut operator,
+        "content-pressure",
+        json!(["/bin/sleep", "60"]),
+    );
+    let session_id = created["result"]["session"]["session_id"]
+        .as_str()
+        .expect("session id");
+    let chunk = "ab".repeat(64 * 1024);
+    let write = creator.call(
+        "session.write",
+        json!({"session_id": session_id, "generation": 1, "data": chunk}),
+    );
+    assert_eq!(write["ok"], true, "{write}");
+    let accepted = write["result"]["accepted"]
+        .as_u64()
+        .expect("accepted count");
+    let remaining = write["result"]["remaining"]
+        .as_u64()
+        .expect("remaining count");
+    assert!(accepted > 0, "{write}");
+    assert!(accepted < 64 * 1024, "{write}");
+    assert_eq!(remaining, 64 * 1024 - accepted, "{write}");
+    assert_eq!(write["result"]["backpressure"], true, "{write}");
+
+    let aborted = creator.call(
+        "session.abort",
+        json!({
+            "session_id": session_id,
+            "expected_generation": 1,
+            "reason_class": "cancel",
+        }),
+    );
+    assert_eq!(aborted["ok"], true, "{aborted}");
+    wait_for_terminal(&mut operator, session_id);
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn terminal_subscribe_requires_the_event_opt_in() {
+    let root = TempRoot::new("content-optin");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    // `controlled_session` negotiates without `events: true`.
+    let ControlledSession {
+        mut creator,
+        session_id,
+        ..
+    } = controlled_session(&root, &mut operator, "content-optin");
+    let refused = creator.call(
+        "session.subscribe",
+        json!({"session_id": session_id, "generation": 1}),
+    );
+    assert_eq!(refused["ok"], false, "{refused}");
+    assert_eq!(refused["error"]["code"], "UnsupportedCapability");
 
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
 }
@@ -3280,7 +3606,12 @@ mod event_wire {
     fn create_and_claim(client: &mut Client, label: &str) -> (String, String, String, Value) {
         let created = client.call(
             "session.create",
-            json!({"kind": "terminal", "idempotency_key": format!("{label}-create")}),
+            json!({
+                "kind": "terminal",
+                "idempotency_key": format!("{label}-create"),
+                "argv": ["/bin/cat"],
+                "cwd": "/",
+            }),
         );
         assert_eq!(created["ok"], true, "{created}");
         let session_id = created["result"]["session"]["session_id"]
@@ -3296,7 +3627,7 @@ mod event_wire {
             json!({
                 "attach_role": "controller",
                 "session_id": session_id,
-                "expected_generation": 0,
+                "expected_generation": 1,
                 "control_token": create_token,
                 "idempotency_key": format!("{label}-claim"),
             }),
@@ -3461,14 +3792,12 @@ mod event_wire {
             json!({
                 "session_id": session_id,
                 "reason_class": "cancel",
-                "generation": 0,
+                "generation": 1,
                 "control_token": controller_token,
             }),
         );
         assert_eq!(aborted["ok"], true, "{aborted}");
-        let terminal_revision = aborted["result"]["session"]["state_revision"]
-            .as_u64()
-            .expect("revision");
+        assert_eq!(aborted["result"]["accepted"], true, "{aborted}");
 
         // Every revision the abort advanced is delivered in order; the terminal
         // one carries the marker and is never shed.
@@ -3477,17 +3806,20 @@ mod event_wire {
             assert_eq!(event["kind"], "session_state", "{event}");
             event = recv_event(&mut creator);
         }
+        let terminal_revision = event["revision"].as_u64().expect("terminal revision");
         assert_eq!(event["terminal"], true, "{event}");
-        assert_eq!(event["revision"], terminal_revision, "{event}");
         assert_eq!(event["attach_id"], attach_id, "{event}");
         assert_eq!(event["terminal_marker"]["state"], "terminated", "{event}");
         assert_eq!(
             event["terminal_marker"]["reason"], "consumer_cancel",
             "{event}"
         );
-        assert_eq!(
-            event["terminal_marker"]["cleanup"], "not_started",
-            "{event}"
+        let cleanup = event["terminal_marker"]["cleanup"]
+            .as_str()
+            .expect("cleanup class");
+        assert!(
+            matches!(cleanup, "swept" | "unverified"),
+            "a bound terminal settles its contained tree: {cleanup}"
         );
 
         // The terminal record is visible to the reconciliation read, and the
@@ -3499,6 +3831,111 @@ mod event_wire {
             status["result"]["session"]["state_revision"], terminal_revision,
             "{status}"
         );
+
+        assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    }
+
+    #[test]
+    fn a_terminal_subscription_delivers_output_frames_on_the_event_wire() {
+        let root = TempRoot::new("events-content");
+        let daemon = Daemon::start(&root);
+        let capability = read_capability(&root);
+        let mut operator = Client::connect(&root.endpoint());
+        assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+        let (mut creator, _) = event_consumer(&root, &mut operator, "content");
+        let (session_id, attach_id, _controller_token, _) =
+            create_and_claim(&mut creator, "content");
+
+        let subscribed = creator.call(
+            "session.subscribe",
+            json!({"session_id": session_id, "generation": 1}),
+        );
+        assert_eq!(subscribed["ok"], true, "{subscribed}");
+        assert_eq!(subscribed["result"]["subscribed"], true, "{subscribed}");
+        assert_eq!(subscribed["result"]["sequence"], 0, "{subscribed}");
+
+        // A repeat subscribe is idempotent and does not reset the sequence.
+        let repeat = creator.call(
+            "session.subscribe",
+            json!({"session_id": session_id, "generation": 1}),
+        );
+        assert_eq!(repeat["ok"], true, "{repeat}");
+        assert_eq!(repeat["result"]["already_subscribed"], true, "{repeat}");
+
+        let written = creator.call(
+            "session.write",
+            json!({
+                "session_id": session_id,
+                "generation": 1,
+                "data": "7375627363726962650a",
+            }),
+        );
+        assert_eq!(written["ok"], true, "{written}");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        while !seen.windows(9).any(|window| window == b"subscribe") {
+            assert!(
+                Instant::now() < deadline,
+                "no content frame carried the echoed bytes: {seen:?}"
+            );
+            let event = recv_event(&mut creator);
+            if event["kind"] != "session_content" {
+                assert_eq!(event["kind"], "session_state", "{event}");
+                continue;
+            }
+            assert_eq!(event["session_id"], session_id, "{event}");
+            assert_eq!(event["attach_id"], attach_id, "{event}");
+            assert_eq!(event["generation"], 1, "{event}");
+            seen.extend(decode_content(event["data"].as_str().expect("content hex")));
+        }
+
+        // The terminal event ends the subscription: no content frame follows.
+        let killed = operator.call(
+            "session.kill",
+            json!({"session_id": session_id, "generation": 1}),
+        );
+        assert_eq!(killed["ok"], true, "{killed}");
+        let mut event = recv_event(&mut creator);
+        while event["kind"] != "session_terminal" {
+            assert!(
+                matches!(
+                    event["kind"].as_str(),
+                    Some("session_state" | "session_content")
+                ),
+                "{event}"
+            );
+            event = recv_event(&mut creator);
+        }
+        assert_eq!(event["terminal"], true, "{event}");
+
+        assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    }
+
+    #[test]
+    fn a_disconnected_content_subscriber_does_not_kill_the_terminal() {
+        let root = TempRoot::new("events-content-disconnect");
+        let daemon = Daemon::start(&root);
+        let capability = read_capability(&root);
+        let mut operator = Client::connect(&root.endpoint());
+        assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+        let (mut creator, _) = event_consumer(&root, &mut operator, "content-drop");
+        let (session_id, _attach_id, _controller_token, _) =
+            create_and_claim(&mut creator, "content-drop");
+        let subscribed = creator.call(
+            "session.subscribe",
+            json!({"session_id": session_id, "generation": 1}),
+        );
+        assert_eq!(subscribed["ok"], true, "{subscribed}");
+
+        // Dropping the controller connection releases the lease and the
+        // subscription; the terminal process itself is not killed or leaked.
+        drop(creator);
+        wait_for_no_lease(&mut operator, &session_id);
+        let status = operator_session(&mut operator, &session_id);
+        assert_eq!(status["state"], "running", "{status}");
 
         assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
     }
@@ -3619,7 +4056,7 @@ mod event_wire {
 
         let created = creator.call(
             "session.create",
-            json!({"kind": "terminal", "idempotency_key": "optout-create"}),
+            json!({"kind": "terminal", "idempotency_key": "optout-create", "argv": ["/bin/cat"], "cwd": "/"}),
         );
         let session_id = created["result"]["session"]["session_id"]
             .as_str()
@@ -3630,7 +4067,7 @@ mod event_wire {
             json!({
                 "attach_role": "controller",
                 "session_id": session_id,
-                "expected_generation": 0,
+                "expected_generation": 1,
                 "control_token": created["result"]["control_token"],
                 "idempotency_key": "optout-claim",
             }),
@@ -3839,7 +4276,7 @@ mod event_wire {
             json!({
                 "attach_role": "controller",
                 "session_id": session_id,
-                "expected_generation": 0,
+                "expected_generation": 1,
                 "control_token": controller_token,
                 "idempotency_key": "reclaim-reconnect",
             }),
@@ -3897,7 +4334,7 @@ mod event_wire {
             json!({
                 "session_id": session_id,
                 "target_attach_id": observer_lease,
-                "generation": 0,
+                "generation": 1,
                 "control_token": controller_token,
                 "idempotency_key": "transfer-control",
             }),
@@ -3953,7 +4390,7 @@ mod event_wire {
 
         let killed = operator.call(
             "session.kill",
-            json!({"session_id": session_id, "generation": 0}),
+            json!({"session_id": session_id, "generation": 1}),
         );
         assert_eq!(killed["ok"], true, "{killed}");
         assert_eq!(killed["result"]["accepted"], true, "{killed}");
@@ -3970,9 +4407,12 @@ mod event_wire {
             event["terminal_marker"]["reason"], "operator_abort",
             "{event}"
         );
-        assert_eq!(
-            event["terminal_marker"]["cleanup"], "not_started",
-            "{event}"
+        let cleanup = event["terminal_marker"]["cleanup"]
+            .as_str()
+            .expect("cleanup class");
+        assert!(
+            matches!(cleanup, "swept" | "unverified"),
+            "a killed terminal settles its contained tree: {cleanup}"
         );
 
         assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));

@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 
+use bitty_daemon::content::{CONTENT_FRAME_BYTES, decode_hex, encode_hex};
 use bitty_daemon::contract::CAPABILITIES;
 use bitty_daemon::handshake::{ClientCorrelation, GrantCorrelation, hex};
 use bitty_daemon::limits::{LimitId, LimitOverride, Limits};
@@ -27,10 +28,12 @@ use crate::harness::runner::{
     cell_vars,
 };
 
-const BASELINE: [&str; 5] = [
+const BASELINE: [&str; 7] = [
     "session.inspect",
     "session.attach",
     "session.control",
+    "terminal.inspect",
+    "terminal.input",
     "terminal.manage",
     "process.spawn",
 ];
@@ -96,6 +99,8 @@ struct FakeConn {
     closed: bool,
 }
 
+type ContentRefusal = (&'static str, &'static str, Option<(u64, u64)>);
+
 struct FakeSession {
     id: String,
     kind: &'static str,
@@ -115,6 +120,11 @@ struct FakeSession {
     last_seen_ms: u64,
     terminal_reason: Option<&'static str>,
     cleanup: Option<&'static str>,
+    /// Simulated terminal output retained for `session.read` and the content
+    /// event wire. The fake models an echo terminal, not a PTY.
+    content: Vec<u8>,
+    /// Whether the controller subscribed on an event-opted connection.
+    subscribed: bool,
 }
 
 #[derive(Clone)]
@@ -404,6 +414,9 @@ impl FakeDriver {
             "session.detach" => self.session_detach(connection, &params),
             "session.control.transfer" => self.session_transfer(connection, &params),
             "session.resize" => self.session_resize(connection, &params),
+            "session.read" => self.session_read(connection, &params),
+            "session.write" => self.session_write(connection, &params),
+            "session.subscribe" => self.session_subscribe(connection, &params),
             "session.abort" => self.session_abort(connection, &params),
             "session.kill" => self.session_kill(connection, &params),
             "lease.heartbeat" => self.lease_heartbeat(connection, &params),
@@ -427,7 +440,7 @@ impl FakeDriver {
             .get("client_version")
             .and_then(|value| value.get("minor"))
             .and_then(Value::as_u64);
-        if major != Some(1) || !matches!(minor, Some(0..=2)) {
+        if major != Some(1) || !matches!(minor, Some(0..=3)) {
             let outcome = self.refuse("daemon.negotiate", "Validation", "VersionMismatch", None);
             self.connection(connection).closed = true;
             return outcome;
@@ -510,7 +523,7 @@ impl FakeDriver {
             .collect();
         let value = json!({
             "wire_version": 1,
-            "service_api_version": {"major": 1, "minor": 2, "min_client_minor": 0},
+            "service_api_version": {"major": 1, "minor": 3, "min_client_minor": 0},
             "daemon_instance_id": self.instance,
             "daemon_pid": FAKE_DAEMON_PID,
             "server_identity": {
@@ -606,6 +619,8 @@ impl FakeDriver {
             "session.control",
             "daemon.inspect",
             "daemon.control",
+            "terminal.inspect",
+            "terminal.input",
             "terminal.manage",
             "process.spawn",
         ]
@@ -620,9 +635,11 @@ impl FakeDriver {
             "session.control" => 3,
             "daemon.inspect" => 4,
             "daemon.control" => 5,
-            "terminal.manage" => 6,
-            "process.spawn" => 7,
-            _ => 8,
+            "terminal.inspect" => 6,
+            "terminal.input" => 7,
+            "terminal.manage" => 8,
+            "process.spawn" => 9,
+            _ => 10,
         });
         scopes
     }
@@ -1011,7 +1028,8 @@ impl FakeDriver {
         if !bound {
             return self.refuse("session.create", "Denied", "ConsentRequired", None);
         }
-        let spec = if kind == "worker" {
+        let wants_spawn = kind == "worker" || params.get("argv").is_some();
+        let spec = if wants_spawn {
             match SpawnSpec::parse(params.as_object(), &self.limits) {
                 Ok(spec) => Some(spec),
                 Err(SpawnSpecError::Invalid) => {
@@ -1064,14 +1082,21 @@ impl FakeDriver {
         }
         let token = self.mint_token();
         let now = self.now();
-        let bound_worker = spec.is_some();
+        let bound = spec.is_some();
+        let kind: &'static str = if kind == "worker" {
+            "worker"
+        } else {
+            "terminal"
+        };
         let session = FakeSession {
             id: id.clone(),
-            kind: if bound_worker { "worker" } else { "terminal" },
+            kind,
+            content: Vec::new(),
+            subscribed: false,
             terminal_id,
-            state: if bound_worker { "running" } else { "created" },
-            generation: u64::from(bound_worker),
-            revision: u64::from(bound_worker),
+            state: if bound { "running" } else { "created" },
+            generation: u64::from(bound),
+            revision: u64::from(bound),
             controller: None,
             pending_grants: 0,
             token: token.clone(),
@@ -1152,7 +1177,7 @@ impl FakeDriver {
         if !authorized {
             return self.refuse("session.resize", "Denied", "ControllerRequired", None);
         }
-        if session.kind != "worker" || session.state != "running" {
+        if session.state != "running" || session.generation == 0 {
             return self.refuse("session.resize", "Denied", "NotRunning", None);
         }
         // `record_resize` renews the controller lease, so the fake must move
@@ -1170,6 +1195,191 @@ impl FakeDriver {
         }
         let value = Self::session_json(session);
         self.reply("session.resize", json!({"session": value}))
+    }
+
+    /// Resolve a terminal content request in the fake.
+    ///
+    /// The fake models one echo terminal per bound terminal session. Authority
+    /// order mirrors the served handler: visibility, generation, lifecycle,
+    /// kind, then the controller lease; an observer never receives content.
+    fn content_target(
+        &self,
+        connection: &str,
+        session_id: &str,
+        generation: u64,
+    ) -> Result<(), ContentRefusal> {
+        if !self.session_visible(connection, session_id, None) {
+            return Err(("NotFound", "NotFound", None));
+        }
+        let Some(session) = self.sessions.get(session_id) else {
+            return Err(("NotFound", "NotFound", None));
+        };
+        if session.generation != generation {
+            return Err((
+                "Denied",
+                "StaleGeneration",
+                Some((session.generation, session.revision)),
+            ));
+        }
+        if is_terminal(session.state) {
+            return Err(("Denied", "NotRunning", None));
+        }
+        if session.state == "stopping" {
+            return Err(("Denied", "SessionStopping", None));
+        }
+        if session.kind != "terminal" || session.generation == 0 {
+            return Err(("Denied", "NotRunning", None));
+        }
+        let now = self.now();
+        let authorized = session.controller.as_ref().is_some_and(|attach| {
+            self.conn(connection)
+                .is_some_and(|conn| conn.leases.contains(attach))
+                && session
+                    .leases
+                    .get(attach)
+                    .is_some_and(|lease| lease.role == "controller" && lease.expires_ms > now)
+        });
+        if !authorized {
+            return Err(("Denied", "ControllerRequired", None));
+        }
+        Ok(())
+    }
+
+    fn content_refusal(&mut self, method: &str, error: ContentRefusal) -> Outcome {
+        let (class, code, counts) = error;
+        match counts {
+            Some((actual, limit)) => self.refuse(method, class, code, Some((actual, limit))),
+            None => self.refuse(method, class, code, None),
+        }
+    }
+
+    fn session_read(&mut self, connection: &str, params: &Value) -> Outcome {
+        if !self.has_scope(connection, "terminal.inspect") {
+            return self.refuse("session.read", "Denied", "ScopeViolation", None);
+        }
+        let Some(session_id) = params.get("session_id").and_then(Value::as_str) else {
+            return self.refuse("session.read", "Validation", "InvalidRequest", None);
+        };
+        let Some(generation) = params.get("generation").and_then(Value::as_u64) else {
+            return self.refuse("session.read", "Validation", "InvalidRequest", None);
+        };
+        let max = params
+            .get("max_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(CONTENT_FRAME_BYTES as u64);
+        if max == 0 {
+            return self.refuse("session.read", "Validation", "InvalidRequest", None);
+        }
+        if max > CONTENT_FRAME_BYTES as u64 {
+            return self.refuse(
+                "session.read",
+                "Framing",
+                "LimitExceeded",
+                Some((max, CONTENT_FRAME_BYTES as u64)),
+            );
+        }
+        let session_id = session_id.to_owned();
+        if let Err(error) = self.content_target(connection, &session_id, generation) {
+            return self.content_refusal("session.read", error);
+        }
+        let take = usize::try_from(max)
+            .unwrap_or(CONTENT_FRAME_BYTES)
+            .min(self.sessions[&session_id].content.len());
+        let session = self.sessions.get_mut(&session_id).expect("checked");
+        let data: Vec<u8> = session.content.drain(..take).collect();
+        let buffered = session.content.len();
+        let generation = session.generation;
+        self.reply(
+            "session.read",
+            json!({
+                "session_id": session_id,
+                "generation": generation,
+                "data": encode_hex(&data),
+                "bytes": data.len(),
+                "buffered_bytes": buffered,
+            }),
+        )
+    }
+
+    fn session_write(&mut self, connection: &str, params: &Value) -> Outcome {
+        if !self.has_scope(connection, "terminal.input") {
+            return self.refuse("session.write", "Denied", "ScopeViolation", None);
+        }
+        let Some(session_id) = params.get("session_id").and_then(Value::as_str) else {
+            return self.refuse("session.write", "Validation", "InvalidRequest", None);
+        };
+        let Some(generation) = params.get("generation").and_then(Value::as_u64) else {
+            return self.refuse("session.write", "Validation", "InvalidRequest", None);
+        };
+        let Some(encoded) = params.get("data").and_then(Value::as_str) else {
+            return self.refuse("session.write", "Validation", "InvalidRequest", None);
+        };
+        let data = match decode_hex(encoded, CONTENT_FRAME_BYTES) {
+            Ok(data) if !data.is_empty() => data,
+            Ok(_) => return self.refuse("session.write", "Validation", "InvalidRequest", None),
+            Err(bitty_daemon::content::HexError::Limit { limit, actual }) => {
+                return self.refuse(
+                    "session.write",
+                    "Framing",
+                    "LimitExceeded",
+                    Some((actual as u64, limit as u64)),
+                );
+            }
+            Err(_) => return self.refuse("session.write", "Validation", "InvalidRequest", None),
+        };
+        let session_id = session_id.to_owned();
+        if let Err(error) = self.content_target(connection, &session_id, generation) {
+            return self.content_refusal("session.write", error);
+        }
+        let accepted = data.len();
+        let session = self.sessions.get_mut(&session_id).expect("checked");
+        // Echo the input, as the line discipline does for a live terminal.
+        let room = CONTENT_FRAME_BYTES.saturating_sub(session.content.len());
+        session.content.extend(&data[..accepted.min(room)]);
+        let generation = session.generation;
+        self.reply(
+            "session.write",
+            json!({
+                "session_id": session_id,
+                "generation": generation,
+                "accepted": accepted,
+                "remaining": 0,
+                "backpressure": false,
+            }),
+        )
+    }
+
+    fn session_subscribe(&mut self, connection: &str, params: &Value) -> Outcome {
+        if !self.has_scope(connection, "terminal.inspect") {
+            return self.refuse("session.subscribe", "Denied", "ScopeViolation", None);
+        }
+        let Some(session_id) = params.get("session_id").and_then(Value::as_str) else {
+            return self.refuse("session.subscribe", "Validation", "InvalidRequest", None);
+        };
+        let Some(generation) = params.get("generation").and_then(Value::as_u64) else {
+            return self.refuse("session.subscribe", "Validation", "InvalidRequest", None);
+        };
+        let session_id = session_id.to_owned();
+        if let Err(error) = self.content_target(connection, &session_id, generation) {
+            return self.content_refusal("session.subscribe", error);
+        }
+        if !self.conn(connection).is_some_and(|conn| conn.events) {
+            return self.refuse("session.subscribe", "Denied", "UnsupportedCapability", None);
+        }
+        let session = self.sessions.get_mut(&session_id).expect("checked");
+        let already = session.subscribed;
+        session.subscribed = true;
+        let generation = session.generation;
+        self.reply(
+            "session.subscribe",
+            json!({
+                "session_id": session_id,
+                "generation": generation,
+                "subscribed": true,
+                "already_subscribed": already,
+                "sequence": 0,
+            }),
+        )
     }
 
     fn session_status(&mut self, connection: &str, params: &Value) -> Outcome {
@@ -1959,7 +2169,13 @@ impl FakeDriver {
         session.initial_token = None;
         session.state = "terminated";
         session.terminal_reason = Some(reason);
-        session.cleanup = Some("not_started");
+        session.cleanup = Some(if session.generation > 0 {
+            "swept"
+        } else {
+            "not_started"
+        });
+        session.content.clear();
+        session.subscribed = false;
         session.last_seen_ms = now;
         session.revision += 1;
         for attach in leases {

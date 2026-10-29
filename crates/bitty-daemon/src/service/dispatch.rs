@@ -72,7 +72,7 @@ use crate::lease::{
 };
 use crate::limits::{LimitId, Limits};
 use crate::operator::{OperatorError, OperatorStore};
-use crate::orphan::OrphanSupervisor;
+use crate::orphan::{JournalError, OrphanSupervisor};
 use crate::peer::DispatchBoundary;
 use crate::registry::RegistryLimits;
 use crate::registry::{
@@ -118,6 +118,15 @@ impl StopMode {
             _ => None,
         }
     }
+}
+
+/// The `daemon.orphans.verify` action (`D-06`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrphanAction {
+    /// Re-run verification (the default when `action` is absent).
+    Verify,
+    /// Remove one quarantined journal record without signalling or adopting.
+    Retire,
 }
 
 impl fmt::Display for StopMode {
@@ -802,7 +811,9 @@ impl Service {
             ServiceMethod::DaemonStatus => self.daemon_status(now),
             ServiceMethod::DaemonStop => self.daemon_stop(connection, fields, now),
             ServiceMethod::DaemonHostGrant => self.daemon_host_grant(connection, fields, now),
-            ServiceMethod::DaemonOrphansVerify => self.daemon_orphans_verify(connection, now),
+            ServiceMethod::DaemonOrphansVerify => {
+                self.daemon_orphans_verify(connection, fields, now)
+            }
             ServiceMethod::SessionCreate => self.session_create(connection, fields, now),
             ServiceMethod::SessionStatus => self.session_status(connection, fields, now),
             ServiceMethod::SessionList => self.session_list(connection, now),
@@ -1255,43 +1266,94 @@ impl Service {
     /// `daemon.orphans.verify` (`D-06`, `daemon.control`).
     ///
     /// Served only when startup selected an enforced containment mechanism and
-    /// opened the owner-private journal. The pass may signal an exact cgroup
-    /// record and quarantines everything it cannot prove; the response carries
-    /// counts by class and never a pid, path, or command.
+    /// opened the owner-private journal. `action` is `verify` (the default) or
+    /// `retire`. A verify pass may signal an exact cgroup record and
+    /// quarantines everything it cannot prove; a retire removes one quarantined
+    /// record and never signals or adopts. Both responses carry counts by class
+    /// and never a pid, path, or command.
     fn daemon_orphans_verify(
         &mut self,
         connection: &Connection,
+        fields: Option<&Map<String, Value>>,
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
+        // Authority first: a caller without the operator capability and a
+        // matching peer learns nothing about whether the verifier is served.
+        self.recheck(connection, DispatchBoundary::OrphanVerify)?;
         if !self.orphans.is_served() {
             return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
         }
-        self.recheck(connection, DispatchBoundary::OrphanVerify)?;
+        let action = match string_field(fields, "action")? {
+            None | Some("verify") => OrphanAction::Verify,
+            Some("retire") => OrphanAction::Retire,
+            Some(_) => return Err(Refusal::invalid_request()),
+        };
         self.admit()?;
-        let report = self
-            .orphans
-            .verify(now)
-            .map_err(|_| Refusal::denied(RefusalCode::Internal))?
-            .ok_or_else(|| Refusal::denied(RefusalCode::UnsupportedCapability))?;
-        let acted = report
-            .reaped
-            .saturating_add(report.unverified)
-            .saturating_add(report.stale);
-        self.record(
-            AuditAction::OrphanVerify,
-            connection,
-            None,
-            AuditTarget::none(),
-            AuditResult::Ok,
-            Some(AuditCounts::new(
-                u64::try_from(acted).unwrap_or(u64::MAX),
-                self.limits.effective(LimitId::MaxOrphanRecords),
-                Some(LimitId::MaxOrphanRecords),
-            )),
-            None,
-            now,
-        );
-        Ok(report.to_json())
+        match action {
+            OrphanAction::Verify => {
+                let report = self
+                    .orphans
+                    .verify_on_demand(now)
+                    .map_err(|_| Refusal::denied(RefusalCode::Internal))?
+                    .ok_or_else(|| Refusal::denied(RefusalCode::UnsupportedCapability))?;
+                let acted = report
+                    .reaped
+                    .saturating_add(report.unverified)
+                    .saturating_add(report.stale);
+                self.record(
+                    AuditAction::OrphanVerify,
+                    connection,
+                    None,
+                    AuditTarget::none(),
+                    AuditResult::Ok,
+                    Some(AuditCounts::new(
+                        u64::try_from(acted).unwrap_or(u64::MAX),
+                        self.limits.effective(LimitId::MaxOrphanRecords),
+                        Some(LimitId::MaxOrphanRecords),
+                    )),
+                    None,
+                    now,
+                );
+                Ok(report.to_json())
+            }
+            OrphanAction::Retire => {
+                let record_id = required_string(fields, "record_id")?;
+                let record = SessionId::parse(record_id).map_err(|_| Refusal::invalid_request())?;
+                let counts = match self.orphans.retire(record) {
+                    Ok(counts) => {
+                        counts.ok_or_else(|| Refusal::denied(RefusalCode::UnsupportedCapability))?
+                    }
+                    Err(JournalError::UnknownRecord) => return Err(Refusal::not_found()),
+                    Err(JournalError::NotQuarantined) => {
+                        return Err(Refusal::denied(RefusalCode::InvalidRequest));
+                    }
+                    Err(_) => return Err(Refusal::denied(RefusalCode::Internal)),
+                };
+                self.record(
+                    AuditAction::OrphanRetire,
+                    connection,
+                    None,
+                    AuditTarget::none(),
+                    AuditResult::Ok,
+                    Some(AuditCounts::new(
+                        1,
+                        self.limits.effective(LimitId::MaxOrphanRecords),
+                        Some(LimitId::MaxOrphanRecords),
+                    )),
+                    None,
+                    now,
+                );
+                Ok(json!({
+                    "action": "retire",
+                    "retired": 1,
+                    "reaped": 0,
+                    "unverified": counts.unverified,
+                    "stale": 0,
+                    "reserved": counts.reserved,
+                    "committed": counts.committed,
+                }))
+            }
+        }
     }
 
     /// Terminate every non-terminal session with `cause` and return the count.
@@ -2918,20 +2980,24 @@ mod tests {
     use crate::peer::PeerGuard;
     use crate::service::scopes::{ServiceScope, ServiceScopeSet};
 
+    type AuditLines = Arc<Mutex<Vec<Vec<u8>>>>;
+
     struct TestWriter {
         fail: Arc<AtomicBool>,
-        lines: Arc<Mutex<Vec<Vec<u8>>>>,
+        lines: AuditLines,
     }
 
     impl TestWriter {
-        fn new() -> (Self, Arc<AtomicBool>) {
+        fn new() -> (Self, Arc<AtomicBool>, AuditLines) {
             let fail = Arc::new(AtomicBool::new(false));
+            let lines = Arc::new(Mutex::new(Vec::new()));
             (
                 Self {
                     fail: fail.clone(),
-                    lines: Arc::new(Mutex::new(Vec::new())),
+                    lines: lines.clone(),
                 },
                 fail,
+                lines,
             )
         }
     }
@@ -2968,7 +3034,7 @@ mod tests {
         )
         .expect("chmod");
         let operator = OperatorStore::create_in(dir.path()).expect("operator store");
-        let (writer, _fail) = TestWriter::new();
+        let (writer, _fail, _lines) = TestWriter::new();
         let service = Service::new(limits, operator, Box::new(writer), orphans).expect("service");
         (service, dir)
     }
@@ -3573,7 +3639,7 @@ mod tests {
         )
         .expect("chmod");
         let operator = OperatorStore::create_in(dir.path()).expect("operator");
-        let (writer, fail) = TestWriter::new();
+        let (writer, fail, _lines) = TestWriter::new();
         let mut service = Service::new(
             Limits::default(),
             operator,
@@ -3828,6 +3894,162 @@ mod tests {
             )
             .expect("served again");
         assert_eq!(second, first, "verify is idempotent");
+    }
+
+    #[test]
+    fn a_served_orphan_retire_removes_only_a_quarantined_record_and_is_audited() {
+        use crate::orphan::{
+            BootId, OrphanJournal, OrphanJournalLimits, Pid, ProcessIdentity, ProcessObservation,
+            ProcessProbe, SystemProbe,
+        };
+
+        // A live decoy gives the seeded record an exact identity, so only the
+        // quarantine rule (a subreaper record is never signalled after a
+        // restart) keeps it from being reaped.
+        let mut decoy = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("decoy");
+        let pid = Pid::new(decoy.id()).expect("pid");
+        let probe = SystemProbe::new();
+        let ProcessObservation::Present {
+            start_time,
+            process_group,
+            uid,
+        } = probe.observe(pid)
+        else {
+            let _ = decoy.kill();
+            let _ = decoy.wait();
+            panic!("decoy must be observable");
+        };
+        let identity = ProcessIdentity::new(pid, start_time, process_group, uid);
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("chmod");
+        let record = SessionId::parse(&"e7".repeat(16)).expect("record id");
+        {
+            let mut journal = OrphanJournal::open(
+                dir.path().join("orphans"),
+                OrphanJournalLimits::default(),
+                BootId::read_system().expect("boot id"),
+            )
+            .expect("journal");
+            journal
+                .reserve(
+                    record,
+                    0,
+                    MonotonicMs::from_millis(1),
+                    crate::containment::ContainmentRecord::Subreaper,
+                )
+                .expect("reserve");
+            journal.commit(record, identity).expect("commit");
+        }
+        let report = crate::containment::ContainmentReport::subreaper(
+            crate::platform::PlatformCell::current(),
+            None,
+        );
+        let supervisor = OrphanSupervisor::open(
+            dir.path().join("orphans"),
+            &OrphanJournalLimits::default(),
+            &report,
+            crate::containment::ContainmentLimits::default(),
+        )
+        .expect("served supervisor");
+        let (mut service, _runtime) = service_with_orphans(Limits::default(), supervisor);
+        let mut operator_conn = operator_connection(&mut service);
+
+        // A committed record cannot be retired; only quarantine may be.
+        let error = service
+            .dispatch(
+                &mut operator_conn,
+                ServiceMethod::DaemonOrphansVerify,
+                &json!({"action": "retire", "record_id": record.as_hex()}),
+                MonotonicMs::from_millis(2),
+            )
+            .expect_err("not quarantined");
+        assert_eq!(error.denied_code(), Some(RefusalCode::InvalidRequest));
+
+        // The first pass quarantines the record and never signals the decoy.
+        let quarantined = service
+            .dispatch(
+                &mut operator_conn,
+                ServiceMethod::DaemonOrphansVerify,
+                &json!({"action": "verify"}),
+                MonotonicMs::from_millis(3),
+            )
+            .expect("verify");
+        assert_eq!(quarantined["unverified"], 1);
+        assert_eq!(quarantined["committed"], 0);
+        assert!(crate::orphan::identity::observe(pid) != ProcessObservation::Absent);
+
+        let retired = service
+            .dispatch(
+                &mut operator_conn,
+                ServiceMethod::DaemonOrphansVerify,
+                &json!({"action": "retire", "record_id": record.as_hex()}),
+                MonotonicMs::from_millis(4),
+            )
+            .expect("retire");
+        assert_eq!(retired["action"], "retire");
+        assert_eq!(retired["retired"], 1);
+        assert_eq!(retired["unverified"], 0);
+        assert!(
+            !retired.to_string().contains("pid"),
+            "retire must not expose a pid"
+        );
+
+        let after = service
+            .dispatch(
+                &mut operator_conn,
+                ServiceMethod::DaemonOrphansVerify,
+                &json!({"action": "verify"}),
+                MonotonicMs::from_millis(5),
+            )
+            .expect("verify again");
+        assert_eq!(after["unverified"], 0);
+        assert_eq!(after["reserved"], 0);
+        assert_eq!(after["committed"], 0);
+
+        // A second retire names no record; a malformed id is a validation
+        // refusal; an unknown action is refused before anything runs.
+        let error = service
+            .dispatch(
+                &mut operator_conn,
+                ServiceMethod::DaemonOrphansVerify,
+                &json!({"action": "retire", "record_id": record.as_hex()}),
+                MonotonicMs::from_millis(6),
+            )
+            .expect_err("unknown record");
+        assert_eq!(error.kind(), RefusalKind::NotFound);
+        let error = service
+            .dispatch(
+                &mut operator_conn,
+                ServiceMethod::DaemonOrphansVerify,
+                &json!({"action": "retire", "record_id": "not-a-record"}),
+                MonotonicMs::from_millis(7),
+            )
+            .expect_err("malformed record id");
+        assert_eq!(error.kind(), RefusalKind::InvalidRequest);
+        let error = service
+            .dispatch(
+                &mut operator_conn,
+                ServiceMethod::DaemonOrphansVerify,
+                &json!({"action": "adopt"}),
+                MonotonicMs::from_millis(8),
+            )
+            .expect_err("unknown action");
+        assert_eq!(error.kind(), RefusalKind::InvalidRequest);
+
+        assert!(
+            crate::orphan::identity::observe(pid) != ProcessObservation::Absent,
+            "no orphan path may signal the record"
+        );
+        let _ = decoy.kill();
+        let _ = decoy.wait();
     }
 
     #[test]

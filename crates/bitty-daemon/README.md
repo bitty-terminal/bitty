@@ -44,14 +44,14 @@ TCP listener; it signals only processes inside a recorded containment identity.
 The contract areas that are deliberately deferred, and the typed answer the
 running service gives today:
 
-| Area                                                                                                                                           | Owner                          | Answer today                                                                                                                                                       |
-| ---------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Worker spawn and bind (`session.create` registers a `created` session; nothing binds generation 1)                                             | bitty#2790                     | `session.create` returns the `created` snapshot with `generation: 0`; containment exists but no slice calls it for a session spawn yet                             |
-| Executable path digest in the orphan record; native Windows job-object reaper                                                                  | bitty#2791 follow-up           | no executable path is recorded; Windows and macOS keep the typed `UnsupportedPlatform` refusal                                                                     |
-| Terminal content plane, including `session.resize` (`terminal.manage`)                                                                         | bitty#2604 / terminal contract | the daemon grants no `terminal.*` scope, so `session.resize` is `Denied/ScopeViolation`                                                                            |
-| Pushing session events on a connection (no subscribe method; the event stream owns its own registry)                                           | bitty#2602                     | `session.status`/`session.list` are the reconciliation reads; no event frame is sent                                                                               |
-| Per-connection refusal-audit aggregation                                                                                                       | bitty#2603 follow-up           | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each                                                     |
-| Conformance corpus and fake-server parity                                                                                                      | bitty#2605                     | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; every shared vector is compared, with no recorded known defect |
+| Area                                                                                                 | Owner                          | Answer today                                                                                                                                                       |
+| ---------------------------------------------------------------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Worker spawn and bind (`session.create` registers a `created` session; nothing binds generation 1)   | bitty#2790                     | `session.create` returns the `created` snapshot with `generation: 0`; containment exists but no slice calls it for a session spawn yet                             |
+| Executable path digest in the orphan record; native Windows job-object reaper                        | bitty#2791 follow-up           | no executable path is recorded; Windows and macOS keep the typed `UnsupportedPlatform` refusal                                                                     |
+| Terminal content plane, including `session.resize` (`terminal.manage`)                               | bitty#2604 / terminal contract | the daemon grants no `terminal.*` scope, so `session.resize` is `Denied/ScopeViolation`                                                                            |
+| Pushing session events on a connection (no subscribe method; the event stream owns its own registry) | bitty#2602                     | `session.status`/`session.list` are the reconciliation reads; no event frame is sent                                                                               |
+| Per-connection refusal-audit aggregation                                                             | bitty#2603 follow-up           | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each                                                     |
+| Conformance corpus and fake-server parity                                                            | bitty#2605                     | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; every shared vector is compared, with no recorded known defect |
 
 Nothing here authorizes autostart, a service file, a TCP listener, or desktop
 wiring; all four stay out of scope.
@@ -215,15 +215,15 @@ precedes a spawn unless `commit` can hold any valid identity.
 
 Classification is conservative and never signals an unverified record:
 
-| Observation                                                                    | Outcome                                              |
-| ------------------------------------------------------------------------------ | ---------------------------------------------------- |
-| Reserved cgroup record, same boot, pre-created subtree                         | reaches `OrphanReaper`; no pid is invented           |
-| Committed cgroup record, same boot, exact or reused pid                        | reaches `OrphanReaper` through the subtree           |
-| Exact subreaper record (boot, pid, start time, group, uid)                     | reaches `OrphanReaper`, which still refuses `swept`  |
-| Different boot id                                                              | `stale`, discarded, never signalled                  |
-| Reserved subreaper record with no pid                                          | `unverified`, quarantined, never signalled           |
-| Absent pid, unreadable start time, reused start time, group or uid mismatch    | `unverified`, quarantined, never signalled           |
-| Reaper cannot verify the whole containment identity                            | `unverified`, quarantined                            |
+| Observation                                                                 | Outcome                                             |
+| --------------------------------------------------------------------------- | --------------------------------------------------- |
+| Reserved cgroup record, same boot, pre-created subtree                      | reaches `OrphanReaper`; no pid is invented          |
+| Committed cgroup record, same boot, exact or reused pid                     | reaches `OrphanReaper` through the subtree          |
+| Exact subreaper record (boot, pid, start time, group, uid)                  | reaches `OrphanReaper`, which still refuses `swept` |
+| Different boot id                                                           | `stale`, discarded, never signalled                 |
+| Reserved subreaper record with no pid                                       | `unverified`, quarantined, never signalled          |
+| Absent pid, unreadable start time, reused start time, group or uid mismatch | `unverified`, quarantined, never signalled          |
+| Reaper cannot verify the whole containment identity                         | `unverified`, quarantined                           |
 
 Quarantined records expire after `orphan_record_retention_ms`; operator
 retirement removes a quarantined record explicitly and never signals. Boot
@@ -486,18 +486,20 @@ Containment is a whole-tree identity, not a pid and not a process-group
 convention. `containment::ContainmentReport::probe()` returns a typed plan for
 the compiled cell; there is no silent fallback and no weaker transport:
 
-| Plan                  | Selection                                                                                                                         | Cleanup claim | Signals                                                          |
-| --------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ------------- | ---------------------------------------------------------------- |
-| `cgroup_v2`           | delegated cgroup v2 root (`/proc/self/cgroup` + writable `cgroup.procs`/`cgroup.kill` + a create/remove probe)                    | `swept`       | members from `cgroup.procs`, then `cgroup.kill`                  |
-| `subreaper_fallback`  | `PR_SET_CHILD_SUBREAPER` confirmed by read-back when cgroup delegation is unavailable                                             | `unverified`  | the exact pidfd and the recorded process group                   |
-| `none`                | no cgroup v2 and no subreaper, or a non-Linux cell                                                                                | none          | no spawn; typed refusal                                          |
+| Plan                 | Selection                                                                                                      | Cleanup claim | Signals                                         |
+| -------------------- | -------------------------------------------------------------------------------------------------------------- | ------------- | ----------------------------------------------- |
+| `cgroup_v2`          | delegated cgroup v2 root (`/proc/self/cgroup` + writable `cgroup.procs`/`cgroup.kill` + a create/remove probe) | `swept`       | members from `cgroup.procs`, then `cgroup.kill` |
+| `subreaper_fallback` | `PR_SET_CHILD_SUBREAPER` confirmed by read-back when cgroup delegation is unavailable                          | `unverified`  | the exact pidfd and the recorded process group  |
+| `none`               | no cgroup v2 and no subreaper, or a non-Linux cell                                                             | none          | no spawn; typed refusal                         |
 
 Linux x86_64 is the first cell. A per-session cgroup is created **before** the
 spawn, and the child writes its own pid into `cgroup.procs` from the audited
 `pre_exec` seam, so a descendant cannot be born outside the identity. The
 graceful window is `orphan_reap_grace_ms`; escalation is `cgroup.kill` or
-`pidfd_send_signal(SIGKILL)`, followed by a bounded emptiness wait. Only an
-empty `cgroup.procs` **and** `cgroup.events` `populated 0` produce `swept`.
+`pidfd_send_signal(SIGKILL)`, followed by a bounded emptiness wait. `swept`
+requires an empty `cgroup.procs` **and** `cgroup.events` `populated 0` and a
+successful subtree removal; an already-absent subtree is already reaped. A
+missing `populated` line is unproved emptiness, never a sweep.
 
 The subreaper fallback is consciously weaker: a `setsid` descendant can leave
 the recorded process group, so the fallback reports `unverified` even after it
@@ -506,27 +508,43 @@ neither mechanism refuses the spawn with a typed error rather than running an
 uncontained child.
 
 `daemon.orphans.verify` is served on Linux x86_64 when startup selected an
-enforced plan and opened the journal. The claim is exact and bounded:
+enforced plan and opened the journal. The method takes an optional `action`:
 
-- the record must match the current boot id, the recorded uid, the process
-  start time, the process group when a pid is present, and a cgroup path that
-  is a direct child of the delegated root and owned by this uid;
-- a reserved cgroup record is actionable without a pid because the subtree was
-  created before the spawn; a pid is never invented;
-- a reused or unreadable subreaper identity is quarantined and never signalled;
-- an absent or empty cgroup subtree is already reaped;
-- a record whose containment cannot be verified stays quarantined and is
-  reported as `unverified`, never claimed verified;
-- the response is counts by class (`reaped`, `unverified`, `stale`, `reserved`,
-  `committed`) with no pid, path, or command, and a second call on the same
-  journal changes nothing.
+- `verify` (the default when `action` is absent) re-runs verification and
+  returns counts by class. The claim is exact and bounded:
+  - the record must match the current boot id, the recorded uid, the process
+    start time, the process group when a pid is present, and a cgroup path that
+    is a direct child of the delegated root and owned by this uid;
+  - a reserved cgroup record is actionable without a pid because the subtree
+    was created before the spawn; a pid is never invented;
+  - a reused or unreadable subreaper identity is quarantined and never
+    signalled;
+  - an absent or empty cgroup subtree is already reaped;
+  - a record whose containment cannot be verified stays quarantined and is
+    reported as `unverified`, never claimed verified;
+  - the response is counts by class (`reaped`, `unverified`, `stale`,
+    `reserved`, `committed`) with no pid, path, or command, and a second call
+    on the same journal changes nothing.
+- `retire` removes exactly one quarantined record named by its bounded
+  `record_id` (the recorded session id, 32 canonical hex characters). It never
+  signals, never adopts, and never touches a reserved or committed record
+  (that is `Denied/InvalidRequest`); an unknown id is `NotFound`. It is the
+  only way to free a quarantined slot before its retention expires. The
+  response is `{action, retired, reaped, unverified, stale, reserved,
+committed}` and is attributed as `daemon.orphans.retire`.
 
 The startup scan completes before the daemon binds its endpoint (`D-06`):
 startup calls `endpoint::prepare_endpoint` (resolve, attest, and take the
 single-instance lock), opens the journal, reaps or quarantines every actionable
 record, and only then binds the socket through `PreparedEndpoint::bind`. The
 lock is held across the scan, so two starts cannot reap the same journal, and no
-client can connect while an earlier record is actionable.
+client can connect while an earlier record is actionable. The startup scan is a
+full pass; an on-demand pass is bounded by one `orphan_reap_grace_ms` plus one
+kill window (`ContainmentLimits::pass_budget`), so a journal full of live
+orphans cannot hold the single-threaded service loop for the full per-record
+window on every record. Every wait is clamped to the remaining budget; a record
+whose wait is clamped stays in its current class, is counted in the response,
+and is retried by the next call.
 
 Every other cell (including macOS and Windows) returns
 `Denied/UnsupportedCapability`; `daemon.status` reports
@@ -538,27 +556,31 @@ implementation in this slice.
 
 Threat-model and evidence references: `T-21` (orphan reaping through a
 containment identity), `P0-AC-023` (child scope limitation), and `ME-05`
-(orphan reaping). The cgroup plan closes `T-21` on the tested cell by fencing
-the tree before the spawn; the fallback leaves the documented double-run
-residual (a crash between the spawn syscall and adoption is quarantined, never
-guessed at). The reaper only opens a recorded path that is a direct child of
-the current delegated root; a restart under a different parent scope therefore
-quarantines the record instead of guessing, and a stable service scope is
-required for reliable cross-restart reaping. A same-uid owner can still edit
-their own cgroup and journal, which the threat model already places inside the
-trust boundary. This slice
-adds live cgroup evidence on Linux x86_64 but
-**does not mark any control verified**: the worker spawn path does not exist,
-the executable path digest is not recorded, and no native Windows or macOS run
-exists. The P0 evidence plan status is unchanged by this README.
+(orphan reaping). The cgroup plan fences the tree before the spawn on the
+tested cell, but this slice **does not close `T-21`, and `ME-05` stays
+blocked**: the worker spawn path does not exist, the executable path digest is
+not recorded, crash injection is not exercised against a real spawn, and no
+native Windows or macOS run exists. The fallback leaves the documented
+double-run residual (a crash between the spawn syscall and adoption is
+quarantined, never guessed at). The reaper only opens a recorded path that is a
+direct child of the current delegated root; a restart under a different parent
+scope therefore quarantines the record instead of guessing, and a stable
+service scope is required for reliable cross-restart reaping. A same-uid owner
+can still edit their own cgroup and journal, which the threat model already
+places inside the trust boundary. This slice adds live cgroup evidence on Linux
+x86_64 but **does not mark any control verified**. The P0 evidence plan status
+is unchanged by this README, and its update is a separate tracked task in
+`bitty-docs`.
 
 ### Live evidence
 
 `cargo test -p bitty-daemon --test containment -- --nocapture` probes the host
 and runs real children: one that ignores `SIGTERM`, one that forks a
-grandchild, the forced subreaper fallback, a contained child alongside an
-unrelated recorded decoy, and a real recorded cgroup orphan that the journal
-reaps and verifies. The probe line is the enforced plan and the cleanup it may
+grandchild, a double-forked `setsid` session leader with closed standard
+descriptors, the forced subreaper fallback including a descendant that ignores
+`SIGTERM` after its leader exits, a contained child alongside an unrelated
+recorded decoy, a reserved record left by a crash before commit, and a real
+recorded cgroup orphan that the journal reaps and verifies. The probe line is the enforced plan and the cleanup it may
 claim. On the development host (CachyOS, cgroup v2 with a delegated user scope)
 the probe selected `cgroup_v2` and the live tests passed with `swept` cleanup;
 the decoy was never signalled and the subreaper path reported `unverified`.

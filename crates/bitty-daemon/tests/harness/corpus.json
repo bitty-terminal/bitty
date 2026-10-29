@@ -5810,6 +5810,184 @@
       ]
     },
     {
+      "id": "C-11",
+      "title": "Orphan retire removes one quarantined record without signalling or adopting",
+      "area": "orphans",
+      "decisions": [
+        "D-06"
+      ],
+      "drivers": [
+        "real"
+      ],
+      "setup": {
+        "host_grant": false,
+        "orphan_record": "quarantined"
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 0
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.orphans.verify",
+          "params": {
+            "action": "verify"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "reaped": 0,
+              "unverified": 1,
+              "stale": 0,
+              "reserved": 0,
+              "committed": 0
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.orphans.verify",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "reaped": 0,
+              "unverified": 1,
+              "stale": 0,
+              "reserved": 0,
+              "committed": 0
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.orphans.verify",
+          "params": {
+            "action": "retire",
+            "record_id": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "action": "retire",
+              "retired": 1,
+              "reaped": 0,
+              "unverified": 0,
+              "stale": 0,
+              "reserved": 0,
+              "committed": 0
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.orphans.verify",
+          "params": {
+            "action": "verify"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "reaped": 0,
+              "unverified": 0,
+              "stale": 0,
+              "reserved": 0,
+              "committed": 0
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.orphans.verify",
+          "params": {
+            "action": "retire",
+            "record_id": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "NotFound",
+            "error_code": "NotFound"
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.orphans.verify",
+          "params": {
+            "action": "retire",
+            "record_id": "not-a-record"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Validation",
+            "error_code": "InvalidRequest"
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "orphans.verify": "served",
+              "orphans.records.unverified": 0
+            }
+          }
+        },
+        {
+          "action": "audit",
+          "expect": {
+            "audit": {
+              "line_bounds": [
+                {
+                  "needle": "a=daemon.orphans.verify r=ok",
+                  "min": 3,
+                  "max": 3
+                },
+                {
+                  "needle": "a=daemon.orphans.retire r=ok",
+                  "min": 1,
+                  "max": 1
+                },
+                {
+                  "needle": "a=daemon.orphans.verify r=refused c=not_found",
+                  "min": 1,
+                  "max": 1
+                },
+                {
+                  "needle": "a=daemon.orphans.verify r=refused c=invalid_request",
+                  "min": 1,
+                  "max": 1
+                }
+              ]
+            }
+          }
+        }
+      ],
+      "fake_skip": "the fake server has no orphan journal or process",
+      "forbidden": [
+        "retire signals or adopts nothing and only removes a quarantined record",
+        "no pid is exposed"
+      ]
+    },
+    {
       "id": "C-04",
       "title": "Every snapshot-visible mutation bumps the revision; heartbeats never do",
       "area": "counters",

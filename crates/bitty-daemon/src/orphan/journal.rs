@@ -1735,21 +1735,9 @@ mod tests {
 
         // The next process starts later in the same boot. Its process-local
         // clock is zero again, but the stored quarantine time is boot-relative.
-        let mut later = OrphanJournal::open_with_origin(
-            journal_dir.clone(),
-            limits(8, ORPHAN_RECORD_BYTES_SYSTEM_MAX, 1000),
-            boot(BOOT_A),
-            5_000,
-        )
-        .expect("later journal");
-        assert_eq!(
-            later.collect_expired(MonotonicMs::ZERO).expect("collect"),
-            vec![session_id]
-        );
-
-        // Within the retention window it is retained.
+        // Within the retention window the record is still retained.
         let mut soon = OrphanJournal::open_with_origin(
-            journal_dir,
+            journal_dir.clone(),
             limits(8, ORPHAN_RECORD_BYTES_SYSTEM_MAX, 1000),
             boot(BOOT_A),
             1_500,
@@ -1759,6 +1747,19 @@ mod tests {
             soon.collect_expired(MonotonicMs::ZERO)
                 .expect("collect")
                 .is_empty()
+        );
+
+        // Past the retention window it expires on the next process origin.
+        let mut later = OrphanJournal::open_with_origin(
+            journal_dir,
+            limits(8, ORPHAN_RECORD_BYTES_SYSTEM_MAX, 1000),
+            boot(BOOT_A),
+            5_000,
+        )
+        .expect("later journal");
+        assert_eq!(
+            later.collect_expired(MonotonicMs::ZERO).expect("collect"),
+            vec![session_id]
         );
     }
 

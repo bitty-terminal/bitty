@@ -90,7 +90,9 @@ impl SeamStatus {
             capabilities: CAPABILITIES,
             ipc_service: IpcServiceState::Wired,
             endpoint: EndpointState::Unbound,
-            containment: ContainmentReport::probe(),
+            // A status command must not create a probe cgroup; the served
+            // daemon selects its plan once at startup.
+            containment: ContainmentReport::unprobed(crate::platform::PlatformCell::current()),
         }
     }
 
@@ -155,5 +157,20 @@ mod tests {
         assert!(rendered.contains("ipc service: wired"));
         assert!(rendered.contains("endpoint: none bound"));
         assert!(rendered.contains("containment: "));
+    }
+
+    #[test]
+    fn status_never_probes_the_host() {
+        // The probe creates and removes a cgroup; a value-only status command
+        // must not touch the host and must not claim a selected plan.
+        let status = SeamStatus::current();
+        assert_eq!(
+            status.containment.kind(),
+            crate::containment::ContainmentKind::Refused
+        );
+        assert!(matches!(
+            status.containment.refusal(),
+            Some(crate::containment::ContainmentRefusal::NotProbed)
+        ));
     }
 }

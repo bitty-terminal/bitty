@@ -288,7 +288,7 @@ impl FakeDriver {
             "daemon.status" => self.daemon_status(connection),
             "daemon.stop" => self.daemon_stop(connection, &params),
             "daemon.host_grant" => self.daemon_host_grant(connection, &params),
-            "daemon.orphans.verify" => self.daemon_orphans_verify(connection),
+            "daemon.orphans.verify" => self.daemon_orphans_verify(connection, &params),
             "session.create" => self.session_create(connection, &params),
             "session.status" => self.session_status(connection, &params),
             "session.list" => self.session_list(connection),
@@ -620,12 +620,46 @@ impl FakeDriver {
         )
     }
 
-    fn daemon_orphans_verify(&mut self, connection: &str) -> Outcome {
+    fn daemon_orphans_verify(&mut self, connection: &str, params: &Value) -> Outcome {
         if !self.has_scope(connection, "daemon.control") {
             return self.refuse("daemon.orphans.verify", "Denied", "ScopeViolation", None);
         }
+        let action = params
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("verify");
+        let action = match action {
+            "verify" => "verify",
+            "retire" => "retire",
+            _ => {
+                return self.refuse(
+                    "daemon.orphans.verify",
+                    "Validation",
+                    "InvalidRequest",
+                    None,
+                );
+            }
+        };
         // The fake has no journal and no process; it models the served shape
-        // with an always-empty store and never claims a real reap.
+        // with an always-empty store and never claims a real reap. A retire
+        // therefore names no record and is the uniform NotFound.
+        if action == "retire" {
+            let known = params
+                .get("record_id")
+                .and_then(Value::as_str)
+                .is_some_and(|record| {
+                    record.len() == 32 && record.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+            if !known {
+                return self.refuse(
+                    "daemon.orphans.verify",
+                    "Validation",
+                    "InvalidRequest",
+                    None,
+                );
+            }
+            return self.refuse("daemon.orphans.verify", "NotFound", "NotFound", None);
+        }
         self.reply(
             "daemon.orphans.verify",
             json!({

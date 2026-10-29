@@ -23,7 +23,6 @@ use nix::sys::signal::Signal;
 
 use crate::containment::ContainmentLimits;
 #[cfg(target_os = "linux")]
-#[cfg(target_os = "linux")]
 use crate::containment::{
     CgroupError, CgroupRoot, ContainmentKind, ContainmentRecord, ContainmentReport, SessionCgroup,
 };
@@ -37,6 +36,10 @@ pub struct SystemOrphanReaper {
     root: Option<CgroupRoot>,
     #[cfg(target_os = "linux")]
     limits: ContainmentLimits,
+    /// Absolute budget for the current pass, set by the caller for an
+    /// on-demand pass. `None` means the full per-record window applies.
+    #[cfg(target_os = "linux")]
+    deadline: Option<Instant>,
 }
 
 #[cfg(target_os = "linux")]
@@ -50,7 +53,20 @@ impl SystemOrphanReaper {
                 .and_then(|path| CgroupRoot::from_absolute(path.to_path_buf()).ok()),
             ContainmentKind::Subreaper | ContainmentKind::Refused => None,
         };
-        Self { root, limits }
+        Self {
+            root,
+            limits,
+            deadline: None,
+        }
+    }
+
+    /// Bound the current pass to `deadline`.
+    ///
+    /// Every wait is clamped to the remaining budget, so one on-demand pass
+    /// cannot block the service loop for the full per-record window on every
+    /// remaining record.
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
     }
 
     #[cfg(test)]
@@ -58,6 +74,7 @@ impl SystemOrphanReaper {
         Self {
             root: Some(root),
             limits,
+            deadline: None,
         }
     }
 
@@ -77,26 +94,53 @@ impl SystemOrphanReaper {
             Err(_) => return ReapResult::Unverified,
         };
         if cgroup.verify_empty().unwrap_or(false) {
-            let _ = cgroup.remove();
-            return ReapResult::Swept;
+            return swept(cgroup.remove());
         }
 
         let _ = cgroup.signal_members(Signal::SIGTERM);
-        if wait_empty(&cgroup, self.limits.term_grace(), self.limits.poll()) {
-            let _ = cgroup.remove();
-            return ReapResult::Swept;
+        if wait_empty(
+            &cgroup,
+            self.limits.term_grace(),
+            self.limits.poll(),
+            self.deadline,
+        ) {
+            return swept(cgroup.remove());
         }
         let _ = cgroup.kill_all();
-        if wait_empty(&cgroup, self.limits.kill_wait(), self.limits.poll()) {
-            let _ = cgroup.remove();
-            return ReapResult::Swept;
+        if wait_empty(
+            &cgroup,
+            self.limits.kill_wait(),
+            self.limits.poll(),
+            self.deadline,
+        ) {
+            return swept(cgroup.remove());
         }
         ReapResult::Unverified
     }
 }
 
+/// `swept` requires the subtree removed, not only an empty read. A removal
+/// failure leaves the identity in place and is reported as unverified.
 #[cfg(target_os = "linux")]
-fn wait_empty(cgroup: &SessionCgroup, window: Duration, poll: Duration) -> bool {
+fn swept(removed: Result<(), CgroupError>) -> ReapResult {
+    if removed.is_ok() {
+        ReapResult::Swept
+    } else {
+        ReapResult::Unverified
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_empty(
+    cgroup: &SessionCgroup,
+    window: Duration,
+    poll: Duration,
+    budget: Option<Instant>,
+) -> bool {
+    let window = match budget {
+        Some(budget) => window.min(budget.saturating_duration_since(Instant::now())),
+        None => window,
+    };
     let deadline = Instant::now() + window;
     loop {
         if cgroup.verify_empty().unwrap_or(false) {
@@ -120,6 +164,9 @@ impl SystemOrphanReaper {
     ) -> Self {
         Self {}
     }
+
+    /// No pass can run on a cell without a mechanism; the bound is unused.
+    pub fn set_deadline(&mut self, _deadline: Option<std::time::Instant>) {}
 }
 
 impl OrphanReaper for SystemOrphanReaper {

@@ -125,6 +125,16 @@ impl ContainmentLimits {
     pub const fn poll(self) -> Duration {
         self.poll
     }
+
+    /// The most one on-demand verification pass may block the caller.
+    ///
+    /// One record is allowed `term_grace + kill_wait`; the deadline clamps
+    /// every subsequent record's waits, so a journal full of live orphans
+    /// cannot make one request hold the service loop for minutes.
+    #[must_use]
+    pub const fn pass_budget(self) -> Duration {
+        self.term_grace.saturating_add(self.kill_wait)
+    }
 }
 
 impl Default for ContainmentLimits {
@@ -141,6 +151,10 @@ pub enum ContainmentRefusal {
         /// The compiled cell.
         cell: PlatformCell,
     },
+    /// This invocation did not probe the host, so it makes no claim about the
+    /// selected plan. Used by the side-effect-free `bittyd` status report; the
+    /// served daemon probes once at startup.
+    NotProbed,
     /// Neither cgroup v2 nor the subreaper fallback is usable.
     NoMechanism {
         /// Why the cgroup probe failed.
@@ -156,6 +170,7 @@ impl fmt::Display for ContainmentRefusal {
             Self::UnsupportedPlatform { cell } => {
                 write!(formatter, "unsupported platform cell {cell}")
             }
+            Self::NotProbed => formatter.write_str("not probed by this invocation"),
             Self::NoMechanism { cgroup, subreaper } => write!(
                 formatter,
                 "no containment mechanism: cgroup v2 {cgroup}; subreaper {subreaper}"
@@ -322,6 +337,23 @@ impl ContainmentReport {
                 fallback_reason: None,
                 cgroup_root: None,
             }
+        }
+    }
+
+    /// Build a report that claims nothing because this invocation did not
+    /// probe the host.
+    ///
+    /// Probing creates and removes a cgroup, so a status or diagnostic command
+    /// must not do it. The daemon probes once at startup; this constructor is
+    /// for the display-only seam status.
+    #[must_use]
+    pub fn unprobed(cell: PlatformCell) -> Self {
+        Self {
+            cell,
+            kind: ContainmentKind::Refused,
+            refusal: Some(ContainmentRefusal::NotProbed),
+            fallback_reason: None,
+            cgroup_root: None,
         }
     }
 

@@ -16,6 +16,7 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde_json::{Value, json};
 
@@ -27,7 +28,7 @@ use crate::orphan::journal::{
 };
 use crate::orphan::reaper::SystemOrphanReaper;
 use crate::platform::PlatformCell;
-use crate::registry::MonotonicMs;
+use crate::registry::{MonotonicMs, SessionId};
 
 /// Runtime subdirectory holding the orphan journal.
 pub const ORPHAN_SUBDIR: &str = "orphans";
@@ -105,6 +106,7 @@ pub struct OrphanRuntime {
     reaper: SystemOrphanReaper,
     mechanism: ContainmentKind,
     fallback_reason: Option<String>,
+    containment_limits: crate::containment::ContainmentLimits,
 }
 
 impl fmt::Debug for OrphanRuntime {
@@ -132,19 +134,70 @@ impl OrphanRuntime {
             reaper: SystemOrphanReaper::new(report, containment_limits),
             mechanism: report.kind(),
             fallback_reason: report.fallback_reason().map(ToOwned::to_owned),
+            containment_limits,
         })
     }
 
     /// Run one full verification pass.
+    ///
+    /// Used by the startup scan, which may block before the endpoint is bound:
+    /// every record is examined and each record's own wait is already bounded.
     ///
     /// # Errors
     ///
     /// Propagates a journal rewrite or removal failure. A failed pass never
     /// claims a record verified.
     pub fn verify(&mut self, now: MonotonicMs) -> Result<OrphanVerifyReport, JournalError> {
-        let pass = self.journal.reap(&self.probe, &mut self.reaper, now)?;
+        self.verify_within(now, None)
+    }
+
+    /// Run one pass whose waits are clamped to `budget`.
+    ///
+    /// The on-demand method uses [`Self::pass_budget`] so a request cannot hold
+    /// the single-threaded service loop for the full per-record window on every
+    /// remaining record. Every record is still examined; a record whose wait is
+    /// clamped stays quarantined, is counted in the returned report, and is
+    /// retried by the next pass. The pass is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a journal rewrite or removal failure. A failed pass never
+    /// claims a record verified.
+    pub fn verify_within(
+        &mut self,
+        now: MonotonicMs,
+        budget: Option<Duration>,
+    ) -> Result<OrphanVerifyReport, JournalError> {
+        self.reaper
+            .set_deadline(budget.map(|budget| std::time::Instant::now() + budget));
+        let pass = self.journal.reap(&self.probe, &mut self.reaper, now);
+        // Clear the pass bound on every path; a failed pass must not leave a
+        // stale deadline on the reaper for the next caller.
+        self.reaper.set_deadline(None);
+        let pass = pass?;
         let _expired = self.journal.collect_expired(now)?;
         Ok(OrphanVerifyReport::from_pass(pass, self.journal.counts()))
+    }
+
+    /// The bound one on-demand pass may block the service loop.
+    #[must_use]
+    pub const fn pass_budget(&self) -> Duration {
+        self.containment_limits.pass_budget()
+    }
+
+    /// Retire one quarantined record without signalling or adopting it.
+    ///
+    /// `record` is the journal record id, which is the recorded session id.
+    /// Only a quarantined record can be retired; removing it frees its journal
+    /// slot so a quarantine cannot block new spawns for the retention window.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a journal failure. An unknown or not-quarantined record is
+    /// refused in the journal and nothing is removed.
+    pub fn retire(&mut self, record: SessionId) -> Result<OrphanCounts, JournalError> {
+        self.journal.retire(record)?;
+        Ok(self.journal.counts())
     }
 
     /// Current stored counts.
@@ -256,6 +309,36 @@ impl OrphanSupervisor {
     pub fn verify(&mut self, now: MonotonicMs) -> Result<Option<OrphanVerifyReport>, JournalError> {
         match self {
             Self::Served(runtime) => runtime.verify(now).map(Some),
+            Self::Unsupported { .. } => Ok(None),
+        }
+    }
+
+    /// Run one on-demand pass under this container's pass budget.
+    ///
+    /// # Errors
+    ///
+    /// Returns `None` for an unsupported cell and propagates a journal failure.
+    pub fn verify_on_demand(
+        &mut self,
+        now: MonotonicMs,
+    ) -> Result<Option<OrphanVerifyReport>, JournalError> {
+        match self {
+            Self::Served(runtime) => {
+                let budget = runtime.pass_budget();
+                runtime.verify_within(now, Some(budget)).map(Some)
+            }
+            Self::Unsupported { .. } => Ok(None),
+        }
+    }
+
+    /// Retire one quarantined record without signalling or adopting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `None` for an unsupported cell and propagates a journal failure.
+    pub fn retire(&mut self, record: SessionId) -> Result<Option<OrphanCounts>, JournalError> {
+        match self {
+            Self::Served(runtime) => runtime.retire(record).map(Some),
             Self::Unsupported { .. } => Ok(None),
         }
     }
@@ -433,7 +516,7 @@ mod tests {
         assert_eq!(first.committed, 0, "the record is quarantined");
         assert!(
             crate::orphan::identity::observe(pid) != ProcessObservation::Absent,
-            "the exact subreaper record was signalled"
+            "the subreaper record must never be signalled"
         );
         let second = runtime
             .verify(MonotonicMs::from_millis(3))

@@ -427,7 +427,9 @@ impl SessionCgroup {
                 return Ok(value.trim() == "0");
             }
         }
-        Ok(true)
+        // Without the `populated` line emptiness is unproved. Failing closed
+        // here keeps a malformed control file from ever producing `swept`.
+        Ok(false)
     }
 
     /// Signal every recorded member and return the pids that accepted the
@@ -447,12 +449,18 @@ impl SessionCgroup {
     ) -> Result<Vec<u32>, CgroupError> {
         let mut signalled = Vec::new();
         for pid in self.pids()? {
-            // A pidfd pins the exact member, so a pid that exits and is reused
-            // between the read and the signal cannot receive it.
-            if let Ok(pinned) = super::linux_sys::PidFd::open(pid) {
-                if pinned.send_signal(signal).is_ok() {
-                    signalled.push(pid);
-                }
+            // Open the pidfd first: it pins whatever process currently holds
+            // the pid. Re-verifying membership afterwards, through the same
+            // pinned pid, refuses a pid that was reused between the read and
+            // the open instead of signalling an unrelated process.
+            let Ok(pinned) = super::linux_sys::PidFd::open(pid) else {
+                continue;
+            };
+            if self.verify_member(pid).is_err() {
+                continue;
+            }
+            if pinned.send_signal(signal).is_ok() {
+                signalled.push(pid);
             }
         }
         Ok(signalled)

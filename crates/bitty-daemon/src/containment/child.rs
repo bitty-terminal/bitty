@@ -107,7 +107,9 @@ impl CleanupOutcome {
 ///
 /// `name` must be unique per live session and carry the
 /// [`crate::containment::SESSION_CGROUP_PREFIX`] prefix; the caller derives it
-/// from the daemon instance and session ids, never from user text.
+/// from the daemon instance and session ids, never from user text. `limits`
+/// bounds the escalation used by the failure path that abandons a child whose
+/// identity could not be observed.
 ///
 /// # Errors
 ///
@@ -118,9 +120,10 @@ pub fn spawn(
     report: &ContainmentReport,
     name: &str,
     command: &mut Command,
+    limits: ContainmentLimits,
 ) -> Result<ContainedChild, ContainmentError> {
     match report.kind() {
-        ContainmentKind::CgroupV2 => spawn_cgroup(report, name, command),
+        ContainmentKind::CgroupV2 => spawn_cgroup(report, name, command, limits),
         ContainmentKind::Subreaper => spawn_subreaper(name, command),
         ContainmentKind::Refused => Err(ContainmentError::Refused(
             report
@@ -137,6 +140,7 @@ fn spawn_cgroup(
     report: &ContainmentReport,
     name: &str,
     command: &mut Command,
+    limits: ContainmentLimits,
 ) -> Result<ContainedChild, ContainmentError> {
     let Some(root_path) = report.cgroup_root() else {
         return Err(ContainmentError::Cgroup(CgroupError::Missing));
@@ -165,13 +169,13 @@ fn spawn_cgroup(
     };
     let pid = child.id();
     let Some(identity) = observe_identity(pid) else {
-        abandon_cgroup_child(child, &cgroup);
+        abandon_cgroup_child(child, &cgroup, limits);
         return Err(ContainmentError::IdentityUnavailable);
     };
     match cgroup.verify_member(pid) {
         Ok(()) | Err(CgroupError::Missing) => {}
         Err(_) => {
-            abandon_cgroup_child(child, &cgroup);
+            abandon_cgroup_child(child, &cgroup, limits);
             return Err(ContainmentError::Cgroup(CgroupError::MembershipMismatch));
         }
     }
@@ -214,15 +218,19 @@ fn spawn_subreaper(_name: &str, command: &mut Command) -> Result<ContainedChild,
 /// fails. The child has already `exec`ed and may have forked, so a pid-only
 /// kill is not enough: `cgroup.kill` reaches the whole recorded identity, then
 /// a bounded wait lets the empty subtree be removed.
-fn abandon_cgroup_child(mut child: Child, cgroup: &SessionCgroup) {
+fn abandon_cgroup_child(mut child: Child, cgroup: &SessionCgroup, limits: ContainmentLimits) {
     let _ = cgroup.kill_all();
     let _ = child.kill();
     let _ = child.wait();
-    let limits = ContainmentLimits::default();
-    let _ = wait_bounded(limits.kill_wait(), limits, || {
+    let empty = wait_bounded(limits.kill_wait(), limits, || {
         cgroup.verify_empty().unwrap_or(false)
     });
-    let _ = cgroup.remove();
+    // Only an empty subtree can be removed, and only a successful removal
+    // leaves nothing behind. A populated subtree is reported through the
+    // spawn error; it is never removed while members remain.
+    if empty {
+        let _ = cgroup.remove();
+    }
 }
 
 fn observe_identity(pid: u32) -> Option<ProcessIdentity> {
@@ -326,8 +334,10 @@ fn term_cgroup(
         let _ = child.try_wait();
         cgroup.verify_empty().unwrap_or(false)
     });
-    if empty {
-        let _ = cgroup.remove();
+    // `swept` is the whole-tree claim; it needs the subtree removed, not just
+    // an empty read. A removal failure leaves the identity in place and is
+    // reported as unverified.
+    if empty && cgroup.remove().is_ok() {
         CleanupOutcome {
             class: CleanupClass::Swept,
             signalled,
@@ -347,6 +357,17 @@ fn term_subreaper(
     limits: ContainmentLimits,
 ) -> CleanupOutcome {
     let pid = identity.pid();
+    // Open the pidfd before checking the identity: the pidfd pins whatever
+    // process currently holds the pid, and the identity check then proves that
+    // pinned process is the recorded one. A pid reused between the observation
+    // and the open is refused instead of signalled.
+    let Ok(pidfd) = PidFd::open(pid.get()) else {
+        let _ = child.try_wait();
+        return CleanupOutcome {
+            class: CleanupClass::Unverified,
+            signalled: 0,
+        };
+    };
     // The process may already be gone; only an exact identity earns a signal.
     if !identity_matches(identity) {
         let _ = child.try_wait();
@@ -355,12 +376,6 @@ fn term_subreaper(
             signalled: 0,
         };
     }
-    let Ok(pidfd) = PidFd::open(pid.get()) else {
-        return CleanupOutcome {
-            class: CleanupClass::Unverified,
-            signalled: 0,
-        };
-    };
     let mut signalled = 0;
     let term_sent = pidfd.send_signal(Signal::SIGTERM).is_ok();
     if term_sent {
@@ -369,17 +384,15 @@ fn term_subreaper(
             let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(raw), Signal::SIGTERM);
         }
     }
-    let reaped = wait_bounded(limits.term_grace(), limits, || {
-        matches!(child.try_wait(), Ok(Some(_)) | Err(_))
-    });
-    // The pidfd pins the exact process even after exit. The process group is
-    // only signalled while the leader is unreaped, so its id cannot have been
-    // reused by an unrelated group.
+    // Keep the leader unreaped through the grace window. While it is a zombie
+    // its pid, and therefore the process-group id, cannot be reused, so a
+    // `SIGTERM`-ignoring descendant is still in the recorded group when the
+    // kill below lands. Reaping the leader first would let the group id be
+    // recycled and leak the descendant.
+    let _ = wait_bounded(limits.term_grace(), limits, || !leader_running(pid.get()));
     let _ = pidfd.send_signal(Signal::SIGKILL);
-    if !reaped {
-        if let Ok(raw) = i32::try_from(pgid.get()) {
-            let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(raw), Signal::SIGKILL);
-        }
+    if let Ok(raw) = i32::try_from(pgid.get()) {
+        let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(raw), Signal::SIGKILL);
     }
     let _ = wait_bounded(limits.kill_wait(), limits, || {
         matches!(child.try_wait(), Ok(Some(_)) | Err(_))
@@ -390,6 +403,21 @@ fn term_subreaper(
         class: CleanupClass::Unverified,
         signalled,
     }
+}
+
+/// Whether the recorded leader can still run, without reaping it.
+///
+/// `/proc` reports a zombie as `Z`; neither a zombie nor an absent entry can
+/// execute, and both leave the pid unreaped so the process-group id stays
+/// reserved.
+fn leader_running(pid: u32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    !matches!(rest.trim_start().chars().next(), Some('Z' | 'X' | 'x'))
 }
 
 fn identity_matches(identity: ProcessIdentity) -> bool {
@@ -477,5 +505,47 @@ fn wait_bounded(
             return false;
         }
         std::thread::sleep(limits.poll.min(deadline.saturating_duration_since(now)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_abandoned_child_is_killed_and_its_subtree_removed() {
+        let report = ContainmentReport::probe();
+        let Some(root_path) = report.cgroup_root() else {
+            eprintln!("cgroup unavailable; typed skip");
+            return;
+        };
+        let root = CgroupRoot::from_absolute(root_path.to_path_buf()).expect("delegated root");
+        let name = format!("bittyd-test-abandon-{}", std::process::id());
+        let cgroup = root.create_session(&name).expect("session cgroup");
+        let procs = File::options()
+            .write(true)
+            .open(cgroup.path().join("cgroup.procs"))
+            .expect("cgroup.procs");
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        command.process_group(0);
+        let child = linux_sys::spawn_into_cgroup(&mut command, procs).expect("child");
+        let pid = child.id();
+        assert!(observe_identity(pid).is_some());
+
+        abandon_cgroup_child(
+            child,
+            &cgroup,
+            ContainmentLimits::new(Duration::from_millis(100), Duration::from_secs(2)),
+        );
+
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the abandoned child was not reaped"
+        );
+        assert!(
+            !cgroup.path().exists(),
+            "the abandoned subtree was not removed"
+        );
     }
 }

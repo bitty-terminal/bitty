@@ -541,6 +541,22 @@ impl RealDriver {
     }
 }
 
+impl RealDriver {
+    /// The `worker_sessions` bit this daemon advertised in the readiness probe.
+    ///
+    /// The probe negotiates a real connection, so the value follows the
+    /// containment plan the daemon selected at startup, not the compile-time
+    /// cell. A refused plan advertises `false` and the worker vectors record a
+    /// typed `cell-not-servable` skip.
+    fn worker_sessions(&self) -> bool {
+        self.facts
+            .capabilities
+            .get("worker_sessions")
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
 impl Driver for RealDriver {
     fn kind(&self) -> DriverKind {
         DriverKind::Real
@@ -560,7 +576,7 @@ impl Driver for RealDriver {
         if let Some(grant) = &self.host_grant {
             vars.insert("host_grant".to_owned(), Value::String(grant.clone()));
         }
-        cell_vars(&mut vars, bitty_daemon::worker::WORKER_SESSIONS_SERVED);
+        cell_vars(&mut vars, self.worker_sessions());
         Ok(vars)
     }
 
@@ -859,7 +875,7 @@ impl Driver for RealDriver {
         if let Some(grant) = &self.host_grant {
             vars.insert("host_grant".to_owned(), Value::String(grant.clone()));
         }
-        cell_vars(&mut vars, bitty_daemon::worker::WORKER_SESSIONS_SERVED);
+        cell_vars(&mut vars, self.worker_sessions());
         Ok(vars)
     }
 

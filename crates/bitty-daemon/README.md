@@ -1060,7 +1060,10 @@ Corpus rules:
 - `session.attach` freezes the request field `attach_role` (the response keeps
   `role`), and the ambient-authority fields `role`, `auth`, and `scope` stay
   refused;
-- a vector that does not run on a driver carries a typed skip reason;
+- a vector that does not run on a driver carries a typed skip reason, and a
+  vector that needs a served capability declares `requires`; a driver whose
+  negotiated capability set lacks it records a typed `cell-not-servable` skip
+  instead of failing the vector;
 - cell-dependent values are seeded variables, never literals: `@worker_sessions`
   is the served capability of the cell a driver models (the reference fake
   models a served worker cell; the real driver seeds the compiled cell truth)

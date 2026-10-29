@@ -35,6 +35,14 @@ fn corpus_is_well_formed_and_frozen() {
     ] {
         assert!(corpus.vector(id).is_some(), "missing Core vector {id}");
     }
+    for id in ["V-03", "V-42", "V-43"] {
+        let vector = corpus.vector(id).expect("worker vector");
+        assert_eq!(
+            vector.requires,
+            ["worker_sessions"],
+            "{id} must skip on a cell that does not serve workers"
+        );
+    }
     for vector in &corpus.vectors {
         assert!(
             !vector.forbidden.is_empty(),
@@ -286,6 +294,11 @@ fn real_conformance_corpus() {
     let skipped: Vec<&str> = rows
         .iter()
         .filter(|row| row.status == RowStatus::Skip)
+        .filter(|row| {
+            !row.skip_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("cell-not-servable:"))
+        })
         .map(|row| row.id.as_str())
         .collect();
     assert_eq!(
@@ -382,21 +395,36 @@ fn fake_and_real_parity() {
     let _ = evidence::write_parity(compared, &divergences, &not_compared);
     assert_no_failures(&fake_rows, "fake");
     assert_no_failures(&real_rows, "real");
-    assert_eq!(compared, 30, "the shared passing set changed");
+    let real_serves_workers =
+        real.facts().capabilities.get("worker_sessions").copied() == Some(true);
+    let mut expected_not_compared = vec![
+        "V-06", "V-18", "V-33", "V-39", "V-40", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07",
+        "C-08", "C-10", "F-01",
+    ];
+    let expected_compared = if real_serves_workers {
+        30
+    } else {
+        // A refused containment plan skips the worker vectors on the real
+        // driver; the fake still models a served cell.
+        expected_not_compared.extend(["V-03", "V-42"]);
+        28
+    };
+    expected_not_compared.sort_unstable();
+    assert_eq!(
+        compared, expected_compared,
+        "the shared passing set changed"
+    );
     assert!(
         divergences.is_empty(),
         "parity divergences: {divergences:?}"
     );
-    let not_compared_ids: Vec<&str> = not_compared
+    let mut not_compared_ids: Vec<&str> = not_compared
         .iter()
         .map(|entry| entry.split(':').next().unwrap_or(entry))
         .collect();
+    not_compared_ids.sort_unstable();
     assert_eq!(
-        not_compared_ids,
-        [
-            "V-06", "V-18", "V-33", "V-39", "V-40", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07",
-            "C-08", "C-10", "F-01"
-        ],
+        not_compared_ids, expected_not_compared,
         "the parity report changed its not-compared set"
     );
 }

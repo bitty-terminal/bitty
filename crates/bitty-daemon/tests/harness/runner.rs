@@ -180,15 +180,37 @@ pub trait Driver {
 /// `worker_sessions` is the served capability of the cell the driver models, so
 /// a handshake vector asserts what that driver must advertise instead of a
 /// Linux-only surface on Windows or macOS. The fake models a served reference
-/// cell and passes `true`; the real driver passes the compiled cell truth.
-/// `cwd` is an absolute directory the host really has: the spawn contract
-/// requires an absolute path, and `"/"` is not absolute on Windows.
+/// cell and passes `true`; the real driver passes the capability its probe
+/// negotiated. `cwd` is an absolute directory the host really has: the spawn
+/// contract requires an absolute path, and `"/"` is not absolute on Windows.
 pub fn cell_vars(vars: &mut Vars, worker_sessions: bool) {
     vars.insert("worker_sessions".to_owned(), Value::Bool(worker_sessions));
-    vars.insert(
-        "cwd".to_owned(),
-        Value::String(std::env::temp_dir().to_string_lossy().into_owned()),
-    );
+    vars.insert("cwd".to_owned(), Value::String(absolute_cwd()));
+}
+
+/// An absolute, UTF-8 working directory the host really has.
+///
+/// `std::env::temp_dir()` honors `TMPDIR`, which may be relative; resolve it
+/// against the current directory so the spawn specification stays valid. A
+/// non-UTF-8 path is rendered lossily rather than panicking in every driver
+/// preparation.
+fn absolute_cwd() -> String {
+    let temp = std::env::temp_dir();
+    let absolute = if temp.is_absolute() {
+        temp
+    } else {
+        std::env::current_dir().map_or_else(
+            |_| {
+                if cfg!(windows) {
+                    std::path::PathBuf::from(r"C:\")
+                } else {
+                    std::path::PathBuf::from("/")
+                }
+            },
+            |cwd| cwd.join(&temp),
+        )
+    };
+    absolute.to_string_lossy().into_owned()
 }
 
 /// One row of the evidence file.
@@ -295,6 +317,20 @@ pub fn run_vector(vector: &Vector, driver: &mut dyn Driver) -> VectorOutcome {
             return row;
         }
     };
+    // A cell that does not serve a required capability is a typed skip, not a
+    // failure: a real Linux cell whose containment probe selected no mechanism
+    // refuses the worker path, while the reference fake models a served cell.
+    let facts = driver.facts();
+    if let Some(missing) = vector
+        .requires
+        .iter()
+        .find(|capability| facts.capabilities.get(*capability).copied() != Some(true))
+    {
+        row.status = RowStatus::Skip;
+        row.skip_reason = Some(format!("cell-not-servable: {missing}"));
+        driver.finish();
+        return row;
+    }
     for (index, step) in vector.steps.iter().chain(vector.state.iter()).enumerate() {
         row.steps += 1;
         match execute_step(step, driver, &mut vars) {

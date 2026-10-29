@@ -2934,6 +2934,55 @@ fn a_worker_exit_is_recorded_once_with_its_containment_cleanup() {
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
 }
 
+/// How long the test waits for the daemon's exit sweep to settle.
+///
+/// The daemon bounds its own post-exit cleanup by `orphan_reap_grace_ms`
+/// (5 s, `D-14`) plus the 2 s kill window; 15 s doubles that for a loaded
+/// shared runner without weakening the assertion that the tree is gone.
+const CONTAINMENT_SETTLE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Poll step for the settle wait, matching the daemon's supervision cadence.
+const CONTAINMENT_SETTLE_STEP: Duration = Duration::from_millis(25);
+
+/// The daemon's own cgroup v2 root, derived the way `CgroupRoot::detect`
+/// derives it from `/proc/self/cgroup` (here `/proc/<daemon>/cgroup`).
+fn daemon_cgroup_root(daemon_pid: u32) -> Option<PathBuf> {
+    let unified = std::fs::read_to_string(format!("/proc/{daemon_pid}/cgroup")).ok()?;
+    let relative = unified.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let relative = PathBuf::from(relative.trim().trim_start_matches('/'));
+    let mount = Path::new(bitty_daemon::containment::CGROUP2_MOUNT);
+    Some(if relative.as_os_str().is_empty() {
+        mount.to_path_buf()
+    } else {
+        mount.join(relative)
+    })
+}
+
+/// Whether the session cgroup proves the recorded tree is gone.
+///
+/// A verified sweep removes the subtree, so an absent directory is settled.
+/// Otherwise `cgroup.procs` must be empty and `cgroup.events` must report
+/// `populated 0`, the same two-file proof the daemon's sweep uses. A dead
+/// process can linger in `/proc` as an unreaped zombie long after the cgroup
+/// is empty, which is why this test waits on containment rather than `/proc`.
+fn session_cgroup_settled(path: &Path) -> bool {
+    let procs = match std::fs::read_to_string(path.join("cgroup.procs")) {
+        Ok(procs) => procs,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    if !procs.trim().is_empty() {
+        return false;
+    }
+    match std::fs::read_to_string(path.join("cgroup.events")) {
+        Ok(events) => events.lines().any(|line| {
+            line.strip_prefix("populated ")
+                .is_some_and(|value| value.trim() == "0")
+        }),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 #[test]
 fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
     let root = TempRoot::new("worker-descendant");
@@ -2962,6 +3011,29 @@ fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
         .as_str()
         .expect("session id")
         .to_owned();
+
+    // The daemon's own containment report names the plan it selected, and the
+    // session cgroup name comes from the daemon's `worker::cgroup_name`, so the
+    // wait observes the same identity the sweep does.
+    let status = operator.call("daemon.status", Value::Null);
+    let mechanism = status["result"]["orphans"]["mechanism"]
+        .as_str()
+        .expect("containment mechanism")
+        .to_owned();
+    let session_cgroup = (mechanism == bitty_daemon::containment::MECHANISM_CGROUP_V2).then(|| {
+        let instance = bitty_daemon::registry::DaemonInstanceId::parse(
+            status["result"]["daemon_instance_id"]
+                .as_str()
+                .expect("daemon instance id"),
+        )
+        .expect("canonical instance id");
+        let session =
+            bitty_daemon::registry::SessionId::parse(&session_id).expect("canonical session id");
+        let name = bitty_daemon::worker::cgroup_name(instance, session);
+        let root = daemon_cgroup_root(daemon.pid()).expect("the daemon's own cgroup is readable");
+        root.join(name)
+    });
+
     let exited = wait_for_worker_state(&mut operator, &session_id, &["exited", "failed"]);
     assert_eq!(exited["terminal_reason"], "worker_exit");
 
@@ -2970,13 +3042,33 @@ fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
         .trim()
         .parse()
         .expect("a pid");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Path::new(&format!("/proc/{descendant}")).exists() {
-        assert!(
-            Instant::now() < deadline,
-            "descendant {descendant} survived the worker exit"
-        );
-        std::thread::sleep(Duration::from_millis(25));
+
+    match mechanism.as_str() {
+        bitty_daemon::containment::MECHANISM_CGROUP_V2 => {
+            let cgroup = session_cgroup.expect("the cgroup plan names a session subtree");
+            let deadline = Instant::now() + CONTAINMENT_SETTLE_TIMEOUT;
+            while !session_cgroup_settled(&cgroup) {
+                assert!(
+                    Instant::now() < deadline,
+                    "session cgroup {} still populated after the worker exit",
+                    cgroup.display()
+                );
+                std::thread::sleep(CONTAINMENT_SETTLE_STEP);
+            }
+        }
+        // The subreaper plan has no subtree to read, so the recorded pid is the
+        // only containment evidence; keep the `/proc` poll with the same bound.
+        bitty_daemon::containment::MECHANISM_SUBREAPER => {
+            let deadline = Instant::now() + CONTAINMENT_SETTLE_TIMEOUT;
+            while Path::new(&format!("/proc/{descendant}")).exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "descendant {descendant} survived the worker exit"
+                );
+                std::thread::sleep(CONTAINMENT_SETTLE_STEP);
+            }
+        }
+        other => panic!("unexpected containment mechanism {other}"),
     }
 
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));

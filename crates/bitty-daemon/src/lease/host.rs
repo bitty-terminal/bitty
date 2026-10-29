@@ -5,7 +5,7 @@
 //! transition atomic: a refused operation changes neither the registry nor the
 //! lease table. It starts no listener, receives no IPC frame, spawns no worker,
 //! signals no process, and performs no containment check; those belong to
-//! bitty#2607, bitty#2604, and bitty#2602.
+//! bitty#2607, bitty#2790, and bitty#2792.
 //!
 //! # Time
 //!
@@ -373,7 +373,7 @@ pub enum ExitObservation {
 /// It carries no token, no terminal content, and no caller string. `attached`
 /// is every lease record still registered at the transition — including one
 /// whose TTL had already lapsed but which the sweep had not removed yet, because
-/// its connection may still be subscribed — and bitty#2602 must reserve a
+/// its connection may still be subscribed — and bitty#2792 must reserve a
 /// terminal control-frame slot for each entry or close that lease with
 /// `TerminalEventLost` **before** the terminal snapshot becomes visible.
 ///
@@ -385,7 +385,7 @@ pub enum ExitObservation {
 /// for `attached`, enqueue the notices, and only then release the `&mut
 /// SessionHost` (or serve any `session.status`); otherwise a concurrent status
 /// can observe `terminated` before a lease's terminal slot exists. Slot
-/// reservation, queues, and `TerminalEventLost` belong to bitty#2602.
+/// reservation, queues, and `TerminalEventLost` belong to bitty#2792.
 #[derive(Debug, PartialEq, Eq)]
 pub struct TerminalNotice {
     /// The terminal snapshot (attach count already released).
@@ -654,7 +654,7 @@ impl SessionHost {
     /// Both roles pass; the point is liveness: an expired, revoked, or foreign
     /// handle is [`LeaseRefusal::NotAttached`]. The caller still checks the
     /// `session.inspect` scope and, for terminal content, `terminal.inspect`,
-    /// plus the event-subscription rules (bitty#2607 / bitty#2602). This is
+    /// plus the event-subscription rules (bitty#2607 / bitty#2792). This is
     /// read-only and never renews the lease; the heartbeat or a controller
     /// content operation does.
     ///
@@ -1192,7 +1192,7 @@ impl SessionHost {
     /// resize) against a live lease.
     ///
     /// The caller still checks `terminal.input` or `terminal.manage` scope and
-    /// the actual PTY operation (bitty#2607/bitty#2604). An observer is
+    /// the actual PTY operation (bitty#2607/bitty#2790). An observer is
     /// [`LeaseRefusal::ControllerRequired`]; an expired or revoked lease is
     /// [`LeaseRefusal::NotAttached`]. This is a read-only check that never
     /// renews the lease: liveness comes from the client heartbeat
@@ -1968,7 +1968,7 @@ impl SessionHost {
     /// The terminal snapshot becomes visible to the registry here. The caller
     /// must reserve every lease slot listed in the notice and enqueue it before
     /// it releases the `&mut SessionHost` (see [`TerminalNotice`]); this method
-    /// cannot reserve slots because the queues belong to bitty#2602.
+    /// cannot reserve slots because the queues belong to bitty#2792.
     fn finish_terminal(
         &mut self,
         session_id: SessionId,

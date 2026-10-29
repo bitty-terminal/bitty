@@ -27,7 +27,7 @@
 //! [`RegistryLimits::from_limits`]. The lease, control-token, and abort state
 //! machine lives in [`crate::lease`] (bitty#2609) and drives this registry
 //! through the operations above; the bounded event stream lives in
-//! [`crate::events`] (bitty#2602) and wraps the same registry. Deferred to
+//! [`crate::events`] (bitty#2792) and wraps the same registry. Deferred to
 //! their owning slices: IPC decoding, scopes, error mapping, `daemon.status`
 //! serialization, and the audit sink writer (bitty#2607), and process
 //! containment or orphan reaping (bitty#2791).
@@ -49,7 +49,7 @@ pub use self::table::{
     TERMINAL_RETENTION_MS_SYSTEM_MAX,
 };
 
-/// Entropy plumbing shared with the event stream (bitty#2602): the stream mints
+/// Entropy plumbing shared with the event stream (bitty#2792): the stream mints
 /// `attach_id` values from the same source the registry mints sessions from, so
 /// tests can drive both sequences deterministically.
 pub(crate) use self::id::{Entropy, ID_GENERATION_ATTEMPTS, OsEntropy};

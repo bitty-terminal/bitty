@@ -37,13 +37,14 @@
 //! # Deliberate deferrals
 //!
 //! `session.resize` is served for a bound worker under the negotiate-time
-//! `terminal.manage` transport grant and the current controller lease; no
-//! content read, write, or subscribe method exists yet, and a terminal session
-//! (registry-only in this slice) has no PTY to resize. `daemon.orphans.verify`
-//! is served on Linux x86_64 from the owner-private journal and the recorded
-//! containment identity; a cell with no accepted mechanism refuses with
-//! `Denied/UnsupportedCapability` instead of pretending an empty verification.
-//! Both are recorded in the crate README.
+//! `terminal.manage` transport grant and the current controller lease
+//! (bitty#2790); no content read, write, or subscribe method exists yet, and a
+//! terminal session has no PTY to resize (the frozen contract's
+//! `session.create` row defines the registry-only `kind: terminal` answer).
+//! `daemon.orphans.verify` is served on Linux x86_64 from the owner-private
+//! journal and the recorded containment identity (bitty#2791); a cell with no
+//! accepted mechanism refuses with `Denied/UnsupportedCapability` instead of
+//! pretending an empty verification. Both are recorded in the crate README.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;

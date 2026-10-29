@@ -9,7 +9,7 @@
 //! and the version negotiation required by the accepted [`bittyd` Session-Host
 //! Contract]. It implements the registry half of bitty#2601 (server-generated
 //! ids, session records, counters, retention), the bounded orphan journal, the
-//! event stream of bitty#2602 (snapshot plus bounded backlog, per-session
+//! event stream of bitty#2792 (snapshot plus bounded backlog, per-session
 //! revision ordering, per-lease routing, control-frame reservation, the
 //! terminal-event guarantee, and heartbeat/last-seen), the compiled limits and
 //! advertised triples of bitty#2603, the two bounded idempotency stores, the
@@ -99,7 +99,7 @@
 //!
 //! | Contract area | Owner | Answer today |
 //! | --- | --- | --- |
-//! | Terminal-session PTY spawn and content plane | bitty#2604 follow-up | `session.create kind: worker` spawns and binds generation 1 on a served cell; a terminal-session create still registers `created` without a process |
+//! | Terminal-session PTY spawn and content plane | bitty#2790 follow-up | `session.create kind: worker` spawns and binds generation 1 on a served cell; a terminal-session create still registers `created` without a process |
 //! | Worker rebind/restart and executable policy | bitty#2790 follow-up | a restarted daemon does not re-attach a worker; the executable allowlist is not enforced |
 //! | Per-connection refusal-audit aggregation | bitty#2603 follow-up | wire-level refusals are budgeted and aggregated; method refusals remain one individual record each |
 //! | Conformance corpus and fake-server parity | bitty#2605 | `tests/harness` corpus, fake and real drivers, parity gate; every shared vector is compared, with no recorded known defect |

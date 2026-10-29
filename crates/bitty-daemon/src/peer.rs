@@ -159,7 +159,11 @@ impl DispatchBoundary {
         Self::ContentPlane,
     ];
 
-    /// The contract method this boundary authorizes.
+    /// The method this boundary is reported as in diagnostics.
+    ///
+    /// Most boundaries guard exactly one contract method; [`Self::ContentPlane`]
+    /// guards `session.read`, `session.write`, and `session.subscribe`, so it
+    /// reports the synthetic `session.content` label.
     #[must_use]
     pub const fn method(self) -> &'static str {
         match self {

@@ -42,10 +42,11 @@ keeps the `1.2` registry-only shape (`created`, generation 0, no content
 plane) for metadata-only clients. Both kinds share one spawn implementation;
 the kind decides only whether the bound PTY owns a terminal content plane, so a
 worker-kind PTY is resizable but answers every content method
-`Denied/NotRunning`. `session.resize`, `session.read`, `session.write`, and
-`session.subscribe` are served only for a bound terminal whose worker still
-holds a live content plane, under the negotiate-time terminal scopes and the
-current controller lease. The spawn path is Linux-only, and `worker_sessions`
+`Denied/NotRunning`. `session.resize` applies to any bound PTY, terminal or
+worker; only `session.read`, `session.write`, and `session.subscribe` require a
+bound terminal whose worker still holds a live content plane. All four run
+under the negotiate-time terminal scopes and the current controller lease. The
+spawn path is Linux-only, and `worker_sessions`
 is compiled from the cell truth and narrowed to the containment plan the
 startup probe selected, so a daemon can never advertise a path it does not
 serve.

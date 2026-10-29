@@ -3843,9 +3843,14 @@ mod event_wire {
         let mut operator = Client::connect(&root.endpoint());
         assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
 
-        let (mut creator, _) = event_consumer(&root, &mut operator, "content");
+        let (mut creator, handshake) = event_consumer(&root, &mut operator, "content");
+        let instance = handshake["result"]["daemon_instance_id"]
+            .as_str()
+            .expect("instance id")
+            .to_owned();
         let (session_id, attach_id, _controller_token, _) =
             create_and_claim(&mut creator, "content");
+        let expected_revision = operator_revision(&mut operator, &session_id);
 
         let subscribed = creator.call(
             "session.subscribe",
@@ -3891,13 +3896,14 @@ mod event_wire {
             assert_eq!(event["generation"], 1, "{event}");
             assert_eq!(event["terminal"], false, "{event}");
             assert_eq!(
-                event["instance_id"].as_str().map(str::len),
-                Some(32),
-                "content frames carry the daemon instance: {event}"
+                event["instance_id"].as_str(),
+                Some(instance.as_str()),
+                "content frames carry the negotiated daemon instance: {event}"
             );
-            assert!(
-                event["revision"].as_u64().is_some(),
-                "content frames carry the current state revision: {event}"
+            assert_eq!(
+                event["revision"].as_u64(),
+                Some(expected_revision),
+                "content frames carry the session's current state revision: {event}"
             );
             assert_eq!(
                 event["sequence"].as_u64(),

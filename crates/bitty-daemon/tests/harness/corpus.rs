@@ -335,7 +335,15 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
             step.action.as_deref(),
             Some("advance_clock" | "restart" | "crash")
         );
-        if !setup_action && !step.expect.has_typed_assertion() {
+        // A pushed-event read asserts through `args.events`, one expectation
+        // object per frame, because each frame needs its own revision.
+        let event_action = step.action.as_deref() == Some("read_events")
+            && step
+                .args
+                .get("events")
+                .and_then(Value::as_array)
+                .is_some_and(|events| !events.is_empty());
+        if !setup_action && !event_action && !step.expect.has_typed_assertion() {
             return Err(fail(format!(
                 "step {:?} has no typed expectation",
                 step.method.as_deref().or(step.action.as_deref())

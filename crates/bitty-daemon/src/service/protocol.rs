@@ -20,6 +20,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use crate::audit::AuditActor;
+use crate::events::Event;
 use crate::handshake::{ClientId, EffectiveScopes, PeerIdentityFacts};
 use crate::lease::ControlToken;
 use crate::peer::{DispatchBoundary, PeerGuard, PeerIdentity};
@@ -48,6 +49,11 @@ pub struct Connection {
     leases: BTreeMap<AttachId, SessionId>,
     detached: VecDeque<(AttachId, SessionId)>,
     pending_tokens: BTreeMap<AttachId, ControlToken>,
+    /// The client asked for pushed session events at negotiate (`D-10`).
+    events: bool,
+    /// Frames that must be written before the connection's next response, in
+    /// order: drained lease queues and the final `lease_revoked` frame.
+    pending_frames: Vec<Event>,
 }
 
 impl Connection {
@@ -64,6 +70,8 @@ impl Connection {
             leases: BTreeMap::new(),
             detached: VecDeque::new(),
             pending_tokens: BTreeMap::new(),
+            events: false,
+            pending_frames: Vec::new(),
         }
     }
 
@@ -260,6 +268,33 @@ impl Connection {
             return None;
         }
         self.pending_tokens.remove(&attach_id)
+    }
+
+    /// Record the client's `events` opt-in from the accepted negotiate.
+    pub(crate) const fn mark_events(&mut self, events: bool) {
+        self.events = events;
+    }
+
+    /// Whether this connection receives pushed session events.
+    #[must_use]
+    pub const fn events_enabled(&self) -> bool {
+        self.events
+    }
+
+    /// Queue frames that must be written before the next response.
+    ///
+    /// The service uses this for the final frames of a lease that is about to
+    /// disappear: its queued events and the target-only `lease_revoked` frame
+    /// stay ordered and are never dropped by the lease bookkeeping.
+    pub(crate) fn queue_frames(&mut self, frames: Vec<Event>) {
+        self.pending_frames.extend(frames);
+    }
+
+    /// Take every queued frame, in order.
+    #[cfg(all(unix, target_os = "linux"))]
+    #[must_use]
+    pub(crate) fn take_pending_frames(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.pending_frames)
     }
 }
 

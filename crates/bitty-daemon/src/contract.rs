@@ -45,6 +45,15 @@ pub const CAPABILITY_NAMES: [&str; 6] = [
     "idempotent_mutations",
 ];
 
+/// Whether this build serves the pushed session-event wire (bitty#2792).
+///
+/// Delivery rides the negotiated connection, so it is served exactly where the
+/// daemon's admission loop is compiled: the Linux Unix-socket cell. Every other
+/// cell advertises `events: false` and refuses a negotiate that requests
+/// delivery with `Denied/UnsupportedCapability`, so a client can never wait on
+/// frames a build does not send.
+pub const EVENTS_SERVED: bool = cfg!(all(unix, target_os = "linux"));
+
 /// The explicit capability set this build can advertise.
 ///
 /// `worker_sessions` is compiled from [`crate::worker::WORKER_SESSIONS_SERVED`]:
@@ -53,14 +62,13 @@ pub const CAPABILITY_NAMES: [&str; 6] = [
 /// containment plan its startup probe selected
 /// ([`crate::worker::sessions_served`]): a Linux cell whose cgroup and
 /// subreaper probes both failed advertises `false` and answers
-/// `session.create` with `kind: worker` as `Denied/UnsupportedCapability`. The
-/// other capabilities are the contract target set; `events` stays `true` even
-/// though no event frame is pushed in this slice (bitty#2792 owns the delivered
-/// event wire).
+/// `session.create` with `kind: worker` as `Denied/UnsupportedCapability`.
+/// `events` is compiled from [`EVENTS_SERVED`] for the same reason: the bit
+/// describes the served wire, not a plan.
 pub const CAPABILITIES: Capabilities = Capabilities {
     terminal_sessions: true,
     worker_sessions: crate::worker::WORKER_SESSIONS_SERVED,
-    events: true,
+    events: EVENTS_SERVED,
     observer_grants: true,
     control_transfer: true,
     idempotent_mutations: true,
@@ -257,7 +265,7 @@ mod tests {
             Capabilities {
                 terminal_sessions: true,
                 worker_sessions: crate::worker::WORKER_SESSIONS_SERVED,
-                events: true,
+                events: EVENTS_SERVED,
                 observer_grants: true,
                 control_transfer: true,
                 idempotent_mutations: true,
@@ -267,8 +275,10 @@ mod tests {
         if crate::worker::WORKER_SESSIONS_SERVED {
             enabled.push("worker_sessions");
         }
+        if EVENTS_SERVED {
+            enabled.push("events");
+        }
         enabled.extend([
-            "events",
             "observer_grants",
             "control_transfer",
             "idempotent_mutations",

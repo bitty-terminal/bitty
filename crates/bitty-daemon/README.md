@@ -57,16 +57,16 @@ before its terminal record is written.
 The contract areas that are deliberately deferred, and the typed answer the
 running service gives today:
 
-| Area                                                                                                 | Owner                          | Answer today                                                                                                                                                       |
-| ---------------------------------------------------------------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Terminal-session PTY spawn (`session.create kind: terminal` stays registry-only)                     | bitty#2604 / terminal contract | `session.create` returns the `created` snapshot with `generation: 0`; only `kind: worker` spawns a PTY today                                                       |
-| Worker content reads/writes (`session.resize` is served; no stream or input method exists)           | bitty#2604 / terminal contract | `session.resize` applies to the worker PTY and bumps the revision; no content read, write, or subscribe method is served                                           |
-| Worker rebind and restart across generations                                                         | bitty#2790 follow-up           | a worker binds generation 1 exactly once; a terminal record is never revived and no automatic restart exists                                                       |
-| Executable allowlist for worker `argv[0]`                                                            | bitty#2604 / security corpus   | any executable reachable under the daemon user is accepted; no allowlist or digest policy is enforced yet                                                          |
-| Executable path digest in the orphan record; native Windows job-object reaper                        | bitty#2791 follow-up           | no executable path is recorded; Windows and macOS keep the typed `UnsupportedPlatform` refusal                                                                     |
-| Pushing session events on a connection (no subscribe method; the event stream owns its own registry) | bitty#2602                     | `session.status`/`session.list` are the reconciliation reads; no event frame is sent                                                                               |
-| Per-connection refusal-audit aggregation                                                             | bitty#2603 follow-up           | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each                                                     |
-| Conformance corpus and fake-server parity                                                            | bitty#2605                     | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; every shared vector is compared, with no recorded known defect |
+| Area                                                                                       | Owner                          | Answer today                                                                                                                                                       |
+| ------------------------------------------------------------------------------------------ | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Terminal-session PTY spawn (`session.create kind: terminal` stays registry-only)           | bitty#2604 / terminal contract | `session.create` returns the `created` snapshot with `generation: 0`; only `kind: worker` spawns a PTY today                                                       |
+| Worker content reads/writes (`session.resize` is served; no stream or input method exists) | bitty#2604 / terminal contract | `session.resize` applies to the worker PTY and bumps the revision; no content read, write, or subscribe method is served                                           |
+| Worker rebind and restart across generations                                               | bitty#2790 follow-up           | a worker binds generation 1 exactly once; a terminal record is never revived and no automatic restart exists                                                       |
+| Executable allowlist for worker `argv[0]`                                                  | bitty#2604 / security corpus   | any executable reachable under the daemon user is accepted; no allowlist or digest policy is enforced yet                                                          |
+| Executable path digest in the orphan record; native Windows job-object reaper              | bitty#2791 follow-up           | no executable path is recorded; Windows and macOS keep the typed `UnsupportedPlatform` refusal                                                                     |
+| Per-connection event backlog counters in `daemon.status`; a shed-able observability class  | bitty#2603 / bitty#2806        | delivery is served on the Linux cell (`events: true`); no shed-able class exists and no status counter is served                                                   |
+| Per-connection refusal-audit aggregation                                                   | bitty#2603 follow-up           | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each                                                     |
+| Conformance corpus and fake-server parity                                                  | bitty#2605                     | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; every shared vector is compared, with no recorded known defect |
 
 Nothing here authorizes autostart, a service file, a TCP listener, or desktop
 wiring; all four stay out of scope.
@@ -91,9 +91,11 @@ non-served cell or a Linux cell whose probe selected no mechanism advertises
 `worker_sessions: false` and answers a worker create with
 `Denied/UnsupportedCapability`; a served daemon advertises `true` and gates the
 same call by `process.spawn`, `session.host` consent, a live host grant, and the
-bounded spawn specification. `events` is advertised though no
-event frame is pushed in this slice (bitty#2792 owns the delivered event wire).
-Do not read any bit as a claim about a path this README marks deferred.
+bounded spawn specification. `events` is compiled from `contract::EVENTS_SERVED`
+and is `true` exactly where the admission loop serves pushed frames (the Linux
+Unix-socket cell); every other cell advertises `false` and refuses a negotiate
+that asks for delivery with `Denied/UnsupportedCapability`. Do not read any bit
+as a claim about a path this README marks deferred.
 
 ## Registry core (bitty#2601)
 
@@ -370,6 +372,50 @@ is bounded to 128 bytes of valid UTF-8 with no control characters and is
 recorded only as a truncated 128-bit SHA-256 digest (`D-08`);
 `operator_capability` and `host_grant` stay out of this crate until the slice
 that owns their secret lifetime and storage exists.
+
+## Pushed event wire (bitty#2792)
+
+A connection opts in with `"events": true` on `daemon.negotiate`. Only then does
+the server write event frames on that same connection, for the leases it holds.
+Source: contract `D-10`; the frozen envelope is restated in
+`bittyd-ipc-contract.md` ("Event schema and capability").
+
+- **Envelope.** `{"v": 1, "id": <server correlation>, "event": {...}}`. `id` is
+  chosen by the server per connection (`e<counter>`, at most 64 bytes) and is
+  never a client value. The event object always carries `kind`, `instance_id`,
+  `session_id`, `attach_id`, `revision`, and `terminal`; `detail` is present only
+  for `control_transfer` (`{from, to}`) and `daemon_stopping` (`{deadline_ms}`),
+  and `terminal_marker` only on `session_terminal`.
+- **Ordering.** One event per `state_revision`, in revision order, per session.
+  The service reports the session it mutated and the last emitted revision is
+  the source of truth: a revision the handler did not report is filled with a
+  plain `session_state` frame, and a revision is never re-emitted or renumbered.
+  Frames are written after the response they follow, so an event never preempts
+  a response.
+- **Routing.** Every frame is a per-lease copy addressed to the receiving
+  connection's own `attach_id`; nothing is broadcast. A revoked lease's final
+  `lease_revoked` frame is routed to the connection that owns that lease, not to
+  the requester's response.
+- **Bounded backlog.** The per-session ring is `max_event_backlog_events` /
+  `max_event_backlog_bytes`; the per-lease queue is `max_lease_queue_events` /
+  `max_lease_queue_bytes`. A control frame is never shed: when a lease queue
+  cannot accept one, the lease is closed with `TerminalEventLost` and its
+  connection retires after the current response. The outbound buffer is capped at
+  `max_connection_outbound_bytes`; a full buffer stops draining the lease queues
+  instead of growing memory, so pressure is absorbed by the bounded queue and
+  then reported as the typed close.
+- **Terminal guarantee.** The terminal event is emitted before the terminal
+  state is readable, pinned until every recipient observes it, and written
+  before an idle close shuts the connection down. A client either receives the
+  frame or learns it was lost; `session.status`/`session.list` stay the
+  reconciliation reads.
+- **Attach replay.** An event-opted `session.attach` result carries the optional
+  `backlog` (the retained ring, routed to the new lease), `backlog_truncated`,
+  and `earliest_revision`. A `1.0` request carries no cursor, so the ring is
+  served whole and the client deduplicates by `(session_id, revision, kind)`.
+- **Opt-out.** A connection that does not opt in receives no frame of any kind,
+  including a lease's final frame, and its attach result carries no replay keys.
+- There is no subscribe method in `1.x`; events ride the negotiated connection.
 
 ## Event stream (bitty#2602)
 
@@ -1148,8 +1194,9 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
 - `src/registry/` — ids, session records and lifecycle, the registry table,
   counters, retention, and refusals.
 - `src/events/` — the event envelope and kinds, the bounded backlog ring, lease
-  queues with the control reservation, the enforced limits, and the per-session
-  stream.
+  queues with the control reservation, the enforced limits, the per-session
+  stream, and the wire delivery bus (`bus.rs`: per-session ring, per-lease
+  queues, pinned terminal event, replay window).
 - `src/lease/` — the control token and digest, lease records and limits, the
   lease/control/stop state machine, and its closed refusals.
 - `src/orphan/` — process identity probes, the bounded journal, classification,
@@ -1180,6 +1227,9 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
 - `tests/binary.rs` — `--version`, no-argument seam, no runtime files, usage
   error.
 - `tests/registry.rs` — public registry lifecycle, ids, refusals, limits.
+- `tests/service_loop.rs` (`event_wire`) — real-socket delivery: response-first
+  ordering, per-lease routing, the terminal marker, disconnect cleanup, the
+  opt-out, and the attach replay.
 - `tests/events.rs` — public stream behavior: revision ordering, replay and
   truncation boundaries, the terminal guarantee, control frames, heartbeat
   memory stability, and the seeded 10,000-operation no-loss audit.

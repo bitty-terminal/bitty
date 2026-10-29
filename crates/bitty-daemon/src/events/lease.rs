@@ -162,6 +162,11 @@ impl LeaseQueue {
         self.events.len()
     }
 
+    /// Whether the queue holds nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
     /// Queued event bytes.
     pub(crate) fn bytes(&self) -> usize {
         self.bytes

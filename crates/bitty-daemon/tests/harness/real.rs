@@ -214,6 +214,28 @@ impl Client {
             .map_err(|_| "write raw frame".to_owned())
     }
 
+    /// Read one complete frame and return its raw JSON value.
+    fn recv_frame(&mut self) -> Result<Value, String> {
+        let mut header = [0u8; 4];
+        match self.stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(error) if is_eof(&error) => {
+                return Err("connection closed before the event".to_owned());
+            }
+            Err(_) => return Err("read event header".to_owned()),
+        }
+        let length = u32::from_be_bytes(header) as usize;
+        let mut payload = vec![0u8; length];
+        match self.stream.read_exact(&mut payload) {
+            Ok(()) => {}
+            Err(error) if is_eof(&error) => {
+                return Err("connection closed before the event".to_owned());
+            }
+            Err(_) => return Err("read event body".to_owned()),
+        }
+        serde_json::from_slice(&payload).map_err(|_| "parse event".to_owned())
+    }
+
     fn recv(&mut self) -> Result<Outcome, String> {
         let mut header = [0u8; 4];
         match self.stream.read_exact(&mut header) {
@@ -560,6 +582,23 @@ impl RealDriver {
 impl Driver for RealDriver {
     fn kind(&self) -> DriverKind {
         DriverKind::Real
+    }
+
+    fn read_events(&mut self, connection: &str, count: usize) -> Result<Vec<Value>, String> {
+        let client = self.client(connection);
+        let mut events = Vec::with_capacity(count);
+        for _ in 0..count {
+            let frame = client.recv_frame()?;
+            if frame.get("ok").is_some() {
+                return Err("an event frame carried a response envelope".to_owned());
+            }
+            let event = frame
+                .get("event")
+                .cloned()
+                .ok_or_else(|| format!("frame is not a pushed event: {frame}"))?;
+            events.push(event);
+        }
+        Ok(events)
     }
 
     fn prepare(&mut self, vector: &Vector) -> Result<Vars, String> {

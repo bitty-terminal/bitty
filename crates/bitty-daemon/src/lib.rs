@@ -51,7 +51,7 @@
 //!
 //! # Frozen here
 //!
-//! - [`contract::SERVICE_API_VERSION`]: service API `1.1` with minimum client
+//! - [`contract::SERVICE_API_VERSION`]: service API `1.2` with minimum client
 //!   minor `0` (contract D-11).
 //! - [`contract::CAPABILITIES`]: `terminal_sessions`, `worker_sessions`
 //!   (compiled for the cell and narrowed to the probed containment plan),

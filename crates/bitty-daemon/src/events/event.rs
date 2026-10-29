@@ -317,6 +317,7 @@ mod tests {
             state_revision: 1,
             attach_count: 0,
             attached: false,
+            controller_present: false,
             owner_peer: None,
             terminal_reason: None,
             exit: ExitInformation::NotApplicable,

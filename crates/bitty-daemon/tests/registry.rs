@@ -40,7 +40,7 @@ fn lifecycle_counters_and_retention_work_through_the_public_surface() {
         .create(
             CreateSession {
                 terminal_id: Some(terminal("term-1")),
-                owner_peer: Some(OwnerPeer::new(b"uid=1000").expect("bounded")),
+                owner_peer: Some(OwnerPeer::new(1000, 7)),
             },
             ms(1),
         )

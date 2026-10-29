@@ -403,6 +403,27 @@ pub struct ServerFacts {
     pub daemon_pid: u32,
 }
 
+/// The daemon process facts `daemon.status` serves (`D-06`; bitty#2806).
+///
+/// `pid` is observational and never a signal target or an authority input;
+/// `started_at` is the server monotonic clock at daemon start, so `uptime_ms`
+/// is a subtraction on the same clock every request already carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DaemonFacts {
+    /// Observational daemon process id.
+    pub pid: u32,
+    /// Server monotonic clock at daemon start.
+    pub started_at: MonotonicMs,
+}
+
+impl DaemonFacts {
+    /// Build the daemon facts.
+    #[must_use]
+    pub const fn new(pid: u32, started_at: MonotonicMs) -> Self {
+        Self { pid, started_at }
+    }
+}
+
 /// A service construction failure. The daemon must not start on any of them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceError {
@@ -458,6 +479,8 @@ pub struct Service {
     state: DaemonState,
     stop_requested: Option<StopMode>,
     drain_deadline_ms: Option<u64>,
+    /// Process facts for `daemon.status` (`D-06`; bitty#2806).
+    daemon: DaemonFacts,
 }
 
 /// Full observer-grant ids retained for keyed `session.grant` replays.
@@ -485,6 +508,7 @@ impl Service {
         writer: Box<dyn AuditWriter>,
         orphans: OrphanSupervisor,
         containment: ContainmentReport,
+        daemon: DaemonFacts,
     ) -> Result<Self, ServiceError> {
         let host = SessionHost::new(
             RegistryLimits::from_limits(&limits),
@@ -518,6 +542,7 @@ impl Service {
             state: DaemonState::Running,
             stop_requested: None,
             drain_deadline_ms: None,
+            daemon,
         })
     }
 
@@ -1644,6 +1669,8 @@ impl Service {
                 "terminal": counts.terminal,
             },
             "audit_degraded": self.audit.is_degraded(),
+            "daemon_pid": self.daemon.pid,
+            "uptime_ms": now.saturating_since(self.daemon.started_at),
             "drain_deadline_ms": self.drain_deadline_ms,
             "tcp_listeners": tcp_listener_count(),
             "limits": limits,
@@ -2080,8 +2107,8 @@ impl Service {
                         .complete(reservation, IdempotencyResult::Refused(store_code(error)));
                     return Err(error);
                 }
-                let owner_peer = OwnerPeer::new(&connection.peer_uid().to_be_bytes())
-                    .map_err(|_| Refusal::internal())?;
+                let owner_peer =
+                    OwnerPeer::new(connection.peer_uid(), connection.peer().identity().pid());
                 let created = self.host.create_kind(
                     crate::registry::CreateSession {
                         terminal_id,
@@ -2161,7 +2188,7 @@ impl Service {
                                 .map(|token| crate::handshake::hex(token.expose_secret()))
                         };
                         Ok(json!({
-                            "session": session_json(&snapshot),
+                            "session": self.session_json(&snapshot, now),
                             "control_token": token,
                             "replayed": false,
                         }))
@@ -2313,7 +2340,7 @@ impl Service {
             now,
         );
         Ok(json!({
-            "session": session_json(snapshot),
+            "session": self.session_json(snapshot, now),
             "control_token": token,
             "replayed": true,
         }))
@@ -2328,7 +2355,7 @@ impl Service {
         let session_id = parse_session_id(fields)?;
         let token = optional_control_token(fields)?;
         let snapshot = self.visible(connection, session_id, token.as_ref(), now)?;
-        Ok(json!({"session": session_json(&snapshot)}))
+        Ok(json!({"session": self.session_json(&snapshot, now)}))
     }
 
     fn session_list(
@@ -2336,14 +2363,30 @@ impl Service {
         connection: &mut Connection,
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
+        let operator = self.has_operator_view(connection);
         let sessions: Vec<Value> = self
             .host
             .snapshots(now)
             .filter(|snapshot| {
-                self.has_operator_view(connection)
-                    || self.holds_live_lease(connection, snapshot.session_id, now)
+                operator || self.holds_live_lease(connection, snapshot.session_id, now)
             })
-            .map(|snapshot| session_json(&snapshot))
+            .map(|snapshot| {
+                let mut value = self.session_json(&snapshot, now);
+                // `D-09`: the operator all-session view is the only view that
+                // carries the owner peer, and only as the two numeric facts.
+                // An ordinary view omits the key entirely (omit, never null).
+                if operator {
+                    if let Some(owner) = snapshot.owner_peer {
+                        if let Some(map) = value.as_object_mut() {
+                            map.insert(
+                                "owner".to_owned(),
+                                json!({"uid": owner.uid(), "pid": owner.pid()}),
+                            );
+                        }
+                    }
+                }
+                value
+            })
             .collect();
         Ok(json!({"sessions": sessions}))
     }
@@ -2404,11 +2447,12 @@ impl Service {
                     .host
                     .find_attach_by_ref(applied.session_id, applied.result_ref);
                 Ok(json!({
-                    "session": session_json(&snapshot),
+                    "session": self.session_json(&snapshot, now),
                     "attach_id": attach.map(|attach| attach.as_hex()),
                     "role": "controller",
                     "replayed": true,
                     "not_attached": attach.is_none(),
+                    "server_monotonic_ms": now.as_millis(),
                 }))
             }
             Ok(Admission::Replay(IdempotencyResult::Refused(code))) => Err(Refusal::denied(code)),
@@ -2476,12 +2520,14 @@ impl Service {
                         );
                         let rotated = crate::handshake::hex(claimed.control_token.expose_secret());
                         let mut result = json!({
-                            "session": session_json(&claimed.session),
+                            "session": self.session_json(&claimed.session, now),
                             "attach_id": attach_id.as_hex(),
                             "role": "controller",
                             "lease_expires_at_ms": claimed.lease.expires_at().as_millis(),
                             "control_token": rotated,
                             "replayed": false,
+                            "scopes": connection.scopes().names(),
+                            "server_monotonic_ms": now.as_millis(),
                         });
                         attach_replay_fields(
                             &mut result,
@@ -2602,11 +2648,13 @@ impl Service {
                     now,
                 );
                 let mut result = json!({
-                    "session": session_json(&session),
+                    "session": self.session_json(&session, now),
                     "attach_id": attach_id.as_hex(),
                     "role": "observer",
                     "lease_expires_at_ms": attached.lease.expires_at().as_millis(),
                     "replayed": false,
+                    "scopes": connection.scopes().names(),
+                    "server_monotonic_ms": now.as_millis(),
                 });
                 attach_replay_fields(
                     &mut result,
@@ -2937,7 +2985,7 @@ impl Service {
                 now,
             );
             return Ok(json!({
-                "session": session_json(&snapshot),
+                "session": self.session_json(&snapshot, now),
                 "attach_id": target.as_hex(),
                 "was_attached": false,
                 "not_attached": true,
@@ -3013,7 +3061,7 @@ impl Service {
                     now,
                 );
                 Ok(json!({
-                    "session": session_json(&detached.session),
+                    "session": self.session_json(&detached.session, now),
                     "attach_id": target.as_hex(),
                     "was_attached": detached.was_attached,
                     "not_attached": !detached.was_attached,
@@ -3060,7 +3108,7 @@ impl Service {
                     .host
                     .find_attach_by_ref(applied.session_id, applied.result_ref);
                 Ok(json!({
-                    "session": session_json(&snapshot),
+                    "session": self.session_json(&snapshot, now),
                     "controller": controller.map(|attach| attach.as_hex()),
                     "replayed": true,
                     "not_attached": controller.is_none(),
@@ -3136,7 +3184,7 @@ impl Service {
                             now,
                         );
                         Ok(json!({
-                            "session": session_json(&transferred.session),
+                            "session": self.session_json(&transferred.session, now),
                             "controller": controller.as_hex(),
                             "previous_controller": transferred
                                 .previous_controller
@@ -3218,7 +3266,7 @@ impl Service {
             None,
             now,
         );
-        Ok(json!({"session": session_json(&resized)}))
+        Ok(json!({"session": self.session_json(&resized, now)}))
     }
 
     fn session_abort(
@@ -3234,7 +3282,7 @@ impl Service {
         let snapshot = self.control_target(connection, session_id, token.as_ref(), now)?;
         if snapshot.state.is_terminal() {
             return Ok(json!({
-                "session": session_json(&snapshot),
+                "session": self.session_json(&snapshot, now),
                 "accepted": false,
                 "not_running": true,
             }));
@@ -3296,7 +3344,7 @@ impl Service {
         let snapshot = self.visible(connection, session_id, None, now)?;
         if snapshot.state.is_terminal() {
             return Ok(json!({
-                "session": session_json(&snapshot),
+                "session": self.session_json(&snapshot, now),
                 "accepted": false,
                 "not_running": true,
             }));
@@ -3329,7 +3377,7 @@ impl Service {
     ) -> Result<Value, Refusal> {
         match outcome {
             StopOutcome::AlreadyTerminal { session } => Ok(json!({
-                "session": session_json(&session),
+                "session": self.session_json(&session, now),
                 "accepted": false,
                 "not_running": true,
             })),
@@ -3369,7 +3417,7 @@ impl Service {
                     Termination::AlreadyTerminal { session } => session,
                 };
                 Ok(json!({
-                    "session": session_json(&snapshot),
+                    "session": self.session_json(&snapshot, now),
                     "accepted": true,
                     "reason": accepted.reason.as_str(),
                     "stage": "not_started",
@@ -3391,7 +3439,7 @@ impl Service {
                     now,
                 );
                 Ok(json!({
-                    "session": session_json(&accepted.session),
+                    "session": self.session_json(&accepted.session, now),
                     "accepted": true,
                     "reason": terminal_reason.as_str(),
                     "stage": accepted.stage.as_str(),
@@ -3426,10 +3474,11 @@ impl Service {
             now,
         );
         Ok(json!({
-            "session": session_json(&heartbeat.session),
+            "session": self.session_json(&heartbeat.session, now),
             "attach_id": attach_id.as_hex(),
             "lease_expires_at_ms": heartbeat.lease.expires_at().as_millis(),
             "control_token": token,
+            "server_monotonic_ms": now.as_millis(),
         }))
     }
 
@@ -3439,43 +3488,65 @@ impl Service {
         }
         self.initial_tokens.remove(&session_id);
     }
+
+    /// Unconsumed, unrevoked, unexpired observer grants for one snapshot.
+    ///
+    /// Bounded by `max_pending_observer_grants_per_session`; a terminal
+    /// session serves `0` because no grant it still stores can be consumed.
+    fn pending_observer_grants(&self, snapshot: &SessionSnapshot, now: MonotonicMs) -> u16 {
+        if snapshot.state.is_terminal() {
+            return 0;
+        }
+        u16::try_from(
+            self.grants
+                .pending_observer_grants(snapshot.session_id, now.as_millis()),
+        )
+        .unwrap_or(u16::MAX)
+    }
+
+    /// Render the shared metadata-only `session` object (`D-03`, `D-09`).
+    ///
+    /// Controller presence and the pending observer-grant count are metadata
+    /// additions (`1.2`, bitty#2806); the owner peer and terminal content are
+    /// never part of this object.
+    fn session_json(&self, snapshot: &SessionSnapshot, now: MonotonicMs) -> Value {
+        let mut value = json!({
+            "session_id": snapshot.session_id.as_hex(),
+            "kind": snapshot.kind.as_str(),
+            "terminal_id": snapshot.terminal_id.as_str(),
+            "state": snapshot.state.as_str(),
+            "generation": snapshot.generation,
+            "state_revision": snapshot.state_revision,
+            "attach_count": snapshot.attach_count,
+            "attached": snapshot.attached,
+            "controller_present": snapshot.controller_present,
+            "pending_observer_grants": self.pending_observer_grants(snapshot, now),
+            "created_at_ms": snapshot.created_at_ms.as_millis(),
+            "last_seen_ms": snapshot.last_seen_ms.as_millis(),
+        });
+        if let Some(map) = value.as_object_mut() {
+            if snapshot.state.is_terminal() {
+                map.insert(
+                    "terminal_reason".to_owned(),
+                    snapshot
+                        .terminal_reason
+                        .map(|reason| Value::String(reason.as_str().to_owned()))
+                        .unwrap_or(Value::Null),
+                );
+                map.insert(
+                    "cleanup".to_owned(),
+                    snapshot
+                        .cleanup
+                        .map(|cleanup| Value::String(cleanup.as_str().to_owned()))
+                        .unwrap_or(Value::Null),
+                );
+            }
+        }
+        value
+    }
 }
 
 // ── rendering and parsing helpers ──────────────────────────────────────────
-
-fn session_json(snapshot: &SessionSnapshot) -> Value {
-    let mut value = json!({
-        "session_id": snapshot.session_id.as_hex(),
-        "kind": snapshot.kind.as_str(),
-        "terminal_id": snapshot.terminal_id.as_str(),
-        "state": snapshot.state.as_str(),
-        "generation": snapshot.generation,
-        "state_revision": snapshot.state_revision,
-        "attach_count": snapshot.attach_count,
-        "attached": snapshot.attached,
-        "created_at_ms": snapshot.created_at_ms.as_millis(),
-        "last_seen_ms": snapshot.last_seen_ms.as_millis(),
-    });
-    if let Some(map) = value.as_object_mut() {
-        if snapshot.state.is_terminal() {
-            map.insert(
-                "terminal_reason".to_owned(),
-                snapshot
-                    .terminal_reason
-                    .map(|reason| Value::String(reason.as_str().to_owned()))
-                    .unwrap_or(Value::Null),
-            );
-            map.insert(
-                "cleanup".to_owned(),
-                snapshot
-                    .cleanup
-                    .map(|cleanup| Value::String(cleanup.as_str().to_owned()))
-                    .unwrap_or(Value::Null),
-            );
-        }
-    }
-    value
-}
 
 /// Add the optional attach replay keys (`D-10`, bitty#2792).
 ///
@@ -4008,6 +4079,20 @@ mod tests {
         orphans: OrphanSupervisor,
         containment: crate::containment::ContainmentReport,
     ) -> (Service, tempfile::TempDir) {
+        service_with_daemon(
+            limits,
+            orphans,
+            containment,
+            DaemonFacts::new(std::process::id(), MonotonicMs::ZERO),
+        )
+    }
+
+    fn service_with_daemon(
+        limits: Limits,
+        orphans: OrphanSupervisor,
+        containment: crate::containment::ContainmentReport,
+        daemon: DaemonFacts,
+    ) -> (Service, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("temp dir");
         std::fs::set_permissions(
             dir.path(),
@@ -4016,8 +4101,15 @@ mod tests {
         .expect("chmod");
         let operator = OperatorStore::create_in(dir.path()).expect("operator store");
         let (writer, _fail, _lines) = TestWriter::new();
-        let service = Service::new(limits, operator, Box::new(writer), orphans, containment)
-            .expect("service");
+        let service = Service::new(
+            limits,
+            operator,
+            Box::new(writer),
+            orphans,
+            containment,
+            daemon,
+        )
+        .expect("service");
         (service, dir)
     }
 
@@ -4123,6 +4215,40 @@ mod tests {
             .to_owned()
     }
 
+    /// Create a session and claim control, returning the creator connection,
+    /// the session id, and the fresh controller claim result.
+    fn controller_session(
+        service: &mut Service,
+        operator: &mut Connection,
+        label: &str,
+    ) -> (Connection, String, Value) {
+        let grant = mint_host_grant(service, operator, 2);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        let created = create_session(service, &mut creator, label);
+        let id = session_id(&created);
+        let token = created["control_token"].as_str().expect("token").to_owned();
+        let claimed = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": id,
+                    "expected_generation": 0,
+                    "control_token": token,
+                    "idempotency_key": format!("{label}-claim"),
+                }),
+                MonotonicMs::from_millis(11),
+            )
+            .expect("claim");
+        (creator, id, claimed)
+    }
+
     #[test]
     fn negotiation_freezes_the_version_and_baseline_scopes() {
         let (mut service, _dir) = service();
@@ -4137,7 +4263,7 @@ mod tests {
             )
             .expect("accepted");
         assert_eq!(response.wire_version, 1);
-        assert_eq!(response.service_api_version.to_string(), "1.1");
+        assert_eq!(response.service_api_version.to_string(), "1.2");
         assert_eq!(response.scopes.service, ServiceScopeSet::baseline());
         assert_eq!(response.daemon_pid, std::process::id());
         assert_eq!(response.peer_identity.pid, std::process::id());
@@ -4876,6 +5002,7 @@ mod tests {
             crate::containment::ContainmentReport::unprobed(
                 crate::platform::PlatformCell::current(),
             ),
+            DaemonFacts::new(std::process::id(), MonotonicMs::ZERO),
         )
         .expect("service");
         let mut operator_conn = operator_connection(&mut service);
@@ -5665,6 +5792,394 @@ mod tests {
             )
             .expect_err("daemon.control is required");
         assert_eq!(error.denied_code(), Some(RefusalCode::ScopeViolation));
+    }
+
+    /// `session.attach` serves the connection's effective lease scopes and the
+    /// server clock on every success branch (`D-09`; bitty#2806).
+    #[test]
+    fn session_attach_serves_effective_scopes_and_the_server_clock() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let (mut creator, id, claimed) =
+            controller_session(&mut service, &mut operator, "meta-attach");
+        // The creator consumed a host grant, so `session.host` is present; the
+        // test connection carries the one transport grant the helper adds.
+        assert_eq!(
+            claimed["scopes"],
+            json!([
+                "session.inspect",
+                "session.host",
+                "session.attach",
+                "session.control",
+                "process.spawn"
+            ])
+        );
+        assert_eq!(claimed["server_monotonic_ms"], 11);
+
+        // A keyed replay carries the clock but never re-asserts lease scopes.
+        let replay = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": id,
+                    "expected_generation": 0,
+                    "control_token": claimed["control_token"],
+                    "idempotency_key": "meta-attach-claim",
+                }),
+                MonotonicMs::from_millis(12),
+            )
+            .expect("replay");
+        assert_eq!(replay["replayed"], true);
+        assert_eq!(replay["server_monotonic_ms"], 12);
+        assert!(replay.get("scopes").is_none());
+
+        let minted = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": id, "idempotency_key": "meta-attach-grant"}),
+                MonotonicMs::from_millis(13),
+            )
+            .expect("grant");
+        let mut observer = consumer();
+        negotiate_ok(&mut service, &mut observer, 14);
+        let attached = service
+            .dispatch(
+                &mut observer,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "observer",
+                    "session_id": id,
+                    "observer_grant": minted["grant"],
+                }),
+                MonotonicMs::from_millis(15),
+            )
+            .expect("observer attach");
+        assert_eq!(
+            attached["scopes"],
+            json!([
+                "session.inspect",
+                "session.attach",
+                "session.control",
+                "process.spawn"
+            ])
+        );
+        assert_eq!(attached["server_monotonic_ms"], 15);
+    }
+
+    /// Controller presence and the pending observer-grant count are bounded
+    /// metadata on every session object, and a terminal snapshot serves zero
+    /// for both (`D-09`; bitty#2806).
+    #[test]
+    fn session_status_serves_bounded_controller_presence_and_pending_grants() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let (mut creator, id, claimed) =
+            controller_session(&mut service, &mut operator, "meta-status");
+        assert_eq!(claimed["session"]["controller_present"], true);
+        assert_eq!(claimed["session"]["pending_observer_grants"], 0);
+
+        let status = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": id}),
+                MonotonicMs::from_millis(12),
+            )
+            .expect("status");
+        assert_eq!(status["session"]["controller_present"], true);
+        assert_eq!(status["session"]["pending_observer_grants"], 0);
+
+        // Fill the per-session pending cap. The count is the enforced bound, so
+        // a wider value can never be served.
+        let cap = service
+            .limits()
+            .effective_usize(LimitId::MaxPendingObserverGrantsPerSession);
+        let mut last = Value::Null;
+        for index in 0..cap {
+            last = service
+                .dispatch(
+                    &mut creator,
+                    ServiceMethod::SessionGrant,
+                    &json!({"session_id": id, "idempotency_key": format!("meta-pending-{index}")}),
+                    MonotonicMs::from_millis(20 + index as u64),
+                )
+                .expect("mint at the cap");
+        }
+        let status = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": id}),
+                MonotonicMs::from_millis(30),
+            )
+            .expect("status at the cap");
+        assert_eq!(status["session"]["pending_observer_grants"], json!(cap));
+        assert!(cap <= usize::from(u16::MAX));
+        let error = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": id, "idempotency_key": "meta-pending-over"}),
+                MonotonicMs::from_millis(31),
+            )
+            .expect_err("the cap refuses a further mint");
+        assert!(
+            matches!(error.kind(), RefusalKind::LimitExceeded { .. }),
+            "the cap is the typed limit refusal, not a denial: {error:?}"
+        );
+
+        // Consuming one grant lowers the count by exactly one.
+        let mut observer = consumer();
+        negotiate_ok(&mut service, &mut observer, 32);
+        service
+            .dispatch(
+                &mut observer,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "observer",
+                    "session_id": id,
+                    "observer_grant": last["grant"],
+                }),
+                MonotonicMs::from_millis(33),
+            )
+            .expect("observer attach");
+        let status = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": id}),
+                MonotonicMs::from_millis(34),
+            )
+            .expect("status after consume");
+        assert_eq!(status["session"]["pending_observer_grants"], json!(cap - 1));
+
+        // A terminal session has no live lease and no usable pending grant.
+        let aborted = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAbort,
+                &json!({
+                    "session_id": id,
+                    "expected_generation": 0,
+                    "reason_class": "cancel",
+                }),
+                MonotonicMs::from_millis(35),
+            )
+            .expect("abort");
+        assert_eq!(aborted["session"]["state"], "terminated");
+        assert_eq!(aborted["session"]["controller_present"], false);
+        assert_eq!(aborted["session"]["pending_observer_grants"], 0);
+
+        let after = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": id}),
+                MonotonicMs::from_millis(36),
+            )
+            .expect("post-terminal status");
+        assert_eq!(after["session"]["controller_present"], false);
+        assert_eq!(after["session"]["pending_observer_grants"], 0);
+    }
+
+    /// The owner peer is served only in the operator all-session view, and only
+    /// as uid and pid (`D-09`; bitty#2806).
+    #[test]
+    fn session_list_serves_the_owner_peer_only_in_the_operator_view() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let (mut creator, id, _) = controller_session(&mut service, &mut operator, "meta-owner");
+
+        let own = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionList,
+                &Value::Null,
+                MonotonicMs::from_millis(12),
+            )
+            .expect("ordinary list");
+        let sessions = own["sessions"].as_array().expect("sessions");
+        assert_eq!(sessions.len(), 1);
+        assert!(
+            sessions[0].get("owner").is_none(),
+            "an ordinary view never carries the owner peer"
+        );
+
+        let viewed = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::SessionList,
+                &Value::Null,
+                MonotonicMs::from_millis(13),
+            )
+            .expect("operator view");
+        let entry = viewed["sessions"]
+            .as_array()
+            .expect("sessions")
+            .iter()
+            .find(|entry| entry["session_id"] == json!(id))
+            .expect("operator sees the session");
+        assert_eq!(
+            entry["owner"],
+            json!({
+                "uid": nix::unistd::geteuid().as_raw(),
+                "pid": std::process::id(),
+            })
+        );
+        assert!(
+            entry["owner"].get("path").is_none() && entry["owner"].get("cmdline").is_none(),
+            "the owner object carries uid and pid only"
+        );
+
+        // Status never carries the owner, even for the operator.
+        let status = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": id}),
+                MonotonicMs::from_millis(14),
+            )
+            .expect("operator status");
+        assert!(status["session"].get("owner").is_none());
+    }
+
+    /// `lease.heartbeat` keeps the expiry and serves the server clock next to
+    /// it (`D-12`; bitty#2806).
+    #[test]
+    fn lease_heartbeat_serves_the_server_monotonic_clock() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let (mut creator, _id, claimed) =
+            controller_session(&mut service, &mut operator, "meta-heartbeat");
+        let attach = claimed["attach_id"].as_str().expect("attach").to_owned();
+        let beat = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::LeaseHeartbeat,
+                &json!({"attach_id": attach}),
+                MonotonicMs::from_millis(40),
+            )
+            .expect("heartbeat");
+        assert_eq!(beat["server_monotonic_ms"], 40);
+        assert!(
+            beat["lease_expires_at_ms"].as_u64().expect("expiry") > 40,
+            "the expiry stays a server monotonic value after the request"
+        );
+    }
+
+    /// `daemon.status` serves the observational pid, the uptime on the same
+    /// clock, and every orphan class the journal can report (`D-06`).
+    #[test]
+    fn daemon_status_serves_pid_uptime_and_orphan_classes() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::set_permissions(
+            dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("chmod");
+        let report = crate::containment::ContainmentReport::subreaper(
+            crate::platform::PlatformCell::current(),
+            None,
+        );
+        let supervisor = OrphanSupervisor::open(
+            dir.path().join("orphans"),
+            &crate::orphan::OrphanJournalLimits::default(),
+            &report,
+            crate::containment::ContainmentLimits::default(),
+        )
+        .expect("served supervisor");
+        let (mut service, _runtime) = service_with_daemon(
+            Limits::default(),
+            supervisor,
+            report,
+            DaemonFacts::new(4242, MonotonicMs::from_millis(100)),
+        );
+        let mut operator = operator_connection(&mut service);
+        let status = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonStatus,
+                &Value::Null,
+                MonotonicMs::from_millis(175),
+            )
+            .expect("status");
+        assert_eq!(status["daemon_pid"], 4242);
+        assert_eq!(status["uptime_ms"], 75);
+        let records = &status["orphans"]["records"];
+        for class in ["reserved", "committed", "unverified", "reaped", "stale"] {
+            assert_eq!(records[class], json!(0), "class {class}");
+        }
+        let serialized = status["orphans"].to_string();
+        for forbidden in ["pid", "path", "cmdline", "argv"] {
+            assert!(
+                !serialized.contains(forbidden),
+                "{forbidden} leaked into the orphan status"
+            );
+        }
+
+        // The uptime is a subtraction, never a wall-clock read: an earlier
+        // request cannot report a negative or wrapping value.
+        let early = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonStatus,
+                &Value::Null,
+                MonotonicMs::from_millis(90),
+            )
+            .expect("early status");
+        assert_eq!(early["uptime_ms"], 0);
+    }
+
+    /// The served additions keep the frozen session object metadata-only: no
+    /// owner, handle, path, or content key enters it.
+    #[test]
+    fn the_session_metadata_shape_stays_content_and_handle_free() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let (mut creator, id, _) = controller_session(&mut service, &mut operator, "meta-shape");
+        let status = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": id}),
+                MonotonicMs::from_millis(12),
+            )
+            .expect("status");
+        let session = status["session"].as_object().expect("session object");
+        for key in [
+            "session_id",
+            "kind",
+            "terminal_id",
+            "state",
+            "generation",
+            "state_revision",
+            "attach_count",
+            "attached",
+            "controller_present",
+            "pending_observer_grants",
+            "created_at_ms",
+            "last_seen_ms",
+        ] {
+            assert!(session.contains_key(key), "missing served key {key}");
+        }
+        for forbidden in [
+            "owner",
+            "attach_id",
+            "controller_attach_id",
+            "pid",
+            "path",
+            "cmdline",
+            "content",
+            "scopes",
+        ] {
+            assert!(
+                !session.contains_key(forbidden),
+                "the session object must not carry {forbidden}"
+            );
+        }
     }
 
     #[test]

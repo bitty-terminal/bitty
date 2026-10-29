@@ -29,10 +29,10 @@ use harness::real::RealDriver;
 #[test]
 fn corpus_is_well_formed_and_frozen() {
     let corpus = Corpus::load().expect("the embedded corpus parses");
-    assert_eq!(corpus.vectors.len(), 50, "corpus size changed");
+    assert_eq!(corpus.vectors.len(), 51, "corpus size changed");
     for id in [
         "C-01", "C-02", "C-03", "C-04", "C-05", "C-06", "C-07", "C-08", "C-12", "C-13", "C-14",
-        "C-15", "C-16",
+        "C-15", "C-16", "C-17",
     ] {
         assert!(corpus.vector(id).is_some(), "missing Core vector {id}");
     }
@@ -414,12 +414,13 @@ fn fake_and_real_parity() {
         expected_not_compared.push("V-44");
     }
     let expected_compared = if real_serves_workers {
-        if cfg!(feature = "test-seams") { 33 } else { 32 }
+        if cfg!(feature = "test-seams") { 34 } else { 33 }
     } else {
         // A refused containment plan skips the worker vectors on the real
-        // driver; the fake still models a served cell.
+        // driver; the fake still models a served cell. C-17 runs on both
+        // drivers because it creates a terminal session only.
         expected_not_compared.extend(["V-03", "V-42"]);
-        if cfg!(feature = "test-seams") { 31 } else { 30 }
+        if cfg!(feature = "test-seams") { 32 } else { 31 }
     };
     expected_not_compared.sort_unstable();
     assert_eq!(

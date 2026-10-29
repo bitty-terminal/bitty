@@ -38,9 +38,9 @@ mod table;
 
 pub use self::id::{AttachId, DaemonInstanceId, ID_HEX_CHARS, IdError, SessionId};
 pub use self::session::{
-    CleanupClass, ExitInformation, LifecycleState, MAX_OWNER_PEER_BYTES, MonotonicMs, OwnerPeer,
-    OwnerPeerError, SessionKind, SessionSnapshot, TERMINAL_ID_MAX_BYTES, TerminalId,
-    TerminalIdError, TerminalOutcome, TerminalOutcomeError, TerminalReason,
+    CleanupClass, ExitInformation, LifecycleState, MonotonicMs, OwnerPeer, SessionKind,
+    SessionSnapshot, TERMINAL_ID_MAX_BYTES, TerminalId, TerminalIdError, TerminalOutcome,
+    TerminalOutcomeError, TerminalReason,
 };
 pub use self::table::{
     CreateSession, MAX_RETAINED_TERMINAL_RECORDS_SYSTEM_MAX, MAX_SESSIONS_DEFAULT,

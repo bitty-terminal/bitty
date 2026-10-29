@@ -1102,7 +1102,7 @@ mod tests {
             .create(
                 CreateSession {
                     terminal_id: None,
-                    owner_peer: Some(OwnerPeer::new(b"uid=1000").expect("bounded")),
+                    owner_peer: Some(OwnerPeer::new(1000, 7)),
                 },
                 ms(1),
             )
@@ -1115,10 +1115,7 @@ mod tests {
         assert_eq!(snapshot.attach_count, 0);
         assert!(!snapshot.attached);
         assert_eq!(snapshot.terminal_id.as_str().len(), 32);
-        assert_eq!(
-            snapshot.owner_peer,
-            Some(OwnerPeer::new(b"uid=1000").expect("bounded"))
-        );
+        assert_eq!(snapshot.owner_peer, Some(OwnerPeer::new(1000, 7)));
         assert_eq!(snapshot.last_seen_ms, ms(1));
         assert_eq!(registry.live_count(), 1);
         assert_eq!(registry.retained_count(), 0);
@@ -1836,7 +1833,7 @@ mod tests {
             .create(
                 CreateSession {
                     terminal_id: Some(TerminalId::supplied("term").expect("valid")),
-                    owner_peer: Some(OwnerPeer::new(b"uid=1000,pid=7").expect("bounded")),
+                    owner_peer: Some(OwnerPeer::new(1000, 7)),
                 },
                 ms(1),
             )
@@ -1872,10 +1869,7 @@ mod tests {
         assert_eq!(snapshot.terminal_reason, Some(TerminalReason::WorkerExit));
         assert_eq!(snapshot.exit, ExitInformation::ExitCode(7));
         assert_eq!(snapshot.cleanup, Some(CleanupClass::Swept));
-        assert_eq!(
-            snapshot.owner_peer,
-            Some(OwnerPeer::new(b"uid=1000,pid=7").expect("bounded"))
-        );
+        assert_eq!(snapshot.owner_peer, Some(OwnerPeer::new(1000, 7)));
         let counts = registry.counts();
         assert_eq!(counts.exited, 1);
         assert_eq!(counts.live, 0);

@@ -21,14 +21,6 @@ use super::id::{Entropy, SessionId, random_hex};
 pub const TERMINAL_ID_MAX_BYTES: usize =
     crate::limits::LimitId::TerminalIdBytes.system_max_value() as usize;
 
-/// Maximum bytes in the opaque owner peer facts this registry stores.
-///
-/// The service layer (bitty#2607) captures authenticated peer credentials and
-/// passes a bounded encoding; the registry never parses it and never treats it
-/// as authority. The bound keeps one record inside `session_record_bytes` and
-/// keeps a peer descriptor from becoming a content channel.
-pub const MAX_OWNER_PEER_BYTES: usize = 256;
-
 /// Session kind (`D-01`).
 ///
 /// A `worker` record is only minted where the worker spawn path is served
@@ -420,77 +412,38 @@ impl fmt::Display for TerminalIdError {
 
 impl std::error::Error for TerminalIdError {}
 
-/// Opaque, bounded owner peer facts.
+/// Authenticated owner peer identity captured at create.
 ///
-/// The registry stores and returns the bytes without parsing them. Authority
-/// comes from the authenticated peer check in the IPC slice (bitty#2607), not
-/// from this value.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnerPeer(Box<[u8]>);
+/// The registry stores the two numeric facts the accepted contract serves in
+/// the operator `session.list` view (`D-09`): the authenticated uid and the
+/// informational pid. No path, command line, gid, or start time is retained,
+/// and the value is never authority: the peer check owns authentication and
+/// the operator view owns disclosure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerPeer {
+    uid: u32,
+    pid: u32,
+}
 
 impl OwnerPeer {
-    /// Store opaque peer facts.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`OwnerPeerError`] when the value is empty or above
-    /// [`MAX_OWNER_PEER_BYTES`].
-    pub fn new(bytes: &[u8]) -> Result<Self, OwnerPeerError> {
-        if bytes.is_empty() {
-            return Err(OwnerPeerError::Empty);
-        }
-        if bytes.len() > MAX_OWNER_PEER_BYTES {
-            return Err(OwnerPeerError::TooLong { bytes: bytes.len() });
-        }
-        Ok(Self(bytes.into()))
+    /// Store the captured owner facts.
+    #[must_use]
+    pub const fn new(uid: u32, pid: u32) -> Self {
+        Self { uid, pid }
     }
 
-    /// The stored bytes.
+    /// The authenticated owner uid.
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
+    pub const fn uid(self) -> u32 {
+        self.uid
     }
 
-    /// Stored length in bytes.
+    /// The owner pid. Informational: a pid can be reused (`D-08`).
     #[must_use]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Whether the stored value is empty. Construction rejects empty values.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    pub const fn pid(self) -> u32 {
+        self.pid
     }
 }
-
-/// A refused owner peer value.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OwnerPeerError {
-    /// Zero bytes.
-    Empty,
-    /// More than [`MAX_OWNER_PEER_BYTES`] bytes.
-    TooLong {
-        /// Observed length; the value itself is not echoed.
-        bytes: usize,
-    },
-}
-
-impl fmt::Display for OwnerPeerError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Empty => formatter.write_str("owner peer facts are empty"),
-            Self::TooLong { bytes } => {
-                write!(
-                    formatter,
-                    "owner peer facts are {bytes} bytes, above the bound"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for OwnerPeerError {}
 
 /// Process-local monotonic time in milliseconds.
 ///
@@ -553,11 +506,19 @@ pub struct SessionSnapshot {
     pub attach_count: u16,
     /// `attach_count > 0`, derived rather than stored.
     pub attached: bool,
-    /// Opaque owner peer facts captured by the service layer.
+    /// Whether a live controller lease holds control at the snapshot instant.
     ///
-    /// Operator-only data: consumer `session.status` responses must not
-    /// serialize it, while the operator view (`daemon.inspect`) may include
-    /// it. The registry never parses or authorizes on these bytes.
+    /// The registry does not own leases, so its raw snapshot reports `false`;
+    /// [`crate::lease::SessionHost`] composes the live value. This is presence
+    /// only: the controller's `attach_id` is never served, so a status read
+    /// cannot become a handle oracle.
+    pub controller_present: bool,
+    /// Authenticated owner peer facts captured at create.
+    ///
+    /// Operator-only data: an ordinary `session.status` or `session.list`
+    /// response never serializes it, while the operator view
+    /// (`daemon.inspect`) serves the uid and pid. The registry never
+    /// authorizes on these facts.
     pub owner_peer: Option<OwnerPeer>,
     /// Terminal reason, present exactly in a terminal state.
     pub terminal_reason: Option<TerminalReason>,
@@ -623,15 +584,14 @@ impl SessionRecord {
     }
 
     /// Accounted record bytes: the fixed in-memory record plus the variable
-    /// identifier and peer bytes it owns.
+    /// identifier bytes it owns.
     ///
     /// The contract's `session_record_bytes` bound covers per-session metadata,
     /// not terminal content, so this sum is the enforcement unit. It is
-    /// deterministic for a given record.
+    /// deterministic for a given record; the structured owner peer is inline
+    /// and has no variable payload.
     pub(crate) fn record_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.terminal_id.as_str().len()
-            + self.owner_peer.as_ref().map_or(0, OwnerPeer::len)
+        std::mem::size_of::<Self>() + self.terminal_id.as_str().len()
     }
 
     /// A read-only snapshot with the derived attach flag.
@@ -645,7 +605,8 @@ impl SessionRecord {
             state_revision: self.state_revision,
             attach_count: self.attach_count,
             attached: self.attach_count > 0,
-            owner_peer: self.owner_peer.clone(),
+            controller_present: false,
+            owner_peer: self.owner_peer,
             terminal_reason: self.terminal_reason,
             exit: self.exit,
             cleanup: self.cleanup,
@@ -713,21 +674,13 @@ mod tests {
     }
 
     #[test]
-    fn owner_peer_is_opaque_and_bounded() {
-        assert_eq!(OwnerPeer::new(b""), Err(OwnerPeerError::Empty));
-        let peer = OwnerPeer::new(b"uid=1000\0pid=42").expect("bounded peer facts");
-        assert_eq!(peer.as_bytes(), b"uid=1000\0pid=42");
-        assert_eq!(peer.len(), 15);
-        assert!(!peer.is_empty());
-
-        let oversized = vec![0u8; MAX_OWNER_PEER_BYTES + 1];
-        assert_eq!(
-            OwnerPeer::new(&oversized),
-            Err(OwnerPeerError::TooLong {
-                bytes: MAX_OWNER_PEER_BYTES + 1
-            })
-        );
-        assert!(OwnerPeer::new(&vec![0u8; MAX_OWNER_PEER_BYTES]).is_ok());
+    fn owner_peer_carries_only_uid_and_pid() {
+        let peer = OwnerPeer::new(1000, 42);
+        assert_eq!(peer.uid(), 1000);
+        assert_eq!(peer.pid(), 42);
+        assert_eq!(peer, OwnerPeer::new(1000, 42));
+        assert_ne!(peer, OwnerPeer::new(1001, 42));
+        assert_eq!(std::mem::size_of::<OwnerPeer>(), 8);
     }
 
     #[test]
@@ -863,6 +816,7 @@ mod tests {
         );
         let snapshot = record.snapshot();
         assert!(!snapshot.attached);
+        assert!(!snapshot.controller_present);
         assert_eq!(snapshot.attach_count, 0);
         assert_eq!(snapshot.kind, SessionKind::Terminal);
         assert_eq!(snapshot.state, LifecycleState::Created);
@@ -883,12 +837,12 @@ mod tests {
             SessionId::parse("22222222222222222222222222222222").expect("canonical"),
             SessionKind::Terminal,
             TerminalId::supplied(&"a".repeat(TERMINAL_ID_MAX_BYTES)).expect("valid"),
-            Some(OwnerPeer::new(&[7u8; MAX_OWNER_PEER_BYTES]).expect("bounded")),
+            Some(OwnerPeer::new(7, 9)),
             MonotonicMs::ZERO,
         );
         assert_eq!(
             long.record_bytes() - short.record_bytes(),
-            (TERMINAL_ID_MAX_BYTES - 1) + MAX_OWNER_PEER_BYTES
+            TERMINAL_ID_MAX_BYTES - 1
         );
     }
 }

@@ -29,7 +29,7 @@ pub mod scopes;
 pub mod server;
 pub mod wire;
 
-pub use dispatch::{Refusal, Service};
+pub use dispatch::{DaemonFacts, Refusal, Service};
 pub use grants::{GrantId, GrantKind, GrantStore};
 pub use protocol::Connection;
 pub use scopes::{

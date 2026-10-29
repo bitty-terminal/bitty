@@ -82,7 +82,7 @@ fn version_reports_the_crate_and_service_versions() {
         "crate version missing from: {stdout}"
     );
     assert!(
-        stdout.contains("service API 1.1"),
+        stdout.contains("service API 1.2"),
         "contract service version missing from: {stdout}"
     );
 }

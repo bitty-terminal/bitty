@@ -374,6 +374,23 @@ impl GrantStore {
         self.grants.is_empty()
     }
 
+    /// Unconsumed, unrevoked, unexpired observer grants for one session.
+    ///
+    /// Bounded by `max_pending_observer_grants_per_session` because a mint at
+    /// the cap is refused, so the count fits the wire `u16` without a wider
+    /// type. The walk is allocation-free and reads no bearer.
+    #[must_use]
+    pub fn pending_observer_grants(&self, session_id: SessionId, now_ms: u64) -> usize {
+        self.grants
+            .values()
+            .filter(|record| {
+                record.kind == GrantKind::Observer
+                    && record.session_id == Some(session_id)
+                    && record.is_active(now_ms)
+            })
+            .count()
+    }
+
     /// Whether an unconsumed host grant is live.
     #[must_use]
     pub fn host_grant_active(&self, grant_id: GrantId, now_ms: u64) -> bool {

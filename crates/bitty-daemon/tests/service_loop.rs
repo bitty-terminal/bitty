@@ -42,6 +42,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use bitty_daemon::containment::ContainmentLimits;
+use bitty_daemon::limits::{LimitId, LimitOverride, Limits};
+
 const BITTYD: &str = env!("CARGO_BIN_EXE_bittyd");
 
 static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
@@ -2934,6 +2937,96 @@ fn a_worker_exit_is_recorded_once_with_its_containment_cleanup() {
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
 }
 
+/// The daemon's own containment window, rebuilt from its advertised limits.
+///
+/// `daemon.status` advertises the effective `orphan_reap_grace_ms`, and
+/// `ContainmentLimits::from_limits` is the daemon's own mapping from the limit
+/// table to the containment windows, so the test waits on the same bound the
+/// daemon applies instead of a hardcoded guess.
+fn daemon_containment_limits(status: &Value) -> ContainmentLimits {
+    let grace = status["result"]["limits"]
+        .as_array()
+        .expect("advertised limits")
+        .iter()
+        .find(|entry| entry["name"] == LimitId::OrphanReapGraceMs.name())
+        .and_then(|entry| entry["effective"].as_u64())
+        .expect("the advertised orphan-reap grace");
+    let limits = Limits::new(&[LimitOverride::new(LimitId::OrphanReapGraceMs, grace)])
+        .expect("the daemon advertises a valid grace");
+    ContainmentLimits::from_limits(&limits)
+}
+
+/// How long the test waits for the daemon's exit sweep to settle.
+///
+/// A natural exit signals the recorded group on the first tick after the
+/// leader becomes a zombie, and the terminal transition is recorded once the
+/// subtree is empty or `ContainmentLimits::kill_wait` expires. The bound is
+/// therefore the daemon's own `kill_wait` plus one supervision tick; the
+/// `SIGTERM` grace (`orphan_reap_grace_ms`) is never spent on a natural exit.
+fn containment_settle_timeout(limits: ContainmentLimits) -> Duration {
+    limits.kill_wait() + Duration::from_millis(u64::from(bitty_daemon::service::server::TICK_MS))
+}
+
+/// Whether `pid` is still a running process.
+///
+/// An absent `/proc` entry means the process is gone. A `Z` (or `X`) state
+/// means it is already dead and only its exit status is outstanding, which
+/// belongs to whichever subreaper adopted it; in a container that is often the
+/// container init rather than this daemon, so a `/proc` entry alone cannot
+/// distinguish "still running" from "already killed".
+fn process_is_live(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => match stat.rsplit_once(')') {
+            Some((_, rest)) => !matches!(rest.split_whitespace().next(), Some("Z" | "X")),
+            None => true,
+        },
+        Err(_) => false,
+    }
+}
+
+/// Poll step for the settle wait, matching `wait_for_worker_state`'s 25 ms
+/// step; the daemon itself supervises on one 250 ms tick.
+const CONTAINMENT_SETTLE_STEP: Duration = Duration::from_millis(25);
+
+/// The daemon's own cgroup v2 root, derived the way `CgroupRoot::detect`
+/// derives it from `/proc/self/cgroup` (here `/proc/<daemon>/cgroup`).
+fn daemon_cgroup_root(daemon_pid: u32) -> Option<PathBuf> {
+    let unified = std::fs::read_to_string(format!("/proc/{daemon_pid}/cgroup")).ok()?;
+    let relative = unified.lines().find_map(|line| line.strip_prefix("0::"))?;
+    let relative = PathBuf::from(relative.trim().trim_start_matches('/'));
+    let mount = Path::new(bitty_daemon::containment::CGROUP2_MOUNT);
+    Some(if relative.as_os_str().is_empty() {
+        mount.to_path_buf()
+    } else {
+        mount.join(relative)
+    })
+}
+
+/// Whether the session cgroup proves the recorded tree is gone.
+///
+/// A verified sweep removes the subtree, so an absent directory is settled.
+/// Otherwise `cgroup.procs` must be empty and `cgroup.events` must report
+/// `populated 0`, the same two-file proof the daemon's sweep uses. A dead
+/// process can linger in `/proc` as an unreaped zombie long after the cgroup
+/// is empty, which is why this test waits on containment rather than `/proc`.
+fn session_cgroup_settled(path: &Path) -> bool {
+    let procs = match std::fs::read_to_string(path.join("cgroup.procs")) {
+        Ok(procs) => procs,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    if !procs.trim().is_empty() {
+        return false;
+    }
+    match std::fs::read_to_string(path.join("cgroup.events")) {
+        Ok(events) => events.lines().any(|line| {
+            line.strip_prefix("populated ")
+                .is_some_and(|value| value.trim() == "0")
+        }),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 #[test]
 fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
     let root = TempRoot::new("worker-descendant");
@@ -2944,7 +3037,8 @@ fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
 
     // The shell leaves a background descendant in its process group and then
     // exits. A reap-before-signal path would drop the group id before the kill
-    // and leak the descendant.
+    // and leak the descendant. The descendant ignores `SIGHUP`, so only the
+    // daemon's group kill removes it.
     let pid_file = root.path.join("descendant.pid");
     let (_creator, created) = create_worker(
         &root,
@@ -2953,7 +3047,7 @@ fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
         json!([
             "/bin/sh",
             "-c",
-            "sleep 60 & echo $! > \"$1\"; exit 3",
+            "trap '' HUP; sleep 60 & echo $! > \"$1\"; exit 3",
             "bittyd-worker",
             pid_file.to_str().expect("a UTF-8 temp path"),
         ]),
@@ -2962,6 +3056,30 @@ fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
         .as_str()
         .expect("session id")
         .to_owned();
+
+    // The daemon's own containment report names the plan it selected, and the
+    // session cgroup name comes from the daemon's `worker::cgroup_name`, so the
+    // wait observes the same identity the sweep does.
+    let status = operator.call("daemon.status", Value::Null);
+    let mechanism = status["result"]["orphans"]["mechanism"]
+        .as_str()
+        .expect("containment mechanism")
+        .to_owned();
+    let settle = daemon_containment_limits(&status);
+    let session_cgroup = (mechanism == bitty_daemon::containment::MECHANISM_CGROUP_V2).then(|| {
+        let instance = bitty_daemon::registry::DaemonInstanceId::parse(
+            status["result"]["daemon_instance_id"]
+                .as_str()
+                .expect("daemon instance id"),
+        )
+        .expect("canonical instance id");
+        let session =
+            bitty_daemon::registry::SessionId::parse(&session_id).expect("canonical session id");
+        let name = bitty_daemon::worker::cgroup_name(instance, session);
+        let root = daemon_cgroup_root(daemon.pid()).expect("the daemon's own cgroup is readable");
+        root.join(name)
+    });
+
     let exited = wait_for_worker_state(&mut operator, &session_id, &["exited", "failed"]);
     assert_eq!(exited["terminal_reason"], "worker_exit");
 
@@ -2970,13 +3088,37 @@ fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
         .trim()
         .parse()
         .expect("a pid");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Path::new(&format!("/proc/{descendant}")).exists() {
-        assert!(
-            Instant::now() < deadline,
-            "descendant {descendant} survived the worker exit"
-        );
-        std::thread::sleep(Duration::from_millis(25));
+
+    match mechanism.as_str() {
+        bitty_daemon::containment::MECHANISM_CGROUP_V2 => {
+            let cgroup = session_cgroup.expect("the cgroup plan names a session subtree");
+            let deadline = Instant::now() + containment_settle_timeout(settle);
+            while !session_cgroup_settled(&cgroup) {
+                assert!(
+                    Instant::now() < deadline,
+                    "session cgroup {} still populated after the worker exit",
+                    cgroup.display()
+                );
+                std::thread::sleep(CONTAINMENT_SETTLE_STEP);
+            }
+        }
+        // The subreaper plan has no subtree to read, so the recorded pid is the
+        // only containment evidence. The signal is the assertion: a live
+        // descendant is a leak, while a zombie is a killed process whose reap
+        // belongs to whichever subreaper adopted it (in a container that is
+        // often the container init, not this daemon), so a `/proc` entry alone
+        // cannot distinguish "still running" from "already dead".
+        bitty_daemon::containment::MECHANISM_SUBREAPER => {
+            let deadline = Instant::now() + containment_settle_timeout(settle);
+            while process_is_live(descendant) {
+                assert!(
+                    Instant::now() < deadline,
+                    "descendant {descendant} survived the worker exit"
+                );
+                std::thread::sleep(CONTAINMENT_SETTLE_STEP);
+            }
+        }
+        other => panic!("unexpected containment mechanism {other}"),
     }
 
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));

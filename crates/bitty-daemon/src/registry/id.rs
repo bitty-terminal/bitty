@@ -178,7 +178,7 @@ impl AttachId {
         Self::generate_with(&mut OsEntropy)
     }
 
-    /// Mint a fresh attach id from an injected entropy source (bitty#2602).
+    /// Mint a fresh attach id from an injected entropy source (bitty#2792).
     ///
     /// Only the lease layer mints attach ids; a client-supplied value is parsed
     /// for lookup and never becomes a new identity.
@@ -318,7 +318,7 @@ mod tests {
         assert_eq!(AttachId::parse(""), Err(IdError::InvalidLength));
 
         // The injected source mints the same identity shape for the event
-        // stream (bitty#2602) and the lease layer (bitty#2609).
+        // stream (bitty#2792) and the lease layer (bitty#2609).
         let minted = AttachId::generate_with(&mut entropy).expect("OS entropy is available");
         assert_eq!(AttachId::parse(&minted.as_hex()), Ok(minted));
     }

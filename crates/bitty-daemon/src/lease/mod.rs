@@ -64,7 +64,7 @@
 //! | Control-token digest comparison | bitty#2609 (this module) | Constant time; `InvalidControlToken`. The token is consulted only for an authority with no lease. |
 //! | Transfer token delivery | bitty#2607 (router), bitty#2609 (value) | [`TransferDelivery`] yields the rotated secret only for the target attach id; the request response never carries it (`D-09`). |
 //! | PTY containment, graceful/kill signals, reap, cleanup class | bitty#2791 | This module emits the deadline and accepts the verified [`CleanupClass`](crate::registry::CleanupClass). |
-//! | Event envelope, per-lease queues, terminal slot reservation, `TerminalEventLost` | bitty#2602 | This module returns the one terminal [`TerminalNotice`] and the leases it covers. |
+//! | Event envelope, per-lease queues, terminal slot reservation, `TerminalEventLost` | bitty#2792 | This module returns the one terminal [`TerminalNotice`] and the leases it covers. |
 //! | Idempotency key stores (session-scoped and create-key) | bitty#2603 | Termination and revocation are keyless and never consult a store. |
 //! | Audit record emission | bitty#2607, bitty#2608 | [`Actor`] and [`TerminalNotice`] carry attribution, never a token. |
 //!

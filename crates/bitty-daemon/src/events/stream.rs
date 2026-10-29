@@ -1,6 +1,6 @@
 //! The per-session event stream: attach snapshot plus bounded backlog, revision
 //! ordering, per-lease routing, control-frame reservation, the terminal-event
-//! guarantee, and heartbeat/last-seen (bitty#2602; contract `D-10`, `D-12`,
+//! guarantee, and heartbeat/last-seen (bitty#2792; contract `D-10`, `D-12`,
 //! `D-14`, `D-18`).
 //!
 //! # Invariants

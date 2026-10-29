@@ -379,6 +379,11 @@ impl WorkerPool {
     ) -> Vec<SessionId> {
         let mut finished = Vec::new();
         let kill_wait_ms = u64::try_from(self.limits.kill_wait().as_millis()).unwrap_or(u64::MAX);
+        // A descendant killed by the natural-exit group signal can become a
+        // zombie only after the tick that recorded the exit. The subreaper plan
+        // adopts it, so reap adopted children on every pass; the cgroup plan
+        // never adopts one and this finds nothing.
+        crate::containment::drain_adopted_children();
         let session_ids: Vec<SessionId> = self.workers.keys().copied().collect();
         for session_id in session_ids {
             let mut collected: Option<CleanupClass> = None;

@@ -685,6 +685,18 @@ impl Drop for ContainedChild {
     }
 }
 
+/// Reap adopted descendants that no live handle owns.
+///
+/// The subreaper plan adopts a worker's orphaned descendants. One that the
+/// natural-exit group signal killed can become a zombie only after the tick
+/// that recorded the exit, so the service loop drains adopted children on
+/// every pass: the plan's whole-tree proof is "recorded pids gone, no adopted
+/// child". A leader owned by a live [`ContainedChild`] is left for its own
+/// handle.
+pub(crate) fn drain_adopted_children() {
+    drain_adopted(0);
+}
+
 /// Reap adopted children without stealing another session's child.
 ///
 /// `waitid(WNOWAIT)` peeks at the next exited child; a pid owned by a live

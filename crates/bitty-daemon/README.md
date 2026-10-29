@@ -21,7 +21,7 @@ The normative service surface is the accepted
 This crate fixes the service version, the capability set, and the version
 negotiation, implements the registry half of bitty#2601 (server-generated ids,
 the in-memory session registry, generation and revision counters, retention,
-and the bounded orphan journal), the event stream of bitty#2602 (snapshot plus
+and the bounded orphan journal), the event stream of bitty#2792 (snapshot plus
 bounded backlog, revision ordering, per-lease routing, control-frame
 reservation, the terminal-event guarantee, and heartbeat/last-seen), the
 compiled limits and advertised triples of bitty#2603, the two bounded
@@ -65,12 +65,13 @@ running service gives today:
 
 | Area                                                                                       | Owner                          | Answer today                                                                                                                                                       |
 | ------------------------------------------------------------------------------------------ | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Terminal-session PTY spawn (`session.create kind: terminal` stays registry-only)           | bitty#2604 / terminal contract | `session.create` returns the `created` snapshot with `generation: 0`; only `kind: worker` spawns a PTY today                                                       |
-| Worker content reads/writes (`session.resize` is served; no stream or input method exists) | bitty#2604 / terminal contract | `session.resize` applies to the worker PTY and bumps the revision; no content read, write, or subscribe method is served                                           |
+| Terminal-session PTY spawn and content plane                                               | bitty#2790 / terminal contract | the frozen contract's `session.create` row defines the registry-only `kind: terminal` answer; only `kind: worker` spawns a PTY today                               |
+| Worker content reads/writes (`session.resize` is served; no stream or input method exists) | bitty#2790 / terminal contract | `session.resize` applies to the worker PTY and bumps the revision; no content read, write, or subscribe method is served                                           |
 | Worker rebind and restart across generations                                               | bitty#2790 follow-up           | a worker binds generation 1 exactly once; a terminal record is never revived and no automatic restart exists                                                       |
-| Executable allowlist for worker `argv[0]`                                                  | bitty#2604 / security corpus   | any executable reachable under the daemon user is accepted; no allowlist or digest policy is enforced yet                                                          |
+| Executable allowlist for worker `argv[0]`                                                  | bitty#2790 / security corpus   | any executable reachable under the daemon user is accepted; no allowlist or digest policy is enforced yet                                                          |
 | Executable path digest in the orphan record; native Windows job-object reaper              | bitty#2791 follow-up           | no executable path is recorded; Windows and macOS keep the typed `UnsupportedPlatform` refusal                                                                     |
-| Per-connection event backlog counters in `daemon.status`; a shed-able observability class  | bitty#2603 / bitty#2806        | delivery is served on the Linux cell (`events: true`); no shed-able class exists and no status counter is served                                                   |
+| Per-connection event backlog counters in `daemon.status`; a shed-able observability class  | bitty#2806                     | delivery is served on the Linux cell (`events: true`); no shed-able class exists and no status counter is served                                                   |
+| Post-handshake request deadline (`request_timeout_ms` is advertised, not enforced)         | bitty#2805                     | the negotiate deadline is the only `Timeout` emission today; the advertised limit alone changes nothing                                                            |
 | Per-connection refusal-audit aggregation                                                   | bitty#2603 follow-up           | wire-level refusals are budgeted and aggregated (see below); method refusals remain one individual record each                                                     |
 | Conformance corpus and fake-server parity                                                  | bitty#2605                     | `tests/harness` holds the corpus, the reference fake, the real-service driver, and the parity gate; every shared vector is compared, with no recorded known defect |
 
@@ -433,7 +434,7 @@ Source: contract `D-10`; the frozen envelope is restated in
   including a lease's final frame, and its attach result carries no replay keys.
 - There is no subscribe method in `1.x`; events ride the negotiated connection.
 
-## Event stream (bitty#2602)
+## Event stream (bitty#2792)
 
 `events::SessionEventStream` wraps one `SessionRegistry` and owns every
 snapshot-visible mutation together with its event, so `state_revision` and the
@@ -477,7 +478,7 @@ per-session stream cannot disagree. Source: contract `D-10`, `D-12`, `D-14`,
   signal, so the stream reports none.
 - The compiled `D-14` table advertises these caps as
   `{effective, default, system_max}`; `daemon.status` queue/backlog counters
-  arrive with bitty#2607, and bitty#2605 adds the V-21, V-23, C-04, and C-06
+  arrive with bitty#2806, and bitty#2605 adds the V-21, V-23, C-04, and C-06
   corpus vectors against a real transport.
 
 ## Endpoint and peer trust (bitty#2604)
@@ -718,6 +719,10 @@ as `failed`/`spawn_failed` at generation 0, with the cleanup class the plan
 could prove (`not_started` before a child existed, `swept` or `unverified` after
 one did), settles the journal record, and returns the normal create shape with a
 `null` token.
+
+Recorded worker-pool follow-ups (bitty#2809): `WorkerPool::forget` does not yet
+reap a leader-exited cgroup handle, the per-tick PTY drain has no byte budget,
+and the resize ioctl still sits in `worker.rs` outside the syscall seam.
 
 `session.resize` requires `terminal.manage` (granted to every connection at
 negotiate, alongside `process.spawn`) and the **current controller lease** for

@@ -1134,6 +1134,12 @@ impl Runtime {
         self.set_layout(next);
         self.set_focus(source);
         self.pending_full_redraw = true;
+        // Issue #2798: the drop reflows the reparented leaf (and its new
+        // siblings) on this tick, so the first frame after the release must
+        // paint the committed rectangles. The ghost already showed the
+        // target rect; interpolating from the pre-drag one would paint the
+        // reflowed grid into a stale viewport. Only chrome fades.
+        self.content_geometry_commit_unpresented = true;
         // CTX-1070 (issue #1811): a committed drop arms the move transition
         // on the moved panel so the result settles instead of snapping. The
         // tree commits immediately (terminal content is never interpolated);

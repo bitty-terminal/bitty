@@ -1947,7 +1947,12 @@ impl TerminalApp {
                 let mut layout = self.runtime.layout().clone();
                 if resize_focused_pane_with_step(&mut layout, focused, dir, self.chrome.resize_step)
                 {
-                    self.runtime.set_layout(layout);
+                    // Issue #2798: the step reflows the pane grids with the
+                    // committed ratios on the same tick, so the next present
+                    // must paint those committed rectangles. The install
+                    // latches the unpresented commit (same funnel as the
+                    // pointer resize path); only the chrome rings fade.
+                    self.runtime.set_layout_committed(layout);
                     // CTX-0967: a committed keyboard resize arms the resize
                     // transition on the focused panel. Ratios commit
                     // immediately (terminal content is never interpolated);
@@ -4174,6 +4179,207 @@ mod tests {
         assert!(app.apply_chrome_action(ChromeAction::CloseView));
         assert_eq!(app.runtime.leaf_count(), 1);
         assert!(!app.runtime.has_pending_close_confirm());
+    }
+
+    /// Painted frame of `view` in `rt` (the present layer's geometry).
+    fn painted_frame(
+        rt: &Runtime,
+        view: ViewId,
+        now: std::time::Instant,
+    ) -> bitty_runtime::PresentFrame {
+        rt.paint_frames_at(now)
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .unwrap_or_else(|| panic!("{view:?} must be painted"))
+    }
+
+    /// The overlay scrollbar resolves from the same frame the leaf paints
+    /// (issue #2789), so its track's right edge is the painted content edge
+    /// plus the window padding.
+    fn assert_scrollbar_track_hugs_painted_content(rt: &Runtime, now: std::time::Instant) {
+        let painted = painted_frame(
+            rt,
+            rt.focused_view().expect("focused pane owns the scrollbar"),
+            now,
+        );
+        let (track, thumb) = rt
+            .scrollbar_geometry_at(now)
+            .expect("scrollback exists, so the track must resolve");
+        let pad = i32::try_from(rt.window_padding_physical()).expect("padding fits i32");
+        let width = i32::try_from(rt.scrollbar_width_physical()).expect("width fits i32");
+        let content_right = painted.content.x
+            + pad
+            + i32::try_from(painted.content.width).expect("content fits i32");
+        assert_eq!(
+            track.x + width,
+            content_right,
+            "the scrollbar track must hug the painted content edge"
+        );
+        assert_eq!(
+            track.height, painted.content.height,
+            "the track must span the painted content height"
+        );
+        assert!(
+            thumb.y.saturating_add(thumb.height) <= track.height,
+            "the thumb must stay inside its track"
+        );
+    }
+
+    /// Issue #2798: a keyboard `resize_split` commits the new split ratios
+    /// and reflows the pane grids on the same tick, so the frame that paints
+    /// that commit must use the committed rectangles. Interpolating from the
+    /// previous frame paints the fresh grid into a stale viewport (mid-frame
+    /// committed width 407 vs painted 372 in the report); only the resize
+    /// ring may fade.
+    #[test]
+    fn keyboard_resize_paints_committed_bounds_issue_2798() {
+        use bitty_config::{ChromeAction, SplitDir};
+        use bitty_runtime::{AnimationKind, ScrollbarMode};
+
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let rt = Runtime::new(RuntimeConfig {
+            scrollbar_mode: ScrollbarMode::Always,
+            ..RuntimeConfig::default()
+        })
+        .expect("headless runtime builds");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            maps,
+            SpawnSpec::default(),
+        );
+        app.runtime.set_layout(two_pane_layout());
+        // Enough output that the focused primary pane owns scrollback, so
+        // the overlay scrollbar has a track and thumb to place.
+        for i in 0..40 {
+            app.runtime
+                .handle_pty_bytes(format!("scrollback line {i:02}\r\n").as_bytes());
+        }
+        assert!(app.runtime.scrollback_len() > 0, "fixture needs scrollback");
+        let mut now = std::time::Instant::now();
+        app.runtime.tick_at(now).expect("baseline presents");
+        let focused = app.runtime.focused_view().expect("focused pane");
+        assert_eq!(focused, ViewId::new(1), "primary pane owns the scrollbar");
+
+        // Every step must move the divider: an inert step would satisfy the
+        // painted/committed comparison without exercising a reflow.
+        let mut content_width = painted_frame(&app.runtime, focused, now).content.width;
+        for (step, dir) in [
+            SplitDir::Right,
+            SplitDir::Right,
+            SplitDir::Left,
+            SplitDir::Right,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let armed = std::time::Instant::now();
+            app.apply_chrome_action(ChromeAction::ResizeSplit(dir));
+            now = armed + std::time::Duration::from_millis(40);
+            app.runtime
+                .tick_at(now)
+                .unwrap_or_else(|| panic!("step {step} presents"));
+            let committed = app.runtime.present_frames();
+            let painted = app.runtime.paint_frames_at(now);
+            assert_eq!(
+                painted, committed,
+                "step {step}: the reflowed grid must paint its committed bounds"
+            );
+            assert!(
+                app.runtime
+                    .animation_progress(AnimationKind::Resize, Some(focused), now)
+                    .is_some(),
+                "step {step}: only the resize ring fades"
+            );
+            let next_width = painted_frame(&app.runtime, focused, now).content.width;
+            assert_ne!(
+                next_width, content_width,
+                "step {step}: the keyboard step must move the divider"
+            );
+            content_width = next_width;
+            assert_scrollbar_track_hugs_painted_content(&app.runtime, now);
+        }
+
+        // A split and a resize can share one transition window: the new
+        // pane's open ring fades while the resize commits over the reflowed
+        // grid.
+        let armed = std::time::Instant::now();
+        app.apply_chrome_action(ChromeAction::NewSplit(SplitDir::Right));
+        assert!(
+            app.runtime.set_focus(focused),
+            "focus returns to the tiled pane"
+        );
+        app.apply_chrome_action(ChromeAction::ResizeSplit(SplitDir::Right));
+        now = armed + std::time::Duration::from_millis(40);
+        app.runtime.tick_at(now).expect("split + resize presents");
+        assert_eq!(
+            app.runtime.paint_frames_at(now),
+            app.runtime.present_frames(),
+            "a resize over an open transition must still paint the commit"
+        );
+        assert_scrollbar_track_hugs_painted_content(&app.runtime, now);
+
+        // PR #2796 review follow-up: a pane with an in-flight bounds tween
+        // that this step does *not* resize must not resume it once the
+        // commit latch clears. Installing the three-pane tree arms the open
+        // transition (and a bounds tween on the kept pane); the following
+        // keyboard step resizes only the right column.
+        let overlap = now + std::time::Duration::from_millis(200);
+        // The root ratio differs from the settled split so the kept pane
+        // itself carries an in-flight bounds tween that the resize must
+        // cancel even though it does not resize that pane.
+        app.runtime.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.35,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
+            LayoutNode::split(
+                SplitAxis::Vertical,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(2), 40, 12)),
+                LayoutNode::leaf(View::new(ViewId::new(3), 40, 12)),
+            ),
+        ));
+        app.runtime.tick_at(overlap).expect("open presents");
+        assert!(app.runtime.set_focus(ViewId::new(2)));
+        let armed = std::time::Instant::now();
+        app.apply_chrome_action(ChromeAction::ResizeSplit(SplitDir::Down));
+        let committed_frame = armed + std::time::Duration::from_millis(40);
+        app.runtime
+            .tick_at(committed_frame)
+            .expect("resize presents");
+        assert_eq!(
+            app.runtime.paint_frames_at(committed_frame),
+            app.runtime.present_frames(),
+            "the resized column paints its commit"
+        );
+        // The next present runs after the latch cleared: the kept pane's
+        // suppressed tween must be gone, never resumed from its old start.
+        let after = committed_frame + std::time::Duration::from_millis(20);
+        app.runtime.tick_at(after).expect("post-commit presents");
+        assert_eq!(
+            app.runtime.paint_frames_at(after),
+            app.runtime.present_frames(),
+            "a suppressed pane tween must not resume after the commit"
+        );
+
+        // The commit is final after the rings expire: no late tween may
+        // resume from a suppressed surface and jump the painted geometry.
+        let settled = after + std::time::Duration::from_millis(300);
+        app.runtime
+            .tick_at(settled)
+            .expect("settled frame presents");
+        assert_eq!(
+            app.runtime.paint_frames_at(settled),
+            app.runtime.present_frames(),
+            "the settled frame must stay committed"
+        );
+        assert!(
+            !app.runtime.animations_active_at(settled),
+            "the ring transitions expire"
+        );
+        assert_scrollbar_track_hugs_painted_content(&app.runtime, settled);
     }
 
     fn last_pane_test_app(mode: CloseConfirmMode) -> TerminalApp {

@@ -78,7 +78,7 @@ fn temp_dir(tag: &str) -> PathBuf {
 /// covered deterministically by
 /// `slow_disk_store_commit_does_not_fail_cross_vm_service_call`.
 fn runtime(third_party_roots: Vec<PathBuf>) -> PluginRuntime {
-    PluginRuntime::new(PluginRuntimeConfig {
+    let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
         data_dir: None,
         store_root: None,
@@ -86,7 +86,13 @@ fn runtime(third_party_roots: Vec<PathBuf>) -> PluginRuntime {
         third_party_roots,
         settings: Rc::new(MapSettings::default()),
         snapshot: Rc::new(StaticSnapshot),
-    })
+    });
+    // bitty#2781/bitty#2800: probe service routing and schemas, not the wall
+    // clock. Activation is slice-only, so the test-only wall seams are
+    // installed before `discover` builds the VMs; parks are still settled on
+    // the documented cold-tick resume.
+    common::install_harness_seams(&mut rt);
+    rt
 }
 
 /// Write a plugin package with service sections under `root/<id>/`.
@@ -318,8 +324,7 @@ fn provide_resolve_call_round_trip_with_schemas() {
 
     // A pinned handle serves through dispatch.
     assert_eq!(
-        rt.dispatch_command(&shop_id(), "total", &[])
-            .expect("dispatch"),
+        common::settle_dispatch(&mut rt, &shop_id(), "total", &[]).expect_value("total"),
         LuaValue::Integer(30)
     );
     assert_eq!(
@@ -343,8 +348,7 @@ fn suspend_resume_dispose_fail_closed_with_gone() {
     rt.suspend(&calc_id()).expect("suspend");
     assert_eq!(rt.service_directory().borrow().published_count(), 16);
     assert_eq!(
-        rt.dispatch_command(&shop_id(), "total", &[])
-            .expect("dispatch"),
+        common::settle_dispatch(&mut rt, &shop_id(), "total", &[]).expect_value("total"),
         LuaValue::Integer(-1)
     );
     assert_eq!(
@@ -354,16 +358,14 @@ fn suspend_resume_dispose_fail_closed_with_gone() {
 
     rt.resume(&calc_id()).expect("resume");
     assert_eq!(
-        rt.dispatch_command(&shop_id(), "total", &[])
-            .expect("dispatch"),
+        common::settle_dispatch(&mut rt, &shop_id(), "total", &[]).expect_value("total"),
         LuaValue::Integer(30)
     );
 
     rt.dispose(&calc_id()).expect("dispose");
     assert_eq!(rt.service_directory().borrow().published_count(), 15);
     assert_eq!(
-        rt.dispatch_command(&shop_id(), "total", &[])
-            .expect("dispatch"),
+        common::settle_dispatch(&mut rt, &shop_id(), "total", &[]).expect_value("total"),
         LuaValue::Integer(-1)
     );
     assert_eq!(
@@ -376,8 +378,7 @@ fn suspend_resume_dispose_fail_closed_with_gone() {
     rt.activate(&calc_id()).expect("re-activate after dispose");
     assert_eq!(rt.service_directory().borrow().published_count(), 16);
     assert_eq!(
-        rt.dispatch_command(&shop_id(), "total", &[])
-            .expect("dispatch"),
+        common::settle_dispatch(&mut rt, &shop_id(), "total", &[]).expect_value("total"),
         LuaValue::Integer(-1)
     );
     assert_eq!(
@@ -653,8 +654,7 @@ fn slow_disk_store_commit_does_not_fail_cross_vm_service_call() {
         Some("NONE".to_string())
     );
     assert_eq!(
-        rt.dispatch_command(&shop_id(), "total", &[])
-            .expect("dispatch"),
+        common::settle_dispatch(&mut rt, &shop_id(), "total", &[]).expect_value("total"),
         LuaValue::Integer(30)
     );
     assert_eq!(store_int(&rt, &calc_id(), "calls"), Some(2));
@@ -860,8 +860,7 @@ fn granted_calls_record_provider_owner_and_backing_heads() {
     assert_eq!(calls[1].heads, vec![TEST_HEAD.to_string()]);
     // A pinned-handle dispatch records the same owner and heads.
     assert_eq!(
-        rt.dispatch_command(&shop_id(), "total", &[])
-            .expect("dispatch"),
+        common::settle_dispatch(&mut rt, &shop_id(), "total", &[]).expect_value("total"),
         LuaValue::Integer(30)
     );
     let calls = rt.service_call_ledger().borrow().calls();

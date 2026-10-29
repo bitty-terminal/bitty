@@ -9,6 +9,8 @@
 //! here; the atomic user-layer writer is covered by the application's unit
 //! tests. Headless and Windows-safe (temp dirs only).
 
+mod common;
+
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -100,6 +102,8 @@ fn runtime(
     if let Some(backend) = backend {
         rt.set_config_write_backend(Some(backend));
     }
+    // bitty#2781/bitty#2800: probe the config contract, not the wall clock.
+    common::install_harness_seams(&mut rt);
     rt
 }
 
@@ -179,13 +183,6 @@ fn write_store_package(
 
 fn pid(id: &str) -> PluginId {
     PluginId::new(id).expect("id")
-}
-
-fn string(value: LuaValue) -> String {
-    match value {
-        LuaValue::String(s) => s,
-        other => panic!("expected a string result, got {other:?}"),
-    }
 }
 
 const PROBE: &str = r##"
@@ -310,10 +307,9 @@ fn dev_runtime_without_record() -> (PluginRuntime, PathBuf) {
 }
 
 fn run(rt: &mut PluginRuntime, command: &str) -> String {
-    string(
-        rt.dispatch_command(&pid("xuepoo.configprobe"), command, &[])
-            .unwrap_or_else(|error| panic!("dispatch {command}: {error}")),
-    )
+    // bitty#2800: settle a documented RC-1 park instead of requiring the
+    // command to finish inside one wall window.
+    common::settle_dispatch(rt, &pid("xuepoo.configprobe"), command, &[]).expect_string(command)
 }
 
 #[test]
@@ -382,10 +378,8 @@ fn approval_tokens_are_generation_bound() {
     assert!(backend.calls.borrow().is_empty(), "no write yet");
 
     rt.reload(&id).expect("reload the generation");
-    let replay = string(
-        rt.dispatch_command(&id, "apply_digest", &[LuaValue::String(digest)])
-            .expect("dispatch apply_digest"),
-    );
+    let replay = common::settle_dispatch(&mut rt, &id, "apply_digest", &[LuaValue::String(digest)])
+        .expect_string("apply_digest");
     assert_eq!(
         replay, "ERR:E_CONFIG_APPROVAL_REQUIRED",
         "a pre-reload token never authorizes the new generation"

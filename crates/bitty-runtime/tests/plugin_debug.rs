@@ -6,6 +6,8 @@
 //! go through the real Lua bridge, grant snapshot, and runtime-owned
 //! `DebugView`/`TraceHub`. Headless and Windows-safe (temp dirs only).
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -68,6 +70,9 @@ fn runtime(root: PathBuf) -> PluginRuntime {
         snapshot: Rc::new(NoSnapshot),
     });
     rt.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
+    // bitty#2800: host calls are charged on their own raw wall clock; widen
+    // that probe-only dimension as well. Parks still settle on the cold tick.
+    rt.set_host_call_deadline_ms(Some(common::HARNESS_HOST_CALL_DEADLINE_MS));
     rt
 }
 
@@ -127,13 +132,6 @@ events = [{events}]
 
 fn pid(id: &str) -> PluginId {
     PluginId::new(id).expect("id")
-}
-
-fn string(value: LuaValue) -> String {
-    match value {
-        LuaValue::String(s) => s,
-        other => panic!("expected a string result, got {other:?}"),
-    }
 }
 
 /// Inspector: serializes `inspect(target)` rows to `a|b|c;...` strings.
@@ -322,10 +320,9 @@ fn setup(tag: &str) -> (PluginRuntime, PathBuf) {
 }
 
 fn run(rt: &mut PluginRuntime, id: &str, command: &str) -> String {
-    string(
-        rt.dispatch_command(&pid(id), command, &[])
-            .unwrap_or_else(|error| panic!("{id}:{command}: {error}")),
-    )
+    // bitty#2800: settle a documented RC-1 park instead of requiring the
+    // command to finish inside one wall window.
+    common::settle_dispatch(rt, &pid(id), command, &[]).expect_string(command)
 }
 
 #[test]
@@ -447,9 +444,8 @@ fn trace_records_delivered_events_and_drops_on_dispose() {
     rt.dispose(&pid(TRACER_ID)).expect("dispose");
     rt.deliver_event("terminal.opened", &payload(10));
     rt.activate(&pid(TRACER_ID)).expect("reactivate");
-    let old = rt
-        .dispatch_command(&pid(TRACER_ID), "probe", &[LuaValue::Integer(1)])
-        .expect("probe");
+    let old = common::settle_dispatch(&mut rt, &pid(TRACER_ID), "probe", &[LuaValue::Integer(1)])
+        .expect_value("probe");
     assert_eq!(old, LuaValue::String("NIL".to_string()));
     assert_eq!(run(&mut rt, TRACER_ID, "start"), "2");
     assert_eq!(run(&mut rt, TRACER_ID, "drain"), "|dropped=0");
@@ -484,9 +480,8 @@ fn trace_handles_are_isolated_between_plugins() {
     }
     assert_eq!(run(&mut rt, TRACER_ID, "start"), "1");
     rt.deliver_event("terminal.opened", &LuaValue::Table(Vec::new()));
-    let probe = rt
-        .dispatch_command(&pid(second), "probe", &[LuaValue::Integer(1)])
-        .expect("probe");
+    let probe = common::settle_dispatch(&mut rt, &pid(second), "probe", &[LuaValue::Integer(1)])
+        .expect_value("probe");
     assert_eq!(probe, LuaValue::String("NIL".to_string()));
     // The foreign probe consumed nothing.
     assert_eq!(

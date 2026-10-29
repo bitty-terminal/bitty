@@ -9,6 +9,8 @@
 //! `bitty.component.poll`. Nothing writes the install layout by hand and no
 //! test-only producer stands in for the surface.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -267,7 +269,7 @@ fn poll_until_settled(
     let args = LuaValue::table([("ticket", ticket)]);
     for _ in 0..POLL_ATTEMPTS {
         pump_component_requests(runtime, plugins, Instant::now());
-        match plugins.invoke_command(&format!("{plugin}:poll"), &args) {
+        match common::settle_invoke(plugins, &format!("{plugin}:poll"), &args).outcome {
             Ok(LuaValue::String(report)) if report != "pending" => return report,
             Ok(_) => {}
             Err(error) => panic!("poll command failed: {error}"),
@@ -279,9 +281,7 @@ fn poll_until_settled(
 
 /// Queue one request through the plugin's Lua surface.
 fn queue_request(plugins: &mut PluginRuntime, plugin: &str) -> String {
-    match plugins
-        .invoke_command(&format!("{plugin}:go"), &LuaValue::Nil)
-        .expect("go command")
+    match common::settle_invoke(plugins, &format!("{plugin}:go"), &LuaValue::Nil).expect_value("go")
     {
         LuaValue::String(ticket) => ticket,
         other => panic!("go must return a ticket string, got {other:?}"),
@@ -373,6 +373,9 @@ fn production_surface_reaches_an_installed_component_and_fails_closed() {
         snapshot: std::rc::Rc::new(EmptySnapshot),
     });
     plugins.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
+    // bitty#2800: host calls are charged on their own raw wall clock; widen
+    // that probe-only dimension too. Parks still settle on the cold tick.
+    plugins.set_host_call_deadline_ms(Some(common::HARNESS_HOST_CALL_DEADLINE_MS));
     let discovered = plugins.discover();
     for (id, result) in &discovered {
         if let Err(error) = result {
@@ -454,13 +457,13 @@ fn production_surface_reaches_an_installed_component_and_fails_closed() {
     eprintln!("out-of-grant: {report}");
 
     // ── an over-bound payload is rejected before any send ─────────────────
-    let report = match plugins
-        .invoke_command(&format!("{oversize}:big"), &LuaValue::Nil)
-        .expect("big command")
-    {
-        LuaValue::String(report) => report,
-        other => panic!("big must return a report string, got {other:?}"),
-    };
+    let report =
+        match common::settle_invoke(&mut plugins, &format!("{oversize}:big"), &LuaValue::Nil)
+            .expect_value("big")
+        {
+            LuaValue::String(report) => report,
+            other => panic!("big must return a report string, got {other:?}"),
+        };
     assert_eq!(report, "err:E_COMPONENT_PAYLOAD_TOO_LARGE");
     let queue = plugins.component_request_queue().borrow();
     assert_eq!(queue.pending(), 0, "an over-bound payload never enqueues");
@@ -597,6 +600,7 @@ fn reload_fixture(tag: &str) -> ReloadFixture {
     // lifecycle/denial semantics, not latency, so give the Lua calls the
     // 100x harness room.
     plugins.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
+    plugins.set_host_call_deadline_ms(Some(common::HARNESS_HOST_CALL_DEADLINE_MS));
     let id = PluginId::new(RELOAD_PLUGIN).expect("plugin id");
     let report = plugins.activate(&id).expect("activate v1");
     assert_eq!(report.state, LifecycleState::Active);
@@ -652,10 +656,12 @@ fn reload_refreshes_the_mirrored_generation_and_purges_the_predecessor() {
         LuaValue::Integer(stale_ticket.parse().expect("stale ticket integer")),
     )]);
     assert_eq!(
-        fixture
-            .plugins
-            .invoke_command(&format!("{RELOAD_PLUGIN}:poll"), &stale)
-            .expect("poll stale ticket"),
+        common::settle_invoke(
+            &mut fixture.plugins,
+            &format!("{RELOAD_PLUGIN}:poll"),
+            &stale,
+        )
+        .expect_value("poll stale ticket"),
         LuaValue::String("err:E_COMPONENT_TICKET".to_string()),
         "the predecessor's ticket is purged by the reload"
     );

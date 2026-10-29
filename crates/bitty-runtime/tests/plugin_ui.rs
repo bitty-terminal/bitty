@@ -31,20 +31,22 @@ use bitty_runtime::{
 // Mount-loop wall-clock budget (bitty#1744, CTX-1001)
 // ---------------------------------------------------------------------------
 
-/// Test-local wall-clock budget for the mount-loop activation VM.
+/// Test-local wall-clock budget for the fixture activation VMs.
 ///
 /// Decision (bitty#1744): widen, do not retry or exempt — the #1727
 /// treatment. The mount loop runs 65 `bitty.ui.mount` calls through
 /// `PluginRuntime::activate`, which enforces the per-chunk RC-1 wall budget
-/// via `execute_bounded`. Production keeps `RC1_WALL_CLOCK_BUDGET_MS`
-/// (50ms); the test previously used that default and suspended at 63ms
-/// (`WallClockExceeded`) under sharded CI load (QG2 shard 2/2 during #1741
-/// CI). Wall time is load-sensitive, not correctness-sensitive. A fixed 10x
-/// headroom (500ms, wall only; instruction/memory stay at RC defaults) keeps
-/// the chunk bounded while absorbing scheduler stalls. Budget enforcement
-/// itself stays pinned by `bitty-lua/tests/measurement_lua.rs` and
-/// `load_gate.rs`, which keep the 50ms production assertions. The block
-/// budget under test (`UI_MAX_BLOCKS`) is unchanged.
+/// via `execute_bounded`; bitty#2800 applies the same wall-only seam to every
+/// UI probe because activation is slice-only and cannot be settled. Production
+/// keeps `RC1_WALL_CLOCK_BUDGET_MS` (50ms); the mount loop previously used that
+/// default and suspended at 63ms (`WallClockExceeded`) under sharded CI load
+/// (QG2 shard 2/2 during #1741 CI). Wall time is load-sensitive, not
+/// correctness-sensitive. A fixed 10x headroom (500ms, wall only;
+/// instruction/memory stay at RC defaults) keeps the chunk bounded while
+/// absorbing scheduler stalls. Budget enforcement itself stays pinned by
+/// `bitty-lua/tests/measurement_lua.rs` and `load_gate.rs`, which keep the
+/// 50ms production assertions. The block budget under test (`UI_MAX_BLOCKS`)
+/// is unchanged.
 const MOUNT_LOOP_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
 
 #[derive(Default)]
@@ -79,7 +81,10 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn runtime(roots: Vec<PathBuf>, data_dir: PathBuf) -> PluginRuntime {
-    runtime_with_wall_budget(roots, data_dir, None)
+    // bitty#2800: activation callbacks are slice-only and cannot be settled,
+    // so every probe fixture gets the same wall-only headroom as the mount
+    // loop; instruction and memory keep their production values.
+    runtime_with_wall_budget(roots, data_dir, Some(MOUNT_LOOP_WALL_BUDGET_MS))
 }
 
 fn runtime_with_wall_budget(
@@ -103,6 +108,9 @@ fn runtime_with_wall_budget(
     // test still proves policy under production-adjacent budgets. Wall is the
     // sole load-sensitive dimension (bitty#1744, same as bitty#1727).
     rt.set_vm_wall_budget_ms(wall_budget_ms);
+    // bitty#2800: host calls are charged on their own raw wall clock; widen
+    // that probe-only dimension too. Parks still settle on the cold tick.
+    rt.set_host_call_deadline_ms(Some(common::HARNESS_HOST_CALL_DEADLINE_MS));
     // W-146: disk-backed stores commit through an injected backend.
     common::install_stub_backend(&mut rt);
     rt
@@ -237,7 +245,7 @@ impl Fixture {
             claims,
             commands,
             events,
-            None,
+            Some(MOUNT_LOOP_WALL_BUDGET_MS),
             init_src,
         )
     }
@@ -245,8 +253,8 @@ impl Fixture {
     /// Activate with an explicit wall-clock override (bitty#1744).
     ///
     /// `Some(ms)` widens only the wall dimension; instruction/memory stay at
-    /// RC defaults. Only the load-sensitive mount-loop test uses this; every
-    /// other fixture keeps `None` (production 50ms).
+    /// RC defaults. Every fixture uses the mount-loop headroom because
+    /// activation is slice-only and cannot settle a park (bitty#2800).
     fn activate_with_wall_budget(
         tag: &str,
         id: &str,
@@ -837,14 +845,13 @@ fn reload_starts_the_next_generation_with_a_fresh_registry() {
     first.with_ui_blocks(|blocks| assert_eq!(blocks.len(), 1));
     // A real generation-1 handle serves updates before the reload.
     assert_eq!(
-        fixture
-            .runtime
-            .dispatch_command(
-                &fixture.id,
-                "probe",
-                &[LuaValue::String("before".to_string())],
-            )
-            .expect("dispatch"),
+        common::settle_dispatch(
+            &mut fixture.runtime,
+            &fixture.id,
+            "probe",
+            &[LuaValue::String("before".to_string())],
+        )
+        .expect_value("probe"),
         LuaValue::Bool(true)
     );
     let first_handle = match store_value(&fixture.runtime, &fixture.id, "old_handle") {
@@ -876,14 +883,13 @@ fn reload_starts_the_next_generation_with_a_fresh_registry() {
     );
     // ...and the real pre-reload handle is dead, not aliased onto it.
     assert_eq!(
-        fixture
-            .runtime
-            .dispatch_command(
-                &fixture.id,
-                "probe",
-                &[LuaValue::String("after_reload".to_string())],
-            )
-            .expect("dispatch"),
+        common::settle_dispatch(
+            &mut fixture.runtime,
+            &fixture.id,
+            "probe",
+            &[LuaValue::String("after_reload".to_string())],
+        )
+        .expect_value("probe"),
         LuaValue::Bool(false),
         "a real pre-reload handle must report false after reload, never error"
     );
@@ -949,10 +955,13 @@ fn suspend_invalidates_handles_until_remount() {
     };
 
     let probe = |fixture: &mut Fixture, command: &str, key: &str| {
-        fixture
-            .runtime
-            .dispatch_command(&fixture.id, command, &[LuaValue::String(key.to_string())])
-            .expect("dispatch")
+        common::settle_dispatch(
+            &mut fixture.runtime,
+            &fixture.id,
+            command,
+            &[LuaValue::String(key.to_string())],
+        )
+        .expect_value(command)
     };
 
     // update-before-suspend: the live handle serves.
@@ -986,10 +995,8 @@ fn suspend_invalidates_handles_until_remount() {
 
     // Re-mount mints a fresh handle; the pre-suspend handle stays dead.
     assert_eq!(
-        fixture
-            .runtime
-            .dispatch_command(&fixture.id, "remount", &[])
-            .expect("dispatch"),
+        common::settle_dispatch(&mut fixture.runtime, &fixture.id, "remount", &[])
+            .expect_value("remount"),
         LuaValue::Bool(true)
     );
     let second_handle = match store_value(&fixture.runtime, &fixture.id, "handle") {
@@ -1109,11 +1116,9 @@ fn overlay_capture_is_single_owner_and_release_is_idempotent() {
             -- third acquires must succeed; when they do not, the stored code
             -- distinguishes a real single-owner regression
             -- (`E_UI_ALREADY_CAPTURED`, `E_UI_NOT_OWNER`) from a scheduler
-            -- stall (`E_TIMEOUT`) without widening any budget. The PR's
-            -- `set_vm_wall_budget_ms` only widens the mount-loop activation
-            -- (500ms wall); this probe keeps the production 50ms default, and
-            -- a wall suspension would surface as dispatch `Err`, never as
-            -- `false`, so `false` always carries a bridge code here.
+            -- stall (`E_TIMEOUT`). bitty#2800 installs the wall-only harness
+            -- seam and settles a park on the cold tick, so `false` always
+            -- carries a bridge code here.
             bitty.store.set(key .. "_a_err", a_ok and "NONE" or a_err.code)
             bitty.store.set(key .. "_a2", a2_ok and "NONE" or a2_err.code)
             bitty.store.set(key .. "_r1", r1)
@@ -1176,12 +1181,15 @@ fn overlay_capture_is_single_owner_and_release_is_idempotent() {
     // Through Lua: acquire, release twice, acquire again (single generation
     // release/acquire round trip; the cross-owner conflict is proven above).
     // Load-flake triage (bitty#1746): a wall suspension would be dispatch
-    // `Err`, never `false`; `false` carries `x_a_err` (no budget widened,
-    // production 50ms kept, PR's mount-loop 500ms untouched).
-    let dispatched = fixture
-        .runtime
-        .dispatch_command(&fixture.id, "probe", &[LuaValue::String("x".to_string())])
-        .expect("dispatch");
+    // `Err`, never `false`; `false` carries `x_a_err`. bitty#2800 settles a
+    // park on the cold tick, so a loaded runner cannot surface one here.
+    let dispatched = common::settle_dispatch(
+        &mut fixture.runtime,
+        &fixture.id,
+        "probe",
+        &[LuaValue::String("x".to_string())],
+    )
+    .expect_value("probe");
     let first_err = store_value(&fixture.runtime, &fixture.id, "x_a_err");
     assert_eq!(
         dispatched,
@@ -1435,11 +1443,11 @@ return {}
     let origin = band_origin_for(&fixture.runtime, &fixture.id);
 
     // Positive control: the live origin delegates to the generic body.
+    let first = fixture
+        .runtime
+        .dispatch_ui_command(&fixture.id, "step", &[], &origin);
     assert_eq!(
-        fixture
-            .runtime
-            .dispatch_ui_command(&fixture.id, "step", &[], &origin)
-            .expect("live origin"),
+        common::settle_outcome(&mut fixture.runtime, "step", first).expect_value("step"),
         LuaValue::String("1".to_string())
     );
 
@@ -1490,11 +1498,11 @@ return {}
     ));
     let after_reload = band_origin_for(&fixture.runtime, &fixture.id);
     assert_ne!(after_reload.generation, before_reload.generation);
+    let first = fixture
+        .runtime
+        .dispatch_ui_command(&fixture.id, "step", &[], &after_reload);
     assert_eq!(
-        fixture
-            .runtime
-            .dispatch_ui_command(&fixture.id, "step", &[], &after_reload)
-            .expect("fresh origin"),
+        common::settle_outcome(&mut fixture.runtime, "step", first).expect_value("step"),
         LuaValue::String("1".to_string())
     );
 
@@ -1619,10 +1627,8 @@ fn stale_and_foreign_handles_keep_the_false_update_contract_for_anchored_trees()
     };
 
     // Foreign handle while the real block still exists.
-    let foreign = fixture
-        .runtime
-        .dispatch_command(&fixture.id, "update_foreign", &[])
-        .expect("dispatch");
+    let foreign = common::settle_dispatch(&mut fixture.runtime, &fixture.id, "update_foreign", &[])
+        .expect_value("update_foreign");
     assert_false_not_error(foreign);
 
     // Pre-suspend handle after the registry is cleared (suspend/dispose).
@@ -1631,9 +1637,7 @@ fn stale_and_foreign_handles_keep_the_false_update_contract_for_anchored_trees()
         .services(&fixture.id)
         .expect("services")
         .clear_ui_blocks();
-    let stale = fixture
-        .runtime
-        .dispatch_command(&fixture.id, "update_old", &[])
-        .expect("dispatch");
+    let stale = common::settle_dispatch(&mut fixture.runtime, &fixture.id, "update_old", &[])
+        .expect_value("update_old");
     assert_false_not_error(stale);
 }

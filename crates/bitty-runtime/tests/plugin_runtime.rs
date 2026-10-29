@@ -81,6 +81,11 @@ fn runtime(
     });
     // W-146: disk-backed stores commit through an injected backend.
     common::install_stub_backend(&mut rt);
+    // bitty#2781/bitty#2800: these probes assert discovery/activation/store
+    // semantics, not runner scheduling. The test-only wall seams are
+    // installed before `discover` builds the VMs; parks still settle on the
+    // documented cold tick.
+    common::install_harness_seams(&mut rt);
     rt
 }
 
@@ -192,9 +197,8 @@ fn discovers_activates_and_dispatches_bundled_plugin() {
     assert!(!report.skipped_safe_mode);
     assert_eq!(rt.state(&sample_id()), Some(&LifecycleState::Active));
 
-    let result = rt
-        .dispatch_command(&sample_id(), "summary", &[])
-        .expect("dispatch");
+    let result =
+        common::settle_dispatch(&mut rt, &sample_id(), "summary", &[]).expect_value("summary");
     assert_eq!(result, LuaValue::String("ok".to_string()));
 
     let notifications = rt.drain_notifications();
@@ -488,9 +492,7 @@ fn real_activity_plugin_activates() {
     assert_eq!(report.state, LifecycleState::Active);
     assert_eq!(report.commands, 2, "summary + clear");
     assert_eq!(report.events, 6, "declared observation + lifecycle events");
-    let result = rt
-        .dispatch_command(&id, "summary", &[])
-        .expect("summary runs");
+    let result = common::settle_dispatch(&mut rt, &id, "summary", &[]).expect_value("summary");
     assert!(matches!(result, LuaValue::String(_)));
     let _ = std::fs::remove_dir_all(&data);
 }
@@ -719,8 +721,7 @@ fn notification_queue_overflow_is_counted_not_silent() {
     assert_eq!(rt.notifications_dropped(), 0);
     let extra = 6usize;
     for _ in 0..(NOTIFICATION_QUEUE_CAPACITY + extra) {
-        rt.dispatch_command(&sample_id(), "summary", &[])
-            .expect("dispatch");
+        common::settle_dispatch(&mut rt, &sample_id(), "summary", &[]).expect_value("summary");
     }
     assert_eq!(
         rt.notifications_dropped(),

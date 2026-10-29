@@ -187,6 +187,23 @@ pub const HARNESS_HOST_CALL_DEADLINE_MS: u64 = bitty_lua::RC1_CALLBACK_CEILING_M
 #[allow(dead_code)]
 pub const HARNESS_VM_WALL_BUDGET_MS: u64 = bitty_lua::RC1_CALLBACK_CEILING_MS;
 
+/// Install both documented test-only wall seams on a probe runtime
+/// (bitty#2781, bitty#2800).
+///
+/// Capability probes assert what a plugin can do, never how long the runner
+/// needed to schedule it, so they widen only the two wall dimensions:
+/// activation/dispatch ([`HARNESS_VM_WALL_BUDGET_MS`]) and host calls
+/// ([`HARNESS_HOST_CALL_DEADLINE_MS`]). Instruction, memory, and
+/// cumulative-callback limits keep their production values. Call before
+/// `discover`/activation because the wall budget is read when the VM is built.
+/// A park that still happens (the runner stalled past the callback envelope)
+/// is settled on the documented cold-tick resume.
+#[allow(dead_code)]
+pub fn install_harness_seams(runtime: &mut PluginRuntime) {
+    runtime.set_host_call_deadline_ms(Some(HARNESS_HOST_CALL_DEADLINE_MS));
+    runtime.set_vm_wall_budget_ms(Some(HARNESS_VM_WALL_BUDGET_MS));
+}
+
 /// One app-dispatched command invoked once and settled on the cold ticks.
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -215,6 +232,14 @@ impl SettledDispatch {
             other => panic!("{command}: expected a string result, got {other:?}"),
         }
     }
+
+    /// Consume the settlement, requiring a terminal error.
+    pub fn expect_error(self, command: &str) -> PluginRuntimeError {
+        match self.outcome {
+            Err(error) => error,
+            Ok(value) => panic!("{command}: expected a terminal error, got {value:?}"),
+        }
+    }
 }
 
 /// Dispatch one command and settle an RC-1 park on the documented resume
@@ -239,57 +264,115 @@ pub fn settle_dispatch(
     command: &str,
     args: &[LuaValue],
 ) -> SettledDispatch {
-    match runtime.dispatch_command(id, command, args) {
+    let first = runtime.dispatch_command(id, command, args);
+    match first {
         Ok(value) => SettledDispatch {
             outcome: Ok(value),
             parked: false,
             resume_ticks: 0,
         },
-        Err(error) if error.is_parked() => {
-            assert_eq!(
-                runtime.parked_command_count(),
-                1,
-                "{command}: the park must be recorded exactly once"
-            );
-            for tick in 0..RC1_RESUME_TICKS {
-                let mut completions = runtime.pump_parked_commands();
-                if completions.is_empty() {
-                    // Still parked: the next cold tick opens the next RC-1
-                    // wall window.
-                    continue;
-                }
-                assert_eq!(
-                    completions.len(),
-                    1,
-                    "{command}: one parked invocation completes per cold tick"
-                );
-                let completion = completions.pop().expect("checked exactly one completion");
-                assert_eq!(completion.plugin, *id, "{command}: completion owner");
-                assert_eq!(completion.command, command, "{command}: completion id");
-                assert_eq!(
-                    runtime.parked_command_count(),
-                    0,
-                    "{command}: a completed park must be dropped"
-                );
-                assert!(
-                    runtime.pump_parked_commands().is_empty(),
-                    "{command}: a completed command must never replay"
-                );
-                return SettledDispatch {
-                    outcome: completion.outcome,
-                    parked: true,
-                    resume_ticks: tick + 1,
-                };
-            }
-            panic!(
-                "{command}: the parked invocation did not complete within \
-                 {RC1_RESUME_TICKS} cold ticks"
-            )
-        }
+        Err(error) if error.is_parked() => settle_parked(runtime, command, Some((id, command))),
         Err(error) => SettledDispatch {
             outcome: Err(error),
             parked: false,
             resume_ticks: 0,
         },
     }
+}
+
+/// Invoke one qualified command through the application entry and settle an
+/// RC-1 park on the documented resume signal (bitty#2800).
+///
+/// [`PluginRuntime::invoke_command`] delegates to
+/// [`PluginRuntime::dispatch_command`], so it can park exactly like a direct
+/// dispatch. Tests that assert the command result use this helper instead of
+/// treating the documented park as a refusal.
+#[allow(dead_code)]
+pub fn settle_invoke(
+    runtime: &mut PluginRuntime,
+    qualified: &str,
+    args: &LuaValue,
+) -> SettledDispatch {
+    let first = runtime.invoke_command(qualified, args);
+    settle_outcome(runtime, qualified, first)
+}
+
+/// Settle an already-produced dispatch result (bitty#2800).
+///
+/// Use this for entry points that perform their own pre-dispatch checks before
+/// delegating to [`PluginRuntime::dispatch_command`], such as
+/// [`PluginRuntime::dispatch_ui_command`].
+#[allow(dead_code)]
+pub fn settle_outcome(
+    runtime: &mut PluginRuntime,
+    label: &str,
+    first: Result<LuaValue, PluginRuntimeError>,
+) -> SettledDispatch {
+    match first {
+        Ok(value) => SettledDispatch {
+            outcome: Ok(value),
+            parked: false,
+            resume_ticks: 0,
+        },
+        Err(error) if error.is_parked() => settle_parked(runtime, label, None),
+        Err(error) => SettledDispatch {
+            outcome: Err(error),
+            parked: false,
+            resume_ticks: 0,
+        },
+    }
+}
+
+/// Drive a recorded park to its terminal outcome on the documented cold tick.
+///
+/// `expected` pins the completion owner/command when the caller dispatched
+/// directly; entry points that only know a qualified label pass `None` and
+/// still verify the single-completion/no-replay contract.
+#[allow(dead_code)]
+fn settle_parked(
+    runtime: &mut PluginRuntime,
+    label: &str,
+    expected: Option<(&PluginId, &str)>,
+) -> SettledDispatch {
+    assert_eq!(
+        runtime.parked_command_count(),
+        1,
+        "{label}: the park must be recorded exactly once"
+    );
+    for tick in 0..RC1_RESUME_TICKS {
+        let mut completions = runtime.pump_parked_commands();
+        if completions.is_empty() {
+            // Still parked: the next cold tick opens the next RC-1 wall
+            // window.
+            continue;
+        }
+        assert_eq!(
+            completions.len(),
+            1,
+            "{label}: one parked invocation completes per cold tick"
+        );
+        let completion = completions.pop().expect("checked exactly one completion");
+        if let Some((id, command)) = expected {
+            assert_eq!(completion.plugin, *id, "{label}: completion owner");
+            assert_eq!(completion.command, command, "{label}: completion id");
+        }
+        assert_eq!(
+            runtime.parked_command_count(),
+            0,
+            "{label}: a completed park must be dropped"
+        );
+        assert!(
+            runtime.pump_parked_commands().is_empty(),
+            "{label}: a completed command must never replay"
+        );
+        return SettledDispatch {
+            outcome: completion.outcome,
+            parked: true,
+            resume_ticks: tick + 1,
+        };
+    }
+    panic!(
+        "{label}: the parked invocation did not complete within \
+         {RC1_RESUME_TICKS} cold ticks"
+    )
 }

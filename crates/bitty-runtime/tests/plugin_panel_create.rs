@@ -12,6 +12,8 @@
 //! carries no layout authority. Headless and Windows-safe (temp dirs only,
 //! no PTY spawn, no processes or sockets).
 
+mod common;
+
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -119,6 +121,9 @@ fn runtime(root: PathBuf, backend: Option<PanelCreateHandler>) -> PluginRuntime 
     rt.set_panel_create_backend(backend);
     // Harness headroom for activation only; see `HARNESS_WALL_BUDGET_MS`.
     rt.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
+    // bitty#2800: host calls inside a dispatch are charged separately on a
+    // raw wall clock; widen that probe-only dimension too.
+    rt.set_host_call_deadline_ms(Some(common::HARNESS_HOST_CALL_DEADLINE_MS));
     rt
 }
 
@@ -168,13 +173,6 @@ events = []
 
 fn pid(id: &str) -> PluginId {
     PluginId::new(id).expect("id")
-}
-
-fn string(value: LuaValue) -> String {
-    match value {
-        LuaValue::String(s) => s,
-        other => panic!("expected a string result, got {other:?}"),
-    }
 }
 
 fn activate_all(rt: &mut PluginRuntime) {
@@ -232,10 +230,9 @@ fn probe_runtime(
 }
 
 fn run(rt: &mut PluginRuntime, id: &PluginId, command: &str) -> String {
-    string(
-        rt.dispatch_command(id, command, &[])
-            .unwrap_or_else(|error| panic!("dispatch {command}: {error}")),
-    )
+    // bitty#2800: settle a documented RC-1 park instead of requiring the
+    // command to finish inside one wall window.
+    common::settle_dispatch(rt, id, command, &[]).expect_string(command)
 }
 
 /// Split an `OK:<id>/<generation>` probe result into raw handle parts.

@@ -169,14 +169,11 @@ impl World {
     }
 
     fn run_count(&mut self) -> String {
-        match self
-            .runtime
-            .dispatch_command(&self.id, "runs", &[])
-            .expect("runs must dispatch")
-        {
-            LuaValue::String(value) => value,
-            other => panic!("runs must return a string, got {other:?}"),
-        }
+        // The real 50 ms production budget stays in force here (the park
+        // assertions below depend on it). This cheap read is still settled on
+        // the documented cold tick so a loaded runner cannot turn it into a
+        // spurious park; bitty#2800.
+        common::settle_dispatch(&mut self.runtime, &self.id, "runs", &[]).expect_string("runs")
     }
 }
 

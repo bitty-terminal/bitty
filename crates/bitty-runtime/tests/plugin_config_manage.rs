@@ -384,7 +384,7 @@ bitty.commands.register({ id = "enable", title = "Enable", run = function()
   if not ok then return "ERR:" .. p.code end
   local applied, out = pcall(bitty.config.set_enabled, "owner.plugin", true, p.digest)
   if not applied then return "ERR:" .. out.code end
-  return p.rendered .. "|" .. p.keys[1] .. "|" .. tostring(out.changed) .. "|" .. out.reload
+  return p.rendered .. "|" .. p.keys[1] .. "|" .. tostring(p.changed) .. "|" .. tostring(out.changed) .. "|" .. out.reload
 end })
 bitty.commands.register({ id = "enable_replay", title = "Enable replay", run = function()
   local ok, p = pcall(bitty.config.preview_enabled, "owner.plugin", true)
@@ -650,7 +650,7 @@ fn enable_and_profile_use_are_token_bound_over_the_wire() {
     let (mut rt, _backend) = granted_runtime();
     assert_eq!(
         run(&mut rt, "enable"),
-        "plugins.owner.plugin.enabled = true|plugins.owner.plugin.enabled|true|restart"
+        "plugins.owner.plugin.enabled = true|plugins.owner.plugin.enabled|true|true|restart"
     );
     assert_eq!(run(&mut rt, "enable_replay"), "E_CONFIG_APPROVAL_REQUIRED");
     assert_eq!(

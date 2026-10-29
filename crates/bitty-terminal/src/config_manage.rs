@@ -21,10 +21,11 @@ use std::path::PathBuf;
 use bitty_config::{ConfigSource, LayerKind, MergedConfig};
 use bitty_runtime::plugin_runtime::writable_setting;
 use bitty_runtime::plugin_runtime::{
-    CONFIG_LIST_MAX_ROWS, ConfigApplyOutcome, ConfigChange, ConfigPreviewRendering,
-    ConfigReadFailure, ConfigReadValue, ConfigSourceLabel, ConfigSourceList, ConfigSourceRow,
-    ConfigValueRow, ConfigWriteBackend, ConfigWriteFailure, PluginEnabledRendering, PluginList,
-    PluginListRow, ProfileList, ProfileListRow, ProfileUseRendering, candidate_digest,
+    CONFIG_LIST_MAX_BYTES, CONFIG_LIST_MAX_ROWS, ConfigApplyOutcome, ConfigChange,
+    ConfigPreviewRendering, ConfigReadFailure, ConfigReadValue, ConfigSourceLabel,
+    ConfigSourceList, ConfigSourceRow, ConfigValueRow, ConfigWriteBackend, ConfigWriteFailure,
+    PluginEnabledRendering, PluginList, PluginListRow, ProfileList, ProfileListRow,
+    ProfileUseRendering, candidate_digest, list_row_bytes,
 };
 
 use crate::config_cli::ConfigValue;
@@ -230,6 +231,29 @@ impl AppConfigManage {
     }
 }
 
+/// Retain the sorted prefix that fits both list bounds.
+///
+/// The runtime re-checks [`CONFIG_LIST_MAX_ROWS`] and [`CONFIG_LIST_MAX_BYTES`]
+/// on the returned rows, so a backend that caps rows only would turn a large
+/// catalog into a hard `E_DEF_LIMIT` instead of a shortened list. Row size uses
+/// the runtime's own [`list_row_bytes`] formula so both sides agree byte for
+/// byte. Returns whether any row was dropped.
+fn truncate_list_rows<T>(rows: &mut Vec<T>, row_bytes: impl Fn(&T) -> usize) -> bool {
+    let mut kept = 0usize;
+    let mut bytes = 0usize;
+    for row in rows.iter() {
+        let size = row_bytes(row);
+        if kept == CONFIG_LIST_MAX_ROWS || bytes + size > CONFIG_LIST_MAX_BYTES {
+            break;
+        }
+        bytes += size;
+        kept += 1;
+    }
+    let truncated = rows.len() > kept;
+    rows.truncate(kept);
+    truncated
+}
+
 /// One prepared profile switch (no write performed).
 struct PreparedProfileUse {
     content: String,
@@ -303,8 +327,14 @@ impl ConfigWriteBackend for AppConfigManage {
         let mut rows = plugin::rows_for_config_manage(&state, self.store_root.as_deref())
             .map_err(plugin_read_failure)?;
         rows.sort_by(|left, right| left.id.cmp(&right.id));
-        let truncated = rows.len() > CONFIG_LIST_MAX_ROWS;
-        rows.truncate(CONFIG_LIST_MAX_ROWS);
+        let truncated = truncate_list_rows(&mut rows, |row| {
+            list_row_bytes(&[
+                &row.id,
+                &row.source,
+                &row.version,
+                if row.recorded { "true" } else { "false" },
+            ])
+        });
         Ok(PluginList {
             rows: rows
                 .into_iter()
@@ -321,9 +351,14 @@ impl ConfigWriteBackend for AppConfigManage {
     }
 
     fn profiles_list(&self, _plugin_id: &str) -> Result<ProfileList, ConfigReadFailure> {
-        let (names, truncated) =
+        let (mut names, scan_truncated) =
             scan_names(&self.profiles_dir, PROFILE_SCAN_CAP, CONFIG_LIST_MAX_ROWS)
                 .map_err(|_| ConfigReadFailure::Io)?;
+        // `scan_names` follows `read_dir` order; sort before truncating so the
+        // retained prefix is deterministic (the runtime sorts again).
+        names.sort();
+        let byte_truncated = truncate_list_rows(&mut names, |name| list_row_bytes(&[name]));
+        let truncated = scan_truncated || byte_truncated;
         // The running chain wins: `--profile`/`BITTY_PROFILE` first, then the
         // persisted selector. A successful `profiles.use` updates the
         // selector immediately, but the running table is not re-merged, so
@@ -777,6 +812,87 @@ mod tests {
             assert!(!row.id.is_empty());
             assert!(row.source.len() <= 128);
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn plugin_list_truncates_on_the_byte_bound_not_only_rows() {
+        let dir = scratch("list-bytes");
+        let backend = backend(&dir, None);
+        // Long ledger ids exceed 4 KiB well before the 64-row cap.
+        let mut state = plugin::PluginState::new();
+        for index in 0..48 {
+            state.insert(
+                format!("owner.{}{index}", "x".repeat(56)),
+                plugin::PluginRecord {
+                    source: String::from("bundled"),
+                    manifest_hash: "0".repeat(64),
+                    enabled: false,
+                    granted: std::collections::BTreeSet::new(),
+                    denied: std::collections::BTreeSet::new(),
+                },
+            );
+        }
+        plugin::save_state_for_config_manage(&dir.join("bitty-plugins.lua"), &state).expect("seed");
+        let list = backend.plugins_list("p").expect("list");
+        let bytes: usize = list
+            .rows
+            .iter()
+            .map(|row| {
+                list_row_bytes(&[
+                    &row.id,
+                    &row.source,
+                    &row.version,
+                    if row.managed { "true" } else { "false" },
+                ])
+            })
+            .sum();
+        assert!(list.truncated, "dropped rows must be reported");
+        assert!(
+            list.rows.len() < CONFIG_LIST_MAX_ROWS,
+            "the byte bound, not the row bound, must stop this list"
+        );
+        assert!(
+            bytes <= CONFIG_LIST_MAX_BYTES,
+            "returned rows must fit the runtime bound, got {bytes}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn profile_list_truncates_on_the_byte_bound_not_only_rows() {
+        let dir = scratch("profiles-bytes");
+        std::fs::create_dir_all(dir.join("profiles")).expect("profiles");
+        for index in 0..60 {
+            let name = format!("{}{index:02}", "p".repeat(60));
+            std::fs::write(
+                dir.join("profiles").join(format!("{name}.lua")),
+                "return {}\n",
+            )
+            .expect("profile");
+        }
+        let backend = backend(&dir, None);
+        let list = backend.profiles_list("p").expect("profiles");
+        let bytes: usize = list
+            .rows
+            .iter()
+            .map(|row| list_row_bytes(&[&row.name]))
+            .sum();
+        assert!(list.truncated, "dropped rows must be reported");
+        assert!(
+            list.rows.len() < 60,
+            "the byte bound, not the row bound, must stop this list"
+        );
+        assert!(
+            bytes <= CONFIG_LIST_MAX_BYTES,
+            "returned rows must fit the runtime bound, got {bytes}"
+        );
+        let first = format!("{}00", "p".repeat(60));
+        assert_eq!(
+            list.rows.first().map(|row| row.name.as_str()),
+            Some(first.as_str()),
+            "the retained prefix is sorted, not read_dir order"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

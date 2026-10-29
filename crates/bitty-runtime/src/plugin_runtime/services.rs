@@ -4358,9 +4358,14 @@ impl HostServices for PluginServices {
         &self,
         id: &str,
         enabled: bool,
-    ) -> Result<(String, String, Vec<String>), BridgeError> {
+    ) -> Result<(String, String, Vec<String>, bool), BridgeError> {
         let token = PluginServices::config_preview_enabled(self, id, enabled)?;
-        Ok((token.digest, token.rendered, token.changed_keys))
+        Ok((
+            token.digest,
+            token.rendered,
+            token.changed_keys,
+            token.changed,
+        ))
     }
 
     fn config_set_enabled(
@@ -10910,6 +10915,7 @@ mod tests {
         write_failure: Cell<Option<ConfigWriteFailure>>,
         outcome: ConfigApplyOutcome,
         profile_changed: bool,
+        enabled_changed: bool,
     }
 
     impl RecordingManageBackend {
@@ -10942,6 +10948,7 @@ mod tests {
                 write_failure: Cell::new(None),
                 outcome: ConfigApplyOutcome::Applied,
                 profile_changed: true,
+                enabled_changed: true,
             })
         }
 
@@ -11036,7 +11043,11 @@ mod tests {
         ) -> Result<PluginEnabledRendering, ConfigWriteFailure> {
             let (rendered, candidate_digest) = self.rendering(&format!("{id}.{enabled}"));
             Ok(PluginEnabledRendering {
-                changed_keys: vec![format!("plugins.{id}.enabled")],
+                changed_keys: if self.enabled_changed {
+                    vec![format!("plugins.{id}.enabled")]
+                } else {
+                    Vec::new()
+                },
                 rendered,
                 candidate_digest,
             })
@@ -11426,6 +11437,25 @@ mod tests {
             .profiles_use("default", &preview.digest)
             .expect_err("wrong profile");
         assert_eq!(error.code, "E_CONFIG_APPROVAL_REQUIRED");
+    }
+
+    #[test]
+    fn enable_preview_reports_a_no_op_as_unchanged() {
+        let mut backend = RecordingManageBackend::new();
+        let unique = Rc::get_mut(&mut backend).expect("unique");
+        unique.enabled_changed = false;
+        unique.outcome = ConfigApplyOutcome::Unchanged;
+        let services = manage_services(backend);
+        let preview = services
+            .config_preview_enabled("owner.plugin", true)
+            .expect("preview");
+        assert!(!preview.changed, "a no-op preview reports changed = false");
+        assert!(preview.changed_keys.is_empty());
+        let (changed, reload) = services
+            .config_set_enabled("owner.plugin", true, &preview.digest)
+            .expect("apply");
+        assert!(!changed);
+        assert_eq!(reload, "none");
     }
 
     #[test]

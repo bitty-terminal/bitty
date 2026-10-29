@@ -1300,12 +1300,13 @@ pub trait HostServices {
     /// Render one managed plugin enable/disable candidate for
     /// `bitty.config.preview_enabled` (CTX-1647).
     ///
-    /// Returns `(digest, rendered, changed_keys)`. The default fails closed.
+    /// Returns `(digest, rendered, changed_keys, changed)`. The default fails
+    /// closed.
     fn config_preview_enabled(
         &self,
         id: &str,
         enabled: bool,
-    ) -> Result<(String, String, Vec<String>), BridgeError> {
+    ) -> Result<(String, String, Vec<String>, bool), BridgeError> {
         let _ = (id, enabled);
         Err(BridgeError::not_implemented("bitty.config.preview_enabled"))
     }
@@ -7041,7 +7042,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             .to_error(ctx));
                         }
                     };
-                    let (digest, rendered, keys) = state
+                    let (digest, rendered, keys, changed) = state
                         .bounded(|_expiry| state.services.config_preview_enabled(&id, enabled))
                         .map_err(|error| error.to_error(ctx))?;
                     stack.replace(
@@ -7053,6 +7054,7 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                                 "keys",
                                 LuaValue::array(keys.into_iter().map(LuaValue::String).collect()),
                             ),
+                            ("changed", LuaValue::Bool(changed)),
                         ])
                         .to_lua(ctx),
                     );

@@ -16,7 +16,7 @@
 # (`osc service disabledrun` / `osc addremove`), never hand-edited.
 #
 Name:           bitty
-Version:        0.0.30
+Version:        0.0.31
 Release:        0
 Summary:        GPU-accelerated terminal emulator with a pane multiplexer and Lua extensions
 License:        MIT OR Apache-2.0
@@ -102,7 +102,9 @@ tic -x -o %{buildroot}%{_datadir}/terminfo terminfo/bitty.ti
 %{_datadir}/terminfo/b/bitty
 
 %changelog
-* Mon Oct 26 2026 Bitty Maintainers <maintainers@bitty-terminal.dev> - 0.0.30-0
+* Thu Oct 29 2026 Bitty Maintainers <maintainers@bitty-terminal.dev> - 0.0.31-0
+- Release 0.0.31
+* Tue Oct 28 2026 Bitty Maintainers <maintainers@bitty-terminal.dev> - 0.0.30-0
 - Release 0.0.30
 * Fri Oct 23 2026 Bitty Maintainers <maintainers@bitty-terminal.dev> - 0.0.28-0
 - Initial openSUSE package: source build via OBS, desktop entry, AppStream

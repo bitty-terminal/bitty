@@ -31,14 +31,15 @@ dependencies = [
 
 [[package]]
 name = "bitty-term-state"
-version = "0.0.30"
+version = "0.0.31"
 dependencies = [
  "bitty-vt",
+ "unicode-bidi",
 ]
 
 [[package]]
 name = "bitty-vt"
-version = "0.0.30"
+version = "0.0.31"
 dependencies = [
  "miniz_oxide",
  "vte",
@@ -131,6 +132,12 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "unicode-bidi"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
 
 [[package]]
 name = "vte"

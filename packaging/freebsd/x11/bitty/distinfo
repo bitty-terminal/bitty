@@ -1,8 +1,8 @@
 # distinfo is generated, never hand-edited: run `make makesum` in this
-# directory once the v0.0.30 release tag exists, and commit the result.
+# directory once the v0.0.31 release tag exists, and commit the result.
 #
 # `make makesum` records, for this port:
-#   - SHA256 (and SIZE) of bitty-0.0.30.tar.gz, the source tarball for the tag
+#   - SHA256 (and SIZE) of bitty-0.0.31.tar.gz, the source tarball for the tag
 #     fetched from MASTER_SITES, and
 #   - one SHA256 entry per crate in CARGO_CRATES, stored under DISTDIR/rust/crates.
 #

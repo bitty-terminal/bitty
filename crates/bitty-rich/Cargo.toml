@@ -14,14 +14,14 @@ publish = true
 workspace = true
 
 [dependencies]
-bitty-term-state = { version = "0.0.30", path = "../bitty-term-state" }
-bitty-vt = { version = "0.0.30", path = "../bitty-vt" }
-bitty-platform = { version = "0.0.30", path = "../bitty-platform" }
+bitty-term-state = { version = "0.0.31", path = "../bitty-term-state" }
+bitty-vt = { version = "0.0.31", path = "../bitty-vt" }
+bitty-platform = { version = "0.0.31", path = "../bitty-platform" }
 # W-103 G-3: the blocking hosted-editor spawn records and kills the whole
 # owned process tree through the execution boundary's reviewed tracker
 # (`bitty_pty::OwnedTree`); workspace-internal path edge, no new
 # supply-chain surface.
-bitty-pty = { version = "0.0.30", path = "../bitty-pty" }
+bitty-pty = { version = "0.0.31", path = "../bitty-pty" }
 # CTX-1412 (#2117): the `bitty-ipc` edge existed only for the unwired
 # fragment-to-`RichBlock` projection; it is retired, so this Core crate keeps
 # no production edge to the extracted IPC repository.

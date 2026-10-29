@@ -1,6 +1,6 @@
 # Template file for 'bitty'
 pkgname=bitty
-version=0.0.30
+version=0.0.31
 revision=1
 build_style=cargo
 make_install_args="--path crates/bitty-terminal --bin bitty"

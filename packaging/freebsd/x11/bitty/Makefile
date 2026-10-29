@@ -5,7 +5,7 @@
 #
 #   cp -R packaging/freebsd/x11/bitty /usr/ports/x11/bitty
 #   cd /usr/ports/x11/bitty
-#   make makesum      # once the v0.0.30 tag exists; see distinfo
+#   make makesum      # once the v0.0.31 tag exists; see distinfo
 #   make install clean
 #
 # packaging/freebsd.md documents the workflow; packaging/README.md documents the
@@ -14,7 +14,7 @@
 # Keep PORTVERSION in step with the workspace version in Cargo.toml.
 
 PORTNAME=	bitty
-PORTVERSION=	0.0.30
+PORTVERSION=	0.0.31
 CATEGORIES=	x11
 
 # Distfile is the released source tarball for the v${PORTVERSION} tag: the same

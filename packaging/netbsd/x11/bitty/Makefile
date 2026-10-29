@@ -6,7 +6,7 @@
 #
 #   cp -R packaging/netbsd/x11/bitty /usr/pkgsrc/x11/bitty
 #   cd /usr/pkgsrc/x11/bitty
-#   bmake makesum     # once the v0.0.30 tag exists; see distinfo
+#   bmake makesum     # once the v0.0.31 tag exists; see distinfo
 #   bmake install clean
 #
 # packaging/netbsd.md documents the workflow; packaging/README.md documents the
@@ -14,7 +14,7 @@
 #
 # Keep DISTNAME version in step with the workspace version in Cargo.toml.
 
-DISTNAME=	bitty-0.0.30
+DISTNAME=	bitty-0.0.31
 CATEGORIES=	x11
 MASTER_SITES=	${MASTER_SITE_GITHUB:=bitty-terminal/}
 GITHUB_PROJECT=	bitty

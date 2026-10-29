@@ -14,7 +14,7 @@ publish = true
 workspace = true
 
 [dependencies]
-bitty-vt = { version = "0.0.30", path = "../bitty-vt" }
+bitty-vt = { version = "0.0.31", path = "../bitty-vt" }
 # CTX-1612 (bitty#1766, OQ-091): UAX #9 resolution for paint-time line
 # reordering. MIT OR Apache-2.0, MSRV 1.47, safe Rust, UCD 16.0.0 bidi
 # classes (the repo's generated width/cluster tables are UCD 18.0.0; the

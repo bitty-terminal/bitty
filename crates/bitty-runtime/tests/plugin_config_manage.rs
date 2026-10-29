@@ -73,6 +73,7 @@ impl ConfigWriteBackend for RecordingBackend {
             rows: vec![PluginListRow {
                 id: String::from("owner.plugin"),
                 enabled: true,
+                managed: true,
                 source: String::from("bundled"),
                 version: String::from("1.0.0"),
             }],
@@ -371,7 +372,7 @@ end })
 bitty.commands.register({ id = "plugins", title = "Plugins", run = function()
   local ok, rows = pcall(bitty.plugins.list)
   if not ok then return "ERR:" .. rows.code end
-  return rows.count .. "|" .. rows.rows[1].id .. "|" .. tostring(rows.rows[1].enabled) .. "|" .. rows.rows[1].source .. "|" .. rows.rows[1].version
+  return rows.count .. "|" .. rows.rows[1].id .. "|" .. tostring(rows.rows[1].enabled) .. "|" .. tostring(rows.rows[1].managed) .. "|" .. rows.rows[1].source .. "|" .. rows.rows[1].version
 end })
 bitty.commands.register({ id = "profiles", title = "Profiles", run = function()
   local ok, rows = pcall(bitty.profiles.list)
@@ -426,6 +427,8 @@ bitty.commands.register({ id = "keys", title = "Bad keys", run = function()
     errcode(function() return bitty.config.preview("../../init", "x") end),
     errcode(function() return bitty.config.preview("appearance", "x") end),
     errcode(function() return bitty.config.preview("history.capture.transcript", true) end),
+    errcode(function() return bitty.config.get("history.capture.transcript") end),
+    errcode(function() return bitty.config.get("history.capture.commands") end),
   }, ",")
 end })
 "##;
@@ -594,7 +597,8 @@ fn no_path_or_command_key_is_addressable() {
     let (mut rt, backend) = granted_runtime();
     assert_eq!(
         run(&mut rt, "keys"),
-        "ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY"
+        "ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY,\
+ERR:E_CONFIG_KEY,ERR:E_CONFIG_KEY"
     );
     assert!(
         backend.calls.borrow().is_empty(),
@@ -634,7 +638,10 @@ fn read_verbs_cross_the_wire_with_logical_sources() {
         "appearance.theme|catppuccin|text|user|false"
     );
     assert_eq!(run(&mut rt, "sources"), "2|appearance.theme|user|false");
-    assert_eq!(run(&mut rt, "plugins"), "1|owner.plugin|true|bundled|1.0.0");
+    assert_eq!(
+        run(&mut rt, "plugins"),
+        "1|owner.plugin|true|true|bundled|1.0.0"
+    );
     assert_eq!(run(&mut rt, "profiles"), "default|2|default|true");
 }
 
@@ -643,7 +650,7 @@ fn enable_and_profile_use_are_token_bound_over_the_wire() {
     let (mut rt, _backend) = granted_runtime();
     assert_eq!(
         run(&mut rt, "enable"),
-        "plugins.owner.plugin.enabled = true|plugins.owner.plugin.enabled|true|auto"
+        "plugins.owner.plugin.enabled = true|plugins.owner.plugin.enabled|true|restart"
     );
     assert_eq!(run(&mut rt, "enable_replay"), "E_CONFIG_APPROVAL_REQUIRED");
     assert_eq!(

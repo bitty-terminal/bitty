@@ -89,15 +89,6 @@ pub const CONFIG_LIST_MAX_BYTES: usize = 4096;
 /// Maximum bytes of one `config.get` value (P-3 bound).
 pub const CONFIG_GET_MAX_VALUE_BYTES: usize = 1024;
 
-/// Maximum `config.manage` list calls per generation per second.
-///
-/// Lists share the same 16 calls/s and 4 KiB/s window as previews so one
-/// plugin cannot spin a dashboard refresh into an unbounded read stream.
-pub const CONFIG_LIST_CALLS_PER_SECOND: u32 = CONFIG_SET_CALLS_PER_SECOND;
-
-/// Maximum bytes one generation may read through `config.manage` per second.
-pub const CONFIG_LIST_BYTES_PER_SECOND: usize = CONFIG_SET_BYTES_PER_SECOND;
-
 /// Marker returned instead of a secret-shaped configuration value.
 pub const CONFIG_REDACTED_VALUE: &str = "***REDACTED***";
 
@@ -518,7 +509,7 @@ pub struct ConfigSetOutcome {
 /// Logical source label exposed to plugins.
 ///
 /// Host paths never cross the bridge: the application maps its layer stack
-/// onto these four labels, and `plugin:<id>` is reserved for a future
+/// onto these three labels, and `plugin:<id>` is reserved for a future
 /// plugin-provided configuration layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigSourceLabel {
@@ -529,19 +520,16 @@ pub enum ConfigSourceLabel {
     User,
     /// A plugin-provided layer, labelled by plugin id.
     Plugin(String),
-    /// A one-launch environment/CLI override.
-    Env,
 }
 
 impl ConfigSourceLabel {
-    /// Stable wire label (`default`, `user`, `plugin:<id>`, `env`).
+    /// Stable wire label (`default`, `user`, `plugin:<id>`).
     #[must_use]
     pub fn as_wire(&self) -> String {
         match self {
             Self::Default => String::from("default"),
             Self::User => String::from("user"),
             Self::Plugin(id) => format!("plugin:{id}"),
-            Self::Env => String::from("env"),
         }
     }
 
@@ -635,7 +623,16 @@ pub struct PluginListRow {
     /// Qualified plugin id.
     pub id: String,
     /// Recorded desired enabled state.
+    ///
+    /// Catalog-only rows (no managed ledger record) report `false`; use
+    /// [`Self::managed`] to tell them apart from a recorded disabled plugin.
     pub enabled: bool,
+    /// Whether a managed ledger record exists for this id.
+    ///
+    /// Only managed rows can be toggled through `config.set_enabled`; store
+    /// packages and unrecorded bundled catalog rows are installed and
+    /// enabled through the CLI.
+    pub managed: bool,
     /// Provenance label (`bundled`, `registry`, `local-path`, ...).
     pub source: String,
     /// Manifest version, or `-` when no manifest body is available.
@@ -1173,13 +1170,15 @@ pub fn candidate_digest(bytes: &[u8]) -> String {
 /// Map one backend failure to the plugin-visible typed error.
 ///
 /// Only the path-free class and message cross; the backend's own diagnostic
-/// (which may name a host path) stays in the host log.
+/// (which may name a host path) stays in the host log. `target` is the
+/// request subject the caller names in the message (a setting key, plugin id,
+/// or profile name).
 #[must_use]
-pub fn config_backend_error(failure: ConfigWriteFailure, key: &str) -> BridgeError {
+pub fn config_backend_error(failure: ConfigWriteFailure, target: &str) -> BridgeError {
     BridgeError::new(
         failure.class(),
         failure.code(),
-        format!("{} (key '{key}')", failure.message()),
+        format!("{} (target '{target}')", failure.message()),
     )
 }
 

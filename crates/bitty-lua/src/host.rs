@@ -1266,8 +1266,8 @@ pub trait HostServices {
     /// for `bitty.config.get` (CTX-1647, bitty#2393).
     ///
     /// Returns a bounded table `{ key, found, value, kind, source, redacted }`.
-    /// `source` is a logical label (`default`, `user`, `plugin:<id>`, `env`),
-    /// never a host path. The default fails closed.
+    /// `source` is a logical label (`default`, `user`, `plugin:<id>`), never a
+    /// host path. The default fails closed.
     fn config_get(&self, key: &str) -> Result<LuaValue, BridgeError> {
         let _ = key;
         Err(BridgeError::not_implemented("bitty.config.get"))
@@ -1281,8 +1281,12 @@ pub trait HostServices {
     }
     /// List bounded plugin rows for `bitty.plugins.list`.
     ///
-    /// Returns `{ rows = { { id, enabled, source, version }, ... }, count,
-    /// truncated }` with no grants and no paths. The default fails closed.
+    /// Returns `{ rows = { { id, enabled, managed, source, version }, ... },
+    /// count, truncated }` with no grants and no paths. `managed` reports
+    /// whether the row has a managed ledger record, so a catalog-only row
+    /// (`enabled = false`, `managed = false`) is never mistaken for a
+    /// recorded disabled plugin; only managed rows accept
+    /// `config.set_enabled`. The default fails closed.
     fn plugins_list(&self) -> Result<LuaValue, BridgeError> {
         Err(BridgeError::not_implemented("bitty.plugins.list"))
     }
@@ -1308,7 +1312,10 @@ pub trait HostServices {
     /// Apply one approved plugin enable/disable for
     /// `bitty.config.set_enabled` (CTX-1647).
     ///
-    /// Returns `(changed, reload)`. The default fails closed.
+    /// Returns `(changed, reload)`. `reload` is `restart` after an applied
+    /// toggle: the managed ledger is read at activation, and nothing
+    /// re-activates the generation at runtime. A no-op reports `none`. The
+    /// default fails closed.
     fn config_set_enabled(
         &self,
         id: &str,

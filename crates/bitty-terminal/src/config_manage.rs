@@ -32,8 +32,8 @@ use crate::init::render_selector_lua;
 use crate::plugin::{self, PluginFailure};
 use crate::profile::{
     PROFILE_SCAN_CAP, SchemaField, UserLayerConfigWriter, bounded_line_diff,
-    rewrite_selector_profile, scan_names, schema_field_entry, selector_profile_from_path,
-    validate_prospective_selector,
+    effective_profile_name, resolved_profile_name, rewrite_selector_profile, scan_names,
+    schema_field_entry, selector_profile_from_path, validate_prospective_selector_for_write,
 };
 
 /// One app-side backend implementing every `config.manage` method.
@@ -90,11 +90,8 @@ impl AppConfigManage {
         };
         // Startup precedence: `--profile`/`BITTY_PROFILE` wins over the
         // persisted selector. Reads must reflect the profile the running app
-        // actually loaded, so prefer `active_profile` here.
-        let selected = self
-            .active_profile
-            .clone()
-            .or_else(|| selector_profile_from_path(&self.target));
+        // actually loaded, so both sides go through the one shared rule.
+        let selected = resolved_profile_name(user.as_ref(), self.active_profile.as_deref());
         let chain = match selected.as_deref() {
             Some(name) => bitty_config::file::load_profile_chain_in_dir(name, &self.profiles_dir)
                 .map_err(|_| ConfigReadFailure::Invalid)?,
@@ -111,15 +108,18 @@ impl AppConfigManage {
     /// Logical source label for one effective key.
     fn source_label(merged: &MergedConfig, key: &str) -> ConfigSourceLabel {
         match merged.source_of(key).map(|source| source.layer) {
-            Some(LayerKind::Cli) => ConfigSourceLabel::Env,
             Some(LayerKind::User | LayerKind::Profile | LayerKind::TrustedLocal) => {
                 ConfigSourceLabel::User
             }
+            // `load_merged` resolves with empty `CliOverrides`, so no `Cli`
+            // layer exists to attribute; the arm keeps the match exhaustive
+            // without advertising an `env` label the backend can never emit.
             Some(
                 LayerKind::CoreDefaults
                 | LayerKind::SystemDefaults
                 | LayerKind::SystemPolicy
-                | LayerKind::Distribution,
+                | LayerKind::Distribution
+                | LayerKind::Cli,
             )
             | None => ConfigSourceLabel::Default,
         }
@@ -179,13 +179,21 @@ impl AppConfigManage {
                 Some(found) if found.profile == name => {}
                 _ => return Err(ConfigWriteFailure::Invalid),
             }
-            validate_prospective_selector(&self.profiles_dir, name, &self.target, &rewritten)
-                .map_err(|_| ConfigWriteFailure::Invalid)?;
+            validate_prospective_selector_for_write(
+                &self.profiles_dir,
+                name,
+                &self.target,
+                &rewritten,
+            )?;
             rewritten
         } else {
             let rendered = render_selector_lua(name);
-            validate_prospective_selector(&self.profiles_dir, name, &self.target, &rendered)
-                .map_err(|_| ConfigWriteFailure::Invalid)?;
+            validate_prospective_selector_for_write(
+                &self.profiles_dir,
+                name,
+                &self.target,
+                &rendered,
+            )?;
             rendered
         };
         let rendered = bounded_line_diff(previous.as_deref().unwrap_or(""), &content)?;
@@ -303,6 +311,7 @@ impl ConfigWriteBackend for AppConfigManage {
                 .map(|row| PluginListRow {
                     id: row.id,
                     enabled: row.enabled,
+                    managed: row.recorded,
                     source: row.source,
                     version: row.version,
                 })
@@ -315,12 +324,15 @@ impl ConfigWriteBackend for AppConfigManage {
         let (names, truncated) =
             scan_names(&self.profiles_dir, PROFILE_SCAN_CAP, CONFIG_LIST_MAX_ROWS)
                 .map_err(|_| ConfigReadFailure::Io)?;
-        // Prefer the persisted selector: a successful `profiles.use` updates
-        // it immediately, and the caller learns from `pending_restart` that
-        // the running table still needs a restart. Fall back to the profile
-        // startup resolved when no selector exists.
-        let active =
-            selector_profile_from_path(&self.target).or_else(|| self.active_profile.clone());
+        // The running chain wins: `--profile`/`BITTY_PROFILE` first, then the
+        // persisted selector. A successful `profiles.use` updates the
+        // selector immediately, but the running table is not re-merged, so
+        // the caller learns from `pending_restart` that `active` still names
+        // the startup profile until the next launch.
+        let active = effective_profile_name(
+            self.active_profile.as_deref(),
+            selector_profile_from_path(&self.target),
+        );
         Ok(ProfileList {
             rows: names
                 .into_iter()
@@ -532,6 +544,15 @@ mod tests {
                 .iter()
                 .any(|row| row.key == "appearance.theme" && row.source == ConfigSourceLabel::User)
         );
+        // `history.capture.*` is deliberately outside the writable allowlist,
+        // so the read path refuses it too (defense in depth behind the
+        // runtime's own key gate).
+        assert_eq!(
+            backend
+                .config_get("p", "history.capture.transcript")
+                .expect_err("excluded key"),
+            ConfigReadFailure::Invalid
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -559,6 +580,24 @@ mod tests {
         let backend = backend(&dir, Some("work"));
         let theme = backend.config_get("p", "appearance.theme").expect("theme");
         assert_eq!(theme.value, ConfigReadValue::Text(String::from("dracula")));
+        let listed = backend.profiles_list("p").expect("profiles");
+        assert_eq!(
+            listed.active.as_deref(),
+            Some("work"),
+            "the list reports the running chain, not the selector"
+        );
+        assert!(
+            listed
+                .rows
+                .iter()
+                .any(|row| row.name == "work" && row.active)
+        );
+        assert!(
+            listed
+                .rows
+                .iter()
+                .any(|row| row.name == "default" && !row.active)
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -673,12 +712,16 @@ mod tests {
         assert!(selector.contains("-- keep"));
         assert!(selector.contains("window = { opacity = 0.9 }"));
         let listed = backend.profiles_list("p").expect("profiles");
-        assert_eq!(listed.active.as_deref(), Some("work"));
+        assert_eq!(
+            listed.active.as_deref(),
+            Some("default"),
+            "the running table stays on the startup profile until restart"
+        );
         assert!(
             listed
                 .rows
                 .iter()
-                .any(|row| row.name == "work" && row.active)
+                .any(|row| row.name == "default" && row.active)
         );
         let backups: Vec<_> = std::fs::read_dir(&dir)
             .expect("dir")
@@ -734,6 +777,123 @@ mod tests {
             assert!(!row.id.is_empty());
             assert!(row.source.len() <= 128);
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn plugin_list_marks_catalog_only_rows_as_unmanaged() {
+        let dir = scratch("list-unmanaged");
+        let backend = backend(&dir, None);
+        let list = backend.plugins_list("p").expect("list");
+        assert!(!list.rows.is_empty(), "the bundled catalog is listed");
+        for row in &list.rows {
+            assert!(!row.managed, "no managed ledger record exists");
+            assert!(
+                !row.enabled,
+                "a catalog-only row is never reported as an enabled plugin"
+            );
+        }
+        // Toggling a catalog-only row is refused, which is exactly why the
+        // row must not look like a recorded disabled plugin.
+        let id = list.rows[0].id.clone();
+        assert_eq!(
+            backend
+                .preview_plugin_enabled("p", &id, true)
+                .expect_err("unrecorded row"),
+            ConfigWriteFailure::Invalid
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn plugin_list_marks_a_recorded_row_as_managed() {
+        let dir = scratch("list-managed");
+        let backend = backend(&dir, None);
+        let manifest = bitty_plugin_host::bundled::all_bundled_manifests()
+            .into_iter()
+            .next()
+            .expect("at least one bundled plugin");
+        let id = manifest.id().as_str().to_string();
+        let mut state = plugin::PluginState::new();
+        state.insert(
+            id.clone(),
+            plugin::PluginRecord {
+                source: String::from("bundled"),
+                manifest_hash: manifest.manifest_hash(),
+                enabled: true,
+                granted: manifest.capabilities.all_ids().expect("declared"),
+                denied: std::collections::BTreeSet::new(),
+            },
+        );
+        plugin::save_state_for_config_manage(&dir.join("bitty-plugins.lua"), &state).expect("seed");
+        let list = backend.plugins_list("p").expect("list");
+        let row = list
+            .rows
+            .iter()
+            .find(|row| row.id == id)
+            .expect("recorded row");
+        assert!(row.managed, "the ledger records this id");
+        assert!(row.enabled);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn profile_use_creates_a_fresh_selector_owner_only() {
+        let dir = scratch("profile-fresh");
+        std::fs::create_dir_all(dir.join("profiles")).expect("profiles");
+        std::fs::write(dir.join("profiles/default.lua"), "return {}\n").expect("default");
+        std::fs::write(dir.join("profiles/work.lua"), "return {}\n").expect("work");
+        let backend = backend(&dir, None);
+        let preview = backend.preview_profile_use("p", "work").expect("preview");
+        let outcome = backend
+            .apply_profile_use("p", "work", &preview.candidate_digest)
+            .expect("apply");
+        assert_eq!(outcome, ConfigApplyOutcome::Applied);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.join("init.lua"))
+                .expect("selector")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "a fresh selector is owner-only, got {mode:o}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn profile_use_reports_an_io_failure_from_the_atomic_writer() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch("profile-io");
+        std::fs::write(
+            dir.join("init.lua"),
+            "return { format = \"bitty-profile-v1\", profile = \"default\" }\n",
+        )
+        .expect("selector");
+        std::fs::create_dir_all(dir.join("profiles")).expect("profiles");
+        std::fs::write(dir.join("profiles/default.lua"), "return {}\n").expect("default");
+        std::fs::write(dir.join("profiles/work.lua"), "return {}\n").expect("work");
+        let backend = backend(&dir, Some("default"));
+        let preview = backend.preview_profile_use("p", "work").expect("preview");
+        // A read-only config root lets the preview read the selector but the
+        // atomic replace cannot stage its recovery copy; the writer reports
+        // the path-free Io class (root bypasses this, like the other
+        // permission-based tests in this suite).
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+            .expect("read-only root");
+        let error = backend
+            .apply_profile_use("p", "work", &preview.candidate_digest)
+            .expect_err("atomic write fails");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore root");
+        assert_eq!(error, ConfigWriteFailure::Io);
+        let selector = std::fs::read_to_string(dir.join("init.lua")).expect("selector");
+        assert!(
+            selector.contains("profile = \"default\""),
+            "a failed write leaves the selector intact"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

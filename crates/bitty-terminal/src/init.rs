@@ -4628,6 +4628,9 @@ pub(crate) enum InitWriteError {
 /// - Replacements write and sync a unique sibling temporary file, then rename
 ///   over the target (the rename is the commit point); new files use exclusive
 ///   creation. A failed write leaves the previous bytes in place.
+/// - New and replaced files, and their `.bak` recovery copies, are created
+///   owner-only (`0600` on Unix): configuration can name local resources and
+///   must never be group/world readable.
 /// - Parent directories are created as needed.
 ///
 /// Total: every failure maps to [`InitWriteError`], never a panic.
@@ -4738,11 +4741,10 @@ fn write_recoverable_backup(
         } else {
             target.with_file_name(format!("{name}.bak.{attempt}"))
         };
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        restrict_to_owner(&mut options);
+        match options.open(&candidate) {
             Ok(mut file) => {
                 file.write_all(&previous).map_err(|err| {
                     InitWriteError::Io(format!(
@@ -4774,18 +4776,19 @@ fn write_recoverable_backup(
 }
 
 /// Creates a brand-new file with `create_new` (never overwrites), writes and
-/// syncs it. A partial file from a failed write is removed.
+/// syncs it. A partial file from a failed write is removed. The file is
+/// owner-only from creation: configuration can name local resources and must
+/// never be group/world readable.
 fn create_new_exclusively(target: &std::path::Path, content: &str) -> Result<(), InitWriteError> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(target)
-        .map_err(|err| {
-            InitWriteError::Io(format!(
-                "bitty init: cannot create '{}': {err}",
-                target.display()
-            ))
-        })?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    restrict_to_owner(&mut options);
+    let mut file = options.open(target).map_err(|err| {
+        InitWriteError::Io(format!(
+            "bitty init: cannot create '{}': {err}",
+            target.display()
+        ))
+    })?;
     let result = file
         .write_all(content.as_bytes())
         .and_then(|()| file.sync_all());
@@ -4806,24 +4809,22 @@ fn create_new_exclusively(target: &std::path::Path, content: &str) -> Result<(),
 
 /// Replaces an existing file atomically: write a unique sibling temp,
 /// sync it, then rename over the target (the rename is the commit point).
+/// The replacement is owner-only from creation, independent of the mode the
+/// previous file happened to carry.
 fn replace_atomically(target: &std::path::Path, content: &str) -> Result<(), InitWriteError> {
     let parent = target.parent().unwrap_or_else(|| std::path::Path::new("."));
     let name = target.file_name().map_or_else(
         || "config.lua".to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
-    let previous_permissions = std::fs::metadata(target)
-        .ok()
-        .map(|meta| meta.permissions());
     let mut temp = None;
     for _ in 0..INIT_MAX_TEMP_ATTEMPTS {
         let counter = INIT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let candidate = parent.join(format!(".{name}.tmp-{}-{counter}", std::process::id()));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        restrict_to_owner(&mut options);
+        match options.open(&candidate) {
             Ok(file) => {
                 temp = Some((candidate, file));
                 break;
@@ -4854,9 +4855,6 @@ fn replace_atomically(target: &std::path::Path, content: &str) -> Result<(), Ini
             target.display()
         )));
     }
-    if let Some(permissions) = previous_permissions {
-        let _ = std::fs::set_permissions(&temp_path, permissions);
-    }
     if let Err(err) = std::fs::rename(&temp_path, target) {
         let _ = std::fs::remove_file(&temp_path);
         return Err(InitWriteError::Io(format!(
@@ -4869,6 +4867,22 @@ fn replace_atomically(target: &std::path::Path, content: &str) -> Result<(), Ini
     // selector still reads as the previous bytes.
     sync_parent_dir(target);
     Ok(())
+}
+
+/// Apply owner-only creation mode on Unix.
+///
+/// Configuration can name local resources (shells, fonts, image roots), so a
+/// freshly created selector, profile, or recovery copy must never be
+/// group/world readable, not even between create and a later chmod. Other
+/// platforms keep their default ACL handling.
+fn restrict_to_owner(options: &mut std::fs::OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = options;
 }
 
 /// Flushes the directory entry for `path` after an atomic replace.

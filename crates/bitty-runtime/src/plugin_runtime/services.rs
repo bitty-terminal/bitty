@@ -3958,7 +3958,14 @@ impl PluginServices {
         let bytes = list
             .rows
             .iter()
-            .map(|row| list_row_bytes(&[&row.id, &row.source, &row.version]))
+            .map(|row| {
+                list_row_bytes(&[
+                    &row.id,
+                    &row.source,
+                    &row.version,
+                    if row.managed { "true" } else { "false" },
+                ])
+            })
             .sum();
         check_list_bounds(list.rows.len(), bytes)?;
         self.config_charge_result_bytes(started, bytes)?;
@@ -4064,7 +4071,9 @@ impl PluginServices {
         };
         let backend = self.config_backend_or_unavailable()?;
         match backend.apply_plugin_enabled(&self.plugin_id, id, enabled, &candidate_digest) {
-            Ok(ConfigApplyOutcome::Applied) => Ok((true, "auto")),
+            // The ledger is read at activation: nothing re-activates the
+            // generation at runtime, so an applied toggle needs a restart.
+            Ok(ConfigApplyOutcome::Applied) => Ok((true, "restart")),
             Ok(ConfigApplyOutcome::Unchanged) => Ok((false, "none")),
             Err(failure) => Err(config_backend_error(failure, id)),
         }
@@ -4217,6 +4226,7 @@ fn plugin_list_value(list: &PluginList) -> LuaValue {
                         LuaValue::table([
                             ("id", LuaValue::String(row.id.clone())),
                             ("enabled", LuaValue::Bool(row.enabled)),
+                            ("managed", LuaValue::Bool(row.managed)),
                             ("source", LuaValue::String(row.source.clone())),
                             ("version", LuaValue::String(row.version.clone())),
                         ])
@@ -4375,7 +4385,12 @@ impl HostServices for PluginServices {
         name: &str,
     ) -> Result<(String, String, Vec<String>, bool), BridgeError> {
         let token = PluginServices::profiles_preview_use(self, name)?;
-        Ok((token.digest, token.rendered, token.changed_keys, true))
+        Ok((
+            token.digest,
+            token.rendered,
+            token.changed_keys,
+            token.changed,
+        ))
     }
 
     fn profiles_use(
@@ -10892,6 +10907,7 @@ mod tests {
         profile_calls: RefCell<Vec<(String, String)>>,
         nonce: Cell<u32>,
         stale: Cell<bool>,
+        write_failure: Cell<Option<ConfigWriteFailure>>,
         outcome: ConfigApplyOutcome,
         profile_changed: bool,
     }
@@ -10904,6 +10920,7 @@ mod tests {
                 plugin_rows: RefCell::new(vec![PluginListRow {
                     id: String::from("owner.plugin"),
                     enabled: true,
+                    managed: true,
                     source: String::from("bundled"),
                     version: String::from("1.0.0"),
                 }]),
@@ -10922,6 +10939,7 @@ mod tests {
                 profile_calls: RefCell::new(Vec::new()),
                 nonce: Cell::new(0),
                 stale: Cell::new(false),
+                write_failure: Cell::new(None),
                 outcome: ConfigApplyOutcome::Applied,
                 profile_changed: true,
             })
@@ -11039,6 +11057,9 @@ mod tests {
             if self.stale.get() {
                 return Err(ConfigWriteFailure::Stale);
             }
+            if let Some(failure) = self.write_failure.get() {
+                return Err(failure);
+            }
             let (_, candidate_digest) = self.rendering(&format!("{id}.{enabled}"));
             if candidate_digest != expected_candidate_digest {
                 return Err(ConfigWriteFailure::Stale);
@@ -11075,6 +11096,9 @@ mod tests {
                 .push((name.to_string(), expected_candidate_digest.to_string()));
             if self.stale.get() {
                 return Err(ConfigWriteFailure::Stale);
+            }
+            if let Some(failure) = self.write_failure.get() {
+                return Err(failure);
             }
             let (_, candidate_digest) = self.rendering(name);
             if candidate_digest != expected_candidate_digest {
@@ -11151,6 +11175,114 @@ mod tests {
     }
 
     #[test]
+    fn config_get_refuses_excluded_history_capture_keys() {
+        let services = manage_services(RecordingManageBackend::new());
+        for key in ["history.capture.transcript", "history.capture.commands"] {
+            let error = services.config_get(key).expect_err("excluded key");
+            assert_eq!(error.code, "E_CONFIG_KEY", "{key}");
+            assert!(
+                !error.message.contains(key),
+                "the refused key is never echoed: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn manage_writes_check_the_expiry_before_consuming_the_token() {
+        let backend = RecordingManageBackend::new();
+        let services = manage_services(Rc::clone(&backend));
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("instant is old enough");
+
+        let toggle = services
+            .config_preview_enabled("owner.plugin", true)
+            .expect("preview toggle");
+        let error = services
+            .config_set_enabled_with_expiry(
+                "owner.plugin",
+                true,
+                &toggle.digest,
+                Instant::now(),
+                expired,
+            )
+            .expect_err("expired toggle");
+        assert_eq!(error.code, "E_TIMEOUT");
+        assert!(
+            backend.enabled_calls.borrow().is_empty(),
+            "an expired write never reaches the backend"
+        );
+        // Expiry refuses before the token is consumed, so the same approval
+        // still commits inside the window.
+        let (changed, _) = services
+            .config_set_enabled("owner.plugin", true, &toggle.digest)
+            .expect("token survives the timeout");
+        assert!(changed);
+
+        let switch = services.profiles_preview_use("work").expect("preview use");
+        let error = services
+            .profiles_use_with_expiry("work", &switch.digest, Instant::now(), expired)
+            .expect_err("expired switch");
+        assert_eq!(error.code, "E_TIMEOUT");
+        assert!(
+            backend.profile_calls.borrow().is_empty(),
+            "an expired switch never reaches the backend"
+        );
+        let (changed, _) = services
+            .profiles_use("work", &switch.digest)
+            .expect("token survives the timeout");
+        assert!(changed);
+    }
+
+    #[test]
+    fn set_enabled_surfaces_a_stale_backend_as_e_config_stale() {
+        let backend = RecordingManageBackend::new();
+        let services = manage_services(Rc::clone(&backend));
+        let preview = services
+            .config_preview_enabled("owner.plugin", true)
+            .expect("preview");
+        backend.stale.set(true);
+        let error = services
+            .config_set_enabled("owner.plugin", true, &preview.digest)
+            .expect_err("moved ledger");
+        assert_eq!(error.code, "E_CONFIG_STALE");
+        assert_eq!(error.class, "runtime");
+    }
+
+    #[test]
+    fn manage_writes_surface_backend_io_as_e_config_io() {
+        let backend = RecordingManageBackend::new();
+        backend.write_failure.set(Some(ConfigWriteFailure::Io));
+        let services = manage_services(Rc::clone(&backend));
+        let toggle = services
+            .config_preview_enabled("owner.plugin", true)
+            .expect("preview toggle");
+        let error = services
+            .config_set_enabled("owner.plugin", true, &toggle.digest)
+            .expect_err("atomic write failed");
+        assert_eq!(error.code, "E_CONFIG_IO");
+        assert_eq!(error.class, "io");
+        assert!(
+            error.message.contains("target 'owner.plugin'"),
+            "the refusal names the request subject, not a setting key: {}",
+            error.message
+        );
+
+        let switch = services.profiles_preview_use("work").expect("preview use");
+        let error = services
+            .profiles_use("work", &switch.digest)
+            .expect_err("atomic write failed");
+        assert_eq!(error.code, "E_CONFIG_IO");
+        assert_eq!(error.class, "io");
+        assert!(
+            error.message.contains("target 'work'"),
+            "the refusal names the request subject, not a setting key: {}",
+            error.message
+        );
+    }
+
+    #[test]
     fn read_calls_are_admitted_before_the_backend_even_when_they_fail() {
         let mut backend = RecordingManageBackend::new();
         Rc::get_mut(&mut backend).expect("unique").read_failure = Some(ConfigReadFailure::Io);
@@ -11195,6 +11327,7 @@ mod tests {
             backend.plugin_rows.borrow_mut().push(PluginListRow {
                 id: format!("owner.plugin{index}"),
                 enabled: true,
+                managed: true,
                 source: String::from("bundled"),
                 version: String::from("1.0.0"),
             });
@@ -11252,7 +11385,7 @@ mod tests {
             .config_set_enabled("owner.plugin", true, &preview.digest)
             .expect("apply");
         assert!(changed);
-        assert_eq!(reload, "auto");
+        assert_eq!(reload, "restart");
         assert_eq!(backend.enabled_calls.borrow().len(), 1);
 
         let replay = services

@@ -202,7 +202,7 @@ impl ProfileVerb {
 
 /// A failed profile command: stable code, message, and process exit code.
 #[derive(Debug)]
-pub(crate) struct Failure {
+struct Failure {
     /// Envelope `error.code`.
     code: &'static str,
     /// User-facing one-line (bounded) diagnostic.
@@ -762,7 +762,7 @@ fn use_result(name: &str, selector: &Path, changed: bool, backup: Option<&Path>)
 /// (`appearance.theme`, background images, keymaps). Checking only the target
 /// profile chain let `use` activate a selector that `config check` then
 /// rejected (for example `appearance = { theme = "local:missing" }`).
-pub(crate) fn validate_prospective_selector(
+fn validate_prospective_selector(
     dir: &Path,
     name: &str,
     selector: &Path,
@@ -809,6 +809,18 @@ pub(crate) fn validate_prospective_selector(
         ),
         &merged.effective,
     )
+}
+
+/// Validate a prospective selector for the `config.manage` writer and map
+/// the CLI-shaped refusal onto the path-free write class.
+pub(crate) fn validate_prospective_selector_for_write(
+    dir: &Path,
+    name: &str,
+    selector: &Path,
+    selector_bytes: &str,
+) -> Result<(), ConfigWriteFailure> {
+    validate_prospective_selector(dir, name, selector, selector_bytes)
+        .map_err(|_| ConfigWriteFailure::Invalid)
 }
 
 /// `bitty config profile create NAME`.
@@ -1363,8 +1375,9 @@ fn referencing_profiles(dir: &Path, target: &str) -> Vec<String> {
 /// first, then the persisted selector (the startup order).
 fn active_profile_name(args: &Args) -> Option<String> {
     let env = std::env::var("BITTY_PROFILE").ok();
-    bitty_config::file::resolve_profile_request(args.profile.as_deref(), env.as_deref())
-        .or_else(|| selector_profile_name(args))
+    let request =
+        bitty_config::file::resolve_profile_request(args.profile.as_deref(), env.as_deref());
+    effective_profile_name(request.as_deref(), selector_profile_name(args))
 }
 
 /// Profile named by the persisted `init.lua` selector only.
@@ -4184,20 +4197,32 @@ fn parse_user_plan(
     Ok(bitty_config::LayeredPlan::new(source, plan))
 }
 
+/// Startup profile precedence: the one-launch request wins over the user
+/// layer's own persisted selector.
+///
+/// This is the single precedence rule shared by startup, the `config.manage`
+/// reads (`config.get`, `profiles.list`), and the user-layer writer. Reading
+/// or validating against the selector while startup runs
+/// `--profile`/`BITTY_PROFILE` would report (and accept) a different
+/// profile's values than the running app loaded.
+pub(crate) fn effective_profile_name(
+    active_profile: Option<&str>,
+    selector: Option<String>,
+) -> Option<String> {
+    active_profile.map(str::to_string).or(selector)
+}
+
 /// Profile the next launch loads: the one-launch request wins over the user
 /// layer's own selector, matching startup resolution.
-///
-/// CTX-1613 review: seeding or validating against the selector while startup
-/// runs `--profile`/`BITTY_PROFILE` would pin (and accept) a different
-/// profile's values, changing settings the user never saw approved.
-fn resolved_profile_name(
+pub(crate) fn resolved_profile_name(
     user: Option<&bitty_config::LayeredPlan>,
     active_profile: Option<&str>,
 ) -> Option<String> {
-    active_profile.map(str::to_string).or_else(|| {
+    effective_profile_name(
+        active_profile,
         user.and_then(|layer| layer.plan.selector.as_ref())
-            .map(|selector| selector.profile.clone())
-    })
+            .map(|selector| selector.profile.clone()),
+    )
 }
 
 /// Merge a candidate user layer over its active profile chain without

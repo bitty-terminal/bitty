@@ -140,9 +140,18 @@ impl EventBus {
     }
 
     /// Register one attached lease with an empty queue.
-    pub(crate) fn attach(&mut self, session_id: SessionId, attach_id: AttachId) {
-        if let Some(session) = self.sessions.get_mut(&session_id) {
-            session.leases.insert(attach_id, LeaseQueue::new());
+    ///
+    /// Returns `false` when the session has no delivery state. A live session
+    /// is registered at create, so a caller must treat that as an internal
+    /// invariant failure instead of silently serving a lease that can never
+    /// receive a frame.
+    pub(crate) fn attach(&mut self, session_id: SessionId, attach_id: AttachId) -> bool {
+        match self.sessions.get_mut(&session_id) {
+            Some(session) => {
+                session.leases.insert(attach_id, LeaseQueue::new());
+                true
+            }
+            None => false,
         }
     }
 
@@ -327,6 +336,21 @@ impl EventBus {
             .unwrap_or_default()
     }
 
+    /// Pop the oldest queued frame for one lease.
+    ///
+    /// The transport drains one frame at a time so a full outbound buffer
+    /// leaves the rest of the queue intact instead of dropping a batch.
+    pub(crate) fn drain_next(
+        &mut self,
+        session_id: SessionId,
+        attach_id: AttachId,
+    ) -> Option<Event> {
+        self.sessions
+            .get_mut(&session_id)
+            .and_then(|session| session.leases.get_mut(&attach_id))
+            .and_then(LeaseQueue::pop_front)
+    }
+
     /// Whether one lease still has a queued frame.
     pub(crate) fn has_pending(&self, session_id: SessionId, attach_id: AttachId) -> bool {
         self.sessions
@@ -463,7 +487,7 @@ mod tests {
         let session_id = SessionId::parse(&"2".repeat(32)).expect("session");
         let attach_id = AttachId::parse(&"3".repeat(32)).expect("attach");
         bus.register(session_id);
-        bus.attach(session_id, attach_id);
+        assert!(bus.attach(session_id, attach_id));
         (session_id, attach_id)
     }
 
@@ -472,7 +496,7 @@ mod tests {
         let mut bus = bus(8);
         let (session_id, attach_id) = session(&mut bus);
         let other = AttachId::parse(&"4".repeat(32)).expect("attach");
-        bus.attach(session_id, other);
+        assert!(bus.attach(session_id, other));
 
         bus.emit(
             session_id,

@@ -3070,7 +3070,51 @@ mod event_wire {
             "an event frame is not a response envelope: {frame}"
         );
         assert_eq!(frame["v"], 1, "the event rides the v1 wire: {frame}");
+        let id = frame["id"]
+            .as_str()
+            .expect("every event frame carries a server-chosen id");
+        assert!(
+            id.starts_with("evt-"),
+            "event ids use the reserved event namespace: {frame}"
+        );
+        assert!(id.len() <= 64, "the event id stays bounded: {frame}");
         frame["event"].clone()
+    }
+
+    /// Send one request, waiting out the per-connection wire rate limiter.
+    ///
+    /// A `RateLimited` refusal applies nothing, so the same request (and its
+    /// idempotency key) is safe to retry after the bucket refills.
+    fn call_retrying_rate_limit(client: &mut Client, method: &str, params: Value) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = client.call(method, params.clone());
+            if response["error"]["code"] != "RateLimited" {
+                return response;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the wire rate limiter never refilled: {response}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Wait until the operator view reports no live lease on the session.
+    fn wait_for_no_lease(operator: &mut Client, session_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = operator.call("session.status", json!({"session_id": session_id}));
+            assert_eq!(status["ok"], true, "{status}");
+            if status["result"]["session"]["attach_count"] == 0 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the disconnect detach never completed: {status}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// A host-consent mint plus an event-opted consumer connection.
@@ -3294,8 +3338,13 @@ mod event_wire {
         assert_eq!(event["terminal"], true, "{event}");
         assert_eq!(event["revision"], terminal_revision, "{event}");
         assert_eq!(event["attach_id"], attach_id, "{event}");
+        assert_eq!(event["terminal_marker"]["state"], "terminated", "{event}");
         assert_eq!(
             event["terminal_marker"]["reason"], "consumer_cancel",
+            "{event}"
+        );
+        assert_eq!(
+            event["terminal_marker"]["cleanup"], "not_started",
             "{event}"
         );
 
@@ -3534,5 +3583,338 @@ mod event_wire {
             .as_str()
             .expect("observer attach")
             .to_owned()
+    }
+
+    #[test]
+    fn a_last_lease_disconnect_keeps_the_ring_for_a_reconnect() {
+        let root = TempRoot::new("events-reattach-ring");
+        let daemon = Daemon::start(&root);
+        let capability = read_capability(&root);
+        let mut operator = Client::connect(&root.endpoint());
+        assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+        let (mut creator, _) = event_consumer(&root, &mut operator, "reattach-ring");
+        let (session_id, _controller_attach, _controller_token, _) =
+            create_and_claim(&mut creator, "reattach-ring");
+        let minted = creator.call(
+            "session.grant",
+            json!({"session_id": session_id, "idempotency_key": "reattach-ring-grant"}),
+        );
+        assert_eq!(minted["ok"], true, "{minted}");
+        let grant = minted["result"]["grant"]
+            .as_str()
+            .expect("observer grant")
+            .to_owned();
+        let _ = recv_event(&mut creator);
+
+        let before = operator.call("session.status", json!({"session_id": session_id}));
+        let revision = before["result"]["session"]["state_revision"]
+            .as_u64()
+            .expect("revision");
+
+        // The last lease disconnects. The session stays live, so the retained
+        // ring must survive the detach for the reconnect below.
+        drop(creator);
+        wait_for_no_lease(&mut operator, &session_id);
+
+        let mut observer = Client::connect(&root.endpoint());
+        assert_eq!(negotiate_events(&mut observer, None)["ok"], true);
+        let attached = observer.call(
+            "session.attach",
+            json!({
+                "attach_role": "observer",
+                "session_id": session_id,
+                "observer_grant": grant,
+            }),
+        );
+        assert_eq!(attached["ok"], true, "{attached}");
+        let backlog = attached["result"]["backlog"]
+            .as_array()
+            .expect("the replay is served");
+        assert!(
+            !backlog.is_empty(),
+            "a live session keeps its retained ring: {attached}"
+        );
+        assert_eq!(attached["result"]["backlog_truncated"], false, "{attached}");
+        assert_eq!(attached["result"]["earliest_revision"], 1, "{attached}");
+        let replay_revision = backlog
+            .last()
+            .and_then(|event| event["revision"].as_u64())
+            .expect("replay revision");
+        let current = attached["result"]["session"]["state_revision"]
+            .as_u64()
+            .expect("current revision");
+        assert_eq!(
+            replay_revision, current,
+            "the reconnect replays through the current revision: {attached}"
+        );
+        assert!(
+            current > revision,
+            "the disconnect detach is itself a revision: {attached}"
+        );
+
+        // The reattached lease is registered with the bus, so it receives
+        // later events instead of an empty backlog forever.
+        let future = operator.call(
+            "session.grant",
+            json!({"session_id": session_id, "idempotency_key": "reattach-ring-future"}),
+        );
+        assert_eq!(future["ok"], true, "{future}");
+        let event = recv_event(&mut observer);
+        assert_eq!(event["kind"], "session_state", "{event}");
+        assert!(
+            event["revision"].as_u64().expect("revision") > current,
+            "{event}"
+        );
+
+        assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    }
+
+    #[test]
+    fn a_disconnect_keeps_the_controller_token_reclaimable() {
+        let root = TempRoot::new("events-reclaim-token");
+        let daemon = Daemon::start(&root);
+        let capability = read_capability(&root);
+        let mut operator = Client::connect(&root.endpoint());
+        assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+        let (mut creator, _) = event_consumer(&root, &mut operator, "reclaim");
+        let (session_id, _controller_attach, controller_token, _) =
+            create_and_claim(&mut creator, "reclaim");
+        drop(creator);
+        wait_for_no_lease(&mut operator, &session_id);
+
+        // The disconnect detach is a lifecycle mutation and is audited.
+        assert!(
+            audit_lines_with(&root, "a=session.detach") >= 1,
+            "the disconnect detach is attributed"
+        );
+
+        let mut reclaimer = Client::connect(&root.endpoint());
+        assert_eq!(negotiate_events(&mut reclaimer, None)["ok"], true);
+        let reclaimed = reclaimer.call(
+            "session.attach",
+            json!({
+                "attach_role": "controller",
+                "session_id": session_id,
+                "expected_generation": 0,
+                "control_token": controller_token,
+                "idempotency_key": "reclaim-reconnect",
+            }),
+        );
+        assert_eq!(reclaimed["ok"], true, "{reclaimed}");
+        assert_eq!(reclaimed["result"]["role"], "controller", "{reclaimed}");
+        assert!(
+            reclaimed["result"]["control_token"].as_str().is_some(),
+            "the reconnect rotates the still-current token: {reclaimed}"
+        );
+
+        assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    }
+
+    #[test]
+    fn a_control_transfer_event_names_both_leases() {
+        let root = TempRoot::new("events-transfer-detail");
+        let daemon = Daemon::start(&root);
+        let capability = read_capability(&root);
+        let mut operator = Client::connect(&root.endpoint());
+        assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+        let (mut creator, _) = event_consumer(&root, &mut operator, "transfer");
+        let (session_id, controller_attach, controller_token, _) =
+            create_and_claim(&mut creator, "transfer");
+        let minted = creator.call(
+            "session.grant",
+            json!({"session_id": session_id, "idempotency_key": "transfer-grant"}),
+        );
+        let grant = minted["result"]["grant"]
+            .as_str()
+            .expect("observer grant")
+            .to_owned();
+        let _ = recv_event(&mut creator);
+
+        let mut observer = Client::connect(&root.endpoint());
+        assert_eq!(negotiate_events(&mut observer, None)["ok"], true);
+        let attached = observer.call(
+            "session.attach",
+            json!({
+                "attach_role": "observer",
+                "session_id": session_id,
+                "observer_grant": grant,
+            }),
+        );
+        assert_eq!(attached["ok"], true, "{attached}");
+        let observer_lease = observer_attach(&attached);
+        // The controller sees the observer attach and the grant consume; the
+        // transfer frame comes after them.
+        let _ = recv_event(&mut creator);
+        let _ = recv_event(&mut creator);
+
+        let transferred = creator.call(
+            "session.control.transfer",
+            json!({
+                "session_id": session_id,
+                "target_attach_id": observer_lease,
+                "generation": 0,
+                "control_token": controller_token,
+                "idempotency_key": "transfer-control",
+            }),
+        );
+        assert_eq!(transferred["ok"], true, "{transferred}");
+        assert_eq!(transferred["result"]["controller"], observer_lease);
+
+        let controller_event = recv_event(&mut creator);
+        assert_eq!(
+            controller_event["kind"], "control_transfer",
+            "{controller_event}"
+        );
+        assert_eq!(
+            controller_event["detail"]["from"], controller_attach,
+            "{controller_event}"
+        );
+        assert_eq!(
+            controller_event["detail"]["to"], observer_lease,
+            "{controller_event}"
+        );
+
+        let observer_event = recv_event(&mut observer);
+        assert_eq!(
+            observer_event["kind"], "control_transfer",
+            "{observer_event}"
+        );
+        assert_eq!(
+            observer_event["attach_id"], observer_lease,
+            "{observer_event}"
+        );
+        assert_eq!(
+            observer_event["detail"]["from"], controller_attach,
+            "{observer_event}"
+        );
+        assert_eq!(
+            observer_event["detail"]["to"], observer_lease,
+            "{observer_event}"
+        );
+
+        assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    }
+
+    #[test]
+    fn a_kill_pushes_the_terminal_marker() {
+        let root = TempRoot::new("events-kill");
+        let daemon = Daemon::start(&root);
+        let capability = read_capability(&root);
+        let mut operator = Client::connect(&root.endpoint());
+        assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+        let (mut creator, _) = event_consumer(&root, &mut operator, "kill");
+        let (session_id, attach_id, _controller_token, _) = create_and_claim(&mut creator, "kill");
+
+        let killed = operator.call(
+            "session.kill",
+            json!({"session_id": session_id, "generation": 0}),
+        );
+        assert_eq!(killed["ok"], true, "{killed}");
+        assert_eq!(killed["result"]["accepted"], true, "{killed}");
+
+        let mut event = recv_event(&mut creator);
+        while event["kind"] != "session_terminal" {
+            assert_eq!(event["kind"], "session_state", "{event}");
+            event = recv_event(&mut creator);
+        }
+        assert_eq!(event["terminal"], true, "{event}");
+        assert_eq!(event["attach_id"], attach_id, "{event}");
+        assert_eq!(event["terminal_marker"]["state"], "terminated", "{event}");
+        assert_eq!(
+            event["terminal_marker"]["reason"], "operator_abort",
+            "{event}"
+        );
+        assert_eq!(
+            event["terminal_marker"]["cleanup"], "not_started",
+            "{event}"
+        );
+
+        assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+    }
+
+    #[test]
+    fn an_attach_reports_a_truncated_ring_with_its_earliest_revision() {
+        let root = TempRoot::new("events-truncated");
+        let daemon = Daemon::start(&root);
+        let capability = read_capability(&root);
+        let mut operator = Client::connect(&root.endpoint());
+        assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+        let (mut creator, _) = event_consumer(&root, &mut operator, "truncated");
+        let (session_id, _, _, _) = create_and_claim(&mut creator, "truncated");
+        // One mint plus one revoke per two revisions, draining each frame so
+        // the lease queue never sheds. The ring keeps only the newest 256
+        // events.
+        for index in 0..(bitty_daemon::events::MAX_EVENT_BACKLOG_EVENTS / 2 + 1) {
+            let minted = call_retrying_rate_limit(
+                &mut creator,
+                "session.grant",
+                json!({
+                    "session_id": session_id,
+                    "idempotency_key": format!("truncated-grant-{index}"),
+                }),
+            );
+            assert_eq!(minted["ok"], true, "{minted}");
+            let grant_id = minted["result"]["grant_id"]
+                .as_str()
+                .expect("grant id")
+                .to_owned();
+            let _ = recv_event(&mut creator);
+            let revoked = call_retrying_rate_limit(
+                &mut creator,
+                "session.grant.revoke",
+                json!({"grant_id": grant_id}),
+            );
+            assert_eq!(revoked["ok"], true, "{revoked}");
+            let _ = recv_event(&mut creator);
+        }
+        let minted = call_retrying_rate_limit(
+            &mut creator,
+            "session.grant",
+            json!({"session_id": session_id, "idempotency_key": "truncated-grant-observer"}),
+        );
+        let grant = minted["result"]["grant"]
+            .as_str()
+            .expect("observer grant")
+            .to_owned();
+        let _ = recv_event(&mut creator);
+
+        let mut observer = Client::connect(&root.endpoint());
+        assert_eq!(negotiate_events(&mut observer, None)["ok"], true);
+        let attached = observer.call(
+            "session.attach",
+            json!({
+                "attach_role": "observer",
+                "session_id": session_id,
+                "observer_grant": grant,
+            }),
+        );
+        assert_eq!(attached["ok"], true, "{attached}");
+        assert_eq!(attached["result"]["backlog_truncated"], true, "{attached}");
+        let earliest = attached["result"]["earliest_revision"]
+            .as_u64()
+            .expect("a truncated replay names its earliest revision");
+        assert!(
+            earliest > 1,
+            "the oldest revisions were dropped: {attached}"
+        );
+        let backlog = attached["result"]["backlog"]
+            .as_array()
+            .expect("the replay is served");
+        assert_eq!(
+            backlog.first().and_then(|event| event["revision"].as_u64()),
+            Some(earliest),
+            "{attached}"
+        );
+        assert!(
+            backlog.len() <= bitty_daemon::events::MAX_EVENT_BACKLOG_EVENTS,
+            "the replay never exceeds the ring: {attached}"
+        );
+
+        assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
     }
 }

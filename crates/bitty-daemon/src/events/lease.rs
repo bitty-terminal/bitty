@@ -157,6 +157,13 @@ impl LeaseQueue {
         self.events.drain(..).collect()
     }
 
+    /// Pop the oldest queued event and release its accounted bytes.
+    pub(crate) fn pop_front(&mut self) -> Option<Event> {
+        let event = self.events.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(event.accounted_bytes());
+        Some(event)
+    }
+
     /// Queued events.
     pub(crate) fn len(&self) -> usize {
         self.events.len()

@@ -45,8 +45,9 @@ never advertise a spawn path it does not serve.
 
 bitty#2792 adds the delivered event wire: an opted-in connection receives
 per-lease event frames on the negotiated socket, drained from the bounded
-queues and written after the response they follow. It is the last deferred wire
-slice; see [Pushed event wire](#pushed-event-wire-bitty2792).
+queues and written after the response they follow. This closes the deferred
+event wire; the terminal-session content plane remains deferred. See
+[Pushed event wire](#pushed-event-wire-bitty2792).
 
 `bittyd start` binds the per-user endpoint (`0700` directory, `0600` socket,
 single-instance lock), mints the per-boot operator capability, opens the
@@ -371,10 +372,10 @@ Windows job-object reaper remains designed-not-implemented (bitty#2791).
 limit facts. The remaining response fields (`wire_version` (transport-owned),
 `daemon_instance_id`, `daemon_pid`, `server_identity`, `peer_identity`,
 `client_id`, `scopes`, `server_monotonic_ms`, `daemon_state`) and the optional
-request fields (`client_correlation`, `operator_capability`, `host_grant`) are
-listed in the module docs and arrive with bitty#2601/#2607. `client_correlation`
-is bounded to 128 bytes of valid UTF-8 with no control characters and is
-recorded only as a truncated 128-bit SHA-256 digest (`D-08`);
+request fields (`client_correlation`, `operator_capability`, `host_grant`,
+`events`) are listed in the module docs and arrive with bitty#2601/#2607.
+`client_correlation` is bounded to 128 bytes of valid UTF-8 with no control
+characters and is recorded only as a truncated 128-bit SHA-256 digest (`D-08`);
 `operator_capability` and `host_grant` stay out of this crate until the slice
 that owns their secret lifetime and storage exists.
 
@@ -386,17 +387,24 @@ Source: contract `D-10`; the frozen envelope is restated in
 `bittyd-ipc-contract.md` ("Event schema and capability").
 
 - **Envelope.** `{"v": 1, "id": <server correlation>, "event": {...}}`. `id` is
-  chosen by the server per connection (`e<counter>`, at most 64 bytes) and is
-  never a client value. The event object always carries `kind`, `instance_id`,
-  `session_id`, `attach_id`, `revision`, and `terminal`; `detail` is present only
-  for `control_transfer` (`{from, to}`) and `daemon_stopping` (`{deadline_ms}`),
-  and `terminal_marker` only on `session_terminal`.
-- **Ordering.** One event per `state_revision`, in revision order, per session.
-  The service reports the session it mutated and the last emitted revision is
-  the source of truth: a revision the handler did not report is filled with a
-  plain `session_state` frame, and a revision is never re-emitted or renumbered.
-  Frames are written after the response they follow, so an event never preempts
-  a response.
+  chosen by the server per connection (`evt-<counter>`, at most 64 bytes) and is
+  never a client value. Event ids occupy the reserved `evt-` namespace; they are
+  not request ids, and a client demultiplexes on the `event` key. The event
+  object always carries `kind`, `instance_id`, `session_id`, `attach_id`,
+  `revision`, and `terminal`; `detail` is present only for `control_transfer`
+  (`{from, to}`) and `daemon_stopping` (`{deadline_ms}`), and `terminal_marker`
+  only on `session_terminal`. The marker carries `state`, `reason`, and
+  `cleanup`; the terminal `exit` information remains a recorded 1.2 narrowing
+  (see the contract notes).
+- **Ordering.** One event per `state_revision` the session advanced, in revision
+  order, per session. The service reports the session it mutated and the last
+  emitted revision is the source of truth: a revision the handler did not report
+  is filled with a plain `session_state` frame, and a revision is never
+  re-emitted or renumbered. The daemon-scoped `daemon_stopping` frame and the
+  target-only `lease_revoked` frame carry the current revision without a bump,
+  so they can share a revision with a `session_state` frame (for different
+  leases in the `lease_revoked` case). Frames are written after the response
+  they follow, so an event never preempts a response.
 - **Routing.** Every frame is a per-lease copy addressed to the receiving
   connection's own `attach_id`; nothing is broadcast. A revoked lease's final
   `lease_revoked` frame is routed to the connection that owns that lease, not to
@@ -416,8 +424,10 @@ Source: contract `D-10`; the frozen envelope is restated in
   reconciliation reads.
 - **Attach replay.** An event-opted `session.attach` result carries the optional
   `backlog` (the retained ring, routed to the new lease), `backlog_truncated`,
-  and `earliest_revision`. A `1.0` request carries no cursor, so the ring is
-  served whole and the client deduplicates by `(session_id, revision, kind)`.
+  and `earliest_revision`. The replay is bounded by the effective
+  `max_lease_queue_bytes`, so a lowered limit also lowers the served replay. A
+  `1.0` request carries no cursor, so the ring is served whole and the client
+  deduplicates by `(session_id, revision, kind)`.
 - **Opt-out.** A connection that does not opt in receives no frame of any kind,
   including a lease's final frame, and its attach result carries no replay keys.
 - There is no subscribe method in `1.x`; events ride the negotiated connection.
@@ -842,7 +852,8 @@ release removes them and the corpus already uses only the canonical names.
 
 `daemon.negotiate` is the only pre-authentication method. The request carries
 `client_version`, optional `client_correlation`, optional
-`operator_capability`, and optional `host_grant`. The response carries
+`operator_capability`, optional `host_grant`, and optional `events`. The
+response carries
 `wire_version`, `service_api_version`, `daemon_instance_id`, `daemon_pid`,
 `server_identity`, `peer_identity`, `client_id`, `scopes`, `capabilities`,
 `limits` (`{effective, default, system_max}` for every row), `server_monotonic_ms`,

@@ -265,8 +265,8 @@ fn fake_conformance_corpus() {
     assert_eq!(
         skipped,
         [
-            "V-18", "V-39", "V-40", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07", "C-08", "C-15",
-            "C-16"
+            "V-18", "V-39", "V-40", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07", "C-08", "C-12",
+            "C-15", "C-16"
         ],
         "the fake suite skips exactly the real-only vectors"
     );
@@ -401,15 +401,15 @@ fn fake_and_real_parity() {
         real.facts().capabilities.get("worker_sessions").copied() == Some(true);
     let mut expected_not_compared = vec![
         "V-06", "V-18", "V-33", "V-39", "V-40", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07",
-        "C-08", "C-10", "F-01", "C-15", "C-16",
+        "C-08", "C-10", "C-12", "F-01", "C-15", "C-16",
     ];
     let expected_compared = if real_serves_workers {
-        33
+        32
     } else {
         // A refused containment plan skips the worker vectors on the real
         // driver; the fake still models a served cell.
         expected_not_compared.extend(["V-03", "V-42"]);
-        31
+        30
     };
     expected_not_compared.sort_unstable();
     assert_eq!(

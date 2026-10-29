@@ -263,7 +263,9 @@ pub fn parse_negotiate(params: &Value) -> Result<NegotiateRequest, Refusal> {
 /// The frozen envelope fields (`D-10`) are always present. `detail` is added
 /// only when the kind carries a payload, so `control_transfer` names the two
 /// leases and `daemon_stopping` carries its deadline; a kind with no payload
-/// has no `detail` key at all.
+/// has no `detail` key at all. `terminal_marker` carries `state`, `reason`,
+/// and `cleanup`; the terminal `exit` information is a recorded `1.2`
+/// narrowing (the contract notes own the follow-up).
 pub fn event_value(event: &Event) -> Value {
     let mut value = json!({
         "kind": event.kind.as_str(),

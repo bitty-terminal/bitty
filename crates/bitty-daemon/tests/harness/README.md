@@ -108,7 +108,10 @@ the response `result`; a leading `result.` is accepted and normalized.
 
 Actions: `restart`, `crash`, `advance_clock`, `oversized_frame`, `partial_frame`,
 `queue_pressure`, `audit`, `file_mode`, `no_tcp_listener`, `daemon_absent`,
-`request_log`, `peer_exit`, and `refusal_burst`. `retry_ms` is the only bounded
+`request_log`, `read_events`, `peer_exit`, and `refusal_burst`. `read_events`
+reads `args.count` pushed frames; `args.events` is an optional per-frame array
+of expectation objects (index-aligned with the frames), and `expect.result` is
+the fallback applied to every frame. `retry_ms` is the only bounded
 settlement: it re-sends the same request until the typed expectation holds or
 the deadline passes, for an effect the service applies on another connection.
 

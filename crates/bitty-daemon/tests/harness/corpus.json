@@ -7836,9 +7836,9 @@
         "D-10"
       ],
       "drivers": [
-        "fake",
         "real"
       ],
+      "fake_skip": "requires-real-event-wire (the reference fake synthesizes events after the call returns)",
       "setup": {
         "host_grant": true
       },
@@ -8428,7 +8428,10 @@
                 "kind": "session_terminal",
                 "revision": 3,
                 "attach_id": "@controller_attach",
-                "terminal": true
+                "terminal": true,
+                "terminal_marker.state": "terminated",
+                "terminal_marker.reason": "consumer_cancel",
+                "terminal_marker.cleanup": "not_started"
               }
             ]
           }
@@ -8471,7 +8474,7 @@
     },
     {
       "id": "C-16",
-      "title": "A revoked lease receives its final frame on its own connection and then closes",
+      "title": "A revoked lease receives its final frame on its own connection",
       "area": "events",
       "decisions": [
         "D-09",
@@ -8669,7 +8672,7 @@
       ],
       "forbidden": [
         "a revoked lease never receives a survivor's frame",
-        "the final frame is written before the connection closes"
+        "the final frame is routed to the revoked lease's own connection, not the requester's response"
       ]
     }
   ]

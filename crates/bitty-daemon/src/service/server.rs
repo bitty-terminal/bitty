@@ -382,6 +382,8 @@ mod unix {
         ///
         /// The id is server-chosen, unique per connection, bounded, and never
         /// a client value; it is not durable and never echoed from a request.
+        /// Event ids live in the reserved `evt-` namespace, so they cannot
+        /// collide with a client request id that does not use that prefix.
         event_sequence: u64,
         closed: bool,
     }
@@ -1054,10 +1056,15 @@ mod unix {
         if peer.close_after_write {
             return;
         }
-        for event in service.drain_events(&peer.client) {
+        // Drain one frame at a time: a full outbound buffer leaves the rest of
+        // the lease queue intact for the next pass instead of dropping a
+        // batch, and the terminal pin is released only for the frame actually
+        // handed to the transport.
+        while let Some(event) = service.drain_next_event(&peer.client) {
             if !push_event(peer, &event, cap) {
                 return;
             }
+            service.ack_terminal(&event);
         }
     }
 
@@ -1065,7 +1072,7 @@ mod unix {
     /// cannot fit the outbound bound or the frame layer refuses it.
     fn push_event(peer: &mut PeerIo, event: &crate::events::Event, cap: usize) -> bool {
         peer.event_sequence = peer.event_sequence.wrapping_add(1);
-        let id = format!("e{}", peer.event_sequence);
+        let id = format!("evt-{}", peer.event_sequence);
         let Ok(bytes) = wire::render_event(&id, event) else {
             peer.close();
             return false;

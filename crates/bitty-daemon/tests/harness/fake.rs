@@ -2186,7 +2186,7 @@ fn canonical_target_attach(params: &Value) -> Option<&str> {
 mod tests {
     use serde_json::json;
 
-    use super::{canonical_generation, canonical_target_attach};
+    use super::{FakeDriver, canonical_generation, canonical_target_attach};
 
     #[test]
     fn generation_alias_conflicts_use_the_raw_json_value() {
@@ -2248,5 +2248,14 @@ mod tests {
             None
         );
         assert_eq!(canonical_target_attach(&json!({})), None);
+    }
+
+    #[test]
+    fn the_reference_cell_advertises_the_served_event_wire_on_every_host() {
+        // The fake derives events from revisions, so its capability is not
+        // tied to the build's admission loop. This is the cross-platform
+        // guard for V-01/C-14, which assert `capabilities.events: true`.
+        assert!(FakeDriver::capability("events", false));
+        assert!(FakeDriver::capability("worker_sessions", false));
     }
 }

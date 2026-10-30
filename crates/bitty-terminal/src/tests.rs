@@ -1218,6 +1218,117 @@ return {}
     }
 
     #[test]
+    fn hidden_surface_with_retained_damage_arms_the_repair_wake() {
+        // bitty#2830 hypothesis 2: the occlusion gate retains damage but used
+        // to arm no timed wake, so a lost reveal parked the loop forever. The
+        // runtime's repair deadline must reach the `AboutToWait` wake minimum.
+        let mut fixture = Fixture::new("hidden-repair-wake");
+        fixture.platform_event(PlatformEvent::Suspended);
+        assert!(!fixture.app.runtime.is_surface_visible());
+        fixture.app.runtime.handle_pty_bytes(b"hidden repair wake");
+        assert!(fixture.app.drive_tick().is_none(), "no frame while hidden");
+        let deadline = fixture
+            .app
+            .runtime
+            .hidden_repair_deadline()
+            .expect("retained damage must arm the repair wake");
+
+        fixture.operations.borrow_mut().clear();
+        let mut context = EventContext::recording(&fixture.operations);
+        <TerminalApp as AppHandler>::handle_event(
+            &mut fixture.app,
+            &mut context,
+            PlatformEvent::AboutToWait,
+        );
+        let operations = fixture.operations.borrow();
+        assert!(
+            operations.iter().any(
+                |operation| matches!(operation, RecordingOperation::WaitUntil(at) if *at == deadline)
+            ),
+            "AboutToWait must arm the hidden-repair wake: {operations:?}"
+        );
+    }
+
+    #[test]
+    fn hidden_surface_repair_self_heals_a_missing_reveal() {
+        // The reveal edge is dropped (no `Resumed`/`Occluded(false)` delivery).
+        // The bounded repair probe asks the compositor for one redraw; a
+        // served redraw is the proof the surface is mapped again, so the gate
+        // opens and the retained frame paints.
+        let mut fixture = Fixture::new("hidden-repair-heal");
+        fixture.platform_event(PlatformEvent::Suspended);
+        fixture.app.runtime.handle_pty_bytes(b"repair me");
+        let before = fixture.app.presented_frames;
+        assert!(fixture.app.drive_tick().is_none(), "no frame while hidden");
+        assert_eq!(fixture.app.presented_frames, before);
+        let deadline = fixture
+            .app
+            .runtime
+            .hidden_repair_deadline()
+            .expect("the repair wake is armed");
+
+        // The timed attempt runs: the probe alone proves nothing, so the gate
+        // stays closed and the damage stays retained.
+        fixture.app.repair_hidden_surface(deadline);
+        assert!(
+            !fixture.app.runtime.is_surface_visible(),
+            "requesting a probe must not open the gate by itself"
+        );
+        assert!(fixture.app.drive_tick().is_none());
+        assert_eq!(fixture.app.presented_frames, before);
+
+        // The compositor serves the probe's redraw: the lost reveal is
+        // reconstructed and the retained frame presents.
+        let served = deadline + std::time::Duration::from_millis(16);
+        assert!(fixture.app.apply_hidden_repair_probe(true, served));
+        assert!(fixture.app.runtime.is_surface_visible());
+        assert!(
+            fixture.app.drive_tick().is_some(),
+            "the retained frame paints after the self-heal"
+        );
+        assert_eq!(fixture.app.presented_frames, before + 1);
+        assert_eq!(fixture.app.runtime.hidden_repair_deadline(), None);
+    }
+
+    #[test]
+    fn hidden_repair_probe_never_presents_while_the_gate_is_closed() {
+        // The repair attempt still respects the occlusion gate: an unserved
+        // probe (the surface really is hidden) must not present, and a stale
+        // probe must never re-open the gate on an unrelated redraw.
+        let mut fixture = Fixture::new("hidden-repair-closed");
+        fixture.platform_event(PlatformEvent::Suspended);
+        fixture.app.runtime.handle_pty_bytes(b"still hidden");
+        let before = fixture.app.presented_frames;
+        assert!(fixture.app.drive_tick().is_none());
+        let deadline = fixture
+            .app
+            .runtime
+            .hidden_repair_deadline()
+            .expect("the repair wake is armed");
+
+        fixture.app.repair_hidden_surface(deadline);
+        let unserved = deadline + std::time::Duration::from_millis(16);
+        assert!(
+            !fixture.app.apply_hidden_repair_probe(false, unserved),
+            "an unserved probe is not a reveal"
+        );
+        assert!(!fixture.app.runtime.is_surface_visible());
+        assert!(fixture.app.drive_tick().is_none());
+        assert_eq!(fixture.app.presented_frames, before);
+
+        fixture.app.repair_hidden_surface(unserved);
+        let late = unserved
+            + crate::terminal_app::HIDDEN_REPAIR_PROBE_TTL
+            + std::time::Duration::from_millis(1);
+        assert!(
+            !fixture.app.apply_hidden_repair_probe(true, late),
+            "a stale probe must not open the gate"
+        );
+        assert!(!fixture.app.runtime.is_surface_visible());
+        assert_eq!(fixture.app.presented_frames, before);
+    }
+
+    #[test]
     fn reveal_lifecycle_is_recorded_once_per_transition() {
         // CTX-1605 review F8: the crash report records `Revealed` on the gate
         // transition, not on every `Occluded(false)`. A `Resized`-driven

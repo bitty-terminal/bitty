@@ -413,6 +413,16 @@ pub const SYNC_UPDATE_DEFER_TIMEOUT: std::time::Duration = std::time::Duration::
 /// though bytes keep arriving.
 pub const PRESENT_SETTLE_MAX: std::time::Duration = std::time::Duration::from_millis(8);
 
+/// Bounded self-heal cadence for a hidden surface that still retains work
+/// (bitty#2830 hypothesis 2).
+///
+/// The occlusion gate keeps every present off a hidden surface, and a hidden
+/// tick deliberately arms nothing, so a reveal edge that never arrives leaves
+/// the damage stranded with the loop parked in `ControlFlow::Wait`. One repair
+/// attempt per second is far below any cost that matters while hidden and is
+/// only armed while damage is retained (an idle hidden window arms nothing).
+pub const HIDDEN_REPAIR_INTERVAL_MS: u64 = 1_000;
+
 /// Minimal status flash while a paste pends after the full banner expires
 /// (CTX-0192). Bounded, single-line, always `Some` while pending.
 ///
@@ -1307,6 +1317,19 @@ pub struct Runtime {
     /// as a next-frame task on its own wake instead of presenting inline in
     /// the visibility transition. See `runtime::present`.
     surface_visible: bool,
+    /// Next bounded self-heal attempt for a hidden surface that still retains
+    /// work (bitty#2830 hypothesis 2).
+    ///
+    /// A lost reveal edge - a dropped `Resumed`/`Occluded(false)` delivery, a
+    /// compositor that never re-sends the edge, a focus/workspace transition
+    /// the embedder never saw - otherwise leaves the gate closed with damage
+    /// retained and no armed wake at all, parking the loop in
+    /// `ControlFlow::Wait` forever. While this is `Some`, the embedder joins
+    /// it into its wake minimum and re-checks the surface; see
+    /// [`Runtime::hidden_repair_deadline`]. `None` whenever the surface is
+    /// visible or holds nothing to repaint, so an idle hidden window still
+    /// arms nothing.
+    hidden_repair_at: Option<std::time::Instant>,
     /// Test-only present-failure seam (issue #2570 B1).
     ///
     /// Forces the real-GPU branch and injects a bounded number of failures so
@@ -1699,6 +1722,8 @@ impl std::fmt::Debug for Runtime {
             .field("presents_coalesced", &self.presents_coalesced)
             .field("coalesced_pending", &self.coalesced_pending)
             .field("surface_visible", &self.surface_visible)
+            .field("hidden_repair_at", &self.hidden_repair_at)
+            .field("hidden_retained_work", &self.hidden_retained_work())
             .field("leaf_count", &self.layout.leaf_count())
             .field("focused", &self.focus.focused())
             .field("workspace_count", &self.workspaces.len())
@@ -2112,6 +2137,7 @@ impl Runtime {
             // Issue #2589: the gate starts visible so the startup path and
             // every existing present schedule keep their pre-change behavior.
             surface_visible: true,
+            hidden_repair_at: None,
             #[cfg(test)]
             test_present: None,
             pending_activation_gesture: None,
@@ -2416,6 +2442,7 @@ impl Runtime {
             // Issue #2589: the gate starts visible so the startup path and
             // every existing present schedule keep their pre-change behavior.
             surface_visible: true,
+            hidden_repair_at: None,
             #[cfg(test)]
             test_present: None,
             pending_activation_gesture: None,
@@ -3192,6 +3219,27 @@ impl Runtime {
             .and_then(|host| host.try_borrow().ok().map(|host| host.panel_count()))
             .unwrap_or(0);
         self.hang_gauges.set_panel_bindings(panels, bands);
+        // bitty#2830 hypothesis 2: the occlusion/reveal stall shape. The
+        // watchdog names it as `pending=hidden-damage` and uses it to arm the
+        // no-present detector, so it must be published even when nothing else
+        // about a hidden frame changes.
+        self.hang_gauges
+            .set_hidden_damage(self.hidden_retained_work());
+        self.hang_gauges
+            .set_pending_replies(self.pending_reply_bytes());
+    }
+
+    /// Bytes of PTY replies queued across every live grid and not yet answered.
+    ///
+    /// bitty#2830: replies are bounded (`REPLY_CAP_BYTES` per grid) and drained
+    /// on every poll, so a non-zero value at an idle park names a child query
+    /// whose answer is still held. The watchdog reports it as `pending=replies`.
+    fn pending_reply_bytes(&self) -> usize {
+        let mut bytes = self.state.pending_reply_bytes();
+        for session in self.pane_sessions.values() {
+            bytes = bytes.saturating_add(session.state.pending_reply_bytes());
+        }
+        bytes
     }
 
     /// Estimated retained terminal content bytes across every live grid.

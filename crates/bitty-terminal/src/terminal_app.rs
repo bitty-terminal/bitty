@@ -51,6 +51,16 @@ pub(crate) fn parked_command_wake(
     parked.then(|| now + PARKED_COMMAND_RETRY_DELAY)
 }
 
+/// How long a hidden-surface repair probe trusts a served redraw
+/// (bitty#2830 hypothesis 2).
+///
+/// The probe asks the compositor for one frame; a frame callback that arrives
+/// inside this window proves the surface is mapped again. The window covers a
+/// slow compositor plus scheduling jitter while staying far below the minutes
+/// a genuinely suspended surface stays unmapped, so an unrelated redraw hours
+/// later can never re-open the gate.
+pub(crate) const HIDDEN_REPAIR_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Window title carrying the resolved theme preset and its source layer.
 ///
 /// Visible via `hyprctl clients` and (where decorations show) the title bar,
@@ -768,6 +778,15 @@ pub(crate) struct TerminalApp {
     /// Test-only override for the surface-retry wake (issue #2570 B1).
     #[cfg(test)]
     pub(crate) test_surface_retry_deadline: Option<std::time::Instant>,
+    /// When the current hidden-surface repair probe asked the compositor for
+    /// a redraw (bitty#2830 hypothesis 2).
+    ///
+    /// A served redraw is the only proof a suspended surface is mapped again:
+    /// if the compositor answers the probe, the reveal edge that was lost is
+    /// reconstructed from the frame callback. `None` when no probe is
+    /// outstanding; bounded by [`HIDDEN_REPAIR_PROBE_TTL`] so a stale probe
+    /// can never re-open the gate on an unrelated redraw.
+    hidden_repair_probe_at: Option<std::time::Instant>,
     /// Chrome-owned key state (keymaps, modifier mirror, held keys, zoom).
     pub(crate) chrome: crate::chrome_keys::ChromeState,
     /// Frozen startup spawn recipe so `new_split` leaves replay the exact
@@ -948,6 +967,7 @@ impl TerminalApp {
             stall_watchdog,
             #[cfg(test)]
             test_surface_retry_deadline: None,
+            hidden_repair_probe_at: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
             log_level: LogLevel::default_level(),
@@ -999,6 +1019,7 @@ impl TerminalApp {
             stall_watchdog,
             #[cfg(test)]
             test_surface_retry_deadline: None,
+            hidden_repair_probe_at: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
             log_level: LogLevel::default_level(),
@@ -1111,8 +1132,59 @@ impl TerminalApp {
         if self.runtime.is_surface_visible() == visible {
             return;
         }
+        // A repair probe belongs to the hidden surface incarnation that armed
+        // it: any real edge ends it (bitty#2830 hypothesis 2).
+        self.hidden_repair_probe_at = None;
         self.runtime.set_surface_visibility(visible);
         log_surface_gate(visible, reason);
+    }
+
+    /// Runs one bounded hidden-surface repair probe (bitty#2830 hypothesis 2).
+    ///
+    /// Consumes a [`Runtime::hidden_repair_deadline`] wake. The probe asks the
+    /// compositor for one redraw; the gate stays closed until the frame
+    /// callback proves the surface is mapped again
+    /// ([`Self::apply_hidden_repair_probe`]). A genuinely hidden surface keeps
+    /// its retained damage and gets one attempt per
+    /// `HIDDEN_REPAIR_INTERVAL_MS`, never a busy loop.
+    pub(crate) fn repair_hidden_surface(&mut self, now: std::time::Instant) {
+        if self.runtime.is_surface_visible() {
+            self.hidden_repair_probe_at = None;
+            return;
+        }
+        self.hidden_repair_probe_at = Some(now);
+        if let Some(win) = self.window.handle.as_ref() {
+            win.request_redraw();
+        }
+        self.runtime.note_hidden_repair_at(now);
+    }
+
+    /// Applies the proof a hidden-surface repair probe received.
+    ///
+    /// The platform has no "is the surface mapped" accessor; the compositor
+    /// serving a frame callback is that answer, and the redraw-starvation probe
+    /// already derives its synthetic occlusion edge from the same signal. A
+    /// served redraw inside [`HIDDEN_REPAIR_PROBE_TTL`] therefore reconstructs
+    /// the reveal edge that was lost (a dropped `Resumed`/`Occluded(false)`),
+    /// and the runtime's own reveal path queues the from-truth frame. Returns
+    /// whether the gate was opened.
+    pub(crate) fn apply_hidden_repair_probe(
+        &mut self,
+        served: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(asked_at) = self.hidden_repair_probe_at else {
+            return false;
+        };
+        self.hidden_repair_probe_at = None;
+        if !served || now.saturating_duration_since(asked_at) > HIDDEN_REPAIR_PROBE_TTL {
+            return false;
+        }
+        if self.runtime.is_surface_visible() {
+            return false;
+        }
+        self.set_surface_gate(true, "hidden-repair");
+        true
     }
 
     /// Mark the active main-loop phase for the opt-in stall watchdog.
@@ -1141,7 +1213,20 @@ impl TerminalApp {
 
     fn watchdog_idle(&self) {
         if let Some(watchdog) = self.stall_watchdog.as_ref() {
+            watchdog.presented(self.presented_frames);
             watchdog.idle();
+        }
+    }
+
+    /// Publishes the presented-frame counter to the hang watchdog.
+    ///
+    /// bitty#2830: the no-present detector compares this counter against the
+    /// bounded bound, so a hidden surface that keeps parsing output but never
+    /// paints is reported as `trigger=no-present` while the phase heartbeat
+    /// alone would call it healthy. One relaxed store per present.
+    fn watchdog_presented(&self) {
+        if let Some(watchdog) = self.stall_watchdog.as_ref() {
+            watchdog.presented(self.presented_frames);
         }
     }
 
@@ -1915,6 +2000,7 @@ impl TerminalApp {
         self.sync_cursor_icon();
         if let Some(present) = stats {
             self.presented_frames += 1;
+            self.watchdog_presented();
             // CTX-0592: emit the real-window first-frame marker exactly once
             // when the opt-in perf harness asked for it. The harness starts
             // its timer before spawning this process and reads the elapsed
@@ -4685,6 +4771,19 @@ impl TerminalApp {
                         }
                     }
                     WindowEventKind::RedrawRequested => {
+                        // bitty#2830 hypothesis 2: while the gate is closed a
+                        // repair probe asked for this frame. The compositor
+                        // serving it proves the surface is mapped again even
+                        // when the reveal edge itself never arrived.
+                        if self.hidden_repair_probe_at.is_some()
+                            && self.apply_hidden_repair_probe(true, std::time::Instant::now())
+                        {
+                            crate::logging::info(|| {
+                                String::from(
+                                    "bitty: hidden-surface repair probe served; reveal reconstructed",
+                                )
+                            });
+                        }
                         // Frame-on-demand: no damage → no present, no redraw
                         // loop. Keep Wait mode (default `ControlFlow::Wait`)
                         // so idle burns ≤ 1 % CPU (PB-7 budget).
@@ -4706,6 +4805,20 @@ impl TerminalApp {
                     crash_report::record_exit(crash_report::ExitReason::ShellExit);
                     ctx.exit();
                     return;
+                }
+                // bitty#2830 hypothesis 2: with the gate closed and damage
+                // retained the runtime arms one bounded repair wake per
+                // interval. Consuming it here re-probes the surface, so a
+                // reveal edge that was lost can never park the loop with the
+                // retained frame. The probe only re-requests a redraw; the
+                // gate opens when (and only when) the compositor serves it.
+                let repair_now = std::time::Instant::now();
+                if self
+                    .runtime
+                    .hidden_repair_deadline()
+                    .is_some_and(|deadline| deadline <= repair_now)
+                {
+                    self.repair_hidden_surface(repair_now);
                 }
                 // CTX-1332 C-D1: this is the only cold-delivery phase. Tick
                 // first so workspace/pin/FX/theme/submit/timer/overlay/
@@ -4774,6 +4887,10 @@ impl TerminalApp {
                 // arms a bounded retry; without this wake a quiet window would
                 // never retry and could stay stale after a workspace switch.
                 let surface_retry = self.surface_retry_wake();
+                // bitty#2830 hypothesis 2: a hidden surface with retained
+                // damage arms a bounded repair wake; without it a lost reveal
+                // parks the loop in `ControlFlow::Wait` forever.
+                let hidden_repair = self.runtime.hidden_repair_deadline();
                 let wake = [
                     hover,
                     animation,
@@ -4786,6 +4903,7 @@ impl TerminalApp {
                     shell_exit,
                     selection_auto,
                     surface_retry,
+                    hidden_repair,
                 ]
                 .into_iter()
                 .flatten()

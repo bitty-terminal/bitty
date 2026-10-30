@@ -109,6 +109,42 @@
 //! the app calls [`StallWatchdog::idle`], so a quiet window is never reported
 //! as a stall. The monitor only fires while a phase is active and the
 //! heartbeat has not advanced past that phase's bound.
+//!
+//! ## Parked work and the no-present detector (bitty#2830)
+//!
+//! bitty#2830 has two shapes that a phase heartbeat cannot see. First, a park
+//! with a backlog: the loop sits in `ControlFlow::Wait` while bytes are still
+//! queued for the PTY writer, query replies are unwritten, or the
+//! surface-visibility gate holds retained damage. [`PendingWork`] reads those
+//! three bits from the lock-free runtime gauges, and a park with any of them
+//! stays stall-eligible instead of counting as a quiet window. Second, a
+//! surface that keeps parsing output but never paints (`trigger=no-present`):
+//! the presented-frame counter is independent of the heartbeat, so a hidden
+//! surface with retained damage that stops presenting is reported even though
+//! progress keeps advancing.
+//!
+//! Every report carries `  parked: pending=<bits> present_stale_ms=<ms>
+//! trigger=<reason>`, where `pending` is one of `hidden-damage`, `pty`,
+//! `replies`, a `|`-joined subset, or `none`.
+//!
+//! A long workspace switch-away with a pane that keeps printing looks the same
+//! to this detector as the reported shape, so repeats are bounded to one
+//! report per [`REPORT_REPEAT_INTERVAL`]; the bounded repair wake is what keeps
+//! the loop alive in both cases.
+//!
+//! ## One trigger: `SIGUSR1`
+//!
+//! The freeze campaign that produced this diagnostic used an out-of-band
+//! dump-request file (`bitty/stall-watchdog.dump.req` polled by the monitor)
+//! because it was a separate patch and needed a trigger that could not be
+//! gated by the environment switch. This crate is `#![forbid(unsafe_code)]`,
+//! so it cannot install an async-signal-safe handler itself; `signal_hook`
+//! wraps the one unsafe registration, and the monitor thread owns the flag.
+//! Given that, this build keeps the single `SIGUSR1` capture: it is already
+//! armed in every build, needs no new file or watcher, cannot be spoofed by
+//! another local process writing a slot, and works from a process that looks
+//! idle. The campaign's parked-work bitset and no-present semantics are kept;
+//! only the trigger differs.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -171,6 +207,14 @@ const MIN_POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// Minimum interval between two `SIGUSR1`-requested dumps.
 #[cfg(unix)]
 const SIGNAL_REPORT_INTERVAL: Duration = Duration::from_secs(1);
+/// Minimum interval between two parked-work reports for one continuous
+/// backlog, and between two `no-present` reports for one continuous
+/// hidden-with-retained-damage span (bitty#2830).
+///
+/// Both states are otherwise invisible, so they must be reported; the bound
+/// keeps a legitimately long workspace switch-away (a hidden pane still
+/// printing) or a slow-but-live child from writing a report on every poll.
+const REPORT_REPEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// Minimum time between app-context samples pushed by the main thread.
 ///
 /// The sampler allocates the bounded plugin/band id lists, so it must not run
@@ -592,6 +636,10 @@ struct StallReport {
     /// Outcomes of earlier report deliveries, shown in-band so a lost evidence
     /// write is visible in the next report that does get through.
     delivery: DeliverySummary,
+    /// Parked work that was outstanding at report time (bitty#2830).
+    pending: PendingWork,
+    /// How long the presented-frame counter had been stuck at report time.
+    present_stale_ms: Option<u64>,
 }
 
 /// Bounded in-band delivery summary carried by the monitor.
@@ -630,6 +678,16 @@ struct MonitorState {
     last_progress: u64,
     stall_started: Option<Instant>,
     reported: bool,
+    /// Last sampled presented-frame counter (bitty#2830).
+    last_presented: u64,
+    /// When `last_presented` last moved; the anchor for `present_stale_ms`.
+    presented_at: Option<Instant>,
+    /// Last `no-present` report, for the repeat bound.
+    no_present_at: Option<Instant>,
+    /// Last stall report caused by parked work, for the repeat bound. A
+    /// parked loop keeps marking progress (`AboutToWait`), so the one-shot
+    /// contract alone would re-report every threshold.
+    parked_at: Option<Instant>,
 }
 
 /// What the monitor decided after one sample.
@@ -644,7 +702,61 @@ enum MonitorAction {
 }
 
 impl MonitorState {
+    /// Starts the detector with the first sample already taken.
+    fn new(now: Instant, progress: u64, presented: u64) -> Self {
+        Self {
+            last_progress: progress,
+            stall_started: None,
+            reported: false,
+            last_presented: presented,
+            presented_at: Some(now),
+            no_present_at: None,
+            parked_at: None,
+        }
+    }
+
+    /// Tracks the presented-frame counter and returns how long it has been
+    /// stuck (bitty#2830 no-present detector).
+    fn sample_presented(&mut self, now: Instant, presented: u64) -> Duration {
+        if presented != self.last_presented || self.presented_at.is_none() {
+            self.last_presented = presented;
+            self.presented_at = Some(now);
+            return Duration::ZERO;
+        }
+        now.saturating_duration_since(self.presented_at.unwrap_or(now))
+    }
+
+    /// Decides whether the stuck frame counter is a reportable state.
+    ///
+    /// Only a hidden surface that retains damage qualifies: an idle terminal
+    /// legitimately presents nothing, and a visible surface with damage has
+    /// its own bounded retry wake. The repeat bound keeps a legitimately long
+    /// workspace switch-away from writing more than one line per interval.
+    fn no_present_due(
+        &mut self,
+        now: Instant,
+        stale: Duration,
+        hidden_damage: bool,
+        threshold: Duration,
+    ) -> Option<Duration> {
+        if !hidden_damage || stale < threshold {
+            return None;
+        }
+        if self
+            .no_present_at
+            .is_some_and(|last| now.saturating_duration_since(last) < REPORT_REPEAT_INTERVAL)
+        {
+            return None;
+        }
+        self.no_present_at = Some(now);
+        Some(stale)
+    }
+
     /// Evaluate one sample.
+    ///
+    /// `parked` marks outstanding work published at `ControlFlow::Wait`: a
+    /// park with a backlog is not a quiet window, so it stays stall-eligible
+    /// even though the app called [`StallWatchdog::idle`] (bitty#2830).
     fn evaluate(
         &mut self,
         now: Instant,
@@ -652,7 +764,9 @@ impl MonitorState {
         active: bool,
         idle: Duration,
         threshold: Duration,
+        parked: bool,
     ) -> MonitorAction {
+        let active = active || parked;
         if progress != self.last_progress {
             self.last_progress = progress;
             let recovered = self
@@ -680,7 +794,20 @@ impl MonitorState {
             // One-shot: a continuous stall never writes a second report.
             return MonitorAction::None;
         }
+        if parked
+            && self
+                .parked_at
+                .is_some_and(|last| now.saturating_duration_since(last) < REPORT_REPEAT_INTERVAL)
+        {
+            // A parked loop keeps marking progress, which resets the one-shot
+            // flag; bound the repeats for the same backlog instead.
+            self.reported = true;
+            return MonitorAction::None;
+        }
         self.reported = true;
+        if parked {
+            self.parked_at = Some(now);
+        }
         MonitorAction::Report { idle }
     }
 }
@@ -696,6 +823,13 @@ struct Shared {
     context: Mutex<WatchdogContext>,
     /// Lock-free runtime gauges published on every tick (bitty#2830).
     gauges: Arc<HangGauges>,
+    /// Frames the app has presented (bitty#2830 no-present detector).
+    ///
+    /// The phase heartbeat advances on every parsed byte, so a hidden surface
+    /// that never paints looks healthy to the stall detector. The presented
+    /// counter is the independent signal: it only moves when a frame actually
+    /// committed.
+    presented_frames: AtomicU64,
 }
 
 impl Shared {
@@ -709,6 +843,7 @@ impl Shared {
             progress: AtomicU64::new(0),
             context: Mutex::new(WatchdogContext::default()),
             gauges,
+            presented_frames: AtomicU64::new(0),
         }
     }
 
@@ -928,6 +1063,18 @@ impl StallWatchdog {
         self.shared.mark(phase, true);
     }
 
+    /// Publish the app's presented-frame counter (bitty#2830).
+    ///
+    /// One relaxed store per present; the monitor's no-present detector reads
+    /// it without touching app state. `presented` is monotonic, so a stale
+    /// value is exactly the diagnostic: the loop kept running while no frame
+    /// committed.
+    pub(crate) fn presented(&self, frames: u64) {
+        self.shared
+            .presented_frames
+            .store(frames, Ordering::Relaxed);
+    }
+
     /// Mark the loop idle (armed `ControlFlow::Wait`): not a stall.
     pub(crate) fn idle(&self) {
         self.shared.mark(Phase::Idle, false);
@@ -988,10 +1135,11 @@ fn monitor_loop(
     poll_interval: Duration,
     sink: &mut (dyn FnMut(&str) -> DeliveryOutcome + Send),
 ) {
-    let mut state = MonitorState {
-        last_progress: shared.progress.load(Ordering::Relaxed),
-        ..MonitorState::default()
-    };
+    let mut state = MonitorState::new(
+        Instant::now(),
+        shared.progress.load(Ordering::Relaxed),
+        shared.presented_frames.load(Ordering::Relaxed),
+    );
     let mut delivery = DeliverySummary::default();
     #[cfg(unix)]
     let mut last_signal_at: Option<Instant> = None;
@@ -1006,7 +1154,16 @@ fn monitor_loop(
                 .is_none_or(|last| now.saturating_duration_since(last) >= SIGNAL_REPORT_INTERVAL);
             if due && !stop.is_stopped() {
                 last_signal_at = Some(now);
-                let report = build_report(shared, config, DiagnosticReason::Signal, now, delivery);
+                let stale =
+                    state.sample_presented(now, shared.presented_frames.load(Ordering::Relaxed));
+                let report = build_report(
+                    shared,
+                    config,
+                    DiagnosticReason::Signal,
+                    now,
+                    delivery,
+                    Some(stale),
+                );
                 let rendered = render_report(&report);
                 if stop.is_stopped() {
                     return;
@@ -1023,10 +1180,21 @@ fn monitor_loop(
         let active = shared.active.load(Ordering::Relaxed);
         let idle = shared.idle_for();
         let bound = config.bound_for(phase);
-        match state.evaluate(now, progress, active, idle, bound) {
+        // One gauge sample per poll drives both the parked-work bitset and
+        // the no-present detector (bitty#2830).
+        let pending = PendingWork::from_gauges(&shared.gauges.snapshot());
+        let stale = state.sample_presented(now, shared.presented_frames.load(Ordering::Relaxed));
+        match state.evaluate(now, progress, active, idle, bound, pending.any()) {
             MonitorAction::None => {}
             MonitorAction::Report { idle: _ } => {
-                let report = build_report(shared, config, DiagnosticReason::Stall, now, delivery);
+                let report = build_report(
+                    shared,
+                    config,
+                    DiagnosticReason::Stall,
+                    now,
+                    delivery,
+                    Some(stale),
+                );
                 let rendered = render_report(&report);
                 // Sampling /proc and rendering takes time; never emit once
                 // shutdown was requested.
@@ -1047,6 +1215,28 @@ fn monitor_loop(
                 )));
             }
         }
+        // bitty#2830 hypothesis 2: the phase heartbeat keeps advancing while a
+        // hidden surface parses output but never paints. The presented-frame
+        // counter is the independent signal that catches that shape.
+        let no_present_threshold = config.bound_for(Phase::Idle);
+        if let Some(stale) =
+            state.no_present_due(now, stale, pending.hidden_damage, no_present_threshold)
+        {
+            let report = build_report(
+                shared,
+                config,
+                DiagnosticReason::NoPresent,
+                now,
+                delivery,
+                Some(stale),
+            );
+            let rendered = render_report(&report);
+            if stop.is_stopped() {
+                return;
+            }
+            delivery.record(sink(&rendered));
+            maybe_abort_after_report();
+        }
     }
 }
 
@@ -1055,6 +1245,10 @@ fn monitor_loop(
 enum DiagnosticReason {
     /// The monitored phase exceeded its bound.
     Stall,
+    /// The loop keeps advancing (output is parsed) but no frame is presented
+    /// while the surface is hidden with retained damage (bitty#2830
+    /// hypothesis 2, the occlusion/reveal stall).
+    NoPresent,
     /// The operator sent `SIGUSR1` (Unix only).
     #[cfg(unix)]
     Signal,
@@ -1064,6 +1258,7 @@ impl DiagnosticReason {
     fn as_str(self) -> &'static str {
         match self {
             Self::Stall => "stall",
+            Self::NoPresent => "no-present",
             #[cfg(unix)]
             Self::Signal => "sigusr1",
         }
@@ -1071,10 +1266,64 @@ impl DiagnosticReason {
 
     fn prefix(self) -> &'static str {
         match self {
-            Self::Stall => STALL_REPORT_PREFIX,
+            Self::Stall | Self::NoPresent => STALL_REPORT_PREFIX,
             #[cfg(unix)]
             Self::Signal => SIGNAL_REPORT_PREFIX,
         }
+    }
+}
+
+/// Parked work the loop still owes while it sits in `ControlFlow::Wait`.
+///
+/// bitty#2830: a park is only a quiet window when nothing is outstanding. The
+/// bitset is published as `pending=` in every report so a lost wakeup names
+/// its backlog instead of looking idle. The three sources are the ones the
+/// freeze campaign proved matter: queued PTY bytes, queued query replies, and
+/// the occlusion gate holding retained damage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PendingWork {
+    /// Bytes queued for the PTY writer and not yet written.
+    pty: bool,
+    /// Query replies queued and not yet answered.
+    replies: bool,
+    /// The surface-visibility gate is closed while retained work is owed.
+    hidden_damage: bool,
+}
+
+impl PendingWork {
+    /// Derives the bitset from one lock-free gauge sample.
+    fn from_gauges(gauges: &HangGaugeSnapshot) -> Self {
+        Self {
+            pty: gauges.pending_input_bytes > 0,
+            replies: gauges.pending_replies > 0,
+            hidden_damage: gauges.hidden_damage > 0,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.pty || self.replies || self.hidden_damage
+    }
+
+    /// One stable `|`-separated field, `none` when nothing is outstanding.
+    fn render(self) -> String {
+        if !self.any() {
+            return String::from("none");
+        }
+        let mut out = String::new();
+        for (set, name) in [
+            (self.hidden_damage, "hidden-damage"),
+            (self.pty, "pty"),
+            (self.replies, "replies"),
+        ] {
+            if !set {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push('|');
+            }
+            out.push_str(name);
+        }
+        out
     }
 }
 
@@ -1085,9 +1334,11 @@ fn build_report(
     reason: DiagnosticReason,
     now: Instant,
     delivery: DeliverySummary,
+    present_stale: Option<Duration>,
 ) -> StallReport {
     let phase = Phase::from_u8(shared.phase.load(Ordering::Relaxed));
     let totals_snapshot = sample_process_totals();
+    let gauges = shared.gauges.snapshot();
     StallReport {
         reason,
         threshold: config.bound_for(phase),
@@ -1096,7 +1347,10 @@ fn build_report(
         app_uptime: now.saturating_duration_since(shared.start),
         progress: shared.progress.load(Ordering::Relaxed),
         context: shared.context.try_lock().ok().map(|slot| slot.clone()),
-        gauges: shared.gauges.snapshot(),
+        pending: PendingWork::from_gauges(&gauges),
+        present_stale_ms: present_stale
+            .map(|stale| u64::try_from(stale.as_millis()).unwrap_or(u64::MAX)),
+        gauges,
         threads: totals_snapshot.0,
         totals: totals_snapshot.1,
         delivery,
@@ -1266,6 +1520,19 @@ fn render_report(report: &StallReport) -> String {
                 std::process::id(),
             );
         }
+        DiagnosticReason::NoPresent => {
+            let _ = writeln!(
+                out,
+                "{}: no frame presented for {} ms while the surface is hidden with retained damage (threshold {} ms, phase={}, app_uptime {} ms, progress={}, pid={})",
+                report.reason.prefix(),
+                report.present_stale_ms.unwrap_or_default(),
+                report.threshold.as_millis(),
+                report.phase.as_str(),
+                report.app_uptime.as_millis(),
+                report.progress,
+                std::process::id(),
+            );
+        }
         #[cfg(unix)]
         DiagnosticReason::Signal => {
             let _ = writeln!(
@@ -1281,6 +1548,18 @@ fn render_report(report: &StallReport) -> String {
         }
     }
     let _ = writeln!(out, "  reason={}", report.reason.as_str());
+    // bitty#2830: the parked-work bitset and the stuck-frame span. A lost
+    // wakeup names its backlog here instead of looking idle; `trigger=` names
+    // what wrote this report (`stall`, `no-present`, or `sigusr1`).
+    let _ = writeln!(
+        out,
+        "  parked: pending={} present_stale_ms={} trigger={}",
+        report.pending.render(),
+        report
+            .present_stale_ms
+            .map_or_else(|| String::from("none"), |ms| ms.to_string()),
+        report.reason.as_str(),
+    );
     match &report.context {
         Some(context) => {
             let focus = context
@@ -3198,7 +3477,8 @@ mod tests {
                 1,
                 false,
                 Duration::from_secs(60),
-                DEFAULT_STALL_THRESHOLD
+                DEFAULT_STALL_THRESHOLD,
+                false
             ),
             MonitorAction::None
         );
@@ -3208,7 +3488,8 @@ mod tests {
                 1,
                 true,
                 Duration::from_millis(1999),
-                DEFAULT_STALL_THRESHOLD
+                DEFAULT_STALL_THRESHOLD,
+                false
             ),
             MonitorAction::None
         );
@@ -3227,7 +3508,8 @@ mod tests {
                 7,
                 true,
                 DEFAULT_STALL_THRESHOLD,
-                DEFAULT_STALL_THRESHOLD
+                DEFAULT_STALL_THRESHOLD,
+                false
             ),
             MonitorAction::Report {
                 idle: DEFAULT_STALL_THRESHOLD
@@ -3240,7 +3522,8 @@ mod tests {
                 7,
                 true,
                 Duration::from_secs(7),
-                DEFAULT_STALL_THRESHOLD
+                DEFAULT_STALL_THRESHOLD,
+                false
             ),
             MonitorAction::None
         );
@@ -3250,7 +3533,8 @@ mod tests {
                 7,
                 true,
                 Duration::from_secs(32),
-                DEFAULT_STALL_THRESHOLD
+                DEFAULT_STALL_THRESHOLD,
+                false
             ),
             MonitorAction::None
         );
@@ -3261,7 +3545,8 @@ mod tests {
                 8,
                 true,
                 Duration::from_millis(0),
-                DEFAULT_STALL_THRESHOLD
+                DEFAULT_STALL_THRESHOLD,
+                false
             ),
             MonitorAction::Recovered {
                 stalled_for: Duration::from_secs(31)
@@ -3273,9 +3558,56 @@ mod tests {
                 8,
                 true,
                 Duration::from_millis(0),
-                DEFAULT_STALL_THRESHOLD
+                DEFAULT_STALL_THRESHOLD,
+                false
             ),
             MonitorAction::None
+        );
+    }
+
+    #[test]
+    fn no_present_requires_hidden_damage_and_is_repeat_bounded() {
+        let start = Instant::now();
+        let mut state = MonitorState::new(start, 1, 7);
+        let threshold = DEFAULT_STALL_THRESHOLD;
+        // A stuck counter on a visible surface is an idle app, not a stall:
+        // the gate holds no retained damage, so nothing is reported.
+        assert_eq!(
+            state.no_present_due(start + threshold, threshold, false, threshold),
+            None
+        );
+        // Hidden with retained damage past the threshold reports the span...
+        assert_eq!(
+            state.no_present_due(start + threshold, threshold, true, threshold),
+            Some(threshold)
+        );
+        // ...and the same continuous span is not re-reported immediately.
+        assert_eq!(
+            state.no_present_due(
+                start + threshold + Duration::from_secs(1),
+                threshold + Duration::from_secs(1),
+                true,
+                threshold,
+            ),
+            None
+        );
+        // One interval later the still-stuck state reports again.
+        assert_eq!(
+            state.no_present_due(
+                start + threshold + REPORT_REPEAT_INTERVAL,
+                threshold + REPORT_REPEAT_INTERVAL,
+                true,
+                threshold,
+            ),
+            Some(threshold + REPORT_REPEAT_INTERVAL)
+        );
+        // A presented frame resets the anchor, so the next stall is measured
+        // from the frame that did commit.
+        let later = start + threshold + REPORT_REPEAT_INTERVAL + Duration::from_secs(5);
+        assert_eq!(state.sample_presented(later, 8), Duration::ZERO);
+        assert_eq!(
+            state.sample_presented(later + Duration::from_millis(250), 8),
+            Duration::from_millis(250)
         );
     }
 
@@ -3296,6 +3628,7 @@ mod tests {
                     true,
                     Duration::from_secs(3600),
                     DEFAULT_STALL_THRESHOLD,
+                    false,
                 ),
                 MonitorAction::Report { .. }
             ) {
@@ -4117,9 +4450,23 @@ mod tests {
                 failures: 1,
                 last: Some(DeliveryOutcome::TimedOut),
             },
+            pending: PendingWork {
+                pty: true,
+                replies: true,
+                hidden_damage: true,
+            },
+            present_stale_ms: Some(12_345),
         };
         let rendered = render_report(&report);
         assert!(rendered.contains("phase=runtime-tick"), "{rendered}");
+        // bitty#2830: the parked-work line names the bitset, the stuck-frame
+        // span, and what fired.
+        assert!(
+            rendered.contains(
+                "parked: pending=hidden-damage|pty|replies present_stale_ms=12345 trigger=stall"
+            ),
+            "{rendered}"
+        );
         assert!(rendered.contains("[main]"), "{rendered}");
         assert!(
             rendered.contains("watchdog-delivery: attempts=2 failures=1 last=timed-out"),
@@ -4167,6 +4514,8 @@ mod tests {
                 failures: 2,
                 last: Some(DeliveryOutcome::EvidenceFailed),
             },
+            pending: PendingWork::default(),
+            present_stale_ms: None,
         };
         let rendered = render_report(&report);
         assert!(rendered.len() <= MAX_REPORT_BYTES, "{}", rendered.len());
@@ -4283,6 +4632,122 @@ mod tests {
             .recv_timeout(Duration::from_secs(5))
             .expect("recovery line");
         assert!(recovered.contains("hang recovered"), "{recovered}");
+        watchdog
+            .stop_and_join()
+            .expect("monitor thread must exit cleanly");
+    }
+
+    /// bitty#2830: each parked-work source renders its own bit, in one stable
+    /// order, and yields `none` when nothing is outstanding.
+    #[test]
+    fn pending_work_bitset_names_each_source() {
+        assert_eq!(PendingWork::default().render(), "none");
+        assert!(!PendingWork::default().any());
+        let cases = [
+            (
+                PendingWork {
+                    pty: true,
+                    ..PendingWork::default()
+                },
+                "pty",
+            ),
+            (
+                PendingWork {
+                    replies: true,
+                    ..PendingWork::default()
+                },
+                "replies",
+            ),
+            (
+                PendingWork {
+                    hidden_damage: true,
+                    ..PendingWork::default()
+                },
+                "hidden-damage",
+            ),
+        ];
+        for (work, expected) in cases {
+            assert!(work.any());
+            assert_eq!(work.render(), expected);
+        }
+        let all = PendingWork::from_gauges(&HangGaugeSnapshot {
+            pending_input_bytes: 64,
+            pending_replies: 12,
+            hidden_damage: 1,
+            ..HangGaugeSnapshot::default()
+        });
+        assert_eq!(all.render(), "hidden-damage|pty|replies");
+    }
+
+    /// bitty#2830: a park is only quiet when nothing is outstanding. A queue
+    /// reply still waiting to be written keeps the sample stall-eligible, and
+    /// the report names the `replies` bit.
+    #[test]
+    fn parked_replies_are_not_a_quiet_window() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let gauges = Arc::new(HangGauges::new());
+        gauges.set_pending_replies(24);
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(60),
+            true,
+            Arc::clone(&gauges),
+            Box::new(move |line| {
+                let _ = tx.send(line.to_string());
+                DeliveryOutcome::Delivered
+            }),
+        );
+        // The loop is parked in `ControlFlow::Wait` with an unwritten reply.
+        watchdog.idle();
+        let line = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("parked work must report even while idle");
+        assert!(line.starts_with(STALL_REPORT_PREFIX), "{line}");
+        assert!(line.contains("reason=stall"), "{line}");
+        assert!(line.contains("pending=replies"), "{line}");
+        assert!(line.contains("trigger=stall"), "{line}");
+        watchdog
+            .stop_and_join()
+            .expect("monitor thread must exit cleanly");
+    }
+
+    /// bitty#2830 hypothesis 2: the phase heartbeat keeps advancing (output is
+    /// parsed on every tick) while a hidden surface never presents. The
+    /// presented-frame counter is the only signal that catches it, and the
+    /// report must name `trigger=no-present` with the stuck span.
+    #[test]
+    fn hidden_surface_with_stuck_frames_reports_no_present_while_progress_advances() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let gauges = Arc::new(HangGauges::new());
+        gauges.set_hidden_damage(true);
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(50),
+            true,
+            Arc::clone(&gauges),
+            Box::new(move |line| {
+                let _ = tx.send(line.to_string());
+                DeliveryOutcome::Delivered
+            }),
+        );
+        // Healthy heartbeat: the hidden loop keeps advancing (parsed output
+        // and the repair wake both mark progress). Only the frame counter is
+        // stuck, so the stall detector alone would never fire.
+        let mut line = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            watchdog.enter(Phase::PluginTimers);
+            if let Ok(report) = rx.recv_timeout(Duration::from_millis(20)) {
+                line = Some(report);
+                break;
+            }
+        }
+        let line = line.unwrap_or_else(|| panic!("a hidden surface with stuck frames must report"));
+        // Visible with `--nocapture`: the exact dump an operator gets.
+        eprintln!("{line}");
+        assert!(line.contains("reason=no-present"), "{line}");
+        assert!(line.contains("trigger=no-present"), "{line}");
+        assert!(line.contains("pending=hidden-damage"), "{line}");
+        assert!(line.contains("present_stale_ms="), "{line}");
+        assert!(!line.contains("present_stale_ms=none"), "{line}");
         watchdog
             .stop_and_join()
             .expect("monitor thread must exit cleanly");

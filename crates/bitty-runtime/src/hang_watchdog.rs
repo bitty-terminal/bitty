@@ -85,6 +85,17 @@ pub struct HangGaugeSnapshot {
     pub input_commands_dropped: u64,
     /// Shell-exit edges awaiting the cold phase.
     pub pending_exits: u64,
+    /// Bytes of PTY replies queued and not yet answered (bitty#2830).
+    ///
+    /// A child query (DSR/DA1/XTWINOPS/OSC) that the surface never answers
+    /// leaves its reply here; the watchdog names it as `pending=replies`.
+    pub pending_replies: u64,
+    /// Whether the surface-visibility gate is closed while retained work is
+    /// owed (`1`/`0`, bitty#2830 hypothesis 2).
+    ///
+    /// This is the occlusion/reveal stall shape: the loop keeps parsing output
+    /// but never presents, so the phase heartbeat alone calls it healthy.
+    pub hidden_damage: u64,
 }
 
 impl HangGaugeSnapshot {
@@ -101,7 +112,8 @@ pending_input_dropped={} cold_queue={} cold_dropped={} plugin_events={} \
 plugin_event_bytes={} plugin_side={} plugin_side_dropped={} event_ring={} \
 pending_deliveries={} plugin_parked={} plugin_active={} workers={} component_events={} \
 component_events_dropped={} panes={} leaves={} content_bytes={} leases={} bindings={} \
-input_commands={} input_commands_dropped={} pending_exits={}",
+input_commands={} input_commands_dropped={} pending_exits={} pending_replies={} \
+hidden_damage={}",
             self.tick_count,
             self.last_tick_ns / 1_000_000,
             self.max_tick_ns / 1_000_000,
@@ -128,6 +140,8 @@ input_commands={} input_commands_dropped={} pending_exits={}",
             self.input_commands,
             self.input_commands_dropped,
             self.pending_exits,
+            self.pending_replies,
+            self.hidden_damage,
         )
     }
 }
@@ -165,6 +179,8 @@ pub struct HangGauges {
     input_commands: AtomicU64,
     input_commands_dropped: AtomicU64,
     pending_exits: AtomicU64,
+    pending_replies: AtomicU64,
+    hidden_damage: AtomicU64,
 }
 
 impl HangGauges {
@@ -202,6 +218,8 @@ impl HangGauges {
             input_commands: self.input_commands.load(Ordering::Relaxed),
             input_commands_dropped: self.input_commands_dropped.load(Ordering::Relaxed),
             pending_exits: self.pending_exits.load(Ordering::Relaxed),
+            pending_replies: self.pending_replies.load(Ordering::Relaxed),
+            hidden_damage: self.hidden_damage.load(Ordering::Relaxed),
         }
     }
 
@@ -288,6 +306,24 @@ impl HangGauges {
             u64::try_from(pending).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
+    }
+
+    /// Publishes the bytes of PTY replies queued and not yet answered.
+    ///
+    /// Written by the runtime owner thread on every tick; public so a
+    /// composition root or a diagnostic test can seed the same gauge.
+    pub fn set_pending_replies(&self, bytes: usize) {
+        self.pending_replies
+            .store(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Publishes whether a hidden surface retains work (bitty#2830).
+    ///
+    /// Written by the runtime owner thread on every tick; public so the
+    /// watchdog's no-present regression can seed the occlusion shape.
+    pub fn set_hidden_damage(&self, retained: bool) {
+        self.hidden_damage
+            .store(u64::from(retained), Ordering::Relaxed);
     }
 }
 
@@ -395,6 +431,8 @@ mod tests {
             "workers=",
             "input_commands=",
             "pending_exits=",
+            "pending_replies=",
+            "hidden_damage=",
         ] {
             assert!(rendered.contains(key), "missing {key}: {rendered}");
         }

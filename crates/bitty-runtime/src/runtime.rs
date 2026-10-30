@@ -1061,7 +1061,8 @@ pub struct Runtime {
     /// adjusts the adjacent split ratio live (same clamped geometry as
     /// keyboard resize). `None` when no drag is active; cleared on release
     /// and when the cursor leaves the window. Never starts while Shift, Alt,
-    /// or Super is held, and never while a mouse-mode app captures the pointer.
+    /// or Super is held; a mouse-mode app no longer owns a divider press
+    /// (issue #2828).
     border_drag: Option<BorderDragState>,
     /// Active Alt+edge float resize (CTX-1150, issue #1980 follow-up).
     ///

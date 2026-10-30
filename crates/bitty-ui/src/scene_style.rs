@@ -53,6 +53,13 @@ use crate::theme::{ResolvedTokens, TokenColor, TokenLayer};
 // Caps (accepted analogue ranges, candidate application)
 // ---------------------------------------------------------------------------
 
+// `bitty-ui` has no production edge to `bitty-rich` (the scene crate is a
+// dev-dependency only, and W-147 fences the core graph), so the vocabulary is
+// mirrored here. `bitty-runtime` depends on both and carries the drift test
+// that pins every cap and token name equal
+// (`tests/scene_style_vocabulary.rs`), so the resolver and the paint path
+// cannot silently disagree.
+
 /// Maximum padding in cells.
 ///
 /// Reuses the accepted `decoration.content_inset` upper bound (`32`).
@@ -83,6 +90,10 @@ pub const SCENE_STYLE_MAX_NAME_BYTES: usize = 32;
 /// The set is closed and contains only `content.*`/`state.*` tokens, never
 /// Core chrome tokens: a plugin contributes appearance for content it owns and
 /// cannot claim Core-owned chrome. Adding a token is a contract change.
+///
+/// The scene model carries the same closed set as
+/// `bitty_rich::scene::ContentToken`; `bitty-runtime`'s vocabulary drift test
+/// pins the two name-for-name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BorderToken {
     /// `content.foreground` — the default border colour.

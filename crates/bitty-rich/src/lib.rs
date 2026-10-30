@@ -20,6 +20,9 @@
 //!   (CTX-1628 / bitty#2760): the renderer lays the scene out inside a leaf
 //!   content rect and emits a bounded paint list, while validation and
 //!   admission stay here.
+//!   The additive v2 [`scene::SceneNode::Styled`] kind carries bounded style
+//!   data (padding cells `0..=32`, radius px `0..=16`, border px `0..=16`, and
+//!   a closed content token) and no layout: Core measures and paints it.
 //!
 //! `bitty_term_state::ImageStore` (64 entries, 4096 bytes each) remains as
 //! the legacy terminal-truth placeholder seam; this crate's `image`
@@ -68,6 +71,9 @@
 //! | [`scene::SCENE_MAX_TEXT_BYTES_PER_BLOCK`] (SCN-3) | 256 KiB | typed error |
 //! | [`scene::SCENE_MAX_RICH_BYTES_PER_TERMINAL`] (SCN-4) | 2 MiB | typed error |
 //! | [`scene::SCENE_MAX_BLOCKS_PER_TERMINAL`] (SCN-5) | 64 | typed error |
+//! | [`scene::SCENE_STYLE_MAX_PADDING_CELLS`] style padding | 32 cells | typed error |
+//! | [`scene::SCENE_STYLE_MAX_RADIUS_PX`] style radius | 16 px | typed error |
+//! | [`scene::SCENE_STYLE_MAX_BORDER_PX`] style border | 16 px | typed error |
 //! | [`blocks::COMMAND_BLOCK_MAX`] command blocks | 256 | newest retained, oldest dropped |
 //! | [`blocks::FOLD_MAX`] folded ids | 256 | fold fails closed at cap |
 //! | [`hints::HINT_TARGET_MAX`] hint targets / labels | 256 | register fails closed; batch sheds sorted tail |
@@ -183,9 +189,10 @@ pub use kitty_unicode::{
 };
 pub use loader::{MAX_PATH_LEN, MAX_ROOTS, ResourceError, ResourcePolicy, validate_resource_path};
 pub use scene::{
-    BlockAnchor, BlockId, Border, CodeBlockModel, ListModel, RichBlock,
+    BlockAnchor, BlockId, Border, CodeBlockModel, ContentToken, ListModel, RichBlock,
     SCENE_MAX_BLOCKS_PER_TERMINAL, SCENE_MAX_DEPTH, SCENE_MAX_NODES_PER_BLOCK,
-    SCENE_MAX_RICH_BYTES_PER_TERMINAL, SCENE_MAX_TEXT_BYTES_PER_BLOCK, Scene, SceneError,
-    SceneNode, ScrollBehavior, StyledSpan, TableModel,
+    SCENE_MAX_RICH_BYTES_PER_TERMINAL, SCENE_MAX_TEXT_BYTES_PER_BLOCK, SCENE_STYLE_MAX_BORDER_PX,
+    SCENE_STYLE_MAX_PADDING_CELLS, SCENE_STYLE_MAX_RADIUS_PX, SCENE_STYLE_SCHEMA_VERSION, Scene,
+    SceneError, SceneNode, SceneNodeStyle, SceneStyleError, ScrollBehavior, StyledSpan, TableModel,
 };
 pub use shell::{CommandRegion, ShellIntegration};

@@ -148,7 +148,9 @@ fn interactive_purposes_resolve_from_declared_purpose() {
 /// extension `SceneKind` with a resolved role (or fail closed for `Unknown`).
 #[test]
 fn scene_kind_mirror_tracks_bitty_rich() {
-    use bitty_rich::scene::{Border, CodeBlockModel, ListModel, SceneNode, StyledSpan, TableModel};
+    use bitty_rich::scene::{
+        Border, CodeBlockModel, ListModel, SceneNode, SceneNodeStyle, StyledSpan, TableModel,
+    };
 
     let span = StyledSpan {
         text: String::from("t"),
@@ -169,6 +171,15 @@ fn scene_kind_mirror_tracks_bitty_rich() {
                 child: Box::new(leaf.clone()),
             },
             SceneKind::Block,
+        ),
+        // A v2 style wrapper is paint only: it projects the child's kind, so
+        // a border, padding, or radius never adds or hides an a11y node.
+        (
+            SceneNode::Styled {
+                style: SceneNodeStyle::new(2, 4, 1, bitty_rich::scene::ContentToken::Accent),
+                child: Box::new(leaf.clone()),
+            },
+            SceneKind::Text,
         ),
         (
             SceneNode::Image(bitty_rich::image::PlacementId(1)),
@@ -196,19 +207,28 @@ fn scene_kind_mirror_tracks_bitty_rich() {
         ),
         (SceneNode::Rule, SceneKind::Rule),
     ];
-    for (node, kind) in &cases {
-        let mapped = match node {
+    /// Projects one node to the a11y kind, unwrapping v2 style nodes.
+    ///
+    /// The style wrapper carries paint data only, so the projection must be
+    /// exactly the child's kind; any other mapping would change a role or
+    /// reading order just because a producer declared a border.
+    fn project(node: &SceneNode) -> SceneKind {
+        match node {
             SceneNode::Text(_) => SceneKind::Text,
             SceneNode::Row(_) => SceneKind::Row,
             SceneNode::Column(_) => SceneKind::Column,
             SceneNode::Block { .. } => SceneKind::Block,
+            SceneNode::Styled { child, .. } => project(child),
             SceneNode::Image(_) => SceneKind::Image,
             SceneNode::CodeBlock(_) => SceneKind::CodeBlock,
             SceneNode::Table(_) => SceneKind::Table,
             SceneNode::List(_) => SceneKind::List,
             SceneNode::Rule => SceneKind::Rule,
             SceneNode::Unknown(_) => SceneKind::Unknown,
-        };
+        }
+    }
+    for (node, kind) in &cases {
+        let mapped = project(node);
         assert_eq!(mapped, *kind);
         assert!(role_of(*kind).is_ok(), "{kind:?} must resolve a role");
     }

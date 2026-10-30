@@ -843,8 +843,9 @@ from their `SHA256SUMS`, never hand-written.
 
 Extensions are published on their own release track. A Core release tag (for
 example `v0.0.25`) does not imply a `0.0.25` extension payload: only versions
-listed in `catalog.v1` exist. Never infer extension availability from the
-Core version; use the catalog or fetch
+with a published tarball and `SHA256SUMS` exist on the CDN, and the catalog is
+derived from those release objects. Never infer extension availability from the
+Core version; read the catalog (the manager-owned resolution input) or fetch
 `https://cdn.bitty.run/extensions/<name>/<version>/SHA256SUMS`.
 
 #### Trust
@@ -853,10 +854,15 @@ Unsigned 0.1.0 verifies the seed by hash only: the release `SHA256SUMS` entry
 must match the downloaded bytes, and the first successful install records a
 TOFU pin under `<user>/<name>/tarball.sha256`. A later payload substitution
 for an installed extension fails closed as pin-mismatch until an explicit
-`--force` re-pin. The seed allowlists the _initial_ URL, but it follows
-`curl --location` redirects: HTTPS therefore does not pin the host and path
-across a redirect. The digest chain still verifies the fetched bytes; a
-redirect cannot substitute content without failing the hash check.
+`--force` re-pin. The seed allowlists the _initial_ URL only. It follows
+`curl --location` redirects, and `--proto =https` keeps them on HTTPS, but the
+effective host and path are not pinned: a redirect can move the fetch to
+another origin. The hash chain binds the tarball to the `SHA256SUMS` fetched in
+the same invocation, not the manifest to `cdn.bitty.run`, so a party
+controlling the redirect (or the initial origin) can serve a self-consistent
+manifest and tarball; only the TOFU pin refuses a later change. Treat first
+contact as trust-on-first-use, not origin proof. Enforcing the effective host
+across redirects is a follow-up; signature verification is the durable fix.
 Signatures (Sigstore/cosign or an Ed25519 key directory with a rotation
 story) remain a follow-up for the seed.
 

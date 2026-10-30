@@ -8,14 +8,20 @@
 //!
 //! This guard closes the source-level blind spot that behavior tests leave
 //! open: a re-added catalog path with no caller, or a latest selector hidden
-//! behind another name, would otherwise pass a green suite. Mutation proof
-//! (recorded in the PR): re-adding any retired symbol below, or a third
-//! `transport.fetch` site, fails the guard; deleting the whole catalog module
-//! keeps it green.
+//! behind another name, would otherwise pass a green suite. The scan covers
+//! every Rust source under `src/`, so a retired symbol cannot hide in a
+//! module the seed no longer imports. Comments are stripped before matching,
+//! so prose that names a retired symbol cannot false-fail the guard while
+//! actual code still does.
+//!
+//! Mutation proof (recorded in the PR): re-adding any retired symbol below in
+//! any `src/**/*.rs` file, or a third `transport.fetch` site in the seed,
+//! fails the guard; deleting the whole catalog module keeps it green.
 
 use std::path::{Path, PathBuf};
 
-/// Extension seed source files that must stay pinned-only.
+/// Extension seed source files that must stay pinned-only and off the Rust
+/// network stack. Retired-identifier scanning covers all of `src/`.
 const SEED_SOURCES: &[&str] = &["src/component_seed.rs", "src/component.rs"];
 
 /// Identifiers that only a Core-owned catalog/latest path would expose.
@@ -48,25 +54,98 @@ fn crate_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-/// True when Rust source names `ident` as a whole token (catches
+/// Recursively collect every `.rs` file under `dir`, relative to `root`.
+///
+/// Sorted for a deterministic failure report. No symlinked directories are
+/// followed: the repository tree is the only trusted scan input.
+fn rust_sources(dir: &Path, root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            rust_sources(&path, root, out);
+        } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+            if let Ok(relative) = path.strip_prefix(root) {
+                out.push(relative.to_path_buf());
+            }
+        }
+    }
+}
+
+/// Remove line and (nested) block comments so documentation mentions do not
+/// read as code. String literals are left intact deliberately: a retired
+/// identifier in a string is still suspicious enough to review.
+fn strip_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    let mut block_depth = 0usize;
+    while index < bytes.len() {
+        if block_depth > 0 {
+            if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+                block_depth += 1;
+                index += 2;
+            } else if bytes[index] == b'*' && bytes.get(index + 1) == Some(&b'/') {
+                block_depth -= 1;
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'/') {
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index] == b'/' && bytes.get(index + 1) == Some(&b'*') {
+            block_depth = 1;
+            index += 2;
+            continue;
+        }
+        let ch = text[index..]
+            .chars()
+            .next()
+            .expect("index is on a char boundary");
+        out.push(ch);
+        index += ch.len_utf8();
+    }
+    out
+}
+
+/// True when source code names `ident` as a whole token (catches
 /// `ident::...`, `use ident;`, and declarations without `::`).
 fn names_identifier(text: &str, ident: &str) -> bool {
     text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
         .any(|token| token == ident)
 }
 
-/// Reject a catalog/latest symbol anywhere in the seed sources.
+/// Reject a catalog/latest symbol anywhere in the crate sources.
 #[test]
 fn catalog_and_latest_stay_out_of_core() {
     let root = crate_root();
+    let mut sources = Vec::new();
+    rust_sources(&root.join("src"), &root, &mut sources);
+    sources.sort();
+    assert!(
+        !sources.is_empty(),
+        "the guard must find Rust sources under src/"
+    );
     let mut offenders = Vec::new();
-    for relative in SEED_SOURCES {
-        let path = root.join(relative);
+    for relative in sources {
+        let path = root.join(&relative);
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let code = strip_comments(&text);
         for ident in RETIRED_IDENTIFIERS {
-            if names_identifier(&text, ident) {
-                offenders.push(format!("{relative}: {ident}"));
+            if names_identifier(&code, ident) {
+                offenders.push(format!("{}: {ident}", relative.display()));
             }
         }
     }
@@ -93,10 +172,13 @@ fn seed_budget_is_one_pinned_release() {
     // would add a third call site and fail here before review notices. Count
     // `.fetch(` rather than the one-line `transport.fetch(` spelling so a
     // rustfmt line break (the manifest call is wrapped) cannot false-pass.
-    let fetch_sites = text.matches(".fetch(").count();
+    // Only the production half counts: test stubs and fixtures may call
+    // `.fetch(` freely without weakening the budget.
+    let production = text.split("#[cfg(test)]").next().unwrap_or(&text);
+    let fetch_sites = production.matches(".fetch(").count();
     assert_eq!(
         fetch_sites, 2,
-        "the seed performs exactly two transport fetch sites (SHA256SUMS + one release), found {fetch_sites}"
+        "the seed performs exactly two production transport fetch sites (SHA256SUMS + one release), found {fetch_sites}"
     );
 }
 
@@ -118,15 +200,12 @@ fn seed_has_no_network_stack() {
 /// Guard fixture: the identifier scanner ignores prose-only mentions.
 #[test]
 fn scanner_ignores_documentation_mentions() {
-    let prose = "//! The catalog stays a published artifact; no fetch_catalog here.\n";
-    assert!(!names_identifier(prose, "parse_catalog"));
+    let prose = "//! The catalog stays a published artifact; no parse_catalog here.\n";
+    assert!(!names_identifier(&strip_comments(prose), "parse_catalog"));
+    let block = "/* parse_catalog is retired */\nfn live() {}\n";
+    assert!(!names_identifier(&strip_comments(block), "parse_catalog"));
     assert!(names_identifier(
-        "pub fn parse_catalog() {}",
+        &strip_comments("pub fn parse_catalog() {}"),
         "parse_catalog"
     ));
 }
-
-/// Keep the helper honest across platforms; `Path` is referenced by
-/// `crate_root`'s return type on every target.
-#[allow(dead_code)]
-fn _path_marker(_: &Path) {}

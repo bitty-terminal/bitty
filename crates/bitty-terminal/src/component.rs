@@ -126,11 +126,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitty_runtime::component::{
-    ActivationState, COMPONENT_DESCRIPTOR_FILE, COMPONENT_EXECUTABLE_MAX_BYTES,
-    COMPONENT_EXECUTABLE_PREFIX, ComponentDescriptor, ComponentSummary, component_search_roots_for,
-    component_state_root_for, data_home_for, discover_components, executable_file_name,
-    incompatible_component_hint, read_component_activation_with_state, remove_activation_artifacts,
-    seam_for, validate_component_name,
+    ActivationState, COMPONENT_DESCRIPTOR_FILE, COMPONENT_DESCRIPTOR_MAX_BYTES,
+    COMPONENT_EXECUTABLE_MAX_BYTES, COMPONENT_EXECUTABLE_PREFIX, ComponentDescriptor,
+    ComponentSummary, component_search_roots_for, component_state_root_for, data_home_for,
+    discover_components, executable_file_name, incompatible_component_hint,
+    read_component_activation_with_state, remove_activation_artifacts, seam_for,
+    validate_component_name,
 };
 
 // ---------------------------------------------------------------------------
@@ -1881,8 +1882,26 @@ fn write_tofu_pin(user: &Path, name: &str, digest: &str) -> Result<(), Component
 /// protocol range, a symlinked executable, or a digest mismatch all return
 /// `None` so the normal verified fetch path runs instead.
 fn verified_installed_version(user: &Path, name: &str, version: &str) -> Option<PathBuf> {
-    let dir = user.join(name).join(version);
-    let descriptor_text = std::fs::read_to_string(dir.join(COMPONENT_DESCRIPTOR_FILE)).ok()?;
+    let component_dir = user.join(name);
+    let dir = component_dir.join(version);
+    // The offline cache hit bypasses `install_staged`, so it must apply the
+    // same no-follow guards: a symlinked component or version dir would make
+    // the descriptor/executable read escape the user tier, and the caller
+    // would then rewrite `current` through the link.
+    for path in [&component_dir, &dir] {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            _ => return None,
+        }
+    }
+    let descriptor_path = dir.join(COMPONENT_DESCRIPTOR_FILE);
+    let descriptor_metadata = std::fs::symlink_metadata(&descriptor_path).ok()?;
+    if !descriptor_metadata.is_file()
+        || descriptor_metadata.len() > COMPONENT_DESCRIPTOR_MAX_BYTES as u64
+    {
+        return None;
+    }
+    let descriptor_text = std::fs::read_to_string(&descriptor_path).ok()?;
     let descriptor = ComponentDescriptor::parse(&descriptor_text).ok()?;
     if descriptor.name != name || descriptor.version != version {
         return None;
@@ -1909,10 +1928,34 @@ fn verified_installed_version(user: &Path, name: &str, version: &str) -> Option<
 ///
 /// The offline cache-hit path bypasses `install_staged`, so it must apply the
 /// same symlink guard before writing: `current` is read by the resolver and a
-/// pre-existing symlink would escape the install directory. The write is
-/// atomic (temp sibling + rename) like every other publish.
+/// pre-existing symlink would escape the install directory. The component dir
+/// itself is re-checked too (defense in depth against a TOCTOU swap of the
+/// directory between verification and publish). The write is atomic (temp
+/// sibling + rename) like every other publish.
+///
+/// Local trust: a cache hit only reads and repoints the user's own component
+/// tree, which is already inside the user's trust domain. It rewrites
+/// `current` to the explicitly requested `--version`, exactly as an online
+/// install of that version would; it never selects a different version.
 fn refresh_current_pointer(user: &Path, name: &str, version: &str) -> Result<(), ComponentFailure> {
-    let path = user.join(name).join("current");
+    let component_dir = user.join(name);
+    match std::fs::symlink_metadata(&component_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return Err(ComponentFailure::generic(format!(
+                "bitty extension: refusing symlink or non-directory '{}'",
+                component_dir.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(ComponentFailure::generic(format!(
+                "bitty extension: cannot inspect '{}': {error}",
+                component_dir.display()
+            )));
+        }
+    }
+    let path = component_dir.join("current");
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(ComponentFailure::generic(format!(
@@ -4165,9 +4208,11 @@ mod tests {
         }
     }
 
-    /// Stub transport that fails every fetch with a transport error, as an
-    /// offline host does. Integrity failures are a different class and must
-    /// never reach the cached-install fallback.
+    /// Stub transport that fails the manifest fetch with a transport error, as
+    /// an offline host does. A tarball fetch must never happen: the manifest
+    /// has not been parsed, so that call is a test bug and fails loudly.
+    /// Integrity failures are a different class and must never reach the
+    /// cached-install fallback.
     struct OfflineTransport {
         fetch_calls: usize,
     }
@@ -4180,6 +4225,11 @@ mod tests {
             _max: u64,
         ) -> Result<(), crate::component_seed::SeedError> {
             self.fetch_calls += 1;
+            if !url.ends_with("SHA256SUMS") {
+                return Err(crate::component_seed::SeedError::Fetch(format!(
+                    "unexpected tarball fetch while the manifest is offline: {url}"
+                )));
+            }
             Err(crate::component_seed::SeedError::ManifestTransport(
                 format!("bitty extension: offline (test stub): {url}"),
             ))
@@ -4298,7 +4348,7 @@ mod tests {
         )
         .expect("idempotent");
 
-        // Different bytes for the same version fail closed (downgrade by
+        // Different bytes for the same version fail closed (substitution by
         // content swap), leaving the install untouched.
         let mut stub = InstallStub::canned("net", "0.0.23", target, b"other-bytes");
         let mut out = Vec::new();
@@ -4491,9 +4541,9 @@ mod tests {
             "stderr names the offline fallback: {}",
             String::from_utf8_lossy(&out)
         );
-        assert!(
-            offline.fetch_calls >= 1,
-            "the seed tries the manifest first"
+        assert_eq!(
+            offline.fetch_calls, 1,
+            "the seed attempts exactly one fetch (the manifest) before the cache hit"
         );
         assert_eq!(
             std::fs::read_to_string(user.join("net").join("current")).expect("current"),
@@ -4552,6 +4602,167 @@ mod tests {
         )
         .expect_err("tampered cache must not be reused");
         assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- offline cache symlink guards -------------------------------------
+
+    /// Write a verified local install (`<dir>/<version>/{descriptor,exe}`)
+    /// outside the user tier; callers then prove the offline path never reads
+    /// or writes through a symlink to it.
+    #[cfg(unix)]
+    fn write_local_install(dir: &Path, name: &str, version: &str, exe: &[u8]) {
+        let version_dir = dir.join(version);
+        std::fs::create_dir_all(&version_dir).expect("version dir");
+        let executable = version_dir.join(executable_file_name(&format!(
+            "{COMPONENT_EXECUTABLE_PREFIX}{name}"
+        )));
+        std::fs::write(executable, exe).expect("local exe");
+        let digest = bitty_package::integrity::sha256_hex(exe);
+        let descriptor = format!(
+            "[component]\nname = \"{name}\"\nversion = \"{version}\"\nprotocol = [1, 1]\nexecutable = \"bitty-{name}\"\nsha256 = \"{digest}\"\n"
+        );
+        std::fs::write(version_dir.join(COMPONENT_DESCRIPTOR_FILE), descriptor)
+            .expect("local descriptor");
+    }
+
+    /// Run an offline pinned install and return the failure.
+    #[cfg(unix)]
+    fn offline_install_error(user: &Path) -> (ComponentFailure, OfflineTransport, Vec<u8>) {
+        let mut offline = OfflineTransport { fetch_calls: 0 };
+        let mut out = Vec::new();
+        let mut input = std::io::BufReader::new(&b""[..]);
+        let error = op_install(
+            "net",
+            Some("0.0.23"),
+            None,
+            false,
+            Some(user),
+            &mut out,
+            &mut input,
+            true,
+            &mut offline,
+        )
+        .expect_err("a symlinked cache entry must not be reused");
+        (error, offline, out)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_reuse_refuses_symlinked_component_dir() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-offline-symlink-component");
+        let user = base.join("user");
+        let outside = base.join("outside").join("net");
+        std::fs::create_dir_all(&user).expect("user dir");
+        write_local_install(&outside, "net", "0.0.23", b"outside-bytes");
+        std::os::unix::fs::symlink(&outside, user.join("net")).expect("component symlink");
+
+        let (error, offline, _) = offline_install_error(&user);
+        assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        assert_eq!(
+            offline.fetch_calls, 1,
+            "the manifest fetch is still attempted before the cache check"
+        );
+        assert!(
+            !outside.join("current").exists(),
+            "offline reuse must not write current through the component symlink"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_reuse_refuses_symlinked_version_dir() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-offline-symlink-version");
+        let user = base.join("user");
+        let outside = base.join("outside").join("net").join("0.0.23");
+        let user_component = user.join("net");
+        std::fs::create_dir_all(&user_component).expect("user component dir");
+        write_local_install(
+            &base.join("outside").join("net"),
+            "net",
+            "0.0.23",
+            b"outside-bytes",
+        );
+        std::os::unix::fs::symlink(&outside, user_component.join("0.0.23"))
+            .expect("version symlink");
+
+        let (error, offline, _) = offline_install_error(&user);
+        assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        assert_eq!(offline.fetch_calls, 1);
+        assert!(
+            !user_component.join("current").exists(),
+            "a symlinked version dir is a cache miss, so no current is published"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn offline_reuse_refuses_symlinked_descriptor() {
+        if crate::component_seed::host_target_triple().is_none() {
+            return;
+        }
+        let base = scratch("install-offline-symlink-descriptor");
+        let user = base.join("user");
+        let user_version = user.join("net").join("0.0.23");
+        std::fs::create_dir_all(&user_version).expect("user version dir");
+        let exe = b"outside-bytes";
+        std::fs::write(
+            user_version.join(executable_file_name(&format!(
+                "{COMPONENT_EXECUTABLE_PREFIX}net"
+            ))),
+            exe,
+        )
+        .expect("exe");
+        let outside_descriptor = base.join("outside-component.toml");
+        let digest = bitty_package::integrity::sha256_hex(exe);
+        std::fs::write(
+            &outside_descriptor,
+            format!(
+                "[component]\nname = \"net\"\nversion = \"0.0.23\"\nprotocol = [1, 1]\nexecutable = \"bitty-net\"\nsha256 = \"{digest}\"\n"
+            ),
+        )
+        .expect("descriptor");
+        std::os::unix::fs::symlink(
+            &outside_descriptor,
+            user_version.join(COMPONENT_DESCRIPTOR_FILE),
+        )
+        .expect("descriptor symlink");
+
+        let (error, offline, _) = offline_install_error(&user);
+        assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        assert_eq!(offline.fetch_calls, 1);
+        assert!(
+            !user.join("net").join("current").exists(),
+            "a symlinked descriptor is a cache miss, so no current is published"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_current_pointer_refuses_symlinked_component_dir() {
+        let base = scratch("refresh-current-symlink");
+        let user = base.join("user");
+        let outside = base.join("outside").join("net");
+        std::fs::create_dir_all(&user).expect("user dir");
+        write_local_install(&outside, "net", "0.0.23", b"outside-bytes");
+        std::os::unix::fs::symlink(&outside, user.join("net")).expect("component symlink");
+
+        let error = refresh_current_pointer(&user, "net", "0.0.23")
+            .expect_err("refresh must not write through a component symlink");
+        assert_eq!(error.exit, EXIT_GENERIC, "{}", error.message);
+        assert!(
+            !outside.join("current").exists(),
+            "refresh must not escape the user tier"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

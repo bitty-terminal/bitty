@@ -371,12 +371,16 @@ pub enum SeedError {
     Manifest(String),
     /// A fetched body exceeded its hard byte bound (`curl --max-filesize`).
     Oversize(String),
+    /// A fetched artifact was empty. Empty is an artifact-integrity failure,
+    /// not an environmental transport failure: there is nothing to verify.
+    EmptyArtifact(String),
     /// The fetched bytes do not match the manifest digest (tamper).
     DigestMismatch(String),
     /// The extracted payload is not exactly the two expected members.
     MemberViolation(String),
     /// The extracted descriptor disagrees with the request or its binary
-    /// (substitution or downgrade).
+    /// (substitution; a downgrade names its own older version and is refused
+    /// by the per-name TOFU pin instead).
     DescriptorMismatch(String),
     /// A filesystem operation failed after validation (I/O context).
     Io(String),
@@ -399,6 +403,7 @@ impl SeedError {
             | Self::Io(_) => 1,
             Self::Manifest(_)
             | Self::Oversize(_)
+            | Self::EmptyArtifact(_)
             | Self::DigestMismatch(_)
             | Self::MemberViolation(_)
             | Self::DescriptorMismatch(_) => 4,
@@ -432,6 +437,7 @@ impl SeedError {
             Self::ManifestTransport(detail) => detail.clone(),
             Self::Manifest(detail) => detail.clone(),
             Self::Oversize(detail) => detail.clone(),
+            Self::EmptyArtifact(detail) => detail.clone(),
             Self::DigestMismatch(detail) => detail.clone(),
             Self::MemberViolation(detail) => detail.clone(),
             Self::DescriptorMismatch(detail) => detail.clone(),
@@ -1263,6 +1269,28 @@ fn find_tarball_digest(manifest: &str, tarball_file: &str) -> Result<String, See
     }
 }
 
+/// Bound the fetched tarball by length before hashing or unpacking.
+///
+/// `curl --max-filesize` is the transport-side bound; this post-read check is
+/// the second line of defense, so a transport that ignores the cap (or a future
+/// non-curl transport) still fails closed. An empty artifact is an
+/// integrity-class refusal (exit `4`), not an environmental one: there is
+/// nothing to verify.
+fn check_tarball_size(len: u64) -> Result<(), SeedError> {
+    if len > SEED_TARBALL_MAX_BYTES {
+        return Err(SeedError::Oversize(format!(
+            "bitty extension: fetched tarball exceeds {SEED_TARBALL_MAX_BYTES} bytes"
+        )));
+    }
+    if len == 0 {
+        return Err(SeedError::EmptyArtifact(
+            "bitty extension: fetched tarball is empty (nothing to verify; refusing to install)"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Fetch the tarball plus its manifest and verify every available digest.
 ///
 /// All-available-must-match (#1906): the CDN `SHA256SUMS` entry and the
@@ -1329,16 +1357,7 @@ fn fetch_verified_tarball(
             "bitty extension: cannot read fetched tarball: {error}"
         ))
     })?;
-    if bytes.len() as u64 > SEED_TARBALL_MAX_BYTES {
-        return Err(SeedError::Oversize(format!(
-            "bitty extension: fetched tarball exceeds {SEED_TARBALL_MAX_BYTES} bytes"
-        )));
-    }
-    if bytes.is_empty() {
-        return Err(SeedError::Fetch(
-            "bitty extension: fetched tarball is empty".to_string(),
-        ));
-    }
+    check_tarball_size(bytes.len() as u64)?;
     let actual = bitty_package::integrity::sha256_hex(&bytes);
     if !digests_equal_ct(&actual, &expected) {
         return Err(SeedError::DigestMismatch(format!(
@@ -1449,9 +1468,10 @@ fn audit_extracted(
 /// Unpack verified tarball bytes and validate the payload.
 ///
 /// Checks, in order: exact member set (audit), descriptor parse (strict
-/// installed rules), name/version binding to the request (substitution and
-/// downgrade fail here), executable-name binding, and descriptor-digest
-/// equality against the extracted binary (tamper fails here).
+/// installed rules), name/version binding to the request (substitution fails
+/// here; downgrade is refused later by the per-name TOFU pin), executable-name
+/// binding, and descriptor-digest equality against the extracted binary
+/// (tamper fails here).
 fn unpack_and_validate(
     tarball: &[u8],
     tarball_digest: &str,
@@ -1513,7 +1533,9 @@ fn unpack_and_validate(
             "bitty extension: extracted descriptor is invalid: {error}"
         ))
     })?;
-    // Substitution/downgrade: the payload must BE the requested release.
+    // Substitution: the payload must BE the requested release. An explicit
+    // downgrade requests the older version and passes this check; the
+    // per-name TOFU pin is what refuses a differing older artifact.
     if descriptor.name != name {
         return Err(SeedError::DescriptorMismatch(format!(
             "bitty extension: payload is for '{}', not {name:?} (refusing to install)",
@@ -1736,6 +1758,32 @@ mod tests {
         assert!(argv[0].iter().any(|arg| arg == &urls.manifest_url));
         assert!(argv[1].iter().any(|arg| arg == &urls.tarball_url));
         assert_eq!(stub.spawn_count("tar"), 2);
+    }
+
+    #[test]
+    fn empty_tarball_is_an_integrity_failure() {
+        let urls = seed_urls("net", "0.0.1", "x86_64-unknown-linux-gnu").expect("valid urls");
+        let empty_digest = bitty_package::integrity::sha256_hex(b"");
+        let manifest = manifest_for(&urls.tarball_file, &empty_digest);
+        let mut stub =
+            StubTransport::serving(&urls.tarball_url, b"", &urls.manifest_url, &manifest);
+        let error = fetch_seed_payload("net", "0.0.1", "x86_64-unknown-linux-gnu", None, &mut stub)
+            .expect_err("an empty artifact must refuse");
+        assert_eq!(error.exit_code(), 4);
+        assert!(error.message().contains("empty"), "{error}");
+    }
+
+    #[test]
+    fn post_read_tarball_size_guard_covers_bounds() {
+        // The post-read check is defense in depth behind `--max-filesize`:
+        // exercise the exact helper without materializing a 256 MiB body.
+        assert!(check_tarball_size(SEED_TARBALL_MAX_BYTES).is_ok());
+        let oversize = check_tarball_size(SEED_TARBALL_MAX_BYTES + 1).expect_err("over bound");
+        assert_eq!(oversize.exit_code(), 4);
+        assert!(oversize.message().contains("exceeds"), "{oversize}");
+        let empty = check_tarball_size(0).expect_err("empty body");
+        assert_eq!(empty.exit_code(), 4);
+        assert!(empty.message().contains("empty"), "{empty}");
     }
 
     /// Hostile corpus (mirrors the `make-component-dist.sh --print-url`
@@ -2865,6 +2913,7 @@ mod tests {
         assert_eq!(SeedError::Io("x".into()).exit_code(), 1);
         assert_eq!(SeedError::Manifest("x".into()).exit_code(), 4);
         assert_eq!(SeedError::Oversize("x".into()).exit_code(), 4);
+        assert_eq!(SeedError::EmptyArtifact("x".into()).exit_code(), 4);
         assert_eq!(SeedError::DigestMismatch("x".into()).exit_code(), 4);
         assert_eq!(SeedError::MemberViolation("x".into()).exit_code(), 4);
         assert_eq!(SeedError::DescriptorMismatch("x".into()).exit_code(), 4);

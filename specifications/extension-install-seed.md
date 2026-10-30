@@ -35,45 +35,66 @@ weakening the existing integrity controls.
 - **Lock record:** the release's published `SHA256SUMS` is the only lock Core
   reads. `extensions/catalog.v1` is not fetched, parsed, or embedded by Core.
 - **Budget:** at most one release artifact plus its `SHA256SUMS` manifest per
-  invocation. A verified local cache hit fetches nothing.
+  invocation. A verified local cache hit downloads nothing: the manifest fetch
+  is still attempted first, and only its transport failure activates reuse.
 - **Offline fallback:** the seed attempts the manifest fetch before checking
   the cache. When that manifest fetch fails (offline, DNS/TLS, timeout,
   non-success HTTP), an already-installed exact version that verifies
   locally is reused with no download. Reuse is available only when both
   `--digest` and `--force` are absent; either flag keeps the full fetch path.
   A tarball transport failure after a parsed manifest does not qualify, and
-  integrity, manifest-shape, and size failures never reach the cache.
+  integrity, manifest-shape, and size failures never reach the cache. The
+  cache read applies the same no-follow rules as `install_staged`: a
+  symlinked component dir, version dir, descriptor, or executable is a cache
+  miss, so reuse (and the `current` refresh) cannot escape the user tier.
+  The hit trusts the local user-tier tree, which is already in the user's
+  trust domain; it rewrites `current` to the explicitly requested
+  `--version`, exactly as an online install of that version would, and never
+  selects a different version.
 - **Handoff:** after staging, the seed prints the installed executable and
   stops. Catalog resolution, latest selection, updates, and list/inspect
   presentation are `bitty-plugin-manager` work.
 
 ## Bounds
 
-| Dimension         | Bound                                                      |
-| ----------------- | ---------------------------------------------------------- |
-| Seed identities   | 1 `(name, version, host target)` per invocation            |
-| Name              | `[a-z][a-z0-9-]{0,31}`                                     |
-| Version           | strict numeric `X.Y.Z` (no prerelease/build metadata)      |
-| Target            | host triple grammar, at most 64 bytes                      |
-| URLs              | at most 512 bytes, `https` on `cdn.bitty.run` only         |
-| Manifest total    | at most 64 KiB, 4096 lines, 1024 bytes per line            |
-| Tarball           | executable ceiling plus 1 MiB of descriptor/tar/gzip slack |
-| Extracted members | exactly `bitty-component.toml` and `bitty-<name>`          |
+| Dimension         | Bound                                                     |
+| ----------------- | --------------------------------------------------------- |
+| Seed identities   | 1 `(name, version, host target)` per invocation           |
+| Name              | `[a-z][a-z0-9-]{0,31}`                                    |
+| Version           | strict numeric `X.Y.Z` (no prerelease/build metadata)     |
+| Target            | host triple grammar, at most 64 bytes                     |
+| URLs              | at most 512 bytes, `https` on `cdn.bitty.run` only        |
+| Digest            | 64 ASCII hex chars; either case accepted, lowercased      |
+| Manifest total    | at most 64 KiB, 4096 lines, 1024 bytes per line           |
+| Tarball           | non-empty, at most executable ceiling plus 1 MiB of slack |
+| Extracted members | exactly `bitty-component.toml` and `bitty-<name>`         |
 
 Every bound is checked before the user tier is mutated. A failure exits `4`
 for metadata/artifact-integrity failures and `1` for environmental failures.
+An empty tarball is an artifact-integrity failure (exit `4`), not an
+environmental one: there is nothing to verify. The transport-side
+`--max-filesize` cap is re-checked after the read, so a transport that ignores
+the cap still fails closed.
 
 ## Trust chain
 
 - Unsigned 0.1.0 verifies by hash only; Windows ships unsigned, so hash-only
   is the uniform story. Sigstore/cosign remains a follow-up.
 - The seed allowlists the initial URL only. It follows `curl --location`
-  redirects, so HTTPS does not pin the host and path across a redirect; the
-  downloaded bytes are still checked against `SHA256SUMS`, so a redirect
-  cannot substitute content without failing the hash gate.
+  redirects, and `--proto =https` keeps redirects on HTTPS, but the effective
+  host and path are not pinned: a redirect can move the fetch to another
+  origin. The hash chain binds the tarball to the `SHA256SUMS` fetched in the
+  same invocation, not the manifest to `cdn.bitty.run`. A party controlling
+  the redirect (or the initial origin) can therefore serve a self-consistent
+  manifest and tarball; only the TOFU pin refuses a later change. Treat first
+  contact as trust-on-first-use, not as origin proof. Enforcing the effective
+  host across redirects is a follow-up; signature verification is the durable
+  fix.
 - All-available-must-match: the `SHA256SUMS` entry and the optional
   caller-supplied `--digest` must each match the downloaded bytes. A
-  mismatch refuses with exit `4`; there is no silent pick.
+  mismatch refuses with exit `4`; there is no silent pick. `--digest` matching
+  is ASCII case-insensitive and the pin is stored lowercase; uppercase input is
+  accepted and canonicalized, not rejected.
 - The TOFU pin records the first verified digest per extension name. A later
   differing digest fails closed as a pin mismatch unless `--force` explicitly
   re-pins after verification. That refusal is also the seed's downgrade and
@@ -116,12 +137,15 @@ single pinned artifact it installs.
 ## Verification
 
 - `crates/bitty-terminal/tests/extension_seed_boundary.rs` — retired symbols
-  stay out of Core; the budget stays one pinned release; the seed opens no
-  Rust network path.
+  stay out of every `src/**/*.rs` file (comments excluded); the production
+  budget stays one pinned release; the seed opens no Rust network path.
 - `crates/bitty-terminal/src/component.rs` unit tests — pinned install end to
-  end, offline verified-cache reuse (manifest-only), tarball-outage refusal
-  without cache reuse, tamper/pin-mismatch refusal, corrupt-pin recovery only
-  with `--force`, and downgrade-with-differing-digest refusal.
+  end, offline verified-cache reuse (manifest-only, exactly one fetch),
+  symlinked component dir/version dir/descriptor refusal, tarball-outage
+  refusal without cache reuse, tamper/pin-mismatch refusal, corrupt-pin
+  recovery only with `--force`, and downgrade-with-differing-digest refusal.
+- `crates/bitty-terminal/src/component_seed.rs` unit tests — empty tarball and
+  post-read oversize both fail as artifact integrity (exit `4`).
 - `crates/bitty-terminal/tests/cli_component.rs` — a bare install is usage
   (exit `2`) before any network contact; help names the manager boundary.
 - `crates/bitty-terminal/tests/fetch_env.rs` — exactly two fetches
@@ -147,4 +171,5 @@ trust chain:
   resolution input.
 
 Those changes belong to `bitty-plugins` and its manager task; this repository
-does not implement or gate them.
+does not implement or gate them. Tracked as
+[bitty-plugins#121](https://github.com/bitty-terminal/bitty-plugins/issues/121).

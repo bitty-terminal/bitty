@@ -19,9 +19,13 @@
 //!
 //! The child never inherits the daemon environment or a daemon descriptor:
 //! the environment is exactly the explicit spawn specification, stdio is the
-//! PTY slave only with close-on-exec duplicates, the master is close-on-exec,
-//! and the listener, audit, journal, and capability descriptors are all
-//! opened close-on-exec by their owners.
+//! PTY slave only, and the child's descriptor table is reduced to exactly
+//! 0/1/2 before `exec` - the slave handles are close-on-exec duplicates and a
+//! `close_range(2)` sweep in the child marks everything the parent already
+//! held close-on-exec, so a harness pipe or a sibling's transient handle cannot
+//! survive the exec. The master is close-on-exec, and the listener, audit,
+//! journal, and capability descriptors are all opened close-on-exec by their
+//! owners.
 //!
 //! The worker path is served on Linux only, and only when the startup
 //! containment probe selected an enforced plan. Every other platform or a
@@ -601,6 +605,11 @@ impl PtyCommand {
         // The child establishes the session and takes the PTY slave as its
         // controlling terminal inside the one documented syscall seam.
         crate::containment::establish_controlling_terminal(&mut command);
+        // Whatever the parent already held - a concurrently forked sibling's
+        // PTY duplicates, a test harness IPC pipe on a CI runner - is marked
+        // close-on-exec in the child, so the worker's descriptor table is
+        // exactly its stdio (bitty#2824).
+        crate::containment::close_inherited_descriptors(&mut command);
         Ok(Self {
             command,
             master: Some(master),
@@ -611,10 +620,12 @@ impl PtyCommand {
 #[cfg(target_os = "linux")]
 fn dup_file(slave: &File) -> Result<File, WorkerSpawnError> {
     // `openpty` descriptors are not close-on-exec. The child `dup2`s these
-    // copies onto 0/1/2 (which clears CLOEXEC on the target), but the copies
-    // themselves must not survive `exec`: duplicate them already
-    // close-on-exec so the worker inherits only stdio and never an extra
-    // slave handle.
+    // copies onto 0/1/2 (which clears CLOEXEC on the target), so the copies
+    // must not survive `exec` themselves: duplicate them already
+    // close-on-exec so a concurrently forked child of the daemon cannot
+    // inherit a stray slave handle either. The `close_range(2)` sweep on the
+    // command is the guarantee that nothing above stdio survives this worker's
+    // own `exec`.
     crate::containment::dup_cloexec(slave).map_err(|_| WorkerSpawnError::NotStarted)
 }
 
@@ -796,6 +807,12 @@ mod tests {
             "--nocapture",
             "--test-threads=1",
         ];
+        // Hold a non-close-on-exec pipe across the spawn: the same class of
+        // descriptor a CI test harness exposes at fd 142/145 (bitty#2824). A
+        // worker whose child-side sweep is missing reports it in the table
+        // below, so the assertion does not depend on how the local harness
+        // happens to open its own descriptors.
+        let _inherited = nix::unistd::pipe().expect("an inherited descriptor pair");
         let (mut pool, session) =
             spawn_test_worker_with_env(&limits, &argv, &["BITTY_FD_TABLE_PROBE=1"]);
 

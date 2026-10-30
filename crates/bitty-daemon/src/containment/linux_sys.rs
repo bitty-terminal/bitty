@@ -11,13 +11,16 @@
 //!   is the PTY slave on fd 0;
 //! - `pidfd_open(2)` and `pidfd_send_signal(2)`, so an orphan reap pins the
 //!   exact process and cannot signal a reused pid;
+//! - `close_range(2)` in the child, so the worker's descriptor table is
+//!   exactly its stdio no matter what the parent already held;
 //! - `ioctl(TIOCSWINSZ)` plus the `fcntl(2)` descriptor flags the PTY owner
 //!   needs (close-on-exec and non-blocking).
 //!
 //! All calls are async-signal-safe or descriptor-local. The `pre_exec`
 //! closures allocate nothing and touch no lock: one formats the pid into a
-//! stack buffer and calls `write`, the other calls `setsid` and `ioctl`. A
-//! failure aborts the exec and surfaces as a spawn error.
+//! stack buffer and calls `write`, another calls `setsid` and `ioctl`, and the
+//! descriptor sweep calls one syscall or a bounded `fcntl` loop. A failure
+//! aborts the exec and surfaces as a spawn error.
 
 #![allow(unsafe_code)]
 
@@ -84,6 +87,119 @@ pub(crate) fn dup_cloexec<Fd: AsFd>(fd: Fd) -> io::Result<File> {
     // SAFETY: `F_DUPFD_CLOEXEC` returned a fresh descriptor owned by this
     // call and not referenced anywhere else.
     Ok(File::from(unsafe { OwnedFd::from_raw_fd(raw) }))
+}
+
+/// The lowest descriptor a worker child may not inherit: stdio is 0/1/2.
+const FIRST_INHERITED_FD: u32 = 3;
+
+/// Highest descriptor the `fcntl` fallback scans when the soft limit is
+/// unbounded: the loop covers `3..FALLBACK_SCAN_MAX`.
+///
+/// `RLIMIT_NOFILE` is commonly `RLIM_INFINITY` on hosts that raise it; the
+/// fallback needs a finite bound, and a descriptor above this one is not
+/// reachable through the documented spawn surface anyway.
+const FALLBACK_SCAN_MAX: nix::libc::rlim_t = 1 << 20;
+
+/// Mark every descriptor above stdio close-on-exec in the forked child.
+///
+/// `Command`'s stdio setup `dup2`s the PTY slave onto 0/1/2 before any
+/// `pre_exec` closure runs, so this hook can mark the rest of the table
+/// close-on-exec without disturbing the worker's stdio. The kernel walks the
+/// child's own table, so descriptors the parent already held - a test harness
+/// IPC pipe, an inherited socket - are covered even though this crate never
+/// opened them (bitty#2824).
+///
+/// Descriptors are marked, not closed. `std` reports a failed `exec` through a
+/// close-on-exec pipe that must stay usable until `exec` itself, and the
+/// cgroup plan still writes the child's pid through its `cgroup.procs`
+/// descriptor in a later hook; both are already close-on-exec or are marked by
+/// this sweep, so neither survives the exec. Closing them here would turn a
+/// failed `exec` into a silent exit instead of a spawn error.
+pub(crate) fn close_inherited_descriptors(command: &mut Command) {
+    // SAFETY: `pre_exec` runs in the forked child between fork and exec. The
+    // closure calls one syscall, or a bounded `fcntl` loop, and allocates
+    // nothing and touches no Rust data structure or lock. Returning an error
+    // aborts the exec and is reported to the parent by `std`.
+    unsafe {
+        command.pre_exec(mark_inherited_cloexec);
+    }
+}
+
+/// The child-side descriptor sweep registered by
+/// [`close_inherited_descriptors`].
+fn mark_inherited_cloexec() -> io::Result<()> {
+    // `close_range(2)` arrived in Linux 5.9 and `CLOSE_RANGE_CLOEXEC` in 5.11;
+    // the raw syscall keeps the binary runnable on a libc whose `close_range`
+    // wrapper is newer than the deployed glibc.
+    // SAFETY: `close_range(2)` takes three scalar arguments and returns -1 on
+    // error; no pointer crosses the boundary.
+    let result = unsafe {
+        nix::libc::syscall(
+            nix::libc::SYS_close_range,
+            FIRST_INHERITED_FD,
+            u32::MAX,
+            nix::libc::CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        // `ENOSYS`: no `close_range` at all. `EINVAL`: the kernel predates the
+        // `CLOSE_RANGE_CLOEXEC` flag.
+        Some(code) if code == nix::libc::ENOSYS || code == nix::libc::EINVAL => {
+            mark_inherited_cloexec_by_fcntl()
+        }
+        // Any other failure means the sweep cannot be proven: abort the exec
+        // rather than start a worker with an unknown descriptor table.
+        _ => Err(error),
+    }
+}
+
+/// The fallback sweep for kernels without `CLOSE_RANGE_CLOEXEC`.
+///
+/// The scan is bounded by the process soft limit (see [`FALLBACK_SCAN_MAX`]);
+/// it runs once per spawn and only on kernels that predate the `close_range`
+/// flag.
+fn mark_inherited_cloexec_by_fcntl() -> io::Result<()> {
+    for fd in FIRST_INHERITED_FD..descriptor_ceiling() {
+        // SAFETY: `fcntl(2)` with `F_SETFD` takes one descriptor-local flag and
+        // no pointer.
+        let result = unsafe {
+            nix::libc::fcntl(
+                fd as nix::libc::c_int,
+                nix::libc::F_SETFD,
+                nix::libc::FD_CLOEXEC,
+            )
+        };
+        if result == 0 {
+            continue;
+        }
+        let error = io::Error::last_os_error();
+        // A closed descriptor is `EBADF` and cannot survive `exec`; any other
+        // failure means the sweep cannot be proven.
+        if error.raw_os_error() != Some(nix::libc::EBADF) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// The exclusive upper bound of the `fcntl` fallback scan.
+fn descriptor_ceiling() -> u32 {
+    let mut limit = nix::libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit(2)` writes one `struct rlimit` through the pointer and
+    // reads nothing else.
+    let status = unsafe { nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, &mut limit) };
+    if status != 0 {
+        return u32::try_from(FALLBACK_SCAN_MAX).unwrap_or(u32::MAX);
+    }
+    let soft = limit.rlim_cur.min(FALLBACK_SCAN_MAX);
+    u32::try_from(soft).unwrap_or(u32::MAX)
 }
 
 /// Set non-blocking I/O on `file`.
@@ -282,5 +398,44 @@ mod tests {
             "the child must lead the session it created"
         );
         assert_ne!(tty, 0, "the PTY slave must be the controlling terminal");
+    }
+
+    #[test]
+    fn descriptors_above_stdio_do_not_survive_exec() {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+
+        use nix::fcntl::{FcntlArg, fcntl};
+
+        let _pty = crate::containment::test_lock::lock();
+        // A pipe the parent holds without close-on-exec, the same class of
+        // descriptor a test harness hands its child on CI (bitty#2824). The
+        // high duplicate keeps the probe clear of the descriptors `sh` opens
+        // for itself.
+        let (read, _write) = nix::unistd::pipe().expect("pipe");
+        let duplicated = fcntl(&read, FcntlArg::F_DUPFD(64)).expect("dup the read end");
+        // SAFETY: `F_DUPFD` returned a fresh descriptor owned by this test.
+        let inherited = unsafe { OwnedFd::from_raw_fd(duplicated) };
+        let probe = format!("test -e /proc/self/fd/{}", inherited.as_raw_fd());
+
+        // The probe has teeth: without the hook the parent's descriptor is
+        // visible in the child after `exec`.
+        let leaked = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&probe)
+            .status()
+            .expect("the control child");
+        assert!(
+            leaked.success(),
+            "the parent's descriptor must be visible without the hook"
+        );
+
+        let mut hardened = Command::new("/bin/sh");
+        hardened.arg("-c").arg(&probe);
+        close_inherited_descriptors(&mut hardened);
+        let swept = hardened.status().expect("the hardened child");
+        assert!(
+            !swept.success(),
+            "a descriptor the parent held survived the child's exec"
+        );
     }
 }

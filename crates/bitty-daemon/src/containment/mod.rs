@@ -53,7 +53,8 @@ pub use self::child::{
 };
 #[cfg(target_os = "linux")]
 pub(crate) use self::linux_sys::{
-    dup_cloexec, establish_controlling_terminal, resize_pty, set_cloexec, set_nonblocking,
+    close_inherited_descriptors, dup_cloexec, establish_controlling_terminal, resize_pty,
+    set_cloexec, set_nonblocking,
 };
 #[cfg(target_os = "linux")]
 pub use self::subreaper::{SubreaperGuard, SubreaperRefusal};

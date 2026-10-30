@@ -85,6 +85,7 @@
 
 use crate::PanelLayoutMode;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use bitty_platform::{
     Clipboard, CursorPosition, KeyEvent, MouseButton, PhysicalSize, PlatformEvent, PressState,
@@ -123,6 +124,7 @@ use bitty_plugin_host::{
 
 use crate::config::{RuntimeConfig, TextStack};
 use crate::error::RuntimeError;
+use crate::hang_watchdog::HangGauges;
 use crate::queue::{ColdEvent, ColdQueue};
 
 pub mod animations;
@@ -565,6 +567,11 @@ pub struct Runtime {
     surface: Surface,
     gpu: Option<GpuContext>,
     cold_queue: ColdQueue,
+    /// Lock-free gauges published for the process hang watchdog (bitty#2830).
+    ///
+    /// The monitor thread reads only these atomics; it never borrows runtime
+    /// state, so reporting a wedged main thread cannot deadlock against it.
+    hang_gauges: Arc<HangGauges>,
     plugin_host: PluginHost,
     /// Native-component host (CTX-1361, bitty#2254).
     ///
@@ -1999,6 +2006,7 @@ impl Runtime {
             surface,
             gpu: None,
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
+            hang_gauges: Arc::new(HangGauges::new()),
             plugin_host,
             component_host: None,
             component_events: std::collections::VecDeque::new(),
@@ -2302,6 +2310,7 @@ impl Runtime {
             surface,
             gpu: None,
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
+            hang_gauges: Arc::new(HangGauges::new()),
             plugin_host,
             component_host: None,
             component_events: std::collections::VecDeque::new(),
@@ -3139,6 +3148,74 @@ impl Runtime {
     #[must_use]
     pub fn cold_queue_dropped(&self) -> u64 {
         self.cold_queue.dropped()
+    }
+
+    /// Lock-free gauges published for the process hang watchdog (bitty#2830).
+    ///
+    /// The composition root clones this handle into the watchdog monitor so a
+    /// stalled main thread can be described without taking any runtime lock.
+    #[must_use]
+    pub fn hang_gauges(&self) -> &Arc<HangGauges> {
+        &self.hang_gauges
+    }
+
+    /// Publishes the per-tick queue, layout, and content gauges.
+    ///
+    /// Called at the end of [`Self::tick_at`] on every return path. `Relaxed`
+    /// stores only; the values are diagnostics and never gate behavior.
+    fn publish_hang_gauges(&self) {
+        self.hang_gauges
+            .set_cold_queue(self.cold_queue.len(), self.cold_queue.dropped());
+        self.hang_gauges.set_plugin_pipeline(
+            self.plugin_host.pipeline().total_queued_events(),
+            self.plugin_host.pipeline().total_queued_bytes(),
+        );
+        self.hang_gauges.set_plugin_side(
+            self.plugin_host.side_queue().len(),
+            self.plugin_host.side_queue().dropped(),
+        );
+        self.hang_gauges
+            .set_component_events(self.component_events.len(), self.component_events_dropped);
+        let content_bytes = self.retained_content_bytes();
+        self.hang_gauges.set_layout(
+            self.pane_sessions.len(),
+            self.layout.leaf_count(),
+            content_bytes,
+        );
+        let bands = self.chrome_bands.top.len()
+            + self.chrome_bands.bottom.len()
+            + self.chrome_bands.left.len()
+            + self.chrome_bands.right.len();
+        let panels = self
+            .scene_host
+            .as_ref()
+            .and_then(|host| host.try_borrow().ok().map(|host| host.panel_count()))
+            .unwrap_or(0);
+        self.hang_gauges.set_panel_bindings(panels, bands);
+    }
+
+    /// Estimated retained terminal content bytes across every live grid.
+    ///
+    /// Counts the visible grid plus retained scrollback rows at their cell
+    /// width. This is an accounting estimate (the cell struct plus inline
+    /// style), not an allocator measurement; it exists to make long-run growth
+    /// visible in a hang dump, and it is bounded by the configured scrollback
+    /// caps by construction.
+    fn retained_content_bytes(&self) -> u64 {
+        fn grid_bytes(state: &State, cols: usize) -> u64 {
+            let cell = std::mem::size_of::<Cell>();
+            let rows = state.scrollback_len().saturating_add(state.height());
+            u64::try_from(rows)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(u64::try_from(cols).unwrap_or(u64::MAX))
+                .saturating_mul(u64::try_from(cell).unwrap_or(u64::MAX))
+        }
+        let mut bytes = grid_bytes(&self.state, self.cols);
+        for session in self.pane_sessions.values() {
+            let cols = session.state.width();
+            bytes = bytes.saturating_add(grid_bytes(&session.state, cols));
+        }
+        bytes
     }
 
     /// Drains all queued cold-path events in FIFO order.

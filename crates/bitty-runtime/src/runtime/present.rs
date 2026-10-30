@@ -2732,7 +2732,16 @@ impl Runtime {
     /// [`PASTE_BANNER_FULL_DURATION`] → still pending (never-silent) → gone
     /// on confirm/cancel. Behavior is otherwise identical to `tick()`.
     pub fn tick_at(&mut self, now: std::time::Instant) -> Option<PresentStats> {
+        // bitty#2830: bracket the whole tick (including every early return)
+        // so the hang watchdog can name the frame that never completed.
+        let tick_started = std::time::Instant::now();
+        // Publish the pre-tick queue depths too: a tick that blocks before it
+        // returns still leaves the dump with the state that fed it.
+        self.publish_hang_gauges();
         let stats = self.tick_at_inner(now);
+        self.publish_hang_gauges();
+        self.hang_gauges
+            .finish_tick(u64::try_from(tick_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         // Issue #2570: a retry tick that produced no present (the frame was
         // deferred, had no damage to rebuild, or returned before the present
         // phase) must not leave a past-due retry deadline behind:

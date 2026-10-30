@@ -1,4 +1,4 @@
-//! Bounded main-loop stall watchdog (issue #2483).
+//! Bounded main-loop hang watchdog (issues #2483, #2830).
 //!
 //! Long-running sessions can stop answering while the window stays mapped:
 //! the main (winit) thread is parked inside one phase, no further events are
@@ -6,24 +6,41 @@
 //! owner's report left no process behind, so this module exists to make the
 //! next occurrence self-describing.
 //!
+//! bitty#2830 made the diagnostic built in instead of opt-in: release builds
+//! arm the monitor by default, a single blocked tick or command writes one
+//! report, and `SIGUSR1` captures the same evidence from a process that still
+//! looks idle because winit is parked in `ControlFlow::Wait`.
+//!
 //! Design constraints:
 //!
 //! - **Observability only.** The watchdog never changes routing, timing, or
 //!   state. It marks phases and, on a stall, writes a bounded report.
-//! - **Opt-in.** `BITTY_STALL_WATCHDOG` is the required enable switch for the
-//!   monitor thread; CI, headless smoke runs, and normal sessions stay quiet
-//!   by default. A threshold variable never enables the watchdog on its own.
+//! - **Default-on in release, opt-in in debug.** `BITTY_HANG_WATCHDOG=0`
+//!   disables it. Debug builds default to off so unit/CI runs never write
+//!   diagnostics unless a developer asks for them; `BITTY_HANG_WATCHDOG=1`
+//!   enables the same monitor there. The legacy `BITTY_STALL_WATCHDOG` name
+//!   remains an accepted alias. A threshold variable never enables the
+//!   watchdog on its own.
+//! - **Named bounds.** [`HANG_WATCHDOG_TICK_BOUND`] and
+//!   [`HANG_WATCHDOG_COMMAND_BOUND`] tighten the generic
+//!   [`HANG_WATCHDOG_DEFAULT_BOUND`] for the two phases that have caused the
+//!   reported freezes: `Runtime::tick` and the cold command pump.
+//! - **One-shot.** One continuous stall writes exactly one report; after the
+//!   loop advances, one recovery line records how long it was wedged. A later
+//!   stall reports again. `SIGUSR1` always writes (rate-limited to one per
+//!   second) because the owner explicitly asked for that sample.
 //! - **No hot-path work.** A phase mark is one relaxed atomic store plus a
 //!   timestamp. The app publishes its bounded context sample at most twice a
-//!   second, and the monitor thread touches `/proc` only after a stall.
-//! - **Bounded.** A fixed thread-row cap, a fixed report-byte cap, and a
-//!   report count/interval limit per stall; repeated stalls cannot grow the
-//!   log without bound. The latest stall report atomically replaces one XDG
-//!   state slot (`bitty/stall-watchdog.log`) inside a disposable helper
-//!   process that also owns the stderr copy: the previous slot stays intact
-//!   unless a complete new report is renamed in, and a blocked stderr pipe is
-//!   bounded by killing the helper, never by changing the application's
-//!   descriptor flags.
+//!   second, the runtime publishes lock-free gauges on every tick, and the
+//!   monitor thread touches `/proc` only after a stall.
+//! - **Bounded.** A fixed thread-row cap, a fixed report-byte cap, and one
+//!   report per stall; repeated stalls cannot grow the log without bound. The
+//!   latest report atomically replaces one XDG state slot
+//!   (`bitty/stall-watchdog.log`) inside a disposable helper process that
+//!   also owns the stderr copy: the previous slot stays intact unless a
+//!   complete new report is renamed in, and a blocked stderr pipe is bounded
+//!   by killing the helper, never by changing the application's descriptor
+//!   flags.
 //! - **Observable delivery.** Every delivery returns a [`DeliveryOutcome`].
 //!   The sink mirrors a bounded ledger (`attempts`, `failures`, last outcome,
 //!   up to four recent failures) to a companion slot
@@ -74,17 +91,24 @@
 //!
 //! Configuration:
 //!
-//! - `BITTY_STALL_WATCHDOG=1` (or `true`/`on`) enables the watchdog with the
-//!   default 2000 ms threshold.
-//! - `BITTY_STALL_WATCHDOG=<milliseconds>` enables it with that threshold.
-//! - `BITTY_STALL_WATCHDOG_MS=<milliseconds>` overrides the threshold
+//! - Release builds arm the monitor with the default 10 s bound.
+//! - `BITTY_HANG_WATCHDOG=0` (or `false`/`off`/`no`) disables it; `1`
+//!   (or `true`/`on`/`yes`) enables it (including in debug builds).
+//! - `BITTY_HANG_WATCHDOG=<milliseconds>` enables it with that generic bound.
+//! - `BITTY_HANG_WATCHDOG_MS=<milliseconds>` overrides the generic bound
 //!   (clamped to `50..=600000`) but does not enable the watchdog by itself.
-//! - `0`/`false`/`off` leaves it disabled; invalid values stay disabled.
+//! - The legacy `BITTY_STALL_WATCHDOG` / `BITTY_STALL_WATCHDOG_MS` names are
+//!   accepted as aliases for existing runbooks.
+//! - `BITTY_HANG_WATCHDOG_ABORT=1` additionally aborts a debug build after
+//!   the report (with a backtrace); release builds never abort.
+//! - `SIGUSR1` (Unix) writes the same report without exiting and is not
+//!   gated by the environment switch: an operator capturing a wedged process
+//!   must not need to have predicted it at launch.
 //!
 //! The idle state is explicit: after the event loop arms `ControlFlow::Wait`
 //! the app calls [`StallWatchdog::idle`], so a quiet window is never reported
 //! as a stall. The monitor only fires while a phase is active and the
-//! heartbeat has not advanced past the threshold.
+//! heartbeat has not advanced past that phase's bound.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -98,14 +122,44 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::logging;
+use bitty_runtime::hang_watchdog::{HangGaugeSnapshot, HangGauges};
 
-/// Environment switch for the watchdog.
-pub(crate) const WATCHDOG_ENV: &str = "BITTY_STALL_WATCHDOG";
-/// Environment override for the stall threshold in milliseconds.
-pub(crate) const WATCHDOG_THRESHOLD_ENV: &str = "BITTY_STALL_WATCHDOG_MS";
+#[cfg(unix)]
+use signal_hook::SigId;
+#[cfg(unix)]
+use signal_hook::consts::SIGUSR1;
+#[cfg(unix)]
+use signal_hook::flag as signal_flag;
 
-/// Default no-progress threshold (#2446 asks for a >2 s stall report).
-pub(crate) const DEFAULT_STALL_THRESHOLD: Duration = Duration::from_secs(2);
+/// Environment switch for the watchdog (bitty#2830).
+pub(crate) const HANG_WATCHDOG_ENV: &str = "BITTY_HANG_WATCHDOG";
+/// Environment override for the generic hang bound in milliseconds.
+pub(crate) const HANG_WATCHDOG_THRESHOLD_ENV: &str = "BITTY_HANG_WATCHDOG_MS";
+/// Legacy (pre-#2830) environment switch, kept as an alias for runbooks.
+pub(crate) const LEGACY_WATCHDOG_ENV: &str = "BITTY_STALL_WATCHDOG";
+/// Legacy (pre-#2830) threshold override, kept as an alias.
+pub(crate) const LEGACY_WATCHDOG_THRESHOLD_ENV: &str = "BITTY_STALL_WATCHDOG_MS";
+/// Opt-in debug abort after a report (with a backtrace).
+pub(crate) const HANG_WATCHDOG_ABORT_ENV: &str = "BITTY_HANG_WATCHDOG_ABORT";
+
+/// Generic no-progress bound for an arbitrary main-loop phase.
+///
+/// Ten seconds is long enough that a loaded but healthy desktop never trips it
+/// and short enough that the owner still has a live process to inspect.
+pub(crate) const HANG_WATCHDOG_DEFAULT_BOUND: Duration = Duration::from_secs(10);
+/// Tighter bound for one `Runtime::tick` (the reported freeze stage).
+///
+/// A healthy frame is milliseconds; three seconds means the compositor has
+/// already shown the window as unresponsive.
+pub(crate) const HANG_WATCHDOG_TICK_BOUND: Duration = Duration::from_secs(3);
+/// Bound for the cold plugin-command pump.
+///
+/// A single command may legitimately run for several seconds under its own
+/// RC-1 budget; ten seconds names a callback that outlived its executor
+/// deadline.
+pub(crate) const HANG_WATCHDOG_COMMAND_BOUND: Duration = Duration::from_secs(10);
+/// Default no-progress threshold before bitty#2830 tightened single phases.
+pub(crate) const DEFAULT_STALL_THRESHOLD: Duration = HANG_WATCHDOG_DEFAULT_BOUND;
 /// Smallest accepted threshold; below this normal cold ticks look like stalls.
 const MIN_STALL_THRESHOLD: Duration = Duration::from_millis(50);
 /// Largest accepted threshold; keeps the monitor useful after long idles.
@@ -114,8 +168,9 @@ const MAX_STALL_THRESHOLD: Duration = Duration::from_secs(600);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Minimum sampling period; small thresholds still get several samples.
 const MIN_POLL_INTERVAL: Duration = Duration::from_millis(5);
-/// Minimum time between repeated reports for one continuous stall.
-const REPORT_REPEAT_INTERVAL: Duration = Duration::from_secs(30);
+/// Minimum interval between two `SIGUSR1`-requested dumps.
+#[cfg(unix)]
+const SIGNAL_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 /// Minimum time between app-context samples pushed by the main thread.
 ///
 /// The sampler allocates the bounded plugin/band id lists, so it must not run
@@ -131,8 +186,8 @@ const STATE_FILE_NAME: &str = "stall-watchdog.log";
 const DELIVERY_FILE_NAME: &str = "stall-watchdog-delivery.log";
 /// Prefix of a stall report line; only these overwrite the state slot.
 const STALL_REPORT_PREFIX: &str = "bitty: main-loop stall detected";
-/// Maximum reports for one continuous stall (bounded log growth).
-const MAX_REPORTS_PER_STALL: u32 = 5;
+/// Prefix of a `SIGUSR1` capture line; also overwrites the state slot.
+const SIGNAL_REPORT_PREFIX: &str = "bitty: main-loop hang dump (SIGUSR1)";
 /// Maximum thread rows included in one report.
 ///
 /// Linux-only: the sampler reads `/proc/self/task`; other targets render an
@@ -140,7 +195,7 @@ const MAX_REPORTS_PER_STALL: u32 = 5;
 #[cfg(target_os = "linux")]
 const MAX_THREAD_ROWS: usize = 64;
 /// Maximum bytes in one report (hard cap after rendering).
-const MAX_REPORT_BYTES: usize = 8 * 1024;
+const MAX_REPORT_BYTES: usize = 16 * 1024;
 /// Deadline for the complete isolated report delivery.
 ///
 /// Covers helper spawn, the bounded stdin transfer, helper work (atomic state
@@ -371,7 +426,7 @@ pub(crate) struct WatchdogConfig {
 }
 
 impl WatchdogConfig {
-    /// Default opt-in configuration (2 s threshold).
+    /// Default configuration (10 s generic bound).
     const fn default_threshold() -> Self {
         Self {
             threshold: DEFAULT_STALL_THRESHOLD,
@@ -385,19 +440,35 @@ impl WatchdogConfig {
             threshold: candidate.clamp(MIN_STALL_THRESHOLD, MAX_STALL_THRESHOLD),
         }
     }
+
+    /// Effective no-progress bound for one phase.
+    ///
+    /// The tighter per-phase bounds are the bitty#2830 contract: a tick or a
+    /// cold command that outlives them is a hang even when the generic bound
+    /// has not elapsed. A caller-configured generic threshold still wins when
+    /// it is shorter, so an operator can only tighten diagnostics.
+    fn bound_for(&self, phase: Phase) -> Duration {
+        let phase_bound = match phase {
+            Phase::RuntimeTick => HANG_WATCHDOG_TICK_BOUND,
+            Phase::ColdCommands => HANG_WATCHDOG_COMMAND_BOUND,
+            _ => HANG_WATCHDOG_DEFAULT_BOUND,
+        };
+        self.threshold.min(phase_bound)
+    }
 }
 
-/// Parse the opt-in switch and optional threshold.
+/// Parse the enable switch and optional threshold.
 ///
 /// Pure so the environment contract is testable without touching the process
-/// environment. Returns `None` for an absent switch, an explicit off value,
-/// or an unparseable value (fail-quiet: diagnostics never surprise CI).
+/// environment. `enable = None` means the build default (on in release, off
+/// in debug); an explicit off value always wins. An unparseable value leaves
+/// the watchdog disabled (fail-quiet: diagnostics never surprise CI).
 pub(crate) fn config_from_values(
     enable: Option<&str>,
     threshold: Option<&str>,
 ) -> Option<WatchdogConfig> {
     let enabled = match enable.map(str::trim) {
-        None | Some("") => false,
+        None | Some("") => default_enabled(),
         Some(value)
             if value.eq_ignore_ascii_case("0")
                 || value.eq_ignore_ascii_case("false")
@@ -435,11 +506,56 @@ pub(crate) fn config_from_values(
     })
 }
 
-/// Read the opt-in configuration from the process environment.
+/// Whether this build arms the watchdog without an environment switch.
+///
+/// Release is the owner-facing product build and must capture the next hang
+/// without anyone predicting it. Debug is a developer/CI build where a
+/// deliberately slow test could otherwise write a state slot; `BITTY_HANG_WATCHDOG=1`
+/// opts in there for reproduction.
+const fn default_enabled() -> bool {
+    !cfg!(debug_assertions)
+}
+
+/// Read the configuration from the process environment.
 fn config_from_env() -> Option<WatchdogConfig> {
-    let enable = std::env::var(WATCHDOG_ENV).ok();
-    let threshold = std::env::var(WATCHDOG_THRESHOLD_ENV).ok();
+    let enable = std::env::var(HANG_WATCHDOG_ENV)
+        .ok()
+        .or_else(|| std::env::var(LEGACY_WATCHDOG_ENV).ok());
+    let threshold = std::env::var(HANG_WATCHDOG_THRESHOLD_ENV)
+        .ok()
+        .or_else(|| std::env::var(LEGACY_WATCHDOG_THRESHOLD_ENV).ok());
     config_from_values(enable.as_deref(), threshold.as_deref())
+}
+
+/// Whether the operator explicitly switched the watchdog off.
+///
+/// Distinguishes `BITTY_HANG_WATCHDOG=0` (no monitor, no `SIGUSR1` capture)
+/// from the debug-build default (monitor present for signal capture, periodic
+/// stall reporting off).
+fn environment_disables() -> bool {
+    let value = std::env::var(HANG_WATCHDOG_ENV)
+        .ok()
+        .or_else(|| std::env::var(LEGACY_WATCHDOG_ENV).ok());
+    value.is_some_and(|value| {
+        let value = value.trim();
+        value.eq_ignore_ascii_case("0")
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("off")
+            || value.eq_ignore_ascii_case("no")
+    })
+}
+
+/// Whether a debug build should abort after writing the report.
+fn abort_after_report() -> bool {
+    if !cfg!(debug_assertions) {
+        return false;
+    }
+    std::env::var(HANG_WATCHDOG_ABORT_ENV).is_ok_and(|value| {
+        !(value.eq_ignore_ascii_case("0")
+            || value.eq_ignore_ascii_case("false")
+            || value.eq_ignore_ascii_case("off")
+            || value.eq_ignore_ascii_case("no"))
+    })
 }
 
 /// One sampled thread's kernel-visible state.
@@ -462,12 +578,15 @@ pub(crate) struct ProcessTotals {
 
 /// One rendered stall report, built on the monitor thread only.
 struct StallReport {
+    reason: DiagnosticReason,
     threshold: Duration,
     idle: Duration,
     phase: Phase,
     app_uptime: Duration,
     progress: u64,
     context: Option<WatchdogContext>,
+    /// Lock-free runtime gauges sampled at dump time (bitty#2830).
+    gauges: HangGaugeSnapshot,
     threads: Vec<ThreadRow>,
     totals: ProcessTotals,
     /// Outcomes of earlier report deliveries, shown in-band so a lost evidence
@@ -505,14 +624,12 @@ impl DeliverySummary {
 }
 
 /// Monitor state machine, kept separate from the thread for deterministic
-/// tests of the rate limiter.
+/// tests of the one-shot contract.
 #[derive(Debug, Default)]
 struct MonitorState {
     last_progress: u64,
     stall_started: Option<Instant>,
-    last_report: Option<Instant>,
-    reports: u32,
-    suppression_logged: bool,
+    reported: bool,
 }
 
 /// What the monitor decided after one sample.
@@ -520,12 +637,10 @@ struct MonitorState {
 enum MonitorAction {
     /// Nothing to emit.
     None,
-    /// Emit a stall report for `idle` of no progress.
+    /// Emit the one report for this continuous stall (`idle` old).
     Report { idle: Duration },
     /// The loop made progress again after a reported stall.
     Recovered { stalled_for: Duration },
-    /// The per-stall report cap was reached; emit one suppression line.
-    Suppressed,
 }
 
 impl MonitorState {
@@ -544,10 +659,7 @@ impl MonitorState {
                 .stall_started
                 .take()
                 .map(|started| now.saturating_duration_since(started));
-            let had_report = self.reports > 0;
-            self.reports = 0;
-            self.last_report = None;
-            self.suppression_logged = false;
+            let had_report = std::mem::replace(&mut self.reported, false);
             return match recovered {
                 Some(stalled_for) if had_report => MonitorAction::Recovered { stalled_for },
                 _ => MonitorAction::None,
@@ -557,32 +669,19 @@ impl MonitorState {
             // Idle is expected: no stall, and a threshold crossing that ended
             // without a report leaves no recovery line.
             self.stall_started = None;
-            self.reports = 0;
-            self.last_report = None;
-            self.suppression_logged = false;
+            self.reported = false;
             return MonitorAction::None;
         }
         if idle < threshold {
             return MonitorAction::None;
         }
         let _ = self.stall_started.get_or_insert(now);
-        let due = match self.last_report {
-            None => true,
-            Some(last) => now.saturating_duration_since(last) >= REPORT_REPEAT_INTERVAL,
-        };
-        if due && self.reports < MAX_REPORTS_PER_STALL {
-            self.reports = self.reports.saturating_add(1);
-            self.last_report = Some(now);
-            return MonitorAction::Report { idle };
-        }
-        if !due {
+        if self.reported {
+            // One-shot: a continuous stall never writes a second report.
             return MonitorAction::None;
         }
-        if !self.suppression_logged {
-            self.suppression_logged = true;
-            return MonitorAction::Suppressed;
-        }
-        MonitorAction::None
+        self.reported = true;
+        MonitorAction::Report { idle }
     }
 }
 
@@ -595,10 +694,12 @@ struct Shared {
     active: AtomicBool,
     progress: AtomicU64,
     context: Mutex<WatchdogContext>,
+    /// Lock-free runtime gauges published on every tick (bitty#2830).
+    gauges: Arc<HangGauges>,
 }
 
 impl Shared {
-    fn new() -> Self {
+    fn new(gauges: Arc<HangGauges>) -> Self {
         Self {
             start: Instant::now(),
             last_beat_ns: AtomicU64::new(0),
@@ -607,6 +708,7 @@ impl Shared {
             active: AtomicBool::new(true),
             progress: AtomicU64::new(0),
             context: Mutex::new(WatchdogContext::default()),
+            gauges,
         }
     }
 
@@ -692,7 +794,7 @@ impl StopSignal {
     }
 }
 
-/// Opt-in main-loop watchdog handle.
+/// Main-loop hang watchdog handle (issue #2483, built in by bitty#2830).
 ///
 /// `Drop` requests a stop and joins the monitor: shutdown leaves no detached
 /// monitor behind and no report is written once `Drop` returns. The production
@@ -705,38 +807,81 @@ pub(crate) struct StallWatchdog {
     shared: Arc<Shared>,
     stop: Arc<StopSignal>,
     monitor: Option<JoinHandle<()>>,
+    /// `SIGUSR1` registration; unregistered on shutdown.
+    ///
+    /// The flag the handler sets lives on the monitor thread.
+    #[cfg(unix)]
+    signal_id: Option<SigId>,
     /// Set by the monitor thread right before it exits (test observability).
     #[cfg(test)]
     finished: Arc<AtomicBool>,
 }
 
 impl StallWatchdog {
-    /// Start the watchdog when the environment opts in.
-    pub(crate) fn from_env() -> Option<Self> {
-        config_from_env().map(|config| {
-            let slot = StateSlot::from_env();
-            let mut sink = ReportSink::new(slot, Box::new(HelperDelivery::current()));
-            Self::start(config, Box::new(move |line| sink.emit(line)))
-        })
+    /// Start the watchdog from the environment.
+    ///
+    /// Release builds start it by default. Debug builds start it only when
+    /// `BITTY_HANG_WATCHDOG=1`; `SIGUSR1` capture is still armed in debug so
+    /// a developer can ask for a dump from any running test binary. An
+    /// explicit `BITTY_HANG_WATCHDOG=0` disables both.
+    pub(crate) fn from_env(gauges: Arc<HangGauges>) -> Option<Self> {
+        if environment_disables() {
+            return None;
+        }
+        let config = config_from_env();
+        let stall_enabled = config.is_some();
+        // Unit-test binaries construct many apps; without an explicit opt-in
+        // they neither need periodic reports nor a signal-capture thread per
+        // instance. The denial test drives `StallWatchdog::start` directly.
+        if cfg!(test) && !stall_enabled {
+            return None;
+        }
+        let config = config.unwrap_or_else(WatchdogConfig::default_threshold);
+        let slot = StateSlot::from_env();
+        let mut sink = ReportSink::new(slot, Box::new(HelperDelivery::current()));
+        Some(Self::start(
+            config,
+            stall_enabled,
+            gauges,
+            Box::new(move |line| sink.emit(line)),
+        ))
     }
 
     /// Start a watchdog with an explicit configuration and sink.
     fn start(
         config: WatchdogConfig,
+        stall_enabled: bool,
+        gauges: Arc<HangGauges>,
         mut sink: Box<dyn FnMut(&str) -> DeliveryOutcome + Send>,
     ) -> Self {
-        let shared = Arc::new(Shared::new());
+        let shared = Arc::new(Shared::new(gauges));
         let stop = Arc::new(StopSignal::new());
+        #[cfg(unix)]
+        let (signal_flag, signal_id) = {
+            let flag = Arc::new(AtomicBool::new(false));
+            match signal_flag::register(SIGUSR1, Arc::clone(&flag)) {
+                Ok(id) => (flag, Some(id)),
+                Err(error) => {
+                    logging::warn(|| {
+                        format!(
+                            "bitty: SIGUSR1 hang capture unavailable ({error}); periodic watchdog remains armed"
+                        )
+                    });
+                    (flag, None)
+                }
+            }
+        };
         #[cfg(test)]
         let finished = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
         let thread_stop = Arc::clone(&stop);
+        #[cfg(unix)]
+        let thread_signal = Arc::clone(&signal_flag);
         #[cfg(test)]
         let thread_finished = Arc::clone(&finished);
-        let threshold = config.threshold;
         let poll_interval = std::cmp::max(
             MIN_POLL_INTERVAL,
-            std::cmp::min(DEFAULT_POLL_INTERVAL, threshold / 4),
+            std::cmp::min(DEFAULT_POLL_INTERVAL, config.threshold / 4),
         );
         let spawn = std::thread::Builder::new()
             .name(String::from("bitty-stall-watchdog"))
@@ -744,7 +889,10 @@ impl StallWatchdog {
                 monitor_loop(
                     &thread_shared,
                     &thread_stop,
-                    threshold,
+                    config,
+                    stall_enabled,
+                    #[cfg(unix)]
+                    &thread_signal,
                     poll_interval,
                     &mut sink,
                 );
@@ -756,7 +904,7 @@ impl StallWatchdog {
             Err(error) => {
                 logging::warn(|| {
                     format!(
-                        "bitty: stall watchdog thread unavailable ({error}); diagnostics stay off"
+                        "bitty: hang watchdog thread unavailable ({error}); diagnostics stay off"
                     )
                 });
                 #[cfg(test)]
@@ -768,6 +916,8 @@ impl StallWatchdog {
             shared,
             stop,
             monitor,
+            #[cfg(unix)]
+            signal_id,
             #[cfg(test)]
             finished,
         }
@@ -804,6 +954,10 @@ impl StallWatchdog {
     /// Request monitor shutdown and wait for the thread to exit.
     fn shutdown(&mut self) -> std::thread::Result<()> {
         self.stop.request();
+        #[cfg(unix)]
+        if let Some(id) = self.signal_id.take() {
+            let _ = signal_hook::low_level::unregister(id);
+        }
         match self.monitor.take() {
             Some(handle) => handle.join(),
             None => Ok(()),
@@ -824,10 +978,13 @@ impl Drop for StallWatchdog {
 }
 
 /// Monitor thread body.
+#[allow(clippy::too_many_arguments)]
 fn monitor_loop(
     shared: &Shared,
     stop: &StopSignal,
-    threshold: Duration,
+    config: WatchdogConfig,
+    stall_enabled: bool,
+    #[cfg(unix)] signal_flag: &AtomicBool,
     poll_interval: Duration,
     sink: &mut (dyn FnMut(&str) -> DeliveryOutcome + Send),
 ) {
@@ -836,31 +993,40 @@ fn monitor_loop(
         ..MonitorState::default()
     };
     let mut delivery = DeliverySummary::default();
+    #[cfg(unix)]
+    let mut last_signal_at: Option<Instant> = None;
     loop {
         if stop.wait(poll_interval) {
             return;
         }
         let now = Instant::now();
+        #[cfg(unix)]
+        if signal_flag.swap(false, Ordering::SeqCst) {
+            let due = last_signal_at
+                .is_none_or(|last| now.saturating_duration_since(last) >= SIGNAL_REPORT_INTERVAL);
+            if due && !stop.is_stopped() {
+                last_signal_at = Some(now);
+                let report = build_report(shared, config, DiagnosticReason::Signal, now, delivery);
+                let rendered = render_report(&report);
+                if stop.is_stopped() {
+                    return;
+                }
+                delivery.record(sink(&rendered));
+                maybe_abort_after_report();
+            }
+        }
+        if !stall_enabled {
+            continue;
+        }
         let progress = shared.progress.load(Ordering::Relaxed);
         let phase = Phase::from_u8(shared.phase.load(Ordering::Relaxed));
         let active = shared.active.load(Ordering::Relaxed);
         let idle = shared.idle_for();
-        match state.evaluate(now, progress, active, idle, threshold) {
+        let bound = config.bound_for(phase);
+        match state.evaluate(now, progress, active, idle, bound) {
             MonitorAction::None => {}
-            MonitorAction::Report { idle } => {
-                let context = shared.context.try_lock().ok().map(|slot| slot.clone());
-                let totals_snapshot = sample_process_totals();
-                let report = StallReport {
-                    threshold,
-                    idle,
-                    phase,
-                    app_uptime: now.saturating_duration_since(shared.start),
-                    progress,
-                    context,
-                    threads: totals_snapshot.0,
-                    totals: totals_snapshot.1,
-                    delivery,
-                };
+            MonitorAction::Report { idle: _ } => {
+                let report = build_report(shared, config, DiagnosticReason::Stall, now, delivery);
                 let rendered = render_report(&report);
                 // Sampling /proc and rendering takes time; never emit once
                 // shutdown was requested.
@@ -868,28 +1034,83 @@ fn monitor_loop(
                     return;
                 }
                 delivery.record(sink(&rendered));
+                maybe_abort_after_report();
             }
             MonitorAction::Recovered { stalled_for } => {
                 if stop.is_stopped() {
                     return;
                 }
                 delivery.record(sink(&format!(
-                    "bitty: main-loop stall recovered after {} ms (phase={})",
+                    "bitty: main-loop hang recovered after {} ms (phase={})",
                     stalled_for.as_millis(),
                     phase.as_str()
                 )));
             }
-            MonitorAction::Suppressed => {
-                if stop.is_stopped() {
-                    return;
-                }
-                delivery.record(sink(&format!(
-                    "bitty: main-loop stall still active after {} reports; further reports suppressed",
-                    MAX_REPORTS_PER_STALL
-                )));
-            }
         }
     }
+}
+
+/// Why one diagnostic is being written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosticReason {
+    /// The monitored phase exceeded its bound.
+    Stall,
+    /// The operator sent `SIGUSR1` (Unix only).
+    #[cfg(unix)]
+    Signal,
+}
+
+impl DiagnosticReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stall => "stall",
+            #[cfg(unix)]
+            Self::Signal => "sigusr1",
+        }
+    }
+
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Stall => STALL_REPORT_PREFIX,
+            #[cfg(unix)]
+            Self::Signal => SIGNAL_REPORT_PREFIX,
+        }
+    }
+}
+
+/// Assemble one report from the shared heartbeat, context, gauges, and `/proc`.
+fn build_report(
+    shared: &Shared,
+    config: WatchdogConfig,
+    reason: DiagnosticReason,
+    now: Instant,
+    delivery: DeliverySummary,
+) -> StallReport {
+    let phase = Phase::from_u8(shared.phase.load(Ordering::Relaxed));
+    let totals_snapshot = sample_process_totals();
+    StallReport {
+        reason,
+        threshold: config.bound_for(phase),
+        idle: shared.idle_for(),
+        phase,
+        app_uptime: now.saturating_duration_since(shared.start),
+        progress: shared.progress.load(Ordering::Relaxed),
+        context: shared.context.try_lock().ok().map(|slot| slot.clone()),
+        gauges: shared.gauges.snapshot(),
+        threads: totals_snapshot.0,
+        totals: totals_snapshot.1,
+        delivery,
+    }
+}
+
+/// Debug-only opt-in abort after a report.
+fn maybe_abort_after_report() {
+    if !abort_after_report() {
+        return;
+    }
+    let backtrace = std::backtrace::Backtrace::force_capture();
+    eprintln!("bitty: hang watchdog debug abort requested\n{backtrace}");
+    std::process::abort();
 }
 
 /// Sample all threads and process totals (Linux); other targets return empty.
@@ -951,15 +1172,28 @@ fn linux_thread_snapshot() -> (Vec<ThreadRow>, ProcessTotals) {
     totals.fd_count = std::fs::read_dir("/proc/self/fd")
         .map(|entries| entries.flatten().count())
         .unwrap_or(0);
-    totals.rss_kib = read_proc_text("/proc/self/status", 8192)
+    // bitty#2830: RSS comes from `/proc/self/statm` (resident pages), scaled
+    // by the kernel page size reported by the first `smaps` mapping. The
+    // 4 KiB fallback matches every x86_64 target and keeps the field present
+    // when `smaps` is restricted.
+    totals.rss_kib = rss_kib_from_statm().unwrap_or(0);
+    (rows, totals)
+}
+
+/// Resident set size in KiB from `/proc/self/statm` plus the kernel page size.
+#[cfg(target_os = "linux")]
+fn rss_kib_from_statm() -> Option<u64> {
+    let statm = read_proc_text("/proc/self/statm", 256)?;
+    let resident_pages = statm.split_whitespace().nth(1)?.parse::<u64>().ok()?;
+    let page_kib = read_proc_text("/proc/self/smaps", 4096)
         .and_then(|text| {
             text.lines().find_map(|line| {
-                let rest = line.strip_prefix("VmRSS:")?;
+                let rest = line.trim().strip_prefix("KernelPageSize:")?;
                 rest.split_whitespace().next()?.parse::<u64>().ok()
             })
         })
-        .unwrap_or(0);
-    (rows, totals)
+        .unwrap_or(4);
+    resident_pages.checked_mul(page_kib)
 }
 
 /// Read a proc file, capping bytes before UTF-8 lossy conversion.
@@ -1017,16 +1251,36 @@ fn sanitize_identifier(raw: &str, max_chars: usize) -> String {
 
 /// Render one bounded report.
 fn render_report(report: &StallReport) -> String {
-    let mut out = String::with_capacity(1024);
-    let _ = writeln!(
-        out,
-        "bitty: main-loop stall detected: no progress for {} ms (threshold {} ms, phase={}, app_uptime {} ms, progress={})",
-        report.idle.as_millis(),
-        report.threshold.as_millis(),
-        report.phase.as_str(),
-        report.app_uptime.as_millis(),
-        report.progress,
-    );
+    let mut out = String::with_capacity(2048);
+    match report.reason {
+        DiagnosticReason::Stall => {
+            let _ = writeln!(
+                out,
+                "{}: no progress for {} ms (threshold {} ms, phase={}, app_uptime {} ms, progress={}, pid={})",
+                report.reason.prefix(),
+                report.idle.as_millis(),
+                report.threshold.as_millis(),
+                report.phase.as_str(),
+                report.app_uptime.as_millis(),
+                report.progress,
+                std::process::id(),
+            );
+        }
+        #[cfg(unix)]
+        DiagnosticReason::Signal => {
+            let _ = writeln!(
+                out,
+                "{}: operator requested a capture (phase={}, app_uptime {} ms, progress={}, pid={}, idle {} ms)",
+                report.reason.prefix(),
+                report.phase.as_str(),
+                report.app_uptime.as_millis(),
+                report.progress,
+                std::process::id(),
+                report.idle.as_millis(),
+            );
+        }
+    }
+    let _ = writeln!(out, "  reason={}", report.reason.as_str());
     match &report.context {
         Some(context) => {
             let focus = context
@@ -1087,9 +1341,12 @@ fn render_report(report: &StallReport) -> String {
     }
     let _ = writeln!(
         out,
-        "  process: threads={} fds={} rss={} KiB",
+        "  process: threads={} fds={} rss={} KiB (statm)",
         report.totals.thread_count, report.totals.fd_count, report.totals.rss_kib,
     );
+    // bitty#2830: the runtime gauges make an accumulation or deadlock visible
+    // without a second tool: queue depths, content bytes, plugin state.
+    let _ = writeln!(out, "{}", report.gauges.render());
     // The delivery summary goes before the thread table: the row list is the
     // only unbounded-ish section, so truncation must drop rows, never the
     // evidence about earlier failed deliveries.
@@ -2230,13 +2487,14 @@ impl ReportSink {
     /// Emit one line, record what happened, and return the outcome.
     fn emit(&mut self, line: &str) -> DeliveryOutcome {
         let redacted = crate::observability::redact_text_for_stderr(line);
-        // Recovery/suppression lines share the sink but never overwrite the
-        // stall evidence.
-        let slot = if line.starts_with(STALL_REPORT_PREFIX) {
-            self.slot.as_ref()
-        } else {
-            None
-        };
+        // Recovery lines share the sink but never overwrite the diagnostic;
+        // both the periodic stall and the SIGUSR1 capture own the slot.
+        let slot =
+            if line.starts_with(STALL_REPORT_PREFIX) || line.starts_with(SIGNAL_REPORT_PREFIX) {
+                self.slot.as_ref()
+            } else {
+                None
+            };
         let attempt = self.ledger.attempts.saturating_add(1);
         let result = self.delivery.deliver(DeliveryRequest {
             line: redacted.as_ref(),
@@ -2890,8 +3148,11 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
-    fn config_is_opt_in_and_threshold_is_clamped() {
-        assert_eq!(config_from_values(None, None), None);
+    fn config_is_default_on_and_threshold_is_clamped() {
+        assert_eq!(
+            config_from_values(None, None),
+            default_enabled().then(WatchdogConfig::default_threshold)
+        );
         assert_eq!(config_from_values(Some("0"), None), None);
         assert_eq!(config_from_values(Some("off"), None), None);
         assert_eq!(config_from_values(Some("nonsense"), None), None);
@@ -2954,7 +3215,7 @@ mod tests {
     }
 
     #[test]
-    fn monitor_reports_then_rate_limits_and_recovers() {
+    fn monitor_reports_once_and_recovers() {
         let mut state = MonitorState {
             last_progress: 7,
             ..MonitorState::default()
@@ -2965,14 +3226,14 @@ mod tests {
                 start,
                 7,
                 true,
-                Duration::from_millis(2000),
+                DEFAULT_STALL_THRESHOLD,
                 DEFAULT_STALL_THRESHOLD
             ),
             MonitorAction::Report {
-                idle: Duration::from_millis(2000)
+                idle: DEFAULT_STALL_THRESHOLD
             }
         );
-        // Within the repeat interval: silent.
+        // One-shot: a continuous stall never writes a second report.
         assert_eq!(
             state.evaluate(
                 start + Duration::from_secs(5),
@@ -2983,7 +3244,6 @@ mod tests {
             ),
             MonitorAction::None
         );
-        // At the repeat interval: report again.
         assert_eq!(
             state.evaluate(
                 start + Duration::from_secs(30),
@@ -2992,9 +3252,7 @@ mod tests {
                 Duration::from_secs(32),
                 DEFAULT_STALL_THRESHOLD
             ),
-            MonitorAction::Report {
-                idle: Duration::from_secs(32)
-            }
+            MonitorAction::None
         );
         // Progress after a report emits one recovery line.
         assert_eq!(
@@ -3022,30 +3280,52 @@ mod tests {
     }
 
     #[test]
-    fn monitor_caps_reports_per_stall() {
+    fn monitor_is_one_shot_per_stall() {
         let mut state = MonitorState {
             last_progress: 9,
             ..MonitorState::default()
         };
         let start = Instant::now();
         let mut reports = 0;
-        let mut suppressed = 0;
         for step in 0..20 {
             let now = start + Duration::from_secs(30 * step);
-            match state.evaluate(
-                now,
-                9,
-                true,
-                Duration::from_secs(3600),
-                DEFAULT_STALL_THRESHOLD,
+            if matches!(
+                state.evaluate(
+                    now,
+                    9,
+                    true,
+                    Duration::from_secs(3600),
+                    DEFAULT_STALL_THRESHOLD,
+                ),
+                MonitorAction::Report { .. }
             ) {
-                MonitorAction::Report { .. } => reports += 1,
-                MonitorAction::Suppressed => suppressed += 1,
-                _ => {}
+                reports += 1;
             }
         }
-        assert_eq!(reports, MAX_REPORTS_PER_STALL);
-        assert_eq!(suppressed, 1);
+        assert_eq!(reports, 1, "a continuous stall writes exactly one report");
+    }
+
+    #[test]
+    fn per_phase_bounds_tighten_tick_and_command() {
+        let config = WatchdogConfig::default_threshold();
+        assert_eq!(
+            config.bound_for(Phase::RuntimeTick),
+            HANG_WATCHDOG_TICK_BOUND
+        );
+        assert_eq!(
+            config.bound_for(Phase::ColdCommands),
+            HANG_WATCHDOG_COMMAND_BOUND
+        );
+        assert_eq!(
+            config.bound_for(Phase::PluginTimers),
+            HANG_WATCHDOG_DEFAULT_BOUND
+        );
+        // A shorter operator threshold still wins.
+        let tight = WatchdogConfig::with_threshold_ms(500);
+        assert_eq!(
+            tight.bound_for(Phase::RuntimeTick),
+            Duration::from_millis(500)
+        );
     }
 
     #[test]
@@ -3061,7 +3341,7 @@ mod tests {
 
     #[test]
     fn context_samples_are_throttled() {
-        let shared = Shared::new();
+        let shared = Shared::new(Arc::new(HangGauges::new()));
         assert!(shared.context_due());
         shared
             .last_context_ns
@@ -3802,6 +4082,7 @@ mod tests {
         }
         rows.truncate(MAX_THREAD_ROWS);
         let report = StallReport {
+            reason: DiagnosticReason::Stall,
             threshold: DEFAULT_STALL_THRESHOLD,
             idle: Duration::from_secs(3),
             phase: Phase::RuntimeTick,
@@ -3822,6 +4103,13 @@ mod tests {
                 probe_redraw_seen: true,
                 ..Default::default()
             }),
+            gauges: HangGaugeSnapshot {
+                tick_count: 41,
+                last_tick_ns: 4_000_000,
+                plugin_parked_commands: 1,
+                plugin_active_commands: 1,
+                ..HangGaugeSnapshot::default()
+            },
             threads: rows,
             totals,
             delivery: DeliverySummary {
@@ -3864,12 +4152,14 @@ mod tests {
             })
             .collect();
         let report = StallReport {
+            reason: DiagnosticReason::Stall,
             threshold: DEFAULT_STALL_THRESHOLD,
             idle: Duration::from_secs(3),
             phase: Phase::RuntimeTick,
             app_uptime: Duration::from_secs(7200),
             progress: 42,
             context: None,
+            gauges: HangGaugeSnapshot::default(),
             threads: rows,
             totals: ProcessTotals::default(),
             delivery: DeliverySummary {
@@ -3902,6 +4192,8 @@ mod tests {
         let (tx, rx) = mpsc::channel::<String>();
         let watchdog = StallWatchdog::start(
             WatchdogConfig::with_threshold_ms(40),
+            true,
+            Arc::new(HangGauges::new()),
             Box::new(move |line| {
                 let _ = tx.send(line.to_string());
                 DeliveryOutcome::Delivered
@@ -3917,7 +4209,80 @@ mod tests {
         let recovered = rx
             .recv_timeout(Duration::from_secs(5))
             .expect("recovery line must arrive");
-        assert!(recovered.contains("stall recovered"), "{recovered}");
+        assert!(recovered.contains("hang recovered"), "{recovered}");
+        watchdog
+            .stop_and_join()
+            .expect("monitor thread must exit cleanly");
+    }
+
+    /// bitty#2830 acceptance: a blocked stage writes exactly one report, and
+    /// that report names every field the issue requires.
+    #[test]
+    fn blocked_stage_writes_one_complete_dump() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let gauges = Arc::new(HangGauges::new());
+        gauges.set_input_commands(2, 1);
+        gauges.set_pending_exits(3);
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(100),
+            true,
+            Arc::clone(&gauges),
+            Box::new(move |line| {
+                let _ = tx.send(line.to_string());
+                DeliveryOutcome::Delivered
+            }),
+        );
+        // Simulate the runtime tick that never returns: the main thread stops
+        // advancing the phase while the monitor keeps sampling.
+        watchdog.enter(Phase::RuntimeTick);
+        let first = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("blocked tick must produce a dump");
+        assert!(first.starts_with(STALL_REPORT_PREFIX), "{first}");
+        assert!(first.contains("phase=runtime-tick"), "{first}");
+        assert!(first.contains("reason=stall"), "{first}");
+        // Runtime gauges (bitty#2830 field set).
+        for key in [
+            "runtime: tick_count=",
+            "last_tick_ms=",
+            "pending_input_bytes=",
+            "cold_queue=",
+            "plugin_events=",
+            "plugin_parked=",
+            "plugin_active=",
+            "component_events=",
+            "panes=",
+            "content_bytes=",
+            "event_ring=",
+            "pending_deliveries=",
+            "workers=",
+            "leases=",
+            "bindings=",
+            "input_commands=2",
+            "input_commands_dropped=1",
+            "pending_exits=3",
+        ] {
+            assert!(first.contains(key), "missing {key}: {first}");
+        }
+        // Process evidence.
+        assert!(first.contains("fds="), "{first}");
+        assert!(first.contains("rss="), "{first}");
+        #[cfg(target_os = "linux")]
+        {
+            assert!(first.contains("tid="), "{first}");
+            assert!(first.contains("[main]"), "{first}");
+            assert!(first.contains("state="), "{first}");
+        }
+        // Still blocked: the one-shot contract forbids a second report.
+        assert!(
+            rx.recv_timeout(Duration::from_millis(400)).is_err(),
+            "a continuous stall must not write a second dump"
+        );
+        watchdog.idle();
+        let recovered = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("recovery line");
+        assert!(recovered.contains("hang recovered"), "{recovered}");
         watchdog
             .stop_and_join()
             .expect("monitor thread must exit cleanly");
@@ -4047,6 +4412,8 @@ mod tests {
         let sink_writes = Arc::clone(&writes);
         let watchdog = StallWatchdog::start(
             WatchdogConfig::with_threshold_ms(45),
+            true,
+            Arc::new(HangGauges::new()),
             Box::new(move |line| {
                 let outcome = sink.emit(line);
                 sink_writes.fetch_add(1, Ordering::SeqCst);
@@ -4139,6 +4506,8 @@ mod tests {
         let sink_writes = Arc::clone(&writes);
         let watchdog = StallWatchdog::start(
             WatchdogConfig::with_threshold_ms(30),
+            true,
+            Arc::new(HangGauges::new()),
             Box::new(move |_line| {
                 let _ = entered_tx.send(());
                 // Hold the monitor inside the sink until the test releases it.
@@ -4566,6 +4935,8 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let watchdog = StallWatchdog::start(
             WatchdogConfig::with_threshold_ms(30),
+            true,
+            Arc::new(HangGauges::new()),
             Box::new(move |line| {
                 let _ = entered_tx.send(());
                 let started = Instant::now();

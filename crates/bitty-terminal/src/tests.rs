@@ -9215,6 +9215,26 @@ fn init_preview_echo_absent_without_preview() {
     );
 }
 
+#[test]
+fn parked_command_wake_is_a_bounded_future_deadline() {
+    let now = std::time::Instant::now();
+    assert_eq!(
+        crate::terminal_app::parked_command_wake(now, false),
+        None,
+        "no parked command must not arm a wake"
+    );
+    let deadline =
+        crate::terminal_app::parked_command_wake(now, true).expect("a parked command arms a wake");
+    assert!(
+        deadline > now,
+        "a parked command must never re-arm a past-due wake (bitty#2830)"
+    );
+    assert!(
+        deadline - now <= std::time::Duration::from_millis(10),
+        "the resume wake must stay prompt"
+    );
+}
+
 // Live-spawn: the wizard-owned preview session hot-updates per step on the
 // real constructor (not the deterministic rasterizer). Unix-only in this
 // slice (no ConPTY coverage); require_pty keeps the force-no-PTY simulation

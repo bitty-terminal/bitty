@@ -733,6 +733,10 @@ impl Runtime {
         // finished (fast disks) apply here, still within the same poll's
         // timing class; slower reads complete on later polls. Non-blocking.
         self.pump_kitty_local_completions();
+        // bitty#2830: publish the bounded writer-buffer depth for the hang
+        // watchdog without a second pass over the queue.
+        self.hang_gauges
+            .set_pending_input(self.pending_input.len(), self.pending_input_dropped);
         count
     }
 

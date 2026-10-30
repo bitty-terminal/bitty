@@ -214,6 +214,7 @@ pub mod cw_present;
 pub mod error;
 pub mod execution_component;
 mod execution_jobs;
+pub mod hang_watchdog;
 pub mod host_bridge;
 pub mod inspect;
 pub mod paste;

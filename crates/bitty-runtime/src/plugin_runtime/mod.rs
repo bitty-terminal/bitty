@@ -65,6 +65,7 @@ use bitty_plugin_host::{
     parse_service_reference, validate_interface_schema, value_satisfies_schema,
 };
 
+use crate::hang_watchdog::{ActiveCommandGuard, HangGauges};
 pub use crate::runtime::fx::{FX_PULSE_QUEUE_CAPACITY, FxPulseQueue, QueuedFxPulse};
 pub use bitty_lua::runtime_inspect::{
     DecorationGeometry, ExtensionActivation, ExtensionInspectRow, ExtensionTrust, InspectRows,
@@ -974,6 +975,11 @@ pub struct PluginRuntime {
     /// per plugin on dispose/reload/rollback. Bounded by the live timer cap
     /// in practice (one entry per unconsumed fire, normally zero).
     timer_fired: BTreeSet<(PluginId, i64)>,
+    /// Shared hang-watchdog gauges (bitty#2830).
+    ///
+    /// `None` in tests and embedders that do not install a watchdog; command
+    /// dispatch then skips the two relaxed atomic stores per invocation.
+    hang_gauges: Option<Arc<HangGauges>>,
 }
 
 impl PluginRuntime {
@@ -1072,6 +1078,51 @@ impl PluginRuntime {
             parked_commands: BTreeMap::new(),
             timer_deadlines: BTreeMap::new(),
             timer_fired: BTreeSet::new(),
+            hang_gauges: None,
+        }
+    }
+
+    /// Installs the shared hang-watchdog gauges (bitty#2830).
+    ///
+    /// The composition root passes the same handle the [`Runtime`] publishes
+    /// into, so the monitor thread can read plugin parked/active/worker counts
+    /// while the owner thread is blocked inside a plugin callback.
+    ///
+    /// [`Runtime`]: crate::Runtime
+    pub fn set_hang_gauges(&mut self, gauges: Arc<HangGauges>) {
+        self.hang_gauges = Some(gauges);
+        self.publish_hang_gauges();
+    }
+
+    /// Republish the plugin-side hang gauges (parked commands, live VMs).
+    ///
+    /// The watchdog context sampler calls this at its bounded cadence so a
+    /// count that changes outside dispatch (activation, dispose, reload) is
+    /// visible without adding stores to the lifecycle hot path.
+    pub fn publish_hang_gauges(&self) {
+        self.publish_hang_command_gauges();
+        self.publish_hang_worker_gauge();
+    }
+
+    /// Publishes the parked command count for the hang watchdog.
+    ///
+    /// The active count is owned by [`ActiveCommandGuard`] and is never
+    /// rewritten here, so a parked publish cannot race a live invocation.
+    fn publish_hang_command_gauges(&self) {
+        if let Some(gauges) = self.hang_gauges.as_ref() {
+            gauges.set_plugin_parked(self.parked_commands.len());
+        }
+    }
+
+    /// Publishes the live plugin-VM count for the hang watchdog.
+    fn publish_hang_worker_gauge(&self) {
+        if let Some(gauges) = self.hang_gauges.as_ref() {
+            let workers = self
+                .entries
+                .values()
+                .filter(|entry| entry.vm.is_some())
+                .count();
+            gauges.set_plugin_workers(workers);
         }
     }
 
@@ -2535,6 +2586,7 @@ impl PluginRuntime {
     pub fn activate(&mut self, id: &PluginId) -> Result<ActivationReport, PluginRuntimeError> {
         let result = self.activate_inner(id);
         self.sync_debug_view();
+        self.publish_hang_worker_gauge();
         result
     }
 
@@ -3338,6 +3390,7 @@ impl PluginRuntime {
     pub fn dispose(&mut self, id: &PluginId) -> Result<(), PluginRuntimeError> {
         let result = self.dispose_inner(id);
         self.sync_debug_view();
+        self.publish_hang_worker_gauge();
         result
     }
 
@@ -3573,7 +3626,12 @@ impl PluginRuntime {
             .cloned()
             .ok_or_else(|| lifecycle_error(id, "no VM"))?;
         let result = match vm.try_borrow_mut() {
-            Ok(mut vm) => vm.call_function_resumable(&run, args),
+            Ok(mut vm) => {
+                // bitty#2830: mark the callback in flight before entering the
+                // VM so a hang dump still sees the invocation it interrupted.
+                let _active = ActiveCommandGuard::new(self.hang_gauges.as_ref());
+                vm.call_function_resumable(&run, args)
+            }
             Err(_) => {
                 return Err(PluginRuntimeError::Vm(format!(
                     "command '{command_id}' owner '{}' is busy",
@@ -3594,6 +3652,7 @@ impl PluginRuntime {
                         result_schema: result_schema.clone(),
                     },
                 );
+                self.publish_hang_command_gauges();
                 return Err(PluginRuntimeError::Parked {
                     plugin: id.to_string(),
                     detail: format!(
@@ -3826,7 +3885,12 @@ impl PluginRuntime {
                 continue;
             };
             let outcome = match vm.try_borrow_mut() {
-                Ok(mut vm) => vm.resume_parked_call(),
+                Ok(mut vm) => {
+                    // bitty#2830: a resumed parked body is still an executing
+                    // plugin command for hang attribution.
+                    let _active = ActiveCommandGuard::new(self.hang_gauges.as_ref());
+                    vm.resume_parked_call()
+                }
                 Err(_) => {
                     // A live borrow is unexpected on the cold path; keep the
                     // park for the next tick instead of guessing.
@@ -3871,6 +3935,7 @@ impl PluginRuntime {
                 }
             }
         }
+        self.publish_hang_command_gauges();
         completed
     }
 
@@ -3888,6 +3953,7 @@ impl PluginRuntime {
         if self.clear_vm_park(id) {
             self.parked_commands.remove(id);
         }
+        self.publish_hang_command_gauges();
     }
 
     /// Drop the VM's parked executor. Returns `false` only when a live borrow

@@ -203,6 +203,27 @@ Bitty is shaped by the tools its authors use every day:
 Bitty does not share code with these projects; the inspiration is in the
 product ideas and the standards they helped define.
 
+## Diagnostics
+
+Release builds arm a built-in hang watchdog: if a frame or a cold plugin
+command stops making progress past its bound, Bitty writes one bounded report
+to `$XDG_STATE_HOME/bitty/stall-watchdog.log` (falling back to
+`~/.local/state/bitty/stall-watchdog.log`) with the current phase, tick
+durations, queue and plugin counts, retained content bytes, file-descriptor
+count, RSS, and per-thread kernel states. If the window stops repainting or
+accepting input, capture the same report from a live process without killing
+it:
+
+```sh
+kill -USR1 "$(pgrep -n bitty)"
+```
+
+`SIGUSR1` is Unix-only and writes one dump per second at most. The watchdog is
+on by default in release builds; set `BITTY_HANG_WATCHDOG=0` to disable it, or
+`BITTY_HANG_WATCHDOG=1` to enable it in a debug build. `BITTY_HANG_WATCHDOG_MS`
+overrides the generic bound (the tick and command phases keep their own
+tighter bounds).
+
 ## Development
 
 Prerequisites and the pinned development tools are documented in

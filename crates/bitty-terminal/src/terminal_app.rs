@@ -30,6 +30,27 @@ use crate::stall_watchdog::{Phase, StallWatchdog, WatchdogContext};
 /// hold at [`bitty_runtime::PRESENT_SETTLE_MAX`] under a continuous producer.
 pub(crate) const PRESENT_SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
 
+/// Bounded retry delay for a parked plugin command's resume wake (bitty#2830).
+///
+/// A parked command resumes one RC-1 wall window per cold tick. Re-arming the
+/// wake at `Instant::now()` made an otherwise idle window spin through the
+/// cold phase continuously while the command stayed parked; 2 ms keeps the
+/// resume prompt without creating a busy loop.
+pub(crate) const PARKED_COMMAND_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(2);
+
+/// Wake time for a parked plugin command (bitty#2830).
+///
+/// `None` when nothing is parked. `Some(now + PARKED_COMMAND_RETRY_DELAY)`
+/// otherwise: never `now`, because a past-due wake re-enters `AboutToWait`
+/// immediately and spins the cold phase while the command stays parked.
+pub(crate) fn parked_command_wake(
+    now: std::time::Instant,
+    parked: bool,
+) -> Option<std::time::Instant> {
+    parked.then(|| now + PARKED_COMMAND_RETRY_DELAY)
+}
+
 /// Window title carrying the resolved theme preset and its source layer.
 ///
 /// Visible via `hyprctl clients` and (where decorations show) the title bar,
@@ -917,13 +938,14 @@ impl TerminalApp {
         spawn_spec: SpawnSpec,
     ) -> Self {
         let event_tracker = EventTracker::from_runtime(&runtime);
+        let stall_watchdog = StallWatchdog::from_env(std::sync::Arc::clone(runtime.hang_gauges()));
         Self {
             runtime,
             window: WindowState::new(theme_name, source),
             pty_rx: None,
             _pty_thread: None,
             presented_frames: 0,
-            stall_watchdog: StallWatchdog::from_env(),
+            stall_watchdog,
             #[cfg(test)]
             test_surface_retry_deadline: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
@@ -967,13 +989,14 @@ impl TerminalApp {
     ) -> Self {
         let (pty_rx, handle) = spawn_demo_pty_pump_with_theme(theme_name, source);
         let event_tracker = EventTracker::from_runtime(&runtime);
+        let stall_watchdog = StallWatchdog::from_env(std::sync::Arc::clone(runtime.hang_gauges()));
         Self {
             runtime,
             window: WindowState::new(theme_name, source),
             pty_rx: Some(pty_rx),
             _pty_thread: Some(handle),
             presented_frames: 0,
-            stall_watchdog: StallWatchdog::from_env(),
+            stall_watchdog,
             #[cfg(test)]
             test_surface_retry_deadline: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
@@ -1136,6 +1159,17 @@ impl TerminalApp {
         if !watchdog.context_due() {
             return;
         }
+        // bitty#2830: app-owned queue depths and the plugin-side gauges ride
+        // the same bounded cadence as the identifier sample.
+        let gauges = self.runtime.hang_gauges();
+        gauges.set_input_commands(
+            self.pending_input_commands.len(),
+            self.pending_input_commands_dropped,
+        );
+        gauges.set_pending_exits(self.pending_exits.len());
+        if let Some(plugin) = self.plugin_runtime.as_ref() {
+            plugin.publish_hang_gauges();
+        }
         let discovered = self
             .plugin_runtime
             .as_ref()
@@ -1281,7 +1315,12 @@ impl TerminalApp {
     /// Attaches the plugin runtime (CTX-0892). Production startup passes
     /// the runtime returned by [`crate::plugin_runtime::discover_and_activate`];
     /// tests and plugin-less runs leave it `None`.
-    pub(crate) fn with_plugin_runtime(mut self, runtime: Option<PluginRuntime>) -> Self {
+    pub(crate) fn with_plugin_runtime(mut self, mut runtime: Option<PluginRuntime>) -> Self {
+        // bitty#2830: share the Core gauge handle so a hung plugin callback is
+        // visible in the watchdog dump without borrowing plugin state.
+        if let Some(plugin) = runtime.as_mut() {
+            plugin.set_hang_gauges(std::sync::Arc::clone(self.runtime.hang_gauges()));
+        }
         self.plugin_runtime = runtime;
         self
     }
@@ -2279,10 +2318,11 @@ impl TerminalApp {
     /// the next loop iteration deliver the resume window. `None` when nothing
     /// is parked, so idle wakeups are unchanged.
     fn parked_command_deadline(&self) -> Option<std::time::Instant> {
-        self.plugin_runtime
+        let parked = self
+            .plugin_runtime
             .as_ref()
-            .filter(|runtime| runtime.parked_command_count() > 0)
-            .map(|_| std::time::Instant::now())
+            .is_some_and(|runtime| runtime.parked_command_count() > 0);
+        parked_command_wake(std::time::Instant::now(), parked)
     }
 
     /// Fire due one-shot plugin timers (CTX-1244).

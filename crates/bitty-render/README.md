@@ -114,7 +114,11 @@ coverage is absent.
   frame. Since CTX-1641 (bitty#2785) a shipped build installs the shared scene
   host at composition time and routes `bitty.ui.mount("terminal", …)` /
   `ui.update` through the `ui.rich` reader into an attached scene, so a
-  mounted plugin scene does paint. Image nodes stay placement references: this
+  mounted plugin scene does paint. The additive v2 `SceneNode::Styled` kind
+  (CTX-1659, bitty#2112) is measured and painted here too: padding insets the
+  child, and a bordered node emits one rounded ring into the compositor's
+  existing rounded pass (no new pipeline), with the colour resolved from the
+  closed content-token palette. Image nodes stay placement references: this
   module resolves no pixels for them, and forwarding them to the admitted
   image plane is a separate slice.
 - `src/error.rs` — owned error types.

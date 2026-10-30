@@ -45,6 +45,12 @@
 //! | `CodeBlock` | `CodeBlock` |
 //! | `Table` | `Table` |
 //! | `Rule` | `Rule` |
+//!
+//! The additive v2 `SceneNode::Styled` kind is not emitted by this v1 bridge:
+//! `UiRichNode` has no style field yet and the candidate wire form is not
+//! shipped. The scene model, its admission check, the paint path, and the
+//! accessibility projection all support the kind, so a future `ui.rich`
+//! revision is a reader change with no new Core vocabulary.
 
 #![forbid(unsafe_code)]
 
@@ -248,6 +254,10 @@ mod tests {
                 SceneNode::Row(_) => "row",
                 SceneNode::Column(_) => "column",
                 SceneNode::Block { .. } => "block",
+                // The v1 `ui.rich` bridge never emits the additive v2 style
+                // kind (no style field exists on `UiRichNode` yet); the arm
+                // keeps the drift test exhaustive for the scene model.
+                SceneNode::Styled { .. } => "styled",
                 SceneNode::Image(_) => "image",
                 SceneNode::CodeBlock(_) => "codeblock",
                 SceneNode::Table(_) => "table",

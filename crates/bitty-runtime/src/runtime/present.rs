@@ -3389,6 +3389,7 @@ impl Runtime {
             built.atlas_epoch = Some(epoch);
         }
         built.fills.extend(scene.fills);
+        built.rounded.extend(scene.rounded);
         built.glyphs.extend(scene.glyphs);
         built.needs_draw = true;
         built.scene_report.views = built.scene_report.views.saturating_add(1);

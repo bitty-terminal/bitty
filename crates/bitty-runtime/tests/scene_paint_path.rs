@@ -16,12 +16,13 @@ use bitty_render::glyph::{
 use bitty_render::grid::SnapshotDamage;
 use bitty_render::grid::{CellMetrics, DrawList, GridRenderer};
 use bitty_render::scene::{
-    ScenePaintBudget, ScenePaintError, ScenePaintStyle, SceneSurface, paint_scene,
+    ContentPalette, ScenePaintBudget, ScenePaintError, ScenePaintStyle, SceneSurface, paint_scene,
     paint_scene_with_style,
 };
-use bitty_render::{ExtentPx, RectPx, frame::plan_frame};
+use bitty_render::{ExtentPx, RectPx, ThemePalette, frame::plan_frame};
 use bitty_rich::scene::{
-    BlockAnchor, BlockId, Border, RichBlock, SceneError, SceneNode, ScrollBehavior, StyledSpan,
+    BlockAnchor, BlockId, Border, ContentToken, RichBlock, SceneError, SceneNode, SceneNodeStyle,
+    ScrollBehavior, StyledSpan,
 };
 use bitty_runtime::cw_present::consume_scene_present_at;
 use bitty_runtime::registry::{PanelHandle, PanelRegistryConfig, PanelRuntime, PanelType};
@@ -590,6 +591,85 @@ fn present_loop_paints_panel_scene_inside_its_leaf_and_projects_its_text() {
         changed_inside += 1;
     }
     assert!(changed_inside > 0, "the scene never reached the frame");
+}
+
+/// A scene whose only content is one bordered, rounded, padded text node.
+fn styled_ring_scene() -> bitty_rich::scene::Scene {
+    let mut scene = bitty_rich::scene::Scene::new();
+    scene
+        .insert(
+            RichBlock::new(
+                BlockId(1),
+                BlockAnchor::Zone(1),
+                SceneNode::Styled {
+                    style: SceneNodeStyle::new(0, 6, 4, ContentToken::Error),
+                    child: Box::new(SceneNode::Text(StyledSpan {
+                        text: "held".to_string(),
+                        bold: false,
+                        italic: false,
+                    })),
+                },
+                ScrollBehavior::Inline,
+                1,
+                1,
+                1,
+            )
+            .expect("styled block fits SCN-1..3 and the style caps"),
+        )
+        .expect("scene admits the block");
+    scene
+}
+
+#[test]
+fn present_loop_composes_a_style_ring_into_the_rounded_pass() {
+    let now = Instant::now();
+    let view = ViewId::new(1);
+    let mut rt = present_runtime();
+    let (host, _handle) = scene_host(view, styled_ring_scene());
+    rt.install_scene_host(host);
+    rt.tick_at(now).expect("styled scene frame presents");
+
+    let report = rt.scene_frame().clone();
+    assert_eq!(report.views, 1);
+    assert_eq!(
+        report.ops, 2,
+        "one rounded ring plus one text op reach the frame"
+    );
+    assert_eq!(report.images, 0);
+    assert_eq!(report.refusals, 0);
+    assert_eq!(
+        report.a11y.len(),
+        1,
+        "the styled scene still projects exactly one a11y node"
+    );
+    assert_eq!(
+        report.a11y[0].lines,
+        vec![(0, "held".to_string())],
+        "the style ring adds no node and hides no text"
+    );
+
+    let surface = presented_surface(&rt, view);
+    // The ring frame is the measured text box ("held" = 4 cells x 1 row).
+    let ring = RectPx::new(
+        surface.rect.x,
+        surface.rect.y,
+        4 * cell().width,
+        cell().height,
+    );
+    let rgba = rt.headless_rgba().expect("headless rgba");
+    let width = usize::try_from(rt.surface_extent().expect("surface").width()).expect("width");
+    let expected =
+        ContentPalette::from_theme_palette(&ThemePalette::bitty_dark()).color(ContentToken::Error);
+    // Sample the middle of the top ring band: the SDF corner cut cannot reach
+    // it, so the pixel is exactly the resolved state.error colour.
+    let x = ring.x + i32::try_from(ring.width / 2).expect("x fits i32");
+    let y = ring.y + 1;
+    let index = (usize::try_from(y).expect("y") * width + usize::try_from(x).expect("x")) * 4;
+    assert_eq!(
+        &rgba[index..index + 4],
+        expected,
+        "the rounded style ring is composed into the frame"
+    );
 }
 
 #[test]

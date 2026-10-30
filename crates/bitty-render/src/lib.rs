@@ -326,9 +326,9 @@ pub use hidpi::{
 };
 pub use pipeline::UNDERLINE_WGSL;
 pub use scene::{
-    SCENE_PAINT_MAX_BORDER_CELLS, SCENE_PAINT_MAX_OPS, ScenePaint, ScenePaintBudget,
-    ScenePaintCache, ScenePaintError, ScenePaintOp, ScenePaintStyle, SceneSurface, SceneTextLine,
-    paint_scene, paint_scene_prefix, paint_scene_with_style,
+    ContentPalette, SCENE_PAINT_MAX_BORDER_CELLS, SCENE_PAINT_MAX_OPS, ScenePaint,
+    ScenePaintBudget, ScenePaintCache, ScenePaintError, ScenePaintOp, ScenePaintStyle,
+    SceneSurface, SceneTextLine, paint_scene, paint_scene_prefix, paint_scene_with_style,
 };
 pub use shaped::{
     ASCII_PRINTABLE_FIRST, ASCII_PRINTABLE_LAST, CJK_ADVANCE_EPSILON_PX, GRID_ADVANCE_EPSILON_PX,

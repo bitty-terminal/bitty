@@ -158,3 +158,36 @@ fn event_ring_and_lease_queues_stay_bounded_over_many_cycles() {
         "no terminal pin may remain on a live session"
     );
 }
+
+/// Content read/write churn: a slow reader never grows past the cap and every
+/// accepted byte is either popped or retained (never silently lost).
+#[test]
+fn content_read_write_stays_bounded() {
+    use bitty_daemon::content::ContentBuffer;
+
+    const CAPACITY: usize = 4 * 1024;
+    let mut buffer = ContentBuffer::with_capacity(CAPACITY);
+    let chunk = [b'x'; 97];
+    let mut accepted = 0u64;
+    let mut popped = 0u64;
+    for cycle in 0..5_000u64 {
+        accepted += buffer.push(&chunk) as u64;
+        assert!(
+            buffer.len() <= CAPACITY,
+            "cycle {cycle}: content buffer exceeded its cap"
+        );
+        // Alternate between no read (backpressure) and bounded reads.
+        if cycle % 3 != 0 {
+            popped += buffer.pop(256).len() as u64;
+        }
+        assert_eq!(
+            buffer.len() as u64,
+            accepted - popped,
+            "cycle {cycle}: retained bytes must equal accepted minus popped"
+        );
+    }
+    popped += buffer.pop(buffer.len()).len() as u64;
+    assert!(buffer.is_empty());
+    assert_eq!(accepted, popped, "no accepted byte may be lost");
+    assert!(accepted > 0);
+}

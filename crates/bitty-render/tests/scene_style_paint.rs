@@ -312,10 +312,11 @@ fn padding_insets_the_child_by_cells_and_emits_no_op() {
 }
 
 #[test]
-fn padding_is_bounded_by_the_frame_not_the_leaf() {
+fn padding_past_the_leaf_clips_the_child_away() {
     // 40 columns of leaf, a 1-column child, 32 cells of padding per side:
-    // the measured frame wants 65 columns and is clamped to the leaf, but the
-    // child still starts at its honest inset (clipped away by the leaf).
+    // the measured frame wants 65 columns and is clamped to the leaf; the
+    // padded child origin then falls outside the 40-column allocation, so the
+    // child receives no paint extent and nothing visible is emitted.
     let paint = paint(styled(
         SceneNodeStyle::new(32, 0, 0, ContentToken::Foreground),
         text("x"),
@@ -477,6 +478,40 @@ fn a_clipped_frame_paints_its_ring_inside_the_leaf() {
     assert!(surface().aligned_rect().contains_rect(&rings[0].0));
     let line = paint.text_lines().next().expect("clipped text paints");
     assert_eq!(line.text.len(), 40);
+}
+
+#[test]
+fn a_parent_clipped_ring_paints_inside_the_allocation() {
+    // A Row gives its second child only the 1 column left after the first:
+    // the styled child measures 4 columns, so its ring must clip to the
+    // allocated rect instead of vanishing or bleeding into its sibling.
+    let content = SceneNode::Row(vec![
+        text(&"a".repeat(39)),
+        styled(
+            SceneNodeStyle::new(0, 0, 1, ContentToken::Accent),
+            text("bbbb"),
+        ),
+    ]);
+    let paint = paint(content);
+    let rings = rings(&paint);
+    assert_eq!(rings.len(), 1, "a clipped ring still paints");
+    let expected = RectPx::new(
+        surface().rect.x + 39 * i32::try_from(cell().width).unwrap(),
+        surface().rect.y,
+        cell().width,
+        cell().height,
+    );
+    assert_eq!(rings[0].0, expected);
+    assert!(surface().aligned_rect().contains_rect(&rings[0].0));
+    let line = paint
+        .text_lines()
+        .find(|line| line.text.starts_with('b'))
+        .expect("the clipped child text paints");
+    assert_eq!(line.col, 39);
+    assert_eq!(
+        line.text, "b",
+        "the child line is clipped to its allocation"
+    );
 }
 
 // ---------------------------------------------------------------------------

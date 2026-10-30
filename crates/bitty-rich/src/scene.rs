@@ -161,13 +161,13 @@ const _: () = assert!(SCENE_STYLE_SCHEMA_VERSION > RICH_BLOCK_VERSION);
 /// is owned here so the scene model and the extension resolver cannot drift.
 pub const SCENE_STYLE_MAX_PADDING_CELLS: u16 = 32;
 
-/// Inclusive maximum style corner radius in logical pixels.
+/// Inclusive maximum style corner radius in physical pixels.
 ///
 /// Reuses the accepted `decoration.radius` upper bound (`0..=16`) and matches
 /// `bitty_ui::scene_style::SCENE_STYLE_MAX_RADIUS_PX`.
 pub const SCENE_STYLE_MAX_RADIUS_PX: u16 = 16;
 
-/// Inclusive maximum style border width in logical pixels.
+/// Inclusive maximum style border width in physical pixels.
 ///
 /// Reuses the accepted outline `border_width` upper bound (`0..=16`) and
 /// matches `bitty_ui::scene_style::SCENE_STYLE_MAX_BORDER_PX`.
@@ -292,9 +292,15 @@ impl std::error::Error for SceneStyleError {}
 /// | Field           | Unit        | Default               | Cap  |
 /// |-----------------|-------------|-----------------------|------|
 /// | `padding_cells` | cells       | `0`                   | `32` |
-/// | `radius_px`     | logical px  | `0`                   | `16` |
-/// | `border_px`     | logical px  | `0`                   | `16` |
+/// | `radius_px`     | physical px | `0`                   | `16` |
+/// | `border_px`     | physical px | `0`                   | `16` |
 /// | `border_token`  | closed set  | `content.foreground`  | —    |
+///
+/// `radius_px` and `border_px` are **physical pixels**: the paint path passes
+/// them unchanged into the accepted `RoundedFill` geometry, which is physical
+/// pixel space, so the scene layer applies no DPI scale. A logical-pixel unit
+/// with a DPI story is a separate future change; declaring one here would make
+/// the documented unit disagree with the painted frame.
 ///
 /// Construction is plain data: an out-of-bounds value is representable so a
 /// test (or a hostile producer that bypasses a typed constructor) can prove
@@ -304,9 +310,9 @@ impl std::error::Error for SceneStyleError {}
 pub struct SceneNodeStyle {
     /// Padding around the child content, in cells per side.
     pub padding_cells: u16,
-    /// Corner radius applied to the painted frame, in logical pixels.
+    /// Corner radius applied to the painted ring, in physical pixels.
     pub radius_px: u16,
-    /// Border stroke width inside the frame, in logical pixels.
+    /// Border stroke width inside the frame, in physical pixels.
     pub border_px: u16,
     /// Border colour token from the closed content set.
     pub border_token: ContentToken,
@@ -380,6 +386,11 @@ impl SceneNodeStyle {
 /// pipelines, native windows, or global-coordinate drawing. Unknown variants
 /// received from a newer producer are rendered as bounded plain-text fallback
 /// (`Unknown`) per compatibility requirement.
+///
+/// The enum is intentionally not `#[non_exhaustive]`: during the `0.0.x`
+/// series a new variant is accepted as a breaking change for a downstream
+/// exhaustive match. Adding `#[non_exhaustive]` is a separate compatibility
+/// decision, not part of the additive [`SceneNode::Styled`] kind.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SceneNode {
     /// Text span.
@@ -1981,23 +1992,22 @@ mod tests {
 
     #[test]
     fn style_caps_are_inclusive_and_one_past_fails() {
-        let at_cap = SceneNodeStyle::new(
-            SCENE_STYLE_MAX_PADDING_CELLS,
-            SCENE_STYLE_MAX_RADIUS_PX,
-            SCENE_STYLE_MAX_BORDER_PX,
-            ContentToken::Accent,
+        assert_eq!(
+            (
+                SCENE_STYLE_MAX_PADDING_CELLS,
+                SCENE_STYLE_MAX_RADIUS_PX,
+                SCENE_STYLE_MAX_BORDER_PX
+            ),
+            (32, 16, 16),
+            "the public caps are the candidate record's literal values"
         );
+        let at_cap = SceneNodeStyle::new(32, 16, 16, ContentToken::Accent);
         assert_eq!(at_cap.validate(), Ok(()));
 
         for style in [
-            SceneNodeStyle::new(
-                SCENE_STYLE_MAX_PADDING_CELLS + 1,
-                0,
-                0,
-                ContentToken::Accent,
-            ),
-            SceneNodeStyle::new(0, SCENE_STYLE_MAX_RADIUS_PX + 1, 0, ContentToken::Accent),
-            SceneNodeStyle::new(0, 0, SCENE_STYLE_MAX_BORDER_PX + 1, ContentToken::Accent),
+            SceneNodeStyle::new(33, 0, 0, ContentToken::Accent),
+            SceneNodeStyle::new(0, 17, 0, ContentToken::Accent),
+            SceneNodeStyle::new(0, 0, 17, ContentToken::Accent),
         ] {
             assert!(style.validate().is_err());
         }
@@ -2075,6 +2085,41 @@ mod tests {
         assert_eq!(scene.aggregated_bytes(), before);
     }
 
+    /// The replace path is a separate admission entry point: out-of-cap style
+    /// content must fail there too, leaving the previous content and version
+    /// untouched.
+    #[test]
+    fn scene_replace_content_rejects_unchecked_over_cap_style() {
+        let mut scene = Scene::new();
+        let good = RichBlock::new(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            tiny_text("ok"),
+            ScrollBehavior::Inline,
+            1,
+            0,
+            1,
+        )
+        .unwrap();
+        scene.insert(good).unwrap();
+        let before = scene.get(BlockId(1)).unwrap().content().clone();
+        let before_version = scene.get(BlockId(1)).unwrap().version();
+
+        let err = scene
+            .replace_content(
+                BlockId(1),
+                styled(SceneNodeStyle::new(0, 0, 17, ContentToken::Accent)),
+            )
+            .unwrap_err();
+        assert!(matches!(err, SceneError::StyleInvalid { .. }));
+        assert_eq!(
+            scene.get(BlockId(1)).unwrap().content(),
+            &before,
+            "the rejected replacement never lands"
+        );
+        assert_eq!(scene.get(BlockId(1)).unwrap().version(), before_version);
+    }
+
     #[test]
     fn style_is_not_text_and_keeps_the_v1_budgets() {
         let plain = tiny_text("hello");
@@ -2095,6 +2140,11 @@ mod tests {
 
     #[test]
     fn v1_content_reports_the_v1_schema_and_styled_content_reports_v2() {
+        assert_eq!(RICH_BLOCK_VERSION, 1, "v1 is the accepted literal");
+        assert_eq!(
+            SCENE_STYLE_SCHEMA_VERSION, 2,
+            "the additive style revision is the literal 2"
+        );
         let v1 = RichBlock::new(
             BlockId(1),
             BlockAnchor::Zone(1),
@@ -2105,8 +2155,8 @@ mod tests {
             1,
         )
         .unwrap();
-        assert_eq!(v1.schema_version(), RICH_BLOCK_VERSION);
-        assert_eq!(v1.version(), RICH_BLOCK_VERSION);
+        assert_eq!(v1.schema_version(), 1);
+        assert_eq!(v1.version(), 1);
 
         let v2 = RichBlock::new(
             BlockId(2),
@@ -2121,10 +2171,10 @@ mod tests {
             2,
         )
         .unwrap();
-        assert_eq!(v2.schema_version(), SCENE_STYLE_SCHEMA_VERSION);
+        assert_eq!(v2.schema_version(), 2);
         // The block revision counter is unchanged: schema and revision are
         // distinct, so v1 decoding paths are unaffected.
-        assert_eq!(v2.version(), RICH_BLOCK_VERSION);
+        assert_eq!(v2.version(), 1);
     }
 
     #[test]

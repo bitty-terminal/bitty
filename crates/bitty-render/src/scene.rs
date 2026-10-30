@@ -100,8 +100,8 @@
 //! | Primitive | Unit | Default | Cap | Paint |
 //! |---|---|---|---|---|
 //! | padding | cells | `0` | `32` | child inset; no op |
-//! | radius | logical px | `0` | `16` | corner radius of the border ring |
-//! | border | logical px | `0` | `16` | one rounded ring op |
+//! | radius | physical px | `0` | `16` | corner radius of the border ring |
+//! | border | physical px | `0` | `16` | one rounded ring op |
 //! | border token | closed content set | `content.foreground` | — | [`ContentPalette`] colour |
 //!
 //! Core owns every measurement and pixel: the producer declares data and
@@ -112,19 +112,31 @@
 //! frame and never expands that frame, so adding a border cannot move a
 //! sibling. It also reserves no layout cells: text sits at the frame edge
 //! when `padding = 0`, so an author who wants the ring clear of glyphs
-//! declares padding (`padding >= border` in logical pixels reads best).
+//! declares padding. Padding is whole cells and the border is physical
+//! pixels, so the two units are not directly comparable: choose padding whose
+//! cell extent covers the stroke (`padding_cells * cell width >= border_px`
+//! on the horizontal axis).
+//!
+//! `radius_px` and `border_px` are physical pixels and pass unchanged into
+//! [`RoundedFill`], which is physical pixel space. A logical-pixel unit with a
+//! DPI story is a separate future change; this scene layer applies no scale.
 //!
 //! The ring's rectangle is the node's own measured frame (already clamped to
-//! the leaf by layout) and is intersected with the cell-aligned leaf before
-//! it is emitted, so a styled node can never damage or paint outside its
-//! leaf. A ring is skipped when the frame does not fit the allocation the
-//! parent handed the node, which is the same rule the v1 `Block` border uses
-//! for its clipped edges: a sibling never gets another node's frame.
+//! the leaf by layout), intersected with the allocation its parent handed the
+//! node and with the cell-aligned leaf before it is emitted. A frame larger
+//! than its allocation is clipped to that allocation instead of being dropped,
+//! so its visible top/left portion still paints like a v1 `Block`. The rounded
+//! ring closes at the clip boundary because it is one geometry op, and it
+//! never draws outside the allocation or the leaf.
 //!
 //! Style is paint only. It never hides text: [`ScenePaint::text_lines`], the
-//! accessibility projection, and [`ScenePaint::plain_text`] read the same
-//! text ops with or without a wrapper, so padding shifts a line but cannot
-//! drop it, and a border or radius never removes content from the tree.
+//! present loop's panel accessibility text projection, and
+//! [`ScenePaint::plain_text`] read the same text ops with or without a
+//! wrapper, so padding shifts a line but cannot drop it, and a border or
+//! radius never removes content from the tree. There is no production
+//! per-node `SceneNode -> SceneKind` projection: a panel scene stays one
+//! `Column` node in the accessibility run, and the style wrapper is
+//! transparent to the text lines that run carries.
 //!
 //! # Text
 //!
@@ -448,7 +460,8 @@ pub enum ScenePaintOp {
     /// in physical pixels. The ring is drawn inside `rect`; it never expands
     /// the node's measured box and never changes hit testing.
     Rounded {
-        /// Outer ring rectangle in physical pixels, clipped to the leaf.
+        /// Outer ring rectangle in physical pixels, clipped to the parent
+        /// allocation and the leaf.
         rect: RectPx,
         /// Ring thickness in physical pixels.
         border: u16,
@@ -1302,14 +1315,20 @@ impl Painter {
                     cols: inner.cols.saturating_add(double),
                     rows: inner.rows.saturating_add(double),
                 };
-                if style.border_px > 0 && frame.cols <= width && frame.rows <= height {
+                if style.border_px > 0 {
                     // One ring op, painted inside the node's own frame. The
-                    // frame is the measured (leaf-clamped) extent, so a node
-                    // that layout clipped simply has a clipped ring; the op is
-                    // intersected with the cell-aligned leaf so it never
-                    // damages outside the surface.
+                    // frame is the measured (leaf-clamped) extent; clip it to
+                    // the allocation this node was handed and to the leaf so
+                    // a parent-clipped node still paints its visible top/left
+                    // portion (the v1 `Block` rule) instead of dropping the
+                    // ring. The ring closes at the clip boundary and never
+                    // damages a sibling or the surface.
                     let full = self.cell_rect(x, y, frame.cols, frame.rows);
-                    if let Some(rect) = full.intersection(&self.surface.aligned_rect()) {
+                    let allocated = self.cell_rect(x, y, width, height);
+                    if let Some(rect) = full
+                        .intersection(&allocated)
+                        .and_then(|rect| rect.intersection(&self.surface.aligned_rect()))
+                    {
                         if !rect.is_empty() {
                             self.push_op(ScenePaintOp::Rounded {
                                 rect,

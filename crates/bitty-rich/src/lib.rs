@@ -21,8 +21,9 @@
 //!   content rect and emits a bounded paint list, while validation and
 //!   admission stay here.
 //!   The additive v2 [`scene::SceneNode::Styled`] kind carries bounded style
-//!   data (padding cells `0..=32`, radius px `0..=16`, border px `0..=16`, and
-//!   a closed content token) and no layout: Core measures and paints it.
+//!   data (padding cells `0..=32`, radius physical px `0..=16`, border physical
+//!   px `0..=16`, and a closed content token) and no layout: Core measures and
+//!   paints it.
 //!
 //! `bitty_term_state::ImageStore` (64 entries, 4096 bytes each) remains as
 //! the legacy terminal-truth placeholder seam; this crate's `image`
@@ -72,8 +73,8 @@
 //! | [`scene::SCENE_MAX_RICH_BYTES_PER_TERMINAL`] (SCN-4) | 2 MiB | typed error |
 //! | [`scene::SCENE_MAX_BLOCKS_PER_TERMINAL`] (SCN-5) | 64 | typed error |
 //! | [`scene::SCENE_STYLE_MAX_PADDING_CELLS`] style padding | 32 cells | typed error |
-//! | [`scene::SCENE_STYLE_MAX_RADIUS_PX`] style radius | 16 px | typed error |
-//! | [`scene::SCENE_STYLE_MAX_BORDER_PX`] style border | 16 px | typed error |
+//! | [`scene::SCENE_STYLE_MAX_RADIUS_PX`] style radius | 16 physical px | typed error |
+//! | [`scene::SCENE_STYLE_MAX_BORDER_PX`] style border | 16 physical px | typed error |
 //! | [`blocks::COMMAND_BLOCK_MAX`] command blocks | 256 | newest retained, oldest dropped |
 //! | [`blocks::FOLD_MAX`] folded ids | 256 | fold fails closed at cap |
 //! | [`hints::HINT_TARGET_MAX`] hint targets / labels | 256 | register fails closed; batch sheds sorted tail |

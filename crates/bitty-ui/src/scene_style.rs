@@ -12,12 +12,17 @@
 //!
 //! # Primitive set
 //!
-//! | Primitive      | Wire key       | Unit  | Cap | Accepted analogue |
-//! |----------------|----------------|-------|-----|-------------------|
-//! | Padding        | `padding`      | cells | 32  | `content_inset` range |
-//! | Corner radius  | `radius`       | px    | 16  | `decoration.radius` range |
-//! | Border width   | `border`       | px    | 16  | `border_width` range |
-//! | Border color   | `border_token` | token | —   | theme token contract |
+//! | Primitive      | Wire key       | Unit        | Cap | Accepted analogue |
+//! |----------------|----------------|-------------|-----|-------------------|
+//! | Padding        | `padding`      | cells       | 32  | `content_inset` range |
+//! | Corner radius  | `radius`       | physical px | 16  | `decoration.radius` range |
+//! | Border width   | `border`       | physical px | 16  | `border_width` range |
+//! | Border color   | `border_token` | token       | —   | theme token contract |
+//!
+//! Radius and border width are physical pixels because the scene paint path
+//! forwards them unchanged into `RoundedFill`, which is physical pixel space.
+//! A logical-pixel unit with DPI scaling is a separate future change; this
+//! resolver declares no scale it does not apply.
 //!
 //! Elevation is deliberately absent: no accepted contract defines a shadow or
 //! elevation model, so the candidate record keeps it an open point rather than
@@ -65,12 +70,12 @@ use crate::theme::{ResolvedTokens, TokenColor, TokenLayer};
 /// Reuses the accepted `decoration.content_inset` upper bound (`32`).
 pub const SCENE_STYLE_MAX_PADDING_CELLS: u16 = 32;
 
-/// Maximum corner radius in logical pixels.
+/// Maximum corner radius in physical pixels.
 ///
 /// Reuses the accepted `decoration.radius` upper bound (`16`).
 pub const SCENE_STYLE_MAX_RADIUS_PX: u16 = 16;
 
-/// Maximum border width in logical pixels.
+/// Maximum border width in physical pixels.
 ///
 /// Reuses the accepted outline `border_width` upper bound (`16`).
 pub const SCENE_STYLE_MAX_BORDER_PX: u16 = 16;
@@ -370,7 +375,7 @@ impl SceneStyle {
         Ok(self)
     }
 
-    /// Declares a corner radius in logical pixels, subject to
+    /// Declares a corner radius in physical pixels, subject to
     /// [`SCENE_STYLE_MAX_RADIUS_PX`].
     pub fn with_radius(mut self, px: u16) -> Result<Self, SceneStyleError> {
         if px > SCENE_STYLE_MAX_RADIUS_PX {
@@ -383,7 +388,7 @@ impl SceneStyle {
         Ok(self)
     }
 
-    /// Declares a border width in logical pixels, subject to
+    /// Declares a border width in physical pixels, subject to
     /// [`SCENE_STYLE_MAX_BORDER_PX`].
     pub fn with_border(mut self, px: u16) -> Result<Self, SceneStyleError> {
         if px > SCENE_STYLE_MAX_BORDER_PX {
@@ -409,13 +414,13 @@ impl SceneStyle {
         self.padding_cells
     }
 
-    /// Declared radius in logical pixels, if any.
+    /// Declared radius in physical pixels, if any.
     #[must_use]
     pub const fn radius_px(self) -> Option<u16> {
         self.radius_px
     }
 
-    /// Declared border width in logical pixels, if any.
+    /// Declared border width in physical pixels, if any.
     #[must_use]
     pub const fn border_px(self) -> Option<u16> {
         self.border_px
@@ -567,7 +572,7 @@ impl SceneStyle {
 /// One resolved border.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ResolvedBorder {
-    /// Effective width in logical pixels (non-zero).
+    /// Effective width in physical pixels (non-zero).
     pub width_px: u16,
     /// The named content token.
     pub token: BorderToken,
@@ -605,7 +610,7 @@ impl ResolvedSceneStyle {
         self.padding_source
     }
 
-    /// Effective corner radius in logical pixels.
+    /// Effective corner radius in physical pixels.
     #[must_use]
     pub const fn radius_px(self) -> u16 {
         self.radius_px
@@ -690,14 +695,14 @@ pub enum StylePaintOp {
         /// Padding in cells.
         cells: u16,
     },
-    /// Clip the painted frame with a corner radius.
+    /// Round the painted border ring's corners.
     RadiusClip {
-        /// Radius in logical pixels.
+        /// Radius in physical pixels.
         px: u16,
     },
     /// Stroke a border.
     Border {
-        /// Width in logical pixels.
+        /// Width in physical pixels.
         width_px: u16,
         /// Theme-resolved colour.
         color: TokenColor,

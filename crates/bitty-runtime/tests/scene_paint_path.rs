@@ -647,6 +647,10 @@ fn present_loop_composes_a_style_ring_into_the_rounded_pass() {
         vec![(0, "held".to_string())],
         "the style ring adds no node and hides no text"
     );
+    assert_eq!(
+        report.a11y[0].kind, SCENE_A11Y_KIND,
+        "the panel is still one Column node; there is no per-node SceneKind projection"
+    );
 
     let surface = presented_surface(&rt, view);
     // The ring frame is the measured text box ("held" = 4 cells x 1 row).

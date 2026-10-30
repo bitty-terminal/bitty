@@ -146,6 +146,12 @@ fn interactive_purposes_resolve_from_declared_purpose() {
 
 /// Drift coupling: every `bitty-rich` `SceneNode` variant must map to an
 /// extension `SceneKind` with a resolved role (or fail closed for `Unknown`).
+///
+/// This is a **test-local projection mirror**, not a production mapping: the
+/// live present loop exposes a panel scene as one `SceneKind::Column` with its
+/// text runs and has no per-node `SceneNode -> SceneKind` step. The test pins
+/// the rule a future production projection must follow (the v2 style wrapper
+/// is transparent).
 #[test]
 fn scene_kind_mirror_tracks_bitty_rich() {
     use bitty_rich::scene::{

@@ -218,11 +218,17 @@ it:
 kill -USR1 "$(pgrep -n bitty)"
 ```
 
-`SIGUSR1` is Unix-only and writes one dump per second at most. The watchdog is
-on by default in release builds; set `BITTY_HANG_WATCHDOG=0` to disable it, or
-`BITTY_HANG_WATCHDOG=1` to enable it in a debug build. `BITTY_HANG_WATCHDOG_MS`
-overrides the generic bound (the tick and command phases keep their own
-tighter bounds).
+`SIGUSR1` is Unix-only and writes one dump per second at most, and a capture
+never aborts the process. The watchdog is on by default in release builds; set
+`BITTY_HANG_WATCHDOG=0` to disable it, or `BITTY_HANG_WATCHDOG=1` to enable it
+in a debug build. Disabling the watchdog also disables the `SIGUSR1` handler,
+so with `=0` that signal keeps its default process-terminating action.
+`BITTY_HANG_WATCHDOG_MS` sets the generic bound (the tick and command phases
+keep their own tighter caps, so raising it affects every other phase).
+`BITTY_HANG_WATCHDOG_ABORT=1` additionally aborts a debug build after a stall
+report, never after a `SIGUSR1` capture. A parked-work report names its
+backlog as `pending=pty` (the production PTY writer FIFO), `replies`, or
+`hidden-damage`.
 
 ## Development
 

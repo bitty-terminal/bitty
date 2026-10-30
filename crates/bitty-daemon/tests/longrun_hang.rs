@@ -170,15 +170,20 @@ fn content_read_write_stays_bounded() {
     let chunk = [b'x'; 97];
     let mut accepted = 0u64;
     let mut popped = 0u64;
+    let mut partial_pushes = 0u64;
     for cycle in 0..5_000u64 {
-        accepted += buffer.push(&chunk) as u64;
+        let accepted_this_cycle = buffer.push(&chunk);
+        accepted += accepted_this_cycle as u64;
+        if accepted_this_cycle < chunk.len() {
+            partial_pushes += 1;
+        }
         assert!(
             buffer.len() <= CAPACITY,
             "cycle {cycle}: content buffer exceeded its cap"
         );
         // Alternate between no read (backpressure) and bounded reads.
         if cycle % 3 != 0 {
-            popped += buffer.pop(256).len() as u64;
+            popped += buffer.pop(64).len() as u64;
         }
         assert_eq!(
             buffer.len() as u64,
@@ -190,4 +195,8 @@ fn content_read_write_stays_bounded() {
     assert!(buffer.is_empty());
     assert_eq!(accepted, popped, "no accepted byte may be lost");
     assert!(accepted > 0);
+    assert!(
+        partial_pushes > 0,
+        "repeated saturation must exercise a partial push"
+    );
 }

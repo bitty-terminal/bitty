@@ -27,9 +27,22 @@ use bitty_runtime::{Runtime, RuntimeConfig};
 use bitty_ui::SplitAxis;
 
 /// Liveness budget on a shared CI shard (never a performance target).
-const SOAK_BUDGET_CI: Duration = Duration::from_secs(180);
+///
+/// CI runs the unoptimized `test` profile: this workload measured 114.7 s on
+/// the Linux X11 shard and 137.6 s on Windows, against 180 s before. Keep the
+/// guard above the slowest observed run with headroom; nextest's slow-timeout
+/// (`.config/nextest.toml`) sits above this value so the test's own message
+/// fires before the process is killed.
+const SOAK_BUDGET_CI: Duration = Duration::from_secs(240);
 /// Liveness budget on a development host.
 const SOAK_BUDGET_LOCAL: Duration = Duration::from_secs(60);
+/// Serializes the soak tests: RSS and fd counts are process-wide.
+///
+/// Each integration test binary is its own process under nextest, but a
+/// plain `cargo test` may run sibling tests on threads of one process. Hold
+/// this guard for a whole measured body so their transient descriptors and
+/// memory never overlap the measurement window.
+static PROCESS_METRICS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Frames in the compressed run (five simulated seconds each).
 const FRAMES: u64 = 400;
 /// Simulated seconds per frame.
@@ -153,24 +166,21 @@ fn make_runtime() -> Runtime {
     .expect("deterministic runtime must build")
 }
 
+/// Resident set size in KiB from `/proc/self/status`.
+///
+/// `VmRSS` is already in KiB, so no page-size lookup is needed (and the
+/// lock-sensitive `smaps` traversal is avoided).
 #[cfg(target_os = "linux")]
 fn rss_kib() -> u64 {
-    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
-    let pages = statm
-        .split_whitespace()
-        .nth(1)
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    let page_kib = std::fs::read_to_string("/proc/self/smaps")
+    std::fs::read_to_string("/proc/self/status")
         .ok()
         .and_then(|text| {
             text.lines().find_map(|line| {
-                let rest = line.trim().strip_prefix("KernelPageSize:")?;
+                let rest = line.strip_prefix("VmRSS:")?;
                 rest.split_whitespace().next()?.parse::<u64>().ok()
             })
         })
-        .unwrap_or(4);
-    pages.saturating_mul(page_kib)
+        .unwrap_or(0)
 }
 
 #[cfg(target_os = "linux")]
@@ -207,6 +217,9 @@ fn tui_modes() -> &'static str {
 
 #[test]
 fn opencode_shaped_soak_stays_bounded() {
+    let _serial = PROCESS_METRICS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let start = Instant::now();
     let mut rt = make_runtime();
     let cols = u16::try_from(rt.snapshot().width).expect("grid width fits u16");
@@ -299,6 +312,7 @@ fn opencode_shaped_soak_stays_bounded() {
         #[cfg(unix)]
         if frame % PANE_CYCLE == PANE_CYCLE - 1 {
             rt.set_layout(two_pane_layout(ViewId::new(1), ViewId::new(2)));
+            // pty-gate-exempt: inside `#[cfg(unix)]`; /bin/sh never spawns on Windows.
             let _ = rt.spawn_shell_for_view(
                 ViewId::new(2),
                 "/bin/sh",
@@ -368,10 +382,11 @@ fn opencode_shaped_soak_stays_bounded() {
     }
 
     // Layout and pane lifecycle must be clean after the churn.
+    // CodeQL rust/cleartext-logging: the panic message must not carry any
+    // value derived from the session ids; `is_empty()` alone names the defect.
     assert!(
         rt.pane_session_ids().is_empty(),
-        "attach/detach churn must not leave pane sessions: {:?}",
-        rt.pane_session_ids()
+        "attach/detach churn must not leave pane sessions"
     );
 
     let gauges = rt.hang_gauges().snapshot();

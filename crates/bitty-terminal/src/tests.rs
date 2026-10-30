@@ -9327,23 +9327,60 @@ fn init_preview_echo_absent_without_preview() {
 }
 
 #[test]
-fn parked_command_wake_is_a_bounded_future_deadline() {
+fn parked_command_wake_backs_off_and_stays_a_future_deadline() {
+    use crate::terminal_app::{
+        PARKED_COMMAND_RETRY_DELAY, PARKED_COMMAND_RETRY_MAX, ParkedCommandBackoff,
+    };
+
     let now = std::time::Instant::now();
+    let mut backoff = ParkedCommandBackoff::default();
     assert_eq!(
-        crate::terminal_app::parked_command_wake(now, false),
+        backoff.wake(now, false),
         None,
         "no parked command must not arm a wake"
     );
-    let deadline =
-        crate::terminal_app::parked_command_wake(now, true).expect("a parked command arms a wake");
+    let first = backoff
+        .wake(now, true)
+        .expect("a parked command arms a wake");
     assert!(
-        deadline > now,
+        first > now,
         "a parked command must never re-arm a past-due wake (bitty#2830)"
     );
-    assert!(
-        deadline - now <= std::time::Duration::from_millis(10),
-        "the resume wake must stay prompt"
+    assert_eq!(
+        first - now,
+        PARKED_COMMAND_RETRY_DELAY,
+        "the first resume wake stays prompt"
     );
+
+    // Consecutive parked samples back off up to the cap instead of waking at
+    // a fixed 500 Hz for the whole park.
+    let mut previous = first - now;
+    let mut last = first;
+    for _ in 0..8 {
+        let next = backoff
+            .wake(last, true)
+            .expect("a still-parked command keeps a wake");
+        let delay = next - last;
+        assert!(
+            delay >= previous,
+            "the backoff must never shrink while parked: {delay:?} < {previous:?}"
+        );
+        assert!(
+            delay <= PARKED_COMMAND_RETRY_MAX,
+            "the backoff must respect its ceiling: {delay:?}"
+        );
+        previous = delay;
+        last = next;
+    }
+    assert_eq!(
+        previous, PARKED_COMMAND_RETRY_MAX,
+        "the backoff must reach its ceiling"
+    );
+
+    // A drained park resets the backoff so the next park resumes promptly.
+    assert_eq!(backoff.wake(last, false), None);
+    let reset = backoff.wake(last, true).expect("the next park arms a wake");
+    assert_eq!(reset - last, PARKED_COMMAND_RETRY_DELAY);
 }
 
 // Live-spawn: the wizard-owned preview session hot-updates per step on the

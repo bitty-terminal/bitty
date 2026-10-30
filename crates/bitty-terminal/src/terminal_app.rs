@@ -30,25 +30,59 @@ use crate::stall_watchdog::{Phase, StallWatchdog, WatchdogContext};
 /// hold at [`bitty_runtime::PRESENT_SETTLE_MAX`] under a continuous producer.
 pub(crate) const PRESENT_SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
 
-/// Bounded retry delay for a parked plugin command's resume wake (bitty#2830).
+/// First retry delay for a parked plugin command's resume wake (bitty#2830).
 ///
 /// A parked command resumes one RC-1 wall window per cold tick. Re-arming the
 /// wake at `Instant::now()` made an otherwise idle window spin through the
-/// cold phase continuously while the command stayed parked; 2 ms keeps the
-/// resume prompt without creating a busy loop.
+/// cold phase continuously while the command stayed parked. A prompt first
+/// retry keeps resume latency low; consecutive parked samples then back off.
 pub(crate) const PARKED_COMMAND_RETRY_DELAY: std::time::Duration =
     std::time::Duration::from_millis(2);
 
-/// Wake time for a parked plugin command (bitty#2830).
+/// Ceiling for the parked-command resume backoff (about 60 Hz).
 ///
-/// `None` when nothing is parked. `Some(now + PARKED_COMMAND_RETRY_DELAY)`
-/// otherwise: never `now`, because a past-due wake re-enters `AboutToWait`
-/// immediately and spins the cold phase while the command stays parked.
-pub(crate) fn parked_command_wake(
-    now: std::time::Instant,
-    parked: bool,
-) -> Option<std::time::Instant> {
-    parked.then(|| now + PARKED_COMMAND_RETRY_DELAY)
+/// A fixed 2 ms wake is a 500 Hz loop while a command stays parked. Doubling
+/// from [`PARKED_COMMAND_RETRY_DELAY`] to this cap keeps the resume prompt on
+/// the short parks the RC-1 budget produces and stops a long park from
+/// burning a core on `AboutToWait` turns.
+pub(crate) const PARKED_COMMAND_RETRY_MAX: std::time::Duration =
+    std::time::Duration::from_millis(16);
+
+/// Bounded exponential backoff for a parked plugin command's resume wake.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParkedCommandBackoff {
+    delay: std::time::Duration,
+}
+
+impl Default for ParkedCommandBackoff {
+    fn default() -> Self {
+        Self {
+            delay: PARKED_COMMAND_RETRY_DELAY,
+        }
+    }
+}
+
+impl ParkedCommandBackoff {
+    /// Wake time for a parked plugin command.
+    ///
+    /// `None` when nothing is parked, which also resets the backoff for the
+    /// next park. Otherwise returns `Some(now + delay)` and doubles the delay
+    /// up to [`PARKED_COMMAND_RETRY_MAX`]. Never returns `now`: a past-due
+    /// wake re-enters `AboutToWait` immediately and spins the cold phase
+    /// while the command stays parked.
+    pub(crate) fn wake(
+        &mut self,
+        now: std::time::Instant,
+        parked: bool,
+    ) -> Option<std::time::Instant> {
+        if !parked {
+            self.delay = PARKED_COMMAND_RETRY_DELAY;
+            return None;
+        }
+        let deadline = now + self.delay;
+        self.delay = self.delay.saturating_mul(2).min(PARKED_COMMAND_RETRY_MAX);
+        Some(deadline)
+    }
 }
 
 /// How long a hidden-surface repair probe trusts a served redraw
@@ -775,6 +809,9 @@ pub(crate) struct TerminalApp {
     /// Phase marks are observability only: they never alter routing, timing,
     /// or runtime state.
     pub(crate) stall_watchdog: Option<StallWatchdog>,
+    /// Bounded backoff for a parked plugin command's cold-tick resume wake
+    /// (bitty#2830).
+    pub(crate) parked_command_backoff: ParkedCommandBackoff,
     /// Test-only override for the surface-retry wake (issue #2570 B1).
     #[cfg(test)]
     pub(crate) test_surface_retry_deadline: Option<std::time::Instant>,
@@ -965,6 +1002,7 @@ impl TerminalApp {
             _pty_thread: None,
             presented_frames: 0,
             stall_watchdog,
+            parked_command_backoff: ParkedCommandBackoff::default(),
             #[cfg(test)]
             test_surface_retry_deadline: None,
             hidden_repair_probe_at: None,
@@ -1017,6 +1055,7 @@ impl TerminalApp {
             _pty_thread: Some(handle),
             presented_frames: 0,
             stall_watchdog,
+            parked_command_backoff: ParkedCommandBackoff::default(),
             #[cfg(test)]
             test_surface_retry_deadline: None,
             hidden_repair_probe_at: None,
@@ -1142,8 +1181,8 @@ impl TerminalApp {
     /// Runs one bounded hidden-surface repair probe (bitty#2830 hypothesis 2).
     ///
     /// Consumes a [`Runtime::hidden_repair_deadline`] wake. The probe asks the
-    /// compositor for one redraw; the gate stays closed until the frame
-    /// callback proves the surface is mapped again
+    /// compositor for one redraw; on Wayland the gate stays closed until the
+    /// frame callback proves the surface is mapped again
     /// ([`Self::apply_hidden_repair_probe`]). A genuinely hidden surface keeps
     /// its retained damage and gets one attempt per
     /// `HIDDEN_REPAIR_INTERVAL_MS`, never a busy loop.
@@ -1161,13 +1200,22 @@ impl TerminalApp {
 
     /// Applies the proof a hidden-surface repair probe received.
     ///
-    /// The platform has no "is the surface mapped" accessor; the compositor
-    /// serving a frame callback is that answer, and the redraw-starvation probe
-    /// already derives its synthetic occlusion edge from the same signal. A
-    /// served redraw inside [`HIDDEN_REPAIR_PROBE_TTL`] therefore reconstructs
-    /// the reveal edge that was lost (a dropped `Resumed`/`Occluded(false)`),
-    /// and the runtime's own reveal path queues the from-truth frame. Returns
-    /// whether the gate was opened.
+    /// On Wayland the platform has no "is the surface mapped" accessor; the
+    /// compositor serving a frame callback is that answer, and the
+    /// redraw-starvation probe already derives its synthetic occlusion edge
+    /// from the same signal. A served redraw inside [`HIDDEN_REPAIR_PROBE_TTL`]
+    /// therefore reconstructs the reveal edge that was lost (a dropped
+    /// `Resumed`/`Occluded(false)`), and the runtime's own reveal path queues
+    /// the from-truth frame. Returns whether the gate was opened.
+    ///
+    /// This proof is Wayland-specific: winit's X11 backend synthesizes
+    /// `RedrawRequested` for a `request_redraw()` on the event loop instead
+    /// of gating it on a compositor frame callback, so a served redraw there
+    /// only proves the loop ran, not that a still-occluded window became
+    /// mapped. The X11 path loses nothing by trying (presenting to an
+    /// unmapped window is a no-op rather than a swap-chain wait), but the
+    /// "still occluded never presents" statement belongs to the Wayland
+    /// probe.
     pub(crate) fn apply_hidden_repair_probe(
         &mut self,
         served: bool,
@@ -2042,6 +2090,10 @@ impl TerminalApp {
                     "bitty: {pane_written} pane reply bytes written to PTY masters (post-tick)"
                 );
             }
+            // bitty#2830 (review): both reply queues just drained. Republish
+            // the gauges so an idle park's `pending=replies` names only bytes
+            // that are genuinely still held, instead of the pre-flush count.
+            self.runtime.refresh_hang_gauges();
         }
         self.watchdog_phase(Phase::RuntimeEvents);
         // CTX-0892: deliver coalesced runtime events to plugin VMs last, after
@@ -2396,19 +2448,22 @@ impl TerminalApp {
             .and_then(|runtime| runtime.timer_deadline())
     }
 
-    /// Immediate cold-tick wake while a command is parked at the RC-1 wall
-    /// budget (bitty #2314).
+    /// Bounded cold-tick wake while a command is parked at the RC-1 wall
+    /// budget (bitty #2314, #2833).
     ///
     /// A park must continue on a later `AboutToWait`; under `ControlFlow::Wait`
-    /// no further event may arrive, so joining `now` into the wake-min makes
-    /// the next loop iteration deliver the resume window. `None` when nothing
-    /// is parked, so idle wakeups are unchanged.
-    fn parked_command_deadline(&self) -> Option<std::time::Instant> {
+    /// no further event may arrive, so joining the wake-min makes the next loop
+    /// iteration deliver the resume window. The delay backs off exponentially
+    /// from 2 ms to 16 ms while the same command stays parked, so a long park
+    /// does not wake the loop at a fixed 500 Hz. `None` when nothing is parked,
+    /// so idle wakeups are unchanged.
+    fn parked_command_deadline(&mut self) -> Option<std::time::Instant> {
         let parked = self
             .plugin_runtime
             .as_ref()
             .is_some_and(|runtime| runtime.parked_command_count() > 0);
-        parked_command_wake(std::time::Instant::now(), parked)
+        self.parked_command_backoff
+            .wake(std::time::Instant::now(), parked)
     }
 
     /// Fire due one-shot plugin timers (CTX-1244).

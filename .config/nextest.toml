@@ -54,3 +54,18 @@ slow-timeout = { period = "300s", terminate-after = 1 }
 filter = 'package(bitty-pty) | binary(/^(m1_shell_coverage|selection_view_owned|mouse_report_panes|session_save_restore|pane_damage|shell_input_1356|panel_session_invariants|focused_input_modes|poll_budget_0476|copy_search_view_bound|dogfooding|shell_knob|resize_scrollback)$/)'
 test-group = "live-pty"
 retries = 2
+
+# bitty#2830 long-run harnesses own a wall-clock liveness budget (150 s and
+# 240 s). nextest's default 60 s x 3 would kill them at 180 s, below the
+# second budget, so each gets one period above its own guard: a genuinely
+# hung run still fails inside the CI shard, and a loaded-but-correct run
+# reports the test's own diagnostic instead of a bare timeout kill.
+# Measured unoptimized: 171 s / 114-138 s before recalibration on the shared
+# X11 and Windows runners.
+[[profile.default.overrides]]
+filter = 'test(compressed_long_run_stays_bounded)'
+slow-timeout = { period = "180s", terminate-after = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(opencode_shaped_soak_stays_bounded)'
+slow-timeout = { period = "270s", terminate-after = 1 }

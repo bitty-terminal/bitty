@@ -376,3 +376,28 @@ fn real_pty_kitty_font_query_writes_once() {
     assert_eq!(written, expected, "both answers must reach the PTY once");
     assert_eq!(rt.write_replies(), 0, "no duplicate reply write");
 }
+
+/// bitty#2830 (#2834 review): the desktop embedder flushes replies *after*
+/// `tick_at` returns, so the gauge must be republished after the drain. A
+/// stale pre-flush count would keep an idle park stall-eligible and report
+/// `pending=replies` for queues that are already empty.
+#[test]
+fn refresh_hang_gauges_tracks_the_post_tick_reply_drain() {
+    let mut rt = Runtime::with_defaults().expect("build");
+    rt.handle_pty_bytes(b"\x1b[6n");
+    assert!(rt.tick().is_some(), "the headless tick presents");
+    assert!(
+        rt.hang_gauges().snapshot().pending_replies > 0,
+        "the reply queued before the tick must be visible"
+    );
+    let replies = rt.take_replies();
+    assert!(!replies.is_empty(), "DSR 6 must produce a reply");
+    // `tick_at` published before the drain; the embedder calls this after
+    // `write_replies()` and every `write_pane_replies()`.
+    rt.refresh_hang_gauges();
+    assert_eq!(
+        rt.hang_gauges().snapshot().pending_replies,
+        0,
+        "the republished gauge must name the drained queue"
+    );
+}

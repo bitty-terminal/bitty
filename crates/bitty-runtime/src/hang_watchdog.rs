@@ -12,7 +12,8 @@
 //! - [`Runtime::tick_at`](crate::Runtime::tick_at) brackets one frame
 //!   (tick count, last/max duration, queue depths, retained content bytes,
 //!   mounted panels and chrome bands).
-//! - [`crate::Runtime::poll_pty`] publishes the bounded input buffer depth.
+//! - [`crate::Runtime::poll_pty`] publishes the bounded PTY writer FIFO
+//!   backlog (primary plus panes) as the `pending=pty` evidence.
 //! - [`crate::plugin_runtime::PluginRuntime::dispatch_command`] publishes the
 //!   one command currently executing in a plugin VM (the active-command
 //!   guard), so a hung Lua callback is visible in the dump.
@@ -38,9 +39,13 @@ pub struct HangGaugeSnapshot {
     pub last_tick_ns: u64,
     /// Longest completed tick since construction, in nanoseconds.
     pub max_tick_ns: u64,
-    /// Bytes buffered for the PTY writer (`pending_input`).
+    /// Bytes accepted by the bounded PTY writer FIFOs and not yet written
+    /// (primary plus every pane). Rendered as `pending=pty`.
     pub pending_input_bytes: u64,
-    /// Bytes dropped from the bounded PTY writer buffer.
+    /// Bytes dropped from the headless input observation buffer.
+    ///
+    /// Production runs write to the queued `PtyWriter`; this counter is only
+    /// nonzero in headless test harnesses that own no writer.
     pub pending_input_dropped: u64,
     /// Queued cold-path events.
     pub cold_queue_len: u64,

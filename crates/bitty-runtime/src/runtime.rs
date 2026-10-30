@@ -3186,6 +3186,19 @@ impl Runtime {
         &self.hang_gauges
     }
 
+    /// Republishes the lock-free hang gauges after an embedder-level flush.
+    ///
+    /// [`Self::tick_at`] publishes before and after the tick, but the desktop
+    /// embedder flushes PTY replies *after* the tick returns (the post-present
+    /// `ReplyFlush` phase). Without this second publication `pending_replies`
+    /// keeps the pre-flush count until the next tick, so an otherwise idle
+    /// park can be reported as `pending=replies` after the queues were
+    /// already drained (bitty#2830). The stores are relaxed and cheap; this
+    /// runs once per presented frame.
+    pub fn refresh_hang_gauges(&self) {
+        self.publish_hang_gauges();
+    }
+
     /// Publishes the per-tick queue, layout, and content gauges.
     ///
     /// Called at the end of [`Self::tick_at`] on every return path. `Relaxed`
@@ -3227,6 +3240,20 @@ impl Runtime {
             .set_hidden_damage(self.hidden_retained_work());
         self.hang_gauges
             .set_pending_replies(self.pending_reply_bytes());
+    }
+
+    /// Bytes accepted by the bounded PTY writer FIFOs and not yet written.
+    ///
+    /// bitty#2830: this is the production writer backlog the watchdog names as
+    /// `pending=pty`. The headless observation buffer (`pending_input`) is a
+    /// separate, test-only seam and is not production backlog, so it is
+    /// deliberately not published here.
+    fn pending_writer_bytes(&self) -> usize {
+        let mut bytes = self.pty_writer.as_ref().map_or(0, PtyWriter::queued_bytes);
+        for session in self.pane_sessions.values() {
+            bytes = bytes.saturating_add(session.writer.queued_bytes());
+        }
+        bytes
     }
 
     /// Bytes of PTY replies queued across every live grid and not yet answered.

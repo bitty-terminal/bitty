@@ -138,12 +138,259 @@ pub struct ListModel {
     pub ordered: bool,
 }
 
-/// Declarative layout and paint primitive (v1).
+// ---------------------------------------------------------------------------
+// Style primitives (v2, additive)
+// ---------------------------------------------------------------------------
+
+/// Additive scene-schema revision that introduced [`SceneNode::Styled`].
+///
+/// A block whose content only uses v1 kinds reports [`RICH_BLOCK_VERSION`];
+/// a block that carries a styled subtree reports this revision through
+/// [`RichBlock::schema_version`]. The block's `version` field stays the
+/// monotonic revision counter, so nothing about v1 blocks moves.
+pub const SCENE_STYLE_SCHEMA_VERSION: u32 = 2;
+
+// The style schema is an additive revision after v1; a smaller value would
+// make `schema_version()` lie about a v1-only block.
+const _: () = assert!(SCENE_STYLE_SCHEMA_VERSION > RICH_BLOCK_VERSION);
+
+/// Inclusive maximum style padding in cells.
+///
+/// Reuses the accepted `decoration.content_inset` upper bound (`0..=32`) and
+/// matches `bitty_ui::scene_style::SCENE_STYLE_MAX_PADDING_CELLS`; the value
+/// is owned here so the scene model and the extension resolver cannot drift.
+pub const SCENE_STYLE_MAX_PADDING_CELLS: u16 = 32;
+
+/// Inclusive maximum style corner radius in physical pixels.
+///
+/// Reuses the accepted `decoration.radius` upper bound (`0..=16`) and matches
+/// `bitty_ui::scene_style::SCENE_STYLE_MAX_RADIUS_PX`.
+pub const SCENE_STYLE_MAX_RADIUS_PX: u16 = 16;
+
+/// Inclusive maximum style border width in physical pixels.
+///
+/// Reuses the accepted outline `border_width` upper bound (`0..=16`) and
+/// matches `bitty_ui::scene_style::SCENE_STYLE_MAX_BORDER_PX`.
+pub const SCENE_STYLE_MAX_BORDER_PX: u16 = 16;
+
+/// Closed content-token set a style colour may name.
+///
+/// Only `content.*`/`state.*` tokens are in the set: an extension styles
+/// content it owns and never claims Core-owned chrome (`border.*`,
+/// `chrome.*`). There is no colour-literal variant, so a producer cannot
+/// smuggle an arbitrary colour through a style. Adding a token is a contract
+/// change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ContentToken {
+    /// `content.foreground` — the default border colour.
+    #[default]
+    Foreground,
+    /// `content.accent`.
+    Accent,
+    /// `content.muted`.
+    Muted,
+    /// `state.error`.
+    Error,
+    /// `state.warning`.
+    Warning,
+    /// `state.success`.
+    Success,
+}
+
+impl ContentToken {
+    /// Every permitted token, in canonical declaration order.
+    pub const ALL: [Self; 6] = [
+        Self::Foreground,
+        Self::Accent,
+        Self::Muted,
+        Self::Error,
+        Self::Warning,
+        Self::Success,
+    ];
+
+    /// Canonical wire spelling (the theme token name).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Foreground => "content.foreground",
+            Self::Accent => "content.accent",
+            Self::Muted => "content.muted",
+            Self::Error => "state.error",
+            Self::Warning => "state.warning",
+            Self::Success => "state.success",
+        }
+    }
+
+    /// Parses an exact, case-sensitive token name; `None` outside the set.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|token| token.as_str() == name)
+    }
+}
+
+impl std::fmt::Display for ContentToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Typed refusal of an out-of-bounds style value.
+///
+/// Caps are inclusive; one past the cap is rejected and never clamped. The
+/// extension resolver (`bitty_ui::scene_style::SceneStyleError`) carries the
+/// same three cap variants plus its wire-parsing variants, so an authoring
+/// diagnostic and the admission refusal describe a cap the same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SceneStyleError {
+    /// Padding exceeds [`SCENE_STYLE_MAX_PADDING_CELLS`].
+    PaddingOverCap {
+        /// Rejected value.
+        found: u16,
+        /// The cap that was exceeded.
+        cap: u16,
+    },
+    /// Radius exceeds [`SCENE_STYLE_MAX_RADIUS_PX`].
+    RadiusOverCap {
+        /// Rejected value.
+        found: u16,
+        /// The cap that was exceeded.
+        cap: u16,
+    },
+    /// Border width exceeds [`SCENE_STYLE_MAX_BORDER_PX`].
+    BorderOverCap {
+        /// Rejected value.
+        found: u16,
+        /// The cap that was exceeded.
+        cap: u16,
+    },
+}
+
+impl std::fmt::Display for SceneStyleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PaddingOverCap { found, cap } => {
+                write!(f, "scene style padding exceeds cap: {found} > {cap}")
+            }
+            Self::RadiusOverCap { found, cap } => {
+                write!(f, "scene style radius exceeds cap: {found} > {cap}")
+            }
+            Self::BorderOverCap { found, cap } => {
+                write!(f, "scene style border exceeds cap: {found} > {cap}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SceneStyleError {}
+
+/// Bounded, data-only style for one styled scene subtree (v2).
+///
+/// The values are declarations, not paint: Core owns measurement and
+/// painting, so a producer never runs a layout algorithm. Every field has a
+/// documented default, an inclusive cap, and a unit:
+///
+/// | Field           | Unit        | Default               | Cap  |
+/// |-----------------|-------------|-----------------------|------|
+/// | `padding_cells` | cells       | `0`                   | `32` |
+/// | `radius_px`     | physical px | `0`                   | `16` |
+/// | `border_px`     | physical px | `0`                   | `16` |
+/// | `border_token`  | closed set  | `content.foreground`  | —    |
+///
+/// `radius_px` and `border_px` are **physical pixels**: the paint path passes
+/// them unchanged into the accepted `RoundedFill` geometry, which is physical
+/// pixel space, so the scene layer applies no DPI scale. A logical-pixel unit
+/// with a DPI story is a separate future change; declaring one here would make
+/// the documented unit disagree with the painted frame.
+///
+/// Construction is plain data: an out-of-bounds value is representable so a
+/// test (or a hostile producer that bypasses a typed constructor) can prove
+/// admission rejects it, and [`Self::validate`] is the single check every
+/// entry point applies. A token is inert while `border_px == 0`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct SceneNodeStyle {
+    /// Padding around the child content, in cells per side.
+    pub padding_cells: u16,
+    /// Corner radius applied to the painted ring, in physical pixels.
+    pub radius_px: u16,
+    /// Border stroke width inside the frame, in physical pixels.
+    pub border_px: u16,
+    /// Border colour token from the closed content set.
+    pub border_token: ContentToken,
+}
+
+impl SceneNodeStyle {
+    /// The flat style: no padding, no radius, no border. A flat style paints
+    /// no operation and measures exactly like an unstyled node.
+    pub const FLAT: Self = Self {
+        padding_cells: 0,
+        radius_px: 0,
+        border_px: 0,
+        border_token: ContentToken::Foreground,
+    };
+
+    /// Builds a style declaration; bounds are checked by [`Self::validate`].
+    #[must_use]
+    pub const fn new(
+        padding_cells: u16,
+        radius_px: u16,
+        border_px: u16,
+        border_token: ContentToken,
+    ) -> Self {
+        Self {
+            padding_cells,
+            radius_px,
+            border_px,
+            border_token,
+        }
+    }
+
+    /// Checks every field against its inclusive cap.
+    ///
+    /// # Errors
+    ///
+    /// A typed [`SceneStyleError`] naming the field, the rejected value, and
+    /// the cap. Values are never clamped.
+    pub fn validate(self) -> Result<(), SceneStyleError> {
+        if self.padding_cells > SCENE_STYLE_MAX_PADDING_CELLS {
+            return Err(SceneStyleError::PaddingOverCap {
+                found: self.padding_cells,
+                cap: SCENE_STYLE_MAX_PADDING_CELLS,
+            });
+        }
+        if self.radius_px > SCENE_STYLE_MAX_RADIUS_PX {
+            return Err(SceneStyleError::RadiusOverCap {
+                found: self.radius_px,
+                cap: SCENE_STYLE_MAX_RADIUS_PX,
+            });
+        }
+        if self.border_px > SCENE_STYLE_MAX_BORDER_PX {
+            return Err(SceneStyleError::BorderOverCap {
+                found: self.border_px,
+                cap: SCENE_STYLE_MAX_BORDER_PX,
+            });
+        }
+        Ok(())
+    }
+
+    /// True when no geometry is claimed; the border token is then inert.
+    #[must_use]
+    pub const fn is_flat(self) -> bool {
+        self.padding_cells == 0 && self.radius_px == 0 && self.border_px == 0
+    }
+}
+
+/// Declarative layout and paint primitive (v1, with the additive v2
+/// [`SceneNode::Styled`] kind).
 ///
 /// Text, rows, columns, blocks, images, tables, lists, and rules. No shaders,
 /// pipelines, native windows, or global-coordinate drawing. Unknown variants
 /// received from a newer producer are rendered as bounded plain-text fallback
 /// (`Unknown`) per compatibility requirement.
+///
+/// The enum is intentionally not `#[non_exhaustive]`: during the `0.0.x`
+/// series a new variant is accepted as a breaking change for a downstream
+/// exhaustive match. Adding `#[non_exhaustive]` is a separate compatibility
+/// decision, not part of the additive [`SceneNode::Styled`] kind.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SceneNode {
     /// Text span.
@@ -157,6 +404,19 @@ pub enum SceneNode {
         /// Optional border.
         border: Option<Border>,
         /// Child.
+        child: Box<SceneNode>,
+    },
+    /// Styled subtree (additive v2 kind).
+    ///
+    /// Carries bounded style data only. Core measures the child and paints
+    /// the padding inset, the rounded border ring, and the token colour; the
+    /// producer expresses no layout and holds no render handle. A v1
+    /// producer never constructs this variant, so v1 scenes are unchanged,
+    /// and an `Unknown` child still falls back to bounded plain text.
+    Styled {
+        /// Bounded style declaration; validated at block admission.
+        style: SceneNodeStyle,
+        /// Child subtree.
         child: Box<SceneNode>,
     },
     /// Image placement reference.
@@ -195,7 +455,7 @@ impl SceneNode {
             Self::Row(children) | Self::Column(children) => {
                 1 + children.iter().map(Self::count_nodes).sum::<usize>()
             }
-            Self::Block { child, .. } => 1 + child.count_nodes(),
+            Self::Block { child, .. } | Self::Styled { child, .. } => 1 + child.count_nodes(),
         }
     }
 
@@ -212,7 +472,7 @@ impl SceneNode {
                     1 + children.iter().map(Self::depth).max().unwrap_or(0)
                 }
             }
-            Self::Block { child, .. } => 1 + child.depth(),
+            Self::Block { child, .. } | Self::Styled { child, .. } => 1 + child.depth(),
         }
     }
 
@@ -237,7 +497,60 @@ impl SceneNode {
             Self::Block { border, child } => {
                 child.text_bytes() + border.as_ref().map_or(0, |b| b.color.len())
             }
+            // Style is not text: a closed token enum and integer fields carry
+            // no string payload, so styling never consumes the SCN-3 budget.
+            Self::Styled { child, .. } => child.text_bytes(),
             Self::Image(_) | Self::Rule => 0,
+        }
+    }
+
+    /// Scene-schema revision this subtree requires.
+    ///
+    /// Returns [`RICH_BLOCK_VERSION`] for a v1-only subtree and
+    /// [`SCENE_STYLE_SCHEMA_VERSION`] once any [`SceneNode::Styled`] kind is
+    /// present. Consumers that only understand v1 can use this to degrade a
+    /// newer producer's block instead of misreading it.
+    #[must_use]
+    pub fn schema_version(&self) -> u32 {
+        match self {
+            Self::Styled { child, .. } => SCENE_STYLE_SCHEMA_VERSION.max(child.schema_version()),
+            Self::Row(children) | Self::Column(children) => children
+                .iter()
+                .map(Self::schema_version)
+                .max()
+                .unwrap_or(RICH_BLOCK_VERSION),
+            Self::Block { child, .. } => child.schema_version(),
+            Self::Text(_)
+            | Self::Image(_)
+            | Self::CodeBlock(_)
+            | Self::Table(_)
+            | Self::List(_)
+            | Self::Rule
+            | Self::Unknown(_) => RICH_BLOCK_VERSION,
+        }
+    }
+
+    /// Validates every style declaration in the subtree.
+    ///
+    /// Called by block admission so an out-of-bounds style is rejected with a
+    /// typed diagnostic instead of being clamped during layout.
+    fn validate_style_bounds(&self) -> Result<(), SceneStyleError> {
+        match self {
+            Self::Styled { style, child } => {
+                style.validate()?;
+                child.validate_style_bounds()
+            }
+            Self::Row(children) | Self::Column(children) => {
+                children.iter().try_for_each(Self::validate_style_bounds)
+            }
+            Self::Block { child, .. } => child.validate_style_bounds(),
+            Self::Text(_)
+            | Self::Image(_)
+            | Self::CodeBlock(_)
+            | Self::Table(_)
+            | Self::List(_)
+            | Self::Rule
+            | Self::Unknown(_) => Ok(()),
         }
     }
 }
@@ -269,7 +582,15 @@ pub struct RichBlock {
 /// Single choke point used by [`RichBlock::new`], [`Scene::insert`], and
 /// [`Scene::replace_content`] so a block that reaches the scene through any
 /// path is bounded the same way.
+///
+/// Style bounds are checked first: an out-of-cap style is a producer defect
+/// that must fail the whole block (the parent), never be clamped later by the
+/// paint path. The check runs at every entry point, so a value that bypassed
+/// the typed constructor still cannot reach the renderer.
 fn check_block_content_limits(content: &SceneNode) -> Result<(), SceneError> {
+    content
+        .validate_style_bounds()
+        .map_err(|error| SceneError::StyleInvalid { error })?;
     let nodes = content.count_nodes();
     if nodes > SCENE_MAX_NODES_PER_BLOCK {
         return Err(SceneError::NodesTooMany {
@@ -295,10 +616,13 @@ fn check_block_content_limits(content: &SceneNode) -> Result<(), SceneError> {
 }
 
 impl RichBlock {
-    /// Creates a v1 block with validation (SCN-1..3).
+    /// Creates a block with validation (SCN-1..3 plus style bounds).
     ///
-    /// Returns `Err` with a typed diagnostic when any per-block limit is
-    /// exceeded; the last good scene is retained by the caller (RFC).
+    /// Returns `Err` with a typed diagnostic when any per-block limit or a
+    /// style value is out of bounds; the last good scene is retained by the
+    /// caller (RFC). A block that carries a [`SceneNode::Styled`] subtree
+    /// still reports [`RICH_BLOCK_VERSION`] here; read
+    /// [`Self::schema_version`] for the additive scene revision.
     pub fn new(
         id: BlockId,
         anchor: BlockAnchor,
@@ -409,6 +733,16 @@ impl RichBlock {
         self.content.depth()
     }
 
+    /// Scene-schema revision this block requires.
+    ///
+    /// [`RICH_BLOCK_VERSION`] for a v1 block, [`SCENE_STYLE_SCHEMA_VERSION`]
+    /// once the content carries a styled subtree. The block's [`Self::version`]
+    /// stays the monotonic revision counter.
+    #[must_use]
+    pub fn schema_version(&self) -> u32 {
+        self.content.schema_version()
+    }
+
     /// Text bytes for this block.
     #[must_use]
     pub fn text_bytes(&self) -> usize {
@@ -462,6 +796,11 @@ pub enum SceneError {
     DuplicateBlockId(BlockId),
     /// Block not found for replacement.
     BlockNotFound(BlockId),
+    /// A style declaration in the block content is out of bounds.
+    StyleInvalid {
+        /// The typed style refusal (never clamped).
+        error: SceneStyleError,
+    },
 }
 
 impl std::fmt::Display for SceneError {
@@ -476,11 +815,19 @@ impl std::fmt::Display for SceneError {
             Self::BlocksTooMany { count, cap } => write!(f, "blocks too many: {count} > {cap}"),
             Self::DuplicateBlockId(id) => write!(f, "duplicate block id: {}", id.0),
             Self::BlockNotFound(id) => write!(f, "block not found: {}", id.0),
+            Self::StyleInvalid { error } => write!(f, "invalid scene style: {error}"),
         }
     }
 }
 
-impl std::error::Error for SceneError {}
+impl std::error::Error for SceneError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::StyleInvalid { error } => Some(error),
+            _ => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Scene (composed)
@@ -1548,6 +1895,7 @@ mod tests {
                 SceneNode::Row(_) => "row",
                 SceneNode::Column(_) => "column",
                 SceneNode::Block { .. } => "block",
+                SceneNode::Styled { .. } => "styled",
                 SceneNode::Image(_) => "image",
                 SceneNode::CodeBlock(_) => "codeblock",
                 SceneNode::Table(_) => "table",
@@ -1572,6 +1920,13 @@ mod tests {
                 },
                 "block",
             ),
+            (
+                SceneNode::Styled {
+                    style: SceneNodeStyle::FLAT,
+                    child: Box::new(SceneNode::Rule),
+                },
+                "styled",
+            ),
             (SceneNode::Image(PlacementId(0)), "image"),
             (
                 SceneNode::CodeBlock(CodeBlockModel {
@@ -1591,15 +1946,272 @@ mod tests {
             (SceneNode::Rule, "rule"),
             (SceneNode::Unknown(String::new()), "unknown"),
         ];
-        assert_eq!(cases.len(), 10);
+        assert_eq!(cases.len(), 11);
         for (node, expected) in &cases {
             assert_eq!(kind(node), *expected);
             // Every variant is measurable and bounded; leaves sit at depth
-            // 1, a block wrapping one child at depth 2 with 2 nodes.
-            let (expected_depth, expected_nodes) =
-                if *expected == "block" { (2, 2) } else { (1, 1) };
+            // 1, a block or styled wrapper around one child at depth 2 with
+            // 2 nodes.
+            let (expected_depth, expected_nodes) = if *expected == "block" || *expected == "styled"
+            {
+                (2, 2)
+            } else {
+                (1, 1)
+            };
             assert_eq!(node.depth(), expected_depth);
             assert_eq!(node.count_nodes(), expected_nodes);
+        }
+    }
+
+    // -- v2 style primitives (bitty#2112) -----------------------------------
+
+    fn styled(style: SceneNodeStyle) -> SceneNode {
+        SceneNode::Styled {
+            style,
+            child: Box::new(tiny_text("hi")),
+        }
+    }
+
+    #[test]
+    fn content_token_set_is_closed_and_stable() {
+        assert_eq!(ContentToken::ALL.len(), 6);
+        for token in ContentToken::ALL {
+            assert_eq!(ContentToken::parse(token.as_str()), Some(token));
+            assert!(!token.as_str().is_empty());
+        }
+        assert_eq!(
+            ContentToken::parse("content.accent"),
+            Some(ContentToken::Accent)
+        );
+        assert_eq!(ContentToken::parse("content.accent "), None);
+        assert_eq!(ContentToken::parse("#ff0000"), None);
+        assert_eq!(ContentToken::parse("border.idle"), None);
+        assert_eq!(ContentToken::parse("chrome.accent"), None);
+        assert_eq!(ContentToken::default(), ContentToken::Foreground);
+    }
+
+    #[test]
+    fn style_caps_are_inclusive_and_one_past_fails() {
+        assert_eq!(
+            (
+                SCENE_STYLE_MAX_PADDING_CELLS,
+                SCENE_STYLE_MAX_RADIUS_PX,
+                SCENE_STYLE_MAX_BORDER_PX
+            ),
+            (32, 16, 16),
+            "the public caps are the candidate record's literal values"
+        );
+        let at_cap = SceneNodeStyle::new(32, 16, 16, ContentToken::Accent);
+        assert_eq!(at_cap.validate(), Ok(()));
+
+        for style in [
+            SceneNodeStyle::new(33, 0, 0, ContentToken::Accent),
+            SceneNodeStyle::new(0, 17, 0, ContentToken::Accent),
+            SceneNodeStyle::new(0, 0, 17, ContentToken::Accent),
+        ] {
+            assert!(style.validate().is_err());
+        }
+    }
+
+    /// Parent fails: `RichBlock::new` (the block that owns the subtree) must
+    /// reject an out-of-cap style for every primitive instead of admitting it
+    /// and letting the paint path clamp.
+    #[test]
+    fn parent_block_rejects_each_over_cap_style() {
+        let cases = [
+            SceneNodeStyle::new(
+                SCENE_STYLE_MAX_PADDING_CELLS + 1,
+                0,
+                0,
+                ContentToken::Accent,
+            ),
+            SceneNodeStyle::new(0, SCENE_STYLE_MAX_RADIUS_PX + 1, 0, ContentToken::Accent),
+            SceneNodeStyle::new(0, 0, SCENE_STYLE_MAX_BORDER_PX + 1, ContentToken::Accent),
+        ];
+        for style in cases {
+            let err = RichBlock::new(
+                BlockId(1),
+                BlockAnchor::Zone(1),
+                styled(style),
+                ScrollBehavior::Inline,
+                1,
+                0,
+                1,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, SceneError::StyleInvalid { .. }),
+                "out-of-cap style must fail the block, got {err:?}"
+            );
+        }
+    }
+
+    /// Parent fails at the scene boundary too: an unchecked block that
+    /// bypassed `RichBlock::new` is rejected by `Scene::insert` before it can
+    /// paint, and the last good scene is retained.
+    #[test]
+    fn parent_scene_insert_rejects_unchecked_over_cap_style() {
+        let mut scene = Scene::new();
+        let good = RichBlock::new(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            tiny_text("ok"),
+            ScrollBehavior::Inline,
+            1,
+            0,
+            1,
+        )
+        .unwrap();
+        scene.insert(good).unwrap();
+        let before = scene.aggregated_bytes();
+
+        let bad = RichBlock::new_unchecked(
+            BlockId(2),
+            BlockAnchor::Zone(2),
+            styled(SceneNodeStyle::new(
+                0,
+                0,
+                SCENE_STYLE_MAX_BORDER_PX + 1,
+                ContentToken::Accent,
+            )),
+            ScrollBehavior::Inline,
+            1,
+            0,
+            2,
+        );
+        let err = scene.insert(bad).unwrap_err();
+        assert!(matches!(err, SceneError::StyleInvalid { .. }));
+        assert_eq!(scene.len(), 1, "last good scene is retained");
+        assert_eq!(scene.aggregated_bytes(), before);
+    }
+
+    /// The replace path is a separate admission entry point: out-of-cap style
+    /// content must fail there too, leaving the previous content and version
+    /// untouched.
+    #[test]
+    fn scene_replace_content_rejects_unchecked_over_cap_style() {
+        let mut scene = Scene::new();
+        let good = RichBlock::new(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            tiny_text("ok"),
+            ScrollBehavior::Inline,
+            1,
+            0,
+            1,
+        )
+        .unwrap();
+        scene.insert(good).unwrap();
+        let before = scene.get(BlockId(1)).unwrap().content().clone();
+        let before_version = scene.get(BlockId(1)).unwrap().version();
+
+        let err = scene
+            .replace_content(
+                BlockId(1),
+                styled(SceneNodeStyle::new(0, 0, 17, ContentToken::Accent)),
+            )
+            .unwrap_err();
+        assert!(matches!(err, SceneError::StyleInvalid { .. }));
+        assert_eq!(
+            scene.get(BlockId(1)).unwrap().content(),
+            &before,
+            "the rejected replacement never lands"
+        );
+        assert_eq!(scene.get(BlockId(1)).unwrap().version(), before_version);
+    }
+
+    #[test]
+    fn style_is_not_text_and_keeps_the_v1_budgets() {
+        let plain = tiny_text("hello");
+        let styled_node = SceneNode::Styled {
+            style: SceneNodeStyle::new(
+                SCENE_STYLE_MAX_PADDING_CELLS,
+                SCENE_STYLE_MAX_RADIUS_PX,
+                SCENE_STYLE_MAX_BORDER_PX,
+                ContentToken::Success,
+            ),
+            child: Box::new(plain.clone()),
+        };
+        assert_eq!(styled_node.text_bytes(), plain.text_bytes());
+        // The wrapper is one node and one level, so SCN-1..2 stay bounded.
+        assert_eq!(styled_node.count_nodes(), plain.count_nodes() + 1);
+        assert_eq!(styled_node.depth(), plain.depth() + 1);
+    }
+
+    #[test]
+    fn v1_content_reports_the_v1_schema_and_styled_content_reports_v2() {
+        assert_eq!(RICH_BLOCK_VERSION, 1, "v1 is the accepted literal");
+        assert_eq!(
+            SCENE_STYLE_SCHEMA_VERSION, 2,
+            "the additive style revision is the literal 2"
+        );
+        let v1 = RichBlock::new(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            tiny_text("v1"),
+            ScrollBehavior::Inline,
+            1,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(v1.schema_version(), 1);
+        assert_eq!(v1.version(), 1);
+
+        let v2 = RichBlock::new(
+            BlockId(2),
+            BlockAnchor::Zone(2),
+            SceneNode::Column(vec![
+                tiny_text("a"),
+                styled(SceneNodeStyle::new(2, 4, 1, ContentToken::Accent)),
+            ]),
+            ScrollBehavior::Inline,
+            1,
+            0,
+            2,
+        )
+        .unwrap();
+        assert_eq!(v2.schema_version(), 2);
+        // The block revision counter is unchanged: schema and revision are
+        // distinct, so v1 decoding paths are unaffected.
+        assert_eq!(v2.version(), 1);
+    }
+
+    #[test]
+    fn flat_style_is_a_pure_wrapper() {
+        assert_eq!(SceneNodeStyle::default(), SceneNodeStyle::FLAT);
+        assert!(SceneNodeStyle::FLAT.is_flat());
+        assert!(
+            SceneNodeStyle::new(0, 0, 0, ContentToken::Error).is_flat(),
+            "an inert token does not make a style non-flat"
+        );
+        assert!(!SceneNodeStyle::new(1, 0, 0, ContentToken::Foreground).is_flat());
+        assert!(!SceneNodeStyle::new(0, 1, 0, ContentToken::Foreground).is_flat());
+        assert!(!SceneNodeStyle::new(0, 0, 1, ContentToken::Foreground).is_flat());
+    }
+
+    #[test]
+    fn unknown_kind_fallback_survives_a_styled_wrapper() {
+        let node = styled_default(SceneNode::Unknown("fallback".to_string()));
+        assert_eq!(node.text_bytes(), "fallback".len());
+        assert_eq!(node.count_nodes(), 2);
+        let block = RichBlock::new(
+            BlockId(1),
+            BlockAnchor::Zone(1),
+            node,
+            ScrollBehavior::Overlay,
+            1,
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(block.text_bytes(), "fallback".len());
+    }
+
+    fn styled_default(child: SceneNode) -> SceneNode {
+        SceneNode::Styled {
+            style: SceneNodeStyle::default(),
+            child: Box::new(child),
         }
     }
 }

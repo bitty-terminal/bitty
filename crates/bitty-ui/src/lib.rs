@@ -111,7 +111,8 @@
 //! - [`scene_style`] — closed candidate style primitives for extension-owned
 //!   scene nodes (`padding`, `radius`, `border`, `border_token`) resolved from
 //!   the theme with inclusive caps and fail-closed overflow (bitty#2112,
-//!   candidate; no paint consumer yet).
+//!   candidate; the scene paint path consumes the mirrored vocabulary, with
+//!   no plugin-facing wire key yet).
 
 //! - [`canvas`] — bounded `Canvas` display lists retained for compositor
 //!   replay at refresh, revision-gated like [`uitree`] (UX-25, CTX-0671,

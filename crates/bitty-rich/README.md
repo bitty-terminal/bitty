@@ -40,7 +40,9 @@ and closed `OQ-008`, `OQ-015`, and `OQ-016` at design level.
 - `Cargo.toml` — package metadata and decoder dependencies.
 - `src/lib.rs` — crate docs with the accepted contracts and the bound table.
 - `src/image.rs` — RFC-compliant presentation image store.
-- `src/scene.rs` — versioned blocks and declarative scene composition.
+- `src/scene.rs` — versioned blocks and declarative scene composition,
+  including the additive v2 `SceneNode::Styled` style node with bounded
+  geometry caps and the closed content-token set.
 - `src/kitty_place.rs` — Kitty placement policy (declared-size pre-check plus
   admission/eviction/rect geometry) and the kitty ledger bounds
   (`KITTY_PLACE_MAX_IMAGES`, `KITTY_LEDGER_MAX_BYTES`). Bounded decode and

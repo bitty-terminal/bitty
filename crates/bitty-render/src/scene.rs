@@ -48,6 +48,7 @@
 //! |---|---|---|
 //! | [`SCENE_PAINT_MAX_OPS`] paint ops per frame | 16,384 | typed refusal |
 //! | [`SCENE_PAINT_MAX_BORDER_CELLS`] block border width | 8 | typed refusal |
+//! | style ops per styled node | 1 ring (borders only) | counted by the op budget |
 //! | blocks per frame | `SCENE_MAX_BLOCKS_PER_TERMINAL` (64) | typed refusal |
 //! | nodes per block | `SCENE_MAX_NODES_PER_BLOCK` (2048) | typed refusal |
 //! | depth per block | `SCENE_MAX_DEPTH` (32) | typed refusal |
@@ -75,6 +76,7 @@
 //! | `Row` | children left to right, each at `min(measured, remaining)`; height = tallest child |
 //! | `Column` | children top to bottom, each at `min(measured, remaining)`; width = widest child |
 //! | `Block` | `border.width` cells of inset on every side around the child |
+//! | `Styled` | `style.padding_cells` cells of inset on every side around the child |
 //! | `CodeBlock` | one row per content line, plus one header row when `lang` is set |
 //! | `Table` | one row per table row, cells joined with `" \| "` |
 //! | `List` | one row per item, prefixed `"- "` or `"N. "` when ordered |
@@ -82,11 +84,59 @@
 //! | `Image` | one content row reserved for the admitted placement |
 //!
 //! Ops are emitted in declaration order. Fills land in [`DrawList::fills`]
-//! (below Core decoration rings, like cell backgrounds) and text glyphs land
-//! in [`DrawList::glyphs`] (above the rings, like grid text), so a decorated
+//! (below Core decoration rings, like cell backgrounds), rounded style rings
+//! in [`DrawList::rounded_fills`] (the same rounded pass Core uses for View
+//! frames: after plain fills and before glyphs), and text glyphs land in
+//! [`DrawList::glyphs`] (above the rings, like grid text), so a decorated
 //! leaf keeps the accepted z-order. Image nodes emit a
 //! [`ScenePaintOp::Image`] reference and no pixels: the admitted image plane
 //! keeps owning image painting, and this path adds no decode seam.
+//!
+//! # Style primitives (v2)
+//!
+//! A producer may wrap a subtree in [`SceneNode::Styled`] with a bounded
+//! [`SceneNodeStyle`]:
+//!
+//! | Primitive | Unit | Default | Cap | Paint |
+//! |---|---|---|---|---|
+//! | padding | cells | `0` | `32` | child inset; no op |
+//! | radius | physical px | `0` | `16` | corner radius of the border ring |
+//! | border | physical px | `0` | `16` | one rounded ring op |
+//! | border token | closed content set | `content.foreground` | — | [`ContentPalette`] colour |
+//!
+//! Core owns every measurement and pixel: the producer declares data and
+//! never lays out or draws. A **flat** style (`padding = radius = border = 0`)
+//! measures and paints exactly like the unwrapped child and emits zero ops,
+//! so an unstyled v1 scene and a scene that declares the default style are
+//! byte-identical. A border is a stroke *inside* the node's own measured
+//! frame and never expands that frame, so adding a border cannot move a
+//! sibling. It also reserves no layout cells: text sits at the frame edge
+//! when `padding = 0`, so an author who wants the ring clear of glyphs
+//! declares padding. Padding is whole cells and the border is physical
+//! pixels, so the two units are not directly comparable: choose padding whose
+//! cell extent covers the stroke (`padding_cells * cell width >= border_px`
+//! on the horizontal axis).
+//!
+//! `radius_px` and `border_px` are physical pixels and pass unchanged into
+//! [`RoundedFill`], which is physical pixel space. A logical-pixel unit with a
+//! DPI story is a separate future change; this scene layer applies no scale.
+//!
+//! The ring's rectangle is the node's own measured frame (already clamped to
+//! the leaf by layout), intersected with the allocation its parent handed the
+//! node and with the cell-aligned leaf before it is emitted. A frame larger
+//! than its allocation is clipped to that allocation instead of being dropped,
+//! so its visible top/left portion still paints like a v1 `Block`. The rounded
+//! ring closes at the clip boundary because it is one geometry op, and it
+//! never draws outside the allocation or the leaf.
+//!
+//! Style is paint only. It never hides text: [`ScenePaint::text_lines`], the
+//! present loop's panel accessibility text projection, and
+//! [`ScenePaint::plain_text`] read the same text ops with or without a
+//! wrapper, so padding shifts a line but cannot drop it, and a border or
+//! radius never removes content from the tree. There is no production
+//! per-node `SceneNode -> SceneKind` projection: a panel scene stays one
+//! `Column` node in the accessibility run, and the style wrapper is
+//! transparent to the text lines that run carries.
 //!
 //! # Text
 //!
@@ -116,8 +166,9 @@
 
 use bitty_rich::image::PlacementId;
 use bitty_rich::scene::{
-    Border, CodeBlockModel, ListModel, RichBlock, SCENE_MAX_BLOCKS_PER_TERMINAL, SCENE_MAX_DEPTH,
-    SCENE_MAX_NODES_PER_BLOCK, SCENE_MAX_RICH_BYTES_PER_TERMINAL, Scene, SceneNode, TableModel,
+    Border, CodeBlockModel, ContentToken, ListModel, RichBlock, SCENE_MAX_BLOCKS_PER_TERMINAL,
+    SCENE_MAX_DEPTH, SCENE_MAX_NODES_PER_BLOCK, SCENE_MAX_RICH_BYTES_PER_TERMINAL, Scene,
+    SceneNode, SceneNodeStyle, TableModel,
 };
 use bitty_term_state::char_cell_width;
 
@@ -125,6 +176,7 @@ use crate::geometry::RectPx;
 use crate::glyph::GlyphRasterizer;
 use crate::grid::{
     CellMetrics, DECORATION_BORDER, DEFAULT_FG, DrawList, FillRect, GridRenderer, Rgba8,
+    RoundedFill, ThemePalette, palette_rgb_in,
 };
 
 // ---------------------------------------------------------------------------
@@ -304,6 +356,15 @@ pub enum ScenePaintError {
         /// Cap.
         cap: u16,
     },
+    /// A [`SceneNodeStyle`] value is out of bounds.
+    ///
+    /// Admission already rejects this, so the paint path only observes it
+    /// when a scene bypasses [`RichBlock::new`];
+    /// it refuses rather than clamping.
+    StyleInvalid {
+        /// The typed style refusal, shared with the scene model.
+        error: bitty_rich::scene::SceneStyleError,
+    },
 }
 
 impl std::fmt::Display for ScenePaintError {
@@ -327,11 +388,19 @@ impl std::fmt::Display for ScenePaintError {
             Self::BorderTooWide { width, cap } => {
                 write!(f, "scene paint border too wide: {width} > {cap}")
             }
+            Self::StyleInvalid { error } => write!(f, "scene paint style invalid: {error}"),
         }
     }
 }
 
-impl std::error::Error for ScenePaintError {}
+impl std::error::Error for ScenePaintError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::StyleInvalid { error } => Some(error),
+            _ => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Paint list
@@ -382,6 +451,25 @@ pub enum ScenePaintOp {
         /// Reserved destination rectangle (one content row).
         rect: RectPx,
     },
+    /// Rounded border ring emitted by a styled scene node (v2).
+    ///
+    /// This is the accepted [`RoundedFill`] geometry the compositor already
+    /// uses for View frames, evaluated by the same SDF in the software and
+    /// WGSL backends: no new pipeline, one op per bordered node. `border` is the ring thickness (equal to the
+    /// declared style border) and `radius` the declared corner radius, both
+    /// in physical pixels. The ring is drawn inside `rect`; it never expands
+    /// the node's measured box and never changes hit testing.
+    Rounded {
+        /// Outer ring rectangle in physical pixels, clipped to the parent
+        /// allocation and the leaf.
+        rect: RectPx,
+        /// Ring thickness in physical pixels.
+        border: u16,
+        /// Corner radius in physical pixels, clamped by the rasterizer.
+        radius: u16,
+        /// Straight-alpha ring color.
+        color: Rgba8,
+    },
 }
 
 impl ScenePaintOp {
@@ -389,7 +477,10 @@ impl ScenePaintOp {
     #[must_use]
     pub const fn rect(&self) -> RectPx {
         match self {
-            Self::Fill { rect, .. } | Self::Text { rect, .. } | Self::Image { rect, .. } => *rect,
+            Self::Fill { rect, .. }
+            | Self::Text { rect, .. }
+            | Self::Image { rect, .. }
+            | Self::Rounded { rect, .. } => *rect,
         }
     }
 
@@ -398,7 +489,7 @@ impl ScenePaintOp {
     pub fn text(&self) -> Option<&str> {
         match self {
             Self::Text { text, .. } => Some(text),
-            Self::Fill { .. } | Self::Image { .. } => None,
+            Self::Fill { .. } | Self::Image { .. } | Self::Rounded { .. } => None,
         }
     }
 }
@@ -497,7 +588,9 @@ impl ScenePaint {
                 col: *col,
                 text: text.as_str(),
             }),
-            ScenePaintOp::Fill { .. } | ScenePaintOp::Image { .. } => None,
+            ScenePaintOp::Fill { .. }
+            | ScenePaintOp::Image { .. }
+            | ScenePaintOp::Rounded { .. } => None,
         })
     }
 
@@ -530,23 +623,34 @@ impl ScenePaint {
         renderer: &mut GridRenderer<R>,
         list: &mut DrawList,
     ) -> usize {
-        self.append_into(renderer, &mut list.fills, &mut list.glyphs)
+        self.append_into(
+            renderer,
+            &mut list.fills,
+            &mut list.rounded_fills,
+            &mut list.glyphs,
+        )
     }
 
-    /// Pushes this list's fills and glyphs into separate frame layers.
+    /// Pushes this list's fills, rounded rings, and glyphs into separate frame
+    /// layers.
     ///
     /// The runtime present loop composes a combined frame from per-leaf
     /// primitive vectors rather than from a per-leaf [`DrawList`], so it
     /// consumes this entry point instead of synthesizing a throwaway list.
     /// Semantics are exactly [`Self::append_to`]: text goes through the grid
     /// renderer's overlay text seam, faux bold adds the same one-pixel pass,
-    /// and image references are counted, never rasterized.
+    /// and image references are counted, never rasterized. A
+    /// [`ScenePaintOp::Rounded`] ring becomes one
+    /// [`RoundedFill`] in `rounded`, which the
+    /// compositor paints in its existing rounded pass after plain fills and
+    /// before glyphs.
     ///
     /// Returns the number of image references skipped.
     pub fn append_into<R: GlyphRasterizer>(
         &self,
         renderer: &mut GridRenderer<R>,
         fills: &mut Vec<FillRect>,
+        rounded: &mut Vec<RoundedFill>,
         glyphs: &mut Vec<crate::grid::GlyphInstance>,
     ) -> usize {
         let mut images = 0usize;
@@ -555,6 +659,19 @@ impl ScenePaint {
                 ScenePaintOp::Fill { rect, color } => {
                     fills.push(FillRect {
                         rect: *rect,
+                        color: *color,
+                    });
+                }
+                ScenePaintOp::Rounded {
+                    rect,
+                    border,
+                    radius,
+                    color,
+                } => {
+                    rounded.push(RoundedFill {
+                        frame: *rect,
+                        border: *border,
+                        radius: *radius,
                         color: *color,
                     });
                 }
@@ -594,13 +711,99 @@ impl ScenePaint {
 // Style
 // ---------------------------------------------------------------------------
 
+/// ANSI index carrying the `content.accent` role.
+///
+/// Mirrors `HELP_PANEL_ACCENT_ANSI_INDEX` (bright blue), so the resolver's
+/// accent token and the Core chrome accent agree on one source.
+const CONTENT_ACCENT_ANSI_INDEX: u8 = 12;
+/// ANSI index carrying the `content.muted` role (bright black).
+const CONTENT_MUTED_ANSI_INDEX: u8 = 8;
+/// ANSI index carrying the `state.error` role.
+const CONTENT_ERROR_ANSI_INDEX: u8 = 1;
+/// ANSI index carrying the `state.warning` role.
+const CONTENT_WARNING_ANSI_INDEX: u8 = 3;
+/// ANSI index carrying the `state.success` role.
+const CONTENT_SUCCESS_ANSI_INDEX: u8 = 2;
+
+/// Resolved colours for the closed content-token set.
+///
+/// The scene model carries a token, never a colour literal; this palette is
+/// the only place a token becomes pixels. [`Self::default`] resolves the Bitty
+/// Dark reference roles through [`ThemePalette`] (including live OSC 4
+/// overrides), and a caller with a themed [`ScenePaintStyle`] passes its own
+/// palette through [`Self::from_theme_palette`]. Theme-content-style keys are
+/// still owner-pending, so no second colour grammar is introduced here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentPalette {
+    /// `content.foreground`.
+    pub foreground: Rgba8,
+    /// `content.accent`.
+    pub accent: Rgba8,
+    /// `content.muted`.
+    pub muted: Rgba8,
+    /// `state.error`.
+    pub error: Rgba8,
+    /// `state.warning`.
+    pub warning: Rgba8,
+    /// `state.success`.
+    pub success: Rgba8,
+}
+
+impl ContentPalette {
+    /// Resolves the closed token roles from a render palette.
+    ///
+    /// The four state roles use the ANSI entries the palette already carries,
+    /// so a theme preset and live OSC 4 remaps recolor them without a second
+    /// source of truth.
+    #[must_use]
+    pub fn from_theme_palette(palette: &ThemePalette) -> Self {
+        let ansi = |index: u8| -> Rgba8 {
+            let [r, g, b] = palette_rgb_in(palette, index);
+            [r, g, b, 0xFF]
+        };
+        Self {
+            foreground: palette.foreground,
+            accent: ansi(CONTENT_ACCENT_ANSI_INDEX),
+            muted: ansi(CONTENT_MUTED_ANSI_INDEX),
+            error: ansi(CONTENT_ERROR_ANSI_INDEX),
+            warning: ansi(CONTENT_WARNING_ANSI_INDEX),
+            success: ansi(CONTENT_SUCCESS_ANSI_INDEX),
+        }
+    }
+
+    /// Colour for one closed content token.
+    #[must_use]
+    pub const fn color(&self, token: ContentToken) -> Rgba8 {
+        match token {
+            ContentToken::Foreground => self.foreground,
+            ContentToken::Accent => self.accent,
+            ContentToken::Muted => self.muted,
+            ContentToken::Error => self.error,
+            ContentToken::Warning => self.warning,
+            ContentToken::Success => self.success,
+        }
+    }
+}
+
+impl Default for ContentPalette {
+    fn default() -> Self {
+        Self::from_theme_palette(&ThemePalette::default())
+    }
+}
+
 /// Style used while painting a scene.
+///
+/// The core text/rule roles stay exactly as before; `content` only resolves
+/// the v2 style tokens. Default construction therefore paints an unstyled
+/// scene byte-identically to the pre-style path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScenePaintStyle {
     /// Text color for scene text.
     pub text: Rgba8,
     /// Rule and border color (Core-owned decoration role).
     pub rule: Rgba8,
+    /// Resolved colours for the v2 content tokens.
+    pub content: ContentPalette,
 }
 
 impl Default for ScenePaintStyle {
@@ -608,6 +811,7 @@ impl Default for ScenePaintStyle {
         Self {
             text: DEFAULT_FG,
             rule: DECORATION_BORDER,
+            content: ContentPalette::default(),
         }
     }
 }
@@ -962,6 +1166,18 @@ impl Painter {
                     rows: inner.rows.saturating_add(inset.saturating_mul(2)).min(rows),
                 }
             }
+            SceneNode::Styled { style, child } => {
+                // The border is a stroke inside the frame, so only padding
+                // consumes layout cells; Core derives the box, the producer
+                // never does.
+                let style = paint_style(*style)?;
+                let inner = self.measure(child, depth + 1)?;
+                let inset = style.padding_cells.saturating_mul(2);
+                Size {
+                    cols: inner.cols.saturating_add(inset).min(cols),
+                    rows: inner.rows.saturating_add(inset).min(rows),
+                }
+            }
             SceneNode::CodeBlock(model) => {
                 let (width, height) = code_block_extent(model);
                 Size {
@@ -1086,6 +1302,53 @@ impl Painter {
                         y.saturating_add(inset),
                         (width - double).min(inner.cols),
                         (height - double).min(inner.rows),
+                        depth + 1,
+                    )?;
+                }
+                Ok(())
+            }
+            SceneNode::Styled { style, child } => {
+                let style = paint_style(*style)?;
+                let inner = self.measure(child, depth + 1)?;
+                let double = style.padding_cells.saturating_mul(2);
+                let frame = Size {
+                    cols: inner.cols.saturating_add(double),
+                    rows: inner.rows.saturating_add(double),
+                };
+                if style.border_px > 0 {
+                    // One ring op, painted inside the node's own frame. The
+                    // frame is the measured (leaf-clamped) extent; clip it to
+                    // the allocation this node was handed and to the leaf so
+                    // a parent-clipped node still paints its visible top/left
+                    // portion (the v1 `Block` rule) instead of dropping the
+                    // ring. The ring closes at the clip boundary and never
+                    // damages a sibling or the surface.
+                    let full = self.cell_rect(x, y, frame.cols, frame.rows);
+                    let allocated = self.cell_rect(x, y, width, height);
+                    if let Some(rect) = full
+                        .intersection(&allocated)
+                        .and_then(|rect| rect.intersection(&self.surface.aligned_rect()))
+                    {
+                        if !rect.is_empty() {
+                            self.push_op(ScenePaintOp::Rounded {
+                                rect,
+                                border: style.border_px,
+                                radius: style.radius_px,
+                                color: self.style.content.color(style.border_token),
+                            })?;
+                        }
+                    }
+                }
+                if width > double && height > double {
+                    // Hand the child the allocation minus padding, exactly
+                    // like an unstyled node receives its allocation: a flat
+                    // style must not narrow a root text line.
+                    self.paint_node(
+                        child,
+                        x.saturating_add(style.padding_cells),
+                        y.saturating_add(style.padding_cells),
+                        width - double,
+                        height - double,
                         depth + 1,
                     )?;
                 }
@@ -1346,6 +1609,18 @@ fn border_cells(border: Option<&Border>) -> Result<u16, ScenePaintError> {
         });
     }
     Ok(border.width)
+}
+
+/// Validates a v2 style declaration before measuring or painting it.
+///
+/// Admission already rejects an out-of-bounds style, so this is defense in
+/// depth for a value that bypassed [`RichBlock::new`]:
+/// the paint path refuses with the shared typed error and never clamps.
+fn paint_style(style: SceneNodeStyle) -> Result<SceneNodeStyle, ScenePaintError> {
+    style
+        .validate()
+        .map_err(|error| ScenePaintError::StyleInvalid { error })?;
+    Ok(style)
 }
 
 fn saturating_i32_from_u32(value: u32) -> i32 {

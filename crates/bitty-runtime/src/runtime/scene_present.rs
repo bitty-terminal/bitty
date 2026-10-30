@@ -19,6 +19,10 @@
 //!
 //! - fills join the normal leaf fill layer, painted after that leaf's cell
 //!   backgrounds and before later leaves;
+//! - v2 style rings join the compositor's existing rounded pass
+//!   (`CombinedLeaves::rounded`, painted after plain fills and before
+//!   glyphs), one [`RoundedFill`] per bordered styled node, so styling adds
+//!   no pipeline and no per-frame allocation beyond that bounded ring list;
 //! - glyphs go through the grid renderer's overlay text seam
 //!   ([`ScenePaint::append_into`] → `GridRenderer::overlay_text_glyphs`), so
 //!   scene text and cell text share one rasterizer and one atlas epoch;
@@ -61,7 +65,7 @@
 //! consumes owned paint data and the shared CPU text seam only.
 
 use bitty_render::geometry::RectPx;
-use bitty_render::grid::{FillRect, GlyphInstance, RoundedClip, scale_alpha};
+use bitty_render::grid::{FillRect, GlyphInstance, RoundedClip, RoundedFill, scale_alpha};
 use bitty_render::scene::{ScenePaint, ScenePaintError, SceneSurface};
 use bitty_ui::ViewId;
 use bitty_ui::a11y_host::{SceneKind, UiSnapshotHost};
@@ -122,6 +126,9 @@ pub struct SceneFrameReport {
 pub(super) struct LeafScene {
     /// Cell-aligned fills (window pixels).
     pub fills: Vec<FillRect>,
+    /// Rounded style rings (window pixels); the compositor's rounded pass
+    /// paints them after plain fills and before glyphs.
+    pub rounded: Vec<RoundedFill>,
     /// Glyph instances placed through the overlay text seam (window pixels).
     pub glyphs: Vec<GlyphInstance>,
     /// Bounded invalidation rectangles, clipped to the leaf surface.
@@ -152,6 +159,7 @@ pub(super) struct RetainedScene {
     occluders: Vec<RectPx>,
     atlas_epoch: u64,
     fills: Vec<FillRect>,
+    rounded: Vec<RoundedFill>,
     glyphs: Vec<GlyphInstance>,
     damage: Vec<RectPx>,
     ops: usize,
@@ -164,6 +172,7 @@ impl RetainedScene {
     fn primitive(&self) -> LeafScene {
         LeafScene {
             fills: self.fills.clone(),
+            rounded: self.rounded.clone(),
             glyphs: self.glyphs.clone(),
             damage: self.damage.clone(),
             ops: self.ops,
@@ -343,8 +352,9 @@ impl Runtime {
             lines: a11y.scene_text()[before..].to_vec(),
         };
         let mut fills = Vec::new();
+        let mut rounded = Vec::new();
         let mut glyphs = Vec::new();
-        let images = paint.append_into(renderer, &mut fills, &mut glyphs);
+        let images = paint.append_into(renderer, &mut fills, &mut rounded, &mut glyphs);
         let mut damage = Vec::with_capacity(paint.damage().len());
         for rect in paint.damage() {
             if let Some(clipped) = rect.intersection(&surface.rect) {
@@ -354,6 +364,11 @@ impl Runtime {
         for fill in &mut fills {
             if fade < 1.0 {
                 fill.color = scale_alpha(fill.color, fade);
+            }
+        }
+        for ring in &mut rounded {
+            if fade < 1.0 {
+                ring.color = scale_alpha(ring.color, fade);
             }
         }
         glyphs.retain(|glyph| {
@@ -371,6 +386,7 @@ impl Runtime {
             ops: paint.ops().len(),
             images,
             fills,
+            rounded,
             glyphs,
             run,
         };
@@ -383,6 +399,7 @@ impl Runtime {
                 occluders: occluders.to_vec(),
                 atlas_epoch: renderer.atlas_epoch(),
                 fills: leaf.fills.clone(),
+                rounded: leaf.rounded.clone(),
                 glyphs: leaf.glyphs.clone(),
                 damage: leaf.damage.clone(),
                 ops: leaf.ops,

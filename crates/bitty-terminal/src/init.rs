@@ -6084,7 +6084,7 @@ pub(crate) fn run_init_subcommand_with_io(
                 for component in &declared {
                     let _ = writeln!(
                         output,
-                        "bitty init: extension '{component}' is missing; re-run `bitty extension install {component}` (latest catalog release) or `bitty extension install {component} --version <X.Y.Z>` (exact pin; nothing fetched by init)"
+                        "bitty init: extension '{component}' is missing; re-run `bitty extension install {component} --version <X.Y.Z>` (exact pin; nothing fetched by init; latest selection is bitty-plugin-manager work)"
                     );
                 }
             }

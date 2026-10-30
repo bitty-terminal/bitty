@@ -318,9 +318,19 @@ fn component_install_needs_consent_and_an_exact_version_when_pinned() {
     let home = scratch_dir("install-version");
     let system = home.join("system-components");
     std::fs::create_dir_all(&system).expect("system dir");
-    // No `--version` resolves the catalog latest, but consent comes first:
-    // empty stdin aborts (exit 1) before any fetch or staging.
+    // A bare install is a usage error (exit 2): Core never resolves a latest
+    // release or contacts a catalog (bitty#2399).
     let output = run_in(&home, &system, &["component", "install", "net"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("--version"), "{}", stderr(&output));
+    assert!(!user_root(&home).join("net").exists());
+    // A pinned install still prompts, and empty stdin aborts (exit 1) before
+    // any fetch or staging.
+    let output = run_in(
+        &home,
+        &system,
+        &["component", "install", "net", "--version", "0.0.23"],
+    );
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
     assert!(
         stderr(&output).contains("not approved") || stderr(&output).contains("aborted"),
@@ -973,14 +983,14 @@ fn extension_unknown_name_suggests_closest_known_command() {
 }
 
 #[test]
-fn extension_install_without_version_prompts_before_network() {
-    // Bare install resolves the catalog latest, but consent precedes every
-    // transport contact: empty stdin aborts with nothing fetched or staged.
-    let home = scratch_dir("latest-consent");
+fn extension_install_without_version_is_usage_before_network() {
+    // A bare install is a usage error (exit 2) and Core never fetches a
+    // catalog or resolves a latest release (bitty#2399).
+    let home = scratch_dir("pinned-only");
     let system = home.join("system-components");
     std::fs::create_dir_all(&system).expect("system dir");
     // A scrubbed PATH would surface a tool-missing error if anything spawned;
-    // the consent abort must win first.
+    // the usage rejection must win first.
     let empty_path = home.join("empty-path");
     std::fs::create_dir_all(&empty_path).expect("empty path");
     let output = run_with_env(
@@ -989,25 +999,21 @@ fn extension_install_without_version_prompts_before_network() {
         &["extension", "install", "bitty-graphics"],
         &[("PATH", &empty_path.display().to_string())],
     );
-    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    let diagnostic = stderr(&output);
+    assert!(diagnostic.contains("--version"), "{diagnostic}");
     assert!(
-        stderr(&output).contains("aborted") || stderr(&output).contains("not approved"),
-        "{}",
-        stderr(&output)
+        diagnostic.contains("bitty-plugin-manager"),
+        "the refusal names the catalog owner: {diagnostic}"
     );
-    // The alias resolved to `graphics` before the prompt: the install path
-    // names the stored component, never `bitty-graphics`.
-    let prompt = stdout(&output);
-    assert!(prompt.contains("latest 'graphics' release"), "{prompt}");
-    assert!(!prompt.contains("bitty-graphics"), "{prompt}");
     assert!(!user_root(&home).join("graphics").exists());
     assert!(!user_root(&home).join("bitty-graphics").exists());
     let _ = std::fs::remove_dir_all(&home);
 }
 
 #[test]
-fn extension_help_documents_latest_pinning_and_aliases() {
-    let home = scratch_dir("help-latest");
+fn extension_help_documents_pinned_install_and_aliases() {
+    let home = scratch_dir("help-pinned");
     let system = home.join("system-components");
     std::fs::create_dir_all(&system).expect("system dir");
     let output = run_in(&home, &system, &["extension", "--help"]);
@@ -1021,7 +1027,8 @@ fn extension_help_documents_latest_pinning_and_aliases() {
         text.contains("bitty extension install net --version 0.0.1"),
         "{text}"
     );
-    assert!(text.contains("latest"), "{text}");
+    assert!(text.contains("pinned install (bitty#2399)"), "{text}");
+    assert!(text.contains("bitty-plugin-manager"), "{text}");
     assert!(text.contains("bitty-graphics"), "{text}");
     let _ = std::fs::remove_dir_all(&home);
 }

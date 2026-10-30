@@ -86,6 +86,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Extension install seed is pinned-only; catalog ownership moves to the
+  extension layer (bitty#2399, W-72):** `bitty extension install` now
+  requires `--version X.Y.Z` and performs at most one pinned release fetch
+  plus its `SHA256SUMS`; a bare install is a usage error (exit `2`) instead
+  of a latest-catalog resolution. Core no longer fetches, parses, or embeds
+  `extensions/catalog.v1`; catalog resolution, latest selection, and
+  list/inspect presentation belong to `bitty-plugin-manager`, and the
+  registry/extension layer owns the catalog and lock lifecycle. The seed
+  keeps the SHA-256 lock chain, exact-two-member audit, consent, and TOFU
+  pin, reuses an already-installed exact version that verifies locally when
+  the manifest is unreachable (offline idempotence), and refuses
+  tampered or oversize metadata and pin-mismatched downgrades. The retired
+  surface is guarded by
+  `crates/bitty-terminal/tests/extension_seed_boundary.rs`, and the contract
+  is recorded in `specifications/extension-install-seed.md`.
 - **Plugin surfaces read one store (`CTX-1634`, bitty#2773, bitty#2774,
   bitty#2775):** `--test-mode` publishes sanitized lifecycle rows (id,
   version, generation, state, manifest hash, declared capabilities) to a

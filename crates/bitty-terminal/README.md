@@ -30,6 +30,14 @@ libraries, as stated in `src/main.rs`.
   the verb still validates its arguments and then fails with exit 1.
 - Third-party dependencies, per `Cargo.toml`: `pollster` only; no
   network-facing dependency is declared.
+- The only network-reaching path is the pinned extension install seed
+  (`src/component_seed.rs`, bitty#2399): fixed-argv system `curl`, one
+  `(name, version, host target)` release plus its `SHA256SUMS`, verified
+  before staging. Core does not fetch or parse `extensions/catalog.v1`;
+  catalog resolution, latest selection, and list/inspect are
+  `bitty-plugin-manager` work (`W-72`). See
+  `specifications/extension-install-seed.md` for the bounds, offline
+  fallback, and trust chain.
 - Must not own business behavior: grid, parsing, rendering, plugin, and IPC
   semantics belong to the libraries it wires.
 - Flag parsing itself is pure and total; config-file loading, window and GPU

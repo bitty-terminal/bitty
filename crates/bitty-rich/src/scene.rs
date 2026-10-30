@@ -150,6 +150,10 @@ pub struct ListModel {
 /// monotonic revision counter, so nothing about v1 blocks moves.
 pub const SCENE_STYLE_SCHEMA_VERSION: u32 = 2;
 
+// The style schema is an additive revision after v1; a smaller value would
+// make `schema_version()` lie about a v1-only block.
+const _: () = assert!(SCENE_STYLE_SCHEMA_VERSION > RICH_BLOCK_VERSION);
+
 /// Inclusive maximum style padding in cells.
 ///
 /// Reuses the accepted `decoration.content_inset` upper bound (`0..=32`) and
@@ -2091,10 +2095,6 @@ mod tests {
 
     #[test]
     fn v1_content_reports_the_v1_schema_and_styled_content_reports_v2() {
-        assert!(
-            SCENE_STYLE_SCHEMA_VERSION > RICH_BLOCK_VERSION,
-            "the style schema is an additive revision after v1"
-        );
         let v1 = RichBlock::new(
             BlockId(1),
             BlockAnchor::Zone(1),

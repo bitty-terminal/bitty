@@ -94,9 +94,8 @@
 //!
 //! # Style primitives (v2)
 //!
-//! A producer may wrap a subtree in [`SceneNode::Styled`]
-//! (`bitty_rich::scene::SceneNode::Styled`) with a bounded
-//! [`SceneNodeStyle`](bitty_rich::scene::SceneNodeStyle):
+//! A producer may wrap a subtree in [`SceneNode::Styled`] with a bounded
+//! [`SceneNodeStyle`]:
 //!
 //! | Primitive | Unit | Default | Cap | Paint |
 //! |---|---|---|---|---|
@@ -345,11 +344,10 @@ pub enum ScenePaintError {
         /// Cap.
         cap: u16,
     },
-    /// A [`SceneNodeStyle`](bitty_rich::scene::SceneNodeStyle) value is out
-    /// of bounds.
+    /// A [`SceneNodeStyle`] value is out of bounds.
     ///
     /// Admission already rejects this, so the paint path only observes it
-    /// when a scene bypasses [`RichBlock::new`](bitty_rich::scene::RichBlock::new);
+    /// when a scene bypasses [`RichBlock::new`];
     /// it refuses rather than clamping.
     StyleInvalid {
         /// The typed style refusal, shared with the scene model.
@@ -443,10 +441,9 @@ pub enum ScenePaintOp {
     },
     /// Rounded border ring emitted by a styled scene node (v2).
     ///
-    /// This is the accepted [`RoundedFill`](crate::grid::RoundedFill)
-    /// geometry the compositor already uses for View frames, evaluated by the
-    /// same SDF in the software and WGSL backends: no new pipeline, one op
-    /// per bordered node. `border` is the ring thickness (equal to the
+    /// This is the accepted [`RoundedFill`] geometry the compositor already
+    /// uses for View frames, evaluated by the same SDF in the software and
+    /// WGSL backends: no new pipeline, one op per bordered node. `border` is the ring thickness (equal to the
     /// declared style border) and `radius` the declared corner radius, both
     /// in physical pixels. The ring is drawn inside `rect`; it never expands
     /// the node's measured box and never changes hit testing.
@@ -631,7 +628,7 @@ impl ScenePaint {
     /// renderer's overlay text seam, faux bold adds the same one-pixel pass,
     /// and image references are counted, never rasterized. A
     /// [`ScenePaintOp::Rounded`] ring becomes one
-    /// [`RoundedFill`](crate::grid::RoundedFill) in `rounded`, which the
+    /// [`RoundedFill`] in `rounded`, which the
     /// compositor paints in its existing rounded pass after plain fills and
     /// before glyphs.
     ///
@@ -1598,7 +1595,7 @@ fn border_cells(border: Option<&Border>) -> Result<u16, ScenePaintError> {
 /// Validates a v2 style declaration before measuring or painting it.
 ///
 /// Admission already rejects an out-of-bounds style, so this is defense in
-/// depth for a value that bypassed [`RichBlock::new`](bitty_rich::scene::RichBlock::new):
+/// depth for a value that bypassed [`RichBlock::new`]:
 /// the paint path refuses with the shared typed error and never clamps.
 fn paint_style(style: SceneNodeStyle) -> Result<SceneNodeStyle, ScenePaintError> {
     style

@@ -593,9 +593,9 @@ the compiled cell; there is no silent fallback and no weaker transport:
 
 Linux x86_64 is the first cell. A per-session cgroup is created **before** the
 spawn, and the child writes its own pid into `cgroup.procs` from a `pre_exec`
-hook, so a descendant cannot be born outside the identity. That hook and the
-PTY `setsid`/`TIOCSCTTY` hook are the only `pre_exec` closures in the crate, and
-both live in the single documented syscall seam,
+hook, so a descendant cannot be born outside the identity. That hook, the PTY
+`setsid`/`TIOCSCTTY` hook, and the descriptor sweep are the only `pre_exec`
+closures in the crate, and all live in the single documented syscall seam,
 `containment/linux_sys.rs`. The graceful window is `orphan_reap_grace_ms`;
 escalation is `cgroup.kill` or `pidfd_send_signal(SIGKILL)`, followed by a
 bounded emptiness wait. `swept`

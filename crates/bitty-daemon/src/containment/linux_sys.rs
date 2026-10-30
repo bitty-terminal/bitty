@@ -92,13 +92,15 @@ pub(crate) fn dup_cloexec<Fd: AsFd>(fd: Fd) -> io::Result<File> {
 /// The lowest descriptor a worker child may not inherit: stdio is 0/1/2.
 const FIRST_INHERITED_FD: u32 = 3;
 
-/// Highest descriptor the `fcntl` fallback scans when the soft limit is
-/// unbounded: the loop covers `3..FALLBACK_SCAN_MAX`.
+/// Highest descriptor the `fcntl` fallback scans: the loop covers
+/// `3..FALLBACK_SCAN_MAX`.
 ///
-/// `RLIMIT_NOFILE` is commonly `RLIM_INFINITY` on hosts that raise it; the
-/// fallback needs a finite bound, and a descriptor above this one is not
-/// reachable through the documented spawn surface anyway.
-const FALLBACK_SCAN_MAX: nix::libc::rlim_t = 1 << 20;
+/// The process soft `RLIMIT_NOFILE` is not a valid bound: a descriptor opened
+/// before the limit was lowered keeps its number above the new soft limit and
+/// would survive `exec`. The kernel refuses descriptors at or above
+/// `fs.nr_open` (1048576 by default), so the fixed ceiling covers every
+/// descriptor a process can hold.
+const FALLBACK_SCAN_MAX: u32 = 1 << 20;
 
 /// Mark every descriptor above stdio close-on-exec in the forked child.
 ///
@@ -147,8 +149,13 @@ fn mark_inherited_cloexec() -> io::Result<()> {
     let error = io::Error::last_os_error();
     match error.raw_os_error() {
         // `ENOSYS`: no `close_range` at all. `EINVAL`: the kernel predates the
-        // `CLOSE_RANGE_CLOEXEC` flag.
-        Some(code) if code == nix::libc::ENOSYS || code == nix::libc::EINVAL => {
+        // `CLOSE_RANGE_CLOEXEC` flag. `EPERM`: a sandbox filter denies a
+        // syscall it does not know; the `fcntl` scan still proves the sweep.
+        Some(code)
+            if code == nix::libc::ENOSYS
+                || code == nix::libc::EINVAL
+                || code == nix::libc::EPERM =>
+        {
             mark_inherited_cloexec_by_fcntl()
         }
         // Any other failure means the sweep cannot be proven: abort the exec
@@ -159,11 +166,12 @@ fn mark_inherited_cloexec() -> io::Result<()> {
 
 /// The fallback sweep for kernels without `CLOSE_RANGE_CLOEXEC`.
 ///
-/// The scan is bounded by the process soft limit (see [`FALLBACK_SCAN_MAX`]);
-/// it runs once per spawn and only on kernels that predate the `close_range`
-/// flag.
+/// The scan is bounded by [`FALLBACK_SCAN_MAX`] rather than the process soft
+/// limit. It runs once per spawn and only on kernels that predate the
+/// `close_range` flag, where the full scan costs a bounded sweep of `fcntl`
+/// calls and never more.
 fn mark_inherited_cloexec_by_fcntl() -> io::Result<()> {
-    for fd in FIRST_INHERITED_FD..descriptor_ceiling() {
+    for fd in FIRST_INHERITED_FD..FALLBACK_SCAN_MAX {
         // SAFETY: `fcntl(2)` with `F_SETFD` takes one descriptor-local flag and
         // no pointer.
         let result = unsafe {
@@ -184,22 +192,6 @@ fn mark_inherited_cloexec_by_fcntl() -> io::Result<()> {
         }
     }
     Ok(())
-}
-
-/// The exclusive upper bound of the `fcntl` fallback scan.
-fn descriptor_ceiling() -> u32 {
-    let mut limit = nix::libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `getrlimit(2)` writes one `struct rlimit` through the pointer and
-    // reads nothing else.
-    let status = unsafe { nix::libc::getrlimit(nix::libc::RLIMIT_NOFILE, &mut limit) };
-    if status != 0 {
-        return u32::try_from(FALLBACK_SCAN_MAX).unwrap_or(u32::MAX);
-    }
-    let soft = limit.rlim_cur.min(FALLBACK_SCAN_MAX);
-    u32::try_from(soft).unwrap_or(u32::MAX)
 }
 
 /// Set non-blocking I/O on `file`.

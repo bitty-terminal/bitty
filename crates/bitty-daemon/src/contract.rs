@@ -26,8 +26,11 @@ pub const SERVICE_API_MAJOR: u16 = 1;
 /// `kind: worker` and a served `session.resize`. `1.2` serves the accepted
 /// session and daemon metadata fields (bitty#2806) as optional response keys,
 /// so no existing field changes meaning and a `1.0` or `1.1` client remains in
-/// the accepted range because `min_client_minor` is `0`.
-pub const SERVICE_API_MINOR: u16 = 2;
+/// the accepted range because `min_client_minor` is `0`. `1.3` serves the
+/// terminal session spawn and the terminal content plane (`session.read`,
+/// `session.write`, `session.subscribe`) with the `terminal.inspect` and
+/// `terminal.input` transport grants.
+pub const SERVICE_API_MINOR: u16 = 3;
 
 /// Lowest client minor the server accepts for [`SERVICE_API_MAJOR`] (`D-11`:
 /// `min_client_minor` starts at `0` for `1.0`).
@@ -64,10 +67,15 @@ pub const EVENTS_SERVED: bool = cfg!(all(unix, target_os = "linux"));
 /// containment plan its startup probe selected
 /// ([`crate::worker::sessions_served`]): a Linux cell whose cgroup and
 /// subreaper probes both failed advertises `false` and answers
-/// `session.create` with `kind: worker` as `Denied/UnsupportedCapability`.
+/// `session.create` with `kind: worker`, or a terminal create that supplies a
+/// spawn specification, as `Denied/UnsupportedCapability`.
 /// `events` is compiled from [`EVENTS_SERVED`] for the same reason: the bit
 /// describes the served wire, not a plan.
 pub const CAPABILITIES: Capabilities = Capabilities {
+    // Registry-only terminal sessions are served on every cell; a terminal
+    // create that supplies a spawn specification additionally needs the
+    // contained PTY path and refuses `UnsupportedCapability` where the plan
+    // cannot enforce it.
     terminal_sessions: true,
     worker_sessions: crate::worker::WORKER_SESSIONS_SERVED,
     events: EVENTS_SERVED,
@@ -144,7 +152,7 @@ impl ServiceApiVersion {
             && client.minor <= self.minor
     }
 
-    /// The accepted client range, for diagnostics (`1.0..=1.2`).
+    /// The accepted client range, for diagnostics (`1.0..=1.3`).
     #[must_use]
     pub fn client_range(self) -> String {
         format!(
@@ -165,8 +173,8 @@ impl fmt::Display for ServiceApiVersion {
 pub struct Capabilities {
     /// Terminal sessions are hosted in v0.2.0.
     pub terminal_sessions: bool,
-    /// Worker sessions are contract-defined but disabled in every v0.2.0
-    /// build (`D-01`).
+    /// Worker sessions are served on a Linux cell whose containment plan is
+    /// enforced, and disabled everywhere else (`D-01`, `D-15`).
     pub worker_sessions: bool,
     /// Ordered, revision-tagged event delivery is available.
     pub events: bool,
@@ -221,11 +229,11 @@ mod tests {
     #[test]
     fn service_version_matches_the_accepted_contract() {
         assert_eq!(SERVICE_API_MAJOR, 1);
-        assert_eq!(SERVICE_API_MINOR, 2);
+        assert_eq!(SERVICE_API_MINOR, 3);
         assert_eq!(MIN_CLIENT_MINOR, 0);
-        assert_eq!(SERVICE_API_VERSION, ServiceApiVersion::new(1, 2, 0));
-        assert_eq!(SERVICE_API_VERSION.to_string(), "1.2");
-        assert_eq!(SERVICE_API_VERSION.client_range(), "1.0..=1.2");
+        assert_eq!(SERVICE_API_VERSION, ServiceApiVersion::new(1, 3, 0));
+        assert_eq!(SERVICE_API_VERSION.to_string(), "1.3");
+        assert_eq!(SERVICE_API_VERSION.client_range(), "1.0..=1.3");
     }
 
     #[test]
@@ -236,7 +244,8 @@ mod tests {
         assert!(!server.accepts(ClientVersion::new(2, 0)));
         assert!(server.accepts(ClientVersion::new(1, 1)));
         assert!(server.accepts(ClientVersion::new(1, 2)));
-        assert!(!server.accepts(ClientVersion::new(1, 3)));
+        assert!(server.accepts(ClientVersion::new(1, 3)));
+        assert!(!server.accepts(ClientVersion::new(1, 4)));
 
         let wider = ServiceApiVersion::new(1, 4, 2);
         assert!(!wider.accepts(ClientVersion::new(1, 1)));

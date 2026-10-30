@@ -23,9 +23,10 @@
 //!   it (`daemon.negotiate`);
 //! - the operator capability adds `daemon.inspect` and `daemon.control`;
 //! - `terminal.*` is never stretched to cover session or daemon
-//!   administration, so the one method whose contract scope is a v1 scope
-//!   (`session.resize`, `terminal.manage`) is expressed as a transport
-//!   requirement instead of a service scope;
+//!   administration; the methods whose contract scopes are v1 scopes
+//!   (`session.resize`/`terminal.manage`, `session.read` and
+//!   `session.subscribe`/`terminal.inspect`, `session.write`/`terminal.input`)
+//!   express them as transport requirements instead of service scopes;
 //! - a well-formed method name outside the service catalog is `NotFound`
 //!   (deny-by-default), and a name that violates the `bitty-ipc` method grammar
 //!   is `InvalidMethod`. The grammar and the v1 registry are reused from
@@ -307,6 +308,12 @@ pub enum ServiceMethod {
     SessionControlTransfer,
     /// `session.resize`.
     SessionResize,
+    /// `session.read`.
+    SessionRead,
+    /// `session.write`.
+    SessionWrite,
+    /// `session.subscribe`.
+    SessionSubscribe,
     /// `session.abort`.
     SessionAbort,
     /// `session.kill`.
@@ -324,10 +331,12 @@ const SESSION_INSPECT: [ServiceScope; 1] = [ServiceScope::SessionInspect];
 const SESSION_HOST: [ServiceScope; 1] = [ServiceScope::SessionHost];
 const SESSION_ATTACH: [ServiceScope; 1] = [ServiceScope::SessionAttach];
 const TERMINAL_MANAGE: [TransportScope; 1] = [TransportScope::TerminalManage];
+const TERMINAL_INSPECT: [TransportScope; 1] = [TransportScope::TerminalInspect];
+const TERMINAL_INPUT: [TransportScope; 1] = [TransportScope::TerminalInput];
 
 impl ServiceMethod {
     /// Every method in the frozen catalog order.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 20] = [
         Self::DaemonNegotiate,
         Self::DaemonStatus,
         Self::DaemonStop,
@@ -342,6 +351,9 @@ impl ServiceMethod {
         Self::SessionDetach,
         Self::SessionControlTransfer,
         Self::SessionResize,
+        Self::SessionRead,
+        Self::SessionWrite,
+        Self::SessionSubscribe,
         Self::SessionAbort,
         Self::SessionKill,
         Self::LeaseHeartbeat,
@@ -365,6 +377,9 @@ impl ServiceMethod {
             Self::SessionDetach => "session.detach",
             Self::SessionControlTransfer => "session.control.transfer",
             Self::SessionResize => "session.resize",
+            Self::SessionRead => "session.read",
+            Self::SessionWrite => "session.write",
+            Self::SessionSubscribe => "session.subscribe",
             Self::SessionAbort => "session.abort",
             Self::SessionKill => "session.kill",
             Self::LeaseHeartbeat => "lease.heartbeat",
@@ -401,6 +416,10 @@ impl ServiceMethod {
                 ScopeRequirement::Service(&SESSION_CONTROL)
             }
             Self::SessionResize => ScopeRequirement::Transport(&TERMINAL_MANAGE),
+            Self::SessionRead | Self::SessionSubscribe => {
+                ScopeRequirement::Transport(&TERMINAL_INSPECT)
+            }
+            Self::SessionWrite => ScopeRequirement::Transport(&TERMINAL_INPUT),
             Self::LeaseHeartbeat => ScopeRequirement::None,
         }
     }
@@ -437,6 +456,9 @@ impl ServiceMethod {
             Self::DaemonStop => Some(DispatchBoundary::DaemonStop),
             Self::DaemonOrphansVerify => Some(DispatchBoundary::OrphanVerify),
             Self::SessionResize => Some(DispatchBoundary::Resize),
+            Self::SessionRead | Self::SessionWrite | Self::SessionSubscribe => {
+                Some(DispatchBoundary::ContentPlane)
+            }
             Self::DaemonNegotiate
             | Self::DaemonStatus
             | Self::SessionStatus
@@ -468,6 +490,9 @@ impl ServiceMethod {
             Self::DaemonStop => &[DispatchBoundary::DaemonStop],
             Self::DaemonOrphansVerify => &[DispatchBoundary::OrphanVerify],
             Self::SessionResize => &[DispatchBoundary::Resize],
+            Self::SessionRead | Self::SessionWrite | Self::SessionSubscribe => {
+                &[DispatchBoundary::ContentPlane]
+            }
             Self::DaemonNegotiate
             | Self::DaemonStatus
             | Self::SessionStatus
@@ -504,7 +529,10 @@ impl ServiceMethod {
     #[must_use]
     pub const fn capability(self) -> Option<&'static str> {
         match self {
-            Self::SessionCreate => Some("terminal_sessions"),
+            Self::SessionCreate
+            | Self::SessionRead
+            | Self::SessionWrite
+            | Self::SessionSubscribe => Some("terminal_sessions"),
             Self::SessionAttach | Self::SessionGrant | Self::SessionGrantRevoke => {
                 Some("observer_grants")
             }
@@ -521,7 +549,10 @@ impl ServiceMethod {
             | Self::SessionAttach
             | Self::SessionGrant
             | Self::SessionControlTransfer => IdempotencyClass::Keyed,
-            Self::SessionResize | Self::DaemonHostGrant => IdempotencyClass::UnkeyedOpen,
+            Self::SessionResize
+            | Self::SessionWrite
+            | Self::SessionSubscribe
+            | Self::DaemonHostGrant => IdempotencyClass::UnkeyedOpen,
             _ => IdempotencyClass::Keyless,
         }
     }
@@ -548,6 +579,9 @@ impl ServiceMethod {
             Self::SessionDetach => AuditAction::Detach,
             Self::SessionControlTransfer => AuditAction::Transfer,
             Self::SessionResize => AuditAction::Resize,
+            Self::SessionRead => AuditAction::Read,
+            Self::SessionWrite => AuditAction::Write,
+            Self::SessionSubscribe => AuditAction::Subscribe,
             Self::SessionAbort => AuditAction::Abort,
             Self::SessionKill => AuditAction::Kill,
             Self::LeaseHeartbeat => AuditAction::Heartbeat,
@@ -564,6 +598,8 @@ impl ServiceMethod {
                 | Self::DaemonStatus
                 | Self::SessionStatus
                 | Self::SessionList
+                | Self::SessionRead
+                | Self::SessionSubscribe
                 | Self::LeaseHeartbeat
         )
     }
@@ -734,6 +770,9 @@ mod tests {
                 "session.detach",
                 "session.control.transfer",
                 "session.resize",
+                "session.read",
+                "session.write",
+                "session.subscribe",
                 "session.abort",
                 "session.kill",
                 "lease.heartbeat",
@@ -813,25 +852,47 @@ mod tests {
             ScopeRequirement::Transport(&TERMINAL_MANAGE)
         );
         assert_eq!(
+            ServiceMethod::SessionRead.scope(),
+            ScopeRequirement::Transport(&TERMINAL_INSPECT)
+        );
+        assert_eq!(
+            ServiceMethod::SessionSubscribe.scope(),
+            ScopeRequirement::Transport(&TERMINAL_INSPECT)
+        );
+        assert_eq!(
+            ServiceMethod::SessionWrite.scope(),
+            ScopeRequirement::Transport(&TERMINAL_INPUT)
+        );
+        assert_eq!(
             ServiceMethod::LeaseHeartbeat.scope(),
             ScopeRequirement::None
         );
     }
 
     #[test]
-    fn terminal_manage_is_the_only_transport_requirement() {
+    fn the_terminal_scopes_are_the_only_transport_requirements() {
         let mut transport = 0;
         for method in ServiceMethod::ALL {
             match method.scope() {
                 ScopeRequirement::Transport(scopes) => {
                     transport += 1;
-                    assert_eq!(method, ServiceMethod::SessionResize);
-                    assert_eq!(scopes, &[TransportScope::TerminalManage]);
+                    match method {
+                        ServiceMethod::SessionResize => {
+                            assert_eq!(scopes, &[TransportScope::TerminalManage]);
+                        }
+                        ServiceMethod::SessionRead | ServiceMethod::SessionSubscribe => {
+                            assert_eq!(scopes, &[TransportScope::TerminalInspect]);
+                        }
+                        ServiceMethod::SessionWrite => {
+                            assert_eq!(scopes, &[TransportScope::TerminalInput]);
+                        }
+                        other => panic!("{other} has an unexpected transport requirement"),
+                    }
                 }
                 ScopeRequirement::None | ScopeRequirement::Service(_) => {}
             }
         }
-        assert_eq!(transport, 1);
+        assert_eq!(transport, 4);
     }
 
     #[test]
@@ -839,10 +900,9 @@ mod tests {
         let mut mapped = Vec::new();
         for method in ServiceMethod::ALL {
             for boundary in method.boundaries() {
-                assert!(
-                    !mapped.contains(boundary),
-                    "{boundary} is mapped from two methods"
-                );
+                // The three content methods share one peer-re-check boundary,
+                // so the catalog maps a boundary from more than one method by
+                // design; the invariant is that every boundary is reachable.
                 mapped.push(*boundary);
             }
         }
@@ -852,7 +912,6 @@ mod tests {
                 "{boundary} has no catalog method"
             );
         }
-        assert_eq!(mapped.len(), DispatchBoundary::ALL.len());
         assert_eq!(
             ServiceMethod::DaemonHostGrant.boundary(),
             Some(DispatchBoundary::HostGrantMint)
@@ -924,6 +983,8 @@ mod tests {
                     | ServiceMethod::DaemonStatus
                     | ServiceMethod::SessionStatus
                     | ServiceMethod::SessionList
+                    | ServiceMethod::SessionRead
+                    | ServiceMethod::SessionSubscribe
                     | ServiceMethod::LeaseHeartbeat
             );
             assert_eq!(method.is_mutating(), expected, "{method}");

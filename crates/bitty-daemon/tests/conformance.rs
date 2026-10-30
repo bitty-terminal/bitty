@@ -29,12 +29,18 @@ use harness::real::RealDriver;
 #[test]
 fn corpus_is_well_formed_and_frozen() {
     let corpus = Corpus::load().expect("the embedded corpus parses");
-    assert_eq!(corpus.vectors.len(), 51, "corpus size changed");
+    assert_eq!(corpus.vectors.len(), 56, "corpus size changed");
     for id in [
         "C-01", "C-02", "C-03", "C-04", "C-05", "C-06", "C-07", "C-08", "C-12", "C-13", "C-14",
         "C-15", "C-16", "C-17",
     ] {
         assert!(corpus.vector(id).is_some(), "missing Core vector {id}");
+    }
+    for id in ["V-45", "V-46", "V-47", "V-48", "V-49"] {
+        assert!(
+            corpus.vector(id).is_some(),
+            "missing terminal content vector {id}"
+        );
     }
     for id in ["V-03", "V-42", "V-43"] {
         let vector = corpus.vector(id).expect("worker vector");
@@ -271,7 +277,7 @@ fn fake_conformance_corpus() {
         skipped,
         [
             "V-18", "V-39", "V-40", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07", "C-08", "C-12",
-            "C-15", "C-16"
+            "C-15", "C-16", "V-49"
         ],
         "the fake suite skips exactly the real-only vectors"
     );
@@ -406,7 +412,7 @@ fn fake_and_real_parity() {
         real.facts().capabilities.get("worker_sessions").copied() == Some(true);
     let mut expected_not_compared = vec![
         "V-06", "V-18", "V-33", "V-39", "V-40", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07",
-        "C-08", "C-10", "C-12", "F-01", "C-15", "C-16",
+        "C-08", "C-10", "C-12", "F-01", "C-15", "C-16", "V-49",
     ];
     if !cfg!(feature = "test-seams") {
         // Without the real seam V-44 is a fake-only row: the real driver
@@ -414,13 +420,13 @@ fn fake_and_real_parity() {
         expected_not_compared.push("V-44");
     }
     let expected_compared = if real_serves_workers {
-        if cfg!(feature = "test-seams") { 34 } else { 33 }
+        if cfg!(feature = "test-seams") { 38 } else { 37 }
     } else {
         // A refused containment plan skips the worker vectors on the real
         // driver; the fake still models a served cell. C-17 runs on both
         // drivers because it creates a terminal session only.
-        expected_not_compared.extend(["V-03", "V-42"]);
-        if cfg!(feature = "test-seams") { 32 } else { 31 }
+        expected_not_compared.extend(["V-03", "V-42", "V-45", "V-46", "V-47"]);
+        if cfg!(feature = "test-seams") { 33 } else { 32 }
     };
     expected_not_compared.sort_unstable();
     assert_eq!(

@@ -143,6 +143,12 @@ pub enum AuditAction {
     Transfer,
     /// Controller-only terminal resize.
     Resize,
+    /// `session.read` (a refused content read is a refusal record).
+    Read,
+    /// `session.write` (a refused content write is a refusal record).
+    Write,
+    /// `session.subscribe` (a refused content subscription is a refusal record).
+    Subscribe,
     /// `session.abort`.
     Abort,
     /// `session.kill`.
@@ -190,6 +196,9 @@ impl AuditAction {
             Self::HostGrantExpire => "host_grant.expire",
             Self::Transfer => "session.control.transfer",
             Self::Resize => "session.resize",
+            Self::Read => "session.read",
+            Self::Write => "session.write",
+            Self::Subscribe => "session.subscribe",
             Self::Abort => "session.abort",
             Self::Kill => "session.kill",
             Self::DaemonStatus => "daemon.status",

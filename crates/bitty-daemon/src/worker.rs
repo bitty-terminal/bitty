@@ -879,8 +879,11 @@ mod tests {
     use super::*;
     use crate::containment::ContainmentReport;
     use crate::content::CONTENT_FRAME_BYTES;
-    use crate::limits::Limits;
+    use crate::limits::{LimitId, Limits};
     use crate::registry::{DaemonInstanceId, SessionId, SessionKind};
+
+    /// Pause between content-plane readiness polls.
+    const READY_POLL: Duration = Duration::from_millis(10);
 
     /// Spawn one live terminal worker through the production path.
     fn spawn_test_worker(limits: &Limits, argv: &[&str]) -> (WorkerPool, SessionId) {
@@ -946,6 +949,47 @@ mod tests {
         .expect("the test worker must spawn");
     }
 
+    /// Wait, bounded, until `session` owns a live terminal content plane.
+    ///
+    /// Binding is synchronous with the spawn call, but the leader is scheduled
+    /// independently: a test that asserts immediately can observe the handle
+    /// before the child has done anything, and a leader that is already gone
+    /// (an exec failure, a hangup) must surface as a bounded timeout instead
+    /// of racing the assertion that follows. The bound is the committed
+    /// `spawn_bind_timeout_ms`.
+    fn wait_for_content_ready(pool: &WorkerPool, limits: &Limits, session: SessionId) {
+        let deadline =
+            Instant::now() + Duration::from_millis(limits.effective(LimitId::SpawnBindTimeoutMs));
+        while !pool.content_ready(session) {
+            assert!(
+                Instant::now() < deadline,
+                "the worker never owned a live content plane within spawn_bind_timeout_ms"
+            );
+            std::thread::sleep(READY_POLL);
+        }
+    }
+
+    /// Replace one worker's PTY master with a regular-file producer that
+    /// already holds `bytes` unread bytes, and return the real master.
+    ///
+    /// The caller must keep the returned master alive for as long as the
+    /// handle drains the file: dropping it hangs the session up, and a leader
+    /// that has not installed its signal handling yet dies from the pending
+    /// `SIGHUP`, which turns a liveness assertion into a load-dependent flake.
+    /// A regular file is used instead of a PTY or pipe so the queued volume is
+    /// deterministic.
+    fn use_file_producer(pool: &mut WorkerPool, session: SessionId, bytes: usize) -> File {
+        let mut producer = tempfile::tempfile().expect("a temporary producer");
+        producer
+            .write_all(&vec![b'x'; bytes])
+            .expect("fill the over-budget producer");
+        producer
+            .seek(SeekFrom::Start(0))
+            .expect("rewind the producer");
+        let worker = pool.workers.get_mut(&session).expect("the bound worker");
+        std::mem::replace(&mut worker.master, producer)
+    }
+
     #[test]
     fn forget_reaps_a_leader_that_already_exited() {
         let limits = Limits::default();
@@ -976,21 +1020,14 @@ mod tests {
     fn one_tick_drains_at_most_the_budget_and_resumes_after_a_read() {
         let limits = Limits::default();
         let (mut pool, session) = spawn_test_worker(&limits, &["/bin/sleep", "60"]);
+        wait_for_content_ready(&pool, &limits, session);
 
-        // A producer that is already over budget when the tick starts. A
-        // regular file is used instead of a PTY or pipe so the queued volume is
-        // deterministic: the test proves the drain loop stops at the budget
-        // instead of relying on a kernel buffer size.
-        let mut master = tempfile::tempfile().expect("a temporary producer");
-        master
-            .write_all(&vec![b'x'; DRAIN_BUDGET_BYTES * 4])
-            .expect("fill the over-budget producer");
-        master
-            .seek(SeekFrom::Start(0))
-            .expect("rewind the producer");
+        // A producer that is already over budget when the tick starts: the
+        // test proves the drain loop stops at the budget instead of relying on
+        // a kernel buffer size. The real PTY master stays open in this test.
+        let _pty_master = use_file_producer(&mut pool, session, DRAIN_BUDGET_BYTES * 4);
 
         let worker = pool.workers.get_mut(&session).expect("the bound worker");
-        worker.master = master;
         worker.drain(DRAIN_BUDGET_BYTES);
         assert_eq!(
             worker.drained_bytes, DRAIN_BUDGET_BYTES as u64,
@@ -1179,15 +1216,15 @@ mod tests {
 
         // Deterministic producers: a regular file already holds more than the
         // whole shared budget, so each worker can only stop at its own share.
+        // Both real PTY masters stay open for the duration of the test.
+        let mut pty_masters = Vec::new();
         for session in [first, second] {
-            let mut master = tempfile::tempfile().expect("a temporary producer");
-            master
-                .write_all(&vec![b'x'; DRAIN_BUDGET_BYTES * 2])
-                .expect("fill the over-budget producer");
-            master
-                .seek(SeekFrom::Start(0))
-                .expect("rewind the producer");
-            pool.workers.get_mut(&session).expect("bound worker").master = master;
+            wait_for_content_ready(&pool, &limits, session);
+            pty_masters.push(use_file_producer(
+                &mut pool,
+                session,
+                DRAIN_BUDGET_BYTES * 2,
+            ));
         }
 
         let share = per_worker_drain_budget(2);
@@ -1227,20 +1264,15 @@ mod tests {
     #[test]
     fn a_slow_reader_stops_the_drain_at_the_buffer_cap() {
         let limits = Limits::default();
-        // Replacing the PTY master with a regular file closes the slave and
-        // would hang up a normal child; ignore SIGHUP so this test measures the
-        // buffer cap, not the hangup path.
-        let (mut pool, session) =
-            spawn_test_worker(&limits, &["/bin/sh", "-c", "trap '' HUP; exec sleep 60"]);
+        let (mut pool, session) = spawn_test_worker(&limits, &["/bin/sleep", "60"]);
+        wait_for_content_ready(&pool, &limits, session);
 
-        let mut master = tempfile::tempfile().expect("a temporary producer");
-        master
-            .write_all(&vec![b'x'; DRAIN_BUDGET_BYTES * 8])
-            .expect("fill the over-budget producer");
-        master
-            .seek(SeekFrom::Start(0))
-            .expect("rewind the producer");
-        pool.workers.get_mut(&session).expect("bound worker").master = master;
+        // A deterministic producer that is already far past the cap. The real
+        // PTY master is held open by the test: replacing it with the file and
+        // dropping the master hangs the session up, and a leader that has not
+        // installed its signal handling yet dies from the pending `SIGHUP`
+        // before the cap is reached (a loaded runner loses that race).
+        let _pty_master = use_file_producer(&mut pool, session, DRAIN_BUDGET_BYTES * 8);
 
         // No reader: every tick stops when the bounded buffer is full, and the
         // drained total never grows past the cap or the shared tick budget.
@@ -1303,6 +1335,7 @@ mod tests {
     fn terminal_content_round_trips_through_read_and_write() {
         let limits = Limits::default();
         let (mut pool, session) = spawn_test_worker(&limits, &["/bin/cat"]);
+        wait_for_content_ready(&pool, &limits, session);
 
         match pool.write(session, b"hello\n") {
             ContentWrite::Accepted { accepted, .. } => assert_eq!(accepted, 6),

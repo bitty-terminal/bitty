@@ -756,17 +756,16 @@ open (`worker::tests::the_child_fd_table_is_exactly_the_pty_stdio` probes that
 table from the child). `worker.rs` drains the master on every poll tick into
 the per-session bounded content buffer (terminal kind) or discards it (worker
 kind), checks the leader's exit without reaping it (`waitid` with `WNOWAIT`),
-signals the recorded
-identity while the unreaped zombie still reserves its process-group id, then
-reaps the leader and drains the recorded group. It never blocks the service
-loop for a running worker. On exit it signals the recorded identity once (not
-a pid), then settles the cleanup class through the plan: a verified-empty cgroup
-subtree is `swept` and its journal record is removed; the subreaper fallback is
-`unverified` and its record is quarantined for the retention window. A failed
-spawn terminalizes the session
-as `failed`/`spawn_failed` at generation 0, with the cleanup class the plan
-could prove (`not_started` before a child existed, `swept` or `unverified` after
-one did), settles the journal record, and returns the normal create shape with a
+signals the recorded identity while the unreaped zombie still reserves its
+process-group id, then reaps the leader and drains the recorded group. It never
+blocks the service loop for a running worker. On exit it signals the recorded
+identity once (not a pid), then settles the cleanup class through the plan: a
+verified-empty cgroup subtree is `swept` and its journal record is removed; the
+subreaper fallback is `unverified` and its record is quarantined for the
+retention window. A failed spawn terminalizes the session as
+`failed`/`spawn_failed` at generation 0, with the cleanup class the plan could
+prove (`not_started` before a child existed, `swept` or `unverified` after one
+did), settles the journal record, and returns the normal create shape with a
 `null` token.
 
 `WorkerPool::forget` terminates a handle that is not already settled with the

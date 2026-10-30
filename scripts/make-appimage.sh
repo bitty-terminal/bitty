@@ -222,6 +222,13 @@ fi
 
 mkdir -p "$(dirname "$OUTPUT")"
 
+# appimagetool's continuous build (2026-10-29 and later) refuses an AppDir
+# whose root or entries are not readable/executable by every user, and
+# `mktemp -d` creates the root with mode 0700. Normalise the staged tree
+# before packaging so the bundle is usable by the installing user.
+chmod 0755 "${APPDIR}"
+chmod -R a+rX "${APPDIR}"
+
 echo "make-appimage: generating ${OUTPUT} via ${TOOL_PATH}..."
 APPIMAGE_EXTRACT_AND_RUN=1 ARCH="${ARCH}" "$TOOL_PATH" "${APPDIR}" "${OUTPUT}"
 

@@ -96,6 +96,9 @@ test -f "$APPDIR/usr/bin/bitty" || { echo "missing usr/bin/bitty" >&2; exit 6; }
 test -x "$APPDIR/usr/bin/bitty" || { echo "usr/bin/bitty not executable" >&2; exit 7; }
 test -f "$APPDIR/usr/share/metainfo/run.bitty.Bitty.metainfo.xml" || { echo "missing metainfo" >&2; exit 8; }
 test -f "$APPDIR/usr/share/applications/run.bitty.Bitty.desktop" || { echo "missing applications desktop" >&2; exit 9; }
+# appimagetool's continuous build (2026-10-29+) requires the AppDir root to be
+# readable/executable by every user; `mktemp -d` creates it 0700.
+test "$(stat -c %a "$APPDIR")" = 755 || { echo "AppDir root is not 0755" >&2; exit 10; }
 
 # Emit a mock AppImage with a recognizable payload: the test proves the output
 # came from this mock, not from a host, cached, or downloaded appimagetool.

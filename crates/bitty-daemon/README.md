@@ -593,9 +593,9 @@ the compiled cell; there is no silent fallback and no weaker transport:
 
 Linux x86_64 is the first cell. A per-session cgroup is created **before** the
 spawn, and the child writes its own pid into `cgroup.procs` from a `pre_exec`
-hook, so a descendant cannot be born outside the identity. That hook and the
-PTY `setsid`/`TIOCSCTTY` hook are the only `pre_exec` closures in the crate, and
-both live in the single documented syscall seam,
+hook, so a descendant cannot be born outside the identity. That hook, the PTY
+`setsid`/`TIOCSCTTY` hook, and the descriptor sweep are the only `pre_exec`
+closures in the crate, and all live in the single documented syscall seam,
 `containment/linux_sys.rs`. The graceful window is `orphan_reap_grace_ms`;
 escalation is `cgroup.kill` or `pidfd_send_signal(SIGKILL)`, followed by a
 bounded emptiness wait. `swept`
@@ -725,7 +725,13 @@ idempotency store keeps only its domain-separated digest.
 
 The PTY is single-owner. The child is spawned with `setsid` plus
 `TIOCSCTTY`, the master is close-on-exec and non-blocking, and stdio is the
-slave only. `worker.rs` drains the master on every poll tick, checks the
+slave only: the three stdio descriptors are `F_DUPFD_CLOEXEC` copies from the
+syscall seam, and a `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` sweep in the
+child marks every other descriptor close-on-exec just before `exec`, including
+descriptors the parent already held. The worker therefore starts with an fd
+table of exactly 0/1/2 on the slave, whatever the daemon or a test harness had
+open (`worker::tests::the_child_fd_table_is_exactly_the_pty_stdio` probes that
+table from the child). `worker.rs` drains the master on every poll tick, checks the
 leader's exit without reaping it (`waitid` with `WNOWAIT`), signals the recorded
 identity while the unreaped zombie still reserves its process-group id, then
 reaps the leader and drains the recorded group. It never blocks the service

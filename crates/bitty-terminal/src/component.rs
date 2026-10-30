@@ -114,7 +114,7 @@
 //! - `--version`: 1..=[`MAX_COMPONENT_VERSION_BYTES`] bytes.
 //! - `--digest`: 1..=[`MAX_COMPONENT_DIGEST_BYTES`] bytes, no NUL, plus 64 hex shape.
 //! - Source path: 1..=[`MAX_COMPONENT_PATH_BYTES`] bytes, no NUL.
-//! - Descriptor: [`COMPONENT_DESCRIPTOR_MAX_BYTES`](bitty_runtime::component::COMPONENT_DESCRIPTOR_MAX_BYTES) bytes (via runtime).
+//! - Descriptor: [`COMPONENT_DESCRIPTOR_MAX_BYTES`] bytes (via runtime).
 //! - Executable: [`COMPONENT_EXECUTABLE_MAX_BYTES`] bytes (via runtime).
 //! - TOFU pin file: [`MAX_PIN_FILE_BYTES`] bytes (`tarball.sha256`).
 

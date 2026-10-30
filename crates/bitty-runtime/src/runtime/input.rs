@@ -1115,6 +1115,25 @@ impl Runtime {
             self.hyperlink_press_uri = None;
             self.plaintext_press_uri = None;
         }
+        // Issue #2828: a plain left press on a split/panel divider is Core
+        // chrome and grabs the resize **before** the capture decision, so a
+        // focused app that enabled mouse reporting (DECSET 1000/1002/1003
+        // with 1006, or any other encoding) never receives the press. The
+        // grab is a precise hit test: it refuses every content rect
+        // (`pointer_in_content`, so floats, scrollbars, and app cells keep
+        // the pointer), moves no focus (a divider owns no leaf), and fails
+        // soft under Shift/Alt/Super (the selection and window-drag
+        // escapes). A press that does not land on a divider leaves all state
+        // untouched and falls through to capture byte-for-byte.
+        if !shift_override
+            && event.button == MouseButton::Left
+            && event.state == PressState::Pressed
+            && !self.alt_pressed
+            && !self.super_pressed
+            && self.begin_border_drag()
+        {
+            return;
+        }
         // CTX-0532: capture decision reads the focused pane's modes (primary
         // fallback for session-less leaves) — a focus change with no pump
         // must never capture with the previous pane's tracking/encoding.
@@ -1131,14 +1150,15 @@ impl Runtime {
         let capture = !shift_override && capture_tracking && self.should_capture_mouse();
 
         if capture {
-            // A border press is host-owned and may be canceled by an
-            // external geometry change before the app enables mouse
-            // tracking. Consume its matching release before capture can
-            // report an orphan event to the app; live border drags keep the
-            // existing capture behavior.
+            // Issue #2828: a border press is Core chrome consumed before the
+            // capture report, so a capturing app never saw the press. Its
+            // release belongs to the resize gesture whether the drag is still
+            // live (the normal case) or was canceled by an external geometry
+            // change or the pointer leaving the window (the tombstone).
+            // Consume it before capture can report an orphan event to the app.
             if event.button == MouseButton::Left
                 && event.state == PressState::Released
-                && self.consume_canceled_border_drag_release()
+                && (self.consume_canceled_border_drag_release() || self.end_border_drag())
             {
                 return;
             }
@@ -1291,21 +1311,6 @@ impl Runtime {
             && event.state == PressState::Pressed
             && (self.alt_pressed || self.super_pressed)
             && self.begin_tiled_drag_at(now)
-        {
-            return;
-        }
-        // Issue #1348: a plain left press on a split divider grabs it for
-        // a border-drag resize and consumes the event (no selection
-        // starts, no focus moves — a border owns no leaf). Shift/Mod
-        // presses fall through to the selection and drag paths, and
-        // mouse-capture apps never reach here (they returned above), so
-        // border-drag never breaks selection or app pointer ownership.
-        if !shift_override
-            && event.button == MouseButton::Left
-            && event.state == PressState::Pressed
-            && !self.alt_pressed
-            && !self.super_pressed
-            && self.begin_border_drag()
         {
             return;
         }

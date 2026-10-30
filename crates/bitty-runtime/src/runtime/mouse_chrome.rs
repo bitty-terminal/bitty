@@ -1322,11 +1322,14 @@ impl Runtime {
     /// the selection, Alt+drag, and Mod tiled-drag paths per the
     /// CTX-0181/CTX-0260/CTX-0966 precedents)
     /// plus a known cursor over a split handle
-    /// ([`LayoutNode::hit_test_split_handle_kind`]). Callers run this after
-    /// the mouse-capture and scrollbar checks, so a mouse-mode app and the
-    /// scroll thumb keep the pointer. Returns `true` when the drag started
+    /// ([`LayoutNode::hit_test_split_handle_kind`]). Callers run this
+    /// before the mouse-capture decision (issue #2828): a divider press is
+    /// Core chrome and must start the resize even when the focused app
+    /// enabled mouse reporting. Content presses are refused by
+    /// `pointer_in_content`, so the scroll thumb, floats, and every
+    /// app-owned cell keep the pointer. Returns `true` when the drag started
     /// (caller consumes the press and skips selection); `false` leaves all
-    /// state untouched so the press falls through to selection.
+    /// state untouched so the press falls through to selection or capture.
     ///
     /// Cross-drag (issues #1445/#2572): when the cursor is at the
     /// intersection of perpendicular splits (e.g., a 2x2 grid center), the
@@ -1494,16 +1497,18 @@ impl Runtime {
         true
     }
 
-    /// Ends the active border drag, if any. Returns `true` when one was
-    /// active (caller skips the selection-release commit/copy: no selection
-    /// was started by the grabbing press).
+    /// Ends the active border drag, if any, and consumes a canceled tombstone.
+    /// Returns `true` when a border gesture owned this release (caller skips
+    /// the selection-release commit/copy: no selection was started by the
+    /// grabbing press).
     pub fn end_border_drag(&mut self) -> bool {
         self.border_drag.take().is_some()
     }
 
     /// Consumes the left-button release owned by an externally canceled
-    /// border drag. Returns `true` only for the tombstone, leaving a live
-    /// drag untouched so capture routing keeps its existing behavior.
+    /// border drag. Returns `true` only for the tombstone; a live drag is
+    /// left for [`Self::end_border_drag`], which the capture route also
+    /// consults (issue #2828) so the app never receives an orphan release.
     pub(super) fn consume_canceled_border_drag_release(&mut self) -> bool {
         if self.border_drag.as_ref().is_some_and(|drag| drag.canceled) {
             self.border_drag = None;
@@ -1513,9 +1518,10 @@ impl Runtime {
         }
     }
 
-    /// Marks an active border drag canceled by an external geometry change.
-    /// The tombstone is consumed by the matching left-button release through
-    /// normal or capture routing, so selection-release/auto-copy cannot run.
+    /// Marks an active border drag canceled by an external event (geometry
+    /// change or the pointer leaving the window). The tombstone is consumed
+    /// by the matching left-button release through normal or capture
+    /// routing, so selection-release/auto-copy cannot run.
     pub(super) fn cancel_border_drag(&mut self) {
         if let Some(drag) = self.border_drag.as_mut() {
             drag.canceled = true;

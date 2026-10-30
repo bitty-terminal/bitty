@@ -587,11 +587,23 @@ jobs:
       # clang is in the FreeBSD base image; cmake + pkgconf drive
       # crossfont's fontconfig/FreeType probes. git + ca_root_nss let
       # `cargo --locked` fetch the pinned git dependencies over TLS.
+      #
+      # The VM image ships a snapshot pkg whose repository metadata can be a
+      # schema behind the repository, or can be mid-sync with a package
+      # missing. Force a metadata refresh and retry the install before failing
+      # the whole release on a transient mirror state.
       - name: Install FreeBSD build prerequisites
         run: |
           set -eux
-          sudo pkg update
-          sudo pkg install -y git cmake pkgconf ca_root_nss freetype2 fontconfig bash
+          for attempt in 1 2 3; do
+            sudo pkg update -f || true
+            if sudo pkg install -y git cmake pkgconf ca_root_nss freetype2 fontconfig bash; then
+              break
+            fi
+            echo "FreeBSD package install failed on attempt ${attempt}; refreshing repository metadata"
+            sleep 10
+          done
+          sudo pkg info cmake
 
       - name: Install pinned Rust toolchain (rustup)
         run: |

@@ -447,15 +447,15 @@ invocations in the release workflow; the key itself is the part after the
 bucket name. Every object address keeps the `bitty/` bucket prefix so the one
 shipped and verified bucket never moves:
 
-| Prefix                                                             | Class                                 | State                                                                                                             |
-| ------------------------------------------------------------------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `bitty/releases/<TAG>/<artifact>`                                  | Immutable versioned release payload   | Shipped and verified by the `r2-mirror` job                                                                       |
-| `bitty/install/latest.txt`                                         | Mutable stable version pointer        | Published by the `r2-stable` job (new in this task)                                                               |
-| `bitty/install/install.sh`                                         | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy                                                          |
-| `bitty/install/install.ps1`                                        | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy                                                          |
-| `bitty/extensions/<name>/<version>/<target>.tar.gz` + `SHA256SUMS` | Immutable versioned extension payload | Packed by `scripts/make-component-dist.sh` (#1792); published by the extension release CD jobs                    |
-| `bitty/extensions/catalog.v1`                                      | Mutable registry metadata             | Published (schema 1, 2026-10-22); generated and read-back-verified by `scripts/make-extension-catalog.sh` (#2440) |
-| `bitty/docs/<version>/<lang>.tar.gz`                               | Immutable versioned docs payload      | Reserved manual track, not uploaded here                                                                          |
+| Prefix                                                             | Class                                 | State                                                                                                                                                                                                 |
+| ------------------------------------------------------------------ | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `bitty/releases/<TAG>/<artifact>`                                  | Immutable versioned release payload   | Shipped and verified by the `r2-mirror` job                                                                                                                                                           |
+| `bitty/install/latest.txt`                                         | Mutable stable version pointer        | Published by the `r2-stable` job (new in this task)                                                                                                                                                   |
+| `bitty/install/install.sh`                                         | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy                                                                                                                                              |
+| `bitty/install/install.ps1`                                        | Mutable stable script object          | Reserved; lands with CTX-1047 Phase 2, same cache policy                                                                                                                                              |
+| `bitty/extensions/<name>/<version>/<target>.tar.gz` + `SHA256SUMS` | Immutable versioned extension payload | Packed by `scripts/make-component-dist.sh` (#1792); published by the extension release CD jobs                                                                                                        |
+| `bitty/extensions/catalog.v1`                                      | Mutable registry metadata             | Published (schema 1, 2026-10-22); manager-owned from bitty#2399; generated and read-back-verified by the compatibility publisher `scripts/make-extension-catalog.sh` (#2440); Core no longer reads it |
+| `bitty/docs/<version>/<lang>.tar.gz`                               | Immutable versioned docs payload      | Reserved manual track, not uploaded here                                                                                                                                                              |
 
 See `bitty-terminal-docs/architecture/directory-semantics.md` for extension directory semantics.
 
@@ -474,11 +474,11 @@ https://cdn.bitty.run/install/latest.txt
 
 ### Pointer classes and cache policy
 
-| Class                                                     | Keys                                                               | `Cache-Control`                                                                                   |
-| --------------------------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- |
-| Immutable versioned (`releases/`, `extensions/`, `docs/`) | Every versioned artifact, sidecar, `SHA256SUMS`, `provenance.json` | `public, max-age=31536000, immutable` (already emitted by `r2-mirror`)                            |
-| Mutable registry metadata (`extensions/catalog.v1`)       | Extension name/version/target/digest index                         | `public, max-age=300, must-revalidate` (5 minutes; readers fail closed on a fetched bad object)   |
-| Mutable stable (`install/`)                               | `latest.txt`, `install.sh`, `install.ps1`                          | `public, max-age=300, must-revalidate` (5 minutes, bounded staleness; scripts re-fetch every run) |
+| Class                                                     | Keys                                                               | `Cache-Control`                                                                                         |
+| --------------------------------------------------------- | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| Immutable versioned (`releases/`, `extensions/`, `docs/`) | Every versioned artifact, sidecar, `SHA256SUMS`, `provenance.json` | `public, max-age=31536000, immutable` (already emitted by `r2-mirror`)                                  |
+| Mutable registry metadata (`extensions/catalog.v1`)       | Extension name/version/target/digest index                         | `public, max-age=300, must-revalidate` (5 minutes; manager readers fail closed on a fetched bad object) |
+| Mutable stable (`install/`)                               | `latest.txt`, `install.sh`, `install.ps1`                          | `public, max-age=300, must-revalidate` (5 minutes, bounded staleness; scripts re-fetch every run)       |
 
 ### Checksums and signatures
 
@@ -635,10 +635,11 @@ policy are reserved here so Phase 2 changes no convention.
 
 Prebuilt extension distribution for machines without cargo and without a Rust
 network stack in `bitty`. The client side is implemented: `bitty extension
-install <name>` reads this layout through the catalog and verifies the
-`SHA256SUMS` digest before staging (the minimal seed that bootstraps the
-manager is #1791). This section ships the artifact side only: pack mechanics,
-manifest generation, and the upload contract. Core uploads nothing.
+install <name> --version <X.Y.Z>` reads this layout's `SHA256SUMS` (not the
+catalog) and verifies the digest before staging; the minimal seed that
+bootstraps the manager is #1791/#2399. This section ships the artifact side
+only: pack mechanics, manifest generation, and the upload contract. Core
+uploads nothing.
 
 `VERSION` is the strict `X.Y.Z` extension version from `bitty-component.toml`
 (the internal descriptor file name); pack policy takes only the `X.Y.Z` core
@@ -699,10 +700,16 @@ hash verification. `bitty-graphics` publishes `graphics` and `bitty-network`
 publishes `net`; this repository does not upload extension payloads.
 Versioned extension prefixes are immutable once published, like `releases/`.
 
-### Extension catalog (v1, #2111, #2440)
+### Extension catalog (manager-owned from bitty#2399)
 
-The extension registry backend is a single bounded metadata object on the same
-bucket and CDN host as the payloads. It is published:
+The extension catalog is no longer a Core runtime input. Core neither fetches
+nor parses `extensions/catalog.v1`, and it embeds no catalog or full lock
+table. Catalog resolution, latest selection, and list/inspect presentation
+belong to `bitty-plugin-manager` under `W-72`; the registry/extension layer
+(`bitty-plugins`) owns the catalog and lock lifecycle.
+
+The published object is retained for compatibility and as the manager's
+input:
 
 ```text
 R2 key:   bitty/extensions/catalog.v1
@@ -720,74 +727,49 @@ extension graphics 0.0.24 x86_64-unknown-linux-gnu 7e331044e6bbede32909fb04729f5
 extension net 0.0.1 x86_64-unknown-linux-gnu 1764de2db9eb1a00dd80535dfcf744b28d4d74dae2af12c4a31e01c4156b1615
 ```
 
-It stays on `cdn.bitty.run` rather than the plugin store host because the
-installer egress allowlist is exactly one first-party host
-(`cdn.bitty.run:443`); adding a second host for metadata would widen the
-trust boundary for no security gain. Lua plugin registry metadata
-(`generated/registry.json` in `bitty-plugins`) is a separate corpus and is
-not read by `bitty extension install`.
+Lua plugin registry metadata (`generated/registry.json` in `bitty-plugins`)
+is a separate corpus and is not read by `bitty extension install` either.
 
-`bitty extension install <name>` fetches this object after the explicit
-download consent and, when `--version` is omitted, selects the highest strict
-`X.Y.Z` record for the exact `(name, host target)` pair. `--version X.Y.Z`
-still pins exactly one `(name, version, host target)` key. The catalog is a
-digest index plus a latest selector, not a version solver: prereleases are not
-published by the pack policy, so they never participate. A latest install
-prints the resolved version before the release download. A pinned install
-keeps the offline paths described below (release `SHA256SUMS` fallback and
-verified local reuse); a latest install cannot fall back (there is no version)
-and fails closed with a `--version` hint.
+#### Core seed path (pinned only)
 
-#### Grammar
+`bitty extension install <name> --version <X.Y.Z>` is the bootstrap seed:
 
-UTF-8, line-oriented, bounded. Blank lines and lines starting with `#` are
-ignored. Exactly one `schema 1` line must appear before any record. Every
-record is one published target artifact:
+- `--version` is required; a bare install is a usage error (exit `2`), never
+  a latest resolution.
+- The seed fetches at most one release artifact plus that release's
+  `SHA256SUMS` manifest from `https://cdn.bitty.run`.
+- The `SHA256SUMS` entry and the optional caller `--digest` must each match
+  the downloaded bytes; any mismatch fails closed (exit `4`).
+- The first verified digest becomes the TOFU pin; a later differing digest
+  fails closed as pin-mismatch until `--force` explicitly re-pins after
+  verification.
+- The seed attempts the manifest fetch before checking the cache. When that
+  manifest fetch fails (offline, DNS/TLS, timeout, non-success HTTP), an
+  already-installed exact version that verifies locally is reused with no
+  download. Reuse is disabled by `--digest` and by `--force`; a tarball
+  transport failure after a parsed manifest does not qualify, and neither
+  does a tampered or malformed local install.
 
-```text
-schema 1
-extension <name> <version> <target> <sha256>
-```
+| Condition                                                                | Seed behavior                                                                                   |
+| ------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
+| Manifest fetched, entry present, digests agree                           | Continue: verify the tarball, audit exactly two members, stage atomically, pin on first contact |
+| Manifest fetched, entry absent/malformed/oversize/duplicate              | Fail closed (exit `4`) before the tarball; absence is authoritative                             |
+| Manifest transport failure, exact version installed and locally verified | Reuse the installed version with no download (offline idempotence)                              |
+| Manifest transport failure, otherwise                                    | Fail closed (exit `1`) before the tarball; no digest is skipped                                 |
+| `--digest` supplied and differing or malformed                           | Fail closed (exit `4` for mismatch, exit `2` for malformed); never a replacement for metadata   |
+| Tarball digest differs from `SHA256SUMS`                                 | Fail closed (exit `4`) before unpacking or staging                                              |
 
-- `<name>` uses the extension-name grammar `[a-z][a-z0-9-]{0,31}`.
-- `<version>` uses the strict `X.Y.Z` pack policy (no prerelease or build
-  metadata).
-- `<target>` uses the lowercase Rust target-triple grammar.
-- `<sha256>` is exactly 64 lowercase hex characters: the digest of
-  `<target>.tar.gz`, byte-identical to the entry in that release's
-  `SHA256SUMS`.
-- Duplicate `(name, version, target)` records, unknown directives, records
-  before `schema 1`, extra fields, and non-UTF-8 input fail closed.
+The seed's whole fetch budget is one pinned release plus its manifest. The
+retired catalog/latest surface is guarded by
+`crates/bitty-terminal/tests/extension_seed_boundary.rs`, so a future change
+that re-adds a catalog parser, a latest selector, or a third fetch site fails
+`just check`.
 
-Client bounds: 256 KiB object, 4096 lines, 1024 bytes per line, 1024 entries.
-The installer parses the object only after a successful fetch within those
-bounds. The live object (2026-10-22) carries the two published artifacts; the
-records are derived from their `SHA256SUMS`, never hand-written.
+#### Catalog grammar and generation (compatibility)
 
-#### Read path and fail-closed matrix
-
-| Condition                                                                             | Installer behavior                                                                                                            |
-| ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| Catalog fetched, entry present, digests agree                                         | Continue: catalog digest and `SHA256SUMS` both must equal the tarball; the exact-two-member audit still runs                  |
-| Catalog fetched, entry absent                                                         | Fail closed (exit `4`) before the tarball fetch; absence is authoritative, never "fall back and guess"                        |
-| Catalog fetched, malformed/oversize/duplicate                                         | Fail closed (exit `4`) before the tarball fetch                                                                               |
-| Catalog transport failure, pinned `--version`, version installed and locally verified | Reuse the installed version with no download (offline idempotence); a tampered local copy does not qualify                    |
-| Catalog transport failure, pinned `--version`, otherwise                              | Explicit offline fallback: fetch the release `SHA256SUMS` and verify it as before; explicit consent already applied           |
-| Catalog transport failure, bare latest                                                | Fail closed (exit `4`) with a concrete `--version` example (HTTP 404 is named as "not published"); a version is never guessed |
-| Catalog digest differs from `SHA256SUMS` or the tarball                               | Fail closed (exit `4`) before unpacking or staging                                                                            |
-| `--digest` supplied and differing                                                     | Fail closed (exit `4`); caller input is an extra constraint, never a replacement for canonical metadata                       |
-
-The offline fallback is deliberately narrow: it applies only to a pinned
-install whose catalog transport failed, keeps the original hash-verified
-single-release pipeline and exact-two-member archive audit, and never enables
-a silent install. A successful catalog response is authoritative and cannot be
-bypassed. Latest selection is a convenience, not a trust upgrade: the catalog
-stays mutable metadata, so reproducible automation should pin `--version`.
-
-#### Generation and publication (#2440)
-
-`scripts/make-extension-catalog.sh` is the only writer of `catalog.v1`. It
-cannot drift from `SHA256SUMS` by construction:
+`scripts/make-extension-catalog.sh` is retained as the compatibility
+publisher for release tooling during the migration. It is the only writer of
+`catalog.v1` and cannot drift from `SHA256SUMS` by construction:
 
 1. Discovery lists `extensions/` through the Cloudflare R2 API (the CDN has no
    directory listing) and keeps every `<name>/<version>/SHA256SUMS`.
@@ -827,25 +809,67 @@ mutable metadata.
 The fixture test (`scripts/tests/make-extension-catalog.test.sh`, also
 `just extension-catalog-test`) pins canonical bytes, numeric ordering, the
 digest chain, and the fail-closed cases (missing/malformed/duplicate
-manifests, tampered artifacts, empty discovery). The Rust client parses the
-same checked-in golden fixture, so the publisher and the installer share one
-grammar and one document.
+manifests, tampered artifacts, empty discovery). The Rust client no longer
+parses this grammar; the publisher's own fixture remains the compatibility
+record until the registry/manager takes ownership.
+
+Grammar (unchanged, for the manager and compatibility tooling): UTF-8,
+line-oriented, bounded. Blank lines and lines starting with `#` are ignored.
+Exactly one `schema 1` line must appear before any record:
+
+```text
+schema 1
+extension <name> <version> <target> <sha256>
+```
+
+- `<name>` uses the extension-name grammar `[a-z][a-z0-9-]{0,31}`.
+- `<version>` uses the strict `X.Y.Z` pack policy (no prerelease or build
+  metadata).
+- `<target>` uses the lowercase Rust target-triple grammar.
+- `<sha256>` is exactly 64 lowercase hex characters: the digest of
+  `<target>.tar.gz`, byte-identical to the entry in that release's
+  `SHA256SUMS`.
+- Duplicate `(name, version, target)` records, unknown directives, records
+  before `schema 1`, extra fields, and non-UTF-8 input fail closed.
+
+Reader bounds for the manager/compatibility client: 256 KiB object, 4096
+lines, 1024 bytes per line, 1024 entries. The compatibility publisher emits
+well under those bounds for the live set, but it does not itself enforce them
+(the manager owns the refreshed catalog contract). The live object
+(2026-10-22) carries the two published artifacts; the records are derived
+from their `SHA256SUMS`, never hand-written.
 
 #### Distribution track (not per Core release)
 
 Extensions are published on their own release track. A Core release tag (for
 example `v0.0.25`) does not imply a `0.0.25` extension payload: only versions
-listed in `catalog.v1` exist, and `latest` selects the highest strict version
-for the host target from that list. Never infer extension availability from
-the Core version; use the catalog or fetch
+with a published tarball and `SHA256SUMS` exist on the CDN, and the catalog is
+derived from those release objects. Never infer extension availability from the
+Core version; read the catalog (the manager-owned resolution input) or fetch
 `https://cdn.bitty.run/extensions/<name>/<version>/SHA256SUMS`.
 
 #### Trust
 
-Unsigned 0.1.0 verifies by hash only, so the catalog is canonical metadata,
-not a signature. HTTPS pins the host and path; the catalog digest and the
-release `SHA256SUMS` are compared, and the first successful install records
-a TOFU pin under `<user>/<name>/tarball.sha256`. A later catalog or payload
-substitution for an installed extension fails closed as pin-mismatch until
-an explicit `--force` re-pin. Signatures (Sigstore/cosign or an Ed25519 key
-directory with a rotation story) remain a follow-up, not a silent addition.
+Unsigned 0.1.0 verifies the seed by hash only: the release `SHA256SUMS` entry
+must match the downloaded bytes, and the first successful install records a
+TOFU pin under `<user>/<name>/tarball.sha256`. A later payload substitution
+for an installed extension fails closed as pin-mismatch until an explicit
+`--force` re-pin. The seed allowlists the _initial_ URL only. It follows
+`curl --location` redirects, and `--proto =https` keeps them on HTTPS, but the
+effective host and path are not pinned: a redirect can move the fetch to
+another origin. The hash chain binds the tarball to the `SHA256SUMS` fetched in
+the same invocation, not the manifest to `cdn.bitty.run`, so a party
+controlling the redirect (or the initial origin) can serve a self-consistent
+manifest and tarball; only the TOFU pin refuses a later change. Treat first
+contact as trust-on-first-use, not origin proof. Enforcing the effective host
+across redirects is a follow-up; signature verification is the durable fix.
+Signatures (Sigstore/cosign or an Ed25519 key directory with a rotation
+story) remain a follow-up for the seed.
+
+The refreshed catalog's trust chain is owned by the registry/manager, not by
+Core: a signed, versioned snapshot with a monotonic `snapshot_version`, a
+bounded timestamp/expiry window, a digest over the exact bytes, unknown
+fields rejected rather than ignored, total/entry/per-entry byte bounds, and
+a hard refusal of a snapshot older than the last accepted version. That
+cross-repository work is tracked for `bitty-plugins` and is not implemented
+or gated in this repository.

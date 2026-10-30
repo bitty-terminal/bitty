@@ -276,9 +276,12 @@ perf-disk-test:
 catalog-generate *args:
     python3 scripts/generate-official-catalog.py {{ args }}
 
-# Fail when the checked-in official catalog differs from the pinned
+# Fail when the checked-in official plugin catalog differs from the pinned
 # bitty-plugins revision. Read-only; needs a registry checkout (see
-# `check-registry`).
+# `check-registry`). From bitty#2399 the extension payload catalog
+# (`extensions/catalog.v1`) is manager-owned and has its own drift gate
+# (`check-extension-catalog`); this recipe only guards the compiled-in
+# official plugin catalog.
 catalog-check *args:
     python3 scripts/generate-official-catalog.py --check {{ args }}
 
@@ -294,9 +297,13 @@ catalog-pins *args:
 # first (`git -C <bitty-plugins> fetch origin main`); it prints the compared
 # commit and its date so a stale ref is visible. Catches a registry code change
 # that a manifest-hash digest can never see; run it with
-# `just check-registry-fresh`, not in every PR.
+# `just check-registry-fresh`, not in every PR. From bitty#2399 it also
+# re-runs the seed boundary guard: the extension payload catalog is
+# manager-owned, so Core must not re-add a catalog/latest path next to the
+# official plugin catalog it still compiles in.
 check-registry-fresh *args:
     @just catalog-test
+    @cargo test -p bitty-terminal --test extension_seed_boundary --locked
     @just catalog-pins --revision origin/main {{ args }}
 
 # Hermetic generator tests: repository-location `GIT_*` scrubbing, immutable
@@ -307,11 +314,14 @@ catalog-test:
     python3 scripts/tests/test_generate_official_catalog.py
 
 # Strict registry gate (CI, release checks): verify the checked-in official
-# catalog against a real bitty-plugins checkout. Deliberately excluded from
-# `check` so a plain checkout stays green; provide the registry with
+# plugin catalog against a real bitty-plugins checkout. Deliberately excluded
+# from `check` so a plain checkout stays green; provide the registry with
 # `BITTY_PLUGINS_DIR=... just check-registry`, a sibling checkout, or
 # `just check-registry --registry DIR`. CI runs the generator directly against
-# the pinned external/bitty-plugins checkout, which is this same gate.
+# the pinned external/bitty-plugins checkout, which is this same gate. The
+# extension payload catalog (bitty#2399) is manager-owned and checked by
+# `check-extension-catalog`; the pinned seed boundary is part of `just check`
+# through `tests/extension_seed_boundary.rs`.
 check-registry *args:
     @just catalog-test
     @just catalog-check {{ args }}
@@ -458,6 +468,15 @@ component-dist-test:
 # `just extension-catalog-test`
 extension-catalog-test:
     ./scripts/tests/make-extension-catalog.test.sh
+
+# Extension payload catalog drift gate (bitty#2399): compares the live
+# `extensions/catalog.v1` with the canonical bytes generated from the
+# published SHA256SUMS. The catalog is manager-owned from W-72; Core no
+# longer fetches or parses it, and `tests/extension_seed_boundary.rs` keeps
+# the seed pinned-only. Needs Cloudflare credentials, so this recipe stays
+# out of `check` and runs on the release/publish track.
+check-extension-catalog:
+    ./scripts/make-extension-catalog.sh --check
 
 # Exercise the release bundle verifier's per-target decision: the gnu bundle is
 # executed, while musl and aarch64 are inspected but not run. The musl case is

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # make-extension-catalog.sh — generate, verify, or publish `extensions/catalog.v1`.
 #
+# Compatibility publisher retained after bitty#2399. The extension catalog is
+# owned by the registry/extension layer (`bitty-plugins`) and consumed by
+# `bitty-plugin-manager`; Core neither fetches nor parses it. This script
+# stays for release tooling until the manager publisher lands.
+#
 # The catalog is a digest index over the published extension payloads:
 #
 #   schema 1

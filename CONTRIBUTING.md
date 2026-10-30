@@ -141,7 +141,13 @@ just check-registry-fresh
 `just catalog-pins` runs the same check at `BITTY_PLUGINS_REV` (or an explicit
 `--revision`). Run the freshness gate before a release and when the plugin
 registry advances; it is intentionally not part of every PR (`just check`
-stays network-free).
+stays network-free). It also re-runs the Core seed boundary guard
+(`crates/bitty-terminal/tests/extension_seed_boundary.rs`): from bitty#2399
+the extension payload catalog (`extensions/catalog.v1`) is manager-owned and
+Core must not re-add a catalog/latest path beside the official plugin catalog
+it still compiles in. `just check-extension-catalog` is the equivalent live
+drift gate for that manager-owned payload catalog; it needs Cloudflare
+credentials and stays out of `check`.
 
 ## Delivery lifecycle
 

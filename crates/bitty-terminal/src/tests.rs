@@ -6835,6 +6835,19 @@ fn init_yes_defaults_are_sane() {
 }
 
 #[test]
+fn init_missing_component_hint_stays_pinned_only() {
+    // bitty#2399: a bare `extension install` is a usage error, so the init
+    // hint may only recommend the explicit `--version` form.
+    let hint = crate::init::init_missing_component_hint("net");
+    assert!(
+        hint.contains("bitty extension install net --version <X.Y.Z>"),
+        "{hint}"
+    );
+    assert!(!hint.contains("latest catalog release"), "{hint}");
+    assert!(!hint.contains("install net`"), "bare install hint: {hint}");
+}
+
+#[test]
 fn init_answer_parsers_cover_new_steps_fail_closed() {
     // Font family: empty takes the default; trim; bound + controls rejected.
     assert_eq!(

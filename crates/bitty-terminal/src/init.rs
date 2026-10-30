@@ -744,6 +744,17 @@ pub(crate) fn init_bundled_plugin_components(id: &str) -> Vec<String> {
     Vec::new()
 }
 
+/// Render the `bitty init` missing-extension hint.
+///
+/// Pinned form only: a bare `bitty extension install <name>` is a usage error
+/// since bitty#2399, so the hint must never recommend it. `bitty init` itself
+/// fetches nothing and does not resolve a latest release.
+pub(crate) fn init_missing_component_hint(component: &str) -> String {
+    format!(
+        "bitty init: extension '{component}' is missing; re-run `bitty extension install {component} --version <X.Y.Z>` (exact pin; nothing fetched by init; latest selection is bitty-plugin-manager work)"
+    )
+}
+
 /// Escapes a string for a double-quoted Lua value. Wizard inputs are
 /// control-free by construction ([`init_clean_shell`]), generated values
 /// harder still; backslash and quote are escaped so paths like
@@ -6082,10 +6093,7 @@ pub(crate) fn run_init_subcommand_with_io(
                 );
             } else {
                 for component in &declared {
-                    let _ = writeln!(
-                        output,
-                        "bitty init: extension '{component}' is missing; re-run `bitty extension install {component}` (latest catalog release) or `bitty extension install {component} --version <X.Y.Z>` (exact pin; nothing fetched by init)"
-                    );
+                    let _ = writeln!(output, "{}", init_missing_component_hint(component));
                 }
             }
             let _ = output.flush();

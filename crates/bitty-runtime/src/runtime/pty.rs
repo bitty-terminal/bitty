@@ -733,6 +733,12 @@ impl Runtime {
         // finished (fast disks) apply here, still within the same poll's
         // timing class; slower reads complete on later polls. Non-blocking.
         self.pump_kitty_local_completions();
+        // bitty#2830: publish the bounded production writer backlog for the
+        // hang watchdog (primary plus every pane). The headless observation
+        // buffer is a separate seam; `pending_dropped` still accounts for it.
+        let writer_pending = self.pending_writer_bytes();
+        self.hang_gauges
+            .set_pending_input(writer_pending, self.pending_input_dropped);
         count
     }
 

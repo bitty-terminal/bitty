@@ -20,6 +20,11 @@ const GPU_PRESENT_LOG_BURST: u64 = 8;
 /// flood stderr at the retry cadence forever.
 const GPU_PRESENT_LOG_EVERY: u64 = 60;
 
+/// [`HIDDEN_REPAIR_INTERVAL_MS`] as a duration.
+fn hidden_repair_interval() -> std::time::Duration {
+    std::time::Duration::from_millis(HIDDEN_REPAIR_INTERVAL_MS)
+}
+
 /// Bounded total log policy for failed real-GPU presents.
 fn should_log_present_failure(total: u64) -> bool {
     total <= GPU_PRESENT_LOG_BURST || total % GPU_PRESENT_LOG_EVERY == 0
@@ -1855,6 +1860,8 @@ impl Runtime {
         for sess in self.pane_sessions.values_mut() {
             sess.last_presented_generation = sess.state.generation();
         }
+        // bitty#2830: a presented frame is the repair timer's success case.
+        self.hidden_repair_at = None;
         // CTX-1231: every path through here consumes damage (real presents
         // and idle write-backs alike), so no deferred frame is pending after
         // it. The atlas-reject path intentionally bypasses this function and
@@ -2004,6 +2011,74 @@ impl Runtime {
         self.set_surface_visibility_at(std::time::Instant::now(), visible);
     }
 
+    /// Whether a hidden surface still owes presentation work (bitty#2830).
+    ///
+    /// This is the retained-damage half of the occlusion gate: Terminal Truth
+    /// advanced (or a paint-only invalidation or a cancelled presentation is
+    /// armed) while the surface was hidden, so the next visible frame must
+    /// repaint it. The hide transition only keeps `pending_full_redraw` when
+    /// something real was retained, so the flag means work here rather than
+    /// "a re-mapped surface will paint from truth anyway" - counting the
+    /// latter would make every hidden window look damaged and arm a wake for
+    /// nothing.
+    #[must_use]
+    pub(crate) fn hidden_retained_work(&self) -> bool {
+        if self.surface_visible {
+            return false;
+        }
+        if self.pending_paint_redraw || self.coalesced_pending {
+            return true;
+        }
+        if self.pending_full_redraw {
+            // A cancelled presentation or an explicit invalidation that has
+            // not been consumed: a reveal that never arrives strands it.
+            return true;
+        }
+        if self.state.generation() != self.last_presented_generation {
+            return true;
+        }
+        self.pane_sessions
+            .values()
+            .any(|session| session.last_presented_generation != session.state.generation())
+    }
+
+    /// Bounded self-heal wake for a hidden surface with retained work.
+    ///
+    /// bitty#2830 hypothesis 2: `set_surface_visibility_at(false)` keeps the
+    /// damage but arms no wake, so a reveal edge that is never delivered (a
+    /// dropped `Resumed`/`Occluded(false)`, a compositor quirk, a lost
+    /// focus/workspace transition) parks the loop in `ControlFlow::Wait`
+    /// forever. While this is `Some`, the embedder joins it into its wake
+    /// minimum and re-enters the present path through the same occlusion gate
+    /// ([`HIDDEN_REPAIR_INTERVAL_MS`] apart): a missed reveal then self-heals
+    /// instead of stranding the frame, and a surface that is genuinely still
+    /// hidden keeps its damage without a busy loop.
+    ///
+    /// `None` when the surface is visible or holds nothing to repaint, so an
+    /// idle hidden window arms nothing.
+    #[must_use]
+    pub fn hidden_repair_deadline(&self) -> Option<std::time::Instant> {
+        if !self.hidden_retained_work() {
+            return None;
+        }
+        self.hidden_repair_at
+    }
+
+    /// Consumes one repair wake and re-arms the next bounded attempt.
+    ///
+    /// The embedder calls this after it has probed the surface on a
+    /// [`Self::hidden_repair_deadline`] wake: a surface that is still hidden
+    /// gets one more attempt per [`HIDDEN_REPAIR_INTERVAL_MS`], and one that
+    /// was revealed clears the timer through
+    /// [`Self::set_surface_visibility_at`] instead.
+    pub fn note_hidden_repair_at(&mut self, now: std::time::Instant) {
+        if self.surface_visible || !self.hidden_retained_work() {
+            self.hidden_repair_at = None;
+            return;
+        }
+        self.hidden_repair_at = now.checked_add(hidden_repair_interval());
+    }
+
     /// Tracks a surface visibility transition and re-schedules presentation
     /// alongside it (issue #2589).
     ///
@@ -2027,7 +2102,10 @@ impl Runtime {
     ///   cleared (so no past-due coalesced wake can spin the loop while
     ///   occluded), and `pending_full_redraw` is armed so the shown surface
     ///   later repaints from truth in one frame. Nothing is consumed: the
-    ///   grid, generations, and pane rings stay exactly as they were.
+    ///   grid, generations, and pane rings stay exactly as they were. When
+    ///   real work was retained, a bounded repair wake is armed
+    ///   ([`HIDDEN_REPAIR_INTERVAL_MS`]) so a reveal edge that never arrives
+    ///   cannot park the loop forever (bitty#2830 hypothesis 2).
     /// - **Show** (hidden → visible): one full-redraw frame is queued by
     ///   arming the coalesced wake at `now`, so the embedder's existing
     ///   `AboutToWait` wake selection presents it on the next loop turn.
@@ -2039,6 +2117,17 @@ impl Runtime {
         if self.surface_visible == visible {
             return;
         }
+        // bitty#2830: remember what the transition cancels *before* the hide
+        // arms its own truth repaint, so the repair timer keys on real
+        // retained work rather than on the conservative full redraw.
+        let retained = self.pending_full_redraw
+            || self.pending_paint_redraw
+            || self.coalesced_pending
+            || self.state.generation() != self.last_presented_generation
+            || self
+                .pane_sessions
+                .values()
+                .any(|session| session.last_presented_generation != session.state.generation());
         self.surface_visible = visible;
         if visible {
             // Reveal: queue one full-redraw presentation as a next-frame
@@ -2047,6 +2136,10 @@ impl Runtime {
             // loop turn rather than inside this transition handler.
             self.coalesced_pending = true;
             self.coalesced_deadline = Some(now);
+            // The reveal owns a from-truth repaint; the repair timer has
+            // done its job and must never wake a visible surface.
+            self.pending_full_redraw = true;
+            self.hidden_repair_at = None;
         } else {
             // Hide: cancel the pending presentation without consuming
             // anything. `mark_frame_presented` is deliberately *not* called:
@@ -2062,8 +2155,16 @@ impl Runtime {
             // let its old deadline win over the reveal's next-frame queue;
             // hidden ticks also must not re-arm it.
             self.suspend_surface_retry();
+            // Retain the cancelled presentation as damage, exactly as before,
+            // and arm the bounded self-heal only when something real was
+            // retained (bitty#2830 hypothesis 2). A clean hide arms nothing.
+            self.pending_full_redraw = retained;
+            self.hidden_repair_at = if retained {
+                now.checked_add(hidden_repair_interval())
+            } else {
+                None
+            };
         }
-        self.pending_full_redraw = true;
     }
 
     /// Present-latest gate: cadence (CTX-1231, #2093) plus PTY-quiescence
@@ -2732,7 +2833,16 @@ impl Runtime {
     /// [`PASTE_BANNER_FULL_DURATION`] → still pending (never-silent) → gone
     /// on confirm/cancel. Behavior is otherwise identical to `tick()`.
     pub fn tick_at(&mut self, now: std::time::Instant) -> Option<PresentStats> {
+        // bitty#2830: bracket the whole tick (including every early return)
+        // so the hang watchdog can name the frame that never completed.
+        let tick_started = std::time::Instant::now();
+        // Publish the pre-tick queue depths too: a tick that blocks before it
+        // returns still leaves the dump with the state that fed it.
+        self.publish_hang_gauges();
         let stats = self.tick_at_inner(now);
+        self.publish_hang_gauges();
+        self.hang_gauges
+            .finish_tick(u64::try_from(tick_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         // Issue #2570: a retry tick that produced no present (the frame was
         // deferred, had no damage to rebuild, or returned before the present
         // phase) must not leave a past-due retry deadline behind:
@@ -2821,6 +2931,17 @@ impl Runtime {
         if !self.surface_visible {
             self.coalesced_pending = false;
             self.coalesced_deadline = None;
+            // bitty#2830 hypothesis 2: this tick is the only place that sees
+            // output arriving while hidden. Retained work must never sit
+            // without a wake - a lost reveal would otherwise strand it until
+            // an unrelated event. Keep one bounded attempt armed; a surface
+            // with nothing to repaint clears it.
+            self.hidden_repair_at = if self.hidden_retained_work() {
+                self.hidden_repair_at
+                    .or_else(|| now.checked_add(hidden_repair_interval()))
+            } else {
+                None
+            };
             return None;
         }
         if self.tick_time_gates(now) {
@@ -10482,6 +10603,7 @@ mod surface_visibility_tests {
         [
             rt.present_coalescing_deadline(),
             rt.surface_retry_deadline(),
+            rt.hidden_repair_deadline(),
         ]
         .into_iter()
         .flatten()
@@ -10821,6 +10943,193 @@ mod surface_visibility_tests {
             "the reveal queue is consumed with the frame"
         );
         assert_eq!(stats.generation, rt.last_presented_generation);
+    }
+
+    #[test]
+    fn hidden_surface_with_retained_damage_arms_a_bounded_repair_wake() {
+        // bitty#2830 hypothesis 2: the one unarmed state was a hidden surface
+        // with retained damage. A reveal edge that never arrives must not park
+        // the loop forever, so the hide transition arms one bounded attempt.
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        // A clean visible frame first, so nothing else is pending.
+        assert!(rt.tick_at(t0).is_some(), "the startup frame presents");
+        assert!(!rt.pending_full_redraw);
+        assert!(rt.hidden_repair_deadline().is_none());
+
+        // Output the surface now owes a repaint for, then switch away.
+        rt.handle_pty_bytes(b"hidden repair damage");
+        let t_hidden = t0 + std::time::Duration::from_millis(5);
+        rt.set_surface_visibility_at(t_hidden, false);
+        assert!(rt.hidden_retained_work(), "Terminal Truth advanced");
+        let deadline = rt
+            .hidden_repair_deadline()
+            .expect("retained damage must arm the repair wake");
+        assert_eq!(
+            deadline,
+            t_hidden + std::time::Duration::from_millis(HIDDEN_REPAIR_INTERVAL_MS),
+            "the attempt is one named interval out, never immediate"
+        );
+        assert_eq!(
+            wake_min(&rt),
+            Some(deadline),
+            "the embedder's wake minimum must carry the repair attempt"
+        );
+    }
+
+    #[test]
+    fn hidden_surface_without_retained_work_arms_no_repair_wake() {
+        // "No wake when nothing is retained": hiding a clean surface must not
+        // start a 1 Hz wakeup for the whole time the window is hidden.
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        assert!(rt.tick_at(t0).is_some(), "the startup frame presents");
+        let t_hidden = t0 + std::time::Duration::from_millis(5);
+        rt.set_surface_visibility_at(t_hidden, false);
+        assert!(!rt.is_surface_visible());
+        assert!(!rt.hidden_retained_work(), "nothing was owed at the hide");
+        assert_eq!(rt.hidden_repair_deadline(), None);
+        assert_eq!(wake_min(&rt), None, "the loop may wait with no wake");
+
+        // A hidden tick with nothing to repaint keeps it unarmed...
+        for step in 1..=5u64 {
+            let now = t_hidden + std::time::Duration::from_millis(step);
+            assert!(rt.tick_at(now).is_none());
+            assert_eq!(
+                rt.hidden_repair_deadline(),
+                None,
+                "step {step}: an idle hidden surface arms nothing"
+            );
+        }
+
+        // ...and the first hidden output arms it (output is only observable
+        // on a tick).
+        rt.handle_pty_bytes(b"late output");
+        let t_output = t_hidden + std::time::Duration::from_millis(10);
+        assert!(rt.tick_at(t_output).is_none());
+        let deadline = rt
+            .hidden_repair_deadline()
+            .expect("hidden output must arm the repair wake");
+        assert!(deadline > t_output, "the wake is always in the future");
+        assert!(
+            deadline <= t_output + std::time::Duration::from_millis(HIDDEN_REPAIR_INTERVAL_MS),
+            "the wake is bounded by the repair interval"
+        );
+    }
+
+    #[test]
+    fn hidden_repair_never_presents_while_the_gate_is_closed() {
+        // The repair attempt re-enters the present path through the same
+        // occlusion gate: it must never acquire for a surface that is still
+        // hidden, and a re-armed attempt must never be past due.
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        rt.enable_test_present(0);
+        assert!(rt.tick_at(t0).is_some());
+        let visible_attempts = rt.test_present_attempts();
+
+        rt.handle_pty_bytes(b"repair gate probe");
+        let t_hidden = t0 + std::time::Duration::from_millis(5);
+        rt.set_surface_visibility_at(t_hidden, false);
+        let mut now = t_hidden;
+        for attempt in 0..5u64 {
+            // Advance to the armed deadline and consume the attempt: the
+            // embedder would call the probe and then re-arm.
+            let deadline = rt
+                .hidden_repair_deadline()
+                .expect("attempt {attempt}: still retained");
+            assert!(deadline > now, "attempt {attempt}: never past due");
+            now = deadline;
+            assert!(
+                rt.tick_at(now).is_none(),
+                "attempt {attempt}: the closed gate consumes no frame"
+            );
+            rt.note_hidden_repair_at(now);
+            let next = rt
+                .hidden_repair_deadline()
+                .expect("attempt {attempt}: re-armed");
+            assert_eq!(
+                next,
+                now + std::time::Duration::from_millis(HIDDEN_REPAIR_INTERVAL_MS),
+                "attempt {attempt}: one attempt per interval, not a busy loop"
+            );
+        }
+        assert_eq!(
+            rt.test_present_attempts(),
+            visible_attempts,
+            "no present attempt may reach the swap chain while hidden"
+        );
+        assert!(
+            rt.hidden_retained_work(),
+            "damage is retained for the reveal"
+        );
+    }
+
+    #[test]
+    fn reveal_clears_the_hidden_repair_wake_and_presents_the_retained_frame() {
+        // A missing reveal is the failure the timer exists for; a delivered
+        // one must cancel the timer and flush the retained frame immediately.
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        rt.enable_test_present(0);
+        assert!(rt.tick_at(t0).is_some());
+        rt.handle_pty_bytes(b"repair reveal");
+        let t_hidden = t0 + std::time::Duration::from_millis(5);
+        rt.set_surface_visibility_at(t_hidden, false);
+        assert!(rt.hidden_repair_deadline().is_some());
+
+        let t_show = t_hidden + std::time::Duration::from_millis(20);
+        rt.set_surface_visibility_at(t_show, true);
+        assert_eq!(
+            rt.hidden_repair_deadline(),
+            None,
+            "the reveal owns presentation; the repair timer must be cleared"
+        );
+        let stats = rt.tick_at(t_show).expect("the reveal frame presents");
+        assert_eq!(stats.generation, rt.state.generation());
+        assert_eq!(rt.hidden_repair_deadline(), None);
+        assert!(!rt.hidden_retained_work());
+    }
+
+    #[test]
+    fn hidden_repair_probe_self_heals_a_missing_reveal() {
+        // End-to-end shape of the fix, runtime side: the surface is hidden
+        // with damage, the reveal edge never arrives, and the bounded repair
+        // attempt at the armed deadline is what re-enters the present path.
+        // The gate is opened by the embedder (the compositor proved the
+        // surface back); the next tick presents the retained frame.
+        let t0 = std::time::Instant::now();
+        let mut rt = runtime();
+        rt.enable_test_present(0);
+        assert!(rt.tick_at(t0).is_some());
+        let before = rt.test_present_attempts();
+        rt.handle_pty_bytes(b"dropped reveal");
+        let t_hidden = t0 + std::time::Duration::from_millis(5);
+        rt.set_surface_visibility_at(t_hidden, false);
+        let deadline = rt.hidden_repair_deadline().expect("repair armed");
+
+        // The reveal edge is dropped: no `set_surface_visibility(true)`.
+        // Only the timed attempt is left.
+        assert!(rt.tick_at(deadline).is_none(), "still gated");
+        assert_eq!(
+            rt.test_present_attempts(),
+            before,
+            "the gated attempt cannot present"
+        );
+        rt.note_hidden_repair_at(deadline);
+
+        // The probe proved the surface is back: the gate opens (embedder).
+        rt.set_surface_visibility_at(deadline, true);
+        let stats = rt
+            .tick_at(deadline)
+            .expect("the retained frame paints after the self-heal");
+        assert_eq!(stats.generation, rt.state.generation());
+        assert_eq!(
+            rt.test_present_attempts(),
+            before + 1,
+            "exactly one present, the one the repair recovered"
+        );
+        assert_eq!(rt.hidden_repair_deadline(), None);
     }
 }
 

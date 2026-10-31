@@ -30,6 +30,71 @@ use crate::stall_watchdog::{Phase, StallWatchdog, WatchdogContext};
 /// hold at [`bitty_runtime::PRESENT_SETTLE_MAX`] under a continuous producer.
 pub(crate) const PRESENT_SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
 
+/// First retry delay for a parked plugin command's resume wake (bitty#2830).
+///
+/// A parked command resumes one RC-1 wall window per cold tick. Re-arming the
+/// wake at `Instant::now()` made an otherwise idle window spin through the
+/// cold phase continuously while the command stayed parked. A prompt first
+/// retry keeps resume latency low; consecutive parked samples then back off.
+pub(crate) const PARKED_COMMAND_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(2);
+
+/// Ceiling for the parked-command resume backoff (about 60 Hz).
+///
+/// A fixed 2 ms wake is a 500 Hz loop while a command stays parked. Doubling
+/// from [`PARKED_COMMAND_RETRY_DELAY`] to this cap keeps the resume prompt on
+/// the short parks the RC-1 budget produces and stops a long park from
+/// burning a core on `AboutToWait` turns.
+pub(crate) const PARKED_COMMAND_RETRY_MAX: std::time::Duration =
+    std::time::Duration::from_millis(16);
+
+/// Bounded exponential backoff for a parked plugin command's resume wake.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParkedCommandBackoff {
+    delay: std::time::Duration,
+}
+
+impl Default for ParkedCommandBackoff {
+    fn default() -> Self {
+        Self {
+            delay: PARKED_COMMAND_RETRY_DELAY,
+        }
+    }
+}
+
+impl ParkedCommandBackoff {
+    /// Wake time for a parked plugin command.
+    ///
+    /// `None` when nothing is parked, which also resets the backoff for the
+    /// next park. Otherwise returns `Some(now + delay)` and doubles the delay
+    /// up to [`PARKED_COMMAND_RETRY_MAX`]. Never returns `now`: a past-due
+    /// wake re-enters `AboutToWait` immediately and spins the cold phase
+    /// while the command stays parked.
+    pub(crate) fn wake(
+        &mut self,
+        now: std::time::Instant,
+        parked: bool,
+    ) -> Option<std::time::Instant> {
+        if !parked {
+            self.delay = PARKED_COMMAND_RETRY_DELAY;
+            return None;
+        }
+        let deadline = now + self.delay;
+        self.delay = self.delay.saturating_mul(2).min(PARKED_COMMAND_RETRY_MAX);
+        Some(deadline)
+    }
+}
+
+/// How long a hidden-surface repair probe trusts a served redraw
+/// (bitty#2830 hypothesis 2).
+///
+/// The probe asks the compositor for one frame; a frame callback that arrives
+/// inside this window proves the surface is mapped again. The window covers a
+/// slow compositor plus scheduling jitter while staying far below the minutes
+/// a genuinely suspended surface stays unmapped, so an unrelated redraw hours
+/// later can never re-open the gate.
+pub(crate) const HIDDEN_REPAIR_PROBE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Window title carrying the resolved theme preset and its source layer.
 ///
 /// Visible via `hyprctl clients` and (where decorations show) the title bar,
@@ -744,9 +809,21 @@ pub(crate) struct TerminalApp {
     /// Phase marks are observability only: they never alter routing, timing,
     /// or runtime state.
     pub(crate) stall_watchdog: Option<StallWatchdog>,
+    /// Bounded backoff for a parked plugin command's cold-tick resume wake
+    /// (bitty#2830).
+    pub(crate) parked_command_backoff: ParkedCommandBackoff,
     /// Test-only override for the surface-retry wake (issue #2570 B1).
     #[cfg(test)]
     pub(crate) test_surface_retry_deadline: Option<std::time::Instant>,
+    /// When the current hidden-surface repair probe asked the compositor for
+    /// a redraw (bitty#2830 hypothesis 2).
+    ///
+    /// A served redraw is the only proof a suspended surface is mapped again:
+    /// if the compositor answers the probe, the reveal edge that was lost is
+    /// reconstructed from the frame callback. `None` when no probe is
+    /// outstanding; bounded by [`HIDDEN_REPAIR_PROBE_TTL`] so a stale probe
+    /// can never re-open the gate on an unrelated redraw.
+    hidden_repair_probe_at: Option<std::time::Instant>,
     /// Chrome-owned key state (keymaps, modifier mirror, held keys, zoom).
     pub(crate) chrome: crate::chrome_keys::ChromeState,
     /// Frozen startup spawn recipe so `new_split` leaves replay the exact
@@ -917,15 +994,18 @@ impl TerminalApp {
         spawn_spec: SpawnSpec,
     ) -> Self {
         let event_tracker = EventTracker::from_runtime(&runtime);
+        let stall_watchdog = StallWatchdog::from_env(std::sync::Arc::clone(runtime.hang_gauges()));
         Self {
             runtime,
             window: WindowState::new(theme_name, source),
             pty_rx: None,
             _pty_thread: None,
             presented_frames: 0,
-            stall_watchdog: StallWatchdog::from_env(),
+            stall_watchdog,
+            parked_command_backoff: ParkedCommandBackoff::default(),
             #[cfg(test)]
             test_surface_retry_deadline: None,
+            hidden_repair_probe_at: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
             log_level: LogLevel::default_level(),
@@ -967,15 +1047,18 @@ impl TerminalApp {
     ) -> Self {
         let (pty_rx, handle) = spawn_demo_pty_pump_with_theme(theme_name, source);
         let event_tracker = EventTracker::from_runtime(&runtime);
+        let stall_watchdog = StallWatchdog::from_env(std::sync::Arc::clone(runtime.hang_gauges()));
         Self {
             runtime,
             window: WindowState::new(theme_name, source),
             pty_rx: Some(pty_rx),
             _pty_thread: Some(handle),
             presented_frames: 0,
-            stall_watchdog: StallWatchdog::from_env(),
+            stall_watchdog,
+            parked_command_backoff: ParkedCommandBackoff::default(),
             #[cfg(test)]
             test_surface_retry_deadline: None,
+            hidden_repair_probe_at: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
             log_level: LogLevel::default_level(),
@@ -1088,8 +1171,68 @@ impl TerminalApp {
         if self.runtime.is_surface_visible() == visible {
             return;
         }
+        // A repair probe belongs to the hidden surface incarnation that armed
+        // it: any real edge ends it (bitty#2830 hypothesis 2).
+        self.hidden_repair_probe_at = None;
         self.runtime.set_surface_visibility(visible);
         log_surface_gate(visible, reason);
+    }
+
+    /// Runs one bounded hidden-surface repair probe (bitty#2830 hypothesis 2).
+    ///
+    /// Consumes a [`Runtime::hidden_repair_deadline`] wake. The probe asks the
+    /// compositor for one redraw; on Wayland the gate stays closed until the
+    /// frame callback proves the surface is mapped again
+    /// ([`Self::apply_hidden_repair_probe`]). A genuinely hidden surface keeps
+    /// its retained damage and gets one attempt per
+    /// `HIDDEN_REPAIR_INTERVAL_MS`, never a busy loop.
+    pub(crate) fn repair_hidden_surface(&mut self, now: std::time::Instant) {
+        if self.runtime.is_surface_visible() {
+            self.hidden_repair_probe_at = None;
+            return;
+        }
+        self.hidden_repair_probe_at = Some(now);
+        if let Some(win) = self.window.handle.as_ref() {
+            win.request_redraw();
+        }
+        self.runtime.note_hidden_repair_at(now);
+    }
+
+    /// Applies the proof a hidden-surface repair probe received.
+    ///
+    /// On Wayland the platform has no "is the surface mapped" accessor; the
+    /// compositor serving a frame callback is that answer, and the
+    /// redraw-starvation probe already derives its synthetic occlusion edge
+    /// from the same signal. A served redraw inside [`HIDDEN_REPAIR_PROBE_TTL`]
+    /// therefore reconstructs the reveal edge that was lost (a dropped
+    /// `Resumed`/`Occluded(false)`), and the runtime's own reveal path queues
+    /// the from-truth frame. Returns whether the gate was opened.
+    ///
+    /// This proof is Wayland-specific: winit's X11 backend synthesizes
+    /// `RedrawRequested` for a `request_redraw()` on the event loop instead
+    /// of gating it on a compositor frame callback, so a served redraw there
+    /// only proves the loop ran, not that a still-occluded window became
+    /// mapped. The X11 path loses nothing by trying (presenting to an
+    /// unmapped window is a no-op rather than a swap-chain wait), but the
+    /// "still occluded never presents" statement belongs to the Wayland
+    /// probe.
+    pub(crate) fn apply_hidden_repair_probe(
+        &mut self,
+        served: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        let Some(asked_at) = self.hidden_repair_probe_at else {
+            return false;
+        };
+        self.hidden_repair_probe_at = None;
+        if !served || now.saturating_duration_since(asked_at) > HIDDEN_REPAIR_PROBE_TTL {
+            return false;
+        }
+        if self.runtime.is_surface_visible() {
+            return false;
+        }
+        self.set_surface_gate(true, "hidden-repair");
+        true
     }
 
     /// Mark the active main-loop phase for the opt-in stall watchdog.
@@ -1118,7 +1261,20 @@ impl TerminalApp {
 
     fn watchdog_idle(&self) {
         if let Some(watchdog) = self.stall_watchdog.as_ref() {
+            watchdog.presented(self.presented_frames);
             watchdog.idle();
+        }
+    }
+
+    /// Publishes the presented-frame counter to the hang watchdog.
+    ///
+    /// bitty#2830: the no-present detector compares this counter against the
+    /// bounded bound, so a hidden surface that keeps parsing output but never
+    /// paints is reported as `trigger=no-present` while the phase heartbeat
+    /// alone would call it healthy. One relaxed store per present.
+    fn watchdog_presented(&self) {
+        if let Some(watchdog) = self.stall_watchdog.as_ref() {
+            watchdog.presented(self.presented_frames);
         }
     }
 
@@ -1135,6 +1291,17 @@ impl TerminalApp {
         // it: at most one sample per 500 ms, and never when disabled.
         if !watchdog.context_due() {
             return;
+        }
+        // bitty#2830: app-owned queue depths and the plugin-side gauges ride
+        // the same bounded cadence as the identifier sample.
+        let gauges = self.runtime.hang_gauges();
+        gauges.set_input_commands(
+            self.pending_input_commands.len(),
+            self.pending_input_commands_dropped,
+        );
+        gauges.set_pending_exits(self.pending_exits.len());
+        if let Some(plugin) = self.plugin_runtime.as_ref() {
+            plugin.publish_hang_gauges();
         }
         let discovered = self
             .plugin_runtime
@@ -1281,7 +1448,12 @@ impl TerminalApp {
     /// Attaches the plugin runtime (CTX-0892). Production startup passes
     /// the runtime returned by [`crate::plugin_runtime::discover_and_activate`];
     /// tests and plugin-less runs leave it `None`.
-    pub(crate) fn with_plugin_runtime(mut self, runtime: Option<PluginRuntime>) -> Self {
+    pub(crate) fn with_plugin_runtime(mut self, mut runtime: Option<PluginRuntime>) -> Self {
+        // bitty#2830: share the Core gauge handle so a hung plugin callback is
+        // visible in the watchdog dump without borrowing plugin state.
+        if let Some(plugin) = runtime.as_mut() {
+            plugin.set_hang_gauges(std::sync::Arc::clone(self.runtime.hang_gauges()));
+        }
         self.plugin_runtime = runtime;
         self
     }
@@ -1876,6 +2048,7 @@ impl TerminalApp {
         self.sync_cursor_icon();
         if let Some(present) = stats {
             self.presented_frames += 1;
+            self.watchdog_presented();
             // CTX-0592: emit the real-window first-frame marker exactly once
             // when the opt-in perf harness asked for it. The harness starts
             // its timer before spawning this process and reads the elapsed
@@ -1917,6 +2090,10 @@ impl TerminalApp {
                     "bitty: {pane_written} pane reply bytes written to PTY masters (post-tick)"
                 );
             }
+            // bitty#2830 (review): both reply queues just drained. Republish
+            // the gauges so an idle park's `pending=replies` names only bytes
+            // that are genuinely still held, instead of the pre-flush count.
+            self.runtime.refresh_hang_gauges();
         }
         self.watchdog_phase(Phase::RuntimeEvents);
         // CTX-0892: deliver coalesced runtime events to plugin VMs last, after
@@ -2271,18 +2448,22 @@ impl TerminalApp {
             .and_then(|runtime| runtime.timer_deadline())
     }
 
-    /// Immediate cold-tick wake while a command is parked at the RC-1 wall
-    /// budget (bitty #2314).
+    /// Bounded cold-tick wake while a command is parked at the RC-1 wall
+    /// budget (bitty #2314, #2833).
     ///
     /// A park must continue on a later `AboutToWait`; under `ControlFlow::Wait`
-    /// no further event may arrive, so joining `now` into the wake-min makes
-    /// the next loop iteration deliver the resume window. `None` when nothing
-    /// is parked, so idle wakeups are unchanged.
-    fn parked_command_deadline(&self) -> Option<std::time::Instant> {
-        self.plugin_runtime
+    /// no further event may arrive, so joining the wake-min makes the next loop
+    /// iteration deliver the resume window. The delay backs off exponentially
+    /// from 2 ms to 16 ms while the same command stays parked, so a long park
+    /// does not wake the loop at a fixed 500 Hz. `None` when nothing is parked,
+    /// so idle wakeups are unchanged.
+    fn parked_command_deadline(&mut self) -> Option<std::time::Instant> {
+        let parked = self
+            .plugin_runtime
             .as_ref()
-            .filter(|runtime| runtime.parked_command_count() > 0)
-            .map(|_| std::time::Instant::now())
+            .is_some_and(|runtime| runtime.parked_command_count() > 0);
+        self.parked_command_backoff
+            .wake(std::time::Instant::now(), parked)
     }
 
     /// Fire due one-shot plugin timers (CTX-1244).
@@ -4645,6 +4826,19 @@ impl TerminalApp {
                         }
                     }
                     WindowEventKind::RedrawRequested => {
+                        // bitty#2830 hypothesis 2: while the gate is closed a
+                        // repair probe asked for this frame. The compositor
+                        // serving it proves the surface is mapped again even
+                        // when the reveal edge itself never arrived.
+                        if self.hidden_repair_probe_at.is_some()
+                            && self.apply_hidden_repair_probe(true, std::time::Instant::now())
+                        {
+                            crate::logging::info(|| {
+                                String::from(
+                                    "bitty: hidden-surface repair probe served; reveal reconstructed",
+                                )
+                            });
+                        }
                         // Frame-on-demand: no damage → no present, no redraw
                         // loop. Keep Wait mode (default `ControlFlow::Wait`)
                         // so idle burns ≤ 1 % CPU (PB-7 budget).
@@ -4666,6 +4860,20 @@ impl TerminalApp {
                     crash_report::record_exit(crash_report::ExitReason::ShellExit);
                     ctx.exit();
                     return;
+                }
+                // bitty#2830 hypothesis 2: with the gate closed and damage
+                // retained the runtime arms one bounded repair wake per
+                // interval. Consuming it here re-probes the surface, so a
+                // reveal edge that was lost can never park the loop with the
+                // retained frame. The probe only re-requests a redraw; the
+                // gate opens when (and only when) the compositor serves it.
+                let repair_now = std::time::Instant::now();
+                if self
+                    .runtime
+                    .hidden_repair_deadline()
+                    .is_some_and(|deadline| deadline <= repair_now)
+                {
+                    self.repair_hidden_surface(repair_now);
                 }
                 // CTX-1332 C-D1: this is the only cold-delivery phase. Tick
                 // first so workspace/pin/FX/theme/submit/timer/overlay/
@@ -4734,6 +4942,10 @@ impl TerminalApp {
                 // arms a bounded retry; without this wake a quiet window would
                 // never retry and could stay stale after a workspace switch.
                 let surface_retry = self.surface_retry_wake();
+                // bitty#2830 hypothesis 2: a hidden surface with retained
+                // damage arms a bounded repair wake; without it a lost reveal
+                // parks the loop in `ControlFlow::Wait` forever.
+                let hidden_repair = self.runtime.hidden_repair_deadline();
                 let wake = [
                     hover,
                     animation,
@@ -4746,6 +4958,7 @@ impl TerminalApp {
                     shell_exit,
                     selection_auto,
                     surface_retry,
+                    hidden_repair,
                 ]
                 .into_iter()
                 .flatten()

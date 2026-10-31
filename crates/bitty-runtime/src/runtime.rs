@@ -85,6 +85,7 @@
 
 use crate::PanelLayoutMode;
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 
 use bitty_platform::{
     Clipboard, CursorPosition, KeyEvent, MouseButton, PhysicalSize, PlatformEvent, PressState,
@@ -123,6 +124,7 @@ use bitty_plugin_host::{
 
 use crate::config::{RuntimeConfig, TextStack};
 use crate::error::RuntimeError;
+use crate::hang_watchdog::HangGauges;
 use crate::queue::{ColdEvent, ColdQueue};
 
 pub mod animations;
@@ -411,6 +413,16 @@ pub const SYNC_UPDATE_DEFER_TIMEOUT: std::time::Duration = std::time::Duration::
 /// though bytes keep arriving.
 pub const PRESENT_SETTLE_MAX: std::time::Duration = std::time::Duration::from_millis(8);
 
+/// Bounded self-heal cadence for a hidden surface that still retains work
+/// (bitty#2830 hypothesis 2).
+///
+/// The occlusion gate keeps every present off a hidden surface, and a hidden
+/// tick deliberately arms nothing, so a reveal edge that never arrives leaves
+/// the damage stranded with the loop parked in `ControlFlow::Wait`. One repair
+/// attempt per second is far below any cost that matters while hidden and is
+/// only armed while damage is retained (an idle hidden window arms nothing).
+pub const HIDDEN_REPAIR_INTERVAL_MS: u64 = 1_000;
+
 /// Minimal status flash while a paste pends after the full banner expires
 /// (CTX-0192). Bounded, single-line, always `Some` while pending.
 ///
@@ -565,6 +577,11 @@ pub struct Runtime {
     surface: Surface,
     gpu: Option<GpuContext>,
     cold_queue: ColdQueue,
+    /// Lock-free gauges published for the process hang watchdog (bitty#2830).
+    ///
+    /// The monitor thread reads only these atomics; it never borrows runtime
+    /// state, so reporting a wedged main thread cannot deadlock against it.
+    hang_gauges: Arc<HangGauges>,
     plugin_host: PluginHost,
     /// Native-component host (CTX-1361, bitty#2254).
     ///
@@ -1300,6 +1317,19 @@ pub struct Runtime {
     /// as a next-frame task on its own wake instead of presenting inline in
     /// the visibility transition. See `runtime::present`.
     surface_visible: bool,
+    /// Next bounded self-heal attempt for a hidden surface that still retains
+    /// work (bitty#2830 hypothesis 2).
+    ///
+    /// A lost reveal edge - a dropped `Resumed`/`Occluded(false)` delivery, a
+    /// compositor that never re-sends the edge, a focus/workspace transition
+    /// the embedder never saw - otherwise leaves the gate closed with damage
+    /// retained and no armed wake at all, parking the loop in
+    /// `ControlFlow::Wait` forever. While this is `Some`, the embedder joins
+    /// it into its wake minimum and re-checks the surface; see
+    /// [`Runtime::hidden_repair_deadline`]. `None` whenever the surface is
+    /// visible or holds nothing to repaint, so an idle hidden window still
+    /// arms nothing.
+    hidden_repair_at: Option<std::time::Instant>,
     /// Test-only present-failure seam (issue #2570 B1).
     ///
     /// Forces the real-GPU branch and injects a bounded number of failures so
@@ -1692,6 +1722,8 @@ impl std::fmt::Debug for Runtime {
             .field("presents_coalesced", &self.presents_coalesced)
             .field("coalesced_pending", &self.coalesced_pending)
             .field("surface_visible", &self.surface_visible)
+            .field("hidden_repair_at", &self.hidden_repair_at)
+            .field("hidden_retained_work", &self.hidden_retained_work())
             .field("leaf_count", &self.layout.leaf_count())
             .field("focused", &self.focus.focused())
             .field("workspace_count", &self.workspaces.len())
@@ -1999,6 +2031,7 @@ impl Runtime {
             surface,
             gpu: None,
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
+            hang_gauges: Arc::new(HangGauges::new()),
             plugin_host,
             component_host: None,
             component_events: std::collections::VecDeque::new(),
@@ -2104,6 +2137,7 @@ impl Runtime {
             // Issue #2589: the gate starts visible so the startup path and
             // every existing present schedule keep their pre-change behavior.
             surface_visible: true,
+            hidden_repair_at: None,
             #[cfg(test)]
             test_present: None,
             pending_activation_gesture: None,
@@ -2302,6 +2336,7 @@ impl Runtime {
             surface,
             gpu: None,
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
+            hang_gauges: Arc::new(HangGauges::new()),
             plugin_host,
             component_host: None,
             component_events: std::collections::VecDeque::new(),
@@ -2407,6 +2442,7 @@ impl Runtime {
             // Issue #2589: the gate starts visible so the startup path and
             // every existing present schedule keep their pre-change behavior.
             surface_visible: true,
+            hidden_repair_at: None,
             #[cfg(test)]
             test_present: None,
             pending_activation_gesture: None,
@@ -3139,6 +3175,122 @@ impl Runtime {
     #[must_use]
     pub fn cold_queue_dropped(&self) -> u64 {
         self.cold_queue.dropped()
+    }
+
+    /// Lock-free gauges published for the process hang watchdog (bitty#2830).
+    ///
+    /// The composition root clones this handle into the watchdog monitor so a
+    /// stalled main thread can be described without taking any runtime lock.
+    #[must_use]
+    pub fn hang_gauges(&self) -> &Arc<HangGauges> {
+        &self.hang_gauges
+    }
+
+    /// Republishes the lock-free hang gauges after an embedder-level flush.
+    ///
+    /// [`Self::tick_at`] publishes before and after the tick, but the desktop
+    /// embedder flushes PTY replies *after* the tick returns (the post-present
+    /// `ReplyFlush` phase). Without this second publication `pending_replies`
+    /// keeps the pre-flush count until the next tick, so an otherwise idle
+    /// park can be reported as `pending=replies` after the queues were
+    /// already drained (bitty#2830). The stores are relaxed and cheap; this
+    /// runs once per presented frame.
+    pub fn refresh_hang_gauges(&self) {
+        self.publish_hang_gauges();
+    }
+
+    /// Publishes the per-tick queue, layout, and content gauges.
+    ///
+    /// Called at the end of [`Self::tick_at`] on every return path. `Relaxed`
+    /// stores only; the values are diagnostics and never gate behavior.
+    fn publish_hang_gauges(&self) {
+        self.hang_gauges
+            .set_cold_queue(self.cold_queue.len(), self.cold_queue.dropped());
+        self.hang_gauges.set_plugin_pipeline(
+            self.plugin_host.pipeline().total_queued_events(),
+            self.plugin_host.pipeline().total_queued_bytes(),
+        );
+        self.hang_gauges.set_plugin_side(
+            self.plugin_host.side_queue().len(),
+            self.plugin_host.side_queue().dropped(),
+        );
+        self.hang_gauges
+            .set_component_events(self.component_events.len(), self.component_events_dropped);
+        let content_bytes = self.retained_content_bytes();
+        self.hang_gauges.set_layout(
+            self.pane_sessions.len(),
+            self.layout.leaf_count(),
+            content_bytes,
+        );
+        let bands = self.chrome_bands.top.len()
+            + self.chrome_bands.bottom.len()
+            + self.chrome_bands.left.len()
+            + self.chrome_bands.right.len();
+        let panels = self
+            .scene_host
+            .as_ref()
+            .and_then(|host| host.try_borrow().ok().map(|host| host.panel_count()))
+            .unwrap_or(0);
+        self.hang_gauges.set_panel_bindings(panels, bands);
+        // bitty#2830 hypothesis 2: the occlusion/reveal stall shape. The
+        // watchdog names it as `pending=hidden-damage` and uses it to arm the
+        // no-present detector, so it must be published even when nothing else
+        // about a hidden frame changes.
+        self.hang_gauges
+            .set_hidden_damage(self.hidden_retained_work());
+        self.hang_gauges
+            .set_pending_replies(self.pending_reply_bytes());
+    }
+
+    /// Bytes accepted by the bounded PTY writer FIFOs and not yet written.
+    ///
+    /// bitty#2830: this is the production writer backlog the watchdog names as
+    /// `pending=pty`. The headless observation buffer (`pending_input`) is a
+    /// separate, test-only seam and is not production backlog, so it is
+    /// deliberately not published here.
+    fn pending_writer_bytes(&self) -> usize {
+        let mut bytes = self.pty_writer.as_ref().map_or(0, PtyWriter::queued_bytes);
+        for session in self.pane_sessions.values() {
+            bytes = bytes.saturating_add(session.writer.queued_bytes());
+        }
+        bytes
+    }
+
+    /// Bytes of PTY replies queued across every live grid and not yet answered.
+    ///
+    /// bitty#2830: replies are bounded (`REPLY_CAP_BYTES` per grid) and drained
+    /// on every poll, so a non-zero value at an idle park names a child query
+    /// whose answer is still held. The watchdog reports it as `pending=replies`.
+    fn pending_reply_bytes(&self) -> usize {
+        let mut bytes = self.state.pending_reply_bytes();
+        for session in self.pane_sessions.values() {
+            bytes = bytes.saturating_add(session.state.pending_reply_bytes());
+        }
+        bytes
+    }
+
+    /// Estimated retained terminal content bytes across every live grid.
+    ///
+    /// Counts the visible grid plus retained scrollback rows at their cell
+    /// width. This is an accounting estimate (the cell struct plus inline
+    /// style), not an allocator measurement; it exists to make long-run growth
+    /// visible in a hang dump, and it is bounded by the configured scrollback
+    /// caps by construction.
+    fn retained_content_bytes(&self) -> u64 {
+        fn grid_bytes(state: &State, cols: usize) -> u64 {
+            let cell = std::mem::size_of::<Cell>();
+            let rows = state.scrollback_len().saturating_add(state.height());
+            u64::try_from(rows)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(u64::try_from(cols).unwrap_or(u64::MAX))
+                .saturating_mul(u64::try_from(cell).unwrap_or(u64::MAX))
+        }
+        let mut bytes = grid_bytes(&self.state, self.cols);
+        for session in self.pane_sessions.values() {
+            let cols = session.state.width();
+            bytes = bytes.saturating_add(grid_bytes(&session.state, cols));
+        }
+        bytes
     }
 
     /// Drains all queued cold-path events in FIFO order.

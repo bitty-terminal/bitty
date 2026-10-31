@@ -1003,6 +1003,16 @@ impl Service {
             // once its connection is gone; the map is unbounded and attach ids
             // are never reused.
             self.pending_frames.remove(attach_id);
+            // bitty#2830: a rotated control token still queued for this lease
+            // has no owner left. Attach ids are never reused, so leaving the
+            // entry in the map leaks it for the daemon's lifetime and makes
+            // every later delivery pass scan a longer key set.
+            self.pending_deliveries.remove(attach_id);
+            // Queue-overflow closes retained for the owning connection's next
+            // response have the same lifetime: once the connection is gone
+            // nothing can drain them.
+            self.closed_leases
+                .retain(|close| close.attach_id != *attach_id);
         }
         self.flush_events(now);
         for (_, session_id) in &leases {
@@ -1057,6 +1067,7 @@ impl Service {
         }
         self.events.detach(session_id, close.attach_id);
         self.pending_frames.remove(&close.attach_id);
+        self.pending_deliveries.remove(&close.attach_id);
         self.closed_leases.push(close);
         self.touch(session_id);
         self.maybe_forget_events(session_id, now);
@@ -3157,6 +3168,11 @@ impl Service {
                 self.events.detach(session_id, target);
                 connection.forget_lease(target);
                 self.content_subscriptions.remove(&target);
+                // bitty#2830: a rotated token still queued for this lease can
+                // never reach it once the lease is gone, and attach ids are
+                // never reused, so the entry would leak for the daemon's
+                // lifetime.
+                self.pending_deliveries.remove(&target);
                 // Record the acting connection for a controller/operator
                 // revocation of another connection's lease too; the target
                 // lookup has already removed it, so only this history can
@@ -7464,6 +7480,142 @@ mod tests {
         assert!(
             !service.pending_frames.contains_key(&observer_attach),
             "a closed connection drops its pending final frames"
+        );
+    }
+
+    /// bitty#2830 regression: a rotated control token queued for a lease must
+    /// not outlive the connection that owned it.
+    #[test]
+    fn closing_a_connection_drops_its_pending_control_token() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 1);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(2))
+            .expect("negotiate");
+
+        let created = create_session(&mut service, &mut creator, "pending-token-create");
+        let session = session_id(&created);
+        let create_token = created["control_token"].as_str().expect("token").to_owned();
+        let claimed = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": session,
+                    "expected_generation": 0,
+                    "control_token": create_token,
+                    "idempotency_key": "pending-token-claim",
+                }),
+                MonotonicMs::from_millis(11),
+            )
+            .expect("attach");
+        assert_eq!(claimed["role"], "controller");
+        let minted = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": session, "idempotency_key": "pending-token-grant"}),
+                MonotonicMs::from_millis(12),
+            )
+            .expect("grant");
+        let observer_grant = minted["grant"].as_str().expect("grant").to_owned();
+
+        let mut observer = consumer();
+        negotiate_ok(&mut service, &mut observer, 13);
+        let attached = service
+            .dispatch(
+                &mut observer,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "observer",
+                    "session_id": session,
+                    "observer_grant": observer_grant,
+                }),
+                MonotonicMs::from_millis(14),
+            )
+            .expect("observer attach");
+        let observer_attach =
+            AttachId::parse(attached["attach_id"].as_str().expect("attach id")).expect("attach id");
+        let generation = attached["session"]["generation"]
+            .as_u64()
+            .expect("attach carries the session generation");
+
+        service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionControlTransfer,
+                &json!({
+                    "session_id": session,
+                    "attach_id": observer_attach.as_hex(),
+                    "expected_generation": generation,
+                    "idempotency_key": "pending-token-transfer",
+                }),
+                MonotonicMs::from_millis(16),
+            )
+            .expect("transfer");
+        assert_eq!(
+            service.pending_delivery_targets(),
+            vec![observer_attach],
+            "the rotated token is queued for the new controller"
+        );
+
+        // The observer disconnects before any delivery pass drains the token.
+        service.close_connection_leases(&observer, MonotonicMs::from_millis(17));
+        assert!(
+            service.pending_delivery_targets().is_empty(),
+            "a closed connection drops its queued control token"
+        );
+    }
+
+    /// bitty#2830: a queue-overflow lease close must also drop a token still
+    /// queued for that lease.
+    #[test]
+    fn a_closed_lease_drops_its_queued_control_token() {
+        let (mut service, _dir) = service();
+        let mut creator = consumer();
+        negotiate_ok(&mut service, &mut creator, 1);
+        let created = create_session(&mut service, &mut creator, "closed-token-create");
+        let session = session_id(&created);
+        let session_key = SessionId::parse(&session).expect("session id");
+        let token = service
+            .initial_tokens
+            .remove(&session_key)
+            .expect("created token");
+        let claimed = service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": session,
+                    "expected_generation": 0,
+                    "control_token": created["control_token"],
+                    "idempotency_key": "closed-token-claim",
+                }),
+                MonotonicMs::from_millis(2),
+            )
+            .expect("attach");
+        let attach =
+            AttachId::parse(claimed["attach_id"].as_str().expect("attach id")).expect("attach id");
+        service.pending_deliveries.insert(attach, token);
+        assert_eq!(service.pending_delivery_targets(), vec![attach]);
+
+        service.close_lease_now(
+            session_key,
+            LeaseClose {
+                attach_id: attach,
+                reason: crate::events::LeaseCloseReason::TerminalEventLost,
+            },
+            MonotonicMs::from_millis(3),
+        );
+        assert!(
+            service.pending_delivery_targets().is_empty(),
+            "a closed lease drops its queued control token"
         );
     }
 

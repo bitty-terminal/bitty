@@ -60,6 +60,11 @@ pollster = "1.0"
 ed25519-dalek = "3"
 rustix = { version = "1.1.4", default-features = false }
 nix = { version = "0.31.3", default-features = false }
+# bitty#2830: safe `SIGUSR1` registration for the built-in hang capture. The
+# crate is the audited safe wrapper over `sigaction`; Core stays
+# `#![forbid(unsafe_code)]`. `flag` is always available, and the channel/
+# iterator features are not needed.
+signal-hook = { version = "0.3.18", default-features = false }
 # CTX-1020: errno constants for the Unix PTY backend's transient-spawn
 # classifier (`EPERM`/`ENOTTY` from the child `TIOCSCTTY`). Lock already
 # carries the 0.2 line via `portable-pty`; no new crate version.

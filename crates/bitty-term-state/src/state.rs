@@ -1696,6 +1696,16 @@ impl State {
         self.replies.drain()
     }
 
+    /// Bytes of device-status replies queued and not yet drained (bitty#2830).
+    ///
+    /// A non-zero value at an idle park names a child query whose answer is
+    /// still held; the hang watchdog reports it as `pending=replies`. Bounded
+    /// by [`crate::REPLY_CAP_BYTES`] by construction.
+    #[must_use]
+    pub fn pending_reply_bytes(&self) -> usize {
+        self.replies.total_bytes()
+    }
+
     /// Whether any reply was dropped due to the reply cap since the last
     /// drain (RFC invariant 7).
     #[must_use]

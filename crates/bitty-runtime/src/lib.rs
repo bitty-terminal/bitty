@@ -214,6 +214,7 @@ pub mod cw_present;
 pub mod error;
 pub mod execution_component;
 mod execution_jobs;
+pub mod hang_watchdog;
 pub mod host_bridge;
 pub mod inspect;
 pub mod paste;
@@ -308,12 +309,12 @@ pub use runtime::{
     ClosingFrame, DEFAULT_PASTE_CONFIRM_TIMEOUT, DEFAULT_PLUGIN_DROP_POLICY,
     DEFAULT_PLUGIN_PIPELINE_CAPACITY, DEFAULT_PLUGIN_SIDE_CAPACITY, FX_PULSE_DURATION_MS,
     FX_PULSE_QUEUE_CAPACITY, FileUrlActivation, FxPulseQueue, FxPulseTracker,
-    IME_COMMIT_ECHO_WINDOW, ImeCursorArea, KittyDisplayOutcome, KittyImageError,
-    MAX_CONCURRENT_ANIMATIONS, PASTE_BANNER_FLASH_TEXT, PASTE_BANNER_FULL_DURATION,
-    POLL_PTY_MAX_BYTES, POLL_PTY_MAX_CHUNKS, POLL_PTY_TIME_BUDGET, PRESENT_SETTLE_MAX,
-    PTY_FORWARD_CAPACITY_CHUNKS, PanelAnimator, PresentStats, PtyWaker, QueuedFxPulse,
-    ReducedMotionMode, Runtime, SCENE_A11Y_KIND, SYNC_UPDATE_DEFER_TIMEOUT, SceneA11yRun,
-    SceneFrameReport, TargetAnchorSummary, TerminalDiagnostics, UrlActivation,
+    HIDDEN_REPAIR_INTERVAL_MS, IME_COMMIT_ECHO_WINDOW, ImeCursorArea, KittyDisplayOutcome,
+    KittyImageError, MAX_CONCURRENT_ANIMATIONS, PASTE_BANNER_FLASH_TEXT,
+    PASTE_BANNER_FULL_DURATION, POLL_PTY_MAX_BYTES, POLL_PTY_MAX_CHUNKS, POLL_PTY_TIME_BUDGET,
+    PRESENT_SETTLE_MAX, PTY_FORWARD_CAPACITY_CHUNKS, PanelAnimator, PresentStats, PtyWaker,
+    QueuedFxPulse, ReducedMotionMode, Runtime, SCENE_A11Y_KIND, SYNC_UPDATE_DEFER_TIMEOUT,
+    SceneA11yRun, SceneFrameReport, TargetAnchorSummary, TerminalDiagnostics, UrlActivation,
 };
 
 // Re-export layout primitives for ergonomic `Runtime::set_layout` callers.

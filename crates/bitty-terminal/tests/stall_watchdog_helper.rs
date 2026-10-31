@@ -160,8 +160,9 @@ fn helper_fails_closed_on_oversized_input_and_keeps_the_previous_slot() {
     let path = slot_path(&dir);
     std::fs::create_dir_all(path.parent().expect("slot parent")).expect("state dir");
     std::fs::write(&path, "previous report\n").expect("seed slot");
-    // The helper caps stdin at the 8 KiB report bound; 16 KiB is over-cap.
-    let report = vec![b'x'; 16 * 1024];
+    // The helper caps stdin at the report bound (16 KiB since bitty#2830);
+    // 32 KiB is over-cap.
+    let report = vec![b'x'; 32 * 1024];
     let output = run_helper(HelperInvocation::new(&dir, &report));
     assert!(
         !output.status.success(),

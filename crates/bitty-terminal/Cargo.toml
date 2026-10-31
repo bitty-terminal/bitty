@@ -84,6 +84,9 @@ pollster = { workspace = true }
 # and kill path (CTX-1479); `user` is the watchdog's owner checks (CTX-1472).
 # No other feature changes behavior.
 nix = { workspace = true, features = ["fs", "poll", "process", "signal", "term", "user"] }
+# bitty#2830: `SIGUSR1` hang capture uses the safe `flag` registration; the
+# binary stays `#![forbid(unsafe_code)]`.
+signal-hook = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }

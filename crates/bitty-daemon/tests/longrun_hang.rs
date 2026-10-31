@@ -13,8 +13,30 @@ use bitty_daemon::registry::{
     SessionRegistry, TerminalId, TerminalOutcome, TerminalReason,
 };
 
+/// The compiled per-session retention bounds (`D-10`, `D-14`) and the fixture
+/// budget for every accounted stream byte.
+const MAX_BACKLOG_EVENTS: usize = 256;
+const MAX_BACKLOG_BYTES: usize = 262_144;
+const MAX_ACCOUNTED_BYTES: usize = 512 * 1024;
+
 fn ms(value: u64) -> MonotonicMs {
     MonotonicMs::from_millis(value)
+}
+
+/// Assert one live session's stream state sits inside the compiled caps.
+fn assert_stream_bounded(stream: &SessionEventStream, session: SessionId, context: &str) {
+    assert!(
+        stream.backlog_len(session).unwrap_or(0) <= MAX_BACKLOG_EVENTS,
+        "{context}: backlog events exceeded the compiled cap"
+    );
+    assert!(
+        stream.backlog_bytes(session).unwrap_or(0) <= MAX_BACKLOG_BYTES,
+        "{context}: backlog bytes exceeded the compiled cap"
+    );
+    assert!(
+        stream.accounted_bytes(session).unwrap_or(0) <= MAX_ACCOUNTED_BYTES,
+        "{context}: accounted stream bytes grew past the bounded fixture budget"
+    );
 }
 
 fn new_stream() -> SessionEventStream {
@@ -83,6 +105,14 @@ fn event_ring_and_lease_queues_stay_bounded_over_many_cycles() {
         // issue calls out (ring freed at terminal; pin released on ack/close).
         if cycle % 400 == 399 {
             terminal_cycles += 1;
+            // The ring only frees at the terminal transition, so this is the
+            // interval peak: measure it before `terminate()` can hide an
+            // over-cap regression that frees everything at the transition.
+            assert_stream_bounded(
+                &stream,
+                session,
+                &format!("cycle {cycle} before the terminal transition"),
+            );
             let terminal_lease = stream
                 .attach(
                     AttachRequest {
@@ -141,18 +171,7 @@ fn event_ring_and_lease_queues_stay_bounded_over_many_cycles() {
 
     assert_eq!(terminal_cycles, 5);
     assert_eq!(stream.lease_count(session), Some(0));
-    assert!(
-        stream.backlog_len(session).unwrap_or(0) <= 256,
-        "backlog events exceeded the compiled cap"
-    );
-    assert!(
-        stream.backlog_bytes(session).unwrap_or(0) <= 262_144,
-        "backlog bytes exceeded the compiled cap"
-    );
-    assert!(
-        stream.accounted_bytes(session).unwrap_or(0) <= 512 * 1024,
-        "accounted stream bytes grew past the bounded fixture budget"
-    );
+    assert_stream_bounded(&stream, session, "after the final cycle");
     assert!(
         matches!(stream.pending_terminal_consumers(session), None | Some(0)),
         "no terminal pin may remain on a live session"

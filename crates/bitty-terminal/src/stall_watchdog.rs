@@ -1651,7 +1651,7 @@ fn render_report(report: &StallReport) -> String {
     }
     let _ = writeln!(
         out,
-        "  process: threads={} fds={} rss={} KiB (statm)",
+        "  process: threads={} fds={} rss={} KiB (VmRSS)",
         report.totals.thread_count, report.totals.fd_count, report.totals.rss_kib,
     );
     // bitty#2830: the runtime gauges make an accumulation or deadlock visible

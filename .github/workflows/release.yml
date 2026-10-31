@@ -601,7 +601,10 @@ jobs:
           # package that has been dropped from the current quarterly snapshot
           # is still installable.
           sudo mkdir -p /usr/local/etc/pkg/repos
-          printf '%s\n' 'FreeBSD: { enabled: yes, url: "pkg+https://pkg.FreeBSD.org/${ABI}/latest" }' \
+          # `pkg+https` makes pkg 2.8 infer an SRV mirror and reject the
+          # plain host URL ("implies SRV mirror type"), so write the https
+          # URL directly; pkg still expands ${ABI} in the config.
+          printf '%s\n' 'FreeBSD: { enabled: yes, url: "https://pkg.FreeBSD.org/${ABI}/latest" }' \
             | sudo tee /usr/local/etc/pkg/repos/FreeBSD.conf
           for attempt in 1 2 3; do
             sudo pkg update -f || true

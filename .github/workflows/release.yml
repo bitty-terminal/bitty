@@ -581,7 +581,12 @@ jobs:
         with:
           operating_system: freebsd
           version: "15.1"
-          memory: 6G
+          # pkg 2.8 downloads and unpacks the full `latest` packagesite
+          # (data.tzst) during `pkg update`; 6G is not enough headroom and the
+          # VM OOM-kills pkg ("failed to reclaim memory", no swap), which then
+          # leaves no package matching cmake. 12G holds the update plus the
+          # rustc build.
+          memory: 12G
           cpu_count: 8
 
       # clang is in the FreeBSD base image; cmake + pkgconf drive

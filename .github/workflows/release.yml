@@ -606,19 +606,17 @@ jobs:
           # package that has been dropped from the current quarterly snapshot
           # is still installable.
           sudo mkdir -p /usr/local/etc/pkg/repos
-          # `pkg+https` makes pkg 2.8 infer an SRV mirror and reject the
-          # plain host URL ("implies SRV mirror type"), so write the https
-          # URL directly; pkg still expands ${ABI} in the config.
+          # `pkg+https` makes pkg infer an SRV mirror and reject the URL, and
+          # `pkg update -f` on this image re-enters pkg's self-upgrade loop
+          # ("New version of pkg detected") without ever installing cmake.
+          # Write the https URL, refresh once, upgrade pkg once, then install;
+          # every command is bounded so a stall fails the job instead of
+          # consuming the 120-minute budget.
           printf '%s\n' 'FreeBSD: { enabled: yes, url: "https://pkg.FreeBSD.org/${ABI}/latest" }' \
             | sudo tee /usr/local/etc/pkg/repos/FreeBSD.conf
-          for attempt in 1 2 3; do
-            sudo pkg update -f || true
-            if sudo pkg install -y git cmake pkgconf ca_root_nss freetype2 fontconfig bash; then
-              break
-            fi
-            echo "FreeBSD package install failed on attempt ${attempt}; refreshing repository metadata"
-            sleep 10
-          done
+          sudo timeout 300 pkg update
+          sudo timeout 300 pkg install -y pkg
+          sudo timeout 900 pkg install -y git cmake pkgconf ca_root_nss freetype2 fontconfig bash
           sudo pkg info cmake
 
       - name: Install pinned Rust toolchain (rustup)

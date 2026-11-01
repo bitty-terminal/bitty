@@ -817,48 +817,71 @@ pub(crate) fn current_effective() -> Option<EffectiveConfig> {
 /// The outer option reports whether a reload context is installed: `None`
 /// means there is none (unit tests, headless paths, `--safe`), so the caller
 /// keeps its startup identity. `Some(None)` is a real state — the running
-/// config was merged without any profile.
+/// config was merged without any profile. A context borrowed by an in-flight
+/// reload or classification also reports `None`, so a caller falls back to its
+/// startup identity instead of panicking.
 pub(crate) fn running_profile() -> Option<Option<String>> {
-    CONTEXT.with(|slot| slot.borrow().as_ref().map(|ctx| ctx.profile.clone()))
+    CONTEXT.with(|slot| {
+        slot.try_borrow()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|ctx| ctx.profile.clone()))
+    })
 }
 
-/// Classify a profile switch the app just persisted (bitty#2814).
+/// Classify a profile switch the app has just persisted (bitty#2814).
 ///
-/// `AppConfigManage` writes the selector and the file watcher resolves the
-/// same sources on its next tick. Running that resolution here — the installed
+/// `AppConfigManage` writes the selector and the file watcher resolves the same
+/// sources on its next tick. Running that resolution here — the installed
 /// resolver, so exactly the watcher's code — and diffing it against the
 /// committed running config answers whether the switch is live-only.
 ///
+/// This is classification only. The running profile identity moves in
+/// [`ReloadContext::reload_into`] when the watcher actually adopts the
+/// resolution (and a rolled-back adopt restores it), so a switch that is
+/// refused or fails to apply can never leave `profiles.list.active`,
+/// `config.get`, or `config.sources` naming a profile the runtime does not
+/// reflect (bitty#2848 review).
+///
 /// Returns `pending_restart`:
 ///
-/// * `false` when every differing field is live-class and adopted, so the
-///   watcher adopts the same resolution on its next tick. The identity that
-///   resolution used becomes the running identity, which keeps
-///   `profiles.list.active`, `config.get`, and `config.sources` on the running
-///   table. An explicit `--profile`/`BITTY_PROFILE` therefore still wins: the
-///   resolver keeps honouring it, so the identity never moves.
+/// * `false` when every differing field is live-class and adopted *and* the
+///   resolution selected `requested`, i.e. the next tick will adopt exactly
+///   this switch.
 /// * `true` when a restart-class (or otherwise unadoptable) field differs, the
-///   resolver fails, or no context is installed. The running identity stays,
-///   so reads keep naming the profile the table actually reflects.
+///   resolver fails, no context is installed, or the resolution selected a
+///   different profile. That last arm covers a one-launch
+///   `--profile`/`BITTY_PROFILE` override: the resolver keeps honoring it, so
+///   the selector write never merges while the override holds, and the reply
+///   must not claim a switch the running table cannot make (bitty#2848
+///   review).
 ///
 /// The reload context and the plugin runtime both live on the main thread (the
 /// app installs `AppConfigManage` as an `Rc` in that runtime), so reaching this
-/// thread-local from the backend is sound; plugin calls never run inside
-/// [`ReloadContext::reload_into`], so the `RefCell` cannot be re-entered.
-pub(crate) fn settle_profile_switch() -> bool {
+/// thread-local from the backend is sound. A resolver that re-entered this
+/// module would find the context borrowed; `try_borrow_mut` turns that into the
+/// conservative `true` instead of a panic.
+///
+/// Cost: this resolves the whole config (user layer plus profile chain) on the
+/// plugin call path. The 10 ms budget charged before the backend covers
+/// authorization only, not this classification; the write head stays
+/// approval-gated and rate-limited to 16 calls/s.
+pub(crate) fn classify_profile_switch(requested: &str) -> bool {
     CONTEXT.with(|slot| {
-        let mut slot = slot.borrow_mut();
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return true;
+        };
         let Some(ctx) = slot.as_mut() else {
             return true;
         };
         let Ok(resolved) = (ctx.resolve)() else {
             return true;
         };
-        if !restart_pending_fields(ctx.engine.current(), &resolved.effective).is_empty() {
+        // The override (or a selector that lost the race) means the persisted
+        // switch is not what the running table is about to become.
+        if resolved.profile.as_deref() != Some(requested) {
             return true;
         }
-        ctx.profile = resolved.profile;
-        false
+        !pending_fields(ctx.engine.current(), &resolved.effective, runtime_adopts).is_empty()
     })
 }
 
@@ -895,9 +918,22 @@ fn poll_file_at(runtime: &mut bitty_runtime::Runtime, at: Instant) -> Option<Rel
     })
 }
 
-/// Live-class fields that differ between `launched` and `current` and that
-/// `adopts` rejects: the restart-pending set (split out so the filter is
-/// testable while every current `Live` field has an adopter).
+/// Whether one classified field difference is adopted live by the runtime.
+///
+/// The single inversion point shared by both restart-pending classifications,
+/// so a new [`bitty_config::ReloadClass`] cannot drift between them.
+fn adopted_live(class: bitty_config::ReloadClass, field: &str, adopts: fn(&str) -> bool) -> bool {
+    class == bitty_config::ReloadClass::Live && adopts(field)
+}
+
+/// Fields that differ and that the running runtime would not adopt live: the
+/// restart-pending set.
+///
+/// `launched` against the committed `current` is the ctl `restart_required`
+/// case (fields the runtime could not adopt stay at their launch values);
+/// `running` against a prospective config is the profile-switch classification
+/// (bitty#2814). `adopts` is injected so the filter is testable; production
+/// passes [`runtime_adopts`].
 fn pending_fields(
     launched: &EffectiveConfig,
     current: &EffectiveConfig,
@@ -906,25 +942,7 @@ fn pending_fields(
     bitty_config::diff(launched, current)
         .diffs
         .into_iter()
-        .filter(|diff| diff.class == bitty_config::ReloadClass::Live && !adopts(&diff.field))
-        .map(|diff| diff.field)
-        .collect()
-}
-
-/// Fields a prospective config would leave pending a restart (bitty#2814).
-///
-/// A difference is adoptable only when `bitty-config` classifies it
-/// [`bitty_config::ReloadClass::Live`] *and* the runtime has an adopter
-/// ([`runtime_adopts`]). Restart-class, rejected, and live-without-adopter
-/// fields all keep the running value until the next launch, so any of them
-/// makes the switch restart-pending. An empty result is the live-only case.
-fn restart_pending_fields(running: &EffectiveConfig, prospective: &EffectiveConfig) -> Vec<String> {
-    bitty_config::diff(running, prospective)
-        .diffs
-        .into_iter()
-        .filter(|diff| {
-            diff.class != bitty_config::ReloadClass::Live || !runtime_adopts(&diff.field)
-        })
+        .filter(|diff| !adopted_live(diff.class, &diff.field, adopts))
         .map(|diff| diff.field)
         .collect()
 }
@@ -1982,16 +2000,18 @@ mod tests {
     }
 
     #[test]
-    fn settle_profile_switch_is_conservative_without_a_context() {
+    fn classify_profile_switch_is_conservative_without_a_context() {
         // bitty#2814: a headless/test path cannot classify the switch, so it
         // must report a restart instead of guessing.
         clear();
-        assert!(settle_profile_switch());
+        assert!(classify_profile_switch("work"));
         assert!(running_profile().is_none(), "no context, no identity");
     }
 
     #[test]
-    fn settle_profile_switch_moves_the_running_identity_for_a_live_diff() {
+    fn classify_profile_switch_reports_live_without_adopting_the_identity() {
+        // bitty#2848 review: classification must not move the running identity;
+        // only an adopted reload does (see `adopted_reload_moves_the_running_profile`).
         let baseline = bitty_config::fallback_builtin();
         let mut live = baseline.clone();
         live.font.size = baseline.font.size + 1.0;
@@ -2007,13 +2027,17 @@ mod tests {
             }),
             None,
         );
-        assert!(!settle_profile_switch(), "font.size is live-class");
-        assert_eq!(running_profile(), Some(Some(String::from("work"))));
+        assert!(!classify_profile_switch("work"), "font.size is live-class");
+        assert_eq!(
+            running_profile(),
+            Some(Some(String::from("default"))),
+            "nothing was adopted yet"
+        );
         clear();
     }
 
     #[test]
-    fn settle_profile_switch_keeps_the_identity_for_a_restart_diff() {
+    fn classify_profile_switch_reports_restart_for_a_restart_diff() {
         let baseline = bitty_config::fallback_builtin();
         let mut live = baseline.clone();
         live.terminal.scrollback = baseline.terminal.scrollback.saturating_add(1);
@@ -2030,7 +2054,7 @@ mod tests {
             None,
         );
         assert!(
-            settle_profile_switch(),
+            classify_profile_switch("work"),
             "terminal.scrollback is restart-required"
         );
         assert_eq!(
@@ -2042,7 +2066,33 @@ mod tests {
     }
 
     #[test]
-    fn settle_profile_switch_keeps_the_identity_when_the_resolver_fails() {
+    fn classify_profile_switch_reports_restart_for_another_profile() {
+        // bitty#2848 review: the resolution selecting a different profile than
+        // the requested one (a one-launch `--profile`/`BITTY_PROFILE` override)
+        // means the switch cannot reach the running table, even when the merged
+        // config is identical.
+        let baseline = bitty_config::fallback_builtin();
+        clear();
+        install_with_profile(
+            baseline.clone(),
+            Some(String::from("work")),
+            Box::new(move || {
+                Ok(ResolvedConfig {
+                    effective: baseline.clone(),
+                    profile: Some(String::from("work")),
+                })
+            }),
+            None,
+        );
+        assert!(
+            classify_profile_switch("default"),
+            "an explicit override keeps the running table"
+        );
+        clear();
+    }
+
+    #[test]
+    fn classify_profile_switch_reports_restart_when_the_resolver_fails() {
         clear();
         install_with_profile(
             bitty_config::fallback_builtin(),
@@ -2050,7 +2100,7 @@ mod tests {
             Box::new(|| Err(String::from("boom"))),
             None,
         );
-        assert!(settle_profile_switch());
+        assert!(classify_profile_switch("work"));
         assert_eq!(running_profile(), Some(Some(String::from("default"))));
         clear();
     }

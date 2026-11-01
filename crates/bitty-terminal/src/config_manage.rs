@@ -494,14 +494,17 @@ impl ConfigWriteBackend for AppConfigManage {
             log_refusal(plugin_id, "profiles.use", mapped);
             mapped
         })?;
-        // bitty#2814: the selector is committed; whether the running table
-        // follows live is a reload classification, not a property of the
-        // write. The reload context and this backend share the main thread —
-        // `crate::plugin_runtime` installs it as an `Rc` into the same
-        // runtime that owns the context — so the thread-local lookup is sound,
-        // and a missing context (headless, `--safe`, unit tests) stays
-        // conservative.
-        let pending_restart = crate::config_reload::settle_profile_switch();
+        // bitty#2814 / bitty#2848: the selector is committed; whether the
+        // running table follows live is a classification of the *prospective*
+        // resolution, not a property of the write. The classification never
+        // moves the running identity — that happens in `config_reload` when the
+        // watcher adopts the same resolution — so a refused or failed tick
+        // leaves reads on the profile the runtime reflects. The reload context
+        // and this backend share the main thread (`crate::plugin_runtime`
+        // installs the backend as an `Rc` into the same runtime that owns the
+        // context), so the thread-local lookup is sound, and a missing context
+        // (headless, `--safe`, unit tests) stays conservative.
+        let pending_restart = crate::config_reload::classify_profile_switch(name);
         Ok(ConfigApplyOutcome::Applied { pending_restart })
     }
 }
@@ -624,6 +627,44 @@ mod tests {
     fn write_profile(dir: &Path, name: &str, body: &str) {
         std::fs::create_dir_all(dir.join("profiles")).expect("profiles");
         std::fs::write(dir.join("profiles").join(format!("{name}.lua")), body).expect("profile");
+    }
+
+    /// Render one host path as a Lua string literal (Windows separators too).
+    fn lua_string(path: &Path) -> String {
+        let mut out = String::from("\"");
+        for ch in path.display().to_string().chars() {
+            match ch {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                other => out.push(other),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    /// A 4x4 RGBA PNG: the same decodable fixture the reload tests use for
+    /// background-adoption failures.
+    const TEST_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x04, 0x08, 0x06, 0x00, 0x00, 0x00, 0xA9,
+        0xF1, 0x9E, 0x7E, 0x00, 0x00, 0x00, 0x15, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0xFC,
+        0xCF, 0xC0, 0xF0, 0x9F, 0x01, 0x09, 0x30, 0x21, 0x73, 0x88, 0x13, 0x00, 0x00, 0x83, 0xD1,
+        0x02, 0x06, 0x04, 0xBC, 0x24, 0x47, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+        0x42, 0x60, 0x82,
+    ];
+
+    /// Deterministic runtime seeded from the running config (same construction
+    /// as the reload tests, so no host font discovery is involved).
+    fn runtime_for(effective: &bitty_config::EffectiveConfig) -> bitty_runtime::Runtime {
+        let cfg = crate::config_cli::runtime_config_from_effective(effective).expect("runtime cfg");
+        bitty_runtime::Runtime::with_deterministic_rasterizer(cfg).expect("runtime")
+    }
+
+    /// Drive the reload the file watcher performs on its next tick.
+    fn tick(running: &bitty_config::EffectiveConfig) -> crate::config_reload::ReloadOutcomeInfo {
+        let mut runtime = runtime_for(running);
+        crate::config_reload::reload_requested(&mut runtime).expect("context installed")
     }
 
     #[test]
@@ -886,9 +927,9 @@ mod tests {
     #[test]
     fn live_only_profile_switch_reports_no_restart_and_follows_the_running_table() {
         // bitty#2814: with the reload context installed, a switch whose only
-        // differences are live-class fields reports no pending restart, and
-        // the read verbs follow the running table instead of the startup
-        // profile.
+        // differences are live-class fields reports no pending restart. The
+        // reads follow the switch only after the watcher adopts it
+        // (bitty#2848 review: classification never moves the identity).
         let dir = scratch("profile-live");
         write_selector(&dir, "default");
         write_profile(&dir, "default", "return { window = { opacity = 0.9 } }\n");
@@ -900,7 +941,7 @@ mod tests {
         let running = resolve_current(&dir, None);
         crate::config_reload::clear();
         crate::config_reload::install_with_profile(
-            running.effective,
+            running.effective.clone(),
             Some(String::from("default")),
             resolver(&dir, None),
             None,
@@ -916,8 +957,26 @@ mod tests {
             ConfigApplyOutcome::Applied {
                 pending_restart: false
             },
-            "font.family and window.opacity are live-class and adopted"
+            "window.opacity and window.padding are live-class and adopted"
         );
+
+        // Nothing is adopted yet: until the watcher tick, reads still name the
+        // running table.
+        assert_eq!(
+            backend
+                .profiles_list("p")
+                .expect("profiles")
+                .active
+                .as_deref(),
+            Some("default"),
+            "classification alone never moves the identity"
+        );
+        let opacity = backend.config_get("p", "window.opacity").expect("opacity");
+        assert_eq!(opacity.value, ConfigReadValue::Number(0.9));
+
+        // The next watcher tick adopts the same resolution the classifier saw.
+        let info = tick(&running.effective);
+        assert_eq!(info.kind, "applied", "{info:?}");
 
         let listed = backend.profiles_list("p").expect("profiles");
         assert_eq!(listed.active.as_deref(), Some("work"));
@@ -958,6 +1017,145 @@ mod tests {
             rendering.rendered.contains("padding = 4"),
             "the pinned seed follows the running profile: {}",
             rendering.rendered
+        );
+        crate::config_reload::clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn selector_only_switch_moves_the_identity_on_an_unchanged_tick() {
+        // bitty#2814 / bitty#2848 review: two profiles with identical effective
+        // values still move the running identity — the tick reports
+        // `unchanged`, but the selector it resolved is the new one.
+        let dir = scratch("profile-unchanged");
+        write_selector(&dir, "default");
+        write_profile(&dir, "default", "return { window = { opacity = 0.9 } }\n");
+        write_profile(&dir, "work", "return { window = { opacity = 0.9 } }\n");
+        let running = resolve_current(&dir, None);
+        crate::config_reload::clear();
+        crate::config_reload::install_with_profile(
+            running.effective.clone(),
+            Some(String::from("default")),
+            resolver(&dir, None),
+            None,
+        );
+        let backend = backend(&dir, Some("default"));
+
+        let preview = backend.preview_profile_use("p", "work").expect("preview");
+        let outcome = backend
+            .apply_profile_use("p", "work", &preview.candidate_digest)
+            .expect("apply");
+        assert_eq!(
+            outcome,
+            ConfigApplyOutcome::Applied {
+                pending_restart: false
+            },
+            "identical effective values need no restart"
+        );
+        assert_eq!(
+            backend
+                .profiles_list("p")
+                .expect("profiles")
+                .active
+                .as_deref(),
+            Some("default"),
+            "not adopted before the tick"
+        );
+
+        let info = tick(&running.effective);
+        assert_eq!(info.kind, "unchanged", "{info:?}");
+        assert_eq!(
+            backend
+                .profiles_list("p")
+                .expect("profiles")
+                .active
+                .as_deref(),
+            Some("work"),
+            "the adopted selector moves the identity even with no field diff"
+        );
+        crate::config_reload::clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn apply_error_after_a_live_classification_keeps_the_running_profile() {
+        // bitty#2848 review: `profiles.use` may classify a switch live-only,
+        // but if the next watcher tick cannot adopt it (the background image
+        // vanished between the write and the tick) the rolled-back tick must
+        // leave the identity and the reads on the running profile.
+        let dir = scratch("profile-apply-error");
+        let red = dir.join("red.png");
+        let blue = dir.join("blue.png");
+        std::fs::write(&red, TEST_PNG).expect("red");
+        std::fs::write(&blue, TEST_PNG).expect("blue");
+        write_selector(&dir, "default");
+        write_profile(
+            &dir,
+            "default",
+            &format!(
+                "return {{ decoration = {{ background_image = {}, background_image_roots = {{ {} }} }}, window = {{ opacity = 0.9 }} }}\n",
+                lua_string(&red),
+                lua_string(&dir)
+            ),
+        );
+        write_profile(
+            &dir,
+            "work",
+            &format!(
+                "return {{ decoration = {{ background_image = {}, background_image_roots = {{ {} }} }}, window = {{ opacity = 0.8 }} }}\n",
+                lua_string(&blue),
+                lua_string(&dir)
+            ),
+        );
+        let running = resolve_current(&dir, None);
+        assert!(
+            running.effective.decoration.background_image.is_some(),
+            "the running chain carries the image"
+        );
+        crate::config_reload::clear();
+        crate::config_reload::install_with_profile(
+            running.effective.clone(),
+            Some(String::from("default")),
+            resolver(&dir, None),
+            None,
+        );
+        let backend = backend(&dir, Some("default"));
+
+        let preview = backend.preview_profile_use("p", "work").expect("preview");
+        let outcome = backend
+            .apply_profile_use("p", "work", &preview.candidate_digest)
+            .expect("apply");
+        assert_eq!(
+            outcome,
+            ConfigApplyOutcome::Applied {
+                pending_restart: false
+            },
+            "the image still existed when the switch was classified"
+        );
+
+        // The image vanishes before the watcher tick: the adopt fails closed.
+        std::fs::remove_file(&blue).expect("remove blue");
+        let info = tick(&running.effective);
+        assert_eq!(info.kind, "apply-error", "{info:?}");
+        assert_eq!(
+            crate::config_reload::running_profile(),
+            Some(Some(String::from("default"))),
+            "a rolled-back adopt keeps the running identity"
+        );
+        assert_eq!(
+            backend
+                .profiles_list("p")
+                .expect("profiles")
+                .active
+                .as_deref(),
+            Some("default"),
+            "reads keep naming the profile the runtime reflects"
+        );
+        let opacity = backend.config_get("p", "window.opacity").expect("opacity");
+        assert_eq!(
+            opacity.value,
+            ConfigReadValue::Number(0.9),
+            "reads never follow a switch the runtime did not adopt"
         );
         crate::config_reload::clear();
         let _ = std::fs::remove_dir_all(dir);
@@ -1018,10 +1216,13 @@ mod tests {
 
     #[test]
     fn explicit_profile_override_is_never_re_merged_live() {
-        // bitty#2814: `--profile work` wins over the selector for the whole
-        // process, so switching the selector persists for the next launch but
-        // cannot move the running table, and `active` keeps naming the
-        // override.
+        // bitty#2814 / bitty#2848 review: `--profile work` wins over the
+        // selector for the whole process, so switching the selector persists
+        // for the next launch but cannot move the running table and
+        // `profiles.list.active` keeps naming the override. The reply's
+        // `pending_restart` follows: it must not claim a live switch the
+        // resolver refused to make (the reply's own `active` field still echoes
+        // the requested name; that is the pre-existing field semantics).
         let dir = scratch("profile-override");
         write_selector(&dir, "work");
         write_profile(&dir, "default", "return { window = { opacity = 0.9 } }\n");
@@ -1046,9 +1247,9 @@ mod tests {
         assert_eq!(
             outcome,
             ConfigApplyOutcome::Applied {
-                pending_restart: false
+                pending_restart: true
             },
-            "no running field differs while the override holds"
+            "the override keeps selecting `work`, so the switch cannot be live"
         );
         let selector = std::fs::read_to_string(dir.join("init.lua")).expect("selector");
         assert!(selector.contains("profile = \"default\""));

@@ -46,6 +46,9 @@ pub(crate) struct AppConfigManage {
     /// Managed plugin ledger beside the selector.
     ledger_path: PathBuf,
     /// Profile startup actually loaded, when one was selected.
+    ///
+    /// Fallback only: once the live reload context is installed it owns the
+    /// running identity, so reads follow an adopted switch (bitty#2814).
     active_profile: Option<String>,
     /// Installed plugin store root, if any.
     store_root: Option<PathBuf>,
@@ -79,6 +82,22 @@ impl AppConfigManage {
         })
     }
 
+    /// The scalar writer bound to the profile the running table reflects
+    /// (bitty#2814).
+    ///
+    /// `preview`/`apply` seed pinned tables (`font`, `window`, `terminal`, …)
+    /// from the running chain, which moves on a live-only `profiles.use`;
+    /// seeding from the startup chain would pin the previous profile's values
+    /// into the user layer. Without an installed context the startup chain
+    /// stands, exactly as when the backend was built.
+    fn writer(&self) -> UserLayerConfigWriter {
+        let profile = match crate::config_reload::running_profile() {
+            Some(profile) => profile,
+            None => self.active_profile.clone(),
+        };
+        self.writer.with_profile(profile)
+    }
+
     /// Load the strict merged configuration the running app would use.
     fn load_merged(&self) -> Result<MergedConfig, ConfigReadFailure> {
         let user = if self.target.exists() {
@@ -89,10 +108,15 @@ impl AppConfigManage {
         } else {
             None
         };
-        // Startup precedence: `--profile`/`BITTY_PROFILE` wins over the
-        // persisted selector. Reads must reflect the profile the running app
-        // actually loaded, so both sides go through the one shared rule.
-        let selected = resolved_profile_name(user.as_ref(), self.active_profile.as_deref());
+        // bitty#2814: once the live reload context is installed it owns the
+        // running identity, so reads follow a switch the watcher adopted (or
+        // this backend proved live) instead of the startup profile. Without a
+        // context the startup precedence stands: `--profile`/`BITTY_PROFILE`
+        // wins over the persisted selector, matching what startup loaded.
+        let selected = match crate::config_reload::running_profile() {
+            Some(profile) => profile,
+            None => resolved_profile_name(user.as_ref(), self.active_profile.as_deref()),
+        };
         let chain = match selected.as_deref() {
             Some(name) => bitty_config::file::load_profile_chain_in_dir(name, &self.profiles_dir)
                 .map_err(|_| ConfigReadFailure::Invalid)?,
@@ -277,7 +301,7 @@ impl ConfigWriteBackend for AppConfigManage {
         plugin_id: &str,
         change: &ConfigChange,
     ) -> Result<ConfigPreviewRendering, ConfigWriteFailure> {
-        self.writer.preview(plugin_id, change)
+        self.writer().preview(plugin_id, change)
     }
 
     fn apply(
@@ -286,7 +310,7 @@ impl ConfigWriteBackend for AppConfigManage {
         change: &ConfigChange,
         expected_candidate_digest: &str,
     ) -> Result<ConfigApplyOutcome, ConfigWriteFailure> {
-        self.writer
+        self.writer()
             .apply(plugin_id, change, expected_candidate_digest)
     }
 
@@ -359,15 +383,17 @@ impl ConfigWriteBackend for AppConfigManage {
         names.sort();
         let byte_truncated = truncate_list_rows(&mut names, |name| list_row_bytes(&[name]));
         let truncated = scan_truncated || byte_truncated;
-        // The running chain wins: `--profile`/`BITTY_PROFILE` first, then the
-        // persisted selector. A successful `profiles.use` updates the
-        // selector immediately, but the running table is not re-merged, so
-        // the caller learns from `pending_restart` that `active` still names
-        // the startup profile until the next launch.
-        let active = effective_profile_name(
-            self.active_profile.as_deref(),
-            selector_profile_from_path(&self.target),
-        );
+        // bitty#2814: report the profile the running table reflects. The live
+        // reload context owns that identity once installed (a live-only
+        // switch moves it); without one the startup chain wins, exactly as at
+        // launch (`--profile`/`BITTY_PROFILE` first, then the selector).
+        let active = match crate::config_reload::running_profile() {
+            Some(profile) => profile,
+            None => effective_profile_name(
+                self.active_profile.as_deref(),
+                selector_profile_from_path(&self.target),
+            ),
+        };
         Ok(ProfileList {
             rows: names
                 .into_iter()
@@ -421,7 +447,10 @@ impl ConfigWriteBackend for AppConfigManage {
                 mapped
             },
         )?;
-        Ok(ConfigApplyOutcome::Applied)
+        // The ledger is read at activation only, so the toggle is never live.
+        Ok(ConfigApplyOutcome::Applied {
+            pending_restart: true,
+        })
     }
 
     fn preview_profile_use(
@@ -465,7 +494,15 @@ impl ConfigWriteBackend for AppConfigManage {
             log_refusal(plugin_id, "profiles.use", mapped);
             mapped
         })?;
-        Ok(ConfigApplyOutcome::Applied)
+        // bitty#2814: the selector is committed; whether the running table
+        // follows live is a reload classification, not a property of the
+        // write. The reload context and this backend share the main thread —
+        // `crate::plugin_runtime` installs it as an `Rc` into the same
+        // runtime that owns the context — so the thread-local lookup is sound,
+        // and a missing context (headless, `--safe`, unit tests) stays
+        // conservative.
+        let pending_restart = crate::config_reload::settle_profile_switch();
+        Ok(ConfigApplyOutcome::Applied { pending_restart })
     }
 }
 
@@ -535,6 +572,58 @@ mod tests {
             None,
         )
         .expect("backend")
+    }
+
+    /// Type-erased resolver the reload context installs (tests).
+    type Resolver = Box<dyn Fn() -> Result<crate::config_reload::ResolvedConfig, String>>;
+
+    /// Merge the scratch dir exactly as startup does, including the
+    /// `--profile`/`BITTY_PROFILE` precedence over the stored selector.
+    fn resolve_current(dir: &Path, explicit: Option<&str>) -> crate::config_reload::ResolvedConfig {
+        let target = dir.join("init.lua");
+        let user = target
+            .exists()
+            .then(|| bitty_config::file::load_user_layer(&target).expect("user layer"));
+        let selected = resolved_profile_name(user.as_ref(), explicit);
+        let chain = match selected.as_deref() {
+            Some(name) => {
+                bitty_config::file::load_profile_chain_in_dir(name, &dir.join("profiles"))
+                    .expect("profile chain")
+            }
+            None => Vec::new(),
+        };
+        let merged = bitty_config::file::resolve_effective_with_profiles(
+            user,
+            chain,
+            &bitty_config::file::CliOverrides::default(),
+        )
+        .expect("merged config");
+        crate::config_reload::ResolvedConfig {
+            effective: merged.effective,
+            profile: selected,
+        }
+    }
+
+    /// Resolver closure over the scratch dir (the test analogue of the
+    /// production `load_app_config` resolver).
+    fn resolver(dir: &Path, explicit: Option<&str>) -> Resolver {
+        let dir = dir.to_path_buf();
+        let explicit = explicit.map(str::to_string);
+        Box::new(move || Ok(resolve_current(&dir, explicit.as_deref())))
+    }
+
+    /// Write the selector file the profile write path rewrites.
+    fn write_selector(dir: &Path, profile: &str) {
+        std::fs::write(
+            dir.join("init.lua"),
+            format!("return {{ format = \"bitty-profile-v1\", profile = \"{profile}\" }}\n"),
+        )
+        .expect("selector");
+    }
+
+    fn write_profile(dir: &Path, name: &str, body: &str) {
+        std::fs::create_dir_all(dir.join("profiles")).expect("profiles");
+        std::fs::write(dir.join("profiles").join(format!("{name}.lua")), body).expect("profile");
     }
 
     #[test]
@@ -673,7 +762,13 @@ mod tests {
         let outcome = backend
             .apply_plugin_enabled("p", &id, true, &preview.candidate_digest)
             .expect("apply");
-        assert_eq!(outcome, ConfigApplyOutcome::Applied);
+        assert_eq!(
+            outcome,
+            ConfigApplyOutcome::Applied {
+                pending_restart: true
+            },
+            "the ledger is read at activation only"
+        );
         let saved = std::fs::read_to_string(dir.join("bitty-plugins.lua")).expect("ledger");
         assert!(saved.contains("enabled = true"));
         assert!(dir.join("bitty-plugins.lua.bak").exists());
@@ -741,7 +836,14 @@ mod tests {
         let outcome = backend
             .apply_profile_use("p", "work", &preview.candidate_digest)
             .expect("apply");
-        assert_eq!(outcome, ConfigApplyOutcome::Applied);
+        // bitty#2814: no reload context is installed here, so the backend
+        // cannot prove live adoption and stays conservative.
+        assert_eq!(
+            outcome,
+            ConfigApplyOutcome::Applied {
+                pending_restart: true
+            }
+        );
         let selector = std::fs::read_to_string(dir.join("init.lua")).expect("selector");
         assert!(selector.contains("profile = \"work\""));
         assert!(selector.contains("-- keep"));
@@ -750,7 +852,7 @@ mod tests {
         assert_eq!(
             listed.active.as_deref(),
             Some("default"),
-            "the running table stays on the startup profile until restart"
+            "a conservative switch keeps the startup identity"
         );
         assert!(
             listed
@@ -778,6 +880,190 @@ mod tests {
             .apply_profile_use("p", "default", &preview.candidate_digest)
             .expect_err("stale");
         assert_eq!(error, ConfigWriteFailure::Stale);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn live_only_profile_switch_reports_no_restart_and_follows_the_running_table() {
+        // bitty#2814: with the reload context installed, a switch whose only
+        // differences are live-class fields reports no pending restart, and
+        // the read verbs follow the running table instead of the startup
+        // profile.
+        let dir = scratch("profile-live");
+        write_selector(&dir, "default");
+        write_profile(&dir, "default", "return { window = { opacity = 0.9 } }\n");
+        write_profile(
+            &dir,
+            "work",
+            "return { window = { opacity = 0.8, padding = 4 } }\n",
+        );
+        let running = resolve_current(&dir, None);
+        crate::config_reload::clear();
+        crate::config_reload::install_with_profile(
+            running.effective,
+            Some(String::from("default")),
+            resolver(&dir, None),
+            None,
+        );
+        let backend = backend(&dir, Some("default"));
+
+        let preview = backend.preview_profile_use("p", "work").expect("preview");
+        let outcome = backend
+            .apply_profile_use("p", "work", &preview.candidate_digest)
+            .expect("apply");
+        assert_eq!(
+            outcome,
+            ConfigApplyOutcome::Applied {
+                pending_restart: false
+            },
+            "font.family and window.opacity are live-class and adopted"
+        );
+
+        let listed = backend.profiles_list("p").expect("profiles");
+        assert_eq!(listed.active.as_deref(), Some("work"));
+        assert!(
+            listed
+                .rows
+                .iter()
+                .any(|row| row.name == "work" && row.active)
+        );
+        assert!(
+            listed
+                .rows
+                .iter()
+                .any(|row| row.name == "default" && !row.active)
+        );
+
+        // `config.get` reads the running chain, not the startup one.
+        let opacity = backend.config_get("p", "window.opacity").expect("opacity");
+        assert_eq!(opacity.value, ConfigReadValue::Number(0.8));
+        // `config.sources` attributes a key only the new profile sets.
+        let sources = backend.config_sources("p").expect("sources");
+        assert!(
+            sources
+                .rows
+                .iter()
+                .any(|row| row.key == "window.padding" && row.source == ConfigSourceLabel::User),
+            "the read chain follows the switched profile"
+        );
+
+        // A scalar write after the switch seeds its pinned `window` table from
+        // the running chain (`work` pads 4), not from the startup chain.
+        let change = ConfigChange::new(
+            writable_setting("window.opacity").expect("allowlisted"),
+            bitty_runtime::plugin_runtime::ConfigSettingValue::Number(0.7),
+        );
+        let rendering = backend.preview("p", &change).expect("scalar preview");
+        assert!(
+            rendering.rendered.contains("padding = 4"),
+            "the pinned seed follows the running profile: {}",
+            rendering.rendered
+        );
+        crate::config_reload::clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn restart_class_profile_switch_reports_pending_and_keeps_the_running_table() {
+        // bitty#2814: one restart-class difference means the switch cannot be
+        // adopted live, so the marker stays set and reads keep the running
+        // chain.
+        let dir = scratch("profile-restart");
+        write_selector(&dir, "default");
+        write_profile(&dir, "default", "return { window = { opacity = 0.9 } }\n");
+        let running = resolve_current(&dir, None);
+        let scrollback = running.effective.terminal.scrollback.saturating_add(1);
+        write_profile(
+            &dir,
+            "work",
+            &format!(
+                "return {{ terminal = {{ scrollback = {scrollback} }}, window = {{ opacity = 0.8 }} }}\n"
+            ),
+        );
+        crate::config_reload::clear();
+        crate::config_reload::install_with_profile(
+            running.effective,
+            Some(String::from("default")),
+            resolver(&dir, None),
+            None,
+        );
+        let backend = backend(&dir, Some("default"));
+
+        let preview = backend.preview_profile_use("p", "work").expect("preview");
+        let outcome = backend
+            .apply_profile_use("p", "work", &preview.candidate_digest)
+            .expect("apply");
+        assert_eq!(
+            outcome,
+            ConfigApplyOutcome::Applied {
+                pending_restart: true
+            },
+            "terminal.scrollback is restart-required"
+        );
+        let listed = backend.profiles_list("p").expect("profiles");
+        assert_eq!(
+            listed.active.as_deref(),
+            Some("default"),
+            "the running table did not move"
+        );
+        let opacity = backend.config_get("p", "window.opacity").expect("opacity");
+        assert_eq!(
+            opacity.value,
+            ConfigReadValue::Number(0.9),
+            "reads stay on the running chain"
+        );
+        crate::config_reload::clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn explicit_profile_override_is_never_re_merged_live() {
+        // bitty#2814: `--profile work` wins over the selector for the whole
+        // process, so switching the selector persists for the next launch but
+        // cannot move the running table, and `active` keeps naming the
+        // override.
+        let dir = scratch("profile-override");
+        write_selector(&dir, "work");
+        write_profile(&dir, "default", "return { window = { opacity = 0.9 } }\n");
+        write_profile(&dir, "work", "return { window = { opacity = 0.8 } }\n");
+        let running = resolve_current(&dir, Some("work"));
+        crate::config_reload::clear();
+        crate::config_reload::install_with_profile(
+            running.effective,
+            Some(String::from("work")),
+            resolver(&dir, Some("work")),
+            None,
+        );
+        let backend = backend(&dir, Some("work"));
+
+        let preview = backend
+            .preview_profile_use("p", "default")
+            .expect("preview");
+        assert!(preview.changed, "the persisted selector still moves");
+        let outcome = backend
+            .apply_profile_use("p", "default", &preview.candidate_digest)
+            .expect("apply");
+        assert_eq!(
+            outcome,
+            ConfigApplyOutcome::Applied {
+                pending_restart: false
+            },
+            "no running field differs while the override holds"
+        );
+        let selector = std::fs::read_to_string(dir.join("init.lua")).expect("selector");
+        assert!(selector.contains("profile = \"default\""));
+        assert_eq!(
+            backend
+                .profiles_list("p")
+                .expect("profiles")
+                .active
+                .as_deref(),
+            Some("work"),
+            "the explicit override keeps naming the running table"
+        );
+        let opacity = backend.config_get("p", "window.opacity").expect("opacity");
+        assert_eq!(opacity.value, ConfigReadValue::Number(0.8));
+        crate::config_reload::clear();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -964,7 +1250,14 @@ mod tests {
         let outcome = backend
             .apply_profile_use("p", "work", &preview.candidate_digest)
             .expect("apply");
-        assert_eq!(outcome, ConfigApplyOutcome::Applied);
+        // No reload context in a headless writer test: stay conservative
+        // (bitty#2814).
+        assert_eq!(
+            outcome,
+            ConfigApplyOutcome::Applied {
+                pending_restart: true
+            }
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

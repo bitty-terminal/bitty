@@ -123,7 +123,11 @@ impl ConfigWriteBackend for RecordingBackend {
         if candidate_digest(rendered.as_bytes()) != expected_candidate_digest {
             return Err(ConfigWriteFailure::Stale);
         }
-        Ok(ConfigApplyOutcome::Applied)
+        // The ledger is only read at activation, so an applied toggle always
+        // needs a restart.
+        Ok(ConfigApplyOutcome::Applied {
+            pending_restart: true,
+        })
     }
 
     fn preview_profile_use(
@@ -150,7 +154,10 @@ impl ConfigWriteBackend for RecordingBackend {
         if candidate_digest(rendered.as_bytes()) != expected_candidate_digest {
             return Err(ConfigWriteFailure::Stale);
         }
-        Ok(ConfigApplyOutcome::Applied)
+        // bitty#2814: a live-only switch reports no pending restart.
+        Ok(ConfigApplyOutcome::Applied {
+            pending_restart: false,
+        })
     }
 
     fn preview(
@@ -180,7 +187,11 @@ impl ConfigWriteBackend for RecordingBackend {
         }
         match self.failure {
             Some(failure) => Err(failure),
-            None => Ok(ConfigApplyOutcome::Applied),
+            // `config.set` has no restart marker on its reply; the scalar
+            // writer cannot classify the change, so it stays conservative.
+            None => Ok(ConfigApplyOutcome::Applied {
+                pending_restart: true,
+            }),
         }
     }
 }
@@ -655,7 +666,8 @@ fn enable_and_profile_use_are_token_bound_over_the_wire() {
     assert_eq!(run(&mut rt, "enable_replay"), "E_CONFIG_APPROVAL_REQUIRED");
     assert_eq!(
         run(&mut rt, "use"),
-        "profile = \"work\"|profile|work|true|true"
+        "profile = \"work\"|profile|work|true|false",
+        "bitty#2814: a live-class switch reports no pending restart"
     );
     assert_eq!(run(&mut rt, "use_replay"), "E_CONFIG_APPROVAL_REQUIRED");
 }

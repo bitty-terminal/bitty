@@ -3791,7 +3791,7 @@ impl PluginServices {
         // concurrent edit between preview and set cannot commit a different
         // change under the same approval.
         match backend.apply(&self.plugin_id, &change, &candidate_digest) {
-            Ok(ConfigApplyOutcome::Applied) => Ok(ConfigSetOutcome {
+            Ok(ConfigApplyOutcome::Applied { .. }) => Ok(ConfigSetOutcome {
                 applied: true,
                 reload: "auto",
             }),
@@ -4073,7 +4073,7 @@ impl PluginServices {
         match backend.apply_plugin_enabled(&self.plugin_id, id, enabled, &candidate_digest) {
             // The ledger is read at activation: nothing re-activates the
             // generation at runtime, so an applied toggle needs a restart.
-            Ok(ConfigApplyOutcome::Applied) => Ok((true, "restart")),
+            Ok(ConfigApplyOutcome::Applied { .. }) => Ok((true, "restart")),
             Ok(ConfigApplyOutcome::Unchanged) => Ok((false, "none")),
             Err(failure) => Err(config_backend_error(failure, id)),
         }
@@ -4137,7 +4137,7 @@ impl PluginServices {
         digest: &str,
         started: Instant,
         expiry: Instant,
-    ) -> Result<(bool, &'static str), BridgeError> {
+    ) -> Result<(bool, &'static str, bool), BridgeError> {
         self.config_authorize()?;
         validate_manage_profile_name(name)?;
         validate_manage_digest(digest)?;
@@ -4153,14 +4153,24 @@ impl PluginServices {
         };
         let backend = self.config_backend_or_unavailable()?;
         match backend.apply_profile_use(&self.plugin_id, name, &candidate_digest) {
-            Ok(ConfigApplyOutcome::Applied) => Ok((true, "auto")),
-            Ok(ConfigApplyOutcome::Unchanged) => Ok((false, "none")),
+            // bitty#2814: the backend diffs the persisted switch against the
+            // running table, so `pending_restart` no longer mirrors `changed`.
+            // The selector write always propagates through the watcher, which
+            // is why the reload marker stays `auto`.
+            Ok(ConfigApplyOutcome::Applied { pending_restart }) => {
+                Ok((true, "auto", pending_restart))
+            }
+            Ok(ConfigApplyOutcome::Unchanged) => Ok((false, "none", false)),
             Err(failure) => Err(config_backend_error(failure, name)),
         }
     }
 
     #[cfg(test)]
-    fn profiles_use(&self, name: &str, digest: &str) -> Result<(bool, &'static str), BridgeError> {
+    fn profiles_use(
+        &self,
+        name: &str,
+        digest: &str,
+    ) -> Result<(bool, &'static str, bool), BridgeError> {
         self.profiles_use_with_expiry(
             name,
             digest,
@@ -4404,10 +4414,9 @@ impl HostServices for PluginServices {
         digest: &str,
         expiry: Instant,
     ) -> Result<(bool, &'static str, bool), BridgeError> {
-        let (changed, reload) =
-            PluginServices::profiles_use_with_expiry(self, name, digest, Instant::now(), expiry)?;
-        // A no-op switch changes no table, so it needs no restart marker.
-        Ok((changed, reload, changed))
+        // bitty#2814: `pending_restart` comes from the backend's live diff, so
+        // a no-op switch and a live-only switch both report `false`.
+        PluginServices::profiles_use_with_expiry(self, name, digest, Instant::now(), expiry)
     }
 
     fn env_get(&self, key: &str) -> Result<Option<LuaValue>, BridgeError> {
@@ -10946,7 +10955,9 @@ mod tests {
                 nonce: Cell::new(0),
                 stale: Cell::new(false),
                 write_failure: Cell::new(None),
-                outcome: ConfigApplyOutcome::Applied,
+                outcome: ConfigApplyOutcome::Applied {
+                    pending_restart: false,
+                },
                 profile_changed: true,
                 enabled_changed: true,
             })
@@ -11240,10 +11251,14 @@ mod tests {
             backend.profile_calls.borrow().is_empty(),
             "an expired switch never reaches the backend"
         );
-        let (changed, _) = services
+        let (changed, _, pending_restart) = services
             .profiles_use("work", &switch.digest)
             .expect("token survives the timeout");
         assert!(changed);
+        assert!(
+            !pending_restart,
+            "the fixture backend classifies the switch as live-only"
+        );
     }
 
     #[test]
@@ -11422,11 +11437,15 @@ mod tests {
         let preview = services.profiles_preview_use("work").expect("preview");
         assert_eq!(preview.changed_keys, vec!["profile"]);
         assert!(preview.changed);
-        let (changed, reload) = services
+        let (changed, reload, pending_restart) = services
             .profiles_use("work", &preview.digest)
             .expect("apply");
         assert!(changed);
         assert_eq!(reload, "auto");
+        assert!(
+            !pending_restart,
+            "bitty#2814: a live-only switch no longer reports a pending restart"
+        );
         assert_eq!(backend.profile_calls.borrow().len(), 1);
 
         let replay = services
@@ -11468,11 +11487,35 @@ mod tests {
         let preview = services.profiles_preview_use("work").expect("preview");
         assert!(!preview.changed, "a no-op preview reports changed = false");
         assert!(preview.changed_keys.is_empty());
-        let (changed, reload) = services
+        let (changed, reload, pending_restart) = services
             .profiles_use("work", &preview.digest)
             .expect("apply");
         assert!(!changed);
         assert_eq!(reload, "none");
+        assert!(!pending_restart, "a no-op switch changes no table");
+    }
+
+    #[test]
+    fn profile_use_bridge_reports_a_restart_class_switch() {
+        // bitty#2814: the Lua bridge used to return `pending_restart = changed`
+        // and so always claimed a restart; it now forwards the backend's live
+        // classification.
+        let mut backend = RecordingManageBackend::new();
+        Rc::get_mut(&mut backend).expect("unique").outcome = ConfigApplyOutcome::Applied {
+            pending_restart: true,
+        };
+        let services = manage_services(backend);
+        let preview = services.profiles_preview_use("work").expect("preview");
+        let (changed, reload, pending_restart) = HostServices::profiles_use(
+            &services,
+            "work",
+            &preview.digest,
+            Instant::now() + Duration::from_millis(CONFIG_SET_MAX_WALL_MS),
+        )
+        .expect("apply");
+        assert!(changed);
+        assert_eq!(reload, "auto");
+        assert!(pending_restart, "a restart-class switch keeps the marker");
     }
 
     #[test]
@@ -12348,7 +12391,9 @@ mod history_tests {
             Rc::new(Self {
                 previews: RefCell::new(Vec::new()),
                 calls: RefCell::new(Vec::new()),
-                outcome: ConfigApplyOutcome::Applied,
+                outcome: ConfigApplyOutcome::Applied {
+                    pending_restart: true,
+                },
                 failure: None,
                 nonce: Cell::new(0),
                 stale: Cell::new(false),
@@ -12359,7 +12404,9 @@ mod history_tests {
             Rc::new(Self {
                 previews: RefCell::new(Vec::new()),
                 calls: RefCell::new(Vec::new()),
-                outcome: ConfigApplyOutcome::Applied,
+                outcome: ConfigApplyOutcome::Applied {
+                    pending_restart: true,
+                },
                 failure: Some(failure),
                 nonce: Cell::new(0),
                 stale: Cell::new(false),

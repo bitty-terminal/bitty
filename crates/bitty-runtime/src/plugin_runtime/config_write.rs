@@ -987,6 +987,10 @@ pub trait ConfigWriteBackend {
 
     /// Apply one approved profile switch through the validated CLI writer.
     ///
+    /// The `pending_restart` payload is reported on the `profiles.use` wire
+    /// reply: the backend diffs the running table against the switch it just
+    /// persisted, so a live-only switch reports `false` (bitty#2814).
+    ///
     /// # Errors
     ///
     /// Returns a path-free [`ConfigWriteFailure`].
@@ -1004,7 +1008,16 @@ pub trait ConfigWriteBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigApplyOutcome {
     /// The user layer changed on disk.
-    Applied,
+    Applied {
+        /// Whether the running process still needs a restart before it shows
+        /// the change.
+        ///
+        /// `profiles.use` computes this from the running live diff (bitty#2814)
+        /// and reports it on the wire. A backend that cannot classify the
+        /// change passes `true`, so a reply never claims a live adoption that
+        /// did not happen.
+        pending_restart: bool,
+    },
     /// The requested value already matched; nothing was written.
     Unchanged,
 }

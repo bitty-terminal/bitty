@@ -21,18 +21,36 @@
 //! The owned headless logic (DPI conversions, resize-extent mapping) is also
 //! asserted before attempting the event loop so the test proves headless
 //! determinism even when no window system exists.
+//!
+//! The live path is bounded: a hidden window can lose the `request_redraw`
+//! issued before the X server maps it, and a `ControlFlow::Wait` loop then
+//! blocks forever because `about_to_wait` only fires again for a new event.
+//! The handler therefore re-requests the redraw and re-arms a short wake on
+//! every `AboutToWait`, and fails in bounded time instead of hanging the CI
+//! job (observed: an 18-minute stall, then job cancellation).
 
 #![forbid(unsafe_code)]
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use bitty_platform::{
     App, AppHandler, EventContext, LogicalSize, PhysicalSize, PlatformError, PlatformEvent,
-    ScaleFactor, SurfaceTarget, WindowConfig, WindowEventKind, map_resize_to_surface_extent,
+    ScaleFactor, SurfaceTarget, WindowConfig, WindowEventKind, WindowHandle,
+    map_resize_to_surface_extent,
 };
+
+/// How long the live window may go without delivering `Resized` or
+/// `RedrawRequested` before the test fails instead of blocking the job.
+const PROGRESS_BUDGET: Duration = Duration::from_secs(20);
+
+/// Bounded re-arm interval for the `AboutToWait` progress watchdog.
+const WATCHDOG_TICK: Duration = Duration::from_millis(50);
 
 #[derive(Default)]
 struct State {
@@ -46,8 +64,11 @@ struct State {
 struct WinitWindowTest {
     config: WindowConfig,
     state: Arc<std::sync::Mutex<State>>,
-    watchdog: Arc<AtomicU32>,
-    finished: Arc<AtomicBool>,
+    /// Window kept alive for the whole loop so a retried `request_redraw`
+    /// targets the same live window instead of a dropped handle.
+    window: Option<WindowHandle>,
+    started: Instant,
+    timed_out: Arc<AtomicBool>,
 }
 
 impl AppHandler for WinitWindowTest {
@@ -93,6 +114,7 @@ impl AppHandler for WinitWindowTest {
                         // Also check target-level helper.
                         assert_eq!(target.logical_to_physical(logical), expected);
                         drop(st);
+                        self.window = Some(handle.clone());
                         handle.request_redraw();
                     }
                     Err(err) => {
@@ -122,12 +144,10 @@ impl AppHandler for WinitWindowTest {
                             None
                         );
                         st.resized = Some(size);
-                        self.finished.store(true, Ordering::SeqCst);
                         ctx.exit();
                     }
                     WindowEventKind::RedrawRequested => {
                         st.redraw = true;
-                        self.finished.store(true, Ordering::SeqCst);
                         ctx.exit();
                     }
                     WindowEventKind::CloseRequested => {
@@ -148,17 +168,33 @@ impl AppHandler for WinitWindowTest {
                 }
             }
             PlatformEvent::AboutToWait => {
-                // Watchdog prevents compositor hangs.
-                if self.watchdog.fetch_add(1, Ordering::SeqCst) > 800 {
-                    eprintln!("watchdog: no resize/redraw within budget, exiting");
-                    // Still consider it a pass for headless fallback if we never created a window.
+                // Bounded progress watchdog. Counting ticks is not enough: a
+                // `Wait` loop with no events never calls this again, so the
+                // counter would stop at one and the job would hang. Re-arm a
+                // short wake and re-request the redraw, then fail on the
+                // deadline instead of never returning.
+                let progressed = {
                     let st = self.state.lock().expect("poison-free");
-                    if st.window_created {
-                        panic!("live window did not deliver resize/redraw within watchdog");
-                    } else {
-                        ctx.exit();
-                    }
+                    st.resized.is_some() || st.redraw
+                };
+                if progressed {
+                    return;
                 }
+                if self.started.elapsed() >= PROGRESS_BUDGET {
+                    eprintln!(
+                        "watchdog: no resize/redraw within {PROGRESS_BUDGET:?}, failing the test"
+                    );
+                    self.timed_out.store(true, Ordering::SeqCst);
+                    ctx.exit();
+                    return;
+                }
+                if let Some(window) = self.window.as_ref() {
+                    // A hidden X11 window can drop the redraw requested from
+                    // `Resumed`; retry so the event is delivered once the
+                    // server maps the window.
+                    window.request_redraw();
+                }
+                ctx.set_wait_until(Instant::now() + WATCHDOG_TICK);
             }
             PlatformEvent::Exiting => {
                 ctx.exit();
@@ -217,17 +253,26 @@ fn main() {
 
     // Then attempt the real winit 0.30 event loop.
     let state = Arc::new(std::sync::Mutex::new(State::default()));
+    let timed_out = Arc::new(AtomicBool::new(false));
     let handler = WinitWindowTest {
         config: WindowConfig::new()
             .with_title("bitty winit_window integration")
             .with_inner_size(LogicalSize::new(320.0, 240.0).expect("valid"))
             .with_visible(false),
         state: Arc::clone(&state),
-        watchdog: Arc::new(AtomicU32::new(0)),
-        finished: Arc::new(AtomicBool::new(false)),
+        window: None,
+        started: Instant::now(),
+        timed_out: Arc::clone(&timed_out),
     };
 
     let outcome = App::run(handler);
+    if timed_out.load(Ordering::SeqCst) {
+        eprintln!(
+            "fail: live window never delivered resize/redraw within {PROGRESS_BUDGET:?} \
+             (window created, no progress events)"
+        );
+        std::process::exit(1);
+    }
     match outcome {
         Ok(()) => {
             let st = state.lock().expect("poison-free");

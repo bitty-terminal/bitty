@@ -4852,16 +4852,18 @@ mod tests {
 
     impl std::io::Write for BrokenStderr {
         fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            // Record whether the state evidence already existed when this
-            // write arrived; that is the ordering the helper guarantees. The
-            // first write is recorded separately so a later report cannot mask
-            // an ordering violation in the first delivery.
+            // Observe the slot exactly once per write: on Windows the monitor
+            // publishes the next report with `MoveFileEx`, which is not an
+            // atomic replacement, so a second `exists()` can fall into the
+            // window where the destination name is unbound and report a
+            // violation that never happened.
+            let state_present = self.state_path.exists();
             let first = !self.first_write_seen.swap(true, Ordering::SeqCst);
             if first {
                 self.first_write_saw_state
-                    .store(self.state_path.exists(), Ordering::SeqCst);
+                    .store(state_present, Ordering::SeqCst);
             }
-            if self.state_path.exists() {
+            if state_present {
                 self.saw_state_before_write.store(true, Ordering::SeqCst);
             }
             Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
@@ -5013,11 +5015,14 @@ mod tests {
             first_write_state.load(Ordering::SeqCst),
             "evidence must be on disk before the first failing stderr write"
         );
-        assert!(
-            saw_state.load(Ordering::SeqCst),
-            "evidence must be on disk before the failing stderr write"
-        );
-
+        // `write_report_to` deliberately attempts stderr even when the state
+        // commit failed, so the per-write invariant is the ordering of that
+        // attempt, not the presence of a report on every soak pass: a soak
+        // pass can legitimately find no freshly published slot (a failed
+        // commit, or - on Windows - the window while the monitor replaces the
+        // slot with `MoveFileEx`). The first-write probe above is the
+        // non-vacuous ordering assertion; the per-emit ordering is covered
+        // deterministically by `report_sink_persists_state_before_a_broken_stderr_write`.
         // The broken stderr must not panic the monitor: join succeeds and the
         // thread records its own exit.
         let finished = Arc::clone(&watchdog.finished);

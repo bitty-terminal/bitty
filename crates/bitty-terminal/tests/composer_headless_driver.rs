@@ -71,6 +71,18 @@ use bitty_lua::{
 /// 50ms production assertions.
 const DRIVER_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
 
+/// Per-host-call deadline for the harness VM in milliseconds.
+///
+/// The bitty#1727 headroom covers the VM's wall budget; the bridge checks its
+/// own per-call deadline in raw wall time as well, and the same scheduler
+/// stalls land inside a single host call. Keeping the production 50 ms here
+/// flaked `composer_headless_driver` on a loaded runner
+/// (`E_TIMEOUT: host call exceeded its deadline` while executing the real
+/// `init.lua`), so the driver widens both dimensions together. The mock host
+/// is in-memory, so no real I/O is being excused, and production still uses
+/// `DEFAULT_HOST_DEADLINE_MS`.
+const DRIVER_HOST_CALL_DEADLINE_MS: u64 = DRIVER_WALL_BUDGET_MS;
+
 // ---------------------------------------------------------------------------
 // Scratch and fixture location (no hardcoded host paths)
 // ---------------------------------------------------------------------------
@@ -287,8 +299,12 @@ fn harness_vm(services: Rc<DriverServices>) -> LuaVm {
     let mut vm = build_plugin_vm("composer-headless-driver", Some(budgets))
         .expect("driver budgets are valid");
     let host: Rc<dyn HostServices> = services;
-    vm.install_host_module(host, MarshallingLimits::default(), 50)
-        .expect("install host");
+    vm.install_host_module(
+        host,
+        MarshallingLimits::default(),
+        DRIVER_HOST_CALL_DEADLINE_MS,
+    )
+    .expect("install host");
     vm
 }
 

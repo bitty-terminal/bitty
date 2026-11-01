@@ -618,7 +618,7 @@ jobs:
           # pkg 2.8.4 self-upgrade can loop ("New version of pkg detected" /
           # "most recent versions already installed"); the static binary
           # force-reinstalls the matching pkg and breaks the loop.
-          sudo timeout 300 pkg-static install -fy pkg || true
+          sudo timeout 300 pkg-static install -fy pkg
           sudo timeout 900 pkg install -y git cmake pkgconf ca_root_nss freetype2 fontconfig bash
           sudo pkg info cmake
 

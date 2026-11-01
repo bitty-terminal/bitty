@@ -3879,6 +3879,21 @@ impl UserLayerConfigWriter {
         })
     }
 
+    /// Rebind the writer to the profile the running table reflects
+    /// (bitty#2814).
+    ///
+    /// The app's `config.manage` backend builds its writer at startup, but a
+    /// live-only `profiles.use` moves the running chain. Pinned-table seeding
+    /// must follow it: seeding from the startup chain would pin the previous
+    /// profile's values into the user layer.
+    pub(crate) fn with_profile(&self, active_profile: Option<String>) -> Self {
+        Self {
+            config_dir: self.config_dir.clone(),
+            target: self.target.clone(),
+            active_profile,
+        }
+    }
+
     /// Render the exact candidate user-layer bytes and the bounded diff.
     ///
     /// Neither `preview` nor a refused `apply` writes anything: the only
@@ -4086,7 +4101,12 @@ impl bitty_runtime::plugin_runtime::ConfigWriteBackend for UserLayerConfigWriter
             log_config_refusal(plugin_id, change.key(), &self.target, failure);
             return Err(failure);
         }
-        Ok(ConfigApplyOutcome::Applied)
+        // The scalar writer has no reload context of its own to diff against,
+        // so it never claims a live adoption; the app backend that owns it
+        // classifies `profiles.use` itself (bitty#2814).
+        Ok(ConfigApplyOutcome::Applied {
+            pending_restart: true,
+        })
     }
 }
 
@@ -5372,7 +5392,13 @@ mod tests {
         assert!(approved.changed_keys.contains(&"appearance.theme"));
         assert!(approved.rendered.contains("theme = \"catppuccin\""));
         let outcome = apply(&writer, &change).expect("applied");
-        assert_eq!(outcome, ConfigApplyOutcome::Applied);
+        assert_eq!(
+            outcome,
+            ConfigApplyOutcome::Applied {
+                pending_restart: true
+            },
+            "the CLI writer has no running context to classify against"
+        );
         let content = std::fs::read_to_string(dir.join("init.lua")).expect("layer");
         assert!(content.contains("theme = \"catppuccin\""), "{content}");
         let _ = std::fs::remove_dir_all(dir);
@@ -5514,7 +5540,13 @@ mod tests {
         assert_eq!(approved.candidate_digest.len(), 64);
 
         let outcome = apply(&writer, &change).expect("applied");
-        assert_eq!(outcome, ConfigApplyOutcome::Applied);
+        assert_eq!(
+            outcome,
+            ConfigApplyOutcome::Applied {
+                pending_restart: true
+            },
+            "the CLI writer has no running context to classify against"
+        );
 
         let path = dir.join("init.lua");
         let content = std::fs::read_to_string(&path).expect("written layer");
@@ -5572,7 +5604,13 @@ mod tests {
         );
         assert!(approved.rendered.contains("size = 12.5"));
         let outcome = apply(&writer, &change).expect("applied");
-        assert_eq!(outcome, ConfigApplyOutcome::Applied);
+        assert_eq!(
+            outcome,
+            ConfigApplyOutcome::Applied {
+                pending_restart: true
+            },
+            "the CLI writer has no running context to classify against"
+        );
 
         let content = std::fs::read_to_string(&path).expect("layer");
         assert!(content.contains("profile = \"work\""), "selector survives");

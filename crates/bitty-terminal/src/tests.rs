@@ -804,7 +804,7 @@ return {}
         effective.appearance.theme = Some("light:github-light,dark:dracula".to_string());
         crate::config_reload::install_with(
             effective.clone(),
-            Box::new(move || Ok(effective.clone())),
+            Box::new(move || Ok(effective.clone().into())),
             None,
         );
 

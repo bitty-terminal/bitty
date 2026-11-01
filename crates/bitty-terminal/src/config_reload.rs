@@ -640,6 +640,28 @@ impl ConfigFileWatcher {
     }
 }
 
+/// One re-resolved configuration plus the profile identity it was merged from.
+///
+/// The reload engine adopts the effective config; the identity lets the app
+/// keep reads on the profile the running table actually reflects (bitty#2814).
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedConfig {
+    /// Merged effective config a reload would adopt.
+    pub(crate) effective: EffectiveConfig,
+    /// Profile the merge used (`--profile`/`BITTY_PROFILE`, else the user
+    /// layer's selector); `None` when no profile participated.
+    pub(crate) profile: Option<String>,
+}
+
+impl From<EffectiveConfig> for ResolvedConfig {
+    fn from(effective: EffectiveConfig) -> Self {
+        Self {
+            effective,
+            profile: None,
+        }
+    }
+}
+
 /// The installed reload context: the engine plus how to re-resolve the config.
 struct ReloadContext {
     engine: ReloadEngine,
@@ -647,8 +669,14 @@ struct ReloadContext {
     /// still run with these values until restart, so pending restart fields
     /// are always computed against it rather than against the last reload.
     launched: EffectiveConfig,
+    /// Profile identity the running table reflects (bitty#2814): the startup
+    /// chain until a reload is adopted, then the identity that reload was
+    /// merged from. A persisted selector switch therefore moves it, while an
+    /// explicit `--profile`/`BITTY_PROFILE` keeps it because the resolver keeps
+    /// honouring the explicit request.
+    profile: Option<String>,
     /// Re-resolve the effective config from the original sources.
-    resolve: Box<dyn Fn() -> Result<EffectiveConfig, String>>,
+    resolve: Box<dyn Fn() -> Result<ResolvedConfig, String>>,
     watcher: Option<ConfigFileWatcher>,
     path_label: String,
 }
@@ -664,31 +692,50 @@ thread_local! {
 /// Install the production reload context from the resolved startup config.
 ///
 /// Called once by `main` before the event loop. `file_path` is the resolved
-/// user config file (as reported at startup) and becomes the watched path.
+/// user config file (as reported at startup) and becomes the watched path;
+/// `profile` is the profile that startup chain loaded, so the running identity
+/// is known before the first reload.
 pub(crate) fn install(
     args: crate::cli::Args,
     effective: EffectiveConfig,
     file_path: Option<PathBuf>,
+    profile: Option<String>,
 ) {
-    let path_label = file_path.as_ref().map_or_else(
-        || String::from("(defaults; no file)"),
-        |path| path.display().to_string(),
-    );
     // CTX-2464: the local themes directory is watched even without a config
     // file, because `--theme local:<name>` can select a file directly and a
     // directory that does not exist yet becomes observable on creation.
     let theme_dir = bitty_config::local_themes_dir();
-    let watcher = if file_path.is_some() || theme_dir.is_some() {
-        Some(ConfigFileWatcher::new_with_theme_dir(file_path, theme_dir))
+    let resolve: Box<dyn Fn() -> Result<ResolvedConfig, String>> = Box::new(move || {
+        crate::config_cli::load_app_config(&args).map(|app| ResolvedConfig {
+            effective: app.effective,
+            profile: app.profile_name,
+        })
+    });
+    install_context(effective, profile, resolve, file_path, theme_dir);
+}
+
+/// Install the process-wide context (shared by production and tests).
+fn install_context(
+    effective: EffectiveConfig,
+    profile: Option<String>,
+    resolve: Box<dyn Fn() -> Result<ResolvedConfig, String>>,
+    watch: Option<PathBuf>,
+    theme_dir: Option<PathBuf>,
+) {
+    let path_label = watch.as_ref().map_or_else(
+        || String::from("(defaults; no file)"),
+        |path| path.display().to_string(),
+    );
+    let watcher = if watch.is_some() || theme_dir.is_some() {
+        Some(ConfigFileWatcher::new_with_theme_dir(watch, theme_dir))
     } else {
         None
     };
-    let resolve: Box<dyn Fn() -> Result<EffectiveConfig, String>> =
-        Box::new(move || crate::config_cli::load_app_config(&args).map(|app| app.effective));
     CONTEXT.with(|slot| {
         *slot.borrow_mut() = Some(ReloadContext {
             launched: effective.clone(),
             engine: ReloadEngine::new(effective),
+            profile,
             resolve,
             watcher,
             path_label,
@@ -708,10 +755,22 @@ pub(crate) fn clear() {
 #[cfg(test)]
 pub(crate) fn install_with(
     effective: EffectiveConfig,
-    resolve: Box<dyn Fn() -> Result<EffectiveConfig, String>>,
+    resolve: Box<dyn Fn() -> Result<ResolvedConfig, String>>,
     watch: Option<PathBuf>,
 ) {
-    install_with_theme_dir(effective, resolve, watch, None);
+    install_context(effective, None, resolve, watch, None);
+}
+
+/// Install a context with an injected resolver and the profile identity the
+/// seeded config was merged from (tests only).
+#[cfg(test)]
+pub(crate) fn install_with_profile(
+    effective: EffectiveConfig,
+    profile: Option<String>,
+    resolve: Box<dyn Fn() -> Result<ResolvedConfig, String>>,
+    watch: Option<PathBuf>,
+) {
+    install_context(effective, profile, resolve, watch, None);
 }
 
 /// Install a context with an injected resolver and an explicit themes
@@ -719,28 +778,11 @@ pub(crate) fn install_with(
 #[cfg(test)]
 pub(crate) fn install_with_theme_dir(
     effective: EffectiveConfig,
-    resolve: Box<dyn Fn() -> Result<EffectiveConfig, String>>,
+    resolve: Box<dyn Fn() -> Result<ResolvedConfig, String>>,
     watch: Option<PathBuf>,
     theme_dir: Option<PathBuf>,
 ) {
-    let path_label = watch.as_ref().map_or_else(
-        || String::from("(defaults; no file)"),
-        |path| path.display().to_string(),
-    );
-    let watcher = if watch.is_some() || theme_dir.is_some() {
-        Some(ConfigFileWatcher::new_with_theme_dir(watch, theme_dir))
-    } else {
-        None
-    };
-    CONTEXT.with(|slot| {
-        *slot.borrow_mut() = Some(ReloadContext {
-            launched: effective.clone(),
-            engine: ReloadEngine::new(effective),
-            resolve,
-            watcher,
-            path_label,
-        });
-    });
+    install_context(effective, None, resolve, watch, theme_dir);
 }
 
 /// Serve an explicit `bitty ctl` reload against the installed context.
@@ -767,6 +809,79 @@ pub(crate) fn current_effective() -> Option<EffectiveConfig> {
         slot.borrow()
             .as_ref()
             .map(|ctx| ctx.engine.current().clone())
+    })
+}
+
+/// The profile the running table was merged from (bitty#2814).
+///
+/// The outer option reports whether a reload context is installed: `None`
+/// means there is none (unit tests, headless paths, `--safe`), so the caller
+/// keeps its startup identity. `Some(None)` is a real state — the running
+/// config was merged without any profile. A context borrowed by an in-flight
+/// reload or classification also reports `None`, so a caller falls back to its
+/// startup identity instead of panicking.
+pub(crate) fn running_profile() -> Option<Option<String>> {
+    CONTEXT.with(|slot| {
+        slot.try_borrow()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|ctx| ctx.profile.clone()))
+    })
+}
+
+/// Classify a profile switch the app has just persisted (bitty#2814).
+///
+/// `AppConfigManage` writes the selector and the file watcher resolves the same
+/// sources on its next tick. Running that resolution here — the installed
+/// resolver, so exactly the watcher's code — and diffing it against the
+/// committed running config answers whether the switch is live-only.
+///
+/// This is classification only. The running profile identity moves in
+/// [`ReloadContext::reload_into`] when the watcher actually adopts the
+/// resolution (and a rolled-back adopt restores it), so a switch that is
+/// refused or fails to apply can never leave `profiles.list.active`,
+/// `config.get`, or `config.sources` naming a profile the runtime does not
+/// reflect (bitty#2848 review).
+///
+/// Returns `pending_restart`:
+///
+/// * `false` when every differing field is live-class and adopted *and* the
+///   resolution selected `requested`, i.e. the next tick will adopt exactly
+///   this switch.
+/// * `true` when a restart-class (or otherwise unadoptable) field differs, the
+///   resolver fails, no context is installed, or the resolution selected a
+///   different profile. That last arm covers a one-launch
+///   `--profile`/`BITTY_PROFILE` override: the resolver keeps honoring it, so
+///   the selector write never merges while the override holds, and the reply
+///   must not claim a switch the running table cannot make (bitty#2848
+///   review).
+///
+/// The reload context and the plugin runtime both live on the main thread (the
+/// app installs `AppConfigManage` as an `Rc` in that runtime), so reaching this
+/// thread-local from the backend is sound. A resolver that re-entered this
+/// module would find the context borrowed; `try_borrow_mut` turns that into the
+/// conservative `true` instead of a panic.
+///
+/// Cost: this resolves the whole config (user layer plus profile chain) on the
+/// plugin call path. The 10 ms budget charged before the backend covers
+/// authorization only, not this classification; the write head stays
+/// approval-gated and rate-limited to 16 calls/s.
+pub(crate) fn classify_profile_switch(requested: &str) -> bool {
+    CONTEXT.with(|slot| {
+        let Ok(mut slot) = slot.try_borrow_mut() else {
+            return true;
+        };
+        let Some(ctx) = slot.as_mut() else {
+            return true;
+        };
+        let Ok(resolved) = (ctx.resolve)() else {
+            return true;
+        };
+        // The override (or a selector that lost the race) means the persisted
+        // switch is not what the running table is about to become.
+        if resolved.profile.as_deref() != Some(requested) {
+            return true;
+        }
+        !pending_fields(ctx.engine.current(), &resolved.effective, runtime_adopts).is_empty()
     })
 }
 
@@ -803,9 +918,22 @@ fn poll_file_at(runtime: &mut bitty_runtime::Runtime, at: Instant) -> Option<Rel
     })
 }
 
-/// Live-class fields that differ between `launched` and `current` and that
-/// `adopts` rejects: the restart-pending set (split out so the filter is
-/// testable while every current `Live` field has an adopter).
+/// Whether one classified field difference is adopted live by the runtime.
+///
+/// The single inversion point shared by both restart-pending classifications,
+/// so a new [`bitty_config::ReloadClass`] cannot drift between them.
+fn adopted_live(class: bitty_config::ReloadClass, field: &str, adopts: fn(&str) -> bool) -> bool {
+    class == bitty_config::ReloadClass::Live && adopts(field)
+}
+
+/// Fields that differ and that the running runtime would not adopt live: the
+/// restart-pending set.
+///
+/// `launched` against the committed `current` is the ctl `restart_required`
+/// case (fields the runtime could not adopt stay at their launch values);
+/// `running` against a prospective config is the profile-switch classification
+/// (bitty#2814). `adopts` is injected so the filter is testable; production
+/// passes [`runtime_adopts`].
 fn pending_fields(
     launched: &EffectiveConfig,
     current: &EffectiveConfig,
@@ -814,7 +942,7 @@ fn pending_fields(
     bitty_config::diff(launched, current)
         .diffs
         .into_iter()
-        .filter(|diff| diff.class == bitty_config::ReloadClass::Live && !adopts(&diff.field))
+        .filter(|diff| !adopted_live(diff.class, &diff.field, adopts))
         .map(|diff| diff.field)
         .collect()
 }
@@ -830,8 +958,8 @@ impl ReloadContext {
 
     /// Re-resolve, classify, adopt if live, and build the caller-visible info.
     fn reload_into(&mut self, runtime: &mut bitty_runtime::Runtime) -> ReloadOutcomeInfo {
-        let incoming = match (self.resolve)() {
-            Ok(config) => config,
+        let resolved = match (self.resolve)() {
+            Ok(resolved) => resolved,
             Err(message) => {
                 return ReloadOutcomeInfo {
                     path: self.path_label.clone(),
@@ -844,7 +972,8 @@ impl ReloadContext {
             }
         };
         let previous = self.engine.current().clone();
-        let outcome = self.engine.reload(incoming);
+        let previous_profile = self.profile.clone();
+        let outcome = self.engine.reload(resolved.effective);
         let applied = outcome.applied();
         if matches!(outcome, ReloadOutcome::Applied(_)) {
             if let Err(message) = apply_live(runtime, self.engine.current()) {
@@ -861,6 +990,9 @@ impl ReloadContext {
                 }
                 runtime.release_retained_backgrounds();
                 self.engine.replace_current(previous);
+                // The rollback restores the running table, so the profile
+                // identity must not claim the resolution either (bitty#2814).
+                self.profile = previous_profile;
                 return ReloadOutcomeInfo {
                     path: self.path_label.clone(),
                     kind: "apply-error",
@@ -874,6 +1006,13 @@ impl ReloadContext {
         // Committed (or nothing to adopt): drop the replaced background
         // generation so at most one decoded generation stays resident.
         runtime.release_retained_backgrounds();
+        // An adopted resolution moved the running table (even when nothing
+        // differed and only the selector identity changed), so reads follow
+        // it; a rejected or restart-required resolution kept the old table and
+        // therefore the old identity (bitty#2814).
+        if applied {
+            self.profile = resolved.profile;
+        }
         let changed: Vec<String> = outcome
             .report()
             .diffs
@@ -1381,12 +1520,17 @@ mod tests {
         clear();
         install_with(
             baseline.clone(),
-            Box::new(move || Ok(resolved.clone())),
+            Box::new(move || Ok(resolved.clone().into())),
             None,
         );
         let info = reload_requested(&mut runtime).expect("context installed");
         assert_eq!(info.kind, "apply-error", "{info:?}");
         assert!(!info.applied);
+        assert_eq!(
+            running_profile(),
+            Some(None),
+            "a rolled-back adopt restores the running identity (bitty#2814)"
+        );
         assert_eq!(runtime.config().theme, old_theme, "theme restored");
         assert_eq!(
             runtime.config().background_image,
@@ -1424,7 +1568,7 @@ mod tests {
         clear();
         install_with(
             baseline.clone(),
-            Box::new(move || Ok(resolved.clone())),
+            Box::new(move || Ok(resolved.clone().into())),
             None,
         );
         // The original image vanishes: a re-read would now fail.
@@ -1645,7 +1789,7 @@ mod tests {
                 .ok_or_else(|| String::from("size missing"))?;
             let mut config = bitty_config::fallback_builtin();
             config.font.size = size;
-            Ok(config)
+            Ok(config.into())
         });
         clear();
         install_with(baseline, resolver, Some(path.clone()));
@@ -1675,7 +1819,7 @@ mod tests {
                 .ok_or_else(|| String::from("size missing"))?;
             let mut config = bitty_config::fallback_builtin();
             config.font.size = size;
-            Ok(config)
+            Ok(config.into())
         });
         let mut baseline = bitty_config::fallback_builtin();
         baseline.font.size = 12.0;
@@ -1707,7 +1851,7 @@ mod tests {
         clear();
         install_with(
             baseline.clone(),
-            Box::new(move || Ok(resolve_live.clone())),
+            Box::new(move || Ok(resolve_live.clone().into())),
             None,
         );
         let mut runtime = bitty_runtime::Runtime::with_defaults().expect("runtime");
@@ -1780,7 +1924,12 @@ mod tests {
         install_with(
             baseline.clone(),
             Box::new(move || {
-                crate::config_cli::load_app_config(&resolver_args).map(|app| app.effective)
+                crate::config_cli::load_app_config(&resolver_args).map(|app| {
+                    crate::config_reload::ResolvedConfig {
+                        effective: app.effective,
+                        profile: app.profile_name,
+                    }
+                })
             }),
             Some(path.clone()),
         );
@@ -1834,7 +1983,11 @@ mod tests {
         let mut live = baseline.clone();
         live.font.size = 16.0;
         let resolve_live = live.clone();
-        install_with(baseline, Box::new(move || Ok(resolve_live.clone())), None);
+        install_with(
+            baseline,
+            Box::new(move || Ok(resolve_live.clone().into())),
+            None,
+        );
         let before = current_effective().expect("context installed");
         assert!((before.font.size - 12.0).abs() < f32::EPSILON);
         let mut runtime = bitty_runtime::Runtime::with_defaults().expect("runtime");
@@ -1844,6 +1997,162 @@ mod tests {
         assert!((after.font.size - 16.0).abs() < f32::EPSILON);
         clear();
         assert!(current_effective().is_none());
+    }
+
+    #[test]
+    fn classify_profile_switch_is_conservative_without_a_context() {
+        // bitty#2814: a headless/test path cannot classify the switch, so it
+        // must report a restart instead of guessing.
+        clear();
+        assert!(classify_profile_switch("work"));
+        assert!(running_profile().is_none(), "no context, no identity");
+    }
+
+    #[test]
+    fn classify_profile_switch_reports_live_without_adopting_the_identity() {
+        // bitty#2848 review: classification must not move the running identity;
+        // only an adopted reload does (see `adopted_reload_moves_the_running_profile`).
+        let baseline = bitty_config::fallback_builtin();
+        let mut live = baseline.clone();
+        live.font.size = baseline.font.size + 1.0;
+        clear();
+        install_with_profile(
+            baseline,
+            Some(String::from("default")),
+            Box::new(move || {
+                Ok(ResolvedConfig {
+                    effective: live.clone(),
+                    profile: Some(String::from("work")),
+                })
+            }),
+            None,
+        );
+        assert!(!classify_profile_switch("work"), "font.size is live-class");
+        assert_eq!(
+            running_profile(),
+            Some(Some(String::from("default"))),
+            "nothing was adopted yet"
+        );
+        clear();
+    }
+
+    #[test]
+    fn classify_profile_switch_reports_restart_for_a_restart_diff() {
+        let baseline = bitty_config::fallback_builtin();
+        let mut live = baseline.clone();
+        live.terminal.scrollback = baseline.terminal.scrollback.saturating_add(1);
+        clear();
+        install_with_profile(
+            baseline,
+            Some(String::from("default")),
+            Box::new(move || {
+                Ok(ResolvedConfig {
+                    effective: live.clone(),
+                    profile: Some(String::from("work")),
+                })
+            }),
+            None,
+        );
+        assert!(
+            classify_profile_switch("work"),
+            "terminal.scrollback is restart-required"
+        );
+        assert_eq!(
+            running_profile(),
+            Some(Some(String::from("default"))),
+            "the running table did not move"
+        );
+        clear();
+    }
+
+    #[test]
+    fn classify_profile_switch_reports_restart_for_another_profile() {
+        // bitty#2848 review: the resolution selecting a different profile than
+        // the requested one (a one-launch `--profile`/`BITTY_PROFILE` override)
+        // means the switch cannot reach the running table, even when the merged
+        // config is identical.
+        let baseline = bitty_config::fallback_builtin();
+        clear();
+        install_with_profile(
+            baseline.clone(),
+            Some(String::from("work")),
+            Box::new(move || {
+                Ok(ResolvedConfig {
+                    effective: baseline.clone(),
+                    profile: Some(String::from("work")),
+                })
+            }),
+            None,
+        );
+        assert!(
+            classify_profile_switch("default"),
+            "an explicit override keeps the running table"
+        );
+        clear();
+    }
+
+    #[test]
+    fn classify_profile_switch_reports_restart_when_the_resolver_fails() {
+        clear();
+        install_with_profile(
+            bitty_config::fallback_builtin(),
+            Some(String::from("default")),
+            Box::new(|| Err(String::from("boom"))),
+            None,
+        );
+        assert!(classify_profile_switch("work"));
+        assert_eq!(running_profile(), Some(Some(String::from("default"))));
+        clear();
+    }
+
+    #[test]
+    fn adopted_reload_moves_the_running_profile() {
+        // bitty#2814: the profile identity follows an adopted resolution (even
+        // when only the selector changed) and stays put when the resolution is
+        // not adopted.
+        let baseline = bitty_config::fallback_builtin();
+        let mut live = baseline.clone();
+        live.font.size = baseline.font.size + 1.0;
+        clear();
+        install_with_profile(
+            baseline.clone(),
+            Some(String::from("default")),
+            Box::new(move || {
+                Ok(ResolvedConfig {
+                    effective: live.clone(),
+                    profile: Some(String::from("work")),
+                })
+            }),
+            None,
+        );
+        let mut runtime = bitty_runtime::Runtime::with_defaults().expect("runtime");
+        assert_eq!(
+            reload_requested(&mut runtime).expect("context").kind,
+            "applied"
+        );
+        assert_eq!(running_profile(), Some(Some(String::from("work"))));
+
+        let mut restart = baseline.clone();
+        restart.terminal.scrollback = baseline.terminal.scrollback.saturating_add(1);
+        clear();
+        install_with_profile(
+            baseline,
+            Some(String::from("default")),
+            Box::new(move || {
+                Ok(ResolvedConfig {
+                    effective: restart.clone(),
+                    profile: Some(String::from("work")),
+                })
+            }),
+            None,
+        );
+        let mut runtime = bitty_runtime::Runtime::with_defaults().expect("runtime");
+        assert_eq!(
+            reload_requested(&mut runtime).expect("context").kind,
+            "restart-required"
+        );
+        assert_eq!(running_profile(), Some(Some(String::from("default"))));
+        clear();
     }
 
     #[test]
@@ -1895,7 +2204,7 @@ mod tests {
             let mut config = bitty_config::fallback_builtin();
             config.appearance.theme = Some(String::from("local:sunset"));
             bitty_config::local_theme::apply_selection_from_dir(&mut config, &resolver_dir)?;
-            Ok(config)
+            Ok(config.into())
         });
         clear();
         install_with_theme_dir(baseline.clone(), resolver, None, Some(theme_dir.clone()));

@@ -1406,6 +1406,9 @@ fn main() {
             args.clone(),
             app_config.effective.clone(),
             app_config.file_path.clone(),
+            // bitty#2814: the profile startup loaded (explicit request, else
+            // the selector) seeds the running identity reads report.
+            app_config.profile_name.clone(),
         );
     }
     // Issue #2570: capture the next silent disappearance with a bounded

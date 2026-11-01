@@ -990,6 +990,131 @@ mod tests {
         std::mem::replace(&mut worker.master, producer)
     }
 
+    /// Lowest descriptor the dropped-`CLOEXEC` probe may take.
+    ///
+    /// Above stdio and above the descriptors `openpty` and `Command` open for
+    /// themselves, so the probe never aliases a handle the worker path also
+    /// uses.
+    const PROBE_FD_FLOOR: i32 = 64;
+
+    /// Marker the probe worker prints once it runs its own code.
+    const FD_PROBE_READY: &str = "BITTY_FD_PROBE_READY";
+
+    /// Bound on observing the probe worker's own code after its `exec`.
+    const FD_PROBE_WAIT: Duration = Duration::from_secs(10);
+
+    /// Pin one inheritable descriptor at [`PROBE_FD_FLOOR`] with its
+    /// close-on-exec bit dropped.
+    ///
+    /// The descriptor is exactly a parent handle that survives `exec` unless
+    /// the child-side sweep marks it again; the syscall seam owns the raw
+    /// descriptor work because this crate denies `unsafe_code`.
+    fn inheritable_probe_descriptor() -> std::os::fd::OwnedFd {
+        crate::containment::inheritable_probe_descriptor(PROBE_FD_FLOOR)
+            .expect("pin the probe descriptor")
+    }
+
+    /// Spawn one worker through the production command builder and containment
+    /// path, plus one test-only child hook that clears `descriptor`'s
+    /// close-on-exec bit after the production sweep set it.
+    ///
+    /// This is the negative control arm: the descriptor reaches `exec` exactly
+    /// as a parent handle with a dropped `CLOEXEC` does. The production path
+    /// installs no such hook.
+    fn spawn_control_worker(
+        limits: &Limits,
+        argv: &[&str],
+        descriptor: i32,
+    ) -> (crate::containment::ContainedChild, File) {
+        // Serialized with the other PTY tests: no concurrent `openpty` handle
+        // may land in this worker's descriptor table.
+        let _pty = crate::containment::test_lock::lock();
+        let report = ContainmentReport::probe();
+        let instance = DaemonInstanceId::generate().expect("an instance id");
+        let session = SessionId::parse("0000000000000000000000000000c4d5").expect("a session id");
+        let name = cgroup_name(instance, session);
+        let fields = json!({ "argv": argv, "env": [], "cwd": "/" })
+            .as_object()
+            .expect("a JSON object")
+            .clone();
+        let spec = SpawnSpec::parse(Some(&fields), limits).expect("a valid spawn spec");
+        let mut pty = PtyCommand::build(&spec).expect("the production worker command");
+        let master = pty.master.take().expect("the PTY master");
+        // The mutation is owned by the syscall seam, which is the only module
+        // allowed `unsafe_code`: it clears the bit the sweep set, so the
+        // descriptor reaches `exec` with a dropped `CLOEXEC`.
+        crate::containment::drop_cloexec_before_exec(&mut pty.command, descriptor);
+        let child = spawn_with(
+            &report,
+            &name,
+            &mut pty.command,
+            ContainmentLimits::for_session_stop(limits),
+            SessionMode::NewSession,
+        )
+        .expect("the control worker must spawn");
+        crate::containment::set_nonblocking(&master).expect("a non-blocking probe master");
+        (child, master)
+    }
+
+    /// Drain the PTY until the probe worker reports that it runs its own code.
+    ///
+    /// The marker is the post-`exec` boundary: the worker can only print it
+    /// after its `exec` completed, so the `/proc/<pid>/fd` read that follows
+    /// observes the executed image rather than the forked child.
+    fn wait_for_fd_probe_ready(master: &mut File) {
+        let deadline = Instant::now() + FD_PROBE_WAIT;
+        let mut output = String::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            match master.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => {
+                    output.push_str(&String::from_utf8_lossy(&chunk[..read]));
+                    if output.contains(FD_PROBE_READY) {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the fd probe never reported after exec: {output}"
+                    );
+                    std::thread::sleep(READY_POLL);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                // Linux reports EIO on the master once the last slave closed.
+                Err(error) if error.raw_os_error() == Some(nix::errno::Errno::EIO as i32) => break,
+                Err(error) => panic!("read the worker PTY: {error}"),
+            }
+        }
+        panic!("the fd probe exited before reporting: {output}");
+    }
+
+    /// The descriptor numbers `/proc/<pid>/fd` reports for `pid`.
+    fn child_fd_numbers(pid: u32) -> Vec<u32> {
+        let table = format!("/proc/{pid}/fd");
+        let mut fds: Vec<u32> = std::fs::read_dir(&table)
+            .unwrap_or_else(|error| panic!("read {table}: {error}"))
+            .map(|entry| {
+                entry
+                    .expect("a child fd entry")
+                    .file_name()
+                    .to_str()
+                    .expect("an fd name")
+                    .parse()
+                    .expect("a numeric descriptor")
+            })
+            .collect();
+        fds.sort_unstable();
+        fds
+    }
+
+    /// The target of one descriptor in `/proc/<pid>/fd`.
+    fn child_fd_target(pid: u32, fd: u32) -> std::path::PathBuf {
+        std::fs::read_link(format!("/proc/{pid}/fd/{fd}"))
+            .unwrap_or_else(|error| panic!("read fd {fd} of {pid}: {error}"))
+    }
+
     #[test]
     fn forget_reaps_a_leader_that_already_exited() {
         let limits = Limits::default();
@@ -1185,6 +1310,84 @@ mod tests {
             assert_eq!(
                 target, slave,
                 "fd {fd} does not point at the stdio PTY slave: {fds:?}\n{text}"
+            );
+        }
+
+        let _ = pool.terminate(session);
+    }
+
+    /// `P0-AC-023` / EV-03 negative test: a dropped `CLOEXEC` is observable.
+    ///
+    /// The control arm spawns the production command through the same
+    /// containment path, but a test-only hook clears the close-on-exec bit the
+    /// child-side sweep just set. The pinned descriptor is then exactly a
+    /// parent handle whose `CLOEXEC` was dropped, and the `/proc/<pid>/fd`
+    /// probe must report it: an absent descriptor in the hardened arm is the
+    /// sweep's result, not a vacuous read.
+    ///
+    /// The hardened arm is the real worker spawn path. Its `/proc/<pid>/fd`
+    /// holds no injected descriptor and keeps stdio on the PTY slave, so the
+    /// `close_range(3, u32::MAX, CLOSE_RANGE_CLOEXEC)` sweep runs before
+    /// `exec` and does not touch 0/1/2.
+    ///
+    /// EV-03 stays `partial`: this is the ordering and dropped-`CLOEXEC`
+    /// artifact, not the full evidence package.
+    #[test]
+    fn close_range_runs_before_exec_and_a_dropped_cloexec_fails_the_probe() {
+        use std::os::fd::AsRawFd as _;
+
+        let limits = Limits::default();
+        let script = format!("echo {FD_PROBE_READY}; exec /bin/sleep 30");
+        let argv = ["/bin/sh", "-c", script.as_str()];
+        let probe = inheritable_probe_descriptor();
+        let probe_fd = u32::try_from(probe.as_raw_fd()).expect("a positive descriptor");
+
+        // Control arm: the production command, with one test-only hook that
+        // drops the flag the sweep set, so the probe must see the descriptor.
+        let (mut control, mut control_master) =
+            spawn_control_worker(&limits, &argv, probe.as_raw_fd());
+        let control_pid = control.identity().pid().get();
+        wait_for_fd_probe_ready(&mut control_master);
+        let control_fds = child_fd_numbers(control_pid);
+        assert!(
+            control_fds.contains(&probe_fd),
+            "the fd probe cannot see a dropped close-on-exec descriptor, so the \
+             hardened assertion would be vacuous: {control_fds:?}"
+        );
+        let _ = control.terminate(ContainmentLimits::for_session_stop(&limits));
+        drop(control_master);
+
+        // Hardened arm: the real worker spawn path, no test hook.
+        let (mut pool, session) = spawn_test_worker(&limits, &argv);
+        let worker_pid = pool.workers[&session].child.identity().pid().get();
+        wait_for_fd_probe_ready(
+            &mut pool
+                .workers
+                .get_mut(&session)
+                .expect("the bound worker")
+                .master,
+        );
+        let worker_fds = child_fd_numbers(worker_pid);
+        assert!(
+            !worker_fds.contains(&probe_fd),
+            "fd {probe_fd} survived the worker's exec as a daemon descriptor: {worker_fds:?}"
+        );
+        let stdio: Vec<u32> = worker_fds.iter().copied().filter(|fd| *fd < 3).collect();
+        assert_eq!(
+            stdio,
+            vec![0, 1, 2],
+            "the sweep must not close stdio: {worker_fds:?}"
+        );
+        let slave = child_fd_target(worker_pid, 0);
+        assert!(
+            slave.starts_with("/dev/pts/"),
+            "worker stdio must be a PTY slave: {slave:?}"
+        );
+        for fd in 0..3 {
+            assert_eq!(
+                child_fd_target(worker_pid, fd),
+                slave,
+                "fd {fd} does not point at the stdio PTY slave"
             );
         }
 

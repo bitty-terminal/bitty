@@ -111,6 +111,18 @@ const FALLBACK_SCAN_MAX: u32 = 1 << 20;
 /// IPC pipe, an inherited socket - are covered even though this crate never
 /// opened them (bitty#2824).
 ///
+/// # Ordering
+///
+/// The hook is registered on the `Command`, so `std` runs it in the
+/// `pre_exec` stage: after the stdio `dup2` and before `execve(2)`. The sweep
+/// is `close_range(3, u32::MAX, CLOSE_RANGE_CLOEXEC)`, so it starts above the
+/// stdio descriptors - the PTY slave on 0/1/2 survives - and marks every
+/// higher descriptor for the kernel to drop at the exec that follows. This is
+/// the ordering artifact `P0-AC-023` / EV-03 asks for, and its negative test
+/// lives in `worker::tests`
+/// (`close_range_runs_before_exec_and_a_dropped_cloexec_fails_the_probe`);
+/// EV-03 stays `partial` until the evidence package is reviewed.
+///
 /// Descriptors are marked, not closed. `std` reports a failed `exec` through a
 /// close-on-exec pipe that must stay usable until `exec` itself, and the
 /// cgroup plan still writes the child's pid through its `cgroup.procs`
@@ -192,6 +204,60 @@ fn mark_inherited_cloexec_by_fcntl() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Pin one inheritable descriptor at or above `floor` for the EV-03
+/// negative-control test.
+///
+/// The returned descriptor has its close-on-exec bit cleared, so it survives
+/// `exec` exactly like a parent handle whose `CLOEXEC` was dropped. `floor`
+/// keeps it clear of stdio and of the descriptors `openpty` and `Command`
+/// open for themselves.
+///
+/// Test-only: production never hands a child an inheritable descriptor.
+///
+/// # Errors
+///
+/// Returns the `pipe(2)` or `fcntl(2)` error.
+#[cfg(test)]
+pub(crate) fn inheritable_probe_descriptor(floor: i32) -> io::Result<OwnedFd> {
+    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+
+    let (read, write) = nix::unistd::pipe().map_err(io::Error::from)?;
+    // Only the pinned descriptor is the probe; the pipe ends themselves must
+    // not add to the child's inherited table.
+    let pinned = fcntl(&read, FcntlArg::F_DUPFD(floor)).map_err(io::Error::from)?;
+    drop(read);
+    drop(write);
+    // SAFETY: `F_DUPFD` returned a fresh descriptor owned by this call.
+    let probe = unsafe { OwnedFd::from_raw_fd(pinned) };
+    // `F_DUPFD` already clears the flag on the copy; setting it explicitly
+    // makes the dropped flag the test's stated precondition.
+    fcntl(&probe, FcntlArg::F_SETFD(FdFlag::empty())).map_err(io::Error::from)?;
+    Ok(probe)
+}
+
+/// Clear `fd`'s close-on-exec bit in the forked child, after the production
+/// descriptor sweep.
+///
+/// This is the negative-control mutation for the EV-03 test: the registered
+/// hook runs after [`close_inherited_descriptors`] and before `exec`, so the
+/// descriptor reaches `exec` with a dropped `CLOEXEC`. Production never
+/// registers it.
+#[cfg(test)]
+pub(crate) fn drop_cloexec_before_exec(command: &mut Command, fd: i32) {
+    // SAFETY: `pre_exec` runs in the forked child between fork and exec. The
+    // closure calls one descriptor-local `fcntl(2)`, allocates nothing, and
+    // touches no Rust data structure or lock. Returning an error aborts the
+    // exec.
+    unsafe {
+        command.pre_exec(move || {
+            if nix::libc::fcntl(fd, nix::libc::F_SETFD, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
 }
 
 /// Set non-blocking I/O on `file`.

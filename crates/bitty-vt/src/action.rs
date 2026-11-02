@@ -28,6 +28,7 @@ use crate::bounded::{BoundedBytes, BoundedString};
 use crate::iterm2_osc::Iterm2Reject;
 use crate::kitty_apc::KittyControlKeys;
 use crate::kitty_font_query::KittyFontQuery;
+use crate::sixel::{SixelImage, SixelReject};
 
 /// One printed cell candidate: the leading Unicode scalar of a grapheme
 /// cluster as delivered by the UTF-8 decoder.
@@ -1313,6 +1314,33 @@ pub enum TerminalAction {
     Iterm2ImageRejected {
         /// Why the request was refused.
         reason: Iterm2Reject,
+    },
+    /// A decoded sixel image (`DCS ... q ... ST`, CTX-1668, bitty#2216).
+    ///
+    /// The parser captures the DCS body (already bounded by the control-string
+    /// cap), decodes it with [`crate::sixel`] — palette definitions, raster
+    /// attributes, `!n` repeats, `$`, `-`, and the six-pixel columns — and
+    /// emits exactly one action per accepted string. Terminal state keeps the
+    /// action inert (pixels live downstream, exactly like kitty graphics and
+    /// iTerm2 images); a runtime route places the raster through the shared
+    /// image seam (`store`/`display`).
+    ///
+    /// Sixel is **not** the primary protocol: DA1 still answers the VT102
+    /// baseline with `sixel=false`, so a conforming application does not send
+    /// it unless it probes with a private `DECRQSS`/device-attributes query.
+    SixelGraphics {
+        /// Decoded RGBA8 bitmap with its drawn extent.
+        image: SixelImage,
+    },
+    /// A sixel payload refused before decode (CTX-1668).
+    ///
+    /// Semantically inert and carried for telemetry only: an oversize,
+    /// over-palette, over-area, or malformed payload stored and painted
+    /// nothing. Terminal state counts it in
+    /// `TelemetryCounters::sixel_refused`; replay reproduces the same count.
+    SixelRejected {
+        /// Why the payload was refused.
+        reason: SixelReject,
     },
     /// A control string refused by the parser-wide byte cap (CTX-1592).
     ///

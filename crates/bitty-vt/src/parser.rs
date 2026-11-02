@@ -46,6 +46,7 @@ use crate::iterm2_osc::{
 };
 use crate::kitty_apc::{KITTY_APC_MAX_CONTROL_BYTES, KittyApcAssembler, KittyFeedOutcome};
 use crate::kitty_font_query::{KITTY_FONT_QUERY_WIRE_MAX_BYTES, parse_kitty_font_query};
+use crate::sixel::SixelCapture;
 use vte::Params;
 
 mod dispatch;
@@ -158,8 +159,11 @@ impl std::fmt::Debug for Parser {
 ///
 /// DCS `ESC P +q ... ST` is also the kitty font-query envelope (CTX-1370),
 /// so the hook records that header and `put` captures a fixed-cap payload
-/// for classification at `unhook`. Every other DCS keeps its payload inert
-/// and is reported as [`UnrecognizedSequence`] exactly as before.
+/// for classification at `unhook`. A DCS whose final byte is `q` with no
+/// intermediates is a sixel image (CTX-1668): its body is captured into the
+/// lazily-allocated, bounded [`SixelCapture`] and decoded at `unhook`. Every
+/// other DCS keeps its payload inert and is reported as
+/// [`UnrecognizedSequence`] exactly as before.
 #[derive(Debug)]
 struct PendingDcs {
     active: bool,
@@ -169,6 +173,7 @@ struct PendingDcs {
     font_payload: [u8; KITTY_FONT_QUERY_WIRE_MAX_BYTES],
     font_len: usize,
     font_overflow: bool,
+    sixel: SixelCapture,
 }
 
 impl Default for PendingDcs {
@@ -181,6 +186,7 @@ impl Default for PendingDcs {
             font_payload: [0; KITTY_FONT_QUERY_WIRE_MAX_BYTES],
             font_len: 0,
             font_overflow: false,
+            sixel: SixelCapture::new(),
         }
     }
 }
@@ -1176,6 +1182,11 @@ fn feed_vte<F: FnMut(TerminalAction)>(
                 // and clears the collected body. The refused byte and the
                 // rest of the string never reach it.
                 state_machine.advance(bridge, &bytes[start..i]);
+                // A sixel body this cap cuts short must never decode: the
+                // bytes captured so far are a prefix, so the capture ends
+                // fail-closed instead of painting a truncated image
+                // (CTX-1668).
+                bridge.dcs.sixel.refuse();
                 state_machine.advance(bridge, &[CAN]);
                 #[cfg(test)]
                 control_string.count_forwarded(i - start + 1);
@@ -1381,4 +1392,9 @@ impl<F: FnMut(TerminalAction)> Bridge<'_, F> {
 
 fn sub_params(params: &Params, index: usize) -> Option<&[u16]> {
     params.iter().nth(index)
+}
+
+/// First value of the `index`-th DCS header parameter (first sub-parameter).
+fn param_value(params: &Params, index: usize) -> Option<u16> {
+    sub_params(params, index).and_then(|values| values.first().copied())
 }

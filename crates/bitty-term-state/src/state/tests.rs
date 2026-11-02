@@ -2779,6 +2779,56 @@ fn iterm2_inline_image_is_inert_and_refusals_are_counted() {
 }
 
 #[test]
+fn sixel_actions_are_inert_and_counted() {
+    // CTX-1668: the parser decodes the bounded raster, and placement/paint
+    // live downstream exactly like kitty graphics and iTerm2 images, so the
+    // admitted action must not move the cursor, damage the grid, or enter
+    // Terminal Truth.
+    let mut s = State::new();
+    prints(&mut s, "x");
+    let cursor_before = s.cursor().position;
+    let image = bitty_vt::SixelImage {
+        width: 2,
+        height: 1,
+        transparent: false,
+        rgba: vec![255, 0, 0, 255, 0, 255, 0, 255],
+    };
+    let damage = s.apply(&TerminalAction::SixelGraphics { image });
+    assert!(
+        damage.regions.is_empty(),
+        "image actions never damage the grid"
+    );
+    assert_eq!(
+        s.cursor().position,
+        cursor_before,
+        "the cursor must not advance"
+    );
+    assert_eq!(s.telemetry().sixel_decoded, 1);
+    assert_eq!(s.telemetry().sixel_refused, 0);
+    assert!(s.kitty_placements().is_empty());
+
+    // Every refusal path is counted, and nothing else changes.
+    for reason in [
+        bitty_vt::SixelReject::Empty,
+        bitty_vt::SixelReject::PaletteOverflow { register: 256 },
+        bitty_vt::SixelReject::Malformed { offset: 3 },
+    ] {
+        let damage = s.apply(&TerminalAction::SixelRejected { reason });
+        assert!(damage.regions.is_empty(), "refusals never damage the grid");
+    }
+    assert_eq!(s.telemetry().sixel_refused, 3);
+    assert_eq!(s.telemetry().sixel_decoded, 1);
+    assert_eq!(
+        s.telemetry().iterm2_refused,
+        0,
+        "sixel counters stay separate from the other image families"
+    );
+    assert_eq!(s.telemetry().kitty_refused, 0);
+    assert_eq!(s.cursor().position, cursor_before);
+    assert!(s.check_invariants().is_ok());
+}
+
+#[test]
 fn control_string_refusals_are_counted_separately() {
     // CTX-1592: an over-cap control string is truncated by the parser (the
     // bounded prefix may still have dispatched one mapped action, see

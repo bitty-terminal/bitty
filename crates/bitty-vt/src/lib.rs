@@ -30,6 +30,7 @@
 //! | Control string (OSC/DCS/SOS/PM/APC) | [`CONTROL_STRING_MAX_BYTES`] (4 MiB iTerm2 body cap + its introducer; the introducer is not charged for a `vte`-owned string) | `CAN` injection for `vte` strings, local abort for a parser-handled APC |
 //! | Materialized string/bytes | [`BoundedString`]/[`BoundedBytes`] 4096 bytes | truncation at action construction |
 //! | Kitty graphics | IMG-1 [`KITTY_APC_LEDGER_CAP`], IMG-3 [`KITTY_APC_DECODE_MAX_BYTES`] | streamed decode before allocation |
+//! | Sixel `DCS ... q` | 4 MiB capture, 256 registers, 8192 px/side, 4096 x 4096 area, 64 MiB RGBA ([`sixel`]) | two-pass decode: limits checked before the pixel buffer exists |
 //! | iTerm2 inline image | [`ITERM2_OSC_MAX_WIRE_BYTES`], [`ITERM2_OSC_MAX_ATTRIBUTE_BYTES`] | pre-scan body cap before dispatch |
 //!
 //! The control-string cap is the one bound `vte` does not provide (its `std`
@@ -54,6 +55,16 @@
 //! wire/decoded/pixel caps, and diverts only the `1337;File=` prefix.
 //! Admitted images emit [`TerminalAction::Iterm2Image`]; refusals emit the
 //! inert [`TerminalAction::Iterm2ImageRejected`] telemetry action.
+//!
+//! Sixel (`DCS ... q ... ST`, CTX-1668) reuses the DCS `hook`/`put`/`unhook`
+//! capture the kitty font-query envelope already owns: a header whose final
+//! byte is `q` with no intermediates starts a lazily-allocated, bounded
+//! capture, and `unhook` decodes it ([`sixel`]) into
+//! [`TerminalAction::SixelGraphics`] (RGBA8 raster, no state) or the counted
+//! [`TerminalAction::SixelRejected`]. Nothing is added to the byte-scanning
+//! hot path, and every other DCS stays inert. Sixel is not advertised to
+//! applications: DA1 keeps the VT102 baseline (`sixel=false`), so kitty
+//! graphics remains the primary protocol.
 //!
 //! # Example
 //!
@@ -87,6 +98,7 @@ pub mod iterm2_osc;
 pub mod kitty_apc;
 pub mod kitty_font_query;
 mod parser;
+pub mod sixel;
 
 pub use action::{
     Attribute, AttributeChange, AttributeDiff, CharsetSlot, CharsetTable, ClipboardOp, Col, Color,
@@ -113,3 +125,7 @@ pub use kitty_apc::{
 };
 pub use kitty_font_query::{KittyFontQuery, parse_kitty_font_query};
 pub use parser::{CONTROL_STRING_MAX_BYTES, Parser};
+pub use sixel::{
+    SIXEL_MAX_BYTES, SIXEL_MAX_COLORS, SIXEL_MAX_HEIGHT, SIXEL_MAX_PAYLOAD_BYTES, SIXEL_MAX_PIXELS,
+    SIXEL_MAX_WIDTH, SixelCapture, SixelImage, SixelParams, SixelReject, decode_sixel,
+};

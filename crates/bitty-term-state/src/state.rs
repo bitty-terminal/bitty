@@ -218,6 +218,17 @@ pub struct TelemetryCounters {
     /// `bitty_vt::ControlStringReject::Overflow`). Distinct from
     /// `iterm2_refused`, which counts image-request refusals.
     pub control_string_refused: u64,
+    /// Decoded sixel images admitted (`DCS ... q ... ST`, CTX-1668,
+    /// bitty#2216). Counts one per accepted payload; the raster itself is not
+    /// retained in terminal truth (pixels live downstream, exactly like kitty
+    /// graphics and iTerm2 inline images).
+    pub sixel_decoded: u64,
+    /// Sixel payloads refused before decode: oversize capture, palette index
+    /// past the 256-register cap, drawn area past 4096 x 4096, or a byte
+    /// outside the grammar. Counts both parser refusals and payloads the
+    /// parser-wide control-string cap cut short; nothing was stored or
+    /// painted for any of them.
+    pub sixel_refused: u64,
 }
 
 /// Content displacement produced by one [`State::resize`] call.
@@ -1912,6 +1923,14 @@ impl State {
             // counted (the parser already dropped that request).
             TerminalAction::Iterm2Image { .. } => {}
             TerminalAction::Iterm2ImageRejected { .. } => self.telemetry.iterm2_refused += 1,
+            // Sixel (CTX-1668, bitty#2216): the parser already decoded the
+            // bounded raster, and decode/placement/paint live downstream in
+            // the shared image seam exactly like kitty graphics and iTerm2
+            // images, so terminal state keeps the action inert and only
+            // counts it. Scaling is not part of terminal truth (sixel has no
+            // cell span of its own).
+            TerminalAction::SixelGraphics { .. } => self.telemetry.sixel_decoded += 1,
+            TerminalAction::SixelRejected { .. } => self.telemetry.sixel_refused += 1,
             // CTX-1592: an over-cap control string (OSC/DCS/SOS/PM/APC) was
             // truncated by the parser; the tail past the cap never parsed.
             // This arm only counts it — but the bounded prefix was dispatched

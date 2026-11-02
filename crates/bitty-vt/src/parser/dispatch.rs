@@ -5,7 +5,7 @@
 //! SGR decoding lives in [`super::sgr`].
 
 use super::sgr::parse_sgr;
-use super::{Bridge, sub_params};
+use super::{Bridge, param_value, sub_params};
 use crate::action::{
     CharsetSlot, CharsetTable, ClipboardOp, Col, ControlChar, Count, CursorStyle, Direction,
     DynamicColorOp, DynamicColorTarget, EnhancedKeyboardOp, EnhancedKeyboardSetMode,
@@ -1222,7 +1222,7 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
         }
     }
 
-    fn hook(&mut self, _params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+    fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         let final_byte = u8::try_from(u32::from(action)).unwrap_or(0);
         let packed = pack_intermediates(intermediates);
         if ignore {
@@ -1233,6 +1233,7 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
             self.dcs.font_query = false;
             self.dcs.font_len = 0;
             self.dcs.font_overflow = false;
+            self.dcs.sixel.abort();
             self.emit(TerminalAction::Unknown(UnrecognizedSequence {
                 kind: SequenceKind::Dcs,
                 final_byte,
@@ -1244,17 +1245,36 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
         capture.active = true;
         capture.final_byte = final_byte;
         capture.intermediates = packed;
+        capture.sixel.abort();
         // Kitty font queries share the XTGETTCAP envelope `ESC P +q ... ST`.
         // Capture that payload under a fixed cap so `unhook` can classify it
         // without a raw stream scan.
         capture.font_query = intermediates == b"+" && final_byte == b'q';
         capture.font_len = 0;
         capture.font_overflow = false;
+        // Sixel is `ESC P <P1>;<P2>;<P3> q` with no intermediates (CTX-1668).
+        // The header params are advisory; only `P2 == 1` (transparent
+        // background) changes the decoded raster.
+        if intermediates.is_empty() && final_byte == b'q' {
+            let aspect = param_value(params, 0).unwrap_or(0);
+            let background = param_value(params, 1).unwrap_or(0);
+            capture.sixel.begin(crate::sixel::SixelParams {
+                aspect,
+                transparent: background == 1,
+            });
+        }
     }
 
     fn put(&mut self, byte: u8) {
         let capture = &mut self.dcs;
-        if !capture.active || !capture.font_query {
+        if !capture.active {
+            return;
+        }
+        if capture.sixel.is_active() {
+            capture.sixel.put(byte);
+            return;
+        }
+        if !capture.font_query {
             return;
         }
         if capture.font_len < capture.font_payload.len() {
@@ -1268,6 +1288,23 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
     fn unhook(&mut self) {
         if !self.dcs.active {
             return;
+        }
+        if self.dcs.sixel.is_active() {
+            self.dcs.active = false;
+            match self.dcs.sixel.finish() {
+                Some(Ok(image)) => {
+                    self.emit(TerminalAction::SixelGraphics { image });
+                    return;
+                }
+                Some(Err(reason)) => {
+                    self.emit(TerminalAction::SixelRejected { reason });
+                    return;
+                }
+                // The hook always begins a sixel capture for this header, so
+                // `None` is unreachable; fall through to the unknown report
+                // rather than inventing an action if that ever changes.
+                None => {}
+            }
         }
         if self.dcs.font_query {
             let overflow = self.dcs.font_overflow;

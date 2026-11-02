@@ -600,25 +600,24 @@ jobs:
       - name: Install FreeBSD build prerequisites
         run: |
           set -eux
-          # The FreeBSD 15.1 snapshot image can carry a quarterly repository
-          # that is mid-sync (2026-10-30: `cmake` missing from FreeBSD-ports).
-          # Point the guest at the `latest` repository before refreshing, so a
-          # package that has been dropped from the current quarterly snapshot
-          # is still installable.
+          # The image enables three repositories (`FreeBSD-ports`,
+          # `FreeBSD-ports-kmods`, `FreeBSD`) and they do not agree on the
+          # `pkg` package its metadata carries. With more than one enabled
+          # repository that ships `pkg`, every install re-detects "New version
+          # of pkg detected", finds "The most recent versions of packages are
+          # already installed", re-executes, and loops until the job budget is
+          # gone (`pkg-static install -fy pkg` loops the same way). Keep
+          # exactly one repository, from the `latest` train, so pkg upgrades
+          # itself once during the prerequisite install and the loop cannot
+          # form. `pkg+https` makes pkg infer an SRV mirror and reject the
+          # URL, so the URL stays plain https.
           sudo mkdir -p /usr/local/etc/pkg/repos
-          # `pkg+https` makes pkg infer an SRV mirror and reject the URL, and
-          # `pkg update -f` on this image re-enters pkg's self-upgrade loop
-          # ("New version of pkg detected") without ever installing cmake.
-          # Write the https URL, refresh once, upgrade pkg once, then install;
-          # every command is bounded so a stall fails the job instead of
-          # consuming the 120-minute budget.
-          printf '%s\n' 'FreeBSD: { enabled: yes, url: "https://pkg.FreeBSD.org/${ABI}/latest" }' \
-            | sudo tee /usr/local/etc/pkg/repos/FreeBSD.conf
+          printf '%s\n' \
+            'FreeBSD-ports: { enabled: no }' \
+            'FreeBSD-ports-kmods: { enabled: no }' \
+            'FreeBSD: { enabled: yes, url: "https://pkg.FreeBSD.org/${ABI}/latest" }' \
+            | sudo tee /usr/local/etc/pkg/repos/00-bitty.conf
           sudo timeout 300 pkg update
-          # pkg 2.8.4 self-upgrade can loop ("New version of pkg detected" /
-          # "most recent versions already installed"); the static binary
-          # force-reinstalls the matching pkg and breaks the loop.
-          sudo timeout 300 pkg-static install -fy pkg
           sudo timeout 900 pkg install -y git cmake pkgconf ca_root_nss freetype2 fontconfig bash
           sudo pkg info cmake
 

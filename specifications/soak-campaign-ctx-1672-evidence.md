@@ -119,13 +119,17 @@ are the only leases (collected sessions do not accumulate).
 
 `.github/workflows/soak-nightly.yml` runs the multi-minute form (300 s per
 plane by default, `workflow_dispatch` input `duration_secs` clamped to
-60..7200 s) nightly at 03:17 UTC on `ubuntu-24.04`, with `timeout-minutes: 60`,
+60..600 s) nightly at 03:17 UTC on `ubuntu-24.04`, with `timeout-minutes: 60`,
 a build step before the run, and `actions/upload-artifact` of
-`soak-evidence/` (`if: always()`, 30-day retention). It is a separate workflow
-from `.github/workflows/ci.yml` and is not in the branch-protection required
-check set, so the PR jobs keep their current wall clock. The campaign tests are
-`#[ignore]`d, so `cargo nextest run --workspace` does not execute them on any
-push or pull request.
+`soak-evidence/` (`if: always()`, 30-day retention). The 600 s cap is the
+largest per-plane budget that keeps three serial plane runs plus a cold
+dependency build inside the 60-minute job timeout; an owner campaign that needs
+hours runs `just soak-campaign <secs>` directly (the driver itself accepts up
+to 86,400 s). It is a separate workflow from `.github/workflows/ci.yml` and is
+not in the branch-protection required check set, so the PR jobs keep their
+current wall clock. The campaign tests are `#[ignore]`d, so
+`cargo nextest run --workspace` does not execute them on any push or pull
+request.
 
 ## Residual gap
 

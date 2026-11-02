@@ -3717,7 +3717,10 @@ fn c1_st_returns_to_ground_after_a_hooked_dcs() {
     // unterminated DCS, faked into a refusal at the cap, and the rest of the
     // text is swallowed (CTX-1592 re-review F-A). The tail is deliberately
     // longer than the cap: the desync only surfaces after `CAP` bytes.
-    let mut stream = b"\x1bPqpayload\x9c".to_vec();
+    //
+    // Final byte `r`: `q` with no intermediates is a sixel image since
+    // CTX-1668, so this probe uses a final byte that stays unmapped.
+    let mut stream = b"\x1bPrpayload\x9c".to_vec();
     stream.extend(std::iter::repeat_n(b'B', CAP + 16));
     stream.extend_from_slice(b"ok");
 
@@ -3735,7 +3738,7 @@ fn c1_st_returns_to_ground_after_a_hooked_dcs() {
     assert_eq!(whole.prints, CAP + 18, "the whole text run prints");
     assert_eq!(
         whole.first,
-        Some(unknown(SequenceKind::Dcs, b'q', [0, 0])),
+        Some(unknown(SequenceKind::Dcs, b'r', [0, 0])),
         "the unmapped DCS is still reported once at `ST`"
     );
     assert_eq!(
@@ -3749,7 +3752,7 @@ fn c1_st_returns_to_ground_after_a_hooked_dcs() {
         "the tail is text, not a swallowed string"
     );
 
-    // `\x1bPqpayload` is 10 bytes, so the `0x9C` is at offset 10 and the
+    // `\x1bPrpayload` is 10 bytes, so the `0x9C` is at offset 10 and the
     // text starts at 11; the cuts bracket the terminator and the offset the
     // stale `Other` state used to overflow at.
     let cuts = [
@@ -3782,12 +3785,13 @@ fn c1_st_returns_to_ground_after_a_hooked_dcs() {
 
 #[test]
 fn c1_st_terminates_a_hooked_dcs() {
-    // `ESC P q` calls `hook` (final `q`), so `vte` is in `DcsPassthrough`,
+    // `ESC P r` calls `hook` (final `r`), so `vte` is in `DcsPassthrough`,
     // where C1 `ST` (`0x9C`) unhooks: the unmapped string is reported once
-    // and the following text prints.
-    let stream = b"\x1bPqpayload\x9cok";
+    // and the following text prints. (`q` would be a sixel image since
+    // CTX-1668.)
+    let stream = b"\x1bPrpayload\x9cok";
     let expected = vec![
-        unknown(SequenceKind::Dcs, b'q', [0, 0]),
+        unknown(SequenceKind::Dcs, b'r', [0, 0]),
         TerminalAction::Print(GraphemeCell::from('o')),
         TerminalAction::Print(GraphemeCell::from('k')),
     ];
@@ -3837,13 +3841,15 @@ fn c1_st_does_not_end_a_refused_dcs_header_tail() {
 #[test]
 fn c1_st_ends_a_refused_dcs_passthrough_tail() {
     // Over-cap DCS that had hooked: `vte` ends it on `0x9C` on the wire, so
-    // the discard tail ends there too and the following text prints.
-    let mut stream = b"\x1bPq".to_vec();
+    // the discard tail ends there too and the following text prints. Final
+    // byte `r` keeps the probe on the unmapped-DCS path (`q` is sixel since
+    // CTX-1668, whose truncated capture is refused instead).
+    let mut stream = b"\x1bPr".to_vec();
     stream.extend(std::iter::repeat_n(b'A', CAP + 8));
     stream.extend_from_slice(b"\x9cok");
     let expected = vec![
         // `CAN` unhooks (one unmapped-DCS report) and then executes.
-        unknown(SequenceKind::Dcs, b'q', [0, 0]),
+        unknown(SequenceKind::Dcs, b'r', [0, 0]),
         TerminalAction::PrintControl(ControlChar(0x18)),
         control_refusal(ControlStringKind::Dcs),
         TerminalAction::Print(GraphemeCell::from('o')),
@@ -3851,6 +3857,132 @@ fn c1_st_ends_a_refused_dcs_passthrough_tail() {
     ];
     let cuts = [3, 3 + CAP - 1, 3 + CAP, 3 + CAP + 1, stream.len() - 2];
     assert_capped_stream_invariant(&stream, &expected, &cuts);
+}
+
+/// `ESC P q <body> ST` parses to exactly one `SixelGraphics` action whose
+/// raster matches the wire (CTX-1668).
+#[test]
+fn dcs_sixel_decodes_to_one_action() {
+    let stream = b"\x1bPq#0;2;100;100;100!2@\x1b\\";
+    let actions = parse(stream);
+    assert_eq!(actions.len(), 1, "one action per accepted string");
+    match &actions[0] {
+        TerminalAction::SixelGraphics { image } => {
+            assert_eq!((image.width, image.height), (2, 1));
+            assert!(!image.transparent, "P2 defaults to an opaque background");
+            assert_eq!(image.rgba.len(), 8);
+            assert_eq!(&image.rgba[0..4], &[255, 255, 255, 255]);
+            assert_eq!(&image.rgba[4..8], &[255, 255, 255, 255]);
+        }
+        other => panic!("expected SixelGraphics, got {other:?}"),
+    }
+    assert_eq!(parse_split(stream, 1), actions, "byte-wise feeding matches");
+}
+
+/// `P2 = 1` requests a transparent background and reaches the action.
+#[test]
+fn dcs_sixel_keeps_the_transparent_background_flag() {
+    let actions = parse(b"\x1bP1;1q@\x1b\\");
+    assert_eq!(actions.len(), 1);
+    match &actions[0] {
+        TerminalAction::SixelGraphics { image } => assert!(image.transparent),
+        other => panic!("expected SixelGraphics, got {other:?}"),
+    }
+}
+
+/// A malformed or over-cap payload emits the counted refusal and no image.
+#[test]
+fn dcs_sixel_failures_are_counted_and_inert() {
+    let palette = parse(b"\x1bPq#256;2;100;0;0@\x1b\\");
+    assert_eq!(
+        palette,
+        vec![TerminalAction::SixelRejected {
+            reason: crate::sixel::SixelReject::PaletteOverflow { register: 256 },
+        }]
+    );
+
+    let empty = parse(b"\x1bPq\x1b\\");
+    assert_eq!(
+        empty,
+        vec![TerminalAction::SixelRejected {
+            reason: crate::sixel::SixelReject::Empty,
+        }]
+    );
+
+    let malformed = parse(b"\x1bPq@;\x1b\\");
+    assert_eq!(
+        malformed,
+        vec![TerminalAction::SixelRejected {
+            reason: crate::sixel::SixelReject::Malformed { offset: 1 },
+        }]
+    );
+}
+
+/// Splitting the DCS, the body, or the terminator never changes the result.
+#[test]
+fn dcs_sixel_survives_arbitrary_chunk_boundaries() {
+    let stream = b"\x1bPq\"1;1;12;12#1;2;100;0;0!3~$!2@-!2~\x1b\\";
+    let actions = parse(stream);
+    assert_eq!(actions.len(), 1);
+    assert_eq!(parse_split(stream, 1), actions);
+    for chunk in [2, 3, 5, 7, 11] {
+        assert_eq!(parse_split(stream, chunk), actions, "chunk size {chunk}");
+    }
+}
+
+/// A sixel body cut short by the parser-wide control-string cap is refused;
+/// the truncated prefix is never decoded into an image.
+#[test]
+fn dcs_sixel_truncated_by_the_control_string_cap_is_refused() {
+    let mut stream = b"\x1bPq".to_vec();
+    stream.extend(std::iter::repeat_n(b'@', CAP + 8));
+    stream.extend_from_slice(b"\x1b\\ok");
+    let actions = parse(&stream);
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            TerminalAction::SixelRejected {
+                reason: crate::sixel::SixelReject::PayloadTooLarge { .. }
+            }
+        )),
+        "the truncated capture is refused: {actions:?}"
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|action| matches!(action, TerminalAction::SixelGraphics { .. })),
+        "a truncated body must never paint"
+    );
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            TerminalAction::ControlStringRejected {
+                kind: ControlStringKind::Dcs,
+                ..
+            }
+        )),
+        "the cap refusal is still reported"
+    );
+    assert_eq!(parse_split(&stream, 4096), actions);
+}
+
+/// Only an empty-intermediate `q` is sixel: kitty font queries and DCS
+/// strings with intermediates keep their existing paths.
+#[test]
+fn dcs_sixel_does_not_capture_other_dcs_final_bytes() {
+    let with_intermediate = parse(b"\x1bP q@\x1b\\");
+    assert_eq!(
+        with_intermediate,
+        vec![unknown(SequenceKind::Dcs, b'q', [b' ', 0])]
+    );
+
+    let font_query = parse(b"\x1bP+q544e\x1b\\");
+    assert!(
+        font_query
+            .iter()
+            .all(|action| !matches!(action, TerminalAction::SixelGraphics { .. })),
+        "font queries stay on the XTGETTCAP path: {font_query:?}"
+    );
 }
 
 #[test]

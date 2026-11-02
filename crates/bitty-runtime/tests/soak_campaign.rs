@@ -79,6 +79,7 @@ const RESIZE_EVERY: u64 = 24;
 const DRAG_EVERY: u64 = 8;
 
 /// Cycles between pane attach/detach cycles (spawn, poll, close).
+#[cfg(unix)]
 const PANE_EVERY: u64 = 48;
 
 /// Cycles between paste-sized writes (a 64 KiB diff payload).
@@ -571,6 +572,7 @@ fn presentation_plane_campaign_stays_bounded() {
     let mut cycles = 0u64;
     let mut presented = 0u64;
     let mut drag_steps = 0u64;
+    #[cfg(unix)]
     let mut pane_cycles = 0u64;
     let mut published = 0u64;
     let mut drained = 0u64;

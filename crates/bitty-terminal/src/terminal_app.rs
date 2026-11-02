@@ -85,6 +85,74 @@ impl ParkedCommandBackoff {
     }
 }
 
+/// First delay for the bounded present nudge (bitty#2830).
+///
+/// `AboutToWait` returns to plain `ControlFlow::Wait` when none of its
+/// deadlines is armed, so a frame that is still owed at that point waits for
+/// external input: the "unresponsive until I click" shape, and the
+/// deterministic CI hang where a lost redraw left the arm with an empty
+/// deadline array. 50 ms is far above the 0 ms re-arm that would spin the loop
+/// and far below the watchdog's stall threshold, so the nudge cannot
+/// masquerade as a stall.
+pub(crate) const PRESENT_NUDGE_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Ceiling for the present-nudge backoff (2 Hz).
+///
+/// Every hold the runtime knows about arms its own deadline, so a frame still
+/// owed after a few nudges is an anomaly. Doubling from
+/// [`PRESENT_NUDGE_DELAY`] to this cap keeps that anomaly self-healing while it
+/// lasts without a permanent 20 Hz loop; the nudge clears the moment the
+/// present drains.
+pub(crate) const PRESENT_NUDGE_MAX: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Bounded, self-clearing wake for a frame that is owed with no other
+/// deadline armed (bitty#2830).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PresentNudge {
+    delay: std::time::Duration,
+}
+
+impl Default for PresentNudge {
+    fn default() -> Self {
+        Self {
+            delay: PRESENT_NUDGE_DELAY,
+        }
+    }
+}
+
+impl PresentNudge {
+    /// Wake to hand the loop for this `AboutToWait` turn.
+    ///
+    /// `wake` is the join of every other deadline and always wins: the nudge
+    /// never suppresses it, never shortens it, and never moves it into the
+    /// past. `owed == false` returns `None`, so the caller falls back to
+    /// `set_wait()` and an idle surface keeps its zero-wakeup budget. Only
+    /// `owed == true` with no deadline arms `now + delay`, doubling the delay
+    /// up to [`PRESENT_NUDGE_MAX`]. It never returns `now`: a past-due deadline
+    /// re-enters `AboutToWait` immediately and spins a loop that has nothing
+    /// new to present.
+    pub(crate) fn arm(
+        &mut self,
+        now: std::time::Instant,
+        owed: bool,
+        wake: Option<std::time::Instant>,
+    ) -> Option<std::time::Instant> {
+        if let Some(deadline) = wake {
+            self.delay = PRESENT_NUDGE_DELAY;
+            return Some(deadline);
+        }
+        if !owed {
+            self.delay = PRESENT_NUDGE_DELAY;
+            return None;
+        }
+        // An unrepresentable deadline fails closed to plain `Wait` instead of
+        // handing back `now` and spinning the loop.
+        let deadline = now.checked_add(self.delay)?;
+        self.delay = self.delay.saturating_mul(2).min(PRESENT_NUDGE_MAX);
+        Some(deadline)
+    }
+}
+
 /// How long a hidden-surface repair probe trusts a served redraw
 /// (bitty#2830 hypothesis 2).
 ///
@@ -812,9 +880,25 @@ pub(crate) struct TerminalApp {
     /// Bounded backoff for a parked plugin command's cold-tick resume wake
     /// (bitty#2830).
     pub(crate) parked_command_backoff: ParkedCommandBackoff,
+    /// Bounded, self-clearing wake for a frame that is owed with no other
+    /// deadline armed (bitty#2830).
+    ///
+    /// `AboutToWait` is the last place that can notice "a frame is still owed
+    /// and nothing is going to wake me"; without this it answers `set_wait()`
+    /// and the loop parks until unrelated input.
+    pub(crate) present_nudge: PresentNudge,
     /// Test-only override for the surface-retry wake (issue #2570 B1).
     #[cfg(test)]
     pub(crate) test_surface_retry_deadline: Option<std::time::Instant>,
+    /// Test-only override for the present-owed query (bitty#2830).
+    ///
+    /// The pathological "retained damage with no deadline" state lives inside
+    /// the runtime (a rejected stale-atlas frame, a scene-store borrow
+    /// conflict), so the `AboutToWait` wiring test pins the handoff directly -
+    /// the same shape as [`Self::test_surface_retry_deadline`]. The production
+    /// query is exercised against a real rejection in `bitty-runtime`.
+    #[cfg(test)]
+    pub(crate) test_present_owed: Option<bool>,
     /// When the current hidden-surface repair probe asked the compositor for
     /// a redraw (bitty#2830 hypothesis 2).
     ///
@@ -1003,8 +1087,11 @@ impl TerminalApp {
             presented_frames: 0,
             stall_watchdog,
             parked_command_backoff: ParkedCommandBackoff::default(),
+            present_nudge: PresentNudge::default(),
             #[cfg(test)]
             test_surface_retry_deadline: None,
+            #[cfg(test)]
+            test_present_owed: None,
             hidden_repair_probe_at: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
@@ -1056,8 +1143,11 @@ impl TerminalApp {
             presented_frames: 0,
             stall_watchdog,
             parked_command_backoff: ParkedCommandBackoff::default(),
+            present_nudge: PresentNudge::default(),
             #[cfg(test)]
             test_surface_retry_deadline: None,
+            #[cfg(test)]
+            test_present_owed: None,
             hidden_repair_probe_at: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
@@ -1257,6 +1347,19 @@ impl TerminalApp {
             return Some(deadline);
         }
         self.runtime.surface_retry_deadline()
+    }
+
+    /// Whether the runtime still owes a presented frame (bitty#2830).
+    ///
+    /// Wraps [`bitty_runtime::Runtime::present_owed`] with the test override
+    /// the `AboutToWait` wiring test uses, the same shape as
+    /// [`Self::surface_retry_wake`].
+    fn present_owed(&self) -> bool {
+        #[cfg(test)]
+        if let Some(owed) = self.test_present_owed {
+            return owed;
+        }
+        self.runtime.present_owed()
     }
 
     fn watchdog_idle(&self) {
@@ -4963,6 +5066,18 @@ impl TerminalApp {
                 .into_iter()
                 .flatten()
                 .min();
+                // bitty#2830: every hold above arms its own deadline, but a
+                // frame can still be owed with none of them armed - a rejected
+                // stale-atlas frame, a scene-store borrow conflict, or a reveal
+                // edge that never arrived. Answering `set_wait()` there parks
+                // the loop until unrelated input: the reported "unresponsive
+                // until I click", and the deterministic CI hang where a lost
+                // redraw left this arm with an empty deadline array. The nudge
+                // never overrides a deadline, never re-arms at 0 ms, and clears
+                // as soon as the present drains.
+                let wake =
+                    self.present_nudge
+                        .arm(std::time::Instant::now(), self.present_owed(), wake);
                 match wake {
                     Some(deadline) => ctx.set_wait_until(deadline),
                     None => ctx.set_wait(),

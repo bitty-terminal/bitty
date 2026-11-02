@@ -564,6 +564,12 @@ jobs:
     needs: validate
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    # Tier-2 channel, best effort (bitty#2851): the FreeBSD 15.1 snapshot image
+    # currently loops in pkg's self-upgrade path, and a VM-image fault must not
+    # hold the stable train. The job still builds and uploads its artifact, but
+    # the release job no longer waits for it, so the FreeBSD asset ships with
+    # the first train where this job is verified green.
+    continue-on-error: true
     # `cargo test` would otherwise emit target/debug/incremental output that
     # the VM action syncs between guest and runner for no benefit.
     env:
@@ -1385,7 +1391,6 @@ jobs:
         validate,
         build,
         build-alpine,
-        build-freebsd,
         verify-install,
         macos-universal,
         windows-zip,

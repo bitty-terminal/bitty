@@ -694,6 +694,27 @@ longrun-soak *args:
 longrun-soak-test:
     bash scripts/tests/longrun-soak.test.sh
 
+# Long-duration soak campaign driver (bitty#2830, CTX-1672). Compressed
+# campaign across two planes that the workspace dependency direction keeps in
+# separate crates: the presentation plane (sustained PTY volume, attach/detach,
+# panel drag/resize, plugin activation churn, the app-side delivery queue) and
+# the daemon event plane (lease churn, retained event ring, pending
+# deliveries). Both read the same wall-clock budget from the argument or
+# `BITTY_SOAK_CAMPAIGN_SECS` (default 120 s per plane) and print a sampled
+# series; the nightly `soak-nightly.yml` workflow runs the multi-minute form
+# and uploads the evidence. `cargo test` (not nextest) is deliberate: the
+# driver owns its budget, so nextest's slow-timeout must not kill an
+# hours-long owner campaign. Set `BITTY_SOAK_EVIDENCE_DIR` to keep the series
+# as files.
+soak-campaign secs="120":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export BITTY_SOAK_CAMPAIGN_SECS="{{secs}}"
+    cargo test --locked --no-fail-fast \
+        -p bitty-runtime --test soak_campaign \
+        -p bitty-daemon --test soak_campaign \
+        -- --ignored --nocapture --test-threads=1
+
 # Daily-driver dogfood session planner (CTX-0643, PERF-10). Headless-safe:
 # loads the clamped session config, prints the bounded cycle plan and the
 # hyprctl+grim leg status, and reports UNMEASURED without

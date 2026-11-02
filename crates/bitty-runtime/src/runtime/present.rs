@@ -2011,21 +2011,14 @@ impl Runtime {
         self.set_surface_visibility_at(std::time::Instant::now(), visible);
     }
 
-    /// Whether a hidden surface still owes presentation work (bitty#2830).
+    /// Whether a frame is owed, regardless of surface visibility (bitty#2830).
     ///
-    /// This is the retained-damage half of the occlusion gate: Terminal Truth
-    /// advanced (or a paint-only invalidation or a cancelled presentation is
-    /// armed) while the surface was hidden, so the next visible frame must
-    /// repaint it. The hide transition only keeps `pending_full_redraw` when
-    /// something real was retained, so the flag means work here rather than
-    /// "a re-mapped surface will paint from truth anyway" - counting the
-    /// latter would make every hidden window look damaged and arm a wake for
-    /// nothing.
+    /// This is the single definition of "damage is retained" that the occlusion
+    /// gate, the reveal path and the embedder's bounded present nudge all key
+    /// on, so a new retained-work source added here is immediately covered by
+    /// all of them instead of only by the one that happened to be edited.
     #[must_use]
-    pub(crate) fn hidden_retained_work(&self) -> bool {
-        if self.surface_visible {
-            return false;
-        }
+    fn retained_present_work(&self) -> bool {
         if self.pending_paint_redraw || self.coalesced_pending {
             return true;
         }
@@ -2040,6 +2033,62 @@ impl Runtime {
         self.pane_sessions
             .values()
             .any(|session| session.last_presented_generation != session.state.generation())
+    }
+
+    /// Whether a hidden surface still owes presentation work (bitty#2830).
+    ///
+    /// This is the retained-damage half of the occlusion gate: Terminal Truth
+    /// advanced (or a paint-only invalidation or a cancelled presentation is
+    /// armed) while the surface was hidden, so the next visible frame must
+    /// repaint it. The hide transition only keeps `pending_full_redraw` when
+    /// something real was retained, so the flag means work here rather than
+    /// "a re-mapped surface will paint from truth anyway" - counting the
+    /// latter would make every hidden window look damaged and arm a wake for
+    /// nothing.
+    #[must_use]
+    pub(crate) fn hidden_retained_work(&self) -> bool {
+        !self.surface_visible && self.retained_present_work()
+    }
+
+    /// Whether a visible surface owes a frame that may hold no deadline
+    /// (bitty#2830).
+    ///
+    /// The embedder asks this from `AboutToWait` after its tick. When the
+    /// arm's deadline array is empty and this is still `true`, the loop is
+    /// about to hand itself plain `ControlFlow::Wait` with a frame nobody has
+    /// presented: a rejected stale-atlas frame, a scene-store borrow conflict,
+    /// or any future early return that retains damage without arming a timer
+    /// then parks until unrelated input - the reported "unresponsive until I
+    /// click" shape. A bounded nudge on the app side guarantees another
+    /// attempt instead of an indefinite `Wait`.
+    ///
+    /// `false` right after a committed present (every flag is consumed there),
+    /// so an idle surface arms nothing and PB-7's zero-periodic-wakeup idle
+    /// budget is preserved. A hidden surface is deliberately excluded: its
+    /// retained work is covered by [`Self::hidden_repair_deadline`], and a
+    /// nudge there would fight the occlusion gate's idle.
+    #[must_use]
+    pub fn present_owed(&self) -> bool {
+        if !self.surface_visible {
+            return false;
+        }
+        self.retained_present_work() || self.plugin_scene_owed()
+    }
+
+    /// Whether the mounted plugin scene store advanced past the frame on
+    /// screen (CTX-1641).
+    ///
+    /// A borrow conflict answers `true`: the store is being mutated right now,
+    /// so the frame on screen cannot reflect it. Over-arming one bounded tick
+    /// is the safe direction; under-arming strands the frame until input.
+    fn plugin_scene_owed(&self) -> bool {
+        let Some(host) = self.scene_host.as_ref() else {
+            return false;
+        };
+        match host.try_borrow() {
+            Ok(host) => host.scene_revision() != self.presented_scene_revision,
+            Err(_) => true,
+        }
     }
 
     /// Bounded self-heal wake for a hidden surface with retained work.
@@ -7483,6 +7532,96 @@ mod atlas_epoch_guard_tests {
         assert_eq!(
             rt.stale_atlas_frame_rejects, 0,
             "a clean frame must not leave the bound partly consumed"
+        );
+    }
+
+    #[test]
+    fn a_rejected_frame_owes_a_present_and_arms_no_deadline() {
+        // bitty#2830: the rejection is the deterministic "damage retained,
+        // deadline array empty" state the embedder's `AboutToWait` arm can be
+        // left in. It keeps the damage and arms no timer, so a loop that
+        // answered `set_wait()` here would park until unrelated input.
+        let mut rt = runtime();
+        rt.handle_pty_bytes(b"hello");
+        rt.tick().expect("printed bytes must present a frame");
+
+        let planned_epoch = rt.renderer.atlas_epoch();
+        reset_atlas(&mut rt, 2.0);
+        assert!(rt.reject_stale_atlas_frame(&layers_at(planned_epoch)));
+        assert!(rt.pending_full_redraw, "the rejected frame is retained");
+
+        assert!(
+            rt.present_owed(),
+            "the embedder's nudge keys on exactly this retained frame"
+        );
+        assert!(
+            rt.present_coalescing_deadline().is_none(),
+            "the rejection arms no coalesced wake"
+        );
+        assert!(
+            rt.hidden_repair_deadline().is_none(),
+            "the surface is visible, so no repair wake applies"
+        );
+        assert!(
+            rt.surface_retry_deadline().is_none(),
+            "no present was attempted, so no retry wake applies"
+        );
+    }
+}
+
+#[cfg(test)]
+mod present_owed_tests {
+    use crate::runtime::{Runtime, RuntimeConfig};
+
+    fn runtime() -> Runtime {
+        Runtime::with_deterministic_rasterizer(RuntimeConfig::default())
+            .expect("deterministic runtime must build")
+    }
+
+    #[test]
+    fn an_idle_surface_owes_nothing_after_its_present() {
+        // PB-7 guard: the nudge must not turn a quiet window into a 20 Hz loop.
+        // A committed present consumes every retained-work flag, so a clean
+        // idle surface reports nothing owed and the embedder keeps `set_wait`.
+        let mut rt = runtime();
+        rt.handle_pty_bytes(b"hello");
+        rt.tick().expect("printed bytes must present a frame");
+        assert!(
+            !rt.present_owed(),
+            "a clean idle surface must not arm the present nudge"
+        );
+    }
+
+    #[test]
+    fn new_output_owes_a_present_before_it_is_consumed() {
+        let mut rt = runtime();
+        rt.handle_pty_bytes(b"hello");
+        rt.tick().expect("printed bytes must present a frame");
+        rt.handle_pty_bytes(b"world");
+        assert!(
+            rt.present_owed(),
+            "unconsumed Terminal Truth is a frame nobody has presented"
+        );
+        assert!(
+            rt.tick().is_some(),
+            "the owed frame presents on the next tick"
+        );
+        assert!(!rt.present_owed(), "and the flag clears with it");
+    }
+
+    #[test]
+    fn a_hidden_surface_is_covered_by_the_repair_wake_not_the_nudge() {
+        // The occlusion gate owns hidden damage with its own bounded wake; a
+        // nudge there would fight that idle, so `present_owed` stays false.
+        let mut rt = runtime();
+        rt.handle_pty_bytes(b"hello");
+        rt.tick().expect("printed bytes must present a frame");
+        rt.handle_pty_bytes(b"hidden output");
+        rt.set_surface_visibility_at(std::time::Instant::now(), false);
+        assert!(!rt.present_owed(), "hidden work belongs to the repair wake");
+        assert!(
+            rt.hidden_repair_deadline().is_some(),
+            "the occlusion gate still arms its own bounded wake"
         );
     }
 }

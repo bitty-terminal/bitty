@@ -1136,6 +1136,106 @@ return {}
         );
     }
 
+    /// One `AboutToWait` turn on the real handler, returning the recorded
+    /// loop-control operations (bitty#2830 wiring tests).
+    fn about_to_wait_operations(fixture: &mut Fixture) -> Vec<RecordingOperation> {
+        fixture.operations.borrow_mut().clear();
+        let mut context = EventContext::recording(&fixture.operations);
+        <TerminalApp as AppHandler>::handle_event(
+            &mut fixture.app,
+            &mut context,
+            PlatformEvent::AboutToWait,
+        );
+        fixture.operations.borrow().clone()
+    }
+
+    #[test]
+    fn about_to_wait_arms_a_bounded_present_nudge_when_a_frame_is_owed() {
+        // bitty#2830 regression: retained damage with an empty deadline array
+        // must not leave the loop in plain `Wait`. Before the nudge this arm
+        // answered `set_wait()` and the process stayed frozen - CPU idle and
+        // unresponsive - until unrelated input arrived ("unresponsive until I
+        // click"), which is also the deterministic CI hang where a lost redraw
+        // left `AboutToWait` with nothing armed.
+        let mut fixture = Fixture::new("present-nudge-wake");
+        fixture.app.test_present_owed = Some(true);
+        let started = std::time::Instant::now();
+        let operations = about_to_wait_operations(&mut fixture);
+        let deadlines: Vec<std::time::Instant> = operations
+            .iter()
+            .filter_map(|operation| match operation {
+                RecordingOperation::WaitUntil(at) => Some(*at),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !operations.contains(&RecordingOperation::Wait),
+            "an owed frame must never be handed plain Wait: {operations:?}"
+        );
+        let deadline = deadlines
+            .first()
+            .copied()
+            .unwrap_or_else(|| panic!("no bounded wake armed for an owed frame: {operations:?}"));
+        assert!(
+            deadline > started,
+            "the nudge must be a future deadline, never a 0 ms spin"
+        );
+        assert!(
+            deadline <= started + std::time::Duration::from_secs(1),
+            "the nudge must stay bounded, not park the loop: {deadline:?}"
+        );
+    }
+
+    #[test]
+    fn about_to_wait_returns_to_wait_once_the_present_drains() {
+        // Self-clearing half of the nudge: with nothing owed, the arm must
+        // still answer `set_wait()` so PB-7's zero-periodic-wakeup idle holds.
+        let mut fixture = Fixture::new("present-nudge-drained");
+        fixture.app.test_present_owed = Some(false);
+        let operations = about_to_wait_operations(&mut fixture);
+        assert!(
+            operations.contains(&RecordingOperation::Wait),
+            "a drained present must return to energy-saving Wait: {operations:?}"
+        );
+    }
+
+    #[test]
+    fn present_nudge_is_bounded_and_resets() {
+        // Unit-level contract of the nudge itself: non-zero, capped, and
+        // reset the moment nothing is owed. No sleeps, no wall clock.
+        use crate::terminal_app::{PRESENT_NUDGE_DELAY, PRESENT_NUDGE_MAX, PresentNudge};
+        let now = std::time::Instant::now();
+        let mut nudge = PresentNudge::default();
+
+        let first = nudge.arm(now, true, None).expect("an owed frame arms");
+        assert!(first > now, "never re-arm at 0 ms");
+        assert!(first <= now + PRESENT_NUDGE_MAX, "bounded");
+        assert_eq!(first - now, PRESENT_NUDGE_DELAY, "prompt first attempt");
+
+        // Consecutive owed turns back off instead of spinning at 50 ms.
+        let mut previous = PRESENT_NUDGE_DELAY;
+        for _ in 0..8 {
+            let deadline = nudge.arm(now, true, None).expect("still owed");
+            let delay = deadline - now;
+            assert!(delay >= previous, "the nudge must never get faster");
+            assert!(delay <= PRESENT_NUDGE_MAX, "and never exceed the cap");
+            previous = delay;
+        }
+        assert_eq!(previous, PRESENT_NUDGE_MAX, "backoff reaches the cap");
+
+        // Draining clears the wake and resets the next episode's delay.
+        assert_eq!(nudge.arm(now, false, None), None);
+        assert_eq!(
+            nudge.arm(now, true, None).expect("owed again") - now,
+            PRESENT_NUDGE_DELAY
+        );
+
+        // An already-armed deadline always wins, owed or not.
+        let existing = now + std::time::Duration::from_secs(60);
+        assert_eq!(nudge.arm(now, true, Some(existing)), Some(existing));
+        assert_eq!(nudge.arm(now, false, Some(existing)), Some(existing));
+    }
+
     #[test]
     fn app_handler_visibility_events_update_surface_gate() {
         // Issue #2589 / #2570: a Hyprland workspace switch-away delivers

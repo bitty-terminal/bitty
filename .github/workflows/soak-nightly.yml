@@ -1,0 +1,146 @@
+name: Soak campaign (nightly)
+
+# bitty#2830: the remaining acceptance bullet on the long-uptime
+# unresponsiveness class is a long-duration soak campaign. The driver lives in
+# `crates/bitty-runtime/tests/soak_campaign.rs` (presentation plane) and
+# `crates/bitty-daemon/tests/soak_campaign.rs` (daemon event plane); both are
+# `#[ignore]`d, so no PR job pays for them. This workflow is the nightly,
+# multi-minute form.
+#
+# Deliberately NOT part of the PR-required check set (branch protection lists
+# only the CI `Quality gates` and platform jobs): a multi-minute campaign on
+# every push would spend the review budget without new signal. Manual runs use
+# `workflow_dispatch` with an explicit per-plane budget; the owner campaign
+# raises it to hours.
+#
+# The evidence artifact is the driver's sampled series (`BITTY_SOAK_EVIDENCE_DIR`),
+# uploaded even when the campaign fails, so a regression is diagnosable from the
+# run page alone.
+
+on:
+  schedule:
+    # 03:17 UTC daily, off the top of the hour to avoid the scheduler burst.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: "Wall-clock budget per plane, in seconds (60..7200)"
+        required: false
+        default: "300"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soak-campaign-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # One target tree per runner, matching the PR jobs' layout.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/target
+  CARGO_INCREMENTAL: "0"
+  # The campaign is debug-built like the rest of the suite; drop DWARF so the
+  # runner disk is not spent on symbols the campaign never reads.
+  CARGO_PROFILE_TEST_DEBUG: "line-tables-only"
+
+jobs:
+  campaign:
+    name: Long-duration soak campaign (${{ inputs.duration_secs || '300' }}s per plane)
+    runs-on: ubuntu-24.04
+    # Two runtime tests (2x budget) plus the daemon plane (1x budget) plus a
+    # cold build. 300 s per plane is ~15 min of driving; the timeout leaves
+    # room for a cold dependency build without letting a wedged runner hold
+    # the schedule slot. The campaign itself owns a wall-clock bound, so this
+    # is a backstop, not the budget.
+    timeout-minutes: 60
+    env:
+      # Validity is enforced by the "Clamp campaign budget" step below; the
+      # driver also clamps to 8..86400 s, so a bad manual input cannot pin a
+      # runner for longer than the job timeout.
+      BITTY_SOAK_CAMPAIGN_SECS: ${{ inputs.duration_secs || '300' }}
+      BITTY_SOAK_EVIDENCE_DIR: ${{ github.workspace }}/soak-evidence
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Clamp campaign budget
+        run: |
+          set -euo pipefail
+          secs="${BITTY_SOAK_CAMPAIGN_SECS//[!0-9]/}"
+          if [[ -z "$secs" ]]; then secs=300; fi
+          if (( secs < 60 )); then secs=60; fi
+          if (( secs > 7200 )); then secs=7200; fi
+          echo "BITTY_SOAK_CAMPAIGN_SECS=$secs" >> "$GITHUB_ENV"
+          echo "campaign budget: ${secs}s per plane"
+
+      - name: Reclaim runner disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
+
+      # bitty-runtime links bitty-render, which links the platform font stack
+      # through crossfont/pkg-config.
+      - name: Install font stack development libraries
+        run: >-
+          sudo apt-get update
+          && sudo apt-get install -y --no-install-recommends
+          libfontconfig1-dev libfreetype6-dev
+
+      # The pinned channel lives in rust-toolchain.toml; resolve it instead of
+      # repeating the literal so the campaign tracks the PR jobs.
+      - name: Resolve Rust channel (rust-toolchain.toml)
+        id: rust-channel
+        run: |
+          channel="$(scripts/rust-channel.sh)"
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.rust-channel.outputs.channel }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # A separate namespace from the PR jobs: the nightly campaign must
+          # never evict the cache the required checks depend on.
+          prefix-key: v1-soak-campaign
+          shared-key: campaign
+
+      # Build first so a compile error is not reported as a campaign timeout.
+      - name: Build campaign binaries
+        run: |
+          set -euo pipefail
+          mkdir -p "$BITTY_SOAK_EVIDENCE_DIR"
+          cargo test --locked \
+            -p bitty-runtime --test soak_campaign \
+            -p bitty-daemon --test soak_campaign \
+            --no-run 2>&1 | tee "$BITTY_SOAK_EVIDENCE_DIR/build.log"
+
+      # `cargo test` (not nextest) on purpose: the driver owns a wall-clock
+      # budget and nextest's slow-timeout would kill a legitimate hours-long
+      # run. The outer `timeout` is four times the per-plane budget so a wedge
+      # still ends the job.
+      - name: Run presentation and daemon planes
+        run: |
+          set -euo pipefail
+          limit=$(( BITTY_SOAK_CAMPAIGN_SECS * 4 + 300 ))
+          timeout --signal=TERM "${limit}s" \
+            cargo test --locked --no-fail-fast \
+              -p bitty-runtime --test soak_campaign \
+              -p bitty-daemon --test soak_campaign \
+              -- --ignored --nocapture --test-threads=1 2>&1 \
+            | tee "$BITTY_SOAK_EVIDENCE_DIR/campaign.log"
+
+      - name: Upload campaign evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: soak-campaign-evidence-${{ github.run_id }}
+          path: soak-evidence/
+          if-no-files-found: warn
+          retention-days: 30

@@ -3054,7 +3054,7 @@ impl Runtime {
     /// True for a layout leaf, a pinned leaf, a detached float, a leaf stashed
     /// in an **inactive** workspace slot, or the leaf parked in the window
     /// scratchpad — the same occupied set the view-id allocator refuses to
-    /// reissue ([`Self::live_view_raws_excluding_active_slot`]). A closed view
+    /// reissue (`Self::live_view_raws_excluding_active_slot`). A closed view
     /// is false, so a presentation surface bound to it reports a bounded
     /// `view-closed` dismissal instead of repainting over a survivor.
     ///

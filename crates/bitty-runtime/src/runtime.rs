@@ -467,6 +467,26 @@ pub struct BandContent {
     pub version: u32,
 }
 
+/// Per-frame accounting of one presentation-only overlay paint (issue #2849).
+///
+/// The presentation surface is bounded like a chrome band: at most
+/// `PRESENTATION_OVERLAY_MAX_ROWS` rows and `PRESENTATION_OVERLAY_MAX_BYTES`
+/// of row text are admitted per frame, the tail is dropped deterministically,
+/// and the accounted totals are recorded here so the frame's work is
+/// attributable rather than ambient. Presentation is never grid truth:
+/// nothing here reaches the grid, cursor, or scrollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresentationPaint {
+    /// View the surface was painted over (focus-follow binding).
+    pub view: bitty_ui::ViewId,
+    /// Row count admitted into the frame.
+    pub rows: usize,
+    /// UTF-8 bytes of admitted row text.
+    pub bytes: usize,
+    /// Whether the row or byte budget dropped a tail.
+    pub truncated: bool,
+}
+
 /// One live Core target anchor published to the plugin targeting source
 /// (W-29 successor, issue #2253).
 ///
@@ -858,6 +878,11 @@ pub struct Runtime {
     /// focusable capture surface and above the chrome bands, centered on the
     /// focused view and clipped to its frame. `None` with no session.
     presentation_overlay: Option<BandContent>,
+    /// Presentation-only overlay paint accounting for the last presented
+    /// frame (issue #2849): rows and bytes admitted under the band-like
+    /// budget, plus whether a tail was dropped. `None` when the last frame
+    /// painted no presentation surface.
+    presentation_overlay_paint: Option<PresentationPaint>,
     /// Present-time target annotation batch (W-29 successor, issue #2253).
     ///
     /// Populated from `PluginRuntime::target_annotations()` each tick and
@@ -2255,6 +2280,7 @@ impl Runtime {
             },
             plugin_overlay: None,
             presentation_overlay: None,
+            presentation_overlay_paint: None,
             target_annotations: None,
             panel_target_ids: std::cell::RefCell::new(BTreeMap::new()),
             next_panel_target_raw: std::cell::Cell::new(0),
@@ -2560,6 +2586,7 @@ impl Runtime {
             },
             plugin_overlay: None,
             presentation_overlay: None,
+            presentation_overlay_paint: None,
             target_annotations: None,
             panel_target_ids: std::cell::RefCell::new(BTreeMap::new()),
             next_panel_target_raw: std::cell::Cell::new(0),
@@ -2916,9 +2943,24 @@ impl Runtime {
             }
         };
         self.presentation_overlay = overlay;
+        if self.presentation_overlay.is_none() {
+            self.presentation_overlay_paint = None;
+        }
         if changed {
             self.pending_full_redraw = true;
         }
+    }
+
+    /// Paint accounting of the last presented presentation-only surface
+    /// (issue #2849).
+    ///
+    /// Records the view the surface was drawn over, the rows and UTF-8 bytes
+    /// admitted under the band-like budget, and whether the tail was dropped.
+    /// `None` when the last frame painted no presentation surface, so a
+    /// cleared session leaves no accounting residue.
+    #[must_use]
+    pub fn presentation_overlay_paint(&self) -> Option<PresentationPaint> {
+        self.presentation_overlay_paint
     }
 
     /// Present-time target annotation batch (W-29 successor, issue #2253).

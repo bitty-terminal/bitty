@@ -352,6 +352,10 @@ pub const CLOSED_CAPABILITY_HEADS: &[&str] = &[
     "ui.rich",
     "ui.overlay",
     "ui.overlay.focus",
+    // Issue #2849: draw a non-focusable presentation surface above the
+    // focused view. Separate from the `overlay`-slot mount head and from the
+    // capture head, so draw authority never becomes input authority.
+    "ui.present",
     "ui.protocol-register",
     "clipboard.read",
     "clipboard.write",

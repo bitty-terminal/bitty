@@ -3049,6 +3049,20 @@ impl Runtime {
         self.focus.focused()
     }
 
+    /// Whether `view` is still a live attach point of this window
+    /// (issue #2849).
+    ///
+    /// True for a layout leaf, a pinned leaf, or a detached float: exactly the
+    /// set [`Self::set_focus`] accepts as a focus target. A closed view is
+    /// false, so a presentation surface bound to it reports a bounded
+    /// `view-closed` dismissal instead of repainting over a survivor.
+    #[must_use]
+    pub fn is_live_view(&self, view: ViewId) -> bool {
+        self.layout.leaf_ids().contains(&view)
+            || self.pinned.contains(view)
+            || self.floats.contains(view)
+    }
+
     /// Sets focus to `id` when it exists in the current layout; otherwise
     /// leaves focus unchanged and returns `false`.
     ///

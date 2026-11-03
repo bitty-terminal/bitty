@@ -49,6 +49,49 @@ fn surface_retry_delay(failures: u32) -> std::time::Duration {
 /// keeps its own fail-open rule (it holds the keyboard while up).
 pub(super) const PRESENTATION_OVERLAY_MIN_COLS: u16 = 10;
 
+/// Maximum rows one presentation overlay admits into a frame (issue #2849).
+///
+/// The surface is accounted like a chrome band: the row stack is capped, the
+/// tail is dropped deterministically, and the drop is reported through
+/// [`Runtime::presentation_overlay_paint`](super::Runtime::presentation_overlay_paint)
+/// rather than silently painting past the budget. The capture surface keeps
+/// its own pre-existing unbounded-row behavior.
+pub(super) const PRESENTATION_OVERLAY_MAX_ROWS: usize = 64;
+
+/// Maximum UTF-8 bytes of admitted row text in one presentation overlay frame
+/// (issue #2849).
+///
+/// Same accounting rule as the row cap: the bound is applied at admit time,
+/// whole trailing rows are dropped once it is reached, and the first row is
+/// always kept so a single over-long row clips horizontally instead of
+/// vanishing.
+pub(super) const PRESENTATION_OVERLAY_MAX_BYTES: usize = 16 * 1024;
+
+/// Row budget applied to one overlay paint pass.
+///
+/// `max_rows == 0` and `max_bytes == 0` disable both caps: the focusable
+/// capture surface keeps its historical unbounded row stack, while the
+/// presentation surface always passes the two constants above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OverlayRowBudget {
+    max_rows: usize,
+    max_bytes: usize,
+}
+
+impl OverlayRowBudget {
+    /// No caps (the capture surface's pre-existing behavior).
+    const UNBOUNDED: Self = Self {
+        max_rows: 0,
+        max_bytes: 0,
+    };
+
+    /// The presentation surface's band-like budget (issue #2849).
+    const PRESENTATION: Self = Self {
+        max_rows: PRESENTATION_OVERLAY_MAX_ROWS,
+        max_bytes: PRESENTATION_OVERLAY_MAX_BYTES,
+    };
+}
+
 /// Deterministic headless rasterizer: no font stack required, bit-identical
 /// on every platform and on both Linux and Windows CI.
 ///
@@ -5629,7 +5672,16 @@ impl Runtime {
         } else {
             bitty_render::chrome::ChromeState::Focused
         };
-        self.paint_overlay_surface(&overlay, anchor, 0, state, allocations, pad_px, layers);
+        self.paint_overlay_surface(
+            &overlay,
+            anchor,
+            0,
+            state,
+            allocations,
+            pad_px,
+            layers,
+            OverlayRowBudget::UNBOUNDED,
+        );
     }
 
     /// Presentation-only overlay surface (CTX-1431, `bitty` #2406).
@@ -5648,9 +5700,13 @@ impl Runtime {
         layers: &mut FrameLayers,
     ) {
         let Some(overlay) = self.presentation_overlay.clone() else {
+            self.presentation_overlay_paint = None;
             return;
         };
-        self.paint_overlay_surface(
+        // Issue #2849: the surface is accounted like a chrome band — a
+        // bounded row/byte budget, a deterministic dropped tail, and a
+        // recorded per-frame accounting record.
+        self.presentation_overlay_paint = self.paint_overlay_surface(
             &overlay,
             None,
             PRESENTATION_OVERLAY_MIN_COLS,
@@ -5658,6 +5714,7 @@ impl Runtime {
             allocations,
             pad_px,
             layers,
+            OverlayRowBudget::PRESENTATION,
         );
     }
 
@@ -5667,7 +5724,10 @@ impl Runtime {
     /// `anchor` is the hover-band placement used by the non-modal tooltip
     /// path (`None` = centered). `min_frame_cols` refuses a frame too narrow
     /// for the surface's legibility rule; `0` keeps the capture modal's
-    /// pre-existing fail-open chrome.
+    /// pre-existing fail-open chrome. `budget` caps the admitted row stack and
+    /// returns the accounting record for the presentation surface (issue
+    /// #2849); [`OverlayRowBudget::UNBOUNDED`] keeps the capture surface's
+    /// historical behavior and reports no accounting.
     #[allow(clippy::too_many_arguments)]
     fn paint_overlay_surface(
         &mut self,
@@ -5678,22 +5738,22 @@ impl Runtime {
         allocations: &[layout_focus::PresentFrame],
         pad_px: i32,
         layers: &mut FrameLayers,
-    ) {
+        budget: OverlayRowBudget,
+    ) -> Option<PresentationPaint> {
         let rows = Self::overlay_scene_rows(&overlay.root);
+        let (rows, truncated) = Self::bounded_overlay_rows(rows, budget);
         let live = self.live_cell_metrics();
         if live.width == 0 || live.height == 0 {
-            return;
+            return None;
         }
         let frame = self
             .focused_view()
             .and_then(|view| allocations.iter().find(|frame| frame.view == view))
-            .or_else(|| allocations.first());
-        let Some(frame) = frame else {
-            return;
-        };
+            .or_else(|| allocations.first())?;
         if frame.rows == 0 || frame.cols == 0 || frame.cols < min_frame_cols {
-            return;
+            return None;
         }
+        let painted_view = frame.view;
         let full_w = px_span(frame.cols, live.width);
         // Issue #2411: a hover-anchored tooltip places the row stack just
         // below a top band / just above a bottom band, horizontally centered
@@ -5792,7 +5852,7 @@ impl Runtime {
             painted_rows.push((index, pill));
         }
         if painted_rows.is_empty() {
-            return;
+            return None;
         }
         let clip_rect = match anchored {
             Some(_) => bitty_render::geometry::RectPx::new(
@@ -5841,6 +5901,42 @@ impl Runtime {
             layers.combined_overlay_rounded.push(ring);
         }
         layers.any_needs_draw = true;
+        Some(PresentationPaint {
+            view: painted_view,
+            rows: rows.len(),
+            bytes: rows
+                .iter()
+                .map(|row| row.text.len())
+                .fold(0usize, usize::saturating_add),
+            truncated,
+        })
+    }
+
+    /// Apply a row/byte budget to an overlay row stack (issue #2849).
+    ///
+    /// Deterministic prefix admission: trailing whole rows are dropped once
+    /// either cap is reached, and the first row is always kept so an
+    /// over-long single row clips horizontally instead of disappearing. A
+    /// `zero` cap disables that dimension, so the capture surface's
+    /// [`OverlayRowBudget::UNBOUNDED`] pass is byte-identical to before.
+    fn bounded_overlay_rows(
+        rows: Vec<OverlayRow>,
+        budget: OverlayRowBudget,
+    ) -> (Vec<OverlayRow>, bool) {
+        let mut admitted = Vec::with_capacity(rows.len().min(budget.max_rows.max(1)));
+        let mut bytes = 0usize;
+        for (index, row) in rows.into_iter().enumerate() {
+            let over_rows = budget.max_rows != 0 && index >= budget.max_rows;
+            let over_bytes = budget.max_bytes != 0
+                && index > 0
+                && bytes.saturating_add(row.text.len()) > budget.max_bytes;
+            if over_rows || over_bytes {
+                return (admitted, true);
+            }
+            bytes = bytes.saturating_add(row.text.len());
+            admitted.push(row);
+        }
+        (admitted, false)
     }
 
     /// Resolves one overlay row's pill geometry without painting (CTX-1477).
@@ -7828,7 +7924,10 @@ mod present_origin_tests {
 
 #[cfg(test)]
 mod plugin_overlay_paint_tests {
-    use super::{FrameLayers, PRESENTATION_OVERLAY_MIN_COLS, centered_tooltip_x};
+    use super::{
+        FrameLayers, PRESENTATION_OVERLAY_MAX_BYTES, PRESENTATION_OVERLAY_MAX_ROWS,
+        PRESENTATION_OVERLAY_MIN_COLS, centered_tooltip_x,
+    };
     use crate::runtime::layout_focus::PresentFrame;
     use crate::runtime::{BandContent, Runtime, RuntimeConfig};
     use crate::{BandEdge, BandOverlayAnchor, ChromeBands};
@@ -8884,6 +8983,99 @@ mod plugin_overlay_paint_tests {
                 "no row paints past the focused frame"
             );
         }
+    }
+
+    #[test]
+    fn presentation_overlay_row_budget_drops_the_tail_and_reports_it() {
+        // Issue #2849: the surface is accounted like a chrome band. A scene
+        // with more rows than the budget admits paints only the bounded
+        // prefix and records the drop instead of painting past the budget.
+        let many: Vec<String> = (0..144).map(|index| format!("row {index}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let mut rt = runtime();
+        rt.set_presentation_overlay(Some(surface_with_rows(&refs)));
+        let frame = frame_for(1, 8, 80, 60);
+        rt.focus_mut().set(frame.view);
+        let mut layers = FrameLayers::default();
+        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        let paint = rt
+            .presentation_overlay_paint()
+            .expect("a painted surface records its accounting");
+        assert_eq!(paint.view, frame.view, "accounting names the view");
+        assert_eq!(
+            paint.rows, PRESENTATION_OVERLAY_MAX_ROWS,
+            "the row budget caps the admitted stack"
+        );
+        assert!(paint.truncated, "the dropped tail is reported");
+        assert!(
+            !layers.combined_overlay_content.is_empty()
+                && layers.combined_overlay_content.len() <= PRESENTATION_OVERLAY_MAX_ROWS,
+            "the frame carries at most the admitted rows"
+        );
+        assert!(paint.bytes <= PRESENTATION_OVERLAY_MAX_BYTES);
+    }
+
+    #[test]
+    fn presentation_overlay_byte_budget_drops_whole_tail_rows() {
+        // The byte cap is applied at admit time: whole trailing rows are
+        // dropped and the first row is always kept, so a single over-long row
+        // clips horizontally instead of vanishing.
+        let wide = "y".repeat(PRESENTATION_OVERLAY_MAX_BYTES + 64);
+        let mut rt = runtime();
+        rt.set_presentation_overlay(Some(surface_with_rows(&[&wide, "after"])));
+        let frame = frame_for(1, 8, 40, 20);
+        rt.focus_mut().set(frame.view);
+        let mut layers = FrameLayers::default();
+        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        let paint = rt.presentation_overlay_paint().expect("accounted");
+        assert_eq!(paint.rows, 1, "the over-budget tail row is dropped");
+        assert!(paint.truncated, "the drop is reported");
+        assert_eq!(
+            layers.combined_overlay_content.len(),
+            1,
+            "only the first row paints"
+        );
+    }
+
+    #[test]
+    fn presentation_overlay_paint_clears_with_the_surface() {
+        // Accounting never outlives its surface: a cleared session leaves no
+        // record for the next frame to attribute.
+        let mut rt = runtime();
+        rt.set_presentation_overlay(Some(surface_with_text("panel")));
+        let frame = frame_for(1, 8, 40, 20);
+        rt.focus_mut().set(frame.view);
+        let mut layers = FrameLayers::default();
+        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        assert!(rt.presentation_overlay_paint().is_some());
+        rt.set_presentation_overlay(None);
+        assert!(
+            rt.presentation_overlay_paint().is_none(),
+            "a cleared surface clears its accounting"
+        );
+        let mut layers = FrameLayers::default();
+        rt.paint_presentation_overlay(&[frame], 8, &mut layers);
+        assert!(rt.presentation_overlay_paint().is_none());
+        assert!(!layers.any_needs_draw, "no surface paints nothing");
+    }
+
+    #[test]
+    fn presentation_overlay_never_moves_focus_or_claims_capture() {
+        // Issue #2849: drawing above the focused view is paint-only. The
+        // focus ring is unchanged and no capture session starts.
+        let mut rt = runtime();
+        let first = frame_for(1, 8, 40, 20);
+        let second = frame_for(2, 400, 40, 20);
+        rt.focus_mut().set(second.view);
+        rt.set_presentation_overlay(Some(surface_with_text("panel")));
+        let mut layers = FrameLayers::default();
+        rt.paint_presentation_overlay(&[first, second], 8, &mut layers);
+        assert_eq!(
+            rt.focused_view(),
+            Some(second.view),
+            "painting a presentation surface never changes focus"
+        );
+        assert!(rt.presentation_overlay_paint().is_some());
     }
 }
 

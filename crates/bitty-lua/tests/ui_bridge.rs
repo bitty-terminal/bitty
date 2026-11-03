@@ -766,6 +766,51 @@ fn overlay_presentation_show_hide_round_trips_through_host() {
     );
 }
 
+/// Issue #2849: `bitty.ui.present.show` / `hide` are the named
+/// presentation-only verbs. They route to the same host boundary as the
+/// `bitty.ui.overlay` aliases, never claim capture, and reject a non-integer
+/// handle with the accepted component-invalid diagnostic.
+#[test]
+fn present_namespace_show_hide_round_trips_through_host() {
+    let services = Rc::new(UiServices::default());
+    let mut vm = gate_vm("present-namespace");
+    install(&mut vm, services.clone(), 50);
+    run(
+        &mut vm,
+        r#"
+        bitty.store.set("present_type", type(bitty.ui.present))
+        local shown = bitty.ui.present.show(31)
+        local hidden = bitty.ui.present.hide(31)
+        bitty.store.set("present_shown", shown)
+        bitty.store.set("present_hidden", hidden)
+        local show_ok, show_err = pcall(bitty.ui.present.show, "31")
+        bitty.store.set("present_show_code", show_ok and "NONE" or show_err.code)
+    "#,
+    );
+    assert_eq!(
+        stored(&services, "present_type"),
+        Some(LuaValue::String("table".to_string()))
+    );
+    assert_eq!(
+        stored(&services, "present_shown"),
+        Some(LuaValue::Bool(true))
+    );
+    assert_eq!(
+        stored(&services, "present_hidden"),
+        Some(LuaValue::Bool(false))
+    );
+    assert_eq!(services.overlay_shows.borrow().as_slice(), &[31]);
+    assert_eq!(services.overlay_hides.borrow().as_slice(), &[31]);
+    assert_eq!(
+        stored(&services, "present_show_code"),
+        Some(LuaValue::String("E_UI_COMPONENT_INVALID".to_string()))
+    );
+    assert!(
+        services.overlay_acquires.borrow().is_empty(),
+        "the presentation namespace never claims input capture"
+    );
+}
+
 /// CTX-0941: spec acquire mounts the surface from presentation hints and
 /// returns the session handle; unknown fields are ignored.
 #[test]

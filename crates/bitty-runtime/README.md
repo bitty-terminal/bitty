@@ -128,6 +128,27 @@ so a full queue closes the lease with `TerminalEventLost` rather than shedding
 it. A failed or refused detach still removes the local binding; the refusal is
 returned in the release receipt, so no local lease record leaks.
 
+## Presentation-only overlay surface (issue #2849)
+
+A granted plugin can draw one bounded panel above the focused view without
+gaining any input authority. The mechanism spans `bitty-lua` (Lua verbs and the
+`ui.present` gate) and this crate (`plugin_runtime::presentation_overlay`,
+`Runtime` paint accounting); the canonical contracts remain in
+`bitty-terminal-docs` (`overlay-ownership-reconciliation.md`,
+`help-overlay-ownership-design.md`).
+
+| Property         | Behavior                                                                                                                                                                                                                                                                                                           |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Grant            | `ui.present` alone gates drawing. `ui.rich` + `ui.overlay` mount the block, `ui.overlay.focus` captures input; none of the three implies another and `ui.present` never implies capture. `E_UI_ALREADY_CAPTURED` is unchanged.                                                                                     |
+| Placement        | Painted above the focused view's content and above chrome bands, below the focusable capture surface. Centered on the focused view, clipped to that view's content rect.                                                                                                                                           |
+| Admission        | One surface per window per generation, admitted as `OverlayKind::NonModal` on `OverlayTier::Popup`; a second plugin's show fails closed with `E_UI_UNAVAILABLE`. `modal_active` stays false.                                                                                                                       |
+| Focus-follow     | `PluginRuntime::observe_presentation_focus` runs once per cold tick: it binds the surface to the focused view, re-binds on a focus switch, and drops it with one `view-closed` `overlay.dismissed` observation when the bound view closes.                                                                         |
+| Budget           | `PRESENTATION_OVERLAY_MAX_ROWS` (64) and `PRESENTATION_OVERLAY_MAX_BYTES` (16 KiB) per frame, applied like a chrome band: deterministic prefix admission, whole trailing rows dropped, drop reported. `Runtime::presentation_overlay_paint` records the view, rows, bytes, and truncation flag for the last frame. |
+| Dismissal        | `Esc` dismisses without consuming the press; a coincident confirmation gate keeps its consume. The observation is queued and delivered on the cold tick, never on the input path.                                                                                                                                  |
+| Teardown         | `hide` is idempotent; suspend, unload, disable, crash, rollback, and generation change drop the surface with no residue. A revoked generation's next present paints nothing.                                                                                                                                       |
+| Safe mode        | No plugin generation exists, so no surface exists. A generation that reaches the host under safe policy is refused with `E_UI_UNAVAILABLE` before admission.                                                                                                                                                       |
+| No content reads | The surface carries only what the plugin mounted; nothing here reads grid, scrollback, clipboard, or terminal text.                                                                                                                                                                                                |
+
 ## Layout
 
 - `Cargo.toml` — package metadata and workspace-internal dependencies.

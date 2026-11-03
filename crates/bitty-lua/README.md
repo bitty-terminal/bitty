@@ -40,6 +40,38 @@ the determinism contract are documented in `src/lib.rs`.
 - There is no `mlua` dependency anywhere, so no VM type conflict can arise
   (`src/lib.rs` documents the `phodopus::Lua` boundary).
 
+## Lua surface: presentation overlay (issue #2849)
+
+```lua
+local handle, err = bitty.ui.mount("overlay", scene)   -- needs ui.rich + ui.overlay
+local shown, err = bitty.ui.present.show(handle)        -- needs ui.present
+local hidden, err = bitty.ui.present.hide(handle)       -- idempotent, ungated
+```
+
+The surface is non-modal and paint-only: it draws above the focused view,
+never receives key or pointer events, never takes focus, and never changes the
+focus ring. Core owns geometry, clipping, stacking, the frame budget, and
+teardown; the plugin owns only the scene.
+
+| Item         | Contract                                                                                                                                                                                                                                                                                                 |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `show`       | Argument: an integer block handle this generation mounted into the `overlay` slot. Returns `true` on success and `false` only where documented by the host.                                                                                                                                              |
+| `hide`       | Argument: the same handle. Idempotent: `false` means "nothing of mine was live", never an error. Cleanup stays ungated so a revoked grant can still remove the surface.                                                                                                                                  |
+| Grants       | `ui.present` alone authorizes drawing. `ui.rich` + `ui.overlay` are needed to mount the block; `ui.overlay.focus` is required only for the focusable capture overlay and is neither implied by nor implied from `ui.present`.                                                                            |
+| Admission    | One surface per window per generation; a second plugin's `show` fails closed with `E_UI_UNAVAILABLE`. Never sets the modal authority.                                                                                                                                                                    |
+| Budget       | Bounded like a chrome band: at most 64 rows and 16 KiB of row text per frame, plus the v1 scene budgets enforced at mount. The trailing rows are dropped and the drop is reported, never silently painted.                                                                                               |
+| Focus-follow | The surface tracks the focused view. A focus switch re-centers it; closing the view it was drawn over removes it.                                                                                                                                                                                        |
+| Dismissal    | `Esc` dismisses it without consuming the press (a real confirmation gate keeps its consume). The owner observes one `overlay.dismissed` event with `{ owner, handle, reason }` where `reason` is `"escape"` or `"view-closed"`; delivery is queued to the cold tick, never a callback on the input path. |
+| Errors       | `E_CAPABILITY_DENIED` (missing `ui.present`), `E_UI_UNAVAILABLE` (safe mode, no host surface, or a second plugin's admission), `E_UI_NOT_OWNER` (a handle this generation did not mount into the `overlay` slot), `E_UI_COMPONENT_INVALID` (a non-integer handle), `E_TIMEOUT` (call deadline).          |
+| Lifecycle    | Suspend, unload, disable, crash, rollback, and generation change drop the surface and release its admitted slot; a stale generation's next present paints nothing.                                                                                                                                       |
+| Safe mode    | No plugin VM exists, so no surface exists. A generation that reaches the host under safe policy is refused with `E_UI_UNAVAILABLE`.                                                                                                                                                                      |
+
+`bitty.ui.overlay.show` and `bitty.ui.overlay.hide` remain as the CTX-1431
+spelling of the same session; they are gated by `ui.present` as well, so
+neither spelling can gain input authority. The focusable capture surface
+(`bitty.ui.overlay.acquire`, `update`, `poll`, `release`) and its
+`E_UI_ALREADY_CAPTURED` single-owner contract are unchanged.
+
 ## Evidence
 
 - `tests/readiness_mirror.rs` (RUN-29) mirrors the Phodopus executable gate

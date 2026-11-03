@@ -110,10 +110,15 @@ struct Fixture {
 
 impl Fixture {
     fn new(tag: &str) -> Self {
+        Self::with_safe_mode(tag, false)
+    }
+
+    /// A fixture with an explicit safe-mode flag (issue #2849 absence test).
+    fn with_safe_mode(tag: &str, safe_mode: bool) -> Self {
         let root = temp_dir(&format!("{tag}-root"));
         let data = temp_dir(&format!("{tag}-data"));
         let runtime = PluginRuntime::new(PluginRuntimeConfig {
-            safe_mode: false,
+            safe_mode,
             data_dir: Some(data.clone()),
             store_root: None,
             bundled_roots: Vec::new(),
@@ -159,12 +164,16 @@ impl Drop for Fixture {
 
 const V1_GRANTS: &[&str] = &["ui.rich", "ui.overlay"];
 
+/// Issue #2849: mounting into the `overlay` slot plus the dedicated
+/// presentation grant. `ui.overlay` still mounts; `ui.present` draws.
+const PRESENT_GRANTS: &[&str] = &["ui.rich", "ui.overlay", "ui.present"];
+
 /// A v1 mount owner can present and hide its own panel with no capture grant,
 /// no capture session, and no modal authority.
 #[test]
 fn show_and_hide_present_without_capture() {
     let mut fixture = Fixture::new("lifecycle");
-    write_plugin(&fixture.root, "acme.help", V1_GRANTS, "overlay");
+    write_plugin(&fixture.root, "acme.help", PRESENT_GRANTS, "overlay");
     fixture.runtime.discover();
     let id = fixture.activate("acme.help");
     let handle = fixture.handle(&id);
@@ -218,8 +227,8 @@ fn show_and_hide_present_without_capture() {
 #[test]
 fn one_presentation_surface_per_window() {
     let mut fixture = Fixture::new("one-surface");
-    write_plugin(&fixture.root, "acme.help", V1_GRANTS, "overlay");
-    write_plugin(&fixture.root, "acme.other", V1_GRANTS, "overlay");
+    write_plugin(&fixture.root, "acme.help", PRESENT_GRANTS, "overlay");
+    write_plugin(&fixture.root, "acme.other", PRESENT_GRANTS, "overlay");
     fixture.runtime.discover();
     let owner = fixture.activate("acme.help");
     let other = fixture.activate("acme.other");
@@ -277,31 +286,48 @@ fn one_presentation_surface_per_window() {
     assert!(owner_services.ui_overlay_hide(replacement).expect("hide"));
 }
 
-/// The presentation path requires the two v1 mount grants and never accepts a
-/// non-`overlay` handle.
+/// The presentation path requires the dedicated `ui.present` grant and never
+/// accepts a non-`overlay` handle. `ui.overlay` mounts, `ui.present` draws,
+/// `ui.overlay.focus` captures, and no head implies another.
 #[test]
-fn show_requires_v1_grants_and_an_overlay_handle() {
+fn show_requires_present_grant_and_an_overlay_handle() {
     let mut fixture = Fixture::new("grants");
     write_plugin(&fixture.root, "acme.richonly", &["ui.rich"], "overlay");
-    write_plugin(&fixture.root, "acme.top", V1_GRANTS, "top");
-    write_plugin(&fixture.root, "acme.overlay", V1_GRANTS, "overlay");
+    write_plugin(&fixture.root, "acme.top", PRESENT_GRANTS, "top");
+    write_plugin(&fixture.root, "acme.mountonly", V1_GRANTS, "overlay");
+    write_plugin(&fixture.root, "acme.overlay", PRESENT_GRANTS, "overlay");
     fixture.runtime.discover();
     let rich_only = fixture.activate("acme.richonly");
     let top = fixture.activate("acme.top");
+    let mount_only = fixture.activate("acme.mountonly");
     let overlay = fixture.activate("acme.overlay");
 
-    // Without `ui.overlay` the mount already failed, so the show gate is
-    // probed directly: the capability denial precedes any handle inspection.
+    // Without `ui.present` the mount succeeds but the draw is denied, and the
+    // denial names the presentation head rather than a mount or capture head.
     let error = fixture
         .runtime
         .services(&rich_only)
         .expect("services")
         .ui_overlay_show(1)
-        .expect_err("missing ui.overlay must deny");
+        .expect_err("missing ui.present must deny");
     assert_eq!(error.code, "E_CAPABILITY_DENIED");
-    assert!(error.message.contains("ui.overlay"), "{}", error.message);
+    assert!(error.message.contains("ui.present"), "{}", error.message);
 
-    // A retained `top` block is not presentable.
+    let mount_only_handle = fixture.handle(&mount_only);
+    let error = fixture
+        .runtime
+        .services(&mount_only)
+        .expect("services")
+        .ui_overlay_show(mount_only_handle)
+        .expect_err("ui.rich + ui.overlay never imply ui.present");
+    assert_eq!(error.code, "E_CAPABILITY_DENIED");
+    assert!(error.message.contains("ui.present"), "{}", error.message);
+    assert!(
+        !fixture.runtime.presentation_overlay().borrow().is_active(),
+        "a denied draw admits no surface"
+    );
+
+    // A retained `top` block is not presentable even with the draw grant.
     let top_handle = fixture.handle(&top);
     let error = fixture
         .runtime
@@ -311,14 +337,14 @@ fn show_requires_v1_grants_and_an_overlay_handle() {
         .expect_err("non-overlay handle must fail closed");
     assert_eq!(error.code, "E_UI_NOT_OWNER");
 
-    // `ui.overlay.focus` is neither required nor implied: the v1 owner shows.
+    // `ui.overlay.focus` is neither required nor implied: the draw grant shows.
     assert!(
         fixture
             .runtime
             .services(&overlay)
             .expect("services")
             .ui_overlay_show(fixture.handle(&overlay))
-            .expect("v1 grants are sufficient")
+            .expect("ui.present is sufficient to draw")
     );
     assert!(!fixture.runtime.overlay_capture().borrow().is_active());
 }
@@ -328,7 +354,7 @@ fn show_requires_v1_grants_and_an_overlay_handle() {
 #[test]
 fn escape_and_teardown_clear_the_surface() {
     let mut fixture = Fixture::new("escape");
-    write_plugin(&fixture.root, "acme.help", V1_GRANTS, "overlay");
+    write_plugin(&fixture.root, "acme.help", PRESENT_GRANTS, "overlay");
     fixture.runtime.discover();
     let id = fixture.activate("acme.help");
     let handle = fixture.handle(&id);
@@ -370,7 +396,7 @@ fn escape_and_teardown_clear_the_surface() {
 #[test]
 fn dispose_and_generation_change_drop_the_surface() {
     let mut fixture = Fixture::new("teardown");
-    write_plugin(&fixture.root, "acme.help", V1_GRANTS, "overlay");
+    write_plugin(&fixture.root, "acme.help", PRESENT_GRANTS, "overlay");
     fixture.runtime.discover();
     let id = fixture.activate("acme.help");
     let first = fixture.handle(&id);
@@ -408,5 +434,109 @@ fn dispose_and_generation_change_drop_the_surface() {
     assert_eq!(
         fixture.runtime.presentation_overlay_session(),
         Some((String::from("acme.help"), second))
+    );
+}
+
+/// Issue #2849 focus-follow: the surface binds to the focused view, follows a
+/// focus switch, and drops with one `view-closed` observation when the view it
+/// was drawn over closes.
+#[test]
+fn focus_follow_binds_follows_and_drops_on_view_close() {
+    let mut fixture = Fixture::new("follow");
+    write_plugin(&fixture.root, "acme.help", PRESENT_GRANTS, "overlay");
+    fixture.runtime.discover();
+    let id = fixture.activate("acme.help");
+    let handle = fixture.handle(&id);
+    let services = fixture.runtime.services(&id).expect("services").clone();
+    assert!(services.ui_overlay_show(handle).expect("show"));
+
+    let first = bitty_ui::ViewId::new(1);
+    let second = bitty_ui::ViewId::new(2);
+    assert!(
+        fixture
+            .runtime
+            .observe_presentation_focus(Some(first), |_| true)
+            .is_none(),
+        "binding is not a dismissal"
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .presentation_overlay()
+            .borrow()
+            .session_view(),
+        Some(first)
+    );
+    assert!(
+        fixture
+            .runtime
+            .observe_presentation_focus(Some(second), |_| true)
+            .is_none()
+    );
+    assert_eq!(
+        fixture
+            .runtime
+            .presentation_overlay()
+            .borrow()
+            .session_view(),
+        Some(second),
+        "a focus switch re-binds without dismissing"
+    );
+    assert!(fixture.runtime.presentation_overlay().borrow().is_active());
+    assert!(fixture.runtime.drain_overlay_dismissed().is_empty());
+
+    // The bound view closes: one bounded observation, no surface, slot free.
+    let event = fixture
+        .runtime
+        .observe_presentation_focus(Some(second), |view| view != second)
+        .expect("a closed view dismisses the surface");
+    assert_eq!(event.owner, "acme.help");
+    assert_eq!(event.handle, handle);
+    assert_eq!(event.reason, "view-closed");
+    assert!(!fixture.runtime.presentation_overlay().borrow().is_active());
+    assert_eq!(
+        fixture
+            .runtime
+            .presentation_overlay()
+            .borrow()
+            .admitted_slots(),
+        0
+    );
+    let queued = fixture.runtime.drain_overlay_dismissed();
+    assert_eq!(queued.len(), 1, "exactly one observation is queued");
+    assert_eq!(queued[0].reason, "view-closed");
+}
+
+/// Issue #2849 safe mode: with plugins disabled there is no presentation
+/// surface at all, because no generation is admitted to ask for one.
+#[test]
+fn safe_mode_draws_no_presentation_surface() {
+    let mut fixture = Fixture::with_safe_mode("safe", true);
+    write_plugin(&fixture.root, "acme.help", PRESENT_GRANTS, "overlay");
+    fixture.runtime.discover();
+    let id = PluginId::new("acme.help").expect("valid id");
+    let report = fixture.runtime.activate(&id).expect("activate");
+    assert_ne!(
+        report.state,
+        LifecycleState::Active,
+        "safe mode admits no plugin generation"
+    );
+    assert!(
+        fixture.runtime.services(&id).is_none(),
+        "no generation means no host surface to present through"
+    );
+    assert_eq!(
+        fixture.runtime.presentation_overlay_session(),
+        None,
+        "safe mode draws no presentation overlay"
+    );
+    assert!(!fixture.runtime.presentation_overlay().borrow().is_active());
+    assert_eq!(
+        fixture
+            .runtime
+            .presentation_overlay()
+            .borrow()
+            .admitted_slots(),
+        0
     );
 }

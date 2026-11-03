@@ -875,7 +875,7 @@ pub(crate) struct TerminalApp {
     /// Release builds start it by default; debug builds start it only with an
     /// explicit enable value, and `BITTY_HANG_WATCHDOG=0` disables it
     /// everywhere. Both constructors ([`Self::with_theme`] for real sessions,
-    /// and the test-only [`Self::with_demo_pump`]) obtain it from
+    /// and the test-only `Self::with_demo_pump`) obtain it from
     /// [`StallWatchdog::from_env`], so a headless or test-mode invocation that
     /// never constructs this app starts no monitor and installs no `SIGUSR1`
     /// handler. Phase marks are observability only: they never alter routing,

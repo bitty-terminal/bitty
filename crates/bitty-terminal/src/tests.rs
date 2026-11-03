@@ -17590,3 +17590,56 @@ fn presentation_overlay_update_and_unload_teardown() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&data);
 }
+
+// ---------------------------------------------------------------------------
+// bitty#2859: opt-in idle-RSS attribution dump
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_memory_report_dump_writes_once_per_armed_interval() {
+    use crate::memory_report::MemoryReportDump;
+
+    let maps =
+        bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default()).expect("defaults");
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        maps,
+        SpawnSpec::default(),
+    );
+    let root = std::env::temp_dir().join(format!("bitty-memory-report-app-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    // The test constructor reads the real environment; arm the dump
+    // explicitly so the test never depends on the host's env.
+    app.memory_report = Some(
+        MemoryReportDump::from_parts(Some("30"), Some(root.clone()), std::time::Instant::now())
+            .expect("armed dump"),
+    );
+    app.memory_report_failed = false;
+
+    app.maybe_write_memory_report();
+    let path = root.join(format!("memory-report-{}.txt", std::process::id()));
+    let text = std::fs::read_to_string(&path).expect("the armed dump writes a report");
+    assert!(text.contains("bitty memory attribution"));
+    assert!(text.contains("glyph-atlas"));
+    assert!(text.contains("scrollback"));
+    assert!(text.contains("unattributed"));
+
+    // Second call inside the interval must not write again: removing the file
+    // makes a stray rewrite observable.
+    std::fs::remove_file(&path).expect("remove report");
+    app.maybe_write_memory_report();
+    assert!(
+        !path.exists(),
+        "a report must not be rewritten before its interval elapses"
+    );
+
+    // A disabled session never writes at all.
+    app.memory_report = None;
+    app.maybe_write_memory_report();
+    assert!(!path.exists(), "an unarmed dump writes nothing");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

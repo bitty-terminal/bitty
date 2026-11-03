@@ -714,6 +714,12 @@ longrun-soak-test:
 # driver owns its budget, so nextest's slow-timeout must not kill an
 # hours-long owner campaign. Set `BITTY_SOAK_EVIDENCE_DIR` to keep the series
 # as files.
+#
+# The same recipe also runs the idle-baseline scenario (bitty#2859): one
+# window, `BITTY_SOAK_IDLE_PANES` panes (default 4), no input, sampled on real
+# wall clock at the 1/5/30-minute marks of a nominal 30-minute window scaled by
+# the same budget, with one full memory-attribution report per mark. It adds
+# one budget-length leg to the run; set `BITTY_SOAK_CAMPAIGN_SECS` accordingly.
 soak-campaign secs="120":
     #!/usr/bin/env bash
     set -euo pipefail

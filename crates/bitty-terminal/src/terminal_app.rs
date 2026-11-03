@@ -4569,7 +4569,7 @@ fn log_occlusion_awareness_once() {
         return;
     }
     eprintln!(
-        "bitty: [issue #2570 triage] Wayland session: the vendored winit 0.30.13 carries the upstream #4710 backport, so the surface-visibility gate consumes native `Occluded` edges from the xdg-shell v6 `suspended` state (observed on Hyprland 0.56.2 during a workspace switch-away); compositors that never set `suspended` fall back to the synthetic redraw-starvation probe, which stays silent when the compositor keeps serving frame callbacks to a suspended surface; transition lines need --log-level info (or BITTY_LOG=info), and set BITTY_STALL_WATCHDOG=1 to capture the next stall with thread and surface evidence"
+        "bitty: [issue #2570 triage] Wayland session: the vendored winit 0.30.13 carries the upstream #4710 backport, so the surface-visibility gate consumes native `Occluded` edges from the xdg-shell v6 `suspended` state (observed on Hyprland 0.56.2 during a workspace switch-away); compositors that never set `suspended` fall back to the synthetic redraw-starvation probe, which stays silent when the compositor keeps serving frame callbacks to a suspended surface; transition lines need --log-level info (or BITTY_LOG=info), and set BITTY_HANG_WATCHDOG=1 to capture the next stall with thread and surface evidence"
     );
 }
 

@@ -757,6 +757,12 @@ pub struct Runtime {
     /// workspace; the live `layout`/`focus` above mirror the active slot.
     /// At least one slot always exists; see `runtime::workspaces`.
     workspaces: Vec<WorkspaceSlot>,
+    /// Next slot `WorkspaceId` raw value (OQ-084 B-2).
+    ///
+    /// Monotonic and never reused: a closed workspace's id is not handed to a
+    /// later slot, so a stale panel attribution cannot land in a live bucket.
+    /// [`Runtime::mint_workspace_id`] is the only writer.
+    next_workspace_id_raw: u64,
     /// Active workspace index into `workspaces` (display is 1-based).
     active_workspace: usize,
     /// MRU workspace indices, active fronted, each live index exactly once.
@@ -2241,6 +2247,7 @@ impl Runtime {
             background_rasters: bitty_rich::BackgroundRasterCache::new(),
             retained_backgrounds: None,
             workspaces: Vec::new(),
+            next_workspace_id_raw: 1,
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
             scratchpad: ScratchpadSlot::new(),
@@ -2547,6 +2554,7 @@ impl Runtime {
             background_rasters: bitty_rich::BackgroundRasterCache::new(),
             retained_backgrounds: None,
             workspaces: Vec::new(),
+            next_workspace_id_raw: 1,
             active_workspace: 0,
             workspace_mru: std::collections::VecDeque::new(),
             scratchpad: ScratchpadSlot::new(),

@@ -6,6 +6,8 @@
 
 use super::*;
 
+use std::collections::BTreeMap;
+
 // ---------------------------------------------------------------------------
 // Panel Runtime domain (CTX-0102) — generic Panel Runtime per 9032d1e
 // ---------------------------------------------------------------------------
@@ -825,6 +827,31 @@ impl PanelEventBus {
     }
 }
 
+/// Upper bound on retained generation ceilings (OQ-084 B-4).
+///
+/// One entry per panel that reached a terminal generation edge, kept until its
+/// next successful bind. The bound keeps a long-lived window from accumulating
+/// records for panels that will never rebind; the oldest entry (lowest
+/// `PanelId`, which is minted monotonically) is dropped first.
+pub const MAX_RETAINED_GRANT_CEILINGS: usize = 64;
+
+/// The panel-scoped grant set a departed controller generation held at its
+/// terminal edge (OQ-084 B-4).
+///
+/// The edge release removes the live `capabilities[(PanelId, generation)]` row,
+/// so a later bind that read the live table would see an empty `P` and either
+/// grant nothing or treat "no row" as "no ceiling". This record is what phase 0
+/// of a bind reads instead: the ceiling the predecessor actually held, stamped
+/// with the generation that ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedGrantCeiling {
+    /// The ended controller generation whose edge released the live row.
+    pub ended_generation: Generation,
+    /// The grant rows that generation held at the edge (possibly empty: a
+    /// predecessor that held nothing is a ceiling of `∅`, not an absent one).
+    pub grants: BTreeSet<String>,
+}
+
 /// Generic Panel Runtime per window/process. One registry per window,
 /// single-process winit, holds no PTY fd, GPU object, or OS window handle
 /// (those remain with `bitty-pty`, `bitty-render`, `bitty-platform`).
@@ -842,6 +869,12 @@ pub struct PanelRegistry {
     overlay_manager: UiOverlayManager,
     event_bus: PanelEventBus,
     capabilities: HashMap<(PanelId, Generation), BTreeSet<String>>,
+    /// Generation ceilings retained across the unbind edge (OQ-084 B-4).
+    ///
+    /// Written by [`PanelRegistry::release_generation_scope`] before it drops
+    /// the live row, read by [`PanelRegistry::derive_rebind_grants`] at bind
+    /// entry, and cleared by a successful install or a whole-registry dispose.
+    retained_ceilings: BTreeMap<PanelId, RetainedGrantCeiling>,
     errors: HashMap<String, u64>,
     disposed: bool,
     total_created: u64,
@@ -884,6 +917,7 @@ impl PanelRegistry {
             overlay_manager: UiOverlayManager::new(),
             event_bus: PanelEventBus::new(BusDropPolicy::DropOldest),
             capabilities: HashMap::new(),
+            retained_ceilings: BTreeMap::new(),
             errors: HashMap::new(),
             disposed: false,
             total_created: 0,
@@ -1256,12 +1290,23 @@ impl PanelRegistry {
         generation: Generation,
     ) -> Result<(), PanelError> {
         self.ensure_not_disposed()?;
-        let (stored_gen, workspace) = {
+        let (stored_gen, workspace, was_controller) = {
             let rec = self.panels.get(&panel_id.0).ok_or(PanelError::NotFound {
                 kind: "panel",
                 id_raw: panel_id.0,
             })?;
-            (rec.generation, rec.workspace)
+            // A generation that mounted, or that held panel-scoped grants, was
+            // a controller; a bare `Created` record rolled back from a failed
+            // bind was not.
+            let held_grants = self
+                .capabilities
+                .get(&(panel_id, rec.generation))
+                .is_some_and(|grants| !grants.is_empty());
+            (
+                rec.generation,
+                rec.workspace,
+                rec.state != UiPanelState::Created || held_grants,
+            )
         };
         if stored_gen != generation {
             self.bump_error("StaleHandle");
@@ -1287,7 +1332,16 @@ impl PanelRegistry {
         // Clear commands, bus queues, capabilities
         self.command_registry.unregister_panel(panel_id);
         self.event_bus.clear_panel(panel_id);
-        self.capabilities.remove(&(panel_id, generation));
+        if was_controller {
+            // OQ-084 B-4: the edge release retains the departing generation's
+            // grant set before it removes the live row, so a bind for the
+            // successor reads a real ceiling instead of a drained table.
+            self.release_generation_scope(panel_id, generation)?;
+        } else {
+            // A panel that never mounted and held nothing is not a
+            // predecessor: a rolled-back create leaves no ceiling behind.
+            self.capabilities.remove(&(panel_id, generation));
+        }
         // Retire panel with generation bump
         if let Ok(next) = self.registry_generation.next() {
             self.registry_generation = next;
@@ -1453,6 +1507,19 @@ impl PanelRegistry {
     ) -> Result<(), PanelError> {
         self.ensure_not_disposed()?;
         self.get_panel(panel_id, generation)?;
+        Self::check_panel_capability(panel_id, capability)?;
+        self.capabilities
+            .entry((panel_id, generation))
+            .or_default()
+            .insert(capability.to_string());
+        Ok(())
+    }
+
+    /// Validates one `panel.*` capability against the plugin-host grammar.
+    ///
+    /// # Errors
+    /// `CapabilityDenied` for a malformed id or a non-`panel` family.
+    fn check_panel_capability(panel_id: PanelId, capability: &str) -> Result<(), PanelError> {
         // Validate capability via plugin-host grammar (reuse)
         let cid = bitty_plugin_host::CapabilityId::parse(capability).map_err(|e| {
             PanelError::CapabilityDenied {
@@ -1466,11 +1533,132 @@ impl PanelRegistry {
                 capability: capability.to_string(),
             });
         }
-        self.capabilities
-            .entry((panel_id, generation))
-            .or_default()
-            .insert(capability.to_string());
         Ok(())
+    }
+
+    /// Runs the unbind release for one controller generation (OQ-084 A.2/B-4).
+    ///
+    /// Retains the generation's panel-scoped grant set as the next bind's
+    /// ceiling **before** removing the live row, then removes it. The retain
+    /// happens even when the generation held nothing, because "the predecessor
+    /// existed and held `∅`" is a ceiling of `∅` and must not be confused with
+    /// "there is no predecessor" (which grants the successor's whole
+    /// resolution). Callers that are not a generation edge — a rolled-back
+    /// create — must not call this.
+    ///
+    /// Returns `true` when a live row was removed.
+    ///
+    /// # Errors
+    /// `RegistryDisposed`.
+    pub fn release_generation_scope(
+        &mut self,
+        panel_id: PanelId,
+        generation: Generation,
+    ) -> Result<bool, PanelError> {
+        self.ensure_not_disposed()?;
+        let removed = self.capabilities.remove(&(panel_id, generation));
+        let removed_row = removed.is_some();
+        self.retain_grant_ceiling(panel_id, generation, removed.unwrap_or_default());
+        Ok(removed_row)
+    }
+
+    /// The ceiling phase 0 reads at bind entry (OQ-084 D.2).
+    ///
+    /// `None` means no predecessor generation reached an edge for this panel;
+    /// `Some` with an empty `grants` set means the predecessor existed and held
+    /// nothing. Reads the retained record, never the live grant table.
+    #[must_use]
+    pub fn retained_grant_ceiling(&self, panel_id: PanelId) -> Option<&RetainedGrantCeiling> {
+        self.retained_ceilings.get(&panel_id)
+    }
+
+    /// Number of retained generation ceilings (bounded by
+    /// [`MAX_RETAINED_GRANT_CEILINGS`]).
+    #[must_use]
+    pub fn retained_grant_ceiling_count(&self) -> usize {
+        self.retained_ceilings.len()
+    }
+
+    /// Stores one generation ceiling, evicting the oldest entry past the bound.
+    fn retain_grant_ceiling(
+        &mut self,
+        panel_id: PanelId,
+        generation: Generation,
+        grants: BTreeSet<String>,
+    ) {
+        self.retained_ceilings.insert(
+            panel_id,
+            RetainedGrantCeiling {
+                ended_generation: generation,
+                grants,
+            },
+        );
+        while self.retained_ceilings.len() > MAX_RETAINED_GRANT_CEILINGS {
+            // BTreeMap orders by `PanelId`, minted monotonically, so the first
+            // key is the oldest ceiling. Panel ids are never reused, so a
+            // dropped entry can only name a panel no live record can bind.
+            let Some(oldest) = self.retained_ceilings.keys().next().copied() else {
+                break;
+            };
+            self.retained_ceilings.remove(&oldest);
+        }
+    }
+
+    /// Derives a successor's panel-scoped grant set (OQ-084 D.1).
+    ///
+    /// `grant(n+1) = (R ∩ P) ∪ C`, where `R` is `requested`, `P` is the
+    /// retained predecessor ceiling, and `C` is the subset of `consented` that
+    /// lies in `R \ P`. With no retained predecessor the whole resolution is
+    /// granted with no permission-diff consent: an absent predecessor is not an
+    /// empty ceiling.
+    #[must_use]
+    pub fn derive_rebind_grants(
+        &self,
+        panel_id: PanelId,
+        requested: &BTreeSet<String>,
+        consented: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let Some(ceiling) = self.retained_ceilings.get(&panel_id) else {
+            return requested.clone();
+        };
+        let mut grants: BTreeSet<String> =
+            requested.intersection(&ceiling.grants).cloned().collect();
+        for capability in consented {
+            if requested.contains(capability) && !ceiling.grants.contains(capability) {
+                grants.insert(capability.clone());
+            }
+        }
+        grants
+    }
+
+    /// Commits a rebind's derived grant set and retires the retained ceiling
+    /// (OQ-084 D.2 phase 2 step 1).
+    ///
+    /// The set is written once, all-or-nothing: every element is validated
+    /// before any is installed. A successful install ends the ceiling's
+    /// lifetime — the retention rule is "until the panel's next successful
+    /// bind".
+    ///
+    /// # Errors
+    /// `NotFound`, `StaleHandle`, `CapabilityDenied` (nothing installed),
+    /// `RegistryDisposed`.
+    pub fn install_rebound_grants(
+        &mut self,
+        panel_id: PanelId,
+        generation: Generation,
+        requested: &BTreeSet<String>,
+        consented: &BTreeSet<String>,
+    ) -> Result<BTreeSet<String>, PanelError> {
+        self.ensure_not_disposed()?;
+        self.get_panel(panel_id, generation)?;
+        let grants = self.derive_rebind_grants(panel_id, requested, consented);
+        for capability in &grants {
+            Self::check_panel_capability(panel_id, capability)?;
+        }
+        self.capabilities
+            .insert((panel_id, generation), grants.clone());
+        self.retained_ceilings.remove(&panel_id);
+        Ok(grants)
     }
 
     #[must_use]
@@ -1520,6 +1708,7 @@ impl PanelRegistry {
         // Bus cleared via dropping? Recreate
         self.event_bus = PanelEventBus::new(BusDropPolicy::DropOldest);
         self.capabilities.clear();
+        self.retained_ceilings.clear();
         if let Ok(next) = self.registry_generation.next() {
             self.registry_generation = next;
         } else {

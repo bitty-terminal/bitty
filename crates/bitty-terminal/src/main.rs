@@ -253,6 +253,7 @@ mod inspect;
 mod ipc_serve;
 mod layout_cmd;
 mod logging;
+mod memory_report;
 mod observability;
 mod plugin_ipc;
 mod plugin_runtime;

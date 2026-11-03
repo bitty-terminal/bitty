@@ -3060,6 +3060,28 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         self.atlas.dims()
     }
 
+    /// Retained CPU-side renderer bytes (bitty#2859).
+    ///
+    /// Sums the three caches this renderer owns: the glyph cache's retained
+    /// rasterized coverage ([`GlyphCache::retained_bytes`]), the atlas
+    /// texture, and the block-mask table. Every term is exact owned capacity,
+    /// so the idle-RSS attribution can charge `glyph/atlas` without guessing.
+    ///
+    /// O(number of distinct block masks) — the table holds at most one entry
+    /// per block scalar and cell size — and allocation-free. It is sampled
+    /// when a memory report is due, never inside the paint loop.
+    #[must_use]
+    pub fn retained_bytes(&self) -> u64 {
+        let cache = self.cache.retained_bytes();
+        let atlas = self.atlas.texels().len();
+        let masks = self
+            .block_masks
+            .values()
+            .fold(0usize, |total, mask| total.saturating_add(mask.len()));
+        let total = cache.saturating_add(atlas).saturating_add(masks);
+        u64::try_from(total).unwrap_or(u64::MAX)
+    }
+
     /// Plans and records one frame from `snapshot` limited by `damage`.
     ///
     /// Deterministic: identical `(snapshot, damage, font, insertion order)`

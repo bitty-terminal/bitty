@@ -1241,6 +1241,39 @@ impl PluginRuntime {
         self.vm_wall_budget_ms = wall_budget_ms;
     }
 
+    /// Samples the live plugin Lua heaps for memory attribution (bitty#2859).
+    ///
+    /// `LuaVm::memory_used` is the total the VM refreshed after its last
+    /// execution, so this reads retained accounting instead of walking the
+    /// heap. A VM borrowed mutably elsewhere at sample time is skipped and
+    /// counted in `PluginMemoryUsage::busy_vms`; any skipped VM makes the
+    /// figure `None` (unavailable) rather than a partial total presented as
+    /// measured.
+    #[must_use]
+    pub fn lua_memory_usage(&self) -> crate::runtime::memory::PluginMemoryUsage {
+        let mut bytes = 0u64;
+        let mut vms = 0u32;
+        let mut busy = 0u32;
+        for entry in self.entries.values() {
+            let Some(vm) = entry.vm.as_ref() else {
+                continue;
+            };
+            match vm.try_borrow() {
+                Ok(vm) => {
+                    bytes =
+                        bytes.saturating_add(u64::try_from(vm.memory_used()).unwrap_or(u64::MAX));
+                    vms = vms.saturating_add(1);
+                }
+                Err(_) => busy = busy.saturating_add(1),
+            }
+        }
+        crate::runtime::memory::PluginMemoryUsage {
+            lua_bytes: (vms > 0 && busy == 0).then_some(bytes),
+            vms,
+            busy_vms: busy,
+        }
+    }
+
     /// Install the parsed user budget tightening (bitty#2304).
     ///
     /// The file is parsed by [`bitty_plugin_host::budgets::parse_budget_file`]

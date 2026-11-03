@@ -18,6 +18,11 @@
 # hash) cannot pass. The docs must scope the sidecar claim to bare binaries and
 # archives and name the package/FreeBSD exceptions.
 #
+# CTX-1681 (#2863) adds the Windows discoverability contract: the Scoop
+# manifest renames the raw artifact to the `bitty` shim and declares a `Bitty`
+# Start Menu shortcut per architecture, while the download URL keeps the raw
+# artifact name.
+#
 # The live tag-time fetch/verify path stays in release.yml; this gate pins the
 # generation contract on every PR.
 set -euo pipefail
@@ -159,6 +164,14 @@ check(arch.get("64bit", {}).get("bin") == [["bitty-x86_64-pc-windows-msvc.exe", 
       "Scoop x64 executable is exposed as the bitty shim")
 check(arch.get("arm64", {}).get("bin") == [["bitty-aarch64-pc-windows-msvc.exe", "bitty"]],
       "Scoop arm64 executable is exposed as the bitty shim")
+check(arch.get("64bit", {}).get("shortcuts") == [["bitty-x86_64-pc-windows-msvc.exe", "Bitty"]],
+      "Scoop x64 declares a Bitty Start Menu shortcut")
+check(arch.get("arm64", {}).get("shortcuts") == [["bitty-aarch64-pc-windows-msvc.exe", "Bitty"]],
+      "Scoop arm64 declares a Bitty Start Menu shortcut")
+check(arch.get("64bit", {}).get("url", "").endswith("/bitty-x86_64-pc-windows-msvc.exe"),
+      "Scoop x64 download URL keeps the raw artifact name")
+check(arch.get("arm64", {}).get("url", "").endswith("/bitty-aarch64-pc-windows-msvc.exe"),
+      "Scoop arm64 download URL keeps the raw artifact name")
 notes = manifest.get("notes", "")
 check(f"https://github.com/bitty-terminal/bitty/releases/tag/v{version}" in notes,
       "Scoop documents the GitHub Releases fallback")
@@ -402,6 +415,10 @@ expect_contains "$README" 'packaging/windows/winget/' "packaging/README.md refer
 expect_contains "$INSTALL" 'R2-backed CDN' "packaging/INSTALL.md names the R2-backed CDN"
 expect_contains "$INSTALL" 'GitHub Releases' "packaging/INSTALL.md documents the GitHub fallback"
 expect_contains "$INSTALL" 'winget install' "packaging/INSTALL.md documents winget install"
+for needle in 'Windows channel parity' '-NoShortcut' '-NoPathUpdate' 'Bitty.lnk' 'scoop uninstall bitty'; do
+  expect_contains "$INSTALL" "$needle" \
+    "packaging/INSTALL.md documents Windows channel parity: $needle"
+done
 if [[ -f "./packaging/winget.md" ]]; then
   pass "Documentation exists: packaging/winget.md"
 else

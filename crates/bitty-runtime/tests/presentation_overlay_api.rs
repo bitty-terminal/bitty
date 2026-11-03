@@ -349,6 +349,82 @@ fn show_requires_present_grant_and_an_overlay_handle() {
     assert!(!fixture.runtime.overlay_capture().borrow().is_active());
 }
 
+/// Criterion 4 of bitty#2849, locked as a recorded decision rather than a
+/// review note.
+///
+/// `bitty.ui.overlay.show` used to require the historical `ui.rich` +
+/// `ui.overlay` pair (`f0a6d252`) and now requires the dedicated `ui.present`
+/// head (`8108e4f7`). That re-gate is deliberate, not accidental: PR #2856's
+/// body and commit message state that both spellings of the session "are gated
+/// by the same head", and the published plugin API reference records the same
+/// rule for `8108e4f7`. No compatibility alias exists, so exactly one grant
+/// shape draws and every historical shape is denied with the presentation head
+/// named — while `hide` stays ungated for every shape so cleanup can never
+/// wedge.
+#[test]
+fn show_accepts_exactly_one_grant_shape_and_hide_accepts_every_shape() {
+    const SHAPES: [(&str, &[&str]); 4] = [
+        ("legacy-mount", &["ui.rich", "ui.overlay"]),
+        (
+            "legacy-mount-focus",
+            &["ui.rich", "ui.overlay", "ui.overlay.focus"],
+        ),
+        ("draw", &["ui.rich", "ui.overlay", "ui.present"]),
+        (
+            "draw-focus",
+            &["ui.rich", "ui.overlay", "ui.present", "ui.overlay.focus"],
+        ),
+    ];
+
+    let mut fixture = Fixture::new("grant-shapes");
+    for (name, caps) in SHAPES {
+        write_plugin(&fixture.root, &format!("acme.{name}"), caps, "overlay");
+    }
+    fixture.runtime.discover();
+
+    let mut accepted: Vec<&str> = Vec::new();
+    for (name, _) in SHAPES {
+        let id = fixture.activate(&format!("acme.{name}"));
+        let handle = fixture.handle(&id);
+        let services = fixture.runtime.services(&id).expect("services");
+        match services.ui_overlay_show(handle) {
+            Ok(true) => {
+                accepted.push(name);
+                // `hide` is ungated: the same shape removes its own surface.
+                assert!(
+                    services.ui_overlay_hide(handle).expect("hide"),
+                    "{name}: the live surface is removable"
+                );
+            }
+            Ok(false) => panic!("{name}: show must not report a no-op success"),
+            Err(error) => {
+                assert_eq!(error.code, "E_CAPABILITY_DENIED", "{name}");
+                assert!(
+                    error.message.contains("ui.present"),
+                    "{name}: the denial names the draw head: {}",
+                    error.message
+                );
+                // `hide` stays ungated for a shape that was denied the draw.
+                assert!(
+                    !services.ui_overlay_hide(handle).expect("hide"),
+                    "{name}: a denied draw leaves nothing to hide"
+                );
+            }
+        }
+    }
+
+    assert_eq!(
+        accepted,
+        vec!["draw", "draw-focus"],
+        "`ui.present` is necessary and sufficient to draw; the historical \
+         `ui.rich` + `ui.overlay` pair alone is not an accepted shape"
+    );
+    assert!(
+        !fixture.runtime.presentation_overlay().borrow().is_active(),
+        "the last hide released the shared surface"
+    );
+}
+
 /// `Esc` queues exactly one observation and clears the surface; lifecycle
 /// teardown clears without an observation.
 #[test]

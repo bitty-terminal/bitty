@@ -3084,12 +3084,7 @@ impl Runtime {
             self.arm_ime_caret(paint);
         }
         self.paint_frame_overlays(&basis, now, &mut layers);
-        self.paint_chrome_bands(basis.pad_px, &mut layers);
-        // CTX-1431 (#2406): the presentation-only panel paints above chrome
-        // and below the focusable capture surface, matching its accepted
-        // `OverlayTier::Popup` admission. It is paint-only: no input routing.
-        self.paint_presentation_overlay(&basis.allocations, basis.pad_px, &mut layers);
-        self.paint_plugin_overlay(&basis.allocations, basis.pad_px, &mut layers);
+        self.paint_banded_overlay_stack(&basis.allocations, basis.pad_px, &mut layers);
         self.paint_target_annotations(basis.pad_px, &mut layers);
         self.paint_kitty_images(&basis, &mut layers);
         if let Some(paint) = cursor {
@@ -5367,6 +5362,31 @@ impl Runtime {
             layers.combined_glyphs.extend(glyphs);
             layers.any_needs_draw = true;
         }
+    }
+
+    /// Paint the chrome bands and the two plugin overlay surfaces in their
+    /// accepted z-order (issue #2849).
+    ///
+    /// Order, bottom to top: terminal content (already in the layer set),
+    /// chrome bands, the presentation-only panel, then the focusable capture
+    /// surface. The presentation panel therefore paints above chrome and
+    /// below the capture modal, matching its accepted `OverlayTier::Popup`
+    /// admission; it stays paint-only, with no input routing.
+    ///
+    /// Kept as one function so the stacking order has a single definition the
+    /// z-order test can exercise directly instead of restating the sequence
+    /// (CTX-1677).
+    fn paint_banded_overlay_stack(
+        &mut self,
+        allocations: &[layout_focus::PresentFrame],
+        pad_px: i32,
+        layers: &mut FrameLayers,
+    ) {
+        self.paint_chrome_bands(pad_px, layers);
+        // CTX-1431 (#2406): the presentation-only panel paints above chrome
+        // and below the focusable capture surface.
+        self.paint_presentation_overlay(allocations, pad_px, layers);
+        self.paint_plugin_overlay(allocations, pad_px, layers);
     }
 
     /// Renders plugin-mounted chrome bands (CTX-0911, issue #1570; CTX-0946
@@ -8661,6 +8681,77 @@ mod plugin_overlay_paint_tests {
             rt.presentation_overlay().is_some(),
             "a focus switch must not dismiss the presentation"
         );
+    }
+
+    /// Issue #2849 review gap 8: the overlay stack is terminal content ->
+    /// chrome bands -> presentation-only panel -> focusable capture surface.
+    ///
+    /// The order has exactly one definition,
+    /// [`Runtime::paint_banded_overlay_stack`], which `tick_at` calls, so this
+    /// builds all three layers through that production sequence instead of
+    /// restating the call order here.
+    #[test]
+    fn bands_then_presentation_then_capture_stack_in_z_order() {
+        let mut rt = runtime();
+        rt.set_chrome_bands(ChromeBands {
+            top: vec![surface_with_rows(&["  bar content"])],
+            ..ChromeBands::default()
+        });
+        rt.tick()
+            .expect("tick paints the band and insets the container");
+        assert_eq!(rt.visible_band_row(BandEdge::Top, 0), Some(0));
+
+        // A one-row presentation panel above a five-row capture modal over the
+        // same focused frame: the card heights make the two separable inside
+        // the shared card list, so the assertion is about order, not geometry.
+        rt.set_presentation_overlay(Some(surface_with_text("hint")));
+        rt.set_plugin_overlay(Some(surface_with_rows(&["1", "2", "3", "4", "5"])));
+        let frame = one_frame();
+        rt.focus_mut().set(frame.view);
+
+        // Bottom layer: bands paint plain overlay fills plus glyphs and never
+        // a card surface, so nothing can sit below them but content.
+        let mut bands_only = FrameLayers::default();
+        rt.paint_chrome_bands(8, &mut bands_only);
+        assert!(
+            !bands_only.combined_overlay.is_empty(),
+            "the band paints an overlay fill"
+        );
+        assert!(
+            !bands_only.combined_glyphs.is_empty(),
+            "the band paints its text glyphs"
+        );
+        assert!(
+            bands_only.combined_overlay_card_rounded.is_empty(),
+            "a chrome band is not a rounded card surface"
+        );
+        let band_glyphs = bands_only.combined_glyphs.len();
+
+        let mut layers = FrameLayers::default();
+        rt.paint_banded_overlay_stack(&[frame], 8, &mut layers);
+
+        // Both overlay surfaces append their text after the band's, so band
+        // glyphs composite first (lowest) in the shared glyph list.
+        assert!(
+            layers.combined_glyphs.len() > band_glyphs,
+            "panel and modal text append after the band text"
+        );
+        assert_eq!(
+            layers.combined_overlay_card_rounded.len(),
+            2,
+            "one presentation card and one capture card"
+        );
+        let panel = layers.combined_overlay_card_rounded[0].frame;
+        let capture = layers.combined_overlay_card_rounded[1].frame;
+        assert!(
+            capture.height > panel.height,
+            "the five-row capture card must paint after the one-row presentation card"
+        );
+        assert!(
+            panel.y >= 0 && panel.height > 0 && capture.y >= 0,
+            "both cards stay inside the clipped frame"
+        );
+        assert!(layers.any_needs_draw);
     }
 
     #[test]

@@ -3362,6 +3362,35 @@ mod tests {
         assert_eq!(rt.active_workspace_index(), 0);
     }
 
+    /// Issue #2849 review gap 7: a workspace switch stashes the outgoing
+    /// slot's layout into an inactive slot, so a leaf that merely left the
+    /// active workspace must still read as live. Otherwise a presentation
+    /// panel bound to it reports a spurious `view-closed` dismissal on a plain
+    /// `Alt+N` switch.
+    #[test]
+    fn workspace_switch_keeps_stashed_views_live_issue_2849() {
+        let mut rt = fresh();
+        let ws1_view = rt.focused_view().expect("ws1 focus");
+        rt.workspace_new().expect("ws2");
+        let ws2_view = rt.focused_view().expect("ws2 focus");
+        assert_ne!(ws1_view, ws2_view, "each workspace owns its own leaf");
+        assert!(
+            rt.is_live_view(ws1_view),
+            "the stashed ws1 leaf still exists after the switch"
+        );
+
+        assert!(rt.workspace_switch(0));
+        assert!(rt.is_live_view(ws1_view), "the restored leaf is live");
+        assert!(
+            rt.is_live_view(ws2_view),
+            "the ws2 leaf still exists in its inactive slot"
+        );
+        assert!(
+            !rt.is_live_view(ViewId::new(9_999)),
+            "an id no slot holds is still reported closed"
+        );
+    }
+
     #[test]
     fn next_view_id_global_accounts_for_inactive_slots() {
         // CTX-0378: a split in ws1 must never reuse an id an inactive ws2

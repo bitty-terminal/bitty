@@ -1,17 +1,21 @@
-//! Presentation-only overlay session (CTX-1431, `bitty` #2406).
+//! Presentation-only overlay session (CTX-1431, `bitty` #2406; `ui.present`
+//! split for `bitty` #2849).
 //!
 //! A plugin that mounted a block into the `overlay` slot may present it
 //! without acquiring keyboard or pointer capture
-//! (`bitty.ui.overlay.show` / `hide`). This is the mechanism the help and
-//! which-key panel depends on after ADR-0014: Core owns the geometry,
+//! (`bitty.ui.present.show` / `hide`, and `bitty.ui.overlay.show` / `hide` as
+//! the CTX-1431 spelling of the same session). This is the mechanism the help
+//! and which-key panel depends on after ADR-0014: Core owns the geometry,
 //! stacking, `Esc` routing, and teardown; the plugin owns only the scene.
 //!
 //! # Semantics (accepted design, stage 2)
 //!
 //! - **No capture.** A presentation session never claims the focusable
 //!   overlay capture, never requires `ui.overlay.focus`, and never feeds the
-//!   modal authority. It needs only the v1 `ui.rich` + `ui.overlay` grants
-//!   of the mount.
+//!   modal authority. Drawing is gated on its own `ui.present` head; the
+//!   `ui.rich` + `ui.overlay` grants are only what mounting the `overlay`-slot
+//!   block already needed, and they neither imply `ui.present` nor substitute
+//!   for it.
 //! - **One surface per window.** The session is admitted through the
 //!   accepted [`OverlayManager`] vocabulary as
 //!   [`OverlayKind::NonModal`] on [`OverlayTier::Popup`], so it consumes one
@@ -62,7 +66,9 @@ pub const PENDING_DISMISSED_MAX: usize = 64;
 /// One queued `overlay.dismissed` observation.
 ///
 /// `owner` is the presenting plugin id, `handle` the opaque block handle that
-/// was presented, and `reason` the Core-reported cause (`"escape"` today).
+/// was presented, and `reason` the Core-reported cause — [`ESCAPE_DISMISS_REASON`]
+/// when Core routed `Esc`, [`VIEW_CLOSED_DISMISS_REASON`] when the view the
+/// panel was drawn over closed.
 /// The payload carries no input bytes, terminal content, or coordinates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DismissedEvent {
@@ -230,6 +236,10 @@ impl PresentationOverlay {
     /// - A bound view that is no longer live drops the surface with one
     ///   `view-closed` observation instead of silently re-centering on a
     ///   survivor, so a closed view never leaves a panel addressing it.
+    ///   `is_live` must answer *existence*, not active-container membership:
+    ///   a view stashed in an inactive workspace still exists, so a workspace
+    ///   switch re-binds the panel instead of dismissing it
+    ///   ([`Runtime::is_live_view`](crate::runtime::Runtime::is_live_view)).
     ///
     /// Returns the queued observation, if the surface was dropped. Bounded
     /// like every other dismissal: one event, drop-oldest buffer.
@@ -523,6 +533,46 @@ mod tests {
         let drained = overlay.drain_dismissed();
         assert_eq!(drained.len(), 1, "exactly one observation");
         assert_eq!(drained[0].reason, "view-closed");
+    }
+
+    #[test]
+    fn workspace_switch_rebinds_instead_of_dismissing() {
+        // Issue #2849 review gap 7, end to end: a workspace switch stashes the
+        // bound view into an inactive slot, and `Runtime::is_live_view` must
+        // report it as existing so the panel re-binds to the new focus instead
+        // of queueing a spurious `view-closed` dismissal.
+        let mut runtime = crate::Runtime::with_defaults().expect("headless runtime");
+        let mut overlay = PresentationOverlay::new();
+        overlay.show("acme.help", 7).expect("owner admits");
+
+        let ws1_view = runtime.focused_view().expect("ws1 focus");
+        assert!(
+            overlay
+                .observe_focus(Some(ws1_view), |view| runtime.is_live_view(view))
+                .is_none(),
+            "binding is not a dismissal"
+        );
+        assert_eq!(overlay.session_view(), Some(ws1_view));
+
+        runtime.workspace_new().expect("ws2");
+        let ws2_view = runtime.focused_view().expect("ws2 focus");
+        assert_ne!(ws2_view, ws1_view, "the switch focused another leaf");
+
+        let dismissed = overlay.observe_focus(Some(ws2_view), |view| runtime.is_live_view(view));
+        assert!(
+            dismissed.is_none(),
+            "a workspace switch is not a view close"
+        );
+        assert!(overlay.is_active(), "the panel survives the switch");
+        assert_eq!(
+            overlay.session_view(),
+            Some(ws2_view),
+            "the panel follows the newly focused view"
+        );
+        assert!(
+            overlay.drain_dismissed().is_empty(),
+            "no dismissal observation is queued"
+        );
     }
 
     #[test]

@@ -1984,12 +1984,16 @@ pub trait HostServices {
     }
 
     /// Present a block mounted in the `overlay` slot without capturing input
-    /// (CTX-1431, `bitty` #2406: `bitty.ui.overlay.show`).
+    /// (CTX-1431, `bitty` #2406: `bitty.ui.overlay.show`; the `ui.present`
+    /// split of `bitty` #2849 gates it).
     ///
     /// This is the presentation-only session: the block must belong to the
     /// calling generation and be an `overlay`-slot mount, and the generation
-    /// must hold `ui.rich` and `ui.overlay`. `ui.overlay.focus` is neither
-    /// required nor implied, and no keyboard or pointer capture is started.
+    /// must hold `ui.present` — the draw head. `ui.rich` + `ui.overlay` are
+    /// only what mounting the block already required; they neither imply
+    /// `ui.present` nor authorize the draw on their own. `ui.overlay.focus` is
+    /// neither required nor implied, and no keyboard or pointer capture is
+    /// started.
     /// At most one presentation overlay exists per window: a second `show`
     /// by another plugin fails closed with [`E_UI_UNAVAILABLE`], while a
     /// re-show by the same plugin replaces the presented handle. The default

@@ -8014,6 +8014,77 @@ mod tests {
     }
 
     #[test]
+    fn presentation_safe_mode_refuses_before_the_grant_check_and_admission() {
+        // Issue #2849 (safe-mode ordering): the safe-mode refusal is decided
+        // before the `ui.present` grant check and before the surface is
+        // admitted, so a generation that reaches the host under safe policy
+        // can never leave an admitted slot behind.
+        let overlay = Rc::new(RefCell::new(PresentationOverlay::new()));
+        let services = ui_services(UiAccess {
+            rich: true,
+            overlay: true,
+            overlay_focus: false,
+            present: false,
+            claims: Vec::new(),
+        });
+        services.set_presentation_overlay(overlay.clone());
+        let handle = services
+            .ui_mount("overlay", &UiNode::text("hint"))
+            .expect("overlay mount");
+
+        services.set_safe_mode(true);
+        let error = services
+            .ui_overlay_show(handle)
+            .expect_err("safe mode refuses the draw");
+        assert_eq!(error.code, E_UI_UNAVAILABLE);
+        assert!(
+            !error.message.contains("ui.present"),
+            "safe mode outranks the grant gate: {}",
+            error.message
+        );
+        assert_eq!(
+            overlay.borrow().admitted_slots(),
+            0,
+            "the refusal happens before admission"
+        );
+        assert!(!overlay.borrow().is_active(), "no surface was created");
+        assert!(
+            overlay.borrow_mut().drain_dismissed().is_empty(),
+            "a refusal is not a dismissal observation"
+        );
+
+        // With safe mode cleared, the same call reaches the grant gate; the
+        // generation still holds no `ui.present`.
+        services.set_safe_mode(false);
+        let error = services
+            .ui_overlay_show(handle)
+            .expect_err("the missing draw grant denies");
+        assert_eq!(error.code, "E_CAPABILITY_DENIED");
+        assert!(error.message.contains("ui.present"), "{}", error.message);
+        assert_eq!(
+            overlay.borrow().admitted_slots(),
+            0,
+            "a grant denial also admits nothing"
+        );
+
+        // The draw head is what admits exactly one slot.
+        services.set_ui_access(UiAccess {
+            rich: true,
+            overlay: true,
+            overlay_focus: false,
+            present: true,
+            claims: Vec::new(),
+        });
+        assert!(
+            services
+                .ui_overlay_show(handle)
+                .expect("the granted head draws")
+        );
+        assert_eq!(overlay.borrow().admitted_slots(), 1);
+        assert_eq!(overlay.borrow().session(), Some(("xuepoo.test", handle)));
+    }
+
+    #[test]
     fn overlay_spec_acquire_mounts_surface_and_denies_second_owner() {
         let services = focus_services();
         let handle = services

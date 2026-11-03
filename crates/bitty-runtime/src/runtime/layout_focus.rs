@@ -3049,18 +3049,24 @@ impl Runtime {
         self.focus.focused()
     }
 
-    /// Whether `view` is still a live attach point of this window
-    /// (issue #2849).
+    /// Whether `view` still exists anywhere in this window (issue #2849).
     ///
-    /// True for a layout leaf, a pinned leaf, or a detached float: exactly the
-    /// set [`Self::set_focus`] accepts as a focus target. A closed view is
-    /// false, so a presentation surface bound to it reports a bounded
+    /// True for a layout leaf, a pinned leaf, a detached float, a leaf stashed
+    /// in an **inactive** workspace slot, or the leaf parked in the window
+    /// scratchpad — the same occupied set the view-id allocator refuses to
+    /// reissue (`Self::live_view_raws_excluding_active_slot`). A closed view
+    /// is false, so a presentation surface bound to it reports a bounded
     /// `view-closed` dismissal instead of repainting over a survivor.
+    ///
+    /// Active-container membership alone is *not* existence: a workspace
+    /// switch stashes the outgoing slot's layout and the live layout becomes
+    /// the new slot's, so a view that merely left the active workspace would
+    /// otherwise read as closed and dismiss a panel the user never closed
+    /// (bitty#2849 review gap 7).
     #[must_use]
     pub fn is_live_view(&self, view: ViewId) -> bool {
-        self.layout.leaf_ids().contains(&view)
-            || self.pinned.contains(view)
-            || self.floats.contains(view)
+        self.live_view_raws_excluding_active_slot()
+            .contains(&view.0)
     }
 
     /// Sets focus to `id` when it exists in the current layout; otherwise

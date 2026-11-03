@@ -17,8 +17,9 @@
 # Every sample measures `bitty ctl view list` latency, RSS, thread count, and
 # fd count, and counts watchdog stall reports. Evidence stays under --out-dir
 # (gitignored scratch) and carries counts, never host paths. The watchdog is
-# enabled explicitly: `BITTY_STALL_WATCHDOG` is the required switch, while
-# `BITTY_STALL_WATCHDOG_MS` only sets the threshold. Inherited `BITTY_*`
+# started explicitly by the harness through `BITTY_HANG_WATCHDOG=1` (release
+# builds already start it; the legacy `BITTY_STALL_WATCHDOG` alias still works),
+# while `BITTY_HANG_WATCHDOG_MS` only sets the threshold. Inherited `BITTY_*`
 # overrides are cleared before launch so the harness owns the whole run.
 #
 # `--stall-probe` additionally reproduces the blocking-PTY-write class: it
@@ -342,8 +343,8 @@ start_app() {
   done
   export SHELL="$SHELL_BIN"
   export BITTY_INSTANCE_ID="soak$DISPLAY_NUM"
-  export BITTY_STALL_WATCHDOG=1
-  export BITTY_STALL_WATCHDOG_MS="$STALL_MS"
+  export BITTY_HANG_WATCHDOG=1
+  export BITTY_HANG_WATCHDOG_MS="$STALL_MS"
   if [ -n "$PLUGIN_DIR" ]; then
     export BITTY_PLUGIN_DIR="$PLUGIN_DIR"
   fi

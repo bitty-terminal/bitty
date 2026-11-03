@@ -433,6 +433,14 @@ release-paths *binaries:
 release-paths-test:
     ./scripts/tests/check-release-paths.test.sh
 
+# Bounded, fail-closed FreeBSD pkg bootstrap (CTX-1674, bitty#2851). The gate
+# is hermetic: stub pkg/pkg-static clients prove the single-repository
+# selection, the wall-clock bound (timeout(1) and the watchdog fallback), the
+# retry-with-metadata-refresh, and the fail-closed verdict. The guest itself is
+# only exercised by the bsd-tier nightly and the release job.
+freebsd-pkg-test:
+    ./scripts/tests/freebsd-pkg-bootstrap.test.sh
+
 terminfo-check:
     ./scripts/check-terminfo.sh
 
@@ -607,7 +615,7 @@ commit-check message:
 # Local CI-equivalent gate. Registry-free by contract: `catalog-test` runs
 # hermetic fixtures; the strict registry drift gate is `check-registry` and
 # needs a bitty-plugins checkout (see CONTRIBUTING.md).
-check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate daemon-seam-test vendored-winit vendored-winit-test pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test apt-gpg-import-test release-channels-test preview-preflight-test macos-preview-archive-test preview-isolation-test aur-bin-render-test release-paths-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test nix-lock-test m1-matrix-test compat-matrix-test compat-freshness-test perf-disk-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-test nix-patch-test
+check: fmt-check clippy test cold-delivery-test publication-control-test supply-chain supply-chain-test scratch-paths scratch-paths-test pty-gate test-support-gate daemon-seam-test vendored-winit vendored-winit-test pins-test status-drift status-drift-test docs-pin-test runtime-deps-test terminfo-check terminfo-test desktop-check desktop-test install-smoke-test install-scripts-test unix-bundle-test appimage-test component-dist-test extension-catalog-test macos-dmg-test windows-installer-test package-manifests-test release-smoke-test apt-gpg-import-test release-channels-test preview-preflight-test macos-preview-archive-test preview-isolation-test aur-bin-render-test release-paths-test freebsd-pkg-test verify-unix-bundle-dispatch-test rust-channel-test binary-arch-test workflow-publish-test distro-recipes-test nix-lock-test m1-matrix-test compat-matrix-test compat-freshness-test perf-disk-test real-render-soak-test longrun-soak-test dogfood-session-test ci-local-test actionlint markdownlint catalog-test nix-patch-test
 
 # Parser-throughput baseline (CTX-0576, M1-11). Runs the deterministic
 # headless parser benchmark over the committed VT/escape corpora and verifies

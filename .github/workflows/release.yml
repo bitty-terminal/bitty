@@ -599,33 +599,20 @@ jobs:
       # crossfont's fontconfig/FreeType probes. git + ca_root_nss let
       # `cargo --locked` fetch the pinned git dependencies over TLS.
       #
-      # The VM image ships a snapshot pkg whose repository metadata can be a
-      # schema behind the repository, or can be mid-sync with a package
-      # missing. Force a metadata refresh and retry the install before failing
-      # the whole release on a transient mirror state.
+      # scripts/freebsd-pkg-bootstrap.sh owns the bootstrap (bitty#2851). The
+      # image's pkg is the one part of this job that has never been
+      # reproducible (bitty#2851's failure table: quarterly metadata mid-sync,
+      # and a self-upgrade re-exec loop when more than one enabled repository
+      # carries `pkg`). The script selects exactly one repository (`FreeBSD`
+      # on the `latest` train, `FreeBSD-ports*` disabled), runs every pkg call
+      # non-interactively with an explicit wall-clock bound, retries with
+      # backoff, verifies each package is present, and dumps `pkg -vv` plus
+      # the repository configuration when it fails.
       - name: Install FreeBSD build prerequisites
         run: |
           set -eux
-          # The image enables three repositories (`FreeBSD-ports`,
-          # `FreeBSD-ports-kmods`, `FreeBSD`) and they do not agree on the
-          # `pkg` package its metadata carries. With more than one enabled
-          # repository that ships `pkg`, every install re-detects "New version
-          # of pkg detected", finds "The most recent versions of packages are
-          # already installed", re-executes, and loops until the job budget is
-          # gone (`pkg-static install -fy pkg` loops the same way). Keep
-          # exactly one repository, from the `latest` train, so pkg upgrades
-          # itself once during the prerequisite install and the loop cannot
-          # form. `pkg+https` makes pkg infer an SRV mirror and reject the
-          # URL, so the URL stays plain https.
-          sudo mkdir -p /usr/local/etc/pkg/repos
-          printf '%s\n' \
-            'FreeBSD-ports: { enabled: no }' \
-            'FreeBSD-ports-kmods: { enabled: no }' \
-            'FreeBSD: { enabled: yes, url: "https://pkg.FreeBSD.org/${ABI}/latest" }' \
-            | sudo tee /usr/local/etc/pkg/repos/00-bitty.conf
-          sudo timeout 300 pkg update
-          sudo timeout 900 pkg install -y git cmake pkgconf ca_root_nss freetype2 fontconfig bash
-          sudo pkg info cmake
+          sh scripts/freebsd-pkg-bootstrap.sh \
+            --packages "git cmake pkgconf ca_root_nss freetype2 fontconfig bash"
 
       - name: Install pinned Rust toolchain (rustup)
         run: |

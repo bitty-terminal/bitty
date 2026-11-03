@@ -61,11 +61,17 @@ jobs:
       # and pkgconf are needed by crossfont's pkg-config probes
       # (fontconfig/FreeType). git + ca_root_nss let `cargo --locked` fetch
       # the pinned git dependencies over TLS.
+      #
+      # The nightly exercises the same bounded bootstrap the release job uses
+      # (scripts/freebsd-pkg-bootstrap.sh, bitty#2851), so an image regression
+      # shows up here before it can hold a release train: one repository on
+      # the `latest` train, a wall-clock bound on every pkg call, retry with
+      # backoff, and a `pkg -vv` plus repository-config dump on failure.
       - name: Install FreeBSD build prerequisites
         run: |
           set -eux
-          sudo pkg update
-          sudo pkg install -y git cmake pkgconf ca_root_nss freetype2 fontconfig
+          sh scripts/freebsd-pkg-bootstrap.sh \
+            --packages "git cmake pkgconf ca_root_nss freetype2 fontconfig"
 
       # rustup honors rust-toolchain.toml, so the channel is read from the
       # checked-out file (1.98.1) rather than repeated here. `pkg install rust`

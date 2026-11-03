@@ -847,7 +847,12 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
                 row: Row(resolved_coordinate(params, 0)),
                 col: Col::SENTINEL,
             }),
-            b'`' => self.emit(TerminalAction::CursorPosition {
+            // CHA shares HPA's single-axis addressing: the row stays put and
+            // the column is absolute. TUIs that align by jumping over runs of
+            // spaces (Claude Code's word layout, progress bars, tables) depend
+            // on it; without this arm the jumps are dropped and the words run
+            // together.
+            b'G' | b'`' => self.emit(TerminalAction::CursorPosition {
                 row: Row::SENTINEL,
                 col: Col(resolved_coordinate(params, 0)),
             }),

@@ -156,7 +156,7 @@ fn cursor_position_resolves_defaults_and_explicit_values() {
 #[test]
 fn single_axis_addressing_uses_sentinels() {
     assert_eq!(
-        parse(b"\x1b[12d\x1b[34`"),
+        parse(b"\x1b[12d\x1b[34`\x1b[34G\x1b[G\x1b[0G"),
         vec![
             TerminalAction::CursorPosition {
                 row: Row(12),
@@ -165,6 +165,18 @@ fn single_axis_addressing_uses_sentinels() {
             TerminalAction::CursorPosition {
                 row: Row::SENTINEL,
                 col: Col(34)
+            },
+            TerminalAction::CursorPosition {
+                row: Row::SENTINEL,
+                col: Col(34)
+            },
+            TerminalAction::CursorPosition {
+                row: Row::SENTINEL,
+                col: Col(1)
+            },
+            TerminalAction::CursorPosition {
+                row: Row::SENTINEL,
+                col: Col(1)
             },
         ]
     );

@@ -172,6 +172,48 @@ fn deferred_wrap_latches_at_last_column() {
     assert!(!s.cursor().pending_wrap);
 }
 
+/// CHA (`CSI n G`) keeps the row and jumps to an absolute column, so the
+/// cells it skips stay blank. Claude Code and other TUIs lay out every word
+/// gap this way; dropping the sequence is what made `Welcome to Claude Code`
+/// render as `WelcometoClaudeCode`.
+#[test]
+fn absolute_column_move_keeps_the_skipped_cells_blank() {
+    let mut s = State::new();
+    prints(&mut s, "ab");
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row::SENTINEL,
+        col: Col(5),
+    });
+    prints(&mut s, "cd");
+    assert_eq!(live_line_text(&s, 0), "ab  cd");
+    assert_eq!(s.cursor().position.col, 6);
+    assert!(!s.cursor().pending_wrap);
+}
+
+#[test]
+fn claude_code_header_replays_with_word_gaps() {
+    let mut s = State::new();
+    let mut parser = bitty_vt::Parser::new();
+    let bytes = b"\x1b[38;2;215;119;87mWelcome\x1b[9Gto\x1b[12GClaude\x1b[19GCode\x1b[24G\
+\x1b[38;2;153;153;153mv2.1.296\x1b[39m";
+    parser.advance(bytes, |action| {
+        s.apply(&action);
+    });
+    assert_eq!(live_line_text(&s, 0), "Welcome to Claude Code v2.1.296");
+}
+
+#[test]
+fn absolute_column_move_clamps_without_wrapping() {
+    let mut s = State::new();
+    s.apply(&TerminalAction::CursorPosition {
+        row: Row::SENTINEL,
+        col: Col(999),
+    });
+    assert_eq!(s.cursor().position.row, 0);
+    assert_eq!(s.cursor().position.col, GRID_COLUMNS as u16 - 1);
+    assert!(!s.cursor().pending_wrap);
+}
+
 #[test]
 fn origin_mode_addresses_relative_to_region() {
     let mut s = State::new();

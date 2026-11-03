@@ -103,6 +103,38 @@ What each script installs:
   repository, source recipe in `packaging/opensuse/bitty.spec`; see
   `packaging/opensuse.md`.
 
+## Windows channel parity
+
+All three Windows channels create a Start Menu entry, so Windows app search
+resolves "Bitty"; the PowerShell one-liner and Scoop also put `bitty` on a
+shell path. They differ in packaging and removal.
+
+| Channel                              | Start Menu                                           | PATH                                         | Uninstall                |
+| ------------------------------------ | ---------------------------------------------------- | -------------------------------------------- | ------------------------ |
+| `setup.exe` (Inno Setup)             | `Bitty` shortcut, plus an opt-in Desktop shortcut    | not modified                                 | Apps & Features -> Bitty |
+| PowerShell one-liner (`install.ps1`) | `Bitty.lnk`                                          | user `Path` gains `%LOCALAPPDATA%\bitty\bin` | manual steps below       |
+| Scoop                                | `Bitty` shortcut from the manifest `shortcuts` entry | `bitty` shim on the Scoop shim path          | `scoop uninstall bitty`  |
+
+The PowerShell one-liner creates `Bitty.lnk` in
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs` and appends the install
+directory to the user `Path` (`HKCU\Environment`), then broadcasts
+`WM_SETTINGCHANGE`; already-open shells still need a restart. Both actions are
+best-effort: on failure the installer warns and prints the manual step instead
+of failing the install. Scripted installs can skip them with `-NoShortcut` and
+`-NoPathUpdate`:
+
+```powershell
+iex "& { $(irm https://cdn.bitty.run/install/install.ps1) } -Version 0.0.23 -NoShortcut -NoPathUpdate"
+```
+
+Manual uninstall for the PowerShell one-liner:
+
+1. Delete `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Bitty.lnk`.
+2. Remove `%LOCALAPPDATA%\bitty\bin` from the user `Path` (Settings -> System
+   -> About -> Advanced system settings -> Environment Variables, or the
+   `HKCU\Environment` value in `regedit`).
+3. Delete the `%LOCALAPPDATA%\bitty` directory.
+
 ## Prebuilt binaries (manual download)
 
 The R2-backed CDN at `https://cdn.bitty.run/releases/<TAG>/` is the preferred

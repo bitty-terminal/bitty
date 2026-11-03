@@ -564,12 +564,13 @@ jobs:
     needs: validate
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-    # Tier-2 channel, best effort (bitty#2851): the FreeBSD 15.1 snapshot image
-    # currently loops in pkg's self-upgrade path, and a VM-image fault must not
-    # hold the stable train. The job still builds and uploads its artifact, but
-    # the release job no longer waits for it, so the FreeBSD asset ships with
-    # the first train where this job is verified green.
-    continue-on-error: true
+    # Release gate (bitty#2851). The only recurring fault in this leg was the
+    # pkg bootstrap; scripts/freebsd-pkg-bootstrap.sh now bounds each pkg call,
+    # retries with backoff, and fails closed (bitty#2855), so there is no known
+    # flake left that would justify swallowing a failure here. No
+    # `continue-on-error`: the `release` job waits on this job and publishes
+    # everything under `dist/`, so a FreeBSD failure must stop the stable train
+    # instead of silently shipping a release with no FreeBSD asset.
     # `cargo test` would otherwise emit target/debug/incremental output that
     # the VM action syncs between guest and runner for no benefit.
     env:
@@ -1378,6 +1379,7 @@ jobs:
         validate,
         build,
         build-alpine,
+        build-freebsd,
         verify-install,
         macos-universal,
         windows-zip,
@@ -1408,6 +1410,30 @@ jobs:
           TOOLCHAIN="$(scripts/rust-channel.sh)"
           printf '{\n  "commit": "%s",\n  "tag": "%s",\n  "date": "%s",\n  "toolchain": "%s",\n  "build_runner": "github-actions"\n}\n' "$COMMIT" "${{ github.ref_name }}" "$DATE" "$TOOLCHAIN" > dist/provenance.json
           cat dist/provenance.json
+      # `download-artifact` merges every job's artifacts into one `dist` and the
+      # release publishes `dist/*` wholesale, so a platform that uploaded
+      # nothing is indistinguishable from one that was never expected. The
+      # FreeBSD leg is a `needs:` dependency above, so reaching this step means
+      # it ran green; assert its payload is really in `dist` anyway, and that
+      # its sidecar covers exactly those bytes, before the release is created
+      # (bitty#2851).
+      - name: Verify FreeBSD artifacts are in dist
+        run: |
+          set -euo pipefail
+          version="$(bash scripts/check-release-version.sh --print)"
+          for f in \
+            "dist/bitty-x86_64-unknown-freebsd" \
+            "dist/bitty-${version}-x86_64-unknown-freebsd.tar.xz" \
+            "dist/bitty-x86_64-unknown-freebsd.sha256"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::missing FreeBSD release artifact: $f" >&2
+              exit 1
+            fi
+            echo "found $f"
+          done
+          # One sidecar, two lines (bare binary + versioned tarball) per
+          # packaging/README.md; a mismatch here would contradict SHA256SUMS.
+          (cd dist && sha256sum -c bitty-x86_64-unknown-freebsd.sha256)
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:

@@ -109,10 +109,18 @@
 //!   abort, and a `SIGUSR1` capture never aborts: the operator is inspecting
 //!   a live process.
 //! - `SIGUSR1` (Unix) asks a running monitor to write one report without
-//!   exiting. The handler is installed only when the monitor starts, so an
-//!   invocation without a monitor (headless/test-mode, an explicit off
-//!   switch, or the debug-build default) leaves `SIGUSR1` at its default
-//!   process-terminating action instead of silently swallowing it.
+//!   exiting. The report action is installed only after the monitor thread
+//!   spawned and released on shutdown, so an invocation that never starts a
+//!   monitor (headless/test-mode, an explicit off switch, the debug-build
+//!   default, or a failed thread spawn) installs nothing and keeps the
+//!   kernel's default process-terminating action. `signal_hook` cannot
+//!   restore `SIG_DFL` when the last action is removed - its registry
+//!   dispatcher stays installed and would silently swallow the signal - so
+//!   the first monitor also registers one bounded conditional-default action.
+//!   It does nothing while a monitor is registered, and with no monitor it
+//!   emulates the signal's default action, so `SIGUSR1` terminates the
+//!   process again after the last monitor stopped. (Should that registration
+//!   itself fail, one warning is logged and a later `SIGUSR1` is ignored.)
 //! - The latest report atomically replaces `bitty/stall-watchdog.log` under
 //!   the platform state directory (`XDG_STATE_HOME`, `HOME/.local/state`, or
 //!   `LOCALAPPDATA`). Delivery outcomes are mirrored to
@@ -156,14 +164,18 @@
 //! wraps the one unsafe registration, and the monitor thread owns the flag.
 //! Given that, this build keeps the single `SIGUSR1` capture: it needs no new
 //! file or watcher, cannot be spoofed by another local process writing a slot,
-//! and works from a process that looks idle. The handler is registered by
-//! [`StallWatchdog::start`] and removed on shutdown, so it exists exactly when
-//! a monitor exists: release builds by default, debug builds only with an
-//! explicit enable value, and never after `BITTY_HANG_WATCHDOG=0` or in
-//! headless/test-mode invocations, which never construct the app. Without a
-//! monitor, `SIGUSR1` keeps its default process-terminating action. The
-//! campaign's parked-work bitset and no-present semantics are kept; only the
-//! trigger differs.
+//! and works from a process that looks idle. The report action is registered
+//! by [`StallWatchdog::start`] only after the monitor thread spawned and
+//! released on shutdown, so the capture exists exactly while a monitor exists:
+//! release builds by default, debug builds only with an explicit enable value,
+//! and never after `BITTY_HANG_WATCHDOG=0` or in headless/test-mode
+//! invocations, which never construct the app. Because the registry dispatcher
+//! cannot be uninstalled, the first monitor also keeps one conditional-default
+//! action registered: while a monitor runs it does nothing, and once none is
+//! registered it emulates the default action, so an operator's `SIGUSR1`
+//! terminates the process instead of being silently swallowed. The campaign's
+//! parked-work bitset and no-present semantics are kept; only the trigger
+//! differs.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -181,10 +193,6 @@ use bitty_runtime::hang_watchdog::{HangGaugeSnapshot, HangGauges};
 
 #[cfg(unix)]
 use signal_hook::SigId;
-#[cfg(unix)]
-use signal_hook::consts::SIGUSR1;
-#[cfg(unix)]
-use signal_hook::flag as signal_flag;
 
 /// Environment switch for the watchdog (bitty#2830).
 pub(crate) const HANG_WATCHDOG_ENV: &str = "BITTY_HANG_WATCHDOG";
@@ -524,16 +532,19 @@ impl WatchdogConfig {
 /// Parse the enable switch and optional threshold.
 ///
 /// Pure so the environment contract is testable without touching the process
-/// environment. `enable = None` means the build default (on in release, off
-/// in debug); an explicit off value always wins. A numeric enable value
-/// selects the generic bound. An unparseable value leaves the watchdog
-/// disabled (fail-quiet: diagnostics never surprise CI).
+/// environment. `default_on` is the build default the caller selected (see
+/// [`default_enabled`]); it is an explicit input so tests can pin both build
+/// profiles without re-deriving `cfg!(debug_assertions)`. `enable = None`
+/// means the build default; an explicit off value always wins. A numeric
+/// enable value selects the generic bound. An unparseable value leaves the
+/// watchdog disabled (fail-quiet: diagnostics never surprise CI).
 pub(crate) fn config_from_values(
     enable: Option<&str>,
     threshold: Option<&str>,
+    default_on: bool,
 ) -> Option<WatchdogConfig> {
     let enabled = match enable.map(str::trim) {
-        None | Some("") => default_enabled(),
+        None | Some("") => default_on,
         Some(value)
             if value.eq_ignore_ascii_case("0")
                 || value.eq_ignore_ascii_case("false")
@@ -571,14 +582,26 @@ pub(crate) fn config_from_values(
     })
 }
 
+/// Product policy: release builds arm the watchdog without any switch.
+///
+/// One named constant instead of a literal inside [`default_enabled`], so the
+/// release decision is pinned by a test that the debug profile CI run also
+/// executes: silently flipping the release default to off fails CI.
+pub(crate) const RELEASE_DEFAULT_ON: bool = true;
+
 /// Whether this build arms the watchdog without an environment switch.
 ///
 /// Release is the owner-facing product build and must capture the next hang
 /// without anyone predicting it. Debug is a developer/CI build where a
 /// deliberately slow test could otherwise write a state slot; `BITTY_HANG_WATCHDOG=1`
-/// opts in there for reproduction.
+/// opts in there for reproduction. This is the only place the build profile is
+/// read; the decision itself is [`RELEASE_DEFAULT_ON`].
 const fn default_enabled() -> bool {
-    !cfg!(debug_assertions)
+    if cfg!(debug_assertions) {
+        false
+    } else {
+        RELEASE_DEFAULT_ON
+    }
 }
 
 /// Raw enable switch from either accepted variable.
@@ -588,13 +611,11 @@ fn environment_enable_value() -> Option<String> {
         .or_else(|| std::env::var(LEGACY_WATCHDOG_ENV).ok())
 }
 
-/// Read the configuration from the process environment.
-fn config_from_env() -> Option<WatchdogConfig> {
-    let enable = environment_enable_value();
-    let threshold = std::env::var(HANG_WATCHDOG_THRESHOLD_ENV)
+/// Raw threshold override from either accepted variable.
+fn environment_threshold_value() -> Option<String> {
+    std::env::var(HANG_WATCHDOG_THRESHOLD_ENV)
         .ok()
-        .or_else(|| std::env::var(LEGACY_WATCHDOG_THRESHOLD_ENV).ok());
-    config_from_values(enable.as_deref(), threshold.as_deref())
+        .or_else(|| std::env::var(LEGACY_WATCHDOG_THRESHOLD_ENV).ok())
 }
 
 /// Whether a debug build should abort after writing the report.
@@ -960,6 +981,132 @@ impl StopSignal {
     }
 }
 
+/// Process-wide `SIGUSR1` wiring shared by every monitor instance (Unix).
+///
+/// `signal_hook`'s registry keeps its dispatcher installed after the last
+/// action for a signal is removed, so `unregister` alone leaves `SIGUSR1`
+/// silently ignored; it does not restore `SIG_DFL`. Restoring the kernel
+/// disposition is not possible through the registry, so the first monitor also
+/// registers one conditional-default action. That action reads a single shared
+/// flag (no allocation, no lock) and emulates the signal's default action -
+/// process termination by `SIGUSR1` - whenever no monitor is registered, and
+/// does nothing at all while one is. The observable contract is therefore:
+/// a capture while a monitor runs, termination otherwise, including after the
+/// last monitor stopped.
+///
+/// The bookkeeping is serialized by one process-global mutex so concurrent
+/// monitors cannot race the flag that decides between capture and
+/// termination. The registry action itself never takes that mutex.
+#[cfg(unix)]
+mod sigusr1 {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use signal_hook::SigId;
+    use signal_hook::consts::SIGUSR1;
+    use signal_hook::flag as signal_flag;
+
+    use crate::logging;
+
+    /// Registry state for one process.
+    struct Wiring {
+        /// Monitors whose report action is registered; guarded by [`WIRING`].
+        active: usize,
+        /// `true` while no monitor is registered (read in signal context).
+        idle: Arc<AtomicBool>,
+        /// Whether the conditional-default action is registered.
+        fallback: bool,
+    }
+
+    impl Wiring {
+        fn new() -> Self {
+            Self {
+                active: 0,
+                idle: Arc::new(AtomicBool::new(true)),
+                fallback: false,
+            }
+        }
+    }
+
+    static WIRING: Mutex<Option<Wiring>> = Mutex::new(None);
+
+    fn lock() -> std::sync::MutexGuard<'static, Option<Wiring>> {
+        WIRING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Register the report action after its monitor thread spawned and
+    /// publish that a monitor is active.
+    ///
+    /// Returns `None` when the action could not be registered; the caller then
+    /// keeps the monitor but loses only the capture, never the periodic
+    /// reports.
+    pub(super) fn install(flag: Arc<AtomicBool>) -> Option<SigId> {
+        let mut guard = lock();
+        let wiring = guard.get_or_insert_with(Wiring::new);
+        // Publish "a monitor is starting" before the terminating action can
+        // observe the signal: a `SIGUSR1` that races registration must never
+        // kill a process whose monitor is being armed.
+        wiring.idle.store(false, Ordering::SeqCst);
+        if !wiring.fallback {
+            match signal_flag::register_conditional_default(SIGUSR1, Arc::clone(&wiring.idle)) {
+                Ok(_) => wiring.fallback = true,
+                Err(error) => logging::warn(|| {
+                    format!(
+                        "bitty: SIGUSR1 default action unavailable after shutdown ({error}); \
+                         a later SIGUSR1 would be ignored"
+                    )
+                }),
+            }
+        }
+        match signal_flag::register(SIGUSR1, flag) {
+            Ok(id) => {
+                wiring.active = wiring.active.saturating_add(1);
+                Some(id)
+            }
+            Err(error) => {
+                if wiring.active == 0 {
+                    // No capture exists, so keep the default action armed.
+                    wiring.idle.store(true, Ordering::SeqCst);
+                }
+                logging::warn(|| {
+                    format!(
+                        "bitty: SIGUSR1 hang capture unavailable ({error}); periodic watchdog remains armed"
+                    )
+                });
+                None
+            }
+        }
+    }
+
+    /// Remove the report action and re-arm the default action when it was the
+    /// last one.
+    pub(super) fn release(id: SigId) {
+        let _ = signal_hook::low_level::unregister(id);
+        let mut guard = lock();
+        let Some(wiring) = guard.as_mut() else {
+            return;
+        };
+        wiring.active = wiring.active.saturating_sub(1);
+        if wiring.active == 0 {
+            // Arm termination only after the last report action is gone:
+            // while any monitor is registered, `SIGUSR1` must never terminate.
+            wiring.idle.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the bounded conditional-default action is registered.
+    ///
+    /// Test observability only: once installed it stays installed for the life
+    /// of the process, so this is monotonic and safe to assert under a
+    /// parallel harness.
+    #[cfg(test)]
+    pub(super) fn fallback_installed() -> bool {
+        lock().as_ref().is_some_and(|wiring| wiring.fallback)
+    }
+}
+
 /// Main-loop hang watchdog handle (issue #2483, built in by bitty#2830).
 ///
 /// `Drop` requests a stop and joins the monitor: shutdown leaves no detached
@@ -973,9 +1120,11 @@ pub(crate) struct StallWatchdog {
     shared: Arc<Shared>,
     stop: Arc<StopSignal>,
     monitor: Option<JoinHandle<()>>,
-    /// `SIGUSR1` registration; unregistered on shutdown.
+    /// `SIGUSR1` report registration; released on shutdown.
     ///
-    /// The flag the handler sets lives on the monitor thread.
+    /// The flag the action sets lives on the monitor thread. `None` means no
+    /// action was registered (the monitor failed to spawn, or registration
+    /// itself failed), so this handle owns nothing to release.
     #[cfg(unix)]
     signal_id: Option<SigId>,
     /// The monitor's `SIGUSR1` flag, retained for hermetic tests.
@@ -995,20 +1144,42 @@ impl StallWatchdog {
     ///
     /// Release builds start it by default. Debug builds start it only when
     /// `BITTY_HANG_WATCHDOG=1` (or another enable value); an explicit
-    /// `BITTY_HANG_WATCHDOG=0` disables it everywhere. The `SIGUSR1` handler is
-    /// installed by [`Self::start`], so it exists only while a monitor runs.
-    /// Unit-test binaries return `None` unless the switch opts in, so CI runs
-    /// spawn no monitor per app instance.
+    /// `BITTY_HANG_WATCHDOG=0` disables it everywhere. The `SIGUSR1` capture is
+    /// registered by [`Self::start`] only after the monitor thread spawned, so
+    /// it exists only while a monitor runs. Unit-test binaries return `None`
+    /// unless the switch opts in, so CI runs spawn no monitor per app
+    /// instance.
     pub(crate) fn from_env(gauges: Arc<HangGauges>) -> Option<Self> {
-        // `None` covers an explicit off switch and the debug-build default:
-        // neither installs a monitor thread nor a `SIGUSR1` handler.
-        let config = config_from_env()?;
         // Unit-test binaries construct many apps; without an explicit opt-in
-        // they neither need periodic reports nor a `SIGUSR1` handler per
-        // instance.
-        if cfg!(test) && environment_enable_value().is_none() {
+        // they neither need periodic reports nor a `SIGUSR1` action per
+        // instance. The guard runs before any thread or registration exists.
+        let enable = environment_enable_value();
+        if cfg!(test) && enable.is_none() {
             return None;
         }
+        Self::from_values(
+            enable.as_deref(),
+            environment_threshold_value().as_deref(),
+            default_enabled(),
+            gauges,
+        )
+    }
+
+    /// Start from explicit inputs instead of the process environment.
+    ///
+    /// This is the decision core of [`Self::from_env`] with the build default
+    /// passed in, so tests exercise the debug and release defaults in the same
+    /// profile without reading or mutating the environment. `None` means no
+    /// monitor exists: no thread, no registration.
+    fn from_values(
+        enable: Option<&str>,
+        threshold: Option<&str>,
+        default_on: bool,
+        gauges: Arc<HangGauges>,
+    ) -> Option<Self> {
+        // `None` covers an explicit off switch and an off build default:
+        // neither installs a monitor thread nor a `SIGUSR1` action.
+        let config = config_from_values(enable, threshold, default_on)?;
         let slot = StateSlot::from_env();
         let mut sink = ReportSink::new(slot, Box::new(HelperDelivery::current()));
         Some(Self::start(
@@ -1027,20 +1198,7 @@ impl StallWatchdog {
         let shared = Arc::new(Shared::new(gauges));
         let stop = Arc::new(StopSignal::new());
         #[cfg(unix)]
-        let (signal_flag, mut signal_id) = {
-            let flag = Arc::new(AtomicBool::new(false));
-            match signal_flag::register(SIGUSR1, Arc::clone(&flag)) {
-                Ok(id) => (flag, Some(id)),
-                Err(error) => {
-                    logging::warn(|| {
-                        format!(
-                            "bitty: SIGUSR1 hang capture unavailable ({error}); periodic watchdog remains armed"
-                        )
-                    });
-                    (flag, None)
-                }
-            }
-        };
+        let signal_flag = Arc::new(AtomicBool::new(false));
         #[cfg(test)]
         let finished = Arc::new(AtomicBool::new(false));
         let thread_shared = Arc::clone(&shared);
@@ -1073,12 +1231,10 @@ impl StallWatchdog {
         let monitor = match spawn {
             Ok(handle) => Some(handle),
             Err(error) => {
-                // No monitor exists to read the flag: leave `SIGUSR1` at its
-                // default action instead of swallowing it for the process.
-                #[cfg(unix)]
-                if let Some(id) = signal_id.take() {
-                    let _ = signal_hook::low_level::unregister(id);
-                }
+                // Nothing is registered yet, so a failed spawn leaves
+                // `SIGUSR1` exactly as it was: the kernel default when no
+                // monitor ever ran, or the conditional default owned by an
+                // earlier monitor. No cleanup is needed here by design.
                 logging::warn(|| {
                     format!(
                         "bitty: hang watchdog thread unavailable ({error}); diagnostics stay off"
@@ -1088,6 +1244,15 @@ impl StallWatchdog {
                 finished.store(true, Ordering::SeqCst);
                 None
             }
+        };
+        // bitty#2862: register only once a monitor thread exists to consume the
+        // flag. A capture without a monitor would be a dead registration, and
+        // removing one does not restore the default action.
+        #[cfg(unix)]
+        let signal_id = if monitor.is_some() {
+            sigusr1::install(Arc::clone(&signal_flag))
+        } else {
+            None
         };
         Self {
             shared,
@@ -1155,16 +1320,16 @@ impl StallWatchdog {
     /// Request monitor shutdown and wait for the thread to exit.
     fn shutdown(&mut self) -> std::thread::Result<()> {
         self.stop.request();
-        // Join before unregistering: while the monitor is still winding down,
-        // a `SIGUSR1` must continue to reach the handler instead of falling
-        // back to the process-terminating default action.
+        // Join before releasing: while the monitor is still winding down, a
+        // `SIGUSR1` must continue to reach the handler instead of taking the
+        // terminating path.
         let result = match self.monitor.take() {
             Some(handle) => handle.join(),
             None => Ok(()),
         };
         #[cfg(unix)]
         if let Some(id) = self.signal_id.take() {
-            let _ = signal_hook::low_level::unregister(id);
+            sigusr1::release(id);
         }
         result
     }
@@ -3477,75 +3642,140 @@ mod tests {
 
     #[test]
     fn config_is_default_on_and_threshold_is_clamped() {
+        // The build default is an explicit input, so this pins both profiles
+        // in every CI run instead of re-deriving `cfg!(debug_assertions)`.
         assert_eq!(
-            config_from_values(None, None),
-            default_enabled().then(WatchdogConfig::default_threshold)
+            config_from_values(None, None, true),
+            Some(WatchdogConfig::default_threshold())
         );
-        assert_eq!(config_from_values(Some("0"), None), None);
-        assert_eq!(config_from_values(Some("off"), None), None);
-        assert_eq!(config_from_values(Some("nonsense"), None), None);
+        assert_eq!(config_from_values(None, None, false), None);
+        assert_eq!(config_from_values(Some("0"), None, true), None);
+        assert_eq!(config_from_values(Some("off"), None, true), None);
+        assert_eq!(config_from_values(Some("nonsense"), None, true), None);
         assert_eq!(
-            config_from_values(Some("1"), None),
+            config_from_values(Some("1"), None, false),
             Some(WatchdogConfig::default_threshold())
         );
         assert_eq!(
-            config_from_values(Some("750"), None),
+            config_from_values(Some("750"), None, false),
             Some(WatchdogConfig::with_threshold_ms(750))
         );
         assert_eq!(
-            config_from_values(Some("1"), Some("250")),
+            config_from_values(Some("1"), Some("250"), false),
             Some(WatchdogConfig::with_threshold_ms(250))
         );
         assert_eq!(
-            config_from_values(Some("1"), Some("1")).map(|c| c.threshold),
+            config_from_values(Some("1"), Some("1"), false).map(|c| c.threshold),
             Some(MIN_STALL_THRESHOLD)
         );
         assert_eq!(
-            config_from_values(Some("1"), Some("9999999")).map(|c| c.threshold),
+            config_from_values(Some("1"), Some("9999999"), false).map(|c| c.threshold),
             Some(MAX_STALL_THRESHOLD)
         );
     }
 
-    /// The enable contract for both build profiles: unset follows the build
-    /// default, an explicit off value always wins, and a numeric value selects
-    /// the bound.
+    /// The enable contract for both build defaults: unset follows the
+    /// injected default, an explicit off value always wins, and a numeric
+    /// value selects the bound.
+    ///
+    /// Both values run in every profile, so the debug-profile CI run pins the
+    /// release default instead of only pinning debug-off.
     #[test]
     fn watchdog_default_follows_the_build_and_explicit_off_always_wins() {
-        // Both profiles must pass, so the expectation is derived from the
-        // same cfg the implementation uses rather than hardcoded.
-        let default_on = !cfg!(debug_assertions);
-        assert_eq!(config_from_values(None, None).is_some(), default_on);
-        assert_eq!(
-            config_from_values(Some(""), None).is_some(),
-            default_on,
-            "an empty switch means unset"
-        );
-        for off in ["0", "false", "off", "no", "OFF", " No "] {
+        for default_on in [true, false] {
             assert_eq!(
-                config_from_values(Some(off), None),
-                None,
-                "explicit off must win: {off:?}"
+                config_from_values(None, None, default_on).is_some(),
+                default_on,
+                "unset must follow the injected build default"
             );
             assert_eq!(
-                config_from_values(Some(off), Some("250")),
-                None,
-                "a threshold must not override explicit off: {off:?}"
+                config_from_values(Some(""), None, default_on).is_some(),
+                default_on,
+                "an empty switch means unset"
+            );
+            for off in ["0", "false", "off", "no", "OFF", " No "] {
+                assert_eq!(
+                    config_from_values(Some(off), None, default_on),
+                    None,
+                    "explicit off must win: {off:?}"
+                );
+                assert_eq!(
+                    config_from_values(Some(off), Some("250"), default_on),
+                    None,
+                    "a threshold must not override explicit off: {off:?}"
+                );
+            }
+            for on in ["1", "true", "on", "yes", "TRUE"] {
+                assert_eq!(
+                    config_from_values(Some(on), None, default_on),
+                    Some(WatchdogConfig::default_threshold()),
+                    "explicit on must work: {on:?}"
+                );
+            }
+            // The threshold variable follows the build default: it cannot
+            // enable a build whose default is off, and with the default on it
+            // selects the bound of the monitor that is already armed.
+            assert_eq!(
+                config_from_values(None, Some("250"), default_on),
+                default_on.then(|| WatchdogConfig::with_threshold_ms(250))
             );
         }
-        for on in ["1", "true", "on", "yes", "TRUE"] {
-            assert_eq!(
-                config_from_values(Some(on), None),
-                Some(WatchdogConfig::default_threshold()),
-                "explicit on must work: {on:?}"
-            );
-        }
-        // The threshold variable follows the build default: it cannot enable
-        // a debug build, and in release it selects the bound of the monitor
-        // that is already on.
+    }
+
+    /// The release policy is expressed through the config decision, so this
+    /// assertion runs in the debug-profile CI job too: silently turning the
+    /// release watchdog off fails CI instead of only failing in a release run.
+    #[test]
+    fn release_default_on_is_pinned() {
         assert_eq!(
-            config_from_values(None, Some("250")),
-            default_on.then(|| WatchdogConfig::with_threshold_ms(250))
+            config_from_values(None, None, RELEASE_DEFAULT_ON),
+            Some(WatchdogConfig::default_threshold()),
+            "release builds must arm the watchdog without an environment switch"
         );
+        // The debug build must not inherit the release policy.
+        #[cfg(debug_assertions)]
+        assert!(
+            config_from_values(None, None, default_enabled()).is_none(),
+            "debug builds must not arm the watchdog without an explicit switch"
+        );
+    }
+
+    /// `from_env`'s decision core with the build default injected: unset in
+    /// debug starts nothing, unset in release starts a monitor, and an
+    /// explicit off value wins over the release default.
+    ///
+    /// The monitor threads started here are joined immediately; no report is
+    /// delivered because no phase stalls and no signal is raised.
+    #[test]
+    fn from_env_starts_a_monitor_only_when_the_default_or_switch_asks() {
+        let gauges = || Arc::new(HangGauges::new());
+        assert!(
+            StallWatchdog::from_values(None, None, false, gauges()).is_none(),
+            "unset in a debug build must not start a monitor"
+        );
+        let started = StallWatchdog::from_values(None, None, true, gauges())
+            .expect("unset in a release build must start a monitor");
+        #[cfg(unix)]
+        assert!(
+            started.signal_id.is_some(),
+            "a monitor started by the release default must own the SIGUSR1 action"
+        );
+        started
+            .stop_and_join()
+            .expect("the monitor thread must exit");
+        assert!(
+            StallWatchdog::from_values(Some("0"), None, true, gauges()).is_none(),
+            "an explicit off switch must win over the release default"
+        );
+        assert!(
+            StallWatchdog::from_values(Some("off"), Some("250"), true, gauges()).is_none(),
+            "a threshold must not override an explicit off switch"
+        );
+        let started = StallWatchdog::from_values(Some("1"), None, false, gauges())
+            .expect("an explicit on switch must start a monitor in a debug build");
+        started
+            .stop_and_join()
+            .expect("the monitor thread must exit");
     }
 
     #[test]
@@ -3881,8 +4111,11 @@ mod tests {
     }
 
     /// Structural coverage for the real wiring: starting a monitor owns a
-    /// `SIGUSR1` registration. No test raises the signal, because doing so
-    /// after the handler is removed would terminate the harness.
+    /// `SIGUSR1` report action, and the first monitor also installs the
+    /// bounded post-shutdown default action. Real-signal delivery is covered
+    /// in child processes by [`sigusr1_reaches_the_monitor_in_a_child_process`]
+    /// and [`sigusr1_terminates_a_child_after_the_monitor_stopped`]; the
+    /// harness itself never raises the signal.
     #[cfg(unix)]
     #[test]
     fn monitor_start_owns_the_sigusr1_registration() {
@@ -3895,9 +4128,271 @@ mod tests {
             watchdog.signal_id.is_some(),
             "a started monitor must own a SIGUSR1 registration"
         );
+        assert!(
+            sigusr1::fallback_installed(),
+            "a started monitor must install the bounded post-shutdown default action"
+        );
         watchdog
             .stop_and_join()
             .expect("the monitor thread must exit cleanly");
+    }
+
+    /// Environment switch that turns the re-executed test binary into the
+    /// `SIGUSR1` child helper; absent in a normal harness run.
+    #[cfg(unix)]
+    const SIGUSR1_CHILD_ENV: &str = "BITTY_TEST_SIGUSR1_CHILD";
+    /// Directory the child helper publishes its ready marker and report in.
+    #[cfg(unix)]
+    const SIGUSR1_CHILD_DIR_ENV: &str = "BITTY_TEST_SIGUSR1_DIR";
+    /// Exact libtest name of the child helper.
+    #[cfg(unix)]
+    const SIGUSR1_CHILD_TEST: &str = "stall_watchdog::tests::sigusr1_child_process_helper";
+    /// Bound for every parent-side wait on the child helper.
+    #[cfg(unix)]
+    const SIGUSR1_CHILD_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Fresh scratch directory for one child-process signal test.
+    #[cfg(unix)]
+    fn sigusr1_child_dir(tag: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bitty-sigusr1-{tag}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("child scratch directory");
+        dir
+    }
+
+    /// Re-execute this test binary so it runs only the child helper in `mode`.
+    #[cfg(unix)]
+    fn spawn_sigusr1_child(mode: &str, dir: &Path) -> Option<Child> {
+        let exe = std::env::current_exe().ok()?;
+        Command::new(exe)
+            .args([
+                "--exact",
+                SIGUSR1_CHILD_TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(SIGUSR1_CHILD_ENV, mode)
+            .env(SIGUSR1_CHILD_DIR_ENV, dir)
+            .env_remove(HANG_WATCHDOG_ENV)
+            .env_remove(LEGACY_WATCHDOG_ENV)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()
+    }
+
+    /// Wait for the child's ready marker, failing if it exits first.
+    #[cfg(unix)]
+    fn wait_for_child_marker(marker: &Path, child: &mut Child, deadline: Instant) {
+        loop {
+            if marker.exists() {
+                return;
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("the child exited before it was ready: {status:?}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the child did not become ready in time"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Deliver a real `SIGUSR1` to a child this test spawned.
+    ///
+    /// `kill(1)` is used because the crate is `#![forbid(unsafe_code)]` and the
+    /// standard library cannot name a signal. `None` means `kill` is not
+    /// available on this host, so the caller skips; `Some(false)` means the
+    /// signal could not be delivered to a child that was just alive, which is
+    /// a real failure rather than a skip.
+    #[cfg(unix)]
+    fn send_sigusr1(child: &Child) -> Option<bool> {
+        match Command::new("kill")
+            .args(["-USR1", &child.id().to_string()])
+            .status()
+        {
+            Ok(status) => Some(status.success()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("cannot run kill(1): {error}"),
+        }
+    }
+
+    /// Bounded wait for the child to exit; `None` means it outlived the bound.
+    #[cfg(unix)]
+    fn wait_for_child_exit(
+        child: &mut Child,
+        deadline: Instant,
+    ) -> Option<std::process::ExitStatus> {
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Some(status),
+                Ok(None) => {}
+                Err(error) => panic!("cannot observe the child: {error}"),
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Kill and reap a child this test spawned, then report its stderr.
+    #[cfg(unix)]
+    fn reap_child(child: &mut Child) -> String {
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        stderr
+    }
+
+    /// Child-process half of the real-signal tests.
+    ///
+    /// The parent re-executes this test binary with [`SIGUSR1_CHILD_ENV`]; a
+    /// normal harness run does nothing. Modes:
+    ///
+    /// - `report`: start a monitor, publish readiness, wait for a real
+    ///   `SIGUSR1`, write the captured report, and return so libtest exits 0.
+    /// - `stopped`: start and stop a monitor, publish readiness, then stay
+    ///   alive. The documented contract is that `SIGUSR1` terminates the
+    ///   process once no monitor is registered, so the harness fails if this
+    ///   function ever returns.
+    #[cfg(unix)]
+    #[test]
+    fn sigusr1_child_process_helper() {
+        let Ok(mode) = std::env::var(SIGUSR1_CHILD_ENV) else {
+            return;
+        };
+        let dir = std::env::var_os(SIGUSR1_CHILD_DIR_ENV)
+            .map(PathBuf::from)
+            .expect("the parent passes the child directory");
+        let ready = dir.join("ready");
+        let (tx, rx) = mpsc::channel::<String>();
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(60_000),
+            Arc::new(HangGauges::new()),
+            Box::new(move |line| {
+                let _ = tx.send(line.to_string());
+                DeliveryOutcome::Delivered
+            }),
+        );
+        watchdog.idle();
+        if mode == "stopped" {
+            watchdog
+                .stop_and_join()
+                .expect("the monitor thread must exit cleanly");
+            std::fs::write(&ready, b"stopped\n").expect("ready marker");
+            std::thread::sleep(SIGUSR1_CHILD_TIMEOUT);
+            panic!("SIGUSR1 was ignored after the monitor stopped");
+        }
+        std::fs::write(&ready, b"report\n").expect("ready marker");
+        let line = rx
+            .recv_timeout(SIGUSR1_CHILD_TIMEOUT)
+            .expect("a real SIGUSR1 must reach the running monitor");
+        assert!(line.starts_with(SIGNAL_REPORT_PREFIX), "{line}");
+        std::fs::write(dir.join("report.log"), line.as_bytes()).expect("report file");
+    }
+
+    /// End-to-end real-signal coverage of the capture path: a child process
+    /// runs a monitor, receives a real `SIGUSR1`, writes the report, and exits
+    /// 0. The signal is never raised in the test harness itself.
+    #[cfg(unix)]
+    #[test]
+    fn sigusr1_reaches_the_monitor_in_a_child_process() {
+        let dir = sigusr1_child_dir("report");
+        let Some(mut child) = spawn_sigusr1_child("report", &dir) else {
+            eprintln!("skipping SIGUSR1 delivery test: cannot re-exec the test binary");
+            return;
+        };
+        let deadline = Instant::now() + SIGUSR1_CHILD_TIMEOUT;
+        wait_for_child_marker(&dir.join("ready"), &mut child, deadline);
+        match send_sigusr1(&child) {
+            Some(true) => {}
+            Some(false) => {
+                let stderr = reap_child(&mut child);
+                panic!("kill -USR1 failed for a live child\n{stderr}");
+            }
+            None => {
+                let stderr = reap_child(&mut child);
+                let _ = std::fs::remove_dir_all(&dir);
+                eprintln!("skipping SIGUSR1 delivery test: kill(1) unavailable\n{stderr}");
+                return;
+            }
+        }
+        let status = match wait_for_child_exit(&mut child, deadline) {
+            Some(status) => status,
+            None => {
+                let stderr = reap_child(&mut child);
+                panic!("the child outlived the SIGUSR1 deadline\n{stderr}");
+            }
+        };
+        let stderr = reap_child(&mut child);
+        assert!(status.success(), "the child failed: {status:?}\n{stderr}");
+        let report = std::fs::read_to_string(dir.join("report.log"))
+            .expect("the child must write the captured report");
+        assert!(report.starts_with(SIGNAL_REPORT_PREFIX), "{report}");
+        assert!(report.contains("reason=sigusr1"), "{report}");
+        assert!(report.contains("trigger=sigusr1"), "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end real-signal coverage of the post-shutdown contract: with no
+    /// monitor registered, a real `SIGUSR1` terminates the process by the
+    /// signal instead of being swallowed by the registry dispatcher.
+    #[cfg(unix)]
+    #[test]
+    fn sigusr1_terminates_a_child_after_the_monitor_stopped() {
+        use signal_hook::consts::SIGUSR1;
+        use std::os::unix::process::ExitStatusExt;
+
+        let dir = sigusr1_child_dir("stopped");
+        let Some(mut child) = spawn_sigusr1_child("stopped", &dir) else {
+            eprintln!("skipping post-shutdown SIGUSR1 test: cannot re-exec the test binary");
+            return;
+        };
+        let deadline = Instant::now() + SIGUSR1_CHILD_TIMEOUT;
+        wait_for_child_marker(&dir.join("ready"), &mut child, deadline);
+        match send_sigusr1(&child) {
+            Some(true) => {}
+            Some(false) => {
+                let stderr = reap_child(&mut child);
+                panic!("kill -USR1 failed for a live child\n{stderr}");
+            }
+            None => {
+                let stderr = reap_child(&mut child);
+                let _ = std::fs::remove_dir_all(&dir);
+                eprintln!("skipping post-shutdown SIGUSR1 test: kill(1) unavailable\n{stderr}");
+                return;
+            }
+        }
+        let status = match wait_for_child_exit(&mut child, deadline) {
+            Some(status) => status,
+            None => {
+                let stderr = reap_child(&mut child);
+                panic!("the child swallowed SIGUSR1 after the monitor stopped\n{stderr}");
+            }
+        };
+        let stderr = reap_child(&mut child);
+        assert_eq!(
+            status.signal(),
+            Some(SIGUSR1),
+            "the documented post-shutdown action is termination by SIGUSR1: {status:?}\n{stderr}"
+        );
+        assert!(
+            status.code().is_none(),
+            "termination must not look like a normal exit: {status:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

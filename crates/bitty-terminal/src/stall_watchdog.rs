@@ -19,8 +19,8 @@
 //!   disables it. Debug builds default to off so unit/CI runs never write
 //!   diagnostics unless a developer asks for them; `BITTY_HANG_WATCHDOG=1`
 //!   enables the same monitor there. The legacy `BITTY_STALL_WATCHDOG` name
-//!   remains an accepted alias. A threshold variable never enables the
-//!   watchdog on its own.
+//!   remains an accepted alias. A threshold variable only selects the bound;
+//!   it never overrides an explicit off switch or the debug-build default.
 //! - **Named bounds.** [`HANG_WATCHDOG_TICK_BOUND`] and
 //!   [`HANG_WATCHDOG_COMMAND_BOUND`] cap the generic bound for the two phases
 //!   that have caused the reported freezes: `Runtime::tick` and the cold
@@ -29,8 +29,9 @@
 //!   so raising `BITTY_HANG_WATCHDOG_MS` really raises the generic bound.
 //! - **One-shot.** One continuous stall writes exactly one report; after the
 //!   loop advances, one recovery line records how long it was wedged. A later
-//!   stall reports again. `SIGUSR1` always writes (rate-limited to one per
-//!   second) because the owner explicitly asked for that sample.
+//!   stall reports again. While the monitor is running, `SIGUSR1` writes on
+//!   demand (rate-limited to one per second) because the owner explicitly
+//!   asked for that sample.
 //! - **No hot-path work.** A phase mark is one relaxed atomic store plus a
 //!   timestamp. The app publishes its bounded context sample at most twice a
 //!   second, the runtime publishes lock-free gauges on every tick, and the
@@ -93,23 +94,29 @@
 //!
 //! Configuration:
 //!
-//! - Release builds arm the monitor with the default 10 s bound.
+//! - Release builds arm the monitor with the default 10 s bound. Debug builds
+//!   start no monitor unless the switch asks for one.
 //! - `BITTY_HANG_WATCHDOG=0` (or `false`/`off`/`no`) disables it; `1`
 //!   (or `true`/`on`/`yes`) enables it (including in debug builds).
 //! - `BITTY_HANG_WATCHDOG=<milliseconds>` enables it with that generic bound.
 //! - `BITTY_HANG_WATCHDOG_MS=<milliseconds>` overrides the generic bound
-//!   (clamped to `50..=600000`) but does not enable the watchdog by itself.
+//!   (clamped to `50..=600000`) but does not override an explicit off switch
+//!   or the debug-build default.
 //! - The legacy `BITTY_STALL_WATCHDOG` / `BITTY_STALL_WATCHDOG_MS` names are
 //!   accepted as aliases for existing runbooks.
 //! - `BITTY_HANG_WATCHDOG_ABORT=1` additionally aborts a debug build after a
 //!   stall or no-present report (with a backtrace). Release builds never
 //!   abort, and a `SIGUSR1` capture never aborts: the operator is inspecting
 //!   a live process.
-//! - `SIGUSR1` (Unix) writes the same report without exiting. It does not
-//!   depend on the build default (it is armed in debug builds too), but
-//!   `BITTY_HANG_WATCHDOG=0` disables it: with that setting no monitor or
-//!   handler is installed, so `SIGUSR1` keeps its default process-terminating
-//!   action.
+//! - `SIGUSR1` (Unix) asks a running monitor to write one report without
+//!   exiting. The handler is installed only when the monitor starts, so an
+//!   invocation without a monitor (headless/test-mode, an explicit off
+//!   switch, or the debug-build default) leaves `SIGUSR1` at its default
+//!   process-terminating action instead of silently swallowing it.
+//! - The latest report atomically replaces `bitty/stall-watchdog.log` under
+//!   the platform state directory (`XDG_STATE_HOME`, `HOME/.local/state`, or
+//!   `LOCALAPPDATA`). Delivery outcomes are mirrored to
+//!   `bitty/stall-watchdog-delivery.log` in the same directory.
 //!
 //! The idle state is explicit: after the event loop arms `ControlFlow::Wait`
 //! the app calls [`StallWatchdog::idle`], so a quiet window is never reported
@@ -147,13 +154,16 @@
 //! because it was a separate patch. This crate is `#![forbid(unsafe_code)]`,
 //! so it cannot install an async-signal-safe handler itself; `signal_hook`
 //! wraps the one unsafe registration, and the monitor thread owns the flag.
-//! Given that, this build keeps the single `SIGUSR1` capture: it is armed in
-//! every build, needs no new file or watcher, cannot be spoofed by another
-//! local process writing a slot, and works from a process that looks idle.
-//! Like every other watchdog entry point it is disabled by an explicit
-//! `BITTY_HANG_WATCHDOG=0`, which leaves `SIGUSR1` at its default action.
-//! The campaign's parked-work bitset and no-present semantics are kept; only
-//! the trigger differs.
+//! Given that, this build keeps the single `SIGUSR1` capture: it needs no new
+//! file or watcher, cannot be spoofed by another local process writing a slot,
+//! and works from a process that looks idle. The handler is registered by
+//! [`StallWatchdog::start`] and removed on shutdown, so it exists exactly when
+//! a monitor exists: release builds by default, debug builds only with an
+//! explicit enable value, and never after `BITTY_HANG_WATCHDOG=0` or in
+//! headless/test-mode invocations, which never construct the app. Without a
+//! monitor, `SIGUSR1` keeps its default process-terminating action. The
+//! campaign's parked-work bitset and no-present semantics are kept; only the
+//! trigger differs.
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
@@ -515,8 +525,9 @@ impl WatchdogConfig {
 ///
 /// Pure so the environment contract is testable without touching the process
 /// environment. `enable = None` means the build default (on in release, off
-/// in debug); an explicit off value always wins. An unparseable value leaves
-/// the watchdog disabled (fail-quiet: diagnostics never surprise CI).
+/// in debug); an explicit off value always wins. A numeric enable value
+/// selects the generic bound. An unparseable value leaves the watchdog
+/// disabled (fail-quiet: diagnostics never surprise CI).
 pub(crate) fn config_from_values(
     enable: Option<&str>,
     threshold: Option<&str>,
@@ -570,33 +581,20 @@ const fn default_enabled() -> bool {
     !cfg!(debug_assertions)
 }
 
+/// Raw enable switch from either accepted variable.
+fn environment_enable_value() -> Option<String> {
+    std::env::var(HANG_WATCHDOG_ENV)
+        .ok()
+        .or_else(|| std::env::var(LEGACY_WATCHDOG_ENV).ok())
+}
+
 /// Read the configuration from the process environment.
 fn config_from_env() -> Option<WatchdogConfig> {
-    let enable = std::env::var(HANG_WATCHDOG_ENV)
-        .ok()
-        .or_else(|| std::env::var(LEGACY_WATCHDOG_ENV).ok());
+    let enable = environment_enable_value();
     let threshold = std::env::var(HANG_WATCHDOG_THRESHOLD_ENV)
         .ok()
         .or_else(|| std::env::var(LEGACY_WATCHDOG_THRESHOLD_ENV).ok());
     config_from_values(enable.as_deref(), threshold.as_deref())
-}
-
-/// Whether the operator explicitly switched the watchdog off.
-///
-/// Distinguishes `BITTY_HANG_WATCHDOG=0` (no monitor, no `SIGUSR1` capture)
-/// from the debug-build default (monitor present for signal capture, periodic
-/// stall reporting off).
-fn environment_disables() -> bool {
-    let value = std::env::var(HANG_WATCHDOG_ENV)
-        .ok()
-        .or_else(|| std::env::var(LEGACY_WATCHDOG_ENV).ok());
-    value.is_some_and(|value| {
-        let value = value.trim();
-        value.eq_ignore_ascii_case("0")
-            || value.eq_ignore_ascii_case("false")
-            || value.eq_ignore_ascii_case("off")
-            || value.eq_ignore_ascii_case("no")
-    })
 }
 
 /// Whether a debug build should abort after writing the report.
@@ -980,6 +978,13 @@ pub(crate) struct StallWatchdog {
     /// The flag the handler sets lives on the monitor thread.
     #[cfg(unix)]
     signal_id: Option<SigId>,
+    /// The monitor's `SIGUSR1` flag, retained for hermetic tests.
+    ///
+    /// Production keeps the flag inside the monitor thread; tests set it
+    /// directly instead of raising a process signal, which would terminate
+    /// the harness whenever no handler is installed.
+    #[cfg(all(test, unix))]
+    signal_flag: Arc<AtomicBool>,
     /// Set by the monitor thread right before it exits (test observability).
     #[cfg(test)]
     finished: Arc<AtomicBool>,
@@ -989,29 +994,25 @@ impl StallWatchdog {
     /// Start the watchdog from the environment.
     ///
     /// Release builds start it by default. Debug builds start it only when
-    /// `BITTY_HANG_WATCHDOG=1`; a debug build of the app still installs the
-    /// `SIGUSR1` capture whenever the monitor is present. An explicit
-    /// `BITTY_HANG_WATCHDOG=0` disables both. Unit-test binaries return `None`
-    /// unless the switch opts in, so CI runs spawn no monitor per app
-    /// instance.
+    /// `BITTY_HANG_WATCHDOG=1` (or another enable value); an explicit
+    /// `BITTY_HANG_WATCHDOG=0` disables it everywhere. The `SIGUSR1` handler is
+    /// installed by [`Self::start`], so it exists only while a monitor runs.
+    /// Unit-test binaries return `None` unless the switch opts in, so CI runs
+    /// spawn no monitor per app instance.
     pub(crate) fn from_env(gauges: Arc<HangGauges>) -> Option<Self> {
-        if environment_disables() {
-            return None;
-        }
-        let config = config_from_env();
-        let stall_enabled = config.is_some();
+        // `None` covers an explicit off switch and the debug-build default:
+        // neither installs a monitor thread nor a `SIGUSR1` handler.
+        let config = config_from_env()?;
         // Unit-test binaries construct many apps; without an explicit opt-in
-        // they neither need periodic reports nor a signal-capture thread per
-        // instance. The denial test drives `StallWatchdog::start` directly.
-        if cfg!(test) && !stall_enabled {
+        // they neither need periodic reports nor a `SIGUSR1` handler per
+        // instance.
+        if cfg!(test) && environment_enable_value().is_none() {
             return None;
         }
-        let config = config.unwrap_or_else(WatchdogConfig::default_threshold);
         let slot = StateSlot::from_env();
         let mut sink = ReportSink::new(slot, Box::new(HelperDelivery::current()));
         Some(Self::start(
             config,
-            stall_enabled,
             gauges,
             Box::new(move |line| sink.emit(line)),
         ))
@@ -1020,14 +1021,13 @@ impl StallWatchdog {
     /// Start a watchdog with an explicit configuration and sink.
     fn start(
         config: WatchdogConfig,
-        stall_enabled: bool,
         gauges: Arc<HangGauges>,
         mut sink: Box<dyn FnMut(&str) -> DeliveryOutcome + Send>,
     ) -> Self {
         let shared = Arc::new(Shared::new(gauges));
         let stop = Arc::new(StopSignal::new());
         #[cfg(unix)]
-        let (signal_flag, signal_id) = {
+        let (signal_flag, mut signal_id) = {
             let flag = Arc::new(AtomicBool::new(false));
             match signal_flag::register(SIGUSR1, Arc::clone(&flag)) {
                 Ok(id) => (flag, Some(id)),
@@ -1047,6 +1047,8 @@ impl StallWatchdog {
         let thread_stop = Arc::clone(&stop);
         #[cfg(unix)]
         let thread_signal = Arc::clone(&signal_flag);
+        #[cfg(all(test, unix))]
+        let test_signal = Arc::clone(&signal_flag);
         #[cfg(test)]
         let thread_finished = Arc::clone(&finished);
         let poll_interval = std::cmp::max(
@@ -1060,7 +1062,6 @@ impl StallWatchdog {
                     &thread_shared,
                     &thread_stop,
                     config,
-                    stall_enabled,
                     #[cfg(unix)]
                     &thread_signal,
                     poll_interval,
@@ -1072,6 +1073,12 @@ impl StallWatchdog {
         let monitor = match spawn {
             Ok(handle) => Some(handle),
             Err(error) => {
+                // No monitor exists to read the flag: leave `SIGUSR1` at its
+                // default action instead of swallowing it for the process.
+                #[cfg(unix)]
+                if let Some(id) = signal_id.take() {
+                    let _ = signal_hook::low_level::unregister(id);
+                }
                 logging::warn(|| {
                     format!(
                         "bitty: hang watchdog thread unavailable ({error}); diagnostics stay off"
@@ -1088,6 +1095,8 @@ impl StallWatchdog {
             monitor,
             #[cfg(unix)]
             signal_id,
+            #[cfg(all(test, unix))]
+            signal_flag: test_signal,
             #[cfg(test)]
             finished,
         }
@@ -1115,6 +1124,16 @@ impl StallWatchdog {
         self.shared.mark(Phase::Idle, false);
     }
 
+    /// Simulate one `SIGUSR1` receipt for hermetic monitor tests.
+    ///
+    /// The production handler sets the same flag through `signal-hook`; this
+    /// seam never raises a process signal, which would terminate the harness
+    /// whenever no handler is installed.
+    #[cfg(all(test, unix))]
+    fn simulate_signal_receipt(&self) {
+        self.signal_flag.store(true, Ordering::SeqCst);
+    }
+
     /// Whether the app may publish a fresh context sample now.
     ///
     /// The sampler builds two bounded id lists, so it runs at most once per
@@ -1136,14 +1155,18 @@ impl StallWatchdog {
     /// Request monitor shutdown and wait for the thread to exit.
     fn shutdown(&mut self) -> std::thread::Result<()> {
         self.stop.request();
+        // Join before unregistering: while the monitor is still winding down,
+        // a `SIGUSR1` must continue to reach the handler instead of falling
+        // back to the process-terminating default action.
+        let result = match self.monitor.take() {
+            Some(handle) => handle.join(),
+            None => Ok(()),
+        };
         #[cfg(unix)]
         if let Some(id) = self.signal_id.take() {
             let _ = signal_hook::low_level::unregister(id);
         }
-        match self.monitor.take() {
-            Some(handle) => handle.join(),
-            None => Ok(()),
-        }
+        result
     }
 
     /// Stop the monitor and assert the thread actually exited (tests).
@@ -1160,12 +1183,10 @@ impl Drop for StallWatchdog {
 }
 
 /// Monitor thread body.
-#[allow(clippy::too_many_arguments)]
 fn monitor_loop(
     shared: &Shared,
     stop: &StopSignal,
     config: WatchdogConfig,
-    stall_enabled: bool,
     #[cfg(unix)] signal_flag: &AtomicBool,
     poll_interval: Duration,
     sink: &mut (dyn FnMut(&str) -> DeliveryOutcome + Send),
@@ -1208,9 +1229,6 @@ fn monitor_loop(
                 // `SIGUSR1` capture must never terminate the process the
                 // operator is inspecting, even with the debug abort armed.
             }
-        }
-        if !stall_enabled {
-            continue;
         }
         let progress = shared.progress.load(Ordering::Relaxed);
         let phase = Phase::from_u8(shared.phase.load(Ordering::Relaxed));
@@ -3488,6 +3506,48 @@ mod tests {
         );
     }
 
+    /// The enable contract for both build profiles: unset follows the build
+    /// default, an explicit off value always wins, and a numeric value selects
+    /// the bound.
+    #[test]
+    fn watchdog_default_follows_the_build_and_explicit_off_always_wins() {
+        // Both profiles must pass, so the expectation is derived from the
+        // same cfg the implementation uses rather than hardcoded.
+        let default_on = !cfg!(debug_assertions);
+        assert_eq!(config_from_values(None, None).is_some(), default_on);
+        assert_eq!(
+            config_from_values(Some(""), None).is_some(),
+            default_on,
+            "an empty switch means unset"
+        );
+        for off in ["0", "false", "off", "no", "OFF", " No "] {
+            assert_eq!(
+                config_from_values(Some(off), None),
+                None,
+                "explicit off must win: {off:?}"
+            );
+            assert_eq!(
+                config_from_values(Some(off), Some("250")),
+                None,
+                "a threshold must not override explicit off: {off:?}"
+            );
+        }
+        for on in ["1", "true", "on", "yes", "TRUE"] {
+            assert_eq!(
+                config_from_values(Some(on), None),
+                Some(WatchdogConfig::default_threshold()),
+                "explicit on must work: {on:?}"
+            );
+        }
+        // The threshold variable follows the build default: it cannot enable
+        // a debug build, and in release it selects the bound of the monitor
+        // that is already on.
+        assert_eq!(
+            config_from_values(None, Some("250")),
+            default_on.then(|| WatchdogConfig::with_threshold_ms(250))
+        );
+    }
+
     #[test]
     fn phase_round_trips_every_byte() {
         for raw in 0u8..=24 {
@@ -3705,6 +3765,139 @@ mod tests {
             }
         }
         assert_eq!(reports, 1, "a continuous stall writes exactly one report");
+    }
+
+    /// bitty#2830: a `SIGUSR1` capture writes one full report while the loop
+    /// is parked, and the monitor keeps running afterwards.
+    ///
+    /// The receipt is simulated on the monitor's own flag instead of raising a
+    /// real signal: the test binary's handler is a process-wide registration,
+    /// and a real signal can arrive after it is removed, which would terminate
+    /// the whole harness.
+    #[cfg(unix)]
+    #[test]
+    fn signal_receipt_writes_a_report_without_stopping_the_monitor() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(150),
+            Arc::new(HangGauges::new()),
+            Box::new(move |line| {
+                let _ = tx.send(line.to_string());
+                DeliveryOutcome::Delivered
+            }),
+        );
+        // The reported freeze shape: the loop is parked, not in an active
+        // phase, so only the signal can produce this sample.
+        watchdog.idle();
+        watchdog.simulate_signal_receipt();
+        let line = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("SIGUSR1 capture must arrive while idle");
+        assert!(line.starts_with(SIGNAL_REPORT_PREFIX), "{line}");
+        assert!(line.contains("reason=sigusr1"), "{line}");
+        assert!(line.contains("trigger=sigusr1"), "{line}");
+        assert!(line.contains("phase=idle"), "{line}");
+        assert!(line.contains("progress="), "{line}");
+        assert!(line.contains("  parked: pending="), "{line}");
+        assert!(line.contains("  surface: "), "{line}");
+        assert!(line.contains("  process: threads="), "{line}");
+        #[cfg(target_os = "linux")]
+        assert!(line.contains("[main] tid="), "{line}");
+        #[cfg(not(target_os = "linux"))]
+        assert!(line.contains("thread-state snapshot unavailable"), "{line}");
+        // The process did not exit or abort: a real stall still reports.
+        watchdog.enter(Phase::RuntimeTick);
+        let stall = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the monitor must keep reporting after a signal capture");
+        assert!(stall.starts_with(STALL_REPORT_PREFIX), "{stall}");
+        assert!(stall.contains("reason=stall"), "{stall}");
+        watchdog
+            .stop_and_join()
+            .expect("the monitor thread must exit cleanly");
+    }
+
+    /// Rapid `SIGUSR1` receipts coalesce into one atomic flag, and receipts
+    /// inside [`SIGNAL_REPORT_INTERVAL`] are dropped: they never queue up or
+    /// grow the report log.
+    #[cfg(unix)]
+    #[test]
+    fn signal_receipts_are_rate_limited_and_do_not_queue() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(60_000),
+            Arc::new(HangGauges::new()),
+            Box::new(move |line| {
+                let _ = tx.send(line.to_string());
+                DeliveryOutcome::Delivered
+            }),
+        );
+        watchdog.idle();
+        let first_at = Instant::now();
+        watchdog.simulate_signal_receipt();
+        let first = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first receipt must write");
+        assert!(first.starts_with(SIGNAL_REPORT_PREFIX), "{first}");
+        // Far more receipts than the monitor can service: the flag is one bit,
+        // so they collapse instead of growing a queue.
+        for _ in 0..256 {
+            watchdog.simulate_signal_receipt();
+        }
+        assert!(
+            rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "receipts inside the interval must be dropped"
+        );
+        // Once the interval elapses, one more receipt is accepted and brings
+        // exactly one report, not 256.
+        let mut accepted = None;
+        while first_at.elapsed() < Duration::from_secs(5) {
+            watchdog.simulate_signal_receipt();
+            match rx.recv_timeout(Duration::from_millis(25)) {
+                Ok(line) => {
+                    accepted = Some(line);
+                    break;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(error) => panic!("report channel closed: {error}"),
+            }
+        }
+        let accepted = accepted.expect("one receipt after the interval must write");
+        assert!(accepted.starts_with(SIGNAL_REPORT_PREFIX), "{accepted}");
+        assert!(
+            first_at.elapsed() >= SIGNAL_REPORT_INTERVAL,
+            "the second dump must respect the interval: {:?}",
+            first_at.elapsed()
+        );
+        // The limiter re-arms: an immediate third receipt is dropped.
+        watchdog.simulate_signal_receipt();
+        assert!(
+            rx.recv_timeout(Duration::from_millis(250)).is_err(),
+            "an immediate receipt after a dump must be dropped"
+        );
+        watchdog
+            .stop_and_join()
+            .expect("the monitor thread must exit cleanly");
+    }
+
+    /// Structural coverage for the real wiring: starting a monitor owns a
+    /// `SIGUSR1` registration. No test raises the signal, because doing so
+    /// after the handler is removed would terminate the harness.
+    #[cfg(unix)]
+    #[test]
+    fn monitor_start_owns_the_sigusr1_registration() {
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::default_threshold(),
+            Arc::new(HangGauges::new()),
+            Box::new(|_line| DeliveryOutcome::Delivered),
+        );
+        assert!(
+            watchdog.signal_id.is_some(),
+            "a started monitor must own a SIGUSR1 registration"
+        );
+        watchdog
+            .stop_and_join()
+            .expect("the monitor thread must exit cleanly");
     }
 
     #[test]
@@ -4625,7 +4818,6 @@ mod tests {
         let (tx, rx) = mpsc::channel::<String>();
         let watchdog = StallWatchdog::start(
             WatchdogConfig::with_threshold_ms(40),
-            true,
             Arc::new(HangGauges::new()),
             Box::new(move |line| {
                 let _ = tx.send(line.to_string());
@@ -4658,7 +4850,6 @@ mod tests {
         gauges.set_pending_exits(3);
         let watchdog = StallWatchdog::start(
             WatchdogConfig::with_threshold_ms(100),
-            true,
             Arc::clone(&gauges),
             Box::new(move |line| {
                 let _ = tx.send(line.to_string());
@@ -4773,7 +4964,6 @@ mod tests {
         gauges.set_pending_replies(24);
         let watchdog = StallWatchdog::start(
             WatchdogConfig::with_threshold_ms(60),
-            true,
             Arc::clone(&gauges),
             Box::new(move |line| {
                 let _ = tx.send(line.to_string());
@@ -4808,7 +4998,6 @@ mod tests {
         // the no-present detector, not about the phase bound.
         let watchdog = StallWatchdog::start(
             WatchdogConfig::with_threshold_ms(1_000),
-            true,
             Arc::clone(&gauges),
             Box::new(move |line| {
                 let _ = tx.send(line.to_string());
@@ -4966,7 +5155,6 @@ mod tests {
         let sink_writes = Arc::clone(&writes);
         let watchdog = StallWatchdog::start(
             WatchdogConfig::with_threshold_ms(45),
-            true,
             Arc::new(HangGauges::new()),
             Box::new(move |line| {
                 let outcome = sink.emit(line);
@@ -5063,7 +5251,6 @@ mod tests {
         let sink_writes = Arc::clone(&writes);
         let watchdog = StallWatchdog::start(
             WatchdogConfig::with_threshold_ms(30),
-            true,
             Arc::new(HangGauges::new()),
             Box::new(move |_line| {
                 let _ = entered_tx.send(());
@@ -5492,7 +5679,6 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel::<()>();
         let watchdog = StallWatchdog::start(
             WatchdogConfig::with_threshold_ms(30),
-            true,
             Arc::new(HangGauges::new()),
             Box::new(move |line| {
                 let _ = entered_tx.send(());

@@ -870,12 +870,14 @@ pub(crate) struct TerminalApp {
     pub(crate) _pty_thread: Option<JoinHandle<()>>,
     /// Count of `tick` calls that presented a frame.
     pub(crate) presented_frames: u64,
-    /// Opt-in main-loop stall watchdog (issue #2483).
+    /// Built-in main-loop stall watchdog (issue #2483, bitty#2830).
     ///
-    /// `None` unless `BITTY_STALL_WATCHDOG` opted in, so CI, headless smoke
-    /// runs, and normal sessions spawn no monitor thread and emit nothing.
-    /// Phase marks are observability only: they never alter routing, timing,
-    /// or runtime state.
+    /// Release builds start it by default; debug builds start it only with an
+    /// explicit enable value, and `BITTY_HANG_WATCHDOG=0` disables it
+    /// everywhere. It is created only by the real-window constructor, so
+    /// headless and test-mode invocations spawn no monitor and install no
+    /// `SIGUSR1` handler. Phase marks are observability only: they never
+    /// alter routing, timing, or runtime state.
     pub(crate) stall_watchdog: Option<StallWatchdog>,
     /// Bounded backoff for a parked plugin command's cold-tick resume wake
     /// (bitty#2830).

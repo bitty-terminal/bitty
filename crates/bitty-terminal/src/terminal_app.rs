@@ -2766,6 +2766,13 @@ impl TerminalApp {
             }
             return;
         };
+        // Issue #2849 focus-follow: bind the presentation surface to the
+        // focused view, re-bind on a focus switch, and drop it with one
+        // `view-closed` observation when the view it was drawn over closes.
+        // Cold tick path only: no plugin runs here, and the observation is
+        // queued for `deliver_overlay_dismissed`.
+        let focused = self.runtime.focused_view();
+        plugin_runtime.observe_presentation_focus(focused, |view| self.runtime.is_live_view(view));
         // CTX-1431 (`bitty` #2406): the presentation-only session is
         // independent of the capture/tooltip surface. Resolve it from the
         // live mount registry so a `ui.update` refreshes the panel contents

@@ -24,6 +24,11 @@
 //! - **Bounded observations.** `Esc` dismissal queues one
 //!   [`DismissedEvent`] per dismissal for the application tick; the buffer is
 //!   bounded with drop-oldest, and no plugin runs on the input path.
+//! - **Focus-follow (issue #2849).** The surface is bound to the focused view
+//!   and re-binds when focus moves; when the view it is bound to closes, the
+//!   surface is dropped with one bounded `view-closed` observation instead of
+//!   silently re-centering on a survivor. At most one presentation surface
+//!   exists per view per generation.
 //! - **Teardown is Core-owned.** Suspend, unload, disable, crash, rollback,
 //!   and generation change drop the session, so no stale surface survives.
 
@@ -31,7 +36,7 @@ use std::collections::VecDeque;
 
 use bitty_lua::{BridgeError, E_UI_UNAVAILABLE};
 use bitty_ui::panel::{MAX_OVERLAYS_PER_WINDOW, OverlayKind, OverlayManager};
-use bitty_ui::{OverlayTier, Rect};
+use bitty_ui::{OverlayTier, Rect, ViewId};
 
 /// Paint tier of a presentation overlay (accepted v1 design).
 pub const PRESENTATION_OVERLAY_TIER: OverlayTier = OverlayTier::Popup;
@@ -41,6 +46,10 @@ pub const PRESENTATION_OVERLAY_KIND: OverlayKind = OverlayKind::NonModal;
 
 /// Core-reported reason for a presentation overlay dismissed by `Esc`.
 pub const ESCAPE_DISMISS_REASON: &str = "escape";
+
+/// Core-reported reason for a presentation overlay dropped because the view it
+/// was bound to closed (issue #2849).
+pub const VIEW_CLOSED_DISMISS_REASON: &str = "view-closed";
 
 /// Maximum pending `overlay.dismissed` observations buffered between ticks.
 ///
@@ -65,11 +74,15 @@ pub struct DismissedEvent {
     pub reason: String,
 }
 
-/// The live presentation session (owner + presented handle).
+/// The live presentation session (owner + presented handle + followed view).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PresentationSession {
     plugin_id: String,
     handle: i64,
+    /// Focused view the surface is drawn over (issue #2849). Bound on the
+    /// first focus observation after `show`, re-bound when focus moves, and
+    /// the surface is dropped when this view is no longer live.
+    view: Option<ViewId>,
 }
 
 /// Runtime-shared single presentation-overlay session per window.
@@ -156,6 +169,9 @@ impl PresentationOverlay {
         self.session = Some(PresentationSession {
             plugin_id: plugin_id.to_string(),
             handle,
+            // Bound by the next `observe_focus`; the admission itself carries
+            // no view, so a host without a layout can still present.
+            view: None,
         });
         Ok(true)
     }
@@ -198,21 +214,72 @@ impl PresentationOverlay {
     /// observation with the `escape` reason. Returns whether a surface was
     /// dismissed (a second press is a no-op and queues nothing).
     pub fn dismiss_escape(&mut self) -> bool {
-        let Some(session) = self.session.as_ref() else {
-            return false;
-        };
+        self.dismiss_with_reason(ESCAPE_DISMISS_REASON).is_some()
+    }
+
+    /// Focus-follow observation, called once per tick before present
+    /// (issue #2849).
+    ///
+    /// `focused` is the window's currently focused view and `is_live` answers
+    /// whether a view still exists in the layout. Semantics:
+    ///
+    /// - An unbound session binds to `focused` (the surface the user just
+    ///   opened follows the view they opened it on).
+    /// - A live bound view re-binds when focus moves: the panel tracks the
+    ///   focused view and is never dismissed by a plain focus switch.
+    /// - A bound view that is no longer live drops the surface with one
+    ///   `view-closed` observation instead of silently re-centering on a
+    ///   survivor, so a closed view never leaves a panel addressing it.
+    ///
+    /// Returns the queued observation, if the surface was dropped. Bounded
+    /// like every other dismissal: one event, drop-oldest buffer.
+    pub fn observe_focus(
+        &mut self,
+        focused: Option<ViewId>,
+        is_live: impl Fn(ViewId) -> bool,
+    ) -> Option<DismissedEvent> {
+        let bound = self.session.as_ref()?.view;
+        match bound {
+            None => {
+                if let Some(view) = focused {
+                    if let Some(session) = self.session.as_mut() {
+                        session.view = Some(view);
+                    }
+                }
+                None
+            }
+            Some(view) if !is_live(view) => self.dismiss_with_reason(VIEW_CLOSED_DISMISS_REASON),
+            Some(view) => {
+                if let Some(next) = focused {
+                    if next != view {
+                        if let Some(session) = self.session.as_mut() {
+                            session.view = Some(next);
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Drop the live surface and queue one observation with `reason`.
+    ///
+    /// Internal funnel shared by the `Esc` and `view-closed` causes, so both
+    /// stay one bounded event with the same drop-oldest buffer.
+    fn dismiss_with_reason(&mut self, reason: &str) -> Option<DismissedEvent> {
+        let session = self.session.as_ref()?;
         let event = DismissedEvent {
             owner: session.plugin_id.clone(),
             handle: session.handle,
-            reason: ESCAPE_DISMISS_REASON.to_string(),
+            reason: reason.to_string(),
         };
         if self.pending_dismissed.len() >= PENDING_DISMISSED_MAX {
             self.pending_dismissed.pop_front();
             self.dismissed_dropped = self.dismissed_dropped.saturating_add(1);
         }
-        self.pending_dismissed.push_back(event);
+        self.pending_dismissed.push_back(event.clone());
         self.clear();
-        true
+        Some(event)
     }
 
     /// Drain pending `overlay.dismissed` observations in order.
@@ -226,6 +293,12 @@ impl PresentationOverlay {
         self.session
             .as_ref()
             .map(|session| (session.plugin_id.as_str(), session.handle))
+    }
+
+    /// View the live surface follows, if it has been bound yet (#2849).
+    #[must_use]
+    pub fn session_view(&self) -> Option<ViewId> {
+        self.session.as_ref().and_then(|session| session.view)
     }
 
     /// Whether a presentation surface is live.
@@ -404,5 +477,84 @@ mod tests {
             overlay.drain_dismissed().is_empty(),
             "lifecycle teardown is not an Esc dismissal observation"
         );
+    }
+
+    #[test]
+    fn focus_follow_binds_then_tracks_the_focused_view() {
+        // Issue #2849: the surface follows the focused view and is never
+        // dismissed by a plain focus switch while the bound view is live.
+        let mut overlay = PresentationOverlay::new();
+        overlay.show("acme.help", 7).expect("owner admits");
+        assert_eq!(overlay.session_view(), None, "unbound at admission");
+        let a = ViewId::new(1);
+        let b = ViewId::new(2);
+        assert!(
+            overlay.observe_focus(Some(a), |_| true).is_none(),
+            "binding is not a dismissal"
+        );
+        assert_eq!(overlay.session_view(), Some(a));
+        assert!(overlay.observe_focus(Some(b), |_| true).is_none());
+        assert_eq!(overlay.session_view(), Some(b), "focus switch re-binds");
+        assert!(overlay.is_active(), "a focus switch never dismisses");
+        assert!(overlay.drain_dismissed().is_empty());
+    }
+
+    #[test]
+    fn focus_follow_drops_the_surface_when_the_bound_view_closes() {
+        // The closed view leaves no surface behind: one bounded `view-closed`
+        // observation, no re-centering on a survivor, slot released.
+        let mut overlay = PresentationOverlay::new();
+        overlay.show("acme.help", 7).expect("owner admits");
+        let a = ViewId::new(1);
+        let b = ViewId::new(2);
+        overlay.observe_focus(Some(a), |_| true);
+        let event = overlay
+            .observe_focus(Some(b), |view| view != a)
+            .expect("a closed view dismisses");
+        assert_eq!(event.owner, "acme.help");
+        assert_eq!(event.handle, 7);
+        assert_eq!(event.reason, VIEW_CLOSED_DISMISS_REASON);
+        assert!(!overlay.is_active(), "no surface survives the closed view");
+        assert_eq!(overlay.admitted_slots(), 0, "the admitted slot is released");
+        assert!(
+            overlay.observe_focus(Some(b), |_| true).is_none(),
+            "a dropped surface observes nothing further"
+        );
+        let drained = overlay.drain_dismissed();
+        assert_eq!(drained.len(), 1, "exactly one observation");
+        assert_eq!(drained[0].reason, "view-closed");
+    }
+
+    #[test]
+    fn focus_follow_with_no_focused_view_keeps_a_live_surface() {
+        // A window with no focused view is not a close: the surface waits for
+        // the next focused view instead of dismissing itself.
+        let mut overlay = PresentationOverlay::new();
+        overlay.show("acme.help", 7).expect("owner admits");
+        let a = ViewId::new(1);
+        overlay.observe_focus(Some(a), |_| true);
+        assert!(overlay.observe_focus(None, |_| true).is_none());
+        assert!(overlay.is_active());
+        assert_eq!(overlay.session_view(), Some(a));
+    }
+
+    #[test]
+    fn one_surface_per_view_per_generation() {
+        // Issue #2849 bound: a generation presents at most one surface, and
+        // the surface occupies exactly one view at a time.
+        let mut overlay = PresentationOverlay::new();
+        overlay.show("acme.help", 7).expect("owner admits");
+        overlay.observe_focus(Some(ViewId::new(1)), |_| true);
+        overlay
+            .show("acme.help", 8)
+            .expect("re-show reuses the slot");
+        assert_eq!(overlay.admitted_slots(), 1);
+        assert_eq!(overlay.session_view(), Some(ViewId::new(1)));
+        assert_eq!(
+            overlay.show("acme.other", 9).map_err(|e| e.code),
+            Err(E_UI_UNAVAILABLE),
+            "a second generation cannot present over the first"
+        );
+        assert_eq!(overlay.admitted_slots(), 1);
     }
 }

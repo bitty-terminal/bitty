@@ -6429,6 +6429,71 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
     ui.set(ctx, "overlay", readonly_table(ctx, overlay))
         .expect("ui table accepts 'overlay'");
 
+    // Issue #2849: `bitty.ui.present.*` is the named presentation surface —
+    // draw above the focused view, never capture input. It drives the same
+    // Core session as `bitty.ui.overlay.show`/`hide` (kept as the CTX-1431
+    // spelling), but the host gates it on its own `ui.present` capability, so
+    // draw authority and capture authority have distinct spellings and a
+    // manifest cannot reach `ui.overlay.focus` by asking to draw. No input
+    // callback is registered and no capture session starts.
+    let present = Table::new(&ctx);
+    present
+        .set(
+            ctx,
+            "show",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let handle = match stack.get(0) {
+                        Value::Integer(handle) => handle,
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.present.show handle must be an integer block handle",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    let shown = state
+                        .bounded_mutation(|expiry| {
+                            state.services.ui_overlay_show_with_expiry(handle, expiry)
+                        })
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(shown));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("present table accepts 'show'");
+    present
+        .set(
+            ctx,
+            "hide",
+            Callback::from_fn(&ctx, {
+                let state = state.clone();
+                move |ctx, _exec, mut stack| {
+                    let handle = match stack.get(0) {
+                        Value::Integer(handle) => handle,
+                        _ => {
+                            return Err(component_invalid(
+                                "ui.present.hide handle must be an integer block handle",
+                            )
+                            .to_error(ctx));
+                        }
+                    };
+                    // Cleanup stays ungated at the host: a hide whose grant was
+                    // revoked mid-session must still remove the surface.
+                    let hidden = state
+                        .bounded_mutation(|_expiry| state.services.ui_overlay_hide(handle))
+                        .map_err(|e| e.to_error(ctx))?;
+                    stack.replace(ctx, Value::Boolean(hidden));
+                    Ok(CallbackReturn::Return)
+                }
+            }),
+        )
+        .expect("present table accepts 'hide'");
+    ui.set(ctx, "present", readonly_table(ctx, present))
+        .expect("ui table accepts 'present'");
+
     // W-29 (CTX-0942, DEC-0085 thin host): read-only targeting mechanism over
     // the existing `bitty-ui` targeting types, exposed under the existing
     // `bitty.ui` namespace (no `bitty.beacon.*` namespace, no new capability,

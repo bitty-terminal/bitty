@@ -58,12 +58,15 @@ use bitty_lua::{
 };
 use bitty_plugin_host::DropPolicy;
 use bitty_plugin_host::capability::CapabilityId;
+// Issue #2849: the presentation surface follows the focused view, so the
+// runtime names the view type in its focus-follow API.
 use bitty_plugin_host::grant::GrantRecord;
 use bitty_plugin_host::host::PluginHost;
 use bitty_plugin_host::manifest::{LazyCommand, PluginId, PluginManifest};
 use bitty_plugin_host::{
     parse_service_reference, validate_interface_schema, value_satisfies_schema,
 };
+use bitty_ui::ViewId;
 
 use crate::hang_watchdog::{ActiveCommandGuard, HangGauges};
 pub use crate::runtime::fx::{FX_PULSE_QUEUE_CAPACITY, FxPulseQueue, QueuedFxPulse};
@@ -124,7 +127,7 @@ pub use overlay::{
 };
 pub use presentation_overlay::{
     DismissedEvent, ESCAPE_DISMISS_REASON, PENDING_DISMISSED_MAX, PRESENTATION_OVERLAY_KIND,
-    PRESENTATION_OVERLAY_TIER, PresentationOverlay,
+    PRESENTATION_OVERLAY_TIER, PresentationOverlay, VIEW_CLOSED_DISMISS_REASON,
 };
 pub use resolution::{
     CURRENT_POINTER_FILE, PLUGIN_INDEX_STATE_VERSION, PluginRecord, content_digest, load_index,
@@ -1949,6 +1952,24 @@ impl PluginRuntime {
         self.presentation_overlay.borrow_mut().dismiss_escape()
     }
 
+    /// Focus-follow observation for the live presentation surface
+    /// (issue #2849), called once per application tick before present.
+    ///
+    /// `focused` is the window's focused view and `is_live` reports whether a
+    /// view still exists. Binds on first observation, re-binds on a focus
+    /// switch, and drops the surface with one `view-closed`
+    /// `overlay.dismissed` observation when the view it was drawn over closes.
+    /// Returns the queued observation when the surface was dropped.
+    pub fn observe_presentation_focus(
+        &self,
+        focused: Option<ViewId>,
+        is_live: impl Fn(ViewId) -> bool,
+    ) -> Option<DismissedEvent> {
+        self.presentation_overlay
+            .borrow_mut()
+            .observe_focus(focused, is_live)
+    }
+
     /// Drain pending `overlay.dismissed` observations in order.
     pub fn drain_overlay_dismissed(&mut self) -> Vec<DismissedEvent> {
         self.presentation_overlay.borrow_mut().drain_dismissed()
@@ -2742,6 +2763,13 @@ impl PluginRuntime {
         let ui_overlay_focus = granted
             .iter()
             .any(|capability| capability.as_str() == "ui.overlay.focus");
+        // Issue #2849: draw a non-focusable presentation surface above the
+        // focused view. Its own head, so `ui.overlay` (mount) and
+        // `ui.overlay.focus` (capture) never imply it and it never implies
+        // either. Safe mode still admits no plugin VM at all.
+        let ui_present = granted
+            .iter()
+            .any(|capability| capability.as_str() == "ui.present");
         let debug_inspect = granted
             .iter()
             .any(|capability| capability.as_str() == "debug.inspect");
@@ -2866,6 +2894,7 @@ impl PluginRuntime {
             rich: ui_rich,
             overlay: ui_overlay,
             overlay_focus: ui_overlay_focus,
+            present: ui_present,
             claims: manifest.lazy.claims.clone(),
         });
         // CTX-0941: safe mode never presents a focusable overlay. The flag

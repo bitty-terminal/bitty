@@ -152,6 +152,12 @@ impl CapabilityFamily {
                 "ui.rich",
                 "ui.overlay",
                 "ui.overlay.focus",
+                // Issue #2849: draw a non-focusable presentation surface above
+                // the focused view. Deliberately a separate head from
+                // `ui.overlay` (the `overlay`-slot mount) and
+                // `ui.overlay.focus` (exclusive input capture), so a manifest
+                // cannot gain input authority by asking to draw.
+                "ui.present",
                 "ui.protocol-register",
             ],
             Self::Clipboard => &["clipboard.read", "clipboard.write"],
@@ -489,6 +495,9 @@ pub fn effect_statement_with(catalog: &CapabilityCatalog, id: &CapabilityId) -> 
         "ui.rich" => "Render rich blocks in the terminal",
         "ui.overlay" => "Show overlays and popups",
         "ui.overlay.focus" => "Acquire a focusable overlay and hold transient input capture",
+        "ui.present" => {
+            "Draw a non-focusable presentation panel above the focused view (no input capture)"
+        }
         "ui.protocol-register" => "Register custom URL protocols (high-risk)",
         "clipboard.read" => "Read clipboard contents",
         "clipboard.write" => "Write to clipboard",

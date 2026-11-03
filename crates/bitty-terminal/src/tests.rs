@@ -17203,6 +17203,7 @@ plugin-api = "^1.0"
 [capabilities]
 ui.rich = true
 ui.overlay = true
+ui.present = true
 
 [lazy]
 commands = ["{presenter}:show", "{presenter}:update"]
@@ -17423,6 +17424,67 @@ fn presentation_overlay_esc_dismisses_and_reaches_pty() {
         presentation_store_value(&app, &presenter, "callback_count"),
         Some(bitty_runtime::plugin_runtime::LuaValue::Integer(1)),
         "explicit delivery proves the hot-path trap was armed"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// Issue #2849 focus-follow: the tick binds the surface to the focused view,
+/// and closing that view drops the surface with one `view-closed` observation
+/// instead of re-centering on a survivor.
+#[test]
+fn presentation_overlay_binds_to_focus_and_drops_when_the_view_closes() {
+    let runtime = Runtime::with_defaults().expect("runtime must build");
+    let (mut app, presenter, watcher, root, data) = presentation_overlay_app("follow", runtime);
+    let _ = app.drive_tick();
+    let bound = app.runtime.focused_view().expect("a view is focused");
+    assert!(app.presentation_overlay_active(), "init.lua presented");
+    assert_eq!(
+        app.plugin_runtime
+            .as_ref()
+            .expect("plugin runtime")
+            .presentation_overlay()
+            .borrow()
+            .session_view(),
+        Some(bound),
+        "the tick binds the surface to the focused view"
+    );
+
+    let mut after = app.runtime.layout().clone();
+    assert!(after.remove_leaf(bound).is_some(), "the bound view closes");
+    app.runtime.set_layout_closing(after, bound);
+    let _ = app.drive_tick();
+    assert!(
+        !app.presentation_overlay_active(),
+        "no surface survives the view it was drawn over"
+    );
+    assert!(
+        app.runtime.presentation_overlay().is_none(),
+        "the paint path clears with the session"
+    );
+    assert!(
+        !app.overlay_capture_active(),
+        "closing a view never starts or moves input capture"
+    );
+    // The observation is queued on the tick that noticed the close and
+    // delivered on the next cold tick, never on the input path.
+    let _ = app.drive_tick();
+
+    let report = app
+        .invoke_plugin_command(
+            &format!("{watcher}:report"),
+            &TerminalApp::empty_command_args(),
+        )
+        .expect("report dispatches");
+    let expected_prefix = format!("{presenter}|");
+    let report = match report {
+        bitty_runtime::plugin_runtime::LuaValue::String(text) => text,
+        other => panic!("report must be a string, got {other:?}"),
+    };
+    assert!(
+        report.starts_with(&expected_prefix) && report.ends_with("|view-closed"),
+        "one bounded view-closed observation, got {report}"
     );
 
     let _ = std::fs::remove_dir_all(&root);

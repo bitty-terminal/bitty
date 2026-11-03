@@ -978,6 +978,11 @@ pub struct UiAccess {
     /// from v1 `ui.overlay` (presentation-only, non-focusable); no
     /// implication either way.
     pub overlay_focus: bool,
+    /// `ui.present` granted (issue #2849) — draw a non-focusable presentation
+    /// surface above the focused view. Its own head: it never implies
+    /// `ui.overlay` (mount), `ui.overlay.focus` (capture), or `ui.rich`, and
+    /// none of those imply it. Draw authority is never input authority.
+    pub present: bool,
     /// Manifest `[lazy].claims` (exclusive slot claims; `workspaceline` for the `tabline` slot).
     pub claims: Vec<String>,
 }
@@ -2730,14 +2735,15 @@ impl PluginServices {
         Ok(())
     }
 
-    /// The presentation-only overlay gate (CTX-1431, `bitty` #2406).
+    /// The presentation-only overlay gate (CTX-1431, `bitty` #2406;
+    /// issue #2849 capability split).
     ///
-    /// Deny-by-default on the two v1 mount grants: a block mounted into the
-    /// `overlay` slot already needed `ui.rich` + `ui.overlay`, and the
-    /// presentation path deliberately does **not** require or imply
-    /// `ui.overlay.focus` (no capture). Safe mode never presents a plugin
-    /// surface, and a host without the shared session fails closed with
-    /// `E_UI_UNAVAILABLE`.
+    /// Deny-by-default on `ui.present`, the head that means "draw above the
+    /// focused view". It never implies and is never implied by `ui.rich`
+    /// (mount), `ui.overlay` (the `overlay` slot) or `ui.overlay.focus`
+    /// (transient input capture), so a manifest cannot gain capture by asking
+    /// to draw. Safe mode never presents a plugin surface, and a host without
+    /// the shared session fails closed with `E_UI_UNAVAILABLE`.
     fn require_presentation_overlay(
         &self,
     ) -> Result<Rc<RefCell<PresentationOverlay>>, BridgeError> {
@@ -2748,14 +2754,8 @@ impl PluginServices {
                 "presentation overlay is unavailable in safe mode",
             ));
         }
-        {
-            let access = self.ui_access.borrow();
-            if !access.rich {
-                return Err(BridgeError::capability_denied("ui.rich"));
-            }
-            if !access.overlay {
-                return Err(BridgeError::capability_denied("ui.overlay"));
-            }
+        if !self.ui_access.borrow().present {
+            return Err(BridgeError::capability_denied("ui.present"));
         }
         self.presentation_overlay().ok_or_else(|| {
             BridgeError::new(
@@ -7739,6 +7739,7 @@ mod tests {
             rich: true,
             overlay: false,
             overlay_focus: false,
+            present: false,
             claims: Vec::new(),
         }
     }
@@ -7749,6 +7750,7 @@ mod tests {
             rich: true,
             overlay: true,
             overlay_focus: true,
+            present: false,
             claims: Vec::new(),
         });
         services.set_overlay_capture(Rc::new(RefCell::new(OverlayCapture::new())));
@@ -7786,6 +7788,7 @@ mod tests {
             rich: true,
             overlay: true,
             overlay_focus: true,
+            present: false,
             claims: Vec::new(),
         });
         services.set_overlay_capture(Rc::clone(capture));
@@ -7828,6 +7831,7 @@ mod tests {
             rich: true,
             overlay: true,
             overlay_focus: false,
+            present: false,
             claims: Vec::new(),
         });
         // CTX-0941: with the grant, the Core hosts the focusable overlay and
@@ -7852,6 +7856,7 @@ mod tests {
             rich: true,
             overlay: true,
             overlay_focus: false,
+            present: false,
             claims: Vec::new(),
         });
         services.set_overlay_capture(Rc::new(RefCell::new(OverlayCapture::new())));
@@ -8322,6 +8327,7 @@ mod tests {
             rich: true,
             overlay: false,
             overlay_focus: false,
+            present: false,
             claims: vec!["tabline".to_string()],
         });
         let error = services
@@ -8332,6 +8338,7 @@ mod tests {
             rich: true,
             overlay: false,
             overlay_focus: false,
+            present: false,
             claims: vec!["workspaceline".to_string()],
         });
         let error = services
@@ -8350,6 +8357,7 @@ mod tests {
             rich: true,
             overlay: true,
             overlay_focus: false,
+            present: false,
             claims: vec!["workspaceline".to_string()],
         });
         for slot in UiSlot::ALL {
@@ -10076,6 +10084,7 @@ mod tests {
             rich: true,
             overlay,
             overlay_focus: overlay,
+            present: false,
             claims: Vec::new(),
         });
         if wire_state {

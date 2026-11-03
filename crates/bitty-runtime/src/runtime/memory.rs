@@ -54,6 +54,11 @@ pub const MEMORY_REPORT_MAX_BYTES: usize = 8 * 1024;
 pub const MAX_FONT_MAPPINGS: usize = 4096;
 
 /// Cap on bytes read from one `/proc` file.
+///
+/// Only the Linux `/proc` reader consumes it, so the constant is gated with
+/// that reader: an ungated definition is dead code on Windows and macOS and
+/// fails the `-D warnings` workspace check there.
+#[cfg(target_os = "linux")]
 const MAX_PROC_BYTES: usize = 8 * 1024 * 1024;
 
 /// Rust's standard per-thread stack reservation when `RUST_MIN_STACK` is

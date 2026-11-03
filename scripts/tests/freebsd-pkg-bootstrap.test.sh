@@ -283,6 +283,24 @@ run_case 0 --no-sudo --dry-run --packages git \
     contains 'FreeBSD: { enabled: yes' 'the one repository stays enabled'
   }
 
+# --- 2b. a re-run does not treat its own file as an image repository --------
+
+new_state rerun
+REPOS_RERUN="$TMP/repos-rerun"
+export PKG_FAKE_VV="$VV_SINGLE"
+run_case 0 --no-sudo --packages git \
+  --repos-dir "$REPOS_RERUN" --base-confs-dir "$NOSRC" &&
+  run_case 0 --no-sudo --packages git \
+    --repos-dir "$REPOS_RERUN" --base-confs-dir "$NOSRC" &&
+  {
+    if grep -q 'FreeBSD-ports' "$REPOS_RERUN/99-bitty-bootstrap.conf"; then
+      fail 'a re-run picked up its own disable lines as image repositories'
+      sed -e 's/^/       /' "$REPOS_RERUN/99-bitty-bootstrap.conf" >&2 || true
+    else
+      pass 'a re-run does not treat its own configuration as an image repository'
+    fi
+  }
+
 # --- 3. happy path ----------------------------------------------------------
 
 new_state happy

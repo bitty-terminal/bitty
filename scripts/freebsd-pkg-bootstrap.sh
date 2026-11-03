@@ -308,7 +308,11 @@ root_tee() {
 repo_present() {
   for rp_dir in "$REPOS_DIR" "$BASE_CONFS_DIR"; do
     [ -d "$rp_dir" ] || continue
-    if grep -rqE "^[[:space:]]*${1}[[:space:]]*:" "$rp_dir" 2>/dev/null; then
+    # The file this script wrote is excluded: on a re-run its own
+    # `FreeBSD-ports: { enabled: no }` lines would otherwise read as an
+    # image-provided repository and get copied forward.
+    if grep -rlE "^[[:space:]]*${1}[[:space:]]*:" "$rp_dir" 2>/dev/null |
+      grep -vxF "$REPOS_DIR/$CONF_NAME" | grep -q .; then
       return 0
     fi
   done

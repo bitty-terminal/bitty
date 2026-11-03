@@ -1290,11 +1290,11 @@ fn idle_baseline_campaign_reports_a_flat_rss() {
             };
             series.push(idle_sample(label, elapsed, cycles, &rt, &report));
             series.check(
-                rt.pane_session_ids().len() as u64 == panes,
+                rt.pane_count() as u64 == panes,
                 &format!(
                     "mark {}: every idle pane must stay attached (expected {panes}, live {})",
                     next_mark + 1,
-                    rt.pane_session_ids().len()
+                    rt.pane_count()
                 ),
             );
             series.check(

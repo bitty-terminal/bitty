@@ -172,6 +172,9 @@ if [[ "$gnu_url" != 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-x86_64-
 fi
 
 # 7. install.ps1 static conformance (pwsh unavailable here; remote CI runs it).
+# CTX-1681 (#2863): Windows Search only indexes Start Menu shortcuts and
+# registered apps, so the script must create Bitty.lnk and update the user
+# Path (with WM_SETTINGCHANGE broadcast) rather than logging an intent.
 if [[ ! -f "$PS1_SCRIPT" ]]; then
   echo "FAIL: $PS1_SCRIPT missing (PowerShell has no in-repo precedent; placed alongside install.sh)" >&2
   FAIL=1
@@ -179,7 +182,10 @@ else
   for needle in 'install/latest.txt' 'releases/$tag' \
     'bitty-$VersionBare-windows-x86_64.zip' 'bitty-aarch64-pc-windows-msvc.exe' \
     'irm https://cdn.bitty.run/install/install.ps1 | iex' \
-    'Expand-Archive' 'Get-FileHash'; do
+    'Expand-Archive' 'Get-FileHash' \
+    'Microsoft\Windows\Start Menu\Programs' 'Bitty.lnk' 'WScript.Shell' \
+    'CreateShortcut' 'SendMessageTimeout' 'WM_SETTINGCHANGE' \
+    'HKCU:\Environment' '-NoShortcut' '-NoPathUpdate'; do
     if ! grep -qF -- "$needle" "$PS1_SCRIPT"; then
       echo "FAIL: install.ps1 missing '$needle'" >&2
       FAIL=1

@@ -28,9 +28,16 @@
 //! series into the CI log; the series is also written to
 //! `BITTY_SOAK_EVIDENCE_DIR` when the nightly job sets it.
 //!
-//! Both tests are `#[ignore]`d: the PR-required `cargo nextest run --workspace`
-//! never pays for a multi-minute campaign. Run them explicitly with
-//! `just soak-campaign [secs]`.
+//! Third scenario (bitty#2859): the idle baseline. One window with N panes and
+//! no input at all, sampled on real wall clock at the 1/5/30-minute marks of a
+//! nominal 30-minute window (scaled by the same budget knob), with a full
+//! memory-attribution report written per mark. The workload campaigns compress
+//! time on the injected clock; this one cannot, because an idle RSS baseline
+//! is a statement about real elapsed time.
+//!
+//! All three tests are `#[ignore]`d: the PR-required `cargo nextest run
+//! --workspace` never pays for a multi-minute campaign. Run them explicitly
+//! with `just soak-campaign [secs]`.
 //!
 //! RSS and file-descriptor readings are Linux-only (`/proc`); other targets
 //! run the identical workload and keep every queue/lease/ring assertion.
@@ -1069,4 +1076,294 @@ fn plugin_activation_campaign_stays_bounded() {
 
     let _ = std::fs::remove_dir_all(&root);
     series.publish("bounded");
+}
+
+// ---------------------------------------------------------------------------
+// Campaign 3: idle baseline (bitty#2859)
+// ---------------------------------------------------------------------------
+
+/// Nominal full-length idle window: the 30-minute mark closes it.
+const IDLE_WINDOW_NOMINAL_SECS: u64 = 1_800;
+
+/// The 1-minute, 5-minute, and 30-minute marks of the nominal window. A
+/// shorter `BITTY_SOAK_CAMPAIGN_SECS` scales every mark by the same factor, so
+/// a two-minute confirmation run still samples three monotonic points.
+const IDLE_MARK_SECS: [u64; 3] = [60, 300, 1_800];
+
+/// Smallest gap between two idle marks, so a very short budget still produces
+/// three distinct, ordered marks instead of three samples of the same instant.
+const MIN_IDLE_MARK_GAP: Duration = Duration::from_secs(1);
+
+/// Pane count when `BITTY_SOAK_IDLE_PANES` is unset.
+const DEFAULT_IDLE_PANES: u64 = 4;
+
+/// Largest accepted pane count for one idle window (each pane is a real shell
+/// process; the cap keeps a typo from forking a hundred children).
+const MAX_IDLE_PANES: u64 = 8;
+
+/// Idle loop period: the window keeps presenting the way a real session does
+/// while no input arrives.
+const IDLE_TICK: Duration = Duration::from_millis(100);
+
+/// Hard cap on RSS growth across the idle window (allocator noise included).
+///
+/// Tighter than the workload campaign's cap on purpose: an idle window with no
+/// input has no legitimate reason to grow, so the bound has to separate
+/// "steady state" from "leak" rather than merely from "catastrophic".
+#[cfg(target_os = "linux")]
+const MAX_IDLE_RSS_GROWTH_KIB: u64 = 32 * 1024;
+
+/// Idle pane count from `BITTY_SOAK_IDLE_PANES` (clamped to 1..=[`MAX_IDLE_PANES`]).
+fn idle_pane_count() -> u64 {
+    std::env::var("BITTY_SOAK_IDLE_PANES")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_IDLE_PANES)
+        .clamp(1, MAX_IDLE_PANES)
+}
+
+/// The marks an idle window of `budget` samples, scaled from the nominal
+/// 1/5/30-minute schedule and forced strictly increasing.
+fn idle_mark_schedule(budget: Duration) -> Vec<Duration> {
+    let mut marks = Vec::with_capacity(IDLE_MARK_SECS.len());
+    let mut previous = Duration::ZERO;
+    for mark_secs in IDLE_MARK_SECS {
+        let millis = budget.as_millis().saturating_mul(u128::from(mark_secs))
+            / u128::from(IDLE_WINDOW_NOMINAL_SECS);
+        let mut mark = Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX));
+        let floor = previous.saturating_add(MIN_IDLE_MARK_GAP);
+        if mark < floor {
+            mark = floor;
+        }
+        mark = mark.min(budget.max(MIN_IDLE_MARK_GAP));
+        previous = mark;
+        marks.push(mark);
+    }
+    marks
+}
+
+/// One window with `panes` leaves, split evenly.
+fn idle_layout(panes: u64) -> LayoutNode {
+    let mut node = LayoutNode::leaf(View::new(ViewId::new(1), 80, 24));
+    for index in 2..=panes {
+        node = LayoutNode::split(
+            SplitAxis::Vertical,
+            0.5,
+            node,
+            LayoutNode::leaf(View::new(ViewId::new(index), 80, 24)),
+        );
+    }
+    node
+}
+
+/// One idle-baseline sample: process RSS plus the attribution report's own
+/// residual, so a growth in the total is immediately explainable by a row.
+fn idle_sample(
+    label: &str,
+    elapsed: Duration,
+    cycles: u64,
+    rt: &Runtime,
+    report: &bitty_runtime::runtime::memory::MemoryReport,
+) -> Sample {
+    let gauges = rt.hang_gauges().snapshot();
+    Sample {
+        label: label.to_string(),
+        elapsed_ms: elapsed.as_millis(),
+        // No virtual clock here: an idle window must measure real wall clock,
+        // so the simulated column stays zero rather than implying a
+        // compression this scenario does not perform.
+        simulated_ms: 0,
+        cycles,
+        rss_kib: report.process.rss_kib,
+        fds: fd_count(),
+        pending_deliveries: gauges.plugin_events_queued,
+        event_ring: gauges.plugin_side_queued,
+        worker_leases: gauges.plugin_workers,
+        panel_leases: gauges.panel_leases,
+        content_bytes: report.bytes_of("scrollback").unwrap_or(0),
+        accounted_bytes: report.accounted_bytes,
+        cold_queue: u64::try_from(rt.cold_queue_len()).unwrap_or(u64::MAX),
+        panes: gauges.pane_count,
+        max_tick_ms: gauges.max_tick_ns / 1_000_000,
+    }
+}
+
+/// Writes the attribution report of one idle mark into the evidence directory.
+///
+/// Distinct file names per mark, because every report is a different point in
+/// the window (the single-slot writer the opt-in session dump uses would
+/// overwrite the previous mark).
+fn publish_idle_report(report: &bitty_runtime::runtime::memory::MemoryReport, mark: usize) {
+    let rendered = report.render();
+    println!("\n--- idle mark {mark} ---\n{rendered}");
+    let Ok(dir) = std::env::var("BITTY_SOAK_EVIDENCE_DIR") else {
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!(
+            "soak campaign: cannot create evidence dir {}",
+            dir.display()
+        );
+        return;
+    }
+    let path = dir.join(format!("idle-rss-mark-{mark}.txt"));
+    if let Err(error) = std::fs::write(&path, rendered) {
+        eprintln!(
+            "soak campaign: cannot write evidence {}: {error}",
+            path.display()
+        );
+    }
+}
+
+/// Idle baseline: one window, N panes, no input, real wall clock.
+///
+/// This is the scenario the owner's 236 MiB baseline describes: nothing is
+/// typed, no PTY bytes are injected, and the only work the process does is
+/// present frames and poll its panes. It measures what a session costs when
+/// left alone, which the workload campaign deliberately does not.
+///
+/// Env knobs (same style as the rest of the driver):
+///
+/// - `BITTY_SOAK_CAMPAIGN_SECS` — window length (default 120 s, clamped
+///   8..86400 s). The nominal window is 1,800 s, so the default samples the
+///   4 s / 20 s / 120 s points of the scaled 1/5/30-minute schedule.
+/// - `BITTY_SOAK_IDLE_PANES` — panes in the window (default 4, clamp 1..=8).
+/// - `BITTY_SOAK_EVIDENCE_DIR` — writes the sampled series and one full
+///   attribution report per mark.
+#[test]
+#[ignore = "idle-baseline soak scenario (real wall clock); run via `just soak-campaign`"]
+fn idle_baseline_campaign_reports_a_flat_rss() {
+    let _serial = PROCESS_METRICS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let budget = campaign_budget();
+    let panes = idle_pane_count();
+    let marks = idle_mark_schedule(budget);
+    let bounds = Bounds {
+        #[cfg(target_os = "linux")]
+        rss_growth_kib: MAX_IDLE_RSS_GROWTH_KIB,
+        #[cfg(not(target_os = "linux"))]
+        rss_growth_kib: 0,
+        #[cfg(target_os = "linux")]
+        fd_growth: MAX_FD_GROWTH,
+        #[cfg(not(target_os = "linux"))]
+        fd_growth: 0,
+        pending_deliveries: 0,
+        event_ring: 0,
+        content_bytes: MAX_CONTENT_BYTES,
+    };
+    let mut series = Series::new("runtime-idle-baseline", budget, bounds);
+
+    let mut rt = make_runtime();
+    rt.set_layout(idle_layout(panes));
+    #[cfg(unix)]
+    for index in 1..=panes {
+        // pty-gate-exempt: inside `#[cfg(unix)]`; /bin/sh never spawns on Windows.
+        rt.spawn_shell_for_view(ViewId::new(index), "/bin/sh", &[], 80, 24)
+            .expect("idle pane shell must spawn");
+    }
+    let start = Instant::now();
+    let mut next_mark = 0usize;
+    let mut cycles = 0u64;
+    let _ = rt.tick_at(Instant::now());
+
+    while next_mark < marks.len() {
+        std::thread::sleep(IDLE_TICK);
+        // Poll and present exactly what an idle session does: drain whatever
+        // the shells produced on their own (a prompt, nothing typed), then
+        // present. No bytes are written to any PTY.
+        let _ = rt.poll_pty();
+        let _ = rt.tick_at(Instant::now());
+        let _ = rt.drain_cold_events();
+        let _ = rt.take_replies();
+        cycles += 1;
+
+        let elapsed = start.elapsed();
+        while next_mark < marks.len() && elapsed >= marks[next_mark] {
+            let report = rt.memory_report();
+            publish_idle_report(&report, next_mark + 1);
+            let label = match next_mark {
+                0 => "mark1",
+                1 => "mark2",
+                _ => "mark3",
+            };
+            series.push(idle_sample(label, elapsed, cycles, &rt, &report));
+            series.check(
+                rt.pane_count() as u64 == panes,
+                &format!(
+                    "mark {}: every idle pane must stay attached (expected {panes}, live {})",
+                    next_mark + 1,
+                    rt.pane_count()
+                ),
+            );
+            series.check(
+                !report.over_attributed,
+                &format!(
+                    "mark {}: attribution rows exceed RSS (accounted {} B, rss {} B)",
+                    next_mark + 1,
+                    report.accounted_bytes,
+                    report.process.rss_bytes()
+                ),
+            );
+            // The glyph/atlas row exists as soon as one frame presented, so a
+            // zero there means the attribution, not the workload, is broken.
+            series.check(
+                report.bytes_of("glyph-atlas").unwrap_or(0) > 0,
+                &format!(
+                    "mark {}: the glyph/atlas row must be charged",
+                    next_mark + 1
+                ),
+            );
+            next_mark += 1;
+        }
+    }
+    series.finalize_labels();
+
+    series.check(
+        series.samples.len() == IDLE_MARK_SECS.len(),
+        "the idle window must sample every mark",
+    );
+    series.check(
+        series.samples.iter().any(|sample| sample.label == "middle"),
+        "the idle series must name a middle sample",
+    );
+    for sample in &series.samples {
+        series.check(
+            sample.panes == panes,
+            &format!(
+                "sample {}: expected {panes} panes, saw {}",
+                sample.label, sample.panes
+            ),
+        );
+        series.check(
+            sample.content_bytes <= MAX_CONTENT_BYTES,
+            &format!(
+                "sample {}: retained content exceeds the campaign budget",
+                sample.label
+            ),
+        );
+    }
+    series.check(
+        series.rss_growth_kib() <= bounds.rss_growth_kib,
+        &format!(
+            "idle RSS grew {} KiB across the window (cap {} KiB)",
+            series.rss_growth_kib(),
+            bounds.rss_growth_kib
+        ),
+    );
+    series.check(
+        series.fd_growth() <= bounds.fd_growth,
+        &format!(
+            "idle open fds grew {} across the window (cap {})",
+            series.fd_growth(),
+            bounds.fd_growth
+        ),
+    );
+
+    #[cfg(unix)]
+    for index in 1..=panes {
+        let _ = rt.close_pane_session(&ViewId::new(index));
+    }
+    series.publish("idle-baseline");
 }

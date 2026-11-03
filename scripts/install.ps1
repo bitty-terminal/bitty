@@ -38,6 +38,13 @@
   in both paths — not URL parity. Like Scoop, this script installs user-local
   with no admin rights and no Rust toolchain.
 
+  Windows discoverability: after the smoke test the script creates a per-user
+  Start Menu shortcut (Bitty.lnk) and appends the install directory to the
+  user Path in HKCU\Environment, broadcasting WM_SETTINGCHANGE so new shells
+  resolve bitty. Both actions are best-effort: a failure warns and prints the
+  manual step instead of failing the install. -NoShortcut and -NoPathUpdate
+  skip each action for scripted installs.
+
   FreeBSD is not a bootstrap target (manual tar.xz download); Linux/macOS
   must use install.sh (curl -fsSL https://cdn.bitty.run/install/install.sh | bash).
 
@@ -63,6 +70,12 @@
   Print the artifact URL and its .sha256 URL, then exit (no network fetch
   beyond the version pointer unless -Version was given).
 
+.PARAMETER NoShortcut
+  Skip the per-user Start Menu shortcut and print the manual step instead.
+
+.PARAMETER NoPathUpdate
+  Skip the user Path update and print the manual step instead.
+
 .EXAMPLE
   irm https://cdn.bitty.run/install/install.ps1 | iex
 
@@ -80,7 +93,9 @@ param(
   [string]$CdnBase = 'https://cdn.bitty.run',
   [string]$Target = '',
   [switch]$DryRun,
-  [switch]$PrintUrl
+  [switch]$PrintUrl,
+  [switch]$NoShortcut,
+  [switch]$NoPathUpdate
 )
 
 Set-StrictMode -Version Latest
@@ -89,6 +104,97 @@ $ErrorActionPreference = 'Stop'
 function Write-BittyLog {
   param([string]$Message)
   Write-Host "install.ps1: $Message"
+}
+
+function Get-BittyStartMenuDir {
+  # Per-user Start Menu folder; Windows Search only indexes shortcuts and
+  # registered applications, so a bare exe elsewhere stays invisible.
+  $appData = "$env:AppData"
+  if ([string]::IsNullOrWhiteSpace($appData)) {
+    return ''
+  }
+  return Join-Path $appData 'Microsoft\Windows\Start Menu\Programs'
+}
+
+function New-BittyShortcut {
+  param([string]$TargetExe, [string]$WorkingDirectory)
+  $startMenuDir = Get-BittyStartMenuDir
+  if ($startMenuDir -eq '') {
+    Write-BittyLog 'warning: AppData is not set; skipping the Start Menu shortcut'
+    Write-BittyLog "manual step: create a shortcut to $TargetExe yourself"
+    return
+  }
+  $shortcutPath = Join-Path $startMenuDir 'Bitty.lnk'
+  try {
+    if (-not (Test-Path $startMenuDir)) {
+      New-Item -ItemType Directory -Path $startMenuDir -Force | Out-Null
+    }
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    $shortcut.TargetPath = $TargetExe
+    $shortcut.WorkingDirectory = $WorkingDirectory
+    $shortcut.IconLocation = "$TargetExe,0"
+    $shortcut.Description = 'Bitty terminal'
+    # Save() writes in place, so a re-run replaces the existing shortcut.
+    $shortcut.Save()
+    Write-BittyLog "created Start Menu shortcut: $shortcutPath"
+  } catch {
+    Write-BittyLog "warning: could not create Start Menu shortcut ${shortcutPath}: $($_.Exception.Message)"
+    Write-BittyLog "manual step: create a shortcut to $TargetExe in $startMenuDir"
+  }
+}
+
+function Send-BittySettingChange {
+  # Broadcast WM_SETTINGCHANGE so Explorer and new shells reload the user
+  # environment after the HKCU\Environment write.
+  if (-not ('Bitty.NativeMethods' -as [type])) {
+    Add-Type -Namespace 'Bitty' -Name 'NativeMethods' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+public static extern System.IntPtr SendMessageTimeout(
+    System.IntPtr hWnd, uint msg, System.UIntPtr wParam, string lParam,
+    uint flags, uint timeout, out System.UIntPtr result);
+'@
+  }
+  $wmSettingChange = 0x001A
+  $smtAbortIfHung = 0x0002
+  $broadcast = [System.IntPtr]0xFFFF
+  $result = [System.UIntPtr]::Zero
+  $sent = [Bitty.NativeMethods]::SendMessageTimeout(
+    $broadcast, $wmSettingChange, [System.UIntPtr]::Zero, 'Environment', $smtAbortIfHung, 5000, [ref]$result)
+  if ($sent -eq [System.IntPtr]::Zero) {
+    throw 'SendMessageTimeout returned 0 (no window accepted the broadcast)'
+  }
+}
+
+function Add-BittyUserPath {
+  param([string]$Directory)
+  $current = [Environment]::GetEnvironmentVariable('Path', 'User')
+  if ($null -eq $current) {
+    $current = ''
+  }
+  $target = $Directory.TrimEnd([char[]]@('\', '/'))
+  # Idempotent: compare case-insensitively and ignore trailing separators so
+  # a re-run never duplicates the entry.
+  foreach ($entry in @($current -split ';')) {
+    $candidate = $entry.Trim().TrimEnd([char[]]@('\', '/'))
+    if ($candidate -ne '' -and $candidate.Equals($target, [System.StringComparison]::OrdinalIgnoreCase)) {
+      Write-BittyLog "user Path already contains $Directory"
+      return
+    }
+  }
+  $updated = $Directory
+  if ($current.Trim() -ne '') {
+    $updated = "$($current.TrimEnd(';'));$Directory"
+  }
+  Set-ItemProperty -Path 'HKCU:\Environment' -Name 'Path' -Value $updated -Type ExpandString
+  Write-BittyLog "added $Directory to the user Path"
+  try {
+    Send-BittySettingChange
+    Write-BittyLog 'broadcast WM_SETTINGCHANGE; new shells can run bitty'
+  } catch {
+    Write-BittyLog "warning: could not broadcast WM_SETTINGCHANGE: $($_.Exception.Message)"
+    Write-BittyLog 'new shells may need a fresh sign-in to see the user Path update'
+  }
 }
 
 function Get-BittyTag {
@@ -214,6 +320,9 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
   }
   $InstallDir = Join-Path $localAppData 'bitty\bin'
 }
+# Absolute so the shortcut target, working directory, and Path entry stay
+# valid from any shell.
+$InstallDir = [System.IO.Path]::GetFullPath($InstallDir)
 
 $kind = 'exe'
 if ($shortTarget -eq 'x64') {
@@ -226,6 +335,21 @@ if ($DryRun) {
   Write-BittyLog "dry-run: artifact URL: $url"
   Write-BittyLog "dry-run: sidecar URL: $shaUrl"
   Write-BittyLog "dry-run: install dir: $InstallDir"
+  if ($NoShortcut) {
+    Write-BittyLog 'dry-run: Start Menu shortcut skipped (-NoShortcut); create a shortcut to bitty.exe manually'
+  } else {
+    $startMenuDir = Get-BittyStartMenuDir
+    if ($startMenuDir -eq '') {
+      Write-BittyLog 'dry-run: Start Menu shortcut unavailable (AppData is not set)'
+    } else {
+      Write-BittyLog "dry-run: would create Start Menu shortcut: $(Join-Path $startMenuDir 'Bitty.lnk')"
+    }
+  }
+  if ($NoPathUpdate) {
+    Write-BittyLog "dry-run: user Path update skipped (-NoPathUpdate); add $InstallDir manually"
+  } else {
+    Write-BittyLog "dry-run: would add to the user Path: $InstallDir"
+  }
   Write-BittyLog 'dry-run: would download, verify SHA256, and install bitty.exe (no changes made)'
   return
 }
@@ -273,7 +397,28 @@ try {
     throw "install smoke failed: $destExe --version exited $LASTEXITCODE"
   }
   Write-BittyLog "smoke OK: $versionOutput"
-  Write-BittyLog "ensure $InstallDir is on PATH"
+  if ($NoShortcut) {
+    Write-BittyLog 'skipping the Start Menu shortcut (-NoShortcut)'
+    Write-BittyLog "manual step: create a shortcut to $destExe in the Start Menu"
+  } else {
+    try {
+      New-BittyShortcut -TargetExe $destExe -WorkingDirectory $InstallDir
+    } catch {
+      Write-BittyLog "warning: could not create the Start Menu shortcut: $($_.Exception.Message)"
+      Write-BittyLog "manual step: create a shortcut to $destExe in the Start Menu"
+    }
+  }
+  if ($NoPathUpdate) {
+    Write-BittyLog 'skipping the user Path update (-NoPathUpdate)'
+    Write-BittyLog "manual step: add $InstallDir to your user Path"
+  } else {
+    try {
+      Add-BittyUserPath -Directory $InstallDir
+    } catch {
+      Write-BittyLog "warning: could not update the user Path: $($_.Exception.Message)"
+      Write-BittyLog "manual step: add $InstallDir to your user Path"
+    }
+  }
 } finally {
   if (Test-Path $stage) {
     Remove-Item -Recurse -Force $stage -ErrorAction SilentlyContinue

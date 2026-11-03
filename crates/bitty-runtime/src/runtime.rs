@@ -146,6 +146,7 @@ pub mod kitty_images;
 pub mod layout_focus;
 pub mod live_config;
 pub mod log_throttle;
+pub mod memory;
 pub mod mouse_chrome;
 pub mod mouse_encode;
 pub mod panel_rules;

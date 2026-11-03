@@ -881,6 +881,15 @@ pub(crate) struct TerminalApp {
     /// handler. Phase marks are observability only: they never alter routing,
     /// timing, or runtime state.
     pub(crate) stall_watchdog: Option<StallWatchdog>,
+    /// Opt-in periodic memory attribution dump (bitty#2859).
+    ///
+    /// `None` unless `BITTY_MEMORY_REPORT_SECS` names a positive interval.
+    /// The per-tick cost while armed is one `Instant` compare; the report
+    /// itself (a bounded `/proc` sample plus a rendered string) runs at most
+    /// once per interval, never on the input or paint path.
+    pub(crate) memory_report: Option<crate::memory_report::MemoryReportDump>,
+    /// One-shot latch so a broken report directory logs its warning once.
+    pub(crate) memory_report_failed: bool,
     /// Bounded backoff for a parked plugin command's cold-tick resume wake
     /// (bitty#2830).
     pub(crate) parked_command_backoff: ParkedCommandBackoff,
@@ -1083,6 +1092,7 @@ impl TerminalApp {
     ) -> Self {
         let event_tracker = EventTracker::from_runtime(&runtime);
         let stall_watchdog = StallWatchdog::from_env(std::sync::Arc::clone(runtime.hang_gauges()));
+        let memory_report = crate::memory_report::MemoryReportDump::from_env();
         Self {
             runtime,
             window: WindowState::new(theme_name, source),
@@ -1090,6 +1100,8 @@ impl TerminalApp {
             _pty_thread: None,
             presented_frames: 0,
             stall_watchdog,
+            memory_report,
+            memory_report_failed: false,
             parked_command_backoff: ParkedCommandBackoff::default(),
             present_nudge: PresentNudge::default(),
             #[cfg(test)]
@@ -1146,6 +1158,8 @@ impl TerminalApp {
             _pty_thread: Some(handle),
             presented_frames: 0,
             stall_watchdog,
+            memory_report: None,
+            memory_report_failed: false,
             parked_command_backoff: ParkedCommandBackoff::default(),
             present_nudge: PresentNudge::default(),
             #[cfg(test)]
@@ -1382,6 +1396,33 @@ impl TerminalApp {
     fn watchdog_presented(&self) {
         if let Some(watchdog) = self.stall_watchdog.as_ref() {
             watchdog.presented(self.presented_frames);
+        }
+    }
+
+    /// Writes one memory attribution report when the opt-in cadence is due
+    /// (bitty#2859).
+    ///
+    /// Disabled sessions return on the first `Option` check. An armed session
+    /// pays one `Instant` compare per tick; the report itself samples `/proc`
+    /// and renders a bounded string, so it never runs on the input or paint
+    /// path. A write failure is reported once and retried next interval.
+    pub(crate) fn maybe_write_memory_report(&mut self) {
+        let now = std::time::Instant::now();
+        let Some(dump) = self.memory_report.as_ref() else {
+            return;
+        };
+        if !dump.due(now) {
+            return;
+        }
+        let report =
+            crate::memory_report::current_report(&self.runtime, self.plugin_runtime.as_ref());
+        let dir = dump.dir().to_path_buf();
+        let result = crate::memory_report::write_report(&report, &dir);
+        if let Some(dump) = self.memory_report.as_mut() {
+            dump.written(now);
+        }
+        if let Err(error) = result {
+            crate::memory_report::note_failure(&mut self.memory_report_failed, &dir, &error);
         }
     }
 
@@ -2128,6 +2169,10 @@ impl TerminalApp {
         // inside compose/present reports as `runtime-tick`, the ANR shape.
         self.watchdog_phase(Phase::RuntimeTick);
         let stats = self.runtime.tick();
+        // bitty#2859: opt-in idle-RSS attribution. Off by default; when armed
+        // this is one `Instant` compare, and the report itself only runs on a
+        // due interval, after the tick committed.
+        self.maybe_write_memory_report();
         self.watchdog_phase(Phase::SnapshotPublish);
         // CTX-0481 (#762): after the tick commits, publish the live plugin
         // snapshot so plugins observe the committed generation instead of a

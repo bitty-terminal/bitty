@@ -1748,7 +1748,26 @@ jobs:
           foreach ($needle in @('install/latest.txt', 'Expand-Archive', 'Get-FileHash', 'irm https://cdn.bitty.run/install/install.ps1 | iex')) {
             if ("$text" -notmatch [regex]::Escape($needle)) { throw "install.ps1 missing '$needle'" }
           }
+          # CTX-1681 (#2863): Windows Search only indexes Start Menu shortcuts
+          # and registered apps, so the script must create Bitty.lnk and update
+          # the user Path instead of logging an intent. Pin the constructs here
+          # and the planned actions below; the local-CDN step installs for real.
+          foreach ($needle in @('Microsoft\Windows\Start Menu\Programs', 'Bitty.lnk', 'WScript.Shell', 'CreateShortcut', 'SendMessageTimeout', 'WM_SETTINGCHANGE', 'HKCU:\Environment', '-NoShortcut', '-NoPathUpdate')) {
+            if ("$text" -notmatch [regex]::Escape($needle)) { throw "install.ps1 missing '$needle'" }
+          }
+          # Write-Host emits on the information stream, so merge all streams.
+          $planDir = Join-Path $env:RUNNER_TEMP 'bitty-plan-install'
+          $plan = (& $script -Version 0.0.23 -Target x64 -InstallDir $planDir -DryRun *>&1) -join "`n"
+          foreach ($needle in @('would create Start Menu shortcut', 'would add to the user Path')) {
+            if ($plan -notmatch [regex]::Escape($needle)) { throw "dry-run plan missing '$needle'" }
+          }
+          $skipped = (& $script -Version 0.0.23 -Target x64 -InstallDir $planDir -DryRun -NoShortcut -NoPathUpdate *>&1) -join "`n"
+          foreach ($needle in @('-NoShortcut', '-NoPathUpdate', 'manual')) {
+            if ($skipped -notmatch [regex]::Escape($needle)) { throw "dry-run opt-out missing '$needle'" }
+          }
+          if ($skipped -match 'would create Start Menu shortcut') { throw 'dry-run opt-out still plans a shortcut' }
           Write-Host 'install.ps1 static asserts OK'
+          Write-Host 'install.ps1 discoverability plan OK'
 
       # Same dry-run smoke under Windows PowerShell 5.1: install.ps1 must stay
       # 5.1-clean (review-only until this leg). Reduced to the x64 plan plus
@@ -1765,6 +1784,104 @@ jobs:
           if ($urls[0] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip') { throw "x64 PrintUrl mismatch: $($urls[0])" }
           if ($urls[1] -ne 'https://cdn.bitty.run/releases/v0.0.23/bitty-0.0.23-windows-x86_64.zip.sha256') { throw "x64 sidecar mismatch: $($urls[1])" }
           Write-Host 'install.ps1 5.1 dry-run OK'
+
+      # CTX-1681 (#2863): install.ps1 only downloads from the CDN, but the
+      # documented -CdnBase test override lets this step serve the locally
+      # built debug exe from a loopback HTTP server. That exercises the real
+      # install path (copy, smoke, Start Menu shortcut, user Path) without
+      # external network. The arm64 row is a bare exe, so no portable ZIP has
+      # to be assembled; the x64 debug binary is a valid stand-in payload
+      # because the script only copies and smoke-runs it. Registry, shortcut,
+      # and server state are restored in `finally`; a runner that blocks the
+      # Start Menu write downgrades that one assert to a skip notice.
+      - name: Verify install.ps1 Start Menu shortcut and user Path
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $script = Join-Path $env:GITHUB_WORKSPACE 'scripts/install.ps1'
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'target\debug\bitty.exe'
+          if (-not (Test-Path $exe)) {
+            & cargo build -p bitty-terminal --bin bitty --locked
+            if ($LASTEXITCODE -ne 0) { throw 'cargo build for the install smoke failed' }
+          }
+          if (-not (Test-Path $exe)) { throw "debug bitty.exe missing: $exe" }
+          $python = Get-Command python -ErrorAction SilentlyContinue
+          if ($null -eq $python) { $python = Get-Command python3 -ErrorAction SilentlyContinue }
+          if ($null -eq $python) {
+            Write-Host '::warning::python is unavailable; skipping the local-CDN install leg'
+            exit 0
+          }
+          $version = '9.9.9'
+          $root = Join-Path $env:RUNNER_TEMP 'bitty-install-ps1'
+          $cdn = Join-Path $root 'cdn'
+          $rel = Join-Path $cdn "releases\v$version"
+          $installDir = Join-Path $root 'bin'
+          New-Item -ItemType Directory -Force -Path $rel, $installDir | Out-Null
+          $payload = Join-Path $rel 'bitty-aarch64-pc-windows-msvc.exe'
+          Copy-Item -Path $exe -Destination $payload
+          $hash = (Get-FileHash -Path $payload -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path "${payload}.sha256" -Value "$hash  bitty-aarch64-pc-windows-msvc.exe"
+          Set-Content -Path (Join-Path $cdn 'health.txt') -Value 'ok'
+          $listener = New-Object -TypeName System.Net.Sockets.TcpListener -ArgumentList @([System.Net.IPAddress]::Loopback, 0)
+          $listener.Start()
+          $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+          $listener.Stop()
+          $server = Start-Process -FilePath $python.Source -WorkingDirectory $cdn -ArgumentList @('-m', 'http.server', "$port", '--bind', '127.0.0.1') -PassThru -WindowStyle Hidden
+          $originalPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $shortcut = Join-Path $env:AppData 'Microsoft\Windows\Start Menu\Programs\Bitty.lnk'
+          $base = "http://127.0.0.1:$port"
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 50; $i++) {
+              try {
+                Invoke-WebRequest -Uri "$base/health.txt" -UseBasicParsing -TimeoutSec 2 | Out-Null
+                $ready = $true
+                break
+              } catch {
+                Start-Sleep -Milliseconds 200
+              }
+            }
+            if (-not $ready) { throw "local CDN server did not start on $base" }
+            $log = (& $script -Version $version -Target arm64 -CdnBase $base -InstallDir $installDir *>&1) -join "`n"
+            if (-not (Test-Path (Join-Path $installDir 'bitty.exe'))) { throw 'install.ps1 did not install bitty.exe' }
+            if ($log -match 'warning: could not create Start Menu shortcut') {
+              Write-Host 'SKIP: Start Menu shortcut unavailable on this runner (warn-only path exercised)'
+            } elseif (-not (Test-Path $shortcut)) {
+              throw "install.ps1 did not create $shortcut"
+            } else {
+              $wsh = New-Object -ComObject WScript.Shell
+              $lnk = $wsh.CreateShortcut($shortcut)
+              if ($lnk.TargetPath -ne (Join-Path $installDir 'bitty.exe')) { throw "shortcut target mismatch: $($lnk.TargetPath)" }
+              if ($lnk.WorkingDirectory -ne $installDir) { throw "shortcut working directory mismatch: $($lnk.WorkingDirectory)" }
+              Write-Host "Start Menu shortcut OK: $shortcut"
+            }
+            if ($log -match 'warning: could not update the user Path') {
+              Write-Host 'SKIP: user Path update unavailable on this runner (warn-only path exercised)'
+            } else {
+              $entries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' |
+                  Where-Object { $_.Trim().TrimEnd('\') -ieq $installDir.TrimEnd('\') })
+              if ($entries.Count -ne 1) { throw "user Path should contain the install dir once, found $($entries.Count)" }
+              & $script -Version $version -Target arm64 -CdnBase $base -InstallDir $installDir *>&1 | Out-Null
+              $entries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' |
+                  Where-Object { $_.Trim().TrimEnd('\') -ieq $installDir.TrimEnd('\') })
+              if ($entries.Count -ne 1) { throw "second run duplicated the user Path entry ($($entries.Count))" }
+              Write-Host 'user Path OK (one entry after two runs)'
+            }
+            $skipped = (& $script -Version $version -Target arm64 -CdnBase $base -InstallDir $installDir -NoShortcut -NoPathUpdate *>&1) -join "`n"
+            foreach ($needle in @('-NoShortcut', '-NoPathUpdate', 'manual step:')) {
+              if ($skipped -notmatch [regex]::Escape($needle)) { throw "opt-out run missing '$needle'" }
+            }
+            Write-Host 'install.ps1 shortcut and user Path behaviour OK'
+          } finally {
+            if ($null -eq $originalPath) {
+              Remove-ItemProperty -Path 'HKCU:\Environment' -Name 'Path' -ErrorAction SilentlyContinue
+            } else {
+              [Environment]::SetEnvironmentVariable('Path', $originalPath, 'User')
+            }
+            Remove-Item -Path $shortcut -Force -ErrorAction SilentlyContinue
+            if ($null -ne $server -and -not $server.HasExited) { Stop-Process -Id $server.Id -Force }
+            Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+          }
 
   # M1-10 / CTX-0574: aggregate the four ADR-0002 Tier 1 platform legs into a
   # single pass/fail view. Each platform job runs the M1 evidence suites by

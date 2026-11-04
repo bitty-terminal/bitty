@@ -998,13 +998,46 @@ impl ConfigModuleGeneration {
     }
 }
 
+/// Host ABI errno codes the refusal details name.
+///
+/// `std::io::Error::raw_os_error` speaks the host's own numbering, so a
+/// literal `40` for `ELOOP` is Linux-only — macOS reports `62`, and the detail
+/// silently fell through to the generic branch there (the macOS leg caught it
+/// on `symlink_loop_at_a_module_path_refuses_as_escape`). `rustix` already
+/// carries the anchored walk, so its portable constants name the classes
+/// instead of a hardcoded host table.
+#[cfg(unix)]
+mod errno {
+    use rustix::io::Errno;
+
+    /// A symlink resolution loop (`ELOOP`).
+    pub(super) const LOOP: i32 = Errno::LOOP.raw_os_error();
+    /// A component the process may not traverse (`EACCES`).
+    pub(super) const ACCESS: i32 = Errno::ACCESS.raw_os_error();
+    /// An out-of-root remainder (`EXDEV`).
+    pub(super) const XDEV: i32 = Errno::XDEV.raw_os_error();
+    /// A non-directory standing in for a component (`ENOTDIR`).
+    pub(super) const NOTDIR: i32 = Errno::NOTDIR.raw_os_error();
+}
+
+/// No errno table off Unix: the host reports Win32 codes instead, where these
+/// classes have no meaning, so every probe already falls through to the
+/// generic, still fail-closed detail.
+#[cfg(not(unix))]
+mod errno {
+    pub(super) const LOOP: i32 = -1;
+    pub(super) const ACCESS: i32 = -1;
+    pub(super) const XDEV: i32 = -1;
+    pub(super) const NOTDIR: i32 = -1;
+}
+
 /// Why a root could not be built, in layout-kind terms only.
 fn root_layout_detail(error: &std::io::Error) -> &'static str {
     match error.raw_os_error() {
         // ELOOP: a resolution loop at the root path.
-        Some(40) => "module root resolution loop refused",
+        Some(errno::LOOP) => "module root resolution loop refused",
         // ENOTDIR: a path component is not a directory.
-        Some(20) => "module root path is not a directory",
+        Some(errno::NOTDIR) => "module root path is not a directory",
         _ => match error.kind() {
             std::io::ErrorKind::NotFound => "module root directory is missing",
             std::io::ErrorKind::PermissionDenied => "module root is unreadable",
@@ -1052,9 +1085,9 @@ fn probe_module_path(path: &Path) -> ModulePathProbe {
 fn canonicalize_detail(error: &std::io::Error) -> &'static str {
     match error.raw_os_error() {
         // ELOOP: a symlink loop inside the module path.
-        Some(40) => "module path has a link resolution loop",
+        Some(errno::LOOP) => "module path has a link resolution loop",
         // EACCES: a component is unreadable.
-        Some(13) => "module path component is unreadable",
+        Some(errno::ACCESS) => "module path component is unreadable",
         _ => "module path could not be canonicalized",
     }
 }
@@ -1063,11 +1096,11 @@ fn canonicalize_detail(error: &std::io::Error) -> &'static str {
 fn escape_detail(error: &std::io::Error) -> &'static str {
     match error.raw_os_error() {
         // EXDEV: `RESOLVE_BENEATH` refused an absolute or `..` remainder.
-        Some(18) => "anchored walk refused an out-of-root remainder",
+        Some(errno::XDEV) => "anchored walk refused an out-of-root remainder",
         // ELOOP: a symlink or magic link at some component.
-        Some(40) => "anchored walk refused a link component",
+        Some(errno::LOOP) => "anchored walk refused a link component",
         // ENOTDIR: a non-directory stood in for a path component.
-        Some(20) => "anchored walk refused a non-directory component",
+        Some(errno::NOTDIR) => "anchored walk refused a non-directory component",
         _ => "anchored walk refused the module path",
     }
 }

@@ -503,6 +503,24 @@ fn symlink_loop_at_a_module_path_refuses_as_escape() {
     assert!(rendered.contains("link resolution loop"), "{rendered}");
 }
 
+/// The loop class is named by the host's own errno, so the portable constant
+/// must equal what this platform reports for a self-symlink. A Linux-only
+/// literal compiled everywhere and left macOS answering the generic
+/// "could not be canonicalized" detail (the macOS leg of bitty#2869 caught it).
+#[cfg(unix)]
+#[test]
+fn the_link_loop_class_matches_the_host_errno() {
+    let dir = TempDir::new("loop-errno");
+    let path = dir.path().join("self.lua");
+    std::os::unix::fs::symlink(&path, &path).expect("self symlink");
+    let error = std::fs::metadata(&path).expect_err("a self symlink cannot resolve");
+    assert_eq!(
+        error.raw_os_error(),
+        Some(errno::LOOP),
+        "the portable ELOOP constant must match the host errno"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn unreadable_module_directory_refuses_as_escape() {

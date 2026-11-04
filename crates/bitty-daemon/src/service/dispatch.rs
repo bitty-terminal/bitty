@@ -2353,9 +2353,13 @@ impl Service {
     ///
     /// The sequence is the contract's two-phase journal: reserve the record
     /// with the pre-spawn containment identity, spawn under that identity,
-    /// commit the observed identity, then bind generation `1`. A spawn failure
-    /// terminalizes the record as `failed/spawn_failed` with the cleanup class
-    /// the plan could prove (`not_started` before a child existed, `swept` or
+    /// commit the observed identity, then bind generation `1`. The spawn
+    /// itself must pass the configured `spawn_bind_timeout_ms` and the bind
+    /// probe before either the commit or the bind: a timeout, an exited child,
+    /// or a closed terminal PTY refuses at generation `0` with no binding and
+    /// no committed journal record (bitty#2790). A spawn failure terminalizes
+    /// the record as `failed/spawn_failed` with the cleanup class the plan
+    /// could prove (`not_started` before a child existed, `swept` or
     /// `unverified` after one did) and settles the journal, so the create still
     /// answers the accepted result shape. Only a journal capacity refusal
     /// returns `Err`, and the caller rolls the whole create back.
@@ -2390,6 +2394,19 @@ impl Service {
                     .orphans
                     .settle(session_id, CleanupClass::NotStarted, now);
                 return self.spawn_failed(session_id, CleanupClass::NotStarted, now);
+            }
+            // A child existed but the bind probe refused it: it had already
+            // exited (or lost its PTY), or the spawn handoff crossed the
+            // committed `spawn_bind_timeout_ms`. The pool already stopped and
+            // reaped the child, so settle the reservation with the class the
+            // plan could prove and terminalize at generation 0. Nothing is
+            // committed to the journal and generation 1 is never bound
+            // (bitty#2790).
+            Err(
+                WorkerSpawnError::NotBindable(cleanup) | WorkerSpawnError::BindTimeout(cleanup),
+            ) => {
+                let _ = self.orphans.settle(session_id, cleanup, now);
+                return self.spawn_failed(session_id, cleanup, now);
             }
             Err(WorkerSpawnError::Cleanup(cleanup)) => {
                 // A child existed and was terminated before the error
@@ -5245,6 +5262,207 @@ mod tests {
         assert_eq!(error.denied_code(), Some(RefusalCode::ConsentRequired));
     }
 
+    /// A served service with a real orphan journal for the spawn-failure
+    /// tests.
+    fn served_worker_service(limits: Limits) -> (Service, tempfile::TempDir) {
+        use crate::containment::ContainmentLimits;
+        use crate::orphan::OrphanJournalLimits;
+
+        let report = crate::containment::ContainmentReport::probe();
+        let journal_dir = tempfile::tempdir().expect("journal dir");
+        std::fs::set_permissions(
+            journal_dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("chmod");
+        let supervisor = OrphanSupervisor::open(
+            journal_dir.path().join("orphans"),
+            &OrphanJournalLimits::from_limits(&limits),
+            &report,
+            ContainmentLimits::default(),
+        )
+        .expect("served supervisor");
+        let (service, _operator_dir) = service_with_containment(limits, supervisor, report);
+        // The journal directory must outlive the service; the operator store
+        // keeps its capability in memory, so its own temp dir may be dropped.
+        (service, journal_dir)
+    }
+
+    /// Dispatch one keyed worker create with consent and return its result.
+    fn create_worker_with_consent(
+        service: &mut Service,
+        operator: &mut Connection,
+        label: &str,
+        argv: Value,
+    ) -> Value {
+        let grant = mint_host_grant(service, operator, 2);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 0))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        service
+            .dispatch(
+                &mut creator,
+                ServiceMethod::SessionCreate,
+                &json!({
+                    "kind": "worker",
+                    "idempotency_key": label,
+                    "argv": argv,
+                    "cwd": "/",
+                    "cols": 100,
+                    "rows": 30,
+                }),
+                MonotonicMs::from_millis(4),
+            )
+            .expect("a failed spawn is an accepted create with a terminal record")
+    }
+
+    #[test]
+    fn a_bind_timeout_is_spawn_failed_at_generation_zero_with_no_binding_or_commit() {
+        let limits = Limits::new(&[LimitOverride::new(LimitId::SpawnBindTimeoutMs, 100)])
+            .expect("a hundred-millisecond bind deadline");
+        let (mut service, _dir) = served_worker_service(limits);
+        // The pause is after the child exists and before the probe, so the
+        // half-second handoff deterministically crosses the configured bound
+        // while leaving the PTY and spawn time comfortably inside it.
+        service
+            .workers
+            .delay_bind_probe_for_test(std::time::Duration::from_millis(500));
+        let mut operator = operator_connection(&mut service);
+        let created = create_worker_with_consent(
+            &mut service,
+            &mut operator,
+            "bind-timeout",
+            json!(["/bin/sleep", "60"]),
+        );
+        let session = &created["session"];
+        assert_eq!(session["state"], "failed");
+        assert_eq!(session["terminal_reason"], "spawn_failed");
+        assert_eq!(session["generation"], 0, "a timed-out spawn never binds");
+        assert!(
+            created["control_token"].is_null(),
+            "a failed session exposes no claimable control"
+        );
+        // The child existed before the deadline fired, so the cleanup class is
+        // the plan's truthful claim (`swept` or `unverified`), never
+        // `not_started`.
+        assert_ne!(session["cleanup"], "not_started");
+
+        // The reservation is settled, not committed: there is no live journal
+        // record for the failed session and no bound generation.
+        let verified = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonOrphansVerify,
+                &json!({"action": "verify"}),
+                MonotonicMs::from_millis(5),
+            )
+            .expect("verify");
+        assert_eq!(verified["reserved"], 0);
+        assert_eq!(verified["committed"], 0);
+        assert!(
+            service.workers.is_empty(),
+            "no timed-out handle stays bound"
+        );
+        let id = session_id(&created);
+        let status = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": id}),
+                MonotonicMs::from_millis(6),
+            )
+            .expect("status");
+        assert_eq!(status["session"]["state"], "failed");
+        assert_eq!(status["session"]["generation"], 0);
+        assert_eq!(status["session"]["attach_count"], 0);
+    }
+
+    #[test]
+    fn a_child_that_exits_before_bind_is_never_running_with_a_live_lease() {
+        let (mut service, _dir) = served_worker_service(Limits::default());
+        // A child that exits immediately is placed before the bind probe, the
+        // same window production covers. Refusing the bind (rather than
+        // binding and recording an exit later) means no client can attach to a
+        // worker that was already gone (bitty#2790).
+        service
+            .workers
+            .delay_bind_probe_for_test(std::time::Duration::from_millis(500));
+        let mut operator = operator_connection(&mut service);
+        let created = create_worker_with_consent(
+            &mut service,
+            &mut operator,
+            "pre-bind-exit",
+            json!(["/bin/sh", "-c", "exit 0"]),
+        );
+        let session = &created["session"];
+        assert_eq!(session["state"], "failed");
+        assert_eq!(session["terminal_reason"], "spawn_failed");
+        assert_eq!(session["generation"], 0);
+        assert_eq!(session["attach_count"], 0);
+        assert!(
+            created["control_token"].is_null(),
+            "the refused create mints no claimable control"
+        );
+        let verified = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonOrphansVerify,
+                &json!({"action": "verify"}),
+                MonotonicMs::from_millis(5),
+            )
+            .expect("verify");
+        assert_eq!(verified["reserved"], 0);
+        assert_eq!(verified["committed"], 0);
+
+        // The failed record is terminal, so an attach has no live lease to
+        // grant at either generation. At generation 1 the generation fence
+        // answers first; at generation 0 the terminal state is `NotRunning`.
+        let id = session_id(&created);
+        let error = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": id,
+                    "expected_generation": 1,
+                    "control_token": "0".repeat(64),
+                    "idempotency_key": "pre-bind-exit-claim-1",
+                }),
+                MonotonicMs::from_millis(5),
+            )
+            .expect_err("no lease on an unbound session");
+        assert_eq!(error.denied_code(), Some(RefusalCode::StaleGeneration));
+        let error = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "controller",
+                    "session_id": id,
+                    "expected_generation": 0,
+                    "control_token": "0".repeat(64),
+                    "idempotency_key": "pre-bind-exit-claim-0",
+                }),
+                MonotonicMs::from_millis(6),
+            )
+            .expect_err("a terminal record has no live lease");
+        assert_eq!(error.denied_code(), Some(RefusalCode::NotRunning));
+        let status = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": id}),
+                MonotonicMs::from_millis(7),
+            )
+            .expect("status");
+        assert_eq!(status["session"]["state"], "failed");
+        assert_eq!(status["session"]["attach_count"], 0);
+    }
+
     #[test]
     fn scope_is_decided_before_target_lookup() {
         let (mut service, _dir) = service();
@@ -7874,12 +8092,14 @@ mod tests {
         }
 
         // A worker that died between ticks is refused before the terminal
-        // transition, even though the registry still reports `running`.
+        // transition, even though the registry still reports `running`. The
+        // child must outlive the pre-bind liveness probe (bitty#2790), so it
+        // sleeps for a second before exiting instead of exiting immediately.
         let (mut dying, dying_id, _) = spawned_controller_session(
             &mut service,
             &mut operator,
             "content-dying",
-            json!(["/bin/sh", "-c", "exit 0"]),
+            json!(["/bin/sh", "-c", "sleep 1; exit 0"]),
             false,
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

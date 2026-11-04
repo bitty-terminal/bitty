@@ -9994,6 +9994,209 @@
       "requires": [
         "worker_sessions"
       ]
+    },
+    {
+      "id": "V-50",
+      "title": "A worker create, bind, resize, and stop chain leaves no running session or journal record",
+      "area": "worker",
+      "decisions": [
+        "D-01",
+        "D-03",
+        "D-04",
+        "D-06"
+      ],
+      "drivers": [
+        "fake",
+        "real"
+      ],
+      "requires": [
+        "worker_sessions"
+      ],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {
+              "major": 1,
+              "minor": 3
+            },
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "worker",
+            "idempotency_key": "v50-create",
+            "argv": [
+              "/bin/sleep",
+              "60"
+            ],
+            "cwd": "@cwd",
+            "cols": 100,
+            "rows": 30
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.kind": "worker",
+              "session.state": "running",
+              "session.generation": 1,
+              "session.attach_count": 0,
+              "replayed": false
+            },
+            "hex_len": {
+              "session.session_id": 32,
+              "control_token": 64
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 1,
+            "control_token": "@create_token",
+            "idempotency_key": "v50-claim"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller",
+              "session.generation": 1,
+              "session.attach_count": 1
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.resize",
+          "params": {
+            "session_id": "@session_id",
+            "generation": 1,
+            "cols": 120,
+            "rows": 40
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.kind": "worker",
+              "session.state": "running",
+              "session.generation": 1
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.abort",
+          "params": {
+            "session_id": "@session_id",
+            "expected_generation": 1,
+            "reason_class": "cancel"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "terminated",
+              "session.terminal_reason": "consumer_cancel",
+              "session.generation": 1,
+              "session.attach_count": 0
+            },
+            "retry_ms": 8000
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.orphans.verify",
+          "params": {
+            "action": "verify"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "reserved": 0,
+              "committed": 0
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "active_sessions": 0,
+              "sessions.running": 0
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "terminated",
+              "session.terminal_reason": "consumer_cancel",
+              "session.generation": 1,
+              "session.attach_count": 0
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a stopped session remains observable as running",
+        "a stopped session leaves a live lease",
+        "a stopped session leaves a reserved or committed journal record"
+      ]
     }
   ]
 }

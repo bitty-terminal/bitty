@@ -2844,6 +2844,168 @@ fn worker_resize_requires_the_controller_lease_and_bumps_the_revision() {
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
 }
 
+#[test]
+fn a_worker_create_bind_resize_stop_chain_leaves_no_session_or_child_behind() {
+    let root = TempRoot::new("worker-chain");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    // The shell records its own pid and then becomes `sleep 60`, so the test
+    // can observe the recorded leader after the daemon stops it.
+    let pid_file = root.path.join("leader.pid");
+    let script = format!(
+        "echo $$ > '{pid_file}'; exec sleep 60",
+        pid_file = pid_file.display()
+    );
+    let (mut creator, created) = create_worker(
+        &root,
+        &mut operator,
+        "chain",
+        json!(["/bin/sh", "-c", script, "bittyd-worker"]),
+    );
+    let session = &created["result"]["session"];
+    assert_eq!(session["state"], "running");
+    assert_eq!(session["generation"], 1);
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let create_token = created["result"]["control_token"].clone();
+
+    let attached = creator.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 1,
+            "control_token": create_token,
+            "idempotency_key": "chain-claim",
+        }),
+    );
+    assert_eq!(attached["ok"], true, "{attached}");
+    assert_eq!(attached["result"]["role"], "controller");
+    assert_eq!(attached["result"]["session"]["state_revision"], 2);
+
+    let resized = creator.call(
+        "session.resize",
+        json!({"session_id": session_id, "generation": 1, "cols": 120, "rows": 40}),
+    );
+    assert_eq!(resized["ok"], true, "{resized}");
+    assert_eq!(resized["result"]["session"]["state"], "running");
+    assert_eq!(resized["result"]["session"]["generation"], 1);
+    assert_eq!(resized["result"]["session"]["state_revision"], 3);
+
+    // Wait until the shell's `exec sleep 60` has landed so the recorded pid
+    // is the process the stop must reach. The test only observes the process
+    // name; it never signals anything itself.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let leader: u32 = loop {
+        match std::fs::read_to_string(&pid_file) {
+            Ok(text) => break text.trim().parse().expect("a pid"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("read the child pid: {error}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the child never wrote its pid file"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    while std::fs::read_to_string(format!("/proc/{leader}/comm"))
+        .map_or(true, |comm| comm.trim() != "sleep")
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the worker never reached its exec image"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The controller lease is the authority; `cancel` is the consumer stop.
+    let stopped = creator.call(
+        "session.abort",
+        json!({
+            "session_id": session_id,
+            "expected_generation": 1,
+            "reason_class": "cancel",
+        }),
+    );
+    assert_eq!(stopped["ok"], true, "{stopped}");
+
+    let terminal = wait_for_worker_state(&mut operator, &session_id, &["terminated"]);
+    assert_eq!(terminal["terminal_reason"], "consumer_cancel");
+    assert_eq!(terminal["generation"], 1);
+    assert_eq!(terminal["state"], "terminated");
+    assert_eq!(
+        terminal["attach_count"], 0,
+        "a terminal session has no live lease"
+    );
+
+    // A stopped session is not running and its content plane is closed.
+    let after = creator.call(
+        "session.read",
+        json!({"session_id": session_id, "generation": 1}),
+    );
+    assert_eq!(after["ok"], false, "{after}");
+    assert_eq!(after["error"]["code"], "NotRunning");
+    let status = operator.call("daemon.status", Value::Null);
+    assert_eq!(status["ok"], true, "{status}");
+    assert_eq!(status["result"]["active_sessions"], 0);
+    assert_eq!(status["result"]["sessions"]["running"], 0);
+
+    // No live journal record survives: the committed identity was settled
+    // through the same cleanup class the terminal notice reports.
+    let verified = operator.call("daemon.orphans.verify", json!({"action": "verify"}));
+    assert_eq!(verified["ok"], true, "{verified}");
+    assert_eq!(verified["result"]["reserved"], 0);
+    assert_eq!(verified["result"]["committed"], 0);
+
+    // The child is gone. The pid was recorded by the child itself before the
+    // exec, and the cgroup plan additionally proves its whole subtree empty;
+    // neither check kills anything.
+    let settle = daemon_containment_limits(&status);
+    let mechanism = status["result"]["orphans"]["mechanism"]
+        .as_str()
+        .expect("containment mechanism")
+        .to_owned();
+    let session_cgroup = (mechanism == bitty_daemon::containment::MECHANISM_CGROUP_V2).then(|| {
+        let instance = bitty_daemon::registry::DaemonInstanceId::parse(
+            status["result"]["daemon_instance_id"]
+                .as_str()
+                .expect("daemon instance id"),
+        )
+        .expect("canonical instance id");
+        let session =
+            bitty_daemon::registry::SessionId::parse(&session_id).expect("canonical session id");
+        let name = bitty_daemon::worker::cgroup_name(instance, session);
+        let root = daemon_cgroup_root(daemon.pid()).expect("the daemon's own cgroup is readable");
+        root.join(name)
+    });
+    let deadline = Instant::now() + containment_settle_timeout(settle);
+    while process_is_live(leader) {
+        assert!(
+            Instant::now() < deadline,
+            "stopped worker leader {leader} survived the stop"
+        );
+        std::thread::sleep(CONTAINMENT_SETTLE_STEP);
+    }
+    if let Some(cgroup) = session_cgroup {
+        let deadline = Instant::now() + containment_settle_timeout(settle);
+        while !session_cgroup_settled(&cgroup) {
+            assert!(
+                Instant::now() < deadline,
+                "session cgroup {} still populated after the stop",
+                cgroup.display()
+            );
+            std::thread::sleep(CONTAINMENT_SETTLE_STEP);
+        }
+    }
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
 /// Decode a lowercase-hex content field.
 fn decode_content(text: &str) -> Vec<u8> {
     assert!(text.len() % 2 == 0, "content hex must be even: {text}");
@@ -3182,6 +3344,51 @@ fn a_failed_worker_spawn_leaves_no_journal_record_or_bound_session() {
 }
 
 #[test]
+fn a_non_executable_worker_program_is_not_started_and_leaves_no_record() {
+    let root = TempRoot::new("worker-eacces");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    // A readable but non-executable file is the deterministic `EACCES` case:
+    // unlike the missing-executable vector it proves the exec failure is
+    // reported as `not_started`, not bound and later recorded as an exit.
+    let program = root.path.join("worker-not-executable");
+    std::fs::write(&program, b"#!/bin/sh\nexit 0\n").expect("write the fixture");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644)).expect("chmod 0644");
+    let (_creator, created) = create_worker(
+        &root,
+        &mut operator,
+        "spawn-eacces",
+        json!([program.to_str().expect("a UTF-8 fixture path")]),
+    );
+    let session = &created["result"]["session"];
+    assert_eq!(session["kind"], "worker");
+    assert_eq!(session["state"], "failed");
+    assert_eq!(session["terminal_reason"], "spawn_failed");
+    assert_eq!(session["cleanup"], "not_started");
+    assert_eq!(session["generation"], 0, "a failed exec never binds");
+    assert_eq!(created["result"]["control_token"], Value::Null);
+
+    let session_id = session["session_id"].as_str().expect("session id");
+    let verified = operator.call("daemon.orphans.verify", json!({"action": "verify"}));
+    assert_eq!(verified["ok"], true, "{verified}");
+    assert_eq!(verified["result"]["reserved"], 0);
+    assert_eq!(verified["result"]["committed"], 0);
+    let status = operator.call("daemon.status", Value::Null);
+    assert_eq!(status["ok"], true, "{status}");
+    assert_eq!(status["result"]["active_sessions"], 0);
+    assert_eq!(status["result"]["sessions"]["running"], 0);
+    assert_eq!(
+        operator_session(&mut operator, session_id)["state"],
+        "failed"
+    );
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
 fn a_worker_exit_is_recorded_once_with_its_containment_cleanup() {
     let root = TempRoot::new("worker-exit");
     let daemon = Daemon::start(&root);
@@ -3193,7 +3400,9 @@ fn a_worker_exit_is_recorded_once_with_its_containment_cleanup() {
         &root,
         &mut operator,
         "exit",
-        json!(["/bin/sh", "-c", "exit 7"]),
+        // The child must outlive the pre-bind liveness probe (bitty#2790);
+        // the short sleep keeps the exit in the post-bind supervision window.
+        json!(["/bin/sh", "-c", "sleep 1; exit 7"]),
     );
     let session_id = created["result"]["session"]["session_id"]
         .as_str()
@@ -3245,7 +3454,7 @@ fn a_worker_exit_is_recorded_once_with_its_containment_cleanup() {
         json!({
             "kind": "worker",
             "idempotency_key": "exit-create",
-            "argv": ["/bin/sh", "-c", "exit 7"],
+            "argv": ["/bin/sh", "-c", "sleep 1; exit 7"],
             "cwd": "/",
             "cols": 100,
             "rows": 30,
@@ -3364,7 +3573,9 @@ fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
     // The shell leaves a background descendant in its process group and then
     // exits. A reap-before-signal path would drop the group id before the kill
     // and leak the descendant. The descendant ignores `SIGHUP`, so only the
-    // daemon's group kill removes it.
+    // daemon's group kill removes it. The leader stays alive for a second so
+    // its exit is a post-bind exit: the pre-bind liveness probe (bitty#2790)
+    // refuses a leader that is already gone.
     let pid_file = root.path.join("descendant.pid");
     let (_creator, created) = create_worker(
         &root,
@@ -3373,7 +3584,7 @@ fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
         json!([
             "/bin/sh",
             "-c",
-            "trap '' HUP; sleep 60 & echo $! > \"$1\"; exit 3",
+            "trap '' HUP; sleep 60 & echo $! > \"$1\"; sleep 1; exit 3",
             "bittyd-worker",
             pid_file.to_str().expect("a UTF-8 temp path"),
         ]),

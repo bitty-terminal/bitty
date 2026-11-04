@@ -14,6 +14,17 @@
 //! 3. the caller commits the observed identity, binds generation `1`, and only
 //!    then exposes the session as `running`.
 //!
+//! The spawn path is bounded before step 3: the configured
+//! `spawn_bind_timeout_ms` covers the PTY allocation and the spawn handoff, and
+//! the child must still be usable when the single bind probe runs. A deadline
+//! that expires, a leader that already exited, or a terminal whose PTY slave is
+//! already closed refuses the bind, stops the recorded tree through the
+//! bounded `SIGTERM` -> `SIGKILL` escalation, and leaves generation `0` with
+//! the truthful cleanup class. The probe is the linearization point: an exit
+//! observed after it is a post-bind exit and supervision records
+//! `worker_exit`, while an exit observed before it can never produce a bound
+//! generation a caller could attach to (bitty#2790).
+//!
 //! The poll loop never waits for the worker. [`WorkerPool::supervise`] drains
 //! the PTY with non-blocking reads, polls `try_wait`, sends the bounded stop
 //! signals when an accepted stop reaches its deadline, and records the
@@ -44,6 +55,8 @@ use std::io;
 use std::io::{Read as _, Write as _};
 #[cfg(target_os = "linux")]
 use std::process::{Command, ExitStatus, Stdio};
+#[cfg(target_os = "linux")]
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "linux")]
 use nix::sys::signal::Signal;
@@ -57,6 +70,8 @@ use crate::containment::{ContainmentLimits, SessionMode, spawn_with};
 use crate::content::ContentBuffer;
 #[cfg(target_os = "linux")]
 use crate::lease::{ExitObservation, SessionHost, Termination};
+#[cfg(target_os = "linux")]
+use crate::limits::LimitId;
 #[cfg(target_os = "linux")]
 use crate::orphan::OrphanSupervisor;
 use crate::registry::{CleanupClass, DaemonInstanceId, SessionId};
@@ -119,6 +134,16 @@ pub enum WorkerSpawnError {
     Unsupported,
     /// The spawn failed before any child existed; nothing needs cleanup.
     NotStarted,
+    /// The child existed, but it was not usable when the bind probe ran: it
+    /// had already exited, or its PTY slave was already closed. The child was
+    /// terminated and reaped before this error returned; the carried class is
+    /// what the cleanup could prove.
+    NotBindable(CleanupClass),
+    /// The PTY handoff and spawn did not finish within the configured
+    /// `spawn_bind_timeout_ms`. The child existed, so it was stopped through
+    /// the bounded escalation and reaped before this error returned; the
+    /// carried class is what the cleanup could prove.
+    BindTimeout(CleanupClass),
     /// A child existed and its cleanup was observed (`swept` or `unverified`).
     Cleanup(CleanupClass),
 }
@@ -128,6 +153,20 @@ impl std::fmt::Display for WorkerSpawnError {
         match self {
             Self::Unsupported => formatter.write_str("worker sessions are not served on this cell"),
             Self::NotStarted => formatter.write_str("worker spawn failed before any child existed"),
+            Self::NotBindable(cleanup) => {
+                write!(
+                    formatter,
+                    "worker was not bindable before generation 1; cleanup {}",
+                    cleanup.as_str()
+                )
+            }
+            Self::BindTimeout(cleanup) => {
+                write!(
+                    formatter,
+                    "worker did not bind within spawn_bind_timeout_ms; cleanup {}",
+                    cleanup.as_str()
+                )
+            }
             Self::Cleanup(cleanup) => {
                 write!(
                     formatter,
@@ -251,6 +290,19 @@ pub struct WorkerPool {
     workers: BTreeMap<SessionId, Worker>,
     #[cfg(target_os = "linux")]
     limits: ContainmentLimits,
+    /// Committed `spawn_bind_timeout_ms` for the spawn+PTY handoff.
+    ///
+    /// Enforced by [`WorkerPool::spawn`] before the caller commits the
+    /// orphan-journal identity or binds generation `1` (bitty#2790).
+    #[cfg(target_os = "linux")]
+    bind_timeout_ms: u64,
+    /// One-shot pre-bind pause used by the failure-injection tests.
+    ///
+    /// The pause runs after the child exists and before the bind probe, so a
+    /// test can place an exit, a PTY hangup, or an elapsed deadline in the
+    /// window the production deadline covers without racing the scheduler.
+    #[cfg(all(test, target_os = "linux"))]
+    pre_bind_delay: Option<Duration>,
 }
 
 impl std::fmt::Debug for WorkerPool {
@@ -289,6 +341,9 @@ impl WorkerPool {
             Self {
                 workers: BTreeMap::new(),
                 limits: ContainmentLimits::for_session_stop(limits),
+                bind_timeout_ms: limits.effective(LimitId::SpawnBindTimeoutMs),
+                #[cfg(test)]
+                pre_bind_delay: None,
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -296,6 +351,16 @@ impl WorkerPool {
             let _ = limits;
             Self {}
         }
+    }
+
+    /// One-shot pre-bind pause for the failure-injection tests.
+    ///
+    /// The pause runs after the child exists and before the bind probe, so a
+    /// test can place an exit, a PTY hangup, or an expired deadline in the
+    /// production window without racing the scheduler.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn delay_bind_probe_for_test(&mut self, delay: Duration) {
+        self.pre_bind_delay = Some(delay);
     }
 
     /// Number of live bound workers.
@@ -373,13 +438,38 @@ impl WorkerPool {
 
     /// Spawn one worker and retain its handle. Returns the observed identity.
     ///
+    /// The configured `spawn_bind_timeout_ms` bounds the whole PTY and spawn
+    /// handoff, and the child must still be usable when the bind probe runs:
+    ///
+    /// - a deadline that expires after the PTY was opened but before any
+    ///   child existed is [`WorkerSpawnError::NotStarted`];
+    /// - a deadline that expires after the child existed stops the child
+    ///   through the bounded escalation and is
+    ///   [`WorkerSpawnError::BindTimeout`];
+    /// - a child that already exited, or a terminal whose PTY slave was
+    ///   already closed, is [`WorkerSpawnError::NotBindable`].
+    ///
+    /// The bind is linearized at the probe. An exit observed after the probe
+    /// is a post-bind exit: the caller binds generation `1` and supervision
+    /// records `worker_exit` on its next tick. An exit observed before it
+    /// never yields a bound generation, so no caller can attach to a worker
+    /// that was already gone (bitty#2790).
+    ///
+    /// The bound is observed at the two points this synchronous handoff can
+    /// inspect: after the PTY is opened and after the child exists. A kernel
+    /// call that never returns cannot be interrupted from the same thread, but
+    /// a handoff that merely completed late is still refused before the commit.
+    ///
+    /// A failed spawn leaves no child running and no pool entry.
+    ///
     /// # Errors
     ///
     /// [`WorkerSpawnError::Unsupported`] on a non-served cell,
     /// [`WorkerSpawnError::NotStarted`] when the PTY or the fork failed before
-    /// any child existed, or [`WorkerSpawnError::Cleanup`] with the class the
-    /// plan could prove after terminating a child that did exist. A failed
-    /// spawn leaves no child running and no pool entry.
+    /// any child existed, [`WorkerSpawnError::NotBindable`] or
+    /// [`WorkerSpawnError::BindTimeout`] when the child existed but could not
+    /// bind, or [`WorkerSpawnError::Cleanup`] with the class the plan could
+    /// prove after terminating a child that did exist.
     #[cfg(target_os = "linux")]
     pub fn spawn(
         &mut self,
@@ -389,9 +479,15 @@ impl WorkerPool {
         spec: &SpawnSpec,
         kind: SessionKind,
     ) -> Result<crate::orphan::identity::ProcessIdentity, WorkerSpawnError> {
+        let started = Instant::now();
         let name = cgroup_name(instance, session_id);
         let mut pty = PtyCommand::build(spec)?;
         let master = pty.master.take().ok_or(WorkerSpawnError::NotStarted)?;
+        if started.elapsed() >= self.bind_timeout() {
+            // No child exists yet, so the refusal needs no cleanup. Dropping
+            // the PTY handles closes both sides.
+            return Err(WorkerSpawnError::NotStarted);
+        }
         let mut child = match spawn_with(
             report,
             &name,
@@ -408,12 +504,23 @@ impl WorkerPool {
             }
         };
         let identity = child.identity();
+        // The command owned the parent-side copies of the child's stdio. Those
+        // copies must be gone before the PTY hangup probe runs, or the master
+        // would still have a slave reference and a dead child would look
+        // usable.
+        drop(pty);
         if crate::containment::set_nonblocking(&master).is_err() {
             // The child exists and is already contained: terminate it before
             // the handle is dropped, and report what the cleanup could prove.
             let cleanup = child.terminate(self.limits).class();
             return Err(WorkerSpawnError::Cleanup(cleanup));
         }
+        #[cfg(test)]
+        if let Some(delay) = self.pre_bind_delay.take() {
+            std::thread::sleep(delay);
+        }
+        let content_enabled = kind == SessionKind::Terminal;
+        self.probe_bindable(&mut child, &master, content_enabled, started)?;
         self.workers.insert(
             session_id,
             Worker {
@@ -424,12 +531,53 @@ impl WorkerPool {
                 term_sent: false,
                 kill_sent: false,
                 settled: false,
-                content_enabled: kind == SessionKind::Terminal,
+                content_enabled,
                 content: ContentBuffer::new(),
                 drained_bytes: 0,
             },
         );
         Ok(identity)
+    }
+
+    /// The configured bind deadline as a duration.
+    #[cfg(target_os = "linux")]
+    fn bind_timeout(&self) -> Duration {
+        Duration::from_millis(self.bind_timeout_ms)
+    }
+
+    /// Decide whether the spawned child may bind generation `1`.
+    ///
+    /// The liveness probe is non-blocking and runs once, so the bind has a
+    /// single linearization point instead of a poll window that a child could
+    /// exit inside. A terminal additionally requires its PTY slave to still be
+    /// open: a child that closed its stdio has no content plane to serve, even
+    /// if its leader has not been reaped yet. A worker kind keeps its PTY for
+    /// resize only, so a service process may close its stdio and still bind.
+    ///
+    /// On refusal the child is terminated through the same bounded
+    /// `SIGTERM` -> `SIGKILL` escalation supervision uses, and the returned
+    /// class is what the containment plan could prove.
+    #[cfg(target_os = "linux")]
+    fn probe_bindable(
+        &self,
+        child: &mut crate::containment::ContainedChild,
+        master: &File,
+        content_enabled: bool,
+        started: Instant,
+    ) -> Result<(), WorkerSpawnError> {
+        if child.leader_exited() {
+            let cleanup = child.terminate(self.limits).class();
+            return Err(WorkerSpawnError::NotBindable(cleanup));
+        }
+        if content_enabled && !pty_slave_open(master) {
+            let cleanup = child.terminate(self.limits).class();
+            return Err(WorkerSpawnError::NotBindable(cleanup));
+        }
+        if started.elapsed() >= self.bind_timeout() {
+            let cleanup = child.terminate(self.limits).class();
+            return Err(WorkerSpawnError::BindTimeout(cleanup));
+        }
+        Ok(())
     }
 
     /// Non-served cells refuse every spawn.
@@ -787,6 +935,10 @@ struct PtyCommand {
 #[cfg(target_os = "linux")]
 impl PtyCommand {
     fn build(spec: &SpawnSpec) -> Result<Self, WorkerSpawnError> {
+        #[cfg(test)]
+        if openpty_failure::take() {
+            return Err(WorkerSpawnError::NotStarted);
+        }
         let winsize = nix::pty::Winsize {
             ws_row: spec.rows(),
             ws_col: spec.cols(),
@@ -836,6 +988,61 @@ impl PtyCommand {
     }
 }
 
+/// Whether the child still holds the PTY slave open.
+///
+/// The parent dropped its slave handle after building stdio, so a hangup on
+/// the master means every child-side slave descriptor is already closed. The
+/// probe never reads content: it only asks whether the terminal can still
+/// deliver a frame. `POLLIN` with buffered output is fine; `POLLHUP`, an
+/// error, or an invalid descriptor is not.
+#[cfg(target_os = "linux")]
+fn pty_slave_open(master: &File) -> bool {
+    use std::os::fd::AsFd as _;
+
+    let mut fds = [nix::poll::PollFd::new(
+        master.as_fd(),
+        nix::poll::PollFlags::POLLIN,
+    )];
+    match nix::poll::poll(&mut fds, nix::poll::PollTimeout::ZERO) {
+        Ok(_) => !fds[0]
+            .revents()
+            .unwrap_or(nix::poll::PollFlags::empty())
+            .intersects(
+                nix::poll::PollFlags::POLLHUP
+                    | nix::poll::PollFlags::POLLERR
+                    | nix::poll::PollFlags::POLLNVAL,
+            ),
+        // An interrupted probe observed nothing, so it must not turn a live
+        // child into a refusal.
+        Err(nix::errno::Errno::EINTR) => true,
+        Err(_) => false,
+    }
+}
+
+/// Test-only `openpty` failure injection.
+///
+/// The seam is thread-local because the unit tests run concurrently and a
+/// process-wide flag would fail an unrelated PTY test. Production compiles it
+/// out entirely.
+#[cfg(all(test, target_os = "linux"))]
+mod openpty_failure {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Fail the next `PtyCommand::build` on this thread.
+    pub fn fail_next() {
+        FAIL_NEXT.with(|flag| flag.set(true));
+    }
+
+    /// Consume one injected failure.
+    pub fn take() -> bool {
+        FAIL_NEXT.with(|flag| flag.replace(false))
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn dup_file(slave: &File) -> Result<File, WorkerSpawnError> {
     // `openpty` descriptors are not close-on-exec. The child `dup2`s these
@@ -879,7 +1086,7 @@ mod tests {
     use super::*;
     use crate::containment::ContainmentReport;
     use crate::content::CONTENT_FRAME_BYTES;
-    use crate::limits::{LimitId, Limits};
+    use crate::limits::{LimitId, LimitOverride, Limits};
     use crate::registry::{DaemonInstanceId, SessionId, SessionKind};
 
     /// Pause between content-plane readiness polls.
@@ -931,11 +1138,7 @@ mod tests {
         session: SessionId,
     ) {
         let report = ContainmentReport::probe();
-        let fields = json!({ "argv": argv, "env": env, "cwd": "/" })
-            .as_object()
-            .expect("a JSON object")
-            .clone();
-        let spec = SpawnSpec::parse(Some(&fields), limits).expect("a valid spawn spec");
+        let spec = test_spec(limits, argv, env);
         // Serialized with the other PTY tests so no concurrent `openpty`
         // descriptor can be inherited by this worker's fork.
         let _pty = crate::containment::test_lock::lock();
@@ -947,6 +1150,171 @@ mod tests {
             kind,
         )
         .expect("the test worker must spawn");
+    }
+
+    /// Build one valid spawn specification for the worker tests.
+    fn test_spec(limits: &Limits, argv: &[&str], env: &[&str]) -> SpawnSpec {
+        let fields = json!({ "argv": argv, "env": env, "cwd": "/" })
+            .as_object()
+            .expect("a JSON object")
+            .clone();
+        SpawnSpec::parse(Some(&fields), limits).expect("a valid spawn spec")
+    }
+
+    /// Spawn into `pool` and return the typed refusal without panicking.
+    fn spawn_test_worker_refusal(
+        pool: &mut WorkerPool,
+        limits: &Limits,
+        argv: &[&str],
+        kind: SessionKind,
+        session: SessionId,
+    ) -> WorkerSpawnError {
+        let report = ContainmentReport::probe();
+        let spec = test_spec(limits, argv, &[]);
+        // Serialized with the other PTY tests for the same `openpty` reason.
+        let _pty = crate::containment::test_lock::lock();
+        pool.spawn(
+            &report,
+            DaemonInstanceId::generate().expect("an instance id"),
+            session,
+            &spec,
+            kind,
+        )
+        .expect_err("the test worker must be refused")
+    }
+
+    /// A session id the spawn-refusal tests can use.
+    fn refusal_session() -> SessionId {
+        SessionId::parse("0000000000000000000000000000c4d2").expect("a session id")
+    }
+
+    #[test]
+    fn an_openpty_failure_is_not_started_and_creates_no_handle() {
+        let limits = Limits::default();
+        let mut pool = WorkerPool::new(&limits);
+        let session = refusal_session();
+        super::openpty_failure::fail_next();
+        let error = spawn_test_worker_refusal(
+            &mut pool,
+            &limits,
+            &["/bin/sleep", "60"],
+            SessionKind::Terminal,
+            session,
+        );
+        assert_eq!(
+            error,
+            WorkerSpawnError::NotStarted,
+            "a PTY allocation failure is typed not_started"
+        );
+        assert!(pool.is_empty(), "no handle may survive an openpty failure");
+    }
+
+    #[test]
+    fn a_non_executable_program_is_not_started_and_creates_no_handle() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let limits = Limits::default();
+        let mut pool = WorkerPool::new(&limits);
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let program = dir.path().join("bitty-not-executable");
+        std::fs::write(&program, b"#!/bin/sh\nexit 0\n").expect("write the fixture");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 0644");
+        let program = program.to_str().expect("a UTF-8 fixture path");
+        let error = spawn_test_worker_refusal(
+            &mut pool,
+            &limits,
+            &[program],
+            SessionKind::Worker,
+            refusal_session(),
+        );
+        // `Command::spawn` reports the child's `exec` failure synchronously
+        // through its error pipe, so `EACCES` is not "missing file": no child
+        // ever ran and the cleanup class is not_started.
+        assert_eq!(error, WorkerSpawnError::NotStarted, "{error}");
+        assert!(pool.is_empty(), "no handle may survive a failed exec");
+    }
+
+    #[test]
+    fn a_child_that_exits_before_bind_is_never_bound() {
+        let limits = Limits::default();
+        let mut pool = WorkerPool::new(&limits);
+        let session = refusal_session();
+        pool.delay_bind_probe_for_test(Duration::from_millis(500));
+        let error = spawn_test_worker_refusal(
+            &mut pool,
+            &limits,
+            &["/bin/sh", "-c", "exit 0"],
+            SessionKind::Worker,
+            session,
+        );
+        assert!(
+            matches!(error, WorkerSpawnError::NotBindable(cleanup) if cleanup != CleanupClass::NotStarted),
+            "an exited leader must refuse the bind after terminating the tree: {error}"
+        );
+        assert!(
+            pool.is_empty(),
+            "an exited child may not stay in the pool as a bound handle"
+        );
+    }
+
+    #[test]
+    fn a_terminal_that_closed_its_pty_before_bind_is_never_bound() {
+        let limits = Limits::default();
+        let mut pool = WorkerPool::new(&limits);
+        let session = refusal_session();
+        pool.delay_bind_probe_for_test(Duration::from_millis(500));
+        let error = spawn_test_worker_refusal(
+            &mut pool,
+            &limits,
+            &["/bin/sh", "-c", "exec 0<&- 1>&- 2>&-; sleep 60"],
+            SessionKind::Terminal,
+            session,
+        );
+        assert!(
+            matches!(error, WorkerSpawnError::NotBindable(_)),
+            "a closed PTY slave cannot serve a terminal content plane: {error}"
+        );
+        assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn a_spawn_that_crosses_the_bind_deadline_is_stopped_and_reaped() {
+        let limits = Limits::new(&[LimitOverride::new(LimitId::SpawnBindTimeoutMs, 100)])
+            .expect("a hundred-millisecond bind deadline");
+        let mut pool = WorkerPool::new(&limits);
+        let session = refusal_session();
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let pid_file = dir.path().join("leader.pid");
+        let script = format!(
+            "echo $$ > '{pid_file}'; exec sleep 60",
+            pid_file = pid_file.display()
+        );
+        // The pause runs after the child exists and before the probe, so the
+        // half-second handoff deterministically crosses the configured bound
+        // while leaving the PTY and spawn time comfortably inside it.
+        pool.delay_bind_probe_for_test(Duration::from_millis(500));
+        let error = spawn_test_worker_refusal(
+            &mut pool,
+            &limits,
+            &["/bin/sh", "-c", script.as_str()],
+            SessionKind::Worker,
+            session,
+        );
+        assert!(
+            matches!(error, WorkerSpawnError::BindTimeout(cleanup) if cleanup != CleanupClass::NotStarted),
+            "a crossed bind deadline must stop the spawned tree: {error}"
+        );
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the child wrote its pid")
+            .trim()
+            .parse()
+            .expect("a pid");
+        assert!(
+            std::fs::metadata(format!("/proc/{pid}")).is_err(),
+            "the timed-out worker leader {pid} must be reaped, not left behind"
+        );
+        assert!(pool.is_empty(), "the timed-out handle may not stay bound");
     }
 
     /// Wait, bounded, until `session` owns a live terminal content plane.
@@ -1118,7 +1486,10 @@ mod tests {
     #[test]
     fn forget_reaps_a_leader_that_already_exited() {
         let limits = Limits::default();
-        let (mut pool, session) = spawn_test_worker(&limits, &["/bin/sh", "-c", "exit 0"]);
+        // The child has to survive the pre-bind liveness probe (bitty#2790),
+        // then exit while the handle is retained. An immediate `exit 0` would
+        // be refused as NotBindable instead of producing a bound handle.
+        let (mut pool, session) = spawn_test_worker(&limits, &["/bin/sleep", "1"]);
         let pid = pool.workers[&session].child.identity().pid().get();
 
         let deadline = Instant::now() + Duration::from_secs(5);

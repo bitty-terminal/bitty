@@ -2220,9 +2220,12 @@ impl Surface {
         let config = config.with_opacity(state.opacity);
         state.config = Some(config);
         // The retained buffer describes the old extent, so it cannot seed the
-        // first retained present at the new one; drop it rather than depend on
-        // the extent check alone (a same-extent resize still owes a clear).
-        state.headless_rgba = None;
+        // first retained present at the new one: invalidate the recorded
+        // extent (a same-extent resize still owes a clear) and let the next
+        // retained present allocate a fresh buffer. The pixels themselves stay
+        // readable through `headless_rgba()` as the last painted frame - the
+        // runtime's headless smoke path asserts the buffer survives a resize,
+        // and dropping it here would report "no frame yet" after one.
         state.headless_rgba_extent = None;
         state.headless_extent = Some(new_extent);
         state.wgpu_config = Some(synthesize_wgpu_config(&config));

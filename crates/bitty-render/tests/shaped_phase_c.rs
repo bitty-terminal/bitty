@@ -165,6 +165,8 @@ fn atlas_probe_holds_2048_shaped_slots() {
         match atlas.ensure_shaped(key, &probe_bitmap()) {
             GlyphSource::Atlas { .. } => placed += 1,
             GlyphSource::Inline { .. } => {}
+            // Shaped coverage fixtures never carry a color presentation.
+            GlyphSource::ColorAtlas { .. } => {}
         }
     }
     assert_eq!(
@@ -508,6 +510,8 @@ fn coverage_frame(
                         texels[(sy * u32::from(dims.width) + sx) as usize]
                     }
                     GlyphSource::Inline { mask, width, .. } => mask[(y * width + x) as usize],
+                    // These fixtures render monochrome coverage only.
+                    GlyphSource::ColorAtlas { .. } => 0,
                 };
                 let dx = glyph.dest[0] + x as i32;
                 let dy = glyph.dest[1] + y as i32;

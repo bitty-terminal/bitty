@@ -61,6 +61,10 @@ const ZWJ: u32 = 0x200D;
 /// base, widening a text-default pictograph or keycap cluster to two cells.
 const VARIATION_SELECTOR_16: char = '\u{FE0F}';
 
+/// Variation selector-15: requests text presentation for the preceding base
+/// (UTS #51; the monochrome counterpart of [`VARIATION_SELECTOR_16`]).
+const VARIATION_SELECTOR_15: char = '\u{FE0E}';
+
 /// Combining enclosing keycap: the third scalar of a keycap sequence
 /// (`#` + VS16 + U+20E3), which renders as one two-cell emoji.
 const COMBINING_KEYCAP: char = '\u{20E3}';
@@ -377,6 +381,101 @@ pub fn cluster_cell_width(cluster: &str, ambiguous: AmbiguousWidth) -> u8 {
     cluster_width(cluster.chars(), ambiguous)
 }
 
+/// Presentation a terminal cluster asks the renderer for (UTS #51 §2).
+///
+/// Terminal emoji rendering has to decide, per cluster, whether the color
+/// glyph or the monochrome outline is the correct one. The decision is a
+/// property of the text, not of the face: `Emoji_Presentation=Yes` scalars
+/// default to emoji, `Emoji_Presentation=No` scalars default to text, and a
+/// variation selector overrides the default — U+FE0F requests emoji
+/// presentation, U+FE0E requests text presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum EmojiPresentation {
+    /// Monochrome text rendering (the [`Default`]: only an explicit U+FE0F
+    /// or an `Emoji_Presentation=Yes` base asks for color).
+    #[default]
+    Text,
+    /// Color emoji rendering.
+    Emoji,
+}
+
+impl EmojiPresentation {
+    /// True when the cluster asks for the color glyph.
+    #[must_use]
+    pub const fn is_emoji(self) -> bool {
+        matches!(self, Self::Emoji)
+    }
+}
+
+/// Whether `scalar` defaults to emoji presentation without a variation
+/// selector (UTS #51 `Emoji_Presentation=Yes`).
+///
+/// U+2705 and the other `Emoji_Presentation=Yes` scalars are true; emoji-capable
+/// text-presentation scalars such as U+2611 and U+2699 are false until a
+/// U+FE0F follows them.
+#[must_use]
+pub fn is_emoji_presentation(scalar: char) -> bool {
+    crate::unicode_tables::emoji_presentation_scalar(scalar as u32)
+}
+
+/// Resolves the presentation of one cluster (leading scalar plus its stored
+/// continuation scalars).
+///
+/// The last variation selector in the cluster wins, which is the UTS #51
+/// rule: a selector applies to the preceding base, so in a malformed cluster
+/// carrying both selectors the later one is authoritative. Without a
+/// selector the base's `Emoji_Presentation` property decides.
+#[must_use]
+pub fn cluster_presentation(glyph: char, tail: &[char]) -> EmojiPresentation {
+    presentation_with_selectors(glyph, tail.iter().copied())
+}
+
+/// The one UTS #51 variation-selector rule both [`cluster_presentation`] and
+/// [`cluster_presentation_str`] apply.
+///
+/// Only the boundary scan differs between the two entry points (a stored
+/// tail is one cluster by construction; a string slice may hold the rest of
+/// a row), so the selector rule itself lives here once — the two used to
+/// carry parallel `match` blocks that could drift apart.
+fn presentation_with_selectors(
+    base: char,
+    selectors: impl Iterator<Item = char>,
+) -> EmojiPresentation {
+    let mut presentation = if is_emoji_presentation(base) {
+        EmojiPresentation::Emoji
+    } else {
+        EmojiPresentation::Text
+    };
+    for scalar in selectors {
+        match scalar {
+            VARIATION_SELECTOR_16 => presentation = EmojiPresentation::Emoji,
+            VARIATION_SELECTOR_15 => presentation = EmojiPresentation::Text,
+            _ => {}
+        }
+    }
+    presentation
+}
+
+/// [`cluster_presentation`] over a cluster's text.
+///
+/// Convenience for callers holding the cluster as a string slice (the shaped
+/// path and the classic fallback both do); same UTS #51 rule, no allocation.
+#[must_use]
+pub fn cluster_presentation_str(cluster: &str) -> EmojiPresentation {
+    let mut scalars = cluster.chars();
+    let Some(base) = scalars.next() else {
+        return EmojiPresentation::Text;
+    };
+    // Only the base's own continuation scalars decide; the scan stops at the
+    // first scalar that cannot belong to this cluster, so a caller holding a
+    // whole line (or the rest of a row) never picks up a selector from the
+    // next cluster.
+    presentation_with_selectors(
+        base,
+        scalars.take_while(|scalar| *scalar as u32 == ZWJ || is_grapheme_extend(*scalar as u32)),
+    )
+}
+
 /// [`cluster_cell_width`] over a leading glyph plus its stored tail.
 ///
 /// The state print path keeps the base scalar in `Cell::glyph` and the
@@ -447,6 +546,54 @@ pub(crate) fn cluster_continues(glyph: char, tail: &[char], next: char) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_presentation_honors_property_and_selectors() {
+        // `Emoji_Presentation=Yes` defaults to color; VS15 keeps it monochrome.
+        assert_eq!(
+            cluster_presentation('\u{2705}', &[]),
+            EmojiPresentation::Emoji
+        );
+        assert_eq!(
+            cluster_presentation('\u{2705}', &['\u{FE0F}']),
+            EmojiPresentation::Emoji
+        );
+        assert_eq!(
+            cluster_presentation('\u{2705}', &['\u{FE0E}']),
+            EmojiPresentation::Text
+        );
+        assert_eq!(
+            cluster_presentation('\u{1F600}', &[]),
+            EmojiPresentation::Emoji
+        );
+        // Emoji-capable but text-presentation scalars stay monochrome until
+        // VS16 asks for the color glyph.
+        for scalar in ['\u{2611}', '\u{2699}', '\u{2600}'] {
+            assert_eq!(
+                cluster_presentation(scalar, &[]),
+                EmojiPresentation::Text,
+                "{scalar:?} defaults to text presentation"
+            );
+            assert_eq!(
+                cluster_presentation(scalar, &['\u{FE0F}']),
+                EmojiPresentation::Emoji,
+                "{scalar:?} + VS16 requests emoji presentation"
+            );
+            assert_eq!(
+                cluster_presentation(scalar, &['\u{FE0F}', '\u{FE0E}']),
+                EmojiPresentation::Text,
+                "the last variation selector wins for {scalar:?}"
+            );
+        }
+        // A plain ASCII scalar never becomes emoji, even with VS16, because
+        // no face has a color glyph for it; the renderer's color probe is the
+        // second half of that decision.
+        assert_eq!(cluster_presentation('A', &[]), EmojiPresentation::Text);
+        assert_eq!(
+            cluster_presentation('A', &['\u{FE0F}']),
+            EmojiPresentation::Emoji
+        );
+    }
 
     fn clusters(text: &str) -> Vec<&str> {
         split_clusters(text)

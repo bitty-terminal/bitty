@@ -331,6 +331,12 @@ impl TerminalRegistry {
 
     /// Creates a workspace bounded by `max_workspaces_per_window`.
     ///
+    /// This minter belongs to the standalone registry subsystem. The
+    /// production workspace creator is [`Runtime`](crate::Runtime), which
+    /// mints through `Runtime::mint_workspace_id`; the two subsystems are not
+    /// composed in one process, and both use the same [`WorkspaceId`] key
+    /// type, so a workspace attribution names one bucket rather than two.
+    ///
     /// # Errors
     /// `TooManyWorkspaces`, `GenerationExhausted`, `RegistryDisposed`.
     pub fn create_workspace(&mut self) -> Result<WorkspaceId, RegistryError> {

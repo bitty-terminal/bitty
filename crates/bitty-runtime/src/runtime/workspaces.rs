@@ -72,6 +72,11 @@ pub struct WorkspaceSlot {
     /// the presented workspace are one bucket rather than two. Deliberately not
     /// `seq`: `Runtime::workspace_swap_current_with` reassigns `seq` between
     /// slots and `Runtime::next_free_workspace_seq` reuses closed sequences.
+    ///
+    /// Not persisted: [`WorkspaceSnapshot::seq`](crate::WorkspaceSnapshot::seq)
+    /// carries no id, and session restore mints a fresh slot id instead of
+    /// reconstructing one from the snapshot index or `seq`. The restore path's
+    /// index-to-id resolution therefore remains open (OQ-084 B-2).
     pub id: WorkspaceId,
     /// Creation sequence (stable identity across index shifts).
     pub seq: u64,
@@ -264,21 +269,30 @@ impl Runtime {
     /// pointer. A focus id that is absent from the presented layout is treated
     /// as "no focused view" rather than attributed to a slot it does not
     /// visibly occupy.
+    ///
+    /// The membership check reads the live [`Self::layout`], never the slot's
+    /// stashed copy: the active slot's `layout` field is only refreshed by the
+    /// next switch/close, so a split performed since then would otherwise make
+    /// a perfectly focused presented workspace answer `None`.
     #[must_use]
     pub fn focused_workspace_id(&self) -> Option<WorkspaceId> {
         let focused = self.focused_view()?;
+        self.layout.find_leaf(focused)?;
         self.workspaces
             .get(self.active_workspace)
-            .filter(|slot| slot.layout.find_leaf(focused).is_some())
             .map(|slot| slot.id)
     }
 
     /// Mints the next slot `WorkspaceId` (monotonic; never reused).
     ///
     /// The runtime is the only production minter of `WorkspaceId`, so every id
-    /// a panel record is keyed by names a slot this window presents. Starts at
-    /// 1; only `u64` exhaustion wraps, and the wrap skips 0 so a zeroed id is
-    /// never handed out (the same bounded pattern as the panel allocator).
+    /// a panel record is keyed by names a slot this window presents. The
+    /// terminal registry's standalone `TerminalRegistry::create_workspace`
+    /// minter is not composed with a `Runtime`; both use the same
+    /// `WorkspaceId` key type, so attribution has one namespace rather than
+    /// two. Starts at 1; only `u64` exhaustion wraps, and the wrap skips 0 so a
+    /// zeroed id is never handed out (the same bounded pattern as the panel
+    /// allocator).
     pub(super) fn mint_workspace_id(&mut self) -> WorkspaceId {
         let id = WorkspaceId::new(self.next_workspace_id_raw);
         self.next_workspace_id_raw = self.next_workspace_id_raw.wrapping_add(1).max(1);

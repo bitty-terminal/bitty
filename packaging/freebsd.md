@@ -19,7 +19,10 @@ Concretely, for this recipe:
   which checks structure, plist/do-install agreement, and absence of host
   paths. That gate cannot run the FreeBSD build.
 - No release job builds or installs this port, and no checksum is published
-  for it: `distinfo` is still empty by design (see below).
+  for it: `distinfo` is still empty by design (see below). The `build-freebsd`
+  leg does gate the stable release now — the prebuilt tarball below is one of
+  the assets it publishes, so a failure stops the train — but that is
+  build-plus-core-tests evidence, not a port install.
 - If a build or install fails, the prebuilt
   `bitty-<version>-x86_64-unknown-freebsd.tar.xz` from
   `https://cdn.bitty.run/releases/v<version>/` (the artifact `scripts/install.sh`

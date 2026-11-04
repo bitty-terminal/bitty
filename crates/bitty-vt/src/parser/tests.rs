@@ -793,6 +793,23 @@ fn esc_decid_reports_primary_device_attributes() {
 }
 
 #[test]
+fn esc_index_next_line_and_reverse_index_map_to_c1_controls() {
+    // `ESC D` (IND), `ESC E` (NEL) and `ESC M` (RI) are the 7-bit forms of
+    // the C1 functions the execute path already forwards, so they must reach
+    // state as the same control bytes instead of being counted as unmapped
+    // ESC dispatches (bitty#2873: `less` scrolls back with `ESC [ H` + `ESC M`
+    // per line and the dropped RI left the region rows in place).
+    assert_eq!(
+        parse(b"\x1bD\x1bE\x1bM"),
+        vec![
+            TerminalAction::PrintControl(ControlChar(0x84)),
+            TerminalAction::PrintControl(ControlChar(0x85)),
+            TerminalAction::PrintControl(ControlChar(0x8D)),
+        ]
+    );
+}
+
+#[test]
 fn resets_map_from_csi_and_esc() {
     assert_eq!(parse(b"\x1b[!p"), vec![TerminalAction::SoftReset]);
 }
@@ -1911,12 +1928,13 @@ fn dcs_strings_report_as_unknown_once_per_string() {
 
 #[test]
 fn unmapped_csi_and_esc_families_report_unknown() {
+    // `ESC M`/`ESC D`/`ESC E` used to stand in for the unmapped ESC family;
+    // they are the 7-bit index controls now (see
+    // `esc_index_next_line_and_reverse_index_map_to_c1_controls`), so `ESC #8`
+    // carries that role.
     assert_eq!(
-        parse(b"\x1bM\x1bD\x1bE\x1b#8\x1b[?12;25h\x1b[3;t"),
+        parse(b"\x1b#8\x1b[?12;25h\x1b[3;t"),
         vec![
-            unknown(SequenceKind::Esc, b'M', [0, 0]),
-            unknown(SequenceKind::Esc, b'D', [0, 0]),
-            unknown(SequenceKind::Esc, b'E', [0, 0]),
             unknown(SequenceKind::Esc, b'8', [b'#', 0]),
             TerminalAction::SetMode {
                 mode: Mode::CursorBlinking,

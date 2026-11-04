@@ -3112,10 +3112,24 @@ impl State {
     fn print_control(&mut self, byte: u8) {
         match byte {
             0x08 => {
-                // Backspace clamps at column 0 (reverse-wrap is not part of
-                // the M1 slice and is unnecessary for determinism).
-                self.cursor.position.col = self.cursor.position.col.saturating_sub(1);
-                self.cursor.pending_wrap = false;
+                // Backspace steps one column left and clamps at column 0
+                // (reverse-wrap is not part of the M1 slice and is
+                // unnecessary for determinism) — except when a deferred wrap
+                // is latched:
+                //
+                // bitty#2873: a latched deferred wrap (DECAWM) is only
+                // *consumed* by BS — the cursor must not step left. xterm's
+                // `CASE_BS` is `if (do_wrap) do_wrap = False; else if
+                // (cur_col > 0) cur_col--`, and tmux agrees. Stepping left
+                // made an overstrike at the right margin (`x\bX` on the last
+                // column, the classic man-page bold run) write one column
+                // early, leaving the old glyph visible as duplicated text and
+                // shifting the run left.
+                if self.cursor.pending_wrap {
+                    self.cursor.pending_wrap = false;
+                } else {
+                    self.cursor.position.col = self.cursor.position.col.saturating_sub(1);
+                }
             }
             0x09 => self.tab_forward_steps(1),
             0x0A..=0x0C => {

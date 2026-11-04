@@ -1269,10 +1269,12 @@ fn windows_final_component_swapped_to_a_junction_refuses_as_escape() {
         "return { value = 'outside' }",
     )
     .expect("outside module");
-    let target = dir.path().join("lua/target.lua");
     let swap_target = outside.path().to_path_buf();
     set_swap_hook(Some(Box::new(move |path: &Path| {
-        if path == target {
+        // The hook is handed the canonical target, which on Windows carries a
+        // verbatim prefix and normalized case, so compare the trailing
+        // components instead of the literal non-canonical path.
+        if path.ends_with("lua/target.lua") {
             let _ = std::fs::remove_file(path);
             junction(path, &swap_target);
         }

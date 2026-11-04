@@ -983,7 +983,7 @@ pub(crate) fn load_app_config(args: &Args) -> Result<AppConfig, String> {
     load_app_config_typed(args).map_err(LoadFailure::into_message)
 }
 
-/// Typed form of [`load_app_config`] used by the reload engine.
+/// Typed form of the strict `config check`/`doctor` resolver, used by the reload engine.
 ///
 /// A module refusal keeps its `E_CONFIG_MODULE_*` record, so the reload result
 /// can carry the typed outcome while the running plan stays untouched.
@@ -997,7 +997,7 @@ fn resolve_app_config(args: &Args) -> Result<AppConfig, LoadFailure> {
     resolve_app_config_in(args, LoadMode::Strict).map(|(app, _)| app)
 }
 
-/// Classified form of [`load_app_config`] with an explicit load mode.
+/// Classified form of the strict `config check`/`doctor` resolver with an explicit load mode.
 fn resolve_app_config_in(
     args: &Args,
     mode: LoadMode,
@@ -1175,8 +1175,8 @@ fn resolve_startup_config(
 /// Loads the config for the process-startup path, applying the R-009
 /// first-start fallback.
 ///
-/// Startup-only: the reload resolver keeps calling [`load_app_config`] (strict
-/// mode), so a later broken reload retains its last-good plan instead of
+/// Startup-only: the reload resolver keeps calling the strict resolver
+/// (`load_app_config_typed`), so a later broken reload retains its last-good plan instead of
 /// replacing it with built-ins.
 ///
 /// # Errors

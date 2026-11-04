@@ -996,6 +996,18 @@ impl<F: FnMut(TerminalAction)> Perform for Bridge<'_, F> {
             ([], b'8') => self.emit(TerminalAction::CursorRestore),
             ([], b'c') => self.emit(TerminalAction::FullReset),
             ([], b'H') => self.emit(TerminalAction::TabSet),
+            // Absolute-index controls in their 7-bit ESC forms: `ESC D`
+            // (IND), `ESC E` (NEL) and `ESC M` (RI) are the ECMA-48 C1
+            // functions 0x84/0x85/0x8D, which `execute` already forwards as
+            // `PrintControl`. Without the aliases a program that reverse-
+            // scrolls a region inside DECSTBM (`less` emits `\x1b[H\x1bM`
+            // per line when scrolling back, vim and ncurses apps do the
+            // same) leaves every region row where it was and paints the one
+            // exposed row over stale text, so the screen reads as
+            // duplicated (bitty#2873).
+            ([], b'D') => self.emit(TerminalAction::PrintControl(ControlChar(0x84))),
+            ([], b'E') => self.emit(TerminalAction::PrintControl(ControlChar(0x85))),
+            ([], b'M') => self.emit(TerminalAction::PrintControl(ControlChar(0x8D))),
             ([], b'=') => self.emit(TerminalAction::SetMode {
                 mode: Mode::ApplicationKeypad,
                 enabled: true,

@@ -97,6 +97,7 @@
 //! measurement harness, corpora, and reference machines are defined by an
 //! implementing task.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use bitty_term_state::{
@@ -111,8 +112,8 @@ use crate::fallback::FallbackRasterizer;
 use crate::frame::{DamageDescriptor, FramePlan, plan_frame};
 use crate::geometry::{ExtentPx, RectPx};
 use crate::glyph::{
-    BitmapFormat, CachedBitmap, FontId, FontQuery, GlyphBitmap, GlyphMetrics, GlyphRasterizer,
-    RasterKey,
+    AlphaMode, BitmapFormat, CachedBitmap, FontId, FontQuery, GlyphBitmap, GlyphMetrics,
+    GlyphRasterizer, RasterKey,
 };
 use crate::shaped::{
     RunAttrs, RunDirection, ShapedCluster, ShapedRunSource, cells_for_range, cells_for_range_in,
@@ -1805,6 +1806,15 @@ pub enum GlyphSource {
         /// Placed region; `uv` on the instance carries the normalized form.
         slot: AtlasSlot,
     },
+    /// Color texels inside the renderer's color atlas texture (CTX-1691).
+    ///
+    /// The slot addresses the RGBA color atlas, not the coverage atlas; the
+    /// instance's `color` is opaque white because the bitmap carries its own
+    /// color and must never be tinted by the cell foreground.
+    ColorAtlas {
+        /// Placed region in the color atlas.
+        slot: AtlasSlot,
+    },
     /// Texels carried inline because the bitmap could not fit the atlas
     /// even after a deterministic wholesale eviction. Coverage bytes,
     /// row-major, length `width * height`.
@@ -2737,6 +2747,347 @@ impl GlyphAtlas {
     }
 }
 
+/// RGBA atlas for color glyphs (COLR/CPAL layer stacks, color bitmap strikes).
+///
+/// A sibling of [`GlyphAtlas`] rather than a second format inside it: the
+/// monochrome atlas stays one byte per texel (coverage), while a color glyph
+/// needs four. Placements share the same `AtlasLayout` allocator and the same
+/// eviction discipline — allocate, grow only when the live set genuinely
+/// exceeds the atlas, otherwise flag [`Self::is_exhausted`] so the frame
+/// pipeline resets wholesale and rebuilds — so a color atlas can never grow
+/// past the configured maximum or leak slots across generations.
+///
+/// Texels are straight-alpha RGBA: the compositors premultiply while
+/// blending, and the CPU-side value stays independent of how often it is
+/// sampled. `epoch` bumps on every wholesale reset exactly like the
+/// monochrome atlas.
+#[derive(Debug)]
+pub struct ColorGlyphAtlas {
+    layout: AtlasLayout,
+    /// Char-keyed color placements (fallback path, overlay text).
+    slots: HashMap<RasterKey, AtlasSlot>,
+    /// Shaped-glyph color placements (production shaped path).
+    shaped_slots: HashMap<crate::shaped::ShapedGlyphKey, AtlasSlot>,
+    texels: Vec<u8>,
+    epoch: u64,
+    exhausted: bool,
+    max_dimension: u16,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl ColorGlyphAtlas {
+    /// Creates an empty square color atlas with `dimension` as the maximum
+    /// side. Allocation starts at [`crate::atlas::INITIAL_ATLAS_DIMENSION`].
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::InvalidInput`] when `dimension` is zero or the initial
+    /// allocation overflows the address space bound.
+    pub fn new(dimension: u16) -> Result<Self, RenderError> {
+        if dimension == 0 {
+            return Err(RenderError::InvalidInput {
+                reason: "color atlas dimension must be non-zero",
+            });
+        }
+        let initial = crate::atlas::INITIAL_ATLAS_DIMENSION.min(dimension);
+        let layout = AtlasLayout::new(initial, initial)?;
+        let texels = color_texel_len(initial, initial).ok_or(RenderError::InvalidInput {
+            reason: "color atlas dimensions overflow the address space bound",
+        })?;
+        Ok(Self {
+            layout,
+            slots: HashMap::new(),
+            shaped_slots: HashMap::new(),
+            texels: vec![0; texels],
+            epoch: 0,
+            exhausted: false,
+            max_dimension: dimension,
+            hits: 0,
+            misses: 0,
+            evictions: 0,
+        })
+    }
+
+    /// Atlas texture dimensions in texels.
+    #[must_use]
+    pub const fn dims(&self) -> AtlasDims {
+        self.layout.dimensions()
+    }
+
+    /// Read-only RGBA texture (four bytes per texel).
+    #[must_use]
+    pub fn texels(&self) -> &[u8] {
+        &self.texels
+    }
+
+    /// Generation of the current placement set.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// True when the last placement pass could not fit a color glyph.
+    #[must_use]
+    pub const fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Number of color placements currently held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.slots.len().saturating_add(self.shaped_slots.len())
+    }
+
+    /// True when no color glyph is placed (no color pass is needed).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty() && self.shaped_slots.is_empty()
+    }
+
+    /// Cumulative `(hits, misses, evictions)` totals.
+    ///
+    /// A miss is any lookup that produced no slot: first placement of a key,
+    /// and every pass whose raster this atlas cannot store (non-RGBA coverage,
+    /// oversized, or beyond a pass's capacity), which the caller degrades to
+    /// the monochrome atlas.
+    #[must_use]
+    pub const fn stats(&self) -> (u64, u64, u64) {
+        (self.hits, self.misses, self.evictions)
+    }
+
+    /// Clears the exhaustion flag for a fresh placement pass.
+    fn clear_exhausted(&mut self) {
+        self.exhausted = false;
+    }
+
+    /// Wholesale reset: drops every placement and bumps the generation.
+    ///
+    /// Same contract as [`GlyphAtlas`]: call only at a placement boundary,
+    /// never while a [`DrawList`] built from the previous generation is still
+    /// in flight.
+    fn evict_now(&mut self) {
+        self.layout.reset();
+        self.slots.clear();
+        self.shaped_slots.clear();
+        self.texels.fill(0);
+        self.epoch = self.epoch.wrapping_add(1);
+        self.exhausted = false;
+        self.evictions = self.evictions.saturating_add(1);
+    }
+
+    /// Ensures a char-keyed color bitmap is placed.
+    ///
+    /// Returns `None` when the bitmap cannot be placed even after growth, so
+    /// the caller can fall back to the monochrome atlas (the color atlas never
+    /// drops a glyph, it degrades it).
+    ///
+    /// A rejected raster counts as a **miss** (CTX-1691 review round 1): the
+    /// key was looked up and the color atlas could not serve it, so
+    /// [`Self::stats`] must record the attempt. The previous early `?` return
+    /// recorded nothing, which under-reported exactly the clusters this atlas
+    /// cannot store — a monochrome emoji face's emoji-presentation rasters —
+    /// and hid the leak behind a flat miss count.
+    fn ensure(&mut self, key: RasterKey, bitmap: &CachedBitmap) -> Option<AtlasSlot> {
+        if let Some(slot) = self.slots.get(&key) {
+            self.hits = self.hits.saturating_add(1);
+            return Some(*slot);
+        }
+        self.misses = self.misses.saturating_add(1);
+        let slot = self.place(bitmap)?;
+        self.slots.insert(key, slot);
+        Some(slot)
+    }
+
+    /// Ensures a shaped-glyph color bitmap is placed.
+    ///
+    /// Same miss accounting as [`Self::ensure`]: an unstorable or unfittable
+    /// raster is a miss, not silence.
+    fn ensure_shaped(
+        &mut self,
+        key: crate::shaped::ShapedGlyphKey,
+        bitmap: &CachedBitmap,
+    ) -> Option<AtlasSlot> {
+        if let Some(slot) = self.shaped_slots.get(&key) {
+            self.hits = self.hits.saturating_add(1);
+            return Some(*slot);
+        }
+        self.misses = self.misses.saturating_add(1);
+        let slot = self.place(bitmap)?;
+        self.shaped_slots.insert(key, slot);
+        Some(slot)
+    }
+
+    /// Places one color bitmap, growing only when the live set earns it.
+    ///
+    /// The raster is validated *before* the allocator is touched (CTX-1691
+    /// review round 1): a bitmap this atlas cannot store (any non-RGBA
+    /// format, or a byte length that disagrees with its metrics) used to
+    /// claim a slot first and fail in [`Self::write`], leaving a region that
+    /// no `slots` entry ever owned. Every pass over such a cluster — an emoji
+    /// cluster that rasterized monochrome, which is exactly what a face with
+    /// no color table produces — then leaked four bytes per texel until
+    /// `max_dimension` reported `exhausted` and the frame pipeline evicted
+    /// both atlases wholesale. Rejecting up front keeps the leak impossible:
+    /// a slot is allocated only for a raster that will be written, so the
+    /// allocator's occupancy stays a function of the live placement set.
+    fn place(&mut self, bitmap: &CachedBitmap) -> Option<AtlasSlot> {
+        let metrics = bitmap.metrics();
+        let width = u16::try_from(metrics.width.max(0)).ok()?;
+        let height = u16::try_from(metrics.height.max(0)).ok()?;
+        if width == 0 || height == 0 || width > self.max_dimension || height > self.max_dimension {
+            return None;
+        }
+        // Convert first: this is the same gate `write` applies, moved ahead
+        // of the allocation. `None` here means "not a color raster", which
+        // the caller degrades to the monochrome atlas — never atlas
+        // exhaustion.
+        let source = color_texels(bitmap)?;
+        if let Some(slot) = self.layout.allocate(width, height) {
+            return self.write(slot, source.as_ref());
+        }
+        if self.layout.occupancy() >= ATLAS_GROW_OCCUPANCY_THRESHOLD && self.try_grow() {
+            if let Some(slot) = self.layout.allocate(width, height) {
+                return self.write(slot, source.as_ref());
+            }
+        }
+        self.exhausted = true;
+        None
+    }
+
+    /// Copies already-validated RGBA texels into `slot` and returns it.
+    fn write(&mut self, slot: AtlasSlot, source: &[u8]) -> Option<AtlasSlot> {
+        let dims = self.layout.dimensions();
+        let stride = usize::from(dims.width);
+        let slot_w = usize::from(slot.width);
+        let slot_h = usize::from(slot.height);
+        for row in 0..slot_h {
+            let src = row.checked_mul(slot_w)?.checked_mul(4)?;
+            let dst = (usize::from(slot.y).checked_add(row)?)
+                .checked_mul(stride)?
+                .checked_add(usize::from(slot.x))?
+                .checked_mul(4)?;
+            let src_end = src.checked_add(slot_w.checked_mul(4)?)?;
+            let dst_end = dst.checked_add(slot_w.checked_mul(4)?)?;
+            self.texels
+                .get_mut(dst..dst_end)?
+                .copy_from_slice(source.get(src..src_end)?);
+        }
+        Some(slot)
+    }
+
+    /// Doubles the atlas (copying live slots) when it is still below the
+    /// configured maximum. Returns whether the atlas grew.
+    fn try_grow(&mut self) -> bool {
+        let current = self.layout.dimensions().width;
+        if current >= self.max_dimension {
+            return false;
+        }
+        let next = current.saturating_mul(2).min(self.max_dimension);
+        if next <= current {
+            return false;
+        }
+        let Some(new_len) = color_texel_len(next, next) else {
+            return false;
+        };
+        let mut new_texels = vec![0u8; new_len];
+        let old_dims = self.layout.dimensions();
+        let old_stride = usize::from(old_dims.width);
+        let new_stride = usize::from(next);
+        for row in 0..usize::from(old_dims.height) {
+            let Some(src) = row
+                .checked_mul(old_stride)
+                .and_then(|offset| offset.checked_mul(4))
+            else {
+                return false;
+            };
+            let Some(dst) = row
+                .checked_mul(new_stride)
+                .and_then(|offset| offset.checked_mul(4))
+            else {
+                return false;
+            };
+            let Some(width_bytes) = old_stride.checked_mul(4) else {
+                return false;
+            };
+            let (Some(src_end), Some(dst_end)) =
+                (src.checked_add(width_bytes), dst.checked_add(width_bytes))
+            else {
+                return false;
+            };
+            let (Some(source), Some(destination)) = (
+                self.texels.get(src..src_end),
+                new_texels.get_mut(dst..dst_end),
+            ) else {
+                return false;
+            };
+            destination.copy_from_slice(source);
+        }
+        let Ok(mut layout) = AtlasLayout::new(next, next) else {
+            return false;
+        };
+        // Reserve the carried-over region on the *candidate* allocator before
+        // publishing it: swapping `self.layout` first left the atlas holding
+        // a fresh layout with stale texels when the reservation failed
+        // (CTX-1691 review round 1).
+        if layout.allocate(current, current).is_none() {
+            return false;
+        }
+        self.layout = layout;
+        self.texels = new_texels;
+        self.epoch = self.epoch.wrapping_add(1);
+        self.exhausted = false;
+        true
+    }
+}
+
+/// Byte length of an RGBA atlas of `width` x `height` texels.
+fn color_texel_len(width: u16, height: u16) -> Option<usize> {
+    usize::from(width)
+        .checked_mul(usize::from(height))?
+        .checked_mul(4)
+}
+
+/// Straight-alpha RGBA texels of a color bitmap, or `None` when the bitmap is
+/// not an RGBA bitmap with a consistent length.
+///
+/// The atlas stores straight alpha so the compositors own the premultiply
+/// step and a texel stays meaningful when sampled with any coverage. Which
+/// input the rasterizer handed over depends on the source that won, so the
+/// conversion follows [`GlyphBitmap::alpha`] instead of assuming one:
+///
+/// * Premultiplied (COLR/CPAL layer stack — `swash` composites the layers
+///   src-over onto a zeroed buffer — plus FreeType/CoreGraphics color
+///   glyphs) is divided out here.
+/// * Straight (CBDT/sbix strikes, decoded PNG bytes copied out verbatim) is
+///   already what the atlas wants and passes through untouched. Assuming
+///   premultiplied for those brightened every translucent edge texel and
+///   clipped it at 255 (CTX-1691 review round 1).
+fn color_texels(bitmap: &CachedBitmap) -> Option<Cow<'_, [u8]>> {
+    let bitmap = bitmap.as_glyph_bitmap();
+    if bitmap.format != BitmapFormat::Rgba || bitmap.validate_source_len().is_err() {
+        return None;
+    }
+    if bitmap.alpha == AlphaMode::Straight {
+        return Some(Cow::Borrowed(&bitmap.data));
+    }
+    let mut texels = Vec::with_capacity(bitmap.data.len());
+    for px in bitmap.data.chunks_exact(4) {
+        let alpha = u32::from(px[3]);
+        if alpha == 0 {
+            texels.extend_from_slice(&[0, 0, 0, 0]);
+            continue;
+        }
+        let straight = |channel: u8| -> u8 {
+            let value = (u32::from(channel) * 255 + alpha / 2) / alpha;
+            u8::try_from(value.min(255)).unwrap_or(255)
+        };
+        texels.extend_from_slice(&[straight(px[0]), straight(px[1]), straight(px[2]), px[3]]);
+    }
+    Some(Cow::Owned(texels))
+}
+
 /// Flattens any supported bitmap format to one coverage byte per texel.
 ///
 /// This is the grayscale-policy application point
@@ -2839,6 +3190,9 @@ pub struct AppliedDpiScale {
 pub struct GridRenderer<R: GlyphRasterizer> {
     cache: GlyphCache<R>,
     atlas: GlyphAtlas,
+    /// Color glyph placements (COLR/CPAL, color strikes), with the same
+    /// bounded eviction policy as [`GlyphAtlas`] (CTX-1691).
+    color_atlas: ColorGlyphAtlas,
     font: FontId,
     /// Cached cell-box masks keyed by `(scalar, width, height)`.
     ///
@@ -2916,6 +3270,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         Ok(Self {
             cache,
             atlas: GlyphAtlas::new(dimension)?,
+            color_atlas: ColorGlyphAtlas::new(dimension)?,
             font,
             block_masks: HashMap::new(),
             point_size: query.point_size,
@@ -3111,6 +3466,42 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         self.atlas.dims()
     }
 
+    /// Read-only color atlas texture (straight-alpha RGBA), or `None` when no
+    /// color glyph has been placed (CTX-1691).
+    ///
+    /// Returned as a pair with its dimensions because the color atlas grows
+    /// independently of the coverage atlas; compositors must use these
+    /// dimensions for its stride.
+    #[must_use]
+    pub fn color_atlas_texels(&self) -> Option<(&[u8], AtlasDims)> {
+        if self.color_atlas.is_empty() {
+            return None;
+        }
+        Some((self.color_atlas.texels(), self.color_atlas.dims()))
+    }
+
+    /// Color atlas placement epoch.
+    ///
+    /// Bumps on every wholesale color-atlas reset, exactly like
+    /// [`Self::atlas_epoch`]: a [`DrawList`] with color glyphs must be
+    /// re-emitted when this changes.
+    #[must_use]
+    pub const fn color_atlas_epoch(&self) -> u64 {
+        self.color_atlas.epoch()
+    }
+
+    /// Number of color glyph placements currently held.
+    #[must_use]
+    pub fn color_atlas_placements(&self) -> usize {
+        self.color_atlas.len()
+    }
+
+    /// Color atlas `(hits, misses, evictions)` totals.
+    #[must_use]
+    pub const fn color_atlas_stats(&self) -> (u64, u64, u64) {
+        self.color_atlas.stats()
+    }
+
     /// Retained CPU-side renderer bytes (bitty#2859).
     ///
     /// Sums the three caches this renderer owns: the glyph cache's retained
@@ -3124,7 +3515,11 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     #[must_use]
     pub fn retained_bytes(&self) -> u64 {
         let cache = self.cache.retained_bytes();
-        let atlas = self.atlas.texels().len();
+        let atlas = self
+            .atlas
+            .texels()
+            .len()
+            .saturating_add(self.color_atlas.texels().len());
         let masks = self
             .block_masks
             .values()
@@ -3239,7 +3634,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         let counters_before = self.counters;
         let atlas_costs_before = self.atlas.cost_snapshot();
         let mut pass = self.place_pass(snapshot, cols, &dirty_rects, &list.plan, &bidi);
-        if self.atlas.is_exhausted() {
+        if self.atlas.is_exhausted() || self.color_atlas.is_exhausted() {
             // Discard pass 1: roll back its renderer/atlas cost counters so
             // the caller sees only the work that produced the returned list.
             // The eviction counter is intentionally kept (the reset really
@@ -3247,6 +3642,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             self.counters = counters_before;
             self.atlas.restore_cost(atlas_costs_before);
             self.atlas.evict_now();
+            self.color_atlas.evict_now();
             pass = self.place_pass(snapshot, cols, &dirty_rects, &list.plan, &bidi);
         }
         Ok(pass)
@@ -3292,6 +3688,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         bidi: &BidiGrid,
     ) -> DrawList {
         self.atlas.clear_exhausted();
+        self.color_atlas.clear_exhausted();
         let mut pass = DrawList {
             generation: snapshot.generation,
             atlas_epoch: self.atlas.epoch(),
@@ -3442,8 +3839,18 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             let pen_advance = if term_cell.glyph == ' ' {
                 self.grid_advance(span_cols)
             } else {
-                let (emitted, advance) =
-                    self.emit_glyph(term_cell.glyph, row, col, span_cols, fg, list);
+                let (emitted, advance) = self.emit_glyph(
+                    term_cell.glyph,
+                    bitty_term_state::cluster_presentation(
+                        term_cell.glyph,
+                        term_cell.zerowidth.as_slice(),
+                    ),
+                    row,
+                    col,
+                    span_cols,
+                    fg,
+                    list,
+                );
                 drew |= emitted;
                 advance
             };
@@ -3551,9 +3958,11 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
     /// Counter ownership lives with the caller: `emit_glyph` never touches
     /// `blank_cells_skipped`, so a cell is classified exactly once from the
     /// per-cell result (glyph or decoration drawn vs. nothing drawn).
+    #[allow(clippy::too_many_arguments)]
     fn emit_glyph(
         &mut self,
         character: char,
+        presentation: bitty_term_state::EmojiPresentation,
         row: usize,
         col: usize,
         span_cols: usize,
@@ -3576,6 +3985,9 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             // unreachable; treating it as "nothing to draw" stays safe.
             return (false, grid_advance);
         };
+        // Presentation is part of the key: the same scalar rasterizes to a
+        // color layer stack or a coverage bitmap depending on it (CTX-1691).
+        let key = key.with_presentation(presentation);
         let bitmap = match self.cache.cached_glyph(key) {
             Ok(CachedGlyphRef::Bitmap(bitmap)) => bitmap,
             Ok(CachedGlyphRef::Blank) => {
@@ -3598,6 +4010,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         let dest_y = baseline - i64::from(metrics.top);
         push_cached_glyph(
             &mut self.atlas,
+            &mut self.color_atlas,
             &mut self.counters,
             key,
             bitmap,
@@ -3667,20 +4080,20 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         };
         let dest_x = col as i64 * i64::from(self.cell.width);
         let dest_y = row as i64 * i64::from(self.cell.height);
-        let instance = match source {
-            GlyphSource::Atlas { slot } => GlyphInstance {
+        let Some(instance) = (match source {
+            GlyphSource::Atlas { slot } => Some(GlyphInstance {
                 dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
                 size: [width, height],
                 uv: slot.uv(self.atlas.dims()),
                 color,
                 clip: None,
                 source: GlyphSource::Atlas { slot },
-            },
+            }),
             GlyphSource::Inline {
                 mask,
                 width,
                 height,
-            } => GlyphInstance {
+            } => Some(GlyphInstance {
                 dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
                 size: [width, height],
                 uv: [0.0; 4],
@@ -3691,7 +4104,14 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                     width,
                     height,
                 },
-            },
+            }),
+            // Block masks are cell-box coverage geometry: they are never
+            // placed in the color atlas. Keeping the match total instead of
+            // asserting means a future block path that did would skip one
+            // instance, never panic inside a frame.
+            GlyphSource::ColorAtlas { .. } => None,
+        }) else {
+            return false;
         };
         list.glyphs.push(instance);
         self.counters.glyphs_emitted += 1;
@@ -3776,6 +4196,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         let dest_y = baseline - i64::from(metrics.top);
         push_cached_glyph(
             &mut self.atlas,
+            &mut self.color_atlas,
             &mut self.counters,
             key,
             bitmap,
@@ -3827,7 +4248,15 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 self.counters.blank_cells_skipped += 1;
                 continue;
             }
-            let (emitted, _) = self.emit_glyph(ch, row, abs_col, 1, fg, list);
+            let (emitted, _) = self.emit_glyph(
+                ch,
+                bitty_term_state::EmojiPresentation::Text,
+                row,
+                abs_col,
+                1,
+                fg,
+                list,
+            );
             if !emitted {
                 self.counters.blank_cells_skipped += 1;
             }
@@ -3921,6 +4350,7 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             self.counters = counters_before;
             self.atlas.restore_cost(atlas_costs_before);
             self.atlas.evict_now();
+            self.color_atlas.evict_now();
             // The final pass may legitimately re-flag exhaustion (a line whose
             // glyphs exceed one fresh generation); its inline fallbacks are
             // the correct terminal outcome, and the next pass clears the flag
@@ -3946,9 +4376,10 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
         color: Rgba8,
     ) -> (Vec<GlyphInstance>, bool) {
         self.atlas.clear_exhausted();
+        self.color_atlas.clear_exhausted();
         let mut out = Vec::new();
         let mut col = 0usize;
-        for character in text.chars().take(max_cells) {
+        for (idx, character) in text.char_indices().take(max_cells) {
             let advance = usize::from(char_cell_width(character));
             if col + advance > max_cells {
                 break;
@@ -3957,7 +4388,16 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 col += advance;
                 continue;
             }
-            let Ok(key) = RasterKey::new(character, self.font, self.point_size) else {
+            // Resolve the cluster's presentation *before* the cache lookup
+            // (CTX-1691 review round 1): the bitmap handed back is whatever
+            // the key asked for, so looking up the text-presentation key and
+            // re-keying afterwards left the monochrome raster in hand — the
+            // color atlas then rejected it every pass, and the overlay (help
+            // card, panels, search) never painted color.
+            let presentation = bitty_term_state::cluster_presentation_str(&text[idx..]);
+            let Ok(key) = RasterKey::new(character, self.font, self.point_size)
+                .map(|key| key.with_presentation(presentation))
+            else {
                 self.counters.blank_cells_skipped += 1;
                 continue;
             };
@@ -3973,7 +4413,14 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 }
             };
             let metrics = bitmap.metrics();
-            let source = self.atlas.ensure_cached(key, bitmap);
+            let source = if key.wants_color() {
+                self.color_atlas
+                    .ensure(key, bitmap)
+                    .map(|slot| GlyphSource::ColorAtlas { slot })
+                    .unwrap_or_else(|| self.atlas.ensure_cached(key, bitmap))
+            } else {
+                self.atlas.ensure_cached(key, bitmap)
+            };
             let dest_x =
                 origin_x + col as i64 * i64::from(self.cell.width) + i64::from(metrics.left);
             let dest_y = baseline - i64::from(metrics.top);
@@ -3988,6 +4435,14 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                     color,
                     clip: None,
                     source: GlyphSource::Atlas { slot },
+                },
+                GlyphSource::ColorAtlas { slot } => GlyphInstance {
+                    dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
+                    size: [slot.width.into(), slot.height.into()],
+                    uv: [0.0; 4],
+                    color: [u8::MAX; 4],
+                    clip: None,
+                    source: GlyphSource::ColorAtlas { slot },
                 },
                 GlyphSource::Inline {
                     mask,
@@ -4011,7 +4466,10 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
             col += advance;
         }
         self.refresh_atlas_uvs(&mut out);
-        (out, self.atlas.is_exhausted())
+        (
+            out,
+            self.atlas.is_exhausted() || self.color_atlas.is_exhausted(),
+        )
     }
 }
 
@@ -4161,10 +4619,11 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
             features,
             &bidi,
         )?;
-        if self.atlas.is_exhausted() {
+        if self.atlas.is_exhausted() || self.color_atlas.is_exhausted() {
             self.counters = counters_before;
             self.atlas.restore_cost(atlas_costs_before);
             self.atlas.evict_now();
+            self.color_atlas.evict_now();
             pass = self.place_shaped_pass(
                 snapshot,
                 cols,
@@ -4191,6 +4650,7 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
         bidi: &BidiGrid,
     ) -> Result<DrawList, RenderError> {
         self.atlas.clear_exhausted();
+        self.color_atlas.clear_exhausted();
         let mut pass = DrawList {
             generation: snapshot.generation,
             atlas_epoch: self.atlas.epoch(),
@@ -4595,7 +5055,18 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
             if count == 1 {
                 if let Some(block) = cluster_block_base(slice) {
                     if slice.chars().count() == 1 {
-                        if self.emit_glyph(block, row, abs_start, count, fg, list).0 {
+                        if self
+                            .emit_glyph(
+                                block,
+                                bitty_term_state::EmojiPresentation::Text,
+                                row,
+                                abs_start,
+                                count,
+                                fg,
+                                list,
+                            )
+                            .0
+                        {
                             idx = group_end;
                             continue;
                         }
@@ -4740,8 +5211,13 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
             .cache
             .rasterizer_mut()
             .inner_mut()
-            .rasterize_shaped_cached_ref(cluster.face, cluster.glyph_id, self.point_size, features)
-        {
+            .rasterize_shaped_cached_ref(
+                cluster.face,
+                cluster.glyph_id,
+                self.point_size,
+                features,
+                cluster.presentation,
+            ) {
             // Rasterizer failure degrades this cluster to tofu — never a
             // frame error (design 2.3 validation order).
             Ok(Some(bitmap)) => bitmap,
@@ -4756,8 +5232,19 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
             cluster.glyph_id,
             self.point_size,
             features,
-        );
-        let source = self.atlas.ensure_shaped_cached(shaped_key, bitmap.inner);
+        )
+        .with_presentation(cluster.presentation);
+        // Color presentation places the RGBA bitmap in the color atlas; a
+        // bitmap it cannot hold degrades to monochrome coverage, so a row of
+        // emoji never changes the layout or drops the glyph (CTX-1691).
+        let source = if cluster.presentation.is_emoji() {
+            self.color_atlas
+                .ensure_shaped(shaped_key, bitmap.inner)
+                .map(|slot| GlyphSource::ColorAtlas { slot })
+                .unwrap_or_else(|| self.atlas.ensure_shaped_cached(shaped_key, bitmap.inner))
+        } else {
+            self.atlas.ensure_shaped_cached(shaped_key, bitmap.inner)
+        };
         // Grid origin plus bearing plus the shaper's accumulated pen and
         // GPOS horizontal offset (Phase C): combining marks and reordered
         // members shaped as separate glyphs carry their placement there.
@@ -4780,6 +5267,15 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
                 color,
                 clip: None,
                 source: GlyphSource::Atlas { slot },
+            },
+            GlyphSource::ColorAtlas { slot } => GlyphInstance {
+                dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
+                size: [slot.width.into(), slot.height.into()],
+                uv: [0.0; 4],
+                // Color bitmaps are never tinted by the cell foreground.
+                color: [u8::MAX; 4],
+                clip: None,
+                source: GlyphSource::ColorAtlas { slot },
             },
             GlyphSource::Inline {
                 mask,
@@ -4846,7 +5342,15 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
             if width == 0 {
                 continue;
             }
-            let (emitted, advance) = self.emit_glyph(base, row, col, width, fg, list);
+            let (emitted, advance) = self.emit_glyph(
+                base,
+                bitty_term_state::cluster_presentation_str(cluster),
+                row,
+                col,
+                width,
+                fg,
+                list,
+            );
             if !emitted {
                 self.counters.blank_cells_skipped += 1;
             }
@@ -4874,6 +5378,7 @@ impl<R: ShapedRunSource> GridRenderer<FallbackRasterizer<R>> {
 #[allow(clippy::too_many_arguments)]
 fn push_cached_glyph(
     atlas: &mut GlyphAtlas,
+    color_atlas: &mut ColorGlyphAtlas,
     counters: &mut RenderCounters,
     key: RasterKey,
     bitmap: &CachedBitmap,
@@ -4883,7 +5388,18 @@ fn push_cached_glyph(
     list: &mut DrawList,
 ) {
     let metrics = bitmap.metrics();
-    let source = atlas.ensure_cached(key, bitmap);
+    // Color presentation places the RGBA bitmap in the color atlas; a bitmap
+    // the color atlas cannot hold (oversized, or the pass exhausted it)
+    // degrades to the monochrome coverage path, so the glyph still paints and
+    // the cell layout never changes (CTX-1691).
+    let source = if key.wants_color() {
+        color_atlas
+            .ensure(key, bitmap)
+            .map(|slot| GlyphSource::ColorAtlas { slot })
+            .unwrap_or_else(|| atlas.ensure_cached(key, bitmap))
+    } else {
+        atlas.ensure_cached(key, bitmap)
+    };
     let instance = match source {
         GlyphSource::Atlas { slot } => GlyphInstance {
             dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
@@ -4897,6 +5413,16 @@ fn push_cached_glyph(
             // decorated frames set a rounded content clip (CTX-0311).
             clip: None,
             source: GlyphSource::Atlas { slot },
+        },
+        GlyphSource::ColorAtlas { slot } => GlyphInstance {
+            dest: [clamp_i32(dest_x), clamp_i32(dest_y)],
+            size: [slot.width.into(), slot.height.into()],
+            uv: [0.0; 4],
+            // The bitmap carries its own color: never tint it with the cell
+            // foreground.
+            color: [u8::MAX; 4],
+            clip: None,
+            source: GlyphSource::ColorAtlas { slot },
         },
         GlyphSource::Inline {
             mask,

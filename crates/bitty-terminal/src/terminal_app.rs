@@ -10,7 +10,7 @@ use bitty_platform::{
 };
 use bitty_render::gpu::{GpuContext, select_instance_backends};
 use bitty_runtime::plugin_runtime::{LuaValue, OverlayKeyChord, PluginRuntime, WorkspaceRequest};
-use bitty_runtime::{Runtime, ViewId, WorkspaceSummary};
+use bitty_runtime::{Runtime, ViewId, WorkspaceId, WorkspaceSummary};
 
 use crate::crash_report;
 use crate::ctl;
@@ -968,6 +968,12 @@ pub(crate) struct TerminalApp {
     /// (bitty#2785): the focused leaf id, refreshed every tick before plugin
     /// work. `None` without a plugin runtime; the plugin never writes it.
     pub(crate) scene_target: Option<std::rc::Rc<std::cell::Cell<Option<ViewId>>>>,
+    /// Core-published `WorkspaceId` of the presented workspace's focused leaf
+    /// (OQ-084 B-2): refreshed next to the scene target so the
+    /// `bitty.panel.create` backend attributes a created panel to the
+    /// workspace the user is looking at. `None` without a plugin runtime; the
+    /// plugin never writes it.
+    pub(crate) focused_workspace: Option<std::rc::Rc<std::cell::Cell<Option<WorkspaceId>>>>,
     /// Plugin runtime (CTX-0892): owns all plugin VMs, delivers events,
     /// dispatches commands. Kept alive by the app loop.
     pub(crate) plugin_runtime: Option<PluginRuntime>,
@@ -1120,6 +1126,7 @@ impl TerminalApp {
             live_pin_state: None,
             live_history: None,
             scene_target: None,
+            focused_workspace: None,
             plugin_runtime: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
@@ -1178,6 +1185,7 @@ impl TerminalApp {
             live_pin_state: None,
             live_history: None,
             scene_target: None,
+            focused_workspace: None,
             plugin_runtime: None,
             safe_mode: false,
             composer_core_fallback_latched: false,
@@ -1638,6 +1646,23 @@ impl TerminalApp {
         self
     }
 
+    /// Attaches the Core-published `WorkspaceId` of the presented workspace
+    /// (OQ-084 B-2).
+    ///
+    /// Production startup passes the handle returned by
+    /// [`crate::plugin_runtime::discover_and_activate`]; [`Self::drive_tick`]
+    /// refreshes it with [`Runtime::focused_workspace_id`] before plugin work,
+    /// so `bitty.panel.create` attributes the panel to the workspace the user
+    /// is looking at. `None` without a plugin runtime leaves the create path
+    /// failing closed with `E_UI_UNAVAILABLE`.
+    pub(crate) fn with_focused_workspace(
+        mut self,
+        workspace: Option<std::rc::Rc<std::cell::Cell<Option<WorkspaceId>>>>,
+    ) -> Self {
+        self.focused_workspace = workspace;
+        self
+    }
+
     /// Sets the safe recovery latch (W-103 S-5, CTX-0929). Production
     /// startup passes the `--safe` flag; the composer cutover reads it to
     /// select the retained Core path without consulting a VM.
@@ -2077,6 +2102,13 @@ impl TerminalApp {
         // is looking at. Core owns this value; plugins never do.
         if let Some(target) = self.scene_target.as_ref() {
             target.set(self.runtime.focused_view());
+        }
+        // OQ-084 B-2: publish the presented workspace's minted id on the same
+        // edge, so a `panel.create` dispatched on this tick is attributed to
+        // the workspace the user is looking at. Core owns the value; plugin
+        // input never reaches it.
+        if let Some(workspace) = self.focused_workspace.as_ref() {
+            workspace.set(self.runtime.focused_workspace_id());
         }
         // CTX-1115: apply queued `bitty.panel.set_pinned` intents before
         // present, so the presented frame reflects the pin state.

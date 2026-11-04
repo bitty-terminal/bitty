@@ -1197,6 +1197,9 @@ fn mid_frame_eviction_never_leaves_stale_atlas_slots() {
         for (col, glyph) in list.glyphs.iter().enumerate() {
             let character = ['a', 'b', 'c', 'd'][col];
             match &glyph.source {
+                GlyphSource::ColorAtlas { .. } => {
+                    panic!("fixture never places color glyphs")
+                }
                 GlyphSource::Atlas { slot } => {
                     atlas_glyphs += 1;
                     let uv = glyph.uv;
@@ -1255,7 +1258,9 @@ fn oversized_glyph_falls_back_inline_instead_of_failing() {
             assert_eq!(mask.len(), 6 * 6);
             assert!(mask.iter().any(|&coverage| coverage > 0));
         }
-        GlyphSource::Atlas { .. } => panic!("expected inline fallback"),
+        GlyphSource::Atlas { .. } | GlyphSource::ColorAtlas { .. } => {
+            panic!("expected inline fallback")
+        }
     }
     assert_eq!(grid.atlas_stats().3, 1); // inline_fallbacks
     assert_eq!(grid.counters().glyphs_emitted, 1);
@@ -2549,6 +2554,7 @@ fn phase_c_cluster(byte_offset: usize, col: usize, count: usize) -> ShapedCluste
         uncovered: false,
         ligature_part: count > 1,
         byte_offset,
+        presentation: bitty_term_state::EmojiPresentation::Text,
     }
 }
 
@@ -3008,6 +3014,7 @@ fn malformed_glyph_dimensions_fail_closed_without_overflowing_coverage() {
             advance: [0, 0],
         },
         format: BitmapFormat::Rgb,
+        alpha: crate::glyph::AlphaMode::Premultiplied,
         data: Vec::new(),
     };
     assert!(matches!(
@@ -3436,6 +3443,9 @@ fn glyph_frame<R: GlyphRasterizer>(
                         texels[(sy * u32::from(dims.width) + sx) as usize]
                     }
                     GlyphSource::Inline { mask, width, .. } => mask[(y * width + x) as usize],
+                    // Coverage frames only; color fixtures assert on the
+                    // color atlas instead.
+                    GlyphSource::ColorAtlas { .. } => 0,
                 };
                 let dx = glyph.dest[0] + x as i32;
                 let dy = glyph.dest[1] + y as i32;
@@ -3942,6 +3952,7 @@ impl FakeShaper {
                 uncovered: false,
                 ligature_part: cells.1 > 1,
                 byte_offset: offset,
+                presentation: bitty_term_state::EmojiPresentation::Text,
             }
         };
         match text {
@@ -4014,6 +4025,7 @@ impl crate::shaped::ShapedRunSource for FakeShaper {
                 uncovered: false,
                 ligature_part: true,
                 byte_offset: 0,
+                presentation: bitty_term_state::EmojiPresentation::Text,
             }]);
         }
         let mut offset = 0usize;
@@ -4030,6 +4042,7 @@ impl crate::shaped::ShapedRunSource for FakeShaper {
                     uncovered: false,
                     ligature_part: false,
                     byte_offset: offset,
+                    presentation: bitty_term_state::EmojiPresentation::Text,
                 };
                 offset += ch.len_utf8();
                 cluster
@@ -4043,6 +4056,7 @@ impl crate::shaped::ShapedRunSource for FakeShaper {
         glyph_id: u16,
         _point_size: f32,
         _features: &[bitty_config::types::OpenTypeFeature],
+        _presentation: bitty_term_state::EmojiPresentation,
     ) -> Result<Option<crate::glyph::ShapedBitmap<'_>>, RenderError> {
         self.scratch = Some(
             crate::glyph::CachedBitmap::source(Self::bitmap(u32::from(glyph_id)))
@@ -4456,4 +4470,385 @@ fn image_paint_layer_maps_wire_z() {
     )
     .unwrap();
     assert_eq!(under.layer, ImagePaintLayer::BelowText);
+}
+
+// -- CTX-1691 (review round 1): color-atlas placement accounting.
+//
+// `ColorGlyphAtlas::place` used to allocate a slot before `write` validated
+// the raster format. Every emoji-presentation cluster that rasterized
+// monochrome (a face with no color table, or an emoji-presentation ASCII
+// cluster) therefore claimed a four-byte-per-texel slot that no placement
+// entry ever owned, until `max_dimension` reported `exhausted` and the frame
+// pipeline evicted both atlases wholesale. These tests pin the accounting,
+// not just the return value: a rejected raster must leave the allocator
+// untouched, so a real color raster still places afterwards.
+
+/// Exact `width x height` RGBA color bitmap for color-atlas fixtures.
+fn color_bitmap(width: i32, height: i32, texel: [u8; 4]) -> GlyphBitmap {
+    GlyphBitmap::try_new(
+        GlyphMetrics {
+            left: 0,
+            top: height,
+            width,
+            height,
+            advance: [width, 0],
+        },
+        BitmapFormat::Rgba,
+        texel.repeat(width as usize * height as usize),
+    )
+    .unwrap()
+}
+
+/// Reads the first texel of `slot` out of the atlas texture.
+fn slot_texel(atlas: &super::ColorGlyphAtlas, slot: super::AtlasSlot) -> [u8; 4] {
+    let dims = atlas.dims();
+    let offset = (usize::from(slot.y) * usize::from(dims.width) + usize::from(slot.x)) * 4;
+    let texels = atlas.texels();
+    [
+        texels[offset],
+        texels[offset + 1],
+        texels[offset + 2],
+        texels[offset + 3],
+    ]
+}
+
+#[test]
+fn color_atlas_rejects_a_coverage_raster_without_consuming_a_slot() {
+    // 64 px maximum: the initial allocation is 64 as well, so `try_grow` can
+    // never rescue a leaked slot and sixteen exact 16x16 placements fill it.
+    let mut atlas = super::ColorGlyphAtlas::new(64).unwrap();
+    let initial_dims = atlas.dims();
+    let font = FontId::next(&mut 0u64);
+    let key = RasterKey::new('\u{2705}', font, 12.0)
+        .unwrap()
+        .with_presentation(bitty_term_state::EmojiPresentation::Emoji);
+    let monochrome = crate::glyph::CachedBitmap::source(gate_bitmap(16, 16)).unwrap();
+    // 32 passes: twice the sixteen slots the atlas can hold, so a leaking
+    // implementation reports exhaustion well inside the loop.
+    for pass in 0..32 {
+        assert!(
+            atlas.ensure(key, &monochrome).is_none(),
+            "a coverage raster is not a color glyph"
+        );
+        assert!(
+            !atlas.is_exhausted(),
+            "pass {pass}: an unstorable raster is not atlas exhaustion"
+        );
+        assert_eq!(atlas.len(), 0, "pass {pass}: nothing was placed");
+        // Accounting, not just the return value: a rejected raster must leave
+        // the allocator's occupancy at zero and the atlas at its initial
+        // dimensions, so repeated passes can never fill it with unowned
+        // regions (the leak this test pins).
+        assert_eq!(
+            atlas.layout.occupancy(),
+            0.0,
+            "pass {pass}: a rejected raster consumed no atlas area"
+        );
+        assert_eq!(
+            atlas.dims(),
+            initial_dims,
+            "pass {pass}: a rejected raster must not grow the atlas"
+        );
+        // …and the reject has to be visible in the stats: one miss per pass.
+        assert_eq!(
+            atlas.stats(),
+            (0, pass + 1, 0),
+            "pass {pass}: each rejected placement is a miss, no hit, no eviction"
+        );
+    }
+    // The rejects consumed no space, so a genuine color raster still fits.
+    let color =
+        crate::glyph::CachedBitmap::source(color_bitmap(16, 16, [0xE0, 0x30, 0x20, 0xFF])).unwrap();
+    let slot = atlas
+        .ensure(key, &color)
+        .expect("a color raster still places after 32 rejected passes");
+    assert_eq!(slot_texel(&atlas, slot), [0xE0, 0x30, 0x20, 0xFF]);
+    assert_eq!(atlas.len(), 1);
+    assert_eq!(
+        atlas.layout.occupancy(),
+        f64::from(16 * 16) / f64::from(64 * 64),
+        "only the real placement occupies the atlas"
+    );
+    // First placement of the key is a miss; the repeat is a hit.
+    assert_eq!(atlas.stats(), (0, 33, 0));
+    assert!(atlas.ensure(key, &color).is_some());
+    assert_eq!(atlas.stats(), (1, 33, 0));
+}
+
+#[test]
+fn color_atlas_un_premultiplies_only_premultiplied_rasters() {
+    let font = FontId::next(&mut 0u64);
+    let key = RasterKey::new('\u{2705}', font, 12.0)
+        .unwrap()
+        .with_presentation(bitty_term_state::EmojiPresentation::Emoji);
+    // Premultiplied (COLR/CPAL layer stack, the default reading): the atlas
+    // divides alpha out, so half-alpha red is the full color again.
+    let mut premultiplied = super::ColorGlyphAtlas::new(64).unwrap();
+    let layers = crate::glyph::CachedBitmap::source(color_bitmap(4, 4, [64, 16, 8, 128])).unwrap();
+    let slot = premultiplied.ensure(key, &layers).expect("premultiplied");
+    assert_eq!(
+        slot_texel(&premultiplied, slot),
+        [128, 32, 16, 128],
+        "a premultiplied texel is divided out to straight alpha"
+    );
+    // Straight (CBDT/sbix strike): the same bytes pass through untouched.
+    // Un-premultiplying them brightened and clipped every translucent edge.
+    let mut straight = super::ColorGlyphAtlas::new(64).unwrap();
+    let strike = crate::glyph::CachedBitmap::source(
+        color_bitmap(4, 4, [64, 16, 8, 128]).with_alpha(crate::glyph::AlphaMode::Straight),
+    )
+    .unwrap();
+    let slot = straight.ensure(key, &strike).expect("straight");
+    assert_eq!(
+        slot_texel(&straight, slot),
+        [64, 16, 8, 128],
+        "a straight-alpha strike is stored as decoded"
+    );
+}
+
+// -- CTX-1691 (review round 1): the shaped color path.
+//
+// `emit_shaped_cluster` -> `ColorGlyphAtlas::ensure_shaped` is the production
+// color path, and its only coverage used to be the live-font test, which
+// skips on hosts without a color face. This fake shaper serves RGBA for emoji
+// clusters and coverage otherwise, so placement, the delivered texel, and the
+// ZWJ cluster are pinned on every host.
+
+/// Deterministic shaper that serves a color bitmap for emoji presentation.
+struct ColorShaper {
+    next_id: u64,
+    texel: [u8; 4],
+    alpha: crate::glyph::AlphaMode,
+    scratch: Option<crate::glyph::CachedBitmap>,
+}
+
+impl ColorShaper {
+    fn new(texel: [u8; 4], alpha: crate::glyph::AlphaMode) -> Self {
+        Self {
+            next_id: 0,
+            texel,
+            alpha,
+            scratch: None,
+        }
+    }
+
+    fn bitmap(&self, presentation: bitty_term_state::EmojiPresentation) -> GlyphBitmap {
+        let metrics = GlyphMetrics {
+            left: 0,
+            top: 6,
+            width: 6,
+            height: 6,
+            advance: [8, 0],
+        };
+        if presentation.is_emoji() {
+            GlyphBitmap::try_new(metrics, BitmapFormat::Rgba, self.texel.repeat(36))
+                .expect("rgba bitmap")
+                .with_alpha(self.alpha)
+        } else {
+            GlyphBitmap::try_new(metrics, BitmapFormat::Rgb, vec![0xFF; 6 * 6 * 3])
+                .expect("coverage bitmap")
+        }
+    }
+}
+
+impl GlyphRasterizer for ColorShaper {
+    fn load_font(&mut self, _query: &FontQuery) -> Result<FontId, RenderError> {
+        Ok(FontId::next(&mut self.next_id))
+    }
+
+    fn rasterize(&mut self, key: RasterKey) -> Result<Option<GlyphBitmap>, RenderError> {
+        Ok(Some(self.bitmap(key.presentation)))
+    }
+}
+
+impl crate::shaped::ShapedRunSource for ColorShaper {
+    fn shaping_supported(&self) -> bool {
+        true
+    }
+
+    fn shape_run(
+        &mut self,
+        text: &str,
+        chain: &[FontId],
+        _attrs: &crate::shaped::RunAttrs,
+    ) -> Result<Vec<crate::shaped::ShapedCluster>, RenderError> {
+        let face = chain[0];
+        let mut col = 0usize;
+        let mut offset = 0usize;
+        let mut clusters = Vec::new();
+        for cluster in bitty_term_state::split_clusters(text) {
+            let width = usize::from(bitty_term_state::cluster_cell_width(
+                cluster,
+                bitty_term_state::AmbiguousWidth::Narrow,
+            ))
+            .max(1);
+            clusters.push(crate::shaped::ShapedCluster {
+                cells: (col, width),
+                glyph_id: cluster.chars().next().unwrap_or(' ') as u16,
+                face,
+                x_advance_px: width as f32 * 8.0,
+                x_offset_px: 0.0,
+                uncovered: false,
+                ligature_part: width > 1,
+                byte_offset: offset,
+                presentation: bitty_term_state::cluster_presentation_str(cluster),
+            });
+            col += width;
+            offset += cluster.len();
+        }
+        Ok(clusters)
+    }
+
+    fn rasterize_shaped_cached_ref(
+        &mut self,
+        _face: FontId,
+        _glyph_id: u16,
+        _point_size: f32,
+        _features: &[bitty_config::types::OpenTypeFeature],
+        presentation: bitty_term_state::EmojiPresentation,
+    ) -> Result<Option<crate::glyph::ShapedBitmap<'_>>, RenderError> {
+        // Keyed on the cluster's presentation, exactly like the production
+        // shaper: one glyph id serves RGBA under emoji presentation and
+        // coverage under text presentation.
+        self.scratch = Some(crate::glyph::CachedBitmap::source(
+            self.bitmap(presentation),
+        )?);
+        Ok(self
+            .scratch
+            .as_ref()
+            .map(|inner| crate::glyph::ShapedBitmap { inner }))
+    }
+
+    fn note_misaligned(&mut self) {}
+
+    fn shape_stats(&self) -> (u64, u64) {
+        (0, 0)
+    }
+
+    fn face_is_monospaced(&self, _face: FontId) -> bool {
+        true
+    }
+}
+
+fn color_shaped_renderer(
+    shaper: ColorShaper,
+) -> GridRenderer<super::FallbackRasterizer<ColorShaper>> {
+    GridRenderer::new(
+        super::FallbackRasterizer::new(shaper, Vec::new()),
+        &font_query(),
+        cell_metrics(),
+    )
+    .expect("renderer builds")
+}
+
+/// First texel of the color-atlas slot a shaped emoji cluster painted.
+fn shaped_color_texel(
+    renderer: &GridRenderer<super::FallbackRasterizer<ColorShaper>>,
+    list: &super::DrawList,
+) -> (super::AtlasSlot, [u8; 4]) {
+    assert_eq!(list.glyphs.len(), 1, "one wide cluster: {list:?}");
+    let slot = match list.glyphs[0].source {
+        GlyphSource::ColorAtlas { slot } => slot,
+        ref other => panic!("an emoji cluster must paint the shaped color bitmap, got {other:?}"),
+    };
+    assert_eq!(
+        list.glyphs[0].color,
+        [u8::MAX; 4],
+        "a color bitmap is never tinted by the cell foreground"
+    );
+    let (texels, dims) = renderer.color_atlas_texels().expect("color atlas payload");
+    let offset = (usize::from(slot.y) * usize::from(dims.width) + usize::from(slot.x)) * 4;
+    (
+        slot,
+        [
+            texels[offset],
+            texels[offset + 1],
+            texels[offset + 2],
+            texels[offset + 3],
+        ],
+    )
+}
+
+#[test]
+fn shaped_emoji_cluster_places_the_color_bitmap() {
+    let texel = [0xE0, 0x30, 0x20, 0xFF];
+    let mut renderer = color_shaped_renderer(ColorShaper::new(
+        texel,
+        crate::glyph::AlphaMode::Premultiplied,
+    ));
+    let state = shaped_state("\u{2705}");
+    let list = renderer
+        .render_shaped(
+            &state.snapshot(),
+            &full_damage(&state),
+            bitty_config::types::LigaturePolicy::Never,
+            &[],
+        )
+        .unwrap();
+    let (_, delivered) = shaped_color_texel(&renderer, &list);
+    assert_eq!(
+        delivered, texel,
+        "the shaped color slot carries the rasterizer's color"
+    );
+    assert_eq!(renderer.counters().shaping_misaligned, 0);
+    assert_eq!(
+        renderer.color_atlas_placements(),
+        1,
+        "one shaped placement, no duplicate"
+    );
+}
+
+/// The same shaped path with a translucent straight-alpha strike (CBDT/sbix):
+/// the texel must reach the atlas unchanged. The premultiplied reading would
+/// double it to [128, 32, 16, 128].
+#[test]
+fn shaped_straight_alpha_strike_reaches_the_atlas_unbrightened() {
+    let texel = [64, 16, 8, 128];
+    let mut renderer =
+        color_shaped_renderer(ColorShaper::new(texel, crate::glyph::AlphaMode::Straight));
+    let state = shaped_state("\u{2705}");
+    let list = renderer
+        .render_shaped(
+            &state.snapshot(),
+            &full_damage(&state),
+            bitty_config::types::LigaturePolicy::Never,
+            &[],
+        )
+        .unwrap();
+    let (_, delivered) = shaped_color_texel(&renderer, &list);
+    assert_eq!(
+        delivered, texel,
+        "a straight-alpha strike is stored as decoded"
+    );
+}
+
+#[test]
+fn shaped_zwj_family_places_one_color_bitmap() {
+    let texel = [0x40, 0x80, 0xE0, 0xFF];
+    let mut renderer = color_shaped_renderer(ColorShaper::new(
+        texel,
+        crate::glyph::AlphaMode::Premultiplied,
+    ));
+    // Man + ZWJ + woman: one two-column cluster that the shaper ligates.
+    let state = shaped_state("\u{1F468}\u{200D}\u{1F469}");
+    let list = renderer
+        .render_shaped(
+            &state.snapshot(),
+            &full_damage(&state),
+            bitty_config::types::LigaturePolicy::Never,
+            &[],
+        )
+        .unwrap();
+    let (slot, delivered) = shaped_color_texel(&renderer, &list);
+    assert_eq!(delivered, texel, "the ZWJ cluster paints the color bitmap");
+    assert_eq!(
+        (slot.width, slot.height),
+        (6, 6),
+        "the color slot keeps the bitmap's texel size"
+    );
+    assert_eq!(
+        renderer.counters().shaping_misaligned,
+        0,
+        "the color cluster stays shaped"
+    );
 }

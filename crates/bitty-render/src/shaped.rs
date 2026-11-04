@@ -48,7 +48,7 @@ use fontdb::{Database, Family, Query, Source, Style, Weight};
 
 use crate::error::RenderError;
 use crate::glyph::{
-    BitmapFormat, CachedBitmap, FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap,
+    AlphaMode, BitmapFormat, CachedBitmap, FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap,
     GlyphMetrics, GlyphRasterizer, RasterKey, ShapedBitmap,
 };
 
@@ -174,8 +174,18 @@ pub enum GlyphSource {
     Outline,
     /// Embedded monochrome bitmap strike.
     Bitmap,
-    /// Embedded color bitmap strike (flattened to `Rgb`; downstream tints
-    /// monochrome by cell foreground — color emoji stays a non-goal).
+    /// Layered color outline stack (COLR/CPAL), composited by the rasterizer
+    /// into one RGBA bitmap (CTX-1691, issue #2858).
+    ///
+    /// Served only when the cluster asked for emoji presentation; the layers
+    /// arrive already composited, so downstream compositors paint the bitmap
+    /// as-is instead of tinting it by the cell foreground.
+    ColorOutline,
+    /// Embedded color bitmap strike (CBDT/sbix).
+    ///
+    /// Served as RGBA when the cluster asked for emoji presentation, and
+    /// flattened to `Rgb` (tinted monochrome by cell foreground) when it did
+    /// not — the text-presentation fallback for color-only faces.
     ColorBitmap,
 }
 
@@ -423,38 +433,57 @@ impl SwashSingle {
 
     /// Renders one glyph to an owned bitmap at `px` pixels.
     ///
-    /// Sources tried in order: scalable outline, then the best-fit embedded
-    /// bitmap strike, then the best-fit color bitmap strike. Color bitmaps
-    /// flatten to `Rgb` (alpha dropped): the downstream atlas path averages
-    /// to luminance and tints by the cell foreground, which is the
-    /// documented monochrome-flatten behavior for emoji-presentation scalars
-    /// (color emoji stays a non-goal). Returns the winning source alongside
-    /// the bitmap so coverage probes share one selection truth.
+    /// Source order depends on the cluster's emoji-presentation decision
+    /// (CTX-1691, issue #2858): with `emoji` the layered color outline stack
+    /// (COLR/CPAL, palette 0) and the best-fit color bitmap strike are tried
+    /// first and served as RGBA, falling back to the monochrome outline and
+    /// strike on a face that has no color glyph; without `emoji` the
+    /// monochrome sources come first and a color bitmap strike is flattened
+    /// to `Rgb`, which is the documented text-presentation behavior for
+    /// color-only faces.
+    ///
+    /// Returns the winning source alongside the bitmap so coverage probes
+    /// share one selection truth.
     fn render_glyph(
         &mut self,
         face: &StoredFace,
         glyph_id: u16,
         px: f32,
+        emoji: bool,
     ) -> Result<(GlyphBitmap, GlyphSource), RenderError> {
         use swash::scale::{Render, Source as SwashSource, StrikeWith};
         let font = Self::font_ref(face)?;
         let mut scaler = self.scale_ctx.builder(font).size(px).hint(true).build();
-        let image = Render::new(&[
-            SwashSource::Outline,
-            SwashSource::Bitmap(StrikeWith::BestFit),
-            SwashSource::ColorBitmap(StrikeWith::BestFit),
-        ])
-        .render(&mut scaler, glyph_id)
-        .ok_or_else(|| RenderError::flatten_rasterizer("glyph has no renderable source"))?;
+        // Emoji presentation asks for color first; a face without a color
+        // glyph (or a host without a color emoji face at all) falls through
+        // to the same monochrome sources the text path uses.
+        let sources: &[SwashSource] = if emoji {
+            &[
+                SwashSource::ColorOutline(0),
+                SwashSource::ColorBitmap(StrikeWith::BestFit),
+                SwashSource::Outline,
+                SwashSource::Bitmap(StrikeWith::BestFit),
+            ]
+        } else {
+            &[
+                SwashSource::Outline,
+                SwashSource::Bitmap(StrikeWith::BestFit),
+                SwashSource::ColorBitmap(StrikeWith::BestFit),
+            ]
+        };
+        let image = Render::new(sources)
+            // A COLR layer without a palette entry (color index 0xFFFF) takes
+            // this color. The bitmap cache is foreground-independent, so the
+            // palette-less layer bakes a fixed black instead of the cell fg;
+            // CPAL-first fonts (every shipped color emoji face) never hit it.
+            .default_color([0, 0, 0, 255])
+            .render(&mut scaler, glyph_id)
+            .ok_or_else(|| RenderError::flatten_rasterizer("glyph has no renderable source"))?;
         let source = match image.source {
             SwashSource::Outline => GlyphSource::Outline,
             SwashSource::Bitmap(_) => GlyphSource::Bitmap,
+            SwashSource::ColorOutline(_) => GlyphSource::ColorOutline,
             SwashSource::ColorBitmap(_) => GlyphSource::ColorBitmap,
-            SwashSource::ColorOutline(_) => {
-                return Err(RenderError::flatten_rasterizer(
-                    "layered color outlines are not served on this path",
-                ));
-            }
         };
         let width =
             i32::try_from(image.placement.width).map_err(|_| RenderError::InvalidInput {
@@ -486,24 +515,32 @@ impl SwashSingle {
                 ));
             }
             swash::scale::image::Content::Color => {
-                // 32-bit RGBA -> `Rgb` (alpha dropped; bitmap strikes are
-                // opaque, and downstream tints monochrome by cell fg).
                 if image.data.len() % 4 != 0 {
                     return Err(RenderError::InvalidInput {
                         reason: "color bitmap length is not a multiple of 4",
                     });
                 }
-                let rgb_len =
-                    (image.data.len() / 4)
-                        .checked_mul(3)
-                        .ok_or(RenderError::InvalidInput {
-                            reason: "glyph pixel count overflows the address space bound",
-                        })?;
-                let mut rgb = Vec::with_capacity(rgb_len);
-                for rgba in image.data.chunks_exact(4) {
-                    rgb.extend_from_slice(&rgba[..3]);
+                if matches!(source, GlyphSource::ColorOutline | GlyphSource::ColorBitmap) && emoji {
+                    // Color presentation: keep the composited layers as
+                    // premultiplied RGBA (swash's layer blit is src-over
+                    // against a zeroed buffer, so the bytes are premultiplied
+                    // by coverage) and let the color atlas paint them as-is.
+                    image.data
+                } else {
+                    // Text presentation on a color-only face: flatten to
+                    // `Rgb` so the monochrome path tints by cell foreground.
+                    let rgb_len =
+                        (image.data.len() / 4)
+                            .checked_mul(3)
+                            .ok_or(RenderError::InvalidInput {
+                                reason: "glyph pixel count overflows the address space bound",
+                            })?;
+                    let mut rgb = Vec::with_capacity(rgb_len);
+                    for rgba in image.data.chunks_exact(4) {
+                        rgb.extend_from_slice(&rgba[..3]);
+                    }
+                    rgb
                 }
-                rgb
             }
         };
         let proxy = swash::proxy::MetricsProxy::from_font(&font);
@@ -526,7 +563,16 @@ impl SwashSingle {
         // upstream output is rejected instead of trusted.
         let format = match image.content {
             swash::scale::image::Content::Mask => BitmapFormat::Rgb,
-            swash::scale::image::Content::Color => BitmapFormat::Rgb,
+            swash::scale::image::Content::Color => {
+                // RGBA stays RGBA only when the color presentation kept the
+                // composited layers; the flattened text-presentation bitmap
+                // is three channels.
+                if matches!(source, GlyphSource::ColorOutline | GlyphSource::ColorBitmap) && emoji {
+                    BitmapFormat::Rgba
+                } else {
+                    BitmapFormat::Rgb
+                }
+            }
             swash::scale::image::Content::SubpixelMask => {
                 return Err(RenderError::flatten_rasterizer(
                     "subpixel mask content is not served on this path",
@@ -534,21 +580,46 @@ impl SwashSingle {
             }
         };
         let bitmap = GlyphBitmap::try_new(metrics, format, data)?;
-        Ok((bitmap, source))
+        // Alpha semantics follow the source that won (CTX-1691 review round
+        // 1): the COLR/CPAL layer stack is composited src-over onto a zeroed
+        // buffer and is premultiplied, while a color bitmap strike is a
+        // decoded PNG (CBDT/sbix) that keeps straight alpha. `swash` reports
+        // exactly which one it served, so the atlas un-premultiplies only
+        // where that is valid instead of assuming premultiplied for both.
+        let alpha = match source {
+            GlyphSource::ColorBitmap => AlphaMode::Straight,
+            GlyphSource::ColorOutline | GlyphSource::Outline | GlyphSource::Bitmap => {
+                AlphaMode::Premultiplied
+            }
+        };
+        Ok((bitmap.with_alpha(alpha), source))
     }
 
     /// Probes which source would render `glyph_id` — the cheap coverage
     /// half of [`render_glyph`](Self::render_glyph) without pixel output.
     ///
-    /// Tiered in the same source order the renderer tries
-    /// (outline, bitmap strike, color bitmap strike), so the probe and the
-    /// render agree by construction (verified: space probes `Outline` on
-    /// both, matching the empty-mask render).
+    /// Tiered in the same source order the renderer tries for the cluster's
+    /// presentation (`emoji`: color outline stack, then color bitmap strike,
+    /// then the monochrome sources; otherwise outline, bitmap strike, color
+    /// bitmap strike), so the probe and the render agree by construction
+    /// (verified: space probes `Outline` on both, matching the empty-mask
+    /// render).
     fn probe_source(
         scaler: &mut swash::scale::Scaler<'_>,
         glyph_id: u16,
+        emoji: bool,
     ) -> Option<(GlyphSource, bool)> {
         use swash::scale::StrikeWith;
+        if emoji && scaler.has_color_outlines() && scaler.scale_color_outline(glyph_id).is_some() {
+            return Some((GlyphSource::ColorOutline, false));
+        }
+        if emoji
+            && scaler
+                .scale_color_bitmap(glyph_id, StrikeWith::BestFit)
+                .is_some()
+        {
+            return Some((GlyphSource::ColorBitmap, false));
+        }
         if let Some(outline) = scaler.scale_outline(glyph_id) {
             // Blank-outline reporting powers the ligature-scaffold detector:
             // JetBrains Mono / Cascadia / Fira Code substitute the first
@@ -586,6 +657,31 @@ impl SwashSingle {
         character: char,
         point_size: f32,
     ) -> Result<Option<GlyphSource>, RenderError> {
+        self.glyph_source_for(
+            font,
+            character,
+            point_size,
+            bitty_term_state::EmojiPresentation::Text,
+        )
+    }
+
+    /// [`glyph_source`](Self::glyph_source) under an explicit presentation.
+    ///
+    /// The coverage half of the private single-glyph renderer: emoji
+    /// presentation reports the color layer stack or color strike first, so a
+    /// caller can assert that a face really serves color for a scalar.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::UnknownFontHandle`] for stale handles,
+    /// [`RenderError::InvalidInput`] for non-finite/non-positive sizes.
+    pub fn glyph_source_for(
+        &mut self,
+        font: FontId,
+        character: char,
+        point_size: f32,
+        presentation: bitty_term_state::EmojiPresentation,
+    ) -> Result<Option<GlyphSource>, RenderError> {
         if !(point_size.is_finite() && point_size > 0.0) {
             return Err(RenderError::InvalidInput {
                 reason: "probe size must be finite and positive",
@@ -603,7 +699,10 @@ impl SwashSingle {
             .size(Self::px(point_size))
             .hint(true)
             .build();
-        Ok(Self::probe_source(&mut scaler, glyph_id).map(|(source, _)| source))
+        Ok(
+            Self::probe_source(&mut scaler, glyph_id, presentation.is_emoji())
+                .map(|(source, _)| source),
+        )
     }
 
     /// Cumulative run-cache hits (served without shaping).
@@ -707,7 +806,7 @@ impl SwashSingle {
                 continue;
             }
             let mut scaler = self.scale_ctx.builder(font_ref).size(px).hint(true).build();
-            if Self::probe_source(&mut scaler, glyph_id).is_some() {
+            if Self::probe_source(&mut scaler, glyph_id, false).is_some() {
                 return Some(font);
             }
         }
@@ -756,7 +855,7 @@ impl SwashSingle {
                 continue;
             }
             let mut scaler = self.scale_ctx.builder(font_ref).size(px).hint(true).build();
-            if Self::probe_source(&mut scaler, glyph_id).is_none() {
+            if Self::probe_source(&mut scaler, glyph_id, false).is_none() {
                 continue;
             }
             // Drawable coverage: retain under the session bounds.
@@ -790,9 +889,15 @@ impl SwashSingle {
         point_size: f32,
         features: &[bitty_config::types::OpenTypeFeature],
     ) -> Result<Option<GlyphBitmap>, RenderError> {
-        self.rasterize_shaped_cached_ref(face, glyph_id, point_size, features)?
-            .map(CachedBitmap::to_glyph_bitmap)
-            .transpose()
+        self.rasterize_shaped_cached_ref(
+            face,
+            glyph_id,
+            point_size,
+            features,
+            bitty_term_state::EmojiPresentation::Text,
+        )?
+        .map(CachedBitmap::to_glyph_bitmap)
+        .transpose()
     }
 
     /// Rasterizes one shaped glyph while retaining the packed cache form.
@@ -804,13 +909,15 @@ impl SwashSingle {
         glyph_id: u16,
         point_size: f32,
         features: &[bitty_config::types::OpenTypeFeature],
+        presentation: bitty_term_state::EmojiPresentation,
     ) -> Result<Option<&CachedBitmap>, RenderError> {
         if !(point_size.is_finite() && point_size > 0.0) {
             return Err(RenderError::InvalidInput {
                 reason: "raster size must be finite and positive",
             });
         }
-        let key = ShapedGlyphKey::new(face, glyph_id, point_size, features);
+        let key = ShapedGlyphKey::new(face, glyph_id, point_size, features)
+            .with_presentation(presentation);
         if self.transient_shaped_key == Some(key) {
             return Ok(self.transient_shaped_glyph.as_ref());
         }
@@ -820,8 +927,17 @@ impl SwashSingle {
         }
         let owned = self.stored(face)?.clone();
         let stored = self
-            .render_glyph_checked(&owned, glyph_id, point_size)?
-            .map(CachedBitmap::grayscale)
+            .render_glyph_checked(&owned, glyph_id, point_size, presentation)?
+            .map(|bitmap| {
+                // Color presentation keeps its premultiplied RGBA channels;
+                // the monochrome policy flattens to one coverage byte so the
+                // atlas path and the tint stay unchanged.
+                if presentation.is_emoji() {
+                    CachedBitmap::source(bitmap)
+                } else {
+                    CachedBitmap::grayscale(bitmap)
+                }
+            })
             .transpose()?;
         let stored_bytes = stored.as_ref().map_or(0, CachedBitmap::retained_bytes);
         if stored_bytes > MAX_SHAPED_GLYPH_CACHE_BYTES {
@@ -846,11 +962,17 @@ impl SwashSingle {
         face: &StoredFace,
         glyph_id: u16,
         point_size: f32,
+        presentation: bitty_term_state::EmojiPresentation,
     ) -> Result<Option<GlyphBitmap>, RenderError> {
         if glyph_id == 0 {
             return Ok(None);
         }
-        match self.render_glyph(face, glyph_id, Self::px(point_size)) {
+        match self.render_glyph(
+            face,
+            glyph_id,
+            Self::px(point_size),
+            presentation.is_emoji(),
+        ) {
             Ok((bitmap, _)) => Ok(Some(bitmap)),
             Err(RenderError::UpstreamRasterizer(_)) => Ok(None),
             Err(other) => Err(other),
@@ -1278,7 +1400,12 @@ impl GlyphRasterizer for SwashSingle {
             // in the fallback `resolve` layer above).
             return Ok(None);
         }
-        let (bitmap, _) = self.render_glyph(&owned, glyph_id, Self::px(key.point_size))?;
+        let (bitmap, _) = self.render_glyph(
+            &owned,
+            glyph_id,
+            Self::px(key.point_size),
+            key.wants_color(),
+        )?;
         Ok(Some(bitmap))
     }
 
@@ -1350,9 +1477,17 @@ impl ShapedRunSource for SwashSingle {
         glyph_id: u16,
         point_size: f32,
         features: &[bitty_config::types::OpenTypeFeature],
+        presentation: bitty_term_state::EmojiPresentation,
     ) -> Result<Option<ShapedBitmap<'_>>, RenderError> {
-        SwashSingle::rasterize_shaped_cached_ref(self, face, glyph_id, point_size, features)
-            .map(|bitmap| bitmap.map(|inner| ShapedBitmap { inner }))
+        SwashSingle::rasterize_shaped_cached_ref(
+            self,
+            face,
+            glyph_id,
+            point_size,
+            features,
+            presentation,
+        )
+        .map(|bitmap| bitmap.map(|inner| ShapedBitmap { inner }))
     }
 
     fn note_misaligned(&mut self) {
@@ -1498,6 +1633,7 @@ pub trait ShapedRunSource: GlyphRasterizer {
         glyph_id: u16,
         point_size: f32,
         features: &[bitty_config::types::OpenTypeFeature],
+        presentation: bitty_term_state::EmojiPresentation,
     ) -> Result<Option<ShapedBitmap<'_>>, RenderError>;
 
     /// Records one grid-advance misalignment that degraded to unshaped.
@@ -1512,6 +1648,14 @@ pub trait ShapedRunSource: GlyphRasterizer {
     /// Unknown handles answer `false`: a stale face cannot claim the strict
     /// mono invariant, and the per-cell placement still keeps the grid.
     fn face_is_monospaced(&self, face: FontId) -> bool;
+}
+
+/// Resolves the emoji presentation of a shaped cluster's text slice.
+///
+/// Thin alias of [`bitty_term_state::cluster_presentation_str`] so the shaped
+/// path and the cell/fallback paths share one UTS #51 rule.
+pub(crate) fn cluster_presentation_at(slice: &str) -> bitty_term_state::EmojiPresentation {
+    bitty_term_state::cluster_presentation_str(slice)
 }
 
 /// One shaped cluster: the glyph(s) covering a grid cell range.
@@ -1544,6 +1688,13 @@ pub struct ShapedCluster {
     /// Byte offset of this cluster's text start in the outer run (splice
     /// bookkeeping for tail reshapes; grid emission reads `cells` only).
     pub byte_offset: usize,
+    /// Presentation the cluster's text asks for (CTX-1691).
+    ///
+    /// Resolved from the cluster's scalars — `Emoji_Presentation` default
+    /// overridden by a U+FE0F/U+FE0E in the cluster — and carried into the
+    /// raster key and shaped-glyph key so the color and monochrome bitmaps of
+    /// one glyph id never collide.
+    pub presentation: bitty_term_state::EmojiPresentation,
 }
 
 fn retained_run_bytes(run: &Vec<ShapedCluster>) -> usize {
@@ -1691,10 +1842,13 @@ pub struct ShapedGlyphKey {
     pub size_bits: u32,
     /// Hash of the run feature list (ligature on/off changes the glyph).
     pub features_hash: u64,
+    /// Presentation the cluster asked for (CTX-1691); a color layer stack and
+    /// a monochrome coverage bitmap of the same glyph id are distinct entries.
+    pub presentation: bitty_term_state::EmojiPresentation,
 }
 
 impl ShapedGlyphKey {
-    /// Derives the key for one shaped glyph lookup.
+    /// Derives the text-presentation key for one shaped glyph lookup.
     #[must_use]
     pub fn new(
         face: FontId,
@@ -1707,7 +1861,18 @@ impl ShapedGlyphKey {
             glyph_id,
             size_bits: point_size.to_bits(),
             features_hash: features_hash(features),
+            presentation: bitty_term_state::EmojiPresentation::Text,
         }
+    }
+
+    /// Returns this key under the cluster's resolved presentation.
+    #[must_use]
+    pub const fn with_presentation(
+        mut self,
+        presentation: bitty_term_state::EmojiPresentation,
+    ) -> Self {
+        self.presentation = presentation;
+        self
     }
 }
 
@@ -2157,10 +2322,14 @@ impl SwashSingle {
             })?;
             let col = col_base + cells_for_range(prefix);
             let glyph_id = info.glyph_id;
+            // Presentation is a property of the cluster text (UTS #51): a
+            // trailing U+FE0F or U+FE0E overrides the base's
+            // `Emoji_Presentation` default (CTX-1691).
+            let presentation = cluster_presentation_at(slice);
             // Drawable, not merely mapped: probe the same source order the
             // rasterizer serves (see `probe_source`).
             let probe = (glyph_id != 0)
-                .then(|| Self::probe_source(&mut scaler, glyph_id as u16))
+                .then(|| Self::probe_source(&mut scaler, glyph_id as u16, presentation.is_emoji()))
                 .flatten();
             let covered = probe.is_some();
             let blank_outline = probe.is_some_and(|(_, blank)| blank);
@@ -2174,6 +2343,7 @@ impl SwashSingle {
                 uncovered: !covered,
                 ligature_part: cells > 1,
                 byte_offset: base_offset + start,
+                presentation,
             });
         }
         // CTX-1612: keep shaper output in logical byte order so downstream

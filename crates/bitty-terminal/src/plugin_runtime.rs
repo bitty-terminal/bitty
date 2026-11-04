@@ -25,9 +25,11 @@ use bitty_runtime::plugin_runtime::{
     QueuedPinRequest, SnapshotSource, TargetSource, TranscriptHistory, WorkspaceAttention,
     WorkspaceInfo, WorkspaceSource,
 };
-use bitty_runtime::registry::{PanelError, PanelRegistryConfig, PanelRuntime, PanelType};
+use bitty_runtime::registry::{
+    PanelError, PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId,
+};
 use bitty_runtime::scene_host::SceneHost;
-use bitty_runtime::{TargetAnchorSummary, ViewId, WorkspaceSummary};
+use bitty_runtime::{E_UI_UNAVAILABLE, TargetAnchorSummary, ViewId, WorkspaceSummary};
 
 /// Environment override for a local-path development plugin root.
 ///
@@ -325,6 +327,13 @@ pub(crate) struct PluginSession {
     /// Core-published placement target for the terminal-slot scene
     /// (bitty#2785): the focused leaf id, refreshed by the app each tick.
     pub(crate) scene_target: Rc<Cell<Option<ViewId>>>,
+    /// Core-published `WorkspaceId` of the presented workspace's focused leaf
+    /// (OQ-084 B-2), refreshed by the app each tick.
+    ///
+    /// The `bitty.panel.create` backend reads it; the plugin never writes it
+    /// and no `panel.create` argument can reach it. `None` fails the create
+    /// closed with `E_UI_UNAVAILABLE`.
+    pub(crate) focused_workspace: Rc<Cell<Option<WorkspaceId>>>,
 }
 
 /// Live resolved-keymap source for `bitty.keymaps.list()` (issue #2405).
@@ -448,8 +457,15 @@ pub(crate) fn startup_pin_backend(
 /// host is the scene store (`SceneHost`), so a panel created here and a
 /// scene attached through `ui.mount("terminal", …)` share identity and
 /// generation checking.
+///
+/// OQ-084 B-2: the panel is attributed to the workspace the runtime presents,
+/// read from the Core-published `focused_workspace` cell. With no presented
+/// workspace or no focused leaf, the create fails closed with
+/// `E_UI_UNAVAILABLE` before any record is allocated; the plugin cannot supply
+/// or influence the id because `panel.create` carries only a type string.
 pub(crate) fn startup_panel_create_backend(
     panels: Rc<RefCell<PanelRuntime>>,
+    focused_workspace: Rc<Cell<Option<WorkspaceId>>>,
 ) -> PanelCreateHandler {
     Rc::new(move |panel_type| {
         let parsed = PanelType::parse(panel_type).ok_or_else(|| {
@@ -466,9 +482,16 @@ pub(crate) fn startup_panel_create_backend(
                 "panel.create cannot create terminal panels: plugins create zero-PTY panels only",
             ));
         }
+        let workspace = focused_workspace.get().ok_or_else(|| {
+            BridgeError::new(
+                "runtime",
+                E_UI_UNAVAILABLE,
+                "panel.create has no presented workspace with a focused view",
+            )
+        })?;
         panels
             .borrow_mut()
-            .create_panel(parsed, None)
+            .create_panel(parsed, Some(workspace))
             .map(|handle| (handle.id.0, handle.generation.get()))
             .map_err(|error| match error {
                 PanelError::TooManyPanels { max, .. } => BridgeError::new(
@@ -606,6 +629,12 @@ pub(crate) struct StartupSeed<'a> {
     /// focused leaf so `init.lua` mounts have a deterministic route before
     /// the first tick publishes the live focus.
     pub(crate) scene_target: Option<ViewId>,
+    /// Core-resolved `WorkspaceId` of the presented workspace's focused leaf
+    /// (OQ-084 B-2). Startup seeds it so an activation-time
+    /// `bitty.panel.create` is attributed to the workspace the runtime
+    /// presents; the tick loop keeps it live. `None` fails the create closed
+    /// with `E_UI_UNAVAILABLE` rather than allocating an unattributed record.
+    pub(crate) focused_workspace: Option<WorkspaceId>,
 }
 
 /// Discover and activate installed and development plugins, returning the
@@ -778,11 +807,17 @@ pub(crate) fn discover_with_roots(
     // second layer. A host that cannot be constructed leaves both backends
     // unwired, so granted calls keep failing closed.
     let scene_target = Rc::new(Cell::new(seed.scene_target));
+    // OQ-084 B-2: Core owns the presented workspace identity. The cell starts
+    // at the startup focus and is refreshed by the app tick loop; the plugin
+    // services can only read it through the create backend.
+    let focused_workspace = Rc::new(Cell::new(seed.focused_workspace));
     let panels = match PanelRuntime::new(PanelRegistryConfig::default()) {
         Ok(host) => {
             let panels = Rc::new(RefCell::new(host));
-            runtime
-                .set_panel_create_backend(Some(startup_panel_create_backend(Rc::clone(&panels))));
+            runtime.set_panel_create_backend(Some(startup_panel_create_backend(
+                Rc::clone(&panels),
+                Rc::clone(&focused_workspace),
+            )));
             // bitty#2785: the `terminal` slot's scene host shares the same
             // `PanelRuntime`, so `bitty.ui.mount("terminal", …)` attaches to
             // the panel the present loop resolves by placement.
@@ -917,6 +952,7 @@ pub(crate) fn discover_with_roots(
         history,
         panels,
         scene_target,
+        focused_workspace,
     })
 }
 
@@ -1115,6 +1151,7 @@ mod tests {
             config_file: None,
             config_profile: None,
             scene_target: None,
+            focused_workspace: None,
         };
         let session =
             discover_probe(&seed, root, Some(home), None).expect("dev root must yield a session");
@@ -1192,6 +1229,7 @@ mod tests {
             config_file: Some(&target),
             config_profile: None,
             scene_target: None,
+            focused_workspace: None,
         };
         let manifest_bytes = std::fs::read(plugin.join("bitty-plugin.toml")).expect("manifest");
         let manifest =
@@ -1308,6 +1346,7 @@ mod tests {
             config_file: None,
             config_profile: None,
             scene_target: None,
+            focused_workspace: None,
         }
     }
 
@@ -1454,6 +1493,7 @@ mod tests {
             config_file: None,
             config_profile: None,
             scene_target: None,
+            focused_workspace: None,
         };
         let session =
             discover_probe(&seed, root, None, None).expect("dev root must yield a session");
@@ -1649,6 +1689,7 @@ bitty.commands.register({ id = "pin_unknown", title = "Pin unknown", run = funct
             config_file: None,
             config_profile: None,
             scene_target: None,
+            focused_workspace: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -1881,6 +1922,7 @@ bitty.commands.register({ id = "pulse_shape", title = "Pulse shape", run = funct
             config_file: None,
             config_profile: None,
             scene_target: None,
+            focused_workspace: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -2047,6 +2089,7 @@ bitty.commands.register({ id = "big", title = "Big", run = function()
             config_file: None,
             config_profile: None,
             scene_target: None,
+            focused_workspace: None,
         };
         let session = discover_with_roots(false, 80, 24, &seed, None, vec![root], None, None)
             .expect("dev root must yield a session");
@@ -2447,6 +2490,7 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             config_file: None,
             config_profile: None,
             scene_target: None,
+            focused_workspace: live.focused_workspace_id(),
         };
         discover_probe(&seed, root, None, None)
             .expect("dev root must yield a session")
@@ -2510,7 +2554,9 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
         let panels = Rc::new(RefCell::new(
             PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host"),
         ));
-        let backend = startup_panel_create_backend(Rc::clone(&panels));
+        let workspace = WorkspaceId::new(7);
+        let backend =
+            startup_panel_create_backend(Rc::clone(&panels), Rc::new(Cell::new(Some(workspace))));
         let (id, generation) = backend("rich").expect("rich allocates");
         assert_eq!(panels.borrow().panel_count(), 1);
         assert_eq!(
@@ -2530,6 +2576,30 @@ bitty.commands.register({ id = "create_terminal", title = "Create terminal", run
             1,
             "rejected types allocate nothing"
         );
+    }
+
+    #[test]
+    fn startup_panel_create_backend_fails_closed_without_a_presented_workspace() {
+        // OQ-084 B-2: no presented workspace resolves no identity. The create
+        // must take the typed `E_UI_UNAVAILABLE` branch without allocating a
+        // record, and a later published id must become usable immediately.
+        let panels = Rc::new(RefCell::new(
+            PanelRuntime::new(PanelRegistryConfig::default()).expect("panel host"),
+        ));
+        let presented = Rc::new(Cell::new(None));
+        let backend = startup_panel_create_backend(Rc::clone(&panels), Rc::clone(&presented));
+        let error = backend("rich").expect_err("no workspace must fail closed");
+        assert_eq!(error.class, "runtime");
+        assert_eq!(error.code, E_UI_UNAVAILABLE);
+        assert_eq!(
+            panels.borrow().panel_count(),
+            0,
+            "a failed resolution allocates no record"
+        );
+
+        presented.set(Some(WorkspaceId::new(3)));
+        backend("rich").expect("a published workspace resolves");
+        assert_eq!(panels.borrow().panel_count(), 1);
     }
 
     fn parse_panel_handle(result: &str, context: &str) -> (u64, u64) {
@@ -2710,6 +2780,7 @@ error("activation fails after mounting the terminal slot scene")
             config_file: None,
             config_profile: None,
             scene_target: Some(primary),
+            focused_workspace: rt.focused_workspace_id(),
         };
         let session =
             discover_probe(&seed, root, None, None).expect("dev root must yield a session");

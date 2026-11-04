@@ -115,7 +115,8 @@ pub use cell::{
 pub use cursor::{Cursor, CursorPosition};
 pub use damage::{Damage, DamageRect, DamagedRegion};
 pub use grapheme::{
-    Graphemes, cluster_cell_width, is_extended_pictographic, is_grapheme_extend,
+    EmojiPresentation, Graphemes, cluster_cell_width, cluster_presentation,
+    cluster_presentation_str, is_emoji_presentation, is_extended_pictographic, is_grapheme_extend,
     is_regional_indicator, split_clusters,
 };
 pub use image::{

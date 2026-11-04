@@ -996,6 +996,51 @@ extern "bitty config profile set" [
     --no-print-shell-init
     --no-shell-init
 ]
+extern "bitty config profile edit" [
+    --json
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --yes
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
 extern "bitty config profile path" [
     --json
     --help(-h)

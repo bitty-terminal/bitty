@@ -20,7 +20,7 @@
 //!   hidden local helpers `bitty +list-profiles` and
 //!   `bitty +list-plugins --installed` for `--profile`/`--profile=`,
 //!   `bitty plugin enable|disable <id>`, and the first operand of
-//!   `bitty config profile show|use|path|get|clone|delete|rename <name>`.
+//!   `bitty config profile show|use|path|get|clone|delete|rename|edit <name>`.
 //!   Handlers are read-only, bounded, network-free, VM-free, and silent on
 //!   failure (see [`crate::candidates`]). Nushell extern signatures are
 //!   static, so its generated script documents the static fallback instead.
@@ -229,7 +229,7 @@ fn bash_script() -> String {
 #      or: eval "$(bitty completion bash)" after the bitty binary is on PATH.
 # Static words come from the generated grammar. `--profile`, `plugin
 # enable|disable <id>`, and the first operand of `config profile
-# show|use|path|get|clone|delete|rename <name>` also offer local candidates
+# show|use|path|get|clone|delete|rename|edit <name>` also offer local candidates
 # from the hidden helpers (`+list-profiles`, `+list-plugins --installed`);
 # helper failures and malformed state yield no candidates and never print
 # into the completion stream.
@@ -313,7 +313,7 @@ _bitty_complete() {{
                     ;;
             esac
             ;;
-        "config profile show"|"config profile use"|"config profile path"|"config profile get"|"config profile clone"|"config profile delete"|"config profile rename")
+        "config profile show"|"config profile use"|"config profile path"|"config profile get"|"config profile clone"|"config profile delete"|"config profile rename"|"config profile edit")
             case "$cur" in
                 -*) ;;
                 *)
@@ -347,7 +347,7 @@ fn zsh_script() -> String {
 # Install: bitty completion zsh > ~/.zfunc/_bitty  (with ~/.zfunc on $fpath)
 #      or: eval "$(bitty completion zsh)" after the bitty binary is on PATH.
 # Dynamic values (`--profile`, `plugin enable|disable`, and the first operand
-# of `config profile show|use|path|get|clone|delete|rename`) come from the
+# of `config profile show|use|path|get|clone|delete|rename|edit`) come from the
 # hidden local helpers; failures are silent.
 _bitty_flag_takes_value() {{
     case "$1" in
@@ -429,7 +429,7 @@ _bitty() {{
                 return 0
             fi
             ;;
-        "config profile show"|"config profile use"|"config profile path"|"config profile get"|"config profile clone"|"config profile delete"|"config profile rename")
+        "config profile show"|"config profile use"|"config profile path"|"config profile get"|"config profile clone"|"config profile delete"|"config profile rename"|"config profile edit")
             if [[ "$cur" != -* ]]; then
                 _bitty_profiles "$cur"
                 return 0
@@ -463,7 +463,7 @@ fn fish_script() -> String {
 # Install: bitty completion fish > ~/.config/fish/completions/bitty.fish
 #      or: bitty completion fish | source
 # Dynamic values (`--profile`, `plugin enable|disable`, and the first operand
-# of `config profile show|use|path|get|clone|delete|rename`) come from the
+# of `config profile show|use|path|get|clone|delete|rename|edit`) come from the
 # hidden local helpers; helper failures yield no candidates and never print
 # into the completion stream.
 function __bitty_flag_takes_value
@@ -532,7 +532,7 @@ function __bitty_complete
                 __bitty_installed_plugins
                 return 0
             end
-        case 'config profile show' 'config profile use' 'config profile path' 'config profile get' 'config profile clone' 'config profile delete' 'config profile rename'
+        case 'config profile show' 'config profile use' 'config profile path' 'config profile get' 'config profile clone' 'config profile delete' 'config profile rename' 'config profile edit'
             if not string match -q -- '-*' "$cur"
                 __bitty_profiles
                 return 0
@@ -561,7 +561,7 @@ fn powershell_script() -> String {
 # Install: bitty completion powershell | Out-String | Invoke-Expression
 #      or save it to a file dot-sourced from $PROFILE.
 # Dynamic values (`--profile`, `plugin enable|disable`, and the first operand
-# of `config profile show|use|path|get|clone|delete|rename`) come from the
+# of `config profile show|use|path|get|clone|delete|rename|edit`) come from the
 # hidden local helpers. Helper failures and malformed state produce no
 # candidates and never write diagnostics.
 if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {{
@@ -613,7 +613,7 @@ if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {{
         }}
         # Operand paths are not grammar nodes (`$paths` only carries grammar
         # keys), so their dynamic branches must run before the static lookup.
-        $isOperandPath = $path -in @('plugin enable', 'plugin disable', 'config profile show', 'config profile use', 'config profile path', 'config profile get', 'config profile clone', 'config profile delete', 'config profile rename')
+        $isOperandPath = $path -in @('plugin enable', 'plugin disable', 'config profile show', 'config profile use', 'config profile path', 'config profile get', 'config profile clone', 'config profile delete', 'config profile rename', 'config profile edit')
         $candidates = @()
         if ($wordToComplete -like '--profile=*') {{
             $profilePrefix = '--profile='
@@ -735,7 +735,7 @@ pub fn completion_help_text(invoked_as: &str) -> String {
          per-command flags. Bash, Zsh, Fish, and PowerShell also complete local\n\
          values for `--profile`/`--profile=`, `plugin enable|disable <id>`, and\n\
          the first operand of the named-profile verbs (`config profile show`,\n\
-         `use`, `path`, `get`, `clone`, `delete`, `rename`) from bounded local\n\
+         `use`, `path`, `get`, `clone`, `delete`, `rename`, `edit`) from bounded local\n\
          state (no runtime, plugin VM, or network); Nushell keeps static values.\n\
          Install it with, for example:\n\
          `bitty completion bash > ~/.local/share/bash-completion/completions/bitty`.\n\
@@ -1102,7 +1102,9 @@ mod tests {
         // The dynamic operand cases are hardcoded per shell, so pin the set
         // here: every verb whose first operand names an *existing* profile.
         // `create` is excluded on purpose — it refuses every existing name.
-        const DYNAMIC: &[&str] = &["show", "use", "path", "get", "clone", "delete", "rename"];
+        const DYNAMIC: &[&str] = &[
+            "show", "use", "path", "get", "clone", "delete", "rename", "edit",
+        ];
         // Guard the derivation: a new profile-name verb must either join the
         // dynamic set or be one of the two documented exceptions — `create`
         // (an absent name, so local candidates would all be rejected) and

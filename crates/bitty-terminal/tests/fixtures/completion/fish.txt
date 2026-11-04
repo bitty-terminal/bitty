@@ -2,7 +2,7 @@
 # Install: bitty completion fish > ~/.config/fish/completions/bitty.fish
 #      or: bitty completion fish | source
 # Dynamic values (`--profile`, `plugin enable|disable`, and the first operand
-# of `config profile show|use|path|get|clone|delete|rename`) come from the
+# of `config profile show|use|path|get|clone|delete|rename|edit`) come from the
 # hidden local helpers; helper failures yield no candidates and never print
 # into the completion stream.
 function __bitty_flag_takes_value
@@ -71,7 +71,7 @@ function __bitty_complete
                 __bitty_installed_plugins
                 return 0
             end
-        case 'config profile show' 'config profile use' 'config profile path' 'config profile get' 'config profile clone' 'config profile delete' 'config profile rename'
+        case 'config profile show' 'config profile use' 'config profile path' 'config profile get' 'config profile clone' 'config profile delete' 'config profile rename' 'config profile edit'
             if not string match -q -- '-*' "$cur"
                 __bitty_profiles
                 return 0
@@ -103,7 +103,7 @@ function __bitty_complete
         case 'config'
             printf '%s\n' path check show validate edit profile --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
         case 'config profile'
-            printf '%s\n' create clone rename delete list show use get set path --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+            printf '%s\n' create clone rename delete list show use get set edit path --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
         case 'config profile create'
             printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
         case 'config profile clone'
@@ -121,6 +121,8 @@ function __bitty_complete
         case 'config profile get'
             printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
         case 'config profile set'
+            printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
+        case 'config profile edit'
             printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init
         case 'config profile path'
             printf '%s\n' --json --help --version --verbose --log-level --headless --test-mode --safe --fail-loud --no-splash --split --split-ratio --stack --overlay --layout --focus --config --profile --theme --font-family --font-size --opacity --format --socket --instance --no-color --yes --force --scrollback --close-confirm --gaps-in --gaps-out --border --radius --plugins --no-plugins --with-components --no-with-components --no-components --without-components --print-shell-init --no-print-shell-init --no-shell-init

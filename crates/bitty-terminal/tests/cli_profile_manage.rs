@@ -63,13 +63,24 @@ fn write_selector(root: &Path, profile: &str) {
 
 /// Runs `bitty <args>` under the isolated root; profiles resolve under it.
 fn run_bitty(root: &Path, args: &[&str]) -> Output {
-    Command::new(BITTY_BIN)
+    run_bitty_env(root, args, &[])
+}
+
+/// [`run_bitty`] with extra environment pairs (editor tests).
+fn run_bitty_env(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(BITTY_BIN);
+    command
         .args(args)
         .env("XDG_CONFIG_HOME", root)
         .env("HOME", root)
         .env("NO_COLOR", "1")
         .env_remove("BITTY_CONFIG")
         .env_remove("BITTY_PROFILE")
+        .env_remove("VISUAL");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command
         .output()
         .unwrap_or_else(|err| panic!("spawn {BITTY_BIN:?} {args:?}: {err}"))
 }
@@ -100,6 +111,38 @@ fn assert_exit(output: &Output, code: i32, what: &str) {
         stdout(output),
         stderr(output)
     );
+}
+
+/// Requires exactly one versioned JSON envelope line and returns it.
+fn assert_json_line(output: &Output, what: &str) -> String {
+    assert_ok(output, what);
+    let text = stdout(output);
+    assert_eq!(
+        text.lines().count(),
+        1,
+        "{what} must print one JSON object: {text}"
+    );
+    assert!(
+        text.starts_with("{\"v\":1,"),
+        "{what} must use the versioned envelope: {text}"
+    );
+    text
+}
+
+/// Requires a failed command's one-line JSON envelope to carry `code`.
+fn assert_json_error(output: &Output, code: &str, what: &str) -> String {
+    let text = stdout(output);
+    assert_eq!(
+        text.lines().count(),
+        1,
+        "{what} must print one JSON object: {text}"
+    );
+    assert!(text.contains("\"ok\":false"), "{what}: {text}");
+    assert!(
+        text.contains(&format!("\"code\":\"{code}\"")),
+        "{what} must report {code}: {text}"
+    );
+    text
 }
 
 /// One `config check` row value for `key`, e.g. `font.size`.
@@ -1706,5 +1749,553 @@ fn set_refuses_a_final_body_that_crosses_the_profile_bound() {
         "a refused final body leaves the profile bytes intact"
     );
     assert_no_temp_files(&root, "final body profile bound");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+// ---------------------------------------------------------------------------
+// CTX-1693: seeded create, selector-aware rename, forced delete, edit, dry-run
+// ---------------------------------------------------------------------------
+
+#[test]
+fn create_seeds_from_preset_and_existing_profile_and_force_overwrites() {
+    let root = scratch_root("create-seeded");
+    let seeded = run_bitty(
+        &root,
+        &[
+            "config", "profile", "create", "work", "--preset", "light", "--json",
+        ],
+    );
+    let text = assert_json_line(&seeded, "create --preset light --json");
+    assert!(text.contains("\"action\":\"create\""), "{text}");
+    assert!(text.contains("\"name\":\"work\""), "{text}");
+    assert!(
+        text.contains("\"preset\":\"light\",\"source\":null")
+            || text.contains("\"source\":null,\"preset\":\"light\""),
+        "preset seed is reported: {text}"
+    );
+    assert!(text.contains("\"changed\":true"), "{text}");
+    assert!(text.contains("\"dry_run\":false"), "{text}");
+    let preset_bytes = std::fs::read_to_string(profile_path(&root, "work")).expect("preset");
+    assert!(
+        preset_bytes.contains("github-light"),
+        "the light preset seeds its theme: {preset_bytes}"
+    );
+
+    let from = run_bitty(
+        &root,
+        &[
+            "config", "profile", "create", "copy", "--from", "work", "--json",
+        ],
+    );
+    let text = assert_json_line(&from, "create --from");
+    assert!(text.contains("\"source\":\"work\""), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "copy")).expect("copy"),
+        preset_bytes,
+        "--from copies the source bytes verbatim"
+    );
+
+    let cloned = run_bitty(
+        &root,
+        &["config", "profile", "clone", "copy", "copy2", "--json"],
+    );
+    let text = assert_json_line(&cloned, "clone --json");
+    assert!(text.contains("\"action\":\"clone\""), "{text}");
+    assert!(text.contains("\"source\":\"copy\""), "{text}");
+    assert!(text.contains("\"changed\":true"), "{text}");
+    assert!(text.contains("\"dry_run\":false"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "copy2")).expect("copy2"),
+        preset_bytes
+    );
+
+    let conflict = run_bitty(&root, &["config", "profile", "create", "work", "--json"]);
+    assert_exit(&conflict, 2, "create existing without --force");
+    assert_json_error(&conflict, "E_PROFILE_CONFLICT", "create conflict");
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "work")).expect("work"),
+        preset_bytes,
+        "a conflict never rewrites the profile"
+    );
+
+    let forced = run_bitty(
+        &root,
+        &[
+            "config", "profile", "create", "work", "--preset", "dark", "--force", "--json",
+        ],
+    );
+    let text = assert_json_line(&forced, "create --force --preset dark");
+    assert!(text.contains("\"force\":true"), "{text}");
+    let dark_bytes = std::fs::read_to_string(profile_path(&root, "work")).expect("dark");
+    assert_ne!(dark_bytes, preset_bytes, "--force replaces the bytes");
+    assert!(dark_bytes.contains("theme = \"dark\""), "{dark_bytes}");
+
+    // A failed seed validation never touches the existing profile.
+    let refused = run_bitty(
+        &root,
+        &[
+            "config", "profile", "create", "work", "--preset", "nope", "--force", "--json",
+        ],
+    );
+    assert_exit(&refused, 2, "unknown preset with --force");
+    assert_json_error(&refused, "E_PROFILE_USAGE", "unknown preset");
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "work")).expect("work"),
+        dark_bytes,
+        "a rejected preset leaves the previous bytes intact"
+    );
+
+    let both = run_bitty(
+        &root,
+        &[
+            "config", "profile", "create", "other", "--from", "work", "--preset", "light",
+        ],
+    );
+    assert_exit(&both, 2, "mutually exclusive seeds");
+    assert!(stderr(&both).contains("mutually exclusive"));
+    assert!(!profile_path(&root, "other").exists());
+    assert_no_temp_files(&root, "seeded create");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rename_updates_the_persisted_selector_and_rolls_back_on_failure() {
+    let root = scratch_root("rename-selector");
+    let original = "return { font = { family = \"Mono\", size = 12 } }\n";
+    write_profile(&root, "old", original);
+    write_selector(&root, "old");
+    let renamed = run_bitty(
+        &root,
+        &["config", "profile", "rename", "old", "new", "--json"],
+    );
+    let text = assert_json_line(&renamed, "rename active profile");
+    assert!(text.contains("\"previous\":\"old\""), "{text}");
+    assert!(text.contains("\"selector_updated\":true"), "{text}");
+    assert!(text.contains("\"selector_would_update\":true"), "{text}");
+    assert!(!profile_path(&root, "old").exists());
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "new")).expect("renamed"),
+        original
+    );
+    let selector = std::fs::read_to_string(init_path(&root)).expect("selector");
+    assert!(
+        selector.contains("profile = \"new\""),
+        "rename follows the persisted selector: {selector}"
+    );
+    assert!(!selector.contains("profile = \"old\""), "{selector}");
+
+    // A selector that the prospective merge rejects rolls the rename back:
+    // the fragment stays at the old name and the selector bytes are intact.
+    let bad_root = scratch_root("rename-rollback");
+    write_profile(&bad_root, "old", original);
+    let bad_selector = "return {\n    format = \"bitty-profile-v1\",\n    profile = \"old\",\n    appearance = { theme = \"local:missing-theme\" },\n}\n";
+    std::fs::write(init_path(&bad_root), bad_selector).expect("bad selector");
+    let refused = run_bitty(
+        &bad_root,
+        &["config", "profile", "rename", "old", "new", "--json"],
+    );
+    assert_exit(&refused, 2, "selector-validating rename");
+    assert_json_error(&refused, "E_PROFILE_INVALID", "rename rollback");
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&bad_root, "old")).expect("old profile"),
+        original,
+        "the fragment is never lost"
+    );
+    assert!(!profile_path(&bad_root, "new").exists());
+    assert_eq!(
+        std::fs::read_to_string(init_path(&bad_root)).expect("selector"),
+        bad_selector,
+        "a failed rename leaves the selector untouched"
+    );
+
+    // `--dry-run` predicts the same refusal without any filesystem change.
+    let dry = run_bitty(
+        &bad_root,
+        &[
+            "config",
+            "profile",
+            "rename",
+            "old",
+            "new",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    assert_exit(&dry, 2, "dry-run selector-validating rename");
+    assert_json_error(&dry, "E_PROFILE_INVALID", "dry-run rename rollback");
+    assert!(profile_path(&bad_root, "old").exists());
+    assert!(!profile_path(&bad_root, "new").exists());
+    assert_eq!(
+        std::fs::read_to_string(init_path(&bad_root)).expect("selector"),
+        bad_selector
+    );
+    assert_no_temp_files(&bad_root, "rename rollback");
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&bad_root);
+}
+
+#[test]
+fn delete_force_removes_the_active_profile_and_missing_profiles_are_errors() {
+    let root = scratch_root("delete-force");
+    write_selector(&root, "work");
+    write_profile(&root, "work", "return {}\n");
+    let selector_before = std::fs::read_to_string(init_path(&root)).expect("selector");
+    let refused = run_bitty(&root, &["config", "profile", "delete", "work", "--json"]);
+    assert_exit(&refused, 2, "delete active without --force");
+    assert_json_error(&refused, "E_PROFILE_CONFLICT", "active delete");
+    assert!(profile_path(&root, "work").exists());
+    assert_eq!(
+        std::fs::read_to_string(init_path(&root)).expect("selector"),
+        selector_before,
+        "a refused delete never touches the selector"
+    );
+    let forced = run_bitty(
+        &root,
+        &["config", "profile", "delete", "work", "--force", "--json"],
+    );
+    let text = assert_json_line(&forced, "delete active --force");
+    assert!(text.contains("\"deleted\":true"), "{text}");
+    assert!(text.contains("\"force\":true"), "{text}");
+    assert!(!profile_path(&root, "work").exists());
+
+    let missing = run_bitty(&root, &["config", "profile", "delete", "gone", "--json"]);
+    assert_exit(&missing, 2, "delete missing");
+    assert_json_error(&missing, "E_PROFILE_NOT_FOUND", "delete missing");
+    let plain = run_bitty(&root, &["config", "profile", "delete", "gone"]);
+    assert_exit(&plain, 2, "delete missing text");
+    assert!(stderr(&plain).contains("not found"), "{}", stderr(&plain));
+    assert_no_temp_files(&root, "delete force");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn dry_run_validates_writes_without_touching_the_filesystem() {
+    let root = scratch_root("dry-run");
+    assert_ok(
+        &run_bitty(
+            &root,
+            &["config", "profile", "create", "work", "--preset", "minimal"],
+        ),
+        "seed work",
+    );
+    assert_ok(
+        &run_bitty(&root, &["config", "profile", "create", "other"]),
+        "seed other",
+    );
+    write_selector(&root, "work");
+    let work_before = std::fs::read_to_string(profile_path(&root, "work")).expect("work");
+    let selector_before = std::fs::read_to_string(init_path(&root)).expect("selector");
+
+    let created = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "create",
+            "draft",
+            "--preset",
+            "light",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    let text = assert_json_line(&created, "create --dry-run");
+    assert!(text.contains("\"dry_run\":true"), "{text}");
+    assert!(text.contains("\"changed\":false"), "{text}");
+    assert!(text.contains("\"preset\":\"light\""), "{text}");
+    assert!(!profile_path(&root, "draft").exists());
+
+    let cloned = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "clone",
+            "work",
+            "copy",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    let text = assert_json_line(&cloned, "clone --dry-run");
+    assert!(text.contains("\"dry_run\":true"), "{text}");
+    assert!(!profile_path(&root, "copy").exists());
+
+    let renamed = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "rename",
+            "work",
+            "renamed",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    let text = assert_json_line(&renamed, "rename --dry-run");
+    assert!(text.contains("\"dry_run\":true"), "{text}");
+    assert!(text.contains("\"selector_would_update\":true"), "{text}");
+    assert!(text.contains("\"selector_updated\":false"), "{text}");
+    assert!(profile_path(&root, "work").exists());
+    assert!(!profile_path(&root, "renamed").exists());
+
+    let set = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "set",
+            "work",
+            "font.size",
+            "15",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    let text = assert_json_line(&set, "set --dry-run");
+    assert!(text.contains("\"dry_run\":true"), "{text}");
+    assert!(text.contains("\"changed\":false"), "{text}");
+    assert!(text.contains("\"key\":\"font.size\""), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "work")).expect("work"),
+        work_before
+    );
+
+    let deleted = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "delete",
+            "work",
+            "--force",
+            "--dry-run",
+            "--json",
+        ],
+    );
+    let text = assert_json_line(&deleted, "delete --dry-run");
+    assert!(text.contains("\"deleted\":false"), "{text}");
+    assert!(text.contains("\"dry_run\":true"), "{text}");
+    assert!(text.contains("\"force\":true"), "{text}");
+    assert!(profile_path(&root, "work").exists());
+
+    let used = run_bitty(
+        &root,
+        &["config", "profile", "use", "other", "--dry-run", "--json"],
+    );
+    let text = assert_json_line(&used, "use --dry-run");
+    assert!(text.contains("\"dry_run\":true"), "{text}");
+    assert!(text.contains("\"changed\":false"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(init_path(&root)).expect("selector"),
+        selector_before,
+        "--dry-run never rewrites the selector"
+    );
+
+    let edited = run_bitty(
+        &root,
+        &["config", "profile", "edit", "work", "--dry-run", "--json"],
+    );
+    let text = assert_json_line(&edited, "edit --dry-run");
+    assert!(text.contains("\"dry_run\":true"), "{text}");
+    assert!(text.contains("\"editor\":null"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "work")).expect("work"),
+        work_before
+    );
+
+    // A real set keeps the same stable shape with `dry_run:false`.
+    let written = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "set",
+            "work",
+            "font.size",
+            "16",
+            "--json",
+        ],
+    );
+    let text = assert_json_line(&written, "set --json");
+    assert!(text.contains("\"action\":\"set\""), "{text}");
+    assert!(text.contains("\"key\":\"font.size\""), "{text}");
+    assert!(text.contains("\"value\":16"), "{text}");
+    assert!(text.contains("\"changed\":true"), "{text}");
+    assert!(text.contains("\"dry_run\":false"), "{text}");
+    assert_no_temp_files(&root, "dry-run");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn invalid_names_missing_profiles_and_unknown_keys_exit_non_zero() {
+    let root = scratch_root("invalid-surface");
+    write_profile(
+        &root,
+        "work",
+        "return { font = { family = \"Mono\", size = 12 } }\n",
+    );
+    let before = std::fs::read_to_string(profile_path(&root, "work")).expect("work");
+
+    for name in ["../escape", "Upper", "with space", "name.lua"] {
+        let output = run_bitty(&root, &["config", "profile", "create", name, "--json"]);
+        assert_exit(&output, 2, &format!("invalid new name {name:?}"));
+        assert_json_error(
+            &output,
+            "E_PROFILE_INVALID",
+            &format!("invalid name {name:?}"),
+        );
+        assert!(!profile_path(&root, name).exists());
+    }
+
+    let clone = run_bitty(
+        &root,
+        &["config", "profile", "clone", "work", "Upper", "--json"],
+    );
+    assert_exit(&clone, 2, "invalid clone destination");
+    assert_json_error(&clone, "E_PROFILE_INVALID", "invalid clone destination");
+    assert!(!profile_path(&root, "Upper").exists());
+
+    let rename = run_bitty(
+        &root,
+        &["config", "profile", "rename", "work", "Upper", "--json"],
+    );
+    assert_exit(&rename, 2, "invalid rename destination");
+    assert_json_error(&rename, "E_PROFILE_INVALID", "invalid rename destination");
+
+    let missing = run_bitty(
+        &root,
+        &["config", "profile", "clone", "gone", "copy", "--json"],
+    );
+    assert_exit(&missing, 2, "missing clone source");
+    assert_json_error(&missing, "E_PROFILE_NOT_FOUND", "missing clone source");
+
+    let get = run_bitty(
+        &root,
+        &["config", "profile", "get", "work", "font.nope", "--json"],
+    );
+    assert_exit(&get, 2, "unknown get key");
+    assert_json_error(&get, "E_PROFILE_INVALID", "unknown get key");
+
+    let set = run_bitty(
+        &root,
+        &[
+            "config",
+            "profile",
+            "set",
+            "work",
+            "font.nope",
+            "1",
+            "--json",
+        ],
+    );
+    assert_exit(&set, 2, "unknown set key");
+    assert_json_error(&set, "E_PROFILE_INVALID", "unknown set key");
+
+    let edit = run_bitty(&root, &["config", "profile", "edit", "gone", "--json"]);
+    assert_exit(&edit, 2, "missing edit profile");
+    assert_json_error(&edit, "E_PROFILE_NOT_FOUND", "missing edit profile");
+
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "work")).expect("work"),
+        before,
+        "no refused command rewrites the profile"
+    );
+    assert_no_temp_files(&root, "invalid surface");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+fn write_executable_script(root: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join(name);
+    std::fs::write(&path, body).expect("editor script");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("editor mode");
+    path
+}
+
+#[cfg(unix)]
+fn write_editor_script(root: &Path, content: &str) -> PathBuf {
+    write_executable_script(
+        root,
+        "editor.sh",
+        &format!("#!/bin/sh\ncat > \"$1\" <<'BITTY_LUA'\n{content}BITTY_LUA\n"),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn failing_set_and_edit_keep_the_original_bytes() {
+    let root = scratch_root("atomic-failure");
+    let original = "return {\n    font = { family = \"Mono\", size = 12 },\n}\n";
+    write_profile(&root, "work", original);
+
+    // `set`: schema rejection and an unknown key both leave the bytes intact.
+    for args in [
+        vec!["config", "profile", "set", "work", "font.size", "0"],
+        vec!["config", "profile", "set", "work", "font.nope", "1"],
+    ] {
+        let output = run_bitty(&root, &args);
+        assert_exit(&output, 2, &format!("set {args:?}"));
+        assert_eq!(
+            std::fs::read_to_string(profile_path(&root, "work")).expect("work"),
+            original,
+            "a failed set never rewrites the original bytes"
+        );
+    }
+
+    // `edit`: a syntactically invalid draft is rejected and removed.
+    let invalid = write_editor_script(&root, "return { font = \n");
+    let edited = run_bitty_env(
+        &root,
+        &["config", "profile", "edit", "work", "--json"],
+        &[("EDITOR", invalid.to_str().expect("editor path"))],
+    );
+    assert_exit(&edited, 2, "invalid edit");
+    assert_json_error(&edited, "E_PROFILE_INVALID", "invalid edit");
+    assert!(
+        stderr(&edited).contains("the original profile is unchanged"),
+        "{}",
+        stderr(&edited)
+    );
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "work")).expect("work"),
+        original,
+        "a rejected edit keeps the original bytes"
+    );
+
+    // `edit`: a non-zero editor never reaches validation or the profile.
+    let failing = write_executable_script(&root, "failing-editor.sh", "#!/bin/sh\nexit 7\n");
+    let failed = run_bitty_env(
+        &root,
+        &["config", "profile", "edit", "work", "--json"],
+        &[("EDITOR", failing.to_str().expect("editor path"))],
+    );
+    assert_exit(&failed, 1, "failing editor");
+    assert_json_error(&failed, "E_PROFILE_EDITOR", "failing editor");
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "work")).expect("work"),
+        original
+    );
+
+    // `edit`: validated bytes replace the profile exactly once.
+    let valid = write_editor_script(
+        &root,
+        "return {\n    font = { family = \"Edited\", size = 13 },\n}\n",
+    );
+    let updated = run_bitty_env(
+        &root,
+        &["config", "profile", "edit", "work", "--json"],
+        &[("EDITOR", valid.to_str().expect("editor path"))],
+    );
+    let text = assert_json_line(&updated, "valid edit");
+    assert!(text.contains("\"action\":\"edit\""), "{text}");
+    assert!(text.contains("\"changed\":true"), "{text}");
+    assert_eq!(
+        std::fs::read_to_string(profile_path(&root, "work")).expect("work"),
+        "return {\n    font = { family = \"Edited\", size = 13 },\n}\n"
+    );
+    assert_no_temp_files(&root, "edit");
     let _ = std::fs::remove_dir_all(&root);
 }

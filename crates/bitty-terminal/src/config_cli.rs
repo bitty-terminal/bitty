@@ -1223,7 +1223,7 @@ pub(crate) fn config_usage() -> String {
      \x20 edit      open the file in $VISUAL/$EDITOR (vi fallback), then validate\n\
      \x20           (--safe is rejected: safe mode never reads the edited file)\n\
      \x20 profile   manage named profiles\n\
-     \x20           (create|clone|rename|delete|list|show|use|get|set|path)\n\
+     \x20           (create|clone|rename|delete|list|show|use|get|set|edit|path)\n\
      \n\
      config file: $XDG_CONFIG_HOME/bitty/init.lua (fallback config.lua alias)\n\
      profiles: $XDG_CONFIG_HOME/bitty/profiles/<name>.lua\n\

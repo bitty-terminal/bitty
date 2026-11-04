@@ -759,8 +759,9 @@ pub struct Runtime {
     workspaces: Vec<WorkspaceSlot>,
     /// Next slot `WorkspaceId` raw value (OQ-084 B-2).
     ///
-    /// Monotonic and never reused: a closed workspace's id is not handed to a
-    /// later slot, so a stale panel attribution cannot land in a live bucket.
+    /// Monotonic and not reused except at `u64` exhaustion: a closed
+    /// workspace's id is not handed to a later slot, so a stale panel
+    /// attribution cannot land in a live bucket.
     /// [`Runtime::mint_workspace_id`] is the only writer.
     next_workspace_id_raw: u64,
     /// Active workspace index into `workspaces` (display is 1-based).

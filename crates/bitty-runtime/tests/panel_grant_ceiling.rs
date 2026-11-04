@@ -12,9 +12,23 @@
 //! Every test here fails if the retention is removed, if the derivation reads
 //! the live table, or if an empty ceiling is conflated with an absent
 //! predecessor.
+//!
+//! One boundary is recorded rather than closed. `PGO-22`'s setup is "dispose
+//! `N`, then bind `N+1`, require `R ∩ P` with `P` non-empty", and this registry
+//! has no way to bind `N+1` under `N`'s `PanelId`: `dispose_panel` retires the
+//! record (`panel.rs`, `self.panels.remove(&panel_id.0)`) and `create_panel` is
+//! the only record-creating path, minting a fresh monotonic `PanelId`. A reload
+//! therefore presents phase 0 with an identity that never had a predecessor, so
+//! the retained ceiling is never read on that path.
+//! `a_successor_panel_after_disposal_is_not_bounded_by_the_retained_ceiling`
+//! drives the real path end to end and asserts that, so the next change builds
+//! on the measured behaviour instead of the intended one. The remaining tests
+//! exercise the retention and derivation seams directly, which is what they can
+//! honestly claim.
 
 use bitty_runtime::registry::{
-    Generation, MAX_RETAINED_GRANT_CEILINGS, PanelId, PanelRegistry, PanelRegistryConfig, PanelType,
+    Generation, MAX_RETAINED_GRANT_CEILINGS, PanelError, PanelId, PanelRegistry,
+    PanelRegistryConfig, PanelType,
 };
 use bitty_ui::ViewId;
 use std::collections::BTreeSet;
@@ -63,12 +77,15 @@ fn the_disposal_edge_retains_the_generation_ceiling() {
 }
 
 #[test]
-fn a_rebind_after_the_edge_is_bounded_by_the_retained_ceiling() {
+fn a_bind_after_an_edge_release_reads_the_retained_ceiling() {
     let mut reg = registry();
     let (panel, generation) = bound_panel(&mut reg, &[CREATE, FOCUS], 2);
 
-    // C.5 order: generation N is disposed before N+1 activates, so the edge
-    // release runs first and the live row is already gone when the bind starts.
+    // This exercises the release/derive/install seam on one live panel record:
+    // the edge release runs explicitly, then the bind installs against the
+    // retained record. It is not a reload — the record is never disposed, so
+    // the generation is the same one that released. The disposal path is
+    // `a_successor_panel_after_disposal_is_not_bounded_by_the_retained_ceiling`.
     assert!(
         reg.release_generation_scope(panel, generation)
             .expect("edge release"),
@@ -76,8 +93,8 @@ fn a_rebind_after_the_edge_is_bounded_by_the_retained_ceiling() {
     );
     assert!(!reg.is_panel_capability_granted(panel, generation, CREATE));
 
-    // The successor resolves three capabilities and consents to none. Reading
-    // the drained table would commit `∅` here.
+    // The bind resolves three capabilities and consents to none. Reading the
+    // drained table would commit `∅` here.
     let granted = reg
         .install_rebound_grants(
             panel,
@@ -89,10 +106,104 @@ fn a_rebind_after_the_edge_is_bounded_by_the_retained_ceiling() {
     assert_eq!(
         granted,
         set(&[CREATE, FOCUS]),
-        "P still bounds the successor after the edge"
+        "P still bounds the install after the release"
     );
     assert!(reg.is_panel_capability_granted(panel, generation, CREATE));
     assert!(!reg.is_panel_capability_granted(panel, generation, OVERLAY));
+}
+
+#[test]
+fn a_repeated_edge_release_leaves_the_retained_ceiling_untouched() {
+    let mut reg = registry();
+    let (panel, generation) = bound_panel(&mut reg, &[CREATE, FOCUS], 7);
+
+    assert!(
+        reg.release_generation_scope(panel, generation)
+            .expect("first release"),
+        "an edge with a live row reports the removal"
+    );
+    // `A.2`: a bind repeats these releases in phase 1 as defence in depth, so
+    // the second call is a normal occurrence, not an error path.
+    assert!(
+        !reg.release_generation_scope(panel, generation)
+            .expect("repeat release"),
+        "the repeat finds no live row"
+    );
+
+    let ceiling = reg
+        .retained_grant_ceiling(panel)
+        .expect("the first release retained the ceiling");
+    assert_eq!(ceiling.ended_generation, generation);
+    assert_eq!(
+        ceiling.grants,
+        set(&[CREATE, FOCUS]),
+        "a repeat with no live row must not rewrite the ceiling as the empty set"
+    );
+
+    let granted = reg
+        .install_rebound_grants(
+            panel,
+            generation,
+            &set(&[CREATE, FOCUS, OVERLAY]),
+            &BTreeSet::new(),
+        )
+        .expect("install after the repeat");
+    assert_eq!(
+        granted,
+        set(&[CREATE, FOCUS]),
+        "the ceiling the first release wrote still bounds the install"
+    );
+}
+
+#[test]
+fn a_successor_panel_after_disposal_is_not_bounded_by_the_retained_ceiling() {
+    let mut reg = registry();
+    let (panel, generation) = bound_panel(&mut reg, &[CREATE, FOCUS], 8);
+    reg.dispose_panel(panel, generation).expect("dispose");
+
+    // The disposal edge keeps the ceiling, keyed by the disposed `PanelId`.
+    let ceiling = reg
+        .retained_grant_ceiling(panel)
+        .expect("the disposal edge retains the ceiling");
+    assert_eq!(ceiling.grants, set(&[CREATE, FOCUS]));
+
+    // It also removes the panel record, so the retired identity cannot be
+    // bound again and no successor generation can name it.
+    assert!(
+        matches!(
+            reg.install_rebound_grants(panel, generation, &set(&[CREATE]), &BTreeSet::new()),
+            Err(PanelError::NotFound { kind: "panel", .. })
+        ),
+        "a disposed identity has no record to bind"
+    );
+    let successor = reg
+        .create_panel(PanelType::Helper, None)
+        .expect("create successor");
+    assert_ne!(
+        successor.id, panel,
+        "the successor a reload creates is a new identity"
+    );
+    assert!(
+        reg.retained_grant_ceiling(successor.id).is_none(),
+        "phase 0 of the successor looks up a key the ceiling is not stored under"
+    );
+
+    // Which lands the successor on the absent-predecessor branch: the whole
+    // resolution, unbounded by what the predecessor held. This is the open
+    // `PGO-22` gap, asserted as measured behaviour rather than described.
+    let granted = reg
+        .install_rebound_grants(
+            successor.id,
+            successor.generation,
+            &set(&[CREATE, FOCUS, OVERLAY]),
+            &BTreeSet::new(),
+        )
+        .expect("successor bind");
+    assert_eq!(
+        granted,
+        set(&[CREATE, FOCUS, OVERLAY]),
+        "gap: a real successor is granted all of R because no path binds the retained identity"
+    );
 }
 
 #[test]

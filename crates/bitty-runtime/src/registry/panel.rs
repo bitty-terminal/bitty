@@ -871,9 +871,10 @@ pub struct PanelRegistry {
     capabilities: HashMap<(PanelId, Generation), BTreeSet<String>>,
     /// Generation ceilings retained across the unbind edge (OQ-084 B-4).
     ///
-    /// Written by [`PanelRegistry::release_generation_scope`] before it drops
-    /// the live row, read by [`PanelRegistry::derive_rebind_grants`] at bind
-    /// entry, and cleared by a successful install or a whole-registry dispose.
+    /// Written by [`PanelRegistry::release_generation_scope`], which copies the
+    /// departing generation's grant set here and then removes the live row;
+    /// read by [`PanelRegistry::derive_rebind_grants`] at bind entry; cleared by
+    /// a successful install or a whole-registry dispose.
     retained_ceilings: BTreeMap<PanelId, RetainedGrantCeiling>,
     errors: HashMap<String, u64>,
     disposed: bool,
@@ -1333,9 +1334,10 @@ impl PanelRegistry {
         self.command_registry.unregister_panel(panel_id);
         self.event_bus.clear_panel(panel_id);
         if was_controller {
-            // OQ-084 B-4: the edge release retains the departing generation's
-            // grant set before it removes the live row, so a bind for the
-            // successor reads a real ceiling instead of a drained table.
+            // OQ-084 B-4: the edge release copies the departing generation's
+            // grant set into the retained ceiling and then removes the live
+            // row, so a bind for the successor reads a real ceiling instead of
+            // a drained table.
             self.release_generation_scope(panel_id, generation)?;
         } else {
             // A panel that never mounted and held nothing is not a
@@ -1538,13 +1540,25 @@ impl PanelRegistry {
 
     /// Runs the unbind release for one controller generation (OQ-084 A.2/B-4).
     ///
-    /// Retains the generation's panel-scoped grant set as the next bind's
-    /// ceiling **before** removing the live row, then removes it. The retain
-    /// happens even when the generation held nothing, because "the predecessor
-    /// existed and held `∅`" is a ceiling of `∅` and must not be confused with
-    /// "there is no predecessor" (which grants the successor's whole
-    /// resolution). Callers that are not a generation edge — a rolled-back
-    /// create — must not call this.
+    /// Copies the generation's panel-scoped grant set into the retained ceiling
+    /// record and only then removes the live row, so the ceiling exists for the
+    /// whole window in which the row does not. The copy happens even when the
+    /// generation held nothing, because "the predecessor existed and held `∅`"
+    /// is a ceiling of `∅` and must not be confused with "there is no
+    /// predecessor" (which grants the successor's whole resolution).
+    ///
+    /// A generation that already reached its edge is not released twice: the
+    /// record the first release wrote is left untouched and `false` is
+    /// returned. `A.2` has a bind repeat these releases in phase 1 as defence in
+    /// depth, so the repetition is a normal call, and it must be idempotent —
+    /// "already released" is not a predecessor that held `∅`. Note that an
+    /// unbound generation holds no live row at all, which is why the duplicate
+    /// is detected from the retained `ended_generation` rather than from the
+    /// presence of a row: absence alone cannot tell "held nothing" from
+    /// "already released".
+    ///
+    /// Callers that are not a generation edge — a rolled-back create — must not
+    /// call this.
     ///
     /// Returns `true` when a live row was removed.
     ///
@@ -1556,10 +1570,22 @@ impl PanelRegistry {
         generation: Generation,
     ) -> Result<bool, PanelError> {
         self.ensure_not_disposed()?;
-        let removed = self.capabilities.remove(&(panel_id, generation));
-        let removed_row = removed.is_some();
-        self.retain_grant_ceiling(panel_id, generation, removed.unwrap_or_default());
-        Ok(removed_row)
+        let already_ended = self
+            .retained_ceilings
+            .get(&panel_id)
+            .is_some_and(|ceiling| ceiling.ended_generation == generation);
+        if already_ended {
+            // `A.2`'s phase-1 repeat: this edge ran, so there is nothing to
+            // retain and nothing to overwrite.
+            return Ok(self.capabilities.remove(&(panel_id, generation)).is_some());
+        }
+        let held = self.capabilities.get(&(panel_id, generation)).cloned();
+        let had_row = held.is_some();
+        // A controller generation that held no grant has no row; that is a
+        // ceiling of `∅`, not an absent predecessor.
+        self.retain_grant_ceiling(panel_id, generation, held.unwrap_or_default());
+        self.capabilities.remove(&(panel_id, generation));
+        Ok(had_row)
     }
 
     /// The ceiling phase 0 reads at bind entry (OQ-084 D.2).

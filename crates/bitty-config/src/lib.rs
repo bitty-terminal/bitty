@@ -83,6 +83,8 @@
 
 pub mod error;
 pub mod file;
+#[cfg(feature = "io-denied-harness")]
+pub mod io_harness;
 pub mod keymap;
 pub mod local_theme;
 pub mod merge;
@@ -99,6 +101,7 @@ pub mod types;
 pub mod validation;
 pub mod wheel;
 
+pub use bitty_lua::{ConfigModuleCode, ConfigModuleDiagnostic, ConfigModulePhase};
 pub use error::{ConfigError, ErrorClass};
 pub use keymap::{
     Chord, ChromeAction, HintConfig, KeyName, KeyRef, LEADER_DEFAULT_CHORD_RAW,

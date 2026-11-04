@@ -16,3 +16,11 @@ workspace = true
 [dependencies]
 bitty-lua = { version = "0.0.32", path = "../bitty-lua" }
 bitty-ui = { version = "0.0.32", path = "../bitty-ui" }
+
+[features]
+default = []
+# Test-only I/O denial harness (`bitty#2869` acceptance): denies and records
+# every external configuration read plus every configuration module-loader
+# install, so `--safe` can be proved to perform none. Never enabled for a
+# shipped build.
+io-denied-harness = []

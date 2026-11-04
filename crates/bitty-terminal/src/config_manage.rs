@@ -578,7 +578,9 @@ mod tests {
     }
 
     /// Type-erased resolver the reload context installs (tests).
-    type Resolver = Box<dyn Fn() -> Result<crate::config_reload::ResolvedConfig, String>>;
+    type Resolver = Box<
+        dyn Fn() -> Result<crate::config_reload::ResolvedConfig, crate::config_cli::LoadFailure>,
+    >;
 
     /// Merge the scratch dir exactly as startup does, including the
     /// `--profile`/`BITTY_PROFILE` precedence over the stored selector.

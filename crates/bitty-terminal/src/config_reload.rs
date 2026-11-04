@@ -115,6 +115,11 @@ pub(crate) struct ReloadOutcomeInfo {
     pub(crate) restart_required: Vec<String>,
     /// Detail for `load-error` / `apply-error`; `None` otherwise.
     pub(crate) message: Option<String>,
+    /// The typed `E_CONFIG_MODULE_*` record behind a `load-error`, when the
+    /// failure was a configuration module refusal. The running plan is never
+    /// partially adopted; this is the contract's typed outcome for the reload
+    /// path.
+    pub(crate) module: Option<Box<bitty_config::ConfigModuleDiagnostic>>,
 }
 
 /// Whether the running app adopts `field` live through [`apply_live`].
@@ -676,7 +681,7 @@ struct ReloadContext {
     /// honouring the explicit request.
     profile: Option<String>,
     /// Re-resolve the effective config from the original sources.
-    resolve: Box<dyn Fn() -> Result<ResolvedConfig, String>>,
+    resolve: Box<dyn Fn() -> Result<ResolvedConfig, crate::config_cli::LoadFailure>>,
     watcher: Option<ConfigFileWatcher>,
     path_label: String,
 }
@@ -705,12 +710,13 @@ pub(crate) fn install(
     // file, because `--theme local:<name>` can select a file directly and a
     // directory that does not exist yet becomes observable on creation.
     let theme_dir = bitty_config::local_themes_dir();
-    let resolve: Box<dyn Fn() -> Result<ResolvedConfig, String>> = Box::new(move || {
-        crate::config_cli::load_app_config(&args).map(|app| ResolvedConfig {
-            effective: app.effective,
-            profile: app.profile_name,
-        })
-    });
+    let resolve: Box<dyn Fn() -> Result<ResolvedConfig, crate::config_cli::LoadFailure>> =
+        Box::new(move || {
+            crate::config_cli::load_app_config_typed(&args).map(|app| ResolvedConfig {
+                effective: app.effective,
+                profile: app.profile_name,
+            })
+        });
     install_context(effective, profile, resolve, file_path, theme_dir);
 }
 
@@ -718,7 +724,7 @@ pub(crate) fn install(
 fn install_context(
     effective: EffectiveConfig,
     profile: Option<String>,
-    resolve: Box<dyn Fn() -> Result<ResolvedConfig, String>>,
+    resolve: Box<dyn Fn() -> Result<ResolvedConfig, crate::config_cli::LoadFailure>>,
     watch: Option<PathBuf>,
     theme_dir: Option<PathBuf>,
 ) {
@@ -755,7 +761,7 @@ pub(crate) fn clear() {
 #[cfg(test)]
 pub(crate) fn install_with(
     effective: EffectiveConfig,
-    resolve: Box<dyn Fn() -> Result<ResolvedConfig, String>>,
+    resolve: Box<dyn Fn() -> Result<ResolvedConfig, crate::config_cli::LoadFailure>>,
     watch: Option<PathBuf>,
 ) {
     install_context(effective, None, resolve, watch, None);
@@ -767,7 +773,7 @@ pub(crate) fn install_with(
 pub(crate) fn install_with_profile(
     effective: EffectiveConfig,
     profile: Option<String>,
-    resolve: Box<dyn Fn() -> Result<ResolvedConfig, String>>,
+    resolve: Box<dyn Fn() -> Result<ResolvedConfig, crate::config_cli::LoadFailure>>,
     watch: Option<PathBuf>,
 ) {
     install_context(effective, profile, resolve, watch, None);
@@ -778,7 +784,7 @@ pub(crate) fn install_with_profile(
 #[cfg(test)]
 pub(crate) fn install_with_theme_dir(
     effective: EffectiveConfig,
-    resolve: Box<dyn Fn() -> Result<ResolvedConfig, String>>,
+    resolve: Box<dyn Fn() -> Result<ResolvedConfig, crate::config_cli::LoadFailure>>,
     watch: Option<PathBuf>,
     theme_dir: Option<PathBuf>,
 ) {
@@ -960,7 +966,8 @@ impl ReloadContext {
     fn reload_into(&mut self, runtime: &mut bitty_runtime::Runtime) -> ReloadOutcomeInfo {
         let resolved = match (self.resolve)() {
             Ok(resolved) => resolved,
-            Err(message) => {
+            Err(failure) => {
+                let (message, module) = failure.into_parts();
                 return ReloadOutcomeInfo {
                     path: self.path_label.clone(),
                     kind: "load-error",
@@ -968,6 +975,7 @@ impl ReloadContext {
                     changed: Vec::new(),
                     restart_required: Vec::new(),
                     message: Some(message),
+                    module,
                 };
             }
         };
@@ -1000,6 +1008,7 @@ impl ReloadContext {
                     changed: Vec::new(),
                     restart_required: Vec::new(),
                     message: Some(message),
+                    module: None,
                 };
             }
         }
@@ -1027,6 +1036,7 @@ impl ReloadContext {
             changed,
             restart_required,
             message: None,
+            module: None,
         }
     }
 }
@@ -1865,7 +1875,15 @@ mod tests {
     fn load_error_is_reported_without_touching_runtime() {
         let baseline = bitty_config::fallback_builtin();
         clear();
-        install_with(baseline, Box::new(|| Err(String::from("boom"))), None);
+        install_with(
+            baseline,
+            Box::new(|| {
+                Err(crate::config_cli::LoadFailure::recoverable(String::from(
+                    "boom",
+                )))
+            }),
+            None,
+        );
         let mut runtime = bitty_runtime::Runtime::with_defaults().expect("runtime");
         let info = reload_requested(&mut runtime).expect("context installed");
         assert_eq!(info.kind, "load-error");
@@ -1884,9 +1902,9 @@ mod tests {
         install_with(
             baseline.clone(),
             Box::new(|| {
-                Err(String::from(
+                Err(crate::config_cli::LoadFailure::recoverable(String::from(
                     "bitty: invalid config file '/xdg/bitty/init.lua': syntax error",
-                ))
+                )))
             }),
             None,
         );
@@ -1930,7 +1948,7 @@ mod tests {
         install_with(
             baseline,
             Box::new(move || {
-                crate::config_cli::load_app_config(&resolver_args).map(|app| {
+                crate::config_cli::load_app_config_typed(&resolver_args).map(|app| {
                     crate::config_reload::ResolvedConfig {
                         effective: app.effective,
                         profile: app.profile_name,
@@ -1950,9 +1968,39 @@ mod tests {
         let message = info.message.as_deref().unwrap_or_default();
         assert!(message.contains("E_CONFIG_MODULE_NOT_FOUND"), "{message}");
         assert!(message.contains("module_spec=\"gone\""), "{message}");
+        // Typed-outcome parity: the reload result carries the same record the
+        // other three paths report, not only the flattened message.
+        let diagnostic = info.module.as_deref().expect("typed module record");
+        assert_eq!(diagnostic.code().as_str(), "E_CONFIG_MODULE_NOT_FOUND");
+        assert_eq!(diagnostic.phase.as_str(), "resolve");
+        assert_eq!(diagnostic.module_spec.as_deref(), Some(b"gone".as_slice()));
+        assert!(!message.contains("lua/gone.lua"), "{message}");
+        assert!(!message.contains("dev="), "{message}");
         // The previous plan is still the running plan.
         assert_eq!(runtime.config().font_size, launched.font_size);
+
+        // A module that raises keeps its message in `detail` but never echoes
+        // the module body: a secret-shaped constant on another line must not
+        // reach the reload result, and neither must the module file path.
+        std::fs::write(
+            dir.join("lua/boom.lua"),
+            "local token = 'sk-live-DO-NOT-ECHO'\nerror('module exploded')\n",
+        )
+        .expect("write raising module");
+        std::fs::write(&path, "return { theme = require('boom').theme }\n")
+            .expect("write raising config");
+        let info = reload_requested(&mut runtime).expect("context installed");
+        assert_eq!(info.kind, "load-error", "{info:?}");
+        let message = info.message.as_deref().unwrap_or_default();
+        let diagnostic = info.module.as_deref().expect("typed module record");
+        assert_eq!(diagnostic.code().as_str(), "E_CONFIG_MODULE_EVAL");
+        assert!(message.contains("module_spec=\"boom\""), "{message}");
+        assert!(message.contains("module exploded"), "{message}");
+        assert!(!message.contains("sk-live-DO-NOT-ECHO"), "{message}");
+        assert!(!message.contains("lua/boom.lua"), "{message}");
+        assert_eq!(runtime.config().font_size, launched.font_size);
         clear();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1977,7 +2025,7 @@ mod tests {
         install_with(
             baseline.clone(),
             Box::new(move || {
-                crate::config_cli::load_app_config(&resolver_args).map(|app| {
+                crate::config_cli::load_app_config_typed(&resolver_args).map(|app| {
                     crate::config_reload::ResolvedConfig {
                         effective: app.effective,
                         profile: app.profile_name,
@@ -2150,7 +2198,11 @@ mod tests {
         install_with_profile(
             bitty_config::fallback_builtin(),
             Some(String::from("default")),
-            Box::new(|| Err(String::from("boom"))),
+            Box::new(|| {
+                Err(crate::config_cli::LoadFailure::recoverable(String::from(
+                    "boom",
+                )))
+            }),
             None,
         );
         assert!(classify_profile_switch("work"));
@@ -2256,7 +2308,8 @@ mod tests {
         let resolver = Box::new(move || {
             let mut config = bitty_config::fallback_builtin();
             config.appearance.theme = Some(String::from("local:sunset"));
-            bitty_config::local_theme::apply_selection_from_dir(&mut config, &resolver_dir)?;
+            bitty_config::local_theme::apply_selection_from_dir(&mut config, &resolver_dir)
+                .map_err(crate::config_cli::LoadFailure::recoverable)?;
             Ok(config.into())
         });
         clear();

@@ -181,6 +181,14 @@ pub enum ConfigInput {
     },
     /// Invalid config; carries the user-facing error text.
     Invalid(String),
+    /// A configuration module refusal (`E_CONFIG_MODULE_*`). The typed record
+    /// is kept so `doctor` reports the same code, phase, spec, source,
+    /// aggregate, and bounded detail the other three paths report, instead of
+    /// flattening it into a generic invalid-config string.
+    Module {
+        /// The contract's typed loader refusal.
+        diagnostic: Box<bitty_config::ConfigModuleDiagnostic>,
+    },
 }
 
 /// Keymap resolution outcome for the effective config.
@@ -243,6 +251,18 @@ pub fn check_config(input: &ConfigInput) -> DoctorCheck {
             "run `bitty config check` for per-key sources, fix the file, then re-run `bitty doctor`"
                 .to_string(),
             truncate(msg, 300),
+        ),
+        ConfigInput::Module { diagnostic } => DoctorCheck::fail(
+            "config",
+            "Configuration file",
+            EXIT_CONFIG,
+            format!(
+                "{} in the configuration module graph; run `bitty config check`, fix the module, then re-run `bitty doctor`",
+                diagnostic.code()
+            ),
+            // The typed record already bounds and escapes every field, so the
+            // doctor detail is the same allowlisted render the other paths use.
+            diagnostic.render(),
         ),
     }
 }
@@ -1149,7 +1169,7 @@ fn truncate(raw: &str, max: usize) -> String {
 // ---------------------------------------------------------------------------
 
 use crate::cli::Args;
-use crate::config_cli::load_merged_config;
+use crate::config_cli::load_merged_config_typed;
 use crate::version::version_semver;
 
 /// Clipboard helpers probed on `PATH` in order (Wayland first, then X11).
@@ -1187,7 +1207,7 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
         Ok(path) => (true, path.display().to_string()),
         Err(_) => (false, String::new()),
     };
-    let (config, keymaps, font_chain, font_probe) = match load_merged_config(args) {
+    let (config, keymaps, font_chain, font_probe) = match load_merged_config_typed(args) {
         Ok(loaded) => {
             let file_path = loaded
                 .probed
@@ -1216,17 +1236,18 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
             );
             (config, keymaps, chain, Some(probe))
         }
-        Err(message) => {
+        Err(failure) => {
             let chain: Vec<String> = bitty_config::types::FONT_FALLBACK_CHAIN
                 .iter()
                 .map(|name| (*name).to_string())
                 .collect();
-            (
-                ConfigInput::Invalid(message),
-                KeymapInput::Skipped,
-                chain,
-                None,
-            )
+            let config = match failure.module_diagnostic() {
+                Some(diagnostic) => ConfigInput::Module {
+                    diagnostic: Box::new(diagnostic.clone()),
+                },
+                None => ConfigInput::Invalid(failure.message),
+            };
+            (config, KeymapInput::Skipped, chain, None)
         }
     };
     let font_tool_available = find_on_path("fc-match").is_some();
@@ -1513,6 +1534,42 @@ mod tests {
         assert_eq!(report.exit_code(), EXIT_CONFIG);
         let worst = report.worst_failure().expect("worst failure");
         assert_eq!(worst.id, "config");
+    }
+
+    #[test]
+    fn module_config_failure_yields_exit_three_and_a_typed_redacted_row() {
+        use bitty_config::{ConfigModuleCode, ConfigModuleDiagnostic, ConfigModulePhase};
+        let mut inputs = healthy_inputs();
+        inputs.config = ConfigInput::Module {
+            diagnostic: Box::new(
+                ConfigModuleDiagnostic::new(ConfigModuleCode::NotFound, ConfigModulePhase::Resolve)
+                    .with_spec(b"missing.module".to_vec())
+                    .with_detail("neither the flat module nor the init module exists"),
+            ),
+        };
+        inputs.keymaps = KeymapInput::Skipped;
+        let report = assemble_report(&inputs);
+        assert_eq!(report.exit_code(), EXIT_CONFIG);
+        let worst = report.worst_failure().expect("worst failure");
+        assert_eq!(worst.id, "config");
+        // Typed-outcome parity: the row carries the contract record, not only a
+        // generic invalid-config string.
+        assert!(
+            worst.detail.contains("E_CONFIG_MODULE_NOT_FOUND"),
+            "{worst:?}"
+        );
+        assert!(worst.detail.contains("phase=resolve"), "{worst:?}");
+        assert!(
+            worst.detail.contains("module_spec=\"missing.module\""),
+            "{worst:?}"
+        );
+        assert!(
+            worst.hint.contains("E_CONFIG_MODULE_NOT_FOUND"),
+            "{worst:?}"
+        );
+        // Redaction: no host path, canonical root, or identity tuple.
+        assert!(!worst.detail.contains("lua/"), "{worst:?}");
+        assert!(!worst.detail.contains("dev="), "{worst:?}");
     }
 
     #[test]

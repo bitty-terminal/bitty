@@ -61,13 +61,33 @@ fn run_bitty(root: &Path, args: &[&str]) -> Output {
 
 /// Run with a hard deadline, so a read that would block is a failure instead
 /// of a hung test (the contract: "a test that hangs is a defect, not a pass").
+///
+/// Stdout and stderr are drained on reader threads while the child runs. A
+/// polling loop that only calls `try_wait` deadlocks as soon as the child
+/// writes more than one pipe buffer (`config check` prints every keymap row,
+/// about 10 KiB, and the buffer here is 8 KiB), which looked like a blocked
+/// configuration read.
 #[cfg(unix)]
 fn run_bitty_within(root: &Path, args: &[&str], limit: Duration) -> Output {
+    use std::io::Read;
+
     let mut child = base_command(root, args)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap_or_else(|err| panic!("spawn bitty {args:?}: {err}"));
+    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut bytes);
+        bytes
+    });
     let deadline = Instant::now() + limit;
     loop {
         match child.try_wait() {
@@ -75,13 +95,20 @@ fn run_bitty_within(root: &Path, args: &[&str], limit: Duration) -> Output {
             Ok(None) if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
                 panic!("bitty {args:?} did not finish inside {limit:?}; a read blocked");
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
             Err(err) => panic!("wait on bitty {args:?}: {err}"),
         }
     }
-    child.wait_with_output().expect("collect output")
+    let status = child.wait().expect("reap bitty");
+    Output {
+        status,
+        stdout: stdout_reader.join().expect("stdout reader"),
+        stderr: stderr_reader.join().expect("stderr reader"),
+    }
 }
 
 fn stdout(output: &Output) -> String {
@@ -203,8 +230,93 @@ fn config_check_reports_a_cycle_with_the_chain() {
 }
 
 #[test]
+fn config_check_reports_a_typed_record_and_redacts_paths_and_module_source() {
+    let root = scratch_root("check-redaction");
+    // A module with a secret-shaped constant on its own line and a runtime
+    // refusal. The record may carry the spec and the raised message, never the
+    // file body or a resolved module path.
+    write_module(
+        &root,
+        "leak.lua",
+        "local token = 'sk-live-DO-NOT-ECHO'\nerror('module exploded')\n",
+    );
+    write_init(&root, "return { theme = require('leak').theme }\n");
+
+    let check = run_bitty(&root, &["config", "check"]);
+    assert_eq!(check.status.code(), Some(2), "{}", stdout(&check));
+    let text = format!("{}{}", stdout(&check), stderr(&check));
+    // Typed outcome parity: code, phase, spec, and source are present.
+    assert!(text.contains("E_CONFIG_MODULE_EVAL"), "{text}");
+    assert!(text.contains("phase=evaluate"), "{text}");
+    assert!(text.contains("module_spec=\"leak\""), "{text}");
+    // Redaction: no module file path, no canonical root, no file body.
+    assert!(!text.contains("lua/leak.lua"), "{text}");
+    assert!(!text.contains("leak.lua:"), "{text}");
+    assert!(!text.contains("sk-live-DO-NOT-ECHO"), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn config_check_json_carries_the_typed_module_code() {
+    let root = scratch_root("check-json");
+    write_init(&root, "return require('missing.module')\n");
+
+    let check = run_bitty(&root, &["config", "check", "--format", "json"]);
+    assert_eq!(check.status.code(), Some(2), "{}", stdout(&check));
+    let text = stdout(&check);
+    // N-6: per-finding records only, no graph, no path, no identity tuple.
+    assert!(
+        text.contains("\"code\":\"E_CONFIG_MODULE_NOT_FOUND\""),
+        "{text}"
+    );
+    assert!(!text.contains("lua/missing"), "{text}");
+    assert!(!text.contains("dev="), "{text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn config_check_and_doctor_report_the_same_root_refusal() {
+    // A missing `<config>/lua` root is one record per generation with
+    // `phase=root`, no `module_spec`, and never `NOT_FOUND`; both strict paths
+    // must show that same record (contract: one loader, one validation
+    // sequence, no divergent second parser).
+    let root = scratch_root("root-refusal");
+    write_init(&root, "return require('anything')\n");
+    std::fs::remove_dir_all(root.join("bitty").join("lua")).expect("remove module root");
+
+    let check = run_bitty(&root, &["config", "check"]);
+    assert_eq!(check.status.code(), Some(2), "{}", stdout(&check));
+    let check_text = format!("{}{}", stdout(&check), stderr(&check));
+    assert!(check_text.contains("E_CONFIG_MODULE_ROOT"), "{check_text}");
+    assert!(
+        !check_text.contains("E_CONFIG_MODULE_NOT_FOUND"),
+        "{check_text}"
+    );
+    assert!(check_text.contains("phase=root"), "{check_text}");
+    assert!(!check_text.contains("module_spec="), "{check_text}");
+
+    let doctor = run_bitty(&root, &["doctor"]);
+    assert_ne!(doctor.status.code(), Some(0), "{}", stdout(&doctor));
+    let doctor_text = format!("{}{}", stdout(&doctor), stderr(&doctor));
+    assert!(
+        doctor_text.contains("E_CONFIG_MODULE_ROOT"),
+        "{doctor_text}"
+    );
+    assert!(
+        !doctor_text.contains("E_CONFIG_MODULE_NOT_FOUND"),
+        "{doctor_text}"
+    );
+    assert!(doctor_text.contains("phase=root"), "{doctor_text}");
+    assert!(!doctor_text.contains("module_spec="), "{doctor_text}");
+    // N-11: no canonical root or host path in the record.
+    assert!(!doctor_text.contains("lua/"), "{doctor_text}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn doctor_reports_a_module_failure_and_exits_non_zero() {
     let root = scratch_root("doctor");
+    write_module(&root, "missing.lua", "return { theme = 'bitty-dark' }");
     write_init(&root, "return require('nope')\n");
 
     let doctor = run_bitty(&root, &["doctor"]);
@@ -217,6 +329,10 @@ fn doctor_reports_a_module_failure_and_exits_non_zero() {
     );
     let text = format!("{}{}", stdout(&doctor), stderr(&doctor));
     assert!(text.contains("E_CONFIG_MODULE_NOT_FOUND"), "{text}");
+    // The diagnosis row carries the same typed record as the check path.
+    assert!(text.contains("module_spec=\"nope\""), "{text}");
+    assert!(text.contains("phase=resolve"), "{text}");
+    assert!(!text.contains("lua/nope.lua"), "{text}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

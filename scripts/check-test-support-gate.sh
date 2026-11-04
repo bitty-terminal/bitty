@@ -50,10 +50,27 @@ readonly -a test_only_features=(
 alternation="$(printf '%s\n' "${test_only_features[@]}" | paste -sd '|' -)"
 readonly pattern="feature \"(${alternation})\""
 
-# Check 1: the pattern must match each listed name.
+# The full dev feature graph. It is also the only place a *dependency's*
+# test-only feature can be proven to exist (e.g. `bitty-ipc`'s `test-support`
+# is declared outside this workspace), so it is resolved before check 1.
+full="$(cargo tree --workspace --locked --target all -e features)"
+
+# Check 1: every listed name must be a real feature — declared by a workspace
+# manifest, or visible in the dev graph for a dependency feature. Rebuilding
+# the expectation from `pattern` would make this check tautological (a typo
+# would edit both sides at once), so resolve against the manifests instead.
 for feature in "${test_only_features[@]}"; do
-  if ! grep -qE "$pattern" <<<"feature \"$feature\""; then
-    echo "check-test-support-gate: self-check failed: pattern misses 'feature \"$feature\"'" >&2
+  declared="$(awk -v want="$feature" '
+    /^\[/ { in_features = ($0 == "[features]"); next }
+    in_features {
+      name = $1
+      sub(/=.*$/, "", name)
+      gsub(/[[:space:]]/, "", name)
+      if (name == want) { print "yes" }
+    }
+  ' Cargo.toml crates/*/Cargo.toml)"
+  if [ -z "$declared" ] && ! grep -qF "feature \"$feature\"" <<<"$full"; then
+    echo "check-test-support-gate: self-check failed: '$feature' is not a declared feature (typo, or the feature was renamed/removed)" >&2
     exit 1
   fi
 done
@@ -92,8 +109,7 @@ if [ -n "$unlisted" ]; then
   exit 1
 fi
 
-# Check 3: the pattern must still see the dev graph.
-full="$(cargo tree --workspace --locked --target all -e features)"
+# Check 3: the pattern must still see the dev graph (reuses `full`, above).
 if ! grep -qE "$pattern" <<<"$full"; then
   echo "check-test-support-gate: self-check failed: no test-only feature in the dev graph" >&2
   echo "  (cargo tree output format changed, or no crate uses one any more)" >&2

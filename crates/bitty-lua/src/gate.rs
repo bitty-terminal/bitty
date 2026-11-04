@@ -153,6 +153,40 @@ pub fn build_plugin_vm(
     }
 }
 
+/// Builder-preserving constructor for a configuration VM.
+///
+/// Same fail-closed budget rule as [`build_plugin_vm`]: explicit RC-1/RC-2
+/// budgets are mandatory, and no VM is constructed when they are missing or
+/// zero. The VM carries the restricted configuration stdlib (no `io`, `os`,
+/// `debug`, `package`, `load`/`loadfile`/`dofile`, `_G`, `coroutine`,
+/// `tonumber`, `print`) rather than the plugin baseline. `require` stays
+/// absent until a caller installs the restricted configuration module loader
+/// (`LuaVm::install_config_require`), which is the only supported loader for
+/// this VM.
+///
+/// # Errors
+///
+/// [`VmError::Budget`](crate::VmError) when `budgets` is `None` or fails
+/// validation.
+pub fn build_config_vm(
+    id: impl Into<String>,
+    budgets: Option<VmBudgets>,
+) -> Result<LuaVm, VmError> {
+    let budgets = budgets.ok_or_else(|| {
+        VmError::Budget(
+            "configuration VM requires explicit RC-1/RC-2 budgets (fail-closed)".to_string(),
+        )
+    })?;
+    budgets.validate()?;
+    Ok(LuaVm::with_config_budgets(
+        id,
+        budgets.instruction_budget,
+        budgets.wall_budget_ms,
+        budgets.warning_ms,
+        budgets.memory_limit,
+    ))
+}
+
 /// Load policy selecting which plugin candidates may load.
 ///
 /// The safe policy (`--safe`) admits zero third-party plugins: selection

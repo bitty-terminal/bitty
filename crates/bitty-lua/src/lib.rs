@@ -73,6 +73,7 @@ use std::time::{Duration, Instant};
 use phodopus::{Closure, Executor, ExecutorMode, Fuel, Lua, StashedExecutor, Value, Variadic};
 
 pub mod config;
+pub mod config_require;
 pub mod error;
 pub mod gate;
 pub mod host;
@@ -84,6 +85,14 @@ pub mod store;
 pub mod ui;
 pub mod ui_catalog;
 pub mod ui_rich;
+
+pub use config_require::{
+    ConfigModuleAggregate, ConfigModuleCode, ConfigModuleDiagnostic, ConfigModulePhase,
+    ConfigModuleStats, MAX_MODULE_AGGREGATE_BYTES, MAX_MODULE_COUNT, MAX_MODULE_DEPTH,
+    MAX_MODULE_DETAIL_BYTES, MAX_MODULE_FILE_BYTES, MAX_MODULE_FILE_LINES, MAX_MODULE_LINE_BYTES,
+    MAX_MODULE_SEGMENT_BYTES, MAX_MODULE_SPEC_BYTES, MAX_MODULE_SPEC_SEGMENTS, MODULE_DIR_NAME,
+    ModuleSpec, escape_rendered,
+};
 
 pub use config::{
     AnimationsData, ColorsData, ConfigData, ConfigOutcome, DecorationData, FontData, KeymapData,
@@ -798,6 +807,10 @@ pub struct LuaVm {
     pub(crate) in_bridge_call: Rc<Cell<bool>>,
     /// Source-only module root used by the injected `require`.
     pub(crate) module_root: Option<PathBuf>,
+    /// Configuration module loader state (one generation), installed only by
+    /// [`LuaVm::install_config_require`]. `None` means configuration Lua has
+    /// no `require` at all, which is the `--safe` posture.
+    pub(crate) config_modules: Option<Rc<RefCell<config_require::ConfigModuleGeneration>>>,
     /// Whether the `bitty` host module has been installed.
     pub(crate) host_installed: bool,
     /// Bounded marshalling limits for this VM.
@@ -934,6 +947,7 @@ impl LuaVm {
             capture: Rc::new(RefCell::new(host::RegistrationCapture::new())),
             in_bridge_call: Rc::new(Cell::new(false)),
             module_root: None,
+            config_modules: None,
             host_installed: false,
             marshalling_limits: host::MarshallingLimits::default(),
             host_deadline_ms: Rc::new(Cell::new(host::DEFAULT_HOST_DEADLINE_MS)),

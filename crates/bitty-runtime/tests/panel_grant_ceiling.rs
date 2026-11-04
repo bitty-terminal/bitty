@@ -1,34 +1,31 @@
 #![forbid(unsafe_code)]
-//! OQ-084 B-4: the predecessor grant ceiling survives the unbind edge.
+//! OQ-084 B-4/D.2: the predecessor grant ceiling survives the unbind edge.
 //!
-//! The third review's finding: the edge release (`A.2`, routed through `C.2`)
-//! removes `(PanelId, N)`'s grant rows before `N+1` binds, so phase 0 read an
-//! empty table and `grant(n+1) = (R ∩ ∅) ∪ C = C` — a reloaded generation that
-//! either holds nothing or (worse) is read as having no ceiling at all. The fix
-//! is one answer for where `P` lives: the edge writes the departing generation's
-//! set into a retained per-panel record, and phase 0 reads that record, never
-//! the live table.
+//! The edge release (`A.2`, routed through `C.2`) removes `(PanelId, N)`'s
+//! grant row before `N+1` binds, so phase 0 must not read the live table. The
+//! release writes a retired-ceiling tombstone first, even when the generation
+//! held nothing, and phase 0 reads that tombstone on the reload path or the live
+//! row when it displaces a still-bound predecessor.
 //!
-//! Every test here fails if the retention is removed, if the derivation reads
-//! the live table, or if an empty ceiling is conflated with an absent
-//! predecessor.
+//! The contract these tests pin:
 //!
-//! One boundary is recorded rather than closed. `PGO-22`'s setup is "dispose
-//! `N`, then bind `N+1`, require `R ∩ P` with `P` non-empty", and this registry
-//! has no way to bind `N+1` under `N`'s `PanelId`: `dispose_panel` retires the
-//! record (`panel.rs`, `self.panels.remove(&panel_id.0)`) and `create_panel` is
-//! the only record-creating path, minting a fresh monotonic `PanelId`. A reload
-//! therefore presents phase 0 with an identity that never had a predecessor, so
-//! the retained ceiling is never read on that path.
-//! `a_successor_panel_after_disposal_is_not_bounded_by_the_retained_ceiling`
-//! drives the real path end to end and asserts that, so the next change builds
-//! on the measured behaviour instead of the intended one. The remaining tests
-//! exercise the retention and derivation seams directly, which is what they can
-//! honestly claim.
+//! - a tombstone for the record's last controller generation bounds the
+//!   successor; an empty tombstone is a real empty ceiling;
+//! - a panel record that names a previous controller but has no matching
+//!   tombstone refuses the bind (`PanelError::CeilingLost`) instead of granting
+//!   the whole resolution;
+//! - panel disposal drops the tombstone with the container, so a later panel is
+//!   a first bind and not a reload of the retired identity;
+//! - the table holds one entry per panel and is bounded by the live-panel
+//!   budget, so another panel's edge can never evict a protected ceiling.
+//!
+//! The lost-tombstone refusal is also unit-tested inside `registry::panel`,
+//! where the invariant can be violated deliberately; the public path never
+//! produces that state.
 
 use bitty_runtime::registry::{
-    Generation, MAX_RETAINED_GRANT_CEILINGS, PanelError, PanelId, PanelRegistry,
-    PanelRegistryConfig, PanelType,
+    Generation, MAX_PANELS_PER_WINDOW, MAX_RETAINED_GRANT_CEILINGS, PanelError, PanelId,
+    PanelRegistry, PanelRegistryConfig, PanelType,
 };
 use bitty_ui::ViewId;
 use std::collections::BTreeSet;
@@ -39,6 +36,14 @@ const OVERLAY: &str = "panel.overlay";
 
 fn registry() -> PanelRegistry {
     PanelRegistry::new(PanelRegistryConfig::default()).expect("panel registry builds")
+}
+
+fn registry_with_max_panels(max_panels_per_window: usize) -> PanelRegistry {
+    let config = PanelRegistryConfig {
+        max_panels_per_window,
+        ..PanelRegistryConfig::default()
+    };
+    PanelRegistry::new(config).expect("panel registry builds")
 }
 
 fn set(items: &[&str]) -> BTreeSet<String> {
@@ -60,32 +65,42 @@ fn bound_panel(reg: &mut PanelRegistry, grants: &[&str], view: u64) -> (PanelId,
 }
 
 #[test]
-fn the_disposal_edge_retains_the_generation_ceiling() {
+fn an_edge_release_retains_the_generation_ceiling() {
     let mut reg = registry();
     let (panel, generation) = bound_panel(&mut reg, &[CREATE, FOCUS], 1);
-    reg.dispose_panel(panel, generation).expect("dispose");
+    reg.release_generation_scope(panel, generation)
+        .expect("edge release");
 
     let ceiling = reg
         .retained_grant_ceiling(panel)
-        .expect("the terminal edge retains the ceiling it releases");
+        .expect("the terminal edge writes the retired-ceiling tombstone");
     assert_eq!(ceiling.ended_generation, generation);
     assert_eq!(ceiling.grants, set(&[CREATE, FOCUS]));
+    assert_eq!(
+        reg.last_controller_generation(panel),
+        Some(generation),
+        "the record retains the ended controller across the unbind"
+    );
     assert!(
         !reg.is_panel_capability_granted(panel, generation, CREATE),
         "the live row is still released: retention is a copy, not a lease"
     );
+    assert!(
+        reg.panel_state(panel, generation).is_ok(),
+        "the unbind release keeps the panel container and its record"
+    );
 }
 
 #[test]
-fn a_bind_after_an_edge_release_reads_the_retained_ceiling() {
+fn a_bind_after_an_edge_release_reads_the_retired_ceiling() {
     let mut reg = registry();
     let (panel, generation) = bound_panel(&mut reg, &[CREATE, FOCUS], 2);
 
     // This exercises the release/derive/install seam on one live panel record:
     // the edge release runs explicitly, then the bind installs against the
-    // retained record. It is not a reload — the record is never disposed, so
-    // the generation is the same one that released. The disposal path is
-    // `a_successor_panel_after_disposal_is_not_bounded_by_the_retained_ceiling`.
+    // tombstone. It is not a reload to a new allocation generation; the
+    // registry has no path that re-binds the same `PanelId` under a new
+    // generation, so the seam is what can honestly be claimed here.
     assert!(
         reg.release_generation_scope(panel, generation)
             .expect("edge release"),
@@ -94,7 +109,8 @@ fn a_bind_after_an_edge_release_reads_the_retained_ceiling() {
     assert!(!reg.is_panel_capability_granted(panel, generation, CREATE));
 
     // The bind resolves three capabilities and consents to none. Reading the
-    // drained table would commit `∅` here.
+    // drained table would commit `∅` here; reading no tombstone as "no
+    // ceiling" would commit all of `R`.
     let granted = reg
         .install_rebound_grants(
             panel,
@@ -113,7 +129,7 @@ fn a_bind_after_an_edge_release_reads_the_retained_ceiling() {
 }
 
 #[test]
-fn a_repeated_edge_release_leaves_the_retained_ceiling_untouched() {
+fn a_repeated_edge_release_leaves_the_retired_ceiling_untouched() {
     let mut reg = registry();
     let (panel, generation) = bound_panel(&mut reg, &[CREATE, FOCUS], 7);
 
@@ -156,19 +172,22 @@ fn a_repeated_edge_release_leaves_the_retained_ceiling_untouched() {
 }
 
 #[test]
-fn a_successor_panel_after_disposal_is_not_bounded_by_the_retained_ceiling() {
+fn panel_disposal_drops_the_retired_ceiling_with_the_container() {
     let mut reg = registry();
     let (panel, generation) = bound_panel(&mut reg, &[CREATE, FOCUS], 8);
     reg.dispose_panel(panel, generation).expect("dispose");
 
-    // The disposal edge keeps the ceiling, keyed by the disposed `PanelId`.
-    let ceiling = reg
-        .retained_grant_ceiling(panel)
-        .expect("the disposal edge retains the ceiling");
-    assert_eq!(ceiling.grants, set(&[CREATE, FOCUS]));
-
-    // It also removes the panel record, so the retired identity cannot be
-    // bound again and no successor generation can name it.
+    assert!(
+        reg.retained_grant_ceiling(panel).is_none(),
+        "A.2/PGO-23: the tombstone is dropped on panel disposal"
+    );
+    assert_eq!(reg.retained_grant_ceiling_count(), 0);
+    assert_eq!(
+        reg.last_controller_generation(panel),
+        None,
+        "a disposed record names no controller"
+    );
+    assert!(!reg.is_panel_capability_granted(panel, generation, CREATE));
     assert!(
         matches!(
             reg.install_rebound_grants(panel, generation, &set(&[CREATE]), &BTreeSet::new()),
@@ -176,21 +195,42 @@ fn a_successor_panel_after_disposal_is_not_bounded_by_the_retained_ceiling() {
         ),
         "a disposed identity has no record to bind"
     );
+}
+
+#[test]
+fn a_new_panel_after_disposal_is_a_first_bind_not_a_reload() {
+    let mut reg = registry();
+    let (panel, generation) = bound_panel(&mut reg, &[CREATE, FOCUS], 9);
+    reg.dispose_panel(panel, generation).expect("dispose");
+
+    // The old gap kept the tombstone for the disposed identity: no path could
+    // bind that identity again, and the entry could never be reclaimed. The
+    // contract drops it with the container, so nothing of the predecessor is
+    // readable by any successor.
+    assert!(reg.retained_grant_ceiling(panel).is_none());
+    assert_eq!(reg.retained_grant_ceiling_count(), 0);
+
     let successor = reg
         .create_panel(PanelType::Helper, None)
         .expect("create successor");
     assert_ne!(
         successor.id, panel,
-        "the successor a reload creates is a new identity"
+        "the successor a new create returns is a new identity"
+    );
+    assert_eq!(
+        reg.last_controller_generation(successor.id),
+        None,
+        "a new container has no previous controller"
     );
     assert!(
         reg.retained_grant_ceiling(successor.id).is_none(),
-        "phase 0 of the successor looks up a key the ceiling is not stored under"
+        "no ceiling is keyed under the new identity"
     );
 
-    // Which lands the successor on the absent-predecessor branch: the whole
-    // resolution, unbounded by what the predecessor held. This is the open
-    // `PGO-22` gap, asserted as measured behaviour rather than described.
+    // A panel with no previous controller is the absent-`P` case: the first
+    // bind commits `R` because `panel.create` is the authorization. This is not
+    // authority carry-over — the disposed ceiling was dropped, so the decision
+    // record's reload path has no predecessor to read.
     let granted = reg
         .install_rebound_grants(
             successor.id,
@@ -198,12 +238,14 @@ fn a_successor_panel_after_disposal_is_not_bounded_by_the_retained_ceiling() {
             &set(&[CREATE, FOCUS, OVERLAY]),
             &BTreeSet::new(),
         )
-        .expect("successor bind");
+        .expect("first bind");
+    assert_eq!(granted, set(&[CREATE, FOCUS, OVERLAY]));
     assert_eq!(
-        granted,
-        set(&[CREATE, FOCUS, OVERLAY]),
-        "gap: a real successor is granted all of R because no path binds the retained identity"
+        reg.retained_grant_ceiling_count(),
+        0,
+        "no tombstone survived the disposal"
     );
+    assert_eq!(reg.error_count("CeilingLost"), 0);
 }
 
 #[test]
@@ -212,6 +254,7 @@ fn an_absent_predecessor_is_not_an_empty_ceiling() {
     let handle = reg
         .create_panel(PanelType::Helper, None)
         .expect("create panel");
+    assert_eq!(reg.last_controller_generation(handle.id), None);
 
     // A first bind has no predecessor, so the create verb is the authorization
     // and the whole resolution is granted without a permission diff.
@@ -224,10 +267,11 @@ fn an_absent_predecessor_is_not_an_empty_ceiling() {
         )
         .expect("first bind install");
     assert_eq!(granted, set(&[CREATE, FOCUS]));
+    assert_eq!(reg.error_count("CeilingLost"), 0);
 }
 
 #[test]
-fn a_bound_predecessor_that_held_nothing_is_a_ceiling_of_emptiness() {
+fn an_empty_predecessor_ceiling_is_a_real_ceiling() {
     let mut reg = registry();
     let (panel, generation) = bound_panel(&mut reg, &[], 3);
     reg.release_generation_scope(panel, generation)
@@ -237,13 +281,40 @@ fn a_bound_predecessor_that_held_nothing_is_a_ceiling_of_emptiness() {
         .retained_grant_ceiling(panel)
         .expect("a predecessor that existed is a predecessor");
     assert!(ceiling.grants.is_empty());
+    assert_eq!(
+        reg.last_controller_generation(panel),
+        Some(generation),
+        "the record remembers that a controller ended even with no grants"
+    );
 
     let granted = reg
         .install_rebound_grants(panel, generation, &set(&[CREATE]), &BTreeSet::new())
-        .expect("rebind install");
+        .expect("an empty ceiling is real, not missing: the bind is not refused");
     assert!(
         granted.is_empty(),
         "existed-and-held-nothing must narrow to nothing, not widen to R"
+    );
+    assert_eq!(
+        reg.error_count("CeilingLost"),
+        0,
+        "an empty tombstone never produces a lost-record refusal"
+    );
+}
+
+#[test]
+fn an_empty_predecessor_ceiling_admits_only_consented_widening() {
+    let mut reg = registry();
+    let (panel, generation) = bound_panel(&mut reg, &[], 13);
+    reg.release_generation_scope(panel, generation)
+        .expect("edge release");
+
+    let granted = reg
+        .install_rebound_grants(panel, generation, &set(&[CREATE, FOCUS]), &set(&[FOCUS]))
+        .expect("an empty ceiling is real, not missing: the bind is not refused");
+    assert_eq!(
+        granted,
+        set(&[FOCUS]),
+        "(R ∩ ∅) ∪ C = C: only the consented widening survives"
     );
 }
 
@@ -267,6 +338,39 @@ fn consent_widens_only_inside_the_successor_resolution() {
 }
 
 #[test]
+fn a_live_row_wins_over_the_retired_tombstone() {
+    let mut reg = registry();
+    let (panel, generation) = bound_panel(&mut reg, &[CREATE], 10);
+    reg.release_generation_scope(panel, generation)
+        .expect("edge release");
+
+    // Synthetic still-bound predecessor: an earlier edge left a tombstone while
+    // a live row now exists for the same panel. Phase 0 takes the live row;
+    // reading the tombstone would grant `CREATE` the live row does not hold.
+    reg.grant_panel_capability(panel, generation, FOCUS)
+        .expect("live regrant");
+
+    let granted = reg
+        .install_rebound_grants(
+            panel,
+            generation,
+            &set(&[CREATE, FOCUS, OVERLAY]),
+            &BTreeSet::new(),
+        )
+        .expect("rebind install");
+    assert_eq!(
+        granted,
+        set(&[FOCUS]),
+        "the live row is P when a predecessor is still bound"
+    );
+    assert!(
+        !reg.is_panel_capability_granted(panel, generation, CREATE),
+        "the tombstone is not consulted while a live row exists"
+    );
+    assert!(reg.retained_grant_ceiling(panel).is_none());
+}
+
+#[test]
 fn a_successful_install_retires_the_ceiling() {
     let mut reg = registry();
     let (panel, generation) = bound_panel(&mut reg, &[CREATE], 5);
@@ -283,6 +387,29 @@ fn a_successful_install_retires_the_ceiling() {
 }
 
 #[test]
+fn the_last_controller_generation_survives_the_unbind_edge() {
+    let mut reg = registry();
+    let (panel, generation) = bound_panel(&mut reg, &[CREATE], 11);
+    assert_eq!(reg.last_controller_generation(panel), None);
+
+    reg.release_generation_scope(panel, generation)
+        .expect("edge release");
+    assert_eq!(
+        reg.last_controller_generation(panel),
+        Some(generation),
+        "the field is retained across the unbind"
+    );
+
+    reg.install_rebound_grants(panel, generation, &set(&[CREATE]), &BTreeSet::new())
+        .expect("rebind install");
+    assert_eq!(
+        reg.last_controller_generation(panel),
+        Some(generation),
+        "a successor bind does not erase the retained predecessor"
+    );
+}
+
+#[test]
 fn a_granted_panel_that_never_mounted_still_retains_its_ceiling() {
     let mut reg = registry();
     let handle = reg
@@ -292,12 +419,19 @@ fn a_granted_panel_that_never_mounted_still_retains_its_ceiling() {
         .expect("grant");
     // Holding a grant makes the generation a controller even without a mount,
     // so its edge must not silently drop the ceiling.
-    reg.dispose_panel(handle.id, handle.generation)
-        .expect("dispose");
+    reg.release_generation_scope(handle.id, handle.generation)
+        .expect("edge release");
     let ceiling = reg
         .retained_grant_ceiling(handle.id)
         .expect("a granted generation is a predecessor");
     assert_eq!(ceiling.grants, set(&[CREATE]));
+
+    reg.dispose_panel(handle.id, handle.generation)
+        .expect("dispose");
+    assert!(
+        reg.retained_grant_ceiling(handle.id).is_none(),
+        "the later panel close reclaims the entry"
+    );
 }
 
 #[test]
@@ -312,27 +446,113 @@ fn a_rolled_back_create_leaves_no_ceiling() {
         .expect("rollback dispose");
     assert!(reg.retained_grant_ceiling(handle.id).is_none());
     assert_eq!(reg.retained_grant_ceiling_count(), 0);
+    assert_eq!(reg.last_controller_generation(handle.id), None);
 }
 
 #[test]
-fn retained_ceilings_stay_bounded() {
-    let mut reg = registry();
-    for index in 0..MAX_RETAINED_GRANT_CEILINGS + 5 {
-        let (panel, generation) = bound_panel(&mut reg, &[CREATE], 100 + index as u64);
-        reg.dispose_panel(panel, generation).expect("dispose");
+fn retired_ceilings_are_bounded_by_live_panels_and_never_evicted() {
+    let mut reg = registry_with_max_panels(MAX_PANELS_PER_WINDOW);
+    let mut handles = Vec::with_capacity(MAX_PANELS_PER_WINDOW);
+    for index in 0..MAX_PANELS_PER_WINDOW {
+        let (panel, generation) = bound_panel(&mut reg, &[CREATE], 2_000 + index as u64);
+        reg.release_generation_scope(panel, generation)
+            .expect("edge release");
+        handles.push((panel, generation));
     }
+
+    // One entry per live panel, exactly at the configured live-panel budget.
+    assert_eq!(reg.panel_count(), MAX_PANELS_PER_WINDOW);
+    assert_eq!(reg.retained_grant_ceiling_count(), MAX_PANELS_PER_WINDOW);
+    assert!(reg.retained_grant_ceiling_count() <= MAX_RETAINED_GRANT_CEILINGS);
+    for (panel, _) in &handles {
+        let ceiling = reg
+            .retained_grant_ceiling(*panel)
+            .expect("every live panel keeps its ceiling at the bound");
+        assert_eq!(ceiling.grants, set(&[CREATE]));
+    }
+    assert!(
+        matches!(
+            reg.create_panel(PanelType::Helper, None),
+            Err(PanelError::TooManyPanels { .. })
+        ),
+        "the live-panel budget, not the ceiling table, is the admission limit"
+    );
+
+    // Saturating the table with live panels did not evict the oldest entry.
+    let (first_panel, first_generation) = handles[0];
+    assert!(reg.retained_grant_ceiling(first_panel).is_some());
+    let granted = reg
+        .install_rebound_grants(
+            first_panel,
+            first_generation,
+            &set(&[CREATE, FOCUS, OVERLAY]),
+            &BTreeSet::new(),
+        )
+        .expect("rebind install");
+    assert_eq!(granted, set(&[CREATE]));
+}
+
+#[test]
+fn many_panel_edges_do_not_evict_a_long_lived_panels_ceiling() {
+    let mut reg = registry();
+    let (panel, generation) = bound_panel(&mut reg, &[CREATE], 12);
+    reg.release_generation_scope(panel, generation)
+        .expect("edge release");
+    assert_eq!(reg.retained_grant_ceiling_count(), 1);
+
+    // The T-25 escalation: 64+ later panels reach their edges and are closed.
+    // A disposal that kept its tombstone would fill the old 64-entry table and
+    // evict the lowest `PanelId` — this long-lived panel — before its successor
+    // bound. Closing each panel reclaims its entry instead.
+    for index in 0..MAX_RETAINED_GRANT_CEILINGS + 1 {
+        let (other, other_generation) = bound_panel(&mut reg, &[CREATE], 10_000 + index as u64);
+        reg.release_generation_scope(other, other_generation)
+            .expect("other edge release");
+        reg.dispose_panel(other, other_generation)
+            .expect("other panel close");
+    }
+
     assert_eq!(
         reg.retained_grant_ceiling_count(),
-        MAX_RETAINED_GRANT_CEILINGS,
-        "a long-lived window accumulates no more than the bound"
+        1,
+        "only the long-lived panel still has a tombstone"
     );
+    let ceiling = reg
+        .retained_grant_ceiling(panel)
+        .expect("the long-lived panel's ceiling was not evicted");
+    assert_eq!(ceiling.ended_generation, generation);
+    assert_eq!(ceiling.grants, set(&[CREATE]));
+
+    let granted = reg
+        .install_rebound_grants(
+            panel,
+            generation,
+            &set(&[CREATE, FOCUS, OVERLAY]),
+            &BTreeSet::new(),
+        )
+        .expect("rebind install");
+    assert_eq!(
+        granted,
+        set(&[CREATE]),
+        "the successor is still narrowed by the original ceiling"
+    );
+    assert!(
+        !reg.is_panel_capability_granted(panel, generation, FOCUS),
+        "no consent-free widening survived the pressure"
+    );
+    assert!(
+        !reg.is_panel_capability_granted(panel, generation, OVERLAY),
+        "no consent-free widening survived the pressure"
+    );
+    assert_eq!(reg.error_count("CeilingLost"), 0);
 }
 
 #[test]
-fn whole_registry_disposal_drops_retained_ceilings() {
+fn whole_registry_disposal_drops_retired_ceilings() {
     let mut reg = registry();
     let (panel, generation) = bound_panel(&mut reg, &[CREATE], 6);
-    reg.dispose_panel(panel, generation).expect("dispose");
+    reg.release_generation_scope(panel, generation)
+        .expect("edge release");
     assert_eq!(reg.retained_grant_ceiling_count(), 1);
     reg.dispose();
     assert_eq!(reg.retained_grant_ceiling_count(), 0);

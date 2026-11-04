@@ -812,8 +812,23 @@ fn reload_config_json(info: &crate::config_reload::ReloadOutcomeInfo) -> String 
         .as_ref()
         .map(|raw| format!(",\"message\":\"{}\"", json_escape(raw)))
         .unwrap_or_default();
+    // Typed-outcome parity for the reload path: a module refusal carries its
+    // contract record (code, phase, and the already allowlisted render), never
+    // a host path, a canonical root, or an identity tuple (contract `N-6`).
+    let module = info
+        .module
+        .as_ref()
+        .map(|diagnostic| {
+            format!(
+                ",\"module\":{{\"code\":\"{}\",\"phase\":\"{}\",\"record\":\"{}\"}}",
+                json_escape(diagnostic.code().as_str()),
+                json_escape(diagnostic.phase.as_str()),
+                json_escape(&diagnostic.render())
+            )
+        })
+        .unwrap_or_default();
     format!(
-        "{{\"reloaded\":true,\"applied\":{},\"kind\":\"{}\",\"path\":\"{}\",\"changed\":[{}],\"restart_required\":[{}]{message}}}",
+        "{{\"reloaded\":true,\"applied\":{},\"kind\":\"{}\",\"path\":\"{}\",\"changed\":[{}],\"restart_required\":[{}]{message}{module}}}",
         info.applied,
         json_escape(info.kind),
         json_escape(&info.path),

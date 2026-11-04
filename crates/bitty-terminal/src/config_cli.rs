@@ -322,19 +322,24 @@ impl SafeDeny {
 /// profile selections, CLI usage errors, and an invalid built-in plan stay
 /// fail-closed (`fatal`), matching `lua-and-xdg.md` §Layers.
 #[derive(Debug)]
-struct LoadFailure {
+pub(crate) struct LoadFailure {
     /// User-facing message; unchanged from the pre-fallback behavior.
-    message: String,
+    pub(crate) message: String,
     /// True only for a present-but-unusable external configuration layer.
     fallback_allowed: bool,
+    /// Typed module loader refusal when this failure came from
+    /// `E_CONFIG_MODULE_*`. Carried so `config check`, `doctor`, and reload
+    /// each report the contract's typed record instead of only flattened text.
+    module: Option<Box<bitty_config::ConfigModuleDiagnostic>>,
 }
 
 impl LoadFailure {
     /// A present external layer is unusable; startup drops it and continues.
-    fn recoverable(message: String) -> Self {
+    pub(crate) fn recoverable(message: String) -> Self {
         Self {
             message,
             fallback_allowed: true,
+            module: None,
         }
     }
 
@@ -343,11 +348,45 @@ impl LoadFailure {
         Self {
             message,
             fallback_allowed: false,
+            module: None,
         }
+    }
+
+    /// A classified configuration error, carrying its typed module refusal
+    /// (if any) alongside the rendered message.
+    fn config_error(
+        message: String,
+        error: &bitty_config::ConfigError,
+        fallback_allowed: bool,
+    ) -> Self {
+        Self {
+            message,
+            fallback_allowed,
+            module: error.module_diagnostic().cloned().map(Box::new),
+        }
+    }
+
+    /// The typed module loader refusal behind this failure, if any.
+    pub(crate) fn module_diagnostic(&self) -> Option<&bitty_config::ConfigModuleDiagnostic> {
+        self.module.as_deref()
+    }
+
+    /// Split into the rendered message and the typed module record, for the
+    /// reload result which carries both.
+    pub(crate) fn into_parts(self) -> (String, Option<Box<bitty_config::ConfigModuleDiagnostic>>) {
+        (self.message, self.module)
     }
 
     fn into_message(self) -> String {
         self.message
+    }
+}
+
+impl From<String> for LoadFailure {
+    fn from(message: String) -> Self {
+        // Injected resolvers and the local-theme adapter speak plain strings;
+        // they carry no typed module record.
+        Self::recoverable(message)
     }
 }
 
@@ -366,19 +405,21 @@ fn classify_merge_failure(
 ) -> LoadFailure {
     if user_file_causal {
         if let Some(path) = user_path {
-            return LoadFailure::recoverable(format!(
-                "bitty: invalid config '{}': {err}",
-                path.display()
-            ));
+            return LoadFailure::config_error(
+                format!("bitty: invalid config '{}': {err}", path.display()),
+                err,
+                true,
+            );
         }
     }
     if let Some(path) = profile_path {
-        return LoadFailure::fatal(format!(
-            "bitty: invalid profile '{}': {err}",
-            path.display()
-        ));
+        return LoadFailure::config_error(
+            format!("bitty: invalid profile '{}': {err}", path.display()),
+            err,
+            false,
+        );
     }
-    LoadFailure::fatal(format!("bitty: invalid --theme: {err}"))
+    LoadFailure::config_error(format!("bitty: invalid --theme: {err}"), err, false)
 }
 
 /// Builds the single CLI override input from parsed [`Args`] (CTX-0180).
@@ -456,7 +497,18 @@ pub(crate) fn appearance_flag_for_field(field: Option<&str>) -> &'static str {
 /// profile identity. impure (filesystem + env); total (all failures become
 /// `Err(String)`).
 pub(crate) fn load_merged_config(args: &Args) -> Result<LoadedConfig, String> {
-    resolve_merged_config(args).map_err(LoadFailure::into_message)
+    load_merged_config_typed(args).map_err(LoadFailure::into_message)
+}
+
+/// Typed form of [`load_merged_config`] used by `config check`, `doctor`, and
+/// the reload engine.
+///
+/// The failure keeps the `E_CONFIG_MODULE_*` record when a module loader
+/// refused, so each path reports the contract's typed outcome rather than
+/// only the flattened message. The rendered message is unchanged, so every
+/// existing caller sees the same text.
+pub(crate) fn load_merged_config_typed(args: &Args) -> Result<LoadedConfig, LoadFailure> {
+    resolve_merged_config(args)
 }
 
 /// Classified form of [`load_merged_config`] for the startup fallback.
@@ -540,10 +592,14 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
                         file_loaded = true;
                     }
                     Err(err) => {
-                        return Err(LoadFailure::recoverable(format!(
-                            "bitty: invalid config file '{}': {err}",
-                            probe.path.display()
-                        )));
+                        return Err(LoadFailure::config_error(
+                            format!(
+                                "bitty: invalid config file '{}': {err}",
+                                probe.path.display()
+                            ),
+                            &err,
+                            true,
+                        ));
                     }
                 }
             }
@@ -716,10 +772,14 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
                         profile_layers = layers;
                     }
                     Err(err) => {
-                        return Err(LoadFailure::recoverable(format!(
-                            "bitty: invalid profile file '{}': {err}",
-                            resolved.display()
-                        )));
+                        return Err(LoadFailure::config_error(
+                            format!(
+                                "bitty: invalid profile file '{}': {err}",
+                                resolved.display()
+                            ),
+                            &err,
+                            true,
+                        ));
                     }
                 }
             }
@@ -792,9 +852,11 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
                         &cli,
                     )
                     .map_err(|_| {
-                        LoadFailure::recoverable(format!(
-                            "bitty: invalid configuration: {err}; ignored; using defaults"
-                        ))
+                        LoadFailure::config_error(
+                            format!("bitty: invalid configuration: {err}; ignored; using defaults"),
+                            &err,
+                            true,
+                        )
                     })?;
                     diagnostics.push(format!(
                         "bitty: warning: ignoring invalid config file '{}': {err}; ignored; using defaults and remaining layers",
@@ -808,17 +870,23 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
                     recovered
                 } else {
                     deny.deny_all_sensitive();
-                    return Err(LoadFailure::recoverable(format!(
-                        "bitty: invalid configuration: {err}; ignored; using defaults"
-                    )));
+                    return Err(LoadFailure::config_error(
+                        format!("bitty: invalid configuration: {err}; ignored; using defaults"),
+                        &err,
+                        true,
+                    ));
                 }
             } else if file_layer.is_some() {
                 let recovered =
                     bitty_config::file::resolve_effective_with_profiles(None, Vec::new(), &cli)
                         .map_err(|_| {
-                            LoadFailure::recoverable(format!(
-                                "bitty: invalid configuration: {err}; ignored; using defaults"
-                            ))
+                            LoadFailure::config_error(
+                                format!(
+                                    "bitty: invalid configuration: {err}; ignored; using defaults"
+                                ),
+                                &err,
+                                true,
+                            )
                         })?;
                 diagnostics.push(format!(
                     "bitty: warning: ignoring invalid config file '{}': {err}; ignored; using defaults and remaining layers",
@@ -910,10 +978,17 @@ fn resolve_merged_config_in(args: &Args, mode: LoadMode) -> Result<LoadedConfig,
 ///
 /// impure (filesystem reads + env vars XDG/HOME/BITTY_*); total (all failures
 /// become `Err(String)`).
+#[cfg(test)]
 pub(crate) fn load_app_config(args: &Args) -> Result<AppConfig, String> {
-    resolve_app_config_in(args, LoadMode::Strict)
-        .map(|(app, _)| app)
-        .map_err(LoadFailure::into_message)
+    load_app_config_typed(args).map_err(LoadFailure::into_message)
+}
+
+/// Typed form of [`load_app_config`] used by the reload engine.
+///
+/// A module refusal keeps its `E_CONFIG_MODULE_*` record, so the reload result
+/// can carry the typed outcome while the running plan stays untouched.
+pub(crate) fn load_app_config_typed(args: &Args) -> Result<AppConfig, LoadFailure> {
+    resolve_app_config_in(args, LoadMode::Strict).map(|(app, _)| app)
 }
 
 /// Strict classified form used by the classifier unit tests.
@@ -1357,7 +1432,7 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 2
             }
         },
-        ConfigCommand::Check | ConfigCommand::Show => match load_merged_config(args) {
+        ConfigCommand::Check | ConfigCommand::Show => match load_merged_config_typed(args) {
             Ok(loaded) => {
                 let merged = loaded.merged;
                 let probed = loaded.probed;
@@ -2108,8 +2183,14 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                 }
                 0
             }
-            Err(msg) => {
-                eprintln!("{msg}");
+            Err(failure) => {
+                // A module refusal keeps its typed record in `message`
+                // (`code=`, `phase=`, `module_spec=`, `source=`), so the text
+                // path reports the contract outcome without a second line.
+                if let Some(diagnostic) = failure.module_diagnostic() {
+                    debug_assert!(failure.message.contains(diagnostic.code().as_str()));
+                }
+                eprintln!("{}", failure.message);
                 2
             }
         },
@@ -2534,17 +2615,20 @@ fn config_error_envelope(
 fn run_config_show_json(args: &Args, cmd: ConfigCommand, format: ConfigFormat) -> i32 {
     debug_assert_eq!(format, ConfigFormat::Json);
     let command = config_command_spelling(args, cmd);
-    match load_merged_config(args) {
+    match load_merged_config_typed(args) {
         Ok(loaded) => {
             println!("{}", config_show_envelope(&command, &loaded));
             0
         }
-        Err(message) => {
+        Err(failure) => {
+            let code = failure
+                .module_diagnostic()
+                .map_or("E_CONFIG_INVALID", |diagnostic| diagnostic.code().as_str());
             println!(
                 "{}",
-                config_error_envelope(&command, args, "E_CONFIG_INVALID", &message, false)
+                config_error_envelope(&command, args, code, &failure.message, false)
             );
-            eprintln!("{message}");
+            eprintln!("{}", failure.message);
             2
         }
     }
@@ -2556,7 +2640,7 @@ fn run_config_show_json(args: &Args, cmd: ConfigCommand, format: ConfigFormat) -
 /// on stderr when invalid. JSON mode always emits the stable envelope.
 fn run_config_validate(args: &Args, format: ConfigFormat) -> i32 {
     let command = config_command_spelling(args, ConfigCommand::Validate);
-    match load_merged_config(args) {
+    match load_merged_config_typed(args) {
         Ok(loaded) => {
             if format == ConfigFormat::Json {
                 let file_path = loaded
@@ -2576,14 +2660,17 @@ fn run_config_validate(args: &Args, format: ConfigFormat) -> i32 {
             }
             0
         }
-        Err(message) => {
+        Err(failure) => {
             if format == ConfigFormat::Json {
+                let code = failure
+                    .module_diagnostic()
+                    .map_or("E_CONFIG_INVALID", |diagnostic| diagnostic.code().as_str());
                 println!(
                     "{}",
-                    config_error_envelope(&command, args, "E_CONFIG_INVALID", &message, false)
+                    config_error_envelope(&command, args, code, &failure.message, false)
                 );
             }
-            eprintln!("{message}");
+            eprintln!("{}", failure.message);
             2
         }
     }
@@ -3812,6 +3899,88 @@ mod startup_tests {
     }
 
     #[test]
+    fn safe_mode_performs_no_external_config_read_under_an_io_denied_harness() {
+        // `bitty#2869` acceptance: deny every configuration filesystem door,
+        // run the exact resolution the binary runs, and require zero attempts.
+        // The trusted bootstrap set is enumerated by the harness and is
+        // compiled-in data only: no entry, profile, local theme, or module root
+        // may take part.
+        let dir = scratch_dir("safe-io-denied");
+        std::fs::create_dir_all(dir.join("bitty/lua")).expect("module root");
+        std::fs::create_dir_all(dir.join("bitty/profiles")).expect("profiles");
+        std::fs::create_dir_all(dir.join("bitty/themes")).expect("themes");
+        std::fs::write(dir.join("bitty/init.lua"), "return require('hostile')\n").expect("entry");
+        std::fs::write(
+            dir.join("bitty/lua/hostile.lua"),
+            "return { theme = 'hostile' }\n",
+        )
+        .expect("module");
+        std::fs::write(dir.join("bitty/profiles/work.lua"), "return {}\n").expect("profile");
+        std::fs::write(dir.join("bitty/themes/t.toml"), "name = \"hostile\"\n").expect("theme");
+
+        let mut args = Args::new();
+        args.safe = true;
+        args.config_path = Some(dir.join("bitty/init.lua").to_string_lossy().into_owned());
+        args.profile = Some(String::from("work"));
+
+        let gate = bitty_config::io_harness::deny();
+        let loaded = resolve_merged_config_in(&args, LoadMode::Strict)
+            .expect("--safe must return the built-in configuration");
+        assert_eq!(
+            loaded.merged.effective,
+            bitty_config::reload::fallback_builtin()
+        );
+        assert!(loaded.probed.is_none(), "safe mode probes no entry path");
+        assert!(!loaded.file_loaded, "safe mode loads no external layer");
+        assert!(
+            gate.attempts().is_empty(),
+            "safe mode attempted external reads: {:?}",
+            gate.attempts()
+        );
+        assert_eq!(
+            bitty_config::io_harness::trusted_bootstrap(),
+            &["builtin:safe-plan"],
+            "the trusted bootstrap set is exactly the compiled-in safe plan"
+        );
+        for source in loaded.merged.attribution.values() {
+            assert_eq!(source.layer, bitty_config::LayerKind::CoreDefaults);
+            assert!(
+                source.path.is_none(),
+                "a bootstrap source must not name a path: {source:?}"
+            );
+        }
+        drop(gate);
+
+        // Negative control: the same resolution without `--safe` must attempt
+        // an external read and must be refused by the armed gate. Without this
+        // half the zero above would be an unfalsifiable restatement.
+        args.safe = false;
+        let gate = bitty_config::io_harness::deny();
+        let failure = match resolve_merged_config_in(&args, LoadMode::Strict) {
+            Ok(_) => panic!("the armed gate must refuse the external entry read"),
+            Err(failure) => failure,
+        };
+        assert!(
+            gate.saw_attempt(),
+            "the negative control must register an attempt"
+        );
+        assert!(
+            failure.message.contains("denied by the I/O harness"),
+            "{}",
+            failure.message
+        );
+        assert!(
+            bitty_config::io_harness::attempted_paths()
+                .iter()
+                .any(|path| path.ends_with("bitty/init.lua")),
+            "{:?}",
+            bitty_config::io_harness::attempted_paths()
+        );
+        drop(gate);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn startup_denies_plugins_instead_of_resurrecting_profile() {
         // CTX-1490 review finding 1 probe: a salvaged `plugins` table in the
         // user file must not let the profile re-enable plugins.
@@ -4059,7 +4228,11 @@ mod startup_tests {
         assert!(is_first_start(), "startup has no plan to retain");
 
         let plan = EffectiveConfig::default();
-        crate::config_reload::install_with(plan, Box::new(|| Err(String::from("unused"))), None);
+        crate::config_reload::install_with(
+            plan,
+            Box::new(|| Err(String::from("unused").into())),
+            None,
+        );
         assert!(
             !is_first_start(),
             "an installed last-good plan means later failures retain it"

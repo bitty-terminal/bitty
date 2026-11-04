@@ -1411,6 +1411,8 @@ fn parse_lua_config_with_policy(
         message: format!("config evaluation refused: {e}"),
     })?;
     if let Some(root) = module_root {
+        #[cfg(feature = "io-denied-harness")]
+        crate::io_harness::deny_loader_install(root)?;
         let entry = source
             .path
             .as_deref()
@@ -3291,6 +3293,8 @@ fn load_layer_with_kind_salvaging(
 
 /// Size-bounded config read shared by the strict and salvaging loaders.
 fn read_config_file(path: &Path) -> Result<String, ConfigError> {
+    #[cfg(feature = "io-denied-harness")]
+    crate::io_harness::deny_config_read(path)?;
     EXTERNAL_CONFIG_READS.with(|reads| reads.set(reads.get() + 1));
     let meta = std::fs::metadata(path).map_err(|e| ConfigError::InvalidInput {
         message: format!("cannot read config '{}': {e}", path.display()),

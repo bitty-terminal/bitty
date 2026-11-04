@@ -7,21 +7,17 @@
 use super::*;
 use crate::ConfigOutcome;
 use crate::config::ConfigEval;
-#[cfg(unix)]
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The test-only swap action: one closure over the canonical module path.
-#[cfg(unix)]
 type SwapHook = Box<dyn Fn(&Path)>;
 
-#[cfg(unix)]
 thread_local! {
     static SWAP_HOOK: RefCell<Option<SwapHook>> = const { RefCell::new(None) };
 }
 
 /// Called between canonicalization and the anchored open (test builds only).
-#[cfg(unix)]
 pub(crate) fn test_swap_hook(path: &Path) {
     SWAP_HOOK.with(|hook| {
         if let Some(swap) = hook.borrow().as_ref() {
@@ -30,7 +26,6 @@ pub(crate) fn test_swap_hook(path: &Path) {
     });
 }
 
-#[cfg(unix)]
 fn set_swap_hook(hook: Option<SwapHook>) {
     SWAP_HOOK.with(|cell| *cell.borrow_mut() = hook);
 }
@@ -1170,4 +1165,193 @@ fn entry_name_is_used_for_root_attribution() {
         }
         other => panic!("expected a root refusal, got {other:?}"),
     }
+}
+
+// ── Windows path security (runs on the Windows CI leg) ──────────────────────
+//
+// The Windows leg is not a prose claim: every test in this section is
+// compiled and executed by `cargo nextest run --workspace` on
+// `windows-latest`. Junctions are created through `mklink /J`, which needs no
+// elevated token (unlike a directory symlink), so the reparse rules are
+// exercised on a stock runner.
+
+/// Create a directory junction at `link` pointing at `target`.
+#[cfg(windows)]
+fn junction(link: &Path, target: &Path) {
+    use std::os::windows::process::CommandExt;
+    assert!(target.is_dir(), "junction target must be a directory");
+    let target = std::fs::canonicalize(target).expect("canonical target");
+    // `mklink` is a cmd builtin, so it is reached through `cmd /C`. `raw_arg`
+    // appends the command line verbatim (the MSVC argument quoter is meant for
+    // the C runtime, not cmd.exe), so a temp path containing spaces stays one
+    // argument.
+    let script = format!("mklink /J \"{}\" \"{}\"", link.display(), target.display());
+    let status = std::process::Command::new("cmd")
+        .arg("/C")
+        .raw_arg(script)
+        .status()
+        .expect("spawn cmd /C mklink /J");
+    assert!(
+        status.success(),
+        "mklink /J {} -> {} failed",
+        link.display(),
+        target.display()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_out_of_root_junction_refuses_as_escape() {
+    let dir = TempDir::new("win-escape-out");
+    dir.module("lua/keep.lua", "return { value = 'inside' }");
+    let outside = TempDir::new("win-escape-outside");
+    std::fs::write(
+        outside.path().join("leak.lua"),
+        "return { value = 'outside' }",
+    )
+    .expect("outside module");
+    junction(&dir.path().join("lua/linked"), outside.path());
+    // Canonical containment refuses the target before the walk starts.
+    let diagnostic = refusal(dir.path(), "return require('linked.leak')");
+    assert_code(&diagnostic, ConfigModuleCode::Escape);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_in_root_junction_is_refused_below_the_canonical_root() {
+    // The contract does not carry the Unix "in-root symlinked layout" allowance
+    // to Windows: a reparse component below the canonical root is refused even
+    // when its target stays inside the root. Canonicalizing first would turn
+    // this junction into its real target and silently admit it, so this test
+    // pins the spec-derived walk.
+    let dir = TempDir::new("win-escape-in");
+    dir.module("lua/real/opts.lua", "return { value = 'inside' }");
+    junction(&dir.path().join("lua/linked"), &dir.path().join("lua/real"));
+    let diagnostic = refusal(dir.path(), "return require('linked.opts')");
+    assert_code(&diagnostic, ConfigModuleCode::Escape);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_intermediate_component_swapped_to_a_junction_refuses_as_escape() {
+    // The Windows half of the contract's declared control: a loader that
+    // opened the canonical path by name and compared identities would follow
+    // the junction and read outside the root.
+    let dir = TempDir::new("win-swap-intermediate");
+    dir.module("lua/pkg/mod.lua", "return { value = 'inside' }");
+    let outside = TempDir::new("win-swap-intermediate-outside");
+    std::fs::write(
+        outside.path().join("mod.lua"),
+        "return { value = 'outside' }",
+    )
+    .expect("outside module");
+    let package_dir = dir.path().join("lua/pkg");
+    let swap_target = outside.path().to_path_buf();
+    set_swap_hook(Some(Box::new(move |path: &Path| {
+        if path.ends_with("pkg/mod.lua") {
+            let _ = std::fs::remove_dir_all(&package_dir);
+            junction(&package_dir, &swap_target);
+        }
+    })));
+    let diagnostic = refusal(dir.path(), "return require('pkg.mod')");
+    set_swap_hook(None);
+    assert_code(&diagnostic, ConfigModuleCode::Escape);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_final_component_swapped_to_a_junction_refuses_as_escape() {
+    let dir = TempDir::new("win-swap-final");
+    dir.module("lua/target.lua", "return { value = 'inside' }");
+    let outside = TempDir::new("win-swap-final-outside");
+    std::fs::write(
+        outside.path().join("payload.lua"),
+        "return { value = 'outside' }",
+    )
+    .expect("outside module");
+    let target = dir.path().join("lua/target.lua");
+    let swap_target = outside.path().to_path_buf();
+    set_swap_hook(Some(Box::new(move |path: &Path| {
+        if path == target {
+            let _ = std::fs::remove_file(path);
+            junction(path, &swap_target);
+        }
+    })));
+    let diagnostic = refusal(dir.path(), "return require('target')");
+    set_swap_hook(None);
+    // `FILE_FLAG_OPEN_REPARSE_POINT` refuses the object at the final
+    // component; following it would have produced a directory and a
+    // `NOT_REGULAR` answer instead.
+    assert_code(&diagnostic, ConfigModuleCode::Escape);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_reserved_device_names_refuse_before_any_open() {
+    let dir = TempDir::new("win-reserved");
+    std::fs::create_dir_all(dir.path().join("lua")).expect("root");
+    for spec in ["con", "nul", "aux", "com1", "lpt9"] {
+        let diagnostic = refusal(dir.path(), &format!("return require('{spec}')"));
+        assert_code(&diagnostic, ConfigModuleCode::Name);
+        assert!(
+            diagnostic.render().contains("reserved Windows device"),
+            "{spec}: {diagnostic}"
+        );
+    }
+    assert!(windows_component_refusal("a/init.lua").is_ok());
+    assert!(windows_component_refusal("con.lua").is_err());
+    assert!(windows_component_refusal("fine/COM1.lua").is_err());
+    assert!(windows_component_refusal("trailing.").is_err());
+    assert!(windows_component_refusal("trailing ").is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_redirected_config_directory_still_loads() {
+    // The enterprise folder-redirection layout: the configuration directory
+    // itself is a junction. Root ancestors are resolved once, so the canonical
+    // root works and no ancestor takes part in containment.
+    let dir = TempDir::new("win-redirected");
+    dir.module("actual/lua/opts.lua", "return { value = 'dark' }");
+    junction(&dir.path().join("config"), &dir.path().join("actual"));
+    let mut vm = LuaVm::with_config_budgets(
+        "test.config",
+        crate::RC1_INSTRUCTION_BUDGET,
+        crate::RC1_WALL_CLOCK_BUDGET_MS,
+        crate::RC1_WARNING_MS,
+        crate::RC2_MEMORY_PER_PLUGIN_BYTES,
+    );
+    vm.install_config_require(dir.path().join("config/lua"), "init.lua")
+        .expect("install loader");
+    let outcome = vm
+        .eval_config("return { theme = require('opts').value }")
+        .expect("eval");
+    match outcome {
+        ConfigOutcome::Completed { data, .. } => {
+            assert_eq!(data.theme.as_deref(), Some("dark"));
+        }
+        other => panic!("a redirected configuration directory must load: {other:?}"),
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_case_variant_specs_collapse_to_one_identity() {
+    // NTFS is case-insensitive, so both spellings reach one file and the
+    // case-folded canonical cache key collapses them to one evaluation.
+    let dir = TempDir::new("win-case");
+    dir.module("lua/Config/Options.lua", "return { value = 'dark' }");
+    let (vm, outcome) = eval_with_root(
+        dir.path(),
+        "local a = require('config.options')\n\
+         local b = require('Config.Options')\n\
+         return { theme = tostring(a == b) }",
+    );
+    match outcome {
+        ConfigOutcome::Completed { data, .. } => {
+            assert_eq!(data.theme.as_deref(), Some("true"));
+        }
+        other => panic!("case variants must resolve on NTFS: {other:?}"),
+    }
+    assert_eq!(vm.config_module_stats().expect("stats").modules, 1);
 }

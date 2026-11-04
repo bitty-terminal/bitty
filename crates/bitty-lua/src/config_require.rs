@@ -695,8 +695,23 @@ impl ConfigModuleGeneration {
             .with_spec(spec.as_str().as_bytes().to_vec())
             .with_detail(detail.to_string()));
         }
-        let flat = root.join(flat_relative);
-        let init = root.join(init_relative);
+        // Windows: a component that names a device, or carries a trailing dot
+        // or space, is refused before any probe. `con`, `nul`, `com1` are
+        // ordinary grammar segments but resolve to devices on Windows, so the
+        // canonical step rejects them here rather than opening one.
+        #[cfg(windows)]
+        if let Err(detail) = windows_component_refusal(&flat_relative)
+            .and_then(|()| windows_component_refusal(&init_relative))
+        {
+            return Err(ConfigModuleDiagnostic::new(
+                ConfigModuleCode::Name,
+                ConfigModulePhase::Resolve,
+            )
+            .with_spec(spec.as_str().as_bytes().to_vec())
+            .with_detail(detail.to_string()));
+        }
+        let flat = root.join(&flat_relative);
+        let init = root.join(&init_relative);
         let refuse = |code: ConfigModuleCode, detail: &str| {
             ConfigModuleDiagnostic::new(code, ConfigModulePhase::Resolve)
                 .with_spec(spec.as_str().as_bytes().to_vec())
@@ -704,7 +719,8 @@ impl ConfigModuleGeneration {
         };
         let flat_probe = probe_module_path(&flat);
         let init_probe = probe_module_path(&init);
-        let candidate = match (flat_probe, init_probe) {
+        #[cfg_attr(not(windows), allow(unused_variables))]
+        let (candidate, resolution_relative) = match (flat_probe, init_probe) {
             // A path that exists but cannot be resolved (a link loop, a
             // component the process may not traverse) is a containment
             // refusal, not "missing": reporting it as absent would tell the
@@ -727,8 +743,8 @@ impl ConfigModuleGeneration {
                     "neither the flat module nor the init module exists",
                 ));
             }
-            (ModulePathProbe::Present, ModulePathProbe::Absent) => flat,
-            (ModulePathProbe::Absent, ModulePathProbe::Present) => init,
+            (ModulePathProbe::Present, ModulePathProbe::Absent) => (flat, flat_relative),
+            (ModulePathProbe::Absent, ModulePathProbe::Present) => (init, init_relative),
         };
         // Canonical containment: the canonical target must stay under the
         // canonical root, which keeps an admitted in-root symlink layout
@@ -757,7 +773,17 @@ impl ConfigModuleGeneration {
                 "canonical target is the module root itself",
             ));
         }
-        Ok((canonical, remainder))
+        // Unix walks the symlink-free canonical remainder, so an admitted
+        // in-root symlink layout loads through its canonical target. Windows
+        // walks the spec-derived remainder instead: the contract refuses a
+        // reparse component anywhere below the canonical root, including one
+        // whose target stays under the root, so canonicalizing it first would
+        // silently admit the layout the Windows rule forbids.
+        #[cfg(windows)]
+        let walk_relative = resolution_relative;
+        #[cfg(not(windows))]
+        let walk_relative = remainder;
+        Ok((canonical, walk_relative))
     }
 
     /// Open, type, identify, read, and charge one resolved module.
@@ -774,8 +800,9 @@ impl ConfigModuleGeneration {
         };
         // Test-only window between canonicalization and the anchored open, so
         // the "component swapped after the containment check" control can be
-        // driven deterministically. Never compiled into a shipped binary.
-        #[cfg(all(test, unix))]
+        // driven deterministically on every platform. Never compiled into a
+        // shipped binary.
+        #[cfg(test)]
         tests::test_swap_hook(canonical);
         let opened = {
             #[cfg(unix)]
@@ -792,7 +819,7 @@ impl ConfigModuleGeneration {
                     .canonical_root
                     .clone()
                     .expect("canonical root is set when resolve succeeds");
-                windows_open_verified(&root, canonical)
+                windows_open_verified(&root, remainder)
             }
         };
         let file = match opened {
@@ -1165,6 +1192,31 @@ pub fn windows_trailing_dot_or_space(component: &str) -> bool {
     component.ends_with(' ') || component.ends_with('.')
 }
 
+/// Refuse a root-relative Windows path whose components name a device or
+/// carry a form the canonical step rejects.
+///
+/// The grammar already refuses `:`, separators, and non-ASCII bytes, so the
+/// remaining Windows-specific forms are the reserved device names (`CON`,
+/// `NUL`, `COM1`..`COM9`, `LPT1`..`LPT9`, with or without an extension) and a
+/// component ending in a dot or a space. Both are checked on the joined file
+/// names (`a/b/c.lua` and `a/b/c/init.lua`), so a spec cannot reach a device
+/// through either resolution.
+#[cfg(windows)]
+fn windows_component_refusal(relative: &str) -> Result<(), &'static str> {
+    for component in relative.split('/') {
+        if component.is_empty() {
+            return Err("joined module path has an empty component");
+        }
+        if windows_trailing_dot_or_space(component) {
+            return Err("module path component has a trailing dot or space");
+        }
+        if windows_reserved_name(component) {
+            return Err("module path names a reserved Windows device");
+        }
+    }
+    Ok(())
+}
+
 /// The canonical target's root-relative remainder.
 ///
 /// Case-insensitive on Windows, where the volume's own comparison is
@@ -1352,17 +1404,23 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 /// reparse-point flag, and refuse any object that carries a reparse attribute
 /// or is not the expected type.
 ///
+/// `remainder` is the spec-derived root-relative path (`a/b/c.lua` or
+/// `a/b/c/init.lua`), not the canonical target: the Windows rule refuses a
+/// reparse component anywhere below the canonical root, so a junction whose
+/// target stays inside the root must be refused at the component rather than
+/// followed and then re-derived.
+///
 /// Only the final component is returned as the opened module; the caller's
 /// `is_file()` check then refuses a directory reachable through the init
 /// resolution as `E_CONFIG_MODULE_NOT_REGULAR`. An intermediate component that
 /// is not a directory is a constraint refusal (`ESCAPE`), never the module.
 #[cfg(windows)]
-fn windows_open_verified(root: &Path, canonical: &Path) -> std::io::Result<std::fs::File> {
+fn windows_open_verified(root: &Path, remainder: &str) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    let remainder = canonical.strip_prefix(root).map_err(|_| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "outside the module root")
-    })?;
-    let components: Vec<_> = remainder.components().collect();
+    let components: Vec<&str> = remainder
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
     if components.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

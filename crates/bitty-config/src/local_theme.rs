@@ -268,6 +268,16 @@ pub fn load_local_themes_from_dir(dir: &Path) -> LocalThemeCatalog {
         dir: Some(dir.to_path_buf()),
         ..LocalThemeCatalog::default()
     };
+    // Test-only I/O denial (`bitty#2869`): a safe-mode generation must never
+    // list, stat, or read the themes directory.
+    #[cfg(feature = "io-denied-harness")]
+    if crate::io_harness::deny_local_theme_read(dir).is_err() {
+        catalog.diagnostics.push(LocalThemeDiagnostic {
+            file: String::from(LOCAL_THEME_DIR_NAME),
+            message: String::from("themes directory read denied by the I/O harness"),
+        });
+        return catalog;
+    }
     // A symlinked themes directory would make every child reachable through
     // a path outside the config root: reject it wholesale, never resolve it.
     if let Ok(metadata) = std::fs::symlink_metadata(dir) {
@@ -518,6 +528,13 @@ fn say_no_dual(effective: &crate::types::EffectiveConfig) -> Result<(), String> 
 
 /// Reads, parses, gates, and bounds one candidate file.
 fn read_one(file_name: &str, path: &Path) -> Result<LocalTheme, LocalThemeError> {
+    #[cfg(feature = "io-denied-harness")]
+    if crate::io_harness::deny_local_theme_read(path).is_err() {
+        return Err(LocalThemeError::Malformed {
+            line: 0,
+            reason: String::from("read denied by the I/O harness"),
+        });
+    }
     let metadata = std::fs::symlink_metadata(path).map_err(|_| LocalThemeError::Malformed {
         line: 0,
         reason: String::from("file metadata is not readable"),

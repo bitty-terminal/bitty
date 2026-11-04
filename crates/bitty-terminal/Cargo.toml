@@ -107,6 +107,11 @@ input-vm-test-support = ["bitty-platform/input-vm-test-support", "bitty-runtime/
 [dev-dependencies]
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674", features = ["test-support"] }
+# `bitty#2869` acceptance: the safe-mode I/O-denied harness lives behind this
+# feature so a test can deny every configuration read and prove `--safe`
+# performs none. Test builds unify the feature; the shipped binary has none of
+# the gate.
+bitty-config = { version = "0.0.32", path = "../bitty-config", features = ["io-denied-harness"] }
 # CTX-0939: storage-parity tests build plugin-store values through the same
 # `LuaValue` type Core validates; test-only, never linked into the binary.
 bitty-lua = { path = "../bitty-lua" }

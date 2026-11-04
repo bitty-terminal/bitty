@@ -16,3 +16,12 @@ workspace = true
 [dependencies]
 phodopus = { version = "0.2.0-alpha.1", git = "https://github.com/bitty-terminal/phodopus", rev = "91b8a2c" }
 chrono.workspace = true
+
+# bitty#2869: the configuration module loader's descriptor-anchored walk
+# (`openat2` with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS`,
+# and the per-component `openat` fallback with `O_NOFOLLOW|O_DIRECTORY`). The
+# safe wrapper keeps this crate at `#![forbid(unsafe_code)]`; an existing
+# workspace dependency, no new crate version.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs", "std"] }
+

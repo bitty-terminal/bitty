@@ -54,22 +54,36 @@ pub(crate) fn install_config_stdlib(lua: &mut Lua) {
             math.set_field(ctx, "random", Value::Nil);
             math.set_field(ctx, "randomseed", Value::Nil);
         }
-        for name in [
-            "_G",
-            "debug",
-            "package",
-            "require",
-            "load",
-            "loadfile",
-            "dofile",
-            "io",
-            "os",
-            "coroutine",
-            "tonumber",
-        ] {
-            ctx.set_global(name, phodopus::Value::Nil);
-        }
+        scrub_config_require_surface(ctx);
     });
+}
+
+/// Remove every dynamic-loading and ambient-authority global from a
+/// configuration VM.
+///
+/// The base loader ships `load`, a preload-only `package`/`require`, and
+/// `debug`; none of them belongs on a configuration VM, and the restricted
+/// configuration loader must not sit beside a second way to compile or fetch
+/// code (a binary chunk is a parse failure, not a load). One deny list is
+/// shared by [`install_config_stdlib`] and the module-loader install so the
+/// two can never drift apart.
+pub(crate) fn scrub_config_require_surface<'gc>(ctx: Context<'gc>) {
+    for name in [
+        "_G",
+        "debug",
+        "package",
+        "require",
+        "load",
+        "loadfile",
+        "dofile",
+        "io",
+        "os",
+        "coroutine",
+        "tonumber",
+        "print",
+    ] {
+        ctx.set_global(name, Value::Nil);
+    }
 }
 
 /// Restricted `os` retained by the accepted baseline: `time`/`clock`/`date`

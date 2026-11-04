@@ -294,3 +294,49 @@ fn query_virtual_prototype_status_ok_replies_exact() {
         vec![b"\x1b_Gi=42;ENOENT:not held\x1b\\".to_vec()]
     );
 }
+
+#[test]
+fn query_probe_ok_implies_the_same_payload_paints() {
+    // Issue #2875 acceptance: `a=q` may only answer OK for what the paint
+    // path actually renders. The probe bytes are then transmitted and
+    // displayed verbatim; the frame must carry a blit.
+    let mut rt = make_runtime();
+    let probe = format!("\x1b_Gi=31,f=32,s=2,v=2,a=q,m=0;{}\x1b\\", red_2x2_b64());
+    rt.handle_pty_bytes(probe.as_bytes());
+    assert_eq!(replies(&mut rt), vec![b"\x1b_Gi=31;OK\x1b\\".to_vec()]);
+    let display = format!(
+        "\x1b_Gi=31,f=32,s=2,v=2,a=T,c=2,r=2,m=0;{}\x1b\\",
+        red_2x2_b64()
+    );
+    rt.handle_pty_bytes(display.as_bytes());
+    assert!(rt.tick().is_some(), "display forces a present");
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "an OK probe must name a payload this terminal can paint"
+    );
+}
+
+#[test]
+fn query_probe_refusal_implies_the_same_payload_paints_nothing() {
+    // The other direction of the truth contract: a declaration the probe
+    // refuses (here: a raw claim whose byte length cannot match `s * v`)
+    // paints nothing when transmitted.
+    let mut rt = make_runtime();
+    let bad = "/wAA/w=="; // 4 bytes for a declared 2x2 RGBA (16 bytes)
+    let probe = format!("\x1b_Gi=31,f=32,s=2,v=2,a=q,m=0;{bad}\x1b\\");
+    rt.handle_pty_bytes(probe.as_bytes());
+    assert_eq!(
+        replies(&mut rt),
+        vec![b"\x1b_Gi=31;EINVAL:bad data\x1b\\".to_vec()]
+    );
+    let display = format!("\x1b_Gi=31,f=32,s=2,v=2,a=T,c=2,r=2,m=0;{bad}\x1b\\");
+    rt.handle_pty_bytes(display.as_bytes());
+    let _ = rt.tick();
+    assert_eq!(rt.kitty_image_count(), 0, "refused payload stores nothing");
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        0,
+        "a refused probe must name a payload that paints nothing"
+    );
+}

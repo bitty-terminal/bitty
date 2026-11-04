@@ -1837,30 +1837,64 @@ pub struct GlyphInstance {
     pub source: GlyphSource,
 }
 
+/// Which present layer an RGBA image blit composites in (kitty `z=`).
+///
+/// kitty's layering rule splits placements by the sign of `z`: a negative
+/// `z-index` draws *under* the text layer, everything else draws above it
+/// (and above selection/cursor overlays, except the focused cursor, #1849
+/// S7). The renderer keeps one blit vector in paint order and splits it by
+/// this tag, so the CPU compositors and the GPU passes agree on both the
+/// split and the order inside each half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ImagePaintLayer {
+    /// `z < 0`: above cell backgrounds and background images, below overlay
+    /// fills and glyphs.
+    BelowText,
+    /// `z >= 0` (the default): topmost, above fills and glyphs.
+    #[default]
+    AboveText,
+}
+
+impl ImagePaintLayer {
+    /// Maps a wire `z=` index to its paint layer: negative draws under text.
+    #[must_use]
+    pub const fn from_z(z: i32) -> Self {
+        if z < 0 {
+            Self::BelowText
+        } else {
+            Self::AboveText
+        }
+    }
+}
+
 /// One RGBA image to composite, fully described in owned data (CTX-0248).
 ///
 /// Produced by the runtime present path from placed Kitty images that the
 /// rich layer rasterized to the exact destination extent. `rgba` is
 /// straight-alpha RGBA8, row-major, exactly
-/// `dest.width * dest.height * 4` bytes. Paint order is after fills and
-/// glyphs: images composite above cells, text, and fill overlays such as
-/// selection, but below the focused cursor (#1849 S7 cursor-on-top punches
-/// the cursor rect out of covering blits), and they never
-/// mutate grid truth. Both CPU compositors (`headless_present` and the
-/// `sw-fallback` `draw_list_onto`) blend every entry, and the real-GPU
-/// pipeline uploads each entry into an RGBA texture and blits it last
-/// (CTX-0291), bounded by `batch::plan_image_uploads`.
+/// `dest.width * dest.height * 4` bytes. [`Self::layer`] places the blit:
+/// [`ImagePaintLayer::AboveText`] (the default) composites above glyphs and
+/// fill overlays such as selection but below the focused cursor (#1849 S7
+/// cursor-on-top punches the cursor rect out of covering blits), while
+/// [`ImagePaintLayer::BelowText`] composites above cell backgrounds and
+/// below overlay fills and glyphs (kitty negative `z=`). Images never mutate
+/// grid truth. Both CPU compositors (`headless_present` and the `sw-fallback`
+/// `draw_list_onto`) split every entry by layer around the glyph pass, and
+/// the real-GPU pipeline uploads each entry into an RGBA texture and uses
+/// the same split (CTX-0291), bounded by `batch::plan_image_uploads`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageBlit {
     /// Destination top-left in logical pixels plus span.
     pub dest: RectPx,
     /// Straight-alpha RGBA8 bytes, row-major, `dest.area() * 4` long.
     pub rgba: Vec<u8>,
+    /// Present layer this blit composites in (kitty `z=` split).
+    pub layer: ImagePaintLayer,
 }
 
 impl ImageBlit {
-    /// Builds a blit, validating the byte length with checked arithmetic
-    /// before accepting the allocation the caller already made.
+    /// Builds a topmost blit, validating the byte length with checked
+    /// arithmetic before accepting the allocation the caller already made.
     ///
     /// # Errors
     ///
@@ -1868,6 +1902,19 @@ impl ImageBlit {
     /// or `rgba.len() != dest.width * dest.height * 4` (including
     /// overflow, which can never satisfy the equality).
     pub fn try_new(dest: RectPx, rgba: Vec<u8>) -> Result<Self, crate::error::RenderError> {
+        Self::try_new_in(dest, rgba, ImagePaintLayer::AboveText)
+    }
+
+    /// Builds a blit in an explicit present layer.
+    ///
+    /// # Errors
+    ///
+    /// Same validation as [`Self::try_new`]; the layer never changes it.
+    pub fn try_new_in(
+        dest: RectPx,
+        rgba: Vec<u8>,
+        layer: ImagePaintLayer,
+    ) -> Result<Self, crate::error::RenderError> {
         if dest.width == 0 || dest.height == 0 {
             return Err(crate::error::RenderError::InvalidInput {
                 reason: "image blit destination must be non-zero",
@@ -1882,7 +1929,7 @@ impl ImageBlit {
                 reason: "image blit bytes do not match destination extent",
             });
         }
-        Ok(Self { dest, rgba })
+        Ok(Self { dest, rgba, layer })
     }
 }
 
@@ -1892,8 +1939,10 @@ impl ImageBlit {
 /// under the `sw-fallback` feature, by
 /// `crate::software::draw_list_onto`. Paint order is fills first, then
 /// rounded fills, then background images, then overlay fills, then glyphs,
-/// then Kitty images; each vector preserves cell scan order so identical
-/// inputs give byte-identical records.
+/// then [`Self::images`] split by [`ImageBlit::layer`] around the glyph
+/// pass (below-text blits paint before glyphs, topmost ones after); each
+/// vector preserves cell scan order so identical inputs give byte-identical
+/// records.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DrawList {
     /// Snapshot generation this list was built from.
@@ -1937,7 +1986,9 @@ pub struct DrawList {
     pub overlay_rounded_fills: Vec<RoundedFill>,
     /// Glyph instances.
     pub glyphs: Vec<GlyphInstance>,
-    /// RGBA image blits (CTX-0248 Kitty present layer, topmost).
+    /// RGBA image blits (CTX-0248 Kitty present layer), split at paint time
+    /// by [`ImageBlit::layer`]: below-text entries composite above cell
+    /// backgrounds and before glyphs, topmost entries paint last.
     pub images: Vec<ImageBlit>,
 }
 

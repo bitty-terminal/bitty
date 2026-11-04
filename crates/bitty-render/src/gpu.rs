@@ -1859,6 +1859,16 @@ impl Surface {
         for blit in &draw_list.backgrounds {
             blend_rgba_blit_rgba(&mut rgba, width, height, blit);
         }
+        // kitty negative `z=`: placements below text stay above cell
+        // backgrounds and the background image, below overlay fills and
+        // glyphs (the same split the real-GPU passes use).
+        for blit in draw_list
+            .images
+            .iter()
+            .filter(|blit| blit.layer == crate::grid::ImagePaintLayer::BelowText)
+        {
+            blend_rgba_blit_rgba(&mut rgba, width, height, blit);
+        }
         // CTX-0347: selection/cursor/chrome overlay fills stay above them.
         for fill in &draw_list.overlay_fills {
             fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
@@ -1966,8 +1976,14 @@ impl Surface {
         // Kitty images (CTX-0248): topmost present-layer blits (see the
         // `present_draw_list` headless branch for the z-order contract).
         // Headless blends every entry (`images_skipped` stays 0); the
-        // real-GPU branch uploads and paints them since CTX-0291.
-        for blit in &draw_list.images {
+        // real-GPU branch uploads and paints them since CTX-0291. Blits in
+        // the below-text layer were already composited before the glyph
+        // pass, so only the topmost half paints here.
+        for blit in draw_list
+            .images
+            .iter()
+            .filter(|blit| blit.layer == crate::grid::ImagePaintLayer::AboveText)
+        {
             blend_rgba_blit_rgba(&mut rgba, width, height, blit);
         }
         // CTX-0290: headless equivalent of the GPU alpha-pinning blend —
@@ -3344,6 +3360,47 @@ mod tests {
     }
 
     #[test]
+    fn headless_present_honors_below_text_image_layer() {
+        // Issue #2875: the CPU present path splits kitty blits by paint
+        // layer around the glyph pass, exactly like `software::draw_list_onto`.
+        use crate::geometry::RectPx;
+        use crate::grid::{GlyphInstance, GlyphSource, ImageBlit, ImagePaintLayer};
+        let composite = |layer| -> [u8; 4] {
+            let surface = Surface::headless(PhysicalSize::new(8, 8)).expect("valid extent");
+            let mut list = image_test_list(vec![
+                ImageBlit::try_new_in(RectPx::new(2, 2, 2, 2), [0xFF, 0, 0, 0xFF].repeat(4), layer)
+                    .unwrap(),
+            ]);
+            list.glyphs.push(GlyphInstance {
+                dest: [2, 2],
+                size: [2, 2],
+                uv: [0.0; 4],
+                color: [255, 255, 255, 255],
+                clip: None,
+                source: GlyphSource::Inline {
+                    mask: vec![255; 4],
+                    width: 2,
+                    height: 2,
+                },
+            });
+            surface.headless_present(&list, None).expect("present");
+            let rgba = surface.headless_rgba().expect("rgba");
+            let idx = (2 * 8 + 2) * 4;
+            [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]]
+        };
+        assert_eq!(
+            composite(ImagePaintLayer::BelowText),
+            [255, 255, 255, 255],
+            "below-text blit is covered by the glyph"
+        );
+        assert_eq!(
+            composite(ImagePaintLayer::AboveText),
+            [0xFF, 0, 0, 0xFF],
+            "above-text blit covers the glyph"
+        );
+    }
+
+    #[test]
     fn headless_present_blends_half_alpha_and_clips() {
         use crate::geometry::RectPx;
         use crate::grid::ImageBlit;
@@ -3394,6 +3451,7 @@ mod tests {
         list.images.push(crate::grid::ImageBlit {
             dest: RectPx::new(0, 0, 2, 2),
             rgba: vec![1; 7],
+            layer: crate::grid::ImagePaintLayer::AboveText,
         });
         let surface = Surface::headless(PhysicalSize::new(4, 4)).expect("valid extent");
         surface.headless_present(&list, None).expect("present");
@@ -3437,6 +3495,7 @@ mod tests {
         malformed.images.push(ImageBlit {
             dest: RectPx::new(0, 0, 2, 2),
             rgba: vec![1; 7],
+            layer: crate::grid::ImagePaintLayer::AboveText,
         });
         let plan = plan_image_uploads(&malformed.images, 4096);
         assert_eq!(plan.admitted, vec![0]);
@@ -3594,6 +3653,7 @@ mod tests {
                 crate::grid::ImageBlit {
                     dest: crate::geometry::RectPx::new(0, 0, 2, 2),
                     rgba: vec![1; 7],
+                    layer: crate::grid::ImagePaintLayer::AboveText,
                 },
             ],
         };

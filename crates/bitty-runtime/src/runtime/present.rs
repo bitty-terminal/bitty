@@ -894,7 +894,7 @@ fn slice_blit_piece(
         let end = start.checked_add(row_len)?;
         rgba.extend_from_slice(blit.rgba.get(start..end)?);
     }
-    bitty_render::grid::ImageBlit::try_new(rect, rgba).ok()
+    bitty_render::grid::ImageBlit::try_new_in(rect, rgba, blit.layer).ok()
 }
 
 /// CTX-1181 (#2041): clip an image blit around higher float frames.
@@ -6436,6 +6436,13 @@ impl Runtime {
         }
     }
 
+    /// Emits the frame's kitty image blits into [`FrameLayers::combined_images`].
+    ///
+    /// Placements arrive in paint order (ascending `z`, then ids) and each
+    /// blit carries the present layer for its `z`: negative placements tag
+    /// [`bitty_render::grid::ImagePaintLayer::BelowText`] and composite under
+    /// the glyph pass, the rest stay topmost (issue #2875). Clipping to the
+    /// pane viewport and the per-frame blit/byte budgets are unchanged.
     fn paint_kitty_images(&mut self, basis: &TickBasis, layers: &mut FrameLayers) {
         let snapshot = &basis.snapshot;
         // CTX-1335: image blits follow the interpolated leaf bounds.
@@ -6651,7 +6658,14 @@ impl Runtime {
                     rect_px.width,
                     rect_px.height,
                 );
-                let Ok(blit) = bitty_render::grid::ImageBlit::try_new(dest, rgba) else {
+                // kitty `z=`: a negative z-index composites below text, so
+                // the blit carries its layer instead of always painting
+                // topmost.
+                let Ok(blit) = bitty_render::grid::ImageBlit::try_new_in(
+                    dest,
+                    rgba,
+                    bitty_render::grid::ImagePaintLayer::from_z(placement.z),
+                ) else {
                     continue;
                 };
                 // CTX-1181 (#2041): the upper float owns the covered part of

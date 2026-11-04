@@ -4432,3 +4432,28 @@ fn unshaped_source_falls_back_to_the_classic_path() {
         "the fallback source must never be asked to shape"
     );
 }
+
+/// Issue #2875: kitty `z=` maps to the present layer by sign alone, and the
+/// blit constructors keep that tag (topmost by default).
+#[test]
+fn image_paint_layer_maps_wire_z() {
+    use super::ImagePaintLayer;
+    use crate::geometry::RectPx;
+
+    assert_eq!(ImagePaintLayer::from_z(-1), ImagePaintLayer::BelowText);
+    assert_eq!(
+        ImagePaintLayer::from_z(i32::MIN),
+        ImagePaintLayer::BelowText
+    );
+    assert_eq!(ImagePaintLayer::from_z(0), ImagePaintLayer::AboveText);
+    assert_eq!(ImagePaintLayer::from_z(5), ImagePaintLayer::AboveText);
+    let topmost = super::ImageBlit::try_new(RectPx::new(0, 0, 1, 1), vec![0; 4]).unwrap();
+    assert_eq!(topmost.layer, ImagePaintLayer::AboveText);
+    let under = super::ImageBlit::try_new_in(
+        RectPx::new(0, 0, 1, 1),
+        vec![0; 4],
+        ImagePaintLayer::from_z(-3),
+    )
+    .unwrap();
+    assert_eq!(under.layer, ImagePaintLayer::BelowText);
+}

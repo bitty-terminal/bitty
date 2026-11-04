@@ -492,10 +492,12 @@ impl SurfaceRgba {
 }
 
 /// Composites a grid-pipeline [`DrawList`] onto a surface: fills, then
-/// rounded decoration fills/rings (CTX-0311), then glyphs (clipped when the
-/// instance carries a rounded clip), then RGBA image blits (CTX-0248,
-/// topmost), preserving vector order. Atlas instances sample
-/// `(atlas_texels, atlas_dims)`; inline instances carry their own masks.
+/// rounded decoration fills/rings (CTX-0311), then the background image,
+/// then below-text RGBA image blits (kitty negative `z=`), then glyphs
+/// (clipped when the instance carries a rounded clip), then topmost RGBA
+/// image blits (CTX-0248), preserving vector order inside each layer.
+/// Atlas instances sample `(atlas_texels, atlas_dims)`; inline instances
+/// carry their own masks.
 ///
 /// Overlay rounded chrome (CTX-1477) paints in three ordered sublayers:
 /// card surface, hosted row backgrounds, then the border ring, so a plugin
@@ -519,6 +521,21 @@ pub fn draw_list_onto(
     // CTX-0347: per-`View` background images paint behind content, above cell
     // backgrounds and the decoration ring.
     for blit in &list.backgrounds {
+        surface.blend_rgba_image(
+            &blit.rgba,
+            blit.dest.width,
+            blit.dest.height,
+            blit.dest.x,
+            blit.dest.y,
+        );
+    }
+    // kitty negative `z=`: placements below text paint above cell backgrounds
+    // and the background image, but under overlay fills and glyphs.
+    for blit in list
+        .images
+        .iter()
+        .filter(|blit| blit.layer == crate::grid::ImagePaintLayer::BelowText)
+    {
         surface.blend_rgba_image(
             &blit.rgba,
             blit.dest.width,
@@ -614,7 +631,11 @@ pub fn draw_list_onto(
             }
         }
     }
-    for blit in &list.images {
+    for blit in list
+        .images
+        .iter()
+        .filter(|blit| blit.layer == crate::grid::ImagePaintLayer::AboveText)
+    {
         surface.blend_rgba_image(
             &blit.rgba,
             blit.dest.width,
@@ -1097,5 +1118,74 @@ mod tests {
         assert_eq!(px(7, 7), [0, 255, 0, 255], "image above the cell fill");
         assert_eq!(px(1, 1), [0, 0, 255, 255], "overlay above the image");
         assert_eq!(px(5, 5), [0, 255, 0, 255], "image outside the overlay");
+    }
+
+    /// Issue #2875: kitty negative `z=` composites image blits below text,
+    /// while non-negative `z` stays topmost. One list carries both, so the
+    /// split (not submission order) has to decide the pixel.
+    #[test]
+    fn draw_list_paints_below_text_images_under_glyphs() {
+        use crate::grid::{DrawList, GlyphInstance, GlyphSource, ImageBlit, ImagePaintLayer};
+        fn list_with(layer: ImagePaintLayer) -> DrawList {
+            DrawList {
+                generation: 1,
+                atlas_epoch: 0,
+                plan: crate::frame::FramePlan {
+                    extent: crate::geometry::ExtentPx::new(4, 4),
+                    mode: crate::frame::FrameMode::Full,
+                    dirty_rects: vec![crate::geometry::RectPx::new(0, 0, 4, 4)],
+                },
+                fills: vec![],
+                rounded_fills: vec![],
+                backgrounds: vec![],
+                overlay_fills: vec![],
+                overlay_card_rounded_fills: vec![],
+                overlay_content_fills: vec![],
+                overlay_rounded_fills: vec![],
+                // A solid white glyph mask over the whole 4x4 surface.
+                glyphs: vec![GlyphInstance {
+                    dest: [0, 0],
+                    size: [4, 4],
+                    uv: [0.0; 4],
+                    color: [255, 255, 255, 255],
+                    clip: None,
+                    source: GlyphSource::Inline {
+                        mask: vec![255; 16],
+                        width: 4,
+                        height: 4,
+                    },
+                }],
+                images: vec![
+                    ImageBlit::try_new_in(
+                        crate::geometry::RectPx::new(0, 0, 4, 4),
+                        [255, 0, 0, 255].repeat(16),
+                        layer,
+                    )
+                    .expect("red blit bytes match extent"),
+                ],
+            }
+        }
+        let composite = |layer| -> [u8; 4] {
+            let mut surface = SurfaceRgba::try_new(4, 4).unwrap();
+            surface.clear([0, 0, 0, 255]);
+            draw_list_onto(&list_with(layer), None, &mut surface).unwrap();
+            let o = (1 * 4 + 1) * 4;
+            [
+                surface.as_bytes()[o],
+                surface.as_bytes()[o + 1],
+                surface.as_bytes()[o + 2],
+                surface.as_bytes()[o + 3],
+            ]
+        };
+        assert_eq!(
+            composite(ImagePaintLayer::BelowText),
+            [255, 255, 255, 255],
+            "negative z paints below text: the glyph wins"
+        );
+        assert_eq!(
+            composite(ImagePaintLayer::AboveText),
+            [255, 0, 0, 255],
+            "non-negative z stays topmost: the image wins"
+        );
     }
 }

@@ -230,6 +230,7 @@ fn headless_image_parity_is_observable_not_silent() {
     malformed.images.push(bitty_render::grid::ImageBlit {
         dest: bitty_render::geometry::RectPx::new(0, 0, 2, 2),
         rgba: vec![1; 7],
+        layer: bitty_render::grid::ImagePaintLayer::AboveText,
     });
     let plan = plan_image_uploads(&malformed.images, 4096);
     assert_eq!(plan.admitted, vec![0]);

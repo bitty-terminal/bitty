@@ -310,7 +310,7 @@ pub use fallback::{
 };
 pub use geometry::{ExtentPx, RectPx};
 pub use glyph::{
-    FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap, GlyphRasterizer,
+    AlphaMode, FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap, GlyphRasterizer,
     MAX_CACHED_BITMAP_BYTES, RasterKey, ShapedBitmap,
 };
 pub use grid::{

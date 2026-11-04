@@ -812,6 +812,70 @@ fn make_rgba_texture(
     }))
 }
 
+/// Copies every color-glyph instance of `draw_list` out of the color atlas
+/// into one straight-alpha RGBA blit (CTX-1691).
+///
+/// The GPU path has no color glyph shader: color glyphs are RGBA quads, so
+/// they ride the existing image pipeline at the glyph position of the pass
+/// order. Slots that fall outside the atlas, or whose dimensions disagree
+/// with the instance, are skipped (fail-closed, never a panic).
+fn color_glyph_blits(
+    draw_list: &DrawList,
+    texels: &[u8],
+    dims: AtlasDims,
+) -> Vec<crate::grid::ImageBlit> {
+    use crate::geometry::RectPx;
+    let stride = usize::from(dims.width);
+    let mut blits = Vec::new();
+    for glyph in &draw_list.glyphs {
+        let crate::grid::GlyphSource::ColorAtlas { slot } = &glyph.source else {
+            continue;
+        };
+        let slot_w = usize::from(slot.width);
+        let slot_h = usize::from(slot.height);
+        let Some(bytes) = slot_w
+            .checked_mul(slot_h)
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            continue;
+        };
+        let mut rgba = Vec::with_capacity(bytes);
+        let mut truncated = false;
+        for row in 0..slot_h {
+            let Some(start) = (usize::from(slot.y) + row)
+                .checked_mul(stride)
+                .and_then(|offset| offset.checked_add(usize::from(slot.x)))
+                .and_then(|index| index.checked_mul(4))
+            else {
+                truncated = true;
+                break;
+            };
+            let Some(end) = start.checked_add(slot_w.checked_mul(4).unwrap_or(0)) else {
+                truncated = true;
+                break;
+            };
+            let Some(row_data) = texels.get(start..end) else {
+                truncated = true;
+                break;
+            };
+            rgba.extend_from_slice(row_data);
+        }
+        if truncated || rgba.len() != bytes {
+            continue;
+        }
+        let dest = RectPx::new(
+            glyph.dest[0],
+            glyph.dest[1],
+            u32::from(slot.width),
+            u32::from(slot.height),
+        );
+        if let Ok(blit) = crate::grid::ImageBlit::try_new(dest, rgba) {
+            blits.push(blit);
+        }
+    }
+    blits
+}
+
 impl GpuResources {
     /// Creates all GPU objects for `format` + `atlas_dims`.
     pub(crate) fn create(
@@ -1391,6 +1455,7 @@ impl GpuResources {
         scale: f32,
         draw_list: &DrawList,
         atlas: Option<(&[u8], AtlasDims)>,
+        color_atlas: Option<(&[u8], AtlasDims)>,
         clear: wgpu::Color,
         opacity: f32,
     ) -> Result<usize, RenderError> {
@@ -1425,6 +1490,23 @@ impl GpuResources {
                 reason: "atlas instance requires atlas texels",
             });
         }
+        // Color glyphs (CTX-1691) ride the RGBA image pipeline: the color
+        // atlas slot is copied into one blit per instance and painted at the
+        // glyph position of the pass order, so no second glyph shader or
+        // texture format exists. A color instance without a color atlas is a
+        // wiring bug, refused before any GPU work.
+        let needs_color = draw_list
+            .glyphs
+            .iter()
+            .any(|g| matches!(g.source, crate::grid::GlyphSource::ColorAtlas { .. }));
+        if needs_color && color_atlas.is_none() {
+            return Err(RenderError::InvalidInput {
+                reason: "color atlas instance requires color atlas texels",
+            });
+        }
+        let color_blits = color_atlas
+            .map(|(texels, dims)| color_glyph_blits(draw_list, texels, dims))
+            .unwrap_or_default();
         // Paint order mirrors both CPU compositors: fills, then rounded
         // decoration fills (CTX-0311), then per-View background images
         // (CTX-0347), then selection/cursor overlay fills, then the overlay
@@ -1719,6 +1801,36 @@ impl GpuResources {
 
         for chunk in &inline_chunks {
             submit_glyph_chunk(&chunk.bytes, chunk.quad_count, &self.inline_bind)?;
+        }
+
+        // Color glyphs (CTX-1691): painted through the RGBA image pipeline at
+        // the glyph position of the pass order (after the coverage and inline
+        // chunks, before the topmost kitty image layer). The color glyphs sit
+        // in their own cells, so intra-layer order against coverage glyphs
+        // cannot be observed. The blits are synthesized from the color atlas
+        // for this frame only; the atlas owns caching and eviction, so no
+        // color texture outlives the pass.
+        if !color_blits.is_empty() {
+            let admitted: Vec<usize> = (0..color_blits.len()).collect();
+            images_skipped = images_skipped.saturating_add(draw_image_layer(
+                &mut self.image_textures,
+                &self.image_pipeline,
+                &self.image_vb,
+                &self.index_buf,
+                &self.image_bind_layout,
+                &self.image_sampler,
+                &self.opacity_buf,
+                device,
+                queue,
+                view,
+                surface_w,
+                surface_h,
+                scale,
+                &color_blits,
+                &admitted,
+                &mut first_pass,
+                clear,
+            )?);
         }
 
         // Kitty images (CTX-0291): the topmost half, painted after fills and

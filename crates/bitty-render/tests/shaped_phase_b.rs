@@ -196,6 +196,7 @@ fn cursor_intersects_only_ligatures() {
         uncovered: false,
         ligature_part: false,
         byte_offset: 0,
+        presentation: bitty_term_state::EmojiPresentation::Text,
     };
     let ligature = ShapedCluster {
         cells: (1, 2),
@@ -206,6 +207,7 @@ fn cursor_intersects_only_ligatures() {
         uncovered: false,
         ligature_part: true,
         byte_offset: 1,
+        presentation: bitty_term_state::EmojiPresentation::Text,
     };
     let clusters = vec![single, ligature];
     // Cursor on single-cell cluster: no un-shape.

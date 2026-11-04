@@ -1400,11 +1400,43 @@ impl Surface {
     ///   headless buffer cap.
     /// - [`RenderError::SurfaceAcquire`] for real-surface texture-acquire
     ///   failures.
+    ///
+    /// [`present_draw_list_color`](Self::present_draw_list_color) without
+    /// color glyphs: the pre-CTX-1691 entry point.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::present_draw_list_color`].
     pub fn present_draw_list(
         &self,
         ctx: &GpuContext,
         draw_list: &DrawList,
         atlas: Option<(&[u8], AtlasDims)>,
+    ) -> Result<PresentStats, RenderError> {
+        self.present_draw_list_color(ctx, draw_list, atlas, None)
+    }
+
+    /// Presents one frame, including color glyphs from `color_atlas`.
+    ///
+    /// `color_atlas` is the renderer's RGBA color atlas
+    /// ([`crate::grid::GridRenderer::color_atlas_texels`]); frames whose glyph
+    /// list carries [`GlyphSource::ColorAtlas`](crate::grid::GlyphSource)
+    /// instances require it and are refused without it, exactly like coverage
+    /// glyphs require the monochrome atlas.
+    ///
+    /// # Errors
+    ///
+    /// - [`RenderError::SurfaceConfigure`] when the surface is not configured.
+    /// - [`RenderError::InvalidInput`] for atlas mismatches or buffer-cap
+    ///   overflows.
+    /// - [`RenderError::SurfaceAcquire`] for real-surface texture-acquire
+    ///   failures.
+    pub fn present_draw_list_color(
+        &self,
+        ctx: &GpuContext,
+        draw_list: &DrawList,
+        atlas: Option<(&[u8], AtlasDims)>,
+        color_atlas: Option<(&[u8], AtlasDims)>,
     ) -> Result<PresentStats, RenderError> {
         // Shared validation: configured?
         let config = {
@@ -1425,6 +1457,15 @@ impl Surface {
         if needs_atlas && atlas.is_none() {
             return Err(RenderError::InvalidInput {
                 reason: "atlas instance requires atlas texels",
+            });
+        }
+        let needs_color = draw_list
+            .glyphs
+            .iter()
+            .any(|g| matches!(g.source, crate::grid::GlyphSource::ColorAtlas { .. }));
+        if needs_color && color_atlas.is_none() {
+            return Err(RenderError::InvalidInput {
+                reason: "color atlas instance requires color atlas texels",
             });
         }
 
@@ -1481,7 +1522,9 @@ impl Surface {
                 for fill in &draw_list.overlay_rounded_fills {
                     fill_rounded_rect_rgba(&mut rgba, width, height, fill);
                 }
-                // Glyphs.
+                // Glyphs. Color glyphs paint from their own atlas at the same
+                // point of the paint order (CTX-1691).
+                blend_color_glyphs_rgba(&mut rgba, width, height, &draw_list.glyphs, color_atlas);
                 if let Some((texels, dims)) = atlas {
                     for glyph in &draw_list.glyphs {
                         match &glyph.source {
@@ -1548,6 +1591,10 @@ impl Surface {
                                     glyph.clip,
                                 );
                             }
+                            // Painted by `blend_color_glyphs_rgba` above: the
+                            // color atlas is a separate texture, so this
+                            // coverage pass has nothing to sample.
+                            crate::grid::GlyphSource::ColorAtlas { .. } => {}
                         }
                     }
                 } else {
@@ -1729,6 +1776,7 @@ impl Surface {
                             scale,
                             draw_list,
                             atlas,
+                            color_atlas,
                             clear,
                             opacity,
                         )
@@ -1806,6 +1854,23 @@ impl Surface {
         draw_list: &DrawList,
         atlas: Option<(&[u8], AtlasDims)>,
     ) -> Result<PresentStats, RenderError> {
+        self.headless_present_color(draw_list, atlas, None)
+    }
+
+    /// Headless present including color glyphs from `color_atlas`
+    /// (CTX-1691).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::headless_present`], plus
+    /// [`RenderError::InvalidInput`] when a color atlas instance is present
+    /// but `color_atlas` is `None`.
+    pub fn headless_present_color(
+        &self,
+        draw_list: &DrawList,
+        atlas: Option<(&[u8], AtlasDims)>,
+        color_atlas: Option<(&[u8], AtlasDims)>,
+    ) -> Result<PresentStats, RenderError> {
         if !self.is_headless() {
             return Err(RenderError::SurfaceConfigure(
                 "headless_present called on a real surface".into(),
@@ -1825,6 +1890,15 @@ impl Surface {
         if needs_atlas && atlas.is_none() {
             return Err(RenderError::InvalidInput {
                 reason: "atlas instance requires atlas texels",
+            });
+        }
+        let needs_color = draw_list
+            .glyphs
+            .iter()
+            .any(|g| matches!(g.source, crate::grid::GlyphSource::ColorAtlas { .. }));
+        if needs_color && color_atlas.is_none() {
+            return Err(RenderError::InvalidInput {
+                reason: "color atlas instance requires color atlas texels",
             });
         }
         let width = config.extent.width();
@@ -1882,6 +1956,9 @@ impl Surface {
         for fill in &draw_list.overlay_rounded_fills {
             fill_rounded_rect_rgba(&mut rgba, width, height, fill);
         }
+        // Glyphs: color glyphs from their own atlas first, then the coverage
+        // and inline passes (CTX-1691).
+        blend_color_glyphs_rgba(&mut rgba, width, height, &draw_list.glyphs, color_atlas);
         if let Some((texels, dims)) = atlas {
             for glyph in &draw_list.glyphs {
                 match &glyph.source {
@@ -1948,6 +2025,8 @@ impl Surface {
                             glyph.clip,
                         );
                     }
+                    // Painted by `blend_color_glyphs_rgba` before this pass.
+                    crate::grid::GlyphSource::ColorAtlas { .. } => {}
                 }
             }
         } else {
@@ -2322,6 +2401,102 @@ fn paint_rounded_run_rgba(
     for x in x0..x1 {
         blend_rounded_pixel_rgba(rgba, width, fill, x, y);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+/// Blends every color-atlas glyph of `glyphs` onto a premultiplied RGBA
+/// buffer (CTX-1691).
+///
+/// Color glyphs live in their own atlas, so they are painted in one ordered
+/// pass at the glyph position of the paint order: above the overlay fills and
+/// below the kitty image layer, exactly like coverage glyphs. Their instances
+/// carry no rounded clip (the emission path never sets one for a color
+/// bitmap) and are never tinted by the cell foreground.
+fn blend_color_glyphs_rgba(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    glyphs: &[crate::grid::GlyphInstance],
+    color_atlas: Option<(&[u8], AtlasDims)>,
+) {
+    let Some((texels, dims)) = color_atlas else {
+        return;
+    };
+    let stride = usize::from(dims.width);
+    let rows = usize::from(dims.height);
+    for glyph in glyphs {
+        let crate::grid::GlyphSource::ColorAtlas { slot } = &glyph.source else {
+            continue;
+        };
+        let slot_h = usize::from(slot.height);
+        let slot_w = usize::from(slot.width);
+        if slot_w == 0 || slot_h == 0 {
+            continue;
+        }
+        let x0 = usize::from(slot.x);
+        let y0 = usize::from(slot.y);
+        if x0.saturating_add(slot_w) > stride || y0.saturating_add(slot_h) > rows {
+            continue;
+        }
+        for row in 0..slot_h {
+            let Some(src_row) = (y0 + row)
+                .checked_mul(stride)
+                .and_then(|offset| offset.checked_add(x0))
+            else {
+                continue;
+            };
+            for col in 0..slot_w {
+                let Some(src) = src_row
+                    .checked_add(col)
+                    .and_then(|index| index.checked_mul(4))
+                else {
+                    continue;
+                };
+                let (Some(texel), Some(px)) = (
+                    texels.get(src..src.saturating_add(4)),
+                    blended_pixel_index(width, height, glyph.dest, row, col),
+                ) else {
+                    continue;
+                };
+                let alpha = u32::from(texel[3]);
+                if alpha == 0 {
+                    continue;
+                }
+                // Straight-alpha texel over premultiplied destination.
+                let inv = 255 - alpha;
+                for channel in 0..3 {
+                    let src = (u32::from(texel[channel]) * alpha + 127) / 255;
+                    let dst = u32::from(rgba[px + channel]);
+                    rgba[px + channel] =
+                        u8::try_from((src + (dst * inv + 127) / 255).min(255)).unwrap_or(255);
+                }
+                let dst_alpha = u32::from(rgba[px + 3]);
+                rgba[px + 3] =
+                    u8::try_from((alpha + (dst_alpha * inv + 127) / 255).min(255)).unwrap_or(255);
+            }
+        }
+    }
+}
+
+/// Destination byte index of texel `(col, row)` for a glyph placed at
+/// `dest`, or `None` when it falls outside the buffer.
+fn blended_pixel_index(
+    width: u32,
+    height: u32,
+    dest: [i32; 2],
+    row: usize,
+    col: usize,
+) -> Option<usize> {
+    let x = i64::from(dest[0]).checked_add(i64::try_from(col).ok()?)?;
+    let y = i64::from(dest[1]).checked_add(i64::try_from(row).ok()?)?;
+    if x < 0 || y < 0 || x >= i64::from(width) || y >= i64::from(height) {
+        return None;
+    }
+    let index = usize::try_from(y)
+        .ok()?
+        .checked_mul(usize::try_from(width).ok()?)?
+        .checked_add(usize::try_from(x).ok()?)?;
+    index.checked_mul(4)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3667,6 +3842,7 @@ mod tests {
                 1.0,
                 &list,
                 None,
+                None,
                 wgpu::Color {
                     r: 0.0,
                     g: 0.0,
@@ -3877,6 +4053,7 @@ mod tests {
                 height,
                 1.0,
                 &list,
+                None,
                 None,
                 wgpu::Color {
                     r: 0.0,

@@ -99,7 +99,7 @@ impl FontQuery {
 }
 
 /// Identifies exactly what to rasterize: one character of one face at one
-/// size.
+/// size, under one emoji-presentation decision.
 #[derive(Debug, Clone, Copy)]
 pub struct RasterKey {
     /// Character to rasterize (already resolved by the text layer; combining
@@ -110,10 +110,18 @@ pub struct RasterKey {
     /// Size in points. Compared and hashed by bit pattern so every distinct
     /// finite value is a distinct key; constructors reject non-finite sizes.
     pub point_size: f32,
+    /// Presentation the cluster asked for (CTX-1691).
+    ///
+    /// Part of the key because the same scalar at the same size rasterizes to
+    /// a color layer stack under emoji presentation and to a monochrome
+    /// coverage bitmap under text presentation (U+2705 with and without
+    /// U+FE0E); a shared key would hand one style the other's bitmap.
+    pub presentation: bitty_term_state::EmojiPresentation,
 }
 
 impl RasterKey {
-    /// Builds a key, rejecting non-finite or non-positive sizes.
+    /// Builds a text-presentation key, rejecting non-finite or non-positive
+    /// sizes.
     ///
     /// # Errors
     ///
@@ -129,7 +137,24 @@ impl RasterKey {
             character,
             font,
             point_size,
+            presentation: bitty_term_state::EmojiPresentation::Text,
         })
+    }
+
+    /// Returns this key with the cluster's resolved presentation.
+    #[must_use]
+    pub const fn with_presentation(
+        mut self,
+        presentation: bitty_term_state::EmojiPresentation,
+    ) -> Self {
+        self.presentation = presentation;
+        self
+    }
+
+    /// True when the cluster asked for the color glyph.
+    #[must_use]
+    pub const fn wants_color(self) -> bool {
+        self.presentation.is_emoji()
     }
 }
 
@@ -140,6 +165,7 @@ impl PartialEq for RasterKey {
         self.character == other.character
             && self.font == other.font
             && self.point_size.to_bits() == other.point_size.to_bits()
+            && self.presentation == other.presentation
     }
 }
 
@@ -150,6 +176,7 @@ impl std::hash::Hash for RasterKey {
         self.character.hash(state);
         self.font.hash(state);
         self.point_size.to_bits().hash(state);
+        self.presentation.hash(state);
     }
 }
 
@@ -177,8 +204,39 @@ pub enum BitmapFormat {
     /// Three bytes per pixel carrying coverage (grayscale antialiasing) or
     /// subpixel triplets, as produced by the upstream engine.
     Rgb,
-    /// Four bytes per pixel, premultiplied alpha.
+    /// Four bytes per pixel, color. The channel semantics depend on the
+    /// source and are carried by [`GlyphBitmap::alpha`]: a COLR/CPAL layer
+    /// stack arrives premultiplied, a color bitmap strike arrives with
+    /// straight alpha.
     Rgba,
+}
+
+/// Channel semantics of a [`BitmapFormat::Rgba`] bitmap's color channels.
+///
+/// The two color sources do not agree, and the color atlas stores straight
+/// alpha, so it has to un-premultiply exactly once and only where that is
+/// valid (CTX-1691 review round 1):
+///
+/// * COLR/CPAL layers are composited src-over onto a zeroed buffer by
+///   `swash`'s layer blit (`blit` in `swash::scale::bitmap`), which leaves
+///   premultiplied bytes.
+/// * CBDT/sbix strikes are decoded PNG images and keep straight alpha;
+///   `swash` copies them out unchanged (`scale_bitmap_impl`, no blit).
+/// * FreeType color bitmaps are `FT_PIXEL_MODE_BGRA`, documented as
+///   premultiplied, and CoreGraphics color glyphs likewise.
+///
+/// The renderer records the winning source with the bitmap instead of
+/// guessing from the bytes, because a straight-alpha bitmap whose channels
+/// happen to stay below alpha is indistinguishable from a premultiplied one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AlphaMode {
+    /// Channels are already multiplied by alpha (COLR layer stack, FreeType
+    /// `FT_PIXEL_MODE_BGRA`, CoreGraphics color glyphs). This is the
+    /// historical meaning of [`BitmapFormat::Rgba`].
+    #[default]
+    Premultiplied,
+    /// Channels are independent of alpha (decoded CBDT/sbix PNG strikes).
+    Straight,
 }
 
 impl BitmapFormat {
@@ -205,6 +263,9 @@ pub struct GlyphBitmap {
     pub metrics: GlyphMetrics,
     /// Channel layout of `data`.
     pub format: BitmapFormat,
+    /// Channel semantics of an [`BitmapFormat::Rgba`] bitmap; ignored for
+    /// [`BitmapFormat::Rgb`], whose bytes are coverage.
+    pub alpha: AlphaMode,
     /// Pixel data, row-major from the top-left, length-validated.
     pub data: Vec<u8>,
 }
@@ -241,6 +302,10 @@ impl GlyphBitmap {
             Ok(len) if len == data.len() => Ok(Self {
                 metrics,
                 format,
+                // Every constructor path that produces straight alpha says
+                // so explicitly (see `AlphaMode`); the default keeps the
+                // historical premultiplied reading of an RGBA bitmap.
+                alpha: AlphaMode::Premultiplied,
                 data,
             }),
             // The mismatch is reported without echoing sizes back: reasons
@@ -256,6 +321,16 @@ impl GlyphBitmap {
     #[must_use]
     pub fn is_blank(&self) -> bool {
         self.data.is_empty()
+    }
+
+    /// Reinterprets the RGBA color channels as `alpha` (see [`AlphaMode`]).
+    ///
+    /// Only a rasterizer that knows which source won can call this; the
+    /// bytes are untouched, so the caller owns the correctness of the claim.
+    #[must_use]
+    pub const fn with_alpha(mut self, alpha: AlphaMode) -> Self {
+        self.alpha = alpha;
+        self
     }
 
     /// Checks the source invariant before converting any channel layout.

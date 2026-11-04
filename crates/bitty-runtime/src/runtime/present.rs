@@ -227,10 +227,16 @@ impl ShapedRunSource for AnyRasterizer {
         glyph_id: u16,
         point_size: f32,
         features: &[bitty_config::types::OpenTypeFeature],
+        presentation: bitty_term_state::EmojiPresentation,
     ) -> Result<Option<ShapedBitmap<'_>>, RenderError> {
         match self {
             Self::Shaped(inner) => <SwashSingle as ShapedRunSource>::rasterize_shaped_cached_ref(
-                inner, face, glyph_id, point_size, features,
+                inner,
+                face,
+                glyph_id,
+                point_size,
+                features,
+                presentation,
             ),
             _ => Err(RenderError::InvalidInput {
                 reason: "text stack does not rasterize shaped glyphs",
@@ -7242,6 +7248,15 @@ impl Runtime {
 
         let atlas_texels = self.renderer.atlas_texels().to_vec();
         let dims = self.renderer.atlas_dims();
+        // Color glyphs (CTX-1691) ride their own atlas; copied once per frame
+        // so the present call does not borrow the renderer.
+        let color_atlas = self
+            .renderer
+            .color_atlas_texels()
+            .map(|(texels, color_dims)| (texels.to_vec(), color_dims));
+        let color_atlas_arg = color_atlas
+            .as_ref()
+            .map(|(texels, color_dims)| (texels.as_slice(), *color_dims));
         let retrying = self.surface_retry.deadline.is_some();
         if retrying {
             bitty_render::telemetry::retry_attempt();
@@ -7263,10 +7278,11 @@ impl Runtime {
                 return None;
             }
             if let Some(gpu) = self.gpu.as_ref() {
-                match self.surface.present_draw_list(
+                match self.surface.present_draw_list_color(
                     gpu,
                     &combined_list,
                     Some((&atlas_texels, dims)),
+                    color_atlas_arg,
                 ) {
                     Ok(s) => {
                         self.clear_surface_retry();
@@ -7296,10 +7312,11 @@ impl Runtime {
                 // Test-only recovery route: no adapter is attached, so the
                 // retained frame is committed through the headless fake and
                 // the retry state clears exactly as a real success would.
-                match self
-                    .surface
-                    .headless_present(&combined_list, Some((&atlas_texels, dims)))
-                {
+                match self.surface.headless_present_color(
+                    &combined_list,
+                    Some((&atlas_texels, dims)),
+                    color_atlas_arg,
+                ) {
                     Ok(stats) => {
                         self.clear_surface_retry();
                         stats
@@ -7308,10 +7325,11 @@ impl Runtime {
                 }
             }
         } else {
-            match self
-                .surface
-                .headless_present(&combined_list, Some((&atlas_texels, dims)))
-            {
+            match self.surface.headless_present_color(
+                &combined_list,
+                Some((&atlas_texels, dims)),
+                color_atlas_arg,
+            ) {
                 Ok(stats) => {
                     self.clear_surface_retry();
                     stats

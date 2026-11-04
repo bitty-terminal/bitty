@@ -51,6 +51,7 @@ use super::*;
 
 use std::collections::VecDeque;
 
+use crate::registry::WorkspaceId;
 use bitty_plugin_host::{BoundedText, EventPayload};
 
 /// Maximum workspaces (mirrors `registry::MAX_WORKSPACES_PER_WINDOW`).
@@ -62,6 +63,16 @@ pub const WORKSPACE_NAME_MAX_CHARS: usize = 32;
 /// One workspace: name plus stashed layout + focus.
 #[derive(Debug, Clone)]
 pub struct WorkspaceSlot {
+    /// Stable `WorkspaceId` for this slot (OQ-084 B-2).
+    ///
+    /// Minted once, by `Runtime::mint_workspace_id`, when the slot is created,
+    /// and never reused. It is the identity a panel is attributed to:
+    /// [`Runtime::focused_workspace_id`] hands it to `create_panel` as the
+    /// panel's workspace, so the panel registry's `workspace_panels` bucket and
+    /// the presented workspace are one bucket rather than two. Deliberately not
+    /// `seq`: `Runtime::workspace_swap_current_with` reassigns `seq` between
+    /// slots and `Runtime::next_free_workspace_seq` reuses closed sequences.
+    pub id: WorkspaceId,
     /// Creation sequence (stable identity across index shifts).
     pub seq: u64,
     /// Display name (`ws{seq}` until rename lands as a follow-up).
@@ -199,7 +210,9 @@ impl Runtime {
     pub(super) fn init_workspaces(&mut self) {
         // Seed from the live pair (clone: the live layout/focus stay
         // authoritative for the active slot until the first switch-away).
+        let id = self.mint_workspace_id();
         self.workspaces = vec![WorkspaceSlot {
+            id,
             seq: 1,
             name: String::from("ws1"),
             layout: self.layout.clone(),
@@ -224,6 +237,52 @@ impl Runtime {
     #[must_use]
     pub fn active_workspace_index(&self) -> usize {
         self.active_workspace
+    }
+
+    /// Stable `WorkspaceId` of the presented workspace (OQ-084 B-2).
+    ///
+    /// Always answers: `workspaces` holds at least one slot and
+    /// `active_workspace` indexes it (the module invariant). Attribution that
+    /// does not depend on focus — the workspace a new panel belongs to when a
+    /// leaf exists — uses this; the create boundary uses
+    /// [`Self::focused_workspace_id`], which additionally requires a focused
+    /// leaf.
+    #[must_use]
+    pub fn active_workspace_id(&self) -> WorkspaceId {
+        self.workspaces[self.active_workspace].id
+    }
+
+    /// Resolves the presented workspace's `WorkspaceId` from its focused leaf,
+    /// or `None` when the presented workspace has no focused leaf (OQ-084
+    /// B-2).
+    ///
+    /// This is the create-path bridge the decision names: Core calls it at the
+    /// `panel.create` boundary and passes the answer to
+    /// [`PanelRegistry::create_panel`](crate::registry::PanelRegistry::create_panel)
+    /// as the panel's `workspace`. `None` fails the create closed (the
+    /// `E_UI_UNAVAILABLE` branch) instead of falling back to a window-global
+    /// pointer. A focus id that is absent from the presented layout is treated
+    /// as "no focused view" rather than attributed to a slot it does not
+    /// visibly occupy.
+    #[must_use]
+    pub fn focused_workspace_id(&self) -> Option<WorkspaceId> {
+        let focused = self.focused_view()?;
+        self.workspaces
+            .get(self.active_workspace)
+            .filter(|slot| slot.layout.find_leaf(focused).is_some())
+            .map(|slot| slot.id)
+    }
+
+    /// Mints the next slot `WorkspaceId` (monotonic; never reused).
+    ///
+    /// The runtime is the only production minter of `WorkspaceId`, so every id
+    /// a panel record is keyed by names a slot this window presents. Starts at
+    /// 1; only `u64` exhaustion wraps, and the wrap skips 0 so a zeroed id is
+    /// never handed out (the same bounded pattern as the panel allocator).
+    pub(super) fn mint_workspace_id(&mut self) -> WorkspaceId {
+        let id = WorkspaceId::new(self.next_workspace_id_raw);
+        self.next_workspace_id_raw = self.next_workspace_id_raw.wrapping_add(1).max(1);
+        id
     }
 
     /// Workspace names in index order.
@@ -1422,9 +1481,11 @@ impl Runtime {
         self.focus = focus.clone();
         // CTX-1147: the fresh workspace starts with no detached floats.
         self.floats = FloatStore::new();
+        let id = self.mint_workspace_id();
         self.workspaces.insert(
             index,
             WorkspaceSlot {
+                id,
                 seq,
                 name: format!("ws{seq}"),
                 layout,
@@ -1945,7 +2006,9 @@ impl Runtime {
             let layout = LayoutNode::leaf(leaf);
             let focus = Focus::with_focus(fresh_id);
             let seq = self.next_free_workspace_seq();
+            let id = self.mint_workspace_id();
             self.workspaces.push(WorkspaceSlot {
+                id,
                 seq,
                 name: format!("ws{seq}"),
                 layout,
@@ -2596,7 +2659,9 @@ impl Runtime {
             removed_source_name = None;
         }
 
+        let id = self.mint_workspace_id();
         let new_slot = WorkspaceSlot {
+            id,
             seq: one_based,
             name: format!("ws{one_based}"),
             layout: LayoutNode::leaf(moved_view),

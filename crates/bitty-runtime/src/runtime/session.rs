@@ -1273,7 +1273,13 @@ impl Runtime {
             for float in &ws.floats {
                 floats.restore_detached(float.view.clone());
             }
+            // OQ-084 B-2: a restored workspace is a new container in this
+            // process, so it takes a fresh id from the same monotonic space
+            // rather than a value recorded in the snapshot. Panel attribution
+            // is per-window identity, not persisted state.
+            let id = self.mint_workspace_id();
             workspaces.push(WorkspaceSlot {
+                id,
                 seq: ws.seq,
                 name: ws.name.clone(),
                 layout: ws.layout.clone(),

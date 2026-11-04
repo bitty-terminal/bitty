@@ -1890,6 +1890,12 @@ impl Surface {
     /// Composites one [`DrawList`] onto an existing premultiplied RGBA
     /// headless buffer without clearing it and without applying window
     /// opacity (the caller owns both).
+    ///
+    /// `color_atlas` is the renderer's RGBA color atlas
+    /// ([`crate::grid::GridRenderer::color_atlas_texels`]). Color glyphs paint
+    /// from it at the glyph point of the paint order, exactly as the real-GPU
+    /// path does; omitting the pass here would leave a color emoji as its
+    /// cleared background while every other layer still drew.
     fn composite_headless_draw_list(
         &self,
         rgba: &mut [u8],
@@ -1897,6 +1903,7 @@ impl Surface {
         height: u32,
         draw_list: &DrawList,
         atlas: Option<(&[u8], AtlasDims)>,
+        color_atlas: Option<(&[u8], AtlasDims)>,
     ) {
         for fill in &draw_list.fills {
             fill_rect_rgba(rgba, width, height, fill.rect, fill.color);
@@ -1933,6 +1940,10 @@ impl Surface {
         for fill in &draw_list.overlay_rounded_fills {
             fill_rounded_rect_rgba(rgba, width, height, fill);
         }
+        // Glyphs: color glyphs paint from their own atlas first, then the
+        // coverage and inline passes (CTX-1691), matching the real-GPU paint
+        // order.
+        blend_color_glyphs_rgba(rgba, width, height, &draw_list.glyphs, color_atlas);
         if let Some((texels, dims)) = atlas {
             for glyph in &draw_list.glyphs {
                 match &glyph.source {
@@ -2116,7 +2127,7 @@ impl Surface {
         let len = headless_buffer_len(width, height)?;
         let mut rgba = vec![0u8; len];
         clear_headless_rgba(&mut rgba, self.theme_palette().background);
-        self.composite_headless_draw_list(&mut rgba, width, height, draw_list, atlas);
+        self.composite_headless_draw_list(&mut rgba, width, height, draw_list, atlas, color_atlas);
         // CTX-0290: headless equivalent of the GPU alpha-pinning blend —
         // scale the finished premultiplied buffer by the configured opacity
         // so CI can prove the window-opacity effect without an adapter.
@@ -2205,7 +2216,9 @@ impl Surface {
                 rgba
             }
         };
-        self.composite_headless_draw_list(&mut rgba, width, height, draw_list, atlas);
+        // Retained present has no color-atlas parameter (its public signature
+        // predates color glyphs); coverage and inline glyphs still composite.
+        self.composite_headless_draw_list(&mut rgba, width, height, draw_list, atlas, None);
         let mut state = self.state.lock().expect("surface state poisoned");
         state.frame += 1;
         state.headless_rgba = Some(rgba);

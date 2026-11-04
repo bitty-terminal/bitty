@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+#[cfg(unix)]
 use std::time::{Duration, Instant};
 
 /// Binary under test (fails to compile if the `[[bin]]` rename regresses).
@@ -60,6 +61,7 @@ fn run_bitty(root: &Path, args: &[&str]) -> Output {
 
 /// Run with a hard deadline, so a read that would block is a failure instead
 /// of a hung test (the contract: "a test that hangs is a defect, not a pass").
+#[cfg(unix)]
 fn run_bitty_within(root: &Path, args: &[&str], limit: Duration) -> Output {
     let mut child = base_command(root, args)
         .stdout(std::process::Stdio::piped())

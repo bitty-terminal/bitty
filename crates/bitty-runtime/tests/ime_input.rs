@@ -71,11 +71,18 @@ fn feed_typing_key(rt: &mut Runtime, preedit: &str, ch: &str) {
 /// the preedit-clear first, then the commit. With `trailing_commit_key`, the
 /// raw keyboard press of the same physical key follows, which is what a
 /// compositor that does not filter the IME's key stream delivers (Wayland).
+///
+/// The trailing press is stamped with the batch instant captured before the
+/// commit was fed (#2879). The IME side still runs through the platform-event
+/// path, but the echo is then judged on the batch's own clock instead of on how
+/// long this thread was off the CPU between the two calls, so the one-shot
+/// claim cannot age out underneath the assertion.
 fn feed_commit(rt: &mut Runtime, committed: &str, trailing_commit_key: Option<KeyEvent>) {
+    let batch = std::time::Instant::now();
     let _ = rt.handle_platform_event(ime_event(ImeEvent::Preedit(String::new(), None)));
     let _ = rt.handle_platform_event(ime_event(ImeEvent::Commit(committed.to_string())));
     if let Some(key) = trailing_commit_key {
-        let _ = rt.handle_platform_event(key_event(key));
+        let _ = rt.handle_key_event_at(key, batch);
     }
 }
 
@@ -143,6 +150,7 @@ fn empty_preedit_then_commit_inserts_exactly_once() {
 #[test]
 fn raw_keys_during_composition_do_not_double_input() {
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    let base = std::time::Instant::now();
     rt.handle_ime_preedit(Some("n".to_string()), Some(1));
 
     // Platform quirk: the raw key for the composition reaches the key path.
@@ -167,12 +175,12 @@ fn raw_keys_during_composition_do_not_double_input() {
     // input. (Before CTX-0783 this asserted the pre-fix semantics, where the
     // very next press inserted — the #1449 trailing space.)
     assert!(
-        rt.handle_key_event(char_key("a")).is_none(),
+        rt.handle_key_event_at(char_key("a"), base).is_none(),
         "the raw copy of the committing key is absorbed, not inserted"
     );
     assert_eq!(rt.pending_input_len(), 0, "absorbed key emits no bytes");
     assert!(
-        rt.handle_key_event(char_key("a")).is_some(),
+        rt.handle_key_event_at(char_key("a"), base).is_some(),
         "the claim is one-shot: later keys are real input again"
     );
     assert_eq!(rt.pending_input(), b"a");
@@ -332,6 +340,10 @@ fn commit_claim_is_bounded_to_one_press() {
     // The claim is one-shot: a swallowed key can never cascade into silently
     // dropping a second, real keystroke.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    // Presses are fed on this test's own timeline (#2879), captured before the
+    // commit, so the claim's deadline is the test's instant and not the
+    // scheduler's.
+    let base = std::time::Instant::now();
 
     feed_typing_key(&mut rt, "n", "n");
     // Commit with the trailing raw key withheld, so the claim is still held
@@ -343,15 +355,15 @@ fn commit_claim_is_bounded_to_one_press() {
     );
 
     assert!(
-        rt.handle_key_event(char_key("a")).is_none(),
+        rt.handle_key_event_at(char_key("a"), base).is_none(),
         "the owed commit key is absorbed"
     );
     assert!(
-        rt.handle_key_event(char_key("b")).is_some(),
+        rt.handle_key_event_at(char_key("b"), base).is_some(),
         "the press after the claim is real input"
     );
     assert!(
-        rt.handle_key_event(char_key("c")).is_some(),
+        rt.handle_key_event_at(char_key("c"), base).is_some(),
         "and so is every later press"
     );
     assert_eq!(std::str::from_utf8(&rt.drain_pending_input()), Ok("bc"));
@@ -366,7 +378,7 @@ fn commit_echo_in_the_next_batch_is_still_absorbed() {
     // handed the echo straight back to the terminal, and the fcitx5 trailing
     // space of #1449 returned on a perfectly ordinary compositor.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
-    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let base = std::time::Instant::now();
 
     feed_typing_key(&mut rt, "ni", "n");
     rt.handle_ime_preedit_at(Some("nihao".to_string()), Some(5), base);
@@ -379,7 +391,7 @@ fn commit_echo_in_the_next_batch_is_still_absorbed() {
     // Batch boundary for the commit arrives first; the echo lands after it.
     rt.tick_at(base);
     assert!(
-        rt.handle_key_event(char_key(" ")).is_none(),
+        rt.handle_key_event_at(char_key(" "), base).is_none(),
         "the echo is still the IME's one batch after the commit"
     );
     assert_eq!(
@@ -394,7 +406,7 @@ fn commit_echo_stays_absorbed_across_several_ticks() {
     // A busy event loop can dispatch several batches inside the echo window;
     // ageing must not accumulate into an early release.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
-    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let base = std::time::Instant::now();
 
     feed_typing_key(&mut rt, "ni", "n");
     rt.handle_ime_preedit_at(Some("ni".to_string()), Some(2), base);
@@ -406,7 +418,8 @@ fn commit_echo_stays_absorbed_across_several_ticks() {
         rt.tick_at(base + IME_COMMIT_ECHO_WINDOW * step / 10);
     }
     assert!(
-        rt.handle_key_event(char_key(" ")).is_none(),
+        rt.handle_key_event_at(char_key(" "), base + IME_COMMIT_ECHO_WINDOW * 9 / 10)
+            .is_none(),
         "ticks inside the window never drop the claim"
     );
 }
@@ -418,7 +431,7 @@ fn presented_and_skipped_frames_alike_do_not_release_the_claim_early() {
     // window skips it. Neither may release a claim that is still inside its
     // echo window.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
-    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let base = std::time::Instant::now();
 
     feed_typing_key(&mut rt, "n", "n");
     rt.handle_ime_preedit_at(Some("n".to_string()), Some(1), base);
@@ -438,7 +451,8 @@ fn presented_and_skipped_frames_alike_do_not_release_the_claim_early() {
     }
     assert!(painted > 0, "at least one of these frames painted");
     assert!(
-        rt.handle_key_event(char_key(" ")).is_none(),
+        rt.handle_key_event_at(char_key(" "), base + IME_COMMIT_ECHO_WINDOW * 8 / 10)
+            .is_none(),
         "no frame inside the window releases the claim"
     );
     assert_eq!(
@@ -467,7 +481,11 @@ fn commit_claim_expires_once_the_echo_window_elapses() {
 
     rt.tick_at(base + IME_COMMIT_ECHO_WINDOW + std::time::Duration::from_millis(1));
     assert!(
-        rt.handle_key_event(char_key("a")).is_some(),
+        rt.handle_key_event_at(
+            char_key("a"),
+            base + IME_COMMIT_ECHO_WINDOW + std::time::Duration::from_millis(1)
+        )
+        .is_some(),
         "an expired claim never absorbs a keystroke"
     );
     assert_eq!(rt.pending_input(), b"a");
@@ -495,7 +513,11 @@ fn expired_claim_does_not_eat_enter_or_delete_after_a_composition() {
             is_synthetic: false,
         };
         assert!(
-            rt.handle_key_event(event).is_some(),
+            rt.handle_key_event_at(
+                event,
+                base + IME_COMMIT_ECHO_WINDOW + std::time::Duration::from_millis(1)
+            )
+            .is_some(),
             "the first {key:?} after a composition must reach the PTY"
         );
     }
@@ -520,7 +542,7 @@ fn idle_after_commit_does_not_absorb_the_next_keystroke() {
     rt.drain_pending_input();
 
     assert!(
-        rt.handle_key_event(char_key("a")).is_some(),
+        rt.handle_key_event_at(char_key("a"), base).is_some(),
         "a long-idle keystroke is never absorbed"
     );
     assert_eq!(rt.pending_input(), b"a");
@@ -555,6 +577,9 @@ fn empty_commit_owns_its_own_key_and_nothing_more() {
     // here; `empty_commit_after_a_live_composition_absorbs_its_own_raw_key`
     // pins the reported ordering itself.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    // Pinned clock (#2879): the press timeline is the test's, not the
+    // scheduler's.
+    let base = std::time::Instant::now();
 
     feed_typing_key(&mut rt, "ni", "n");
     feed_commit(&mut rt, "", None);
@@ -565,11 +590,11 @@ fn empty_commit_owns_its_own_key_and_nothing_more() {
     );
 
     assert!(
-        rt.handle_key_event(char_key("a")).is_none(),
+        rt.handle_key_event_at(char_key("a"), base).is_none(),
         "the owed commit key is absorbed"
     );
     assert!(
-        rt.handle_key_event(char_key("b")).is_some(),
+        rt.handle_key_event_at(char_key("b"), base).is_some(),
         "the press after the claim is real input, so the claim stays one-shot"
     );
     assert_eq!(rt.pending_input(), b"b");
@@ -643,7 +668,11 @@ fn empty_commit_claim_expires_once_the_echo_window_elapses() {
 
     rt.tick_at(base + IME_COMMIT_ECHO_WINDOW + std::time::Duration::from_millis(1));
     assert!(
-        rt.handle_key_event(char_key("a")).is_some(),
+        rt.handle_key_event_at(
+            char_key("a"),
+            base + IME_COMMIT_ECHO_WINDOW + std::time::Duration::from_millis(1)
+        )
+        .is_some(),
         "an expired claim never absorbs a keystroke"
     );
     assert_eq!(rt.pending_input(), b"a");
@@ -657,11 +686,12 @@ fn empty_commit_restamps_the_claim_it_keeps() {
     // its claim expire in the gap between the two. Stamping at the preedit
     // clear alone would release at the tick below and hand the echo back.
     //
-    // The tick is the only clock that moves: the key path reads the real clock,
-    // which is still well inside every window here, so the assertion is about
-    // whether ageing dropped the claim at that tick.
+    // The tick and the key press are both fed on the test's own timeline: the
+    // tick lands past the preedit-clear stamp, the press one window after the
+    // commit, so the assertion is about whether ageing dropped the claim at
+    // that tick — never about how long the test process was off the CPU.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
-    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let base = std::time::Instant::now();
 
     feed_typing_key(&mut rt, "nihao", "n");
     rt.handle_ime_preedit_at(Some("nihao".to_string()), Some(5), base);
@@ -672,7 +702,8 @@ fn empty_commit_restamps_the_claim_it_keeps() {
     // Past the preedit-clear stamp, inside the commit's own stamp.
     rt.tick_at(base + IME_COMMIT_ECHO_WINDOW + std::time::Duration::from_millis(1));
     assert!(
-        rt.handle_key_event(char_key(" ")).is_none(),
+        rt.handle_key_event_at(char_key(" "), base + IME_COMMIT_ECHO_WINDOW)
+            .is_none(),
         "the commit re-stamped the claim, so the echo is still the IME's"
     );
     assert_eq!(rt.drain_pending_input(), b"");
@@ -689,7 +720,8 @@ fn first_key_after_a_100ms_pause_is_not_eaten() {
     rt.handle_ime_commit_at("\u{4f60}".to_string(), base);
     rt.drain_pending_input();
     assert!(
-        rt.handle_key_event(char_key(" ")).is_some(),
+        rt.handle_key_event_at(char_key(" "), base + std::time::Duration::from_millis(100))
+            .is_some(),
         "a key 100 ms after the commit is real input"
     );
     assert_eq!(rt.drain_pending_input(), b" ");
@@ -779,29 +811,34 @@ fn modifier_chords_are_never_absorbed_by_the_claim() {
     // press is never consumed — and it must not spend the claim either, since
     // the committing key's raw copy still has to be absorbed.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
+    // Pinned clock (#2879): the claim's deadline is this test's instant.
+    let base = std::time::Instant::now();
 
     feed_typing_key(&mut rt, "ni", "n");
     feed_commit(&mut rt, "\u{4f60}", None);
     rt.drain_pending_input();
 
     assert!(
-        rt.handle_key_event(KeyEvent {
-            logical_key: LogicalKey::Named(NamedKey::Shift),
-            text: None,
-            location: KeyLocation::Left,
-            state: PressState::Pressed,
-            repeat: false,
-            is_synthetic: false,
-        })
+        rt.handle_key_event_at(
+            KeyEvent {
+                logical_key: LogicalKey::Named(NamedKey::Shift),
+                text: None,
+                location: KeyLocation::Left,
+                state: PressState::Pressed,
+                repeat: false,
+                is_synthetic: false,
+            },
+            base
+        )
         .is_none(),
         "a bare modifier press encodes nothing"
     );
     assert!(
-        rt.handle_key_event(char_key("a")).is_none(),
+        rt.handle_key_event_at(char_key("a"), base).is_none(),
         "the modifier press did not spend the claim"
     );
     assert!(
-        rt.handle_key_event(char_key("a")).is_some(),
+        rt.handle_key_event_at(char_key("a"), base).is_some(),
         "and the claim is still bounded to the one press"
     );
 }
@@ -812,7 +849,7 @@ fn unrelated_modifier_release_does_not_spend_the_claim() {
     // a normal composition commit must not clear the claim before the raw
     // committing key echo arrives.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
-    let base = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let base = std::time::Instant::now();
     rt.handle_ime_preedit_at(Some("ni".to_string()), Some(2), base);
     rt.handle_ime_commit_at("\u{4f60}".to_string(), base);
     rt.drain_pending_input();
@@ -825,14 +862,14 @@ fn unrelated_modifier_release_does_not_spend_the_claim() {
             repeat: false,
             is_synthetic: false,
         };
-        assert!(rt.handle_key_event(event).is_none());
+        assert!(rt.handle_key_event_at(event, base).is_none());
     }
     assert!(
-        rt.handle_key_event(char_key("a")).is_none(),
+        rt.handle_key_event_at(char_key("a"), base).is_none(),
         "a Ctrl release must not spend a non-modifier commit claim"
     );
     assert!(
-        rt.handle_key_event(char_key("b")).is_some(),
+        rt.handle_key_event_at(char_key("b"), base).is_some(),
         "claim is one-shot"
     );
 }
@@ -922,12 +959,15 @@ fn a_repeat_press_never_spends_or_waits_on_the_commit_claim() {
 
     let mut repeat_key = char_key(" ");
     repeat_key.repeat = true;
+    // Both presses land on the commit's own instant (#2879). The claim's
+    // deadline is derived from `base` here, so the echo cannot age out just
+    // because the runner descheduled this thread between the two calls.
     assert!(
-        rt.handle_key_event(repeat_key).is_some(),
+        rt.handle_key_event_at(repeat_key, base).is_some(),
         "a repeat press is real input, not the echo"
     );
     assert!(
-        rt.handle_key_event(char_key(" ")).is_none(),
+        rt.handle_key_event_at(char_key(" "), base).is_none(),
         "and the echo is still absorbed afterwards"
     );
     // Exactly the repeat's own space: the commit was drained above and the
@@ -940,6 +980,10 @@ fn a_repeat_press_is_still_absorbed_during_composition() {
     // The other half of the repeat boundary, unchanged from CTX-0367: while a
     // preedit is up the raw copy of *every* keystroke is suppressed, a held
     // key included, so composition still cannot double-input.
+    //
+    // No clock pin is needed here (#2879): `Composing` absorbs before the
+    // deadline is ever read, so a held key is suppressed by the claim's state
+    // alone and no amount of scheduler delay can change the outcome.
     let mut rt = Runtime::with_defaults().expect("headless runtime must build");
 
     feed_typing_key(&mut rt, "n", "n");
@@ -1007,13 +1051,13 @@ fn esc_cancel_absorbs_its_own_echo_then_hands_the_keyboard_back() {
         is_synthetic: false,
     };
     assert!(
-        rt.handle_key_event(esc).is_none(),
+        rt.handle_key_event_at(esc, base).is_none(),
         "the raw Esc of the cancel gesture is absorbed, not inserted"
     );
     assert_eq!(rt.pending_input_len(), 0, "a cancel inserts no bytes");
 
     assert!(
-        rt.handle_key_event(char_key("a")).is_some(),
+        rt.handle_key_event_at(char_key("a"), base).is_some(),
         "and the keyboard is live immediately after the cancel"
     );
     assert_eq!(rt.pending_input(), b"a");
@@ -1045,7 +1089,8 @@ fn x11_xim_commit_batch_replays_preedit_then_commit_with_no_echo() {
     // Idle, then the next word's first letter.
     rt.tick_at(base + IME_COMMIT_ECHO_WINDOW * 3 / 2);
     assert!(
-        rt.handle_key_event(char_key("h")).is_some(),
+        rt.handle_key_event_at(char_key("h"), base + IME_COMMIT_ECHO_WINDOW * 3 / 2)
+            .is_some(),
         "an X11 XIM session never loses a keystroke to the claim"
     );
     assert_eq!(rt.pending_input(), b"h");
@@ -1062,7 +1107,7 @@ fn wayland_commit_and_echo_in_one_batch_still_absorbs_the_echo() {
     rt.handle_ime_preedit_at(Some("nihao".to_string()), Some(5), base);
     rt.handle_ime_preedit_at(None, None, base);
     rt.handle_ime_commit_at("\u{4f60}\u{597d}".to_string(), base);
-    let _ = rt.handle_platform_event(key_event(char_key(" ")));
+    let _ = rt.handle_key_event_at(char_key(" "), base);
     rt.tick_at(base);
 
     let bytes = rt.drain_pending_input();

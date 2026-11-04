@@ -816,10 +816,15 @@ struct SurfaceState {
     // compositor would never blend (fail-closed, honest).
     alpha_supported: bool,
     // Headless-only last RGBA buffer (premultiplied, `width*height*4` bytes).
+    // `Some` means "this surface has a frame to read": either a real present
+    // or the zeroed placeholder `headless_resize` reallocates at the new
+    // extent. `None` means nothing has ever been presented or resized.
     headless_rgba: Option<Vec<u8>>,
-    // The extent `headless_rgba` was painted at. Byte length is not a
-    // sufficient identity: 800x480 and 960x400 share `W * H * 4` but not the
-    // row stride, so a retained present must compare both.
+    // The extent `headless_rgba` may seed retained compositing at. Byte
+    // length is not a sufficient identity: 800x480 and 960x400 share
+    // `W * H * 4` but not the row stride, so a retained present must compare
+    // both. `None` means the stored buffer is a resize placeholder (zeroed,
+    // never painted) and the next retained present owes a full clear.
     headless_rgba_extent: Option<PhysicalSize>,
     headless_extent: Option<PhysicalSize>,
     // Real-surface GPU presentation resources (pipelines, buffers, atlas
@@ -1853,8 +1858,17 @@ impl Surface {
     }
 
     /// Returns a clone of the last headless RGBA buffer (premultiplied,
-    /// `width*height*4` bytes), if this is a headless surface and
-    /// [`Self::present_draw_list`] has been called at least once.
+    /// `width*height*4` bytes), if this is a headless surface and it has a
+    /// frame to read.
+    ///
+    /// A frame exists after the first [`Self::present_draw_list`] /
+    /// [`Self::headless_present`] / [`Self::headless_present_retained`] and,
+    /// from then on, across [`Self::headless_resize`]: the resize reallocates
+    /// the buffer zeroed at the new extent rather than dropping it, so a
+    /// consumer never sees "no frame yet" merely because the geometry
+    /// changed. The one exception is an extent whose `W * H * 4` exceeds
+    /// [`MAX_HEADLESS_SURFACE_BYTES`], which is dropped instead of allocated
+    /// (the present path then fails closed exactly as before).
     #[must_use]
     pub fn headless_rgba(&self) -> Option<Vec<u8>> {
         let state = self.state.lock().expect("surface state poisoned");
@@ -2123,9 +2137,11 @@ impl Surface {
     ///
     /// The first call, and the first call after [`Self::headless_resize`],
     /// initialize the buffer with the same theme-background clear as
-    /// [`Self::headless_present`]. The stored buffer is keyed by its extent,
-    /// not its byte length, so a resize that happens to preserve `W * H * 4`
-    /// still starts from a clear. Retained compositing is only defined on a
+    /// [`Self::headless_present`]. The resize leaves a zeroed placeholder
+    /// readable through [`Self::headless_rgba`] but clears the retained-seed
+    /// extent, so the next retained present starts from a clear: a resize that
+    /// happens to preserve `W * H * 4` must not composite onto rows laid out
+    /// for the old stride. Retained compositing is only defined on a
     /// fully opaque surface: the stored buffer is already opacity-scaled, so a
     /// configured opacity below `1.0` is rejected instead of scaled twice.
     ///
@@ -2199,6 +2215,13 @@ impl Surface {
     /// and present-mode defaults as [`Self::headless`]. Real surfaces return an
     /// error.
     ///
+    /// A resize keeps a readable frame: the buffer is reallocated zeroed at the
+    /// new extent (see [`Self::headless_rgba`]) instead of being dropped, and
+    /// only an extent past [`MAX_HEADLESS_SURFACE_BYTES`] leaves it unset. The
+    /// retained-seed extent is cleared either way, so the next
+    /// [`Self::headless_present_retained`] starts from a theme-background
+    /// clear rather than reusing pixels laid out for the old geometry.
+    ///
     /// # Errors
     ///
     /// - [`RenderError::InvalidInput`] for zero extents.
@@ -2219,14 +2242,27 @@ impl Surface {
         let mut state = self.state.lock().expect("surface state poisoned");
         let config = config.with_opacity(state.opacity);
         state.config = Some(config);
-        // The retained buffer describes the old extent, so it cannot seed the
-        // first retained present at the new one: invalidate the recorded
-        // extent (a same-extent resize still owes a clear) and let the next
-        // retained present allocate a fresh buffer. The pixels themselves stay
-        // readable through `headless_rgba()` as the last painted frame - the
-        // runtime's headless smoke path asserts the buffer survives a resize,
-        // and dropping it here would report "no frame yet" after one.
-        state.headless_rgba_extent = None;
+        // Keep a readable frame at the new extent instead of dropping the
+        // buffer: `headless_rgba()` returning `None` means "nothing has been
+        // presented yet", and the runtime's headless smoke path asserts a
+        // frame survives a resize. The reallocated buffer is zeroed, and the
+        // retained-seed extent stays unset, so the next retained present still
+        // owes a full theme-background clear - a resize that preserves
+        // `W * H * 4` (800x480 -> 960x400) must not composite new damage onto
+        // rows laid out for the old stride.
+        match headless_buffer_len(new_extent.width(), new_extent.height()) {
+            Ok(len) => {
+                state.headless_rgba = Some(vec![0u8; len]);
+                state.headless_rgba_extent = None;
+            }
+            // Over `MAX_HEADLESS_SURFACE_BYTES`: fail closed like
+            // `headless_present`, which stores nothing for an extent it
+            // refuses to allocate. The reconfiguration itself still succeeds.
+            Err(_) => {
+                state.headless_rgba = None;
+                state.headless_rgba_extent = None;
+            }
+        }
         state.headless_extent = Some(new_extent);
         state.wgpu_config = Some(synthesize_wgpu_config(&config));
         Ok(())
@@ -3183,10 +3219,47 @@ mod tests {
         surface
             .headless_resize(after)
             .expect("resize to an equal-byte-count extent");
+        // (a) The resize must still leave a readable frame at the NEW extent,
+        // zeroed - not drop it and not leave the old rows behind. This is the
+        // `headless_rgba()` "a frame exists" contract the runtime's headless
+        // smoke path asserts after a resize.
+        let reallocated = surface
+            .headless_rgba()
+            .expect("a resize must keep a readable frame");
+        assert_eq!(
+            reallocated.len(),
+            after.width() as usize * after.height() as usize * 4,
+            "the resized frame must be sized to the new extent"
+        );
+        assert!(
+            reallocated.iter().all(|&b| b == 0),
+            "the resized frame must be zeroed, not the stale old pixels"
+        );
         surface
             .headless_present_retained(&empty_list(), None)
             .expect("retained present after resize");
         let rgba = surface.headless_rgba().expect("pixels after resize");
+        // (b) The retained present must equal a plain clear at the new extent:
+        // seeding it with the zeroed placeholder would leave transparent black
+        // instead of the theme background, and seeding it with the old rows
+        // would composite new damage onto the old stride.
+        let reference = Surface::headless(after).expect("reference headless extent");
+        reference
+            .headless_present(&empty_list(), None)
+            .expect("reference clear");
+        let expected = reference.headless_rgba().expect("reference pixels");
+        assert_eq!(
+            rgba.len(),
+            expected.len(),
+            "the retained frame must match the clear at the new extent"
+        );
+        assert!(
+            rgba.iter().zip(&expected).all(|(a, b)| a == b),
+            "a retained present after a resize must start from the theme clear \
+             (got {:?}, expected {:?})",
+            &rgba[0..4],
+            &expected[0..4]
+        );
         assert_eq!(
             rgba.len(),
             after.width() as usize * after.height() as usize * 4,
@@ -3204,6 +3277,74 @@ mod tests {
             &[0, 0xFF, 0, 0xFF],
             "stale green survived the resize"
         );
+    }
+
+    #[test]
+    fn headless_resize_reallocates_a_zeroed_buffer_at_the_new_extent() {
+        // (a) A resize must not turn "has a frame" into "never presented":
+        // `headless_rgba()` reallocates a zeroed buffer of the new dimensions.
+        let before = PhysicalSize::new(640, 384);
+        let after = PhysicalSize::new(800, 600);
+        let surface = Surface::headless(before).expect("valid headless extent");
+        assert!(
+            surface.headless_rgba().is_none(),
+            "no frame exists before the first present"
+        );
+        surface
+            .headless_present(&fill_only(0, 0, 640, 384, [0xFF, 0, 0, 0xFF]), None)
+            .expect("full red paint");
+        assert_eq!(
+            surface.headless_rgba().expect("painted frame").len(),
+            640 * 384 * 4
+        );
+
+        surface.headless_resize(after).expect("grow");
+        let rgba = surface
+            .headless_rgba()
+            .expect("the resize must keep a readable frame");
+        assert_eq!(rgba.len(), 800 * 600 * 4, "frame must match the new extent");
+        assert!(
+            rgba.iter().all(|&b| b == 0),
+            "the reallocated frame must be zeroed, not the old red rows"
+        );
+
+        // A zero extent is still an honest no-op: it neither reconfigures nor
+        // touches the readable frame.
+        surface
+            .headless_resize(PhysicalSize::new(0, 0))
+            .expect("zero resize is a no-op");
+        assert_eq!(surface.extent(), Some(after));
+        assert_eq!(
+            surface.headless_rgba().expect("frame kept").len(),
+            800 * 600 * 4
+        );
+
+        // The next present paints the new extent, so the placeholder never
+        // survives as a frame.
+        surface
+            .headless_present(&fill_only(0, 0, 800, 600, [0, 0, 0xFF, 0xFF]), None)
+            .expect("present after grow");
+        let painted = surface.headless_rgba().expect("painted after grow");
+        assert_eq!(painted.len(), 800 * 600 * 4);
+        assert_eq!(&painted[0..4], &[0, 0, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn headless_resize_over_cap_drops_the_frame_instead_of_allocating() {
+        // 5000 * 5000 * 4 = 100 MiB > the 64 MiB cap: the reconfiguration must
+        // still succeed, but the frame is dropped rather than allocated past
+        // the cap (and the old-size buffer is not passed off as the new
+        // extent). The present path fails closed afterwards, as before.
+        let surface = Surface::headless(PhysicalSize::new(32, 16)).expect("small extent");
+        surface
+            .headless_present(&empty_list(), None)
+            .expect("first present");
+        assert!(surface.headless_rgba().is_some());
+        surface
+            .headless_resize(PhysicalSize::new(5000, 5000))
+            .expect("reconfiguration still succeeds");
+        assert_eq!(surface.extent(), Some(PhysicalSize::new(5000, 5000)));
+        assert!(surface.headless_rgba().is_none());
     }
 
     #[test]

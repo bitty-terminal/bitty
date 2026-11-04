@@ -290,7 +290,7 @@ fn run(
 
     // Seed the retained surface with a full paint of the initial (blank)
     // state, exactly like the first frame after realization.
-    let mut surface =
+    let surface =
         Surface::headless(physical(extent)).expect("headless surface fits the extent cap");
     let snapshot = state.snapshot();
     let seed = incremental
@@ -326,8 +326,11 @@ fn run(
         let resized = next_extent != extent;
         if resized {
             // Production forces a full redraw after a resize; the retained
-            // pixels describe a different extent and cannot be reused.
-            surface = Surface::headless(physical(next_extent))
+            // pixels describe a different extent and cannot be reused. The
+            // resize goes through the same seam the runtime uses, so the
+            // harness keeps one surface across the whole chunk sequence.
+            surface
+                .headless_resize(physical(next_extent))
                 .expect("resized headless surface fits the extent cap");
             extent = next_extent;
         }

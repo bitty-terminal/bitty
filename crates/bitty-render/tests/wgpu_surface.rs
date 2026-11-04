@@ -11,7 +11,8 @@
 //! The test mirrors the contract in `crates/bitty-render/src/gpu.rs`:
 //! - `Surface::headless` validates extents and picks deterministic
 //!   `Bgra8UnormSrgb` + `Fifo` defaults,
-//! - `headless_resize` skips zero extents, reconfigures non-zero,
+//! - `headless_resize` skips zero extents, reconfigures non-zero, and
+//!   reallocates the readable frame zeroed at the new extent,
 //! - `headless_present` composites `DrawList`+`Atlas` onto an owned RGBA
 //!   buffer and increments `frame`,
 //! - `GpuContext::initialize` + `create_surface` are env-gated and skip when
@@ -95,7 +96,10 @@ fn headless_surface_creation_and_configure() {
     assert_eq!(cfg.present_mode, PresentMode::Fifo);
     assert!(surface.wgpu_config_snapshot().is_some());
 
-    // headless_resize: zero is no-op, non-zero reconfigures.
+    // headless_resize: zero is no-op, non-zero reconfigures and keeps a
+    // readable frame - reallocated zeroed at the new extent, so "a frame
+    // exists" survives a resize (the runtime's headless smoke path asserts
+    // exactly that).
     surface
         .headless_resize(PhysicalSize::new(0, 0))
         .expect("zero resize");
@@ -104,7 +108,18 @@ fn headless_surface_creation_and_configure() {
         .headless_resize(PhysicalSize::new(640, 480))
         .expect("valid resize");
     assert_eq!(surface.extent(), Some(PhysicalSize::new(640, 480)));
-    assert!(surface.headless_rgba().is_none());
+    let resized = surface
+        .headless_rgba()
+        .expect("a resize keeps a readable frame");
+    assert_eq!(
+        resized.len(),
+        640 * 480 * 4,
+        "the resized frame must match the new extent"
+    );
+    assert!(
+        resized.iter().all(|&b| b == 0),
+        "the resized frame must be zeroed"
+    );
 }
 
 #[test]

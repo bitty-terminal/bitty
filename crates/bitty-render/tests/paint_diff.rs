@@ -32,11 +32,18 @@
 //! composed by the runtime, not by `GridRenderer::render`), plus glyph
 //! overhang outside a damaged cell (the fake rasterizer stays inside its
 //! cell box).
+//!
+//! The scroll region-copy path has **no** differential coverage here: a chunk
+//! carrying [`DamagedRegion::Scroll`] is handed a full-extent damage rectangle
+//! (a scroll frame is a production full-rebuild fallback in this harness), so
+//! the retained span copy is never exercised and a defect in that copy would
+//! not surface as a divergence.
 
 #![forbid(unsafe_code)]
 
 use bitty_platform::PhysicalSize;
 use bitty_render::error::RenderError;
+use bitty_render::frame::FrameMode;
 use bitty_render::glyph::{
     BitmapFormat, FontId, FontQuery, FontStyle, GlyphBitmap, GlyphMetrics, GlyphRasterizer,
     RasterKey,
@@ -146,6 +153,8 @@ impl Chunk {
 struct Divergence {
     chunk: usize,
     label: String,
+    /// The planner's mode for the present that diverged.
+    mode: FrameMode,
     pixel: usize,
     x: u32,
     y: u32,
@@ -159,6 +168,7 @@ impl Divergence {
     fn first(
         chunk: usize,
         label: &str,
+        mode: FrameMode,
         incremental: &[u8],
         reference: &[u8],
         width: u32,
@@ -177,6 +187,7 @@ impl Divergence {
         Some(Self {
             chunk,
             label: label.to_string(),
+            mode,
             pixel: mismatch,
             x,
             y,
@@ -191,7 +202,7 @@ impl Divergence {
         format!(
             "incremental paint diverged from the full redraw at chunk {} ({}): \
              first differing pixel {} at ({}, {}) in cell row {}, col {} \
-             (incremental {:02x?}, full {:02x?})",
+             on a {:?} present (incremental {:02x?}, full {:02x?})",
             self.chunk,
             self.label,
             self.pixel,
@@ -199,31 +210,70 @@ impl Divergence {
             self.y,
             self.row,
             self.col,
+            self.mode,
             self.incremental,
             self.reference,
         )
     }
 }
 
-/// What one differential run exercised. `partial` counts damage-only
-/// presents; `full` counts the production full-rebuild fallbacks (resize,
-/// scroll) that cannot use retained pixels across an extent/region change.
+/// What one differential run exercised, counted from [`FrameMode`] — the
+/// planner's own decision for each present — not from the damage shape this
+/// harness handed in. `partial` counts presents `plan_frame` kept damage-only;
+/// `full` counts the ones it promoted to a full redraw (a full-extent region,
+/// the region cap, or a frame the harness deliberately hands full-extent
+/// damage for); `promoted` counts the subset that reached `FrameMode::Full`
+/// while the harness handed over the *true* damage list, i.e. the
+/// `covers_extent` promotion a damage-shape heuristic cannot see; `clean`
+/// counts presents with no draw work at all.
 #[derive(Debug, Default)]
 struct Summary {
     chunks: usize,
     actions: usize,
     partial: usize,
     full: usize,
+    promoted: usize,
+    clean: usize,
     glyphs: usize,
 }
 
+impl Summary {
+    /// Presents that were actually planned (the denominator for the split).
+    fn presents(&self) -> usize {
+        self.partial + self.full + self.clean
+    }
+
+    /// One-line split with its denominator, e.g. `9/26 damage-only`.
+    fn split(&self) -> String {
+        format!(
+            "{}/{} damage-only, {}/{} full-redraw ({} promoted from true damage), {}/{} clean",
+            self.partial,
+            self.presents(),
+            self.full,
+            self.presents(),
+            self.promoted,
+            self.clean,
+            self.presents()
+        )
+    }
+}
+
+/// Negative control: drop exactly one damage rectangle from one frame, leaving
+/// the rest of that frame's damage list intact — the #2873 shape (one region
+/// missing from an otherwise partial frame), not "paint nothing".
+#[derive(Debug, Clone, Copy)]
+struct Fault {
+    chunk: usize,
+    region: usize,
+}
+
 /// Runs the scripted chunks and checks the incremental buffer against a full
-/// redraw after every chunk. `fault` injects one frame whose damage is dropped
-/// (a negative control for the harness itself).
+/// redraw after every chunk. `fault` injects one frame whose damage list is
+/// missing a single rectangle (a negative control for the harness itself).
 fn run(
     chunks: &[Chunk],
     initial: (usize, usize),
-    fault: Option<usize>,
+    fault: Option<Fault>,
 ) -> Result<Summary, Divergence> {
     assert!(
         chunks.len() <= MAX_CHUNKS,
@@ -286,34 +336,54 @@ fn run(
         let has_scroll = regions
             .iter()
             .any(|region| matches!(region, DamagedRegion::Scroll { .. }));
-        let full_rebuild = resized || has_scroll;
-        if full_rebuild {
-            summary.full += 1;
-        } else {
-            summary.partial += 1;
-        }
-        let damage = if full_rebuild || fault == Some(index) {
-            // Resize and scroll frames are the production full-rebuild
-            // fallbacks; the fault frame keeps the same full-damage shape but
-            // drops it before rendering, so the harness can prove it notices.
-            if fault == Some(index) {
-                Damage {
-                    generation: generation_after,
-                    regions: Vec::new().into_boxed_slice(),
-                }
-            } else {
-                full_damage(&snapshot)
-            }
+        // Damage shape. Production forces a full redraw after a resize (the
+        // retained pixels describe a different extent), and this harness has
+        // no scroll region-copy path, so a scroll frame also hands the
+        // renderer a full-extent rectangle. Every other frame hands over the
+        // true damage list and lets the planner decide: `plan_frame` promotes
+        // a region that covers the extent to `FrameMode::Full` on its own, and
+        // that promotion is counted below exactly like the explicit fallbacks.
+        let mut damage = if resized || has_scroll {
+            full_damage(&snapshot)
         } else {
             Damage {
                 generation: generation_after,
                 regions: regions.into_boxed_slice(),
             }
         };
+        if let Some(fault) = fault.filter(|fault| fault.chunk == index) {
+            // Negative control: drop exactly one rectangle, keep the rest.
+            let mut kept = damage.regions.to_vec();
+            assert!(
+                fault.region < kept.len(),
+                "fault region {} is outside the {} regions of chunk {index}",
+                fault.region,
+                kept.len()
+            );
+            kept.remove(fault.region);
+            damage = Damage {
+                generation: generation_after,
+                regions: kept.into_boxed_slice(),
+            };
+        }
 
         let painted = incremental
             .render(&snapshot, &damage)
             .expect("incremental render");
+        // The split comes from the planner's decision for this present, never
+        // from the damage shape handed in: a heuristic can claim "partial" for
+        // a frame `plan_frame` promoted to `FrameMode::Full`.
+        let forced_full = resized || has_scroll;
+        match painted.plan.mode {
+            FrameMode::Partial => summary.partial += 1,
+            FrameMode::Full => {
+                summary.full += 1;
+                if !forced_full {
+                    summary.promoted += 1;
+                }
+            }
+            FrameMode::Clean => summary.clean += 1,
+        }
         let incremental_pixels = if resized {
             surface
                 .headless_present(
@@ -350,6 +420,7 @@ fn run(
         if let Some(divergence) = Divergence::first(
             index,
             &chunk.label,
+            painted.plan.mode,
             &incremental_rgba,
             &reference_rgba,
             extent.width,
@@ -462,25 +533,43 @@ fn scripted_incremental_paint_matches_full_redraw() {
     let chunks = synthetic_chunks();
     let summary = run(&chunks, (COLS, ROWS), None)
         .unwrap_or_else(|divergence| panic!("{}", divergence.message()));
-    // The ECH/CUP overwrite frames are the point of this script; a run that
-    // only exercised full rebuilds would not test the damage paint path.
+    // Measured by plan: the ECH/CUP overwrite chunks are the only two presents
+    // `plan_frame` keeps damage-only; the initial full-screen paint, the scroll
+    // chunk, and both resizes are `FrameMode::Full`. A run that lost the
+    // damage paint path would drop `partial` below this floor.
     assert!(
-        summary.partial >= 3,
+        summary.partial >= 2,
         "expected damage-only overwrite frames: {summary:?}"
     );
-    // Scroll and the two resizes must take the full-rebuild fallback.
+    // The initial paint, the scroll frame, and the two resizes.
     assert!(
-        summary.full >= 3,
-        "expected scroll/resize full-rebuild frames: {summary:?}"
+        summary.full >= 4,
+        "expected full-redraw frames: {summary:?}"
+    );
+    // The initial full-screen paint is handed the true damage list and is still
+    // promoted to `FrameMode::Full` by `plan_frame`; a damage-shape heuristic
+    // reports it as a damage-only frame instead.
+    assert!(
+        summary.promoted >= 1,
+        "the planner-promoted full frame was not counted: {summary:?}"
+    );
+    assert_eq!(
+        summary.clean, 0,
+        "every chunk with new state must plan work: {summary:?}"
     );
     assert!(
         summary.glyphs > 0,
         "the script must paint text, not only backgrounds: {summary:?}"
     );
     eprintln!(
-        "synthetic script: {} chunks, {} actions, {} damage-only, {} full-rebuild, {} glyphs",
-        summary.chunks, summary.actions, summary.partial, summary.full, summary.glyphs
+        "synthetic script: {} chunks, {} actions, {} presents ({}), {} glyphs",
+        summary.chunks,
+        summary.actions,
+        summary.presents(),
+        summary.split(),
+        summary.glyphs
     );
+    eprintln!("{SCROLL_COVERAGE_NOTE}");
 }
 
 #[test]
@@ -488,36 +577,72 @@ fn recorded_agy_help_incremental_paint_matches_full_redraw() {
     let chunks = capture_chunks(AGY_HELP);
     let summary = run(&chunks, (COLS, ROWS), None)
         .unwrap_or_else(|divergence| panic!("{}", divergence.message()));
-    // The capture scrolls the bottom row, so some chunks take the full
-    // rebuild fallback; record the split in the failure evidence.
+    // Measured by plan: 9 of the 26 presents are damage-only and 17 are
+    // `FrameMode::Full` — every one of the 17 handed over the true damage list
+    // and was promoted by `plan_frame` on `covers_extent` (the capture repaints
+    // whole screens in places), which is why the old damage-shape heuristic
+    // reported "26 damage-only, 0 full". The floors pin the damage paint
+    // coverage and the promotion the split claims.
     assert!(
-        summary.partial > 0,
-        "capture never exercised a damage-only frame: {summary:?}"
+        summary.partial >= 9,
+        "capture lost damage-only presents: {summary:?}"
+    );
+    assert!(
+        summary.promoted >= 17,
+        "capture did not count the planner-promoted full presents: {summary:?}"
+    );
+    assert_eq!(
+        summary.clean, 0,
+        "every capture chunk with new state must plan work: {summary:?}"
     );
     assert!(
         summary.glyphs > 0,
         "the capture must paint text, not only backgrounds: {summary:?}"
     );
     eprintln!(
-        "agy capture: {} chunks, {} actions, {} damage-only, {} full-rebuild, {} glyphs",
-        summary.chunks, summary.actions, summary.partial, summary.full, summary.glyphs
+        "agy capture: {} chunks, {} actions, {} presents ({}), {} glyphs",
+        summary.chunks,
+        summary.actions,
+        summary.presents(),
+        summary.split(),
+        summary.glyphs
     );
+    eprintln!("{SCROLL_COVERAGE_NOTE}");
 }
 
-/// Negative control: dropping one frame's damage must be reported at that
-/// frame, with the first differing pixel attributed to a cell. Without this,
-/// a green differential run would not prove the comparison has teeth.
+/// Printed next to every run's split so the reported numbers cannot be read as
+/// broader coverage than the harness has.
+const SCROLL_COVERAGE_NOTE: &str = "note: scroll chunks are handed full-extent damage, so the scroll \
+region-copy path has no differential coverage in this harness";
+
+/// Negative control: dropping a single damage rectangle from an otherwise
+/// intact partial frame must be reported at that frame, with the first
+/// differing pixel attributed to a cell. This is the #2873 shape (one region
+/// missing from a damage-only present), not "paint nothing"; without it a
+/// green differential run would not prove the comparison has teeth.
 #[test]
 fn harness_reports_a_dropped_damage_rect() {
     let chunks = synthetic_chunks();
-    let fault = 1; // the frame that overwrites the old screen
+    // Chunk 2 is a `FrameMode::Partial` present with 47 damage rectangles; its
+    // last rectangle is the description column, whose cells change content, so
+    // omitting it leaves stale pixels the comparison must catch.
+    let fault = Fault {
+        chunk: 2,
+        region: 46,
+    };
     let divergence = run(&chunks, (COLS, ROWS), Some(fault))
-        .expect_err("dropping a frame's damage must diverge");
-    assert_eq!(divergence.chunk, fault, "{divergence:?}");
+        .expect_err("dropping one damage rect from a partial frame must diverge");
+    assert_eq!(divergence.chunk, fault.chunk, "{divergence:?}");
+    assert_eq!(
+        divergence.mode,
+        FrameMode::Partial,
+        "the controlled frame must be a damage-only present: {divergence:?}"
+    );
     assert_eq!(
         (divergence.row, divergence.col),
-        (0, 0),
-        "first stale cell should be the overwritten title: {divergence:?}"
+        (11, 0),
+        "first stale cell should be the description column: {divergence:?}"
     );
     assert_ne!(divergence.incremental, divergence.reference);
+    eprintln!("negative control: {}", divergence.message());
 }

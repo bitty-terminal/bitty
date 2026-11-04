@@ -817,6 +817,10 @@ struct SurfaceState {
     alpha_supported: bool,
     // Headless-only last RGBA buffer (premultiplied, `width*height*4` bytes).
     headless_rgba: Option<Vec<u8>>,
+    // The extent `headless_rgba` was painted at. Byte length is not a
+    // sufficient identity: 800x480 and 960x400 share `W * H * 4` but not the
+    // row stride, so a retained present must compare both.
+    headless_rgba_extent: Option<PhysicalSize>,
     headless_extent: Option<PhysicalSize>,
     // Real-surface GPU presentation resources (pipelines, buffers, atlas
     // texture). Created lazily on the first presented frame and recreated
@@ -835,6 +839,7 @@ impl SurfaceState {
             opacity: 1.0,
             alpha_supported: true,
             headless_rgba: None,
+            headless_rgba_extent: None,
             headless_extent: None,
             resources: None,
         }
@@ -1666,6 +1671,7 @@ impl Surface {
                 let mut state = self.state.lock().expect("surface state poisoned");
                 state.frame += 1;
                 state.headless_rgba = Some(rgba);
+                state.headless_rgba_extent = Some(config.extent);
                 Ok(PresentStats {
                     frame: state.frame,
                     fills: draw_list.fills.len()
@@ -2101,6 +2107,7 @@ impl Surface {
         let mut state = self.state.lock().expect("surface state poisoned");
         state.frame += 1;
         state.headless_rgba = Some(rgba);
+        state.headless_rgba_extent = Some(config.extent);
         Ok(headless_present_stats(state.frame, draw_list))
     }
 
@@ -2116,7 +2123,9 @@ impl Surface {
     ///
     /// The first call, and the first call after [`Self::headless_resize`],
     /// initialize the buffer with the same theme-background clear as
-    /// [`Self::headless_present`]. Retained compositing is only defined on a
+    /// [`Self::headless_present`]. The stored buffer is keyed by its extent,
+    /// not its byte length, so a resize that happens to preserve `W * H * 4`
+    /// still starts from a clear. Retained compositing is only defined on a
     /// fully opaque surface: the stored buffer is already opacity-scaled, so a
     /// configured opacity below `1.0` is rejected instead of scaled twice.
     ///
@@ -2160,8 +2169,16 @@ impl Surface {
         let width = config.extent.width();
         let height = config.extent.height();
         let len = headless_buffer_len(width, height)?;
-        let mut rgba = match self.headless_rgba() {
-            Some(rgba) if rgba.len() == len => rgba,
+        // The retained buffer is reusable only for the exact extent it was
+        // painted at. Byte length is not an identity: a resize can preserve
+        // `W * H * 4` while changing the row stride (800x480 -> 960x400), and
+        // reusing the pixels then would composite new damage onto stale rows.
+        let (stored_rgba, stored_extent) = {
+            let state = self.state.lock().expect("surface state poisoned");
+            (state.headless_rgba.clone(), state.headless_rgba_extent)
+        };
+        let mut rgba = match stored_rgba {
+            Some(rgba) if stored_extent == Some(config.extent) && rgba.len() == len => rgba,
             _ => {
                 let mut rgba = vec![0u8; len];
                 clear_headless_rgba(&mut rgba, self.theme_palette().background);
@@ -2172,6 +2189,7 @@ impl Surface {
         let mut state = self.state.lock().expect("surface state poisoned");
         state.frame += 1;
         state.headless_rgba = Some(rgba);
+        state.headless_rgba_extent = Some(config.extent);
         Ok(headless_present_stats(state.frame, draw_list))
     }
 
@@ -2201,6 +2219,11 @@ impl Surface {
         let mut state = self.state.lock().expect("surface state poisoned");
         let config = config.with_opacity(state.opacity);
         state.config = Some(config);
+        // The retained buffer describes the old extent, so it cannot seed the
+        // first retained present at the new one; drop it rather than depend on
+        // the extent check alone (a same-extent resize still owes a clear).
+        state.headless_rgba = None;
+        state.headless_rgba_extent = None;
         state.headless_extent = Some(new_extent);
         state.wgpu_config = Some(synthesize_wgpu_config(&config));
         Ok(())
@@ -3092,6 +3115,28 @@ mod tests {
         }
     }
 
+    /// A draw list with no work at all (used to present a bare clear).
+    fn empty_list() -> DrawList {
+        DrawList {
+            generation: 0,
+            atlas_epoch: 0,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(8, 4),
+                mode: crate::frame::FrameMode::Clean,
+                dirty_rects: vec![],
+            },
+            fills: vec![],
+            rounded_fills: vec![],
+            backgrounds: vec![],
+            overlay_fills: vec![],
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: vec![],
+            glyphs: vec![],
+            images: vec![],
+        }
+    }
+
     #[test]
     fn headless_present_retained_accumulates_instead_of_clearing() {
         let surface = Surface::headless(PhysicalSize::new(8, 4)).expect("valid headless extent");
@@ -3111,6 +3156,51 @@ mod tests {
             .expect("clearing present");
         let cleared = surface.headless_rgba().expect("cleared pixels");
         assert_ne!(&cleared[0..4], &[0xFF, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    fn headless_present_retained_clears_after_same_byte_count_resize() {
+        // 800x480 and 960x400 are the same `W * H * 4` bytes with different
+        // row strides, so a length-only reuse check would composite the new
+        // frame onto pixels laid out for the old stride.
+        let before = PhysicalSize::new(800, 480);
+        let after = PhysicalSize::new(960, 400);
+        assert_eq!(
+            before.width() * before.height(),
+            after.width() * after.height(),
+            "the fixture must preserve the byte count across the resize"
+        );
+        let surface = Surface::headless(before).expect("valid headless extent");
+        surface
+            .headless_present_retained(&fill_only(0, 0, 400, 480, [0xFF, 0, 0, 0xFF]), None)
+            .expect("first retained present");
+        surface
+            .headless_present_retained(&fill_only(400, 0, 400, 480, [0, 0xFF, 0, 0xFF]), None)
+            .expect("second retained present");
+        surface
+            .headless_resize(after)
+            .expect("resize to an equal-byte-count extent");
+        surface
+            .headless_present_retained(&empty_list(), None)
+            .expect("retained present after resize");
+        let rgba = surface.headless_rgba().expect("pixels after resize");
+        assert_eq!(
+            rgba.len(),
+            after.width() as usize * after.height() as usize * 4,
+            "the buffer must be sized to the new extent"
+        );
+        let first = &rgba[0..4];
+        assert!(
+            rgba.chunks_exact(4).all(|px| px == first),
+            "a retained present after a resize must start from a clear, \
+             not composite onto the old rows"
+        );
+        assert_ne!(first, &[0xFF, 0, 0, 0xFF], "stale red survived the resize");
+        assert_ne!(
+            first,
+            &[0, 0xFF, 0, 0xFF],
+            "stale green survived the resize"
+        );
     }
 
     #[test]

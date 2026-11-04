@@ -1981,6 +1981,10 @@ impl Surface {
                             glyph.clip,
                         );
                     }
+                    // Color-atlas glyphs are painted by the color pass, not
+                    // this coverage pass (bitty#2812); the headless path keeps
+                    // them out of the monochrome blend.
+                    crate::grid::GlyphSource::ColorAtlas { .. } => {}
                     crate::grid::GlyphSource::Inline {
                         mask,
                         width: w,

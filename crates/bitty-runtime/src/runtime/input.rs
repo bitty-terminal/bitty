@@ -190,15 +190,25 @@ impl Runtime {
     /// composition the raw copy of *every* keystroke must be suppressed, held
     /// keys included.
     ///
-    /// The deadline is read from the clock here rather than from a cached tick
-    /// because this is the one event that has to decide, and only elapsed time
-    /// separates "the echo is still in flight" from "the loop has been idle
-    /// since the commit" — a cached tick is at best one batch stale, which is
-    /// the case that must not decide it. The read is reached only while a
-    /// commit claim is armed (at most once per IME commit, never on the
-    /// `Composing`/`Free` paths), so it costs one vDSO call per committed
-    /// composition, not per keystroke.
-    fn ime_owns_key_press(&mut self, event: &KeyEvent, is_modifier: bool) -> bool {
+    /// The deadline is compared against the instant the press is handled, not
+    /// against a cached tick, because this is the one event that has to decide:
+    /// only elapsed time separates "the echo is still in flight" from "the loop
+    /// has been idle since the commit", and a cached tick is at best one batch
+    /// stale, which is the case that must not decide it. The live path supplies
+    /// `Instant::now()` (see [`Self::handle_key_event`]); the comparison is
+    /// reached only while a commit claim is armed (at most once per IME commit,
+    /// never on the `Composing`/`Free` paths).
+    ///
+    /// `now` is the clock the deadline is decided against; it is passed in
+    /// rather than read here so the key path is as testable as the IME entries
+    /// ([`Self::handle_ime_commit_at`], `tick_at`) and a caller can pin one
+    /// timeline across a whole gesture.
+    fn ime_owns_key_press(
+        &mut self,
+        event: &KeyEvent,
+        is_modifier: bool,
+        now: std::time::Instant,
+    ) -> bool {
         if event.state != PressState::Pressed || event.is_synthetic {
             // A modifier release can be the echo of a composition that closed
             // on that modifier (fcitx5 Shift toggle). Its raw echo is a
@@ -235,7 +245,7 @@ impl Runtime {
                 // real keystroke that follows a commit the platform never
                 // echoed can never be swallowed twice. Past the deadline
                 // nothing is owed any more, so the key is the user's.
-                let owned = std::time::Instant::now() <= echo_by;
+                let owned = now <= echo_by;
                 self.ime_key_claim = ImeKeyClaim::Free;
                 owned
             }
@@ -416,7 +426,28 @@ impl Runtime {
     /// quirk delivers both — the raw Latin key must never insert alongside the
     /// eventual `Ime::Commit` (CTX-0367), and neither must the raw copy of the
     /// committing key itself (CTX-0783).
+    ///
+    /// Delegates with `Instant::now()` via [`Self::handle_key_event_at`], the
+    /// clock seam the rest of the runtime uses.
     pub fn handle_key_event(&mut self, event: KeyEvent) -> Option<Vec<u8>> {
+        self.handle_key_event_at(event, std::time::Instant::now())
+    }
+
+    /// [`Self::handle_key_event`] with an explicit `now`, the clock seam the
+    /// rest of the runtime uses (`tick_at`, [`Self::handle_ime_preedit_at`],
+    /// [`Self::handle_ime_commit_at`]).
+    ///
+    /// `now` is read only to decide whether the raw echo of a committing key
+    /// can still be in flight ([`Self::ime_owns_key_press`]); every other
+    /// branch of the key path is clock-free. A caller that supplies its own
+    /// instant therefore gets identical routing with a deadline it can pin,
+    /// which is what keeps the echo-window tests independent of how long the
+    /// test process is left off the CPU between two calls.
+    pub fn handle_key_event_at(
+        &mut self,
+        event: KeyEvent,
+        now: std::time::Instant,
+    ) -> Option<Vec<u8>> {
         let is_modifier = matches!(
             &event.logical_key,
             bitty_platform::LogicalKey::Named(
@@ -490,7 +521,7 @@ impl Runtime {
         // closes the same hole after the preedit is cleared (issue #1449).
         // Modifier tracking stays above so chord state never desyncs;
         // releases produce no bytes.
-        if self.ime_owns_key_press(&event, is_modifier) {
+        if self.ime_owns_key_press(&event, is_modifier, now) {
             return None;
         }
         // CTX-0243: any non-modifier press snaps to live (covers Esc-cancel
@@ -627,7 +658,7 @@ impl Runtime {
         // CTX-0367 IME composition guard / CTX-0783 post-commit claim (see
         // the owned path): the IME owns raw presses while a preedit is up and
         // exactly one more press after the commit that closed it.
-        if self.ime_owns_key_press(event, is_modifier) {
+        if self.ime_owns_key_press(event, is_modifier, std::time::Instant::now()) {
             return None;
         }
         // CTX-0243: any non-modifier press snaps to live (see owned path).

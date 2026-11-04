@@ -1,13 +1,18 @@
-//! `bitty config profile` management (CTX-1404 / issue #2187, CTX-1589).
+//! `bitty config profile` management (CTX-1404 / issue #2187, CTX-1589,
+//! CTX-1693).
 //!
 //! Local, pre-runtime operations over `$XDG_CONFIG_HOME/bitty/profiles/`:
 //!
-//! - `create NAME`: write a minimal, valid Lua profile (never overwrites).
+//! - `create NAME [--from EXISTING|--preset NAME] [--force]`: write a
+//!   minimal, valid Lua profile, seeded from a preset or an existing profile.
+//!   An existing name is refused unless `--force`.
 //! - `clone SRC DST`: copy the source profile bytes verbatim (never
 //!   overwrites).
-//! - `rename OLD NEW`: rename one profile file in place.
-//! - `delete NAME`: remove one profile (never `default`, never the active
-//!   profile, never a profile another profile `extends`).
+//! - `rename OLD NEW`: rename one profile file in place and rewrite the
+//!   persisted `init.lua` selector when it named `OLD`; a failed selector
+//!   update rolls the rename back so the fragment is never lost.
+//! - `delete NAME [--force]`: remove one profile (never `default`, never a
+//!   profile another profile `extends`; the active profile needs `--force`).
 //! - `list`: bounded directory metadata only; never evaluates Lua.
 //! - `show NAME`: loads the single-parent `extends` chain (bounded) and
 //!   prints the profile-only effective values with attribution.
@@ -37,10 +42,16 @@
 //!   `appearance` as complete tables, creating one of them in a profile pins
 //!   every inherited leaf first: a one-leaf edit never silently resets the
 //!   other inherited values to core defaults.
+//! - `edit NAME`: edit a sibling draft in `$VISUAL`/`$EDITOR`, validate the
+//!   result through the same strict loader, and only then replace the profile
+//!   atomically. An invalid or failed edit leaves the original bytes intact.
 //! - `path NAME`: validates the name grammar and prints the resolved path.
 //!
-//! `create|clone|rename|delete|list|show|use|get|set|path` all report state;
-//! `--json` (an alias for `--format json`) prints one versioned envelope.
+//! `create|clone|rename|delete|list|show|use|get|set|edit|path` all report
+//! state; `--json` (an alias for `--format json`) prints one versioned
+//! envelope. Every verb that writes accepts `--dry-run`: it performs the same
+//! reads, validation, and merge gates, then reports the prospective change
+//! without touching the filesystem.
 //!
 //! Profiles stay Lua fragments: the CLI never introduces a second config
 //! language, never serializes the typed schema back to Lua, and never
@@ -92,22 +103,26 @@ static PROFILE_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Short usage for `bitty config profile` (stderr, fail-closed exit 2).
 pub(crate) fn profile_usage() -> String {
-    "usage: bitty config profile <verb> [OPERANDS] [--json]\n\
+    "usage: bitty config profile <verb> [OPERANDS] [--json] [--dry-run]\n\
      \n\
      verbs:\n\
-     \x20 create NAME          create an empty profile (never overwrites)\n\
-     \x20 clone SRC DST        copy SRC's Lua bytes to a new profile DST\n\
-     \x20 rename OLD NEW       rename a profile file in place\n\
-     \x20 delete NAME          remove a profile (never the active one)\n\
-     \x20 list                 list profile names (sorted, bounded; no Lua evaluation)\n\
-     \x20 show NAME            load + validate the extends chain and print profile values\n\
-     \x20 use NAME             activate NAME by rewriting only the init.lua selector\n\
-     \x20 get NAME PATH        print the effective value at a documented schema path\n\
+     \x20 create NAME [--from EXISTING|--preset NAME] [--force]\n\
+     \x20                     create a profile (seeded; --force replaces an existing name)\n\
+     \x20 clone SRC DST      copy SRC's Lua bytes to a new profile DST\n\
+     \x20 rename OLD NEW     rename a profile file and update the persisted selector\n\
+     \x20 delete NAME        remove a profile (--force when it is active)\n\
+     \x20 list               list profile names (sorted, bounded; no Lua evaluation)\n\
+     \x20 show NAME          load + validate the extends chain and print profile values\n\
+     \x20 use NAME           activate NAME by rewriting only the init.lua selector\n\
+     \x20 get NAME PATH      print the effective value at a documented schema path\n\
      \x20 set NAME PATH VALUE  validate and write one schema path into NAME\n\
-     \x20 path NAME            print the resolved profile path without creating it\n\
+     \x20 edit NAME          edit in $VISUAL/$EDITOR, validate, then replace atomically\n\
+     \x20 path NAME          print the resolved profile path without creating it\n\
      \n\
+     presets: minimal|dark|light (same seeds as `bitty init --profile NAME`)\n\
      profiles: $XDG_CONFIG_HOME/bitty/profiles/<name>.lua\n\
      --json (or --format json) prints one versioned envelope per command.\n\
+     --dry-run validates a write and reports it without touching the filesystem.\n\
      Writes are validated before any file change and committed atomically;\n\
      `default` is reserved for `bitty init`. Quote values that contain spaces;\n\
      font.fallback takes a comma-separated list. `set` on a profile that only\n\
@@ -134,6 +149,7 @@ pub(crate) enum ProfileVerb {
     Use,
     Get,
     Set,
+    Edit,
     Path,
 }
 
@@ -150,6 +166,7 @@ impl ProfileVerb {
         ("use", Self::Use),
         ("get", Self::Get),
         ("set", Self::Set),
+        ("edit", Self::Edit),
         ("path", Self::Path),
     ];
 
@@ -166,7 +183,7 @@ impl ProfileVerb {
     /// from the verb list instead of duplicating the arity by hand.
     pub(crate) fn operands(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::Create | Self::Delete | Self::Show | Self::Use | Self::Path => {
+            Self::Create | Self::Delete | Self::Show | Self::Use | Self::Path | Self::Edit => {
                 &[("NAME", "profile name")]
             }
             Self::Clone => &[
@@ -182,6 +199,20 @@ impl ProfileVerb {
             ],
             Self::List => &[],
         }
+    }
+
+    /// Whether this verb mutates a profile or the selector.
+    fn writes(self) -> bool {
+        matches!(
+            self,
+            Self::Create
+                | Self::Clone
+                | Self::Rename
+                | Self::Delete
+                | Self::Use
+                | Self::Set
+                | Self::Edit
+        )
     }
 
     fn usage_hint(self) -> String {
@@ -260,6 +291,97 @@ impl Reply {
     }
 }
 
+/// Write options shared by the mutating profile verbs (CTX-1693).
+#[derive(Debug, Default)]
+struct ProfileOptions {
+    /// `--force`: allow replacing an existing profile (`create`) or removing
+    /// the active profile (`delete`).
+    force: bool,
+    /// `--dry-run`: validate and report without any filesystem mutation.
+    dry_run: bool,
+    /// `--from EXISTING`: seed `create` from an existing profile.
+    from: Option<String>,
+    /// `--preset NAME`: seed `create` from a first-class preset.
+    preset: Option<String>,
+}
+
+impl ProfileOptions {
+    /// Reads the profile-scoped flags the argv parser recorded.
+    fn from_args(args: &Args) -> Result<Self, Failure> {
+        for (flag, value) in [
+            ("--from", args.profile_from.as_deref()),
+            ("--preset", args.profile_preset.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                return Err(Failure::usage(format!(
+                    "bitty config profile: {flag} needs a value"
+                )));
+            }
+        }
+        Ok(Self {
+            // `--force` is the historical init flag; init and the profile
+            // write verbs are the only consumers, and each validates it
+            // against its own surface.
+            force: args.init_force,
+            dry_run: args.profile_dry_run,
+            from: args.profile_from.clone(),
+            preset: args.profile_preset.clone(),
+        })
+    }
+
+    /// Rejects a flag on a verb that cannot honour it.
+    fn validate_for(&self, verb: ProfileVerb, raw_verb: &str) -> Result<(), Failure> {
+        if self.force && !matches!(verb, ProfileVerb::Create | ProfileVerb::Delete) {
+            return Err(Failure::usage(format!(
+                "bitty config profile {raw_verb}: --force is not supported (only create and delete \
+                 overwrite or remove state)"
+            )));
+        }
+        if (self.from.is_some() || self.preset.is_some()) && verb != ProfileVerb::Create {
+            return Err(Failure::usage(format!(
+                "bitty config profile {raw_verb}: --from/--preset are only supported by create"
+            )));
+        }
+        if self.from.is_some() && self.preset.is_some() {
+            return Err(Failure::usage(
+                "bitty config profile create: --from and --preset are mutually exclusive"
+                    .to_string(),
+            ));
+        }
+        if self.dry_run && !verb.writes() {
+            return Err(Failure::usage(format!(
+                "bitty config profile {raw_verb}: --dry-run is only supported by \
+                 create|clone|rename|delete|use|set|edit"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The seed label reported by `--json` (`create` only).
+    fn seed_json(&self) -> String {
+        let from = self
+            .from
+            .as_deref()
+            .map_or_else(|| String::from("null"), json_string);
+        let preset = self
+            .preset
+            .as_deref()
+            .map_or_else(|| String::from("null"), json_string);
+        format!("\"source\":{from},\"preset\":{preset}")
+    }
+
+    /// Human seed clause for `create` (empty for a plain profile).
+    fn seed_text(&self) -> String {
+        if let Some(from) = &self.from {
+            format!(" (seeded from '{from}')")
+        } else if let Some(preset) = &self.preset {
+            format!(" (seeded from preset '{preset}')")
+        } else {
+            String::new()
+        }
+    }
+}
+
 /// Runs `bitty config profile ...`; returns the process exit code.
 pub(crate) fn run_profile_subcommand(args: &Args) -> i32 {
     let format = match config_format(args) {
@@ -278,12 +400,18 @@ pub(crate) fn run_profile_subcommand(args: &Args) -> i32 {
     };
     let Some(verb) = ProfileVerb::parse(raw_verb) else {
         eprintln!(
-            "bitty config profile: unknown sub-verb '{raw_verb}' (want create|clone|rename|delete|list|show|use|get|set|path)\n{}",
+            "bitty config profile: unknown sub-verb '{raw_verb}' (want create|clone|rename|delete|list|show|use|get|set|edit|path)\n{}",
             profile_usage()
         );
         return 2;
     };
     let command = format!("config profile {raw_verb}");
+    let options = match ProfileOptions::from_args(args)
+        .and_then(|options| options.validate_for(verb, raw_verb).map(|()| options))
+    {
+        Ok(options) => options,
+        Err(failure) => return fail(format, &command, raw_verb, failure),
+    };
     let operands = match parse_operands(verb, raw_verb, &args.config_args[1..]) {
         Ok(operands) => operands,
         Err(message) => return fail(format, &command, raw_verb, Failure::usage(message)),
@@ -293,15 +421,16 @@ pub(crate) fn run_profile_subcommand(args: &Args) -> i32 {
         Err(message) => return fail(format, &command, raw_verb, Failure::usage(message)),
     };
     let outcome = match verb {
-        ProfileVerb::Create => run_create(&dir, operands[0]),
-        ProfileVerb::Clone => run_clone(args, &dir, operands[0], operands[1]),
-        ProfileVerb::Rename => run_rename(args, &dir, operands[0], operands[1]),
-        ProfileVerb::Delete => run_delete(args, &dir, operands[0]),
+        ProfileVerb::Create => run_create(args, &options, &dir, operands[0]),
+        ProfileVerb::Clone => run_clone(args, &options, &dir, operands[0], operands[1]),
+        ProfileVerb::Rename => run_rename(args, &options, &dir, operands[0], operands[1]),
+        ProfileVerb::Delete => run_delete(args, &options, &dir, operands[0]),
         ProfileVerb::List => run_list(args, &dir),
         ProfileVerb::Show => run_show(&dir, operands[0]),
-        ProfileVerb::Use => run_use(args, &dir, operands[0]),
+        ProfileVerb::Use => run_use(args, &options, &dir, operands[0]),
         ProfileVerb::Get => run_get(&dir, operands[0], operands[1]),
-        ProfileVerb::Set => run_set(args, &dir, operands[0], operands[1], operands[2]),
+        ProfileVerb::Set => run_set(args, &options, &dir, operands[0], operands[1], operands[2]),
+        ProfileVerb::Edit => run_edit(args, &options, &dir, operands[0]),
         ProfileVerb::Path => run_path(&dir, operands[0]),
     };
     match outcome {
@@ -572,7 +701,12 @@ fn run_show(dir: &Path, raw_name: &str) -> Result<Reply, Failure> {
 }
 
 /// `bitty config profile use NAME`.
-fn run_use(args: &Args, dir: &Path, raw_name: &str) -> Result<Reply, Failure> {
+fn run_use(
+    args: &Args,
+    options: &ProfileOptions,
+    dir: &Path,
+    raw_name: &str,
+) -> Result<Reply, Failure> {
     let name = valid_name("use", raw_name)?;
     let profile_path = profile_path(dir, &name);
     ensure_present("use", &name, &profile_path)?;
@@ -613,19 +747,32 @@ fn run_use(args: &Args, dir: &Path, raw_name: &str) -> Result<Reply, Failure> {
             "bitty config profile use: profile '{name}' is already active in '{}'\n",
             selector.display()
         );
-        let result = use_result(&name, &selector, false, None);
+        let result = use_result(&name, &selector, false, None, options.dry_run);
         return Ok(Reply::new(text, result));
     }
     if !selector.exists() {
         let content = render_selector_lua(&name);
         validate_prospective_selector(dir, &name, &selector, &content)?;
+        if options.dry_run {
+            let text = format!(
+                "bitty config profile use: would activate '{name}' in '{}'\n",
+                selector.display()
+            );
+            return Ok(Reply::new(
+                text,
+                use_result(&name, &selector, false, None, true),
+            ));
+        }
         return match write_init_config(&selector, &content, false) {
             Ok(_) => {
                 let text = format!(
                     "bitty config profile use: activated '{name}' in '{}'\n",
                     selector.display()
                 );
-                Ok(Reply::new(text, use_result(&name, &selector, true, None)))
+                Ok(Reply::new(
+                    text,
+                    use_result(&name, &selector, true, None, false),
+                ))
             }
             Err(InitWriteError::Refused(message)) => Err(Failure::invalid(message)),
             Err(InitWriteError::Io(message)) => Err(Failure::io(message)),
@@ -721,6 +868,16 @@ fn run_use(args: &Args, dir: &Path, raw_name: &str) -> Result<Reply, Failure> {
     // just the target profile's chain. Validate before the write so `use`
     // never activates a configuration `config check` rejects.
     validate_prospective_selector(dir, &name, &selector, &rewritten)?;
+    if options.dry_run {
+        let text = format!(
+            "bitty config profile use: would activate '{name}' in '{}'\n",
+            selector.display()
+        );
+        return Ok(Reply::new(
+            text,
+            use_result(&name, &selector, false, None, true),
+        ));
+    }
     match write_init_config(&selector, &rewritten, true) {
         Ok(outcome) => {
             let mut text = String::new();
@@ -736,7 +893,7 @@ fn run_use(args: &Args, dir: &Path, raw_name: &str) -> Result<Reply, Failure> {
             ));
             Ok(Reply::new(
                 text,
-                use_result(&name, &selector, true, outcome.backup.as_deref()),
+                use_result(&name, &selector, true, outcome.backup.as_deref(), false),
             ))
         }
         Err(InitWriteError::Refused(message)) => Err(Failure::invalid(message)),
@@ -745,13 +902,46 @@ fn run_use(args: &Args, dir: &Path, raw_name: &str) -> Result<Reply, Failure> {
 }
 
 /// JSON `result` object for `use`.
-fn use_result(name: &str, selector: &Path, changed: bool, backup: Option<&Path>) -> String {
+fn use_result(
+    name: &str,
+    selector: &Path,
+    changed: bool,
+    backup: Option<&Path>,
+    dry_run: bool,
+) -> String {
     format!(
-        "{{\"kind\":\"profile\",\"action\":\"use\",\"name\":{},\"selector\":{},\"active\":true,\"changed\":{changed},\"backup\":{}}}",
+        "{{\"kind\":\"profile\",\"action\":\"use\",\"name\":{},\"selector\":{},\"active\":true,\"changed\":{changed},\"dry_run\":{dry_run},\"backup\":{}}}",
         json_string(name),
         json_path(selector),
         backup.map_or_else(|| String::from("null"), json_path)
     )
+}
+
+/// What a prospective-selector validation is protecting.
+#[derive(Debug, Clone, Copy)]
+enum SelectorIntent<'a> {
+    /// `use`: the write activates the named profile.
+    Activate,
+    /// `rename`: the write renames `previous` to the named profile.
+    Rename { previous: &'a str },
+}
+
+impl SelectorIntent<'_> {
+    /// Sub-verb used in diagnostics.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Activate => "use",
+            Self::Rename { .. } => "rename",
+        }
+    }
+
+    /// Clause describing what the prospective selector would do.
+    fn phrase(self, name: &str) -> String {
+        match self {
+            Self::Activate => format!("switching to '{name}'"),
+            Self::Rename { previous } => format!("renaming '{previous}' to '{name}'"),
+        }
+    }
 }
 
 /// Validates the configuration a completed switch would load: the prospective
@@ -768,26 +958,62 @@ fn validate_prospective_selector(
     selector: &Path,
     selector_bytes: &str,
 ) -> Result<(), Failure> {
+    validate_prospective_selector_with(
+        SelectorIntent::Activate,
+        dir,
+        name,
+        selector,
+        selector_bytes,
+    )
+}
+
+/// [`validate_prospective_selector`] with the command-specific wording used by
+/// `rename`'s rollback path.
+fn validate_prospective_selector_with(
+    intent: SelectorIntent<'_>,
+    dir: &Path,
+    name: &str,
+    selector: &Path,
+    selector_bytes: &str,
+) -> Result<(), Failure> {
+    let verb = intent.verb();
+    let phrase = intent.phrase(name);
+    let chain = bitty_config::file::load_profile_chain_in_dir(name, dir).map_err(|err| {
+        Failure::invalid(format!(
+            "bitty config profile {verb}: {phrase} would load an invalid profile chain: {err}"
+        ))
+    })?;
+    validate_prospective_selector_chain(intent, name, chain, selector, selector_bytes)
+}
+
+/// [`validate_prospective_selector_with`] over an already-loaded profile chain.
+///
+/// `rename --dry-run` uses this with the old name's chain: the new profile
+/// file does not exist yet, but its bytes are exactly the old fragment's, so
+/// the prospective merge can still be validated without touching the disk.
+fn validate_prospective_selector_chain(
+    intent: SelectorIntent<'_>,
+    name: &str,
+    chain: Vec<bitty_config::LayeredPlan>,
+    selector: &Path,
+    selector_bytes: &str,
+) -> Result<(), Failure> {
+    let verb = intent.verb();
+    let phrase = intent.phrase(name);
     let source = bitty_config::plan::ConfigSource::new(
         bitty_config::plan::LayerKind::User,
         Some(selector.display().to_string()),
     );
     let plan = bitty_config::file::parse_lua_config(selector_bytes, &source).map_err(|err| {
         Failure::invalid(format!(
-            "bitty config profile use: prospective selector '{}' is invalid: {err}",
+            "bitty config profile {verb}: prospective selector '{}' is invalid: {err}",
             selector.display()
         ))
     })?;
     let plan = bitty_config::migrate(plan).map_err(|err| {
         Failure::invalid(format!(
-            "bitty config profile use: prospective selector '{}' is invalid: {err}",
+            "bitty config profile {verb}: prospective selector '{}' is invalid: {err}",
             selector.display()
-        ))
-    })?;
-    let chain = bitty_config::file::load_profile_chain_in_dir(name, dir).map_err(|err| {
-        Failure::invalid(format!(
-            "bitty config profile use: switching to '{name}' would load an invalid profile \
-             chain: {err}"
         ))
     })?;
     let merged = bitty_config::file::resolve_effective_with_profiles(
@@ -797,16 +1023,13 @@ fn validate_prospective_selector(
     )
     .map_err(|err| {
         Failure::invalid(format!(
-            "bitty config profile use: switching to '{name}' would leave '{}' invalid: {err}",
+            "bitty config profile {verb}: {phrase} would leave '{}' invalid: {err}",
             selector.display()
         ))
     })?;
     strict_post_merge_checks(
-        "use",
-        &format!(
-            "switching to '{name}' would leave '{}' invalid",
-            selector.display()
-        ),
+        verb,
+        &format!("{phrase} would leave '{}' invalid", selector.display()),
         &merged.effective,
     )
 }
@@ -823,36 +1046,116 @@ pub(crate) fn validate_prospective_selector_for_write(
         .map_err(|_| ConfigWriteFailure::Invalid)
 }
 
-/// `bitty config profile create NAME`.
-fn run_create(dir: &Path, raw_name: &str) -> Result<Reply, Failure> {
-    let name = valid_name("create", raw_name)?;
+/// `bitty config profile create NAME [--from EXISTING|--preset NAME] [--force]`.
+fn run_create(
+    args: &Args,
+    options: &ProfileOptions,
+    dir: &Path,
+    raw_name: &str,
+) -> Result<Reply, Failure> {
+    let name = valid_new_name("create", raw_name)?;
     reject_reserved("create", &name)?;
     let path = profile_path(dir, &name);
-    ensure_absent("create", &name, &path)?;
-    let content = new_profile_lua(&name);
-    validate_new_profile(&content, &path).map_err(|err| invalid_profile("create", &name, &err))?;
-    create_exclusive(&path, &content).map_err(|err| {
-        if err.kind() == std::io::ErrorKind::AlreadyExists {
-            exists_failure("create", &name, &path)
-        } else {
-            io_failure("create", &format!("create '{}'", path.display()), &err)
-        }
-    })?;
+    let existing = profile_entry_exists("create", &path)?;
+    if existing && !options.force {
+        return Err(exists_failure("create", &name, &path));
+    }
+    let content = if let Some(source_name) = options.from.as_deref() {
+        let src = valid_name("create", source_name)?;
+        let src_path = profile_path(dir, &src);
+        ensure_present("create", &src, &src_path)?;
+        let source = read_clone_source(dir, &src, &src_path)?;
+        // The copied bytes keep their `extends` chain, so validate exactly the
+        // chain that will exist under the new name against the user layer.
+        let cross = merge_with_current_user("create", &src, args, source.chain)?;
+        strict_post_merge_checks("create", &cross.subject(&src), &cross.merged.effective)?;
+        source.content
+    } else if let Some(preset_name) = options.preset.as_deref() {
+        let preset = crate::init::InitProfilePreset::parse(preset_name).ok_or_else(|| {
+            Failure::usage(format!(
+                "bitty config profile create: unknown preset '{preset_name}' \
+                 (want minimal|dark|light)"
+            ))
+        })?;
+        let content = preset_profile_lua(preset);
+        validate_new_profile(&content, &path)
+            .map_err(|err| invalid_profile("create", &name, &err))?;
+        content
+    } else {
+        let content = new_profile_lua(&name);
+        validate_new_profile(&content, &path)
+            .map_err(|err| invalid_profile("create", &name, &err))?;
+        content
+    };
+    let seed_text = options.seed_text();
+    let seed_json = options.seed_json();
+    if options.dry_run {
+        let text = format!(
+            "bitty config profile create: would create '{name}' ('{}'){seed_text}\n",
+            path.display()
+        );
+        let result = format!(
+            "{{\"kind\":\"profile\",\"action\":\"create\",\"name\":{},\"path\":{},\"changed\":false,\"dry_run\":true,\"force\":{},{seed_json}}}",
+            json_string(&name),
+            json_path(&path),
+            options.force
+        );
+        return Ok(Reply::new(text, result));
+    }
+    if existing {
+        write_profile_atomic(&path, &content, None).map_err(|err| match err {
+            ProfileWriteError::Changed => changed_failure(ReadIntent::Edit, &path),
+            ProfileWriteError::NotRegular => not_regular_failure(ReadIntent::Edit, &path),
+            ProfileWriteError::Io(err) => {
+                io_failure("create", &format!("replace '{}'", path.display()), &err)
+            }
+        })?;
+    } else {
+        create_exclusive(&path, &content).map_err(|err| {
+            if err.kind() == std::io::ErrorKind::AlreadyExists {
+                exists_failure("create", &name, &path)
+            } else {
+                io_failure("create", &format!("create '{}'", path.display()), &err)
+            }
+        })?;
+    }
+    let verb = if existing { "replaced" } else { "created" };
     let text = format!(
-        "bitty config profile create: created '{name}' ('{}')\n\
+        "bitty config profile create: {verb} '{name}' ('{}'){seed_text}\n\
          activate it with `bitty config profile use {name}`\n",
         path.display()
     );
-    Ok(Reply::new(
-        text,
-        profile_result("create", &name, &path, ",\"changed\":true"),
-    ))
+    let result = format!(
+        "{{\"kind\":\"profile\",\"action\":\"create\",\"name\":{},\"path\":{},\"changed\":true,\"dry_run\":false,\"force\":{},{seed_json}}}",
+        json_string(&name),
+        json_path(&path),
+        options.force
+    );
+    Ok(Reply::new(text, result))
+}
+
+/// Renders the deterministic Lua fragment for one first-class preset.
+fn preset_profile_lua(preset: crate::init::InitProfilePreset) -> String {
+    let answers = crate::init::init_preset_answers(preset);
+    match preset {
+        crate::init::InitProfilePreset::Minimal => crate::init::render_minimal_profile_lua(
+            &answers,
+            &crate::init::InitOverrides::default(),
+        ),
+        _ => crate::init::render_init_lua(&answers),
+    }
 }
 
 /// `bitty config profile clone SRC DST`.
-fn run_clone(args: &Args, dir: &Path, raw_src: &str, raw_dst: &str) -> Result<Reply, Failure> {
+fn run_clone(
+    args: &Args,
+    options: &ProfileOptions,
+    dir: &Path,
+    raw_src: &str,
+    raw_dst: &str,
+) -> Result<Reply, Failure> {
     let src = valid_name("clone", raw_src)?;
-    let dst = valid_name("clone", raw_dst)?;
+    let dst = valid_new_name("clone", raw_dst)?;
     reject_reserved("clone", &dst)?;
     let src_path = profile_path(dir, &src);
     let dst_path = profile_path(dir, &dst);
@@ -867,6 +1170,22 @@ fn run_clone(args: &Args, dir: &Path, raw_src: &str, raw_dst: &str) -> Result<Re
     let CloneSource { content, chain } = source;
     let cross = merge_with_current_user("clone", &src, args, chain)?;
     strict_post_merge_checks("clone", &cross.subject(&src), &cross.merged.effective)?;
+    if options.dry_run {
+        let text = format!(
+            "bitty config profile clone: would clone '{src}' to '{dst}' ('{}')\n",
+            dst_path.display()
+        );
+        let result = profile_result(
+            "clone",
+            &dst,
+            &dst_path,
+            &format!(
+                ",\"source\":{},\"changed\":false,\"dry_run\":true",
+                json_string(&src)
+            ),
+        );
+        return Ok(Reply::new(text, result));
+    }
     create_exclusive(&dst_path, &content).map_err(|err| {
         if err.kind() == std::io::ErrorKind::AlreadyExists {
             exists_failure("clone", &dst, &dst_path)
@@ -882,15 +1201,29 @@ fn run_clone(args: &Args, dir: &Path, raw_src: &str, raw_dst: &str) -> Result<Re
         "clone",
         &dst,
         &dst_path,
-        &format!(",\"source\":{},\"changed\":true", json_string(&src)),
+        &format!(
+            ",\"source\":{},\"changed\":true,\"dry_run\":false",
+            json_string(&src)
+        ),
     );
     Ok(Reply::new(text, result))
 }
 
 /// `bitty config profile rename OLD NEW`.
-fn run_rename(args: &Args, dir: &Path, raw_old: &str, raw_new: &str) -> Result<Reply, Failure> {
+///
+/// The fragment moves with a no-replace rename. When the persisted selector
+/// named `OLD`, it is rewritten to `NEW` through the same atomic writer `use`
+/// uses; if that rewrite cannot be validated or committed, the rename is
+/// rolled back so the fragment is never lost.
+fn run_rename(
+    args: &Args,
+    options: &ProfileOptions,
+    dir: &Path,
+    raw_old: &str,
+    raw_new: &str,
+) -> Result<Reply, Failure> {
     let old = valid_name("rename", raw_old)?;
-    let new = valid_name("rename", raw_new)?;
+    let new = valid_new_name("rename", raw_new)?;
     reject_reserved("rename", &old)?;
     reject_reserved("rename", &new)?;
     if old == new {
@@ -902,10 +1235,41 @@ fn run_rename(args: &Args, dir: &Path, raw_old: &str, raw_new: &str) -> Result<R
     let new_path = profile_path(dir, &new);
     ensure_present("rename", &old, &old_path)?;
     ensure_absent("rename", &new, &new_path)?;
-    reject_active("rename", &old, args)?;
     reject_referenced("rename", &old, dir)?;
-    if let Err(err) = bitty_config::file::load_profile_chain_in_dir(&old, dir) {
-        return Err(invalid_profile("rename", &old, &err));
+    let old_chain = bitty_config::file::load_profile_chain_in_dir(&old, dir)
+        .map_err(|err| invalid_profile("rename", &old, &err))?;
+    // Prepare the selector rewrite before touching the profile so an
+    // unrewritable selector fails closed with no filesystem change at all.
+    let selector_update = prepare_selector_rename(args, &old, &new)?;
+    if options.dry_run {
+        let would_update = selector_update.is_some();
+        if let Some(update) = &selector_update {
+            // The new file does not exist yet; validate the prospective merge
+            // against the old fragment's chain (the bytes are identical).
+            validate_prospective_selector_chain(
+                SelectorIntent::Rename { previous: &old },
+                &new,
+                old_chain,
+                &update.path,
+                &update.rewritten,
+            )?;
+        }
+        let text = format!(
+            "bitty config profile rename: would rename '{old}' to '{new}' ('{}'){}\n",
+            new_path.display(),
+            if would_update {
+                " and update the persisted selector"
+            } else {
+                ""
+            }
+        );
+        let result = format!(
+            "{{\"kind\":\"profile\",\"action\":\"rename\",\"name\":{},\"path\":{},\"previous\":{},\"changed\":false,\"dry_run\":true,\"selector_updated\":false,\"selector_would_update\":{would_update}}}",
+            json_string(&new),
+            json_path(&new_path),
+            json_string(&old)
+        );
+        return Ok(Reply::new(text, result));
     }
     // The pre-check above gives the clear "already exists" error, but it is
     // only a check: a destination created between it and the rename would be
@@ -929,27 +1293,84 @@ fn run_rename(args: &Args, dir: &Path, raw_old: &str, raw_new: &str) -> Result<R
         }
     }
     sync_parent_dir(&new_path);
+    let selector_would_update = selector_update.is_some();
+    let mut selector_updated = false;
+    let mut backup = None;
+    if let Some(update) = selector_update {
+        match apply_selector_rename(dir, &old, &new, &update) {
+            Ok(selector_backup) => {
+                backup = selector_backup;
+                selector_updated = true;
+            }
+            Err(failure) => return Err(rollback_rename(&old_path, &new_path, failure)),
+        }
+    }
     let text = format!(
         "bitty config profile rename: renamed '{old}' to '{new}' ('{}')\n",
         new_path.display()
     );
-    let result = profile_result(
-        "rename",
-        &new,
-        &new_path,
-        &format!(",\"previous\":{},\"changed\":true", json_string(&old)),
+    let result = format!(
+        "{{\"kind\":\"profile\",\"action\":\"rename\",\"name\":{},\"path\":{},\"previous\":{},\"changed\":true,\"dry_run\":false,\"selector_updated\":{selector_updated},\"selector_would_update\":{selector_would_update},\"backup\":{}}}",
+        json_string(&new),
+        json_path(&new_path),
+        json_string(&old),
+        backup
+            .as_deref()
+            .map_or_else(|| String::from("null"), json_path)
     );
     Ok(Reply::new(text, result))
 }
 
+/// Rolls a committed rename back after the selector update failed.
+///
+/// The profile bytes always live at one of the two names; a failed rollback
+/// reports where the fragment was preserved rather than pretending the
+/// command succeeded.
+fn rollback_rename(old_path: &Path, new_path: &Path, failure: Failure) -> Failure {
+    match commit_profile_rename(new_path, old_path) {
+        Ok(()) => {
+            sync_parent_dir(old_path);
+            failure
+        }
+        Err(err) => Failure::internal(format!(
+            "bitty config profile rename: {}; rollback of '{}' to '{}' also failed ({err}); \
+             the fragment is preserved at '{}' and the selector was not updated",
+            failure.message,
+            new_path.display(),
+            old_path.display(),
+            new_path.display()
+        )),
+    }
+}
+
 /// `bitty config profile delete NAME`.
-fn run_delete(args: &Args, dir: &Path, raw_name: &str) -> Result<Reply, Failure> {
+fn run_delete(
+    args: &Args,
+    options: &ProfileOptions,
+    dir: &Path,
+    raw_name: &str,
+) -> Result<Reply, Failure> {
     let name = valid_name("delete", raw_name)?;
     reject_reserved("delete", &name)?;
     let path = profile_path(dir, &name);
     ensure_present("delete", &name, &path)?;
-    reject_active("delete", &name, args)?;
+    if !options.force {
+        reject_active("delete", &name, args)?;
+    }
     reject_referenced("delete", &name, dir)?;
+    if options.dry_run {
+        let text = format!(
+            "bitty config profile delete: would delete '{name}' ('{}')\n",
+            path.display()
+        );
+        let result = format!(
+            "{{\"kind\":\"profile\",\"action\":\"delete\",\"name\":{},\"path\":{},\"deleted\":false,\"changed\":false,\"dry_run\":true,\"force\":{}}}",
+            json_string(&name),
+            json_path(&path),
+            options.force
+        );
+        return Ok(Reply::new(text, result));
+    }
     if let Err(err) = std::fs::remove_file(&path) {
         return Err(io_failure(
             "delete",
@@ -957,14 +1378,18 @@ fn run_delete(args: &Args, dir: &Path, raw_name: &str) -> Result<Reply, Failure>
             &err,
         ));
     }
+    sync_parent_dir(&path);
     let text = format!(
         "bitty config profile delete: deleted '{name}' ('{}')\n",
         path.display()
     );
-    Ok(Reply::new(
-        text,
-        profile_result("delete", &name, &path, ",\"deleted\":true"),
-    ))
+    let result = format!(
+        "{{\"kind\":\"profile\",\"action\":\"delete\",\"name\":{},\"path\":{},\"deleted\":true,\"changed\":true,\"dry_run\":false,\"force\":{}}}",
+        json_string(&name),
+        json_path(&path),
+        options.force
+    );
+    Ok(Reply::new(text, result))
 }
 
 /// `bitty config profile get NAME PATH`.
@@ -1007,6 +1432,7 @@ fn run_get(dir: &Path, raw_name: &str, raw_key: &str) -> Result<Reply, Failure> 
 /// `bitty config profile set NAME PATH VALUE`.
 fn run_set(
     args: &Args,
+    options: &ProfileOptions,
     dir: &Path,
     raw_name: &str,
     raw_key: &str,
@@ -1082,7 +1508,7 @@ fn run_set(
         };
         return Err(Failure::invalid(message));
     }
-    let merged = merge_candidate(args, dir, &name, &path, &updated)?;
+    let merged = merge_candidate("set", args, dir, &name, &path, &updated)?;
     // Defense in depth: the bytes just spliced must read back as the requested
     // value. A mismatch means the editor wrote somewhere the merge does not
     // read (an alias, a duplicate key the parser resolved differently, or an
@@ -1098,21 +1524,32 @@ fn run_set(
             expected.json()
         )));
     }
-    write_profile_atomic(&path, &updated, Some(&identity)).map_err(|err| match err {
-        ProfileWriteError::Changed => changed_failure(ReadIntent::Edit, &path),
-        ProfileWriteError::NotRegular => not_regular_failure(ReadIntent::Edit, &path),
-        ProfileWriteError::Io(err) => {
-            io_failure("set", &format!("replace '{}'", path.display()), &err)
-        }
-    })?;
+    if !options.dry_run {
+        write_profile_atomic(&path, &updated, Some(&identity)).map_err(|err| match err {
+            ProfileWriteError::Changed => changed_failure(ReadIntent::Edit, &path),
+            ProfileWriteError::NotRegular => not_regular_failure(ReadIntent::Edit, &path),
+            ProfileWriteError::Io(err) => {
+                io_failure("set", &format!("replace '{}'", path.display()), &err)
+            }
+        })?;
+    }
     let value = (field.get)(&merged.effective);
     let source = profile_source_label(&merged, field.path);
-    let mut text = format!(
-        "bitty config profile set: set '{}' = {} in '{name}' ('{}')\n",
-        field.path,
-        display_value(&value, false),
-        path.display()
-    );
+    let mut text = if options.dry_run {
+        format!(
+            "bitty config profile set: would set '{}' = {} in '{name}' ('{}')\n",
+            field.path,
+            display_value(&value, false),
+            path.display()
+        )
+    } else {
+        format!(
+            "bitty config profile set: set '{}' = {} in '{name}' ('{}')\n",
+            field.path,
+            display_value(&value, false),
+            path.display()
+        )
+    };
     if !pinned.is_empty() {
         let names = pinned
             .iter()
@@ -1129,7 +1566,7 @@ fn run_set(
         .collect::<Vec<_>>()
         .join(",");
     let result = format!(
-        "{{\"kind\":\"profile\",\"action\":\"set\",\"name\":{},\"path\":{},\"key\":{},\"value\":{},\"type\":{},\"layer\":{},\"source\":{},\"changed\":true,\"pinned\":[{}]}}",
+        "{{\"kind\":\"profile\",\"action\":\"set\",\"name\":{},\"path\":{},\"key\":{},\"value\":{},\"type\":{},\"layer\":{},\"source\":{},\"changed\":{},\"dry_run\":{},\"pinned\":[{}]}}",
         json_string(&name),
         json_path(&path),
         json_string(field.path),
@@ -1140,9 +1577,213 @@ fn run_set(
             |found| found.layer.label().to_string()
         )),
         json_string(&source),
+        !options.dry_run,
+        options.dry_run,
         pinned_json
     );
     Ok(Reply::new(text, result))
+}
+
+/// `bitty config profile edit NAME`.
+///
+/// The editor works on a sibling draft. Only validated bytes replace the
+/// profile, and only after the draft was written back; an editor failure, an
+/// unparsable draft, or a schema/merge rejection removes the draft and leaves
+/// the original file byte-for-byte intact.
+fn run_edit(
+    args: &Args,
+    options: &ProfileOptions,
+    dir: &Path,
+    raw_name: &str,
+) -> Result<Reply, Failure> {
+    let name = valid_name("edit", raw_name)?;
+    let path = profile_path(dir, &name);
+    ensure_present("edit", &name, &path)?;
+    if options.dry_run {
+        let text = format!(
+            "bitty config profile edit: would edit '{name}' ('{}')\n",
+            path.display()
+        );
+        let result = format!(
+            "{{\"kind\":\"profile\",\"action\":\"edit\",\"name\":{},\"path\":{},\"editor\":null,\"changed\":false,\"dry_run\":true}}",
+            json_string(&name),
+            json_path(&path)
+        );
+        return Ok(Reply::new(text, result));
+    }
+    let editor = resolve_profile_editor();
+    let (original, identity) = read_profile(ReadIntent::ExternalEditor, &name, &path)?;
+    let draft = stage_edit_draft(dir, &name, &original)?;
+    match std::process::Command::new(&editor)
+        .arg(draft.path())
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            let detail = status.code().map_or_else(
+                || String::from("terminated by a signal"),
+                |code| format!("status {code}"),
+            );
+            return Err(Failure::new(
+                "E_PROFILE_EDITOR",
+                format!("bitty config profile edit: editor '{editor}' exited with {detail}"),
+                1,
+            ));
+        }
+        Err(err) => {
+            return Err(Failure::new(
+                "E_PROFILE_EDITOR",
+                format!("bitty config profile edit: cannot run editor '{editor}': {err}"),
+                1,
+            ));
+        }
+    }
+    let edited = read_edit_draft(&name, draft.path())?;
+    if edited == original {
+        let text = format!("bitty config profile edit: '{name}' is unchanged\n");
+        let result = format!(
+            "{{\"kind\":\"profile\",\"action\":\"edit\",\"name\":{},\"path\":{},\"editor\":{},\"changed\":false,\"dry_run\":false}}",
+            json_string(&name),
+            json_path(&path),
+            json_string(&editor)
+        );
+        return Ok(Reply::new(text, result));
+    }
+    if let Err(failure) = merge_candidate("edit", args, dir, &name, &path, &edited) {
+        return Err(Failure::new(
+            failure.code,
+            format!("{} (the original profile is unchanged)", failure.message),
+            failure.exit,
+        ));
+    }
+    write_profile_atomic(&path, &edited, Some(&identity)).map_err(|err| match err {
+        ProfileWriteError::Changed => changed_failure(ReadIntent::ExternalEditor, &path),
+        ProfileWriteError::NotRegular => not_regular_failure(ReadIntent::ExternalEditor, &path),
+        ProfileWriteError::Io(err) => {
+            io_failure("edit", &format!("replace '{}'", path.display()), &err)
+        }
+    })?;
+    let text = format!(
+        "bitty config profile edit: updated '{name}' ('{}')\n",
+        path.display()
+    );
+    let result = format!(
+        "{{\"kind\":\"profile\",\"action\":\"edit\",\"name\":{},\"path\":{},\"editor\":{},\"changed\":true,\"dry_run\":false}}",
+        json_string(&name),
+        json_path(&path),
+        json_string(&editor)
+    );
+    Ok(Reply::new(text, result))
+}
+
+/// `$VISUAL`, then `$EDITOR`, then `vi` (the shared config-editor policy).
+fn resolve_profile_editor() -> String {
+    let visual = std::env::var("VISUAL").ok();
+    let editor = std::env::var("EDITOR").ok();
+    crate::config_cli::resolve_editor_with_env(visual.as_deref(), editor.as_deref())
+}
+
+/// One sibling draft file whose bytes an external editor may change.
+///
+/// The drop removes the draft on every path (success, validation failure, or
+/// an early return), so a rejected edit never leaves temporary profile data
+/// behind.
+struct EditDraft {
+    path: PathBuf,
+}
+
+impl EditDraft {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for EditDraft {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Stages the current profile bytes in a unique sibling draft file.
+///
+/// The draft lives in the profile directory (same filesystem and permissions)
+/// under a `.tmp-` name the CLI's leftover checks already recognize. It is
+/// created exclusively, written in full, and synced before the editor runs.
+fn stage_edit_draft(dir: &Path, name: &str, content: &str) -> Result<EditDraft, Failure> {
+    std::fs::create_dir_all(dir)
+        .map_err(|err| io_failure("edit", &format!("create '{}'", dir.display()), &err))?;
+    let permissions = std::fs::metadata(profile_path(dir, name))
+        .ok()
+        .map(|meta| meta.permissions());
+    for _ in 0..PROFILE_MAX_TEMP_ATTEMPTS {
+        let counter = PROFILE_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = dir.join(format!(".{name}.lua.tmp-{}-{counter}", std::process::id()));
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(io_failure(
+                    "edit",
+                    &format!("create '{}'", candidate.display()),
+                    &err,
+                ));
+            }
+        };
+        let written = file
+            .write_all(content.as_bytes())
+            .and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(err) = written {
+            let _ = std::fs::remove_file(&candidate);
+            return Err(io_failure(
+                "edit",
+                &format!("write '{}'", candidate.display()),
+                &err,
+            ));
+        }
+        if let Some(permissions) = permissions.clone() {
+            let _ = std::fs::set_permissions(&candidate, permissions);
+        }
+        return Ok(EditDraft { path: candidate });
+    }
+    Err(Failure::io(format!(
+        "bitty config profile edit: exhausted temporary names for '{name}'"
+    )))
+}
+
+/// Reads the editor's draft with the loader's size bound.
+fn read_edit_draft(name: &str, path: &Path) -> Result<String, Failure> {
+    let metadata = std::fs::metadata(path).map_err(|err| {
+        Failure::new(
+            "E_PROFILE_EDITOR",
+            format!(
+                "bitty config profile edit: cannot inspect the edited draft for '{name}': {err}; \
+                 the original profile is unchanged"
+            ),
+            1,
+        )
+    })?;
+    if metadata.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
+        return Err(Failure::invalid(format!(
+            "bitty config profile edit: the edited profile '{name}' exceeds {} bytes; \
+             the original profile is unchanged",
+            bitty_config::file::MAX_CONFIG_FILE_BYTES
+        )));
+    }
+    std::fs::read_to_string(path).map_err(|err| {
+        Failure::new(
+            "E_PROFILE_EDITOR",
+            format!(
+                "bitty config profile edit: cannot read the edited draft for '{name}': {err}; \
+                 the original profile is unchanged"
+            ),
+            1,
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,9 +1796,56 @@ fn valid_name(verb: &str, raw: &str) -> Result<String, Failure> {
         .map_err(|err| Failure::invalid(format!("bitty config profile {verb}: {err}")))
 }
 
+/// Validates a name the command will *create* (`create`, `clone`, `rename`).
+///
+/// The loader intentionally accepts `[A-Za-z0-9_-]` so an existing profile
+/// stays addressable; a new name follows the documented lowercase convention
+/// `[a-z0-9][a-z0-9_-]*` (which already excludes path separators and `..`).
+fn valid_new_name(verb: &str, raw: &str) -> Result<String, Failure> {
+    let name = valid_name(verb, raw)?;
+    let mut chars = name.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit());
+    let rest_ok =
+        chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '-');
+    if !first_ok || !rest_ok {
+        return Err(Failure::invalid(format!(
+            "bitty config profile {verb}: invalid new profile name '{name}': use \
+             [a-z0-9][a-z0-9_-]* (lowercase, no paths)"
+        )));
+    }
+    Ok(name)
+}
+
 /// `<dir>/<name>.lua` for an already-validated name.
 fn profile_path(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("{name}.lua"))
+}
+
+/// Whether the entry exists and is a regular file (never a symlink).
+///
+/// `create --force` needs the existence answer without the conflict refusal
+/// [`ensure_absent`] returns; a symlink or special file is still refused
+/// before any write.
+fn profile_entry_exists(verb: &str, path: &Path) -> Result<bool, Failure> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(Failure::invalid(format!(
+            "bitty config profile {verb}: refusing to follow symlink '{}'",
+            path.display()
+        ))),
+        Ok(meta) if !meta.is_file() => Err(Failure::invalid(format!(
+            "bitty config profile {verb}: '{}' is not a regular file",
+            path.display()
+        ))),
+        Ok(_) => Ok(true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(io_failure(
+            verb,
+            &format!("inspect '{}'", path.display()),
+            &err,
+        )),
+    }
 }
 
 /// Refuses the `default` profile name for creating/removing/renaming.
@@ -1191,6 +1879,9 @@ enum ReadIntent {
     /// Read to rewrite the same file (`set`); the preimage is compared before
     /// the replace commits.
     Edit,
+    /// Read to hand to an external editor (`edit`); the original stays on disk
+    /// while the draft is edited and is only replaced after validation.
+    ExternalEditor,
     /// Read to copy the bytes elsewhere (`clone`); the source is never written.
     Copy,
 }
@@ -1200,6 +1891,7 @@ impl ReadIntent {
     fn verb(self) -> &'static str {
         match self {
             Self::Edit => "set",
+            Self::ExternalEditor => "edit",
             Self::Copy => "clone",
         }
     }
@@ -1211,6 +1903,10 @@ impl ReadIntent {
                 "changed while editing; refusing to overwrite the concurrent edit (re-run the \
                  command on the current file)"
             }
+            Self::ExternalEditor => {
+                "changed while it was open in the editor; refusing to overwrite the concurrent \
+                 edit (re-run the command on the current file)"
+            }
             Self::Copy => {
                 "changed while copying; refusing to copy the concurrent change (re-run the \
                  command on the current source)"
@@ -1221,7 +1917,7 @@ impl ReadIntent {
     /// Clause after the path when the entry is not a regular file.
     fn not_regular_clause(self) -> &'static str {
         match self {
-            Self::Edit => "is not a regular file; refusing to edit it",
+            Self::Edit | Self::ExternalEditor => "is not a regular file; refusing to edit it",
             Self::Copy => "is not a regular file; refusing to copy it",
         }
     }
@@ -1229,7 +1925,7 @@ impl ReadIntent {
     /// Size-bound refusal tail (that message already names the profile).
     fn oversized_clause(self) -> &'static str {
         match self {
-            Self::Edit => "refusing to edit it",
+            Self::Edit | Self::ExternalEditor => "refusing to edit it",
             Self::Copy => "refusing to copy it",
         }
     }
@@ -1298,7 +1994,7 @@ fn ensure_absent(verb: &str, name: &str, path: &Path) -> Result<(), Failure> {
     }
 }
 
-/// Refuses to delete or rename the profile the next launch would activate.
+/// Refuses to delete the profile the next launch would activate.
 ///
 /// Either selection source counts: a one-launch `--profile`/`BITTY_PROFILE`
 /// value and the persisted `init.lua` selector. Deleting only the *other*
@@ -1371,7 +2067,7 @@ fn referencing_profiles(dir: &Path, target: &str) -> Vec<String> {
     out
 }
 
-/// Effective profile name for list/delete/rename: `--profile`/`BITTY_PROFILE`
+/// Effective profile name for list/delete: `--profile`/`BITTY_PROFILE`
 /// first, then the persisted selector (the startup order).
 fn active_profile_name(args: &Args) -> Option<String> {
     let env = std::env::var("BITTY_PROFILE").ok();
@@ -1382,13 +2078,136 @@ fn active_profile_name(args: &Args) -> Option<String> {
 
 /// Profile named by the persisted `init.lua` selector only.
 fn selector_profile_name(args: &Args) -> Option<String> {
+    let path = selector_path(args)?;
+    selector_profile_from_path(&path)
+}
+
+/// Resolves the persisted selector path (`--config` > `BITTY_CONFIG` > XDG).
+fn selector_path(args: &Args) -> Option<PathBuf> {
     let bitty_config_env = std::env::var("BITTY_CONFIG").ok();
     let explicit = bitty_config::file::resolve_config_explicit(
         args.config_path.as_deref(),
         bitty_config_env.as_deref(),
     );
-    let probed = bitty_config::file::probe_config_path(explicit.as_deref())?;
-    selector_profile_from_path(&probed.path)
+    bitty_config::file::probe_config_path(explicit.as_deref()).map(|probed| probed.path)
+}
+
+/// The persisted-selector rewrite a `rename` must commit after moving the
+/// fragment.
+struct SelectorRename {
+    /// Selector file that named the old profile.
+    path: PathBuf,
+    /// Rewritten selector bytes (only the `profile` value changed).
+    rewritten: String,
+}
+
+/// Prepares the selector rewrite for `rename` before the profile moves.
+///
+/// Reading and rewriting first means an unrewritable selector (a legacy file,
+/// a long-bracket value, or a malformed selector) refuses the command with no
+/// filesystem change at all.
+fn prepare_selector_rename(
+    args: &Args,
+    old: &str,
+    new: &str,
+) -> Result<Option<SelectorRename>, Failure> {
+    let Some(selector) = selector_path(args) else {
+        return Ok(None);
+    };
+    if !selector.exists() || selector_profile_from_path(&selector).as_deref() != Some(old) {
+        return Ok(None);
+    }
+    let metadata = std::fs::metadata(&selector).map_err(|err| {
+        Failure::io(format!(
+            "bitty config profile rename: cannot inspect '{}': {err}",
+            selector.display()
+        ))
+    })?;
+    if metadata.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
+        return Err(Failure::invalid(format!(
+            "bitty config profile rename: '{}' exceeds {} bytes; refusing to rewrite it",
+            selector.display(),
+            bitty_config::file::MAX_CONFIG_FILE_BYTES
+        )));
+    }
+    let content = std::fs::read_to_string(&selector).map_err(|err| {
+        Failure::io(format!(
+            "bitty config profile rename: cannot read '{}': {err}",
+            selector.display()
+        ))
+    })?;
+    let Some(rewritten) = rewrite_selector_profile(&content, new) else {
+        return Err(Failure::invalid(format!(
+            "bitty config profile rename: cannot update the persisted selector '{}': no \
+             top-level short-quoted `profile = \"{old}\"` assignment; edit it manually",
+            selector.display()
+        )));
+    };
+    // Re-parse the exact bytes that will be written. The same check `use`
+    // runs before its write keeps a rewrite that matched the wrong occurrence
+    // from ever reaching the disk.
+    let source = bitty_config::plan::ConfigSource::new(
+        bitty_config::plan::LayerKind::User,
+        Some(selector.display().to_string()),
+    );
+    let plan = bitty_config::file::parse_lua_config(&rewritten, &source).map_err(|err| {
+        Failure::invalid(format!(
+            "bitty config profile rename: rewritten selector '{}' is invalid ({err}); \
+             refusing to rename",
+            selector.display()
+        ))
+    })?;
+    match plan.selector {
+        Some(found) if found.profile == new => {}
+        Some(found) => {
+            return Err(Failure::invalid(format!(
+                "bitty config profile rename: rewritten selector still names '{}' instead of \
+                 '{new}'; refusing to rename",
+                found.profile
+            )));
+        }
+        None => {
+            return Err(Failure::invalid(
+                "bitty config profile rename: rewritten selector lost its profile field; \
+                 refusing to rename"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(Some(SelectorRename {
+        path: selector,
+        rewritten,
+    }))
+}
+
+/// Validates and atomically commits the selector rewrite after a rename.
+///
+/// On any failure the caller rolls the profile rename back, so the fragment
+/// and its persisted selector remain consistent.
+fn apply_selector_rename(
+    dir: &Path,
+    old: &str,
+    new: &str,
+    update: &SelectorRename,
+) -> Result<Option<PathBuf>, Failure> {
+    validate_prospective_selector_with(
+        SelectorIntent::Rename { previous: old },
+        dir,
+        new,
+        &update.path,
+        &update.rewritten,
+    )?;
+    match write_init_config(&update.path, &update.rewritten, true) {
+        Ok(outcome) => Ok(outcome.backup),
+        Err(InitWriteError::Refused(message)) => Err(Failure::invalid(format!(
+            "bitty config profile rename: cannot update the persisted selector '{}': {message}",
+            update.path.display()
+        ))),
+        Err(InitWriteError::Io(message)) => Err(Failure::io(format!(
+            "bitty config profile rename: cannot update the persisted selector '{}': {message}",
+            update.path.display()
+        ))),
+    }
 }
 
 /// Profile named by one already-resolved selector file.
@@ -1683,6 +2502,7 @@ fn validate_new_profile(content: &str, path: &Path) -> Result<(), bitty_config::
 /// attribution stay on the profile the command targets, and a leaf that is
 /// invalid in isolation must still be repairable by the cross-layer result.
 fn merge_candidate(
+    verb: &str,
     args: &Args,
     dir: &Path,
     name: &str,
@@ -1690,9 +2510,9 @@ fn merge_candidate(
     content: &str,
 ) -> Result<bitty_config::MergedConfig, Failure> {
     let candidate =
-        parse_profile_plan(content, path).map_err(|err| invalid_profile("set", name, &err))?;
+        parse_profile_plan(content, path).map_err(|err| invalid_profile(verb, name, &err))?;
     let mut chain = bitty_config::file::load_profile_chain_in_dir(name, dir)
-        .map_err(|err| invalid_profile("set", name, &err))?;
+        .map_err(|err| invalid_profile(verb, name, &err))?;
     if let Some(entry) = chain.last_mut() {
         *entry = candidate;
     } else {
@@ -1703,15 +2523,15 @@ fn merge_candidate(
         chain.clone(),
         &bitty_config::file::CliOverrides::default(),
     )
-    .map_err(|err| invalid_profile("set", name, &err))?;
+    .map_err(|err| invalid_profile(verb, name, &err))?;
     // The selector is a user layer too: its theme, approved roots, keymaps,
     // and outline overrides participate in what the next launch loads, so the
     // gates must see the cross-layer result. Checking the profile alone both
     // refused valid configurations (selector-approved image roots, a focused
     // outline the selector replaces) and accepted invalid ones (a keymap
     // duplicate or `local:missing` theme only the selector introduced).
-    let cross = merge_with_current_user("set", name, args, chain)?;
-    strict_post_merge_checks("set", &cross.subject(name), &cross.merged.effective)?;
+    let cross = merge_with_current_user(verb, name, args, chain)?;
+    strict_post_merge_checks(verb, &cross.subject(name), &cross.merged.effective)?;
     Ok(merged)
 }
 
@@ -4714,8 +5534,15 @@ mod tests {
             std::fs::write(path, concurrent).expect("concurrent edit");
         });
 
-        let failure = run_set(&args, &dir, "work", "window.padding", "8")
-            .expect_err("a concurrent edit must refuse the write");
+        let failure = run_set(
+            &args,
+            &ProfileOptions::default(),
+            &dir,
+            "work",
+            "window.padding",
+            "8",
+        )
+        .expect_err("a concurrent edit must refuse the write");
         assert_eq!(failure.code, "E_PROFILE_CONFLICT");
         assert_eq!(failure.exit, 2);
         assert!(
@@ -4759,8 +5586,15 @@ mod tests {
             std::fs::remove_file(path).expect("remove profile");
             symlink(&linked_target, path).expect("symlink swap");
         });
-        let failure = run_set(&args, &dir, "work", "window.padding", "8")
-            .expect_err("a symlink swap must refuse the write");
+        let failure = run_set(
+            &args,
+            &ProfileOptions::default(),
+            &dir,
+            "work",
+            "window.padding",
+            "8",
+        )
+        .expect_err("a symlink swap must refuse the write");
         assert_eq!(failure.code, "E_PROFILE_CONFLICT");
         assert_eq!(failure.exit, 2);
         assert!(
@@ -4813,7 +5647,14 @@ mod tests {
                 )
                 .expect("fifo swap");
             });
-            let sent = match run_set(&args, &worker_dir, "work", "window.padding", "8") {
+            let sent = match run_set(
+                &args,
+                &ProfileOptions::default(),
+                &worker_dir,
+                "work",
+                "window.padding",
+                "8",
+            ) {
                 Err(failure) => (failure.code, failure.exit, failure.message),
                 Ok(_) => ("UNEXPECTED_OK", 0, String::new()),
             };
@@ -4887,8 +5728,15 @@ mod tests {
                 std::fs::remove_file(path).expect("remove profile");
                 std::fs::create_dir(path).expect("directory swap");
             });
-            let failure = run_set(&args, &dir, "work", "window.padding", "8")
-                .expect_err("a directory swap must refuse the write");
+            let failure = run_set(
+                &args,
+                &ProfileOptions::default(),
+                &dir,
+                "work",
+                "window.padding",
+                "8",
+            )
+            .expect_err("a directory swap must refuse the write");
             assert_eq!(failure.code, "E_PROFILE_CONFLICT");
             assert_eq!(failure.exit, 2);
             assert!(
@@ -4926,8 +5774,15 @@ mod tests {
                 std::fs::remove_file(path).expect("remove profile");
                 std::fs::create_dir(path).expect("directory swap");
             });
-            let failure = run_set(&args, &dir, "work", "window.padding", "8")
-                .expect_err("a directory swap must refuse the write");
+            let failure = run_set(
+                &args,
+                &ProfileOptions::default(),
+                &dir,
+                "work",
+                "window.padding",
+                "8",
+            )
+            .expect_err("a directory swap must refuse the write");
             assert_eq!(failure.code, "E_PROFILE_IO");
             assert_eq!(failure.exit, 1);
         }
@@ -5262,8 +6117,14 @@ mod tests {
             Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists))
         });
 
-        let failure = run_rename(&args, &dir, "race-old", "race-new")
-            .expect_err("a destination created after the pre-check must conflict");
+        let failure = run_rename(
+            &args,
+            &ProfileOptions::default(),
+            &dir,
+            "race-old",
+            "race-new",
+        )
+        .expect_err("a destination created after the pre-check must conflict");
         assert_eq!(failure.code, "E_PROFILE_CONFLICT");
         assert_eq!(failure.exit, 2);
         assert!(

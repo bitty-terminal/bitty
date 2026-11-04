@@ -127,6 +127,15 @@ pub(crate) struct Args {
     /// [`Self::config_format`] when a `config` subcommand is present; a
     /// bare `--json` stays an unknown-flag usage error elsewhere.
     pub(crate) config_json: bool,
+    /// `bitty config profile <write verb> --dry-run` (CTX-1693): validate and
+    /// report the prospective change without touching the filesystem.
+    pub(crate) profile_dry_run: bool,
+    /// `bitty config profile create NAME --from EXISTING` (CTX-1693): seed
+    /// the new profile from an existing profile's bytes.
+    pub(crate) profile_from: Option<String>,
+    /// `bitty config profile create NAME --preset NAME` (CTX-1693): seed the
+    /// new profile from a named first-class preset (`minimal|dark|light`).
+    pub(crate) profile_preset: Option<String>,
     /// Ghostty-style `+<action>` alias (CTX-1467, issue #2464). Only the
     /// parsed identity is stored; dispatch always reuses the canonical
     /// `list`/`config`/`extension` fields set beside it.
@@ -481,6 +490,9 @@ impl Args {
             config_args: Vec::new(),
             config_format: None,
             config_json: false,
+            profile_dry_run: false,
+            profile_from: None,
+            profile_preset: None,
             plus_action: None,
 
             init_word: false,
@@ -945,6 +957,18 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             i += 1;
             continue;
         }
+        if token.starts_with("--from=") && out.config_cmd == Some(ConfigCommand::Profile) {
+            let val = token.trim_start_matches("--from=");
+            out.profile_from = Some(val.to_string());
+            i += 1;
+            continue;
+        }
+        if token.starts_with("--preset=") && out.config_cmd == Some(ConfigCommand::Profile) {
+            let val = token.trim_start_matches("--preset=");
+            out.profile_preset = Some(val.to_string());
+            i += 1;
+            continue;
+        }
         if token.starts_with("--config=") {
             let val = token.trim_start_matches("--config=");
             if val.trim().is_empty() {
@@ -1352,6 +1376,33 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 // and a bare `--json` outside `config` stays a usage error.
                 out.config_json = true;
                 i += 1;
+            }
+            "--dry-run" if out.config_cmd == Some(ConfigCommand::Profile) => {
+                // CTX-1693: profile write verbs report the validated
+                // prospective change without mutating the filesystem.
+                out.profile_dry_run = true;
+                i += 1;
+            }
+            "--from" if out.config_cmd == Some(ConfigCommand::Profile) => {
+                // CTX-1693: `config profile create NAME --from EXISTING`.
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.profile_from = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    // Empty marker: the profile parser fails closed on it.
+                    out.profile_from = Some(String::new());
+                    i += 1;
+                }
+            }
+            "--preset" if out.config_cmd == Some(ConfigCommand::Profile) => {
+                // CTX-1693: `config profile create NAME --preset NAME`.
+                if i + 1 < raw.len() && !raw[i + 1].starts_with('-') {
+                    out.profile_preset = Some(raw[i + 1].clone());
+                    i += 2;
+                } else {
+                    out.profile_preset = Some(String::new());
+                    i += 1;
+                }
             }
             "--split" => {
                 // Check next token for axis (if not a flag)

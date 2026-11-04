@@ -421,6 +421,7 @@ mod tests {
                         advance: [2, 0],
                     },
                     format: crate::glyph::BitmapFormat::Rgb,
+                    alpha: crate::glyph::AlphaMode::Premultiplied,
                     data: vec![0; 3],
                 }));
             }

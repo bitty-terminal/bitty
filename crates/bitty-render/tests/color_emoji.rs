@@ -15,7 +15,7 @@
 //! bitmap strike on a host that has such a face, and skips cleanly otherwise.
 
 use bitty_platform::PhysicalSize;
-use bitty_render::glyph::{BitmapFormat, GlyphMetrics};
+use bitty_render::glyph::{AlphaMode, BitmapFormat, GlyphMetrics};
 use bitty_render::gpu::Surface;
 use bitty_render::grid::GlyphSource;
 use bitty_render::{
@@ -33,9 +33,30 @@ const COLOR_RGBA: [u8; 4] = [0xE0, 0x30, 0x20, 0xFF];
 /// Rasterizer that serves a color bitmap for emoji presentation and
 /// monochrome coverage otherwise, with identical metrics so a layout
 /// difference between the two presentations is a bug, not a glyph-size
-/// difference.
+/// difference. `texel`/`alpha` let a test model either color source: a
+/// premultiplied COLR layer stack or a straight-alpha CBDT/sbix strike.
 struct ColorFake {
     next_id: u64,
+    texel: [u8; 4],
+    alpha: AlphaMode,
+}
+
+impl ColorFake {
+    fn new() -> Self {
+        Self {
+            next_id: 0,
+            texel: COLOR_RGBA,
+            alpha: AlphaMode::Premultiplied,
+        }
+    }
+
+    fn with_texel(texel: [u8; 4], alpha: AlphaMode) -> Self {
+        Self {
+            next_id: 0,
+            texel,
+            alpha,
+        }
+    }
 }
 
 impl GlyphRasterizer for ColorFake {
@@ -59,8 +80,9 @@ impl GlyphRasterizer for ColorFake {
         };
         if key.wants_color() {
             return Ok(Some(
-                GlyphBitmap::try_new(metrics, BitmapFormat::Rgba, COLOR_RGBA.repeat(36))
-                    .expect("rgba bitmap"),
+                GlyphBitmap::try_new(metrics, BitmapFormat::Rgba, self.texel.repeat(36))
+                    .expect("rgba bitmap")
+                    .with_alpha(self.alpha),
             ));
         }
         Ok(Some(
@@ -70,18 +92,22 @@ impl GlyphRasterizer for ColorFake {
     }
 }
 
-fn renderer() -> GridRenderer<ColorFake> {
+fn renderer_with(fake: ColorFake) -> GridRenderer<ColorFake> {
     let query = FontQuery {
         family: "Fake Color".into(),
         style: FontStyle::Normal,
         point_size: 12.0,
     };
     GridRenderer::new(
-        ColorFake { next_id: 0 },
+        fake,
         &query,
         CellMetrics::new(u32::from(CELL.0), u32::from(CELL.1)).unwrap(),
     )
     .expect("renderer")
+}
+
+fn renderer() -> GridRenderer<ColorFake> {
+    renderer_with(ColorFake::new())
 }
 
 /// One frame's draw list plus the atlas payloads it addresses.
@@ -92,10 +118,10 @@ struct Row {
     color: Option<(Vec<u8>, bitty_render::atlas::AtlasDims)>,
 }
 
-/// Renders one printed row through the shaped emitter and returns the draw
-/// list plus the two atlas payloads.
-fn render_row(cells: &[char]) -> Row {
-    let mut renderer = renderer();
+/// Renders one printed row through the unshaped emitter with `fake` and
+/// returns the draw list plus the two atlas payloads.
+fn render_row_with(fake: ColorFake, cells: &[char]) -> Row {
+    let mut renderer = renderer_with(fake);
     let mut state = State::new();
     for &scalar in cells {
         state.apply(&TerminalAction::Print(GraphemeCell::from(scalar)));
@@ -117,6 +143,11 @@ fn render_row(cells: &[char]) -> Row {
         dims,
         color,
     }
+}
+
+/// Renders one printed row with the default color fake.
+fn render_row(cells: &[char]) -> Row {
+    render_row_with(ColorFake::new(), cells)
 }
 
 fn cell_scalar(cell: &bitty_term_state::Cell) -> char {
@@ -273,6 +304,90 @@ fn cell_zero_is_the_wide_glyph() {
     state.apply(&TerminalAction::Print(GraphemeCell::from('\u{2705}')));
     let snapshot = state.snapshot();
     assert_eq!(cell_scalar(&snapshot.cells[0]), '\u{2705}');
+}
+
+// ---------------------------------------------------------------------------
+// Review round 1: alpha source, overlay color, atlas accounting
+// ---------------------------------------------------------------------------
+
+/// First texel of the color-atlas slot `source` names, read back from `row`.
+fn color_slot_texel(row: &Row, source: &GlyphSource) -> [u8; 4] {
+    let GlyphSource::ColorAtlas { slot } = source else {
+        panic!("expected a color atlas placement, got {source:?}");
+    };
+    let (texels, dims) = row.color.as_ref().expect("color atlas payload");
+    let offset = (usize::from(slot.y) * usize::from(dims.width) + usize::from(slot.x)) * 4;
+    [
+        texels[offset],
+        texels[offset + 1],
+        texels[offset + 2],
+        texels[offset + 3],
+    ]
+}
+
+/// A premultiplied COLR layer stack (half-alpha red arrives as [128, 0, 0,
+/// 128]) is divided out exactly once: the atlas holds the straight color.
+#[test]
+fn premultiplied_layer_stack_is_un_premultiplied_once() {
+    let fake = ColorFake::with_texel([128, 0, 0, 128], AlphaMode::Premultiplied);
+    let row = render_row_with(fake, &['\u{2705}']);
+    assert_eq!(row.list.glyphs.len(), 1);
+    assert_eq!(
+        color_slot_texel(&row, &row.list.glyphs[0].source),
+        [255, 0, 0, 128],
+        "a premultiplied texel is un-premultiplied for the straight-alpha atlas"
+    );
+}
+
+/// The same bytes declared straight alpha (a CBDT/sbix strike) must reach the
+/// atlas unchanged. The unconditional un-premultiply this replaces produced
+/// [255, 0, 0, 128] here — over-brightened, clipped edges on macOS/Android.
+#[test]
+fn straight_alpha_strike_is_stored_as_decoded() {
+    let fake = ColorFake::with_texel([128, 0, 0, 128], AlphaMode::Straight);
+    let row = render_row_with(fake, &['\u{2705}']);
+    assert_eq!(row.list.glyphs.len(), 1);
+    assert_eq!(
+        color_slot_texel(&row, &row.list.glyphs[0].source),
+        [128, 0, 0, 128],
+        "a straight-alpha strike is stored as decoded"
+    );
+}
+
+/// Overlay text (help card, panels, search) must resolve the cluster's
+/// presentation before the glyph lookup, so it paints the color bitmap the
+/// key asks for instead of the monochrome raster it used to re-key after the
+/// fact.
+#[test]
+fn overlay_text_paints_the_color_glyph() {
+    let mut renderer = renderer();
+    let glyphs = renderer.overlay_text_glyphs("\u{2705}", (0, 0), 4, DEFAULT_FG);
+    assert_eq!(glyphs.len(), 1, "one wide overlay cluster: {glyphs:?}");
+    let GlyphSource::ColorAtlas { slot } = glyphs[0].source else {
+        panic!(
+            "overlay text must paint the color bitmap, got {:?}",
+            glyphs[0].source
+        );
+    };
+    assert_eq!(
+        glyphs[0].color,
+        [u8::MAX; 4],
+        "a color bitmap is never tinted by the cell foreground"
+    );
+    let (texels, dims) = renderer.color_atlas_texels().expect("color atlas payload");
+    let offset = (usize::from(slot.y) * usize::from(dims.width) + usize::from(slot.x)) * 4;
+    assert_eq!(
+        &texels[offset..offset + 4],
+        &COLOR_RGBA,
+        "the overlay slot carries the rasterized color"
+    );
+    // The monochrome atlas stays clean: no duplicate placement for the same
+    // cluster (that duplicate is what used to feed the color-atlas leak).
+    assert_eq!(
+        renderer.color_atlas_placements(),
+        1,
+        "one color placement per overlay cluster"
+    );
 }
 
 // ---------------------------------------------------------------------------

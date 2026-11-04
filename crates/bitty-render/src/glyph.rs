@@ -204,8 +204,39 @@ pub enum BitmapFormat {
     /// Three bytes per pixel carrying coverage (grayscale antialiasing) or
     /// subpixel triplets, as produced by the upstream engine.
     Rgb,
-    /// Four bytes per pixel, premultiplied alpha.
+    /// Four bytes per pixel, color. The channel semantics depend on the
+    /// source and are carried by [`GlyphBitmap::alpha`]: a COLR/CPAL layer
+    /// stack arrives premultiplied, a color bitmap strike arrives with
+    /// straight alpha.
     Rgba,
+}
+
+/// Channel semantics of a [`BitmapFormat::Rgba`] bitmap's color channels.
+///
+/// The two color sources do not agree, and the color atlas stores straight
+/// alpha, so it has to un-premultiply exactly once and only where that is
+/// valid (CTX-1691 review round 1):
+///
+/// * COLR/CPAL layers are composited src-over onto a zeroed buffer by
+///   `swash`'s layer blit (`blit` in `swash::scale::bitmap`), which leaves
+///   premultiplied bytes.
+/// * CBDT/sbix strikes are decoded PNG images and keep straight alpha;
+///   `swash` copies them out unchanged (`scale_bitmap_impl`, no blit).
+/// * FreeType color bitmaps are `FT_PIXEL_MODE_BGRA`, documented as
+///   premultiplied, and CoreGraphics color glyphs likewise.
+///
+/// The renderer records the winning source with the bitmap instead of
+/// guessing from the bytes, because a straight-alpha bitmap whose channels
+/// happen to stay below alpha is indistinguishable from a premultiplied one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AlphaMode {
+    /// Channels are already multiplied by alpha (COLR layer stack, FreeType
+    /// `FT_PIXEL_MODE_BGRA`, CoreGraphics color glyphs). This is the
+    /// historical meaning of [`BitmapFormat::Rgba`].
+    #[default]
+    Premultiplied,
+    /// Channels are independent of alpha (decoded CBDT/sbix PNG strikes).
+    Straight,
 }
 
 impl BitmapFormat {
@@ -232,6 +263,9 @@ pub struct GlyphBitmap {
     pub metrics: GlyphMetrics,
     /// Channel layout of `data`.
     pub format: BitmapFormat,
+    /// Channel semantics of an [`BitmapFormat::Rgba`] bitmap; ignored for
+    /// [`BitmapFormat::Rgb`], whose bytes are coverage.
+    pub alpha: AlphaMode,
     /// Pixel data, row-major from the top-left, length-validated.
     pub data: Vec<u8>,
 }
@@ -268,6 +302,10 @@ impl GlyphBitmap {
             Ok(len) if len == data.len() => Ok(Self {
                 metrics,
                 format,
+                // Every constructor path that produces straight alpha says
+                // so explicitly (see `AlphaMode`); the default keeps the
+                // historical premultiplied reading of an RGBA bitmap.
+                alpha: AlphaMode::Premultiplied,
                 data,
             }),
             // The mismatch is reported without echoing sizes back: reasons
@@ -283,6 +321,16 @@ impl GlyphBitmap {
     #[must_use]
     pub fn is_blank(&self) -> bool {
         self.data.is_empty()
+    }
+
+    /// Reinterprets the RGBA color channels as `alpha` (see [`AlphaMode`]).
+    ///
+    /// Only a rasterizer that knows which source won can call this; the
+    /// bytes are untouched, so the caller owns the correctness of the claim.
+    #[must_use]
+    pub const fn with_alpha(mut self, alpha: AlphaMode) -> Self {
+        self.alpha = alpha;
+        self
     }
 
     /// Checks the source invariant before converting any channel layout.

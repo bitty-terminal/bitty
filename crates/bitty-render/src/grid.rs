@@ -97,6 +97,7 @@
 //! measurement harness, corpora, and reference machines are defined by an
 //! implementing task.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use bitty_term_state::{
@@ -111,8 +112,8 @@ use crate::fallback::FallbackRasterizer;
 use crate::frame::{DamageDescriptor, FramePlan, plan_frame};
 use crate::geometry::{ExtentPx, RectPx};
 use crate::glyph::{
-    BitmapFormat, CachedBitmap, FontId, FontQuery, GlyphBitmap, GlyphMetrics, GlyphRasterizer,
-    RasterKey,
+    AlphaMode, BitmapFormat, CachedBitmap, FontId, FontQuery, GlyphBitmap, GlyphMetrics,
+    GlyphRasterizer, RasterKey,
 };
 use crate::shaped::{
     RunAttrs, RunDirection, ShapedCluster, ShapedRunSource, cells_for_range, cells_for_range_in,
@@ -2903,7 +2904,19 @@ impl ColorGlyphAtlas {
         Some(slot)
     }
 
-    /// Places one RGBA bitmap, growing only when the live set earns it.
+    /// Places one color bitmap, growing only when the live set earns it.
+    ///
+    /// The raster is validated *before* the allocator is touched (CTX-1691
+    /// review round 1): a bitmap this atlas cannot store (any non-RGBA
+    /// format, or a byte length that disagrees with its metrics) used to
+    /// claim a slot first and fail in [`Self::write`], leaving a region that
+    /// no `slots` entry ever owned. Every pass over such a cluster — an emoji
+    /// cluster that rasterized monochrome, which is exactly what a face with
+    /// no color table produces — then leaked four bytes per texel until
+    /// `max_dimension` reported `exhausted` and the frame pipeline evicted
+    /// both atlases wholesale. Rejecting up front keeps the leak impossible:
+    /// a slot is allocated only for a raster that will be written, so the
+    /// allocator's occupancy stays a function of the live placement set.
     fn place(&mut self, bitmap: &CachedBitmap) -> Option<AtlasSlot> {
         let metrics = bitmap.metrics();
         let width = u16::try_from(metrics.width.max(0)).ok()?;
@@ -2911,21 +2924,25 @@ impl ColorGlyphAtlas {
         if width == 0 || height == 0 || width > self.max_dimension || height > self.max_dimension {
             return None;
         }
+        // Convert first: this is the same gate `write` applies, moved ahead
+        // of the allocation. `None` here means "not a color raster", which
+        // the caller degrades to the monochrome atlas — never atlas
+        // exhaustion.
+        let source = color_texels(bitmap)?;
         if let Some(slot) = self.layout.allocate(width, height) {
-            return self.write(slot, bitmap);
+            return self.write(slot, source.as_ref());
         }
         if self.layout.occupancy() >= ATLAS_GROW_OCCUPANCY_THRESHOLD && self.try_grow() {
             if let Some(slot) = self.layout.allocate(width, height) {
-                return self.write(slot, bitmap);
+                return self.write(slot, source.as_ref());
             }
         }
         self.exhausted = true;
         None
     }
 
-    /// Copies the bitmap's RGBA texels into `slot` and returns it.
-    fn write(&mut self, slot: AtlasSlot, bitmap: &CachedBitmap) -> Option<AtlasSlot> {
-        let source = color_texels(bitmap)?;
+    /// Copies already-validated RGBA texels into `slot` and returns it.
+    fn write(&mut self, slot: AtlasSlot, source: &[u8]) -> Option<AtlasSlot> {
         let dims = self.layout.dimensions();
         let stride = usize::from(dims.width);
         let slot_w = usize::from(slot.width);
@@ -2992,13 +3009,17 @@ impl ColorGlyphAtlas {
             };
             destination.copy_from_slice(source);
         }
-        let Ok(layout) = AtlasLayout::new(next, next) else {
+        let Ok(mut layout) = AtlasLayout::new(next, next) else {
             return false;
         };
-        self.layout = layout;
-        if self.layout.allocate(current, current).is_none() {
+        // Reserve the carried-over region on the *candidate* allocator before
+        // publishing it: swapping `self.layout` first left the atlas holding
+        // a fresh layout with stale texels when the reservation failed
+        // (CTX-1691 review round 1).
+        if layout.allocate(current, current).is_none() {
             return false;
         }
+        self.layout = layout;
         self.texels = new_texels;
         self.epoch = self.epoch.wrapping_add(1);
         self.exhausted = false;
@@ -3016,14 +3037,25 @@ fn color_texel_len(width: u16, height: u16) -> Option<usize> {
 /// Straight-alpha RGBA texels of a color bitmap, or `None` when the bitmap is
 /// not an RGBA bitmap with a consistent length.
 ///
-/// The rasterizer hands over premultiplied RGBA (the color layer blit in
-/// `swash` is src-over against a zeroed buffer); the atlas stores straight
-/// alpha so the compositors own the premultiply step and a texel stays
-/// meaningful when sampled with any coverage.
-fn color_texels(bitmap: &CachedBitmap) -> Option<Vec<u8>> {
+/// The atlas stores straight alpha so the compositors own the premultiply
+/// step and a texel stays meaningful when sampled with any coverage. Which
+/// input the rasterizer handed over depends on the source that won, so the
+/// conversion follows [`GlyphBitmap::alpha`] instead of assuming one:
+///
+/// * Premultiplied (COLR/CPAL layer stack — `swash` composites the layers
+///   src-over onto a zeroed buffer — plus FreeType/CoreGraphics color
+///   glyphs) is divided out here.
+/// * Straight (CBDT/sbix strikes, decoded PNG bytes copied out verbatim) is
+///   already what the atlas wants and passes through untouched. Assuming
+///   premultiplied for those brightened every translucent edge texel and
+///   clipped it at 255 (CTX-1691 review round 1).
+fn color_texels(bitmap: &CachedBitmap) -> Option<Cow<'_, [u8]>> {
     let bitmap = bitmap.as_glyph_bitmap();
     if bitmap.format != BitmapFormat::Rgba || bitmap.validate_source_len().is_err() {
         return None;
+    }
+    if bitmap.alpha == AlphaMode::Straight {
+        return Some(Cow::Borrowed(&bitmap.data));
     }
     let mut texels = Vec::with_capacity(bitmap.data.len());
     for px in bitmap.data.chunks_exact(4) {
@@ -3038,7 +3070,7 @@ fn color_texels(bitmap: &CachedBitmap) -> Option<Vec<u8>> {
         };
         texels.extend_from_slice(&[straight(px[0]), straight(px[1]), straight(px[2]), px[3]]);
     }
-    Some(texels)
+    Some(Cow::Owned(texels))
 }
 
 /// Flattens any supported bitmap format to one coverage byte per texel.
@@ -4341,7 +4373,16 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 col += advance;
                 continue;
             }
-            let Ok(key) = RasterKey::new(character, self.font, self.point_size) else {
+            // Resolve the cluster's presentation *before* the cache lookup
+            // (CTX-1691 review round 1): the bitmap handed back is whatever
+            // the key asked for, so looking up the text-presentation key and
+            // re-keying afterwards left the monochrome raster in hand — the
+            // color atlas then rejected it every pass, and the overlay (help
+            // card, panels, search) never painted color.
+            let presentation = bitty_term_state::cluster_presentation_str(&text[idx..]);
+            let Ok(key) = RasterKey::new(character, self.font, self.point_size)
+                .map(|key| key.with_presentation(presentation))
+            else {
                 self.counters.blank_cells_skipped += 1;
                 continue;
             };
@@ -4357,8 +4398,6 @@ impl<R: GlyphRasterizer> GridRenderer<R> {
                 }
             };
             let metrics = bitmap.metrics();
-            let key =
-                key.with_presentation(bitty_term_state::cluster_presentation_str(&text[idx..]));
             let source = if key.wants_color() {
                 self.color_atlas
                     .ensure(key, bitmap)

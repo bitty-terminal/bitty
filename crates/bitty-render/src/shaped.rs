@@ -48,7 +48,7 @@ use fontdb::{Database, Family, Query, Source, Style, Weight};
 
 use crate::error::RenderError;
 use crate::glyph::{
-    BitmapFormat, CachedBitmap, FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap,
+    AlphaMode, BitmapFormat, CachedBitmap, FontId, FontMetrics, FontQuery, FontStyle, GlyphBitmap,
     GlyphMetrics, GlyphRasterizer, RasterKey, ShapedBitmap,
 };
 
@@ -580,7 +580,19 @@ impl SwashSingle {
             }
         };
         let bitmap = GlyphBitmap::try_new(metrics, format, data)?;
-        Ok((bitmap, source))
+        // Alpha semantics follow the source that won (CTX-1691 review round
+        // 1): the COLR/CPAL layer stack is composited src-over onto a zeroed
+        // buffer and is premultiplied, while a color bitmap strike is a
+        // decoded PNG (CBDT/sbix) that keeps straight alpha. `swash` reports
+        // exactly which one it served, so the atlas un-premultiplies only
+        // where that is valid instead of assuming premultiplied for both.
+        let alpha = match source {
+            GlyphSource::ColorBitmap => AlphaMode::Straight,
+            GlyphSource::ColorOutline | GlyphSource::Outline | GlyphSource::Bitmap => {
+                AlphaMode::Premultiplied
+            }
+        };
+        Ok((bitmap.with_alpha(alpha), source))
     }
 
     /// Probes which source would render `glyph_id` — the cheap coverage

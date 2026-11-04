@@ -894,6 +894,7 @@ mod tests {
         let bad = GlyphBitmap {
             metrics: metrics(2, 2),
             format: BitmapFormat::Rgb,
+            alpha: crate::glyph::AlphaMode::Premultiplied,
             data: vec![0; 3], // Wrong length for 2x2 RGB.
         };
         assert!(matches!(
@@ -914,6 +915,7 @@ mod tests {
                 advance: [0, 0],
             },
             format: BitmapFormat::Rgba,
+            alpha: crate::glyph::AlphaMode::Premultiplied,
             data: Vec::new(),
         };
         assert!(matches!(

@@ -427,12 +427,26 @@ pub fn is_emoji_presentation(scalar: char) -> bool {
 /// selector the base's `Emoji_Presentation` property decides.
 #[must_use]
 pub fn cluster_presentation(glyph: char, tail: &[char]) -> EmojiPresentation {
-    let mut presentation = if is_emoji_presentation(glyph) {
+    presentation_with_selectors(glyph, tail.iter().copied())
+}
+
+/// The one UTS #51 variation-selector rule both [`cluster_presentation`] and
+/// [`cluster_presentation_str`] apply.
+///
+/// Only the boundary scan differs between the two entry points (a stored
+/// tail is one cluster by construction; a string slice may hold the rest of
+/// a row), so the selector rule itself lives here once — the two used to
+/// carry parallel `match` blocks that could drift apart.
+fn presentation_with_selectors(
+    base: char,
+    selectors: impl Iterator<Item = char>,
+) -> EmojiPresentation {
+    let mut presentation = if is_emoji_presentation(base) {
         EmojiPresentation::Emoji
     } else {
         EmojiPresentation::Text
     };
-    for &scalar in tail {
+    for scalar in selectors {
         match scalar {
             VARIATION_SELECTOR_16 => presentation = EmojiPresentation::Emoji,
             VARIATION_SELECTOR_15 => presentation = EmojiPresentation::Text,
@@ -452,26 +466,14 @@ pub fn cluster_presentation_str(cluster: &str) -> EmojiPresentation {
     let Some(base) = scalars.next() else {
         return EmojiPresentation::Text;
     };
-    let mut presentation = if is_emoji_presentation(base) {
-        EmojiPresentation::Emoji
-    } else {
-        EmojiPresentation::Text
-    };
-    for scalar in scalars {
-        // Only the base's own continuation scalars decide; the scan stops at
-        // the first scalar that cannot belong to this cluster, so a caller
-        // holding a whole line (or the rest of a row) never picks up a
-        // selector from the next cluster.
-        if scalar as u32 != ZWJ && !is_grapheme_extend(scalar as u32) {
-            break;
-        }
-        match scalar {
-            VARIATION_SELECTOR_16 => presentation = EmojiPresentation::Emoji,
-            VARIATION_SELECTOR_15 => presentation = EmojiPresentation::Text,
-            _ => {}
-        }
-    }
-    presentation
+    // Only the base's own continuation scalars decide; the scan stops at the
+    // first scalar that cannot belong to this cluster, so a caller holding a
+    // whole line (or the rest of a row) never picks up a selector from the
+    // next cluster.
+    presentation_with_selectors(
+        base,
+        scalars.take_while(|scalar| *scalar as u32 == ZWJ || is_grapheme_extend(*scalar as u32)),
+    )
 }
 
 /// [`cluster_cell_width`] over a leading glyph plus its stored tail.

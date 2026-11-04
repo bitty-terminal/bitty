@@ -2534,9 +2534,9 @@ fn reload_config_json_carries_the_typed_module_record_scoped_to_the_record() {
     let LuaValue::Table(module) = object_field(&root, "module") else {
         panic!("a module refusal must carry a `module` object: {json}");
     };
-    assert_eq!(string_field(&module, "code"), "E_CONFIG_MODULE_ESCAPE");
-    assert_eq!(string_field(&module, "phase"), "open");
-    let record = string_field(&module, "record");
+    assert_eq!(string_field(module, "code"), "E_CONFIG_MODULE_ESCAPE");
+    assert_eq!(string_field(module, "phase"), "open");
+    let record = string_field(module, "record");
     assert_eq!(
         record,
         "code=E_CONFIG_MODULE_ESCAPE phase=open module_spec=\"pkg.mod\" \

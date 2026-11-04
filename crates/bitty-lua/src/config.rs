@@ -985,9 +985,11 @@ impl LuaVm {
             };
         }
         let in_flight = self.config_module_in_flight();
-        let modules = self.config_module_stats().map_or(0, |stats| stats.modules);
         match evaluated {
-            ConfigOutcome::Suspended { reason, .. } if modules > 0 || in_flight.is_some() => {
+            // Only a frame that is still live says a module was evaluating: a
+            // module that already returned (its frame popped, its value
+            // cached) leaves the budget's own meaning in place.
+            ConfigOutcome::Suspended { reason, .. } if in_flight.is_some() => {
                 let mut diagnostic = ConfigModuleDiagnostic::new(
                     ConfigModuleCode::Budget,
                     ConfigModulePhase::Budget,
@@ -1003,21 +1005,31 @@ impl LuaVm {
                     diagnostic: Box::new(diagnostic),
                 }
             }
-            ConfigOutcome::LuaError { message } => match in_flight {
-                Some(spec) => {
-                    let diagnostic = ConfigModuleDiagnostic::new(
-                        ConfigModuleCode::Eval,
-                        ConfigModulePhase::Evaluate,
-                    )
-                    .with_spec(spec.as_bytes().to_vec())
-                    .with_source(crate::config_require::source_location(&spec, &message))
-                    .with_detail(message);
-                    ConfigOutcome::ModuleRefused {
+            ConfigOutcome::LuaError { message } => {
+                let raised = match in_flight {
+                    // A frame is still on the stack: the error came out of the
+                    // module that owns it.
+                    Some(spec) => Some(
+                        ConfigModuleDiagnostic::new(
+                            ConfigModuleCode::Eval,
+                            ConfigModulePhase::Evaluate,
+                        )
+                        .with_spec(spec.as_bytes().to_vec())
+                        .with_source(crate::config_require::source_location(&spec, &message))
+                        .with_detail(message.clone()),
+                    ),
+                    // The frame was popped by the raise that carried this
+                    // error; the record the loader took at that point names
+                    // the module only when the message is that same error.
+                    None => self.config_module_raise(&message),
+                };
+                match raised {
+                    Some(diagnostic) => ConfigOutcome::ModuleRefused {
                         diagnostic: Box::new(diagnostic),
-                    }
+                    },
+                    None => ConfigOutcome::LuaError { message },
                 }
-                None => ConfigOutcome::LuaError { message },
-            },
+            }
             other => other,
         }
     }

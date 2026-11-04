@@ -35,6 +35,20 @@ fn set_swap_hook(hook: Option<SwapHook>) {
     SWAP_HOOK.with(|cell| *cell.borrow_mut() = hook);
 }
 
+thread_local! {
+    static FSTAT_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the test-only `fstat` fault is armed on this thread.
+pub(crate) fn fstat_fault_armed() -> bool {
+    FSTAT_FAULT.with(std::cell::Cell::get)
+}
+
+/// Arm or disarm the test-only `fstat` fault for the current thread.
+fn arm_fstat_fault(armed: bool) {
+    FSTAT_FAULT.with(|flag| flag.set(armed));
+}
+
 static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct TempDir(PathBuf);
@@ -217,16 +231,32 @@ fn duplicate_require_returns_the_same_table() {
     dir.module("lua/shared.lua", "return { n = 1 }");
     let (vm, outcome) = eval_with_root(
         dir.path(),
-        "local a = require('shared')\nlocal b = require('shared')\nreturn { same = (a == b) }",
+        "local a = require('shared')\nlocal b = require('shared')\n\
+         return { theme = tostring(a == b), close_confirm = tostring(b.n) }",
     );
-    assert!(
-        matches!(outcome, ConfigOutcome::Completed { .. }),
-        "{outcome:?}"
-    );
+    match outcome {
+        ConfigOutcome::Completed { data, .. } => {
+            assert!(data.undeclared.is_empty(), "{data:?}");
+            assert_eq!(
+                data.theme.as_deref(),
+                Some("true"),
+                "the second require returns the first table"
+            );
+            assert_eq!(
+                data.close_confirm.as_deref(),
+                Some("1"),
+                "the chunk ran once"
+            );
+        }
+        other => panic!("expected completion, got {other:?}"),
+    }
     let stats = vm.config_module_stats().expect("stats");
     assert_eq!(stats.modules, 1, "one identity, one evaluation");
 }
 
+// Windows keys the cache by the case-folded canonical path, so a hardlink
+// alias is two identities there — the documented deviation, not this rule.
+#[cfg(unix)]
 #[test]
 fn hardlink_alias_collapses_to_one_evaluation() {
     let dir = TempDir::new("hardlink");
@@ -237,16 +267,27 @@ fn hardlink_alias_collapses_to_one_evaluation() {
     std::fs::hard_link(&first, dir.path().join("lua/second.lua")).expect("hardlink");
     let (vm, outcome) = eval_with_root(
         dir.path(),
-        "local a = require('first')\nlocal b = require('second')\nreturn { n = b.n }",
+        "local a = require('first')\nlocal b = require('second')\n\
+         return { theme = tostring(a == b), close_confirm = tostring(b.n) }",
     );
-    assert!(matches!(outcome, ConfigOutcome::Completed { .. }));
+    match outcome {
+        ConfigOutcome::Completed { data, .. } => {
+            assert!(data.undeclared.is_empty(), "{data:?}");
+            assert_eq!(
+                data.theme.as_deref(),
+                Some("true"),
+                "one file identity is one cached table"
+            );
+            assert_eq!(
+                data.close_confirm.as_deref(),
+                Some("1"),
+                "one file identity is one evaluation"
+            );
+        }
+        other => panic!("expected completion, got {other:?}"),
+    }
     let stats = vm.config_module_stats().expect("stats");
     assert_eq!(stats.modules, 1, "one file identity, one slot");
-    let (_vm, outcome) = eval_with_root(
-        dir.path(),
-        "local a = require('first')\nlocal b = require('second')\nreturn { same = (a == b), n = b.n }",
-    );
-    assert!(matches!(outcome, ConfigOutcome::Completed { .. }));
 }
 
 #[test]
@@ -448,6 +489,47 @@ fn symlink_out_of_the_root_refuses_as_escape() {
 
 #[cfg(unix)]
 #[test]
+fn symlink_loop_at_a_module_path_refuses_as_escape() {
+    // A self-link resolves to `ELOOP`, which `Path::exists` swallowed as "not
+    // found": the operator was told a file that exists is missing. It is a
+    // resolution failure, and the contract names it as a containment refusal.
+    let dir = TempDir::new("escape-loop");
+    std::fs::create_dir_all(dir.path().join("lua")).expect("root");
+    let path = dir.path().join("lua/loop.lua");
+    std::os::unix::fs::symlink(&path, &path).expect("self symlink");
+    let diagnostic = refusal(dir.path(), "return require('loop')");
+    assert_code(&diagnostic, ConfigModuleCode::Escape);
+    let rendered = diagnostic.render();
+    assert!(rendered.contains("link resolution loop"), "{rendered}");
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_module_directory_refuses_as_escape() {
+    // `EACCES` on a component is a refusal, not a missing module. Skipped when
+    // the host ignores mode 000 for this user (root), where the path is
+    // readable and there is nothing to prove.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("escape-eacces");
+    dir.module("lua/locked/m.lua", "return { value = 'hidden' }");
+    let locked = dir.path().join("lua/locked");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+        .expect("lock the directory");
+    let readable = std::fs::metadata(locked.join("m.lua")).is_ok();
+    let diagnostic = (!readable).then(|| refusal(dir.path(), "return require('locked.m')"));
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700))
+        .expect("unlock the directory");
+    let Some(diagnostic) = diagnostic else {
+        eprintln!("skipping: mode 000 is not enforced for this user");
+        return;
+    };
+    assert_code(&diagnostic, ConfigModuleCode::Escape);
+    let rendered = diagnostic.render();
+    assert!(rendered.contains("component is unreadable"), "{rendered}");
+}
+
+#[cfg(unix)]
+#[test]
 fn in_root_symlinked_layout_loads_through_its_canonical_target() {
     let dir = TempDir::new("escape-inroot");
     // A dotfiles-style layout inside the root: `lua/linked` is a link whose
@@ -636,15 +718,23 @@ fn a_read_past_the_ceiling_refuses_instead_of_truncating() {
 
 #[test]
 fn a_failed_fstat_refuses_as_read() {
-    // A closed handle cannot be stat'd; the code path is the same one the
-    // loader takes when `File::metadata` fails on an open module.
+    // No handle this suite can build fails `File::metadata`, so the loader's
+    // own `fstat` branch is driven through the fault seam: this test fails if
+    // that branch's code changes (for example Read -> Syntax), which is what
+    // makes it evidence for the N-10 rule rather than a restatement of it.
     let dir = TempDir::new("fstat");
-    let path = dir.module("lua/ok.lua", "return {}");
-    let file = std::fs::File::open(&path).expect("open");
-    drop(file);
-    let diagnostic = ConfigModuleDiagnostic::new(ConfigModuleCode::Read, ConfigModulePhase::Read)
-        .with_detail("fstat on the opened module failed");
-    assert_code(&diagnostic, ConfigModuleCode::Read);
+    dir.module("lua/ok.lua", "return {}");
+    arm_fstat_fault(true);
+    let (_vm, outcome) = eval_with_root(dir.path(), "return require('ok')");
+    arm_fstat_fault(false);
+    match outcome {
+        ConfigOutcome::ModuleRefused { diagnostic } => {
+            assert_code(&diagnostic, ConfigModuleCode::Read);
+            let rendered = diagnostic.render();
+            assert!(rendered.contains("fstat"), "{rendered}");
+        }
+        other => panic!("expected a read refusal, got {other:?}"),
+    }
 }
 
 // ── parse, evaluation, shape ─────────────────────────────────────────────────
@@ -681,6 +771,10 @@ fn runtime_error_in_a_module_is_an_eval_refusal() {
         other => panic!("expected a module refusal, got {other:?}"),
     };
     assert_code(&diagnostic, ConfigModuleCode::Eval);
+    assert!(
+        diagnostic.render().contains("module_spec=\"boom\""),
+        "the record names the module that raised: {diagnostic}"
+    );
     assert!(
         diagnostic.render().contains("module exploded"),
         "the module-authored message must reach `detail`: {diagnostic}"
@@ -725,6 +819,79 @@ fn entry_chunk_budget_is_not_re_coded_as_a_module_budget() {
         matches!(outcome, ConfigOutcome::Suspended { .. }),
         "the entry chunk keeps its shipped budget meaning: {outcome:?}"
     );
+}
+
+#[test]
+fn entry_budget_after_a_module_load_keeps_its_shipped_meaning() {
+    // The budget tripped in the entry chunk, after the module had already
+    // returned: a module having been loaded is not evidence that the module
+    // was evaluating when the budget ran out.
+    let dir = TempDir::new("entry-budget-after-module");
+    dir.module("lua/ok.lua", "return { ready = true }");
+    let (_vm, outcome) = eval_with_root(dir.path(), "local m = require('ok')\nwhile true do end");
+    assert!(
+        matches!(outcome, ConfigOutcome::Suspended { .. }),
+        "an entry-chunk budget keeps its meaning after a module load: {outcome:?}"
+    );
+}
+
+#[test]
+fn a_module_raise_names_the_module_in_its_attribution() {
+    let dir = TempDir::new("raise-nested");
+    dir.module("lua/outer.lua", "return require('inner')");
+    dir.module("lua/inner.lua", "error('inner exploded')");
+    // The error passes through `outer` on its way out: the record names the
+    // innermost chunk that raised, not the one it unwound through.
+    let diagnostic = refusal(dir.path(), "return require('outer')");
+    assert_code(&diagnostic, ConfigModuleCode::Eval);
+    let rendered = diagnostic.render();
+    assert!(rendered.contains("module_spec=\"inner\""), "{rendered}");
+    assert!(rendered.contains("inner exploded"), "{rendered}");
+}
+
+#[test]
+fn a_caught_module_raise_does_not_spend_a_depth_slot() {
+    // A raised module chunk still pops its in-flight frame, so the frame it
+    // would have left behind cannot turn the sixteenth legal nest into a
+    // depth refusal.
+    let dir = TempDir::new("raise-depth");
+    dir.module("lua/boom.lua", "error('module exploded')");
+    for index in 1..=16 {
+        let body = if index == 16 {
+            "return { leaf = true }".to_string()
+        } else {
+            format!("return require('m{}')", index + 1)
+        };
+        dir.module(&format!("lua/m{index}.lua"), &body);
+    }
+    let (vm, outcome) = eval_with_root(
+        dir.path(),
+        "local ok = pcall(require, 'boom')\nreturn require('m1')",
+    );
+    assert!(
+        matches!(outcome, ConfigOutcome::Completed { .. }),
+        "a caught raise must not occupy a depth slot: {outcome:?}"
+    );
+    assert!(
+        vm.config_module_in_flight().is_none(),
+        "the frame is popped on the raise path"
+    );
+}
+
+#[test]
+fn an_entry_error_after_a_caught_module_raise_keeps_its_own_attribution() {
+    let dir = TempDir::new("raise-attribution");
+    dir.module("lua/boom.lua", "error('module exploded')");
+    let (_vm, outcome) = eval_with_root(
+        dir.path(),
+        "local ok = pcall(require, 'boom')\nerror('entry failure')",
+    );
+    match outcome {
+        ConfigOutcome::LuaError { message } => {
+            assert!(message.contains("entry failure"), "{message}");
+        }
+        other => panic!("an entry failure keeps its own attribution: {other:?}"),
+    }
 }
 
 #[test]

@@ -462,9 +462,11 @@ impl ModuleSpec {
 /// actually opened. The contract's Windows leg names `FILE_ID_INFO`; the
 /// stable standard library does not expose it (`windows_by_handle` is
 /// unstable) and this crate forbids `unsafe`, so Windows keys the cache by the
-/// canonical path instead. That is recorded as an implementation deviation,
-/// with its consequence (case-variant and hardlink aliases do not collapse
-/// there), rather than described as the contract's identity.
+/// canonical path, case-folded with `to_lowercase()`. That is recorded as an
+/// implementation deviation, rather than described as the contract's identity:
+/// case-variant spellings of one path do collapse, but hardlinks, 8.3 short
+/// names, and other aliases that reach one file by different canonical text
+/// spend a second identity and therefore a second count slot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum FileIdentity {
     /// Device and inode of the opened handle.
@@ -505,6 +507,20 @@ struct CachedModule {
 struct InFlightModule {
     identity: FileIdentity,
     spec: String,
+}
+
+/// The module chunk a Lua error escaped from.
+///
+/// Recorded at the raise site, because the unwind pops the in-flight frame
+/// before the entry evaluation reports its outcome: without it a module's own
+/// error would lose its attribution, and a later entry error would be blamed
+/// on the module that happened to raise earlier.
+struct ModuleRaise {
+    /// Spec of the module whose chunk raised.
+    spec: String,
+    /// The message the raise carried, used to tell this error from a later,
+    /// unrelated one.
+    message: String,
 }
 
 /// Counters a budget dashboard needs, without new thresholds.
@@ -550,6 +566,14 @@ pub(crate) struct ConfigModuleGeneration {
     /// calls re-report it, and the entry evaluation reports it even when the
     /// module that caused it swallowed the error with `pcall`.
     error: Option<ConfigModuleDiagnostic>,
+    /// The VM's own `pcall`, captured before any configuration code ran.
+    ///
+    /// Stashed rather than read from the globals at each `require`, so a
+    /// configuration that reassigns `pcall` cannot hide a module's error or
+    /// make a module chunk appear to have returned.
+    protected_call: Option<phodopus::StashedFunction>,
+    /// The module chunk an error last escaped from, if it is still unclaimed.
+    raise: Option<ModuleRaise>,
     stats: ConfigModuleStats,
 }
 
@@ -566,6 +590,8 @@ impl ConfigModuleGeneration {
             cache: HashMap::new(),
             in_flight: Vec::new(),
             error: None,
+            protected_call: None,
+            raise: None,
             stats: ConfigModuleStats::default(),
         }
     }
@@ -676,21 +702,33 @@ impl ConfigModuleGeneration {
                 .with_spec(spec.as_str().as_bytes().to_vec())
                 .with_detail(detail.to_string())
         };
-        let candidate = match (flat.exists(), init.exists()) {
-            (true, true) => {
+        let flat_probe = probe_module_path(&flat);
+        let init_probe = probe_module_path(&init);
+        let candidate = match (flat_probe, init_probe) {
+            // A path that exists but cannot be resolved (a link loop, a
+            // component the process may not traverse) is a containment
+            // refusal, not "missing": reporting it as absent would tell the
+            // operator a file does not exist when it does.
+            (ModulePathProbe::Refused(error), _) | (_, ModulePathProbe::Refused(error)) => {
+                return Err(refuse(
+                    ConfigModuleCode::Escape,
+                    canonicalize_detail(&error),
+                ));
+            }
+            (ModulePathProbe::Present, ModulePathProbe::Present) => {
                 return Err(refuse(
                     ConfigModuleCode::Ambiguous,
                     "both the flat module and the init module exist",
                 ));
             }
-            (false, false) => {
+            (ModulePathProbe::Absent, ModulePathProbe::Absent) => {
                 return Err(refuse(
                     ConfigModuleCode::NotFound,
                     "neither the flat module nor the init module exists",
                 ));
             }
-            (true, false) => flat,
-            (false, true) => init,
+            (ModulePathProbe::Present, ModulePathProbe::Absent) => flat,
+            (ModulePathProbe::Absent, ModulePathProbe::Present) => init,
         };
         // Canonical containment: the canonical target must stay under the
         // canonical root, which keeps an admitted in-root symlink layout
@@ -781,7 +819,7 @@ impl ConfigModuleGeneration {
         };
         // Type first, and the open above was non-blocking, so a FIFO, socket,
         // device, or directory is refused before any read can wait.
-        let metadata = match file.metadata() {
+        let metadata = match module_metadata(&file) {
             Ok(metadata) => metadata,
             Err(_) => {
                 return Err(refuse(
@@ -909,6 +947,9 @@ impl ConfigModuleGeneration {
     }
 
     fn enter(&mut self, identity: FileIdentity, spec: &str) {
+        // A fresh evaluation starts a new chain: any raise still recorded
+        // belongs to an earlier chain whose error was handled already.
+        self.raise = None;
         self.in_flight.push(InFlightModule {
             identity,
             spec: spec.to_string(),
@@ -917,11 +958,43 @@ impl ConfigModuleGeneration {
 
     fn finish(&mut self, identity: FileIdentity, value: phodopus::StashedTable) {
         self.in_flight.pop();
+        // The module returned, so a nested raise it caught is settled and must
+        // not be attributed to whatever fails next.
+        self.raise = None;
         self.cache.insert(identity, CachedModule { value });
     }
 
     fn abandon(&mut self) {
         self.in_flight.pop();
+    }
+
+    /// Record where an error came out of a module chunk, for attribution.
+    ///
+    /// The innermost frame settles first on one unwind, so an existing record
+    /// is kept: it names the module that actually raised, not the ones the
+    /// error passed through on its way out.
+    fn note_raise(&mut self, spec: &str, message: String) {
+        if self.raise.is_none() {
+            self.raise = Some(ModuleRaise {
+                spec: spec.to_string(),
+                message,
+            });
+        }
+    }
+
+    /// The attribution for an error that came out of a module chunk, when
+    /// `message` is that error's message.
+    fn raise_diagnostic(&self, message: &str) -> Option<ConfigModuleDiagnostic> {
+        let raise = self.raise.as_ref()?;
+        if raise.message != message {
+            return None;
+        }
+        Some(
+            ConfigModuleDiagnostic::new(ConfigModuleCode::Eval, ConfigModulePhase::Evaluate)
+                .with_spec(raise.spec.as_bytes().to_vec())
+                .with_source(source_location(&raise.spec, message))
+                .with_detail(message.to_string()),
+        )
     }
 }
 
@@ -939,6 +1012,38 @@ fn root_layout_detail(error: &std::io::Error) -> &'static str {
                 "module root path is not a usable directory"
             }
             _ => "module root could not be resolved",
+        },
+    }
+}
+
+/// What a resolution probe found at one module path.
+///
+/// `Path::exists()` collapses every error to "no", which loses the two cases
+/// the contract names: a link loop (`ELOOP`) and a component the process may
+/// not traverse (`EACCES`). Both mean the path was *not* resolved, not that it
+/// is missing, and both are reported as a containment refusal.
+enum ModulePathProbe {
+    /// The path resolves to an object.
+    Present,
+    /// The path does not resolve to an object (`ENOENT`, or a non-directory
+    /// where a directory would have to be).
+    Absent,
+    /// The path exists but cannot be resolved: a loop or a refused traversal.
+    Refused(std::io::Error),
+}
+
+/// Probe one module path.
+///
+/// Links are followed (the resolver wants the target), and the error kind is
+/// kept instead of flattened to a boolean.
+fn probe_module_path(path: &Path) -> ModulePathProbe {
+    match std::fs::metadata(path) {
+        Ok(_) => ModulePathProbe::Present,
+        Err(error) => match error.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+                ModulePathProbe::Absent
+            }
+            _ => ModulePathProbe::Refused(error),
         },
     }
 }
@@ -1048,6 +1153,20 @@ fn remainder_beneath(root: &Path, canonical: &Path) -> Option<String> {
             .ok()
             .map(|remainder| remainder.to_string_lossy().replace('\\', "/"))
     }
+}
+
+/// The opened handle's metadata, with a test-only fault seam.
+///
+/// No handle this suite can construct fails `File::metadata` on a supported
+/// host, so the `E_CONFIG_MODULE_READ` refusal for a failed `fstat` is driven
+/// by arming the seam and running the loader, rather than by restating the
+/// diagnostic in the test. Never compiled into a shipped binary.
+fn module_metadata(file: &std::fs::File) -> std::io::Result<std::fs::Metadata> {
+    #[cfg(test)]
+    if tests::fstat_fault_armed() {
+        return Err(std::io::Error::other("injected fstat failure"));
+    }
+    file.metadata()
 }
 
 /// Line-count and line-length bounds over the accepted source bytes.
@@ -1194,17 +1313,30 @@ const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 #[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 
-/// Open every component below the canonical root with the reparse-point flag
-/// and refuse any object that carries a reparse attribute or is not the
-/// expected type.
+/// Iterate the components below the canonical root, opening each with the
+/// reparse-point flag, and refuse any object that carries a reparse attribute
+/// or is not the expected type.
+///
+/// Only the final component is returned as the opened module; the caller's
+/// `is_file()` check then refuses a directory reachable through the init
+/// resolution as `E_CONFIG_MODULE_NOT_REGULAR`. An intermediate component that
+/// is not a directory is a constraint refusal (`ESCAPE`), never the module.
 #[cfg(windows)]
 fn windows_open_verified(root: &Path, canonical: &Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     let remainder = canonical.strip_prefix(root).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "outside the module root")
     })?;
+    let components: Vec<_> = remainder.components().collect();
+    if components.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "module path has no components below the root",
+        ));
+    }
     let mut current = root.to_path_buf();
-    for component in remainder.components() {
+    let last = components.len() - 1;
+    for (index, component) in components.iter().enumerate() {
         current.push(component);
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -1217,14 +1349,23 @@ fn windows_open_verified(root: &Path, canonical: &Path) -> std::io::Result<std::
                 "reparse point refused",
             ));
         }
-        if !metadata.is_dir() {
+        if index == last {
             return Ok(file);
         }
+        if !metadata.is_dir() {
+            // A non-directory stood in for an intermediate component: fail the
+            // walk as a constraint refusal instead of handing its bytes back
+            // as the module's source.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "module path component is not a directory",
+            ));
+        }
     }
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(canonical)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "module path has no final component",
+    ))
 }
 
 // ── the `require` bridge ─────────────────────────────────────────────────────
@@ -1244,7 +1385,9 @@ impl LuaVm {
     ///
     /// # Errors
     ///
-    /// [`VmError::Load`] when a configuration loader is already installed.
+    /// [`VmError::Load`] when a configuration loader is already installed, or
+    /// when the VM has no base `pcall` to run a module chunk under (the loader
+    /// refuses to install rather than leave a raised module's frame behind).
     pub fn install_config_require(
         &mut self,
         root: impl Into<PathBuf>,
@@ -1260,10 +1403,23 @@ impl LuaVm {
             entry.into(),
         )));
         let state = generation.clone();
-        self.lua.enter(|ctx| {
+        let installed = self.lua.enter(|ctx| {
+            // Capture the VM's own `pcall` before any configuration code runs.
+            // A module chunk is evaluated under it so that a chunk which
+            // raises still settles its in-flight frame; the handle is stashed
+            // so a configuration that reassigns the `pcall` global cannot
+            // decide that for the loader.
+            let Ok(protected) = ctx.get_global::<Function>("pcall") else {
+                return Err(VmError::Load(
+                    "configuration VM has no base `pcall` for module evaluation".into(),
+                ));
+            };
+            state.borrow_mut().protected_call = Some(ctx.stash(protected));
             crate::stdlib::scrub_config_require_surface(ctx);
             ctx.set_global("require", require_callback(&ctx, state));
+            Ok(())
         });
+        installed?;
         self.config_modules = Some(generation);
         Ok(())
     }
@@ -1294,6 +1450,17 @@ impl LuaVm {
         self.config_modules
             .as_ref()
             .and_then(|state| state.borrow().current_spec())
+    }
+
+    /// The module a Lua error escaped from, when `message` is that error's.
+    ///
+    /// A module chunk runs under the VM's own `pcall`, so the frame is popped
+    /// on the raise path too; this is what still names the module that raised.
+    #[must_use]
+    pub fn config_module_raise(&self, message: &str) -> Option<ConfigModuleDiagnostic> {
+        self.config_modules
+            .as_ref()
+            .and_then(|state| state.borrow().raise_diagnostic(message))
     }
 }
 
@@ -1390,9 +1557,31 @@ fn require_callback<'gc>(
             }
         };
 
+        // The module chunk runs under the VM's own `pcall`, with the store
+        // callback after it, so the in-flight frame is settled on both paths:
+        // a chunk that raises still pops its frame (and is attributed there)
+        // instead of spending a depth slot for the rest of the generation.
+        let protected = match state.borrow().protected_call.clone() {
+            Some(stashed) => ctx.fetch(&stashed),
+            None => {
+                // `install_config_require` refuses to install without one, so
+                // this is unreachable; fail closed rather than evaluate
+                // unprotected.
+                state.borrow_mut().abandon();
+                let diagnostic = ConfigModuleDiagnostic::new(
+                    ConfigModuleCode::Eval,
+                    ConfigModulePhase::Evaluate,
+                )
+                .with_spec(spec_text.clone().into_bytes())
+                .with_detail("module evaluation has no protected call");
+                let diagnostic = state.borrow_mut().refuse(diagnostic);
+                return Err(record(ctx, state.as_ref(), diagnostic));
+            }
+        };
         let store = store_callback(&ctx, state.clone(), identity, spec_text);
-        let composed = Function::compose(&ctx, vec![function, store.into()]);
+        let composed = Function::compose(&ctx, vec![protected, store.into()]);
         stack.clear();
+        stack.push_back(Value::Function(function));
         Ok(CallbackReturn::Call {
             function: composed,
             then: None,
@@ -1402,6 +1591,11 @@ fn require_callback<'gc>(
 
 /// Cache the module's value when its chunk returns, and pop the in-flight
 /// entry so a later `require` of the same identity is a cache hit.
+///
+/// The chunk runs under the VM's `pcall`, so this callback is reached on both
+/// paths: `(true, value…)` when the chunk returned, `(false, error)` when it
+/// raised. A raise pops the frame here and re-raises the original value, so
+/// the depth counter and the cycle chain describe what is actually running.
 fn store_callback<'gc>(
     ctx: &Context<'gc>,
     state: Rc<RefCell<ConfigModuleGeneration>>,
@@ -1409,8 +1603,18 @@ fn store_callback<'gc>(
     spec: String,
 ) -> Callback<'gc> {
     Callback::from_fn(ctx, move |ctx, _exec, mut stack| {
-        let shape_ok = stack.len() == 1 && matches!(stack.get(0), Value::Table(_));
-        let table = match stack.get(0) {
+        if let Value::Boolean(false) = stack.get(0) {
+            let error: phodopus::Error<'gc> = phodopus::error::LuaError::from(stack.get(1)).into();
+            let message = crate::error::format_lua_error(ctx, &error);
+            {
+                let mut generation = state.borrow_mut();
+                generation.abandon();
+                generation.note_raise(&spec, message);
+            }
+            return Err(error);
+        }
+        let shape_ok = stack.len() == 2 && matches!(stack.get(1), Value::Table(_));
+        let table = match stack.get(1) {
             Value::Table(table) if shape_ok => table,
             _ => {
                 state.borrow_mut().abandon();

@@ -207,10 +207,22 @@ mod tests {
     #[test]
     fn bootstrap_set_is_embedded_and_path_free() {
         assert_eq!(trusted_bootstrap(), TRUSTED_BOOTSTRAP);
-        for source in trusted_bootstrap() {
-            assert!(source.starts_with("builtin:"), "{source}");
-            assert!(!source.contains('/'), "{source}");
-            assert!(!source.contains('\\'), "{source}");
+        for (index, source) in trusted_bootstrap().iter().enumerate() {
+            // Report the entry's position, not its text: the payload is embedded
+            // bootstrap Lua, and echoing it into a panic message reads as
+            // logging untrusted source to a sink (CodeQL rust/cleartext-logging).
+            assert!(
+                source.starts_with("builtin:"),
+                "entry {index} is not builtin-prefixed"
+            );
+            assert!(
+                !source.contains('/'),
+                "entry {index} holds a path separator"
+            );
+            assert!(
+                !source.contains('\\'),
+                "entry {index} holds a path separator"
+            );
         }
     }
 }

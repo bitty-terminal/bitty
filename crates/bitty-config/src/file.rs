@@ -1215,6 +1215,10 @@ pub struct SalvagedConfig {
     /// One entry per dropped element, in drop order (bounded by the top-level
     /// element count).
     pub diagnostics: Vec<SalvageDiagnostic>,
+    /// Module-graph counters for this generation (`modules` and
+    /// `module_bytes`), the two fields the loader's budget record adds. Zero
+    /// when the configuration loaded no modules.
+    pub module_stats: bitty_lua::ConfigModuleStats,
 }
 
 /// A loaded layer plus the top-level elements startup salvage dropped.
@@ -1265,8 +1269,65 @@ const MAX_SALVAGE_DROPS: usize = 32;
 /// typed validation failures. Messages carry key paths and Lua line info
 /// only — never file contents.
 pub fn parse_lua_config(content: &str, source: &ConfigSource) -> Result<ConfigPlan, ConfigError> {
-    parse_lua_config_with_policy(content, source, SalvagePolicy::Strict)
+    parse_lua_config_with_root(content, source, None)
+}
+
+/// Parse one configuration chunk with the restricted module loader rooted at
+/// `module_root`.
+///
+/// `module_root` is the single `<config-dir>/lua` tree the contract fixes
+/// ([`module_root_for_entry`]). `None` installs no loader at all, so `require`
+/// does not exist in the VM — that is the shape every in-memory caller keeps.
+///
+/// # Errors
+///
+/// As [`parse_lua_config`], plus [`ConfigError::Module`] for every
+/// `E_CONFIG_MODULE_*` refusal.
+pub fn parse_lua_config_with_root(
+    content: &str,
+    source: &ConfigSource,
+    module_root: Option<&Path>,
+) -> Result<ConfigPlan, ConfigError> {
+    parse_lua_config_with_policy(content, source, SalvagePolicy::Strict, module_root)
         .map(|salvaged| salvaged.plan)
+}
+
+/// The single module root for one entry file: the `lua/` directory of the
+/// configuration directory that owns the entry.
+///
+/// A profile entry (`<config-dir>/profiles/<name>.lua`) is owned by the
+/// directory *above* `profiles/`, so a profile and its `extends` chain share
+/// the root of the user file beside it. Nothing here consults the working
+/// directory, `$PATH`, `$LUA_PATH`, or any Lua-set variable.
+#[must_use]
+pub fn module_root_for_entry(path: &Path, kind: LayerKind) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let config_dir = if kind == LayerKind::Profile
+        && parent.file_name() == Some(std::ffi::OsStr::new(PROFILES_DIR_NAME))
+    {
+        parent.parent().unwrap_or(parent).to_path_buf()
+    } else {
+        parent.to_path_buf()
+    };
+    config_dir.join(bitty_lua::MODULE_DIR_NAME)
+}
+
+// External configuration reads on this thread. One choke point
+// (`read_config_file`) increments it, so a new read path that bypasses the
+// choke point is a visible change rather than an invisible one.
+thread_local! {
+    static EXTERNAL_CONFIG_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Count of external configuration reads on this thread.
+///
+/// `--safe` selects the built-in effective configuration before any external
+/// read, and this counter is how a regression test proves it: a safe-mode load
+/// must not move the counter, whatever is on disk. Thread-local, so a parallel
+/// test suite cannot perturb another test's delta.
+#[must_use]
+pub fn external_config_reads() -> u64 {
+    EXTERNAL_CONFIG_READS.with(std::cell::Cell::get)
 }
 
 /// Parses Lua config content, dropping only invalid top-level elements.
@@ -1287,13 +1348,29 @@ pub fn parse_lua_config_salvaging(
     content: &str,
     source: &ConfigSource,
 ) -> Result<SalvagedConfig, ConfigError> {
-    parse_lua_config_with_policy(content, source, SalvagePolicy::Startup)
+    parse_lua_config_salvaging_with_root(content, source, None)
+}
+
+/// [`parse_lua_config_salvaging`] with the restricted module loader installed.
+///
+/// # Errors
+///
+/// As [`parse_lua_config_salvaging`], plus [`ConfigError::Module`] for every
+/// `E_CONFIG_MODULE_*` refusal. A module refusal is a whole-layer failure, so
+/// it never becomes a per-table salvage.
+pub fn parse_lua_config_salvaging_with_root(
+    content: &str,
+    source: &ConfigSource,
+    module_root: Option<&Path>,
+) -> Result<SalvagedConfig, ConfigError> {
+    parse_lua_config_with_policy(content, source, SalvagePolicy::Startup, module_root)
 }
 
 fn parse_lua_config_with_policy(
     content: &str,
     source: &ConfigSource,
     policy: SalvagePolicy,
+    module_root: Option<&Path>,
 ) -> Result<SalvagedConfig, ConfigError> {
     if content.len() > MAX_CONFIG_FILE_BYTES {
         return Err(ConfigError::InvalidInput {
@@ -1322,18 +1399,36 @@ fn parse_lua_config_with_policy(
     }
 
     let src_desc = source.describe();
-    let mut vm = bitty_lua::gate::build_plugin_vm(
+    // The configuration VM is the restricted configuration surface, not the
+    // plugin baseline: `io`, `os`, `debug`, `package`, `load`/`loadfile`/
+    // `dofile`, `_G`, `coroutine`, `tonumber`, and `print` are absent, and
+    // `require` exists only when this generation has a module root.
+    let mut vm = bitty_lua::gate::build_config_vm(
         "bitty-config",
         Some(bitty_lua::gate::VmBudgets::default()),
     )
     .map_err(|e| ConfigError::InvalidInput {
         message: format!("config evaluation refused: {e}"),
     })?;
-    let mut data = match vm
+    if let Some(root) = module_root {
+        let entry = source
+            .path
+            .as_deref()
+            .and_then(|path| Path::new(path).file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "init.lua".to_string());
+        vm.install_config_require(root, entry)
+            .map_err(|e| ConfigError::InvalidInput {
+                message: format!("config module loader refused: {e}"),
+            })?;
+    }
+    let outcome = vm
         .eval_config(content)
         .map_err(|e| ConfigError::InvalidInput {
             message: format!("config evaluation refused: {e}"),
-        })? {
+        })?;
+    let module_stats = vm.config_module_stats().unwrap_or_default();
+    let mut data = match outcome {
         bitty_lua::ConfigOutcome::Completed { data, .. } => *data,
         bitty_lua::ConfigOutcome::Suspended { reason, .. } => {
             return Err(ConfigError::InvalidInput {
@@ -1347,6 +1442,9 @@ fn parse_lua_config_with_policy(
         }
         bitty_lua::ConfigOutcome::ShapeError { message } => {
             return Err(shape_error_to_config_error(&message, &src_desc));
+        }
+        bitty_lua::ConfigOutcome::ModuleRefused { diagnostic } => {
+            return Err(ConfigError::Module { diagnostic });
         }
     };
 
@@ -1437,7 +1535,13 @@ fn parse_lua_config_with_policy(
     let mut diagnostics: Vec<SalvageDiagnostic> = Vec::new();
     loop {
         match build_plan_from_data(data.clone(), extends.clone(), selector.clone()) {
-            Ok(plan) => return Ok(SalvagedConfig { plan, diagnostics }),
+            Ok(plan) => {
+                return Ok(SalvagedConfig {
+                    plan,
+                    diagnostics,
+                    module_stats,
+                });
+            }
             Err(err) if policy == SalvagePolicy::Startup => {
                 let Some((element, label)) = salvageable_element(&err) else {
                     return Err(err);
@@ -3159,7 +3263,8 @@ pub fn load_profile_layer_salvaging(path: &Path) -> Result<SalvagedLayer, Config
 fn load_layer_with_kind(path: &Path, kind: LayerKind) -> Result<LayeredPlan, ConfigError> {
     let content = read_config_file(path)?;
     let source = ConfigSource::new(kind, Some(path.display().to_string()));
-    let plan = parse_lua_config(&content, &source)?;
+    let plan =
+        parse_lua_config_with_root(&content, &source, Some(&module_root_for_entry(path, kind)))?;
     let migrated = crate::migration::migrate(plan)?;
     Ok(LayeredPlan::new(source, migrated))
 }
@@ -3172,7 +3277,11 @@ fn load_layer_with_kind_salvaging(
 ) -> Result<SalvagedLayer, ConfigError> {
     let content = read_config_file(path)?;
     let source = ConfigSource::new(kind, Some(path.display().to_string()));
-    let salvaged = parse_lua_config_salvaging(&content, &source)?;
+    let salvaged = parse_lua_config_salvaging_with_root(
+        &content,
+        &source,
+        Some(&module_root_for_entry(path, kind)),
+    )?;
     let migrated = crate::migration::migrate(salvaged.plan)?;
     Ok(SalvagedLayer {
         layer: LayeredPlan::new(source, migrated),
@@ -3182,6 +3291,7 @@ fn load_layer_with_kind_salvaging(
 
 /// Size-bounded config read shared by the strict and salvaging loaders.
 fn read_config_file(path: &Path) -> Result<String, ConfigError> {
+    EXTERNAL_CONFIG_READS.with(|reads| reads.set(reads.get() + 1));
     let meta = std::fs::metadata(path).map_err(|e| ConfigError::InvalidInput {
         message: format!("cannot read config '{}': {e}", path.display()),
     })?;

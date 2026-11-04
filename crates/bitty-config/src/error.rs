@@ -120,6 +120,15 @@ pub enum ConfigError {
         /// Reason.
         message: String,
     },
+    /// The restricted configuration module loader refused a `require`.
+    ///
+    /// One typed `E_CONFIG_MODULE_*` record. It is an ordinary whole-layer
+    /// failure: startup drops the layer, `config check` and `doctor` report
+    /// and exit non-zero, and a reload refuses and keeps the previous plan.
+    Module {
+        /// The typed loader diagnostic.
+        diagnostic: Box<bitty_lua::ConfigModuleDiagnostic>,
+    },
 }
 
 impl ConfigError {
@@ -134,6 +143,7 @@ impl ConfigError {
             Self::SchemaVersionUnsupported { .. } | Self::MigrationFailed { .. } => {
                 ErrorClass::Migration
             }
+            Self::Module { .. } => ErrorClass::Resolution,
             Self::TrustViolation { .. } | Self::InvalidInput { .. } => ErrorClass::Trust,
             Self::ReloadRejected { .. } => ErrorClass::Reload,
         }
@@ -147,6 +157,15 @@ impl ConfigError {
             | Self::UndeclaredField { field, .. }
             | Self::MergeConflict { field, .. }
             | Self::NonOverridable { field, .. } => Some(field),
+            _ => None,
+        }
+    }
+
+    /// The typed loader refusal, when this error came from `require`.
+    #[must_use]
+    pub fn module_diagnostic(&self) -> Option<&bitty_lua::ConfigModuleDiagnostic> {
+        match self {
+            Self::Module { diagnostic } => Some(diagnostic),
             _ => None,
         }
     }
@@ -202,6 +221,7 @@ impl fmt::Display for ConfigError {
             Self::TrustViolation { message } => write!(f, "trust violation: {message}"),
             Self::ReloadRejected { message } => write!(f, "reload rejected: {message}"),
             Self::InvalidInput { message } => write!(f, "invalid input: {message}"),
+            Self::Module { diagnostic } => write!(f, "config module: {diagnostic}"),
         }
     }
 }

@@ -174,7 +174,8 @@ fn fixture_escape_storm_replay() {
         attrs(&[AttributeChange::Reset]),
         unknown(SequenceKind::Dcs, b'|', [b'!', 0]),
         TerminalAction::Print(GraphemeCell::from('\u{FFFD}')),
-        unknown(SequenceKind::Esc, b'M', [0, 0]),
+        // `ESC M` is RI (the 7-bit form of C1 0x8D), mapped since bitty#2873.
+        TerminalAction::PrintControl(ControlChar(0x8D)),
         TerminalAction::CursorMove {
             dir: Direction::Right,
             n: Count(u16::MAX),

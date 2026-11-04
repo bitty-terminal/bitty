@@ -879,6 +879,38 @@ fn headless_buffer_len(width: u32, height: u32) -> Result<usize, RenderError> {
     })
 }
 
+/// Clears a headless RGBA buffer to a straight-alpha theme background,
+/// converting to the premultiplied storage every headless compositor assumes.
+fn clear_headless_rgba(rgba: &mut [u8], background: [u8; 4]) {
+    let [r, g, b, a] = background;
+    let pr = premultiply(r, a);
+    let pg = premultiply(g, a);
+    let pb = premultiply(b, a);
+    for px in rgba.chunks_exact_mut(4) {
+        px[0] = pr;
+        px[1] = pg;
+        px[2] = pb;
+        px[3] = a;
+    }
+}
+
+/// [`PresentStats`] for one headless present of `draw_list` at `frame`.
+fn headless_present_stats(frame: u64, draw_list: &DrawList) -> PresentStats {
+    PresentStats {
+        frame,
+        fills: draw_list.fills.len()
+            + draw_list.overlay_fills.len()
+            + draw_list.overlay_content_fills.len(),
+        rounded_fills: draw_list.rounded_fills.len()
+            + draw_list.overlay_card_rounded_fills.len()
+            + draw_list.overlay_rounded_fills.len(),
+        glyphs: draw_list.glyphs.len(),
+        headless: true,
+        images: draw_list.images.len(),
+        images_skipped: 0,
+    }
+}
+
 /// An owned GPU surface: either a real `wgpu` surface created from a
 /// [`SurfaceTarget`] or a headless fake for unit tests.
 ///
@@ -1835,6 +1867,158 @@ impl Surface {
             .clone()
     }
 
+    /// Composites one [`DrawList`] onto an existing premultiplied RGBA
+    /// headless buffer without clearing it and without applying window
+    /// opacity (the caller owns both).
+    fn composite_headless_draw_list(
+        &self,
+        rgba: &mut [u8],
+        width: u32,
+        height: u32,
+        draw_list: &DrawList,
+        atlas: Option<(&[u8], AtlasDims)>,
+    ) {
+        for fill in &draw_list.fills {
+            fill_rect_rgba(rgba, width, height, fill.rect, fill.color);
+        }
+        // Rounded decoration fills/rings (CTX-0311).
+        for fill in &draw_list.rounded_fills {
+            fill_rounded_rect_rgba(rgba, width, height, fill);
+        }
+        // CTX-0347: per-`View` background images paint above cell backgrounds
+        // and the decoration ring, below overlay fills and glyphs.
+        for blit in &draw_list.backgrounds {
+            blend_rgba_blit_rgba(rgba, width, height, blit);
+        }
+        // kitty negative `z=`: placements below text stay above cell
+        // backgrounds and the background image, below overlay fills and
+        // glyphs (the same split the real-GPU passes use).
+        for blit in draw_list
+            .images
+            .iter()
+            .filter(|blit| blit.layer == crate::grid::ImagePaintLayer::BelowText)
+        {
+            blend_rgba_blit_rgba(rgba, width, height, blit);
+        }
+        // CTX-0347: selection/cursor/chrome overlay fills stay above them.
+        for fill in &draw_list.overlay_fills {
+            fill_rect_rgba(rgba, width, height, fill.rect, fill.color);
+        }
+        for fill in &draw_list.overlay_card_rounded_fills {
+            fill_rounded_rect_rgba(rgba, width, height, fill);
+        }
+        for fill in &draw_list.overlay_content_fills {
+            fill_rect_rgba(rgba, width, height, fill.rect, fill.color);
+        }
+        for fill in &draw_list.overlay_rounded_fills {
+            fill_rounded_rect_rgba(rgba, width, height, fill);
+        }
+        if let Some((texels, dims)) = atlas {
+            for glyph in &draw_list.glyphs {
+                match &glyph.source {
+                    crate::grid::GlyphSource::Atlas { slot } => {
+                        let stride = usize::from(dims.width);
+                        let slot_w = usize::from(slot.width);
+                        let slot_h = usize::from(slot.height);
+                        if slot_w == 0 || slot_h == 0 {
+                            continue;
+                        }
+                        let Some(mask_len) = slot_w.checked_mul(slot_h) else {
+                            continue;
+                        };
+                        let mut mask = Vec::with_capacity(mask_len);
+                        for row in 0..slot_h {
+                            let Some(start) = (usize::from(slot.y) + row)
+                                .checked_mul(stride)
+                                .and_then(|offset| offset.checked_add(usize::from(slot.x)))
+                            else {
+                                mask.clear();
+                                break;
+                            };
+                            let Some(end) = start.checked_add(slot_w) else {
+                                mask.clear();
+                                break;
+                            };
+                            let Some(row_data) = texels.get(start..end) else {
+                                mask.clear();
+                                break;
+                            };
+                            mask.extend_from_slice(row_data);
+                        }
+                        if mask.len() != mask_len {
+                            continue;
+                        }
+                        blend_coverage_mask_rgba(
+                            rgba,
+                            width,
+                            height,
+                            &mask,
+                            slot.width.into(),
+                            slot.height.into(),
+                            glyph.dest[0],
+                            glyph.dest[1],
+                            glyph.color,
+                            glyph.clip,
+                        );
+                    }
+                    crate::grid::GlyphSource::Inline {
+                        mask,
+                        width: w,
+                        height: h,
+                    } => {
+                        blend_coverage_mask_rgba(
+                            rgba,
+                            width,
+                            height,
+                            mask,
+                            *w,
+                            *h,
+                            glyph.dest[0],
+                            glyph.dest[1],
+                            glyph.color,
+                            glyph.clip,
+                        );
+                    }
+                }
+            }
+        } else {
+            for glyph in &draw_list.glyphs {
+                if let crate::grid::GlyphSource::Inline {
+                    mask,
+                    width: w,
+                    height: h,
+                } = &glyph.source
+                {
+                    blend_coverage_mask_rgba(
+                        rgba,
+                        width,
+                        height,
+                        mask,
+                        *w,
+                        *h,
+                        glyph.dest[0],
+                        glyph.dest[1],
+                        glyph.color,
+                        glyph.clip,
+                    );
+                }
+            }
+        }
+        // Kitty images (CTX-0248): topmost present-layer blits (see the
+        // `present_draw_list` headless branch for the z-order contract).
+        // Headless blends every entry (`images_skipped` stays 0); the
+        // real-GPU branch uploads and paints them since CTX-0291. Blits in
+        // the below-text layer were already composited before the glyph
+        // pass, so only the topmost half paints here.
+        for blit in draw_list
+            .images
+            .iter()
+            .filter(|blit| blit.layer == crate::grid::ImagePaintLayer::AboveText)
+        {
+            blend_rgba_blit_rgba(rgba, width, height, blit);
+        }
+    }
+
     /// Headless-only present: composites `draw_list` onto the in-memory RGBA
     /// buffer without requiring a [`GpuContext`].
     ///
@@ -1907,164 +2091,8 @@ impl Surface {
         // not reach `vec!` unchecked.
         let len = headless_buffer_len(width, height)?;
         let mut rgba = vec![0u8; len];
-        {
-            // Clear to the resolved theme background (premultiplied, CTX-0355).
-            let bg = self.theme_palette().background;
-            let pr = premultiply(bg[0], bg[3]);
-            let pg = premultiply(bg[1], bg[3]);
-            let pb = premultiply(bg[2], bg[3]);
-            let pa = bg[3];
-            for px in rgba.chunks_exact_mut(4) {
-                px[0] = pr;
-                px[1] = pg;
-                px[2] = pb;
-                px[3] = pa;
-            }
-        }
-        for fill in &draw_list.fills {
-            fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
-        }
-        // Rounded decoration fills/rings (CTX-0311).
-        for fill in &draw_list.rounded_fills {
-            fill_rounded_rect_rgba(&mut rgba, width, height, fill);
-        }
-        // CTX-0347: per-`View` background images paint above cell backgrounds
-        // and the decoration ring, below overlay fills and glyphs.
-        for blit in &draw_list.backgrounds {
-            blend_rgba_blit_rgba(&mut rgba, width, height, blit);
-        }
-        // kitty negative `z=`: placements below text stay above cell
-        // backgrounds and the background image, below overlay fills and
-        // glyphs (the same split the real-GPU passes use).
-        for blit in draw_list
-            .images
-            .iter()
-            .filter(|blit| blit.layer == crate::grid::ImagePaintLayer::BelowText)
-        {
-            blend_rgba_blit_rgba(&mut rgba, width, height, blit);
-        }
-        // CTX-0347: selection/cursor/chrome overlay fills stay above them.
-        for fill in &draw_list.overlay_fills {
-            fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
-        }
-        for fill in &draw_list.overlay_card_rounded_fills {
-            fill_rounded_rect_rgba(&mut rgba, width, height, fill);
-        }
-        for fill in &draw_list.overlay_content_fills {
-            fill_rect_rgba(&mut rgba, width, height, fill.rect, fill.color);
-        }
-        for fill in &draw_list.overlay_rounded_fills {
-            fill_rounded_rect_rgba(&mut rgba, width, height, fill);
-        }
-        // Glyphs: color glyphs from their own atlas first, then the coverage
-        // and inline passes (CTX-1691).
-        blend_color_glyphs_rgba(&mut rgba, width, height, &draw_list.glyphs, color_atlas);
-        if let Some((texels, dims)) = atlas {
-            for glyph in &draw_list.glyphs {
-                match &glyph.source {
-                    crate::grid::GlyphSource::Atlas { slot } => {
-                        let stride = usize::from(dims.width);
-                        let slot_w = usize::from(slot.width);
-                        let slot_h = usize::from(slot.height);
-                        if slot_w == 0 || slot_h == 0 {
-                            continue;
-                        }
-                        let Some(mask_len) = slot_w.checked_mul(slot_h) else {
-                            continue;
-                        };
-                        let mut mask = Vec::with_capacity(mask_len);
-                        for row in 0..slot_h {
-                            let Some(start) = (usize::from(slot.y) + row)
-                                .checked_mul(stride)
-                                .and_then(|offset| offset.checked_add(usize::from(slot.x)))
-                            else {
-                                mask.clear();
-                                break;
-                            };
-                            let Some(end) = start.checked_add(slot_w) else {
-                                mask.clear();
-                                break;
-                            };
-                            let Some(row_data) = texels.get(start..end) else {
-                                mask.clear();
-                                break;
-                            };
-                            mask.extend_from_slice(row_data);
-                        }
-                        if mask.len() != mask_len {
-                            continue;
-                        }
-                        blend_coverage_mask_rgba(
-                            &mut rgba,
-                            width,
-                            height,
-                            &mask,
-                            slot.width.into(),
-                            slot.height.into(),
-                            glyph.dest[0],
-                            glyph.dest[1],
-                            glyph.color,
-                            glyph.clip,
-                        );
-                    }
-                    crate::grid::GlyphSource::Inline {
-                        mask,
-                        width: w,
-                        height: h,
-                    } => {
-                        blend_coverage_mask_rgba(
-                            &mut rgba,
-                            width,
-                            height,
-                            mask,
-                            *w,
-                            *h,
-                            glyph.dest[0],
-                            glyph.dest[1],
-                            glyph.color,
-                            glyph.clip,
-                        );
-                    }
-                    // Painted by `blend_color_glyphs_rgba` before this pass.
-                    crate::grid::GlyphSource::ColorAtlas { .. } => {}
-                }
-            }
-        } else {
-            for glyph in &draw_list.glyphs {
-                if let crate::grid::GlyphSource::Inline {
-                    mask,
-                    width: w,
-                    height: h,
-                } = &glyph.source
-                {
-                    blend_coverage_mask_rgba(
-                        &mut rgba,
-                        width,
-                        height,
-                        mask,
-                        *w,
-                        *h,
-                        glyph.dest[0],
-                        glyph.dest[1],
-                        glyph.color,
-                        glyph.clip,
-                    );
-                }
-            }
-        }
-        // Kitty images (CTX-0248): topmost present-layer blits (see the
-        // `present_draw_list` headless branch for the z-order contract).
-        // Headless blends every entry (`images_skipped` stays 0); the
-        // real-GPU branch uploads and paints them since CTX-0291. Blits in
-        // the below-text layer were already composited before the glyph
-        // pass, so only the topmost half paints here.
-        for blit in draw_list
-            .images
-            .iter()
-            .filter(|blit| blit.layer == crate::grid::ImagePaintLayer::AboveText)
-        {
-            blend_rgba_blit_rgba(&mut rgba, width, height, blit);
-        }
+        clear_headless_rgba(&mut rgba, self.theme_palette().background);
+        self.composite_headless_draw_list(&mut rgba, width, height, draw_list, atlas);
         // CTX-0290: headless equivalent of the GPU alpha-pinning blend —
         // scale the finished premultiplied buffer by the configured opacity
         // so CI can prove the window-opacity effect without an adapter.
@@ -2073,19 +2101,78 @@ impl Surface {
         let mut state = self.state.lock().expect("surface state poisoned");
         state.frame += 1;
         state.headless_rgba = Some(rgba);
-        Ok(PresentStats {
-            frame: state.frame,
-            fills: draw_list.fills.len()
-                + draw_list.overlay_fills.len()
-                + draw_list.overlay_content_fills.len(),
-            rounded_fills: draw_list.rounded_fills.len()
-                + draw_list.overlay_card_rounded_fills.len()
-                + draw_list.overlay_rounded_fills.len(),
-            glyphs: draw_list.glyphs.len(),
-            headless: true,
-            images: draw_list.images.len(),
-            images_skipped: 0,
-        })
+        Ok(headless_present_stats(state.frame, draw_list))
+    }
+
+    /// Headless-only retained present: composites `draw_list` over the buffer
+    /// left by the previous headless present instead of clearing it.
+    ///
+    /// Retained-damage seam for tests and tools: a consumer that presents only
+    /// the damage since its last frame can paint frame by frame onto one
+    /// surface and compare the result with a full redraw. The product present
+    /// paths clear every frame (the runtime retains primitives, not pixels);
+    /// this method exists so a differential harness can prove that the union
+    /// of incremental damage frames equals a full redraw.
+    ///
+    /// The first call, and the first call after [`Self::headless_resize`],
+    /// initialize the buffer with the same theme-background clear as
+    /// [`Self::headless_present`]. Retained compositing is only defined on a
+    /// fully opaque surface: the stored buffer is already opacity-scaled, so a
+    /// configured opacity below `1.0` is rejected instead of scaled twice.
+    ///
+    /// # Errors
+    ///
+    /// - [`RenderError::SurfaceConfigure`] when the surface is not a headless
+    ///   fake or has not been configured.
+    /// - [`RenderError::InvalidInput`] for atlas mismatches, buffer-cap
+    ///   overflows, or a non-opaque configured opacity.
+    pub fn headless_present_retained(
+        &self,
+        draw_list: &DrawList,
+        atlas: Option<(&[u8], AtlasDims)>,
+    ) -> Result<PresentStats, RenderError> {
+        if !self.is_headless() {
+            return Err(RenderError::SurfaceConfigure(
+                "headless_present_retained called on a real surface".into(),
+            ));
+        }
+        telemetry::headless_present();
+        let config = {
+            let state = self.state.lock().expect("surface state poisoned");
+            state
+                .config
+                .ok_or_else(|| RenderError::SurfaceConfigure("surface not configured".into()))?
+        };
+        let needs_atlas = draw_list
+            .glyphs
+            .iter()
+            .any(|g| matches!(g.source, crate::grid::GlyphSource::Atlas { .. }));
+        if needs_atlas && atlas.is_none() {
+            return Err(RenderError::InvalidInput {
+                reason: "atlas instance requires atlas texels",
+            });
+        }
+        if self.effective_opacity() != 1.0 {
+            return Err(RenderError::InvalidInput {
+                reason: "retained headless present requires opacity 1.0",
+            });
+        }
+        let width = config.extent.width();
+        let height = config.extent.height();
+        let len = headless_buffer_len(width, height)?;
+        let mut rgba = match self.headless_rgba() {
+            Some(rgba) if rgba.len() == len => rgba,
+            _ => {
+                let mut rgba = vec![0u8; len];
+                clear_headless_rgba(&mut rgba, self.theme_palette().background);
+                rgba
+            }
+        };
+        self.composite_headless_draw_list(&mut rgba, width, height, draw_list, atlas);
+        let mut state = self.state.lock().expect("surface state poisoned");
+        state.frame += 1;
+        state.headless_rgba = Some(rgba);
+        Ok(headless_present_stats(state.frame, draw_list))
     }
 
     /// Headless-only reconfiguration without a [`GpuContext`] (unit-test seam).
@@ -2977,6 +3064,70 @@ mod tests {
             &[0xFF, 0xFF, 0xFF, 0xFF],
             "clear must be github-light bg"
         );
+    }
+
+    /// One opaque fill covering `(x, y, width, height)` for the retained
+    /// present seam tests.
+    fn fill_only(x: i32, y: i32, width: u32, height: u32, color: [u8; 4]) -> DrawList {
+        DrawList {
+            generation: 1,
+            atlas_epoch: 0,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(8, 4),
+                mode: crate::frame::FrameMode::Full,
+                dirty_rects: vec![crate::geometry::RectPx::new(x, y, width, height)],
+            },
+            fills: vec![crate::grid::FillRect {
+                rect: crate::geometry::RectPx::new(x, y, width, height),
+                color,
+            }],
+            rounded_fills: vec![],
+            backgrounds: vec![],
+            overlay_fills: vec![],
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: vec![],
+            glyphs: vec![],
+            images: vec![],
+        }
+    }
+
+    #[test]
+    fn headless_present_retained_accumulates_instead_of_clearing() {
+        let surface = Surface::headless(PhysicalSize::new(8, 4)).expect("valid headless extent");
+        surface
+            .headless_present_retained(&fill_only(0, 0, 4, 4, [0xFF, 0, 0, 0xFF]), None)
+            .expect("first retained present");
+        surface
+            .headless_present_retained(&fill_only(4, 0, 4, 4, [0, 0xFF, 0, 0xFF]), None)
+            .expect("second retained present");
+        let rgba = surface.headless_rgba().expect("retained pixels");
+        assert_eq!(&rgba[0..4], &[0xFF, 0, 0, 0xFF], "frame one must survive");
+        assert_eq!(&rgba[16..20], &[0, 0xFF, 0, 0xFF], "frame two must paint");
+
+        // The clearing present is the contrast: the red half disappears.
+        surface
+            .headless_present(&fill_only(4, 0, 4, 4, [0, 0xFF, 0, 0xFF]), None)
+            .expect("clearing present");
+        let cleared = surface.headless_rgba().expect("cleared pixels");
+        assert_ne!(&cleared[0..4], &[0xFF, 0, 0, 0xFF]);
+    }
+
+    #[test]
+    fn headless_present_retained_requires_opacity_one() {
+        let config = SurfaceConfig::new(
+            PhysicalSize::new(8, 4),
+            SurfaceFormat::Bgra8UnormSrgb,
+            PresentMode::Fifo,
+        )
+        .expect("valid config")
+        .with_opacity(0.5);
+        let surface = Surface::headless_with_config(config).expect("valid headless extent");
+        let empty = fill_only(0, 0, 0, 0, [0, 0, 0, 0]);
+        assert!(matches!(
+            surface.headless_present_retained(&empty, None),
+            Err(RenderError::InvalidInput { .. })
+        ));
     }
 
     #[test]

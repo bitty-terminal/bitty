@@ -1197,6 +1197,9 @@ fn mid_frame_eviction_never_leaves_stale_atlas_slots() {
         for (col, glyph) in list.glyphs.iter().enumerate() {
             let character = ['a', 'b', 'c', 'd'][col];
             match &glyph.source {
+                GlyphSource::ColorAtlas { .. } => {
+                    panic!("fixture never places color glyphs")
+                }
                 GlyphSource::Atlas { slot } => {
                     atlas_glyphs += 1;
                     let uv = glyph.uv;
@@ -1255,7 +1258,9 @@ fn oversized_glyph_falls_back_inline_instead_of_failing() {
             assert_eq!(mask.len(), 6 * 6);
             assert!(mask.iter().any(|&coverage| coverage > 0));
         }
-        GlyphSource::Atlas { .. } => panic!("expected inline fallback"),
+        GlyphSource::Atlas { .. } | GlyphSource::ColorAtlas { .. } => {
+            panic!("expected inline fallback")
+        }
     }
     assert_eq!(grid.atlas_stats().3, 1); // inline_fallbacks
     assert_eq!(grid.counters().glyphs_emitted, 1);
@@ -2549,6 +2554,7 @@ fn phase_c_cluster(byte_offset: usize, col: usize, count: usize) -> ShapedCluste
         uncovered: false,
         ligature_part: count > 1,
         byte_offset,
+        presentation: bitty_term_state::EmojiPresentation::Text,
     }
 }
 
@@ -3436,6 +3442,9 @@ fn glyph_frame<R: GlyphRasterizer>(
                         texels[(sy * u32::from(dims.width) + sx) as usize]
                     }
                     GlyphSource::Inline { mask, width, .. } => mask[(y * width + x) as usize],
+                    // Coverage frames only; color fixtures assert on the
+                    // color atlas instead.
+                    GlyphSource::ColorAtlas { .. } => 0,
                 };
                 let dx = glyph.dest[0] + x as i32;
                 let dy = glyph.dest[1] + y as i32;
@@ -3942,6 +3951,7 @@ impl FakeShaper {
                 uncovered: false,
                 ligature_part: cells.1 > 1,
                 byte_offset: offset,
+                presentation: bitty_term_state::EmojiPresentation::Text,
             }
         };
         match text {
@@ -4014,6 +4024,7 @@ impl crate::shaped::ShapedRunSource for FakeShaper {
                 uncovered: false,
                 ligature_part: true,
                 byte_offset: 0,
+                presentation: bitty_term_state::EmojiPresentation::Text,
             }]);
         }
         let mut offset = 0usize;
@@ -4030,6 +4041,7 @@ impl crate::shaped::ShapedRunSource for FakeShaper {
                     uncovered: false,
                     ligature_part: false,
                     byte_offset: offset,
+                    presentation: bitty_term_state::EmojiPresentation::Text,
                 };
                 offset += ch.len_utf8();
                 cluster
@@ -4043,6 +4055,7 @@ impl crate::shaped::ShapedRunSource for FakeShaper {
         glyph_id: u16,
         _point_size: f32,
         _features: &[bitty_config::types::OpenTypeFeature],
+        _presentation: bitty_term_state::EmojiPresentation,
     ) -> Result<Option<crate::glyph::ShapedBitmap<'_>>, RenderError> {
         self.scratch = Some(
             crate::glyph::CachedBitmap::source(Self::bitmap(u32::from(glyph_id)))

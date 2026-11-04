@@ -275,9 +275,18 @@ impl<R: GlyphRasterizer> GlyphCache<R> {
             let bitmap = self
                 .rasterizer
                 .rasterize(key)?
-                .map(|bitmap| match self.coverage_policy {
-                    CoveragePolicy::Grayscale => CachedBitmap::grayscale(bitmap),
-                    CoveragePolicy::Subpixel => CachedBitmap::source(bitmap),
+                .map(|bitmap| {
+                    // Color presentation (CTX-1691) keeps the rasterizer's
+                    // premultiplied RGBA so the color atlas can paint it;
+                    // everything else follows the configured coverage policy.
+                    if key.wants_color() {
+                        CachedBitmap::source(bitmap)
+                    } else {
+                        match self.coverage_policy {
+                            CoveragePolicy::Grayscale => CachedBitmap::grayscale(bitmap),
+                            CoveragePolicy::Subpixel => CachedBitmap::source(bitmap),
+                        }
+                    }
                 })
                 .transpose()?;
             let bitmap_bytes = bitmap.as_ref().map_or(0, CachedBitmap::retained_bytes);

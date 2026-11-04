@@ -48,6 +48,7 @@ impl ShapedRunSource for TagRasterizer {
         _glyph_id: u16,
         _point_size: f32,
         _features: &[bitty_config::types::OpenTypeFeature],
+        _presentation: bitty_term_state::EmojiPresentation,
     ) -> Result<Option<ShapedBitmap<'_>>, RenderError> {
         Ok(None)
     }

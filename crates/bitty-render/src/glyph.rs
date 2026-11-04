@@ -99,7 +99,7 @@ impl FontQuery {
 }
 
 /// Identifies exactly what to rasterize: one character of one face at one
-/// size.
+/// size, under one emoji-presentation decision.
 #[derive(Debug, Clone, Copy)]
 pub struct RasterKey {
     /// Character to rasterize (already resolved by the text layer; combining
@@ -110,10 +110,18 @@ pub struct RasterKey {
     /// Size in points. Compared and hashed by bit pattern so every distinct
     /// finite value is a distinct key; constructors reject non-finite sizes.
     pub point_size: f32,
+    /// Presentation the cluster asked for (CTX-1691).
+    ///
+    /// Part of the key because the same scalar at the same size rasterizes to
+    /// a color layer stack under emoji presentation and to a monochrome
+    /// coverage bitmap under text presentation (U+2705 with and without
+    /// U+FE0E); a shared key would hand one style the other's bitmap.
+    pub presentation: bitty_term_state::EmojiPresentation,
 }
 
 impl RasterKey {
-    /// Builds a key, rejecting non-finite or non-positive sizes.
+    /// Builds a text-presentation key, rejecting non-finite or non-positive
+    /// sizes.
     ///
     /// # Errors
     ///
@@ -129,7 +137,24 @@ impl RasterKey {
             character,
             font,
             point_size,
+            presentation: bitty_term_state::EmojiPresentation::Text,
         })
+    }
+
+    /// Returns this key with the cluster's resolved presentation.
+    #[must_use]
+    pub const fn with_presentation(
+        mut self,
+        presentation: bitty_term_state::EmojiPresentation,
+    ) -> Self {
+        self.presentation = presentation;
+        self
+    }
+
+    /// True when the cluster asked for the color glyph.
+    #[must_use]
+    pub const fn wants_color(self) -> bool {
+        self.presentation.is_emoji()
     }
 }
 
@@ -140,6 +165,7 @@ impl PartialEq for RasterKey {
         self.character == other.character
             && self.font == other.font
             && self.point_size.to_bits() == other.point_size.to_bits()
+            && self.presentation == other.presentation
     }
 }
 
@@ -150,6 +176,7 @@ impl std::hash::Hash for RasterKey {
         self.character.hash(state);
         self.font.hash(state);
         self.point_size.to_bits().hash(state);
+        self.presentation.hash(state);
     }
 }
 

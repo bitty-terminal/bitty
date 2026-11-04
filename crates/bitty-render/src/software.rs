@@ -512,6 +512,28 @@ pub fn draw_list_onto(
     atlas: Option<(&[u8], crate::atlas::AtlasDims)>,
     surface: &mut SurfaceRgba,
 ) -> Result<(), RenderError> {
+    draw_list_onto_color(list, atlas, None, surface)
+}
+
+/// [`draw_list_onto`] including color glyphs from an RGBA color atlas
+/// (CTX-1691).
+///
+/// Color glyph instances are painted at the glyph position of the paint order
+/// from `color_atlas`; the coverage atlas stays one byte per texel, so the two
+/// atlases are distinct inputs. A color instance without an atlas is refused
+/// (fail-closed) exactly like a coverage instance.
+///
+/// # Errors
+///
+/// [`RenderError::InvalidInput`] when an atlas instance exists but the
+/// matching atlas was not supplied, or when a mask/atlas payload violates its
+/// own dimensions.
+pub fn draw_list_onto_color(
+    list: &crate::grid::DrawList,
+    atlas: Option<(&[u8], crate::atlas::AtlasDims)>,
+    color_atlas: Option<(&[u8], crate::atlas::AtlasDims)>,
+    surface: &mut SurfaceRgba,
+) -> Result<(), RenderError> {
     for fill in &list.fills {
         surface.fill_rect(fill.rect, fill.color);
     }
@@ -559,6 +581,44 @@ pub fn draw_list_onto(
     }
     for glyph in &list.glyphs {
         match &glyph.source {
+            crate::grid::GlyphSource::ColorAtlas { slot } => {
+                let Some((texels, dims)) = color_atlas else {
+                    return Err(RenderError::InvalidInput {
+                        reason: "color atlas instance requires color atlas texels",
+                    });
+                };
+                let stride = usize::from(dims.width);
+                let slot_w = usize::from(slot.width);
+                let slot_h = usize::from(slot.height);
+                for row in 0..slot_h {
+                    let Some(start) = (usize::from(slot.y) + row)
+                        .checked_mul(stride)
+                        .and_then(|offset| offset.checked_add(usize::from(slot.x)))
+                        .and_then(|index| index.checked_mul(4))
+                    else {
+                        return Err(RenderError::InvalidInput {
+                            reason: "color atlas slot offset overflows the address space bound",
+                        });
+                    };
+                    let Some(end) = start.checked_add(slot_w.saturating_mul(4)) else {
+                        return Err(RenderError::InvalidInput {
+                            reason: "color atlas slot range overflows the address space bound",
+                        });
+                    };
+                    let Some(row_data) = texels.get(start..end) else {
+                        return Err(RenderError::InvalidInput {
+                            reason: "color atlas slot exceeds color atlas texels",
+                        });
+                    };
+                    surface.blend_rgba_image(
+                        row_data,
+                        u32::try_from(slot_w).unwrap_or(0),
+                        1,
+                        glyph.dest[0],
+                        glyph.dest[1] + i32::try_from(row).unwrap_or(0),
+                    );
+                }
+            }
             crate::grid::GlyphSource::Atlas { slot } => {
                 let Some((texels, dims)) = atlas else {
                     return Err(RenderError::InvalidInput {

@@ -826,6 +826,12 @@ struct SurfaceState {
     // both. `None` means the stored buffer is a resize placeholder (zeroed,
     // never painted) and the next retained present owes a full clear.
     headless_rgba_extent: Option<PhysicalSize>,
+    // The effective opacity `headless_rgba` was scaled by when it was stored.
+    // The buffer holds premultiplied pixels after `scale_premultiplied_rgba`,
+    // so reusing it under a different opacity would composite new damage onto
+    // a base scaled for another window alpha. `None` matches the placeholder
+    // case above: nothing was painted, so there is no seed to reuse.
+    headless_rgba_opacity: Option<f32>,
     headless_extent: Option<PhysicalSize>,
     // Real-surface GPU presentation resources (pipelines, buffers, atlas
     // texture). Created lazily on the first presented frame and recreated
@@ -845,6 +851,7 @@ impl SurfaceState {
             alpha_supported: true,
             headless_rgba: None,
             headless_rgba_extent: None,
+            headless_rgba_opacity: None,
             headless_extent: None,
             resources: None,
         }
@@ -1677,6 +1684,7 @@ impl Surface {
                 state.frame += 1;
                 state.headless_rgba = Some(rgba);
                 state.headless_rgba_extent = Some(config.extent);
+                state.headless_rgba_opacity = Some(opacity);
                 Ok(PresentStats {
                     frame: state.frame,
                     fills: draw_list.fills.len()
@@ -1941,8 +1949,10 @@ impl Surface {
             fill_rounded_rect_rgba(rgba, width, height, fill);
         }
         // Glyphs: color glyphs paint from their own atlas first, then the
-        // coverage and inline passes (CTX-1691), matching the real-GPU paint
-        // order.
+        // coverage and inline passes (CTX-1691). This is the same point as the
+        // other CPU compositor; the real GPU submits the color blits just after
+        // the coverage chunks, and the two layers share no cell, so the order
+        // is not observable.
         blend_color_glyphs_rgba(rgba, width, height, &draw_list.glyphs, color_atlas);
         if let Some((texels, dims)) = atlas {
             for glyph in &draw_list.glyphs {
@@ -2137,6 +2147,7 @@ impl Surface {
         state.frame += 1;
         state.headless_rgba = Some(rgba);
         state.headless_rgba_extent = Some(config.extent);
+        state.headless_rgba_opacity = Some(opacity);
         Ok(headless_present_stats(state.frame, draw_list))
     }
 
@@ -2156,16 +2167,28 @@ impl Surface {
     /// readable through [`Self::headless_rgba`] but clears the retained-seed
     /// extent, so the next retained present starts from a clear: a resize that
     /// happens to preserve `W * H * 4` must not composite onto rows laid out
-    /// for the old stride. Retained compositing is only defined on a
-    /// fully opaque surface: the stored buffer is already opacity-scaled, so a
-    /// configured opacity below `1.0` is rejected instead of scaled twice.
+    /// for the old stride.
+    ///
+    /// Retained compositing is only defined on a fully opaque surface: the
+    /// stored buffer is already opacity-scaled, so a configured opacity below
+    /// `1.0` is rejected instead of scaled twice. The seed also records the
+    /// opacity it was painted under, and a seed painted under any other
+    /// opacity is discarded for a clear: `set_opacity` may run between two
+    /// presents, so the current-opacity guard alone cannot keep a dimmed base
+    /// out of the composite.
+    ///
+    /// This entry point takes no color atlas, so a draw list carrying a
+    /// [`GlyphSource::ColorAtlas`](crate::grid::GlyphSource) glyph is rejected
+    /// instead of painting the cell background while `PresentStats::glyphs`
+    /// still counts the glyph.
     ///
     /// # Errors
     ///
     /// - [`RenderError::SurfaceConfigure`] when the surface is not a headless
     ///   fake or has not been configured.
     /// - [`RenderError::InvalidInput`] for atlas mismatches, buffer-cap
-    ///   overflows, or a non-opaque configured opacity.
+    ///   overflows, a non-opaque configured opacity, or a draw list that needs
+    ///   a color atlas this entry point cannot supply.
     pub fn headless_present_retained(
         &self,
         draw_list: &DrawList,
@@ -2192,7 +2215,20 @@ impl Surface {
                 reason: "atlas instance requires atlas texels",
             });
         }
-        if self.effective_opacity() != 1.0 {
+        let needs_color = draw_list
+            .glyphs
+            .iter()
+            .any(|g| matches!(g.source, crate::grid::GlyphSource::ColorAtlas { .. }));
+        if needs_color {
+            // The signature has no color-atlas parameter, and the compositor
+            // would silently skip the glyph (`blend_color_glyphs_rgba` returns
+            // early on `None`) while `PresentStats::glyphs` still counted it.
+            return Err(RenderError::InvalidInput {
+                reason: "retained headless present has no color atlas parameter",
+            });
+        }
+        let opacity = self.effective_opacity();
+        if opacity != 1.0 {
             return Err(RenderError::InvalidInput {
                 reason: "retained headless present requires opacity 1.0",
             });
@@ -2204,12 +2240,26 @@ impl Surface {
         // painted at. Byte length is not an identity: a resize can preserve
         // `W * H * 4` while changing the row stride (800x480 -> 960x400), and
         // reusing the pixels then would composite new damage onto stale rows.
-        let (stored_rgba, stored_extent) = {
+        // The written opacity is part of the identity too: the seed was scaled
+        // by `scale_premultiplied_rgba` at store time, so `set_opacity` between
+        // two presents would otherwise composite full-strength damage onto a
+        // dimmed base (the current-opacity guard above only covers this frame).
+        let (stored_rgba, stored_extent, stored_opacity) = {
             let state = self.state.lock().expect("surface state poisoned");
-            (state.headless_rgba.clone(), state.headless_rgba_extent)
+            (
+                state.headless_rgba.clone(),
+                state.headless_rgba_extent,
+                state.headless_rgba_opacity,
+            )
         };
         let mut rgba = match stored_rgba {
-            Some(rgba) if stored_extent == Some(config.extent) && rgba.len() == len => rgba,
+            Some(rgba)
+                if stored_extent == Some(config.extent)
+                    && stored_opacity == Some(opacity)
+                    && rgba.len() == len =>
+            {
+                rgba
+            }
             _ => {
                 let mut rgba = vec![0u8; len];
                 clear_headless_rgba(&mut rgba, self.theme_palette().background);
@@ -2217,12 +2267,14 @@ impl Surface {
             }
         };
         // Retained present has no color-atlas parameter (its public signature
-        // predates color glyphs); coverage and inline glyphs still composite.
+        // predates color glyphs); the guard above refuses any frame that needs
+        // one, so coverage and inline glyphs are the only glyph layers here.
         self.composite_headless_draw_list(&mut rgba, width, height, draw_list, atlas, None);
         let mut state = self.state.lock().expect("surface state poisoned");
         state.frame += 1;
         state.headless_rgba = Some(rgba);
         state.headless_rgba_extent = Some(config.extent);
+        state.headless_rgba_opacity = Some(opacity);
         Ok(headless_present_stats(state.frame, draw_list))
     }
 
@@ -2271,6 +2323,7 @@ impl Surface {
             Ok(len) => {
                 state.headless_rgba = Some(vec![0u8; len]);
                 state.headless_rgba_extent = None;
+                state.headless_rgba_opacity = None;
             }
             // Over `MAX_HEADLESS_SURFACE_BYTES`: fail closed like
             // `headless_present`, which stores nothing for an extent it
@@ -2278,6 +2331,7 @@ impl Surface {
             Err(_) => {
                 state.headless_rgba = None;
                 state.headless_rgba_extent = None;
+                state.headless_rgba_opacity = None;
             }
         }
         state.headless_extent = Some(new_extent);
@@ -3379,6 +3433,111 @@ mod tests {
             surface.headless_present_retained(&empty, None),
             Err(RenderError::InvalidInput { .. })
         ));
+    }
+
+    /// One color-atlas glyph and nothing else.
+    fn color_glyph_only() -> DrawList {
+        DrawList {
+            generation: 1,
+            atlas_epoch: 1,
+            plan: crate::frame::FramePlan {
+                extent: crate::geometry::ExtentPx::new(8, 4),
+                mode: crate::frame::FrameMode::Full,
+                dirty_rects: vec![crate::geometry::RectPx::new(0, 0, 8, 4)],
+            },
+            fills: vec![],
+            rounded_fills: vec![],
+            backgrounds: vec![],
+            overlay_fills: vec![],
+            overlay_card_rounded_fills: vec![],
+            overlay_content_fills: vec![],
+            overlay_rounded_fills: vec![],
+            glyphs: vec![crate::grid::GlyphInstance {
+                dest: [0, 0],
+                size: [4, 4],
+                uv: [0.0; 4],
+                color: [0xFF; 4],
+                clip: None,
+                source: crate::grid::GlyphSource::ColorAtlas {
+                    slot: crate::atlas::AtlasSlot {
+                        x: 0,
+                        y: 0,
+                        width: 4,
+                        height: 4,
+                    },
+                },
+            }],
+            images: vec![],
+        }
+    }
+
+    /// The retained seam carries no color-atlas parameter, so a draw list that
+    /// needs one must be refused loudly: painting the cell background while
+    /// `PresentStats` still counts the glyph is a silent false frame.
+    #[test]
+    fn headless_present_retained_refuses_color_atlas_glyphs() {
+        let surface = Surface::headless(PhysicalSize::new(8, 4)).expect("valid extent");
+        match surface.headless_present_retained(&color_glyph_only(), None) {
+            Err(RenderError::InvalidInput { reason }) => assert_eq!(
+                reason, "retained headless present has no color atlas parameter",
+                "the refusal must name the missing color atlas"
+            ),
+            other => panic!("a color-atlas draw list must be refused, got {other:?}"),
+        }
+        assert!(
+            surface.headless_rgba().is_none(),
+            "a refused present must not publish a frame"
+        );
+        // The same list is still paintable through the clearing entry point,
+        // which does take a color atlas: the refusal is about this seam only.
+        let texels = [0x00u8, 0x00, 0xFF, 0xFF].repeat(16);
+        surface
+            .headless_present_color(
+                &color_glyph_only(),
+                None,
+                Some((
+                    &texels,
+                    crate::atlas::AtlasDims {
+                        width: 4,
+                        height: 4,
+                    },
+                )),
+            )
+            .expect("the clearing present accepts a color atlas");
+    }
+
+    /// `headless_present` stores the buffer opacity-scaled. A retained present
+    /// after the opacity goes back to `1.0` must not composite onto that
+    /// dimmed base: the seed records the opacity it was painted under.
+    #[test]
+    fn headless_present_retained_discards_a_seed_painted_below_opacity_one() {
+        let surface = Surface::headless(PhysicalSize::new(8, 4)).expect("valid extent");
+        surface.set_opacity(0.5);
+        surface
+            .headless_present(&fill_only(0, 0, 4, 4, [0xFF, 0, 0, 0xFF]), None)
+            .expect("present at half opacity");
+        let dimmed = surface.headless_rgba().expect("dimmed frame");
+        assert_eq!(
+            &dimmed[0..4],
+            &[0x80, 0, 0, 0x80],
+            "the seed must be stored at 50% opacity"
+        );
+        surface.set_opacity(1.0);
+
+        surface
+            .headless_present_retained(&fill_only(4, 0, 4, 4, [0, 0xFF, 0, 0xFF]), None)
+            .expect("retained present at full opacity");
+        let rgba = surface.headless_rgba().expect("retained frame");
+        assert_eq!(
+            &rgba[0..4],
+            &[0x1E, 0x1E, 0x2E, 0xFF],
+            "the dimmed seed must be discarded for a theme-background clear"
+        );
+        assert_eq!(
+            &rgba[16..20],
+            &[0, 0xFF, 0, 0xFF],
+            "the new damage must still paint at full opacity"
+        );
     }
 
     #[test]

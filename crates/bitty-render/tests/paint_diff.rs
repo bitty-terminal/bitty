@@ -31,7 +31,9 @@
 //! window-level swap-chain reuse, and plugin band repaint (overlay layers
 //! composed by the runtime, not by `GridRenderer::render`), plus glyph
 //! overhang outside a damaged cell (the fake rasterizer stays inside its
-//! cell box).
+//! cell box) and color-atlas glyphs: this fake rasterizer emits coverage
+//! bitmaps only, and the retained seam refuses a draw list that needs a color
+//! atlas instead of painting it as the cell background.
 //!
 //! The scroll region-copy path has **no** differential coverage here: a chunk
 //! carrying [`DamagedRegion::Scroll`] is handed a full-extent damage rectangle

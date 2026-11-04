@@ -187,33 +187,40 @@ impl Grid {
     /// Shifts cells in one row right by `n` starting at `col`, blanking the
     /// vacated positions (`ICH`, insert-mode printing).
     ///
-    /// Wide pairs are pre-cleared wherever the shift would tear them: the
-    /// stay/move cut at `col` and both cuts of the moved span.
+    /// The row splits into three ranges: `[..col)` stays, `[col..=last - n]`
+    /// moves right by `n`, and `[last - n + 1..=last]` is pushed past the
+    /// margin. A wide pair survives a shift only when both halves share one
+    /// fate (moving pairs keep their adjacency: `i` and `i + 1` land on
+    /// `i + n` and `i + 1 + n`), so exactly two cuts can tear a pair, and
+    /// both halves of a torn pair are blanked before the shift:
+    ///
+    /// * `col` — a spacer there travels away from the lead staying at
+    ///   `col - 1`.
+    /// * `last - n` — a lead there travels away from the spacer just past
+    ///   the margin.
     pub fn insert_blanks_in_row(&mut self, row: usize, col: usize, n: usize, erase_style: &Style) {
         let last = self.cols - 1;
         let col = col.min(last);
         let n = n.max(1);
-        // Cut between staying cells and movers: a spacer at `col` moves
-        // while its lead at `col - 1` stays; blank both.
+        // Stay/move cut: a spacer at `col` moves while its lead at
+        // `col - 1` stays; blank both.
         if col > 0 && self.get(row, col).spacer {
             self.set(row, col - 1, Cell::erased(*erase_style));
             self.set(row, col, Cell::erased(*erase_style));
         }
-        // Movers occupy sources `[col..=last - n]`. A lead at `last - n`
-        // would move away from its overwritten spacer; a spacer at
-        // `col + n` would move away from its moving lead. Blank both pairs
-        // before the shift.
+        // Move/drop cut: a lead at `last - n` would move away from the
+        // spacer it pushes past the margin; blank both.
         if n <= last - col {
             let move_end = last - n;
             if self.get(row, move_end).width == 2 && !self.get(row, move_end).spacer {
                 self.set(row, move_end, Cell::erased(*erase_style));
                 self.set(row, move_end + 1, Cell::erased(*erase_style));
             }
-            let move_start = col + n;
-            if move_start <= last && self.get(row, move_start).spacer {
-                self.set(row, move_start - 1, Cell::erased(*erase_style));
-            }
         }
+        // No pre-clear at `col + n`: both halves of a pair there are movers
+        // and stay adjacent across the shift. Blanking the lead (as the old
+        // DCH-shaped guard did) stranded its spacer one column right and the
+        // repair pass then erased the pair — bitty#2873.
         for target in (col + n..=last).rev() {
             let source = target - n;
             let moved = *self.get(row, source);
@@ -726,5 +733,189 @@ mod tests {
         g.set_wrapped(0, true);
         g.resize(3, 6, &Style::default());
         assert!(!g.wrapped(0));
+    }
+
+    /// A wide lead with its spacer immediately to the right.
+    fn wide_pair(g: &mut Grid, row: usize, lead: usize, ch: char) {
+        let style = Style::default();
+        g.set(
+            row,
+            lead,
+            Cell {
+                glyph: ch,
+                style,
+                width: 2,
+                spacer: false,
+                padding: false,
+                hyperlink: None,
+                zerowidth: Zerowidth::new(),
+            },
+        );
+        g.set(row, lead + 1, Cell::wide_spacer(style));
+    }
+
+    /// RFC invariant 2 shape check without repairing: every spacer has its
+    /// lead and every lead has its spacer.
+    fn assert_pairs_intact(g: &Grid, row: usize) {
+        for c in 0..g.cols {
+            let cell = *g.get(row, c);
+            if cell.spacer {
+                assert!(c > 0, "orphan spacer at col 0");
+                let lead = *g.get(row, c - 1);
+                assert!(
+                    lead.width == 2 && !lead.spacer,
+                    "orphan spacer at col {c} (lead missing)"
+                );
+            } else if cell.width == 2 {
+                assert!(
+                    c + 1 < g.cols && g.get(row, c + 1).spacer,
+                    "unpaired wide lead at col {c}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn insert_blanks_before_wide_pair_shifts_pair_intact() {
+        // bitty#2873: ICH at a wide lead must carry the pair right, not
+        // blank the lead and strand the moved spacer.
+        let mut g = Grid::new(1, 10);
+        g.set(0, 3, glyph('a'));
+        wide_pair(&mut g, 0, 4, '中');
+        g.set(0, 6, glyph('b'));
+
+        g.insert_blanks_in_row(0, 4, 1, &Style::default());
+
+        assert!(g.get(0, 3).glyph == 'a', "cell left of the insert stays");
+        assert!(g.get(0, 4).is_blank(), "inserted column is blank");
+        assert_eq!(g.get(0, 5).glyph, '中', "wide lead shifts one right");
+        assert!(!g.get(0, 5).spacer);
+        assert!(g.get(0, 6).spacer, "spacer shifts with its lead");
+        assert_eq!(g.get(0, 7).glyph, 'b', "tail after the pair shifts too");
+        assert_pairs_intact(&g, 0);
+    }
+
+    #[test]
+    fn insert_blanks_before_wide_pair_shifts_pair_intact_for_n_gt_one() {
+        let mut g = Grid::new(1, 10);
+        wide_pair(&mut g, 0, 4, '中');
+        g.set(0, 6, glyph('b'));
+
+        g.insert_blanks_in_row(0, 2, 2, &Style::default());
+
+        assert!(g.get(0, 2).is_blank() && g.get(0, 3).is_blank());
+        assert_eq!(g.get(0, 6).glyph, '中');
+        assert!(g.get(0, 7).spacer);
+        assert_eq!(g.get(0, 8).glyph, 'b');
+        assert_pairs_intact(&g, 0);
+    }
+
+    #[test]
+    fn insert_blanks_inside_wide_pair_removes_the_pair_whole() {
+        // Accepted wide-cell policy in this crate: touching one half of a
+        // pair removes the whole pair (see `erase_range_in_row` and the
+        // print path in `State::print`). ICH landing on the spacer keeps
+        // that policy: both halves are blanked and only the tail moves.
+        let mut g = Grid::new(1, 10);
+        wide_pair(&mut g, 0, 4, '中');
+        g.set(0, 6, glyph('b'));
+
+        g.insert_blanks_in_row(0, 5, 1, &Style::default());
+
+        assert!(g.get(0, 4).is_blank(), "lead blanked with its spacer");
+        assert!(g.get(0, 5).is_blank(), "spacer blanked with its lead");
+        assert_eq!(g.get(0, 7).glyph, 'b', "tail still shifts one right");
+        assert_pairs_intact(&g, 0);
+    }
+
+    #[test]
+    fn insert_blanks_at_trailing_pair_cut_blanks_the_torn_pair() {
+        // The pair whose lead sits at `last - n` has its spacer pushed past
+        // the margin; the pair is split by the shift, so both halves blank.
+        let mut g = Grid::new(1, 6);
+        g.set(0, 1, glyph('x'));
+        wide_pair(&mut g, 0, 4, '中');
+
+        g.insert_blanks_in_row(0, 1, 1, &Style::default());
+
+        assert!(g.get(0, 1).is_blank());
+        assert!(g.get(0, 4).is_blank(), "torn lead blanked");
+        assert!(g.get(0, 5).is_blank(), "torn spacer blanked");
+        assert_pairs_intact(&g, 0);
+    }
+
+    #[test]
+    fn insert_blanks_past_right_margin_clamps() {
+        let style = Style::default();
+        let mut g = Grid::new(1, 6);
+        for (c, ch) in [(0, 'a'), (1, 'b'), (2, 'c'), (3, 'd')] {
+            g.set(0, c, glyph(ch));
+        }
+
+        // n wider than the row tail: everything from `col` is blanked.
+        g.insert_blanks_in_row(0, 4, 5, &style);
+        assert_eq!(g.row(0).len(), 6);
+        assert_eq!(g.get(0, 3).glyph, 'd');
+        assert!((4..6).all(|c| g.get(0, c).is_blank()));
+
+        // A column at or past the right margin clamps onto the last column.
+        g.insert_blanks_in_row(0, 99, 1, &style);
+        assert_eq!(g.row(0).len(), 6);
+        assert!(g.get(0, 5).is_blank());
+        assert_pairs_intact(&g, 0);
+    }
+
+    #[test]
+    fn insert_blanks_never_orphans_a_wide_half() {
+        // Exhaustive sweep over pair placements, insertion columns and
+        // counts: whatever the cut, the row must never retain a spacer
+        // without its lead (or a lead without its spacer), and a shift must
+        // never duplicate content (bitty#2873 regression net).
+        let style = Style::default();
+        for lead in 0..7usize {
+            for col in 0..8usize {
+                for n in 1..=9usize {
+                    let mut g = Grid::new(1, 8);
+                    if lead > 0 {
+                        g.set(0, lead - 1, glyph('a'));
+                    }
+                    wide_pair(&mut g, 0, lead, '中');
+                    if lead + 2 < 8 {
+                        g.set(0, lead + 2, glyph('b'));
+                    }
+                    let before = (0..8).filter(|c| !g.get(0, *c).is_blank()).count();
+
+                    g.insert_blanks_in_row(0, col, n, &style);
+
+                    assert_pairs_intact(&g, 0);
+                    assert_eq!(g.row(0).len(), 8);
+                    let after = (0..8).filter(|c| !g.get(0, *c).is_blank()).count();
+                    assert!(
+                        after <= before,
+                        "lead {lead}, col {col}, n {n}: shift duplicated content ({before} -> {after})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn delete_chars_at_wide_pair_cuts_blanks_both_torn_halves() {
+        // Sibling check (DCH): the pair whose lead is destroyed but whose
+        // spacer is a mover is split by the left shift, so both halves are
+        // blanked rather than letting the spacer travel alone.
+        let mut g = Grid::new(1, 8);
+        g.set(0, 0, glyph('a'));
+        g.set(0, 1, glyph('b'));
+        g.set(0, 2, glyph('c'));
+        wide_pair(&mut g, 0, 3, '中');
+        g.set(0, 5, glyph('d'));
+
+        g.delete_chars_in_row(0, 1, 3, &Style::default());
+
+        assert_eq!(g.get(0, 0).glyph, 'a');
+        assert!(g.get(0, 1).is_blank(), "torn spacer must not travel alone");
+        assert_eq!(g.get(0, 2).glyph, 'd', "tail after the cut shifts left");
+        assert_pairs_intact(&g, 0);
     }
 }

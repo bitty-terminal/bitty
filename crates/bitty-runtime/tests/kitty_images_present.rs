@@ -196,30 +196,35 @@ fn display_erase_clears_placement_but_keeps_store_shape() {
 }
 
 #[test]
-fn place_action_for_stored_image_paints_no_blit_today() {
-    // Issue #1802 acceptance pin, documents the R2 shape: `a=p` is
-    // state-owned Terminal Truth (grid records / virtual prototypes),
-    // not yet wired to the pixel layer, so placing a stored image
-    // paints no blit today.
+fn place_action_for_stored_image_paints_blit() {
+    // Issue #2875: `a=p` names a previously transmitted image and places it
+    // without pixels. Terminal truth records the anchor; the pixel layer now
+    // mirrors it, so the `a=t` then `a=p` client shape (image.nvim style)
+    // paints instead of leaving a blank rectangle.
     let mut rt = make_runtime();
     let encoded = "/wAA//8AAP//AAD//wAA/w==";
     let transmit = format!("\x1b_Gf=32,s=2,v=2,a=t,i=7,m=0;{encoded}\x1b\\");
     rt.handle_pty_bytes(transmit.as_bytes());
     assert_eq!(rt.kitty_image_count(), 1);
     assert_eq!(rt.kitty_placement_count(), 0);
-    rt.handle_pty_bytes(b"\x1b_Ga=p,i=7\x1b\\");
+    rt.handle_pty_bytes(b"\x1b_Ga=p,i=7,c=2,r=2\x1b\\");
     assert_eq!(rt.kitty_image_count(), 1, "place action stores nothing new");
     assert_eq!(
         rt.kitty_placement_count(),
-        0,
-        "place action places nothing on the pixel layer today"
+        1,
+        "place action places the stored image on the pixel layer"
     );
     assert!(rt.tick().is_some());
     assert_eq!(
         rt.kitty_last_frame_images(),
-        0,
-        "no blit may paint for a state-only place"
+        1,
+        "the placed image composites one blit"
     );
+    // The identity delete clears both layers: no orphan blit survives.
+    rt.handle_pty_bytes(b"\x1b_Ga=d,d=i,i=7\x1b\\");
+    assert_eq!(rt.kitty_placement_count(), 0);
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 0);
 }
 
 #[test]

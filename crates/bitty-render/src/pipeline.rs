@@ -30,8 +30,9 @@
 //! left earlier chunks overwritten so only the last chunk's fills painted,
 //! i.e. fullscreen TUIs showed top dark stale + bottom blue). Image passes
 //! batch all admitted quads contiguously and submit once per pass (CTX-0390:
-//! one submit for backgrounds in place, one for Kitty images at frame end,
-//! each split deterministically only when past the 32-quad cap). The atlas
+//! one submit for backgrounds in place, then the below-text Kitty half
+//! before glyphs and the topmost Kitty half at frame end, each split
+//! deterministically only when past the 32-quad cap). The atlas
 //! texture is capped by
 //! [`MAX_ATLAS_DIMENSION`](crate::batch::MAX_ATLAS_DIMENSION) and the
 //! transient inline texture is fixed at
@@ -51,7 +52,8 @@
 //! texture's red channel modulating the tint alpha), and the Kitty image
 //! pass (`pos + uv`, straight-alpha `Rgba8UnormSrgb` sampling with
 //! premultiplied `One`/`OneMinusSrcAlpha` blending, CTX-0291). The image
-//! pass paints last, on top of fills and glyphs, matching both CPU
+//! pass paints in two halves: below-text blits before the glyph pass, the
+//! topmost half last on top of fills and glyphs, matching both CPU
 //! compositors. All pipelines composite over backgrounds; per-frame resource
 //! use is bounded (see `batch::plan_image_uploads`).
 //!
@@ -460,6 +462,159 @@ fn upload_image(
     );
     Ok(())
 }
+
+/// Draws one bounded image batch with a single `queue.submit` (CTX-0390).
+///
+/// Free-function form of [`GpuResources::submit_image_batch`] so image-layer
+/// helpers can borrow only the fields they touch (issue #2875). `batch` holds
+/// draws in paint order (see [`batch::collect_image_draws`]); each draw
+/// samples its own positional texture slot but shares the batched vertex
+/// buffer and the shared index buffer. An empty batch is a no-op (no write,
+/// no encoder, no submit), preserving the no-image fast path.
+#[allow(clippy::too_many_arguments)]
+fn submit_image_batch_parts(
+    image_pipeline: &RenderPipeline,
+    image_vb: &Buffer,
+    index_buf: &Buffer,
+    image_textures: &[ImageTexture],
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    view: &TextureView,
+    batch: &[batch::ImageDraw],
+    first_pass: &mut bool,
+    clear: wgpu::Color,
+) -> Result<(), RenderError> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    if batch.len() > batch::MAX_IMAGE_QUADS_PER_BATCH {
+        return Err(RenderError::InvalidInput {
+            reason: "draw batch exceeds the bounded vertex cap",
+        });
+    }
+    let bytes = batch::image_batch_bytes(batch);
+    if bytes.len() as u64 > image_buffer_size() {
+        return Err(RenderError::InvalidInput {
+            reason: "draw batch exceeds the bounded vertex cap",
+        });
+    }
+    queue.write_buffer(image_vb, 0, &bytes);
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("bitty-present-draw-list"),
+    });
+    {
+        let load = if *first_pass {
+            LoadOp::Clear(clear)
+        } else {
+            LoadOp::Load
+        };
+        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("bitty-draw-list"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(image_pipeline);
+        for (i, draw) in batch.iter().enumerate() {
+            let bind = image_textures
+                .get(draw.slot)
+                .ok_or(RenderError::InvalidInput {
+                    reason: "image draw references a missing texture slot",
+                })?;
+            let v_start = (i * batch::IMAGE_QUAD_BYTES) as u64;
+            let v_end = v_start + batch::IMAGE_QUAD_BYTES as u64;
+            // Shared quad-0 index slice for every draw: the vertex slice
+            // already isolates this quad (valid indices 0..3), so per-draw
+            // index offsets would address out-of-range vertices for i > 0
+            // (CTX-0390 review finding).
+            let i_end = batch::image_quad_index_byte_range().1;
+            pass.set_bind_group(0, &bind.bind, &[]);
+            pass.set_vertex_buffer(0, image_vb.slice(v_start..v_end));
+            pass.set_index_buffer(index_buf.slice(0..i_end), IndexFormat::Uint16);
+            pass.draw_indexed(0..INDICES_PER_QUAD as u32, 0, 0..1);
+        }
+    }
+    queue.submit(std::iter::once(encoder.finish()));
+    *first_pass = false;
+    Ok(())
+}
+
+/// Uploads and draws one bounded image layer (issue #2875).
+///
+/// `admitted` holds indices into `blits` (from
+/// [`batch::plan_image_uploads`]) for one
+/// [`crate::grid::ImagePaintLayer`] half. The positional texture pool is
+/// truncated to this layer and every entry uploads into its position in
+/// `admitted`, which is exactly the slot numbering
+/// [`batch::collect_image_draws`] assigns, so the two image halves of a
+/// frame can share one pool without slot drift: the later half re-truncates
+/// and re-uploads after the earlier half's submits were already queued. An
+/// empty layer issues no write and no submit (no-image fast path). Returns
+/// the quads [`batch::collect_image_draws`] refused (counted fail-closed by
+/// the caller).
+#[allow(clippy::too_many_arguments)]
+fn draw_image_layer(
+    image_textures: &mut Vec<ImageTexture>,
+    image_pipeline: &RenderPipeline,
+    image_vb: &Buffer,
+    index_buf: &Buffer,
+    image_bind_layout: &BindGroupLayout,
+    image_sampler: &Sampler,
+    opacity_buf: &Buffer,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    view: &TextureView,
+    surface_w: u32,
+    surface_h: u32,
+    scale: f32,
+    blits: &[crate::grid::ImageBlit],
+    admitted: &[usize],
+    first_pass: &mut bool,
+    clear: wgpu::Color,
+) -> Result<usize, RenderError> {
+    image_textures.truncate(admitted.len());
+    for (slot, &index) in admitted.iter().enumerate() {
+        let blit = &blits[index];
+        upload_image(
+            image_textures,
+            image_bind_layout,
+            image_sampler,
+            opacity_buf,
+            device,
+            queue,
+            slot,
+            blit.dest.width,
+            blit.dest.height,
+            &blit.rgba,
+        )?;
+    }
+    let (draws, extra) = batch::collect_image_draws(blits, admitted, surface_w, surface_h, scale);
+    for chunk in batch::chunk_image_draws(&draws) {
+        submit_image_batch_parts(
+            image_pipeline,
+            image_vb,
+            index_buf,
+            image_textures,
+            device,
+            queue,
+            view,
+            &chunk,
+            first_pass,
+            clear,
+        )?;
+    }
+    Ok(extra)
+}
+
 /// Long-lived GPU objects for one surface, reused across frames.
 pub(crate) struct GpuResources {
     format: TextureFormat,
@@ -1029,14 +1184,9 @@ impl GpuResources {
 
     /// Draws one bounded image batch with a single `queue.submit` (CTX-0390).
     ///
-    /// `batch` holds draws in paint order (see [`batch::collect_image_draws`]);
-    /// each draw samples its own positional texture slot but shares the
-    /// batched vertex buffer at a distinct 64-byte offset and the shared
-    /// index buffer at a distinct 6-index offset, so the single pass emits
-    /// exactly the triangles the old per-blit passes emitted, in the same
-    /// order with the same pipeline, bind groups, and blend state. An empty
-    /// batch is a no-op (no write, no encoder, no submit), preserving the
-    /// no-image fast path.
+    /// Delegates to [`submit_image_batch_parts`] (see there for the batching
+    /// contract); the free-function form lets the present pass' image layers
+    /// borrow disjoint fields around the fill/glyph closures (issue #2875).
     fn submit_image_batch(
         &self,
         device: &wgpu::Device,
@@ -1046,69 +1196,18 @@ impl GpuResources {
         first_pass: &mut bool,
         clear: wgpu::Color,
     ) -> Result<(), RenderError> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-        if batch.len() > batch::MAX_IMAGE_QUADS_PER_BATCH {
-            return Err(RenderError::InvalidInput {
-                reason: "draw batch exceeds the bounded vertex cap",
-            });
-        }
-        let bytes = batch::image_batch_bytes(batch);
-        if bytes.len() as u64 > image_buffer_size() {
-            return Err(RenderError::InvalidInput {
-                reason: "draw batch exceeds the bounded vertex cap",
-            });
-        }
-        queue.write_buffer(&self.image_vb, 0, &bytes);
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("bitty-present-draw-list"),
-        });
-        {
-            let load = if *first_pass {
-                LoadOp::Clear(clear)
-            } else {
-                LoadOp::Load
-            };
-            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("bitty-draw-list"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: Operations {
-                        load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.image_pipeline);
-            for (i, draw) in batch.iter().enumerate() {
-                let bind = self
-                    .image_textures
-                    .get(draw.slot)
-                    .ok_or(RenderError::InvalidInput {
-                        reason: "image draw references a missing texture slot",
-                    })?;
-                let v_start = (i * batch::IMAGE_QUAD_BYTES) as u64;
-                let v_end = v_start + batch::IMAGE_QUAD_BYTES as u64;
-                // Shared quad-0 index slice for every draw: the vertex slice
-                // already isolates this quad (valid indices 0..3), so
-                // per-draw index offsets would address out-of-range vertices
-                // for i > 0 (CTX-0390 review finding).
-                let i_end = batch::image_quad_index_byte_range().1;
-                pass.set_bind_group(0, &bind.bind, &[]);
-                pass.set_vertex_buffer(0, self.image_vb.slice(v_start..v_end));
-                pass.set_index_buffer(self.index_buf.slice(0..i_end), IndexFormat::Uint16);
-                pass.draw_indexed(0..INDICES_PER_QUAD as u32, 0, 0..1);
-            }
-        }
-        queue.submit(std::iter::once(encoder.finish()));
-        *first_pass = false;
-        Ok(())
+        submit_image_batch_parts(
+            &self.image_pipeline,
+            &self.image_vb,
+            &self.index_buf,
+            &self.image_textures,
+            device,
+            queue,
+            view,
+            batch,
+            first_pass,
+            clear,
+        )
     }
 
     /// Uploads atlas texels with dirty-region invalidation.
@@ -1501,6 +1600,56 @@ impl GpuResources {
             self.submit_image_batch(device, queue, view, &chunk, &mut first_pass, clear)?;
         }
 
+        // Kitty images (CTX-0291): two draws around the glyph pass.
+        // Negative-`z` placements (`ImagePaintLayer::BelowText`) submit
+        // after the cell fills, decoration ring, and background image but
+        // before overlay fills and glyphs, so text and selection/cursor
+        // overlays composite over them; the rest stay topmost. This matches
+        // both CPU compositors. `plan_image_uploads` is the single
+        // validation point for both halves: blit count, padded staging
+        // bytes, and texture dimensions are bounded before any allocation,
+        // and the caps cover the union of both layers. Refused blits are
+        // skipped fail-closed and counted in the returned `skipped` so the
+        // caller can warn and report them.
+        let image_plan =
+            batch::plan_image_uploads(&draw_list.images, device.limits().max_texture_dimension_2d);
+        let below_admitted: Vec<usize> = image_plan
+            .admitted
+            .iter()
+            .copied()
+            .filter(|&index| {
+                draw_list.images[index].layer == crate::grid::ImagePaintLayer::BelowText
+            })
+            .collect();
+        let above_admitted: Vec<usize> = image_plan
+            .admitted
+            .iter()
+            .copied()
+            .filter(|&index| {
+                draw_list.images[index].layer == crate::grid::ImagePaintLayer::AboveText
+            })
+            .collect();
+        let mut images_skipped = image_plan.skipped + backgrounds_skipped;
+        images_skipped = images_skipped.saturating_add(draw_image_layer(
+            &mut self.image_textures,
+            &self.image_pipeline,
+            &self.image_vb,
+            &self.index_buf,
+            &self.image_bind_layout,
+            &self.image_sampler,
+            &self.opacity_buf,
+            device,
+            queue,
+            view,
+            surface_w,
+            surface_h,
+            scale,
+            &draw_list.images,
+            &below_admitted,
+            &mut first_pass,
+            clear,
+        )?);
+
         // CTX-0347: selection/cursor overlay fills paint above the background
         // image and below glyphs.
         for chunk in &overlay_chunks {
@@ -1572,49 +1721,36 @@ impl GpuResources {
             submit_glyph_chunk(&chunk.bytes, chunk.quad_count, &self.inline_bind)?;
         }
 
-        // Kitty images (CTX-0291): the topmost pass, painted after fills and
-        // glyphs to match both CPU compositors. `plan_image_uploads` is the
-        // single validation point: blit count, padded staging bytes, and
-        // texture dimensions are bounded before any allocation. Refused blits
-        // are skipped fail-closed and counted in the returned `skipped` so
-        // the caller can warn and report them.
+        // Kitty images (CTX-0291): the topmost half, painted after fills and
+        // glyphs to match both CPU compositors. The below-text half already
+        // ran before the glyph pass; this call reuses the same positional
+        // pool for its own layer. Refused blits were counted in
+        // `images_skipped` so the caller can warn and report them.
         //
         // CTX-0390: all admitted blits upload first, then their quads draw
         // in one pass per bounded chunk (a normal frame: one submit at frame
         // end). Each draw keeps its positional slot, vertex bytes, and paint
         // order, so the batched pass is pixel-identical to the old per-blit
         // submits.
-        let image_plan =
-            batch::plan_image_uploads(&draw_list.images, device.limits().max_texture_dimension_2d);
-        // Frames can shrink: drop cached slot textures beyond the admitted
-        // set so stale image memory never outlives its frame.
-        self.image_textures.truncate(image_plan.admitted.len());
-        for (slot, &index) in image_plan.admitted.iter().enumerate() {
-            let blit = &draw_list.images[index];
-            upload_image(
-                &mut self.image_textures,
-                &self.image_bind_layout,
-                &self.image_sampler,
-                &self.opacity_buf,
-                device,
-                queue,
-                slot,
-                blit.dest.width,
-                blit.dest.height,
-                &blit.rgba,
-            )?;
-        }
-        let (image_draws, image_extra) = batch::collect_image_draws(
-            &draw_list.images,
-            &image_plan.admitted,
+        images_skipped = images_skipped.saturating_add(draw_image_layer(
+            &mut self.image_textures,
+            &self.image_pipeline,
+            &self.image_vb,
+            &self.index_buf,
+            &self.image_bind_layout,
+            &self.image_sampler,
+            &self.opacity_buf,
+            device,
+            queue,
+            view,
             surface_w,
             surface_h,
             scale,
-        );
-        let images_skipped = image_plan.skipped + backgrounds_skipped + image_extra;
-        for chunk in batch::chunk_image_draws(&image_draws) {
-            self.submit_image_batch(device, queue, view, &chunk, &mut first_pass, clear)?;
-        }
+            &draw_list.images,
+            &above_admitted,
+            &mut first_pass,
+            clear,
+        )?);
 
         // Empty frame (no chunks): single Clear so the surface never keeps
         // stale content from the previous frame.

@@ -424,7 +424,14 @@ pub fn grid_text_from_snapshot(
             if cell.spacer {
                 continue;
             }
-            cell.push_text_into(&mut line);
+            // a11y/scene contract: an image cell (`U+10EEEE`) projects as the
+            // object-replacement character, so `bitty ctl terminal text` and
+            // accessibility readers see a named image stand-in instead of an
+            // invisible private-use scalar.
+            match bitty_term_state::image_cell_text_fallback(cell.glyph) {
+                Some(fallback) => line.push(fallback),
+                None => cell.push_text_into(&mut line),
+            }
             chars += 1;
         }
         // Trim trailing blanks (erased cells) so typed text is findable
@@ -621,6 +628,20 @@ mod tests {
         // The column bound is a cell bound: a one-cell row keeps the mark.
         let narrow = grid_text_from_state(&state, 1, 1);
         assert_eq!(narrow.lines[0], "e\u{0301}");
+    }
+
+    #[test]
+    fn grid_text_projects_image_cells_as_object_replacement() {
+        // Issue #2875 a11y/scene contract: a `U+10EEEE` image cell keeps a
+        // readable text fallback in the inspection surface instead of an
+        // invisible private-use scalar.
+        let mut state = State::new();
+        feed_print(&mut state, "a\u{10EEEE}b");
+        let snap = grid_text_from_state(&state, 2, 16);
+        assert_eq!(snap.lines[0], "a\u{FFFC}b");
+        // The raw grid truth is untouched: only the projection substitutes.
+        let raw = state.snapshot();
+        assert_eq!(raw.cells[1].glyph, '\u{10EEEE}');
     }
 
     #[test]

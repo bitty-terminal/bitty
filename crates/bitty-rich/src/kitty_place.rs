@@ -46,9 +46,12 @@
 //!   viewport; a placement fully outside the viewport paints nothing.
 //! - Z-order (documented model): grid cells (backgrounds + glyphs) and every
 //!   fill overlay (selection, cursor, banner, scrollbar) composite first;
-//!   kitty images composite above cells, text, and selection fills,
-//!   ordered by ascending `z` (stable for equal `z`), but below the
-//!   focused cursor (#1849 S7 cursor-on-top). They never mutate grid truth.
+//!   kitty images with non-negative `z` composite above cells, text, and
+//!   selection fills, ordered by ascending `z` (stable for equal `z`), but
+//!   below the focused cursor (#1849 S7 cursor-on-top). A negative `z`
+//!   (kitty layering rule) instead composites above cell backgrounds and
+//!   below text, so glyphs and overlay fills paint over the image. They
+//!   never mutate grid truth.
 //!
 //! # Scroll (tied to grid rows)
 //!

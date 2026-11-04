@@ -4517,6 +4517,7 @@ fn color_atlas_rejects_a_coverage_raster_without_consuming_a_slot() {
     // 64 px maximum: the initial allocation is 64 as well, so `try_grow` can
     // never rescue a leaked slot and sixteen exact 16x16 placements fill it.
     let mut atlas = super::ColorGlyphAtlas::new(64).unwrap();
+    let initial_dims = atlas.dims();
     let font = FontId::next(&mut 0u64);
     let key = RasterKey::new('\u{2705}', font, 12.0)
         .unwrap()
@@ -4534,6 +4535,26 @@ fn color_atlas_rejects_a_coverage_raster_without_consuming_a_slot() {
             "pass {pass}: an unstorable raster is not atlas exhaustion"
         );
         assert_eq!(atlas.len(), 0, "pass {pass}: nothing was placed");
+        // Accounting, not just the return value: a rejected raster must leave
+        // the allocator's occupancy at zero and the atlas at its initial
+        // dimensions, so repeated passes can never fill it with unowned
+        // regions (the leak this test pins).
+        assert_eq!(
+            atlas.layout.occupancy(),
+            0.0,
+            "pass {pass}: a rejected raster consumed no atlas area"
+        );
+        assert_eq!(
+            atlas.dims(),
+            initial_dims,
+            "pass {pass}: a rejected raster must not grow the atlas"
+        );
+        // …and the reject has to be visible in the stats: one miss per pass.
+        assert_eq!(
+            atlas.stats(),
+            (0, pass + 1, 0),
+            "pass {pass}: each rejected placement is a miss, no hit, no eviction"
+        );
     }
     // The rejects consumed no space, so a genuine color raster still fits.
     let color =
@@ -4543,6 +4564,15 @@ fn color_atlas_rejects_a_coverage_raster_without_consuming_a_slot() {
         .expect("a color raster still places after 32 rejected passes");
     assert_eq!(slot_texel(&atlas, slot), [0xE0, 0x30, 0x20, 0xFF]);
     assert_eq!(atlas.len(), 1);
+    assert_eq!(
+        atlas.layout.occupancy(),
+        f64::from(16 * 16) / f64::from(64 * 64),
+        "only the real placement occupies the atlas"
+    );
+    // First placement of the key is a miss; the repeat is a hit.
+    assert_eq!(atlas.stats(), (0, 33, 0));
+    assert!(atlas.ensure(key, &color).is_some());
+    assert_eq!(atlas.stats(), (1, 33, 0));
 }
 
 #[test]

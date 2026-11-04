@@ -2847,6 +2847,11 @@ impl ColorGlyphAtlas {
     }
 
     /// Cumulative `(hits, misses, evictions)` totals.
+    ///
+    /// A miss is any lookup that produced no slot: first placement of a key,
+    /// and every pass whose raster this atlas cannot store (non-RGBA coverage,
+    /// oversized, or beyond a pass's capacity), which the caller degrades to
+    /// the monochrome atlas.
     #[must_use]
     pub const fn stats(&self) -> (u64, u64, u64) {
         (self.hits, self.misses, self.evictions)
@@ -2877,18 +2882,28 @@ impl ColorGlyphAtlas {
     /// Returns `None` when the bitmap cannot be placed even after growth, so
     /// the caller can fall back to the monochrome atlas (the color atlas never
     /// drops a glyph, it degrades it).
+    ///
+    /// A rejected raster counts as a **miss** (CTX-1691 review round 1): the
+    /// key was looked up and the color atlas could not serve it, so
+    /// [`Self::stats`] must record the attempt. The previous early `?` return
+    /// recorded nothing, which under-reported exactly the clusters this atlas
+    /// cannot store — a monochrome emoji face's emoji-presentation rasters —
+    /// and hid the leak behind a flat miss count.
     fn ensure(&mut self, key: RasterKey, bitmap: &CachedBitmap) -> Option<AtlasSlot> {
         if let Some(slot) = self.slots.get(&key) {
             self.hits = self.hits.saturating_add(1);
             return Some(*slot);
         }
-        let slot = self.place(bitmap)?;
         self.misses = self.misses.saturating_add(1);
+        let slot = self.place(bitmap)?;
         self.slots.insert(key, slot);
         Some(slot)
     }
 
     /// Ensures a shaped-glyph color bitmap is placed.
+    ///
+    /// Same miss accounting as [`Self::ensure`]: an unstorable or unfittable
+    /// raster is a miss, not silence.
     fn ensure_shaped(
         &mut self,
         key: crate::shaped::ShapedGlyphKey,
@@ -2898,8 +2913,8 @@ impl ColorGlyphAtlas {
             self.hits = self.hits.saturating_add(1);
             return Some(*slot);
         }
-        let slot = self.place(bitmap)?;
         self.misses = self.misses.saturating_add(1);
+        let slot = self.place(bitmap)?;
         self.shaped_slots.insert(key, slot);
         Some(slot)
     }

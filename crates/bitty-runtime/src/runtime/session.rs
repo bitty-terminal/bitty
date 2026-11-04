@@ -497,6 +497,14 @@ pub struct FloatSnapshot {
 }
 
 /// One workspace's persisted state: identity plus layout, focus, and panes.
+///
+/// The runtime `WorkspaceId` is **not persisted**. It is per-process panel
+/// attribution, not durable workspace identity:
+/// [`Runtime::apply_session_snapshot`] mints a fresh id for every restored
+/// slot instead of reconstructing one from
+/// this snapshot's position or `seq`. The restore path's index-to-`WorkspaceId`
+/// resolution therefore remains open (OQ-084 B-2), and no reader may derive an
+/// id from `seq`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkspaceSnapshot {
     /// Stable creation sequence (`ws{seq}` identity).

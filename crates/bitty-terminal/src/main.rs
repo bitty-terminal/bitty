@@ -1155,6 +1155,10 @@ fn main() {
             // focused leaf so an activation-time `ui.mount("terminal", …)`
             // has a deterministic route; the tick loop keeps it live.
             scene_target: runtime.focused_view(),
+            // OQ-084 B-2: the create seam starts with the presented
+            // workspace's minted id; the tick loop keeps it live. No plugin
+            // input can name this workspace.
+            focused_workspace: runtime.focused_workspace_id(),
         },
     );
     let live_snapshot = plugin_session
@@ -1184,6 +1188,9 @@ fn main() {
     let scene_target = plugin_session
         .as_ref()
         .map(|session| Rc::clone(&session.scene_target));
+    let focused_workspace = plugin_session
+        .as_ref()
+        .map(|session| Rc::clone(&session.focused_workspace));
     let plugin_runtime_handle = plugin_session.map(|session| session.runtime);
     // Issue #2773: publish the attached runtime's sanitized lifecycle rows for
     // the accepted `bitty.debug/listPlugins` / `getPlugin` inspect methods.
@@ -1368,6 +1375,8 @@ fn main() {
     // live placement target for the `terminal` slot.
     .with_panel_scene_host(panel_scene_host)
     .with_scene_target(scene_target)
+    // OQ-084 B-2: publish the presented workspace id for `panel.create`.
+    .with_focused_workspace(focused_workspace)
     // W-103 S-5 (CTX-0929): latch the safe recovery flag so the composer
     // cutover selects the retained Core path without consulting a VM.
     .with_safe_mode(args.safe);

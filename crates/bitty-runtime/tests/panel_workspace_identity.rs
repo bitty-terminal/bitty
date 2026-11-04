@@ -18,7 +18,7 @@ use bitty_runtime::{
     Runtime, RuntimeConfig,
     registry::{PanelRegistry, PanelRegistryConfig, PanelType, WorkspaceId},
 };
-use bitty_ui::ViewId;
+use bitty_ui::{LayoutNode, SplitAxis, View, ViewId};
 
 fn runtime() -> Runtime {
     Runtime::new(RuntimeConfig::default()).expect("headless runtime builds")
@@ -80,6 +80,81 @@ fn a_slot_keeps_its_id_across_index_shifts_and_switching() {
     let replacement = rt.active_workspace_id();
     assert_ne!(replacement, first);
     assert_ne!(replacement, second);
+}
+
+#[test]
+fn focused_workspace_id_tracks_a_live_layout_change() {
+    let mut rt = runtime();
+    let workspace = rt
+        .focused_workspace_id()
+        .expect("a fresh runtime presents a focused workspace");
+    let fresh = View::new(rt.next_view_id_global(), 40, 24);
+    let layout = LayoutNode::split(
+        SplitAxis::Horizontal,
+        0.5,
+        rt.layout().clone(),
+        LayoutNode::leaf(fresh.clone()),
+    );
+    rt.set_layout(layout);
+    rt.set_focus(fresh.id());
+
+    assert_eq!(
+        rt.focused_workspace_id(),
+        Some(workspace),
+        "the presented workspace is the live layout's workspace, not its stale stash"
+    );
+}
+
+#[test]
+fn closing_the_focused_workspace_never_reports_its_id() {
+    let mut rt = runtime();
+    let first = rt.active_workspace_id();
+    rt.workspace_new().expect("second workspace");
+    let second = rt.active_workspace_id();
+    assert_ne!(first, second);
+
+    rt.workspace_close_at(1)
+        .expect("close the focused workspace");
+    assert_eq!(
+        rt.focused_workspace_id(),
+        Some(first),
+        "the survivor's minted id is reported, never the closed id"
+    );
+    assert_ne!(
+        rt.focused_workspace_id(),
+        Some(second),
+        "a closed workspace's id must not survive as a stale attribution"
+    );
+
+    rt.focus_mut().clear();
+    assert_eq!(
+        rt.focused_workspace_id(),
+        None,
+        "no focused leaf reports absence, not the last active id"
+    );
+}
+
+#[test]
+fn plugin_workspace_focus_input_never_supplies_the_id() {
+    let mut rt = runtime();
+    rt.workspace_new().expect("second workspace");
+    rt.workspace_close_at(0).expect("close the first workspace");
+    rt.workspace_new()
+        .expect("replacement workspace reuses seq 1");
+    let resolved = rt
+        .focused_workspace_id()
+        .expect("replacement presents a focused workspace");
+    let seq = rt.workspace_seq_at(0).expect("replacement seq");
+
+    // The plugin/ctl focus path addresses a workspace by its reuse-prone
+    // sequence; the accessor must answer the minted id, never that sequence.
+    assert_eq!(rt.workspace_focus_clamped(seq), Some(0));
+    assert_eq!(rt.focused_workspace_id(), Some(resolved));
+    assert_ne!(
+        resolved,
+        WorkspaceId::new(seq),
+        "the id is minted, not derived from the sequence a plugin can name"
+    );
 }
 
 #[test]

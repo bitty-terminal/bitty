@@ -1,4 +1,4 @@
-use super::apply::{apply_control_envelope, snapshot_text};
+use super::apply::{apply_control_envelope, reload_config_json, snapshot_text};
 #[cfg(unix)]
 use super::apply::{drain_global_control_queue_with, drain_global_control_queue_with_barrier};
 use super::client::extract_string_from;
@@ -2497,6 +2497,70 @@ fn control_config_reload_reports_probe_not_applied() {
             && done.result_json.contains("\"applied\":false"),
         "response must report probed-not-applied: {}",
         done.result_json
+    );
+}
+
+#[test]
+fn reload_config_json_carries_the_typed_module_record_scoped_to_the_record() {
+    // bitty#2885 item 4: the `module` object had no test. It must carry the
+    // code, the phase, and the already allowlisted render, and must not carry
+    // a host path, a canonical root, or an identity tuple (contract `N-6`,
+    // scoped to the record). The envelope's own `path` field is unchanged
+    // pre-existing surface and does name the resolved entry file.
+    let entry = "/home/user/.config/bitty/init.lua";
+    let diagnostic = bitty_config::ConfigModuleDiagnostic::new(
+        bitty_config::ConfigModuleCode::Escape,
+        bitty_config::ConfigModulePhase::Open,
+    )
+    .with_spec(b"pkg.mod".to_vec())
+    .with_detail("opened object is outside the module root");
+    let info = crate::config_reload::ReloadOutcomeInfo {
+        path: entry.to_string(),
+        kind: "load-error",
+        applied: false,
+        changed: Vec::new(),
+        restart_required: Vec::new(),
+        message: Some(String::from("bitty: configuration module refused")),
+        module: Some(Box::new(diagnostic)),
+    };
+    let json = reload_config_json(&info);
+    let LuaValue::Table(root) = parse_json(&json).expect("reload reply must be one JSON value")
+    else {
+        panic!("reload reply must be a JSON object: {json}");
+    };
+    assert_eq!(string_field(&root, "kind"), "load-error");
+    assert!(!bool_field(&root, "applied"));
+    assert_eq!(string_field(&root, "path"), entry);
+    let LuaValue::Table(module) = object_field(&root, "module") else {
+        panic!("a module refusal must carry a `module` object: {json}");
+    };
+    assert_eq!(string_field(&module, "code"), "E_CONFIG_MODULE_ESCAPE");
+    assert_eq!(string_field(&module, "phase"), "open");
+    let record = string_field(&module, "record");
+    assert_eq!(
+        record,
+        "code=E_CONFIG_MODULE_ESCAPE phase=open module_spec=\"pkg.mod\" \
+         detail=\"opened object is outside the module root\""
+    );
+    assert!(
+        !record.contains(entry) && !record.contains("/home/"),
+        "the record must not carry a host path: {record}"
+    );
+
+    // A failure that is not a module refusal carries no `module` key at all,
+    // so a client cannot read an absent record as an empty one.
+    let plain = crate::config_reload::ReloadOutcomeInfo {
+        path: entry.to_string(),
+        kind: "load-error",
+        applied: false,
+        changed: Vec::new(),
+        restart_required: Vec::new(),
+        message: Some(String::from("bitty: cannot read config")),
+        module: None,
+    };
+    assert!(
+        !reload_config_json(&plain).contains("\"module\""),
+        "a non-module failure must not emit a `module` key"
     );
 }
 

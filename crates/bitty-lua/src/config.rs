@@ -26,10 +26,11 @@
 //! single-root module loader in [`crate::config_require`] (bitty#2869,
 //! `config-lua-require-contract.md`). The loader's entire authority is
 //! reading regular files under `<config-dir>/lua`, bounded by a name grammar,
-//! a descriptor-anchored containment walk, per-file and aggregate caps, and
-//! the same RC-1/RC-2 account as the entry chunk. A VM without that install
-//! (`--safe`, an in-memory parse, the plugin runtime, the settings VM) has no
-//! `require` at all.
+//! a no-follow containment walk (descriptor-anchored on Unix, a by-path
+//! per-component walk on Windows with an admitted mid-walk junction window),
+//! per-file and aggregate caps, and the same RC-1/RC-2 account as the entry
+//! chunk. A VM without that install (`--safe`, an in-memory parse, the plugin
+//! runtime, the settings VM) has no `require` at all.
 //!
 //! Metatables can be set but are ignored: extraction reads raw table contents
 //! only, so `__index` tricks cannot smuggle values past validation.

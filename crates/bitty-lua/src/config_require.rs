@@ -5,7 +5,9 @@
 //! one name grammar resolved against exactly one root (`<config-dir>/lua`), a
 //! host-side per-generation cache keyed by opened file identity, typed cycle
 //! and depth refusal, threefold path containment (lexical, canonical, and a
-//! descriptor-anchored no-follow walk from an open root), a length-checked
+//! no-follow containment walk — descriptor-anchored on Unix, a by-path
+//! per-component walk on Windows whose mid-walk junction window is an admitted
+//! residual, see `windows_open_verified`), a length-checked
 //! bounded read, per-file and aggregate graph caps, and redacted typed
 //! diagnostics whose rendered form contains only an allowed byte set.
 //!
@@ -150,7 +152,7 @@ pub enum ConfigModulePhase {
     Name,
     /// Probing the two resolutions.
     Resolve,
-    /// Opening the resolved object through the anchored walk.
+    /// Opening the resolved object through the containment walk.
     Open,
     /// Reading the bounded source bytes.
     Read,
@@ -1404,6 +1406,12 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 /// reparse-point flag, and refuse any object that carries a reparse attribute
 /// or is not the expected type.
 ///
+/// This is a **by-path** walk: each step opens `root.join(component)`, and
+/// `FILE_FLAG_OPEN_REPARSE_POINT` suppresses reparse resolution only for the
+/// final component of that one open. A directory swapped to a junction
+/// *between* two opens of the same walk is therefore followed — the admitted
+/// residual documented below, not a closed property.
+///
 /// `remainder` is the spec-derived root-relative path (`a/b/c.lua` or
 /// `a/b/c/init.lua`), not the canonical target: the Windows rule refuses a
 /// reparse component anywhere below the canonical root, so a junction whose
@@ -1414,6 +1422,31 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 /// `is_file()` check then refuses a directory reachable through the init
 /// resolution as `E_CONFIG_MODULE_NOT_REGULAR`. An intermediate component that
 /// is not a directory is a constraint refusal (`ESCAPE`), never the module.
+///
+/// # Admitted residual: a component swapped *during* the walk
+///
+/// Each open anchors on the accumulated **path**, not on the handle of the
+/// directory just opened, so the walk is not descriptor-anchored the way the
+/// Unix legs are. `FILE_FLAG_OPEN_REPARSE_POINT` (plus the attribute check
+/// below) only refuses an object that is already a reparse point when its own
+/// open runs. A directory that exists as a real directory at step *n* and is
+/// replaced by a junction before step *n + 1* opens is traversed through the
+/// junction: the reparse check at step *n* passed legitimately, and step
+/// *n + 1* is a fresh by-path open that never sees the junction itself. The
+/// read then lands in the junction's target, which may be outside the root.
+///
+/// Unix closes that window because every step is `openat` relative to the
+/// previously opened descriptor (`openat2` with `RESOLVE_BENEATH`, or a
+/// per-component `O_NOFOLLOW` walk). Windows has no descriptor-relative open
+/// in this crate's dependency surface, so the window stays open. It is carried
+/// as an admitted residual in the owning contract's "Admitted residuals" table
+/// (`config-lua-require-contract.md`) rather than claimed closed, and no test
+/// exercises it: the mid-walk swap cannot be driven without a test seam inside
+/// the walk itself.
+///
+/// What the walk does guarantee on Windows is the deterministic case: a
+/// reparse component present before the walk reaches it — in-root or
+/// out-of-root, at any depth — is refused at that component.
 #[cfg(windows)]
 fn windows_open_verified(root: &Path, remainder: &str) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -1430,6 +1463,9 @@ fn windows_open_verified(root: &Path, remainder: &str) -> std::io::Result<std::f
     let mut current = root.to_path_buf();
     let last = components.len() - 1;
     for (index, component) in components.iter().enumerate() {
+        // By-path open, deliberately: see "Admitted residual" above. This
+        // anchors on the accumulated path, not on `parent`'s handle, so a
+        // directory swapped between two iterations is followed.
         current.push(component);
         let file = std::fs::OpenOptions::new()
             .read(true)

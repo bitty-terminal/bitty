@@ -14,11 +14,29 @@
 //!
 //! The gate is deliberately narrow and explicit rather than a syscall filter:
 //! the configuration VM has no `io`, `os`, `loadfile`, or `dofile`, so the
-//! three doors above are the complete external-read surface of a
-//! configuration generation. A test arms the gate, runs the same resolution
-//! the binary runs, and asserts [`attempts`] is empty. The negative control in
-//! the same suite runs an equivalent non-safe load and asserts it is non-empty,
-//! so the harness can fail.
+//! three doors above are the complete surface through which a configuration
+//! generation reads external file **content**. A test arms the gate, runs the
+//! same resolution the binary runs, and asserts [`attempts`] is empty. The
+//! negative control in the same suite runs an equivalent non-safe load and
+//! asserts it is non-empty, so the harness can fail.
+//!
+//! # What the gate does not cover
+//!
+//! Only the three doors above are armed. Metadata probes are not gated, so the
+//! proof is "no external content was read", never "no filesystem call was
+//! made". These stat without recording an attempt:
+//!
+//! - `file::probe_config_path` (and the `config_file_path` family) test entry
+//!   candidates with `Path::exists` before anything reads them;
+//! - the entry resolver's parent-hop check in `file.rs` probes with
+//!   `Path::exists`;
+//! - `trust::load_from_path` pre-checks size with `fs::metadata`; and
+//! - the local-theme loader's `symlink_metadata` probes are likewise ungated,
+//!   although the read door in front of them returns first while armed.
+//!
+//! A stat discloses existence, size, or timestamps of a path the caller already
+//! named; it cannot disclose content. What a safe generation must never reach
+//! is a read, and that is what the armed gate pins.
 //!
 //! # Trusted bootstrap
 //!

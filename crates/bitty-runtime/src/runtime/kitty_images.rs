@@ -39,10 +39,13 @@
 //! Cell reservation (issue #1802, second bug): a successful display
 //! advances the cursor past the placement span (unless `C=1`), so
 //! subsequently printed text starts after the image instead of over it;
-//! at present time images composite topmost over grid cells. Grid truth
-//! itself is never mutated for images (placement records live in the
-//! image layer, not in cells), except for app-emitted `U+10EEEE`
-//! placeholder runs, which occupy ordinary cells by design.
+//! at present time non-negative-`z` images composite above grid cells while
+//! negative-`z` images composite below text (kitty layering, issue #2875).
+//! Grid truth itself is never mutated for images (placement records live in
+//! the image layer, not in cells), except for app-emitted `U+10EEEE`
+//! placeholder runs, which occupy ordinary cells by design (and keep a text
+//! stand-in in the inspection projection, see
+//! [`bitty_term_state::KITTY_IMAGE_TEXT_FALLBACK`]).
 //!
 //! Queries (`a=q`) are answered here (S2, #1849) in spec-exact wire
 //! shape (`recording/references/kitty@0b12ed8`, GPL-3.0-only:
@@ -1758,6 +1761,86 @@ impl Runtime {
             self.pending_full_redraw = true;
             self.invalidate_kitty_raster_cache();
         }
+    }
+
+    /// Mirrors a bodiless `a=p` placement of an already-transmitted image
+    /// into the rich pixel layer (issue #2875).
+    ///
+    /// `a=p` names an image by wire id and places it at the cursor without
+    /// carrying pixels; terminal truth records the anchor, spans, and `z=`
+    /// in [`bitty_term_state::PlacementStore`], but until this arm ran the
+    /// pixel layer never learned about it, so a client that transmits with
+    /// `a=t` and then places with `a=p` showed nothing. This seam resolves
+    /// the stored root through the origin-scoped wire map
+    /// ([`bitty_rich::KittyImageLayer::find_root_for_origin`]) and re-uses
+    /// the same admission path as a transmit-and-display placement
+    /// (`display_for_origin_with_wire`), including per-origin quotas and
+    /// the `(origin, wire image, wire placement)` identity that protocol
+    /// deletes match.
+    ///
+    /// A pinned re-put (`p != 0`) replaces the rendered placement instead of
+    /// accumulating a duplicate, mirroring the terminal-truth `upsert`.
+    /// Anonymous `p=0` placements accumulate on both layers.
+    ///
+    /// Callers pass the anchor captured *before* terminal truth applied the
+    /// command (the same cursor cell truth anchored on, since `a=p` advances
+    /// the cursor past the span unless `C=1`).
+    ///
+    /// Returns `false` when the command names nothing painted: `i=0`
+    /// (anonymous), no stored image for this origin, or a placement-quota
+    /// refusal. Every refusal paints nothing and evicts nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kitty_place_stored(
+        &mut self,
+        anchor_col: u16,
+        anchor_row: u16,
+        scrollback_base: usize,
+        cols: u16,
+        rows: u16,
+        z: i32,
+        wire_image: u32,
+        wire_placement: u32,
+    ) -> bool {
+        if wire_image == 0 {
+            return false;
+        }
+        self.sync_kitty_screen();
+        let Some(image) = self
+            .kitty_images
+            .find_root_for_origin(self.kitty_origin, wire_image)
+        else {
+            return false;
+        };
+        // A pinned put replaces the rendered placement, exactly like the
+        // terminal-truth upsert. Without this a repaint after every
+        // `a=p,p=N` would stack duplicate blits.
+        if wire_placement != 0 {
+            self.kitty_images
+                .delete_by_wire(self.kitty_origin, wire_image, Some(wire_placement));
+        }
+        let metrics = self.live_cell_metrics();
+        let rich_metrics = bitty_rich::CellMetrics {
+            width: metrics.width,
+            height: metrics.height,
+        };
+        let placed = self.kitty_images.display_for_origin_with_wire(
+            image,
+            anchor_col,
+            anchor_row,
+            cols,
+            rows,
+            rich_metrics,
+            scrollback_base,
+            z,
+            self.kitty_origin,
+            wire_image,
+            wire_placement,
+        );
+        if placed.is_err() {
+            return false;
+        }
+        self.pending_full_redraw = true;
+        true
     }
 
     /// Answers one Kitty `a=q` query with at most one bounded reply (S2, #1849).

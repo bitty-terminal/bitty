@@ -1169,6 +1169,43 @@ impl Runtime {
                         _ => {}
                     }
                 }
+                // Issue #2875: a bodiless `a=p` on an already-stored image is
+                // a pixel placement too. Capture the pre-apply anchor (truth
+                // advances the cursor past the span), then mirror the
+                // placement into the rich layer after truth admits it.
+                // Virtual prototypes and relative placements are excluded:
+                // the former paint from `U+10EEEE` runs, the latter need a
+                // resolved parent anchor the rich layer does not model.
+                let bodiless_place = if let TerminalAction::KittyGraphics {
+                    action_a: Some('p'),
+                    cols_c,
+                    rows_r,
+                    control,
+                    ..
+                } = &action
+                {
+                    if !control.is_virtual_placement()
+                        && !control.has_parent()
+                        && (*cols_c != 0 || *rows_r != 0)
+                        && control.image_id != 0
+                    {
+                        let cursor = self.state.cursor().position;
+                        Some((
+                            cursor.col,
+                            cursor.row,
+                            self.state.scrollback_len(),
+                            *cols_c,
+                            *rows_r,
+                            control.z_index,
+                            control.image_id,
+                            control.placement_id,
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let damage = self.state.apply(&action);
                 if !damage.regions.is_empty() {
                     let generation = damage.generation;
@@ -1225,6 +1262,26 @@ impl Runtime {
                         let _ = self.kitty_images.register_virtual_for_origin(
                             origin, image, placement, None, cols, rows, 0, 0, base,
                         );
+                    }
+                }
+                // Issue #2875: mirror an admitted bodiless `a=p` into the
+                // pixel layer so a `t`-then-`p` client paints. Truth already
+                // refused spanless commands above, so the captured spans are
+                // non-zero here; a missing stored image still paints nothing
+                // (fail closed, like a dangling transmit).
+                if let Some((col, row, base, cols, rows, z, image, pin)) = bodiless_place {
+                    // Mirror only what truth actually anchored at this cell:
+                    // a refused placement must not paint.
+                    let recorded =
+                        self.state
+                            .kitty_placements()
+                            .get(image, pin)
+                            .is_some_and(|placed| {
+                                placed.anchor_col == u32::from(col)
+                                    && placed.anchor_row == u32::from(row)
+                            });
+                    if recorded {
+                        let _ = self.kitty_place_stored(col, row, base, cols, rows, z, image, pin);
                     }
                 }
                 continue;

@@ -53,6 +53,34 @@ use bitty_vt::{Color, Rgb};
 /// The Kitty Unicode placeholder base scalar.
 pub const KITTY_PLACEHOLDER: char = '\u{10EEEE}';
 
+/// Text fallback projected for a Kitty image cell (a11y/scene contract).
+///
+/// `U+10EEEE` is a private-use scalar: a screen reader, a log scraper, or a
+/// `bitty ctl terminal text` reader sees an unreadable codepoint where an
+/// image was painted. Every text projection of the grid therefore replaces a
+/// placeholder cell with the Unicode OBJECT REPLACEMENT CHARACTER, the
+/// conventional inline-image stand-in, so the cell reads as "an image is
+/// here" instead of an invisible private-use glyph. This is the whole
+/// contract: image cells stay ordinary grid cells (their text fallback is
+/// never a pixel-only hole), and direct `a=p` placements, which own no grid
+/// cell, are intentionally outside it.
+pub const KITTY_IMAGE_TEXT_FALLBACK: char = '\u{FFFC}';
+
+/// Text fallback for one grid glyph: the object-replacement character for a
+/// Kitty image placeholder cell, `None` for ordinary text.
+///
+/// Callers that project grid cells into a text surface (the `ctl terminal
+/// text` snapshot, accessibility trees) substitute on `Some`, keeping the
+/// image cell's readable stand-in single-sourced here.
+#[must_use]
+pub const fn image_cell_text_fallback(glyph: char) -> Option<char> {
+    if is_kitty_placeholder(glyph) {
+        Some(KITTY_IMAGE_TEXT_FALLBACK)
+    } else {
+        None
+    }
+}
+
 /// Start of the Kitty placeholder reservation window (issue #1400 title).
 pub const KITTY_PLACEHOLDER_RANGE_START: u32 = 0x10EEEE;
 

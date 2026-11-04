@@ -438,7 +438,7 @@ impl Runtime {
     /// [`Self::handle_ime_commit_at`]).
     ///
     /// `now` is read only to decide whether the raw echo of a committing key
-    /// can still be in flight ([`Self::ime_owns_key_press`]); every other
+    /// can still be in flight (`Self::ime_owns_key_press`); every other
     /// branch of the key path is clock-free. A caller that supplies its own
     /// instant therefore gets identical routing with a deadline it can pin,
     /// which is what keeps the echo-window tests independent of how long the

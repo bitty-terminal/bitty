@@ -311,6 +311,7 @@ version = "0.0.32"
 dependencies = [
  "chrono",
  "phodopus",
+ "rustix 1.1.6",
 ]
 
 [[package]]

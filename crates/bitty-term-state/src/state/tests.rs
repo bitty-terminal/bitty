@@ -202,6 +202,68 @@ fn claude_code_header_replays_with_word_gaps() {
     assert_eq!(live_line_text(&s, 0), "Welcome to Claude Code v2.1.296");
 }
 
+/// Replays `bytes` through the real parser into `state`.
+fn feed_bytes(state: &mut State, bytes: &[u8]) {
+    let mut parser = bitty_vt::Parser::new();
+    parser.advance(bytes, |action| {
+        state.apply(&action);
+    });
+}
+
+/// RI (`ESC M`) reverse-scrolls the region at its top margin. `less` scrolls
+/// back one line at a time exactly this way - `ESC [ H`, `ESC M`, then the
+/// line - inside the DECSTBM region it set up. Without the sequence every
+/// region row stays where it was and only the repainted top row changes, so
+/// the screen shows the new line over the old one and the rows below it are
+/// stale: the duplicated-text report of bitty#2873.
+#[test]
+fn esc_reverse_index_scrolls_the_region_down() {
+    let mut s = State::new();
+    feed_bytes(&mut s, b"\x1b[1;10r");
+    for row in 1..=10 {
+        feed_bytes(&mut s, format!("\x1b[{row};1Hline{row}").as_bytes());
+    }
+    feed_bytes(&mut s, b"\x1b[H\x1bM471");
+
+    assert_eq!(live_line_text(&s, 0), "471");
+    assert_eq!(live_line_text(&s, 1), "line1");
+    assert_eq!(live_line_text(&s, 8), "line8");
+    // The region moved down one row, so the old bottom row left it instead of
+    // surviving under a freshly painted line.
+    assert_eq!(live_line_text(&s, 9), "line9");
+    assert!(s.check_invariants().is_ok());
+}
+
+/// The 7-bit ESC form is the same operation as the C1 byte it names, so both
+/// inputs must reach the same state.
+#[test]
+fn esc_reverse_index_matches_the_c1_control() {
+    let mut via_esc = State::new();
+    feed_bytes(&mut via_esc, b"\x1b[1;5r\x1b[3;1Hrow3\x1b[H\x1bM");
+
+    let mut via_c1 = State::new();
+    feed_bytes(&mut via_c1, b"\x1b[1;5r\x1b[3;1Hrow3\x1b[H");
+    via_c1.apply(&TerminalAction::PrintControl(ControlChar(0x8D)));
+
+    assert_eq!(via_esc.state_hash(), via_c1.state_hash());
+}
+
+/// `ESC D` (IND) is a line feed without the carriage return, `ESC E` (NEL) is
+/// a carriage return plus a line feed.
+#[test]
+fn esc_index_and_next_line_advance_the_cursor() {
+    let mut s = State::new();
+    feed_bytes(&mut s, b"\x1b[1;5Habc\x1bDdef");
+    assert_eq!(live_line_text(&s, 0), "    abc");
+    // IND keeps the column the cursor stopped at after "abc".
+    assert_eq!(live_line_text(&s, 1), "       def");
+
+    feed_bytes(&mut s, b"\x1b[3;7Hxy\x1bEzw");
+    assert_eq!(live_line_text(&s, 2), "      xy");
+    assert_eq!(live_line_text(&s, 3), "zw");
+    assert!(s.check_invariants().is_ok());
+}
+
 #[test]
 fn absolute_column_move_clamps_without_wrapping() {
     let mut s = State::new();

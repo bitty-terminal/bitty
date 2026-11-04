@@ -1903,6 +1903,59 @@ mod tests {
     }
 
     #[test]
+    fn module_failure_on_reload_is_refused_and_keeps_the_last_good_plan() {
+        // bitty#2869: a loader refusal is a strict failure on the reload path.
+        // The generation is re-evaluated from disk, so a module edit is seen,
+        // but a refusal at any point leaves the running plan untouched.
+        let dir = temp_dir("reload-module");
+        std::fs::create_dir_all(dir.join("lua")).expect("module root");
+        std::fs::write(
+            dir.join("lua").join("theme.lua"),
+            "return { theme = 'tokyo-night' }\n",
+        )
+        .expect("write module");
+        let path = dir.join("init.lua");
+        std::fs::write(
+            &path,
+            "return { theme = require('theme').theme, font = { family = \"Mono\", size = 13.0 } }\n",
+        )
+        .expect("write valid config");
+        let mut args = crate::cli::Args::new();
+        args.config_path = Some(path.to_string_lossy().into_owned());
+        let baseline = crate::config_cli::load_app_config(&args)
+            .expect("a module graph loads")
+            .effective;
+        let resolver_args = args.clone();
+        clear();
+        install_with(
+            baseline,
+            Box::new(move || {
+                crate::config_cli::load_app_config(&resolver_args).map(|app| {
+                    crate::config_reload::ResolvedConfig {
+                        effective: app.effective,
+                        profile: app.profile_name,
+                    }
+                })
+            }),
+            Some(path.clone()),
+        );
+        let mut runtime = bitty_runtime::Runtime::with_defaults().expect("runtime");
+        let launched = runtime.config().clone();
+
+        std::fs::write(&path, "return { theme = require('gone').theme }\n")
+            .expect("write refusing config");
+        let info = reload_requested(&mut runtime).expect("context installed");
+        assert_eq!(info.kind, "load-error", "{info:?}");
+        assert!(!info.applied);
+        let message = info.message.as_deref().unwrap_or_default();
+        assert!(message.contains("E_CONFIG_MODULE_NOT_FOUND"), "{message}");
+        assert!(message.contains("module_spec=\"gone\""), "{message}");
+        // The previous plan is still the running plan.
+        assert_eq!(runtime.config().font_size, launched.font_size);
+        clear();
+    }
+
+    #[test]
     fn invalid_config_edit_keeps_the_last_good_plan() {
         // CTX-1490 (issue #2580): live reload stays strict. An invalid edit
         // must report `load-error` and keep the last-good plan instead of

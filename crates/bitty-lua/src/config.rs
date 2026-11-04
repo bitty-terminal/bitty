@@ -13,13 +13,24 @@
 //! The sandbox builds [`phodopus::Lua::core`]: pure-computation base library
 //! (`type`, `tostring`, `pairs`, `ipairs`, `error`, `assert`, `select`,
 //! `pcall`, `next`, `rawget`/`rawset`, `setmetatable`/`getmetatable`, …),
-//! `coroutine`, `math`, `string`, and `table` (inventory verified
-//! empirically; see `denied_globals_fail_closed`). Explicitly **absent**
-//! (default deny): `print`, `tonumber`, `io`, `os`, `debug`,
-//! `package`/`require`, `load`/`loadfile`/`dofile`, `_G`, and any host
-//! callback — the chunk cannot read files, spawn processes, touch the
-//! network, or reach host objects. A chunk that references a denied global
-//! fails closed with a Lua runtime error, exactly like a misbehaving plugin.
+//! `math`, `string`, and `table` (inventory verified empirically; see
+//! `denied_globals_fail_closed`). Explicitly **absent** (default deny):
+//! `print`, `tonumber`, `io`, `os`, `debug`, `package`, `load`/`loadfile`/
+//! `dofile`, `_G`, `coroutine`, and any host callback — the chunk cannot read
+//! files, spawn processes, touch the network, or reach host objects. A chunk
+//! that references a denied global fails closed with a Lua runtime error,
+//! exactly like a misbehaving plugin.
+//!
+//! `require` is the one exception, and it is not ambient authority: a
+//! file-backed configuration evaluation installs the restricted,
+//! single-root module loader in [`crate::config_require`] (bitty#2869,
+//! `config-lua-require-contract.md`). The loader's entire authority is
+//! reading regular files under `<config-dir>/lua`, bounded by a name grammar,
+//! a descriptor-anchored containment walk, per-file and aggregate caps, and
+//! the same RC-1/RC-2 account as the entry chunk. A VM without that install
+//! (`--safe`, an in-memory parse, the plugin runtime, the settings VM) has no
+//! `require` at all.
+//!
 //! Metatables can be set but are ignored: extraction reads raw table contents
 //! only, so `__index` tricks cannot smuggle values past validation.
 //!
@@ -71,6 +82,10 @@
 //!   contents beyond the offending line.
 
 use phodopus::{Context, ExecutorMode, Table, Value, Variadic};
+
+use crate::config_require::{
+    ConfigModuleAggregate, ConfigModuleCode, ConfigModuleDiagnostic, ConfigModulePhase,
+};
 
 use crate::{DriveOutcome, LuaVm, SuspendReason, VmError};
 
@@ -853,6 +868,16 @@ pub enum ConfigOutcome {
         /// Diagnostic message.
         message: String,
     },
+    /// The restricted configuration module loader refused a `require`.
+    ///
+    /// One typed record, from the `E_CONFIG_MODULE_*` taxonomy. A refusal
+    /// ends the generation even when the requiring chunk caught the Lua error
+    /// with `pcall`, so this variant can accompany a chunk that otherwise
+    /// completed — the host never adopts a partially good module graph.
+    ModuleRefused {
+        /// The typed loader diagnostic.
+        diagnostic: Box<ConfigModuleDiagnostic>,
+    },
 }
 
 /// Evaluate one config chunk and extract [`ConfigData`].
@@ -874,19 +899,20 @@ pub trait ConfigEval {
 
 impl ConfigEval for LuaVm {
     fn eval_config(&mut self, code: &str) -> Result<ConfigOutcome, VmError> {
-        match self.drive_chunk(code)? {
+        let outcome = self.drive_chunk(code)?;
+        let evaluated = match outcome {
             DriveOutcome::Suspended {
                 reason,
                 instructions_used,
                 wall_elapsed_ms,
                 memory_used,
-            } => Ok(ConfigOutcome::Suspended {
+            } => ConfigOutcome::Suspended {
                 reason,
                 instructions_used,
                 wall_elapsed_ms,
                 memory_used,
-            }),
-            DriveOutcome::Failed { message } => Ok(ConfigOutcome::LuaError { message }),
+            },
+            DriveOutcome::Failed { message } => ConfigOutcome::LuaError { message },
             DriveOutcome::Ready { stashed } => {
                 let mode = self.lua.enter(|ctx| ctx.fetch(&stashed).mode());
                 if mode != ExecutorMode::Result {
@@ -922,20 +948,77 @@ impl ConfigEval for LuaVm {
                     }
                 });
                 match taken {
-                    Taken::LuaErr(message) => Ok(ConfigOutcome::LuaError { message }),
-                    Taken::BadMode(message) => Ok(ConfigOutcome::LuaError { message }),
+                    Taken::LuaErr(message) => ConfigOutcome::LuaError { message },
+                    Taken::BadMode(message) => ConfigOutcome::LuaError { message },
                     Taken::Values(values) => match ConfigData::from_returns(&values) {
-                        Ok(data) => Ok(ConfigOutcome::Completed {
+                        Ok(data) => ConfigOutcome::Completed {
                             data: Box::new(data),
                             instructions_used: self.instructions_used,
                             wall_elapsed_ms: self.wall_elapsed_ms,
                             memory_used: self.memory_used,
                             warning_triggered: self.warning_triggered,
-                        }),
-                        Err(message) => Ok(ConfigOutcome::ShapeError { message }),
+                        },
+                        Err(message) => ConfigOutcome::ShapeError { message },
                     },
                 }
             }
+        };
+        // A loader refusal outranks the chunk's own result: it ends the
+        // generation even when `pcall` swallowed the Lua error, and it is the
+        // typed record the four configuration paths report.
+        Ok(self.attribute_module_failure(evaluated))
+    }
+}
+
+impl LuaVm {
+    /// Re-attribute a completed evaluation to the module loader.
+    ///
+    /// Three sources, in precedence order: a recorded loader refusal (any
+    /// code, including one a `pcall` caught), an RC-1/RC-2 budget that tripped
+    /// while a module was loaded, and a Lua error raised by a module chunk. A
+    /// budget or runtime failure in the *entry* chunk keeps its shipped
+    /// meaning — it is not a module refusal and must not be re-coded as one.
+    fn attribute_module_failure(&self, evaluated: ConfigOutcome) -> ConfigOutcome {
+        if let Some(diagnostic) = self.config_module_refusal() {
+            return ConfigOutcome::ModuleRefused {
+                diagnostic: Box::new(diagnostic),
+            };
+        }
+        let in_flight = self.config_module_in_flight();
+        let modules = self.config_module_stats().map_or(0, |stats| stats.modules);
+        match evaluated {
+            ConfigOutcome::Suspended { reason, .. } if modules > 0 || in_flight.is_some() => {
+                let mut diagnostic = ConfigModuleDiagnostic::new(
+                    ConfigModuleCode::Budget,
+                    ConfigModulePhase::Budget,
+                )
+                .with_aggregate(ConfigModuleAggregate::Budget)
+                .with_detail(format!(
+                    "generation budget tripped inside a module: {reason:?}"
+                ));
+                if let Some(spec) = in_flight {
+                    diagnostic = diagnostic.with_spec(spec.into_bytes());
+                }
+                ConfigOutcome::ModuleRefused {
+                    diagnostic: Box::new(diagnostic),
+                }
+            }
+            ConfigOutcome::LuaError { message } => match in_flight {
+                Some(spec) => {
+                    let diagnostic = ConfigModuleDiagnostic::new(
+                        ConfigModuleCode::Eval,
+                        ConfigModulePhase::Evaluate,
+                    )
+                    .with_spec(spec.as_bytes().to_vec())
+                    .with_source(crate::config_require::source_location(&spec, &message))
+                    .with_detail(message);
+                    ConfigOutcome::ModuleRefused {
+                        diagnostic: Box::new(diagnostic),
+                    }
+                }
+                None => ConfigOutcome::LuaError { message },
+            },
+            other => other,
         }
     }
 }
@@ -4225,12 +4308,19 @@ mod tests {
 
     #[test]
     fn denied_globals_fail_closed() {
-        // No io/os/debug/package ambient authority in the config sandbox.
-        let mut vm = LuaVm::new("test.deny");
+        // No io/os/debug/package/load ambient authority on the configuration
+        // VM, and no `require` unless the restricted configuration loader was
+        // installed (bitty#2869): this VM has none, so `require` is a
+        // nil-global runtime error, not a load.
+        let mut vm =
+            crate::gate::build_config_vm("test.deny", Some(crate::gate::VmBudgets::default()))
+                .expect("config VM");
         for code in [
             r#"return { theme = io.popen("x") }"#,
             r#"return { theme = os.getenv("HOME") }"#,
-            r#"return require("x")"#,
+            r#"return { theme = require("x") }"#,
+            r#"return { theme = load("return 1")() }"#,
+            r#"return { theme = dofile("x") }"#,
         ] {
             match vm.eval_config(code).expect("no refuse") {
                 ConfigOutcome::LuaError { .. } => {}

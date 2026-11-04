@@ -7,17 +7,21 @@
 use super::*;
 use crate::ConfigOutcome;
 use crate::config::ConfigEval;
+#[cfg(unix)]
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The test-only swap action: one closure over the canonical module path.
+#[cfg(unix)]
 type SwapHook = Box<dyn Fn(&Path)>;
 
+#[cfg(unix)]
 thread_local! {
     static SWAP_HOOK: RefCell<Option<SwapHook>> = const { RefCell::new(None) };
 }
 
 /// Called between canonicalization and the anchored open (test builds only).
+#[cfg(unix)]
 pub(crate) fn test_swap_hook(path: &Path) {
     SWAP_HOOK.with(|hook| {
         if let Some(swap) = hook.borrow().as_ref() {
@@ -26,6 +30,7 @@ pub(crate) fn test_swap_hook(path: &Path) {
     });
 }
 
+#[cfg(unix)]
 fn set_swap_hook(hook: Option<SwapHook>) {
     SWAP_HOOK.with(|cell| *cell.borrow_mut() = hook);
 }

@@ -737,7 +737,7 @@ impl ConfigModuleGeneration {
         // Test-only window between canonicalization and the anchored open, so
         // the "component swapped after the containment check" control can be
         // driven deterministically. Never compiled into a shipped binary.
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         tests::test_swap_hook(canonical);
         let opened = {
             #[cfg(unix)]

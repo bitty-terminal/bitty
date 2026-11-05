@@ -33,23 +33,26 @@ order, host-consent and observer grants, the owner-private audit sink, the
 re-check at every privileged boundary.
 
 bitty#2790 adds the process half and the terminal content plane. A
-`session.create` with `kind: worker`, or `kind: terminal` plus a bounded spawn
-specification, parses that specification, reserves the two-phase journal
-record, spawns through the selected containment plan into the per-session
-identity, commits the observed identity, and binds generation 1 before the
-session is exposed as running. A terminal create without a spawn specification
-keeps the `1.2` registry-only shape (`created`, generation 0, no content
-plane) for metadata-only clients. Both kinds share one spawn implementation;
-the kind decides only whether the bound PTY owns a terminal content plane, so a
-worker-kind PTY is resizable but answers every content method
-`Denied/NotRunning`. `session.resize` applies to any bound PTY, terminal or
-worker; only `session.read`, `session.write`, and `session.subscribe` require a
-bound terminal whose worker still holds a live content plane. All four run
-under the negotiate-time terminal scopes and the current controller lease. The
-spawn path is Linux-only, and `worker_sessions`
-is compiled from the cell truth and narrowed to the containment plan the
-startup probe selected, so a daemon can never advertise a path it does not
-serve.
+`session.create` with `kind: terminal` plus a bounded spawn specification
+parses that specification, reserves the two-phase journal record, spawns through
+the selected containment plan into the per-session identity, commits the
+observed identity, and binds generation 1 before the session is exposed as
+running. A terminal create without a spawn specification keeps the `1.2`
+registry-only shape (`created`, generation 0, no content plane) for
+metadata-only clients. `session.resize` applies to any bound PTY;
+`session.read`, `session.write`, and `session.subscribe` require a bound
+terminal whose worker still holds a live content plane. All four run under the
+negotiate-time terminal scopes and the current controller lease. The spawn path
+is Linux-only and narrowed to the containment plan the startup probe selected.
+
+The `kind: worker` path is **reserved, not served**. Contract `D-01` requires
+`worker_sessions: false` in every v0.2.0 build until an accepted ADR 0019
+amendment names worker supervision in the slice and an independent security
+review accepts the spawn, environment, credential, cleanup, and audit behavior.
+The pool, PTY supervision, bind, resize, and their unit tests stay compiled for
+that amendment, but `session.create` with `kind: worker` answers
+`Denied/UnsupportedCapability` before the consent re-check, the spawn-spec parse,
+the journal reservation, or any process work.
 
 bitty#2792 adds the delivered event wire: an opted-in connection receives
 per-lease event frames on the negotiated socket, drained from the bounded
@@ -84,15 +87,17 @@ owner-private orphan journal, runs the startup containment scan, accepts up to
 and stops on `daemon.stop` or a `SIGTERM`/`SIGINT` drain. Plain `bittyd`
 creates no runtime file, binds no endpoint, and prints the status, including
 the selected containment plan. The daemon opens no TCP listener and signals
-only processes inside a recorded containment identity; a worker is spawned
-once, drained non-blockingly on the poll tick, and reaped through the plan
-before its terminal record is written.
+only processes inside a recorded containment identity; a contained child is
+spawned once, drained non-blockingly on the poll tick, and reaped through the
+plan before its terminal record is written. The `kind: worker` path is reserved
+and never reaches a spawn in this build.
 
 The contract areas that are deliberately deferred, and the typed answer the
 running service gives today:
 
 | Area                                                                                      | Owner                        | Answer today                                                                                                                                                                         |
 | ----------------------------------------------------------------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Worker hosting (`kind: worker`)                                                           | bitty#2608                   | reserved: `worker_sessions` is `false` in every build and every worker create is `Denied/UnsupportedCapability` before any process work                                              |
 | Terminal content authority for observers                                                  | terminal contract follow-up  | content is controller-only in this slice: an observer with `terminal.inspect` is refused `Denied/ControllerRequired`; a future revision may define an explicit observer read grant   |
 | Worker-kind content plane                                                                 | bitty#2790 follow-up         | a worker is a service process: `session.resize` applies to its PTY, while `session.read`/`write`/`subscribe` answer `Denied/NotRunning`                                              |
 | Worker rebind and restart across generations                                              | bitty#2790 follow-up         | a worker binds generation 1 exactly once; a terminal record is never revived and no automatic restart exists                                                                         |
@@ -115,24 +120,25 @@ four stay out of scope.
 Source: contract decisions `D-01`, `D-08`, `D-11`, and the "Handshake" section
 of the service surface.
 
-| Item                 | Value                                                                                                                                                                         | Where                                                       |
-| -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
-| Service API version  | `{major: 1, minor: 3}`                                                                                                                                                        | `contract::SERVICE_API_VERSION`                             |
-| Minimum client minor | `0` (`1.0..=1.3` accepted)                                                                                                                                                    | `contract::MIN_CLIENT_MINOR`                                |
-| Capabilities         | `terminal_sessions`, `events`, `observer_grants`, `control_transfer`, `idempotent_mutations` enabled; `worker_sessions` compiled for the cell and narrowed to the probed plan | `contract::CAPABILITIES`, `worker::sessions_served`         |
-| Handshake method     | `daemon.negotiate`                                                                                                                                                            | `contract::NEGOTIATE_METHOD`                                |
-| Negotiation rule     | same major, client minor in `[min_client_minor, server_minor]`; every other case is `VersionMismatch` before any operation                                                    | `handshake::negotiate`                                      |
-| Limits advertisement | every `D-14` row plus the inherited `RC-9`/`RC-10` bounds as `{effective, default, system_max}`                                                                               | `handshake::NegotiateResponse`                              |
-| Worker sessions      | `true` on a Linux cell whose probe selected an enforced plan, `false` everywhere else; `1.0` clients stay accepted because `min_client_minor` is `0`                          | `worker::WORKER_SESSIONS_SERVED`, `worker::sessions_served` |
+| Item                 | Value                                                                                                                                                                | Where                                                                         |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Service API version  | `{major: 1, minor: 3}`                                                                                                                                               | `contract::SERVICE_API_VERSION`                                               |
+| Minimum client minor | `0` (`1.0..=1.3` accepted)                                                                                                                                           | `contract::MIN_CLIENT_MINOR`                                                  |
+| Capabilities         | `terminal_sessions`, `events`, `observer_grants`, `control_transfer`, `idempotent_mutations` enabled; `worker_sessions` reserved and `false` in every build (`D-01`) | `contract::CAPABILITIES`, `worker::WORKER_SESSIONS_SERVED`                    |
+| Handshake method     | `daemon.negotiate`                                                                                                                                                   | `contract::NEGOTIATE_METHOD`                                                  |
+| Negotiation rule     | same major, client minor in `[min_client_minor, server_minor]`; every other case is `VersionMismatch` before any operation                                           | `handshake::negotiate`                                                        |
+| Limits advertisement | every `D-14` row plus the inherited `RC-9`/`RC-10` bounds as `{effective, default, system_max}`                                                                      | `handshake::NegotiateResponse`                                                |
+| Worker sessions      | `false` on every cell and in every build until the `D-01` amendment marker is set; `1.0` clients stay accepted because `min_client_minor` is `0`                     | `worker::WORKER_SESSIONS_SERVED`, `worker::WORKER_HOSTING_AMENDMENT_ACCEPTED` |
 
 The capability bits describe the v1 contract surface this daemon serves. A
-non-served cell or a Linux cell whose probe selected no mechanism advertises
-`worker_sessions: false` and answers a worker create with
-`Denied/UnsupportedCapability`; a served daemon advertises `true` and gates the
-same call by `process.spawn`, `session.host` consent, a live host grant, and the
-bounded spawn specification. A terminal create that supplies a spawn
-specification uses the same gate and answers `Denied/UnsupportedCapability`
-where the plan cannot enforce containment; a terminal create without a
+consumer can target the reserved `worker` kind and receives the typed answer:
+`worker_sessions: false`, and a worker create refused with
+`Denied/UnsupportedCapability` before any process work. The pool is compiled and
+unit-tested for an amended build; no cell, feature, probe, or configuration can
+advertise the bit while `worker::WORKER_HOSTING_AMENDMENT_ACCEPTED` is `false`.
+A terminal create that supplies a spawn specification uses the separately
+accepted 1.3 terminal-spawn slice and answers `Denied/UnsupportedCapability`
+only where the containment plan cannot enforce it; a terminal create without a
 specification is the registry-only compatibility shape and needs no containment
 plan. `events` is compiled from `contract::EVENTS_SERVED`
 and is `true` exactly where the admission loop serves pushed frames (the Linux
@@ -712,17 +718,26 @@ Tests must not be read as a cross-cell claim.
 
 ## Worker spawn, generation 1, and resize (bitty#2790)
 
-`session.create` takes an optional `kind` (`terminal` by default). A worker
-create always spawns; a terminal create spawns when it supplies the bounded
-spawn specification and otherwise keeps the `1.2` registry-only shape. The
-order is frozen and observable:
+`session.create` takes an optional `kind` (`terminal` by default). The worker
+kind is **reserved, not served**: `worker_sessions` is `false` in every build
+(`D-01`), so a `session.create` with `kind: worker` is refused with
+`Denied/UnsupportedCapability` at step 2 below and nothing after that point is
+reachable for it — no consent re-check, no spawn-specification parse, no
+idempotency entry, no journal reservation, no child, and no session record.
+Steps 3-6 exist on the terminal spawn path and become reachable for a worker
+create only after an accepted ADR 0019 amendment names worker supervision in the
+slice and an independent security review accepts the spawn, environment,
+credential, cleanup, and audit behaviour. A terminal create spawns on Linux when
+it supplies the bounded spawn specification and otherwise keeps the `1.2`
+registry-only shape. For that terminal path the order is frozen and observable:
 
 1. stage 6 (transport and service scope) runs in the dispatcher before the
    handler: a connection without `process.spawn` is `Denied/ScopeViolation`
    even when `session.host` is present;
-2. the handler rejects an unknown `kind` as `InvalidRequest`; a worker create
-   on a non-served cell, or a terminal create with a spawn specification whose
-   containment plan cannot enforce it, is `Denied/UnsupportedCapability`;
+2. the handler rejects an unknown `kind` as `InvalidRequest`; a `kind: worker`
+   create is `Denied/UnsupportedCapability` on every cell in every build
+   (`D-01`), and a terminal create with a spawn specification whose containment
+   plan cannot enforce it is `Denied/UnsupportedCapability`;
 3. stage 7 requires `session.host` (a consumed, live host grant), otherwise
    `Denied/ConsentRequired`;
 4. the bounded spawn specification parses; a malformed field is
@@ -779,10 +794,17 @@ assumption: this seam spawns through `fork` + `execvp`, and the C library
 retries an `ENOEXEC` image through `/bin/sh`, so an executable file with a
 foreign header starts a shell (which reports the format as exit status 127)
 instead of refusing the spawn. The `exec_not_executable` class is therefore
-reached through the errno mapping, and
-`service_loop.rs::an_unrecognised_executable_format_is_run_by_the_shell_and_never_refused`
-pins the substitution so a future direct-`execve` seam cannot change it
-silently.
+reached through the errno mapping, which the live tests
+`containment::exec::tests::exec_errnos_are_classified_and_other_spawn_errnos_are_not`
+and `service::dispatch::tests::the_spawn_failure_funnel_maps_every_refusal_to_its_wire_class`
+pin down. The end-to-end fixture for the substitution lives in
+`tests/service_loop.rs` as
+`an_unrecognised_executable_format_is_run_by_the_shell_and_never_refused`; it
+spawns a real worker, so `D-01` marks it `#[ignore]` and it must be re-enabled
+with the ADR 0019 amendment
+(`bittyd-session-host-contract.md` lines 186-187 and 192-194 keep the hosted
+worker path disabled, and forbid an in-process fallback while it is disabled),
+so a future direct-`execve` seam cannot change the substitution silently.
 
 `WorkerPool::forget` terminates a handle that is not already settled with the
 same bounded escalation and reaps its leader before dropping it, so retiring a
@@ -1232,16 +1254,16 @@ methods and two transport grants (`terminal.inspect` and `terminal.input`;
 shape, and a `1.0` through `1.2` client that ignores unknown fields keeps
 working.
 
-| Method                                    | Added key(s)                                                                  | Rule                                                                                                                                                                                                                                                                                                                                                                                                            |
-| ----------------------------------------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| every method returning a `session` object | `controller_present` (bool), `pending_observer_grants` (u16)                  | presence only: the controller's `attach_id` is never served. The count is bounded by `max_pending_observer_grants_per_session`; a terminal session serves `0` for both because no lease or grant it still stores can be used.                                                                                                                                                                                   |
+| Method                                    | Added key(s)                                                                  | Rule                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| every method returning a `session` object | `controller_present` (bool), `pending_observer_grants` (u16)                  | presence only: the controller's `attach_id` is never served. The count is bounded by `max_pending_observer_grants_per_session`; a terminal session serves `0` for both because no lease or grant it still stores can be used.                                                                                                                                                                                                                                                                                                                                                               |
 | every method returning a `session` object | `spawn_failure` (string)                                                      | present exactly when `terminal_reason` is `spawn_failed` (bitty#2790). A static class, never a message and never an errno number: `pty_allocation`, `exec_permission_denied`, `exec_not_executable`, `exec_not_found`, `spawn_error`, `bind_deadline`, `not_bindable`, `bind_timeout`, or `post_spawn_refusal`. `cleanup` still carries what the plan could prove; the pair is what tells an `exec` refusal from a PTY allocation failure. The pushed `session_terminal` marker keeps its frozen envelope and does not carry the class, so a client that needs it reads the session object. |
-| `session.list` operator view              | `owner: {uid, pid}`                                                           | only with `daemon.inspect`, and only as the two numeric facts captured at create. An ordinary view omits the key (omit, never `null`); no path, argv, gid, or start time is retained or served. `session.status` never carries it.                                                                                                                                                                              |
-| `session.attach` fresh success            | `scopes` (array)                                                              | the connection's effective lease scopes: the same service-then-transport names and order as the handshake `scopes`. A keyed controller replay does not re-assert them.                                                                                                                                                                                                                                          |
-| `session.attach` every success            | `server_monotonic_ms` (u64)                                                   | the server clock at the request; a replay carries it too.                                                                                                                                                                                                                                                                                                                                                       |
-| `session.attach` event-opted connection   | `backlog`, `backlog_truncated`, `earliest_revision`                           | already delivered by bitty#2792; absent when the connection did not opt into pushed events.                                                                                                                                                                                                                                                                                                                     |
-| `lease.heartbeat`                         | `server_monotonic_ms` (u64)                                                   | the same clock as `lease_expires_at_ms`; the singular `attach_id` request form is unchanged.                                                                                                                                                                                                                                                                                                                    |
-| `daemon.status`                           | `daemon_pid` (u32), `uptime_ms` (u64), `orphans.records.reaped`/`stale` (u64) | `daemon_pid` is observational only. `uptime_ms` is `now - daemon start` on the server monotonic clock. The `orphans.records` object exists only when `orphans.verify` is `served`; the unsupported branch carries `verify`, `mechanism`, `cell`, and `reason` and omits `records`. The journal removes a reaped or stale record, so those two fields are this instance's cumulative counts, not stored classes. |
+| `session.list` operator view              | `owner: {uid, pid}`                                                           | only with `daemon.inspect`, and only as the two numeric facts captured at create. An ordinary view omits the key (omit, never `null`); no path, argv, gid, or start time is retained or served. `session.status` never carries it.                                                                                                                                                                                                                                                                                                                                                          |
+| `session.attach` fresh success            | `scopes` (array)                                                              | the connection's effective lease scopes: the same service-then-transport names and order as the handshake `scopes`. A keyed controller replay does not re-assert them.                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `session.attach` every success            | `server_monotonic_ms` (u64)                                                   | the server clock at the request; a replay carries it too.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `session.attach` event-opted connection   | `backlog`, `backlog_truncated`, `earliest_revision`                           | already delivered by bitty#2792; absent when the connection did not opt into pushed events.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `lease.heartbeat`                         | `server_monotonic_ms` (u64)                                                   | the same clock as `lease_expires_at_ms`; the singular `attach_id` request form is unchanged.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `daemon.status`                           | `daemon_pid` (u32), `uptime_ms` (u64), `orphans.records.reaped`/`stale` (u64) | `daemon_pid` is observational only. `uptime_ms` is `now - daemon start` on the server monotonic clock. The `orphans.records` object exists only when `orphans.verify` is `served`; the unsupported branch carries `verify`, `mechanism`, `cell`, and `reason` and omits `records`. The journal removes a reaped or stale record, so those two fields are this instance's cumulative counts, not stored classes.                                                                                                                                                                             |
 
 No addition serves terminal text, PTY bytes, a content handle, another
 session's fields, or caller bytes. A count is a count, never a grant id or
@@ -1358,11 +1380,13 @@ Corpus rules:
   enables it) and records a typed
   `cell-not-servable: request_deadline_seam` skip without it;
 - cell-dependent values are seeded variables, never literals: `@worker_sessions`
-  is the served capability of the cell a driver models (the reference fake
-  models a served worker cell; the real driver seeds the readiness probe's
-  served-cell answer)
-  and `@cwd` is a directory the host reports as absolute, so the corpus never
-  asserts a Linux-only capability or a Unix root path on Windows or macOS;
+  is the reserved worker capability every driver models, which is `false` on
+  both the reference fake and the real served cell (`D-01`), and `@cwd` is a
+  directory the host reports as absolute, so the corpus never asserts a
+  Linux-only capability or a Unix root path on Windows or macOS. The harness
+  facts also carry a `terminal_spawn` feature (modeled, not advertised on the
+  wire) so the accepted 1.3 terminal-spawn vectors keep their typed
+  `cell-not-servable` skip on a plan that cannot contain a child;
 - `known_defect` rows record the exact failing step and code or result path,
   are excluded from the parity gate, and fail the suite if they pass or fail at
   another step so the marker cannot rot; the corpus currently carries none
@@ -1381,6 +1405,15 @@ Corpus rules:
   `V-49` is real-only: a spawned terminal delivers a `session_content` frame on
   the event wire over the real PTY; the fake records the typed
   `requires-real-pty` skip;
+- `V-03` runs on both drivers and pins `D-01` directly: the handshake advertises
+  `worker_sessions: false`, a consent-bearing worker create (with or without a
+  spawn specification) answers `Denied/UnsupportedCapability`, no session record
+  exists afterwards, and the daemon owns no child process. `V-42` and `V-50`
+  keep the future worker create/bind/resize/stop chain as typed
+  `d01-amendment-required` skips; `V-43` records the
+  `cell-not-servable: worker_sessions` skip. The pool, PTY supervision, bind,
+  resize, and spawn-failure funnel stay covered by the crate unit tests that
+  drive `worker::WorkerPool` and the reserved create path directly;
 - fault injection covers a transport drop during abort, the pre-auth partial
   frame, the frame bound, the pending grant cap, the attach cap, and an
   instance change (restart); queue pressure with an injected outbound cap is

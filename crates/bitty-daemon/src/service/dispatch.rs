@@ -585,13 +585,14 @@ impl Service {
 
     /// The capability set this probed daemon advertises.
     ///
-    /// The build's [`CAPABILITIES`] are the contract target set; the worker
-    /// bit is narrowed to the plan the startup probe actually selected. A
-    /// Linux cell whose cgroup and subreaper probes both failed cannot contain
-    /// a worker tree, so it must not advertise `worker_sessions` and every
-    /// worker create is `Denied/UnsupportedCapability`. The `events` bit is
-    /// compiled from [`crate::contract::EVENTS_SERVED`] and is never narrowed
-    /// per run: delivery either exists in this build's loop or it does not.
+    /// The build's [`CAPABILITIES`] are the contract target set.
+    /// `worker_sessions` is `false` in every v0.2.0 build (`D-01`); the
+    /// startup-plan term can only narrow it further, never enable it, because
+    /// [`crate::worker::sessions_served`] is itself derived from the absent
+    /// amendment marker. Every worker create is therefore
+    /// `Denied/UnsupportedCapability`. The `events` bit is compiled from
+    /// [`crate::contract::EVENTS_SERVED`] and is never narrowed per run:
+    /// delivery either exists in this build's loop or it does not.
     #[must_use]
     pub fn capabilities(&self) -> Capabilities {
         let mut capabilities = CAPABILITIES;
@@ -2140,14 +2141,42 @@ impl Service {
         fields: Option<&Map<String, Value>>,
         now: MonotonicMs,
     ) -> Result<Value, Refusal> {
+        self.session_create_inner(connection, fields, now, false)
+    }
+
+    /// The in-crate spawn tests drive the reserved worker path directly.
+    ///
+    /// It is compiled only for the unit tests of this module (which are
+    /// Linux-only, like the served loop) and is never reachable from the wire:
+    /// [`Self::session_create`] always passes `false`, so the served
+    /// `worker_sessions` truth remains authoritative.
+    #[cfg(all(test, target_os = "linux"))]
+    fn session_create_with_reserved_worker_path(
+        &mut self,
+        connection: &mut Connection,
+        fields: Option<&Map<String, Value>>,
+        now: MonotonicMs,
+    ) -> Result<Value, Refusal> {
+        self.session_create_inner(connection, fields, now, true)
+    }
+
+    fn session_create_inner(
+        &mut self,
+        connection: &mut Connection,
+        fields: Option<&Map<String, Value>>,
+        now: MonotonicMs,
+        reserve_worker_path: bool,
+    ) -> Result<Value, Refusal> {
+        let worker_sessions = self.capabilities().worker_sessions || reserve_worker_path;
         let kind = match string_field(fields, "kind")?.unwrap_or("terminal") {
             "terminal" => SessionKind::Terminal,
             "worker" => {
                 // The frozen order: after the stage-6 create-scope check and
-                // before the stage-7 host-grant liveness re-check. The plan the
-                // startup probe selected is the serve truth, so a Linux cell
-                // that selected no mechanism refuses here too.
-                if !self.capabilities().worker_sessions {
+                // before the stage-7 host-grant liveness re-check. D-01
+                // reserves the kind in every v0.2.0 build, so this refusal
+                // precedes the consent re-check, the spawn-specification
+                // parse, the journal reservation, and any process work.
+                if !worker_sessions {
                     return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
                 }
                 SessionKind::Worker
@@ -2157,9 +2186,11 @@ impl Service {
         // A terminal or worker that will spawn needs the contained PTY plan.
         // The check stays after `kind` and before consent, matching the frozen
         // worker order and avoiding a malformed-spec oracle on a refused cell.
+        // It covers both kinds because a worker can only reach this point in an
+        // amended build, where it needs the same contained plan.
         let wants_spawn = kind == SessionKind::Worker
             || fields.is_some_and(|values| values.get("argv").is_some());
-        if wants_spawn && !self.capabilities().worker_sessions {
+        if wants_spawn && !crate::worker::spawn_path_served(&self.containment) {
             return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
         }
         // Stage 7: the consumed host consent must still be live.
@@ -5222,10 +5253,9 @@ mod tests {
         });
 
         let first = service
-            .dispatch(
+            .session_create_with_reserved_worker_path(
                 &mut creator,
-                ServiceMethod::SessionCreate,
-                &params,
+                params.as_object(),
                 MonotonicMs::from_millis(4),
             )
             .expect_err("the journal is full");
@@ -5242,10 +5272,9 @@ mod tests {
         // The keyed replay answers the stored class and code, not a collapsed
         // `Denied/Internal`.
         let replay = service
-            .dispatch(
+            .session_create_with_reserved_worker_path(
                 &mut creator,
-                ServiceMethod::SessionCreate,
-                &params,
+                params.as_object(),
                 MonotonicMs::from_millis(5),
             )
             .expect_err("the replay stays refused");
@@ -5253,11 +5282,43 @@ mod tests {
         assert_eq!(replay.code(), "LimitExceeded");
     }
 
+    /// Live child processes of the calling thread.
+    ///
+    /// A spawn happens on the thread that calls `fork`/`clone`, so the
+    /// per-task `children` table is the precise process-table check: parallel
+    /// tests that spawn from other threads cannot make this assertion flaky.
+    /// A failed read panics with the path instead of defaulting to zero, so the
+    /// "no child" evidence cannot pass vacuously.
+    #[cfg(target_os = "linux")]
+    fn thread_child_processes() -> usize {
+        let thread = std::fs::read_link("/proc/thread-self")
+            .expect("read the current thread's /proc/thread-self entry");
+        // The link target is relative to `/proc` (`<pid>/task/<tid>`), not an
+        // absolute path.
+        child_processes_in(&std::path::Path::new("/proc").join(thread))
+    }
+
+    /// Count the `children` pids under one `/proc` thread directory.
+    ///
+    /// The path is a parameter so the fail-closed behavior is testable with a
+    /// missing directory.
+    #[cfg(target_os = "linux")]
+    fn child_processes_in(thread: &std::path::Path) -> usize {
+        let children = thread.join("children");
+        let text = std::fs::read_to_string(&children)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", children.display()));
+        text.split_whitespace().count()
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn a_served_containment_plan_advertises_workers_before_consent() {
-        if !crate::worker::WORKER_SESSIONS_SERVED {
-            return;
-        }
+    #[should_panic(expected = "cannot read")]
+    fn a_missing_thread_task_table_panics_instead_of_reporting_zero() {
+        let _ = child_processes_in(std::path::Path::new("/nonexistent/bittyd-thread-self"));
+    }
+
+    #[test]
+    fn a_served_containment_plan_still_refuses_every_worker_create_before_any_child() {
         let cell = crate::platform::PlatformCell::current();
         let report = crate::containment::ContainmentReport::subreaper(cell, None);
         let (mut service, _dir) = service_with_containment(
@@ -5265,7 +5326,10 @@ mod tests {
             OrphanSupervisor::unsupported(cell, "test"),
             report,
         );
-        assert!(service.capabilities().worker_sessions);
+        assert!(
+            !service.capabilities().worker_sessions,
+            "D-01: even an enforced plan never advertises the worker kind"
+        );
 
         let mut creator = connection(
             ServiceScopeSet::baseline().with(ServiceScope::SessionHost),
@@ -5276,25 +5340,95 @@ mod tests {
             .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(1))
             .expect("negotiate");
         assert!(
-            response.capabilities.worker_sessions,
-            "an enforced plan advertises the worker path"
+            !response.capabilities.worker_sessions,
+            "the handshake advertises worker_sessions=false"
         );
 
-        // The served cell still gates the create on consent before the spec.
-        let error = service
+        let before = thread_child_processes();
+        // The capability refusal precedes the consent liveness re-check and the
+        // spawn-specification parse, so both a complete and a missing
+        // specification answer the same typed denial. The connection carries
+        // `session.host` in its scope set but no consumed grant, which proves
+        // the capability check comes first.
+        for (index, params) in [
+            json!({
+                "kind": "worker",
+                "idempotency_key": "worker-with-spec",
+                "argv": ["/bin/sleep", "60"],
+                "cwd": "/",
+            }),
+            json!({
+                "kind": "worker",
+                "idempotency_key": "worker-without-spec",
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let error = service
+                .dispatch(
+                    &mut creator,
+                    ServiceMethod::SessionCreate,
+                    &params,
+                    MonotonicMs::from_millis(2 + index as u64),
+                )
+                .expect_err("D-01 refuses every worker create");
+            assert_eq!(
+                error.denied_code(),
+                Some(RefusalCode::UnsupportedCapability),
+                "a worker create is the typed capability refusal"
+            );
+        }
+        let after = thread_child_processes();
+        assert_eq!(
+            before, after,
+            "a refused worker create must not add a child process"
+        );
+        assert_eq!(
+            service
+                .host()
+                .snapshots(MonotonicMs::from_millis(4))
+                .count(),
+            0,
+            "a refused worker create leaves no session record"
+        );
+        assert!(
+            service.workers.is_empty(),
+            "a refused worker create leaves no pool handle"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_terminal_create_with_a_spawn_specification_keeps_the_1_3_spawn_slice() {
+        // The D-01 gate covers the reserved worker kind only: the accepted 1.3
+        // terminal-spawn slice keeps the containment-plan gate and still binds
+        // generation 1 on a served plan.
+        let (mut service, _dir) = spawn_service();
+        assert!(!service.capabilities().worker_sessions);
+        let mut operator = operator_connection(&mut service);
+        let grant = mint_host_grant(&mut service, &mut operator, 2);
+        let mut creator = consumer();
+        let request = NegotiateRequest::new(crate::contract::ClientVersion::new(1, 3))
+            .with_host_grant(SecretBearer::parse(&grant).expect("bearer"));
+        service
+            .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
+            .expect("negotiate");
+        let created = service
             .dispatch(
                 &mut creator,
                 ServiceMethod::SessionCreate,
                 &json!({
-                    "kind": "worker",
-                    "idempotency_key": "worker-no-consent",
-                    "argv": ["/bin/true"],
+                    "kind": "terminal",
+                    "idempotency_key": "terminal-spawn",
+                    "argv": ["/bin/sleep", "60"],
                     "cwd": "/",
                 }),
-                MonotonicMs::from_millis(2),
+                MonotonicMs::from_millis(4),
             )
-            .expect_err("no host grant");
-        assert_eq!(error.denied_code(), Some(RefusalCode::ConsentRequired));
+            .expect("the terminal spawn slice stays served");
+        assert_eq!(created["session"]["state"], "running");
+        assert_eq!(created["session"]["generation"], 1);
     }
 
     /// A served service with a real orphan journal for the spawn-failure
@@ -5324,6 +5458,10 @@ mod tests {
     }
 
     /// Dispatch one keyed worker create with consent and return its result.
+    ///
+    /// The served wire refuses this call by contract `D-01`; the spawn-path
+    /// tests drive the reservation, spawn, and journal funnel that an amended
+    /// build would serve, through the test-only entry point.
     fn create_worker_with_consent(
         service: &mut Service,
         operator: &mut Connection,
@@ -5338,17 +5476,20 @@ mod tests {
             .negotiate(&mut creator, &request, facts(), MonotonicMs::from_millis(3))
             .expect("negotiate");
         service
-            .dispatch(
+            .session_create_with_reserved_worker_path(
                 &mut creator,
-                ServiceMethod::SessionCreate,
-                &json!({
-                    "kind": "worker",
-                    "idempotency_key": label,
-                    "argv": argv,
-                    "cwd": "/",
-                    "cols": 100,
-                    "rows": 30,
-                }),
+                Some(
+                    json!({
+                        "kind": "worker",
+                        "idempotency_key": label,
+                        "argv": argv,
+                        "cwd": "/",
+                        "cols": 100,
+                        "rows": 30,
+                    })
+                    .as_object()
+                    .expect("object"),
+                ),
                 MonotonicMs::from_millis(4),
             )
             .expect("a failed spawn is an accepted create with a terminal record")

@@ -22,14 +22,17 @@ pub const SERVICE_API_MAJOR: u16 = 1;
 
 /// Current service-contract minor version (`D-11`).
 ///
-/// `1.1` is the additive worker slice (bitty#2790): `session.create` with
-/// `kind: worker` and a served `session.resize`. `1.2` serves the accepted
-/// session and daemon metadata fields (bitty#2806) as optional response keys,
-/// so no existing field changes meaning and a `1.0` or `1.1` client remains in
-/// the accepted range because `min_client_minor` is `0`. `1.3` serves the
-/// terminal session spawn and the terminal content plane (`session.read`,
-/// `session.write`, `session.subscribe`) with the `terminal.inspect` and
-/// `terminal.input` transport grants.
+/// `1.1` is the additive worker slice (bitty#2790): the reserved
+/// `session.create` `kind: worker` vocabulary and a served `session.resize`.
+/// The kind itself stays unserved under `D-01`
+/// ([`crate::worker::WORKER_HOSTING_AMENDMENT_ACCEPTED`]): a worker create is
+/// `Denied/UnsupportedCapability` in every v0.2.0 build. `1.2` serves the
+/// accepted session and daemon metadata fields (bitty#2806) as optional
+/// response keys, so no existing field changes meaning and a `1.0` or `1.1`
+/// client remains in the accepted range because `min_client_minor` is `0`.
+/// `1.3` serves the terminal session spawn and the terminal content plane
+/// (`session.read`, `session.write`, `session.subscribe`) with the
+/// `terminal.inspect` and `terminal.input` transport grants.
 pub const SERVICE_API_MINOR: u16 = 3;
 
 /// Lowest client minor the server accepts for [`SERVICE_API_MAJOR`] (`D-11`:
@@ -61,14 +64,14 @@ pub const EVENTS_SERVED: bool = cfg!(all(unix, target_os = "linux"));
 
 /// The explicit capability set this build can advertise.
 ///
-/// `worker_sessions` is compiled from [`crate::worker::WORKER_SESSIONS_SERVED`]:
-/// `true` only on the Linux cell that can serve the worker spawn path, `false`
-/// everywhere else. A served daemon additionally narrows the bit to the
-/// containment plan its startup probe selected
-/// ([`crate::worker::sessions_served`]): a Linux cell whose cgroup and
-/// subreaper probes both failed advertises `false` and answers
-/// `session.create` with `kind: worker`, or a terminal create that supplies a
-/// spawn specification, as `Denied/UnsupportedCapability`.
+/// `worker_sessions` is compiled from
+/// [`crate::worker::WORKER_SESSIONS_SERVED`], which is derived only from the
+/// `D-01` amendment marker and is `false` in every v0.2.0 build. The contract
+/// reserves the worker vocabulary so a consumer can target it, but a v0.2.0
+/// daemon refuses worker creation with `Denied/UnsupportedCapability` before
+/// any spawn; a served daemon additionally narrows the bit to the containment
+/// plan its startup probe selected ([`crate::worker::sessions_served`]), which
+/// can only keep it `false` until the amendment lands.
 /// `events` is compiled from [`EVENTS_SERVED`] for the same reason: the bit
 /// describes the served wire, not a plan.
 pub const CAPABILITIES: Capabilities = Capabilities {
@@ -173,8 +176,8 @@ impl fmt::Display for ServiceApiVersion {
 pub struct Capabilities {
     /// Terminal sessions are hosted in v0.2.0.
     pub terminal_sessions: bool,
-    /// Worker sessions are served on a Linux cell whose containment plan is
-    /// enforced, and disabled everywhere else (`D-01`, `D-15`).
+    /// Worker sessions are reserved by `D-01` and not served by any v0.2.0
+    /// build, whatever the cell.
     pub worker_sessions: bool,
     /// Ordered, revision-tagged event delivery is available.
     pub events: bool,
@@ -271,22 +274,21 @@ mod tests {
     }
 
     #[test]
-    fn worker_sessions_follow_the_served_cell_and_terminal_sessions_are_enabled() {
+    fn the_handshake_advertises_the_accepted_capability_set_exactly() {
         assert_eq!(
-            CAPABILITIES,
-            Capabilities {
-                terminal_sessions: true,
-                worker_sessions: crate::worker::WORKER_SESSIONS_SERVED,
-                events: EVENTS_SERVED,
-                observer_grants: true,
-                control_transfer: true,
-                idempotent_mutations: true,
-            }
+            CAPABILITIES.all(),
+            [
+                ("terminal_sessions", true),
+                ("worker_sessions", false),
+                ("events", EVENTS_SERVED),
+                ("observer_grants", true),
+                ("control_transfer", true),
+                ("idempotent_mutations", true),
+            ],
+            "the handshake capability array is the accepted set, in contract order"
         );
+        assert_eq!(CAPABILITIES.all().map(|(name, _)| name), CAPABILITY_NAMES);
         let mut enabled = vec!["terminal_sessions"];
-        if crate::worker::WORKER_SESSIONS_SERVED {
-            enabled.push("worker_sessions");
-        }
         if EVENTS_SERVED {
             enabled.push("events");
         }
@@ -297,10 +299,25 @@ mod tests {
         ]);
         assert_eq!(CAPABILITIES.enabled_names().collect::<Vec<_>>(), enabled);
         assert!(CAPABILITIES.is_enabled("terminal_sessions"));
-        assert_eq!(
-            CAPABILITIES.is_enabled("worker_sessions"),
-            crate::worker::WORKER_SESSIONS_SERVED
-        );
         assert!(!CAPABILITIES.is_enabled("unknown_capability"));
+    }
+
+    #[test]
+    fn worker_sessions_stay_off_without_the_explicit_d01_amendment_marker() {
+        const {
+            assert!(
+                !crate::worker::WORKER_HOSTING_AMENDMENT_ACCEPTED,
+                "D-01 is not amended: no build may enable worker hosting"
+            )
+        };
+        assert_eq!(
+            crate::worker::WORKER_SESSIONS_SERVED,
+            crate::worker::WORKER_HOSTING_AMENDMENT_ACCEPTED,
+            "the served worker bit must be derived only from the amendment marker"
+        );
+        assert!(
+            !CAPABILITIES.is_enabled("worker_sessions"),
+            "every v0.2.0 build advertises worker_sessions=false"
+        );
     }
 }

@@ -45,6 +45,13 @@ pub struct ServiceFacts {
     pub version: String,
     pub capabilities: BTreeMap<String, bool>,
     pub limits: BTreeMap<String, u64>,
+    /// Driver-modeled service facts that are never advertised on the wire.
+    ///
+    /// A corpus `requires` entry may name one of these when the vector depends
+    /// on a served path that has no capability bit (for example the accepted
+    /// 1.3 terminal-spawn slice, whose gate is the containment plan rather than
+    /// the reserved `worker_sessions` bit).
+    pub features: BTreeMap<String, bool>,
     /// Harness-only seams the driver can use, never advertised on the wire.
     pub seams: BTreeMap<String, bool>,
 }
@@ -187,18 +194,28 @@ pub trait Driver {
 
     fn facts(&self) -> ServiceFacts;
 
+    /// Number of live child processes the service under test owns.
+    ///
+    /// A refused create must not add one; the real driver reads the daemon's
+    /// per-task `children` tables, and the fake derives the count from its own
+    /// session model (one child per bound, non-terminal session).
+    ///
+    /// # Errors
+    ///
+    /// A static message when the process table cannot be read.
+    fn child_process_count(&mut self) -> Result<u64, String>;
+
     /// Stop and reap the instance.
     fn finish(&mut self);
 }
 
 /// Seed the variables a corpus vector needs to stay cell-independent.
 ///
-/// `worker_sessions` is the served capability of the cell the driver models, so
-/// a handshake vector asserts what that driver must advertise instead of a
-/// Linux-only surface on Windows or macOS. The fake models a served reference
-/// cell and passes `true`; the real driver passes the capability its probe
-/// negotiated. `cwd` is an absolute directory the host really has: the spawn
-/// contract requires an absolute path, and `"/"` is not absolute on Windows.
+/// `worker_sessions` is the reserved worker capability every driver models; it
+/// is `false` in every v0.2.0 build (`D-01`), so a handshake vector asserts the
+/// same value on the fake and on a real cell. `cwd` is an absolute directory
+/// the host really has: the spawn contract requires an absolute path, and `"/"`
+/// is not absolute on Windows.
 pub fn cell_vars(vars: &mut Vars, worker_sessions: bool) {
     vars.insert("worker_sessions".to_owned(), Value::Bool(worker_sessions));
     vars.insert("cwd".to_owned(), Value::String(absolute_cwd()));
@@ -333,12 +350,14 @@ pub fn run_vector(vector: &Vector, driver: &mut dyn Driver) -> VectorOutcome {
             return row;
         }
     };
-    // A cell that does not serve a required capability is a typed skip, not a
-    // failure: a real Linux cell whose containment probe selected no mechanism
-    // refuses the worker path, while the reference fake models a served cell.
+    // A cell that does not serve a required capability or modeled feature is a
+    // typed skip, not a failure: the accepted 1.3 terminal-spawn vectors skip
+    // when the containment probe selected no mechanism, while the reserved
+    // worker vectors also skip because `worker_sessions` is false everywhere.
     let facts = driver.facts();
     if let Some(missing) = vector.requires.iter().find(|requirement| {
         facts.capabilities.get(*requirement).copied() != Some(true)
+            && facts.features.get(*requirement).copied() != Some(true)
             && facts.seams.get(*requirement).copied() != Some(true)
     }) {
         row.status = RowStatus::Skip;
@@ -585,6 +604,19 @@ fn execute_action(
             Ok(())
         }
         "no_tcp_listener" => driver.no_tcp_listener(),
+        "child_processes" => {
+            let count = driver.child_process_count()?;
+            let expected = step
+                .expect
+                .result
+                .get("count")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| "child_processes action without expect.result.count".to_owned())?;
+            if count != expected {
+                return Err(format!("{count} child processes, expected {expected}"));
+            }
+            Ok(())
+        }
         "daemon_absent" => {
             let observed = driver.daemon_absent()?;
             if let Some(code) = step.expect.exit_code {

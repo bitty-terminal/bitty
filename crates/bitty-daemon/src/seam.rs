@@ -125,12 +125,11 @@ impl SeamStatus {
             .join(", ");
         let _ = writeln!(out, "capabilities: {enabled}");
         let worker = if self.capabilities.worker_sessions {
-            // This is the compiled build truth: a status command must not
-            // probe the host, so it cannot name the startup plan. The served
-            // daemon narrows the bit to that plan before it advertises.
-            "compiled (served cells; a refused startup plan disables it)"
+            // Unreachable while D-01 is unamended; kept as the truthful branch
+            // for a build that accepts the amendment.
+            "served (D-01 amendment accepted; startup plan still applies)"
         } else {
-            "unsupported (not served on this cell)"
+            "reserved (D-01: never served before the ADR 0019 amendment)"
         };
         let _ = writeln!(out, "worker sessions: {worker}");
         let _ = writeln!(out, "ipc service: {}", self.ipc_service);
@@ -161,10 +160,11 @@ mod tests {
         assert!(rendered.contains("service API: 1.3 (accepted client range 1.0..=1.3)"));
         assert!(rendered.contains("terminal_sessions"));
         assert!(rendered.contains("observer_grants"));
-        assert_eq!(
-            rendered.contains("worker sessions: compiled"),
-            crate::worker::WORKER_SESSIONS_SERVED
+        assert!(
+            rendered.contains("worker sessions: reserved (D-01:"),
+            "the status must state that the worker kind is reserved, not served: {rendered}"
         );
+        assert!(!rendered.contains("worker sessions: served"));
         assert!(rendered.contains("ipc service: wired"));
         assert!(rendered.contains("endpoint: none bound"));
         assert!(rendered.contains("containment: "));

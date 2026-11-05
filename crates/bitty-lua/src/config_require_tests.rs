@@ -1233,10 +1233,19 @@ fn windows_in_root_junction_is_refused_below_the_canonical_root() {
 
 #[cfg(windows)]
 #[test]
-fn windows_intermediate_component_swapped_to_a_junction_refuses_as_escape() {
-    // The Windows half of the contract's declared control: a loader that
-    // opened the canonical path by name and compared identities would follow
-    // the junction and read outside the root.
+fn windows_junction_swapped_before_the_walk_is_refused() {
+    // NOT a mid-walk swap. `set_swap_hook` runs once, between
+    // canonicalization and the walk, so `lua/pkg` is already a junction by the
+    // time the first open runs and the ordinary per-component reparse check
+    // refuses it — the same check the in-root-junction test pins. That makes
+    // this a regression test for "a junction present at walk start is refused",
+    // and it cannot distinguish a canonical-remainder walk from a
+    // spec-remainder walk.
+    //
+    // The genuine mid-walk window (a real directory at step n replaced before
+    // the open at step n + 1) is the admitted Windows residual documented on
+    // `windows_open_verified`; it is not exercised here because the swap
+    // cannot be driven deterministically without a test seam inside the walk.
     let dir = TempDir::new("win-swap-intermediate");
     dir.module("lua/pkg/mod.lua", "return { value = 'inside' }");
     let outside = TempDir::new("win-swap-intermediate-outside");

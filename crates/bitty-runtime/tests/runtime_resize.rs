@@ -80,16 +80,39 @@ fn dpi_adoption_derives_grid_from_physical_over_scaled_cells() {
 }
 
 #[test]
-fn dpi_rescale_without_extent_keeps_grid_for_following_resized() {
+fn dpi_rescale_without_extent_reconciles_from_the_surface() {
+    // Issue #2896: a scale change with no physical extent at hand (the
+    // `ScaleFactorChanged` path without a window handle) must still re-derive
+    // the grid for the adopted cell. Leaving the old cell count in place made
+    // the grid outgrow the window by the metric ratio, so the cursor-follow
+    // viewport clipped a full-screen TUI's top rows while the PTY kept the
+    // stale winsize.
     let mut rt = make_runtime();
-    let before = rt.snapshot();
+    let surface = rt.surface_extent().expect("surface configured");
     rt.apply_dpi_scale(1.6, None);
     assert_eq!(rt.dpi_scale(), 1.6, "renderer rescales even without extent");
-    let kept = rt.snapshot();
+
+    // Same grid as an adoption that carried the extent explicitly: the
+    // configured surface is the only size the runtime knows about.
+    let mut explicit = make_runtime();
+    explicit.apply_dpi_scale(1.6, Some(surface));
+    let reconciled = rt.snapshot();
+    let direct = explicit.snapshot();
     assert_eq!(
-        (kept.width, kept.height),
-        (before.width, before.height),
-        "grid waits for the physical extent"
+        (reconciled.width, reconciled.height),
+        (direct.width, direct.height),
+        "no-extent adoption must reach the same grid as the physical path"
+    );
+    let (cell_w, cell_h) = rt.live_cell_size();
+    assert!(
+        reconciled.height * usize::try_from(cell_h).unwrap_or(usize::MAX)
+            <= usize::try_from(surface.height()).unwrap_or(0),
+        "the re-derived grid must fit the surface it was derived from"
+    );
+    assert!(
+        reconciled.width * usize::try_from(cell_w).unwrap_or(usize::MAX)
+            <= usize::try_from(surface.width()).unwrap_or(0),
+        "the re-derived grid must fit the surface it was derived from"
     );
     // The following Resized takes precedence and derives from the same
     // scaled cells (proves Resized-after-scale consistency).

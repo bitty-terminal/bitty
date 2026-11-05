@@ -375,13 +375,26 @@ fn sniff_png_ihdr(payload: &[u8]) -> Result<(u32, u32), KittyDecodeError> {
 /// Validates a PNG payload's `IHDR` against the decode ceilings without
 /// decoding it (issue #2875 scope 4).
 ///
-/// This is the admission gate `decode_png` runs *before* the codec
-/// allocates: signature and `IHDR` placement, non-zero dimensions, the
-/// per-side and area ceilings, and the RGBA8 byte cap. A protocol support
-/// probe (`a=q`) uses it so its verdict matches what a real transmit would
-/// do; without it a probe answered `OK` for a PNG whose `IHDR` the decode
-/// path then refuses, which tells a client "images work" and paints
-/// nothing.
+/// This is the *single* admission gate, and it is single in implementation,
+/// not just in intent: the `a=q` support probe calls this wrapper and
+/// `decode_png` calls the same `png_admission` body before either touches
+/// the codec, so probe and transmit verdicts cannot drift. Without the gate
+/// a probe answered `OK` for a PNG whose `IHDR` the decode path then
+/// refuses, which tells a client "images work" and paints nothing.
+///
+/// It checks signature and `IHDR` placement, non-zero dimensions, the
+/// per-side and area ceilings, and the RGBA8 byte cap.
+///
+/// # Scope
+///
+/// The gate is *header-only*, so it bounds what a refusal proves, not what
+/// an acceptance proves: a payload with a valid `IHDR` and a corrupt or
+/// truncated stream past it passes here and is refused by the codec
+/// (`MalformedPng`). A probe answering `OK` therefore means "the declared
+/// geometry is admissible", never "these bytes decode". Decoding inside a
+/// probe would allocate the pixels the gate exists to avoid, so the
+/// asymmetry is deliberate; `decode_png` stays the authority on stream
+/// validity.
 ///
 /// Pure, allocation-free, and bounded by the header bytes it reads.
 ///
@@ -393,6 +406,15 @@ fn sniff_png_ihdr(payload: &[u8]) -> Result<(u32, u32), KittyDecodeError> {
 /// [`KittyDecodeError::DecodedTooLarge`] past the same caps the decoder
 /// enforces.
 pub fn precheck_png_payload(payload: &[u8]) -> Result<(), KittyDecodeError> {
+    png_admission(payload).map(|_| ())
+}
+
+/// Shared body of the PNG admission gate.
+///
+/// Returns the sniffed `(width, height)` plus the pixel count the RGBA8
+/// expansion will need, so [`decode_png`] allocates against the same
+/// numbers the gate proved admissible instead of re-deriving them.
+fn png_admission(payload: &[u8]) -> Result<(u32, u32, u64), KittyDecodeError> {
     let (width, height) = sniff_png_ihdr(payload)?;
     let pixels = checked_dimensions(width, height)?;
     (pixels as usize)
@@ -402,16 +424,20 @@ pub fn precheck_png_payload(payload: &[u8]) -> Result<(), KittyDecodeError> {
             bytes: usize::MAX,
             cap: KITTY_DECODE_MAX_BYTES,
         })?;
-    Ok(())
+    Ok((width, height, pixels))
 }
 
 /// Decodes a PNG payload into an RGBA8 bitmap.
 ///
-/// The `IHDR` dimensions are validated through [`checked_dimensions`]
-/// before the decoder runs (no pixel allocation on refusal); the decoded
+/// Admission runs through `png_admission` — the same body
+/// [`precheck_png_payload`] wraps for the `a=q` support probe, so probe and
+/// transmit verdicts cannot drift — before the decoder runs (no pixel
+/// allocation on refusal). The decoded
 /// output dimensions are re-checked against the sniffed header before
 /// admission, and the output byte length is checked against
-/// [`KITTY_DECODE_MAX_BYTES`] before it is accepted.
+/// [`KITTY_DECODE_MAX_BYTES`] before it is accepted. This function, not
+/// the header gate, is the authority on stream validity: a valid `IHDR`
+/// with a corrupt stream is refused here.
 ///
 /// PNG decodes through the shared minimal `png` codec (same crate and pin
 /// as the graphics extension seam, never the full `image`
@@ -421,17 +447,11 @@ pub fn precheck_png_payload(payload: &[u8]) -> Result<(), KittyDecodeError> {
 /// and the decoder's own accounting enforces the same byte ceiling.
 /// Animated PNG yields its first frame.
 fn decode_png(payload: &[u8]) -> Result<KittyDecodedImage, KittyDecodeError> {
-    let (width, height) = sniff_png_ihdr(payload)?;
-    let pixels = checked_dimensions(width, height)?;
-    // Bound the accepted output before the codec allocates it: the RGBA8
-    // expansion of the sniffed header must fit the byte cap.
-    (pixels as usize)
-        .checked_mul(4)
-        .filter(|&n| n <= KITTY_DECODE_MAX_BYTES)
-        .ok_or(KittyDecodeError::DecodedTooLarge {
-            bytes: usize::MAX,
-            cap: KITTY_DECODE_MAX_BYTES,
-        })?;
+    // One admission gate, shared with the `a=q` support probe: signature
+    // and `IHDR` placement, non-zero sides, the per-side/area ceilings, and
+    // the RGBA8 byte cap. Duplicating these checks here is exactly how the
+    // probe and the transmit path drift apart.
+    let (width, height, pixels) = png_admission(payload)?;
     let malformed = |err: png::DecodingError| KittyDecodeError::MalformedPng(err.to_string());
     let mut decoder = png::Decoder::new(std::io::Cursor::new(payload));
     // Text chunks are metadata, never pixels; skipping them keeps hostile
@@ -685,6 +705,23 @@ mod tests {
                 "{w}x{h} ({want}): gate and decoder must agree on the refusal"
             );
         }
+    }
+
+    #[test]
+    fn precheck_admits_a_header_only_png_that_the_decoder_refuses() {
+        // F3 (#2875 follow-up): the gate is header-only by design, so it
+        // bounds what a *refusal* proves, not what an acceptance proves. A
+        // valid `IHDR` with no `IDAT`/`IEND` behind it passes the gate and
+        // is refused by the codec. This is the documented asymmetry made
+        // executable: if the gate ever grows a stream check (or the decoder
+        // starts trusting the gate for stream validity), this flips.
+        let bytes = png_with_ihdr(1, 1);
+        precheck_png_payload(&bytes).expect("the gate reads only the header");
+        let err = decode_png(&bytes).expect_err("the codec owns stream validity");
+        assert!(
+            matches!(err, KittyDecodeError::MalformedPng(_)),
+            "a truncated stream is malformed, got {err:?}"
+        );
     }
 
     #[test]

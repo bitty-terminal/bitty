@@ -211,6 +211,67 @@ impl CleanupClass {
     }
 }
 
+/// Why a spawn was refused, on a `spawn_failed` terminal transition
+/// (bitty#2790).
+///
+/// `spawn_failed` says the worker never bound; this class says which refusal
+/// produced that terminal state, so a client can tell an exec refusal
+/// (`EACCES`, `ENOEXEC`, or a `#!` line naming a missing interpreter) from a
+/// PTY allocation failure without reading a message. Every value is a static
+/// spelling; no caller text and no errno number reaches the wire here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SpawnFailure {
+    /// `openpty` or the PTY descriptor setup failed; nothing was started.
+    PtyAllocation,
+    /// `exec` refused the program with `EACCES`: the file exists but the
+    /// session user may not execute it (or search a path component).
+    ExecPermissionDenied,
+    /// `exec` refused the program with `ENOEXEC`: the kernel recognises no
+    /// executable format, so a malformed `#!` line lands here too.
+    ExecNotExecutable,
+    /// `exec` refused with `ENOENT`: the program is missing, or the
+    /// interpreter its `#!` line names is.
+    ExecNotFound,
+    /// The spawn syscall or the containment plan refused before a child
+    /// existed, with an errno the exec classes above do not name.
+    SpawnError,
+    /// The PTY-and-spawn handoff crossed `spawn_bind_timeout_ms` before any
+    /// child existed.
+    BindDeadline,
+    /// The child existed but was not bindable: it had already exited, or its
+    /// PTY slave was already closed.
+    NotBindable,
+    /// The child existed but the handoff crossed `spawn_bind_timeout_ms`.
+    BindTimeout,
+    /// The child existed and a post-spawn step refused it (the journal commit
+    /// or the generation-1 bind); `cleanup` carries what was proven.
+    PostSpawnRefusal,
+}
+
+impl SpawnFailure {
+    /// Contract spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PtyAllocation => "pty_allocation",
+            Self::ExecPermissionDenied => "exec_permission_denied",
+            Self::ExecNotExecutable => "exec_not_executable",
+            Self::ExecNotFound => "exec_not_found",
+            Self::SpawnError => "spawn_error",
+            Self::BindDeadline => "bind_deadline",
+            Self::NotBindable => "not_bindable",
+            Self::BindTimeout => "bind_timeout",
+            Self::PostSpawnRefusal => "post_spawn_refusal",
+        }
+    }
+}
+
+impl fmt::Display for SpawnFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Exit information specific to the terminal reason (`D-04`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExitInformation {
@@ -226,34 +287,41 @@ pub enum ExitInformation {
 ///
 /// Construction enforces the `reason -> terminal state` mapping and the
 /// exit-information rule, so a record can never hold a contradictory
-/// classification.
+/// classification. A `spawn_failed` classification additionally carries its
+/// [`SpawnFailure`] class, and no other reason can carry one (bitty#2790).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalOutcome {
     reason: TerminalReason,
     exit: ExitInformation,
     cleanup: CleanupClass,
+    spawn_failure: Option<SpawnFailure>,
 }
 
 impl TerminalOutcome {
-    /// Validate and build a terminal classification.
+    /// Validate and build a terminal classification that is not a spawn
+    /// failure.
     ///
     /// # Errors
     ///
     /// Returns [`TerminalOutcomeError::ExitInformation`] when the exit payload
-    /// does not match the reason, or
-    /// [`TerminalOutcomeError::Cleanup`] when `not_started` is claimed for a
-    /// worker that must have existed.
+    /// does not match the reason, [`TerminalOutcomeError::Cleanup`] when
+    /// `not_started` is claimed for a worker that must have existed, or
+    /// [`TerminalOutcomeError::SpawnFailure`] when the reason is
+    /// `spawn_failed`, which must be built with [`Self::spawn_failed`] so it
+    /// always names the refusal it came from.
     pub fn new(
         reason: TerminalReason,
         exit: ExitInformation,
         cleanup: CleanupClass,
     ) -> Result<Self, TerminalOutcomeError> {
+        if reason == TerminalReason::SpawnFailed {
+            return Err(TerminalOutcomeError::SpawnFailure { reason });
+        }
         match (reason, exit) {
             (TerminalReason::WorkerExit, ExitInformation::ExitCode(_)) => {}
             (TerminalReason::WorkerSignal, ExitInformation::Signal(signal)) if signal > 0 => {}
             (
-                TerminalReason::SpawnFailed
-                | TerminalReason::SupervisionFailed
+                TerminalReason::SupervisionFailed
                 | TerminalReason::ConsumerCancel
                 | TerminalReason::ConsumerTimeout
                 | TerminalReason::OperatorAbort
@@ -279,6 +347,44 @@ impl TerminalOutcome {
             reason,
             exit,
             cleanup,
+            spawn_failure: None,
+        })
+    }
+
+    /// Validate and build a `spawn_failed` classification with its refusal
+    /// class.
+    ///
+    /// The exit payload is fixed: a spawn failure has no wait status to report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerminalOutcomeError::Cleanup`] when a `not_started` cleanup
+    /// is claimed together with a class that requires a child to have existed
+    /// (a fork refusal is still `not_started`; an exec refusal never is, and
+    /// neither is a bind refusal).
+    pub fn spawn_failed(
+        cleanup: CleanupClass,
+        failure: SpawnFailure,
+    ) -> Result<Self, TerminalOutcomeError> {
+        let child_existed = !matches!(
+            failure,
+            SpawnFailure::PtyAllocation
+                | SpawnFailure::ExecPermissionDenied
+                | SpawnFailure::ExecNotExecutable
+                | SpawnFailure::ExecNotFound
+                | SpawnFailure::SpawnError
+                | SpawnFailure::BindDeadline
+        );
+        if cleanup == CleanupClass::NotStarted && child_existed {
+            return Err(TerminalOutcomeError::Cleanup {
+                reason: TerminalReason::SpawnFailed,
+            });
+        }
+        Ok(Self {
+            reason: TerminalReason::SpawnFailed,
+            exit: ExitInformation::NotApplicable,
+            cleanup,
+            spawn_failure: Some(failure),
         })
     }
 
@@ -299,6 +405,12 @@ impl TerminalOutcome {
     pub const fn cleanup(self) -> CleanupClass {
         self.cleanup
     }
+
+    /// The spawn-refusal class, present exactly on `spawn_failed`.
+    #[must_use]
+    pub const fn spawn_failure(self) -> Option<SpawnFailure> {
+        self.spawn_failure
+    }
 }
 
 /// A refused terminal classification.
@@ -308,6 +420,9 @@ pub enum TerminalOutcomeError {
     ExitInformation { reason: TerminalReason },
     /// `not_started` was claimed for a worker that existed.
     Cleanup { reason: TerminalReason },
+    /// A `spawn_failed` classification was built without its refusal class,
+    /// or with a class that contradicts its cleanup claim.
+    SpawnFailure { reason: TerminalReason },
 }
 
 impl fmt::Display for TerminalOutcomeError {
@@ -320,6 +435,12 @@ impl fmt::Display for TerminalOutcomeError {
                 write!(
                     formatter,
                     "not_started cleanup is impossible for reason {reason}"
+                )
+            }
+            Self::SpawnFailure { reason } => {
+                write!(
+                    formatter,
+                    "spawn_failed requires a matching spawn class for reason {reason}"
                 )
             }
         }
@@ -522,6 +643,9 @@ pub struct SessionSnapshot {
     pub owner_peer: Option<OwnerPeer>,
     /// Terminal reason, present exactly in a terminal state.
     pub terminal_reason: Option<TerminalReason>,
+    /// Spawn-refusal class, present exactly on a `spawn_failed` terminal
+    /// reason (bitty#2790).
+    pub spawn_failure: Option<SpawnFailure>,
     /// Exit information for the terminal reason.
     pub exit: ExitInformation,
     /// Cleanup classification, present exactly in a terminal state.
@@ -544,6 +668,7 @@ pub(crate) struct SessionRecord {
     pub(crate) attach_count: u16,
     owner_peer: Option<OwnerPeer>,
     pub(crate) terminal_reason: Option<TerminalReason>,
+    pub(crate) spawn_failure: Option<SpawnFailure>,
     pub(crate) exit: ExitInformation,
     pub(crate) cleanup: Option<CleanupClass>,
     created_at: MonotonicMs,
@@ -570,6 +695,7 @@ impl SessionRecord {
             attach_count: 0,
             owner_peer,
             terminal_reason: None,
+            spawn_failure: None,
             exit: ExitInformation::NotApplicable,
             cleanup: None,
             created_at: now,
@@ -608,6 +734,7 @@ impl SessionRecord {
             controller_present: false,
             owner_peer: self.owner_peer,
             terminal_reason: self.terminal_reason,
+            spawn_failure: self.spawn_failure,
             exit: self.exit,
             cleanup: self.cleanup,
             created_at_ms: self.created_at,
@@ -734,13 +861,16 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(
+        assert_eq!(
             TerminalOutcome::new(
                 TerminalReason::SpawnFailed,
                 ExitInformation::NotApplicable,
                 CleanupClass::NotStarted
-            )
-            .is_ok()
+            ),
+            Err(TerminalOutcomeError::SpawnFailure {
+                reason: TerminalReason::SpawnFailed
+            }),
+            "a spawn failure must name the refusal class it came from"
         );
 
         assert_eq!(
@@ -783,6 +913,78 @@ mod tests {
                 reason: TerminalReason::WorkerExit
             })
         );
+    }
+
+    #[test]
+    fn spawn_failure_requires_a_matching_cleanup_claim() {
+        assert!(
+            TerminalOutcome::spawn_failed(CleanupClass::NotStarted, SpawnFailure::PtyAllocation)
+                .is_ok()
+        );
+        assert!(
+            TerminalOutcome::spawn_failed(CleanupClass::NotStarted, SpawnFailure::ExecNotFound)
+                .is_ok()
+        );
+        assert!(
+            TerminalOutcome::spawn_failed(CleanupClass::Swept, SpawnFailure::NotBindable).is_ok()
+        );
+        assert_eq!(
+            TerminalOutcome::spawn_failed(CleanupClass::NotStarted, SpawnFailure::BindTimeout),
+            Err(TerminalOutcomeError::Cleanup {
+                reason: TerminalReason::SpawnFailed
+            }),
+            "a child that existed cannot claim not_started"
+        );
+        let typed = TerminalOutcome::spawn_failed(
+            CleanupClass::NotStarted,
+            SpawnFailure::ExecPermissionDenied,
+        )
+        .expect("valid outcome");
+        assert_eq!(typed.reason(), TerminalReason::SpawnFailed);
+        assert_eq!(typed.exit(), ExitInformation::NotApplicable);
+        assert_eq!(typed.cleanup(), CleanupClass::NotStarted);
+        assert_eq!(
+            typed.spawn_failure(),
+            Some(SpawnFailure::ExecPermissionDenied)
+        );
+    }
+
+    #[test]
+    fn spawn_failure_spellings_are_stable_and_distinct() {
+        let all = [
+            SpawnFailure::PtyAllocation,
+            SpawnFailure::ExecPermissionDenied,
+            SpawnFailure::ExecNotExecutable,
+            SpawnFailure::ExecNotFound,
+            SpawnFailure::SpawnError,
+            SpawnFailure::BindDeadline,
+            SpawnFailure::NotBindable,
+            SpawnFailure::BindTimeout,
+            SpawnFailure::PostSpawnRefusal,
+        ];
+        assert_eq!(
+            all.map(SpawnFailure::as_str),
+            [
+                "pty_allocation",
+                "exec_permission_denied",
+                "exec_not_executable",
+                "exec_not_found",
+                "spawn_error",
+                "bind_deadline",
+                "not_bindable",
+                "bind_timeout",
+                "post_spawn_refusal",
+            ]
+        );
+        for (index, left) in all.iter().enumerate() {
+            for right in &all[index + 1..] {
+                assert_ne!(
+                    left.as_str(),
+                    right.as_str(),
+                    "two spawn classes must not share a wire spelling"
+                );
+            }
+        }
     }
 
     #[test]

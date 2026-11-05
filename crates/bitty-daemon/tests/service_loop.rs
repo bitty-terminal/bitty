@@ -3316,6 +3316,9 @@ fn a_failed_worker_spawn_leaves_no_journal_record_or_bound_session() {
     assert_eq!(session["state"], "failed");
     assert_eq!(session["terminal_reason"], "spawn_failed");
     assert_eq!(session["cleanup"], "not_started");
+    // A missing program is its own exec class, not the PTY refusal: the
+    // kernel answered `ENOENT` from `exec` (bitty#2790).
+    assert_eq!(session["spawn_failure"], "exec_not_found");
     assert_eq!(session["generation"], 0, "a failed spawn never binds");
     assert_eq!(
         created["result"]["control_token"],
@@ -3334,6 +3337,7 @@ fn a_failed_worker_spawn_leaves_no_journal_record_or_bound_session() {
     let failed = operator_session(&mut operator, session_id);
     assert_eq!(failed["state"], "failed");
     assert_eq!(failed["terminal_reason"], "spawn_failed");
+    assert_eq!(failed["spawn_failure"], "exec_not_found");
     let status = operator.call("daemon.status", Value::Null);
     assert_eq!(status["ok"], true, "{status}");
     assert_eq!(status["result"]["active_sessions"], 0);
@@ -3344,7 +3348,7 @@ fn a_failed_worker_spawn_leaves_no_journal_record_or_bound_session() {
 }
 
 #[test]
-fn a_non_executable_worker_program_is_not_started_and_leaves_no_record() {
+fn a_non_executable_worker_program_is_an_exec_refusal_and_leaves_no_record() {
     let root = TempRoot::new("worker-eacces");
     let daemon = Daemon::start(&root);
     let capability = read_capability(&root);
@@ -3353,7 +3357,7 @@ fn a_non_executable_worker_program_is_not_started_and_leaves_no_record() {
 
     // A readable but non-executable file is the deterministic `EACCES` case:
     // unlike the missing-executable vector it proves the exec failure is
-    // reported as `not_started`, not bound and later recorded as an exit.
+    // reported as its own exec class, not bound and later recorded as an exit.
     let program = root.path.join("worker-not-executable");
     std::fs::write(&program, b"#!/bin/sh\nexit 0\n").expect("write the fixture");
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644)).expect("chmod 0644");
@@ -3368,6 +3372,10 @@ fn a_non_executable_worker_program_is_not_started_and_leaves_no_record() {
     assert_eq!(session["state"], "failed");
     assert_eq!(session["terminal_reason"], "spawn_failed");
     assert_eq!(session["cleanup"], "not_started");
+    assert_eq!(
+        session["spawn_failure"], "exec_permission_denied",
+        "EACCES has its own typed class (bitty#2790)"
+    );
     assert_eq!(session["generation"], 0, "a failed exec never binds");
     assert_eq!(created["result"]["control_token"], Value::Null);
 
@@ -3380,10 +3388,106 @@ fn a_non_executable_worker_program_is_not_started_and_leaves_no_record() {
     assert_eq!(status["ok"], true, "{status}");
     assert_eq!(status["result"]["active_sessions"], 0);
     assert_eq!(status["result"]["sessions"]["running"], 0);
+    let failed = operator_session(&mut operator, session_id);
+    assert_eq!(failed["state"], "failed");
     assert_eq!(
-        operator_session(&mut operator, session_id)["state"],
-        "failed"
+        failed["spawn_failure"], "exec_permission_denied",
+        "the class is frozen into the retained record, not only the create reply"
     );
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn an_unrecognised_executable_format_is_run_by_the_shell_and_never_refused() {
+    let root = TempRoot::new("worker-enoexec");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    // An executable file whose header is no format the kernel recognises.
+    // `execve` answers `ENOEXEC`, but this seam spawns through `fork` +
+    // `execvp` and the C library retries an `ENOEXEC` image through `/bin/sh`:
+    // the child starts, the shell treats the file as a script and reports the
+    // foreign first line as exit status 127. The typed `exec_not_executable`
+    // class therefore comes from the errno mapping (proved in the containment
+    // unit tests); this fixture pins the substitution so a future
+    // direct-`execve` seam cannot change it silently. The trailing `sleep`
+    // keeps the child alive across the pre-bind liveness probe.
+    let program = root.path.join("worker-bad-format");
+    std::fs::write(&program, b"not-an-executable-format\nsleep 1\nexit 127\n")
+        .expect("write the fixture");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+    let (_creator, created) = create_worker(
+        &root,
+        &mut operator,
+        "spawn-enoexec",
+        json!([program.to_str().expect("a UTF-8 fixture path")]),
+    );
+    let session = &created["result"]["session"];
+    assert_eq!(
+        session["state"], "running",
+        "the shell substitution starts a child, so the spawn binds"
+    );
+    assert_eq!(session["generation"], 1);
+    assert!(
+        session.get("spawn_failure").is_none(),
+        "a bound session never carries a spawn class: {session}"
+    );
+
+    let session_id = session["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let terminal = wait_for_terminal(&mut operator, &session_id);
+    assert_eq!(
+        terminal["terminal_reason"], "worker_exit",
+        "the format failure is the substituted shell's exit, not a spawn refusal"
+    );
+    assert!(
+        terminal.get("spawn_failure").is_none(),
+        "only a spawn_failed record carries a spawn class: {terminal}"
+    );
+
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[test]
+fn a_bad_shebang_is_an_exec_refusal_and_leaves_no_record() {
+    let root = TempRoot::new("worker-bad-shebang");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    // Executable with a well-formed `#!` line whose interpreter does not
+    // exist. The kernel resolves the line inside `execve`, so the refusal
+    // arrives as `ENOENT` and never as a daemon-side parse error.
+    let program = root.path.join("worker-bad-shebang");
+    std::fs::write(&program, b"#!/nonexistent/bitty-interpreter\n").expect("write the fixture");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod 0755");
+    let (_creator, created) = create_worker(
+        &root,
+        &mut operator,
+        "spawn-bad-shebang",
+        json!([program.to_str().expect("a UTF-8 fixture path")]),
+    );
+    let session = &created["result"]["session"];
+    assert_eq!(session["state"], "failed");
+    assert_eq!(session["terminal_reason"], "spawn_failed");
+    assert_eq!(session["cleanup"], "not_started");
+    assert_eq!(
+        session["spawn_failure"], "exec_not_found",
+        "a missing `#!` interpreter is ENOENT, the same class as a missing program"
+    );
+    assert_eq!(session["generation"], 0);
+    assert_eq!(created["result"]["control_token"], Value::Null);
+
+    let verified = operator.call("daemon.orphans.verify", json!({"action": "verify"}));
+    assert_eq!(verified["ok"], true, "{verified}");
+    assert_eq!(verified["result"]["reserved"], 0);
+    assert_eq!(verified["result"]["committed"], 0);
 
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
 }

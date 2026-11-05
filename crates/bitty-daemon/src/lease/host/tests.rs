@@ -1472,7 +1472,7 @@ fn natural_exit_and_spawn_failure_classification() {
         .host
         .record_termination(
             spawn_session,
-            ExitObservation::SpawnFailed,
+            ExitObservation::SpawnFailed(SpawnFailure::PtyAllocation),
             CleanupClass::NotStarted,
             ms(2),
         )
@@ -1483,6 +1483,11 @@ fn natural_exit_and_spawn_failure_classification() {
     assert_eq!(spawn.session.state, LifecycleState::Failed);
     assert_eq!(spawn.reason, TerminalReason::SpawnFailed);
     assert_eq!(spawn.cleanup, CleanupClass::NotStarted);
+    assert_eq!(
+        spawn.session.spawn_failure,
+        Some(SpawnFailure::PtyAllocation),
+        "the spawn-failure class is frozen into the terminal record"
+    );
     assert_eq!(spawn.session.generation, 0);
 
     let (supervision_session, _) = harness.create("term-supervision", 1);
@@ -1520,7 +1525,7 @@ fn natural_exit_and_spawn_failure_classification() {
     assert_eq!(
         harness.host.record_termination(
             running_session,
-            ExitObservation::SpawnFailed,
+            ExitObservation::SpawnFailed(SpawnFailure::NotBindable),
             CleanupClass::Swept,
             ms(3),
         ),

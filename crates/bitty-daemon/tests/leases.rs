@@ -12,7 +12,7 @@ use bitty_daemon::lease::{
 };
 use bitty_daemon::registry::{
     CleanupClass, CreateSession, ExitInformation, LifecycleState, MonotonicMs, RegistryLimits,
-    TerminalId, TerminalReason,
+    SpawnFailure, TerminalId, TerminalReason,
 };
 
 fn ms(value: u64) -> MonotonicMs {
@@ -348,7 +348,7 @@ fn operator_stop_and_exit_classification_are_public() {
     let Termination::Completed(spawn) = host
         .record_termination(
             spawn_session,
-            ExitObservation::SpawnFailed,
+            ExitObservation::SpawnFailed(SpawnFailure::PtyAllocation),
             CleanupClass::NotStarted,
             ms(2),
         )
@@ -358,6 +358,11 @@ fn operator_stop_and_exit_classification_are_public() {
     };
     assert_eq!(spawn.session.state, LifecycleState::Failed);
     assert_eq!(spawn.reason, TerminalReason::SpawnFailed);
+    assert_eq!(
+        spawn.session.spawn_failure,
+        Some(SpawnFailure::PtyAllocation),
+        "the refusal class is part of the terminal record"
+    );
 
     assert!(
         host.attach_observer(signal_session, ms(3)).is_err(),

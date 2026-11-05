@@ -38,6 +38,98 @@ use crate::registry::CleanupClass;
 static LIVE_CHILDREN: LazyLock<Mutex<BTreeSet<u32>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
 
+/// Why `exec` refused a program, from the errno `Command::spawn` reported.
+///
+/// Only errnos `execve` itself produces are classified. A fork refusal or a
+/// `pre_exec` failure keeps the untyped [`ContainmentError::Spawn`], so the
+/// typed case never mislabels a refusal that happened before `exec`
+/// (bitty#2790).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecRefusalKind {
+    /// `EACCES`: the file exists but the session user may not execute it, or a
+    /// path component denies search.
+    NotPermitted,
+    /// `ENOEXEC`: the kernel recognises no executable format for the file, so
+    /// a malformed `#!` line lands here too.
+    NotExecutable,
+    /// `ENOENT`: the program is missing, or the interpreter its `#!` line
+    /// names is. The kernel cannot tell those apart at `exec` time.
+    NotFound,
+}
+
+impl ExecRefusalKind {
+    /// Classify an `exec` errno, or `None` when `exec` does not report it.
+    #[must_use]
+    pub const fn from_errno(errno: i32) -> Option<Self> {
+        match errno {
+            nix::libc::EACCES => Some(Self::NotPermitted),
+            nix::libc::ENOEXEC => Some(Self::NotExecutable),
+            nix::libc::ENOENT => Some(Self::NotFound),
+            _ => None,
+        }
+    }
+
+    /// Stable diagnostic spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotPermitted => "permission_denied",
+            Self::NotExecutable => "not_executable",
+            Self::NotFound => "not_found",
+        }
+    }
+}
+
+/// One refused `exec`: the class plus the raw errno for the daemon log.
+///
+/// No child ran. `Command::spawn` reports the child's `exec` failure
+/// synchronously through its close-on-exec pipe, so this refusal always leaves
+/// nothing to clean up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExecRefusal {
+    kind: ExecRefusalKind,
+    errno: i32,
+}
+
+impl ExecRefusal {
+    /// Build a refusal from an already-classified errno.
+    #[must_use]
+    pub const fn new(kind: ExecRefusalKind, errno: i32) -> Self {
+        Self { kind, errno }
+    }
+
+    /// Classify the error `Command::spawn` returned, or `None` when the errno
+    /// is not one `exec` reports.
+    #[must_use]
+    pub fn from_spawn_error(error: &io::Error) -> Option<Self> {
+        let errno = error.raw_os_error()?;
+        ExecRefusalKind::from_errno(errno).map(|kind| Self::new(kind, errno))
+    }
+
+    /// The refusal class.
+    #[must_use]
+    pub const fn kind(self) -> ExecRefusalKind {
+        self.kind
+    }
+
+    /// The raw errno the kernel reported.
+    #[must_use]
+    pub const fn errno(self) -> i32 {
+        self.errno
+    }
+}
+
+impl fmt::Display for ExecRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "exec refused the program: {} (errno {})",
+            self.kind.as_str(),
+            self.errno
+        )
+    }
+}
+
 /// A spawn failure. Every variant refuses the spawn; none leaves an
 /// uncontained child running.
 #[derive(Debug)]
@@ -50,6 +142,10 @@ pub enum ContainmentError {
     Subreaper(SubreaperRefusal),
     /// `spawn` itself failed; no child was created.
     Spawn(io::Error),
+    /// `exec` refused the program (`EACCES`, `ENOEXEC`, or `ENOENT`). No child
+    /// ran, so this is a distinct typed refusal instead of an untyped spawn
+    /// error (bitty#2790).
+    Exec(ExecRefusal),
     /// The child's `/proc` identity could not be observed. The child existed
     /// and was terminated; the carried class is what the cleanup could prove
     /// (`unverified` for the process-group plan).
@@ -63,15 +159,18 @@ pub enum ContainmentError {
 impl ContainmentError {
     /// The cleanup class observed while the failed spawn was abandoned.
     ///
-    /// A refusal, a pre-fork failure, or an unavailable mechanism started
-    /// nothing ([`CleanupClass::NotStarted`]); a failure after the fork
-    /// reports what the plan could prove about the child it killed.
+    /// A refusal, a pre-fork failure, an `exec` refusal, or an unavailable
+    /// mechanism started nothing ([`CleanupClass::NotStarted`]); a failure
+    /// after the fork reports what the plan could prove about the child it
+    /// killed.
     #[must_use]
     pub const fn cleanup(&self) -> CleanupClass {
         match self {
-            Self::Refused(_) | Self::Cgroup(_) | Self::Subreaper(_) | Self::Spawn(_) => {
-                CleanupClass::NotStarted
-            }
+            Self::Refused(_)
+            | Self::Cgroup(_)
+            | Self::Subreaper(_)
+            | Self::Spawn(_)
+            | Self::Exec(_) => CleanupClass::NotStarted,
             Self::IdentityUnavailable(cleanup) | Self::Uncontained(cleanup) => *cleanup,
         }
     }
@@ -84,6 +183,7 @@ impl fmt::Display for ContainmentError {
             Self::Cgroup(error) => write!(formatter, "cgroup containment failed: {error}"),
             Self::Subreaper(error) => write!(formatter, "subreaper unavailable: {error}"),
             Self::Spawn(error) => write!(formatter, "spawn failed: {error}"),
+            Self::Exec(refusal) => write!(formatter, "{refusal}"),
             Self::IdentityUnavailable(cleanup) => write!(
                 formatter,
                 "spawned child identity could not be observed; cleanup {}",
@@ -109,6 +209,19 @@ impl From<CgroupError> for ContainmentError {
 impl From<io::Error> for ContainmentError {
     fn from(error: io::Error) -> Self {
         Self::Spawn(error)
+    }
+}
+
+/// Turn a failed `Command::spawn` into the typed refusal it carries.
+///
+/// `std` reports the child-side `exec` errno through the close-on-exec pipe,
+/// so an `EACCES`/`ENOEXEC`/`ENOENT` here means no child ever ran. Every other
+/// errno (a fork refusal, a `pre_exec` failure) stays the untyped
+/// [`ContainmentError::Spawn`].
+fn classify_spawn_error(error: io::Error) -> ContainmentError {
+    match ExecRefusal::from_spawn_error(&error) {
+        Some(refusal) => ContainmentError::Exec(refusal),
+        None => ContainmentError::Spawn(error),
     }
 }
 
@@ -224,7 +337,7 @@ fn spawn_cgroup(
         Ok(child) => child,
         Err(error) => {
             let _ = cgroup.remove();
-            return Err(error.into());
+            return Err(classify_spawn_error(error));
         }
     };
     let pid = child.id();
@@ -256,7 +369,7 @@ fn spawn_subreaper(
     if mode == SessionMode::ProcessGroup {
         command.process_group(0);
     }
-    let child = command.spawn()?;
+    let child = command.spawn().map_err(classify_spawn_error)?;
     let pid = child.id();
     let Some(identity) = observe_identity(pid) else {
         let mut child = child;
@@ -770,6 +883,64 @@ mod tests {
             ContainmentError::Uncontained(CleanupClass::Swept).cleanup(),
             CleanupClass::Swept,
             "a verified-empty subtree is the observed class"
+        );
+    }
+
+    #[test]
+    fn exec_errnos_are_classified_and_other_spawn_errnos_are_not() {
+        for (errno, kind) in [
+            (nix::libc::EACCES, ExecRefusalKind::NotPermitted),
+            (nix::libc::ENOEXEC, ExecRefusalKind::NotExecutable),
+            (nix::libc::ENOENT, ExecRefusalKind::NotFound),
+        ] {
+            let error = io::Error::from_raw_os_error(errno);
+            let refusal =
+                ExecRefusal::from_spawn_error(&error).expect("an exec errno is classified");
+            assert_eq!(refusal.kind(), kind);
+            assert_eq!(refusal.errno(), errno);
+            let classified = classify_spawn_error(io::Error::from_raw_os_error(errno));
+            assert!(
+                matches!(classified, ContainmentError::Exec(carried) if carried == refusal),
+                "the errno keeps its typed variant"
+            );
+            assert_eq!(
+                classified.cleanup(),
+                CleanupClass::NotStarted,
+                "an exec refusal never started a child"
+            );
+        }
+        // A fork refusal and a `pre_exec` failure are not exec refusals, so
+        // they must not borrow the typed case.
+        for errno in [nix::libc::EAGAIN, nix::libc::EIO, nix::libc::EPIPE] {
+            assert!(
+                ExecRefusal::from_spawn_error(&io::Error::from_raw_os_error(errno)).is_none(),
+                "errno {errno} is not an exec refusal"
+            );
+            assert!(matches!(
+                classify_spawn_error(io::Error::from_raw_os_error(errno)),
+                ContainmentError::Spawn(_)
+            ));
+        }
+        assert!(
+            ExecRefusal::from_spawn_error(&io::Error::from(io::ErrorKind::NotFound)).is_none(),
+            "a synthetic error carries no errno to classify"
+        );
+    }
+
+    #[test]
+    fn an_exec_refusal_is_its_own_variant_with_a_stable_spelling() {
+        let refusal = ExecRefusal::new(ExecRefusalKind::NotPermitted, nix::libc::EACCES);
+        assert_eq!(
+            refusal.to_string(),
+            "exec refused the program: permission_denied (errno 13)"
+        );
+        assert_eq!(
+            ExecRefusal::new(ExecRefusalKind::NotExecutable, nix::libc::ENOEXEC).to_string(),
+            "exec refused the program: not_executable (errno 8)"
+        );
+        assert_eq!(
+            ExecRefusal::new(ExecRefusalKind::NotFound, nix::libc::ENOENT).to_string(),
+            "exec refused the program: not_found (errno 2)"
         );
     }
 

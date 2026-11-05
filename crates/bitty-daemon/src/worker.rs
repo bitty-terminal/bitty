@@ -61,11 +61,15 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use nix::sys::signal::Signal;
 
+#[cfg(all(test, target_os = "linux"))]
+use crate::containment::ExecRefusalKind;
+#[cfg(target_os = "linux")]
+use crate::containment::{
+    ContainmentError, ContainmentLimits, ExecRefusal, SessionMode, spawn_with,
+};
 use crate::containment::{
     ContainmentKind, ContainmentRecord, ContainmentReport, SESSION_CGROUP_PREFIX,
 };
-#[cfg(target_os = "linux")]
-use crate::containment::{ContainmentLimits, SessionMode, spawn_with};
 #[cfg(target_os = "linux")]
 use crate::content::ContentBuffer;
 #[cfg(target_os = "linux")]
@@ -132,8 +136,20 @@ pub fn sessions_served(report: &ContainmentReport) -> bool {
 pub enum WorkerSpawnError {
     /// This cell does not serve the worker path.
     Unsupported,
-    /// The spawn failed before any child existed; nothing needs cleanup.
-    NotStarted,
+    /// The PTY could not be created or its descriptors could not be prepared.
+    /// Nothing was started, and the refusal is distinct from an `exec`
+    /// refusal so a client can tell "the daemon could not allocate a terminal"
+    /// from "your program could not be executed" (bitty#2790).
+    Pty,
+    /// The spawn syscall, or the containment plan behind it, refused before a
+    /// child existed, with an errno the exec classes do not name.
+    Spawn,
+    /// `exec` refused the program. Nothing was started; the carried refusal
+    /// names the errno class (`EACCES`, `ENOEXEC`, `ENOENT`).
+    Exec(ExecRefusal),
+    /// The PTY handoff crossed the configured `spawn_bind_timeout_ms` before
+    /// any child existed, so nothing needs cleanup.
+    BindDeadline,
     /// The child existed, but it was not usable when the bind probe ran: it
     /// had already exited, or its PTY slave was already closed. The child was
     /// terminated and reaped before this error returned; the carried class is
@@ -152,7 +168,12 @@ impl std::fmt::Display for WorkerSpawnError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unsupported => formatter.write_str("worker sessions are not served on this cell"),
-            Self::NotStarted => formatter.write_str("worker spawn failed before any child existed"),
+            Self::Pty => formatter.write_str("the worker PTY could not be allocated"),
+            Self::Spawn => formatter.write_str("worker spawn failed before any child existed"),
+            Self::Exec(refusal) => write!(formatter, "worker exec was refused: {refusal}"),
+            Self::BindDeadline => formatter.write_str(
+                "the worker handoff crossed spawn_bind_timeout_ms before a child existed",
+            ),
             Self::NotBindable(cleanup) => {
                 write!(
                     formatter,
@@ -442,7 +463,7 @@ impl WorkerPool {
     /// handoff, and the child must still be usable when the bind probe runs:
     ///
     /// - a deadline that expires after the PTY was opened but before any
-    ///   child existed is [`WorkerSpawnError::NotStarted`];
+    ///   child existed is [`WorkerSpawnError::BindDeadline`];
     /// - a deadline that expires after the child existed stops the child
     ///   through the bounded escalation and is
     ///   [`WorkerSpawnError::BindTimeout`];
@@ -465,8 +486,12 @@ impl WorkerPool {
     /// # Errors
     ///
     /// [`WorkerSpawnError::Unsupported`] on a non-served cell,
-    /// [`WorkerSpawnError::NotStarted`] when the PTY or the fork failed before
-    /// any child existed, [`WorkerSpawnError::NotBindable`] or
+    /// [`WorkerSpawnError::Pty`] when the PTY could not be allocated,
+    /// [`WorkerSpawnError::Exec`] when `exec` refused the program (a typed
+    /// errno class, never the PTY refusal), [`WorkerSpawnError::Spawn`] when
+    /// the spawn syscall or the containment plan refused before a child
+    /// existed, [`WorkerSpawnError::BindDeadline`] when the handoff crossed the
+    /// bound before a child existed, [`WorkerSpawnError::NotBindable`] or
     /// [`WorkerSpawnError::BindTimeout`] when the child existed but could not
     /// bind, or [`WorkerSpawnError::Cleanup`] with the class the plan could
     /// prove after terminating a child that did exist.
@@ -482,11 +507,11 @@ impl WorkerPool {
         let started = Instant::now();
         let name = cgroup_name(instance, session_id);
         let mut pty = PtyCommand::build(spec)?;
-        let master = pty.master.take().ok_or(WorkerSpawnError::NotStarted)?;
+        let master = pty.master.take().ok_or(WorkerSpawnError::Pty)?;
         if started.elapsed() >= self.bind_timeout() {
             // No child exists yet, so the refusal needs no cleanup. Dropping
             // the PTY handles closes both sides.
-            return Err(WorkerSpawnError::NotStarted);
+            return Err(WorkerSpawnError::BindDeadline);
         }
         let mut child = match spawn_with(
             report,
@@ -496,9 +521,15 @@ impl WorkerPool {
             SessionMode::NewSession,
         ) {
             Ok(child) => child,
+            // `exec` refused the program: no child ran, and the refusal keeps
+            // its errno class so a client can tell it from a PTY allocation
+            // failure (bitty#2790).
+            Err(ContainmentError::Exec(refusal)) => {
+                return Err(WorkerSpawnError::Exec(refusal));
+            }
             Err(error) => {
                 return Err(match error.cleanup() {
-                    CleanupClass::NotStarted => WorkerSpawnError::NotStarted,
+                    CleanupClass::NotStarted => WorkerSpawnError::Spawn,
                     cleanup => WorkerSpawnError::Cleanup(cleanup),
                 });
             }
@@ -937,7 +968,7 @@ impl PtyCommand {
     fn build(spec: &SpawnSpec) -> Result<Self, WorkerSpawnError> {
         #[cfg(test)]
         if openpty_failure::take() {
-            return Err(WorkerSpawnError::NotStarted);
+            return Err(WorkerSpawnError::Pty);
         }
         let winsize = nix::pty::Winsize {
             ws_row: spec.rows(),
@@ -945,15 +976,14 @@ impl PtyCommand {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let pty =
-            nix::pty::openpty(Some(&winsize), None).map_err(|_| WorkerSpawnError::NotStarted)?;
+        let pty = nix::pty::openpty(Some(&winsize), None).map_err(|_| WorkerSpawnError::Pty)?;
         let master = File::from(pty.master);
         let slave = File::from(pty.slave);
-        crate::containment::set_cloexec(&master).map_err(|_| WorkerSpawnError::NotStarted)?;
+        crate::containment::set_cloexec(&master).map_err(|_| WorkerSpawnError::Pty)?;
         // The slave is dropped after the duplicates, and it must never be
         // inherited either: keep the parent handle close-on-exec while the
         // child's stdio is built from close-on-exec copies.
-        crate::containment::set_cloexec(&slave).map_err(|_| WorkerSpawnError::NotStarted)?;
+        crate::containment::set_cloexec(&slave).map_err(|_| WorkerSpawnError::Pty)?;
         let stdin = Stdio::from(dup_file(&slave)?);
         let stdout = Stdio::from(dup_file(&slave)?);
         let stderr = Stdio::from(dup_file(&slave)?);
@@ -1023,9 +1053,11 @@ fn pty_slave_open(master: &File) -> bool {
 ///
 /// The seam is thread-local because the unit tests run concurrently and a
 /// process-wide flag would fail an unrelated PTY test. Production compiles it
-/// out entirely.
+/// out entirely. The module is `pub(crate)` so the service-layer tests can
+/// prove the PTY refusal and the exec refusal are different wire shapes
+/// (bitty#2790).
 #[cfg(all(test, target_os = "linux"))]
-mod openpty_failure {
+pub(crate) mod openpty_failure {
     use std::cell::Cell;
 
     thread_local! {
@@ -1052,7 +1084,7 @@ fn dup_file(slave: &File) -> Result<File, WorkerSpawnError> {
     // inherit a stray slave handle either. The `close_range(2)` sweep on the
     // command is the guarantee that nothing above stdio survives this worker's
     // own `exec`.
-    crate::containment::dup_cloexec(slave).map_err(|_| WorkerSpawnError::NotStarted)
+    crate::containment::dup_cloexec(slave).map_err(|_| WorkerSpawnError::Pty)
 }
 
 #[cfg(target_os = "linux")]
@@ -1189,7 +1221,7 @@ mod tests {
     }
 
     #[test]
-    fn an_openpty_failure_is_not_started_and_creates_no_handle() {
+    fn an_openpty_failure_is_a_typed_pty_refusal_and_creates_no_handle() {
         let limits = Limits::default();
         let mut pool = WorkerPool::new(&limits);
         let session = refusal_session();
@@ -1203,14 +1235,14 @@ mod tests {
         );
         assert_eq!(
             error,
-            WorkerSpawnError::NotStarted,
-            "a PTY allocation failure is typed not_started"
+            WorkerSpawnError::Pty,
+            "a PTY allocation failure has its own typed refusal"
         );
         assert!(pool.is_empty(), "no handle may survive an openpty failure");
     }
 
     #[test]
-    fn a_non_executable_program_is_not_started_and_creates_no_handle() {
+    fn a_non_executable_program_is_a_typed_exec_refusal_and_creates_no_handle() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let limits = Limits::default();
@@ -1231,7 +1263,51 @@ mod tests {
         // `Command::spawn` reports the child's `exec` failure synchronously
         // through its error pipe, so `EACCES` is not "missing file": no child
         // ever ran and the cleanup class is not_started.
-        assert_eq!(error, WorkerSpawnError::NotStarted, "{error}");
+        assert_eq!(
+            error,
+            WorkerSpawnError::Exec(ExecRefusal::new(
+                ExecRefusalKind::NotPermitted,
+                nix::libc::EACCES
+            )),
+            "{error}"
+        );
+        assert!(
+            !matches!(error, WorkerSpawnError::Pty),
+            "an exec refusal is never the PTY refusal"
+        );
+        assert!(pool.is_empty(), "no handle may survive a failed exec");
+    }
+
+    #[test]
+    fn a_missing_shebang_interpreter_is_a_typed_exec_refusal_and_creates_no_handle() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let limits = Limits::default();
+        let mut pool = WorkerPool::new(&limits);
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        // Executable, correct `#!` shape, but the interpreter path does not
+        // exist. The kernel resolves the line inside `execve`, so the failure
+        // is `ENOENT` and not a daemon-side parse refusal.
+        let program = dir.path().join("bitty-bad-shebang");
+        std::fs::write(&program, b"#!/nonexistent/bitty-interpreter\n").expect("write the fixture");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod 0755");
+        let program = program.to_str().expect("a UTF-8 fixture path");
+        let error = spawn_test_worker_refusal(
+            &mut pool,
+            &limits,
+            &[program],
+            SessionKind::Worker,
+            refusal_session(),
+        );
+        assert_eq!(
+            error,
+            WorkerSpawnError::Exec(ExecRefusal::new(
+                ExecRefusalKind::NotFound,
+                nix::libc::ENOENT
+            )),
+            "{error}"
+        );
         assert!(pool.is_empty(), "no handle may survive a failed exec");
     }
 

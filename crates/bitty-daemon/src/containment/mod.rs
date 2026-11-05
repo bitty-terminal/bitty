@@ -49,7 +49,8 @@ pub use self::cgroup::{CGROUP2_MOUNT, CgroupError, CgroupRefusal, CgroupRoot, Se
 pub(crate) use self::child::drain_adopted_children;
 #[cfg(target_os = "linux")]
 pub use self::child::{
-    CleanupOutcome, ContainedChild, ContainmentError, SessionMode, spawn, spawn_with,
+    CleanupOutcome, ContainedChild, ContainmentError, ExecRefusal, ExecRefusalKind, SessionMode,
+    spawn, spawn_with,
 };
 #[cfg(target_os = "linux")]
 pub(crate) use self::linux_sys::{

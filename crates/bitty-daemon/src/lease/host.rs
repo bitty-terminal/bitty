@@ -21,7 +21,7 @@ use std::fmt;
 use crate::registry::{
     AttachId, CleanupClass, CreateSession, DaemonInstanceId, Entropy, ExitInformation,
     ID_GENERATION_ATTEMPTS, LifecycleState, MonotonicMs, OsEntropy, RegistryLimits, SessionId,
-    SessionRegistry, SessionSnapshot, TerminalOutcome, TerminalReason,
+    SessionRegistry, SessionSnapshot, SpawnFailure, TerminalOutcome, TerminalReason,
 };
 
 use super::record::{Lease, LeaseLimits, LeaseRole};
@@ -361,7 +361,8 @@ pub enum ExitObservation {
         signal: u32,
     },
     /// The worker never bound (spawn error, missing executable, bind timeout).
-    SpawnFailed,
+    /// The carried class is why it never bound (bitty#2790).
+    SpawnFailed(SpawnFailure),
     /// The daemon could not observe, reap, or verify the worker's exit.
     SupervisionFailed,
     /// The daemon terminated the tree after an accepted stop.
@@ -1816,6 +1817,10 @@ impl SessionHost {
                 session: self.compose_snapshot(snapshot, now),
             });
         }
+        let spawn_failure = match observation {
+            ExitObservation::SpawnFailed(failure) => Some(failure),
+            _ => None,
+        };
         let (reason, exit, actor) = {
             let state = self
                 .sessions
@@ -1827,7 +1832,7 @@ impl SessionHost {
                         return Err(LeaseRefusal::CancelPending);
                     }
                     match observation {
-                        ExitObservation::SpawnFailed => (
+                        ExitObservation::SpawnFailed(_) => (
                             TerminalReason::SpawnFailed,
                             ExitInformation::NotApplicable,
                             Actor::Worker,
@@ -1879,7 +1884,10 @@ impl SessionHost {
                 }
             }
         };
-        let outcome = TerminalOutcome::new(reason, exit, cleanup)?;
+        let outcome = match spawn_failure {
+            Some(failure) => TerminalOutcome::spawn_failed(cleanup, failure)?,
+            None => TerminalOutcome::new(reason, exit, cleanup)?,
+        };
         self.finish_terminal(session_id, outcome, actor, now)
     }
 

@@ -15,7 +15,9 @@
 //!   so `bitty_render::batch::derive_scale` is exactly 1.0).
 //!
 //! Coordinates are derived from the runtime's own cell metrics, padding,
-//! and frames; no host path, pixel constant, or scale-1.6 special case.
+//! and frames; no host path, fudge offset, or scale-1.6 special case. The
+//! fixtures spell out the owner's geometry (`155x41` cells of `16x35` px with
+//! a 13 px inset) as documented inputs, never as a correction factor.
 
 #![forbid(unsafe_code)]
 
@@ -330,6 +332,8 @@ fn first_row_text(rt: &Runtime) -> String {
 
 #[test]
 fn rows_fit_the_painted_grid_at_fractional_scales() {
+    #[cfg(unix)]
+    bitty_test_support::require_pty!();
     let extents = [
         (1.0, PhysicalSize::new(1601, 907)),
         (1.25, PhysicalSize::new(1337, 733)),
@@ -338,8 +342,6 @@ fn rows_fit_the_painted_grid_at_fractional_scales() {
     ];
     for (scale, extent) in extents {
         let mut rt = Runtime::new(owner_config()).expect("runtime builds");
-        #[cfg(unix)]
-        bitty_test_support::require_pty!();
         #[cfg(unix)]
         rt.spawn_shell_with_args("/bin/sh", &["-c", "sleep 5"])
             .expect("shell spawns");

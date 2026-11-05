@@ -2052,12 +2052,16 @@ impl Runtime {
     /// (CTX-1707).
     ///
     /// This is the cell size the painter actually shows for `view`: the
-    /// present solver has already removed the window padding, the Core-owned
-    /// decoration, and the sibling gaps. Any consumer that sizes a backing
-    /// grid or a PTY must use this instead of a raw [`Self::layout_allocations`]
-    /// slot, otherwise the terminal advertises rows/columns the painter
-    /// windows away (issue #2896). `None` when `view` has no live frame
-    /// (off-layout workspace slot, closed, or an empty container).
+    /// present solver has already removed the Core-owned decoration and the
+    /// sibling gaps. Frames stay in container coordinates, so the paint path
+    /// adds the window padding when it places the frame and the pointer path
+    /// subtracts the same padding before mapping a pixel; a consumer that
+    /// only needs rows and columns must not apply it again. Any consumer that
+    /// sizes a backing grid or a PTY must prefer this over a raw
+    /// [`Self::layout_allocations`] slot (issue #2896) and still honor
+    /// `fixed_size_for_view` where a view pins its size. `None` when `view`
+    /// has no live frame (off-layout workspace slot or closed); a degenerate
+    /// container still yields at least one row and column.
     #[must_use]
     pub fn presented_frame_cells(&self, view: ViewId) -> Option<(u16, u16)> {
         self.present_frames()

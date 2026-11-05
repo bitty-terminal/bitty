@@ -1296,8 +1296,9 @@ impl TerminalApp {
         // blank first row above it. `workspace_new` and session restore
         // already spawn at the present frame.
         //
-        // CTX-1707: one shared resolver (`Runtime::presented_frame_cells`)
-        // so every spawn caller agrees with the painter.
+        // CTX-1707: the shared resolver (`Runtime::presented_frame_cells`)
+        // keeps this path in the painter's cell space; `workspace_new` and
+        // session restore inline the same present-frame lookup.
         let (cols, rows) = self
             .runtime
             .presented_frame_cells(new_id)

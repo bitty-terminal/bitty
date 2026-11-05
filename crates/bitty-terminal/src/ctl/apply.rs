@@ -851,8 +851,9 @@ pub(super) fn reload_config_json(info: &crate::config_reload::ReloadOutcomeInfo)
 /// Shared ctl creation core (CTX-0387): allocate a globally unique leaf id,
 /// split `focused` along `axis`, validate the fresh view's appearance, and
 /// commit the layout. Fail-closed: a refused split or appearance conflict
-/// leaves the layout untouched. Returns the new leaf id plus its allocation
-/// size in cells.
+/// leaves the layout untouched. Returns the new leaf id plus its painted
+/// content-frame size in cells (the allocation only when the fresh view has no
+/// present frame yet).
 fn create_split_leaf(
     runtime: &mut bitty_runtime::Runtime,
     focused: bitty_runtime::ViewId,

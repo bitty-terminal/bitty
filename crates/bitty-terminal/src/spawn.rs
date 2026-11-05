@@ -353,6 +353,8 @@ mod tests {
         // than the raw allocation (outer gap + border + content inset), so
         // sizing the shell to the allocation advertises rows the painter
         // windows away and a full-screen TUI loses its top lines.
+        #[cfg(unix)]
+        bitty_test_support::require_pty!();
         let mut rt = split_runtime();
         let focused = rt.focused_view().expect("focused leaf");
         let frames = rt.present_frames();

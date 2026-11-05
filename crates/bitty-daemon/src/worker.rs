@@ -64,11 +64,9 @@ use nix::sys::signal::Signal;
 #[cfg(all(test, target_os = "linux"))]
 use crate::containment::ExecRefusalKind;
 #[cfg(target_os = "linux")]
+use crate::containment::{ContainmentError, ContainmentLimits, SessionMode, spawn_with};
 use crate::containment::{
-    ContainmentError, ContainmentLimits, ExecRefusal, SessionMode, spawn_with,
-};
-use crate::containment::{
-    ContainmentKind, ContainmentRecord, ContainmentReport, SESSION_CGROUP_PREFIX,
+    ContainmentKind, ContainmentRecord, ContainmentReport, ExecRefusal, SESSION_CGROUP_PREFIX,
 };
 #[cfg(target_os = "linux")]
 use crate::content::ContentBuffer;

@@ -38,6 +38,7 @@ use crate::platform::PlatformCell;
 mod cgroup;
 #[cfg(target_os = "linux")]
 mod child;
+mod exec;
 #[cfg(target_os = "linux")]
 mod linux_sys;
 #[cfg(target_os = "linux")]
@@ -49,9 +50,9 @@ pub use self::cgroup::{CGROUP2_MOUNT, CgroupError, CgroupRefusal, CgroupRoot, Se
 pub(crate) use self::child::drain_adopted_children;
 #[cfg(target_os = "linux")]
 pub use self::child::{
-    CleanupOutcome, ContainedChild, ContainmentError, ExecRefusal, ExecRefusalKind, SessionMode,
-    spawn, spawn_with,
+    CleanupOutcome, ContainedChild, ContainmentError, SessionMode, spawn, spawn_with,
 };
+pub use self::exec::{ExecRefusal, ExecRefusalKind};
 #[cfg(target_os = "linux")]
 pub(crate) use self::linux_sys::{
     close_inherited_descriptors, dup_cloexec, establish_controlling_terminal, resize_pty,

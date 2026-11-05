@@ -4186,7 +4186,7 @@ mod tests {
             .expect("child resolves");
         assert_eq!(
             resolved,
-            RectPx::new(base.x + 3 * 8, base.y + 1 * 16, 2 * 8, 2 * 16),
+            RectPx::new(base.x + 3 * 8, base.y + 16, 2 * 8, 2 * 16),
             "child paints at parent origin + H=3 / V=1 cells with its own span"
         );
         // Four scrolled rows move the parent up four cells; the child keeps

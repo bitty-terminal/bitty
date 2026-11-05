@@ -2763,10 +2763,16 @@ impl Runtime {
     /// truth, never writes to the PTY, never blocks). Called on input and on
     /// tick so socket probes observe typed text without screenshots.
     pub fn publish_inspect_snapshot(&self) {
-        let grid = crate::inspect::grid_text_from_state(
-            &self.state,
+        // Issue #2875 scope 6 (a11y/scene contract): the devtools grid-text
+        // snapshot is a text projection too, so a painted image that owns no
+        // grid cell must show the object-replacement stand-in here rather
+        // than an empty hole.
+        let images = self.kitty_image_cell_spans_for_primary();
+        let grid = crate::inspect::grid_text_from_snapshot_with_images(
+            &self.state.snapshot(),
             crate::inspect::INSPECT_MAX_ROWS,
             crate::inspect::INSPECT_MAX_COLS,
+            &images,
         );
         crate::inspect::publish_grid(&grid);
         crate::inspect::publish_input_ring(&self.inspect_ring.snapshot_all());

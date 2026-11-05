@@ -168,7 +168,9 @@ pub use image::{
     ImageStoreError, PixelFormat, PlacementAnchor, PlacementGeometry, PlacementId,
     ScrollBehavior as ImageScrollBehavior, payload_fingerprint,
 };
-pub use kitty_decode::{KittyDecodeError, KittyDecodedImage, decode_kitty_payload};
+pub use kitty_decode::{
+    KittyDecodeError, KittyDecodedImage, decode_kitty_payload, precheck_png_payload,
+};
 pub use kitty_place::{
     KITTY_ANIM_MAX_BYTES_PER_IMAGE, KITTY_ANIM_MAX_FRAMES, KITTY_COMPOSE_BLEND,
     KITTY_COMPOSE_REPLACE, KITTY_CURSOR_MAX_SCROLL_LINES_PER_PLACEMENT, KITTY_DECODE_MAX_BYTES,

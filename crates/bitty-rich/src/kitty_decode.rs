@@ -372,6 +372,39 @@ fn sniff_png_ihdr(payload: &[u8]) -> Result<(u32, u32), KittyDecodeError> {
     Ok((width, height))
 }
 
+/// Validates a PNG payload's `IHDR` against the decode ceilings without
+/// decoding it (issue #2875 scope 4).
+///
+/// This is the admission gate [`decode_png`] runs *before* the codec
+/// allocates: signature and `IHDR` placement, non-zero dimensions, the
+/// per-side and area ceilings, and the RGBA8 byte cap. A protocol support
+/// probe (`a=q`) uses it so its verdict matches what a real transmit would
+/// do; without it a probe answered `OK` for a PNG whose `IHDR` the decode
+/// path then refuses, which tells a client "images work" and paints
+/// nothing.
+///
+/// Pure, allocation-free, and bounded by the header bytes it reads.
+///
+/// # Errors
+///
+/// [`KittyDecodeError::MalformedPng`] for a non-PNG/truncated header,
+/// [`KittyDecodeError::ZeroDimension`] for a zero side, and
+/// [`KittyDecodeError::DimensionsTooLarge`]/[`KittyDecodeError::TooManyPixels`]/
+/// [`KittyDecodeError::DecodedTooLarge`] past the same caps the decoder
+/// enforces.
+pub fn precheck_png_payload(payload: &[u8]) -> Result<(), KittyDecodeError> {
+    let (width, height) = sniff_png_ihdr(payload)?;
+    let pixels = checked_dimensions(width, height)?;
+    (pixels as usize)
+        .checked_mul(4)
+        .filter(|&n| n <= KITTY_DECODE_MAX_BYTES)
+        .ok_or(KittyDecodeError::DecodedTooLarge {
+            bytes: usize::MAX,
+            cap: KITTY_DECODE_MAX_BYTES,
+        })?;
+    Ok(())
+}
+
 /// Decodes a PNG payload into an RGBA8 bitmap.
 ///
 /// The `IHDR` dimensions are validated through [`checked_dimensions`]
@@ -603,6 +636,67 @@ mod tests {
         let err = decode_kitty_payload(100, None, None, b"definitely not a png")
             .expect_err("garbage must fail");
         assert!(matches!(err, KittyDecodeError::MalformedPng(_)));
+    }
+
+    /// PNG signature plus a syntactically valid `IHDR` chunk claiming
+    /// `width` x `height`. The CRC is not read by the pre-check or the
+    /// sniff, so this needs no real image data.
+    fn png_with_ihdr(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![137, 80, 78, 71, 13, 10, 26, 10];
+        bytes.extend_from_slice(&13_u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes
+    }
+
+    #[test]
+    fn precheck_png_payload_accepts_what_the_decoder_accepts() {
+        precheck_png_payload(PNG_1X1_RGBA_RED).expect("1x1 RGBA must pass the gate");
+        assert!(decode_kitty_payload(100, None, None, PNG_1X1_RGBA_RED).is_ok());
+    }
+
+    #[test]
+    fn precheck_png_payload_refuses_what_the_decoder_refuses() {
+        // Issue #2875 scope 4: the `a=q` probe gate must never answer `OK`
+        // for a PNG the transmit path refuses, or a client is told images
+        // work and gets a blank.
+        for (w, h, want) in [
+            (9000_u32, 1_u32, "side cap"),
+            (1, 9000, "side cap"),
+            (5000, 5000, "area cap"),
+        ] {
+            let bytes = png_with_ihdr(w, h);
+            let precheck = precheck_png_payload(&bytes);
+            let decoded = decode_kitty_payload(100, None, None, &bytes);
+            assert!(
+                precheck.is_err(),
+                "{w}x{h} ({want}) must be refused by the gate"
+            );
+            assert!(
+                decoded.is_err(),
+                "{w}x{h} ({want}) must be refused by the decoder"
+            );
+            assert_eq!(
+                std::mem::discriminant(&precheck.unwrap_err()),
+                std::mem::discriminant(&decoded.unwrap_err()),
+                "{w}x{h} ({want}): gate and decoder must agree on the refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn precheck_png_payload_refuses_zero_and_non_png() {
+        assert!(matches!(
+            precheck_png_payload(&png_with_ihdr(0, 1)),
+            Err(KittyDecodeError::ZeroDimension)
+        ));
+        assert!(matches!(
+            precheck_png_payload(b"definitely not a png"),
+            Err(KittyDecodeError::MalformedPng(_))
+        ));
     }
 
     #[test]

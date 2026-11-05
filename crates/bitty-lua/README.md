@@ -72,6 +72,34 @@ neither spelling can gain input authority. The focusable capture surface
 (`bitty.ui.overlay.acquire`, `update`, `poll`, `release`) and its
 `E_UI_ALREADY_CAPTURED` single-owner contract are unchanged.
 
+## Lua surface: `process.spawn` working directory (CTX-1715)
+
+```lua
+local result = bitty.process.spawn(
+  { "status", "--porcelain" },
+  { cwd = "pane" }  -- optional; "pane" is the only accepted value
+)
+```
+
+`cwd` selects a **semantic**, never a path. `"pane"` asks the host to run the
+child in the directory of the terminal pane the calling plugin is bound to
+(the host-observed focused pane, the same live model behind
+`bitty.terminal.snapshot`). The host validates the resolved directory
+(absolute, at most 4096 bytes, no NUL or control bytes, canonicalized, an
+existing directory) and records the resolved canonical path in the plugin
+spawn audit entry. A plugin can never supply, override, or influence that
+path.
+
+| Item                      | Contract                                                                                                                                                                                                                        |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cwd`                     | Optional string. `"pane"` is the only accepted value. An absolute or relative path, `~`, `..`, a symlink target, an empty string, and a wrong-case token are all `E_DEF_INVALID` before the host call.                          |
+| Unknown options           | `E_DEF_INVALID`; no option is ever silently ignored. A table mixing `cwd = "pane"` with an unknown key is refused regardless of key order.                                                                                      |
+| `E_SPAWN_CWD_UNAVAILABLE` | The host has no pane binding, the bound pane has not reported a directory (`OSC 7`), or the report is unusable. The spawn never falls back to the host process cwd.                                                             |
+| Unchanged refusals        | The `-C`, `--git-dir`, and `--work-tree` argv denials and the `[tools.git]` executable allowlist are unchanged; the pane directory selects the repository, argv may not.                                                        |
+| Not a filesystem grant    | The pane directory is a **starting directory**, not an `fs` grant. It does not widen what the plugin may read: plugin API reads still follow `fs.read`/`fs.write`, and the child keeps the existing inherited exec confinement. |
+| Reload-free               | The source is read per call, so changing the pane directory changes the result without reloading the plugin.                                                                                                                    |
+| Unchanged calls           | Omitting the option keeps the host default (no child cwd), so existing calls stay valid.                                                                                                                                        |
+
 ## Evidence
 
 - `tests/readiness_mirror.rs` (RUN-29) mirrors the Phodopus executable gate

@@ -95,6 +95,22 @@ diagram lives in `src/lib.rs`.
   by CTX-0918. This crate keeps the generic Panel Runtime mechanism
   (`registry/`) plus the recorded Core slices above.
 
+## Plugin spawn working directory (CTX-1715)
+
+`bitty.process.spawn(argv, { cwd = "pane" })` selects the working directory of
+the calling plugin's focused pane. `bitty-terminal` publishes that directory
+from the same live model that serves `bitty.terminal.snapshot` (`LiveSnapshot`
+implements `PaneCwdSource`); `PluginRuntime` binds the source at activation
+(and otherwise refuses the semantic), and `SpawnService` canonicalizes it per
+dispatch — UTF-8, absolute, at most 4096 bytes, no NUL or control bytes,
+canonicalized, an existing directory — before recording the resolved path in
+the spawn audit ledger and handing it to the supervisor. A missing binding or
+`OSC 7` report fails closed with `E_SPAWN_CWD_UNAVAILABLE`; a plugin-supplied
+path never crosses the Lua bridge. The cwd is a starting directory, not a
+filesystem grant: it adds no read scope (plugin API reads still follow `fs`
+grants), the Landlock exec confinement is unchanged, and `-C`, `--git-dir`,
+and `--work-tree` remain denied in argv.
+
 ## Session attach/detach seam (bitty#2729, CTX-1655)
 
 `src/attach.rs` is the Core half of the accepted

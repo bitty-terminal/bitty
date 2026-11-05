@@ -398,6 +398,13 @@ pub const MAX_TOOL_SPAWN_ARG_PREVIEW_BYTES: usize = 64;
 /// the recorded identity is clamped.
 pub const MAX_TOOL_SPAWN_CALLER_BYTES: usize = 128;
 
+/// Maximum bytes of a host-resolved working directory stored in one audit
+/// entry (CTX-1715).
+///
+/// Matches the `bitty-ipc` execution cwd bound (`4096` bytes). Only the host
+/// ever supplies this value; a plugin can never reach the field with a path.
+pub const MAX_TOOL_SPAWN_CWD_BYTES: usize = 4096;
+
 /// Allow/deny outcome recorded in the [`ToolSpawnLedger`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolSpawnDecision {
@@ -427,13 +434,14 @@ impl std::fmt::Display for ToolSpawnDecision {
 
 /// One tool-spawn audit entry: who asked, what was decided, and why.
 ///
-/// Tool name, caller identity, and bounded arg previews only. Environment
-/// is never accepted by this API: secret values travel via env and
-/// `secret://` handles ([`crate::secret_tiers`] discipline), so env must
-/// never enter logs or audit. `secret://` handle references are names,
-/// never values, and record like any other arg. Bounded and
-/// sequence-numbered (no wall-clock), mirroring [`crate::fs_authz::FsAuditLedger`]
-/// and [`crate::secrets::SecretAuditLedger`].
+/// Tool name, caller identity, bounded arg previews, and (CTX-1715) the
+/// host-resolved working directory only. Environment is never accepted by
+/// this API: secret values travel via env and `secret://` handles
+/// ([`crate::secret_tiers`] discipline), so env must never enter logs or
+/// audit. `secret://` handle references are names, never values, and record
+/// like any other arg. Bounded and sequence-numbered (no wall-clock),
+/// mirroring [`crate::fs_authz::FsAuditLedger`] and
+/// [`crate::secrets::SecretAuditLedger`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpawnEntry {
     /// Monotonic sequence (no wall-clock).
@@ -450,7 +458,12 @@ pub struct ToolSpawnEntry {
     pub args: Vec<String>,
     /// Args beyond the per-entry cap (counted, never silently dropped).
     pub args_omitted: usize,
-    /// Bounded host-authored detail (tool/caller/counts only, never env).
+    /// Host-resolved working directory for this spawn, when the host resolved
+    /// one (CTX-1715). Never plugin-supplied: the value is the canonical
+    /// directory the child started in, recorded for attribution. `None` means
+    /// the host default (no child cwd) or a decision that preceded resolution.
+    pub cwd: Option<String>,
+    /// Bounded host-authored detail (tool/caller/counts/cwd only, never env).
     pub detail: String,
 }
 
@@ -488,16 +501,48 @@ impl ToolSpawnLedger {
     /// Log-tainted: arguments must be attribution (tool/args/caller),
     /// never environment values.
     pub fn push_decision(&mut self, tool: &str, args: &[String], caller: &str, allowed: bool) {
+        self.push_decision_with_cwd(tool, args, caller, allowed, None);
+    }
+
+    /// Record one evaluated spawn decision with the host-resolved working
+    /// directory (CTX-1715).
+    ///
+    /// `cwd` is host-derived by construction: it names the canonical
+    /// directory the child started in (or `None` for the host default / a
+    /// decision that preceded resolution). It is never a plugin-supplied
+    /// path: the plugin selects only the `pane` semantic and the host
+    /// resolves it. The recorded copy is clamped to
+    /// [`MAX_TOOL_SPAWN_CWD_BYTES`]; clamping never affects authorization.
+    ///
+    /// # Logging
+    ///
+    /// Log-tainted: arguments must be attribution (tool/args/caller/cwd),
+    /// never environment values.
+    pub fn push_decision_with_cwd(
+        &mut self,
+        tool: &str,
+        args: &[String],
+        caller: &str,
+        allowed: bool,
+        cwd: Option<&str>,
+    ) {
         let decision = if allowed {
             ToolSpawnDecision::Allow
         } else {
             ToolSpawnDecision::Deny
         };
-        self.push(decision, tool, args, caller);
+        self.push(decision, tool, args, caller, cwd);
     }
 
     /// Bounded append shared by both outcomes.
-    fn push(&mut self, decision: ToolSpawnDecision, tool: &str, args: &[String], caller: &str) {
+    fn push(
+        &mut self,
+        decision: ToolSpawnDecision,
+        tool: &str,
+        args: &[String],
+        caller: &str,
+        cwd: Option<&str>,
+    ) {
         if self.entries.len() >= MAX_TOOL_SPAWN_AUDIT_ENTRIES {
             self.entries.pop_front();
             self.dropped = self.dropped.wrapping_add(1);
@@ -512,8 +557,13 @@ impl ToolSpawnLedger {
         let args_omitted = args.len().saturating_sub(kept.len());
         let tool = clamp_text(tool, TOOL_NAME_MAX_LEN);
         let caller = clamp_text(caller, MAX_TOOL_SPAWN_CALLER_BYTES);
+        let cwd = cwd.map(|path| clamp_text(path, MAX_TOOL_SPAWN_CWD_BYTES));
+        let cwd_detail = match cwd.as_deref() {
+            Some(path) => format!(", cwd '{path}'"),
+            None => String::new(),
+        };
         let detail = format!(
-            "tool spawn {decision} '{tool}' by '{caller}' ({} args, {args_omitted} omitted)",
+            "tool spawn {decision} '{tool}' by '{caller}' ({} args, {args_omitted} omitted{cwd_detail})",
             kept.len(),
         );
         self.entries.push_back(ToolSpawnEntry {
@@ -523,6 +573,7 @@ impl ToolSpawnLedger {
             decision,
             args: kept,
             args_omitted,
+            cwd,
             detail,
         });
     }
@@ -1385,6 +1436,40 @@ mod tests {
         assert_eq!(entry.decision, ToolSpawnDecision::Allow);
         assert_eq!(entry.args, spawn_args(&["status"]));
         assert_eq!(entry.args_omitted, 0);
+        assert_eq!(entry.cwd, None, "host-side decisions carry no cwd");
+    }
+
+    #[test]
+    fn tool_ledger_records_the_host_resolved_cwd() {
+        // CTX-1715: the mediated spawn surface records the resolved pane
+        // directory; host-side decisions (no cwd) stay `None`.
+        let mut ledger = ToolSpawnLedger::new();
+        ledger.push_decision_with_cwd(
+            "git",
+            &spawn_args(&["status"]),
+            "git-panel",
+            true,
+            Some("/home/user/repo"),
+        );
+        let entry = ledger.iter().next().expect("exactly one entry");
+        assert_eq!(entry.cwd.as_deref(), Some("/home/user/repo"));
+        assert!(entry.detail.contains("cwd '/home/user/repo'"));
+        assert_eq!(entry.decision, ToolSpawnDecision::Allow);
+
+        let long = format!("/{}", "a".repeat(MAX_TOOL_SPAWN_CWD_BYTES + 8));
+        ledger.push_decision_with_cwd(
+            "git",
+            &spawn_args(&["status"]),
+            "git-panel",
+            false,
+            Some(&long),
+        );
+        let entry = ledger.iter().nth(1).expect("second entry");
+        assert_eq!(
+            entry.cwd.as_deref().map(str::len),
+            Some(MAX_TOOL_SPAWN_CWD_BYTES),
+            "the recorded cwd is clamped to the bound"
+        );
     }
 
     #[test]

@@ -39,6 +39,43 @@ fn replies(rt: &mut Runtime) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Minimal standard-alphabet base64 encoder for the PNG fixtures.
+fn base64(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in input.chunks(3) {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        out.push(ALPHABET[(a >> 2) as usize] as char);
+        out.push(ALPHABET[(((a & 0x03) << 4) | (b >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(ALPHABET[(((b & 0x0f) << 2) | (c >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(ALPHABET[(c & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// PNG signature plus a syntactically valid `IHDR` chunk claiming
+/// `width` x `height` (no pixel data, no CRC check on the sniff path).
+fn png_with_ihdr(width: u32, height: u32) -> Vec<u8> {
+    let mut bytes = vec![137, 80, 78, 71, 13, 10, 26, 10];
+    bytes.extend_from_slice(&13_u32.to_be_bytes());
+    bytes.extend_from_slice(b"IHDR");
+    bytes.extend_from_slice(&width.to_be_bytes());
+    bytes.extend_from_slice(&height.to_be_bytes());
+    bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+    bytes
+}
+
 #[test]
 fn query_probe_png_ok_replies_exact_and_stores_nothing() {
     // Spec support probe (`docs/graphics-protocol.rst:457` shape with an
@@ -58,6 +95,43 @@ fn query_probe_raw_ok_replies_exact() {
     rt.handle_pty_bytes(seq.as_bytes());
     assert_eq!(replies(&mut rt), vec![b"\x1b_Gi=31;OK\x1b\\".to_vec()]);
     assert_eq!(rt.kitty_image_count(), 0);
+}
+
+#[test]
+fn query_probe_png_oversized_ihdr_answers_einval_like_the_transmit_path() {
+    // Issue #2875 scope 4 (truthful `a=q`): PNG carries its size in the
+    // `IHDR`, so the probe must run the decoder's own header gate. Before
+    // this, a probe answered `OK` for an `IHDR` the transmit path then
+    // refuses — the client was told images work and got a blank.
+    let mut rt = make_runtime();
+    let oversized = png_with_ihdr(9000, 1);
+    let seq = format!("\x1b_Gi=31,f=100,a=q,m=0;{}\x1b\\", base64(&oversized));
+    rt.handle_pty_bytes(seq.as_bytes());
+    assert_eq!(
+        replies(&mut rt),
+        vec![b"\x1b_Gi=31;EINVAL:bad data\x1b\\".to_vec()],
+        "the probe must refuse what the transmit refuses"
+    );
+    assert_eq!(rt.kitty_image_count(), 0, "probes never store");
+    // Same bytes through the real transmit path: refused too, so the probe
+    // verdict and the transmit verdict agree.
+    let transmit = format!("\x1b_Gi=31,f=100,a=T,m=0;{}\x1b\\", base64(&oversized));
+    rt.handle_pty_bytes(transmit.as_bytes());
+    assert_eq!(
+        rt.kitty_image_count(),
+        0,
+        "the refused transmit must store nothing"
+    );
+    assert_eq!(rt.kitty_placement_count(), 0);
+}
+
+#[test]
+fn query_probe_png_still_answers_ok_when_the_decoder_accepts() {
+    // The gate must not over-refuse: a decodable PNG still probes `OK`.
+    let mut rt = make_runtime();
+    let seq = format!("\x1b_Gi=32,f=100,a=q,m=0;{}\x1b\\", red_1x1_png_b64());
+    rt.handle_pty_bytes(seq.as_bytes());
+    assert_eq!(replies(&mut rt), vec![b"\x1b_Gi=32;OK\x1b\\".to_vec()]);
 }
 
 #[test]

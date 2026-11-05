@@ -125,6 +125,37 @@ fn tick_advances_running_animation_in_gap_order() {
 }
 
 #[test]
+fn running_animation_repaints_the_next_frame() {
+    // Issue #2875 scope 5 (animation re-verification): the tick advances
+    // terminal truth's descriptor AND the presented surface must show the
+    // new frame. Descriptor-only coverage would pass even if the paint path
+    // served a stale blit (raster cache keyed too loosely, or missing
+    // damage), which is the "animates in state, frozen on screen" failure
+    // this pins.
+    let mut rt = make_runtime();
+    running_two_frame(&mut rt);
+    let t0 = Instant::now();
+    rt.tick_at(t0);
+    let before = rt.headless_rgba().expect("first present must paint");
+    rt.tick_at(t0 + Duration::from_millis(40));
+    assert_eq!(rt.kitty_anim_current_frame(1), 2);
+    let after = rt.headless_rgba().expect("second present must paint");
+    assert_ne!(
+        before, after,
+        "the presented surface must change when the animation advances"
+    );
+    // The advance is driven by the gap, not by the tick count: one quantum
+    // earlier paints frame 1 again (the animation loops).
+    rt.tick_at(t0 + Duration::from_millis(80));
+    assert_eq!(rt.kitty_anim_current_frame(1), 1);
+    let wrapped = rt.headless_rgba().expect("third present must paint");
+    assert_eq!(
+        wrapped, before,
+        "wrapping back to frame 1 must repaint the bytes frame 1 paints"
+    );
+}
+
+#[test]
 fn loop_budget_v2_stops_on_root() {
     let mut rt = make_runtime();
     running_two_frame(&mut rt);

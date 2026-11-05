@@ -1,4 +1,4 @@
-use super::apply::{apply_control_envelope, reload_config_json, snapshot_text};
+use super::apply::{apply_control_envelope, reload_config_json, snapshot_text_with_images};
 #[cfg(unix)]
 use super::apply::{drain_global_control_queue_with, drain_global_control_queue_with_barrier};
 use super::client::extract_string_from;
@@ -1115,6 +1115,57 @@ fn control_terminal_text_renders_grid_text_not_debug() {
 }
 
 #[test]
+fn control_terminal_text_reports_a_painted_image_instead_of_a_hole() {
+    // Issue #2875 scope 6: a direct `a=T` placement owns no grid cell, so
+    // the grid holds blanks there. `bitty ctl terminal text` must still
+    // report an image (the object-replacement stand-in) rather than an empty
+    // rectangle, which is what a screen reader or an agent reads.
+    let mut rt = headless_runtime();
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    rt.handle_pty_bytes(b"\x1b_Ga=T,f=32,s=2,v=2,c=2,r=1,i=41;/wAA//8AAP//AAD//wAA/w==\x1b\\");
+    let params = ipc_ctl::params_terminal_id("t:1");
+    let reply = apply_control_envelope(
+        &mut rt,
+        ipc_ctl::METHOD_GET_TERMINAL_TEXT,
+        Some(&params),
+        &cli,
+    );
+    assert!(reply.ok, "terminal text must succeed: {reply:?}");
+    let text = extract_string_from(&reply.result_json, "text").expect("text field");
+    assert!(
+        text.contains('\u{FFFC}'),
+        "a painted image must project the object-replacement stand-in, got {text:?}"
+    );
+    assert!(
+        !text.trim().is_empty(),
+        "the image must not read as an empty grid, got {text:?}"
+    );
+}
+
+#[test]
+fn control_terminal_text_keeps_a_deleted_image_out_of_the_projection() {
+    // Fail-closed companion: once the image is deleted the grid is genuinely
+    // empty, and the projection must not invent a stand-in for it.
+    let mut rt = headless_runtime();
+    let cli = bitty_ipc::ScopeSet::cli_default();
+    rt.handle_pty_bytes(b"\x1b_Ga=T,f=32,s=2,v=2,c=2,r=1,i=41;/wAA//8AAP//AAD//wAA/w==\x1b\\");
+    rt.handle_pty_bytes(b"\x1b_Ga=d,d=i,i=41\x1b\\");
+    let params = ipc_ctl::params_terminal_id("t:1");
+    let reply = apply_control_envelope(
+        &mut rt,
+        ipc_ctl::METHOD_GET_TERMINAL_TEXT,
+        Some(&params),
+        &cli,
+    );
+    assert!(reply.ok, "terminal text must succeed: {reply:?}");
+    let text = extract_string_from(&reply.result_json, "text").expect("text field");
+    assert!(
+        !text.contains('\u{FFFC}'),
+        "a deleted image covers nothing, got {text:?}"
+    );
+}
+
+#[test]
 fn control_send_to_unfocused_is_conflict() {
     let mut rt = headless_runtime();
     let cli = bitty_ipc::ScopeSet::cli_default();
@@ -1148,7 +1199,7 @@ fn control_terminal_text_split_owns_its_grid_not_primary() {
     let done = apply_control_envelope(&mut rt, ipc_ctl::METHOD_SPLIT_VIEW, Some(&split), &cli);
     assert!(done.ok, "split must succeed: {done:?}");
     assert_eq!(rt.focused_view().map(|v| v.0), Some(2));
-    let expected = snapshot_text(&rt.snapshot());
+    let expected = snapshot_text_with_images(&rt.snapshot(), &[]);
     assert!(
         expected.contains("parity-probe"),
         "primary grid text must be rendered, got {expected:?}"
@@ -1185,7 +1236,7 @@ fn control_terminal_text_split_owns_its_grid_not_primary() {
     let focus = ipc_ctl::params_focus("v:1");
     let moved = apply_control_envelope(&mut rt, ipc_ctl::METHOD_FOCUS_VIEW, Some(&focus), &cli);
     assert!(moved.ok, "focus v:1 must succeed: {moved:?}");
-    let expected2 = snapshot_text(&rt.snapshot());
+    let expected2 = snapshot_text_with_images(&rt.snapshot(), &[]);
     let t1b = apply_control_envelope(
         &mut rt,
         ipc_ctl::METHOD_GET_TERMINAL_TEXT,

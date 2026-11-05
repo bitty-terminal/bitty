@@ -379,6 +379,51 @@ pub struct GridTextSnapshot {
     pub generation: u64,
 }
 
+/// One painted image's cell footprint in viewport coordinates
+/// (issue #2875 scope 6, the a11y/scene contract).
+///
+/// `row`/`col` are 0-based viewport cells; `rows`/`cols` are the span the
+/// image covers, exactly the cell rectangle the present layer paints. The
+/// grid itself keeps no image cell for a direct `a=p`/`a=T` placement (its
+/// cells hold whatever text was there), so a text projection needs this
+/// footprint to keep a readable stand-in instead of a blank hole.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageCellSpan {
+    /// First covered viewport row.
+    pub row: u32,
+    /// First covered viewport column.
+    pub col: u32,
+    /// Covered rows (>= 1).
+    pub rows: u32,
+    /// Covered columns (>= 1).
+    pub cols: u32,
+}
+
+/// Extract bounded grid text from a terminal [`Snapshot`], projecting each
+/// painted image footprint as a readable stand-in.
+///
+/// Behaves exactly like [`grid_text_from_snapshot`], with one addition:
+/// a blank cell covered by one of `images` projects the Unicode OBJECT
+/// REPLACEMENT CHARACTER ([`bitty_term_state::KITTY_IMAGE_TEXT_FALLBACK`])
+/// instead of a space, so a screen reader or `bitty ctl terminal text`
+/// never reports an image as an empty rectangle.
+///
+/// Cells covered by an image that hold real text keep their text: the grid
+/// truth is what an accessibility reader needs most, and an image painted
+/// over text must not erase the text from the projection. Only blank
+/// ("hole") cells become the stand-in.
+///
+/// `images` is clipped to the snapshot; spans outside it are ignored.
+#[must_use]
+pub fn grid_text_from_snapshot_with_images(
+    snapshot: &Snapshot,
+    max_rows: usize,
+    max_cols: usize,
+    images: &[ImageCellSpan],
+) -> GridTextSnapshot {
+    grid_text_from_snapshot_inner(snapshot, max_rows, max_cols, images)
+}
+
 /// Extract bounded grid text from a terminal [`Snapshot`].
 ///
 /// Skips wide-char spacers (trailing halves), emits each leading glyph once
@@ -392,6 +437,19 @@ pub fn grid_text_from_snapshot(
     snapshot: &Snapshot,
     max_rows: usize,
     max_cols: usize,
+) -> GridTextSnapshot {
+    grid_text_from_snapshot_inner(snapshot, max_rows, max_cols, &[])
+}
+
+/// Shared body of the grid-text projections.
+///
+/// `images` carries the painted image footprints; an empty slice is the
+/// plain text projection.
+fn grid_text_from_snapshot_inner(
+    snapshot: &Snapshot,
+    max_rows: usize,
+    max_cols: usize,
+    images: &[ImageCellSpan],
 ) -> GridTextSnapshot {
     let rows = max_rows.clamp(1, INSPECT_MAX_ROWS);
     let cols = max_cols.clamp(1, INSPECT_MAX_COLS);
@@ -409,10 +467,15 @@ pub fn grid_text_from_snapshot(
         };
     }
     let take_rows = rows.min(snapshot.height);
+    // Per-row covered column ranges, built once so the cell loop stays a
+    // cheap scan over the (few) images crossing the row instead of re-walking
+    // every span per cell. Spans are clipped to the snapshot here.
+    let coverage = image_row_coverage(images, take_rows, snapshot.width);
     let mut lines = Vec::with_capacity(take_rows);
     for r in 0..take_rows {
         let mut line = String::new();
         let mut chars = 0usize;
+        let row_ranges = coverage.get(r).map(|v| v.as_slice()).unwrap_or(&[]);
         for c in 0..snapshot.width {
             if chars >= cols {
                 break;
@@ -430,6 +493,14 @@ pub fn grid_text_from_snapshot(
             // invisible private-use scalar.
             match bitty_term_state::image_cell_text_fallback(cell.glyph) {
                 Some(fallback) => line.push(fallback),
+                // A direct `a=p`/`a=T` placement owns no grid cell: its
+                // cells stay blank. A blank cell under a painted image
+                // footprint projects the same stand-in (issue #2875 scope
+                // 6), so an image never reads as an empty hole. Cells that
+                // already hold text keep it: hidden text is still content.
+                None if cell.glyph == ' ' && column_covered(row_ranges, c) => {
+                    line.push(bitty_term_state::KITTY_IMAGE_TEXT_FALLBACK);
+                }
                 None => cell.push_text_into(&mut line),
             }
             chars += 1;
@@ -450,6 +521,48 @@ pub fn grid_text_from_snapshot(
         rows: snapshot.height,
         generation: snapshot.generation,
     }
+}
+
+/// Per-row covered column intervals for the image footprints intersecting a
+/// `max_rows` x `grid_width` viewport.
+///
+/// Index `r` holds the `[start, end)` column ranges image `r` covers, in
+/// insertion order (never merged: the scan is bounded by the placement cap
+/// and exists only to answer [`column_covered`]). Spans outside the snapshot
+/// are clipped, never indexed.
+fn image_row_coverage(
+    images: &[ImageCellSpan],
+    max_rows: usize,
+    grid_width: usize,
+) -> Vec<Vec<(usize, usize)>> {
+    let mut rows: Vec<Vec<(usize, usize)>> = vec![Vec::new(); max_rows];
+    for span in images {
+        if span.rows == 0 || span.cols == 0 {
+            continue;
+        }
+        let col = usize::try_from(span.col).unwrap_or(usize::MAX);
+        let width = usize::try_from(span.cols).unwrap_or(usize::MAX);
+        let start_col = col.min(grid_width);
+        let end_col = col.saturating_add(width).min(grid_width);
+        if end_col <= start_col {
+            continue;
+        }
+        let row = usize::try_from(span.row).unwrap_or(usize::MAX);
+        let height = usize::try_from(span.rows).unwrap_or(usize::MAX);
+        let start_row = row.min(max_rows);
+        let end_row = row.saturating_add(height).min(max_rows);
+        for row in start_row..end_row {
+            if let Some(ranges) = rows.get_mut(row) {
+                ranges.push((start_col, end_col));
+            }
+        }
+    }
+    rows
+}
+
+/// Whether `col` falls inside any of one row's covered ranges.
+fn column_covered(ranges: &[(usize, usize)], col: usize) -> bool {
+    ranges.iter().any(|&(start, end)| col >= start && col < end)
 }
 
 /// Extract bounded grid text directly from live [`State`].
@@ -642,6 +755,75 @@ mod tests {
         // The raw grid truth is untouched: only the projection substitutes.
         let raw = state.snapshot();
         assert_eq!(raw.cells[1].glyph, '\u{10EEEE}');
+    }
+
+    #[test]
+    fn grid_text_projects_blank_cells_under_a_painted_image() {
+        // Issue #2875 scope 6 for direct `a=p`/`a=T` placements: the image
+        // owns no grid cell, so its cells stay blank. The footprint must
+        // project the object-replacement character instead of a hole.
+        let mut state = State::new();
+        feed_print(&mut state, "ab");
+        let snap = state.snapshot();
+        assert_eq!(snap.cells[2].glyph, ' ');
+        let spans = [ImageCellSpan {
+            row: 0,
+            col: 2,
+            rows: 1,
+            cols: 3,
+        }];
+        let projected = grid_text_from_snapshot_with_images(&snap, 2, 16, &spans);
+        assert_eq!(projected.lines[0], "ab\u{FFFC}\u{FFFC}\u{FFFC}");
+        // Without footprints the same cells stay blank (the pre-fix
+        // behavior this projection exists to close).
+        let plain = grid_text_from_snapshot(&snap, 2, 16);
+        assert_eq!(plain.lines[0], "ab");
+    }
+
+    #[test]
+    fn grid_text_keeps_text_under_a_painted_image() {
+        // An image painted over real text must not erase the text from an
+        // accessibility projection: only blank cells become the stand-in.
+        let mut state = State::new();
+        feed_print(&mut state, "keep");
+        let snap = state.snapshot();
+        let spans = [ImageCellSpan {
+            row: 0,
+            col: 0,
+            rows: 1,
+            cols: 4,
+        }];
+        let projected = grid_text_from_snapshot_with_images(&snap, 2, 16, &spans);
+        assert_eq!(projected.lines[0], "keep");
+    }
+
+    #[test]
+    fn grid_text_image_footprints_are_clipped_to_the_snapshot() {
+        // A footprint past the grid bounds must neither panic nor widen a
+        // row: rows 0..2 and cols 2..(2+u32::MAX) clip to the grid.
+        let mut state = State::new();
+        feed_print(&mut state, "x");
+        let snap = state.snapshot();
+        let spans = [
+            ImageCellSpan {
+                row: 0,
+                col: 1,
+                rows: 1,
+                cols: 2,
+            },
+            // Fully outside: contributes nothing.
+            ImageCellSpan {
+                row: 99,
+                col: 0,
+                rows: 4,
+                cols: 4,
+            },
+        ];
+        let projected = grid_text_from_snapshot_with_images(&snap, 1, 4, &spans);
+        assert_eq!(projected.lines[0], "x\u{FFFC}\u{FFFC}");
+        // Bounded by `max_cols` even when the footprint is wider.
+        let narrow = grid_text_from_snapshot_with_images(&snap, 1, 2, &spans);
+        assert_eq!(narrow.lines[0], "x\u{FFFC}");
     }
 
     #[test]

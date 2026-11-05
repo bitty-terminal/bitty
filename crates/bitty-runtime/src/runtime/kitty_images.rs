@@ -1926,6 +1926,130 @@ impl Runtime {
         true
     }
 
+    /// Painted image cell footprints for one view's live plane (issue #2875
+    /// scope 6, the a11y/scene contract).
+    ///
+    /// Returns the viewport cell rectangle each painted placement covers, in
+    /// the same coordinates as the view's grid snapshot, so a text
+    /// projection (`bitty ctl terminal text`, accessibility readers) can
+    /// keep a readable stand-in for cells an image hides instead of
+    /// reporting a blank hole. Direct `a=p`/`a=T` placements write nothing
+    /// into the grid, which is exactly why the footprint has to be derived
+    /// from the paint layer rather than from cells.
+    ///
+    /// Geometry is resolved with unit cell metrics
+    /// (`CellMetrics { width: 1, height: 1 }`): placements are anchored and
+    /// sized in *cells*, and relative (`P=`/`Q=`) offsets are cell offsets,
+    /// so unit metrics make [`bitty_rich::KittyImageLayer::placement_full_rect_resolved`]
+    /// produce cell coordinates exactly, independent of the live font
+    /// metrics (and therefore headless-deterministic). Dangling placements
+    /// (image evicted under the store caps) paint nothing and project
+    /// nothing; a placement scrolled fully off the viewport is dropped, a
+    /// partially visible one is clipped.
+    ///
+    /// Session-less leaves that are not the primary owner own no plane and
+    /// return an empty list, mirroring the present path.
+    #[must_use]
+    pub fn kitty_image_cell_spans_for_view(
+        &self,
+        view: ViewId,
+    ) -> Vec<crate::inspect::ImageCellSpan> {
+        let (origin, grid_rows, grid_cols, scrollback_now) =
+            if let Some(sess) = self.pane_sessions.get(&view) {
+                (
+                    Some(view.0),
+                    sess.state.height(),
+                    sess.state.width(),
+                    sess.state.scrollback_len(),
+                )
+            } else if Some(view) == self.primary_view {
+                (
+                    None,
+                    self.state.height(),
+                    self.state.width(),
+                    self.state.scrollback_len(),
+                )
+            } else {
+                return Vec::new();
+            };
+        self.kitty_image_cell_spans_for_origin(origin, grid_rows, grid_cols, scrollback_now)
+    }
+
+    /// Painted image cell footprints for the primary grid.
+    ///
+    /// Same contract as [`Self::kitty_image_cell_spans_for_view`], for the
+    /// surface with no pane origin (the primary grid the devtools grid-text
+    /// snapshot publishes).
+    #[must_use]
+    pub fn kitty_image_cell_spans_for_primary(&self) -> Vec<crate::inspect::ImageCellSpan> {
+        self.kitty_image_cell_spans_for_origin(
+            None,
+            self.state.height(),
+            self.state.width(),
+            self.state.scrollback_len(),
+        )
+    }
+
+    /// Shared body of both footprint seams: one origin's live plane.
+    fn kitty_image_cell_spans_for_origin(
+        &self,
+        origin: Option<u64>,
+        grid_rows: usize,
+        grid_cols: usize,
+        scrollback_now: usize,
+    ) -> Vec<crate::inspect::ImageCellSpan> {
+        let unit = bitty_rich::CellMetrics {
+            width: 1,
+            height: 1,
+        };
+        let grid_cols = i64::try_from(grid_cols).unwrap_or(i64::MAX);
+        let grid_rows = i64::try_from(grid_rows).unwrap_or(i64::MAX);
+        let mut spans = Vec::new();
+        for placement in self.kitty_images.placements_in_paint_order_for(origin) {
+            // Same fail-closed rule as the paint pass: an evicted image
+            // covers nothing on screen.
+            if self.kitty_images.get(placement.image).is_none() {
+                continue;
+            }
+            let Some(rect) =
+                self.kitty_images
+                    .placement_full_rect_resolved(placement, unit, scrollback_now)
+            else {
+                continue;
+            };
+            let x0 = i64::from(rect.x).max(0);
+            let y0 = i64::from(rect.y).max(0);
+            let x1 = i64::from(rect.x)
+                .saturating_add(i64::from(rect.width))
+                .min(grid_cols);
+            let y1 = i64::from(rect.y)
+                .saturating_add(i64::from(rect.height))
+                .min(grid_rows);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            let Ok(col) = u32::try_from(x0) else {
+                continue;
+            };
+            let Ok(row) = u32::try_from(y0) else {
+                continue;
+            };
+            let Ok(cols) = u32::try_from(x1 - x0) else {
+                continue;
+            };
+            let Ok(rows) = u32::try_from(y1 - y0) else {
+                continue;
+            };
+            spans.push(crate::inspect::ImageCellSpan {
+                row,
+                col,
+                rows,
+                cols,
+            });
+        }
+        spans
+    }
+
     /// Answers one Kitty `a=q` query with at most one bounded reply (S2, #1849).
     ///
     /// Spec-exact wire shape (`recording/references/kitty@0b12ed8`,
@@ -1943,7 +2067,11 @@ impl Runtime {
     ///   declaration through [`bitty_rich::precheck_declared_image`]:
     ///   unknown `f=` and refused declarations answer
     ///   `Gi=<id>;EINVAL:<msg>`, quota-full stores answer
-    ///   `Gi=<id>;ENOSPC:store full`, otherwise `Gi=<id>;OK`. A `p=` on a
+    ///   `Gi=<id>;ENOSPC:store full`, otherwise `Gi=<id>;OK`. PNG
+    ///   payloads additionally pass
+    ///   [`bitty_rich::precheck_png_payload`], the decoder's own `IHDR`
+    ///   gate, so a probe never answers `OK` for bytes a transmit would
+    ///   refuse (issue #2875 scope 4). A `p=` on a
     ///   probe is ignored (kitty `graphics.c:2549` echoes only `q_iid`).
     ///   Probes REQUIRE `i=` (spec-exact, decided per the open point):
     ///   kitty `REPORT_ERROR`s with no reply when `!q_iid`
@@ -2084,6 +2212,18 @@ impl Runtime {
             if bitty_rich::precheck_declared_image(channels, width_s, height_v, payload.len())
                 .is_err()
             {
+                return Some((
+                    crate::queries::kitty_probe_einval_reply(image_id, "bad data"),
+                    false,
+                ));
+            }
+            // PNG declares no meaningful `s`/`v` (the `IHDR` governs), so
+            // `precheck_declared_image` cannot judge it. Validate the header
+            // through the same gate the transmit path runs (issue #2875
+            // scope 4): a probe must never answer `OK` for bytes the decoder
+            // then refuses, because that tells a client images work and
+            // paints nothing.
+            if channels.is_none() && bitty_rich::precheck_png_payload(payload).is_err() {
                 return Some((
                     crate::queries::kitty_probe_einval_reply(image_id, "bad data"),
                     false,

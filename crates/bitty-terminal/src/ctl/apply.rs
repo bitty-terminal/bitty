@@ -392,12 +392,17 @@ pub fn apply_control(
         // grid is never duplicated as text across tiles (pre-CTX-0359 the
         // focused session-less leaf mirrored primary, which let a fresh
         // workspace leaf read the previous workspace's terminal).
+        //
+        // Issue #2875 scope 6: a painted image that owns no grid cell (a
+        // direct `a=p`/`a=T` placement) must not read as an empty hole, so
+        // the projection carries the view's painted image footprints.
+        let images = runtime.kitty_image_cell_spans_for_view(target_view);
         let text = runtime
             .pane_snapshot(&target_view)
-            .map(|snap| snapshot_text(&snap))
+            .map(|snap| snapshot_text_with_images(&snap, &images))
             .or_else(|| {
                 if runtime.is_primary_view(&target_view) {
-                    Some(snapshot_text(&runtime.snapshot()))
+                    Some(snapshot_text_with_images(&runtime.snapshot(), &images))
                 } else {
                     None
                 }
@@ -974,15 +979,27 @@ fn json_string_array(items: &[String]) -> String {
 /// CTX-0321: `terminal text` must return the rendered grid, not a `Debug` dump
 /// of the internal `Snapshot` struct. This reuses the canonical bounded
 /// row-wise extraction the devtools `grid-text` snapshot exposes
-/// ([`bitty_runtime::inspect::grid_text_from_snapshot`]): wide-char spacers are
-/// skipped, trailing blanks are trimmed per row, and the rows are newline
-/// joined. The joined result is bounded ([`bounded_text`]) and never panics on
-/// an unexpected grid.
-pub(super) fn snapshot_text(snapshot: &bitty_term_state::Snapshot) -> String {
-    let grid = bitty_runtime::inspect::grid_text_from_snapshot(
+/// ([`bitty_runtime::inspect::grid_text_from_snapshot_with_images`]):
+/// wide-char spacers are skipped, trailing blanks are trimmed per row, and the
+/// rows are newline joined. The joined result is bounded ([`bounded_text`])
+/// and never panics on an unexpected grid.
+///
+/// Issue #2875 scope 6 (a11y/scene contract): a direct `a=p`/`a=T`
+/// placement owns no grid cell, so its cells stay blank. Passing the
+/// [footprints](bitty_runtime::inspect::ImageCellSpan) lets the shared
+/// projection substitute the object-replacement character for exactly those
+/// blank cells, so `bitty ctl terminal text` reports an image instead of an
+/// empty hole. Grid text under an image is preserved. Callers with no image
+/// plane pass an empty slice.
+pub(super) fn snapshot_text_with_images(
+    snapshot: &bitty_term_state::Snapshot,
+    images: &[bitty_runtime::inspect::ImageCellSpan],
+) -> String {
+    let grid = bitty_runtime::inspect::grid_text_from_snapshot_with_images(
         snapshot,
         bitty_runtime::inspect::INSPECT_MAX_ROWS,
         bitty_runtime::inspect::INSPECT_MAX_COLS,
+        images,
     );
     bounded_text(&grid.lines.join("\n"))
 }

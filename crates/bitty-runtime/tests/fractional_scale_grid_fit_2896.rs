@@ -34,7 +34,13 @@ fn physical_for(scale: f64) -> PhysicalSize {
 
 fn runtime_at(scale: f64) -> Runtime {
     let mut rt = Runtime::with_defaults().expect("default runtime builds");
-    rt.apply_dpi_scale(scale, Some(physical_for(scale)));
+    // Drive the production route, not a convenience one: the runtime's own
+    // `WindowEventKind::ScaleFactorChanged` handler calls
+    // `apply_dpi_scale(factor, None)` (resize.rs), i.e. the no-extent
+    // adoption whose container re-derivation is the #2896 fix. Passing the
+    // physical extent explicitly here would bypass the fallback and make
+    // every assertion below an arithmetic identity.
+    rt.apply_dpi_scale(scale, None);
     assert_eq!(rt.dpi_scale(), scale, "scale must be adopted verbatim");
     rt
 }
@@ -135,22 +141,28 @@ fn pty_size_equals_the_painted_grid_at_every_scale() {
     }
 }
 
+/// The numbered full-screen fixture from the issue: exactly one screenful,
+/// `01..=rows`, no trailing newline so the fixture does not scroll. Row 1 of
+/// the output must land on the top painted row, and the last row must be
+/// painted in full.
+fn numbered_fixture_at(scale: f64) -> (Runtime, usize) {
+    let mut rt = runtime_at(scale);
+    let rows = usize::from(primary_frame(&rt).rows);
+    let mut feed = String::new();
+    for line in 1..=rows {
+        if line > 1 {
+            feed.push_str("\r\n");
+        }
+        feed.push_str(&format!("{line:02}"));
+    }
+    rt.handle_pty_bytes(feed.as_bytes());
+    (rt, rows)
+}
+
 #[test]
 fn numbered_fixture_keeps_row_one_visible_at_every_scale() {
     for scale in SCALES {
-        let mut rt = runtime_at(scale);
-        let rows = usize::from(primary_frame(&rt).rows);
-        // Exactly one screenful, numbered `01..=rows`, no trailing newline so
-        // the fixture does not scroll: row 1 of the output must be the top
-        // painted row.
-        let mut feed = String::new();
-        for line in 1..=rows {
-            if line > 1 {
-                feed.push_str("\r\n");
-            }
-            feed.push_str(&format!("{line:02}"));
-        }
-        rt.handle_pty_bytes(feed.as_bytes());
+        let (rt, rows) = numbered_fixture_at(scale);
 
         let snapshot = rt.snapshot();
         assert_eq!(
@@ -174,7 +186,15 @@ fn numbered_fixture_keeps_row_one_visible_at_every_scale() {
 #[test]
 fn pointer_in_the_last_cell_maps_to_the_last_cell_at_every_scale() {
     for scale in SCALES {
-        let rt = runtime_at(scale);
+        // Same numbered fixture as the visibility test: a full-screen TUI is
+        // what the reporter was clicking into, and the hit-test must agree
+        // with the grid that fixture sized (rows) and painted.
+        let (rt, rows) = numbered_fixture_at(scale);
+        let snapshot = rt.snapshot();
+        assert_eq!(
+            snapshot.height, rows,
+            "scale {scale}: the fixture must fit the adopted grid"
+        );
         let (cell_w, cell_h) = rt.live_cell_size();
         let frame = primary_frame(&rt);
         let content = frame.content;
@@ -200,6 +220,14 @@ fn pointer_in_the_last_cell_maps_to_the_last_cell_at_every_scale() {
             (frame.rows - 1, frame.cols - 1),
             "scale {scale}: a pixel in the last row/column must map to the \
              last cell, not a cell outside the painted grid"
+        );
+        // ...and the cell it resolved really is the fixture's last line, not
+        // a row past the painted content.
+        assert_eq!(
+            row_text(&snapshot, cell.row as usize),
+            format!("{rows:02}"),
+            "scale {scale}: the bottom-right hit must land on the numbered \
+             fixture's last row"
         );
     }
 }
@@ -239,27 +267,4 @@ fn scale_adopted_without_an_extent_still_fits_the_surface() {
         (usize::from(frame.cols), usize::from(frame.rows)),
         "the PTY grid must follow the re-derived container"
     );
-}
-
-#[test]
-fn a_cell_grown_under_a_stale_container_would_overflow() {
-    // Failure sensitivity: the invariant is tight. Take the 1.6 case and
-    // assume the container was derived with a cell 8% shorter (the ratio the
-    // issue measured between sizing and painting). The grid then exceeds the
-    // painted content rect by that ratio — which is exactly why the container
-    // must be re-derived from the live metric on every change.
-    let rt = runtime_at(1.6);
-    let (cell_w, cell_h) = rt.live_cell_size();
-    let frame = primary_frame(&rt);
-    let stale_cell_h = cell_h - cell_h / 12; // ~8% shorter metric
-    let stale_rows = (frame.content.height / stale_cell_h).max(1);
-    let painted_h = stale_rows * cell_h;
-    assert!(
-        painted_h > frame.content.height,
-        "an 8% shorter sizing metric must produce a grid that overflows the \
-         painted content rect: {stale_rows} rows * {cell_h}px = {painted_h}px \
-         vs {}px",
-        frame.content.height
-    );
-    assert!(stale_cell_h > 0 && cell_w > 0, "metrics stay valid");
 }

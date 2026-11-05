@@ -294,10 +294,11 @@ impl Runtime {
     /// Sanitizes `scale` via [`sanitize_dpi_scale`] (invalid input becomes
     /// 1.0, hostile input clamps to `[MIN_DPI_SCALE, MAX_DPI_SCALE]` — never
     /// panics), reloads the renderer's font at the scaled size through
-    /// `GridRenderer::apply_dpi_scale`, and — when `physical_extent` carries
-    /// a non-zero extent — derives the grid from physical pixels over the
-    /// scaled cells ([`grid_from_surface_extent`]) and reflows state, layout,
-    /// surface, and PTY to match.
+    /// `GridRenderer::apply_dpi_scale`, and — when a non-zero extent is
+    /// available (the `physical_extent` argument, else the configured surface
+    /// extent) — derives the grid from physical pixels over the scaled cells
+    /// ([`grid_from_surface_extent`]) and reflows state, layout, surface, and
+    /// PTY to match.
     ///
     /// Callers holding only cached logical geometry should convert it first
     /// via [`bitty_platform::surface_extent_from_logical`] and pass the

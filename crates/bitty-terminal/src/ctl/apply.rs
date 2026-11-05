@@ -879,11 +879,22 @@ fn create_split_leaf(
         return Err(("usage", "Conflict", format!("spawn refused: {err}")));
     }
     runtime.set_layout(layout);
+    // CTX-1707 (#2896): size the shell to the decorated content frame the
+    // pane actually paints, never the larger raw slot allocation. Spawning
+    // at the allocation makes the PTY advertise rows the painter windows
+    // away, so a full-screen TUI loses its top lines until an unrelated
+    // geometry change re-syncs the pane. Same rule as the keymap
+    // `new_split` path (`commit_new_leaf`); the allocation is a
+    // degenerate-container fallback only.
     let (cols, rows) = runtime
-        .layout_allocations()
-        .iter()
-        .find(|(id, _)| *id == new_id)
-        .map(|(_, rect)| (rect.width.max(1), rect.height.max(1)))
+        .presented_frame_cells(new_id)
+        .or_else(|| {
+            runtime
+                .layout_allocations()
+                .iter()
+                .find(|(id, _)| *id == new_id)
+                .map(|(_, rect)| (rect.width.max(1), rect.height.max(1)))
+        })
         .unwrap_or((80, 24));
     Ok((new_id, cols, rows))
 }

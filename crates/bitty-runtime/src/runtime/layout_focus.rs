@@ -2048,6 +2048,24 @@ impl Runtime {
         (live.width, live.height)
     }
 
+    /// Decorated content grid `(cols, rows)` of `view`'s live present frame
+    /// (CTX-1707).
+    ///
+    /// This is the cell size the painter actually shows for `view`: the
+    /// present solver has already removed the window padding, the Core-owned
+    /// decoration, and the sibling gaps. Any consumer that sizes a backing
+    /// grid or a PTY must use this instead of a raw [`Self::layout_allocations`]
+    /// slot, otherwise the terminal advertises rows/columns the painter
+    /// windows away (issue #2896). `None` when `view` has no live frame
+    /// (off-layout workspace slot, closed, or an empty container).
+    #[must_use]
+    pub fn presented_frame_cells(&self, view: ViewId) -> Option<(u16, u16)> {
+        self.present_frames()
+            .into_iter()
+            .find(|frame| frame.view == view)
+            .map(|frame| (frame.cols.max(1), frame.rows.max(1)))
+    }
+
     /// First owner-grid row painted at the top of `owner`'s content frame.
     ///
     /// CTX-0803: the single row-window translation shared by the pointer

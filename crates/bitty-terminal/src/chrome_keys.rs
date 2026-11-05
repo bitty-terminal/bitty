@@ -1295,12 +1295,12 @@ impl TerminalApp {
         // post-spawn SIGWINCH repaints the prompt and can leave a stray
         // blank first row above it. `workspace_new` and session restore
         // already spawn at the present frame.
+        //
+        // CTX-1707: one shared resolver (`Runtime::presented_frame_cells`)
+        // so every spawn caller agrees with the painter.
         let (cols, rows) = self
             .runtime
-            .present_frames()
-            .iter()
-            .find(|frame| frame.view == new_id)
-            .map(|frame| (frame.cols.max(1), frame.rows.max(1)))
+            .presented_frame_cells(new_id)
             .or_else(|| {
                 self.runtime
                     .layout_allocations()

@@ -1173,9 +1173,11 @@ impl Runtime {
                 // a pixel placement too. Capture the pre-apply anchor (truth
                 // advances the cursor past the span), then mirror the
                 // placement into the rich layer after truth admits it.
-                // Virtual prototypes and relative placements are excluded:
-                // the former paint from `U+10EEEE` runs, the latter need a
-                // resolved parent anchor the rich layer does not model.
+                // Virtual prototypes are excluded: they paint from
+                // `U+10EEEE` runs. Relative placements (`P=`/`Q=` with
+                // `H=`/`V=`) capture their parent link instead of an anchor,
+                // so the paint path derives the child rect from the parent's
+                // painted origin every frame (no second scroll bookkeeping).
                 let bodiless_place = if let TerminalAction::KittyGraphics {
                     action_a: Some('p'),
                     cols_c,
@@ -1185,7 +1187,6 @@ impl Runtime {
                 } = &action
                 {
                     if !control.is_virtual_placement()
-                        && !control.has_parent()
                         && (*cols_c != 0 || *rows_r != 0)
                         && control.image_id != 0
                     {
@@ -1199,6 +1200,10 @@ impl Runtime {
                             control.z_index,
                             control.image_id,
                             control.placement_id,
+                            control.has_parent().then_some((
+                                (control.parent_id, control.parent_placement_id),
+                                (control.parent_dx, control.parent_dy),
+                            )),
                         ))
                     } else {
                         None
@@ -1266,22 +1271,36 @@ impl Runtime {
                 }
                 // Issue #2875: mirror an admitted bodiless `a=p` into the
                 // pixel layer so a `t`-then-`p` client paints. Truth already
-                // refused spanless commands above, so the captured spans are
-                // non-zero here; a missing stored image still paints nothing
-                // (fail closed, like a dangling transmit).
-                if let Some((col, row, base, cols, rows, z, image, pin)) = bodiless_place {
-                    // Mirror only what truth actually anchored at this cell:
-                    // a refused placement must not paint.
+                // refused spanless commands, missing/virtual parents, and
+                // overflow above, so this only mirrors what truth kept.
+                if let Some((col, row, base, cols, rows, z, image, pin, relative)) = bodiless_place
+                {
+                    // Mirror only what truth actually anchored at this cell
+                    // (or with this parent link): a refused placement must
+                    // not paint.
                     let recorded =
                         self.state
                             .kitty_placements()
                             .get(image, pin)
-                            .is_some_and(|placed| {
-                                placed.anchor_col == u32::from(col)
-                                    && placed.anchor_row == u32::from(row)
+                            .is_some_and(|placed| match relative {
+                                None => {
+                                    placed.anchor_col == u32::from(col)
+                                        && placed.anchor_row == u32::from(row)
+                                }
+                                Some((parent, _)) => placed.parent == Some(parent),
                             });
                     if recorded {
-                        let _ = self.kitty_place_stored(col, row, base, cols, rows, z, image, pin);
+                        match relative {
+                            None => {
+                                let _ = self
+                                    .kitty_place_stored(col, row, base, cols, rows, z, image, pin);
+                            }
+                            Some((parent, offset)) => {
+                                let _ = self.kitty_place_stored_relative(
+                                    cols, rows, base, z, image, pin, parent, offset,
+                                );
+                            }
+                        }
                     }
                 }
                 continue;

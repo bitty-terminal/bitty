@@ -39,6 +39,14 @@
 //! # Placement semantics
 //!
 //! - Anchor: the cursor cell (`anchor_col`, `anchor_row`) at display time.
+//! - Relative placements (`a=p` with `P=`/`Q=` plus `H=`/`V=` offsets):
+//!   anchored to the parent's *painted* origin plus those cell offsets,
+//!   recomputed every frame by
+//!   [`KittyImageLayer::placement_full_rect_resolved`]. The child therefore
+//!   scrolls with its parent, hides when the parent leaves the grid or dies,
+//!   and a missing/virtual/cyclic parent chain paints nothing (the walk is
+//!   depth-bounded). `z=` stays the child's own, so a negative-`z` child
+//!   still composites below text.
 //! - Size: explicit `c`/`r` cell spans when non-zero, otherwise derived from
 //!   decoded pixels (`ceil(px / cell)`, at least 1 cell per axis).
 //! - The cell rect maps to pixels through the caller-supplied
@@ -309,6 +317,18 @@ use std::collections::VecDeque;
 use crate::geometry::{CellMetrics, ExtentPx, RectPx};
 use crate::kitty_unicode::{KittyUnicodeRect, KittyUnicodeVirtual, unicode_run_rect};
 use bitty_term_state::{KittyUnicodeCell, KittyUnicodeRun};
+
+/// Maximum parent-chain depth walked when resolving a relative placement
+/// (issue #2875).
+///
+/// The wire lets a client re-put an existing placement with a new `P=`/`Q=`
+/// parent, so a cycle (`p1 → p2 → p1`) is reachable even though terminal
+/// truth refuses a missing parent: truth's cascade only drops *orphans*, and
+/// every node of a cycle has a parent. The resolver therefore bounds the walk
+/// and fails closed past this depth instead of looping. Eight levels cover
+/// every sane composite (a parent plus a few nested overlays) while keeping
+/// the walk O(depth × placements), bounded with the placement caps.
+pub const KITTY_PLACE_MAX_PARENT_DEPTH: u8 = 8;
 
 /// Kitty `f=` value for PNG payloads (Core-retained contract mirror).
 ///
@@ -824,6 +844,18 @@ pub struct KittyPlacement {
     pub scrollback_base: usize,
     /// Stacking order (ascending paints first).
     pub z: i32,
+    /// Wire `(P=, Q=)` parent identity for a relative placement (issue
+    /// #2875): the parent's origin-scoped wire `(image id, placement id)`.
+    /// `None` for an absolutely anchored placement. A relative placement's
+    /// own [`Self::anchor_col`]/[`Self::anchor_row`] are unused: the paint
+    /// path derives its rect from the parent's *painted* origin at paint
+    /// time ([`KittyImageLayer::placement_full_rect_resolved`]), so scroll
+    /// needs no second bookkeeping here and a dead parent simply paints
+    /// nothing.
+    pub parent: Option<(u32, u32)>,
+    /// Wire `H=`/`V=` cell offset from the parent's painted origin as
+    /// `(dx, dy)`; `(0, 0)` for absolute placements.
+    pub parent_offset: (i32, i32),
 }
 
 /// Virtual-prototype record for one `U=1` registration (S4, #1849).
@@ -2162,6 +2194,9 @@ impl KittyImageLayer {
         if removed {
             self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
             self.placements.retain(|p| p.image != id);
+            // Issue #2875: dropping an image drops its placements, so their
+            // relative children orphan and follow (truth cascades too).
+            self.cascade_relative_orphans();
             // S4 (#1849): linked combined-form prototypes cascade with
             // their image, like blit placements.
             self.virtual_protos.retain(|v| v.image != Some(id));
@@ -2291,11 +2326,131 @@ impl KittyImageLayer {
         wire_image: u32,
         wire_placement: u32,
     ) -> Result<KittyPlacementId, KittyPlacementError> {
+        self.push_placement(
+            image,
+            Some((anchor_col, anchor_row)),
+            cols,
+            rows,
+            metrics,
+            scrollback_base,
+            z,
+            origin,
+            wire_image,
+            wire_placement,
+            None,
+            (0, 0),
+        )
+    }
+
+    /// Places a stored image relative to another placement (issue #2875).
+    ///
+    /// The wire form is `a=p` with `P=`/`Q=` (parent image / placement ids,
+    /// `Q=0` = any placement of that image) plus `H=`/`V=` cell offsets. The
+    /// parent link is recorded verbatim — never a resolved anchor — so the
+    /// paint path derives the child rect from wherever the parent paints
+    /// *this* frame ([`Self::placement_full_rect_resolved`]): a scrolling or
+    /// clipped parent moves or hides the child with no extra bookkeeping,
+    /// and a parent that disappears paints the child nowhere (fail closed).
+    ///
+    /// Terminal truth (`bitty_term_state::PlacementStore`) already refused a
+    /// missing or virtual parent before this admission; presentation still
+    /// re-resolves the whole chain at paint time, so an unreachable link, a
+    /// cycle, or an offset the pixel range cannot hold paints nothing.
+    ///
+    /// Spans, `z`, quotas, FIFO eviction, and the origin-scoped wire
+    /// identity are exactly [`Self::display_for_origin_with_wire`]'s.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::display_for_origin_with_wire`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn display_relative_for_origin(
+        &mut self,
+        image: KittyImageId,
+        cols: u16,
+        rows: u16,
+        metrics: CellMetrics,
+        scrollback_base: usize,
+        z: i32,
+        origin: Option<u64>,
+        wire_image: u32,
+        wire_placement: u32,
+        parent: (u32, u32),
+        parent_offset: (i32, i32),
+    ) -> Result<KittyPlacementId, KittyPlacementError> {
+        self.push_placement(
+            image,
+            None,
+            cols,
+            rows,
+            metrics,
+            scrollback_base,
+            z,
+            origin,
+            wire_image,
+            wire_placement,
+            Some(parent),
+            parent_offset,
+        )
+    }
+
+    /// Shared admission behind the absolute and relative placement seams.
+    ///
+    /// `anchor` is `None` for a relative placement (its rect comes from the
+    /// parent at paint time); the stored cell is `(0, 0)` and unused.
+    #[allow(clippy::too_many_arguments)]
+    fn push_placement(
+        &mut self,
+        image: KittyImageId,
+        anchor: Option<(u16, u16)>,
+        cols: u16,
+        rows: u16,
+        metrics: CellMetrics,
+        scrollback_base: usize,
+        z: i32,
+        origin: Option<u64>,
+        wire_image: u32,
+        wire_placement: u32,
+        parent: Option<(u32, u32)>,
+        parent_offset: (i32, i32),
+    ) -> Result<KittyPlacementId, KittyPlacementError> {
         let stored = self
             .get(image)
             .ok_or(KittyPlacementError::ImageNotFound(image))?;
         let cols = cell_span(cols, stored.width, metrics.width);
         let rows = cell_span(rows, stored.height, metrics.height);
+        let (anchor_col, anchor_row) = anchor.unwrap_or((0, 0));
+        let placement = KittyPlacement {
+            id: KittyPlacementId(0),
+            image,
+            origin,
+            wire_image,
+            wire_placement,
+            anchor_col,
+            anchor_row,
+            cols,
+            rows,
+            scrollback_base,
+            z,
+            parent,
+            parent_offset,
+        };
+        // An addressed re-put (`i != 0` and `p != 0`) replaces in place,
+        // exactly like terminal truth's upsert: no quota consumed, nothing
+        // evicted, and — load-bearing for relative placements (#2875) — no
+        // cascade, so children pointing at this wire identity keep
+        // resolving. Replacing by delete-then-add would drop them.
+        if wire_image != 0 && wire_placement != 0 {
+            if let Some(slot) = self.placements.iter_mut().find(|p| {
+                p.origin == origin
+                    && p.wire_image == wire_image
+                    && p.wire_placement == wire_placement
+            }) {
+                let id = slot.id;
+                *slot = KittyPlacement { id, ..placement };
+                return Ok(id);
+            }
+        }
         // Per-origin pressure evicts this origin's own oldest placement;
         // global pressure from other origins refuses instead (no
         // cross-origin eviction). Decided before any mutation so a refusal
@@ -2315,19 +2470,8 @@ impl KittyImageLayer {
         }
         let id = KittyPlacementId(self.next_placement_id);
         self.next_placement_id = self.next_placement_id.wrapping_add(1).max(1);
-        self.placements.push_back(KittyPlacement {
-            id,
-            image,
-            origin,
-            wire_image,
-            wire_placement,
-            anchor_col,
-            anchor_row,
-            cols,
-            rows,
-            scrollback_base,
-            z,
-        });
+        self.placements
+            .push_back(KittyPlacement { id, ..placement });
         Ok(id)
     }
 
@@ -2337,11 +2481,16 @@ impl KittyImageLayer {
         self.placements.iter().find(|p| p.id == id)
     }
 
-    /// Removes a placement by id.
+    /// Removes a placement by id, cascading to its relative children
+    /// (issue #2875: presentation mirrors terminal truth's cascade).
     pub fn remove_placement(&mut self, id: KittyPlacementId) -> bool {
         let before = self.placements.len();
         self.placements.retain(|p| p.id != id);
-        self.placements.len() != before
+        let removed = self.placements.len() != before;
+        if removed {
+            self.cascade_relative_orphans();
+        }
+        removed
     }
 
     /// Iterates placements oldest first.
@@ -2592,6 +2741,9 @@ impl KittyImageLayer {
                     .retain(|v| !(v.origin == origin && v.wire_image == image_id));
             }
         }
+        // Issue #2875: relative children follow their parent, exactly like
+        // terminal truth's cascade.
+        self.cascade_relative_orphans();
         before - (self.placements.len() + self.virtual_protos.len())
     }
 
@@ -2635,6 +2787,109 @@ impl KittyImageLayer {
             saturating_u32(w),
             saturating_u32(h),
         ))
+    }
+
+    /// Scroll-adjusted, unclamped pixel rect for any placement, resolving
+    /// relative (`P=`/`Q=`) anchors against their parents at paint time
+    /// (issue #2875).
+    ///
+    /// Absolute placements are [`Self::placement_full_rect`] unchanged. A
+    /// relative placement walks its parent chain (bounded by
+    /// [`KITTY_PLACE_MAX_PARENT_DEPTH`]) to the absolute ancestor, takes
+    /// that ancestor's *painted* rect — the same scroll-adjusted geometry
+    /// every blit uses — and adds the accumulated `H=`/`V=` cell offsets in
+    /// pixels; the child's own span (not the parent's) becomes the extent.
+    /// Consequences, each a required behavior:
+    ///
+    /// - a scroll moves the child with the parent, because the parent rect
+    ///   is recomputed per frame (the child's own anchor/base never enter);
+    /// - a parent scrolled fully off the top hides the child;
+    /// - a missing parent, a parent on another origin, a virtual prototype
+    ///   (never in this deque), an unset/nonsensical link, a chain past the
+    ///   depth bound (a wire-reachable cycle), or an offset that overflows
+    ///   the pixel range all return `None`: no paint, never a panic.
+    ///
+    /// Pure: reads the bounded placement deque, allocates nothing.
+    #[must_use]
+    pub fn placement_full_rect_resolved(
+        &self,
+        placement: &KittyPlacement,
+        metrics: CellMetrics,
+        scrollback_now: usize,
+    ) -> Option<RectPx> {
+        if placement.parent.is_none() {
+            return Self::placement_full_rect(placement, metrics, scrollback_now);
+        }
+        let mut ancestor = placement;
+        let mut dx_cells: i64 = 0;
+        let mut dy_cells: i64 = 0;
+        let mut depth = 0u8;
+        while let Some((parent_image, parent_placement)) = ancestor.parent {
+            if depth >= KITTY_PLACE_MAX_PARENT_DEPTH {
+                // Depth bound hit: either a cycle or an absurd chain.
+                return None;
+            }
+            let parent =
+                self.find_placement_for_origin(ancestor.origin, parent_image, parent_placement)?;
+            dx_cells = dx_cells.checked_add(i64::from(ancestor.parent_offset.0))?;
+            dy_cells = dy_cells.checked_add(i64::from(ancestor.parent_offset.1))?;
+            ancestor = parent;
+            depth = depth.saturating_add(1);
+        }
+        let base = Self::placement_full_rect(ancestor, metrics, scrollback_now)?;
+        // Pixel origin: the ancestor's painted rect plus the accumulated
+        // cell offsets. Checked, then range-checked: an unrepresentable
+        // origin fails closed instead of saturating into a wrong rect.
+        let x = i64::from(base.x).checked_add(dx_cells.checked_mul(i64::from(metrics.width))?)?;
+        let y = i64::from(base.y).checked_add(dy_cells.checked_mul(i64::from(metrics.height))?)?;
+        let x = i32::try_from(x).ok()?;
+        let y = i32::try_from(y).ok()?;
+        let w = u64::from(placement.cols) * u64::from(metrics.width);
+        let h = u64::from(placement.rows) * u64::from(metrics.height);
+        Some(RectPx::new(x, y, saturating_u32(w), saturating_u32(h)))
+    }
+
+    /// Origin-scoped wire lookup, oldest first — the presentation mirror of
+    /// terminal truth's `PlacementStore::get` (insertion order, so a `Q=0`
+    /// parent resolves to the same anonymous placement on both sides).
+    fn find_placement_for_origin(
+        &self,
+        origin: Option<u64>,
+        wire_image: u32,
+        wire_placement: u32,
+    ) -> Option<&KittyPlacement> {
+        self.placements.iter().find(|p| {
+            p.origin == origin && p.wire_image == wire_image && p.wire_placement == wire_placement
+        })
+    }
+
+    /// Drops relative placements whose parent no longer exists, mirroring
+    /// terminal truth's cascade (issue #2875).
+    ///
+    /// Without this a stale child could resurrect: re-placing a deleted
+    /// parent under the same wire identity would make the old link resolve
+    /// again, painting a child truth already dropped. Repeated until no
+    /// orphan remains, so grandchildren die with their parent; bounded by
+    /// the placement caps.
+    fn cascade_relative_orphans(&mut self) {
+        loop {
+            let mut orphan = None;
+            for entry in &self.placements {
+                if let Some((parent_image, parent_placement)) = entry.parent {
+                    if self
+                        .find_placement_for_origin(entry.origin, parent_image, parent_placement)
+                        .is_none()
+                    {
+                        orphan = Some(entry.id);
+                        break;
+                    }
+                }
+            }
+            match orphan {
+                Some(id) => self.placements.retain(|p| p.id != id),
+                None => break,
+            }
+        }
     }
 
     /// Pixel rect for a placement in the current viewport, if visible.
@@ -3906,5 +4161,215 @@ mod tests {
         let visible =
             KittyImageLayer::placement_rect(placement, METRICS, 80, 24, 0).expect("visible");
         assert_eq!(visible, RectPx::new(0, 0, 8, 24 * 16));
+    }
+
+    /// Relative placements (issue #2875): the resolver derives the child rect
+    /// from the parent's painted origin plus the wire `H=`/`V=` cell offsets,
+    /// and re-derives it per frame so a scroll carries the child along.
+    #[test]
+    fn relative_placement_resolves_parent_origin_plus_offsets_and_scroll() {
+        let mut layer = KittyImageLayer::new();
+        let parent_img = stored_red(&mut layer);
+        let child_img = stored_red(&mut layer);
+        let parent = layer
+            .display_for_origin_with_wire(parent_img, 4, 10, 2, 2, METRICS, 0, 0, None, 7, 1)
+            .expect("parent places");
+        let child = layer
+            .display_relative_for_origin(child_img, 2, 2, METRICS, 0, 0, None, 8, 2, (7, 1), (3, 1))
+            .expect("relative child places");
+        let parent_placement = layer.get_placement(parent).unwrap();
+        let child_placement = layer.get_placement(child).unwrap();
+        let base = KittyImageLayer::placement_full_rect(parent_placement, METRICS, 0).unwrap();
+        assert_eq!(base, RectPx::new(4 * 8, 10 * 16, 2 * 8, 2 * 16));
+        let resolved = layer
+            .placement_full_rect_resolved(child_placement, METRICS, 0)
+            .expect("child resolves");
+        assert_eq!(
+            resolved,
+            RectPx::new(base.x + 3 * 8, base.y + 16, 2 * 8, 2 * 16),
+            "child paints at parent origin + H=3 / V=1 cells with its own span"
+        );
+        // Four scrolled rows move the parent up four cells; the child keeps
+        // its offset with no scroll state of its own.
+        let scrolled_parent = layer
+            .placement_full_rect_resolved(parent_placement, METRICS, 4)
+            .unwrap();
+        let scrolled_child = layer
+            .placement_full_rect_resolved(child_placement, METRICS, 4)
+            .unwrap();
+        assert_eq!(scrolled_parent.y, base.y - 4 * 16);
+        assert_eq!(
+            scrolled_child,
+            RectPx::new(
+                scrolled_parent.x + 3 * 8,
+                scrolled_parent.y + 16,
+                resolved.width,
+                resolved.height
+            )
+        );
+    }
+
+    /// Fail-closed paths (issue #2875): a missing parent and an offset the
+    /// pixel range cannot hold both paint nothing.
+    #[test]
+    fn relative_placement_fails_closed_on_missing_parent_and_overflow() {
+        let mut layer = KittyImageLayer::new();
+        let img = stored_red(&mut layer);
+        // Missing parent: nothing holds wire `(99, 9)`.
+        let orphan = layer
+            .display_relative_for_origin(img, 2, 2, METRICS, 0, 0, None, 8, 2, (99, 9), (0, 0))
+            .expect("admission does not resolve parents");
+        let orphan_placement = layer.get_placement(orphan).unwrap();
+        assert!(
+            layer
+                .placement_full_rect_resolved(orphan_placement, METRICS, 0)
+                .is_none()
+        );
+
+        // Offset overflow: `H=i32::MAX` cells cannot land in an `i32` origin.
+        let parent = layer
+            .display_for_origin_with_wire(img, 0, 0, 2, 2, METRICS, 0, 0, None, 7, 1)
+            .expect("parent places");
+        let far = layer
+            .display_relative_for_origin(
+                img,
+                2,
+                2,
+                METRICS,
+                0,
+                0,
+                None,
+                8,
+                3,
+                (7, 1),
+                (i32::MAX, 0),
+            )
+            .expect("admission does not resolve offsets");
+        assert_eq!(
+            layer.get_placement(far).unwrap().parent,
+            Some((7, 1)),
+            "admission keeps the wire link verbatim"
+        );
+        assert!(
+            layer
+                .placement_full_rect_resolved(layer.get_placement(far).unwrap(), METRICS, 0)
+                .is_none()
+        );
+        assert!(layer.get_placement(parent).is_some());
+    }
+
+    /// Fail-closed path (issue #2875): a parent cycle is reachable when a
+    /// relative placement is admitted before the placement it names, so the
+    /// resolver must stop at the depth bound instead of looping.
+    #[test]
+    fn relative_placement_cycle_hits_the_depth_bound() {
+        let mut layer = KittyImageLayer::new();
+        let img = stored_red(&mut layer);
+        // `(10, 1)` names `(11, 2)` before it exists; `(11, 2)` then names
+        // `(10, 1)`: both links resolve and the chain closes on itself.
+        let first = layer
+            .display_relative_for_origin(img, 2, 2, METRICS, 0, 0, None, 10, 1, (11, 2), (1, 0))
+            .expect("first link admits");
+        let second = layer
+            .display_relative_for_origin(img, 2, 2, METRICS, 0, 0, None, 11, 2, (10, 1), (1, 0))
+            .expect("second link admits");
+        for id in [first, second] {
+            assert!(
+                layer
+                    .placement_full_rect_resolved(layer.get_placement(id).unwrap(), METRICS, 0)
+                    .is_none(),
+                "a cyclic chain must paint nothing"
+            );
+        }
+    }
+
+    /// Depth bound (issue #2875): a chain of exactly
+    /// [`KITTY_PLACE_MAX_PARENT_DEPTH`] links resolves; one more link refuses.
+    #[test]
+    fn relative_placement_chain_stops_at_the_depth_bound() {
+        let mut layer = KittyImageLayer::new();
+        let img = stored_red(&mut layer);
+        let max = u32::from(KITTY_PLACE_MAX_PARENT_DEPTH);
+        layer
+            .display_for_origin_with_wire(img, 0, 0, 1, 1, METRICS, 0, 0, None, 1, 1)
+            .expect("root places");
+        for level in 2..=max + 2 {
+            layer
+                .display_relative_for_origin(
+                    img,
+                    1,
+                    1,
+                    METRICS,
+                    0,
+                    0,
+                    None,
+                    1,
+                    level,
+                    (1, level - 1),
+                    (1, 0),
+                )
+                .expect("link admits");
+        }
+        // Placement ids start at 1, so the level-`n` placement is id `n`:
+        // id `max + 1` sits exactly `max` links below the root and still
+        // resolves ...
+        let deepest = layer
+            .get_placement(KittyPlacementId(u64::from(max) + 1))
+            .expect("level `max + 1` admits");
+        assert!(
+            layer
+                .placement_full_rect_resolved(deepest, METRICS, 0)
+                .is_some(),
+            "a chain of exactly the depth bound resolves"
+        );
+        // ... while one more link is past it.
+        let beyond = layer
+            .get_placement(KittyPlacementId(u64::from(max) + 2))
+            .expect("level `max + 2` admits");
+        assert!(
+            layer
+                .placement_full_rect_resolved(beyond, METRICS, 0)
+                .is_none(),
+            "a chain one link past the bound fails closed"
+        );
+    }
+
+    /// Re-put vs delete (issue #2875): an addressed re-put replaces the
+    /// parent in place, so its relative children keep resolving against the
+    /// new origin; a protocol delete cascades them away with it.
+    #[test]
+    fn relative_child_survives_a_parent_reput_but_not_a_delete() {
+        let mut layer = KittyImageLayer::new();
+        let img = stored_red(&mut layer);
+        layer
+            .display_for_origin_with_wire(img, 0, 0, 2, 2, METRICS, 0, 0, None, 7, 1)
+            .expect("parent places");
+        let child = layer
+            .display_relative_for_origin(img, 1, 1, METRICS, 0, 0, None, 8, 2, (7, 1), (1, 1))
+            .expect("child places");
+        let child_of = |layer: &KittyImageLayer| {
+            layer
+                .placement_full_rect_resolved(layer.get_placement(child).unwrap(), METRICS, 0)
+                .map(|rect| (rect.x, rect.y))
+        };
+        assert_eq!(child_of(&layer), Some((8, 16)));
+        // Same wire identity, new anchor: replace in place, not delete+add.
+        let replaced = layer
+            .display_for_origin_with_wire(img, 3, 3, 2, 2, METRICS, 0, 0, None, 7, 1)
+            .expect("parent re-put");
+        assert_eq!(layer.placement_len(), 2, "a re-put must not duplicate");
+        assert_eq!(
+            child_of(&layer),
+            Some((3 * 8 + 8, 3 * 16 + 16)),
+            "the child follows its re-put parent instead of being dropped"
+        );
+        assert_eq!(
+            layer.get_placement(replaced).map(|p| p.anchor_col),
+            Some(3),
+            "the re-put keeps the placement id and takes the new anchor"
+        );
+        // A delete takes the parent and its child (terminal-truth cascade).
+        assert_eq!(layer.delete_by_wire(None, 7, Some(1)), 2);
+        assert_eq!(layer.placement_len(), 0);
     }
 }

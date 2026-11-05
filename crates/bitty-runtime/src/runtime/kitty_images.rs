@@ -1801,6 +1801,72 @@ impl Runtime {
         wire_image: u32,
         wire_placement: u32,
     ) -> bool {
+        self.kitty_place_stored_common(
+            Some((anchor_col, anchor_row)),
+            scrollback_base,
+            cols,
+            rows,
+            z,
+            wire_image,
+            wire_placement,
+            None,
+        )
+    }
+
+    /// Mirrors a bodiless **relative** `a=p` placement into the rich pixel
+    /// layer (issue #2875).
+    ///
+    /// The wire form is `a=p` plus `P=`/`Q=` (parent image / placement id,
+    /// `Q=0` = any placement of that image) and `H=`/`V=` cell offsets.
+    /// Terminal truth resolves the parent and refuses a missing or virtual
+    /// one (`ENOPARENT`/`EINVAL`) before this seam runs; here the parent
+    /// *identity* is recorded, never an anchor, so the paint path derives
+    /// the child rect from wherever the parent paints each frame
+    /// (`placement_full_rect_resolved`). Scroll and parent death therefore
+    /// need no second bookkeeping, and presentation adds no truth.
+    ///
+    /// Returns `false` when nothing was placed: `i=0` (anonymous), no stored
+    /// image for this origin, or a placement-quota refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kitty_place_stored_relative(
+        &mut self,
+        cols: u16,
+        rows: u16,
+        scrollback_base: usize,
+        z: i32,
+        wire_image: u32,
+        wire_placement: u32,
+        parent: (u32, u32),
+        parent_offset: (i32, i32),
+    ) -> bool {
+        self.kitty_place_stored_common(
+            None,
+            scrollback_base,
+            cols,
+            rows,
+            z,
+            wire_image,
+            wire_placement,
+            Some((parent, parent_offset)),
+        )
+    }
+
+    /// Shared body of the absolute and relative bodiless-`a=p` mirrors.
+    ///
+    /// `anchor` is `Some` for an absolute placement and `None` for a
+    /// relative one (`relative` then carries `((P=, Q=), (H=, V=))`).
+    #[allow(clippy::too_many_arguments)]
+    fn kitty_place_stored_common(
+        &mut self,
+        anchor: Option<(u16, u16)>,
+        scrollback_base: usize,
+        cols: u16,
+        rows: u16,
+        z: i32,
+        wire_image: u32,
+        wire_placement: u32,
+        relative: Option<((u32, u32), (i32, i32))>,
+    ) -> bool {
         if wire_image == 0 {
             return false;
         }
@@ -1811,31 +1877,48 @@ impl Runtime {
         else {
             return false;
         };
-        // A pinned put replaces the rendered placement, exactly like the
-        // terminal-truth upsert. Without this a repaint after every
-        // `a=p,p=N` would stack duplicate blits.
-        if wire_placement != 0 {
-            self.kitty_images
-                .delete_by_wire(self.kitty_origin, wire_image, Some(wire_placement));
-        }
+        // A pinned put replaces the rendered placement in place (issue
+        // #2875): admission matches on `(origin, i, p)`, so a repeated
+        // `a=p,p=N` never stacks duplicate blits and relative children of
+        // that wire identity keep resolving — no delete-then-add, no
+        // cascade.
         let metrics = self.live_cell_metrics();
         let rich_metrics = bitty_rich::CellMetrics {
             width: metrics.width,
             height: metrics.height,
         };
-        let placed = self.kitty_images.display_for_origin_with_wire(
-            image,
-            anchor_col,
-            anchor_row,
-            cols,
-            rows,
-            rich_metrics,
-            scrollback_base,
-            z,
-            self.kitty_origin,
-            wire_image,
-            wire_placement,
-        );
+        let placed = match (anchor, relative) {
+            (Some((anchor_col, anchor_row)), _) => self.kitty_images.display_for_origin_with_wire(
+                image,
+                anchor_col,
+                anchor_row,
+                cols,
+                rows,
+                rich_metrics,
+                scrollback_base,
+                z,
+                self.kitty_origin,
+                wire_image,
+                wire_placement,
+            ),
+            (None, Some(((parent_image, parent_placement), (dx, dy)))) => {
+                self.kitty_images.display_relative_for_origin(
+                    image,
+                    cols,
+                    rows,
+                    rich_metrics,
+                    scrollback_base,
+                    z,
+                    self.kitty_origin,
+                    wire_image,
+                    wire_placement,
+                    (parent_image, parent_placement),
+                    (dx, dy),
+                )
+            }
+            // No anchor and no parent link names no position: paint nothing.
+            (None, None) => return false,
+        };
         if placed.is_err() {
             return false;
         }

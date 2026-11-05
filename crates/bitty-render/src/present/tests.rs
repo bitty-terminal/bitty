@@ -85,6 +85,7 @@ struct FakeControl {
     fail_next: AtomicBool,
     panic_next: AtomicBool,
     fail_configure_next: AtomicBool,
+    panic_drop: AtomicBool,
     factory_failures: AtomicU32,
     drop_gate: Mutex<Option<Arc<Gate>>>,
     wakes: AtomicU64,
@@ -101,6 +102,7 @@ impl FakeControl {
             fail_next: AtomicBool::new(false),
             panic_next: AtomicBool::new(false),
             fail_configure_next: AtomicBool::new(false),
+            panic_drop: AtomicBool::new(false),
             factory_failures: AtomicU32::new(0),
             drop_gate: Mutex::new(None),
             wakes: AtomicU64::new(0),
@@ -194,6 +196,9 @@ impl Drop for FakeBackend {
             gate.enter();
         }
         self.control.alive.fetch_sub(1, Ordering::AcqRel);
+        if self.control.panic_drop.load(Ordering::Acquire) {
+            panic!("injected backend destructor panic");
+        }
     }
 }
 
@@ -922,4 +927,16 @@ fn creation_failure_budget_stops_surface_attempts() {
         .recover()
         .expect("a presented frame allows surface creation again");
     assert!(presenter.shutdown_bounded(Duration::from_millis(500)));
+}
+
+#[test]
+fn a_panicking_backend_destructor_still_signals_exit() {
+    let control = FakeControl::new(false);
+    control.panic_drop.store(true, Ordering::Release);
+    let mut presenter = spawn(&control, false, PresenterConfig::default());
+    assert!(
+        presenter.shutdown_bounded(TEST_WAIT),
+        "the exit signal must survive a panicking surface destructor"
+    );
+    assert!(!presenter.is_active());
 }

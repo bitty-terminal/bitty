@@ -14,19 +14,62 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
-use bitty_lua::{BoundedExecution, HostServices, LuaValue, LuaVm, MarshallingLimits};
+use bitty_lua::{
+    BoundedExecution, HostServices, LuaValue, LuaVm, MarshallingLimits, RC1_CALLBACK_CEILING_MS,
+};
 use bitty_plugin_host::{Attribution, HistorySource, PluginId, StoredRow};
 use bitty_runtime::plugin_runtime::{
     BoundedHistory, EmptySettings, NotificationQueue, PluginServices, PluginStore,
     UnavailableSnapshot,
 };
 
+/// Harness wall window for this surface test (bitty#2905).
+///
+/// RC-1 bounds a callback at `RC1_WALL_CLOCK_BUDGET_MS` (50 ms) on a raw wall
+/// clock measured inside the call, so a runner that deschedules this thread
+/// mid-call is charged the whole stall. The first chunk here also pays the
+/// lazy cost of building the `bitty.history` surface and its marshalling
+/// tables (6.5 ms on an idle reference host), which leaves little margin: the
+/// Linux Wayland / X11 CI legs reported
+/// `Suspended(WallClockExceeded { elapsed_ms: 152, budget_ms: 50 })` on all
+/// four cases while the same file passes locally in ~0.00 s.
+///
+/// These tests assert the history call shapes, never how long the runner
+/// needed to schedule them, so they install the documented test-only wall
+/// seam used by the rest of this crate's runtime harnesses (`common/mod.rs`,
+/// `plugin_audio`, `bar_activation_budget` — the bitty#2432/#2781 treatment):
+/// both wall dimensions move to the documented callback envelope
+/// ([`RC1_CALLBACK_CEILING_MS`]). Instruction (RC-1) and memory (RC-2) budgets
+/// keep their production values, and budget enforcement stays pinned by
+/// `bitty-lua/tests/measurement_lua.rs`, `load_gate.rs`, `host_bridge.rs` and
+/// `bitty-runtime/tests/plugin_budgets.rs`. Production keeps
+/// `RC1_WALL_CLOCK_BUDGET_MS` and `DEFAULT_HOST_DEADLINE_MS`.
+const HARNESS_WALL_BUDGET_MS: u64 = RC1_CALLBACK_CEILING_MS;
+
+/// Host-call deadline for this harness (bitty#2905).
+///
+/// Same reasoning as [`HARNESS_WALL_BUDGET_MS`]: a descheduled runner inside a
+/// `bitty.history.*` call would otherwise fail closed as `E_TIMEOUT` before
+/// the call shape is ever observed. Production keeps
+/// [`bitty_lua::DEFAULT_HOST_DEADLINE_MS`].
+const HARNESS_HOST_CALL_DEADLINE_MS: u64 = RC1_CALLBACK_CEILING_MS;
+
 fn vm_for(services: Rc<PluginServices>) -> LuaVm {
-    let mut vm = build_plugin_vm("bitty-terminal.history", Some(VmBudgets::default()))
-        .expect("default budgets");
+    let budgets = VmBudgets {
+        wall_budget_ms: HARNESS_WALL_BUDGET_MS,
+        ..VmBudgets::default()
+    };
+    let mut vm = build_plugin_vm("bitty-terminal.history", Some(budgets)).expect("harness budgets");
+    // Self-enforcing seam: dropping the override back to RC-1 defaults would
+    // reintroduce the bitty#2905 flake silently, so pin it here.
+    assert_eq!(vm.wall_budget_ms(), HARNESS_WALL_BUDGET_MS);
     let host: Rc<dyn HostServices> = services;
-    vm.install_host_module(host, MarshallingLimits::default(), 50)
-        .expect("install host module");
+    vm.install_host_module(
+        host,
+        MarshallingLimits::default(),
+        HARNESS_HOST_CALL_DEADLINE_MS,
+    )
+    .expect("install host module");
     vm
 }
 

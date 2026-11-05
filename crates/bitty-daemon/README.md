@@ -718,17 +718,26 @@ Tests must not be read as a cross-cell claim.
 
 ## Worker spawn, generation 1, and resize (bitty#2790)
 
-`session.create` takes an optional `kind` (`terminal` by default). A worker
-create always spawns; a terminal create spawns when it supplies the bounded
-spawn specification and otherwise keeps the `1.2` registry-only shape. The
-order is frozen and observable:
+`session.create` takes an optional `kind` (`terminal` by default). The worker
+kind is **reserved, not served**: `worker_sessions` is `false` in every build
+(`D-01`), so a `session.create` with `kind: worker` is refused with
+`Denied/UnsupportedCapability` at step 2 below and nothing after that point is
+reachable for it — no consent re-check, no spawn-specification parse, no
+idempotency entry, no journal reservation, no child, and no session record.
+Steps 3-6 exist on the terminal spawn path and become reachable for a worker
+create only after an accepted ADR 0019 amendment names worker supervision in the
+slice and an independent security review accepts the spawn, environment,
+credential, cleanup, and audit behaviour. A terminal create spawns on Linux when
+it supplies the bounded spawn specification and otherwise keeps the `1.2`
+registry-only shape. For that terminal path the order is frozen and observable:
 
 1. stage 6 (transport and service scope) runs in the dispatcher before the
    handler: a connection without `process.spawn` is `Denied/ScopeViolation`
    even when `session.host` is present;
-2. the handler rejects an unknown `kind` as `InvalidRequest`; a worker create
-   on a non-served cell, or a terminal create with a spawn specification whose
-   containment plan cannot enforce it, is `Denied/UnsupportedCapability`;
+2. the handler rejects an unknown `kind` as `InvalidRequest`; a `kind: worker`
+   create is `Denied/UnsupportedCapability` on every cell in every build
+   (`D-01`), and a terminal create with a spawn specification whose containment
+   plan cannot enforce it is `Denied/UnsupportedCapability`;
 3. stage 7 requires `session.host` (a consumed, live host grant), otherwise
    `Denied/ConsentRequired`;
 4. the bounded spawn specification parses; a malformed field is
@@ -785,10 +794,17 @@ assumption: this seam spawns through `fork` + `execvp`, and the C library
 retries an `ENOEXEC` image through `/bin/sh`, so an executable file with a
 foreign header starts a shell (which reports the format as exit status 127)
 instead of refusing the spawn. The `exec_not_executable` class is therefore
-reached through the errno mapping, and
-`service_loop.rs::an_unrecognised_executable_format_is_run_by_the_shell_and_never_refused`
-pins the substitution so a future direct-`execve` seam cannot change it
-silently.
+reached through the errno mapping, which the live tests
+`containment::exec::tests::exec_errnos_are_classified_and_other_spawn_errnos_are_not`
+and `service::dispatch::tests::the_spawn_failure_funnel_maps_every_refusal_to_its_wire_class`
+pin down. The end-to-end fixture for the substitution lives in
+`tests/service_loop.rs` as
+`an_unrecognised_executable_format_is_run_by_the_shell_and_never_refused`; it
+spawns a real worker, so `D-01` marks it `#[ignore]` and it must be re-enabled
+with the ADR 0019 amendment
+(`bittyd-session-host-contract.md` lines 186-187 and 192-194 keep the hosted
+worker path disabled, and forbid an in-process fallback while it is disabled),
+so a future direct-`execve` seam cannot change the substitution silently.
 
 `WorkerPool::forget` terminates a handle that is not already settled with the
 same bounded escalation and reaps its leader before dropping it, so retiring a

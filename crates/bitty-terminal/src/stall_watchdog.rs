@@ -32,6 +32,14 @@
 //!   stall reports again. While the monitor is running, `SIGUSR1` writes on
 //!   demand (rate-limited to one per second) because the owner explicitly
 //!   asked for that sample.
+//! - **Completed ticks count too.** A `Runtime::tick` that outlived
+//!   [`HANG_WATCHDOG_TICK_BOUND`] is a stall whether the monitor sampled it
+//!   while blocked or only after it returned. The runtime publishes the
+//!   measured duration of every completed tick (`tick_count`/`last_tick_ns`),
+//!   so the monitor reports a completed over-bound tick as
+//!   `phase=runtime-tick` with that measured duration. A block the in-flight
+//!   detector already reported is closed by its one recovery line and never
+//!   reported twice.
 //! - **No hot-path work.** A phase mark is one relaxed atomic store plus a
 //!   timestamp. The app publishes its bounded context sample at most twice a
 //!   second, the runtime publishes lock-free gauges on every tick, and the
@@ -256,7 +264,7 @@ const STATE_FILE_NAME: &str = "stall-watchdog.log";
 /// not be spawned, timed out, or failed is still visible after the fact.
 const DELIVERY_FILE_NAME: &str = "stall-watchdog-delivery.log";
 /// Prefix of a stall report line; only these overwrite the state slot.
-const STALL_REPORT_PREFIX: &str = "bitty: main-loop stall detected";
+pub(crate) const STALL_REPORT_PREFIX: &str = "bitty: main-loop stall detected";
 /// Prefix of a `SIGUSR1` capture line; also overwrites the state slot.
 const SIGNAL_REPORT_PREFIX: &str = "bitty: main-loop hang dump (SIGUSR1)";
 /// Maximum thread rows included in one report.
@@ -649,6 +657,16 @@ pub(crate) struct ProcessTotals {
     pub(crate) rss_kib: u64,
 }
 
+/// The sample a diagnostic report is rendered for.
+#[derive(Clone, Copy, Debug)]
+struct ReportSample {
+    /// Phase the report must name; the detector's phase, not a later read.
+    phase: Phase,
+    /// Age of the heartbeat the detector decided on (a completed tick names
+    /// its measured duration).
+    idle: Duration,
+}
+
 /// One rendered stall report, built on the monitor thread only.
 struct StallReport {
     reason: DiagnosticReason,
@@ -707,6 +725,8 @@ struct MonitorState {
     last_progress: u64,
     stall_started: Option<Instant>,
     reported: bool,
+    /// Last sampled runtime tick counter (bitty#2830 completed-tick rule).
+    last_tick_count: u64,
     /// Last sampled presented-frame counter (bitty#2830).
     last_presented: u64,
     /// When `last_presented` last moved; the anchor for `present_stale_ms`.
@@ -723,24 +743,49 @@ struct MonitorState {
     reported_at: Option<Instant>,
 }
 
+/// One phase-heartbeat sample: the phase, how long its heartbeat has been
+/// still, and the bound that applies to it.
+#[derive(Clone, Copy, Debug)]
+struct StallSample {
+    phase: Phase,
+    idle: Duration,
+    threshold: Duration,
+}
+
+/// Side channels the monitor samples besides the phase heartbeat.
+#[derive(Clone, Copy, Debug, Default)]
+struct PhaseSignals {
+    /// Work still outstanding while the app sits in `ControlFlow::Wait`
+    /// (bitty#2830): a park with a backlog is not a quiet window.
+    parked: bool,
+    /// Measured duration of a completed `Runtime::tick` that outlived
+    /// [`HANG_WATCHDOG_TICK_BOUND`] since the previous sample.
+    completed_tick: Option<Duration>,
+}
+
 /// What the monitor decided after one sample.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MonitorAction {
     /// Nothing to emit.
     None,
     /// Emit the one report for this continuous stall (`idle` old).
-    Report { idle: Duration },
+    ///
+    /// `phase` is the phase the stall belongs to: the sampled phase for an
+    /// in-flight stall, or [`Phase::RuntimeTick`] for a completed tick that
+    /// outlived its bound.
+    Report { idle: Duration, phase: Phase },
     /// The loop made progress again after a reported stall.
     Recovered { stalled_for: Duration },
 }
 
 impl MonitorState {
     /// Starts the detector with the first sample already taken.
-    fn new(now: Instant, progress: u64, presented: u64) -> Self {
+    fn new(now: Instant, progress: u64, presented: u64, tick_count: u64) -> Self {
         Self {
             last_progress: progress,
             stall_started: None,
             reported: false,
+            last_tick_count: tick_count,
             last_presented: presented,
             presented_at: Some(now),
             no_present_at: None,
@@ -762,6 +807,30 @@ impl MonitorState {
             return Duration::ZERO;
         }
         now.saturating_duration_since(self.presented_at.unwrap_or(now))
+    }
+
+    /// Returns the measured duration of a `Runtime::tick` that completed since
+    /// the previous sample and outlived `bound`.
+    ///
+    /// The in-flight detector can only report a tick that is still blocked at
+    /// sample time. The runtime publishes every completed tick's duration
+    /// ([`HangGaugeSnapshot::tick_count`] and
+    /// [`HangGaugeSnapshot::last_tick_ns`]), so a block that returned between
+    /// two samples is still a stall with the same measured evidence.
+    /// Each tick is consumed once: the counter update is unconditional, and
+    /// only the completed tick above the bound yields a duration.
+    fn sample_completed_tick(
+        &mut self,
+        tick_count: u64,
+        last_tick_ns: u64,
+        bound: Duration,
+    ) -> Option<Duration> {
+        if tick_count == self.last_tick_count {
+            return None;
+        }
+        self.last_tick_count = tick_count;
+        let duration = Duration::from_nanos(last_tick_ns);
+        (duration >= bound).then_some(duration)
     }
 
     /// Decides whether the stuck frame counter is a reportable state.
@@ -802,18 +871,32 @@ impl MonitorState {
 
     /// Evaluate one sample.
     ///
-    /// `parked` marks outstanding work published at `ControlFlow::Wait`: a
-    /// park with a backlog is not a quiet window, so it stays stall-eligible
-    /// even though the app called [`StallWatchdog::idle`] (bitty#2830).
+    /// `signals.parked` marks outstanding work published at
+    /// `ControlFlow::Wait`: a park with a backlog is not a quiet window, so it
+    /// stays stall-eligible even though the app called
+    /// [`StallWatchdog::idle`] (bitty#2830).
+    ///
+    /// `signals.completed_tick` carries the measured duration of a tick that
+    /// finished since the previous sample above its bound (see
+    /// [`Self::sample_completed_tick`]). Progress advancing past a blocked
+    /// tick must not hide it: if no in-flight sample reported that stall, the
+    /// completed duration is the report. The report is one-shot per tick; a
+    /// tick the in-flight detector already reported is closed by the normal
+    /// recovery line instead.
     fn evaluate(
         &mut self,
         now: Instant,
         progress: u64,
         active: bool,
-        idle: Duration,
-        threshold: Duration,
-        parked: bool,
+        sample: StallSample,
+        signals: PhaseSignals,
     ) -> MonitorAction {
+        let StallSample {
+            phase,
+            idle,
+            threshold,
+        } = sample;
+        let parked = signals.parked;
         let active = active || parked;
         if progress != self.last_progress {
             self.last_progress = progress;
@@ -822,10 +905,20 @@ impl MonitorState {
                 .take()
                 .map(|started| now.saturating_duration_since(started));
             let had_report = std::mem::replace(&mut self.reported, false);
-            return match recovered {
-                Some(stalled_for) if had_report => MonitorAction::Recovered { stalled_for },
-                _ => MonitorAction::None,
-            };
+            if let Some(stalled_for) = recovered.filter(|_| had_report) {
+                return MonitorAction::Recovered { stalled_for };
+            }
+            if let Some(duration) = signals.completed_tick {
+                // The block returned before a sample crossed the bound. Its
+                // measured duration is the stall, and the episode is already
+                // over: do not arm the one-shot flag for the next tick.
+                self.reported_at = Some(now);
+                return MonitorAction::Report {
+                    idle: duration,
+                    phase: Phase::RuntimeTick,
+                };
+            }
+            return MonitorAction::None;
         }
         if !active {
             // Idle is expected: no stall, and a threshold crossing that ended
@@ -860,7 +953,7 @@ impl MonitorState {
         // repeat interval: a wedged phase already named the same stopped
         // frame, so two lines for one wedge would be duplicate evidence.
         self.reported_at = Some(now);
-        MonitorAction::Report { idle }
+        MonitorAction::Report { idle, phase }
     }
 }
 
@@ -1334,6 +1427,24 @@ impl StallWatchdog {
         result
     }
 
+    /// Start the production monitor with an injected sink (app wiring tests).
+    ///
+    /// The app-level regressions replace the delivery sink so a report is
+    /// observed directly; the monitor thread, phase shared state, and tick
+    /// gauges stay exactly the production path.
+    #[cfg(test)]
+    pub(crate) fn start_for_test(
+        threshold_ms: u64,
+        gauges: Arc<HangGauges>,
+        sink: Box<dyn FnMut(&str) -> DeliveryOutcome + Send>,
+    ) -> Self {
+        Self::start(
+            WatchdogConfig::with_threshold_ms(threshold_ms),
+            gauges,
+            sink,
+        )
+    }
+
     /// Stop the monitor and assert the thread actually exited (tests).
     #[cfg(test)]
     fn stop_and_join(mut self) -> std::thread::Result<()> {
@@ -1356,10 +1467,12 @@ fn monitor_loop(
     poll_interval: Duration,
     sink: &mut (dyn FnMut(&str) -> DeliveryOutcome + Send),
 ) {
+    let initial_gauges = shared.gauges.snapshot();
     let mut state = MonitorState::new(
         Instant::now(),
         shared.progress.load(Ordering::Relaxed),
         shared.presented_frames.load(Ordering::Relaxed),
+        initial_gauges.tick_count,
     );
     let mut delivery = DeliverySummary::default();
     #[cfg(unix)]
@@ -1377,10 +1490,15 @@ fn monitor_loop(
                 last_signal_at = Some(now);
                 let stale =
                     state.sample_presented(now, shared.presented_frames.load(Ordering::Relaxed));
+                let sampled_phase = Phase::from_u8(shared.phase.load(Ordering::Relaxed));
                 let report = build_report(
                     shared,
                     config,
                     DiagnosticReason::Signal,
+                    ReportSample {
+                        phase: sampled_phase,
+                        idle: shared.idle_for(),
+                    },
                     now,
                     delivery,
                     Some(stale),
@@ -1400,17 +1518,43 @@ fn monitor_loop(
         let active = shared.active.load(Ordering::Relaxed);
         let idle = shared.idle_for();
         let bound = config.bound_for(phase);
-        // One gauge sample per poll drives both the parked-work bitset and
-        // the no-present detector (bitty#2830).
-        let pending = PendingWork::from_gauges(&shared.gauges.snapshot());
+        // One gauge sample per poll drives the parked-work bitset, the
+        // no-present detector, and the completed-tick rule (bitty#2830).
+        let gauges = shared.gauges.snapshot();
+        let pending = PendingWork::from_gauges(&gauges);
+        let completed_tick = state.sample_completed_tick(
+            gauges.tick_count,
+            gauges.last_tick_ns,
+            config.bound_for(Phase::RuntimeTick),
+        );
         let stale = state.sample_presented(now, shared.presented_frames.load(Ordering::Relaxed));
-        match state.evaluate(now, progress, active, idle, bound, pending.any()) {
+        match state.evaluate(
+            now,
+            progress,
+            active,
+            StallSample {
+                phase,
+                idle,
+                threshold: bound,
+            },
+            PhaseSignals {
+                parked: pending.any(),
+                completed_tick,
+            },
+        ) {
             MonitorAction::None => {}
-            MonitorAction::Report { idle: _ } => {
+            MonitorAction::Report {
+                idle: stalled_for,
+                phase: report_phase,
+            } => {
                 let report = build_report(
                     shared,
                     config,
                     DiagnosticReason::Stall,
+                    ReportSample {
+                        phase: report_phase,
+                        idle: stalled_for,
+                    },
                     now,
                     delivery,
                     Some(stale),
@@ -1446,6 +1590,10 @@ fn monitor_loop(
                 shared,
                 config,
                 DiagnosticReason::NoPresent,
+                ReportSample {
+                    phase,
+                    idle: shared.idle_for(),
+                },
                 now,
                 delivery,
                 Some(stale),
@@ -1548,22 +1696,26 @@ impl PendingWork {
 }
 
 /// Assemble one report from the shared heartbeat, context, gauges, and `/proc`.
+///
+/// `sample` is the detector's decision, not a fresh read: a completed
+/// over-bound tick is named `runtime-tick` with its measured duration even
+/// though the app has already moved on to the next phase.
 fn build_report(
     shared: &Shared,
     config: WatchdogConfig,
     reason: DiagnosticReason,
+    sample: ReportSample,
     now: Instant,
     delivery: DeliverySummary,
     present_stale: Option<Duration>,
 ) -> StallReport {
-    let phase = Phase::from_u8(shared.phase.load(Ordering::Relaxed));
     let totals_snapshot = sample_process_totals();
     let gauges = shared.gauges.snapshot();
     StallReport {
         reason,
-        threshold: config.bound_for(phase),
-        idle: shared.idle_for(),
-        phase,
+        threshold: config.bound_for(sample.phase),
+        idle: sample.idle,
+        phase: sample.phase,
         app_uptime: now.saturating_duration_since(shared.start),
         progress: shared.progress.load(Ordering::Relaxed),
         context: shared.context.try_lock().ok().map(|slot| slot.clone()),
@@ -3797,9 +3949,12 @@ mod tests {
                 now,
                 1,
                 false,
-                Duration::from_secs(60),
-                DEFAULT_STALL_THRESHOLD,
-                false
+                StallSample {
+                    phase: Phase::Idle,
+                    idle: Duration::from_secs(60),
+                    threshold: DEFAULT_STALL_THRESHOLD,
+                },
+                PhaseSignals::default(),
             ),
             MonitorAction::None
         );
@@ -3808,9 +3963,12 @@ mod tests {
                 now,
                 1,
                 true,
-                Duration::from_millis(1999),
-                DEFAULT_STALL_THRESHOLD,
-                false
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: Duration::from_millis(1999),
+                    threshold: DEFAULT_STALL_THRESHOLD,
+                },
+                PhaseSignals::default(),
             ),
             MonitorAction::None
         );
@@ -3828,12 +3986,16 @@ mod tests {
                 start,
                 7,
                 true,
-                DEFAULT_STALL_THRESHOLD,
-                DEFAULT_STALL_THRESHOLD,
-                false
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: DEFAULT_STALL_THRESHOLD,
+                    threshold: DEFAULT_STALL_THRESHOLD,
+                },
+                PhaseSignals::default(),
             ),
             MonitorAction::Report {
-                idle: DEFAULT_STALL_THRESHOLD
+                idle: DEFAULT_STALL_THRESHOLD,
+                phase: Phase::RuntimeTick,
             }
         );
         // One-shot: a continuous stall never writes a second report.
@@ -3842,9 +4004,12 @@ mod tests {
                 start + Duration::from_secs(5),
                 7,
                 true,
-                Duration::from_secs(7),
-                DEFAULT_STALL_THRESHOLD,
-                false
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: Duration::from_secs(7),
+                    threshold: DEFAULT_STALL_THRESHOLD,
+                },
+                PhaseSignals::default(),
             ),
             MonitorAction::None
         );
@@ -3853,9 +4018,12 @@ mod tests {
                 start + Duration::from_secs(30),
                 7,
                 true,
-                Duration::from_secs(32),
-                DEFAULT_STALL_THRESHOLD,
-                false
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: Duration::from_secs(32),
+                    threshold: DEFAULT_STALL_THRESHOLD,
+                },
+                PhaseSignals::default(),
             ),
             MonitorAction::None
         );
@@ -3865,9 +4033,12 @@ mod tests {
                 start + Duration::from_secs(31),
                 8,
                 true,
-                Duration::from_millis(0),
-                DEFAULT_STALL_THRESHOLD,
-                false
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: Duration::from_millis(0),
+                    threshold: DEFAULT_STALL_THRESHOLD,
+                },
+                PhaseSignals::default(),
             ),
             MonitorAction::Recovered {
                 stalled_for: Duration::from_secs(31)
@@ -3878,9 +4049,12 @@ mod tests {
                 start + Duration::from_secs(32),
                 8,
                 true,
-                Duration::from_millis(0),
-                DEFAULT_STALL_THRESHOLD,
-                false
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: Duration::from_millis(0),
+                    threshold: DEFAULT_STALL_THRESHOLD,
+                },
+                PhaseSignals::default(),
             ),
             MonitorAction::None
         );
@@ -3889,7 +4063,7 @@ mod tests {
     #[test]
     fn no_present_requires_hidden_damage_and_is_repeat_bounded() {
         let start = Instant::now();
-        let mut state = MonitorState::new(start, 1, 7);
+        let mut state = MonitorState::new(start, 1, 7, 0);
         let threshold = DEFAULT_STALL_THRESHOLD;
         // A stuck counter on a visible surface is an idle app, not a stall:
         // the gate holds no retained damage, so nothing is reported.
@@ -3935,11 +4109,24 @@ mod tests {
     #[test]
     fn stall_report_suppresses_the_duplicate_no_present_line() {
         let start = Instant::now();
-        let mut state = MonitorState::new(start, 1, 7);
+        let mut state = MonitorState::new(start, 1, 7, 0);
         let threshold = DEFAULT_STALL_THRESHOLD;
         assert_eq!(
-            state.evaluate(start + threshold, 1, true, threshold, threshold, false),
-            MonitorAction::Report { idle: threshold }
+            state.evaluate(
+                start + threshold,
+                1,
+                true,
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: threshold,
+                    threshold,
+                },
+                PhaseSignals::default(),
+            ),
+            MonitorAction::Report {
+                idle: threshold,
+                phase: Phase::RuntimeTick,
+            }
         );
         // Same poll: a wedged phase also froze the frame counter, so the
         // no-present detector must not add a second line for one wedge.
@@ -3985,9 +4172,12 @@ mod tests {
                     now,
                     9,
                     true,
-                    Duration::from_secs(3600),
-                    DEFAULT_STALL_THRESHOLD,
-                    false,
+                    StallSample {
+                        phase: Phase::RuntimeTick,
+                        idle: Duration::from_secs(3600),
+                        threshold: DEFAULT_STALL_THRESHOLD,
+                    },
+                    PhaseSignals::default(),
                 ),
                 MonitorAction::Report { .. }
             ) {
@@ -3995,6 +4185,216 @@ mod tests {
             }
         }
         assert_eq!(reports, 1, "a continuous stall writes exactly one report");
+    }
+
+    /// bitty#2830 (live 2026-11-05): the completed-tick sampler is the second
+    /// evidence source. It reports one over-bound duration per completed tick
+    /// and stays quiet for a tick that returned inside the bound.
+    #[test]
+    fn completed_tick_sampling_reports_only_over_bound_ticks() {
+        let mut state = MonitorState::new(Instant::now(), 0, 0, 7);
+        let bound = HANG_WATCHDOG_TICK_BOUND;
+        // The same completed tick is never re-sampled.
+        assert_eq!(state.sample_completed_tick(7, 5_000_000_000, bound), None);
+        // One over-bound tick yields its measured duration exactly once.
+        assert_eq!(
+            state.sample_completed_tick(8, 17_490_000_000, bound),
+            Some(Duration::from_millis(17_490))
+        );
+        assert_eq!(state.sample_completed_tick(8, 17_490_000_000, bound), None);
+        // A tick that returned inside the bound is ordinary progress.
+        assert_eq!(state.sample_completed_tick(9, 180_000_000, bound), None);
+        // A later over-bound tick is a new episode.
+        assert_eq!(
+            state.sample_completed_tick(10, 13_090_000_000, bound),
+            Some(Duration::from_millis(13_090))
+        );
+    }
+
+    /// bitty#2830 (live 2026-11-05): the observed shape was
+    /// `block -> ~0.2 s of progress -> block` (17.49 s, then 13.09 s). The
+    /// sample that observes the block is the progress change after it
+    /// returned, so the in-flight `idle` path never sees it. The completed
+    /// tick must still report its measured duration, name `runtime-tick`, and
+    /// report the next block as a new episode.
+    #[test]
+    fn completed_tick_above_the_bound_reports_once_and_repeats() {
+        let start = Instant::now();
+        let mut state = MonitorState::new(start, 1, 0, 10);
+        let bound = HANG_WATCHDOG_TICK_BOUND;
+        let first = Duration::from_millis(17_490);
+        let first_at = start + first;
+        assert_eq!(
+            state.evaluate(
+                first_at,
+                2,
+                true,
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: Duration::ZERO,
+                    threshold: bound,
+                },
+                PhaseSignals {
+                    completed_tick: Some(first),
+                    ..PhaseSignals::default()
+                },
+            ),
+            MonitorAction::Report {
+                idle: first,
+                phase: Phase::RuntimeTick,
+            }
+        );
+        // The same completed tick is not reported on the next sample.
+        assert_eq!(
+            state.evaluate(
+                first_at + Duration::from_millis(100),
+                2,
+                true,
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: Duration::from_millis(100),
+                    threshold: bound,
+                },
+                PhaseSignals::default(),
+            ),
+            MonitorAction::None
+        );
+        // The next block is a separate stall episode and reports again.
+        let second = Duration::from_millis(13_090);
+        let second_at = first_at + Duration::from_millis(200) + second;
+        assert_eq!(
+            state.evaluate(
+                second_at,
+                3,
+                true,
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: Duration::ZERO,
+                    threshold: bound,
+                },
+                PhaseSignals {
+                    completed_tick: Some(second),
+                    ..PhaseSignals::default()
+                },
+            ),
+            MonitorAction::Report {
+                idle: second,
+                phase: Phase::RuntimeTick,
+            }
+        );
+    }
+
+    /// The completed-tick report names the phase and duration the detector
+    /// decided on, not the phase the app had reached by rendering time.
+    #[test]
+    fn completed_tick_report_names_runtime_tick_and_its_measured_duration() {
+        let gauges = Arc::new(HangGauges::new());
+        let shared = Shared::new(Arc::clone(&gauges));
+        // The app has already moved past the tick when the report is built.
+        shared.mark(Phase::SnapshotPublish, true);
+        let measured = Duration::from_millis(17_490);
+        let report = build_report(
+            &shared,
+            WatchdogConfig::with_threshold_ms(10_000),
+            DiagnosticReason::Stall,
+            ReportSample {
+                phase: Phase::RuntimeTick,
+                idle: measured,
+            },
+            Instant::now(),
+            DeliverySummary::default(),
+            None,
+        );
+        assert_eq!(report.phase, Phase::RuntimeTick);
+        assert_eq!(report.threshold, HANG_WATCHDOG_TICK_BOUND);
+        assert_eq!(report.idle, measured);
+        let rendered = render_report(&report);
+        assert!(
+            rendered.contains("no progress for 17490 ms (threshold 3000 ms, phase=runtime-tick"),
+            "{rendered}"
+        );
+    }
+
+    /// One report per continuous stall still holds when the in-flight
+    /// detector caught the block: the tick's completion is the recovery line,
+    /// never a second report for the same wedge.
+    #[test]
+    fn in_flight_tick_report_is_not_duplicated_when_the_tick_returns() {
+        let start = Instant::now();
+        let mut state = MonitorState::new(start, 1, 0, 10);
+        let bound = HANG_WATCHDOG_TICK_BOUND;
+        assert_eq!(
+            state.evaluate(
+                start + bound,
+                1,
+                true,
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: bound,
+                    threshold: bound,
+                },
+                PhaseSignals::default(),
+            ),
+            MonitorAction::Report {
+                idle: bound,
+                phase: Phase::RuntimeTick,
+            }
+        );
+        let long = Duration::from_millis(17_490);
+        assert_eq!(
+            state.evaluate(
+                start + long,
+                2,
+                true,
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: Duration::ZERO,
+                    threshold: bound,
+                },
+                PhaseSignals {
+                    completed_tick: Some(long),
+                    ..PhaseSignals::default()
+                },
+            ),
+            MonitorAction::Recovered {
+                stalled_for: long - bound,
+            }
+        );
+        // The next block's first sample is the progress change that opens a
+        // new episode...
+        let next = start + long + Duration::from_millis(500);
+        assert_eq!(
+            state.evaluate(
+                next,
+                3,
+                true,
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: Duration::ZERO,
+                    threshold: bound,
+                },
+                PhaseSignals::default(),
+            ),
+            MonitorAction::None
+        );
+        // ...and one bound later the new continuous stall reports again.
+        assert_eq!(
+            state.evaluate(
+                next + bound,
+                3,
+                true,
+                StallSample {
+                    phase: Phase::RuntimeTick,
+                    idle: bound,
+                    threshold: bound,
+                },
+                PhaseSignals::default(),
+            ),
+            MonitorAction::Report {
+                idle: bound,
+                phase: Phase::RuntimeTick,
+            }
+        );
     }
 
     /// bitty#2830: a `SIGUSR1` capture writes one full report while the loop

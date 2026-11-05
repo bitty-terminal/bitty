@@ -199,7 +199,9 @@ impl HangGauges {
     #[must_use]
     pub fn snapshot(&self) -> HangGaugeSnapshot {
         HangGaugeSnapshot {
-            tick_count: self.tick_count.load(Ordering::Relaxed),
+            // Acquire pairs with `finish_tick`'s release so a completed
+            // duration is visible whenever its counter is.
+            tick_count: self.tick_count.load(Ordering::Acquire),
             last_tick_ns: self.last_tick_ns.load(Ordering::Relaxed),
             max_tick_ns: self.max_tick_ns.load(Ordering::Relaxed),
             pending_input_bytes: self.pending_input_bytes.load(Ordering::Relaxed),
@@ -229,10 +231,15 @@ impl HangGauges {
     }
 
     /// Records one completed tick.
+    ///
+    /// The duration is published before the counter that announces it: the
+    /// hang watchdog reports a completed over-bound tick when `tick_count`
+    /// advances (bitty#2830), so an acquire load of that counter must observe
+    /// this tick's `last_tick_ns`, never the previous tick's.
     pub(crate) fn finish_tick(&self, elapsed_ns: u64) {
-        self.tick_count.fetch_add(1, Ordering::Relaxed);
         self.last_tick_ns.store(elapsed_ns, Ordering::Relaxed);
         self.max_tick_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
+        self.tick_count.fetch_add(1, Ordering::Release);
     }
 
     pub(crate) fn set_pending_input(&self, bytes: usize, dropped: u64) {

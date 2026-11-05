@@ -912,6 +912,15 @@ pub(crate) struct TerminalApp {
     /// query is exercised against a real rejection in `bitty-runtime`.
     #[cfg(test)]
     pub(crate) test_present_owed: Option<bool>,
+    /// Test-only block injected where the frame present runs (bitty#2830).
+    ///
+    /// The live stall is a compositor fence wait inside `runtime.tick()` that
+    /// cannot be reproduced headlessly. The app-wiring regression places this
+    /// sleep between the `RuntimeTick` phase mark and the tick call to prove
+    /// the watchdog reports the blocked phase; `None` in every production
+    /// build.
+    #[cfg(test)]
+    pub(crate) test_present_block: Option<std::time::Duration>,
     /// When the current hidden-surface repair probe asked the compositor for
     /// a redraw (bitty#2830 hypothesis 2).
     ///
@@ -1114,6 +1123,8 @@ impl TerminalApp {
             test_surface_retry_deadline: None,
             #[cfg(test)]
             test_present_owed: None,
+            #[cfg(test)]
+            test_present_block: None,
             hidden_repair_probe_at: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
@@ -1173,6 +1184,8 @@ impl TerminalApp {
             test_surface_retry_deadline: None,
             #[cfg(test)]
             test_present_owed: None,
+            #[cfg(test)]
+            test_present_block: None,
             hidden_repair_probe_at: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
@@ -2200,6 +2213,13 @@ impl TerminalApp {
         // #2483 deliberately leaves this whole call under one phase: a stall
         // inside compose/present reports as `runtime-tick`, the ANR shape.
         self.watchdog_phase(Phase::RuntimeTick);
+        // Test-only seam for the explicit-sync present block the live report
+        // hit (bitty#2830): the real fence wait is inside `tick` and needs a
+        // compositor, so the regression injects the block at the same phase.
+        #[cfg(test)]
+        if let Some(block) = self.test_present_block.take() {
+            std::thread::sleep(block);
+        }
         let stats = self.runtime.tick();
         // bitty#2859: opt-in idle-RSS attribution. Off by default; when armed
         // this is one `Instant` compare, and the report itself only runs on a

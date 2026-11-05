@@ -17643,3 +17643,95 @@ fn the_memory_report_dump_writes_once_per_armed_interval() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Collect every watchdog line delivered during `window`.
+fn watchdog_lines(
+    rx: &std::sync::mpsc::Receiver<String>,
+    window: std::time::Duration,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let deadline = std::time::Instant::now() + window;
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match rx.recv_timeout(remaining) {
+            Ok(line) => lines.push(line),
+            Err(_) => break,
+        }
+    }
+    lines
+}
+
+/// Headless app wired to a real monitor with a channel sink (bitty#2830).
+fn watchdog_app(threshold_ms: u64) -> (TerminalApp, std::sync::mpsc::Receiver<String>) {
+    let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+        .expect("default keymaps");
+    let rt = Runtime::with_defaults().expect("headless runtime");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "watchdog-present",
+        maps,
+        SpawnSpec::default(),
+    );
+    app.set_session_persistence(false);
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    app.stall_watchdog = Some(crate::stall_watchdog::StallWatchdog::start_for_test(
+        threshold_ms,
+        std::sync::Arc::clone(app.runtime.hang_gauges()),
+        Box::new(move |line| {
+            let _ = tx.send(line.to_string());
+            crate::stall_watchdog::DeliveryOutcome::Delivered
+        }),
+    ));
+    (app, rx)
+}
+
+/// bitty#2830 (live 2026-11-05): the main thread sat in the explicit-sync
+/// present for 17.49 s, then 13.09 s, with ~0.2 s of progress between the
+/// blocks, and the watchdog log stayed empty. A compositor fence wait cannot
+/// be reproduced headlessly, so the injected block stands in for the present
+/// at the same `RuntimeTick` phase. Contract: one report per block, the
+/// report names `runtime-tick`, and a second block after recovery reports
+/// again.
+#[test]
+fn runtime_tick_block_reports_once_per_episode() {
+    let (mut app, rx) = watchdog_app(100);
+    for block_ms in [300_u64, 300] {
+        app.test_present_block = Some(std::time::Duration::from_millis(block_ms));
+        let _ = app.drive_tick();
+        // The real loop parks in `AboutToWait` after the tick; without the
+        // idle mark the test thread's own pause would look like a wedge.
+        app.stall_watchdog.as_ref().expect("fixture monitor").idle();
+        let lines = watchdog_lines(&rx, std::time::Duration::from_millis(400));
+        let reports: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.starts_with(crate::stall_watchdog::STALL_REPORT_PREFIX))
+            .collect();
+        assert_eq!(
+            reports.len(),
+            1,
+            "a {block_ms} ms RuntimeTick block must write exactly one report: {lines:?}"
+        );
+        assert!(
+            reports[0].contains("phase=runtime-tick"),
+            "the blocked present must be named: {reports:?}"
+        );
+        assert!(reports[0].contains("reason=stall"), "{reports:?}");
+    }
+}
+
+/// The other half of the same contract: a block that returns inside the tick
+/// bound is ordinary progress and writes nothing.
+#[test]
+fn runtime_tick_block_inside_the_bound_stays_quiet() {
+    let (mut app, rx) = watchdog_app(3_000);
+    app.test_present_block = Some(std::time::Duration::from_millis(5));
+    let _ = app.drive_tick();
+    app.stall_watchdog.as_ref().expect("fixture monitor").idle();
+    let lines = watchdog_lines(&rx, std::time::Duration::from_millis(300));
+    assert!(
+        lines
+            .iter()
+            .all(|line| !line.starts_with(crate::stall_watchdog::STALL_REPORT_PREFIX)),
+        "a block inside the bound must not report: {lines:?}"
+    );
+}

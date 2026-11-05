@@ -239,8 +239,8 @@ impl Runtime {
     }
 
     /// Pixel extent the combined frame's plan covers: the configured
-    /// surface extent, or the cell-aligned window grid plus the padding
-    /// inset when no surface is configured (CTX-0223, #2520).
+    /// surface extent when one exists, otherwise the cell-aligned window grid
+    /// plus the padding inset (CTX-0223, #2520, CTX-1707).
     ///
     /// The GPU present path recovers its per-frame NDC factor as
     /// `surface / plan` ([`bitty_render::batch::derive_scale`]), so this
@@ -260,6 +260,16 @@ impl Runtime {
     /// bilinearly stretch every glyph — the blurred/damaged text in #2520.
     /// The leftover strip is background, never content scale, so the plan
     /// spans the configured surface extent whenever one exists.
+    ///
+    /// CTX-1707: the plan is returned as *exactly* the surface extent (never
+    /// the larger cell-aligned grid). `derive_scale` must stay `1.0`, which
+    /// is the only way painting shares the pixel space of grid sizing,
+    /// frame geometry, and the pointer hit test. A transient grid larger
+    /// than the surface (for example a scale change adopted without a
+    /// physical extent) is clipped by the surface viewport; feeding it back
+    /// as a denominator would shrink every painted pane while the unstretched
+    /// hit-test frames stayed put, so a pointer over the painted right pane
+    /// would resolve against the left pane's frame.
     pub fn present_plan_extent(&self) -> bitty_render::geometry::ExtentPx {
         // CTX-0873: the plan spans the whole window grid, chrome band
         // included (the band paints inside the plan, outside the container).
@@ -277,13 +287,9 @@ impl Runtime {
         let content = bitty_render::geometry::ExtentPx::new(grid_width, grid_height);
         match self.surface.extent() {
             Some(extent) if extent.width() > 0 && extent.height() > 0 => {
-                // `max` keeps the full plan visible if a transient resize
-                // left the surface smaller than the reflowed grid; a real
-                // surface is never smaller in steady state.
-                bitty_render::geometry::ExtentPx::new(
-                    content.width.max(extent.width()),
-                    content.height.max(extent.height()),
-                )
+                // The draw list is authored in surface pixels; the plan is
+                // the surface, so the GPU sampling scale is exactly 1.0.
+                bitty_render::geometry::ExtentPx::new(extent.width(), extent.height())
             }
             _ => content,
         }
@@ -536,33 +542,40 @@ impl Runtime {
         self.layout.reflow_with_gaps(self.container, self.gaps());
         let frames = self.present_frames();
         self.reflow_overlay_present_layout(&frames);
-        let fallback = (
-            usize::from(self.container.width).max(1),
-            usize::from(self.container.height).max(1),
-        );
         let (cols, rows) = {
             let frames = self.present_frames();
-            // CTX-1088: a durable fixed-size primary owner keeps its grid
-            // through window reflows; its paint dims stay slot-sized, so
-            // the frame alone would shrink the grid back.
-            if let Some(fixed) = self
-                .primary_view
-                .and_then(|primary| self.fixed_size_for_view(primary))
-            {
-                (
-                    usize::from(fixed.width.max(1)),
-                    usize::from(fixed.height.max(1)),
-                )
-            } else {
-                self.primary_view
-                    .and_then(|primary| frames.iter().find(|frame| frame.view == primary))
-                    .map(|frame| {
+            match self.primary_view {
+                // CTX-1088: a durable fixed-size primary owner keeps its grid
+                // through window reflows; its paint dims stay slot-sized, so
+                // the frame alone would shrink the grid back.
+                Some(primary) => {
+                    if let Some(fixed) = self.fixed_size_for_view(primary) {
+                        (
+                            usize::from(fixed.width.max(1)),
+                            usize::from(fixed.height.max(1)),
+                        )
+                    } else if let Some(frame) = frames.iter().find(|frame| frame.view == primary) {
                         (
                             usize::from(frame.cols.max(1)),
                             usize::from(frame.rows.max(1)),
                         )
-                    })
-                    .unwrap_or(fallback)
+                    } else {
+                        // CTX-1707: the owner is not composited right now
+                        // (off-layout workspace slot, zoom onto a sibling).
+                        // Keep its committed grid instead of resizing it to
+                        // the undecorated container: a container-sized grid
+                        // is taller than every decorated content frame, so
+                        // the painter would window rows away and a full-screen
+                        // TUI would lose its top lines. `sync_primary_geometry`
+                        // applies the same owner-absence rule when the owner
+                        // returns.
+                        (self.state.width().max(1), self.state.height().max(1))
+                    }
+                }
+                None => (
+                    usize::from(self.container.width).max(1),
+                    usize::from(self.container.height).max(1),
+                ),
             }
         };
         let (_damage, primary_resize) = self.state.resize_with_report(cols, rows);

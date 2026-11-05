@@ -1232,6 +1232,10 @@ impl Runtime {
                 scaled.round()
             }
         };
+        // CTX-1707: present frames and layout hit tests share the window-grid
+        // cell space: both include the container origin (a plugin band moves
+        // it down), so only the padding and the decoration outer inset are
+        // removed here.
         let x = pos.x - pad_px - deco_outer_px;
         let y = pos.y - pad_px - deco_outer_px;
         if x < 0.0 || y < 0.0 {

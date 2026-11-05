@@ -419,12 +419,20 @@ impl TerminalApp {
             ));
         }
         self.runtime.set_layout(layout);
+        // CTX-1707: size the hosted editor to the painted content frame, the
+        // same cell space the keyboard split and `ctl` use. `set_focus` does
+        // not re-sync geometry, so an allocation-sized PTY would keep the
+        // rows the painter windows away for the whole editor session.
         let (cols, rows) = self
             .runtime
-            .layout_allocations()
-            .iter()
-            .find(|(id, _)| *id == new_id)
-            .map(|(_, rect)| (rect.width.max(1), rect.height.max(1)))
+            .presented_frame_cells(new_id)
+            .or_else(|| {
+                self.runtime
+                    .layout_allocations()
+                    .iter()
+                    .find(|(id, _)| *id == new_id)
+                    .map(|(_, rect)| (rect.width.max(1), rect.height.max(1)))
+            })
             .unwrap_or((80, 24));
         let temp_arg = temp.path().to_string_lossy().into_owned();
         // G-2: the leaf spawns without the ambient credentials (minimized

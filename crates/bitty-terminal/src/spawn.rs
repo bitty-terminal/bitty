@@ -205,11 +205,19 @@ pub(crate) fn spawn_pane_shell_in(
 
 /// Spawns a private shell for every layout leaf except the focused one
 /// (CTX-0176), which keeps the already-spawned primary session, plus every
-/// restored attached pin (CTX-1082). Each pane shell is sized to its leaf
-/// allocation; each pinned shell to its composited frame. Best-effort:
-/// per-leaf failures warn loudly and leave that pane empty (CTX-0359: never
-/// a silent mirror of another pane's grid). Call only after a successful
-/// primary spawn.
+/// restored attached pin (CTX-1082). Each pane shell is sized to its
+/// **decorated present frame** (the cells actually painted), not the larger
+/// raw slot allocation; each pinned shell uses the same composited frame.
+/// Best-effort: per-leaf failures warn loudly and leave that pane empty
+/// (CTX-0359: never a silent mirror of another pane's grid). Call only after
+/// a successful primary spawn.
+///
+/// CTX-1707 (#2896): sizing a shell to the raw allocation makes the PTY
+/// advertise rows/columns the painter never shows (decoration consumes part
+/// of the slot), so a full-screen TUI loses its top rows until an unrelated
+/// geometry change re-syncs the pane. This is the same rule the keyboard
+/// split path (`commit_new_leaf`) and the pinned-pane loop below already
+/// follow; the allocation is only a degenerate-container fallback.
 ///
 /// Returns the number of panes whose shell failed (CTX-0481): the
 /// `--fail-loud` startup path turns any non-zero count into a non-zero
@@ -217,6 +225,7 @@ pub(crate) fn spawn_pane_shell_in(
 pub(crate) fn spawn_startup_pane_shells(runtime: &mut Runtime, spec: &SpawnSpec) -> usize {
     let primary = runtime.focused_view();
     let allocs = runtime.layout_allocations();
+    let frames = runtime.present_frames();
     let mut failed = 0usize;
     for (id, rect) in &allocs {
         if Some(*id) == primary {
@@ -229,9 +238,15 @@ pub(crate) fn spawn_startup_pane_shells(runtime: &mut Runtime, spec: &SpawnSpec)
         if runtime.session_restored() && !runtime.session_pending_contains(id) {
             continue;
         }
-        if let Err(err) =
-            spawn_pane_shell(runtime, spec, *id, rect.width.max(1), rect.height.max(1))
-        {
+        // CTX-1707: the decorated content frame is the painted grid. Fall
+        // back to the allocation only when the leaf has no frame at all
+        // (degenerate container); that keeps the startup path total.
+        let (cols, rows) = frames
+            .iter()
+            .find(|frame| frame.view == *id)
+            .map(|frame| (frame.cols.max(1), frame.rows.max(1)))
+            .unwrap_or((rect.width.max(1), rect.height.max(1)));
+        if let Err(err) = spawn_pane_shell(runtime, spec, *id, cols, rows) {
             crate::logging::warn(|| {
                 format!(
                     "warning: startup pane {id:?} shell spawn failed ({err}) — pane stays empty"
@@ -302,5 +317,81 @@ pub(crate) fn parse_split_token(token: &str) -> (Option<SplitAxis>, Option<f32>)
         (axis, ratio)
     } else {
         (parse_split_axis(token.trim()), None)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use bitty_platform::PhysicalSize;
+    use bitty_runtime::{LayoutNode, RuntimeConfig, SplitAxis, UiRect, View, ViewId};
+
+    fn split_runtime() -> Runtime {
+        let mut rt = Runtime::new(RuntimeConfig {
+            cell_width: 10,
+            cell_height: 22,
+            window_padding: 8,
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime builds");
+        // Fractional HiDPI window: a two-pane container with decoration.
+        rt.apply_dpi_scale(1.6, Some(PhysicalSize::new(2505, 1460)));
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 77, 41)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 77, 41)),
+        ));
+        rt.set_window_cells(UiRect::new(0, 0, 155, 41));
+        rt.reflow_layout();
+        rt
+    }
+
+    #[test]
+    fn startup_pane_shells_size_to_the_painted_frame_not_the_slot() {
+        // CTX-1707 / issue #2896: the decorated content frame is smaller
+        // than the raw allocation (outer gap + border + content inset), so
+        // sizing the shell to the allocation advertises rows the painter
+        // windows away and a full-screen TUI loses its top lines.
+        #[cfg(unix)]
+        bitty_test_support::require_pty!();
+        let mut rt = split_runtime();
+        let focused = rt.focused_view().expect("focused leaf");
+        let frames = rt.present_frames();
+        let allocs = rt.layout_allocations();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(allocs.len(), 2);
+
+        let spec = SpawnSpec {
+            program: Some("/bin/sh".to_string()),
+            program_args: vec!["-c".to_string(), "sleep 2".to_string()],
+            shell_env: None,
+            config_shell: None,
+        };
+        assert_eq!(
+            spawn_startup_pane_shells(&mut rt, &spec),
+            0,
+            "the test shell must spawn"
+        );
+
+        for frame in &frames {
+            if frame.view == focused {
+                continue;
+            }
+            let (alloc_w, alloc_h) = allocs
+                .iter()
+                .find(|(id, _)| *id == frame.view)
+                .map(|(_, rect)| (rect.width, rect.height))
+                .expect("allocation");
+            assert!(
+                (frame.cols, frame.rows) != (alloc_w, alloc_h),
+                "the fixture must exercise the decoration inset"
+            );
+            assert_eq!(
+                rt.pane_pty_size(&frame.view),
+                Some((frame.cols, frame.rows)),
+                "the pane PTY must match its painted grid"
+            );
+        }
     }
 }

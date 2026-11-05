@@ -232,9 +232,29 @@ pub(crate) fn presenter_now_ms() -> u64 {
 }
 
 /// Publishes one in-flight present episode.
+///
+/// An abandoned worker can return from its driver call long after a
+/// replacement began; only a newer (or the same) generation may overwrite the
+/// gauge, so the stale worker cannot clobber the live episode with an old
+/// generation.
 pub(crate) fn presenter_begin(generation: u32, since_ms: u64) {
     let packed = (u64::from(generation) << 32) | since_ms;
-    PRESENT_IN_FLIGHT.store(packed, Ordering::Release);
+    let mut current = PRESENT_IN_FLIGHT.load(Ordering::Relaxed);
+    loop {
+        let current_generation = (current >> 32) as u32;
+        if current != 0 && current_generation > generation {
+            return;
+        }
+        match PRESENT_IN_FLIGHT.compare_exchange_weak(
+            current,
+            packed,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 /// Clears the in-flight gauge only when `packed` is still the live episode.

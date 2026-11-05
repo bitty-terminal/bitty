@@ -1274,7 +1274,8 @@ impl TerminalApp {
     ///
     /// Shared by the split path and the empty-base `new_panel` path
     /// (CTX-1338, #2223): install the layout, spawn the fresh pane's shell
-    /// sized to its allocation, and move focus to it.
+    /// sized to the decorated content frame it is painted in, and move focus
+    /// to it.
     fn commit_new_leaf(&mut self, layout: LayoutNode, new_id: ViewId, label: &str) {
         // CTX-1347 (#2240): capture the source report before installing the
         // layout. `set_layout` re-homes focus to the fresh leaf, so a
@@ -1282,9 +1283,9 @@ impl TerminalApp {
         // surviving float/pin that held focus on the empty-base path.
         let inherited_cwd = self.runtime.inherited_cwd_for(new_id);
         self.runtime.set_layout(layout);
-        // CTX-0176: the fresh leaf gets its own shell/PTY sized
-        // to its allocation — best-effort (startup parity). On
-        // failure the pane stays empty (CTX-0359: it never
+        // CTX-0176: the fresh leaf gets its own shell/PTY sized to the
+        // decorated content frame it is painted in — best-effort (startup
+        // parity). On failure the pane stays empty (CTX-0359: it never
         // paints or feeds the primary grid) with a loud warning.
         //
         // Issue #2145: size the shell to the decorated content frame the
@@ -1295,12 +1296,13 @@ impl TerminalApp {
         // post-spawn SIGWINCH repaints the prompt and can leave a stray
         // blank first row above it. `workspace_new` and session restore
         // already spawn at the present frame.
+        //
+        // CTX-1707: the shared resolver (`Runtime::presented_frame_cells`)
+        // keeps this path in the painter's cell space; `workspace_new` and
+        // session restore inline the same present-frame lookup.
         let (cols, rows) = self
             .runtime
-            .present_frames()
-            .iter()
-            .find(|frame| frame.view == new_id)
-            .map(|frame| (frame.cols.max(1), frame.rows.max(1)))
+            .presented_frame_cells(new_id)
             .or_else(|| {
                 self.runtime
                     .layout_allocations()

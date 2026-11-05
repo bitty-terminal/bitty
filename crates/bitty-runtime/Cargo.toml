@@ -185,6 +185,10 @@ windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 
 
 [dev-dependencies]
+# CTX-1708 (bitty#2899): the pinned bar clock renders the real local minute
+# (`os.date("%H:%M", os.time())`); the timer regression asserts the capsule is
+# that live minute and not an epoch/zero formatting fallback.
+chrono.workspace = true
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
 bitty-ipc = { version = "0.0.1", git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674", features = ["test-support"] }
 bitty-test-support = { path = "../bitty-test-support" }

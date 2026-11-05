@@ -12069,9 +12069,24 @@ fn external_editor_round_trip_applies_and_tears_down() {
     let mut app = editor_test_app();
     let home = app.runtime.focused_view().expect("focused leaf");
     feed_text(&mut app, "hi");
+    // The editor records the winsize its PTY actually has (`stty size` ->
+    // "rows cols"), then appends its edit. That is the only way to observe
+    // the hosted pane's real winsize: `Runtime::pty_size` reports the
+    // primary PTY only.
+    let winsize_path = std::env::temp_dir().join(format!(
+        "bitty-editor-winsize-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     let script = write_fake_editor(
         "append",
-        "#!/bin/sh\nprintf '%s' '-edited' >> \"$1\"\nexit 0\n",
+        &format!(
+            "#!/bin/sh\nstty size > '{}'\nprintf '%s' '-edited' >> \"$1\"\nexit 0\n",
+            winsize_path.display()
+        ),
     );
     let script_arg = script.to_string_lossy().into_owned();
     app.open_external_editor_with(None, None, Some(script_arg.as_str()));
@@ -12080,6 +12095,27 @@ fn external_editor_round_trip_applies_and_tears_down() {
     assert_eq!(app.runtime.leaf_count(), 3);
     assert!(app.runtime.has_pane_session(&editor_view));
     assert_eq!(app.runtime.focused_view(), Some(editor_view));
+    // CTX-1707: the hosted editor's PTY must be the *painted* content frame,
+    // not the raw layout slot. `set_focus` never re-syncs geometry, so an
+    // allocation-sized PTY keeps rows the painter windows away for the whole
+    // editor session. The two differ in this fixture (the split is
+    // decorated), so this discriminates if `editor_host` sizes from
+    // `layout_allocations()` again.
+    let frame = app
+        .runtime
+        .presented_frame_cells(editor_view)
+        .expect("editor leaf presents a frame");
+    let alloc = app
+        .runtime
+        .layout_allocations()
+        .into_iter()
+        .find(|(id, _)| *id == editor_view)
+        .map(|(_, rect)| (rect.width, rect.height))
+        .expect("editor leaf has an allocation");
+    assert_ne!(
+        frame, alloc,
+        "fixture must discriminate: the decorated frame differs from the slot"
+    );
     // A second open while hosted is refused: no fourth leaf.
     app.open_external_editor_with(None, None, Some(script_arg.as_str()));
     assert_eq!(app.runtime.leaf_count(), 3);
@@ -12091,7 +12127,18 @@ fn external_editor_round_trip_applies_and_tears_down() {
     assert_eq!(app.runtime.leaf_count(), 2);
     assert!(!app.runtime.has_pane_session(&editor_view));
     assert_eq!(app.runtime.focused_view(), Some(home));
+    // The child's own `stty size` ("rows cols") is the PTY winsize the
+    // editor actually ran with. It must equal the painted frame, not the
+    // larger layout slot: `editor_host` reverting to `layout_allocations()`
+    // makes this report the slot and fails here.
+    let winsize = std::fs::read_to_string(&winsize_path).expect("fake editor recorded stty size");
+    assert_eq!(
+        winsize.split_whitespace().collect::<Vec<_>>(),
+        vec![frame.1.to_string(), frame.0.to_string()],
+        "the hosted editor PTY must be the painted frame {frame:?}, not the slot {alloc:?}"
+    );
     let _ = std::fs::remove_file(&script);
+    let _ = std::fs::remove_file(&winsize_path);
 }
 
 #[test]

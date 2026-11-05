@@ -1929,13 +1929,32 @@ impl Runtime {
     /// Painted image cell footprints for one view's live plane (issue #2875
     /// scope 6, the a11y/scene contract).
     ///
-    /// Returns the viewport cell rectangle each painted placement covers, in
+    /// Returns the grid cell rectangle each painted placement covers, in
     /// the same coordinates as the view's grid snapshot, so a text
     /// projection (`bitty ctl terminal text`, accessibility readers) can
     /// keep a readable stand-in for cells an image hides instead of
     /// reporting a blank hole. Direct `a=p`/`a=T` placements write nothing
     /// into the grid, which is exactly why the footprint has to be derived
     /// from the paint layer rather than from cells.
+    ///
+    /// # Coordinate space
+    ///
+    /// Spans are **grid** rows (`State::snapshot`), which is what every
+    /// projection of this seam consumes. The present leaf pass resolves
+    /// the same placements against a different base —
+    /// `(scrollback_len - scroll_offset) + cursor_follow_window_start(
+    /// cursor_row, grid_rows, frame_rows)` (`present.rs` leaf pass) —
+    /// because it draws a cursor-follow *window* of the grid on a surface
+    /// whose content frame is smaller than the grid (the default headless
+    /// shape is an 80x24 grid in a 76x22 frame, so the window start is 2)
+    /// and, when the view is scrolled, a scrollback composite. A footprint
+    /// answers "which grid cells does this image cover", not "which frame
+    /// rows does it occupy on screen", so it must stay in grid rows: mixing
+    /// the paint base in would move every stand-in off the text it replaces
+    /// by the decoration inset (2 rows in the default shape). `scroll_offset`
+    /// and the window start are therefore deliberately *not* applied here;
+    /// a consumer that wants screen rows must ask the paint layer, whose
+    /// rects are the authority for pixels.
     ///
     /// Geometry is resolved with unit cell metrics
     /// (`CellMetrics { width: 1, height: 1 }`): placements are anchored and
@@ -1960,6 +1979,9 @@ impl Runtime {
                     Some(view.0),
                     sess.state.height(),
                     sess.state.width(),
+                    // Grid scrollback base (see the coordinate-space note
+                    // above): deliberately not the paint pass's
+                    // `(len - scroll_offset) + window_start` base.
                     sess.state.scrollback_len(),
                 )
             } else if Some(view) == self.primary_view {
@@ -2069,9 +2091,18 @@ impl Runtime {
     ///   `Gi=<id>;EINVAL:<msg>`, quota-full stores answer
     ///   `Gi=<id>;ENOSPC:store full`, otherwise `Gi=<id>;OK`. PNG
     ///   payloads additionally pass
-    ///   [`bitty_rich::precheck_png_payload`], the decoder's own `IHDR`
-    ///   gate, so a probe never answers `OK` for bytes a transmit would
-    ///   refuse (issue #2875 scope 4). A `p=` on a
+    ///   [`bitty_rich::precheck_png_payload`], the shared header-only
+    ///   admission gate `bitty_rich::kitty_decode` runs before the codec
+    ///   allocates, so probe and transmit can never disagree about
+    ///   *declared geometry*: a probe never answers `OK` for an `IHDR`
+    ///   the transmit path refuses (side/area/byte ceilings, zero
+    ///   dimensions, malformed header) (issue #2875 scope 4). What the
+    ///   gate cannot prove is stream validity — a valid `IHDR` with a
+    ///   corrupt stream still probes `OK` and is refused by the codec at
+    ///   transmit. That asymmetry is deliberate: decoding inside a probe
+    ///   would allocate the pixels the gate exists to avoid; a probe
+    ///   guarantees the declaration is admissible, not that the bytes
+    ///   decode. A `p=` on a
     ///   probe is ignored (kitty `graphics.c:2549` echoes only `q_iid`).
     ///   Probes REQUIRE `i=` (spec-exact, decided per the open point):
     ///   kitty `REPORT_ERROR`s with no reply when `!q_iid`

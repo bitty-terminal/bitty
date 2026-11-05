@@ -14,14 +14,37 @@
 
 #![forbid(unsafe_code)]
 
-use bitty_runtime::Runtime;
 use bitty_runtime::inspect::{ImageCellSpan, grid_text_from_snapshot_with_images};
+use bitty_runtime::{AnimationPolicy, PresentFrame, Runtime, RuntimeConfig};
 
 /// 2x2 opaque red RGBA payload (`f=32`), base64 `/wAA//8AAP//AAD//wAA/w==`.
 const RED_2X2_B64: &str = "/wAA//8AAP//AAD//wAA/w==";
 
 fn make_runtime() -> Runtime {
     Runtime::with_defaults().expect("defaults must build")
+}
+
+/// Runtime with animation ticks disabled so `tick` always presents, used by
+/// the coordinate-space guard that inspects the presented frame.
+fn make_presenting_runtime() -> Runtime {
+    Runtime::new(RuntimeConfig {
+        animations: AnimationPolicy {
+            enabled: false,
+            ..AnimationPolicy::default()
+        },
+        ..RuntimeConfig::default()
+    })
+    .expect("headless runtime must build")
+}
+
+/// The focused leaf's present frame (its content rect is what the paint pass
+/// fills; it can be smaller than the grid).
+fn focused_frame(rt: &Runtime) -> PresentFrame {
+    let focused = rt.focused_view().expect("focused leaf");
+    rt.present_frames()
+        .into_iter()
+        .find(|frame| frame.view == focused)
+        .expect("focused leaf has a present frame")
 }
 
 /// Transmit-and-display a 2x2 RGBA image anchored at the cursor with a
@@ -148,4 +171,100 @@ fn footprint_of_a_span_placed_at_the_grid_bottom_stays_inside_the_grid() {
     let projected = grid_text_from_snapshot_with_images(&rt.snapshot(), height, 8, &spans);
     assert_eq!(projected.lines.len(), height);
     assert_eq!(projected.lines[height - 1], "\u{FFFC}\u{FFFC}");
+}
+
+#[test]
+fn footprint_rows_stay_in_grid_space_under_a_cropped_and_scrolled_view() {
+    // F4 (#2875 follow-up), coordinate-space guard. The present leaf pass
+    // resolves placements against
+    // `(scrollback_len - scroll_offset) + cursor_follow_window_start(..)`
+    // because it draws a cursor-follow *window* of the grid (default
+    // headless: an 80x24 grid in a 76x22 content frame) or a scrollback
+    // composite. The text projection consumes the whole grid, so the
+    // footprint must stay in grid rows.
+    //
+    // The image is placed BEFORE the scrollback pressure on purpose: that
+    // leaves `placement.scrollback_base == 0` against a non-zero live
+    // scrollback length, so the grid base (`anchor - len`) and a
+    // paint-style base (`anchor - (len - scroll_offset)`) resolve to
+    // different rows. Injecting either the `+ window_start` term or the
+    // `- scroll_offset` term into the footprint seam turns this test red.
+    let mut rt = make_presenting_runtime();
+    let view = primary_view(&rt);
+    let height = rt.snapshot().height;
+    // `C=1`: keep the cursor where it is, so placing the image cannot scroll
+    // the grid and move the anchor out from under the assertion.
+    rt.handle_pty_bytes(format!("\x1b[{height};3H").as_bytes());
+    rt.handle_pty_bytes(
+        format!("\x1b_Ga=T,f=32,s=2,v=2,c=2,r=1,C=1,i=45;{RED_2X2_B64}\x1b\\").as_bytes(),
+    );
+    assert!(rt.tick().is_some(), "the display must present");
+
+    let frame = focused_frame(&rt);
+    assert!(
+        usize::from(frame.rows) < height,
+        "precondition: the content frame ({}) must crop the {height}-row grid, \
+         so the paint window start is non-zero",
+        frame.rows
+    );
+    assert_eq!(
+        rt.state().scrollback_len(),
+        0,
+        "precondition: the placement's scrollback base must be zero"
+    );
+
+    // Push the grid up: each line at the bottom row adds one scrollback row
+    // and the image moves up with the content, still on the live grid.
+    let scroll_added = 4usize;
+    for i in 0..scroll_added {
+        rt.handle_pty_bytes(format!("S{i}\r\n").as_bytes());
+    }
+    assert_eq!(
+        rt.state().scrollback_len(),
+        scroll_added,
+        "each bottom-row newline must add exactly one scrollback row"
+    );
+
+    // Clear the row the image has scrolled onto: the lines above wrote text
+    // across it, and the projection must have a blank hole to fill before
+    // the stand-in assertion below is meaningful.
+    let image_row = height - 1 - scroll_added;
+    rt.handle_pty_bytes(format!("\x1b[{};1H\x1b[2K", image_row + 1).as_bytes());
+
+    let anchored = ImageCellSpan {
+        row: u32::try_from(image_row).expect("grid rows fit u32"),
+        col: 2,
+        rows: 1,
+        cols: 2,
+    };
+    assert_eq!(
+        rt.kitty_image_cell_spans_for_view(view),
+        vec![anchored],
+        "the footprint marks the grid row the image is anchored on, not the \
+         frame row the paint pass draws it at"
+    );
+    // The stand-in lands on that same row of the projected grid, so text
+    // and footprint agree.
+    let projected = grid_text_from_snapshot_with_images(&rt.snapshot(), height, 8, &[anchored]);
+    assert_eq!(
+        projected.lines[usize::try_from(anchored.row).expect("row fits usize")],
+        "  \u{FFFC}\u{FFFC}"
+    );
+
+    // Scrolled into history: the projection still reads the live grid, so
+    // the footprint keeps grid rows instead of following the composite.
+    let scrollback = rt.state().scrollback_len();
+    {
+        // CTX-0603: bind the guard before borrowing a leaf through it.
+        let mut layout = rt.layout_mut();
+        let leaf = layout.find_leaf_mut(view).expect("view 1 is a leaf");
+        leaf.set_scroll_offset(2, scrollback);
+        assert_eq!(leaf.scroll_offset(), 2, "the scroll must take effect");
+    }
+    assert_eq!(
+        rt.kitty_image_cell_spans_for_view(view),
+        vec![anchored],
+        "a scrolled view keeps the footprint on the grid row the placement is \
+         anchored on, not the paint pass's composite row"
+    );
 }

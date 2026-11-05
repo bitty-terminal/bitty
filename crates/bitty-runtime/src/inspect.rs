@@ -379,19 +379,22 @@ pub struct GridTextSnapshot {
     pub generation: u64,
 }
 
-/// One painted image's cell footprint in viewport coordinates
+/// One painted image's cell footprint in grid coordinates
 /// (issue #2875 scope 6, the a11y/scene contract).
 ///
-/// `row`/`col` are 0-based viewport cells; `rows`/`cols` are the span the
-/// image covers, exactly the cell rectangle the present layer paints. The
-/// grid itself keeps no image cell for a direct `a=p`/`a=T` placement (its
-/// cells hold whatever text was there), so a text projection needs this
-/// footprint to keep a readable stand-in instead of a blank hole.
+/// `row`/`col` are 0-based **grid** cells — the rows and columns of the
+/// snapshot a text projection consumes ([`Snapshot`] from
+/// [`State::snapshot`](bitty_term_state::State::snapshot)), not the
+/// painted frame's rows when the present leaf pass draws a window of the
+/// grid; `rows`/`cols` are the span the image covers. The grid itself
+/// keeps no image cell for a direct `a=p`/`a=T` placement (its cells hold
+/// whatever text was there), so a text projection needs this footprint to
+/// keep a readable stand-in instead of a blank hole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageCellSpan {
-    /// First covered viewport row.
+    /// First covered grid row.
     pub row: u32,
-    /// First covered viewport column.
+    /// First covered grid column.
     pub col: u32,
     /// Covered rows (>= 1).
     pub rows: u32,
@@ -468,18 +471,31 @@ fn grid_text_from_snapshot_inner(
     }
     let take_rows = rows.min(snapshot.height);
     // Per-row covered column ranges, built once so the cell loop stays a
-    // cheap scan over the (few) images crossing the row instead of re-walking
-    // every span per cell. Spans are clipped to the snapshot here.
+    // cheap forward scan over the (few) images crossing the row instead of
+    // re-walking every span per cell. Spans are clipped to the snapshot
+    // here and the ranges are sorted and merged, so one cursor per row can
+    // answer the covered test.
     let coverage = image_row_coverage(images, take_rows, snapshot.width);
     let mut lines = Vec::with_capacity(take_rows);
     for r in 0..take_rows {
         let mut line = String::new();
         let mut chars = 0usize;
+        // F6 (#2875 follow-up): one forward cursor per row. `row_ranges` is
+        // sorted and merged, so the cursor only advances as `c` grows and
+        // the covered test costs one amortised step per cell instead of a
+        // rescan of every range (the old `column_covered` was
+        // O(cells x ranges)).
         let row_ranges = coverage.get(r).map(|v| v.as_slice()).unwrap_or(&[]);
+        let mut ranges = row_ranges.iter();
+        let mut current = ranges.next().copied();
         for c in 0..snapshot.width {
             if chars >= cols {
                 break;
             }
+            while current.is_some_and(|(_, end)| c >= end) {
+                current = ranges.next().copied();
+            }
+            let covered = current.is_some_and(|(start, end)| c >= start && c < end);
             let idx = r * snapshot.width + c;
             let Some(cell) = snapshot.cells.get(idx) else {
                 break;
@@ -498,7 +514,7 @@ fn grid_text_from_snapshot_inner(
                 // footprint projects the same stand-in (issue #2875 scope
                 // 6), so an image never reads as an empty hole. Cells that
                 // already hold text keep it: hidden text is still content.
-                None if cell.glyph == ' ' && column_covered(row_ranges, c) => {
+                None if cell.glyph == ' ' && covered => {
                     line.push(bitty_term_state::KITTY_IMAGE_TEXT_FALLBACK);
                 }
                 None => cell.push_text_into(&mut line),
@@ -526,10 +542,12 @@ fn grid_text_from_snapshot_inner(
 /// Per-row covered column intervals for the image footprints intersecting a
 /// `max_rows` x `grid_width` viewport.
 ///
-/// Index `r` holds the `[start, end)` column ranges image `r` covers, in
-/// insertion order (never merged: the scan is bounded by the placement cap
-/// and exists only to answer [`column_covered`]). Spans outside the snapshot
-/// are clipped, never indexed.
+/// Index `r` holds the `[start, end)` column ranges image `r` covers, sorted
+/// and merged (overlapping or touching footprints collapse into one range).
+/// Spans outside the snapshot are clipped, never indexed. The sort/merge is
+/// bounded by the placement cap and lets the cell loop answer "is this cell
+/// covered" with one forward cursor per row (F6, #2875 follow-up) instead of
+/// rescanning every range per cell.
 fn image_row_coverage(
     images: &[ImageCellSpan],
     max_rows: usize,
@@ -557,12 +575,25 @@ fn image_row_coverage(
             }
         }
     }
+    for ranges in &mut rows {
+        if ranges.len() < 2 {
+            continue;
+        }
+        ranges.sort_unstable();
+        // In-place merge: `write` trails `read`, so no extra allocation.
+        let mut write = 0usize;
+        for read in 1..ranges.len() {
+            let (start, end) = ranges[read];
+            if start <= ranges[write].1 {
+                ranges[write].1 = ranges[write].1.max(end);
+            } else {
+                write += 1;
+                ranges[write] = (start, end);
+            }
+        }
+        ranges.truncate(write + 1);
+    }
     rows
-}
-
-/// Whether `col` falls inside any of one row's covered ranges.
-fn column_covered(ranges: &[(usize, usize)], col: usize) -> bool {
-    ranges.iter().any(|&(start, end)| col >= start && col < end)
 }
 
 /// Extract bounded grid text directly from live [`State`].
@@ -795,6 +826,68 @@ mod tests {
         }];
         let projected = grid_text_from_snapshot_with_images(&snap, 2, 16, &spans);
         assert_eq!(projected.lines[0], "keep");
+    }
+
+    #[test]
+    fn image_row_coverage_sorts_and_merges_overlapping_spans() {
+        // F6 (#2875 follow-up): the per-row ranges are sorted and merged
+        // once, so one forward cursor per row answers the covered test
+        // instead of the old per-cell rescan. Reverting that merge (back to
+        // insertion order, unmerged) makes this assertion fail.
+        let spans = [
+            // Deliberately out of order and overlapping: 6..8, 2..5, 3..7.
+            ImageCellSpan {
+                row: 0,
+                col: 6,
+                rows: 1,
+                cols: 2,
+            },
+            ImageCellSpan {
+                row: 0,
+                col: 2,
+                rows: 1,
+                cols: 3,
+            },
+            ImageCellSpan {
+                row: 0,
+                col: 3,
+                rows: 1,
+                cols: 4,
+            },
+        ];
+        let coverage = image_row_coverage(&spans, 1, 16);
+        assert_eq!(
+            coverage,
+            vec![vec![(2usize, 8usize)]],
+            "overlapping spans collapse into one sorted range"
+        );
+    }
+
+    #[test]
+    fn grid_text_projects_disjoint_footprints_across_gaps() {
+        // F6: the per-row cursor must skip the gap between two footprints,
+        // not stop at the first range's end or smear the stand-in across it.
+        let state = State::new();
+        let snap = state.snapshot();
+        let spans = [
+            ImageCellSpan {
+                row: 0,
+                col: 0,
+                rows: 1,
+                cols: 2,
+            },
+            ImageCellSpan {
+                row: 0,
+                col: 4,
+                rows: 1,
+                cols: 2,
+            },
+        ];
+        let projected = grid_text_from_snapshot_with_images(&snap, 1, 8, &spans);
+        assert_eq!(
+            projected.lines[0], "\u{FFFC}\u{FFFC}  \u{FFFC}\u{FFFC}",
+            "cells 2-3 stay blank between two disjoint footprints"
+        );
     }
 
     #[test]

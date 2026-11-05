@@ -2258,6 +2258,15 @@ mod tests {
         ))
     }
 
+    /// Canonicalizes a child-reported cwd so the comparison is stable across
+    /// platforms: `canonicalize` adds the `\\?\` verbatim prefix on Windows,
+    /// while a process's own cwd report never carries it.
+    fn reported_cwd(report: &str) -> std::path::PathBuf {
+        std::fs::canonicalize(report).unwrap_or_else(|error| {
+            panic!("the child reported a resolvable cwd {report:?}: {error}")
+        })
+    }
+
     /// Whether `error` is the dedicated pane-cwd refusal.
     fn denies_unavailable_cwd(error: &IpcError) -> bool {
         matches!(
@@ -2423,11 +2432,22 @@ mod tests {
         let request = allowed_request("cwd").with_cwd(SpawnCwd::Pane);
 
         let first = dispatch_ok(&mut service, &request, 401).expect("pane spawn serves");
-        assert_eq!(first.stderr_summary, pane_text);
+        // The helper echoes its own cwd, and a process reports the plain drive
+        // path on Windows even when the host hands the verbatim (`\\?\`)
+        // canonical form to `current_dir`, so compare both sides canonically.
+        assert_eq!(
+            reported_cwd(&first.stderr_summary),
+            pane,
+            "the child runs in the host-resolved pane directory"
+        );
 
         source.set(other.clone());
         let second = dispatch_ok(&mut service, &request, 402).expect("second pane spawn serves");
-        assert_eq!(second.stderr_summary, other_text);
+        assert_eq!(
+            reported_cwd(&second.stderr_summary),
+            other,
+            "changing the pane changes the child's directory"
+        );
 
         let entries: Vec<_> = service.tool_audit().iter().collect();
         assert_eq!(entries.len(), 2);

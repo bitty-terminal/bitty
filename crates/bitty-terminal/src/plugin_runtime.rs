@@ -1066,19 +1066,37 @@ mod tests {
         );
     }
 
+    /// Builds the `OSC 7` payload a shell would emit for `dir`.
+    ///
+    /// `file://` URLs always use forward slashes and a Windows drive root is
+    /// written as `/C:/...`, so the separator and leading slash are encoded
+    /// per platform instead of hardcoding a POSIX path.
+    fn osc7_report(dir: &std::path::Path) -> Vec<u8> {
+        let text = dir.to_str().expect("utf-8 dir").replace('\\', "/");
+        let text = if text.starts_with('/') {
+            text
+        } else {
+            format!("/{text}")
+        };
+        format!("\x1b]7;file://{text}\x07").into_bytes()
+    }
+
     #[test]
     fn live_snapshot_publishes_the_focused_pane_cwd_for_spawn() {
         // CTX-1715: the spawn `pane` semantic reads the same published model
         // as `bitty.terminal.snapshot`; the value is the decoded `OSC 7`
         // directory of the focused view, not the host process cwd.
+        let dir = std::env::temp_dir();
         let snapshot = LiveSnapshot::new(80, 24);
         let mut rt = Runtime::with_defaults().expect("must build");
-        rt.handle_pty_bytes(b"\x1b]7;file:///tmp\x07");
+        rt.handle_pty_bytes(&osc7_report(&dir));
         let _ = rt.tick();
         assert!(snapshot.publish(&rt), "publish commits the report");
         assert_eq!(
-            snapshot.pane_cwd(),
-            Some(std::path::PathBuf::from("/tmp")),
+            snapshot
+                .pane_cwd()
+                .map(|path| std::fs::canonicalize(path).expect("the pane cwd resolves")),
+            Some(std::fs::canonicalize(&dir).expect("the temp dir resolves")),
             "the pane source serves the decoded focused-pane report"
         );
         assert!(

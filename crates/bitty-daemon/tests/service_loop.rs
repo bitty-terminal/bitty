@@ -3603,16 +3603,53 @@ fn a_worker_exit_is_recorded_once_with_its_containment_cleanup() {
 /// Live child processes of the daemon across its task table.
 ///
 /// Linux records a child under the task that created it, so the sum is the
-/// daemon's exact direct-child set. A refused create must leave it unchanged.
+/// daemon's exact direct-child set. A refused create must leave it unchanged;
+/// every read failure panics with the path, so the assertion cannot pass on a
+/// zero default.
 fn daemon_child_count(pid: u32) -> u64 {
-    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-        return 0;
-    };
-    tasks
-        .flatten()
-        .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok())
-        .map(|text| text.split_whitespace().count() as u64)
-        .sum()
+    daemon_child_count_in(&Path::new("/proc").join(pid.to_string()).join("task"))
+}
+
+/// Sum the daemon's per-task `children` tables under one task directory.
+///
+/// A failed read is a test failure with the path, never a silent zero: the
+/// caller proves a refused create added no child, which an unreadable table
+/// cannot support.
+fn daemon_child_count_in(tasks: &Path) -> u64 {
+    let entries = std::fs::read_dir(tasks).unwrap_or_else(|error| {
+        panic!(
+            "cannot read the daemon task table {}: {error}",
+            tasks.display()
+        )
+    });
+    let mut total = 0u64;
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| {
+            panic!(
+                "cannot read a daemon task entry in {}: {error}",
+                tasks.display()
+            )
+        });
+        let children = entry.path().join("children");
+        let text = std::fs::read_to_string(&children)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", children.display()));
+        total += text.split_whitespace().count() as u64;
+    }
+    total
+}
+
+#[test]
+#[should_panic(expected = "cannot read the daemon task table")]
+fn a_missing_daemon_task_table_panics_instead_of_reporting_zero() {
+    let _ = daemon_child_count_in(Path::new("/nonexistent/bittyd-daemon-task-table"));
+}
+
+#[test]
+#[should_panic(expected = "cannot read")]
+fn a_daemon_task_without_a_children_file_panics_instead_of_reporting_zero() {
+    let dir = tempfile::tempdir().expect("fixture dir");
+    std::fs::create_dir(dir.path().join("1234")).expect("task dir");
+    let _ = daemon_child_count_in(dir.path());
 }
 
 /// The daemon's own containment window, rebuilt from its advertised limits.

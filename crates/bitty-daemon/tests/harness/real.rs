@@ -46,6 +46,13 @@ pub struct RealDriver {
     request_timeout_ms: Option<u64>,
     handler_delay_ms: u64,
     handler_delay_method: Option<String>,
+    /// A harness-only stand-in for a refused startup containment plan.
+    ///
+    /// The daemon still runs with its real plan; the model reports
+    /// `terminal_spawn: false`, which is exactly what a refused cell reports,
+    /// so the corpus skip path can be exercised on a host that can contain a
+    /// child.
+    forced_terminal_spawn: Option<bool>,
 }
 
 struct Root {
@@ -373,7 +380,21 @@ impl RealDriver {
             request_timeout_ms: None,
             handler_delay_ms: 0,
             handler_delay_method: None,
+            forced_terminal_spawn: None,
         }
+    }
+
+    /// A driver that models a cell whose startup containment probe refused the
+    /// spawn path.
+    ///
+    /// The real daemon still runs with the host's plan; only the modeled
+    /// `terminal_spawn` fact is forced to `false`, so the corpus records the
+    /// same typed skips a refused cell would record. It exists to exercise the
+    /// parity expectation for that cell on a host that can contain a child.
+    pub fn modeling_refused_containment() -> Self {
+        let mut driver = Self::new();
+        driver.forced_terminal_spawn = Some(false);
+        driver
     }
 
     /// Reads the per-boot operator capability once the daemon has written it.
@@ -529,6 +550,9 @@ impl RealDriver {
     /// that plan as the orphan mechanism, so the driver reads it through the
     /// operator capability instead of assuming a Linux cell is always servable.
     fn probe_terminal_spawn(&mut self, endpoint: &Path) -> Result<bool, String> {
+        if let Some(forced) = self.forced_terminal_spawn {
+            return Ok(forced);
+        }
         let mut client = Client::connect(endpoint)?;
         let id = self.next_request_id();
         client.send(
@@ -1207,15 +1231,28 @@ fn seed_orphan_record(root: &Root, seed: Option<&str>) -> Result<(), String> {
 ///
 /// Linux records a child under the task that created it, so summing the
 /// per-task `children` files is the daemon's exact direct-child set. A refused
-/// create must leave this unchanged.
+/// create must leave this unchanged; a failed read is an error, never a zero
+/// count, so the evidence cannot pass vacuously.
 fn child_processes(pid: u32) -> Result<u64, String> {
-    let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
-        .map_err(|_| "cannot read the daemon task table".to_owned())?;
+    child_processes_in(&Path::new("/proc").join(pid.to_string()).join("task"))
+}
+
+/// Sum the `children` tables under one task directory.
+///
+/// Every read failure is returned with the path that failed. The consumer
+/// asserts "no child process", so a missing or unreadable table must fail the
+/// row instead of defaulting to zero.
+fn child_processes_in(tasks: &Path) -> Result<u64, String> {
+    let entries = std::fs::read_dir(tasks)
+        .map_err(|error| format!("cannot read the task table {}: {error}", tasks.display()))?;
     let mut total = 0u64;
-    for task in tasks.flatten() {
-        if let Ok(text) = std::fs::read_to_string(task.path().join("children")) {
-            total += text.split_whitespace().count() as u64;
-        }
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("cannot read a task entry in {}: {error}", tasks.display()))?;
+        let children = entry.path().join("children");
+        let text = std::fs::read_to_string(&children)
+            .map_err(|error| format!("cannot read {}: {error}", children.display()))?;
+        total += text.split_whitespace().count() as u64;
     }
     Ok(total)
 }
@@ -1255,4 +1292,25 @@ fn tcp_listeners(pid: u32) -> Vec<String> {
         }
     }
     listeners
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_task_table_fails_closed() {
+        let error = child_processes_in(Path::new("/nonexistent/bittyd-task-table"))
+            .expect_err("a missing task table must not read as zero children");
+        assert!(error.contains("cannot read the task table"), "{error}");
+    }
+
+    #[test]
+    fn a_task_without_a_children_file_fails_closed() {
+        let dir = tempfile::tempdir().expect("fixture dir");
+        std::fs::create_dir(dir.path().join("1234")).expect("task dir");
+        let error = child_processes_in(dir.path())
+            .expect_err("a task without a children file must not read as zero");
+        assert!(error.contains("cannot read"), "{error}");
+    }
 }

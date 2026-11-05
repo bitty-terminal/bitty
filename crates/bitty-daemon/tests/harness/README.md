@@ -118,22 +118,29 @@ Expectation vocabulary: `ok`, `error_class`, `error_code`, `counts`,
 the response `result`; a leading `result.` is accepted and normalized.
 
 Actions: `restart`, `crash`, `advance_clock`, `oversized_frame`, `partial_frame`,
-`queue_pressure`, `audit`, `file_mode`, `no_tcp_listener`, `daemon_absent`,
-`request_log`, `read_events`, `peer_exit`, and `refusal_burst`. `read_events`
-reads `args.count` pushed frames; `args.events` is an optional per-frame array
-of expectation objects (index-aligned with the frames), and `expect.result` is
-the fallback applied to every frame. `retry_ms` is the only bounded
-settlement: it re-sends the same request until the typed expectation holds or
-the deadline passes, for an effect the service applies on another connection.
+`queue_pressure`, `audit`, `file_mode`, `no_tcp_listener`, `child_processes`,
+`daemon_absent`, `request_log`, `read_events`, `peer_exit`, and
+`refusal_burst`. `child_processes` asserts `expect.result.count` against the
+service's live direct-child count; a failed process-table read fails the row
+rather than reading as zero. `read_events` reads `args.count` pushed frames;
+`args.events` is an optional per-frame array of expectation objects
+(index-aligned with the frames), and `expect.result` is the fallback applied to
+every frame. `retry_ms` is the only bounded settlement: it re-sends the same
+request until the typed expectation holds or the deadline passes, for an effect
+the service applies on another connection.
 
 ## Evidence
 
 `target/conformance/<cell>.<suite>.json` (`$CARGO_TARGET_DIR` wins) records the
 suite (`fake`, `real`, `parity`), label, cell, version, commit, corpus schema,
-the corpus `frozen` map, instance id, capabilities, effective limits, and one
-row per vector with status, skip reason, deferred requirement, known-defect
-issue, instance id, step count, typed signature, failure step, and failure. The record contains no
-host path, username, socket path, port, token, or capability value.
+the corpus `frozen` map, instance id, capabilities, modeled features, effective
+limits, and one row per vector with status, skip reason, deferred requirement,
+known-defect issue, instance id, step count, typed signature, failure step, and
+failure. The record contains no host path, username, socket path, port, token,
+or capability value. `features` carries driver-modeled service facts that are
+never advertised on the wire (for example `terminal_spawn`, the
+containment-plan gate of the accepted 1.3 terminal-spawn slice); `capabilities`
+stays the exact handshake set.
 
 `<cell>.parity.json` lists the shared vectors compared and the divergences. A
 fake run never closes a real row: the files are separate and the parity report

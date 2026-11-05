@@ -5287,14 +5287,34 @@ mod tests {
     /// A spawn happens on the thread that calls `fork`/`clone`, so the
     /// per-task `children` table is the precise process-table check: parallel
     /// tests that spawn from other threads cannot make this assertion flaky.
+    /// A failed read panics with the path instead of defaulting to zero, so the
+    /// "no child" evidence cannot pass vacuously.
     #[cfg(target_os = "linux")]
     fn thread_child_processes() -> usize {
-        let Ok(thread) = std::fs::read_link("/proc/thread-self") else {
-            return 0;
-        };
-        std::fs::read_to_string(thread.join("children"))
-            .map(|text| text.split_whitespace().count())
-            .unwrap_or(0)
+        let thread = std::fs::read_link("/proc/thread-self")
+            .expect("read the current thread's /proc/thread-self entry");
+        // The link target is relative to `/proc` (`<pid>/task/<tid>`), not an
+        // absolute path.
+        child_processes_in(&std::path::Path::new("/proc").join(thread))
+    }
+
+    /// Count the `children` pids under one `/proc` thread directory.
+    ///
+    /// The path is a parameter so the fail-closed behavior is testable with a
+    /// missing directory.
+    #[cfg(target_os = "linux")]
+    fn child_processes_in(thread: &std::path::Path) -> usize {
+        let children = thread.join("children");
+        let text = std::fs::read_to_string(&children)
+            .unwrap_or_else(|error| panic!("cannot read {}: {error}", children.display()));
+        text.split_whitespace().count()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[should_panic(expected = "cannot read")]
+    fn a_missing_thread_task_table_panics_instead_of_reporting_zero() {
+        let _ = child_processes_in(std::path::Path::new("/nonexistent/bittyd-thread-self"));
     }
 
     /// Non-Linux cells serve no spawn path, so the count is always zero.

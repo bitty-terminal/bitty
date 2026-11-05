@@ -22,14 +22,17 @@ pub const SERVICE_API_MAJOR: u16 = 1;
 
 /// Current service-contract minor version (`D-11`).
 ///
-/// `1.1` is the additive worker slice (bitty#2790): `session.create` with
-/// `kind: worker` and a served `session.resize`. `1.2` serves the accepted
-/// session and daemon metadata fields (bitty#2806) as optional response keys,
-/// so no existing field changes meaning and a `1.0` or `1.1` client remains in
-/// the accepted range because `min_client_minor` is `0`. `1.3` serves the
-/// terminal session spawn and the terminal content plane (`session.read`,
-/// `session.write`, `session.subscribe`) with the `terminal.inspect` and
-/// `terminal.input` transport grants.
+/// `1.1` is the additive worker slice (bitty#2790): the reserved
+/// `session.create` `kind: worker` vocabulary and a served `session.resize`.
+/// The kind itself stays unserved under `D-01`
+/// ([`crate::worker::WORKER_HOSTING_AMENDMENT_ACCEPTED`]): a worker create is
+/// `Denied/UnsupportedCapability` in every v0.2.0 build. `1.2` serves the
+/// accepted session and daemon metadata fields (bitty#2806) as optional
+/// response keys, so no existing field changes meaning and a `1.0` or `1.1`
+/// client remains in the accepted range because `min_client_minor` is `0`.
+/// `1.3` serves the terminal session spawn and the terminal content plane
+/// (`session.read`, `session.write`, `session.subscribe`) with the
+/// `terminal.inspect` and `terminal.input` transport grants.
 pub const SERVICE_API_MINOR: u16 = 3;
 
 /// Lowest client minor the server accepts for [`SERVICE_API_MAJOR`] (`D-11`:

@@ -396,15 +396,16 @@ fn real_conformance_corpus() {
     assert!(rows.iter().all(|row| row.status == RowStatus::Skip));
 }
 
+/// Compare the fake and real rows for every vector both drivers ran.
+///
+/// Returns the number of compared rows, the divergences, and the
+/// not-compared entries (`"<id>: <reason>"`).
 #[cfg(target_os = "linux")]
-#[test]
-fn fake_and_real_parity() {
-    let corpus = Corpus::load().expect("corpus");
-    let mut fake = FakeDriver::new();
-    let fake_rows = run_corpus(&corpus, &mut fake);
-    let mut real = RealDriver::new();
-    let real_rows = run_corpus(&corpus, &mut real);
-
+fn compare_corpus_rows(
+    corpus: &Corpus,
+    fake_rows: &[VectorOutcome],
+    real_rows: &[VectorOutcome],
+) -> (usize, Vec<String>, Vec<String>) {
     let mut compared = 0;
     let mut divergences = Vec::new();
     let mut not_compared = Vec::new();
@@ -436,6 +437,55 @@ fn fake_and_real_parity() {
             }
         }
     }
+    (compared, divergences, not_compared)
+}
+
+/// The exact parity expectation for the modeled real cell.
+///
+/// A served plan runs the accepted 1.3 terminal-spawn vectors on both drivers.
+/// A refused plan records the typed `cell-not-servable: terminal_spawn` skip
+/// for them, while the registry-only terminal (`V-48`), the worker refusal
+/// (`V-03`), and every non-spawn vector still pass on both drivers.
+#[cfg(target_os = "linux")]
+fn expected_parity(real_serves_spawn: bool, test_seams: bool) -> (usize, Vec<&'static str>) {
+    let mut expected_not_compared = vec![
+        "V-06", "V-18", "V-33", "V-39", "V-40", "V-42", "V-43", "C-01", "C-02", "C-03", "C-11",
+        "C-07", "C-08", "C-10", "C-12", "F-01", "C-15", "C-16", "V-49", "V-50",
+    ];
+    if !test_seams {
+        // Without the real seam V-44 is a fake-only row: the real driver
+        // records the typed `cell-not-servable: request_deadline_seam` skip.
+        expected_not_compared.push("V-44");
+    }
+    let expected_compared = match (real_serves_spawn, test_seams) {
+        (true, true) => 37,
+        (true, false) => 36,
+        // The terminal-spawn vectors skip on the refused cell. V-48 needs no
+        // process or containment plan, so it stays compared.
+        (false, true) => {
+            expected_not_compared.extend(["V-45", "V-46", "V-47"]);
+            34
+        }
+        (false, false) => {
+            expected_not_compared.extend(["V-45", "V-46", "V-47"]);
+            33
+        }
+    };
+    expected_not_compared.sort_unstable();
+    (expected_compared, expected_not_compared)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fake_and_real_parity() {
+    let corpus = Corpus::load().expect("corpus");
+    let mut fake = FakeDriver::new();
+    let fake_rows = run_corpus(&corpus, &mut fake);
+    let mut real = RealDriver::new();
+    let real_rows = run_corpus(&corpus, &mut real);
+
+    let (compared, divergences, not_compared) =
+        compare_corpus_rows(&corpus, &fake_rows, &real_rows);
     let _ = evidence::write_parity(compared, &divergences, &not_compared);
     assert_no_failures(&fake_rows, "fake");
     assert_no_failures(&real_rows, "real");
@@ -449,33 +499,8 @@ fn fake_and_real_parity() {
         .get("terminal_spawn")
         .copied()
         .unwrap_or(false);
-    let mut expected_not_compared = vec![
-        "V-06", "V-18", "V-33", "V-39", "V-40", "V-42", "V-43", "C-01", "C-02", "C-03", "C-11",
-        "C-07", "C-08", "C-10", "C-12", "F-01", "C-15", "C-16", "V-49", "V-50",
-    ];
-    if !cfg!(feature = "test-seams") {
-        // Without the real seam V-44 is a fake-only row: the real driver
-        // records the typed `cell-not-servable: request_deadline_seam` skip.
-        expected_not_compared.push("V-44");
-    }
-    let expected_compared = match (real_serves_spawn, cfg!(feature = "test-seams")) {
-        // The accepted 1.3 terminal-spawn vectors run on both drivers; the
-        // reserved worker vectors are the only amendment-gated rows.
-        (true, true) => 37,
-        (true, false) => 36,
-        // A refused containment plan skips the terminal-spawn vectors on the
-        // real driver; the fake still models a served plan. V-03 runs on both
-        // because it only refuses a worker create.
-        (false, true) => {
-            expected_not_compared.extend(["V-45", "V-46", "V-47", "V-48"]);
-            33
-        }
-        (false, false) => {
-            expected_not_compared.extend(["V-45", "V-46", "V-47", "V-48"]);
-            32
-        }
-    };
-    expected_not_compared.sort_unstable();
+    let (expected_compared, expected_not_compared) =
+        expected_parity(real_serves_spawn, cfg!(feature = "test-seams"));
     assert_eq!(
         compared, expected_compared,
         "the shared passing set changed"
@@ -493,6 +518,57 @@ fn fake_and_real_parity() {
         not_compared_ids, expected_not_compared,
         "the parity report changed its not-compared set"
     );
+}
+
+/// Exercise the refused-containment parity path on a host that can spawn.
+///
+/// The real driver still runs the daemon with the host's plan; it models
+/// `terminal_spawn: false`, exactly what a refused probe reports. The registry-
+/// only `V-48` must stay compared: it creates no process and needs no
+/// containment plan.
+#[cfg(target_os = "linux")]
+#[test]
+fn refused_containment_parity_keeps_the_registry_only_terminal() {
+    let corpus = Corpus::load().expect("corpus");
+    let mut fake = FakeDriver::new();
+    let fake_rows = run_corpus(&corpus, &mut fake);
+    let mut real = RealDriver::modeling_refused_containment();
+    let real_rows = run_corpus(&corpus, &mut real);
+
+    let (compared, divergences, not_compared) =
+        compare_corpus_rows(&corpus, &fake_rows, &real_rows);
+    assert_no_failures(&fake_rows, "fake");
+    assert_no_failures(&real_rows, "real");
+    assert_eq!(
+        real.facts().features.get("terminal_spawn").copied(),
+        Some(false),
+        "the simulation must model a refused containment plan"
+    );
+    let (expected_compared, expected_not_compared) =
+        expected_parity(false, cfg!(feature = "test-seams"));
+    assert_eq!(
+        compared, expected_compared,
+        "the refused-cell shared passing set changed"
+    );
+    assert!(
+        divergences.is_empty(),
+        "refused-cell parity divergences: {divergences:?}"
+    );
+    let mut not_compared_ids: Vec<&str> = not_compared
+        .iter()
+        .map(|entry| entry.split(':').next().unwrap_or(entry))
+        .collect();
+    not_compared_ids.sort_unstable();
+    assert_eq!(
+        not_compared_ids, expected_not_compared,
+        "the refused-cell not-compared set changed"
+    );
+    assert!(
+        !not_compared_ids.contains(&"V-48"),
+        "the registry-only terminal never needs a containment plan"
+    );
+    // Evidence is written by `fake_and_real_parity` only, so the simulation
+    // cannot race the served-cell report for the same file name.
 }
 
 #[cfg(not(target_os = "linux"))]

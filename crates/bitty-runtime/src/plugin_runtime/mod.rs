@@ -136,14 +136,14 @@ pub use resolution::{
 pub use services::{
     CommandDirectory, CommandRecord, CoreTargetInfo, EmptyEnv, EmptySettings, EnvSource,
     KeymapSource, MAX_ENV_GRANTS, MAX_ENV_VALUE_BYTES, MapEnv, MapSettings, Notification,
-    NotificationQueue, OverlayPeers, PanelCreateHandler, PanelPinHandler, PanelPinQueue,
-    PluginServices, ProcessEnv, QueuedPinRequest, QueuedSubmitRequest, QueuedThemeRequest,
-    QueuedWorkspaceRequest, SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger, ServiceCallRecord,
-    ServiceDirectory, ServiceRecord, SettingsSource, SharedTargetAnnotations, SnapshotSource,
-    TERMINAL_SUBMIT_WINDOW_BYTES, TargetSource, TerminalSubmitQueue, ThemePersistHandler,
-    ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableKeymaps, UnavailableSnapshot,
-    UnavailableTargets, UnavailableWorkspaces, WorkspaceRequestQueue, WorkspaceSource, keymap_row,
-    keymap_rows,
+    NotificationQueue, OverlayPeers, PaneCwdSource, PanelCreateHandler, PanelPinHandler,
+    PanelPinQueue, PluginServices, ProcessEnv, QueuedPinRequest, QueuedSubmitRequest,
+    QueuedThemeRequest, QueuedWorkspaceRequest, SERVICE_CALL_LEDGER_CAPACITY, ServiceCallLedger,
+    ServiceCallRecord, ServiceDirectory, ServiceRecord, SettingsSource, SharedTargetAnnotations,
+    SnapshotSource, TERMINAL_SUBMIT_WINDOW_BYTES, TargetSource, TerminalSubmitQueue,
+    ThemePersistHandler, ThemeRequestQueue, UiAccess, UiBlock, UiBlocks, UnavailableKeymaps,
+    UnavailableSnapshot, UnavailableTargets, UnavailableWorkspaces, WorkspaceRequestQueue,
+    WorkspaceSource, keymap_row, keymap_rows,
 };
 pub use store::{KvCommitBackend, KvCommitError, PluginStore, STORE_FILE_MAX_BYTES};
 // Bridge value/error types the host-service traits are expressed in, so the
@@ -705,6 +705,15 @@ pub struct PluginRuntime {
     /// aliases fail closed rather than being inferred from activated entries.
     settings_alias_registry: Option<Vec<String>>,
     snapshot: Rc<dyn SnapshotSource>,
+    /// Host-observed pane working directory for `process.spawn { cwd = "pane" }`
+    /// (CTX-1715).
+    ///
+    /// `None` until the composition root installs the live terminal model
+    /// ([`PluginRuntime::set_pane_cwd_source`]). Generations activated while
+    /// it is unset still receive a spawn backend, but `cwd = "pane"` fails
+    /// closed with a typed `E_SPAWN_CWD_UNAVAILABLE` instead of running in the
+    /// host process cwd.
+    pane_cwd: Option<Rc<dyn PaneCwdSource>>,
     notifications: Rc<RefCell<NotificationQueue>>,
     bundled_roots: Vec<PathBuf>,
     third_party_roots: Vec<PathBuf>,
@@ -1023,6 +1032,7 @@ impl PluginRuntime {
             settings_dir: None,
             settings_alias_registry: None,
             snapshot: config.snapshot,
+            pane_cwd: None,
             notifications: Rc::new(RefCell::new(NotificationQueue::new(
                 NOTIFICATION_QUEUE_CAPACITY,
             ))),
@@ -1536,6 +1546,21 @@ impl PluginRuntime {
     /// source when its services are built.
     pub fn set_workspace_source(&mut self, source: Rc<dyn WorkspaceSource>) {
         self.workspace_source = Some(source);
+    }
+
+    /// Install the host-observed pane working-directory source (CTX-1715).
+    ///
+    /// Call before activation: each generation's spawn backend captures the
+    /// source, and `bitty.process.spawn(argv, { cwd = "pane" })` resolves
+    /// through it per call. The production source is the application's live
+    /// terminal model (the same `LiveSnapshot` that serves
+    /// `bitty.terminal.snapshot`), so a pane directory change is observed
+    /// without a plugin reload. Installing the source grants nothing: the
+    /// `process.spawn:git` capability and consent gates still decide every
+    /// call, and a generation activated without this source refuses `pane`
+    /// with a typed `E_SPAWN_CWD_UNAVAILABLE`.
+    pub fn set_pane_cwd_source(&mut self, source: Rc<dyn PaneCwdSource>) {
+        self.pane_cwd = Some(source);
     }
 
     /// Install the prebuilt `bitty.runtime.inspect()` snapshot (issue #2396).
@@ -3166,7 +3191,14 @@ impl PluginRuntime {
         // still fail closed as E_SPAWN_DENIED, never ambient.
         if spawn_git {
             plugin_services.set_spawn_git(true);
-            plugin_services.set_spawn_backend(Some(spawn::git_spawn_backend(id.as_str())));
+            // CTX-1715: wire the host-observed pane cwd source (when the
+            // composition root installed one) so `cwd = "pane"` resolves
+            // through the live terminal model. Without it the backend still
+            // refuses the semantic with a typed error.
+            plugin_services.set_spawn_backend(Some(spawn::git_spawn_backend_with_pane_cwd(
+                id.as_str(),
+                self.pane_cwd.clone(),
+            )));
         }
         // CTX-0330: `bitty.env` grant gate. Per-key `env.read:<KEY>` grants
         // from the activation snapshot become the generation allowlist;

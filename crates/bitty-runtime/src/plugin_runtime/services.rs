@@ -28,7 +28,7 @@ use bitty_lua::{
     E_UI_NOT_OWNER, E_UI_UNAVAILABLE, FS_CONTENT_MAX_BYTES, FS_LIST_MAX_BYTES, FS_LIST_MAX_ENTRIES,
     HistoryQueryOp, HistoryQueryRequest, HistoryQuerySource, HostServices, LuaValue, LuaVm,
     OVERLAY_CALL_MAX_BYTES, OVERLAY_SPEC_PLACEHOLDER_MAX_BYTES, OVERLAY_SPEC_TITLE_MAX_BYTES,
-    OverlayInput, OverlayPoll, SNAPSHOT_MAX_BYTES, ServiceRoute, StashedFunction,
+    OverlayInput, OverlayPoll, SNAPSHOT_MAX_BYTES, ServiceRoute, SpawnCwd, StashedFunction,
     TargetSnapshotRow, ThemeTable, WORKSPACE_LIST_MAX_ITEMS, WorkspaceInfo, WorkspaceRequest,
     component_bridge_error, env_grant_shape_ok, validate_env_key,
 };
@@ -217,16 +217,19 @@ pub const WORKSPACELINE_CLAIM: &str = "workspaceline";
 
 /// Injected spawn backend for one plugin generation.
 ///
-/// Receives the Lua-validated argv and returns the bounded result table
-/// (`output`/`stderr`/`truncated`/`exit_code`/`execution_id`/`untrusted`). The production
-/// backend is the consent-gated [`SpawnService`](super::spawn::SpawnService)
-/// path wired at activation; tests inject canned closures. `None` (no
-/// backend) fails closed with `E_SPAWN_UNAVAILABLE`.
+/// Receives the Lua-validated argv plus the host-selected working-directory
+/// semantic and returns the bounded result table
+/// (`output`/`stderr`/`truncated`/`exit_code`/`execution_id`/`untrusted`). The
+/// production backend is the consent-gated
+/// [`SpawnService`](super::spawn::SpawnService) path wired at activation;
+/// tests inject canned closures. `None` (no backend) fails closed with
+/// `E_SPAWN_UNAVAILABLE`.
 ///
-/// The handler takes no working directory: CTX-1345 review F1 found that a
-/// plugin-controlled `{ cwd }` is unconfined, so the bridge rejects the
-/// option and the backend has no path to honor it.
-pub type SpawnHandler = Rc<dyn Fn(&[String]) -> Result<LuaValue, BridgeError>>;
+/// The handler never takes a path: [`SpawnCwd`] is a semantic selected by the
+/// plugin (`HostDefault` or `Pane`), and only the host resolves it (CTX-1715).
+/// A backend with no pane binding refuses `SpawnCwd::Pane` with
+/// `E_SPAWN_CWD_UNAVAILABLE` rather than falling back to the host cwd.
+pub type SpawnHandler = Rc<dyn Fn(&[String], SpawnCwd) -> Result<LuaValue, BridgeError>>;
 
 /// Read-only typed settings source (owned by `bitty-config` in the app).
 pub trait SettingsSource {
@@ -242,6 +245,25 @@ pub trait SnapshotSource {
     ///
     /// Returns a typed `E_SNAPSHOT_*`/`E_CAPABILITY_DENIED` error.
     fn snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError>;
+}
+
+/// Host-observed working directory of the terminal pane a plugin is bound to
+/// (CTX-1715).
+///
+/// The same live model that serves [`SnapshotSource`] publishes this value
+/// once per tick (`LiveSnapshot` in the application), so a pane cwd change is
+/// observed without a plugin reload and plugin calls never reach the runtime
+/// directly. Implementations return a *decoded* `OSC 7` path (absolute, as
+/// reported by the pane); canonicalization, control-byte rejection, the byte
+/// bound, and the directory check happen in
+/// [`spawn`](super::spawn) before the path reaches a child.
+///
+/// `None` means "no usable binding right now" — no focused pane, no report,
+/// or a report that is not an absolute `file://` path. Callers fail closed
+/// with `E_SPAWN_CWD_UNAVAILABLE`; they never substitute the host process cwd.
+pub trait PaneCwdSource {
+    /// Working directory of the bound pane, when observed.
+    fn pane_cwd(&self) -> Option<PathBuf>;
 }
 
 /// Read-only workspace source for `bitty.workspace.list()` (CTX-0889).
@@ -4735,6 +4757,22 @@ impl HostServices for PluginServices {
     }
 
     fn process_spawn(&self, args: &[String]) -> Result<LuaValue, BridgeError> {
+        self.process_spawn_with_cwd(args, SpawnCwd::HostDefault)
+    }
+
+    /// Spawn with the host-selected working-directory semantic (CTX-1715).
+    ///
+    /// The capability gate runs first: a generation without
+    /// `process.spawn:git` is refused with `E_CAPABILITY_DENIED` before any
+    /// pane lookup, so a plugin without spawn authority cannot even probe the
+    /// pane directory. The backend owns resolution; a backend without a pane
+    /// binding refuses `SpawnCwd::Pane` with `E_SPAWN_CWD_UNAVAILABLE` and
+    /// never falls back to the host process cwd.
+    fn process_spawn_with_cwd(
+        &self,
+        args: &[String],
+        cwd: SpawnCwd,
+    ) -> Result<LuaValue, BridgeError> {
         if !self.spawn_git.get() {
             return Err(BridgeError::capability_denied("process.spawn:git"));
         }
@@ -4745,7 +4783,7 @@ impl HostServices for PluginServices {
                 "host spawn backend is not configured",
             )
         })?;
-        backend(args)
+        backend(args, cwd)
     }
 
     fn process_spawn_with_expiry(
@@ -4753,10 +4791,19 @@ impl HostServices for PluginServices {
         args: &[String],
         expiry: Instant,
     ) -> Result<LuaValue, BridgeError> {
+        self.process_spawn_with_cwd_and_expiry(args, SpawnCwd::HostDefault, expiry)
+    }
+
+    fn process_spawn_with_cwd_and_expiry(
+        &self,
+        args: &[String],
+        cwd: SpawnCwd,
+        expiry: Instant,
+    ) -> Result<LuaValue, BridgeError> {
         if Instant::now() > expiry {
             return Err(BridgeError::timeout());
         }
-        self.process_spawn(args)
+        self.process_spawn_with_cwd(args, cwd)
     }
 
     fn ui_mount(&self, slot: &str, component: &UiNode) -> Result<i64, BridgeError> {
@@ -7708,7 +7755,7 @@ mod tests {
         services.set_spawn_git(true);
         let seen = Rc::new(RefCell::new(Vec::new()));
         let seen_clone = seen.clone();
-        services.set_spawn_backend(Some(Rc::new(move |args: &[String]| {
+        services.set_spawn_backend(Some(Rc::new(move |args: &[String], _cwd| {
             seen_clone.borrow_mut().push(args.to_vec());
             Ok(LuaValue::table([(
                 "output",

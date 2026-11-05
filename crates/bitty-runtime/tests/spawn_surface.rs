@@ -6,11 +6,12 @@
 //! `result.output`, failing with `E_SPAWN_UNAVAILABLE` when the surface is
 //! missing. These tests pin that shape end to end: the `bitty.process` table
 //! exists, the grant gate denies without `process.spawn:git`, and a granted
-//! plugin reaches its backend. Manifest/install coverage stays with CTX-0444:
-//! the hand-rolled subset parser rejects quoted capability keys today, so
-//! activation-level fixtures cannot declare the grant yet.
+//! plugin reaches its backend. CTX-1715 adds the confined `{ cwd = "pane" }`
+//! semantic: the plugin selects it, the host resolves it, and a
+//! plugin-supplied path is still refused before any backend contact.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use bitty_lua::gate::{VmBudgets, build_plugin_vm};
@@ -21,10 +22,30 @@ fn gate_vm(id: impl Into<String>) -> LuaVm {
     build_plugin_vm(id, Some(VmBudgets::default())).expect("default budgets are valid")
 }
 use bitty_runtime::plugin_runtime::services::{
-    EmptySettings, NotificationQueue, PluginServices, UnavailableSnapshot,
+    EmptySettings, NotificationQueue, PaneCwdSource, PluginServices, UnavailableSnapshot,
 };
-use bitty_runtime::plugin_runtime::spawn::git_spawn_backend;
+use bitty_runtime::plugin_runtime::spawn::{git_spawn_backend, git_spawn_backend_with_pane_cwd};
 use bitty_runtime::plugin_runtime::store::PluginStore;
+
+/// Test pane source with a caller-controlled directory.
+#[derive(Default)]
+struct StaticPaneCwd {
+    path: RefCell<Option<PathBuf>>,
+}
+
+impl StaticPaneCwd {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path: RefCell::new(Some(path)),
+        }
+    }
+}
+
+impl PaneCwdSource for StaticPaneCwd {
+    fn pane_cwd(&self) -> Option<PathBuf> {
+        self.path.borrow().clone()
+    }
+}
 
 fn services_with(spawn_git: bool, backend: bool) -> Rc<PluginServices> {
     let services = Rc::new(PluginServices::new(
@@ -42,7 +63,7 @@ fn services_with(spawn_git: bool, backend: bool) -> Rc<PluginServices> {
     if backend {
         let seen: Rc<RefCell<Vec<Vec<String>>>> = Rc::new(RefCell::new(Vec::new()));
         let seen_clone = seen.clone();
-        services.set_spawn_backend(Some(Rc::new(move |args: &[String]| {
+        services.set_spawn_backend(Some(Rc::new(move |args: &[String], _cwd| {
             seen_clone.borrow_mut().push(args.to_vec());
             Ok(LuaValue::table([
                 ("output", LuaValue::String(" M staged.lua".to_string())),
@@ -230,4 +251,89 @@ fn production_backend_denies_unallowlisted_verbs_without_spawning() {
         stored(&services, "code"),
         Some(LuaValue::String("E_SPAWN_DENIED".to_string()))
     );
+}
+
+#[test]
+fn pane_cwd_without_a_binding_is_typed_unavailable() {
+    // CTX-1715 acceptance: a production backend with no pane source refuses
+    // the semantic with its own code; it never silently inherits the host
+    // process cwd and never falls through to the allowlist diagnostic.
+    let services = services_with(true, false);
+    services.set_spawn_backend(Some(git_spawn_backend("bitty-terminal.git-panel")));
+    let mut vm = gate_vm("pane-cwd-unbound");
+    install(&mut vm, services.clone());
+    let outcome = vm
+        .execute_bounded(
+            r#"
+            local ok, err = pcall(bitty.process.spawn, { "status" }, { cwd = "pane" })
+            if ok then
+                bitty.store.set("code", "NONE")
+            else
+                bitty.store.set("code", err.code)
+            end
+        "#,
+        )
+        .expect("execute");
+    assert!(
+        matches!(outcome, BoundedExecution::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        stored(&services, "code"),
+        Some(LuaValue::String("E_SPAWN_CWD_UNAVAILABLE".to_string()))
+    );
+}
+
+#[test]
+fn pane_cwd_keeps_git_repo_escape_flags_and_paths_denied() {
+    // CTX-1715 acceptance: the pane directory does not widen the argv
+    // allowlist. `-C`, `--git-dir`, and `--work-tree` remain denied (the host
+    // chooses the repository through the resolved cwd, never argv), and a
+    // plugin path is refused at the bridge.
+    let pane = StaticPaneCwd::new(std::env::temp_dir());
+    let services = services_with(true, false);
+    services.set_spawn_backend(Some(git_spawn_backend_with_pane_cwd(
+        "bitty-terminal.git-panel",
+        Some(Rc::new(pane)),
+    )));
+    let mut vm = gate_vm("pane-cwd-escape");
+    install(&mut vm, services.clone());
+    let cases = [
+        (
+            r#"bitty.process.spawn({ "status", "-C", "/tmp" }, { cwd = "pane" })"#,
+            "E_SPAWN_DENIED",
+        ),
+        (
+            r#"bitty.process.spawn({ "log", "--git-dir=/tmp/.git" }, { cwd = "pane" })"#,
+            "E_SPAWN_DENIED",
+        ),
+        (
+            r#"bitty.process.spawn({ "status", "--work-tree", "/tmp" }, { cwd = "pane" })"#,
+            "E_SPAWN_DENIED",
+        ),
+        (
+            r#"bitty.process.spawn({ "status" }, { cwd = "/tmp" })"#,
+            "E_DEF_INVALID",
+        ),
+        (
+            r#"bitty.process.spawn({ "status" }, { cwd = "../outside" })"#,
+            "E_DEF_INVALID",
+        ),
+    ];
+    for (index, (call, expected)) in cases.iter().enumerate() {
+        let script = format!(
+            r#"local ok, err = pcall(function() {call} end)
+               bitty.store.set("code", ok and "NONE" or err.code)"#
+        );
+        let outcome = vm.execute_bounded(&script).expect("execute");
+        assert!(
+            matches!(outcome, BoundedExecution::Completed),
+            "{index}: {outcome:?}"
+        );
+        assert_eq!(
+            stored(&services, "code"),
+            Some(LuaValue::String((*expected).to_string())),
+            "{index}: {call}"
+        );
+    }
 }

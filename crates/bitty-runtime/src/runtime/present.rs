@@ -12552,6 +12552,31 @@ mod async_present_tests {
         }
     }
 
+    /// Ticks until a committed frame's generation advances past `baseline`.
+    ///
+    /// Deterministic replacement for asserting `tick_at(...) == None` after a
+    /// commit: whether an ack for the next frame has already arrived is worker
+    /// timing, and committing it on this tick is correct behavior. Only the
+    /// generation/counter delta is an invariant the test can rely on.
+    fn tick_until_generation_after(
+        runtime: &mut Runtime,
+        baseline: u64,
+        timeout: Duration,
+    ) -> Option<PresentStats> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(stats) = runtime.tick_at(Instant::now()) {
+                if stats.generation > baseline {
+                    return Some(stats);
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     #[test]
     fn tick_returns_while_a_present_is_blocked_and_input_keeps_flowing() {
         let control = Control::new(true);
@@ -12563,6 +12588,7 @@ mod async_present_tests {
             },
         );
         runtime.handle_pty_bytes(b"first");
+        let presented_before = control.presented();
 
         let started = Instant::now();
         assert!(
@@ -12574,9 +12600,21 @@ mod async_present_tests {
             first_tick < Duration::from_millis(500),
             "the tick must not wait for the acquire (took {first_tick:?})"
         );
+        // The submit path is the invariant: the frame is queued with the
+        // worker and not committed until its ack. No earlier frame exists in
+        // this runtime, so this Option is deterministic.
+        assert!(
+            runtime.pending_present.is_some(),
+            "the blocked frame is submitted, not committed"
+        );
         assert!(
             wait_until(|| control.gate.entered() >= 1, TEST_WAIT),
             "the worker reaches the blocked present"
+        );
+        assert_eq!(
+            control.presented(),
+            presented_before,
+            "no frame is presented while the worker is blocked"
         );
         assert!(
             runtime
@@ -12610,6 +12648,11 @@ mod async_present_tests {
             runtime.notification_banner_at(banner_deadline).is_none(),
             "timer-driven banner expiry is not serialized behind the present"
         );
+        assert_eq!(
+            control.presented(),
+            presented_before,
+            "the blocked present still has not committed a frame"
+        );
 
         control.gate.release();
         let committed = tick_until_committed(&mut runtime, TEST_WAIT)
@@ -12619,20 +12662,21 @@ mod async_present_tests {
             "only the ack commits the frame"
         );
 
-        // The input that arrived while the frame was in flight is not lost:
-        // the next tick builds and submits it.
-        assert_eq!(runtime.tick_at(Instant::now()), None);
-        assert!(
-            runtime.pending_present.is_some(),
-            "new damage after the ack queues the next frame"
-        );
-        assert!(
-            wait_until(|| control.gate.entered() >= 2, TEST_WAIT),
-            "the second frame reaches the worker"
-        );
+        // The input that arrived while frame 1 was in flight is not lost.
+        // Deterministic invariant: a later committed frame advances the
+        // generation. Frame 2 may have been submitted--or even acked and
+        // committed--by the commit tick above, so never assert that a
+        // following `tick_at` returns `None` or that `pending_present` is
+        // still `Some`: an already-arrived ack is correctly committed on the
+        // next tick, and Option identity would race the worker.
         control.gate.release();
-        let second = tick_until_committed(&mut runtime, TEST_WAIT).expect("second frame commits");
+        let second = tick_until_generation_after(&mut runtime, committed.generation, TEST_WAIT)
+            .expect("the input from the blocked window commits in a later frame");
         assert!(second.generation > committed.generation);
+        assert!(
+            control.gate.entered() >= 2,
+            "the later frame reached the presenter worker"
+        );
         assert!(runtime.shutdown());
     }
 

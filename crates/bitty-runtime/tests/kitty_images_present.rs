@@ -875,6 +875,406 @@ fn idle_runtime_holds_no_bytes_in_bounded_stores() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Relative placements (issue #2875): `a=p` with `P=`/`Q=`/`H=`/`V=`
+// ---------------------------------------------------------------------------
+//
+// A relative placement must paint at the absolute rect derived from its
+// parent's *painted* origin plus the wire cell offsets, follow the parent
+// through scrolls, die with it, and fail closed on a missing/virtual/cyclic
+// parent. These pins assert through the same headless surface the shipped
+// kitty paint tests use: placement counts, composite blit counts, and the
+// pixels of the presented frame (`headless_rgba`).
+
+/// Default headless cell metrics (9x19, pinned by
+/// `focused_cursor_wins_over_covering_image`). A `2 x 2`-cell source of
+/// exactly `18 x 38` pixels therefore fills its cell rect with no
+/// letterboxing, so a colour bounding box in the frame *is* the placement
+/// geometry.
+const CELL_W: usize = 9;
+const CELL_H: usize = 19;
+const PARENT_W: u32 = (CELL_W as u32) * 2;
+const PARENT_H: u32 = (CELL_H as u32) * 2;
+const RED: [u8; 4] = [0xFF, 0x00, 0x00, 0xFF];
+const BLUE: [u8; 4] = [0x00, 0x00, 0xFF, 0xFF];
+
+/// Opaque `w x h` RGBA8 fixture in one colour.
+fn solid_rgba(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+    rgba.repeat((w * h) as usize)
+}
+
+/// Stores an image under wire id `wire_image` with `a=t` (no placement).
+fn transmit_solid(rt: &mut Runtime, wire_image: u32, rgba: [u8; 4]) {
+    let pixels = solid_rgba(PARENT_W, PARENT_H, rgba);
+    rt.kitty_display_image_with_wire(
+        32,
+        Some(PARENT_W),
+        Some(PARENT_H),
+        Some('t'),
+        0,
+        0,
+        0,
+        &pixels,
+        0,
+        wire_image,
+        0,
+    )
+    .expect("transmit must store");
+}
+
+/// Absolute `a=p` at cell `(col, row)` with `C=1` (no cursor motion), the
+/// canonical parent shape.
+fn place_absolute(rt: &mut Runtime, image: u32, pin: u32, col: u16, row: u16) {
+    rt.handle_pty_bytes(format!("\x1b[{};{}H", row + 1, col + 1).as_bytes());
+    rt.handle_pty_bytes(format!("\x1b_Ga=p,i={image},p={pin},c=2,r=2,C=1\x1b\\").as_bytes());
+}
+
+/// Relative `a=p` (`P=`/`Q=` plus `H=`/`V=`) for the same 2x2-cell span.
+fn place_relative(
+    rt: &mut Runtime,
+    image: u32,
+    pin: u32,
+    parent: (u32, u32),
+    offset: (i32, i32),
+    z: i32,
+) {
+    let (dx, dy) = offset;
+    let (parent_image, parent_pin) = parent;
+    rt.handle_pty_bytes(
+        format!(
+            "\x1b_Ga=p,i={image},p={pin},c=2,r=2,C=1,P={parent_image},Q={parent_pin},H={dx},V={dy},z={z}\x1b\\"
+        )
+        .as_bytes(),
+    );
+}
+
+/// Red parent `i=7,p=1` at `origin` plus the blue child `i=8,p=2` placed
+/// with `P=7,Q=1,H=2,V=1` (the relative wire form) and `z=child_z`.
+fn relative_pair(origin: (u16, u16), child_z: i32) -> Runtime {
+    let mut rt = make_runtime();
+    transmit_solid(&mut rt, 7, RED);
+    transmit_solid(&mut rt, 8, BLUE);
+    place_absolute(&mut rt, 7, 1, origin.0, origin.1);
+    place_relative(&mut rt, 8, 2, (7, 1), (2, 1), child_z);
+    rt
+}
+
+/// Headless frame width in physical pixels.
+fn frame_width() -> usize {
+    usize::try_from(
+        bitty_runtime::RuntimeConfig::default()
+            .window_extent()
+            .width(),
+    )
+    .expect("window width fits usize")
+}
+
+/// Bounding box `(x, y, w, h)` of the pixels exactly equal to `rgba`.
+fn solid_bbox(frame: &[u8], width: usize, rgba: [u8; 4]) -> Option<(usize, usize, usize, usize)> {
+    let rows = frame.len() / (width * 4);
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (usize::MAX, usize::MAX, 0, 0);
+    let mut found = false;
+    for row in 0..rows {
+        for col in 0..width {
+            let index = (row * width + col) * 4;
+            if frame[index..index + 4] == rgba {
+                found = true;
+                min_x = min_x.min(col);
+                max_x = max_x.max(col);
+                min_y = min_y.min(row);
+                max_y = max_y.max(row);
+            }
+        }
+    }
+    found.then(|| (min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+}
+
+/// Count of pixels exactly equal to `rgba` inside `rect`.
+fn count_pixels(
+    frame: &[u8],
+    width: usize,
+    rect: (usize, usize, usize, usize),
+    rgba: [u8; 4],
+) -> usize {
+    let (x, y, w, h) = rect;
+    let mut count = 0;
+    for row in y..y + h {
+        for col in x..x + w {
+            let index = (row * width + col) * 4;
+            if frame[index..index + 4] == rgba {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+#[test]
+fn relative_child_paints_at_parent_origin_plus_offsets() {
+    // Issue #2875: `a=p,...,P=7,Q=1,H=2,V=1` paints at the parent's painted
+    // origin shifted by two cells right and one cell down — the wire `H=`/`V=`
+    // offsets — instead of at the cursor or not at all.
+    let mut rt = relative_pair((0, 0), 0);
+    assert_eq!(rt.kitty_placement_count(), 2, "parent and child both place");
+    assert!(rt.tick().is_some(), "placement forces a present");
+    assert_eq!(rt.kitty_last_frame_images(), 2, "both images composite");
+    let width = frame_width();
+    let frame = rt.headless_rgba().expect("rgba after tick");
+    let parent = solid_bbox(&frame, width, RED).expect("parent paints");
+    let child = solid_bbox(&frame, width, BLUE).expect("relative child paints");
+    assert_eq!(
+        (parent.2, parent.3),
+        (2 * CELL_W, 2 * CELL_H),
+        "fixture parent fills its 2x2 cell rect"
+    );
+    assert_eq!(
+        (child.2, child.3),
+        (2 * CELL_W, 2 * CELL_H),
+        "the child keeps its own span, not the parent's"
+    );
+    assert_eq!(
+        (child.0, child.1),
+        (parent.0 + 2 * CELL_W, parent.1 + CELL_H),
+        "child origin must be parent origin + H=2 / V=1 cells"
+    );
+}
+
+#[test]
+fn relative_child_follows_parent_through_a_scroll() {
+    // Issue #2875: the child anchor is derived from the parent at paint
+    // time, so a grid scroll moves both by the same pixel delta with no
+    // per-child scroll bookkeeping.
+    //
+    // Two scroll phases: the first also moves the painted window onto the
+    // cursor row (`cursor_follow_window_start`, a pane property unrelated to
+    // kitty), so only the second phase has an exact, window-sized delta.
+    // Both phases pin the invariant that matters: the child keeps its `V=1`
+    // offset below wherever the parent actually paints.
+    let mut rt = relative_pair((0, 12), 0);
+    assert!(rt.tick().is_some());
+    let width = frame_width();
+    let before = rt.headless_rgba().expect("rgba after first tick");
+    let parent_before = solid_bbox(&before, width, RED).expect("parent paints");
+    let child_before = solid_bbox(&before, width, BLUE).expect("child paints");
+    assert_eq!(child_before.1, parent_before.1 + CELL_H);
+
+    let scrollback_before = rt.state().scrollback_len();
+    // Linefeeds at the bottom row scroll the grid by three rows.
+    rt.handle_pty_bytes(b"\x1b[24;1H\n\n\n");
+    assert_eq!(
+        rt.state().scrollback_len() - scrollback_before,
+        3,
+        "fixture must scroll exactly three rows"
+    );
+    assert!(rt.tick().is_some(), "scroll forces a present");
+    let first = rt.headless_rgba().expect("rgba after first scroll");
+    let parent_first = solid_bbox(&first, width, RED).expect("parent still paints");
+    let child_first = solid_bbox(&first, width, BLUE).expect("child still paints");
+    assert!(
+        parent_first.1 < parent_before.1,
+        "the scroll must move the parent up"
+    );
+    assert_eq!(
+        child_first.1,
+        parent_first.1 + CELL_H,
+        "the child keeps its V=1 offset below the scrolled parent"
+    );
+
+    // Second phase: the cursor already sits on the bottom row, so the whole
+    // window shift is the scroll delta and the geometry must be exact.
+    let scrollback_mid = rt.state().scrollback_len();
+    rt.handle_pty_bytes(b"\n\n\n");
+    assert_eq!(rt.state().scrollback_len() - scrollback_mid, 3);
+    assert!(rt.tick().is_some(), "scroll forces a present");
+    let second = rt.headless_rgba().expect("rgba after second scroll");
+    let parent_second = solid_bbox(&second, width, RED).expect("parent still paints");
+    let child_second = solid_bbox(&second, width, BLUE).expect("child still paints");
+    assert_eq!(
+        parent_second.1,
+        parent_first.1 - 3 * CELL_H,
+        "the parent moved up one cell per scrolled row"
+    );
+    assert_eq!(
+        child_second.1,
+        parent_second.1 + CELL_H,
+        "the child keeps its V=1 offset below the scrolled parent"
+    );
+    assert_eq!(
+        (child_second.0, child_second.2, child_second.3),
+        (child_before.0, child_before.2, child_before.3),
+        "a vertical scroll must not change the child's column or span"
+    );
+}
+
+#[test]
+fn relative_child_disappears_when_its_parent_is_deleted() {
+    // Issue #2875: deleting the parent cascades in terminal truth *and* in
+    // the pixel layer, so no orphan blit survives (and a later re-place of
+    // the same wire identity cannot resurrect the dropped child).
+    let mut rt = relative_pair((0, 0), 0);
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 2);
+
+    rt.handle_pty_bytes(b"\x1b_Ga=d,d=i,i=7,p=1\x1b\\");
+    assert_eq!(
+        rt.state().kitty_placements().len(),
+        0,
+        "terminal truth cascades to the relative child"
+    );
+    assert_eq!(
+        rt.kitty_placement_count(),
+        0,
+        "the pixel layer cascades with truth"
+    );
+    assert!(rt.tick().is_some(), "delete forces a present");
+    assert_eq!(rt.kitty_last_frame_images(), 0, "no orphan child blit");
+    let width = frame_width();
+    let frame = rt.headless_rgba().expect("rgba after delete");
+    assert!(
+        solid_bbox(&frame, width, BLUE).is_none(),
+        "the child must leave no pixels on screen"
+    );
+}
+
+#[test]
+fn relative_child_fully_off_grid_paints_nothing() {
+    // Issue #2875 fail-closed: a resolved rect entirely outside the grid is
+    // clipped away by the viewport intersection, while the parent keeps
+    // painting. `V=30` lands 30 rows below a 24-row viewport.
+    let mut rt = make_runtime();
+    transmit_solid(&mut rt, 7, RED);
+    transmit_solid(&mut rt, 8, BLUE);
+    place_absolute(&mut rt, 7, 1, 0, 0);
+    place_relative(&mut rt, 8, 2, (7, 1), (0, 30), 0);
+    assert_eq!(
+        rt.kitty_placement_count(),
+        2,
+        "both placements are admitted; only painting is clipped"
+    );
+    assert!(rt.tick().is_some());
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        1,
+        "only the on-grid parent composites a blit"
+    );
+    let width = frame_width();
+    let frame = rt.headless_rgba().expect("rgba after tick");
+    assert!(
+        solid_bbox(&frame, width, RED).is_some(),
+        "parent still paints"
+    );
+    assert!(
+        solid_bbox(&frame, width, BLUE).is_none(),
+        "an off-grid child paints no pixels"
+    );
+}
+
+#[test]
+fn relative_below_text_child_paints_under_glyphs() {
+    // Issue #2875 #2: z-order is the child's own `z=`. A `z=-1` child
+    // composites below text, so glyph ink punches through its rect; the same
+    // child at `z=0` sits above the text and covers it completely. The
+    // control run is what makes this non-tautological.
+    //
+    // The parent sits at row 2 and the cursor parks inside the pane window
+    // but outside the child rect, so the painted window does not follow the
+    // cursor away from the image (`cursor_follow_window_start`).
+    let text_over_child = b"\x1b[4;1HMMMM";
+    let cursor_away = b"\x1b[4;20H";
+    let mut below = relative_pair((0, 2), -1);
+    below.handle_pty_bytes(text_over_child);
+    below.handle_pty_bytes(cursor_away);
+    assert!(below.tick().is_some());
+    let width = frame_width();
+    let frame = below.headless_rgba().expect("rgba after tick");
+    let rect = solid_bbox(&frame, width, BLUE).expect("below-text child paints");
+    let blue = count_pixels(&frame, width, rect, BLUE);
+    let area = rect.2 * rect.3;
+    assert!(blue > 0, "the child must paint its own pixels");
+    assert!(
+        blue < area,
+        "text must paint over a z=-1 child ({blue} of {area} pixels stay image blue)"
+    );
+
+    let mut above = relative_pair((0, 2), 0);
+    above.handle_pty_bytes(text_over_child);
+    above.handle_pty_bytes(cursor_away);
+    assert!(above.tick().is_some());
+    let frame = above.headless_rgba().expect("rgba after tick");
+    let rect = solid_bbox(&frame, width, BLUE).expect("above-text child paints");
+    let blue = count_pixels(&frame, width, rect, BLUE);
+    let area = rect.2 * rect.3;
+    assert_eq!(
+        blue, area,
+        "a z=0 child covers the text: the control proves the layering assertion above"
+    );
+}
+
+#[test]
+fn relative_child_without_a_parent_paints_nothing() {
+    // Issues #2875 fail-closed: terminal truth refuses a missing parent
+    // (`ENOPARENT`) and a virtual prototype as a parent (`EINVAL`), so
+    // neither reaches the pixel layer. The absolute control run proves the
+    // same command without `P=` does paint here, so the assertions below
+    // test the parent link, not a dead paint path.
+    let mut rt = make_runtime();
+    transmit_solid(&mut rt, 8, BLUE);
+    // Control: the identical `a=p` without `P=` places and paints.
+    rt.handle_pty_bytes(b"\x1b_Ga=p,i=8,p=2,c=2,r=2,C=1\x1b\\");
+    assert_eq!(rt.kitty_placement_count(), 1, "absolute control places");
+    assert!(rt.tick().is_some());
+    assert_eq!(rt.kitty_last_frame_images(), 1, "absolute control paints");
+    rt.handle_pty_bytes(b"\x1b_Ga=d,d=i,i=8,p=2\x1b\\");
+    assert_eq!(rt.kitty_placement_count(), 0);
+
+    // Missing parent: `P=99` names no stored placement.
+    rt.handle_pty_bytes(b"\x1b_Ga=p,i=8,p=2,c=2,r=2,C=1,P=99,Q=5,H=1,V=1\x1b\\");
+    assert_eq!(
+        rt.kitty_placement_count(),
+        0,
+        "a missing parent places nothing on the pixel layer"
+    );
+    // Virtual prototype parent: `a=p,U=1` registers image 9 as a prototype,
+    // which is never a paintable parent.
+    rt.handle_pty_bytes(b"\x1b_Ga=p,U=1,i=9,p=3,c=2,r=2\x1b\\");
+    rt.handle_pty_bytes(b"\x1b_Ga=p,i=8,p=2,c=2,r=2,C=1,P=9,Q=0,H=1,V=1\x1b\\");
+    assert_eq!(
+        rt.kitty_placement_count(),
+        0,
+        "a virtual prototype is never a paintable parent"
+    );
+    assert!(rt.tick().is_some());
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        0,
+        "no blit for a refused child"
+    );
+    let width = frame_width();
+    let frame = rt.headless_rgba().expect("rgba after tick");
+    assert!(solid_bbox(&frame, width, BLUE).is_none());
+}
+
+#[test]
+fn relative_parent_cycle_fails_closed_without_hanging() {
+    // Issue #2875 fail-closed (depth bound): re-putting the parent with the
+    // child as *its* parent is wire-reachable, because every re-put only
+    // requires the named parent to exist. The paint walk must terminate and
+    // paint nothing instead of looping.
+    let mut rt = make_runtime();
+    transmit_solid(&mut rt, 7, RED);
+    transmit_solid(&mut rt, 8, BLUE);
+    place_absolute(&mut rt, 7, 1, 0, 0);
+    place_relative(&mut rt, 8, 2, (7, 1), (2, 1), 0);
+    // Re-put p1 as a child of p2: p1 -> p2 -> p1.
+    place_relative(&mut rt, 7, 1, (8, 2), (0, 0), 0);
+    assert!(rt.tick().is_some(), "cyclic placements must still present");
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        0,
+        "a cyclic parent chain paints nothing"
+    );
+}
+
 /// #2131: yazi's KgpOld driver flow must display, paint, and erase through
 /// raw PTY bytes with no manual flags.
 ///

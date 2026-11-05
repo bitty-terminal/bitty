@@ -6596,7 +6596,14 @@ impl Runtime {
                 // layout"). The viewport-clipped window is the visible
                 // crop; `None` paints nothing (scrolled fully off the top
                 // or outside the viewport).
-                let Some(cell_rect) = bitty_rich::KittyImageLayer::placement_full_rect(
+                //
+                // Issue #2875: relative placements (`P=`/`Q=`/`H=`/`V=`)
+                // derive this rect from the parent's painted origin at
+                // paint time, so they scroll, clip, and die with the
+                // parent and need no bookkeeping of their own. A missing,
+                // virtual, off-origin, or cyclic parent chain yields
+                // `None`: no blit, no panic.
+                let Some(cell_rect) = self.kitty_images.placement_full_rect_resolved(
                     placement,
                     rich_metrics,
                     scrollback,

@@ -16,8 +16,8 @@ use bitty_daemon::events::{
 };
 use bitty_daemon::registry::{
     AttachId, CleanupClass, CreateSession, ExitInformation, LifecycleState, MonotonicMs,
-    RegistryLimits, RegistryRefusal, SessionId, SessionRegistry, SessionSnapshot, TerminalId,
-    TerminalOutcome, TerminalReason,
+    RegistryLimits, RegistryRefusal, SessionId, SessionRegistry, SessionSnapshot, SpawnFailure,
+    TerminalId, TerminalOutcome, TerminalReason,
 };
 
 fn ms(value: u64) -> MonotonicMs {
@@ -89,7 +89,14 @@ fn terminate(
     cleanup: CleanupClass,
     now: u64,
 ) -> bitty_daemon::events::TerminalReport {
-    let outcome = TerminalOutcome::new(reason, exit, cleanup).expect("valid outcome");
+    // A `spawn_failed` classification always names its refusal class
+    // (bitty#2790); these tests only need a valid pre-child class.
+    let outcome = if reason == TerminalReason::SpawnFailed {
+        TerminalOutcome::spawn_failed(cleanup, SpawnFailure::PtyAllocation)
+    } else {
+        TerminalOutcome::new(reason, exit, cleanup)
+    }
+    .expect("valid outcome");
     stream
         .terminate(session_id, outcome, ms(now))
         .expect("terminal transition")
@@ -562,12 +569,9 @@ fn a_refused_terminal_transition_does_not_close_a_lease() {
 
     // `spawn_failed` can only originate in `created`; a `running` session must
     // be refused without touching the stream.
-    let outcome = TerminalOutcome::new(
-        TerminalReason::SpawnFailed,
-        ExitInformation::NotApplicable,
-        CleanupClass::NotStarted,
-    )
-    .expect("valid outcome");
+    let outcome =
+        TerminalOutcome::spawn_failed(CleanupClass::NotStarted, SpawnFailure::PtyAllocation)
+            .expect("valid outcome");
     assert!(matches!(
         stream.terminate(created.session_id, outcome, ms(5)),
         Err(EventRefusal::Registry(RegistryRefusal::ReasonNotAllowed {

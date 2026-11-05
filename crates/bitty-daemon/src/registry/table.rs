@@ -844,6 +844,7 @@ impl SessionRegistry {
         record.state = target;
         record.state_revision = revision;
         record.terminal_reason = Some(outcome.reason());
+        record.spawn_failure = outcome.spawn_failure();
         record.exit = outcome.exit();
         record.cleanup = Some(outcome.cleanup());
         record.last_seen = now;
@@ -973,7 +974,9 @@ mod tests {
 
     use super::*;
     use crate::registry::id::IdError;
-    use crate::registry::session::{CleanupClass, ExitInformation, SessionKind, TerminalReason};
+    use crate::registry::session::{
+        CleanupClass, ExitInformation, SessionKind, SpawnFailure, TerminalReason,
+    };
 
     fn ms(value: u64) -> MonotonicMs {
         MonotonicMs::from_millis(value)
@@ -1089,7 +1092,15 @@ mod tests {
         cleanup: CleanupClass,
         now: u64,
     ) -> SessionSnapshot {
-        let outcome = TerminalOutcome::new(reason, exit, cleanup).expect("valid outcome");
+        // A `spawn_failed` classification always names its refusal class
+        // (bitty#2790); the table tests only exercise the transition table, so
+        // any pre-child class serves here.
+        let outcome = if reason == TerminalReason::SpawnFailed {
+            TerminalOutcome::spawn_failed(cleanup, SpawnFailure::PtyAllocation)
+        } else {
+            TerminalOutcome::new(reason, exit, cleanup)
+        }
+        .expect("valid outcome");
         registry
             .terminate(session_id, outcome, ms(now))
             .expect("terminal transition succeeds")
@@ -1599,12 +1610,9 @@ mod tests {
         registry
             .bind(running.session_id, ms(2))
             .expect("bind succeeds");
-        let spawn_failed = TerminalOutcome::new(
-            TerminalReason::SpawnFailed,
-            ExitInformation::NotApplicable,
-            CleanupClass::NotStarted,
-        )
-        .expect("valid outcome");
+        let spawn_failed =
+            TerminalOutcome::spawn_failed(CleanupClass::NotStarted, SpawnFailure::PtyAllocation)
+                .expect("valid outcome");
         assert_eq!(
             registry.terminate(running.session_id, spawn_failed, ms(3)),
             Err(RegistryRefusal::ReasonNotAllowed {

@@ -28,6 +28,7 @@ use crate::containment::linux_sys::{self, PidFd};
 use crate::containment::subreaper::{SubreaperGuard, SubreaperRefusal};
 use crate::containment::{
     ContainmentKind, ContainmentLimits, ContainmentRecord, ContainmentRefusal, ContainmentReport,
+    ExecRefusal,
 };
 use crate::orphan::identity::{ProcessGroupId, ProcessIdentity, ProcessObservation, observe};
 use crate::registry::CleanupClass;
@@ -50,6 +51,10 @@ pub enum ContainmentError {
     Subreaper(SubreaperRefusal),
     /// `spawn` itself failed; no child was created.
     Spawn(io::Error),
+    /// `exec` refused the program (`EACCES`, `ENOEXEC`, or `ENOENT`). No child
+    /// ran, so this is a distinct typed refusal instead of an untyped spawn
+    /// error (bitty#2790).
+    Exec(ExecRefusal),
     /// The child's `/proc` identity could not be observed. The child existed
     /// and was terminated; the carried class is what the cleanup could prove
     /// (`unverified` for the process-group plan).
@@ -63,15 +68,18 @@ pub enum ContainmentError {
 impl ContainmentError {
     /// The cleanup class observed while the failed spawn was abandoned.
     ///
-    /// A refusal, a pre-fork failure, or an unavailable mechanism started
-    /// nothing ([`CleanupClass::NotStarted`]); a failure after the fork
-    /// reports what the plan could prove about the child it killed.
+    /// A refusal, a pre-fork failure, an `exec` refusal, or an unavailable
+    /// mechanism started nothing ([`CleanupClass::NotStarted`]); a failure
+    /// after the fork reports what the plan could prove about the child it
+    /// killed.
     #[must_use]
     pub const fn cleanup(&self) -> CleanupClass {
         match self {
-            Self::Refused(_) | Self::Cgroup(_) | Self::Subreaper(_) | Self::Spawn(_) => {
-                CleanupClass::NotStarted
-            }
+            Self::Refused(_)
+            | Self::Cgroup(_)
+            | Self::Subreaper(_)
+            | Self::Spawn(_)
+            | Self::Exec(_) => CleanupClass::NotStarted,
             Self::IdentityUnavailable(cleanup) | Self::Uncontained(cleanup) => *cleanup,
         }
     }
@@ -84,6 +92,7 @@ impl fmt::Display for ContainmentError {
             Self::Cgroup(error) => write!(formatter, "cgroup containment failed: {error}"),
             Self::Subreaper(error) => write!(formatter, "subreaper unavailable: {error}"),
             Self::Spawn(error) => write!(formatter, "spawn failed: {error}"),
+            Self::Exec(refusal) => write!(formatter, "{refusal}"),
             Self::IdentityUnavailable(cleanup) => write!(
                 formatter,
                 "spawned child identity could not be observed; cleanup {}",
@@ -109,6 +118,19 @@ impl From<CgroupError> for ContainmentError {
 impl From<io::Error> for ContainmentError {
     fn from(error: io::Error) -> Self {
         Self::Spawn(error)
+    }
+}
+
+/// Turn a failed `Command::spawn` into the typed refusal it carries.
+///
+/// `std` reports the child-side `exec` errno through the close-on-exec pipe,
+/// so an `EACCES`/`ENOEXEC`/`ENOENT` here means no child ever ran. Every other
+/// errno (a fork refusal, a `pre_exec` failure) stays the untyped
+/// [`ContainmentError::Spawn`].
+fn classify_spawn_error(error: io::Error) -> ContainmentError {
+    match ExecRefusal::from_spawn_error(&error) {
+        Some(refusal) => ContainmentError::Exec(refusal),
+        None => ContainmentError::Spawn(error),
     }
 }
 
@@ -224,7 +246,7 @@ fn spawn_cgroup(
         Ok(child) => child,
         Err(error) => {
             let _ = cgroup.remove();
-            return Err(error.into());
+            return Err(classify_spawn_error(error));
         }
     };
     let pid = child.id();
@@ -256,7 +278,7 @@ fn spawn_subreaper(
     if mode == SessionMode::ProcessGroup {
         command.process_group(0);
     }
-    let child = command.spawn()?;
+    let child = command.spawn().map_err(classify_spawn_error)?;
     let pid = child.id();
     let Some(identity) = observe_identity(pid) else {
         let mut child = child;
@@ -771,6 +793,35 @@ mod tests {
             CleanupClass::Swept,
             "a verified-empty subtree is the observed class"
         );
+    }
+
+    #[test]
+    fn the_spawn_seam_routes_exec_errnos_to_the_typed_variant() {
+        // The errno classes themselves are pinned in `containment::exec`; this
+        // proves the spawn seam routes them into the typed variant with the
+        // pre-child cleanup class (bitty#2790).
+        for errno in [nix::libc::EACCES, nix::libc::ENOEXEC, nix::libc::ENOENT] {
+            let refusal = ExecRefusal::from_spawn_error(&io::Error::from_raw_os_error(errno))
+                .expect("an exec errno is classified");
+            let classified = classify_spawn_error(io::Error::from_raw_os_error(errno));
+            assert!(
+                matches!(classified, ContainmentError::Exec(carried) if carried == refusal),
+                "the errno keeps its typed variant"
+            );
+            assert_eq!(
+                classified.cleanup(),
+                CleanupClass::NotStarted,
+                "an exec refusal never started a child"
+            );
+        }
+        // A fork refusal and a `pre_exec` failure are not exec refusals, so
+        // they must not borrow the typed case.
+        for errno in [nix::libc::EAGAIN, nix::libc::EIO, nix::libc::EPIPE] {
+            assert!(matches!(
+                classify_spawn_error(io::Error::from_raw_os_error(errno)),
+                ContainmentError::Spawn(_)
+            ));
+        }
     }
 
     #[test]

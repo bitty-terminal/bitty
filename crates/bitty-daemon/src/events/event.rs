@@ -320,6 +320,7 @@ mod tests {
             controller_present: false,
             owner_peer: None,
             terminal_reason: None,
+            spawn_failure: None,
             exit: ExitInformation::NotApplicable,
             cleanup: None,
             created_at_ms: MonotonicMs::ZERO,

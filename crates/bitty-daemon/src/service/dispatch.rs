@@ -69,7 +69,7 @@ use crate::audit::{
 };
 use crate::audit_sink::{AuditSink, AuditWriter};
 use crate::codes::RefusalCode;
-use crate::containment::ContainmentReport;
+use crate::containment::{ContainmentReport, ExecRefusalKind};
 use crate::content::{CONTENT_FRAME_BYTES, ContentFrame};
 use crate::contract::{CAPABILITIES, Capabilities};
 use crate::events::{
@@ -96,7 +96,7 @@ use crate::peer::DispatchBoundary;
 use crate::registry::RegistryLimits;
 use crate::registry::{
     AttachId, CleanupClass, DaemonInstanceId, LifecycleState, MonotonicMs, OwnerPeer,
-    RegistryRefusal, SessionId, SessionKind, SessionSnapshot, TerminalId,
+    RegistryRefusal, SessionId, SessionKind, SessionSnapshot, SpawnFailure, TerminalId,
 };
 use crate::service::grants::{
     GrantId, GrantKind, GrantRefusal, GrantStore, MintError, RevokeOutcome,
@@ -2360,9 +2360,11 @@ impl Service {
     /// no committed journal record (bitty#2790). A spawn failure terminalizes
     /// the record as `failed/spawn_failed` with the cleanup class the plan
     /// could prove (`not_started` before a child existed, `swept` or
-    /// `unverified` after one did) and settles the journal, so the create still
-    /// answers the accepted result shape. Only a journal capacity refusal
-    /// returns `Err`, and the caller rolls the whole create back.
+    /// `unverified` after one did) and the typed spawn-failure class the wire
+    /// reports in `spawn_failure` (bitty#2790 gap 3), and settles the journal,
+    /// so the create still answers the accepted result shape. Only a journal
+    /// capacity refusal returns `Err`, and the caller rolls the whole create
+    /// back.
     fn start_worker(
         &mut self,
         session_id: SessionId,
@@ -2383,36 +2385,22 @@ impl Service {
             kind,
         ) {
             Ok(identity) => identity,
-            Err(WorkerSpawnError::Unsupported) => {
-                let _ = self
-                    .orphans
-                    .settle(session_id, CleanupClass::NotStarted, now);
-                return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
-            }
-            Err(WorkerSpawnError::NotStarted) => {
-                let _ = self
-                    .orphans
-                    .settle(session_id, CleanupClass::NotStarted, now);
-                return self.spawn_failed(session_id, CleanupClass::NotStarted, now);
-            }
-            // A child existed but the bind probe refused it: it had already
-            // exited (or lost its PTY), or the spawn handoff crossed the
-            // committed `spawn_bind_timeout_ms`. The pool already stopped and
-            // reaped the child, so settle the reservation with the class the
-            // plan could prove and terminalize at generation 0. Nothing is
-            // committed to the journal and generation 1 is never bound
-            // (bitty#2790).
-            Err(
-                WorkerSpawnError::NotBindable(cleanup) | WorkerSpawnError::BindTimeout(cleanup),
-            ) => {
+            Err(error) => {
+                let Some((cleanup, failure)) = spawn_failure(error) else {
+                    // The one refusal answered as a capability denial instead
+                    // of a terminal record: the cell cannot spawn at all.
+                    let _ = self
+                        .orphans
+                        .settle(session_id, CleanupClass::NotStarted, now);
+                    return Err(Refusal::denied(RefusalCode::UnsupportedCapability));
+                };
+                // A refusal that started nothing settles `not_started`; one
+                // that had a child settles the class the plan could prove. The
+                // typed class is what the wire distinguishes (bitty#2790), so
+                // an exec refusal no longer shares its shape with a PTY
+                // allocation failure.
                 let _ = self.orphans.settle(session_id, cleanup, now);
-                return self.spawn_failed(session_id, cleanup, now);
-            }
-            Err(WorkerSpawnError::Cleanup(cleanup)) => {
-                // A child existed and was terminated before the error
-                // returned; report the class the plan could prove.
-                let _ = self.orphans.settle(session_id, cleanup, now);
-                return self.spawn_failed(session_id, cleanup, now);
+                return self.spawn_failed(session_id, cleanup, failure, now);
             }
         };
         if self.orphans.commit(session_id, identity).is_err() {
@@ -2422,7 +2410,7 @@ impl Service {
                 .unwrap_or(CleanupClass::Unverified);
             let _ = self.workers.forget(session_id);
             let _ = self.orphans.settle(session_id, cleanup, now);
-            return self.spawn_failed(session_id, cleanup, now);
+            return self.spawn_failed(session_id, cleanup, SpawnFailure::PostSpawnRefusal, now);
         }
         match self.host.bind(session_id, now) {
             Ok(snapshot) => Ok(snapshot),
@@ -2433,21 +2421,26 @@ impl Service {
                     .unwrap_or(CleanupClass::Unverified);
                 let _ = self.workers.forget(session_id);
                 let _ = self.orphans.settle(session_id, cleanup, now);
-                self.spawn_failed(session_id, cleanup, now)
+                self.spawn_failed(session_id, cleanup, SpawnFailure::PostSpawnRefusal, now)
             }
         }
     }
 
     /// Record the terminal `spawn_failed` transition of an unbound worker.
+    ///
+    /// `cleanup` is the class the containment plan could prove and `failure`
+    /// is the typed refusal class the wire reports, so a client can tell an
+    /// `exec` refusal from a PTY allocation failure (bitty#2790).
     fn spawn_failed(
         &mut self,
         session_id: SessionId,
         cleanup: CleanupClass,
+        failure: SpawnFailure,
         now: MonotonicMs,
     ) -> Result<SessionSnapshot, Refusal> {
         match self.host.record_termination(
             session_id,
-            crate::lease::ExitObservation::SpawnFailed,
+            crate::lease::ExitObservation::SpawnFailed(failure),
             cleanup,
             now,
         ) {
@@ -3896,6 +3889,17 @@ impl Service {
                         .map(|cleanup| Value::String(cleanup.as_str().to_owned()))
                         .unwrap_or(Value::Null),
                 );
+                // Why the spawn was refused, present exactly on
+                // `spawn_failed`. A static class, never a message: an `exec`
+                // refusal, a PTY allocation failure, and a bind refusal are
+                // distinguishable here instead of sharing one shape
+                // (bitty#2790).
+                if let Some(failure) = snapshot.spawn_failure {
+                    map.insert(
+                        "spawn_failure".to_owned(),
+                        Value::String(failure.as_str().to_owned()),
+                    );
+                }
             }
         }
         value
@@ -4041,6 +4045,37 @@ fn map_spawn_spec_refusal(error: SpawnSpecError) -> Refusal {
     match error {
         SpawnSpecError::Invalid => Refusal::invalid_request(),
         SpawnSpecError::Limit { limit, actual } => Refusal::limit_exceeded(limit, actual),
+    }
+}
+
+/// Map a worker spawn refusal to the cleanup class and the client-visible
+/// spawn-failure class (bitty#2790).
+///
+/// `None` is [`WorkerSpawnError::Unsupported`]: the one refusal the caller
+/// answers as a capability denial instead of a terminal record. Every other
+/// variant names what happened, so an `exec` refusal is no longer collapsed
+/// into the same `spawn_failed`/`not_started` shape as a PTY allocation
+/// failure.
+fn spawn_failure(error: WorkerSpawnError) -> Option<(CleanupClass, SpawnFailure)> {
+    let mapped = match error {
+        WorkerSpawnError::Unsupported => return None,
+        WorkerSpawnError::Pty => (CleanupClass::NotStarted, SpawnFailure::PtyAllocation),
+        WorkerSpawnError::Spawn => (CleanupClass::NotStarted, SpawnFailure::SpawnError),
+        WorkerSpawnError::Exec(refusal) => (CleanupClass::NotStarted, exec_failure(refusal.kind())),
+        WorkerSpawnError::BindDeadline => (CleanupClass::NotStarted, SpawnFailure::BindDeadline),
+        WorkerSpawnError::NotBindable(cleanup) => (cleanup, SpawnFailure::NotBindable),
+        WorkerSpawnError::BindTimeout(cleanup) => (cleanup, SpawnFailure::BindTimeout),
+        WorkerSpawnError::Cleanup(cleanup) => (cleanup, SpawnFailure::PostSpawnRefusal),
+    };
+    Some(mapped)
+}
+
+/// The wire class of one `exec` refusal errno class.
+fn exec_failure(kind: ExecRefusalKind) -> SpawnFailure {
+    match kind {
+        ExecRefusalKind::NotPermitted => SpawnFailure::ExecPermissionDenied,
+        ExecRefusalKind::NotExecutable => SpawnFailure::ExecNotExecutable,
+        ExecRefusalKind::NotFound => SpawnFailure::ExecNotFound,
     }
 }
 
@@ -5349,6 +5384,10 @@ mod tests {
         // the plan's truthful claim (`swept` or `unverified`), never
         // `not_started`.
         assert_ne!(session["cleanup"], "not_started");
+        assert_eq!(
+            session["spawn_failure"], "bind_timeout",
+            "the deadline class is distinct from a pre-child refusal"
+        );
 
         // The reservation is settled, not committed: there is no live journal
         // record for the failed session and no bound generation.
@@ -5378,6 +5417,178 @@ mod tests {
         assert_eq!(status["session"]["state"], "failed");
         assert_eq!(status["session"]["generation"], 0);
         assert_eq!(status["session"]["attach_count"], 0);
+    }
+
+    #[test]
+    fn an_exec_refusal_and_a_pty_allocation_failure_have_distinct_wire_classes() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (mut service, _dir) = served_worker_service(Limits::default());
+        let mut operator = operator_connection(&mut service);
+
+        // The daemon could not build the PTY: nothing ran, and the record says
+        // so with its own class.
+        crate::worker::openpty_failure::fail_next();
+        let created = create_worker_with_consent(
+            &mut service,
+            &mut operator,
+            "pty-failure",
+            json!(["/bin/sleep", "60"]),
+        );
+        let pty_session = &created["session"];
+        assert_eq!(pty_session["state"], "failed");
+        assert_eq!(pty_session["terminal_reason"], "spawn_failed");
+        assert_eq!(pty_session["cleanup"], "not_started");
+        assert_eq!(pty_session["spawn_failure"], "pty_allocation");
+        assert!(service.workers.is_empty(), "no handle may survive openpty");
+
+        // The PTY was fine and the program exists, but the session user may
+        // not execute it. `exec` answered `EACCES`, which is a different
+        // class on the wire even though the cleanup claim is the same.
+        let dir = tempfile::tempdir().expect("fixture dir");
+        let program = dir.path().join("bitty-not-executable");
+        std::fs::write(&program, b"#!/bin/sh\nexit 0\n").expect("write the fixture");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 0644");
+        let created = create_worker_with_consent(
+            &mut service,
+            &mut operator,
+            "exec-failure",
+            json!([program.to_str().expect("a UTF-8 fixture path")]),
+        );
+        let exec_session = &created["session"];
+        assert_eq!(exec_session["state"], "failed");
+        assert_eq!(exec_session["terminal_reason"], "spawn_failed");
+        assert_eq!(exec_session["cleanup"], "not_started");
+        assert_eq!(exec_session["spawn_failure"], "exec_permission_denied");
+
+        assert!(
+            service.workers.is_empty(),
+            "no handle may survive a refused exec"
+        );
+    }
+
+    /// One row of the `spawn_failure()` table: the input, a hand-written
+    /// expectation, and the hand-written wire spelling of that expectation.
+    struct FunnelCase {
+        what: &'static str,
+        error: WorkerSpawnError,
+        expected: Option<(CleanupClass, SpawnFailure)>,
+        spellings: Option<(&'static str, &'static str)>,
+    }
+
+    /// The single funnel from a typed spawn refusal to the client-visible
+    /// `(CleanupClass, SpawnFailure)` pair (bitty#2790).
+    ///
+    /// Every expected value below is written out by hand rather than rebuilt
+    /// from the match table under test, so flipping any one arm of
+    /// `spawn_failure()` — including one `exec` sub-kind for another — fails
+    /// here instead of only changing what clients read off the wire.
+    #[test]
+    fn the_spawn_failure_funnel_maps_every_refusal_to_its_wire_class() {
+        use crate::containment::{ExecRefusal, ExecRefusalKind};
+
+        let cases = [
+            FunnelCase {
+                what: "a PTY allocation failure",
+                error: WorkerSpawnError::Pty,
+                expected: Some((CleanupClass::NotStarted, SpawnFailure::PtyAllocation)),
+                spellings: Some(("not_started", "pty_allocation")),
+            },
+            FunnelCase {
+                what: "an unmapped spawn refusal",
+                error: WorkerSpawnError::Spawn,
+                expected: Some((CleanupClass::NotStarted, SpawnFailure::SpawnError)),
+                spellings: Some(("not_started", "spawn_error")),
+            },
+            FunnelCase {
+                what: "EACCES from exec",
+                error: WorkerSpawnError::Exec(ExecRefusal::new(
+                    ExecRefusalKind::NotPermitted,
+                    nix::libc::EACCES,
+                )),
+                expected: Some((CleanupClass::NotStarted, SpawnFailure::ExecPermissionDenied)),
+                spellings: Some(("not_started", "exec_permission_denied")),
+            },
+            FunnelCase {
+                what: "ENOEXEC from exec",
+                error: WorkerSpawnError::Exec(ExecRefusal::new(
+                    ExecRefusalKind::NotExecutable,
+                    nix::libc::ENOEXEC,
+                )),
+                expected: Some((CleanupClass::NotStarted, SpawnFailure::ExecNotExecutable)),
+                spellings: Some(("not_started", "exec_not_executable")),
+            },
+            FunnelCase {
+                what: "ENOENT from exec",
+                error: WorkerSpawnError::Exec(ExecRefusal::new(
+                    ExecRefusalKind::NotFound,
+                    nix::libc::ENOENT,
+                )),
+                expected: Some((CleanupClass::NotStarted, SpawnFailure::ExecNotFound)),
+                spellings: Some(("not_started", "exec_not_found")),
+            },
+            FunnelCase {
+                what: "a handoff deadline before any child existed",
+                error: WorkerSpawnError::BindDeadline,
+                expected: Some((CleanupClass::NotStarted, SpawnFailure::BindDeadline)),
+                spellings: Some(("not_started", "bind_deadline")),
+            },
+            FunnelCase {
+                what: "a child that was not bindable, already swept",
+                error: WorkerSpawnError::NotBindable(CleanupClass::Swept),
+                expected: Some((CleanupClass::Swept, SpawnFailure::NotBindable)),
+                spellings: Some(("swept", "not_bindable")),
+            },
+            FunnelCase {
+                what: "a handoff timeout after the child existed, cleanup unverified",
+                error: WorkerSpawnError::BindTimeout(CleanupClass::Unverified),
+                expected: Some((CleanupClass::Unverified, SpawnFailure::BindTimeout)),
+                spellings: Some(("unverified", "bind_timeout")),
+            },
+            FunnelCase {
+                what: "a post-spawn refusal, already swept",
+                error: WorkerSpawnError::Cleanup(CleanupClass::Swept),
+                expected: Some((CleanupClass::Swept, SpawnFailure::PostSpawnRefusal)),
+                spellings: Some(("swept", "post_spawn_refusal")),
+            },
+            FunnelCase {
+                what: "a cell that does not serve the worker path",
+                error: WorkerSpawnError::Unsupported,
+                expected: None,
+                spellings: None,
+            },
+        ];
+
+        for case in cases {
+            let actual = spawn_failure(case.error);
+            assert_eq!(
+                actual, case.expected,
+                "{} maps to the wrong refusal pair",
+                case.what
+            );
+            match (actual, case.spellings) {
+                (Some((cleanup, failure)), Some(pair)) => assert_eq!(
+                    (cleanup.as_str(), failure.as_str()),
+                    pair,
+                    "{} reads back as the wrong wire spelling",
+                    case.what
+                ),
+                (None, None) => {}
+                _ => panic!(
+                    "{} must map to a terminal record, not a capability denial",
+                    case.what
+                ),
+            }
+        }
+
+        // The carried cleanup class is echoed, not defaulted: a class the
+        // caller proved must survive the funnel unchanged.
+        assert_eq!(
+            spawn_failure(WorkerSpawnError::Cleanup(CleanupClass::Unverified)),
+            Some((CleanupClass::Unverified, SpawnFailure::PostSpawnRefusal)),
+            "the proven cleanup class is carried through, never reset to not_started"
+        );
     }
 
     #[test]

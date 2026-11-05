@@ -765,8 +765,24 @@ subreaper fallback is `unverified` and its record is quarantined for the
 retention window. A failed spawn terminalizes the session as
 `failed`/`spawn_failed` at generation 0, with the cleanup class the plan could
 prove (`not_started` before a child existed, `swept` or `unverified` after one
-did), settles the journal record, and returns the normal create shape with a
-`null` token.
+did) and the typed refusal class in `spawn_failure`, settles the journal record,
+and returns the normal create shape with a `null` token.
+
+The refusal class is typed at every step (bitty#2790): `openpty` and the PTY
+descriptor setup refuse `WorkerSpawnError::Pty`, `exec` refusals keep the errno
+class from `ContainmentError::Exec` (`EACCES`, `ENOEXEC`, `ENOENT`), the spawn
+syscall and the containment plan refuse `WorkerSpawnError::Spawn`, and only the
+pre-child deadline is `BindDeadline`. `containment/child.rs` classifies an errno
+only when `execve` itself produces it, so a fork or `pre_exec` failure never
+borrows an exec class. One platform note is recorded as a test rather than an
+assumption: this seam spawns through `fork` + `execvp`, and the C library
+retries an `ENOEXEC` image through `/bin/sh`, so an executable file with a
+foreign header starts a shell (which reports the format as exit status 127)
+instead of refusing the spawn. The `exec_not_executable` class is therefore
+reached through the errno mapping, and
+`service_loop.rs::an_unrecognised_executable_format_is_run_by_the_shell_and_never_refused`
+pins the substitution so a future direct-`execve` seam cannot change it
+silently.
 
 `WorkerPool::forget` terminates a handle that is not already settled with the
 same bounded escalation and reaps its leader before dropping it, so retiring a
@@ -1219,6 +1235,7 @@ working.
 | Method                                    | Added key(s)                                                                  | Rule                                                                                                                                                                                                                                                                                                                                                                                                            |
 | ----------------------------------------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | every method returning a `session` object | `controller_present` (bool), `pending_observer_grants` (u16)                  | presence only: the controller's `attach_id` is never served. The count is bounded by `max_pending_observer_grants_per_session`; a terminal session serves `0` for both because no lease or grant it still stores can be used.                                                                                                                                                                                   |
+| every method returning a `session` object | `spawn_failure` (string)                                                      | present exactly when `terminal_reason` is `spawn_failed` (bitty#2790). A static class, never a message and never an errno number: `pty_allocation`, `exec_permission_denied`, `exec_not_executable`, `exec_not_found`, `spawn_error`, `bind_deadline`, `not_bindable`, `bind_timeout`, or `post_spawn_refusal`. `cleanup` still carries what the plan could prove; the pair is what tells an `exec` refusal from a PTY allocation failure. The pushed `session_terminal` marker keeps its frozen envelope and does not carry the class, so a client that needs it reads the session object. |
 | `session.list` operator view              | `owner: {uid, pid}`                                                           | only with `daemon.inspect`, and only as the two numeric facts captured at create. An ordinary view omits the key (omit, never `null`); no path, argv, gid, or start time is retained or served. `session.status` never carries it.                                                                                                                                                                              |
 | `session.attach` fresh success            | `scopes` (array)                                                              | the connection's effective lease scopes: the same service-then-transport names and order as the handshake `scopes`. A keyed controller replay does not re-assert them.                                                                                                                                                                                                                                          |
 | `session.attach` every success            | `server_monotonic_ms` (u64)                                                   | the server clock at the request; a replay carries it too.                                                                                                                                                                                                                                                                                                                                                       |

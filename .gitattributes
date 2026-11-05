@@ -34,6 +34,11 @@
 *.tar binary
 *.mp4 binary
 
+# Recorded pty captures (bitty#2873): a raw terminal byte stream must stay
+# byte-identical. A CR LF pair inside it is data the emulator must consume
+# (most full-screen programs use CR LF), never a line ending to normalize.
+*.raw binary
+
 # Vendored patch data must stay byte-identical to upstream (its SHA-256 is
 # pinned in vendor/winit/PATCHES.md); empty context lines legitimately carry
 # the diff's leading space, so whitespace checks and cleanup must skip it.

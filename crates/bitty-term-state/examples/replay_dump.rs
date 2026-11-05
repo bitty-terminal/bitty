@@ -54,8 +54,27 @@ fn main() -> ExitCode {
         state.alt_screen_active(),
         state.cursor().position
     );
+    let bare = std::env::var_os("BITTY_REPLAY_BARE").is_some();
     for row in 0..rows {
         let cells = state.live_grid_row(row).expect("row in range");
+        if bare {
+            // Column-exact text: a wide pair prints once (its spacer is not a
+            // cell of its own) and combining marks stay attached, so the row
+            // is directly comparable with a reference terminal's capture
+            // (bitty#2873 audit, scripts/vt-ref-diff.py).
+            let mut line = String::new();
+            for cell in cells.iter() {
+                if cell.spacer {
+                    continue;
+                }
+                line.push(cell.glyph);
+                for mark in cell.zerowidth.as_slice() {
+                    line.push(*mark);
+                }
+            }
+            println!("{}", line.trim_end());
+            continue;
+        }
         let mut line = vec![' '; cols];
         for (col, cell) in cells.iter().enumerate() {
             if cell.spacer || cell.width == 0 {

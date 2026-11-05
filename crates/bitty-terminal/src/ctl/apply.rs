@@ -787,8 +787,11 @@ pub fn apply_control(
 /// `applied` is false for a restart-required, rejected, load, or apply
 /// error, with `kind` naming which. `changed` lists the conflicting field
 /// paths when a classify-level report exists; `restart_required` lists the
-/// changed fields the runtime cannot adopt live yet.
-fn reload_config_json(info: &crate::config_reload::ReloadOutcomeInfo) -> String {
+/// changed fields the runtime cannot adopt live yet. A module refusal adds the
+/// typed `module` object.
+///
+/// `pub(super)` so `ctl::tests` can pin the encoding without a runtime.
+pub(super) fn reload_config_json(info: &crate::config_reload::ReloadOutcomeInfo) -> String {
     let mut changed = String::new();
     for (index, field) in info.changed.iter().enumerate() {
         if index > 0 {
@@ -813,8 +816,11 @@ fn reload_config_json(info: &crate::config_reload::ReloadOutcomeInfo) -> String 
         .map(|raw| format!(",\"message\":\"{}\"", json_escape(raw)))
         .unwrap_or_default();
     // Typed-outcome parity for the reload path: a module refusal carries its
-    // contract record (code, phase, and the already allowlisted render), never
-    // a host path, a canonical root, or an identity tuple (contract `N-6`).
+    // contract record (code, phase, and the already allowlisted render). The
+    // record is the part held to contract `N-6`: no host path, no canonical
+    // root, no identity tuple. The envelope's own `path` field is unchanged
+    // pre-existing surface and still emits the resolved entry file's absolute
+    // path, so `N-6` scopes to `module.record`, not to the whole reply.
     let module = info
         .module
         .as_ref()

@@ -385,7 +385,10 @@ impl LoadFailure {
 impl From<String> for LoadFailure {
     fn from(message: String) -> Self {
         // Injected resolvers and the local-theme adapter speak plain strings;
-        // they carry no typed module record.
+        // they carry no typed module record. A string-only path is only ever a
+        // present-but-unusable external layer (the resolvers that own the
+        // fatal cases return `LoadFailure` directly), so the default stays
+        // recoverable rather than silently becoming fail-closed.
         Self::recoverable(message)
     }
 }

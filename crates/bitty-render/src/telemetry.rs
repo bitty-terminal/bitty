@@ -21,7 +21,9 @@
 //! The snapshot is copied into the stall-watchdog context at the existing
 //! 500 ms sample cadence and read directly by the panic/signal report.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::Instant;
 
 /// Number of tracked counters; must match the field order in
 /// [`SurfaceTelemetrySnapshot`].
@@ -148,6 +150,27 @@ pub struct SurfaceTelemetrySnapshot {
     pub retry_recoveries: u64,
     /// Most recent retry delay in milliseconds.
     pub retry_last_delay_ms: u64,
+    /// Whether an off-thread presenter currently holds an acquire/present in
+    /// flight (bitty#2830). `false` on the synchronous path and while idle.
+    pub presenter_in_flight: bool,
+    /// Age of that in-flight present, in milliseconds (`0` when idle).
+    ///
+    /// A compositor that stops sampling the surface leaves this growing while
+    /// the event-loop thread stays responsive: the watchdog names the stall
+    /// without a blocked main thread.
+    pub presenter_in_flight_ms: u64,
+    /// Process-relative millisecond timestamp when the in-flight present
+    /// started (`0` when idle). The absolute `in_flight_since` gauge the
+    /// watchdog correlates with `presenter_in_flight_ms`.
+    pub presenter_in_flight_since_ms: u64,
+    /// Stuck-present episodes detected and recovered by the embedder.
+    pub presenter_stuck_presents: u64,
+    /// Presenter workers abandoned and recreated after a stuck present.
+    pub presenter_recoveries: u64,
+    /// Frames replaced in the bounded UI -> worker slot before acquisition.
+    pub presenter_coalesced: u64,
+    /// Acknowledgements dropped because the bounded ack ring was full.
+    pub presenter_acks_dropped: u64,
     /// Last recorded event name, stable for reports.
     pub last_event: &'static str,
 }
@@ -171,6 +194,13 @@ impl Default for SurfaceTelemetrySnapshot {
             retry_attempts: 0,
             retry_recoveries: 0,
             retry_last_delay_ms: 0,
+            presenter_in_flight: false,
+            presenter_in_flight_ms: 0,
+            presenter_in_flight_since_ms: 0,
+            presenter_stuck_presents: 0,
+            presenter_recoveries: 0,
+            presenter_coalesced: 0,
+            presenter_acks_dropped: 0,
             last_event: "none",
         }
     }
@@ -178,6 +208,61 @@ impl Default for SurfaceTelemetrySnapshot {
 
 static COUNTERS: [AtomicU64; COUNTER_SLOTS] = [const { AtomicU64::new(0) }; COUNTER_SLOTS];
 static LAST_EVENT: AtomicU8 = AtomicU8::new(LastEvent::None as u8);
+
+/// Process epoch for the off-thread presenter's in-flight gauge.
+static PRESENT_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// Packed active presenter state: `generation << 32 | (since_ms + 1)`; `0`
+/// means no present is in flight. One compare-exchange clears only the
+/// episode that stored the value, so an abandoned worker returning from a
+/// blocked call can never clear the gauge of the worker that replaced it.
+static PRESENT_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static PRESENT_STUCK: AtomicU64 = AtomicU64::new(0);
+static PRESENT_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+static PRESENT_COALESCED: AtomicU64 = AtomicU64::new(0);
+static PRESENT_ACKS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Milliseconds since the process epoch, bounded to the packed gauge's low
+/// 32 bits. Saturates rather than wrapping.
+pub(crate) fn presenter_now_ms() -> u64 {
+    let epoch = *PRESENT_EPOCH.get_or_init(Instant::now);
+    u64::try_from(epoch.elapsed().as_millis())
+        .unwrap_or(u64::MAX)
+        .min(u64::from(u32::MAX))
+}
+
+/// Publishes one in-flight present episode.
+pub(crate) fn presenter_begin(generation: u32, since_ms: u64) {
+    let packed = (u64::from(generation) << 32) | since_ms;
+    PRESENT_IN_FLIGHT.store(packed, Ordering::Release);
+}
+
+/// Clears the in-flight gauge only when `packed` is still the live episode.
+pub(crate) fn presenter_end(packed: u64) {
+    let _ = PRESENT_IN_FLIGHT.compare_exchange(packed, 0, Ordering::AcqRel, Ordering::Relaxed);
+}
+
+/// Records one presentation-worker recovery and clears the abandoned
+/// worker's in-flight gauge so a wedged episode stops counting as active.
+pub(crate) fn presenter_recovered() {
+    PRESENT_IN_FLIGHT.store(0, Ordering::Release);
+    let _ = PRESENT_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records one stuck-present episode.
+pub(crate) fn presenter_stuck() {
+    let _ = PRESENT_STUCK.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Records `count` frames replaced in the bounded presenter slot.
+pub(crate) fn presenter_coalesced(count: u64) {
+    let _ = PRESENT_COALESCED.fetch_add(count, Ordering::Relaxed);
+}
+
+/// Records one acknowledgement dropped from the bounded ack ring.
+pub(crate) fn presenter_ack_dropped() {
+    let _ = PRESENT_ACKS_DROPPED.fetch_add(1, Ordering::Relaxed);
+}
 
 fn bump(slot: usize) {
     let _ = COUNTERS[slot].fetch_add(1, Ordering::Relaxed);
@@ -270,6 +355,8 @@ pub fn retry_recovered() {
 /// Copy the process-wide surface telemetry slot.
 #[must_use]
 pub fn snapshot() -> SurfaceTelemetrySnapshot {
+    let in_flight = PRESENT_IN_FLIGHT.load(Ordering::Acquire);
+    let presenter_in_flight = in_flight != 0;
     SurfaceTelemetrySnapshot {
         configure_ok: COUNTERS[CONFIGURE_OK].load(Ordering::Relaxed),
         configure_err: COUNTERS[CONFIGURE_ERR].load(Ordering::Relaxed),
@@ -287,6 +374,21 @@ pub fn snapshot() -> SurfaceTelemetrySnapshot {
         retry_attempts: COUNTERS[RETRY_ATTEMPTS].load(Ordering::Relaxed),
         retry_recoveries: COUNTERS[RETRY_RECOVERIES].load(Ordering::Relaxed),
         retry_last_delay_ms: COUNTERS[RETRY_LAST_DELAY_MS].load(Ordering::Relaxed),
+        presenter_in_flight,
+        presenter_in_flight_ms: if presenter_in_flight {
+            presenter_now_ms().saturating_sub(in_flight & 0xFFFF_FFFF)
+        } else {
+            0
+        },
+        presenter_in_flight_since_ms: if presenter_in_flight {
+            in_flight & 0xFFFF_FFFF
+        } else {
+            0
+        },
+        presenter_stuck_presents: PRESENT_STUCK.load(Ordering::Relaxed),
+        presenter_recoveries: PRESENT_RECOVERIES.load(Ordering::Relaxed),
+        presenter_coalesced: PRESENT_COALESCED.load(Ordering::Relaxed),
+        presenter_acks_dropped: PRESENT_ACKS_DROPPED.load(Ordering::Relaxed),
         last_event: LastEvent::from_u8(LAST_EVENT.load(Ordering::Relaxed)).as_str(),
     }
 }

@@ -1799,6 +1799,21 @@ fn render_report(report: &StallReport) -> String {
             let redraw_pending = context
                 .redraw_pending_ms
                 .map_or_else(|| String::from("none"), |ms| ms.to_string());
+            // bitty#2830: the off-thread presenter gauges. A stuck present is
+            // visible here while the main thread is healthy: `in_flight=1`
+            // with a growing `in_flight_ms` names the compositor wait that no
+            // longer blocks the event loop.
+            let _ = writeln!(
+                out,
+                "  presenter: in_flight={} in_flight_since_ms={} in_flight_ms={} stuck_presents={} recoveries={} coalesced={} acks_dropped={}",
+                surface.presenter_in_flight,
+                surface.presenter_in_flight_since_ms,
+                surface.presenter_in_flight_ms,
+                surface.presenter_stuck_presents,
+                surface.presenter_recoveries,
+                surface.presenter_coalesced,
+                surface.presenter_acks_dropped,
+            );
             let _ = writeln!(
                 out,
                 "  surface: last={} visible={} redraw_pending_ms={} probe_seen={} probe_occluded={} configure_err={} acquire_ok={} acquire_timeout={} acquire_outdated={} acquire_lost={} acquire_other={} present_ok={} present_err={} resize={} resize_zero_skipped={} headless_present={} retry_failures={} retry_attempts={} retry_recoveries={} retry_last_delay_ms={} lifecycle={}",

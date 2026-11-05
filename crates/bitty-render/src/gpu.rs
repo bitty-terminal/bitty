@@ -757,6 +757,103 @@ impl SurfaceConfig {
     }
 }
 
+/// Why a swap-chain acquire failed, as an owned class.
+///
+/// The synchronous paths flatten this into
+/// [`RenderError::SurfaceAcquire`]
+/// with the original upstream message; the off-thread presenter (bitty#2830)
+/// reports the class in its acknowledgement so retry/telemetry can name the
+/// outcome (`outdated`, `lost`, `timeout`, `other`) instead of parsing text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentFailureClass {
+    /// The swap chain is outdated: reconfigure and retry.
+    Outdated,
+    /// The surface was lost: reconfigure and retry.
+    Lost,
+    /// The compositor did not release an image within the driver's wait.
+    Timeout,
+    /// `OutOfMemory` or an unknown upstream surface status.
+    Other,
+}
+
+impl PresentFailureClass {
+    /// Stable name for logs/telemetry.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Outdated => "outdated",
+            Self::Lost => "lost",
+            Self::Timeout => "timeout",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// A failed present with the acquire class preserved.
+#[derive(Debug)]
+pub enum PresentFailure {
+    /// The swap-chain acquire failed with `class` and the upstream detail.
+    Surface {
+        /// Classified acquire failure.
+        class: PresentFailureClass,
+        /// Upstream display text (owned, never a borrowed wgpu type).
+        detail: String,
+    },
+    /// A validation, configure, or draw failure that is not an acquire class.
+    Error(crate::error::RenderError),
+}
+
+impl PresentFailure {
+    /// Flattens into the historical [`RenderError`]
+    /// shape so synchronous callers see byte-identical messages.
+    #[must_use]
+    pub fn into_render_error(self) -> crate::error::RenderError {
+        match self {
+            Self::Surface { detail, .. } => crate::error::RenderError::SurfaceAcquire(detail),
+            Self::Error(err) => err,
+        }
+    }
+
+    /// The acquire class, when this was an acquire failure.
+    #[must_use]
+    pub const fn class(&self) -> Option<PresentFailureClass> {
+        match self {
+            Self::Surface { class, .. } => Some(*class),
+            Self::Error(_) => None,
+        }
+    }
+
+    /// The owned diagnostic text.
+    #[must_use]
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Surface { detail, .. } => detail,
+            Self::Error(err) => owned_render_error_detail(err),
+        }
+    }
+}
+
+/// `RenderError`'s stable display text.
+///
+/// Only used for the presenter acknowledgement's diagnostic string; the
+/// synchronous path never converts through it.
+fn owned_render_error_detail(err: &crate::error::RenderError) -> &str {
+    match err {
+        crate::error::RenderError::DeviceRequest(msg)
+        | crate::error::RenderError::FontNotFound(msg)
+        | crate::error::RenderError::UpstreamRasterizer(msg)
+        | crate::error::RenderError::UpstreamGraphics(msg)
+        | crate::error::RenderError::SurfaceCreate(msg)
+        | crate::error::RenderError::SurfaceConfigure(msg)
+        | crate::error::RenderError::SurfaceAcquire(msg) => msg,
+        crate::error::RenderError::InvalidInput { reason } => reason,
+        crate::error::RenderError::NoCompatibleAdapter => "no compatible GPU adapter found",
+        crate::error::RenderError::UnknownFontHandle => {
+            "unknown font handle for this rasterizer session"
+        }
+    }
+}
+
 /// Statistics returned from a present that composited a [`DrawList`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PresentStats {
@@ -1245,6 +1342,22 @@ impl Surface {
         self.configure(ctx, new_extent)
     }
 
+    /// Classifies an acquire failure for the off-thread presenter ack.
+    fn classify_surface_error(error: &wgpu::SurfaceError) -> PresentFailure {
+        let class = match error {
+            wgpu::SurfaceError::Timeout => PresentFailureClass::Timeout,
+            wgpu::SurfaceError::Outdated => PresentFailureClass::Outdated,
+            wgpu::SurfaceError::Lost => PresentFailureClass::Lost,
+            wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other => {
+                PresentFailureClass::Other
+            }
+        };
+        PresentFailure::Surface {
+            class,
+            detail: error.to_string(),
+        }
+    }
+
     /// Records the acquire error class and returns the telemetry event name.
     fn note_acquire_error(error: &wgpu::SurfaceError) {
         match error {
@@ -1487,12 +1600,37 @@ impl Surface {
         atlas: Option<(&[u8], AtlasDims)>,
         color_atlas: Option<(&[u8], AtlasDims)>,
     ) -> Result<PresentStats, RenderError> {
+        self.present_draw_list_color_classified(ctx, draw_list, atlas, color_atlas)
+            .map_err(PresentFailure::into_render_error)
+    }
+
+    /// Presents one frame and keeps the acquire-failure class structured.
+    ///
+    /// Identical to [`Self::present_draw_list_color`] except that a failed
+    /// swap-chain acquire is reported as [`PresentFailure::Surface`] with its
+    /// [`PresentFailureClass`] instead of being flattened into
+    /// [`RenderError::SurfaceAcquire`]. The off-thread presenter (bitty#2830)
+    /// uses this to acknowledge `outdated`, `lost`, `timeout`, and `other`
+    /// separately while the synchronous callers keep the exact historical
+    /// error strings through [`PresentFailure::into_render_error`].
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Self::present_draw_list_color`], classified.
+    pub fn present_draw_list_color_classified(
+        &self,
+        ctx: &GpuContext,
+        draw_list: &DrawList,
+        atlas: Option<(&[u8], AtlasDims)>,
+        color_atlas: Option<(&[u8], AtlasDims)>,
+    ) -> Result<PresentStats, PresentFailure> {
         // Shared validation: configured?
         let config = {
             let state = self.state.lock().expect("surface state poisoned");
             state
                 .config
-                .ok_or_else(|| RenderError::SurfaceConfigure("surface not configured".into()))?
+                .ok_or_else(|| RenderError::SurfaceConfigure("surface not configured".into()))
+                .map_err(PresentFailure::Error)?
         };
         // CTX-0290: effective opacity (1.0 when the platform cannot blend
         // premultiplied alpha, so an unsupported surface stays opaque).
@@ -1504,18 +1642,18 @@ impl Surface {
             .iter()
             .any(|g| matches!(g.source, crate::grid::GlyphSource::Atlas { .. }));
         if needs_atlas && atlas.is_none() {
-            return Err(RenderError::InvalidInput {
+            return Err(PresentFailure::Error(RenderError::InvalidInput {
                 reason: "atlas instance requires atlas texels",
-            });
+            }));
         }
         let needs_color = draw_list
             .glyphs
             .iter()
             .any(|g| matches!(g.source, crate::grid::GlyphSource::ColorAtlas { .. }));
         if needs_color && color_atlas.is_none() {
-            return Err(RenderError::InvalidInput {
+            return Err(PresentFailure::Error(RenderError::InvalidInput {
                 reason: "color atlas instance requires color atlas texels",
-            });
+            }));
         }
 
         match &self.kind {
@@ -1528,7 +1666,7 @@ impl Surface {
                 let height = config.extent.height();
                 // CR-RENDER-01: fail closed before allocating; extreme extents
                 // must not reach `vec!` unchecked.
-                let len = headless_buffer_len(width, height)?;
+                let len = headless_buffer_len(width, height).map_err(PresentFailure::Error)?;
                 let mut rgba = vec![0u8; len];
                 // Clear to the resolved theme background (premultiplied,
                 // CTX-0355); matches the GPU clear color above.
@@ -1712,7 +1850,8 @@ impl Surface {
                     }
                     Err(wgpu::SurfaceError::Outdated) => {
                         telemetry::acquire_outdated();
-                        self.configure(ctx, config.extent)?;
+                        self.configure(ctx, config.extent)
+                            .map_err(PresentFailure::Error)?;
                         // Reconfiguration may have picked a new format; drop
                         // cached resources so the draw below recreates them.
                         self.state.lock().expect("surface state poisoned").resources = None;
@@ -1724,13 +1863,14 @@ impl Surface {
                             Err(e) => {
                                 Self::note_acquire_error(&e);
                                 telemetry::present_err();
-                                return Err(RenderError::SurfaceAcquire(e.to_string()));
+                                return Err(Self::classify_surface_error(&e));
                             }
                         }
                     }
                     Err(wgpu::SurfaceError::Lost) => {
                         telemetry::acquire_lost();
-                        self.configure(ctx, config.extent)?;
+                        self.configure(ctx, config.extent)
+                            .map_err(PresentFailure::Error)?;
                         self.state.lock().expect("surface state poisoned").resources = None;
                         match surface.get_current_texture() {
                             Ok(f) => {
@@ -1740,14 +1880,14 @@ impl Surface {
                             Err(e) => {
                                 Self::note_acquire_error(&e);
                                 telemetry::present_err();
-                                return Err(RenderError::SurfaceAcquire(e.to_string()));
+                                return Err(Self::classify_surface_error(&e));
                             }
                         }
                     }
                     Err(e) => {
                         Self::note_acquire_error(&e);
                         telemetry::present_err();
-                        return Err(RenderError::SurfaceAcquire(e.to_string()));
+                        return Err(Self::classify_surface_error(&e));
                     }
                 };
                 let view = frame
@@ -1796,7 +1936,9 @@ impl Surface {
                             height: crate::atlas::INITIAL_ATLAS_DIMENSION,
                         });
                         let resources = GpuResources::create(&ctx.device, surface_format, dims)
-                            .map_err(|e| RenderError::UpstreamGraphics(e.to_string()))?;
+                            .map_err(|e| {
+                                PresentFailure::Error(RenderError::UpstreamGraphics(e.to_string()))
+                            })?;
                         state.resources = Some(resources);
                     }
                 }
@@ -1815,7 +1957,9 @@ impl Surface {
                 let images_skipped = {
                     let mut state = self.state.lock().expect("surface state poisoned");
                     let resources = state.resources.as_mut().ok_or_else(|| {
-                        RenderError::UpstreamGraphics("GPU resources missing after creation".into())
+                        PresentFailure::Error(RenderError::UpstreamGraphics(
+                            "GPU resources missing after creation".into(),
+                        ))
                     })?;
                     resources
                         .draw_frame(
@@ -1831,7 +1975,9 @@ impl Surface {
                             clear,
                             opacity,
                         )
-                        .map_err(|e| RenderError::UpstreamGraphics(e.to_string()))?
+                        .map_err(|e| {
+                            PresentFailure::Error(RenderError::UpstreamGraphics(e.to_string()))
+                        })?
                 };
                 // CTX-0291: the real-GPU pass uploads and paints kitty image
                 // blits (the CTX-0253 F3 skip gate is retired). A non-zero

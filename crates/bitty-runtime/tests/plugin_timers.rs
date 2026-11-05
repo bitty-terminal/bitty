@@ -29,6 +29,16 @@ use bitty_runtime::plugin_runtime::{
 /// `bar_activation_budget.rs`.
 const HARNESS_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
 
+/// Wall time the slow snapshot fixture charges inside a timer callback
+/// (bitty#2900).
+///
+/// The host call is charged to the callback's RC-1 wall time (only supervised
+/// spawn waits are credited), so a delay of twice the harness budget crosses
+/// the slice on any runner without depending on CPU speed. It stays far below
+/// `HARNESS_HOST_CALL_DEADLINE_MS`, so the call itself returns normally and
+/// the suspension is the callback budget, not a host-call timeout.
+const SLOW_SNAPSHOT_DELAY: Duration = Duration::from_millis(2 * HARNESS_WALL_BUDGET_MS);
+
 #[derive(Default)]
 struct MapSettings(std::collections::BTreeMap<String, LuaValue>);
 
@@ -53,6 +63,28 @@ impl SnapshotSource for StaticSnapshot {
     }
 }
 
+/// Snapshot source that charges a deterministic amount of host-call wall time
+/// (bitty#2900). Used to overrun a timer callback's RC-1 slice without a busy
+/// loop or a runner-speed assumption.
+struct SlowSnapshot {
+    value: LuaValue,
+    delay: Duration,
+}
+
+impl SnapshotSource for SlowSnapshot {
+    fn snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError> {
+        if scope != "semantic" {
+            return Err(BridgeError::new(
+                "validation",
+                "E_SNAPSHOT_SCOPE_UNSUPPORTED",
+                "bad scope",
+            ));
+        }
+        std::thread::sleep(self.delay);
+        Ok(self.value.clone())
+    }
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     // Unique per test + process so parallel nextest shards never share a dir.
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,6 +97,21 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn runtime(data_dir: PathBuf, roots: Vec<PathBuf>) -> PluginRuntime {
+    runtime_with_snapshot(
+        data_dir,
+        roots,
+        Rc::new(StaticSnapshot(LuaValue::table([
+            ("version", LuaValue::Integer(1)),
+            ("terminal_id", LuaValue::Integer(1)),
+        ]))),
+    )
+}
+
+fn runtime_with_snapshot(
+    data_dir: PathBuf,
+    roots: Vec<PathBuf>,
+    snapshot: Rc<dyn SnapshotSource>,
+) -> PluginRuntime {
     let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
         data_dir: Some(data_dir),
@@ -72,10 +119,7 @@ fn runtime(data_dir: PathBuf, roots: Vec<PathBuf>) -> PluginRuntime {
         bundled_roots: Vec::new(),
         third_party_roots: roots,
         settings: Rc::new(MapSettings::default()),
-        snapshot: Rc::new(StaticSnapshot(LuaValue::table([
-            ("version", LuaValue::Integer(1)),
-            ("terminal_id", LuaValue::Integer(1)),
-        ]))),
+        snapshot,
     });
     // Harness headroom for activation only; see `HARNESS_WALL_BUDGET_MS`.
     rt.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
@@ -99,6 +143,29 @@ fn write_plugin(root: &Path, id: &str, init_src: &str) {
         "bitty.commands.register({{ id = \"ok\", title = \"ok\", run = function() return \"ok\" end }})\n{init_src}"
     );
     std::fs::write(plugin.join("lua/init.lua"), body).expect("init");
+}
+
+/// Write a plugin with explicit capabilities and no command registrations.
+///
+/// Used by the failure-path probes: the timer callback only needs the heads
+/// it exercises (`ui.rich` to mount, `terminal.semantic-read` for the slow
+/// snapshot).
+fn write_capability_plugin(root: &Path, id: &str, capabilities: &[&str], init_src: &str) {
+    let plugin = root.join(id);
+    std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+    let caps_toml = capabilities
+        .iter()
+        .map(|capability| format!("{capability} = true"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(
+        plugin.join("bitty-plugin.toml"),
+        format!(
+            "[plugin]\nid = \"{id}\"\nname = \"Test\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[capabilities]\n{caps_toml}\n\n[lazy]\ncommands = []\nevents = []\n"
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(plugin.join("lua/init.lua"), init_src).expect("init");
 }
 
 fn store_get(rt: &PluginRuntime, id: &PluginId, key: &str) -> Option<LuaValue> {
@@ -294,6 +361,160 @@ fn disposed_timers_clear_the_wake() {
     assert_eq!(rt.timer_deadline(), None);
     let far = std::time::Instant::now() + Duration::from_secs(60);
     assert_eq!(rt.pump_due_timers_at(far), 0);
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn timer_callback_wall_overrun_fails_the_generation_without_phantom_fires() {
+    // bitty#2900: a timer callback that overruns RC-1 used to leave the plugin
+    // `Active` with a suspended VM: every later drive was refused, `fired`
+    // still counted phantom work, and the last painted blocks stayed frozen on
+    // screen. The overrun now fails the generation through the same cleanup as
+    // a failed activation, and the reason names the exceeded budget.
+    let data = temp_dir("overrun");
+    let root = temp_dir("overrun-root");
+    let id = PluginId::new("bitty-featured.overrun").expect("id");
+    write_capability_plugin(
+        &root,
+        "bitty-featured.overrun",
+        &["terminal.semantic-read", "ui.rich"],
+        r#"
+        bitty.ui.mount("bottom", { kind = "Text", text = "timer" })
+        bitty.timers.create(100, function()
+          -- The host call charges deterministic wall time; the loop then
+          -- reaches a slice boundary so the drive observes the overrun
+          -- instead of finishing inside the slow host step.
+          bitty.terminal.snapshot({ scope = "semantic" })
+          while true do end
+        end)
+        "#,
+    );
+    let snapshot = Rc::new(SlowSnapshot {
+        value: LuaValue::table([
+            ("version", LuaValue::Integer(1)),
+            ("terminal_id", LuaValue::Integer(1)),
+        ]),
+        delay: SLOW_SNAPSHOT_DELAY,
+    });
+    let mut rt = runtime_with_snapshot(data.clone(), vec![root.clone()], snapshot);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    assert_eq!(rt.ui_blocks().len(), 1, "fixture mounted one UI block");
+    let deadline = rt.timer_deadline().expect("armed");
+
+    // The callback starts, charges the slow host call, and is then aborted by
+    // the wall check: that is one attempted fire, not zero. The generation
+    // must fail in the same pump.
+    assert_eq!(rt.pump_due_timers_at(deadline), 1);
+    let reason = match rt.state(&id) {
+        Some(LifecycleState::Failed(reason)) => reason.clone(),
+        other => panic!("terminal overrun must fail the generation, got {other:?}"),
+    };
+    assert!(
+        reason.contains("RC-1 wall")
+            && reason.contains(&format!("budget_ms={HARNESS_WALL_BUDGET_MS}")),
+        "failure reason must name the exceeded wall budget: {reason}"
+    );
+    assert!(
+        rt.ui_blocks().is_empty(),
+        "failed generation's UI blocks must be cleared"
+    );
+    assert!(
+        rt.services(&id).is_none(),
+        "failed generation must drop its services"
+    );
+    assert!(
+        rt.effective_budgets(&id).is_none(),
+        "failed generation must drop its budgets"
+    );
+    let debug_row = rt
+        .debug_plugins()
+        .into_iter()
+        .find(|row| row.id == id.as_str())
+        .expect("debug row");
+    assert_eq!(debug_row.state, "failed");
+    assert_eq!(rt.timer_deadline(), None, "failed generation arms no wake");
+
+    // The refused drive is not a fire: the same deadline and any later one
+    // select nothing for the failed generation.
+    assert_eq!(rt.pump_due_timers_at(deadline), 0);
+    let far = deadline + Duration::from_secs(3600);
+    assert_eq!(rt.pump_due_timers_at(far), 0);
+    assert_eq!(rt.timer_deadline(), None);
+
+    // Reload from `Failed` is still the documented recovery path.
+    let report = rt.reload(&id).expect("reload from failed");
+    assert_eq!(report.state, LifecycleState::Active);
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn timer_callback_within_budget_keeps_the_generation_active() {
+    // Control for bitty#2900: an ordinary timer that completes inside the
+    // slice keeps firing and never transitions the generation.
+    let data = temp_dir("within-budget");
+    let root = temp_dir("within-budget-root");
+    let id = PluginId::new("bitty-featured.within").expect("id");
+    write_plugin(
+        &root,
+        "bitty-featured.within",
+        r#"
+        bitty.timers.create(100, function() bitty.store.set("first", 1) end)
+        bitty.timers.create(200, function() bitty.store.set("second", 2) end)
+        "#,
+    );
+    let mut rt = runtime(data.clone(), vec![root.clone()]);
+    common::install_stub_backend(&mut rt);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    let first = rt.timer_deadline().expect("armed");
+    assert_eq!(rt.pump_due_timers_at(first), 1);
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    assert_eq!(store_get(&rt, &id, "first"), Some(LuaValue::Integer(1)));
+    let second = rt.timer_deadline().expect("second timer still armed");
+    assert_eq!(rt.pump_due_timers_at(second), 1);
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    assert_eq!(store_get(&rt, &id, "second"), Some(LuaValue::Integer(2)));
+    assert_eq!(rt.timer_deadline(), None);
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn timer_callback_lua_error_is_contained_and_keeps_the_generation_active() {
+    // bitty#2900 classification control: a plain Lua error does not suspend
+    // the VM, so it stays the documented contained failure (the one shot is
+    // consumed, the generation remains usable). Only terminal VM death fails
+    // the plugin.
+    let data = temp_dir("lua-error");
+    let root = temp_dir("lua-error-root");
+    let id = PluginId::new("bitty-featured.lua-error").expect("id");
+    write_plugin(
+        &root,
+        "bitty-featured.lua-error",
+        r#"
+        bitty.timers.create(100, function() error("timer boom") end)
+        bitty.timers.create(200, function() bitty.store.set("after_error", true) end)
+        "#,
+    );
+    let mut rt = runtime(data.clone(), vec![root.clone()]);
+    common::install_stub_backend(&mut rt);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    let first = rt.timer_deadline().expect("armed");
+    assert_eq!(rt.pump_due_timers_at(first), 1);
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    let second = rt.timer_deadline().expect("generation still usable");
+    assert_eq!(rt.pump_due_timers_at(second), 1);
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    assert_eq!(
+        store_get(&rt, &id, "after_error"),
+        Some(LuaValue::Bool(true))
+    );
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&root);
 }

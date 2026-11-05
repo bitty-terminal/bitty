@@ -54,7 +54,7 @@ use bitty_lua::host::DEFAULT_HOST_DEADLINE_MS;
 use bitty_lua::ui::UiNode;
 use bitty_lua::{
     CommandRegistration, HostServices, InvocationOutcome, LuaVm, MarshallingLimits,
-    RegistrationCapture,
+    RegistrationCapture, SuspendReason,
 };
 use bitty_plugin_host::DropPolicy;
 use bitty_plugin_host::capability::CapabilityId;
@@ -2220,10 +2220,14 @@ impl PluginRuntime {
     ///
     /// Cold-tick pump only (the app calls it from `drive_tick` before
     /// present, never on the input hot path). Returns the number of
-    /// callbacks that ran. One-shot: each due timer fires at most once;
-    /// failures are contained (a faulting callback still consumes its
-    /// one shot). Bounded: at most the armed timers plus at most one
-    /// optimistic re-arm chain per fire, capped fail-closed.
+    /// callbacks that actually ran. One-shot: each due timer fires at most
+    /// once; ordinary Lua errors are contained (the faulting callback still
+    /// consumes its one shot and the VM stays usable). A terminal VM
+    /// suspension (wall, instruction, or memory budget) fails the plugin
+    /// generation instead: its VM, UI blocks, publications, and timers are
+    /// released and the lifecycle state carries the exceeded budget.
+    /// Bounded: at most the armed timers plus at most one optimistic re-arm
+    /// chain per fire, capped fail-closed.
     pub fn pump_due_timers(&mut self) -> usize {
         self.pump_due_timers_at(Instant::now())
     }
@@ -2232,10 +2236,18 @@ impl PluginRuntime {
     ///
     /// Fake-clock entry point for tests: arm at activation `T`, then
     /// `pump_due_timers_at(T + delay)` fires. Production calls
-    /// [`Self::pump_due_timers`]. Same bounds and containment as the
+    /// [`Self::pump_due_timers`]. Same bounds and failure handling as the
     /// wall-clock pump; `now` frozen for the whole pump so a `0`-delay
     /// re-arm fires in the same pump (bounded) while future delays stay
     /// pending.
+    ///
+    /// Counting is truthful (bitty#2900): a drive that never started is
+    /// not a fire. A borrow that cannot be acquired, a VM already parked
+    /// on a command callback, and a VM suspended before the drive all
+    /// return `0` for that timer. A callback that started and then hit a
+    /// terminal VM suspension still counts (it ran), and the generation is
+    /// marked [`LifecycleState::Failed`] so nothing for it is selected
+    /// again.
     pub fn pump_due_timers_at(&mut self, now: Instant) -> usize {
         self.sync_timer_cancels();
         self.sync_new_timers(now);
@@ -2261,13 +2273,48 @@ impl PluginRuntime {
             // pruning cannot lose it; on consume contention the
             // `timer_fired` entry is kept fail-closed.
             self.consume_fired_timer(&plugin, handle);
+            let mut terminal = None;
             if active {
                 if let (Some(vm), Some(callback)) = (vm, callback) {
                     if let Ok(mut vm_ref) = vm.try_borrow_mut() {
-                        let _ = vm_ref.call_function(&callback, &[]);
+                        if let Some(reason) = vm_ref.suspend_reason().cloned() {
+                            // Refused drive: the VM was already unusable, so
+                            // the callback never ran. Fail the generation
+                            // without a phantom fire.
+                            terminal = Some(reason);
+                        } else if vm_ref.is_parked() {
+                            // The parked command owns the VM this tick; a
+                            // timer drive is refused before execution, so it
+                            // is not a fire either. The one-shot stays
+                            // consumed, matching prior containment.
+                        } else {
+                            match vm_ref.call_function(&callback, &[]) {
+                                Ok(_) => fired += 1,
+                                Err(_) => {
+                                    if let Some(reason) = vm_ref.suspend_reason().cloned() {
+                                        // The callback started, then the
+                                        // drive died on a terminal budget;
+                                        // the work happened even though it
+                                        // did not complete.
+                                        fired += 1;
+                                        terminal = Some(reason);
+                                    } else {
+                                        // Ordinary Lua error: the callback
+                                        // ran and raised, the VM remains
+                                        // usable, and the one shot is
+                                        // consumed. Contained with no state
+                                        // change; there is no bounded
+                                        // failure channel to report through.
+                                        fired += 1;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    fired += 1;
                 }
+            }
+            if let Some(reason) = terminal {
+                self.fail_runtime(&plugin, timer_terminal_reason(&reason));
             }
             self.sync_timer_cancels();
             self.sync_new_timers(now);
@@ -4439,6 +4486,29 @@ impl PluginRuntime {
             .retain_owners(|owner| live.contains(owner));
     }
 
+    /// Terminally fail a live generation after a runtime fault (bitty#2900).
+    ///
+    /// Applies the failed-activation cleanup ([`Self::rollback`]) to a
+    /// generation that was already active, and first cancels any command
+    /// parked against its VM so no executor survives the drop. The state
+    /// becomes [`Failed`] with `reason`, and the debug view is republished so
+    /// lifecycle consumers observe `failed` on their next read. There is no
+    /// separate host diagnostic channel for plugin faults; the lifecycle
+    /// state carries the reason.
+    ///
+    /// [`Failed`]: LifecycleState::Failed
+    fn fail_runtime(&mut self, id: &PluginId, reason: String) {
+        self.cancel_parked_command(id);
+        self.rollback(id, reason);
+        // A failed activation never commits a registration capture, but a
+        // generation that ran did: release its dead callbacks so the debug
+        // snapshot and any fallback lookup cannot retain them.
+        if let Some(entry) = self.entries.get_mut(id) {
+            entry.registrations = RegistrationCapture::new();
+        }
+        self.sync_debug_view();
+    }
+
     /// Roll back a failed activation attempt atomically.
     ///
     /// Purges the policy-host generation (identity, command ownership, and
@@ -4581,6 +4651,28 @@ fn lifecycle_error(id: &PluginId, detail: &str) -> PluginRuntimeError {
     PluginRuntimeError::Lifecycle {
         plugin: id.to_string(),
         detail: detail.to_string(),
+    }
+}
+
+/// Host-authored [`LifecycleState::Failed`] reason for a terminal timer
+/// callback suspension (bitty#2900).
+///
+/// Names the budget that was exceeded and its measured value; every field is
+/// host-derived (never plugin content), so the message is safe to surface.
+fn timer_terminal_reason(reason: &SuspendReason) -> String {
+    match reason {
+        SuspendReason::WallClockExceeded {
+            elapsed_ms,
+            budget_ms,
+        } => format!(
+            "timer callback exceeded the RC-1 wall budget (elapsed_ms={elapsed_ms}, budget_ms={budget_ms})"
+        ),
+        SuspendReason::InstructionBudgetExceeded { used, budget } => format!(
+            "timer callback exceeded the RC-1 instruction budget (used={used}, budget={budget})"
+        ),
+        SuspendReason::MemoryExceeded { used, limit } => format!(
+            "timer callback exceeded the RC-2 memory limit (used_bytes={used}, limit_bytes={limit})"
+        ),
     }
 }
 

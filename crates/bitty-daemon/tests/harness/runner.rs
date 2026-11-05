@@ -197,8 +197,8 @@ pub trait Driver {
     /// Number of live child processes the service under test owns.
     ///
     /// A refused create must not add one; the real driver reads the daemon's
-    /// per-task `children` tables, and the fake (which has no process plane)
-    /// reports zero.
+    /// per-task `children` tables, and the fake derives the count from its own
+    /// session model (one child per bound, non-terminal session).
     ///
     /// # Errors
     ///

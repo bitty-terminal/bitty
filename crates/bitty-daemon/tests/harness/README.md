@@ -122,7 +122,16 @@ Actions: `restart`, `crash`, `advance_clock`, `oversized_frame`, `partial_frame`
 `daemon_absent`, `request_log`, `read_events`, `peer_exit`, and
 `refusal_burst`. `child_processes` asserts `expect.result.count` against the
 service's live direct-child count; a failed process-table read fails the row
-rather than reading as zero. `read_events` reads `args.count` pushed frames;
+rather than reading as zero. The real driver reads the daemon's per-task
+`children` tables and
+`harness::real::tests::a_live_child_is_observable_so_a_zero_child_row_cannot_be_vacuous`
+spawns a short-lived child and asserts the reader sees its pid, so a zero count
+is a measurement rather than a constant. The fake has no process plane; it
+derives the count from its own model instead of returning zero — one child per
+bound, non-terminal session
+(`harness::fake::tests::the_fake_child_count_follows_its_own_session_state`), so
+a refused create that never binds reads zero because the fake models the
+absence, not because the step cannot observe anything. `read_events` reads `args.count` pushed frames;
 `args.events` is an optional per-frame array of expectation objects
 (index-aligned with the frames), and `expect.result` is the fallback applied to
 every frame. `retry_ms` is the only bounded settlement: it re-sends the same

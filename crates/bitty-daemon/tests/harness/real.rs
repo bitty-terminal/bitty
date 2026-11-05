@@ -1237,24 +1237,49 @@ fn child_processes(pid: u32) -> Result<u64, String> {
     child_processes_in(&Path::new("/proc").join(pid.to_string()).join("task"))
 }
 
-/// Sum the `children` tables under one task directory.
+/// Direct child pids under one `/proc` task directory.
 ///
 /// Every read failure is returned with the path that failed. The consumer
 /// asserts "no child process", so a missing or unreadable table must fail the
-/// row instead of defaulting to zero.
-fn child_processes_in(tasks: &Path) -> Result<u64, String> {
+/// row instead of defaulting to zero. The pids (not just the total) are
+/// returned so a positive control can name the child it expects to see.
+fn child_pids_in(tasks: &Path) -> Result<Vec<u32>, String> {
     let entries = std::fs::read_dir(tasks)
         .map_err(|error| format!("cannot read the task table {}: {error}", tasks.display()))?;
-    let mut total = 0u64;
+    let mut pids = Vec::new();
     for entry in entries {
         let entry = entry
             .map_err(|error| format!("cannot read a task entry in {}: {error}", tasks.display()))?;
         let children = entry.path().join("children");
-        let text = std::fs::read_to_string(&children)
-            .map_err(|error| format!("cannot read {}: {error}", children.display()))?;
-        total += text.split_whitespace().count() as u64;
+        let text = match std::fs::read_to_string(&children) {
+            Ok(text) => text,
+            // A thread that exits between the directory read and this open
+            // takes its `children` file with it. That is a vanished task, not
+            // an unreadable table; a live task without the file, and every
+            // other read failure, still fails the row.
+            Err(error) if error.kind() == ErrorKind::NotFound && !entry.path().exists() => {
+                continue;
+            }
+            Err(error) => {
+                return Err(format!("cannot read {}: {error}", children.display()));
+            }
+        };
+        for field in text.split_whitespace() {
+            let pid = field.parse::<u32>().map_err(|_| {
+                format!(
+                    "cannot parse the child pid {field:?} in {}",
+                    children.display()
+                )
+            })?;
+            pids.push(pid);
+        }
     }
-    Ok(total)
+    Ok(pids)
+}
+
+/// Sum the `children` tables under one task directory.
+fn child_processes_in(tasks: &Path) -> Result<u64, String> {
+    child_pids_in(tasks).map(|pids| pids.len() as u64)
 }
 
 /// Socket inodes the process holds, plus any of them in a TCP LISTEN row.
@@ -1312,5 +1337,43 @@ mod tests {
         let error = child_processes_in(dir.path())
             .expect_err("a task without a children file must not read as zero");
         assert!(error.contains("cannot read"), "{error}");
+    }
+
+    /// A live child must be visible to the same reader the vectors use.
+    ///
+    /// This is the positive control for the three "no child process" rows:
+    /// without it those rows would pass even if the reader could never observe
+    /// a child at all. The assertion names the child's pid, so a reader that
+    /// returned an arbitrary non-zero count would not pass either. The child is
+    /// short-lived and reaped on every path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_child_is_observable_so_a_zero_child_row_cannot_be_vacuous() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the control child");
+        let expected = child.id();
+        let tasks = Path::new("/proc")
+            .join(std::process::id().to_string())
+            .join("task");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = Vec::new();
+        while Instant::now() < deadline {
+            observed = child_pids_in(&tasks).expect("read this process's task table");
+            if observed.contains(&expected) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            observed.contains(&expected),
+            "the child reader never observed the live child {expected}: {observed:?}"
+        );
     }
 }

@@ -2477,9 +2477,18 @@ impl Driver for FakeDriver {
     }
 
     fn child_process_count(&mut self) -> Result<u64, String> {
-        // The reference cell has no process or PTY plane, so a refused create
-        // provably adds no child.
-        Ok(0)
+        // The reference cell has no process or PTY plane, so it models the
+        // child instead of ignoring it: a session that bound at generation 1
+        // would hold exactly one child until it reaches a terminal state, and
+        // a session that never bound (every refused create) holds none. The
+        // count is derived from the fake's own state so it can move, rather
+        // than being pinned at zero, which would let every "no child process"
+        // assertion in the corpus pass without observing anything.
+        Ok(self
+            .sessions
+            .values()
+            .filter(|session| session.generation >= 1 && !is_terminal(session.state))
+            .count() as u64)
     }
 
     fn daemon_absent(&mut self) -> Result<ExitObservation, String> {
@@ -2584,7 +2593,7 @@ mod tests {
         FAKE_INPUT_BYTES, FakeConn, FakeDriver, FakeLease, FakeSession, canonical_generation,
         canonical_target_attach,
     };
-    use crate::harness::runner::Outcome;
+    use crate::harness::runner::{Driver, Outcome};
 
     /// One live fake terminal with a controller lease on `creator`.
     fn fake_terminal() -> (FakeDriver, String) {
@@ -2774,5 +2783,30 @@ mod tests {
             "the reference cell cannot advertise a worker plane while D-01 is unamended"
         );
         assert!(!FakeDriver::capability("worker_sessions", false));
+    }
+
+    #[test]
+    fn the_fake_child_count_follows_its_own_session_state() {
+        // The fake never spawns a real process, so it models the child of a
+        // bound session. The count must move with the model: a bound session
+        // reads one child, a terminal one reads none, and a fresh cell reads
+        // none. A hardcoded zero would make every "no child process" corpus
+        // assertion pass without observing anything.
+        let (mut fake, id) = fake_terminal();
+        assert_eq!(
+            fake.child_process_count().expect("count a bound session"),
+            1,
+            "a bound session would hold one child"
+        );
+
+        fake.sessions.get_mut(&id).expect("the bound session").state = "exited";
+        assert_eq!(
+            fake.child_process_count().expect("count a retired session"),
+            0,
+            "a retired session holds no child"
+        );
+
+        let mut fresh = FakeDriver::new();
+        assert_eq!(fresh.child_process_count().expect("count a fresh cell"), 0);
     }
 }

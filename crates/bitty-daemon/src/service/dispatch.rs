@@ -5317,12 +5317,6 @@ mod tests {
         let _ = child_processes_in(std::path::Path::new("/nonexistent/bittyd-thread-self"));
     }
 
-    /// Non-Linux cells serve no spawn path, so the count is always zero.
-    #[cfg(not(target_os = "linux"))]
-    fn thread_child_processes() -> usize {
-        0
-    }
-
     #[test]
     fn a_served_containment_plan_still_refuses_every_worker_create_before_any_child() {
         let cell = crate::platform::PlatformCell::current();

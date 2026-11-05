@@ -84,6 +84,9 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 /// Real git repository with one untracked file, returning its canonical path.
+// Only the Landlock-gated probes spawn git, so the helper must be gated too:
+// an ungated copy is dead code off Linux and fails `-D warnings` there.
+#[cfg(target_os = "linux")]
 fn git_repo(root: &Path, tag: &str, untracked: &str) -> PathBuf {
     std::fs::create_dir_all(root).expect("repo dir");
     let status = std::process::Command::new("git")

@@ -38,11 +38,14 @@
 //!   the last [`TICK_RING_CAPACITY`] `(sequence, duration)` records in a
 //!   lock-free ring; the monitor drains them oldest first and writes one
 //!   `phase=runtime-tick` report per over-bound tick with that measured
-//!   duration. Pending records survive progress changes and are reported
-//!   later if a poll cannot deliver them yet. A block the in-flight detector
-//!   already reported is closed by its one recovery line and never reported
-//!   twice. Records overwritten before a drain are named once by a
-//!   `tick-ring: capacity=… missed=… seq=…` line in the next report, so
+//!   duration, in bounded per-poll batches so a drained burst cannot delay
+//!   the next in-flight sample; the remainder carries to the next poll.
+//!   Pending records survive progress changes and are reported later if a
+//!   poll cannot deliver them yet. A block the in-flight detector already
+//!   reported is closed by its one recovery line and never reported twice.
+//!   Records overwritten before a drain are named once by a
+//!   `tick-ring: capacity=… missed_at_most=… seq=…` line in the next
+//!   report, so
 //!   overflow is visible instead of silent.
 //! - **No hot-path work.** A phase mark is one relaxed atomic store plus a
 //!   timestamp. The app publishes its bounded context sample at most twice a
@@ -245,6 +248,14 @@ const MAX_STALL_THRESHOLD: Duration = Duration::from_secs(600);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Minimum sampling period; small thresholds still get several samples.
 const MIN_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// Maximum completed-tick reports delivered per monitor poll.
+///
+/// One delivery can spend the helper's bounded 250 ms deadline (plus a 1 s
+/// evidence-lock wait on the fallback path). Draining a whole ring of 16
+/// serially could keep the monitor away from the next in-flight sample for
+/// roughly twenty seconds, so the rest stay pending for the next poll. One
+/// report is still written per completed episode.
+const MAX_COMPLETED_REPORTS_PER_POLL: usize = 4;
 /// Minimum interval between two `SIGUSR1`-requested dumps.
 #[cfg(unix)]
 const SIGNAL_REPORT_INTERVAL: Duration = Duration::from_secs(1);
@@ -893,6 +904,25 @@ impl MonitorState {
         let tick = self.pending_ticks.pop_front()?;
         self.reported_at = Some(now);
         Some(tick)
+    }
+
+    /// Pops up to [`MAX_COMPLETED_REPORTS_PER_POLL`] completed ticks, oldest
+    /// first.
+    ///
+    /// The remainder stays queued so a drained burst cannot keep the monitor
+    /// from sampling the next in-flight stall for the whole delivery budget.
+    fn take_completed_batch(
+        &mut self,
+        now: Instant,
+    ) -> [Option<CompletedTick>; MAX_COMPLETED_REPORTS_PER_POLL] {
+        let mut batch = [None; MAX_COMPLETED_REPORTS_PER_POLL];
+        for slot in &mut batch {
+            *slot = self.next_completed_report(now);
+            if slot.is_none() {
+                break;
+            }
+        }
+        batch
     }
 
     /// Takes the ring-overflow span for the next report.
@@ -1660,8 +1690,10 @@ fn monitor_loop(
         // Completed over-bound ticks are independent evidence: a progress
         // change on this poll must not discard them, and each one gets its own
         // report oldest first. The tick that completed a reported in-flight
-        // stall was already dropped by `accept_tick_drain`.
-        while let Some(tick) = state.next_completed_report(now) {
+        // stall was already dropped by `accept_tick_drain`. The batch is
+        // capped so a burst cannot delay the next in-flight sample for the
+        // whole delivery budget; the rest carry to the next poll.
+        for tick in state.take_completed_batch(now).into_iter().flatten() {
             let report = build_report(
                 shared,
                 config,
@@ -1707,6 +1739,27 @@ fn monitor_loop(
             }
             delivery.record(sink(&rendered));
             maybe_abort_after_report();
+        }
+        // A ring gap observed by this poll may not have found a report: every
+        // retained tick was under the bound and no phase/no-present stall
+        // fired. Write a minimal bounded line through the same sink and slot
+        // so overflow is never silent (bitty#2830 review N2). A report built
+        // above already took and rendered the gap.
+        if let Some(gap) = state.take_tick_gap() {
+            if stop.is_stopped() {
+                return;
+            }
+            let line = format!(
+                "{STALL_REPORT_PREFIX}: completed-tick ring gap (capacity={} missed_at_most={} seq={}..{}, phase={}, app_uptime={} ms, pid={})",
+                TICK_RING_CAPACITY,
+                gap.missed(),
+                gap.from,
+                gap.to,
+                phase.as_str(),
+                shared.start.elapsed().as_millis(),
+                std::process::id(),
+            );
+            delivery.record(sink(&line));
         }
     }
 }
@@ -2035,7 +2088,7 @@ fn render_report(report: &StallReport) -> String {
     if let Some(gap) = report.tick_gap {
         let _ = writeln!(
             out,
-            "  tick-ring: capacity={} missed={} seq={}..{}",
+            "  tick-ring: capacity={} missed_at_most={} seq={}..{}",
             TICK_RING_CAPACITY,
             gap.missed(),
             gap.from,
@@ -4458,7 +4511,42 @@ mod tests {
         );
         let rendered = render_report(&report);
         assert!(
-            rendered.contains("tick-ring: capacity=16 missed=4 seq=1..4"),
+            rendered.contains("tick-ring: capacity=16 missed_at_most=4 seq=1..4"),
+            "{rendered}"
+        );
+    }
+
+    /// bitty#2830 review N3: merged spans include retained sequences between
+    /// them, so the rendered count is explicitly an upper bound.
+    #[test]
+    fn merged_tick_gaps_render_an_upper_bound() {
+        let mut gap = None;
+        merge_tick_gap(&mut gap, TickGap { from: 3, to: 4 });
+        merge_tick_gap(&mut gap, TickGap { from: 10, to: 12 });
+        let gap = gap.expect("merged gap");
+        assert_eq!(gap, TickGap { from: 3, to: 12 });
+        // Sequences 5..=9 are retained between the two gaps; the count is the
+        // span length, not an exact lost-entry count.
+        assert_eq!(gap.missed(), 10);
+
+        let gauges = Arc::new(HangGauges::new());
+        let shared = Shared::new(Arc::clone(&gauges));
+        let report = build_report(
+            &shared,
+            WatchdogConfig::with_threshold_ms(10_000),
+            DiagnosticReason::Stall,
+            ReportSample {
+                phase: Phase::RuntimeTick,
+                idle: Duration::from_millis(1),
+                tick_gap: Some(gap),
+            },
+            Instant::now(),
+            DeliverySummary::default(),
+            None,
+        );
+        let rendered = render_report(&report);
+        assert!(
+            rendered.contains("tick-ring: capacity=16 missed_at_most=10 seq=3..12"),
             "{rendered}"
         );
     }
@@ -4549,6 +4637,123 @@ mod tests {
             MonitorAction::Recovered {
                 stalled_for: long - bound,
             }
+        );
+    }
+
+    /// bitty#2830 review N2: a ring gap with no other report must still be
+    /// delivered. Twenty fast ticks cannot produce a pending over-bound
+    /// report, so only the fallback line can carry the overflow evidence.
+    #[test]
+    fn tick_ring_gap_is_delivered_without_any_stall_report() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let gauges = Arc::new(HangGauges::new());
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(600_000),
+            Arc::clone(&gauges),
+            Box::new(move |line| {
+                let _ = tx.send(line.to_string());
+                DeliveryOutcome::Delivered
+            }),
+        );
+        watchdog.idle();
+        // Let the monitor settle on the empty ring so the whole burst is one
+        // observed overflow.
+        std::thread::sleep(Duration::from_millis(150));
+        for _ in 0..(TICK_RING_CAPACITY + 4) {
+            gauges.record_tick_for_test(Duration::from_millis(1));
+        }
+        let line = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a ring gap must be delivered without a stall report");
+        assert!(line.starts_with(STALL_REPORT_PREFIX), "{line}");
+        assert!(line.contains("completed-tick ring gap"), "{line}");
+        assert!(line.contains("capacity=16"), "{line}");
+        assert!(line.contains("missed_at_most=4"), "{line}");
+        assert!(line.contains("seq=1..4"), "{line}");
+        assert!(line.contains("phase=idle"), "{line}");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(400)).is_err(),
+            "the gap is delivered exactly once"
+        );
+        watchdog.stop_and_join().expect("monitor exits");
+    }
+
+    /// bitty#2830 review N4: the completed-tick ring path through the real
+    /// monitor loop. The phase is idle and the generic bound is 600 s, so the
+    /// in-flight detector cannot produce this report; only the ring can.
+    #[test]
+    fn completed_tick_ring_reports_through_the_monitor_loop() {
+        let (tx, rx) = mpsc::channel::<String>();
+        let gauges = Arc::new(HangGauges::new());
+        let watchdog = StallWatchdog::start(
+            WatchdogConfig::with_threshold_ms(600_000),
+            Arc::clone(&gauges),
+            Box::new(move |line| {
+                let _ = tx.send(line.to_string());
+                DeliveryOutcome::Delivered
+            }),
+        );
+        watchdog.idle();
+        // Let the monitor capture its initial tick sequence before the seeded
+        // tick so the drain sees it (a startup watermark of 1 would ignore it).
+        std::thread::sleep(Duration::from_millis(150));
+        let measured = Duration::from_millis(4_500);
+        gauges.record_tick_for_test(measured);
+        let line = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a completed over-bound tick must report");
+        assert!(line.starts_with(STALL_REPORT_PREFIX), "{line}");
+        assert!(line.contains("phase=runtime-tick"), "{line}");
+        assert!(line.contains("reason=stall"), "{line}");
+        assert!(line.contains("no progress for 4500 ms"), "{line}");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "one report per completed tick"
+        );
+        watchdog.stop_and_join().expect("monitor exits");
+    }
+
+    /// bitty#2830 review N5: a drained burst is delivered in bounded batches
+    /// and the remainder carries to the next poll.
+    #[test]
+    fn completed_report_batch_is_capped_and_carried() {
+        let gauges = Arc::new(HangGauges::new());
+        for _ in 0..(MAX_COMPLETED_REPORTS_PER_POLL + 2) {
+            gauges.record_tick_for_test(Duration::from_millis(4_000));
+        }
+        let mut state = MonitorState::new(Instant::now(), 0, 0, 0);
+        state.accept_tick_drain(gauges.drain_ticks_since(0), HANG_WATCHDOG_TICK_BOUND);
+        let now = Instant::now();
+        let first: Vec<u64> = state
+            .take_completed_batch(now)
+            .iter()
+            .flatten()
+            .map(|tick| tick.seq)
+            .collect();
+        assert_eq!(
+            first,
+            (1..=MAX_COMPLETED_REPORTS_PER_POLL as u64).collect::<Vec<_>>()
+        );
+        let second: Vec<u64> = state
+            .take_completed_batch(now)
+            .iter()
+            .flatten()
+            .map(|tick| tick.seq)
+            .collect();
+        assert_eq!(
+            second,
+            vec![
+                MAX_COMPLETED_REPORTS_PER_POLL as u64 + 1,
+                MAX_COMPLETED_REPORTS_PER_POLL as u64 + 2,
+            ]
+        );
+        assert!(
+            state
+                .take_completed_batch(now)
+                .iter()
+                .flatten()
+                .next()
+                .is_none()
         );
     }
 

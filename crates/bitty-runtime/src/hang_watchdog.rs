@@ -26,7 +26,7 @@
 //! monitor can report every over-bound tick, not only the latest one.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
 
 /// Number of completed tick records retained for the hang watchdog.
 ///
@@ -115,7 +115,7 @@ impl TickRingDrain {
         self.last_seq
     }
 
-    /// Sequences overwritten before this drain, when any.
+    /// Span containing sequences overwritten before this drain, when any.
     #[must_use]
     pub const fn gap(&self) -> Option<TickGap> {
         self.gap
@@ -139,10 +139,12 @@ impl TickRingDrain {
 
 /// One ring slot.
 ///
-/// `stamp` is a seqlock word: `(seq << 1) | writing`. The producer sets the
-/// odd "writing" stamp before storing `duration_ns` and the even sequence
-/// stamp after, so a reader that races a rewrite sees either an odd stamp or a
-/// changed stamp and rejects the pair. The logical sequence is `stamp >> 1`.
+/// `stamp` is a seqlock word: `(seq << 1) | writing`. The producer stores the
+/// odd "writing" stamp with `Release`, fences, stores `duration_ns`, and
+/// stores the even sequence stamp with `Release`; the fences are what order
+/// the duration on weak-memory targets. A reader that races a rewrite sees
+/// either an odd stamp or a changed stamp and rejects the pair. The logical
+/// sequence is `stamp >> 1`.
 #[derive(Debug, Default)]
 struct TickRingSlot {
     stamp: AtomicU64,
@@ -390,12 +392,18 @@ impl HangGauges {
     ///
     /// Caller contract: exactly one producer (the runtime owner thread) calls
     /// this; readers never write. The slot uses a seqlock: the odd "writing"
-    /// stamp is published with `Release` before the duration, the even
-    /// sequence stamp after it, and only then `tick_count` announces the
-    /// sequence with `Release`. A reader that observes sequence `S` in the
-    /// counter therefore observes the completed slot `S`, and a reader that
-    /// races a rewrite rejects the pair and surfaces a [`TickGap`] instead of
-    /// pairing a sequence with another tick's duration.
+    /// stamp is stored with `Release`, a `Release` fence orders it before the
+    /// duration, the even sequence stamp is stored with `Release` (ordering
+    /// the duration before it), and only then `tick_count` announces the
+    /// sequence with `Release`.
+    ///
+    /// The fences are load-bearing on weak-memory targets (macOS ARM64 is
+    /// shipped): a `Release` store orders *prior* operations, not the
+    /// following duration store, so without the first fence the duration
+    /// could become visible before the odd stamp. A reader that observes
+    /// sequence `S` in the counter therefore observes the completed slot `S`,
+    /// and a reader that races a rewrite rejects the pair and surfaces a
+    /// [`TickGap`] instead of pairing a sequence with another tick's duration.
     ///
     /// `last_tick_ns`, `max_tick_ns`, and `tick_count` remain display values
     /// for the report body; per-tick decisions use [`Self::drain_ticks_since`].
@@ -404,7 +412,11 @@ impl HangGauges {
         let slot = &self.tick_ring[(seq % TICK_RING_CAPACITY as u64) as usize];
         let stamp = seq << 1;
         slot.stamp.store(stamp | 1, Ordering::Release);
+        // Release store orders prior operations; the fence makes the odd
+        // stamp visible before the duration on weak-memory targets.
+        fence(Ordering::Release);
         slot.duration_ns.store(elapsed_ns, Ordering::Relaxed);
+        // The Release store of the even stamp orders the duration before it.
         slot.stamp.store(stamp, Ordering::Release);
         self.last_tick_ns.store(elapsed_ns, Ordering::Relaxed);
         self.max_tick_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
@@ -417,9 +429,12 @@ impl HangGauges {
     /// free. Every sequence between `last_seen + 1` and [`TickRingDrain::last_seq`]
     /// is either returned or covered by [`TickRingDrain::gap`]; the caller
     /// never silently loses a retained tick. A duration is accepted only when
-    /// the slot's sequence still matches both before and after the read, so a
-    /// slot rewritten by a newer tick is rejected rather than paired with the
-    /// wrong sequence.
+    /// the slot's sequence stamp still matches both before and after the read.
+    /// The reader's `Acquire` fence between the duration load and the second
+    /// stamp load is load-bearing: an `Acquire` load orders later operations,
+    /// not the following plain load, so without the fence a rewrite could slip
+    /// between the duration read and the check and pair a newer duration with
+    /// the old sequence. A rewritten slot is rejected and surfaced as a gap.
     #[must_use]
     pub fn drain_ticks_since(&self, last_seen: u64) -> TickRingDrain {
         let mut drain = TickRingDrain {
@@ -444,12 +459,15 @@ impl HangGauges {
             let slot = &self.tick_ring[(seq % TICK_RING_CAPACITY as u64) as usize];
             let stamp = seq << 1;
             let before = slot.stamp.load(Ordering::Acquire);
-            if before != stamp {
+            if before & 1 == 1 || before != stamp {
                 // Overwritten by a newer tick, or the producer is mid-write.
                 drain.note_gap(seq);
                 continue;
             }
             let duration_ns = slot.duration_ns.load(Ordering::Relaxed);
+            // Make the duration load visible before the second stamp check;
+            // Acquire alone on `before` does not order the following load.
+            fence(Ordering::Acquire);
             let after = slot.stamp.load(Ordering::Acquire);
             if after != before {
                 drain.note_gap(seq);

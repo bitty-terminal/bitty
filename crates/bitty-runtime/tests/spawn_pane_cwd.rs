@@ -4,9 +4,11 @@
 //! These probes activate a real local-path package, dispatch a registered
 //! command, and run the real `[tools.git]` backend (subject to the same
 //! Landlock confinement as production on Linux). The pane directory is
-//! supplied by a [`PaneCwdSource`] the test controls — the same seam the
-//! application fills from its live `LiveSnapshot` — so a pane `cd` is
-//! observed without reloading the plugin.
+//! supplied by a [`PaneCwdSource`]: most tests control it directly, while the
+//! security-review probes feed the real host-observed model — raw `OSC 7`
+//! pane bytes and a focused session-less view — so the untrusted channel and
+//! the fail-closed focus case are covered without a test seam substituting a
+//! path.
 //!
 //! The acceptance shape is the git-panel one: the child's working directory
 //! is the pane's, the host process cwd is not consulted, a plugin path is
@@ -25,6 +27,7 @@ use bitty_runtime::plugin_runtime::{
     EmptySettings, LifecycleState, PaneCwdSource, PluginRuntime, PluginRuntimeConfig,
     SnapshotSource, UnavailableSnapshot,
 };
+use bitty_runtime::{LayoutNode, Runtime, SplitAxis, View, ViewId};
 
 const PROBE_ID: &str = "bitty-featured.pane-cwd-probe";
 
@@ -44,6 +47,29 @@ impl PaneCwdSource for SharedPaneCwd {
     fn pane_cwd(&self) -> Option<PathBuf> {
         self.path.borrow().clone()
     }
+}
+
+/// Adapter over the real host-observed terminal model, so a test can prove
+/// the resolver reads exactly what a pane program reported over `OSC 7`.
+struct RuntimePaneCwd {
+    runtime: Rc<RefCell<Runtime>>,
+}
+
+impl PaneCwdSource for RuntimePaneCwd {
+    fn pane_cwd(&self) -> Option<PathBuf> {
+        self.runtime.borrow().focused_pane_cwd()
+    }
+}
+
+/// Raw `OSC 7` bytes, the untrusted channel a pane program drives.
+fn osc7(dir: &Path) -> Vec<u8> {
+    let url = dir.display().to_string().replace(' ', "%20");
+    format!("\x1b]7;file://{url}\x07").into_bytes()
+}
+
+/// One layout leaf for focus/panel probes.
+fn leaf(id: u64) -> LayoutNode {
+    LayoutNode::leaf(View::new(ViewId::new(id), 80, 24))
 }
 
 /// Unique scratch root under the platform temp dir.
@@ -127,7 +153,7 @@ bitty.commands.register({
 }
 
 /// Activated runtime over a dev-root package.
-fn runtime(root: &Path, pane: Option<Rc<SharedPaneCwd>>) -> PluginRuntime {
+fn runtime_with_source(root: &Path, pane: Option<Rc<dyn PaneCwdSource>>) -> PluginRuntime {
     let snapshot: Rc<dyn SnapshotSource> = Rc::new(UnavailableSnapshot);
     let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
@@ -153,6 +179,11 @@ fn runtime(root: &Path, pane: Option<Rc<SharedPaneCwd>>) -> PluginRuntime {
         "probe package activates"
     );
     runtime
+}
+
+/// Activated runtime with the test-controlled pane source.
+fn runtime(root: &Path, pane: Option<Rc<SharedPaneCwd>>) -> PluginRuntime {
+    runtime_with_source(root, pane.map(|pane| pane as Rc<dyn PaneCwdSource>))
 }
 
 fn dispatch(runtime: &mut PluginRuntime) -> common::SettledDispatch {
@@ -272,6 +303,84 @@ fn plugin_without_the_spawn_capability_gets_a_capability_denial() {
     assert_eq!(
         output, "ERR:E_CAPABILITY_DENIED",
         "no spawn capability means no pane probe"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn raw_osc7_pane_report_is_the_resolution_source() {
+    // CTX-1715 security review: the resolver's input is the untrusted pane
+    // `OSC 7` channel, fed end to end from raw terminal bytes through the
+    // host-observed model into the real spawn backend. No test seam supplies
+    // the path directly: the bytes a pane program emits select the directory.
+    let root = scratch("osc7-source");
+    let repo = git_repo(&root.join("pane"), "osc7-source", "osc7.txt");
+    write_probe(&root, &["process.spawn:git"]);
+
+    let terminal = Rc::new(RefCell::new(
+        Runtime::with_defaults().expect("headless terminal"),
+    ));
+    terminal.borrow_mut().handle_pty_bytes(&osc7(&repo));
+    assert_eq!(
+        terminal.borrow().focused_pane_cwd().as_deref(),
+        Some(repo.as_path()),
+        "the raw OSC 7 report is the decoded resolution source"
+    );
+
+    let mut runtime =
+        runtime_with_source(&root, Some(Rc::new(RuntimePaneCwd { runtime: terminal })));
+    let output = dispatch(&mut runtime).expect_string("run");
+    let (toplevel, status) = output.split_once('|').expect("two sections");
+    assert_eq!(
+        Path::new(toplevel.trim()),
+        repo.as_path(),
+        "the child must run in the directory the raw OSC 7 report named"
+    );
+    assert!(status.contains("osc7.txt"), "{status:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn focused_view_without_a_terminal_session_refuses_pane_cwd() {
+    // CTX-1715 security review: a focused view with no terminal session (a
+    // panel-like surface) has no pane report. The resolver must refuse rather
+    // than fall back to the primary grid's report or the host process cwd.
+    let root = scratch("no-session");
+    let primary = root.join("primary");
+    std::fs::create_dir_all(&primary).expect("primary dir");
+    write_probe(&root, &["process.spawn:git"]);
+
+    let terminal = Rc::new(RefCell::new(
+        Runtime::with_defaults().expect("headless terminal"),
+    ));
+    {
+        let mut rt = terminal.borrow_mut();
+        // The primary grid reports a usable directory...
+        rt.handle_pty_bytes(&osc7(&primary));
+        assert!(rt.primary_cwd().is_some(), "primary report is present");
+        // ...but focus moves to a session-less non-primary view: no private
+        // pane session, so there is no report for the resolver to use.
+        rt.set_layout(LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            leaf(1),
+            leaf(2),
+        ));
+        assert!(rt.set_focus(ViewId::new(2)), "focus the session-less view");
+        assert_eq!(
+            rt.focused_pane_cwd(),
+            None,
+            "a session-less focused view has no pane cwd"
+        );
+    }
+
+    let mut runtime =
+        runtime_with_source(&root, Some(Rc::new(RuntimePaneCwd { runtime: terminal })));
+    let output = dispatch(&mut runtime).expect_string("run");
+    assert_eq!(
+        output, "ERR:E_SPAWN_CWD_UNAVAILABLE",
+        "no session means a typed refusal, never the primary or host cwd"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

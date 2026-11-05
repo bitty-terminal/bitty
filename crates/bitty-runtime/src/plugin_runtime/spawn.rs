@@ -97,16 +97,22 @@
 //!   `<= 16 KiB` (`tool_dispatch::MAX_TOOL_ARGS_BYTES`).
 //! - `cwd`: a host-selected semantic only ([`SpawnCwd`]). The plugin may
 //!   request `pane` (`bitty.process.spawn(argv, { cwd = "pane" })`); the
-//!   host resolves that to the bound pane's `OSC 7` directory, validates it
-//!   (absolute, bounded, control-free, canonicalized, existing directory),
-//!   and records the resolved path in the audit entry. A plugin-supplied path
-//!   never reaches this module (CTX-1345 rejected one; CTX-1715 replaced the
-//!   rejection with the confined semantic). `pane` without a binding or a
-//!   usable report fails closed as `Denied[SpawnCwdUnavailable]`, never as a
-//!   silent host-cwd fallback. The cwd is a *starting directory*, not a
-//!   filesystem grant: it adds no read scope (plugin API reads still follow
-//!   the plugin's `fs` grants) and the child's inherited exec confinement is
-//!   unchanged.
+//!   host resolves the **globally focused view's** `OSC 7` directory at call
+//!   time, validates it (absolute, bounded, control-free, canonicalized,
+//!   existing directory), and records the resolved path in the audit entry.
+//!   The plugin cannot supply a path (CTX-1345 rejected one; CTX-1715
+//!   replaced the rejection with the semantic), but `OSC 7` is an untrusted
+//!   pane channel: any pane program, or displayed content that emits it, can
+//!   influence the report, and focus/terminal/write capabilities can steer
+//!   the focused pane. `pane` without a binding, session, or usable report
+//!   fails closed as `Denied[SpawnCwdUnavailable]`, never as a silent
+//!   host-cwd fallback. The cwd is a *starting directory*:
+//!   `process.spawn:git` is itself a repository-read capability, so the
+//!   child reads the pane tree with the user's OS authority (the plugin
+//!   API's reads still follow `fs` grants) and the inherited exec
+//!   confinement is unchanged. Repo metadata (`.git`/`core.worktree`) is a
+//!   separate channel that the argv denials do not close; `.git` policy and
+//!   an inode-bound cwd are tracked follow-ups.
 //! - Env: at most `64` explicit entries with [`EnvVar`] grammar
 //!   (`devtools::MAX_INPUT_RING`, `auth`/`ctl` field bounds).
 //! - Timeout `1..=30_000` ms, default `5_000` ms
@@ -1413,8 +1419,9 @@ impl SpawnService {
         {
             Ok(authorized) => {
                 // CTX-1715: the audit records the host-resolved directory
-                // on the allow path. The plugin never supplied it, and it
-                // is the canonical path this child actually started in.
+                // on the allow path. The plugin never supplied it; this is
+                // the authorized canonical path, not proof of the child's
+                // cwd on failure or under a path swap.
                 self.audit.push_decision_with_cwd(
                     &request.tool,
                     &request.args,
@@ -1912,10 +1919,13 @@ pub fn git_spawn_backend(plugin_id: impl Into<String>) -> super::services::Spawn
 /// never supply a path, and the resolved canonical directory is recorded in
 /// the spawn audit ledger.
 ///
-/// The cwd is a starting directory, not a filesystem grant: it adds no read
-/// scope (plugin API reads still follow the plugin's `fs` grants) and the
-/// child's inherited exec confinement is unchanged. `-C`, `--git-dir`, and
-/// `--work-tree` stay denied.
+/// The cwd is a starting directory, not a filesystem grant.
+/// `process.spawn:git` is itself a repository-read capability: the child
+/// reads the pane tree with the user's OS authority, not through the plugin's
+/// `fs` grants (the plugin API's reads still follow those grants), and the
+/// inherited exec confinement is unchanged. `-C`, `--git-dir`, and
+/// `--work-tree` stay denied for argv, but repository metadata is a separate
+/// channel; `.git` policy and an inode-bound cwd are tracked follow-ups.
 #[must_use]
 pub fn git_spawn_backend_with_pane_cwd(
     plugin_id: impl Into<String>,

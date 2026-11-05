@@ -82,23 +82,37 @@ local result = bitty.process.spawn(
 ```
 
 `cwd` selects a **semantic**, never a path. `"pane"` asks the host to run the
-child in the directory of the terminal pane the calling plugin is bound to
-(the host-observed focused pane, the same live model behind
-`bitty.terminal.snapshot`). The host validates the resolved directory
-(absolute, at most 4096 bytes, no NUL or control bytes, canonicalized, an
-existing directory) and records the resolved canonical path in the plugin
-spawn audit entry. A plugin can never supply, override, or influence that
-path.
+child in the directory of the **globally focused view at call time** (there is
+no per-plugin pane binding), resolved from that pane's `OSC 7` report — the
+same live model behind `bitty.terminal.snapshot`. The host validates the
+resolved directory (absolute, at most 4096 bytes, no NUL or control bytes,
+canonicalized, an existing directory) and records the resolved canonical path
+in the plugin spawn audit entry.
 
-| Item                      | Contract                                                                                                                                                                                                                        |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cwd`                     | Optional string. `"pane"` is the only accepted value. An absolute or relative path, `~`, `..`, a symlink target, an empty string, and a wrong-case token are all `E_DEF_INVALID` before the host call.                          |
-| Unknown options           | `E_DEF_INVALID`; no option is ever silently ignored. A table mixing `cwd = "pane"` with an unknown key is refused regardless of key order.                                                                                      |
-| `E_SPAWN_CWD_UNAVAILABLE` | The host has no pane binding, the bound pane has not reported a directory (`OSC 7`), or the report is unusable. The spawn never falls back to the host process cwd.                                                             |
-| Unchanged refusals        | The `-C`, `--git-dir`, and `--work-tree` argv denials and the `[tools.git]` executable allowlist are unchanged; the pane directory selects the repository, argv may not.                                                        |
-| Not a filesystem grant    | The pane directory is a **starting directory**, not an `fs` grant. It does not widen what the plugin may read: plugin API reads still follow `fs.read`/`fs.write`, and the child keeps the existing inherited exec confinement. |
-| Reload-free               | The source is read per call, so changing the pane directory changes the result without reloading the plugin.                                                                                                                    |
-| Unchanged calls           | Omitting the option keeps the host default (no child cwd), so existing calls stay valid.                                                                                                                                        |
+A plugin cannot **supply** that path. The resolver's input is the pane's
+`OSC 7` report, which is an untrusted terminal channel: any program running in
+a pane, and displayed content that emits `OSC 7`, can influence the reported
+value, and a plugin holding focus, terminal-input, or write capabilities can
+also steer the focused pane or its contents. None of that hands the resolver a
+plugin-supplied path; it only changes which host-observed directory the
+resolver sees.
+
+| Item                      | Contract                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cwd`                     | Optional string. `"pane"` is the only accepted value. An absolute or relative path, `~`, `..`, a symlink target, an empty string, and a wrong-case token are all `E_DEF_INVALID` before the host call.                                                                                                                                      |
+| Unknown options           | `E_DEF_INVALID`; no option is ever silently ignored. A table mixing `cwd = "pane"` with an unknown key is refused regardless of key order.                                                                                                                                                                                                  |
+| `E_SPAWN_CWD_UNAVAILABLE` | The host has no pane binding, the focused view has no terminal session, the pane has not reported a directory (`OSC 7`), or the report is unusable. The spawn never falls back to the host process cwd.                                                                                                                                     |
+| Unchanged refusals        | The `-C`, `--git-dir`, and `--work-tree` argv denials and the `[tools.git]` executable allowlist are unchanged; they close argv-selected directories, not repository metadata (see below).                                                                                                                                                  |
+| Not a filesystem grant    | The pane directory is a **starting directory**, not an `fs` grant. `process.spawn:git` is itself a repository-read capability: the child reads the pane tree with the user's OS authority, not through the plugin's `fs` grants. The plugin API's reads still follow `fs.read`/`fs.write`, and the inherited exec confinement is unchanged. |
+| Reload-free               | The source is read per call, so changing the pane directory changes the result without reloading the plugin.                                                                                                                                                                                                                                |
+| Unchanged calls           | Omitting the option keeps the host default (no child cwd), so existing calls stay valid.                                                                                                                                                                                                                                                    |
+
+**Repository metadata is a separate channel.** The `-C`, `--git-dir`, and
+`--work-tree` denials close argv-selected directories, not repository
+selection: a resolved pane tree can carry `.git`/`core.worktree` metadata
+that points `git` at another repository, and a plugin able to write the pane
+tree could plant it (latent today, because `fs.write` is not implemented).
+`.git` policy and an inode-bound cwd are tracked follow-ups.
 
 ## Evidence
 

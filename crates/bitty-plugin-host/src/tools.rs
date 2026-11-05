@@ -460,8 +460,10 @@ pub struct ToolSpawnEntry {
     pub args_omitted: usize,
     /// Host-resolved working directory for this spawn, when the host resolved
     /// one (CTX-1715). Never plugin-supplied: the value is the canonical
-    /// directory the child started in, recorded for attribution. `None` means
-    /// the host default (no child cwd) or a decision that preceded resolution.
+    /// directory the host authorized for the child, recorded for attribution.
+    /// It is not proof of the child's actual cwd on failure or under a path
+    /// swap. `None` means the host default (no child cwd) or a decision that
+    /// preceded resolution.
     pub cwd: Option<String>,
     /// Bounded host-authored detail (tool/caller/counts/cwd only, never env).
     pub detail: String,
@@ -508,10 +510,10 @@ impl ToolSpawnLedger {
     /// directory (CTX-1715).
     ///
     /// `cwd` is host-derived by construction: it names the canonical
-    /// directory the child started in (or `None` for the host default / a
-    /// decision that preceded resolution). It is never a plugin-supplied
-    /// path: the plugin selects only the `pane` semantic and the host
-    /// resolves it. The recorded copy is clamped to
+    /// directory the host authorized for the child (or `None` for the host
+    /// default / a decision that preceded resolution). It is never a
+    /// plugin-supplied path: the plugin selects only the `pane` semantic and
+    /// the host resolves it. The recorded copy is clamped to
     /// [`MAX_TOOL_SPAWN_CWD_BYTES`]; clamping never affects authorization.
     ///
     /// # Logging

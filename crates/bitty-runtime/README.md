@@ -98,18 +98,26 @@ diagram lives in `src/lib.rs`.
 ## Plugin spawn working directory (CTX-1715)
 
 `bitty.process.spawn(argv, { cwd = "pane" })` selects the working directory of
-the calling plugin's focused pane. `bitty-terminal` publishes that directory
-from the same live model that serves `bitty.terminal.snapshot` (`LiveSnapshot`
-implements `PaneCwdSource`); `PluginRuntime` binds the source at activation
-(and otherwise refuses the semantic), and `SpawnService` canonicalizes it per
+the **globally focused view at call time** — there is no per-plugin pane
+binding. `bitty-terminal` publishes that directory from the same live model
+that serves `bitty.terminal.snapshot` (`LiveSnapshot` implements
+`PaneCwdSource`); `PluginRuntime` binds the source at activation (and
+otherwise refuses the semantic), and `SpawnService` canonicalizes it per
 dispatch — UTF-8, absolute, at most 4096 bytes, no NUL or control bytes,
 canonicalized, an existing directory — before recording the resolved path in
-the spawn audit ledger and handing it to the supervisor. A missing binding or
-`OSC 7` report fails closed with `E_SPAWN_CWD_UNAVAILABLE`; a plugin-supplied
-path never crosses the Lua bridge. The cwd is a starting directory, not a
-filesystem grant: it adds no read scope (plugin API reads still follow `fs`
-grants), the Landlock exec confinement is unchanged, and `-C`, `--git-dir`,
-and `--work-tree` remain denied in argv.
+the spawn audit ledger and handing it to the supervisor. A missing binding, a
+focused view without a terminal session, a missing `OSC 7` report, or an
+unusable report fails closed with `E_SPAWN_CWD_UNAVAILABLE`; a plugin-supplied
+path never crosses the Lua bridge.
+
+The cwd is a starting directory, not a filesystem grant. `process.spawn:git`
+is itself a repository-read capability: the child reads the pane tree with the
+user's OS authority, not through the plugin's `fs` grants (the plugin API's
+reads still follow those grants), and the Landlock exec confinement is
+unchanged. The `-C`, `--git-dir`, and `--work-tree` denials remain, but
+repository metadata (`.git`/`core.worktree`) is a separate channel that those
+argv denials do not close; `.git` policy and an inode-bound cwd are tracked
+follow-ups.
 
 ## Session attach/detach seam (bitty#2729, CTX-1655)
 

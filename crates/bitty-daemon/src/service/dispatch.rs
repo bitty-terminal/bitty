@@ -5462,13 +5462,132 @@ mod tests {
         assert_eq!(exec_session["cleanup"], "not_started");
         assert_eq!(exec_session["spawn_failure"], "exec_permission_denied");
 
-        assert_ne!(
-            pty_session["spawn_failure"], exec_session["spawn_failure"],
-            "a PTY allocation failure and an exec refusal are distinguishable on the wire (bitty#2790)"
-        );
         assert!(
             service.workers.is_empty(),
             "no handle may survive a refused exec"
+        );
+    }
+
+    /// One row of the `spawn_failure()` table: the input, a hand-written
+    /// expectation, and the hand-written wire spelling of that expectation.
+    struct FunnelCase {
+        what: &'static str,
+        error: WorkerSpawnError,
+        expected: Option<(CleanupClass, SpawnFailure)>,
+        spellings: Option<(&'static str, &'static str)>,
+    }
+
+    /// The single funnel from a typed spawn refusal to the client-visible
+    /// `(CleanupClass, SpawnFailure)` pair (bitty#2790).
+    ///
+    /// Every expected value below is written out by hand rather than rebuilt
+    /// from the match table under test, so flipping any one arm of
+    /// `spawn_failure()` — including one `exec` sub-kind for another — fails
+    /// here instead of only changing what clients read off the wire.
+    #[test]
+    fn the_spawn_failure_funnel_maps_every_refusal_to_its_wire_class() {
+        use crate::containment::{ExecRefusal, ExecRefusalKind};
+
+        let cases = [
+            FunnelCase {
+                what: "a PTY allocation failure",
+                error: WorkerSpawnError::Pty,
+                expected: Some((CleanupClass::NotStarted, SpawnFailure::PtyAllocation)),
+                spellings: Some(("not_started", "pty_allocation")),
+            },
+            FunnelCase {
+                what: "an unmapped spawn refusal",
+                error: WorkerSpawnError::Spawn,
+                expected: Some((CleanupClass::NotStarted, SpawnFailure::SpawnError)),
+                spellings: Some(("not_started", "spawn_error")),
+            },
+            FunnelCase {
+                what: "EACCES from exec",
+                error: WorkerSpawnError::Exec(ExecRefusal::new(
+                    ExecRefusalKind::NotPermitted,
+                    nix::libc::EACCES,
+                )),
+                expected: Some((CleanupClass::NotStarted, SpawnFailure::ExecPermissionDenied)),
+                spellings: Some(("not_started", "exec_permission_denied")),
+            },
+            FunnelCase {
+                what: "ENOEXEC from exec",
+                error: WorkerSpawnError::Exec(ExecRefusal::new(
+                    ExecRefusalKind::NotExecutable,
+                    nix::libc::ENOEXEC,
+                )),
+                expected: Some((CleanupClass::NotStarted, SpawnFailure::ExecNotExecutable)),
+                spellings: Some(("not_started", "exec_not_executable")),
+            },
+            FunnelCase {
+                what: "ENOENT from exec",
+                error: WorkerSpawnError::Exec(ExecRefusal::new(
+                    ExecRefusalKind::NotFound,
+                    nix::libc::ENOENT,
+                )),
+                expected: Some((CleanupClass::NotStarted, SpawnFailure::ExecNotFound)),
+                spellings: Some(("not_started", "exec_not_found")),
+            },
+            FunnelCase {
+                what: "a handoff deadline before any child existed",
+                error: WorkerSpawnError::BindDeadline,
+                expected: Some((CleanupClass::NotStarted, SpawnFailure::BindDeadline)),
+                spellings: Some(("not_started", "bind_deadline")),
+            },
+            FunnelCase {
+                what: "a child that was not bindable, already swept",
+                error: WorkerSpawnError::NotBindable(CleanupClass::Swept),
+                expected: Some((CleanupClass::Swept, SpawnFailure::NotBindable)),
+                spellings: Some(("swept", "not_bindable")),
+            },
+            FunnelCase {
+                what: "a handoff timeout after the child existed, cleanup unverified",
+                error: WorkerSpawnError::BindTimeout(CleanupClass::Unverified),
+                expected: Some((CleanupClass::Unverified, SpawnFailure::BindTimeout)),
+                spellings: Some(("unverified", "bind_timeout")),
+            },
+            FunnelCase {
+                what: "a post-spawn refusal, already swept",
+                error: WorkerSpawnError::Cleanup(CleanupClass::Swept),
+                expected: Some((CleanupClass::Swept, SpawnFailure::PostSpawnRefusal)),
+                spellings: Some(("swept", "post_spawn_refusal")),
+            },
+            FunnelCase {
+                what: "a cell that does not serve the worker path",
+                error: WorkerSpawnError::Unsupported,
+                expected: None,
+                spellings: None,
+            },
+        ];
+
+        for case in cases {
+            let actual = spawn_failure(case.error);
+            assert_eq!(
+                actual, case.expected,
+                "{} maps to the wrong refusal pair",
+                case.what
+            );
+            match (actual, case.spellings) {
+                (Some((cleanup, failure)), Some(pair)) => assert_eq!(
+                    (cleanup.as_str(), failure.as_str()),
+                    pair,
+                    "{} reads back as the wrong wire spelling",
+                    case.what
+                ),
+                (None, None) => {}
+                _ => panic!(
+                    "{} must map to a terminal record, not a capability denial",
+                    case.what
+                ),
+            }
+        }
+
+        // The carried cleanup class is echoed, not defaulted: a class the
+        // caller proved must survive the funnel unchanged.
+        assert_eq!(
+            spawn_failure(WorkerSpawnError::Cleanup(CleanupClass::Unverified)),
+            Some((CleanupClass::Unverified, SpawnFailure::PostSpawnRefusal)),
+            "the proven cleanup class is carried through, never reset to not_started"
         );
     }
 

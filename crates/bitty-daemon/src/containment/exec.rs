@@ -61,7 +61,7 @@ impl ExecRefusalKind {
     }
 }
 
-/// One refused `exec`: the class plus the raw errno for the daemon log.
+/// One refused `exec`: the class plus the raw errno it was classified from.
 ///
 /// No child ran. `Command::spawn` reports the child's `exec` failure
 /// synchronously through its close-on-exec pipe, so this refusal always leaves

@@ -359,9 +359,9 @@ impl TerminalOutcome {
     /// # Errors
     ///
     /// Returns [`TerminalOutcomeError::Cleanup`] when a `not_started` cleanup
-    /// is claimed together with a class that requires a child to have existed
-    /// (a fork refusal is still `not_started`; an exec refusal never is, and
-    /// neither is a bind refusal).
+    /// is claimed together with a class that requires a child to have existed.
+    /// A fork or `exec` refusal requires no child, so `not_started` is the only
+    /// truthful claim for it; a bind refusal always requires one.
     pub fn spawn_failed(
         cleanup: CleanupClass,
         failure: SpawnFailure,

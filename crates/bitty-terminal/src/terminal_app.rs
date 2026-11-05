@@ -4484,6 +4484,11 @@ impl TerminalApp {
         if let Some(note) = backend_selection.log_note() {
             crate::logging::info(|| format!("bitty: gpu backend fallback ({note})"));
         }
+        // bitty#2830: only Wayland has the explicit-sync swapchain whose
+        // acquire can park the caller in `drm_syncobj_timeline_wait_ioctl`
+        // until the compositor next samples the surface. Every other display
+        // server (and headless attach) keeps the synchronous present path.
+        let off_thread_present = target.display_server().is_wayland();
         match pollster::block_on(GpuContext::initialize_for_surface(&target)) {
             Ok(gpu) => match gpu.create_surface(&target) {
                 Ok(surface) => {
@@ -4502,18 +4507,48 @@ impl TerminalApp {
                                     )
                                 });
                             }
-                            self.runtime.attach_gpu(gpu, surface);
-                            crate::logging::info(|| {
-                                format!(
-                                    "bitty: gpu attached (extent={}x{} scale={scale} dpi={} grid={}x{} text_stack={})",
-                                    extent.width(),
-                                    extent.height(),
-                                    self.runtime.dpi_scale(),
-                                    snap.width,
-                                    snap.height,
-                                    self.runtime.text_stack()
-                                )
-                            });
+                            let attached = if off_thread_present {
+                                // Ownership of the surface and GPU context
+                                // moves to the `bitty-present` worker.
+                                match self.runtime.attach_gpu_async(
+                                    gpu,
+                                    surface,
+                                    target.clone(),
+                                    extent,
+                                    self.window.opacity,
+                                ) {
+                                    Ok(()) => true,
+                                    Err(err) => {
+                                        crate::logging::warn(|| {
+                                            format!(
+                                                "bitty: off-thread presenter attach failed ({err}) — staying headless"
+                                            )
+                                        });
+                                        false
+                                    }
+                                }
+                            } else {
+                                self.runtime.attach_gpu(gpu, surface);
+                                true
+                            };
+                            if attached {
+                                crate::logging::info(|| {
+                                    format!(
+                                        "bitty: gpu attached (extent={}x{} scale={scale} dpi={} grid={}x{} text_stack={} presentation={})",
+                                        extent.width(),
+                                        extent.height(),
+                                        self.runtime.dpi_scale(),
+                                        snap.width,
+                                        snap.height,
+                                        self.runtime.text_stack(),
+                                        if off_thread_present {
+                                            "off-thread"
+                                        } else {
+                                            "synchronous"
+                                        }
+                                    )
+                                });
+                            }
                         }
                         Err(err) => {
                             crate::logging::warn(|| {
@@ -4551,6 +4586,16 @@ impl AppHandler for TerminalApp {
         // signal (plus once on EOF). `Mutex` keeps the closure `Send + Sync`
         // even if the proxy is only `Send`.
         let shared = std::sync::Arc::new(std::sync::Mutex::new(waker));
+        // bitty#2830: a presenter ack must wake the loop immediately so the
+        // committed frame is observed (and the next frame built) without
+        // waiting for an unrelated event or the bounded stuck wake.
+        let shared_present = std::sync::Arc::clone(&shared);
+        let present_wake: bitty_render::present::PresentWake = std::sync::Arc::new(move || {
+            if let Ok(w) = shared_present.lock() {
+                w.wake_pty();
+            }
+        });
+        self.runtime.set_present_waker(Some(present_wake));
         let shared_pty = std::sync::Arc::clone(&shared);
         let pty_waker: bitty_runtime::PtyWaker = std::sync::Arc::new(move || {
             if let Ok(w) = shared_pty.lock() {
@@ -5137,6 +5182,11 @@ impl TerminalApp {
                 // damage arms a bounded repair wake; without it a lost reveal
                 // parks the loop in `ControlFlow::Wait` forever.
                 let hidden_repair = self.runtime.hidden_repair_deadline();
+                // bitty#2830: while a frame is with the off-thread presenter,
+                // this is the stuck-present bound. The ack wake normally fires
+                // first; if the worker is wedged in the compositor, this wake
+                // is what notices and recovers instead of parking forever.
+                let present_recovery = self.runtime.present_recovery_deadline();
                 let wake = [
                     hover,
                     animation,
@@ -5150,6 +5200,7 @@ impl TerminalApp {
                     selection_auto,
                     surface_retry,
                     hidden_repair,
+                    present_recovery,
                 ]
                 .into_iter()
                 .flatten()

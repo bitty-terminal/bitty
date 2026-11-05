@@ -160,5 +160,5 @@ pub use keyboard::{
     ext_modifier_key,
 };
 pub use notification::{BellSink, OsBellSink, OsDeliveryOutcome, OsDeliverySkip};
-pub use surface::{SurfaceTarget, map_resize_to_surface_extent};
+pub use surface::{DisplayServer, SurfaceTarget, map_resize_to_surface_extent};
 pub use url::{URL_MAX_LEN, ValidatedUrl, validate_file_url, validate_url};

@@ -373,6 +373,15 @@ impl Runtime {
         if (sanitized - self.surface.opacity()).abs() < f32::EPSILON {
             return Ok(self.surface.opacity_alpha_supported());
         }
+        if let (Some(presenter), Some(extent)) = (self.presenter.as_mut(), self.surface.extent()) {
+            // bitty#2830: the worker owns the surface; the reconfigure is a
+            // message applied before the next acquire. The mirror follows so
+            // the runtime's own opacity queries stay truthful.
+            presenter.configure(extent, sanitized);
+            self.surface.set_opacity(sanitized);
+            self.pending_full_redraw = true;
+            return Ok(presenter.alpha_supported());
+        }
         match (self.gpu.as_ref(), self.surface.extent()) {
             (Some(gpu), Some(extent)) if !self.surface.is_headless() => {
                 self.surface

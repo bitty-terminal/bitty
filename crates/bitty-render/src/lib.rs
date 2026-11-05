@@ -287,6 +287,7 @@ pub mod gpu;
 pub mod grid;
 pub mod hidpi;
 pub(crate) mod pipeline;
+pub mod present;
 pub mod scene;
 pub mod shaped;
 pub mod telemetry;

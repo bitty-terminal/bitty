@@ -262,6 +262,58 @@ impl SurfaceTarget {
     pub fn scale_change_extent(&self, logical: LogicalSize) -> Option<PhysicalSize> {
         crate::dpi::surface_extent_from_logical(logical, self.source.scale_factor())
     }
+
+    /// The display-server protocol behind this window, when the platform
+    /// reports one.
+    ///
+    /// Used by the embedder to scope the off-thread presenter (bitty#2830) to
+    /// Wayland: that backend is the one whose explicit-sync swapchain can park
+    /// a caller inside `drm_syncobj_timeline_wait_ioctl` while the surface is
+    /// not composited. X11 and the non-Linux backends keep the synchronous
+    /// present path. A refused or unavailable display handle reports
+    /// [`DisplayServer::Unknown`] (the honest answer, not a guess).
+    #[must_use]
+    pub fn display_server(&self) -> DisplayServer {
+        self.source
+            .display_handle()
+            .as_ref()
+            .map_or(DisplayServer::Unknown, classify_display_server)
+    }
+}
+
+/// Classifies a raw display handle into the owned [`DisplayServer`] value.
+fn classify_display_server(handle: &RawDisplayHandle) -> DisplayServer {
+    match handle {
+        RawDisplayHandle::Wayland(_) => DisplayServer::Wayland,
+        RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_) => DisplayServer::X11,
+        _ => DisplayServer::Other,
+    }
+}
+
+/// Display-server protocol behind a [`SurfaceTarget`].
+///
+/// Owned re-description of the raw display handle; no upstream type is
+/// exposed. Only [`DisplayServer::Wayland`] selects the off-thread presenter
+/// today (bitty#2830).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DisplayServer {
+    /// Wayland compositor client connection.
+    Wayland,
+    /// X11 (Xlib or XCB connection).
+    X11,
+    /// A display server Bitty does not special-case (for example macOS
+    /// Cocoa or Windows Win32).
+    Other,
+    /// The platform could not report a display handle.
+    Unknown,
+}
+
+impl DisplayServer {
+    /// True for the Wayland protocol.
+    #[must_use]
+    pub const fn is_wayland(self) -> bool {
+        matches!(self, Self::Wayland)
+    }
 }
 
 /// Maps a resize-event size onto the extent a GPU surface should be
@@ -441,6 +493,35 @@ mod tests {
     fn resize_extent_mapping_keeps_non_zero_sizes() {
         let size = PhysicalSize::new(640, 480);
         assert_eq!(map_resize_to_surface_extent(size), Some(size));
+    }
+
+    // Unix-only: `WaylandDisplayHandle`/`XlibDisplayHandle` are `raw-window-
+    // handle`'s unix module, which is not exported on Windows/macOS.
+    #[cfg(unix)]
+    #[test]
+    fn display_server_classifies_every_protocol_family() {
+        use crate::raw_window_handle::{WaylandDisplayHandle, XlibDisplayHandle};
+        use std::ptr::NonNull;
+
+        let wayland = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(NonNull::dangling()));
+        assert_eq!(classify_display_server(&wayland), DisplayServer::Wayland);
+        assert!(DisplayServer::Wayland.is_wayland());
+        let xlib = RawDisplayHandle::Xlib(XlibDisplayHandle::new(Some(NonNull::dangling()), 0));
+        assert_eq!(classify_display_server(&xlib), DisplayServer::X11);
+        assert!(!DisplayServer::X11.is_wayland());
+        assert_eq!(
+            classify_display_server(&fixture_display()),
+            DisplayServer::Other
+        );
+        // A refused display handle is honestly unknown, not "other".
+        assert_eq!(
+            target(FakeSource {
+                fail_display: true,
+                ..FakeSource::ok()
+            })
+            .display_server(),
+            DisplayServer::Unknown
+        );
     }
 
     #[test]

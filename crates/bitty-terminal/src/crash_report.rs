@@ -389,7 +389,7 @@ fn render_lifecycle(last: Lifecycle) -> String {
 
 fn render_surface(surface: &bitty_render::telemetry::SurfaceTelemetrySnapshot) -> String {
     format!(
-        "last={} configure_ok={} configure_err={} acquire_ok={} acquire_timeout={} acquire_outdated={} acquire_lost={} acquire_other={} present_ok={} present_err={} resize={} resize_zero_skipped={} headless_present={} retry_failures={} retry_attempts={} retry_recoveries={} retry_last_delay_ms={}",
+        "last={} configure_ok={} configure_err={} acquire_ok={} acquire_timeout={} acquire_outdated={} acquire_lost={} acquire_other={} present_ok={} present_err={} resize={} resize_zero_skipped={} headless_present={} retry_failures={} retry_attempts={} retry_recoveries={} retry_last_delay_ms={} presenter_in_flight={} presenter_in_flight_since_ms={} presenter_in_flight_ms={} presenter_stuck_presents={} presenter_recoveries={} presenter_coalesced={} presenter_acks_dropped={}",
         surface.last_event,
         surface.configure_ok,
         surface.configure_err,
@@ -407,6 +407,13 @@ fn render_surface(surface: &bitty_render::telemetry::SurfaceTelemetrySnapshot) -
         surface.retry_attempts,
         surface.retry_recoveries,
         surface.retry_last_delay_ms,
+        surface.presenter_in_flight,
+        surface.presenter_in_flight_since_ms,
+        surface.presenter_in_flight_ms,
+        surface.presenter_stuck_presents,
+        surface.presenter_recoveries,
+        surface.presenter_coalesced,
+        surface.presenter_acks_dropped,
     )
 }
 

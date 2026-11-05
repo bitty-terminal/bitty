@@ -501,8 +501,21 @@ impl Runtime {
         // PTY winsize exclude the band through this one reflow path.
         self.window_cells = default_container(cols, rows);
         self.reflow_content_to_chrome();
-        // Surface resize: real GPU path when attached, else headless
-        if let Some(gpu) = self.gpu.as_ref() {
+        // Surface resize: real GPU path when attached, else headless.
+        // bitty#2830: with the off-thread presenter, the extent change is a
+        // worker message (the UI never calls `configure` on a surface the
+        // worker owns) and the runtime-side mirror follows it. The pending
+        // commit describes pre-resize geometry, so it is invalidated here:
+        // its ack can no longer publish allocations for the new layout.
+        if let Some(presenter) = self.presenter.as_mut() {
+            let opacity = self.surface.opacity();
+            // The live palette (OSC 4/10/11 overrides included) must survive
+            // the mirror replacement; `config.theme` is only the base table.
+            let palette = self.surface.theme_palette();
+            presenter.resize(surface_extent, opacity);
+            self.surface = super::headless_mirror(surface_extent, opacity, palette)?;
+            self.pending_present = None;
+        } else if let Some(gpu) = self.gpu.as_ref() {
             self.surface
                 .resize(gpu, surface_extent)
                 .map_err(RuntimeError::from)?;

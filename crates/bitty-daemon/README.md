@@ -1253,8 +1253,11 @@ cell), and
 
 `daemon.stop` also returns `unverified`, the number of bound workers the
 containment check could not prove gone. It is `0` for a registry-only or
-pre-bind stop and is the daemon-side input to exit code `5`; a worker that was
-verified gone keeps the clean result (`swept`).
+pre-bind stop and for the pidfd subreaper plan, whose advertised cleanup claim
+is `unverified` for every terminal transition; a structural fallback limitation
+is not an exit-`5` failure. On the cgroup v2 plan, a worker that was verified
+gone keeps the clean result (`swept`), and only a cleanup that could not prove
+the sweep counts toward exit code `5`.
 
 ### Served metadata fields (bitty#2806)
 

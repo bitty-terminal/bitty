@@ -14,14 +14,17 @@
 
 use std::time::Duration;
 
+#[cfg(unix)]
 use serde_json::{Value, json};
 
+#[cfg(unix)]
 use crate::contract::{MIN_CLIENT_MINOR, SERVICE_API_MAJOR};
 #[cfg(unix)]
 use crate::endpoint::{EndpointEnv, EndpointError, EndpointPaths};
 #[cfg(unix)]
 use crate::operator::{OperatorError, OperatorStore};
 use crate::service::dispatch::StopMode;
+#[cfg(unix)]
 use crate::service::wire;
 #[cfg(unix)]
 use std::io::{Read, Write};
@@ -232,6 +235,7 @@ fn exchange(
 }
 
 /// One parsed response envelope.
+#[cfg(unix)]
 struct Reply {
     ok: bool,
     result: Value,
@@ -240,6 +244,7 @@ struct Reply {
     counts: Option<(u64, u64)>,
 }
 
+#[cfg(unix)]
 impl Reply {
     fn from_value(value: Value) -> Option<Self> {
         let object = value.as_object()?;
@@ -278,6 +283,7 @@ impl Reply {
     }
 }
 
+#[cfg(unix)]
 fn refusal_from(reply: &Reply) -> StopError {
     if reply.class == "Unauthenticated" || reply.code == "Unauthenticated" {
         return StopError::Authentication;
@@ -289,6 +295,7 @@ fn refusal_from(reply: &Reply) -> StopError {
     }
 }
 
+#[cfg(unix)]
 fn parse_stop_result(result: &Value) -> Result<StopReply, StopError> {
     let mode = result
         .get("mode")
@@ -318,7 +325,7 @@ fn parse_stop_result(result: &Value) -> Result<StopReply, StopError> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

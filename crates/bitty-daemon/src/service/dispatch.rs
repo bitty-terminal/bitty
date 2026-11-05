@@ -69,7 +69,7 @@ use crate::audit::{
 };
 use crate::audit_sink::{AuditSink, AuditWriter};
 use crate::codes::RefusalCode;
-use crate::containment::{ContainmentReport, ExecRefusalKind};
+use crate::containment::{ContainmentKind, ContainmentReport, ExecRefusalKind};
 use crate::content::{CONTENT_FRAME_BYTES, ContentFrame};
 use crate::contract::{CAPABILITIES, Capabilities};
 use crate::events::{
@@ -163,6 +163,18 @@ struct TerminationReport {
     terminated: u64,
     /// Bound workers the containment check could not prove gone (`D-05`).
     unverified: u64,
+}
+
+/// Whether one stop cleanup is an unverified worker for `D-05` exit `5`.
+///
+/// `None` means the pool held no worker handle, so no worker existed to
+/// verify; that is not an unverified worker. `Some(Unverified)` is an exit-5
+/// condition only on a plan that can claim a verified sweep (cgroup v2). The
+/// pidfd subreaper plan advertises `cleanup: unverified` for every terminal
+/// transition by design (`containment` module table), so treating its normal
+/// stop as exit `5` would fail every stop on that supported fallback.
+fn stop_worker_unverified(plan: ContainmentKind, cleanup: Option<CleanupClass>) -> bool {
+    matches!(cleanup, Some(CleanupClass::Unverified)) && plan == ContainmentKind::CgroupV2
 }
 
 /// A static refusal.
@@ -2081,13 +2093,14 @@ impl Service {
             {
                 continue;
             }
-            let cleanup = self
-                .workers
-                .terminate(session_id)
-                .unwrap_or(CleanupClass::Unverified);
-            if cleanup == CleanupClass::Unverified {
+            let worker_cleanup = self.workers.terminate(session_id);
+            if stop_worker_unverified(self.containment.kind(), worker_cleanup) {
                 report.unverified = report.unverified.saturating_add(1);
             }
+            // A missing handle is not an unverified worker: the session never
+            // had a worker to verify, so its terminal record is `not_started`
+            // and any stale journal record is removed rather than quarantined.
+            let cleanup = worker_cleanup.unwrap_or(CleanupClass::NotStarted);
             let _ = self.workers.forget(session_id);
             let _ = self.orphans.settle(session_id, cleanup, now);
             if let Ok(Termination::Completed(notice)) = self.host.record_termination(
@@ -6419,6 +6432,105 @@ mod tests {
             .expect("daemon status");
         assert_eq!(status["active_sessions"], 0);
         assert_eq!(status["sessions"]["terminal"], 0);
+    }
+
+    #[test]
+    fn only_a_verified_sweep_plan_counts_an_unverified_worker() {
+        assert!(stop_worker_unverified(
+            ContainmentKind::CgroupV2,
+            Some(CleanupClass::Unverified)
+        ));
+        assert!(!stop_worker_unverified(
+            ContainmentKind::Subreaper,
+            Some(CleanupClass::Unverified)
+        ));
+        assert!(!stop_worker_unverified(ContainmentKind::CgroupV2, None));
+        assert!(!stop_worker_unverified(
+            ContainmentKind::CgroupV2,
+            Some(CleanupClass::Swept)
+        ));
+        assert!(!stop_worker_unverified(
+            ContainmentKind::CgroupV2,
+            Some(CleanupClass::NotStarted)
+        ));
+    }
+
+    #[test]
+    fn stopping_without_a_worker_reports_no_unverified_worker() {
+        {
+            let (mut service, _dir) = service();
+            let mut operator = operator_connection(&mut service);
+            let stopped = service
+                .dispatch(
+                    &mut operator,
+                    ServiceMethod::DaemonStop,
+                    &json!({"mode": "force"}),
+                    MonotonicMs::from_millis(12),
+                )
+                .expect("force stop");
+            assert_eq!(stopped["terminated"], 0);
+            assert_eq!(stopped["unverified"], 0);
+            assert!(!service.stop_unverified());
+        }
+
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+        let drained = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonStop,
+                &json!({"mode": "drain"}),
+                MonotonicMs::from_millis(13),
+            )
+            .expect("drain");
+        assert_eq!(drained["terminated"], 0);
+        assert!(!service.stop_unverified());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_subreaper_worker_keeps_its_structural_unverified_cleanup_without_exit_five() {
+        let cell = crate::platform::PlatformCell::current();
+        let (mut service, _dir) = service_with_containment(
+            Limits::default(),
+            OrphanSupervisor::unsupported(cell, "subreaper test"),
+            ContainmentReport::subreaper(cell, Some("subreaper test".to_owned())),
+        );
+        let mut operator = operator_connection(&mut service);
+        let (_creator, session_id, _attach) = spawned_controller_session(
+            &mut service,
+            &mut operator,
+            "subreaper-stop",
+            json!(["/bin/cat"]),
+            false,
+        );
+
+        let stopped = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonStop,
+                &json!({"mode": "force"}),
+                MonotonicMs::from_millis(20),
+            )
+            .expect("force stop");
+        assert_eq!(stopped["terminated"], 1);
+        assert_eq!(stopped["unverified"], 0, "{stopped}");
+        assert!(!service.stop_unverified());
+
+        let terminal = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": session_id}),
+                MonotonicMs::from_millis(21),
+            )
+            .expect("status");
+        assert_eq!(terminal["session"]["state"], "terminated");
+        assert_eq!(terminal["session"]["terminal_reason"], "daemon_stop");
+        assert_eq!(
+            terminal["session"]["cleanup"], "unverified",
+            "the subreaper plan still advertises its structural cleanup claim"
+        );
     }
 
     #[test]

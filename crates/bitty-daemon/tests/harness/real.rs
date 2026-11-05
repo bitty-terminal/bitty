@@ -46,6 +46,13 @@ pub struct RealDriver {
     request_timeout_ms: Option<u64>,
     handler_delay_ms: u64,
     handler_delay_method: Option<String>,
+    /// A harness-only stand-in for a refused startup containment plan.
+    ///
+    /// The daemon still runs with its real plan; the model reports
+    /// `terminal_spawn: false`, which is exactly what a refused cell reports,
+    /// so the corpus skip path can be exercised on a host that can contain a
+    /// child.
+    forced_terminal_spawn: Option<bool>,
 }
 
 struct Root {
@@ -373,7 +380,21 @@ impl RealDriver {
             request_timeout_ms: None,
             handler_delay_ms: 0,
             handler_delay_method: None,
+            forced_terminal_spawn: None,
         }
+    }
+
+    /// A driver that models a cell whose startup containment probe refused the
+    /// spawn path.
+    ///
+    /// The real daemon still runs with the host's plan; only the modeled
+    /// `terminal_spawn` fact is forced to `false`, so the corpus records the
+    /// same typed skips a refused cell would record. It exists to exercise the
+    /// parity expectation for that cell on a host that can contain a child.
+    pub fn modeling_refused_containment() -> Self {
+        let mut driver = Self::new();
+        driver.forced_terminal_spawn = Some(false);
+        driver
     }
 
     /// Reads the per-boot operator capability once the daemon has written it.
@@ -506,6 +527,10 @@ impl RealDriver {
             version: bitty_daemon::CRATE_VERSION.to_owned(),
             capabilities,
             limits,
+            features: std::collections::BTreeMap::from([(
+                "terminal_spawn".to_owned(),
+                self.probe_terminal_spawn(&endpoint)?,
+            )]),
             // The seam is present exactly when this run injected it: the
             // driver sets the override variables for the vector and passes
             // them to the daemon, so the flag tracks the run rather than a
@@ -515,6 +540,53 @@ impl RealDriver {
                 cfg!(feature = "test-seams") && self.request_timeout_ms.is_some(),
             )]),
         })
+    }
+
+    /// Whether the running daemon selected a containment plan that can spawn.
+    ///
+    /// The capability bit cannot answer this: `worker_sessions` is `false` in
+    /// every build by `D-01`, while the accepted 1.3 terminal-spawn slice is
+    /// gated by the plan the startup probe selected. `daemon.status` reports
+    /// that plan as the orphan mechanism, so the driver reads it through the
+    /// operator capability instead of assuming a Linux cell is always servable.
+    fn probe_terminal_spawn(&mut self, endpoint: &Path) -> Result<bool, String> {
+        if let Some(forced) = self.forced_terminal_spawn {
+            return Ok(forced);
+        }
+        let mut client = Client::connect(endpoint)?;
+        let id = self.next_request_id();
+        client.send(
+            &id,
+            "daemon.negotiate",
+            &json!({
+                "client_version": {"major": 1, "minor": 0},
+                "operator_capability": self.operator_capability,
+            }),
+        )?;
+        match client.recv()? {
+            Outcome::Reply(reply) if reply.ok => {}
+            _ => return Err("terminal-spawn probe handshake refused".to_owned()),
+        }
+        let id = self.next_request_id();
+        client.send(&id, "daemon.status", &Value::Null)?;
+        let mechanism = match client.recv() {
+            Ok(Outcome::Reply(reply)) if reply.ok => reply
+                .result
+                .get("orphans")
+                .and_then(|orphans| orphans.get("mechanism"))
+                .and_then(Value::as_str)
+                .unwrap_or(bitty_daemon::containment::MECHANISM_NONE)
+                .to_owned(),
+            // V-44 injects a 250 ms status handler behind a 100 ms request
+            // bound, so the probe cannot read the mechanism. That vector never
+            // spawns and a refused plan still answers status, so keeping the
+            // served Linux default is safe; every other refusal is an error.
+            _ if self.request_timeout_ms.is_some() => {
+                return Ok(true);
+            }
+            _ => return Err("terminal-spawn probe status refused".to_owned()),
+        };
+        Ok(mechanism != bitty_daemon::containment::MECHANISM_NONE)
     }
 
     fn mint_host_grant(&mut self) -> Result<String, String> {
@@ -615,10 +687,9 @@ impl RealDriver {
 impl RealDriver {
     /// The `worker_sessions` bit this daemon advertised in the readiness probe.
     ///
-    /// The probe negotiates a real connection, so the value follows the
-    /// containment plan the daemon selected at startup, not the compile-time
-    /// cell. A refused plan advertises `false` and the worker vectors record a
-    /// typed `cell-not-servable` skip.
+    /// Contract `D-01` reserves the worker kind, so a served build always
+    /// reports `false`. The value is still read from the real handshake rather
+    /// than hardcoded here, so the vectors would follow an amended build.
     fn worker_sessions(&self) -> bool {
         self.facts
             .capabilities
@@ -1038,6 +1109,15 @@ impl Driver for RealDriver {
         }
     }
 
+    fn child_process_count(&mut self) -> Result<u64, String> {
+        let pid = self
+            .daemon
+            .as_ref()
+            .map(Daemon::pid)
+            .ok_or_else(|| "no daemon".to_owned())?;
+        child_processes(pid)
+    }
+
     fn daemon_absent(&mut self) -> Result<ExitObservation, String> {
         let root = Root::new("absent");
         std::fs::create_dir_all(root.runtime()).map_err(|_| "runtime dir".to_owned())?;
@@ -1147,6 +1227,61 @@ fn seed_orphan_record(root: &Root, seed: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
+/// Live child processes of `pid` across its task table.
+///
+/// Linux records a child under the task that created it, so summing the
+/// per-task `children` files is the daemon's exact direct-child set. A refused
+/// create must leave this unchanged; a failed read is an error, never a zero
+/// count, so the evidence cannot pass vacuously.
+fn child_processes(pid: u32) -> Result<u64, String> {
+    child_processes_in(&Path::new("/proc").join(pid.to_string()).join("task"))
+}
+
+/// Direct child pids under one `/proc` task directory.
+///
+/// Every read failure is returned with the path that failed. The consumer
+/// asserts "no child process", so a missing or unreadable table must fail the
+/// row instead of defaulting to zero. The pids (not just the total) are
+/// returned so a positive control can name the child it expects to see.
+fn child_pids_in(tasks: &Path) -> Result<Vec<u32>, String> {
+    let entries = std::fs::read_dir(tasks)
+        .map_err(|error| format!("cannot read the task table {}: {error}", tasks.display()))?;
+    let mut pids = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("cannot read a task entry in {}: {error}", tasks.display()))?;
+        let children = entry.path().join("children");
+        let text = match std::fs::read_to_string(&children) {
+            Ok(text) => text,
+            // A thread that exits between the directory read and this open
+            // takes its `children` file with it. That is a vanished task, not
+            // an unreadable table; a live task without the file, and every
+            // other read failure, still fails the row.
+            Err(error) if error.kind() == ErrorKind::NotFound && !entry.path().exists() => {
+                continue;
+            }
+            Err(error) => {
+                return Err(format!("cannot read {}: {error}", children.display()));
+            }
+        };
+        for field in text.split_whitespace() {
+            let pid = field.parse::<u32>().map_err(|_| {
+                format!(
+                    "cannot parse the child pid {field:?} in {}",
+                    children.display()
+                )
+            })?;
+            pids.push(pid);
+        }
+    }
+    Ok(pids)
+}
+
+/// Sum the `children` tables under one task directory.
+fn child_processes_in(tasks: &Path) -> Result<u64, String> {
+    child_pids_in(tasks).map(|pids| pids.len() as u64)
+}
+
 /// Socket inodes the process holds, plus any of them in a TCP LISTEN row.
 fn tcp_listeners(pid: u32) -> Vec<String> {
     let mut owned = Vec::new();
@@ -1182,4 +1317,63 @@ fn tcp_listeners(pid: u32) -> Vec<String> {
         }
     }
     listeners
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_task_table_fails_closed() {
+        let error = child_processes_in(Path::new("/nonexistent/bittyd-task-table"))
+            .expect_err("a missing task table must not read as zero children");
+        assert!(error.contains("cannot read the task table"), "{error}");
+    }
+
+    #[test]
+    fn a_task_without_a_children_file_fails_closed() {
+        let dir = tempfile::tempdir().expect("fixture dir");
+        std::fs::create_dir(dir.path().join("1234")).expect("task dir");
+        let error = child_processes_in(dir.path())
+            .expect_err("a task without a children file must not read as zero");
+        assert!(error.contains("cannot read"), "{error}");
+    }
+
+    /// A live child must be visible to the same reader the vectors use.
+    ///
+    /// This is the positive control for the three "no child process" rows:
+    /// without it those rows would pass even if the reader could never observe
+    /// a child at all. The assertion names the child's pid, so a reader that
+    /// returned an arbitrary non-zero count would not pass either. The child is
+    /// short-lived and reaped on every path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_child_is_observable_so_a_zero_child_row_cannot_be_vacuous() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the control child");
+        let expected = child.id();
+        let tasks = Path::new("/proc")
+            .join(std::process::id().to_string())
+            .join("task");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed = Vec::new();
+        while Instant::now() < deadline {
+            observed = child_pids_in(&tasks).expect("read this process's task table");
+            if observed.contains(&expected) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            observed.contains(&expected),
+            "the child reader never observed the live child {expected}: {observed:?}"
+        );
+    }
 }

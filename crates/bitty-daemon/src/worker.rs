@@ -40,10 +40,15 @@
 //! journal, and capability descriptors are all opened close-on-exec by their
 //! owners.
 //!
-//! The worker path is served on Linux only, and only when the startup
-//! containment probe selected an enforced plan. Every other platform or a
-//! `Refused` plan returns the typed [`WorkerSpawnError::Unsupported`] and
-//! advertises `worker_sessions: false`.
+//! No build serves the worker kind today. Contract `D-01` reserves the
+//! vocabulary but requires `worker_sessions: false` in every v0.2.0 build until
+//! an accepted ADR 0019 amendment names worker supervision in the slice and an
+//! independent security review accepts the spawn, environment, credential,
+//! cleanup, and audit behavior. The served wire therefore refuses every worker
+//! create with `Denied/UnsupportedCapability` before any spawn work; the pool
+//! below stays compiled and directly testable for the amendment that enables
+//! it. The terminal spawn path is the separately accepted 1.3 slice and keeps
+//! the containment-plan gate ([`spawn_path_served`]).
 
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
@@ -82,17 +87,44 @@ use crate::registry::{LifecycleState, MonotonicMs, SessionKind};
 #[cfg(target_os = "linux")]
 use crate::spawn::SpawnSpec;
 
-/// Whether this build serves the contained spawn path at all.
+/// Whether the two `D-01` enablement conditions exist in this build.
 ///
-/// The value is compiled from the platform cell, exactly like the containment
-/// plan: Linux enforces a whole-tree identity (cgroup v2 or the subreaper
-/// fallback), while every other cell refuses at startup. The served harness is
-/// additionally narrowed by [`sessions_served`] from the plan this process
-/// actually probed, so a Linux cell whose probe selected no mechanism neither
-/// advertises nor serves a worker or a terminal spawn. The capability name
-/// stays `worker_sessions` because it gates the worker kind; a terminal create
-/// that supplies a spawn specification uses the same cell truth.
-pub const WORKER_SESSIONS_SERVED: bool = cfg!(target_os = "linux");
+/// Worker hosting may be advertised only after (a) an accepted ADR 0019
+/// amendment names worker supervision in the slice and (b) an independent
+/// security review accepts the spawn, environment, credential, cleanup, and
+/// audit behavior. Neither exists, so the marker is `false` in every shipped
+/// build. Flipping it is a contract change, not a configuration choice.
+pub const WORKER_HOSTING_AMENDMENT_ACCEPTED: bool = false;
+
+/// Whether this build advertises and serves the worker kind.
+///
+/// Derived only from [`WORKER_HOSTING_AMENDMENT_ACCEPTED`], so no cell,
+/// feature, probe, or configuration can turn the capability on while the
+/// amendment is absent. The served harness narrows the value further with
+/// [`sessions_served`]; today both are `false` everywhere.
+pub const WORKER_SESSIONS_SERVED: bool = WORKER_HOSTING_AMENDMENT_ACCEPTED;
+
+/// Whether this build and the probed containment plan serve worker sessions.
+///
+/// Always `false` until [`WORKER_HOSTING_AMENDMENT_ACCEPTED`] is set, because
+/// the contract reserves the kind in every v0.2.0 build. The containment-plan
+/// term is kept so an amended build still cannot advertise a worker tree on a
+/// cell whose probe selected no mechanism.
+#[must_use]
+pub fn sessions_served(report: &ContainmentReport) -> bool {
+    WORKER_SESSIONS_SERVED && report.kind() != ContainmentKind::Refused
+}
+
+/// Whether this build and plan serve the contained spawn path for terminals.
+///
+/// This is the separately accepted 1.3 terminal-spawn slice: it depends only on
+/// the platform cell and the plan the startup probe selected, never on the
+/// reserved worker capability. A `Refused` plan returns the typed
+/// `Denied/UnsupportedCapability` before the spawn specification is parsed.
+#[must_use]
+pub fn spawn_path_served(report: &ContainmentReport) -> bool {
+    cfg!(target_os = "linux") && report.kind() != ContainmentKind::Refused
+}
 
 /// Bytes one worker's PTY may hand the poll loop in a single tick.
 ///
@@ -116,17 +148,6 @@ fn per_worker_drain_budget(worker_count: usize) -> usize {
         .checked_div(worker_count.max(1))
         .unwrap_or(DRAIN_BUDGET_BYTES)
         .clamp(1, DRAIN_BUDGET_BYTES)
-}
-
-/// Whether this compiled cell and the probed containment plan serve workers.
-///
-/// A [`ContainmentKind::Refused`] plan has no whole-tree identity, so the
-/// worker path is the typed `Denied/UnsupportedCapability` and the handshake
-/// must not advertise `worker_sessions`. The startup probe selects the plan
-/// once; every worker decision reads this same truth.
-#[must_use]
-pub fn sessions_served(report: &ContainmentReport) -> bool {
-    WORKER_SESSIONS_SERVED && report.kind() != ContainmentKind::Refused
 }
 
 /// Why a worker spawn was refused.
@@ -165,7 +186,9 @@ pub enum WorkerSpawnError {
 impl std::fmt::Display for WorkerSpawnError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unsupported => formatter.write_str("worker sessions are not served on this cell"),
+            Self::Unsupported => {
+                formatter.write_str("worker sessions are not served by this build")
+            }
             Self::Pty => formatter.write_str("the worker PTY could not be allocated"),
             Self::Spawn => formatter.write_str("worker spawn failed before any child existed"),
             Self::Exec(refusal) => write!(formatter, "worker exec was refused: {refusal}"),

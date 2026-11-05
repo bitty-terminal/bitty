@@ -265,7 +265,7 @@
     },
     {
       "id": "V-03",
-      "title": "A worker create needs create scope, consent, and a known kind in the frozen order",
+      "title": "D-01 reserves the worker kind: false capability, typed refusal, no child",
       "area": "handshake",
       "decisions": [
         "D-01"
@@ -273,9 +273,6 @@
       "drivers": [
         "fake",
         "real"
-      ],
-      "requires": [
-        "worker_sessions"
       ],
       "setup": {
         "host_grant": true
@@ -298,7 +295,7 @@
           "expect": {
             "ok": true,
             "result": {
-              "capabilities.worker_sessions": "@worker_sessions"
+              "capabilities.worker_sessions": false
             }
           }
         },
@@ -337,12 +334,30 @@
           "method": "session.create",
           "params": {
             "kind": "worker",
+            "idempotency_key": "worker-served-refusal",
+            "argv": [
+              "/bin/sleep",
+              "60"
+            ],
+            "cwd": "@cwd"
+          },
+          "expect": {
+            "ok": false,
+            "error_class": "Denied",
+            "error_code": "UnsupportedCapability"
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "worker",
             "idempotency_key": "worker-no-spec"
           },
           "expect": {
             "ok": false,
-            "error_class": "Validation",
-            "error_code": "InvalidRequest"
+            "error_class": "Denied",
+            "error_code": "UnsupportedCapability"
           }
         },
         {
@@ -356,6 +371,15 @@
             "ok": false,
             "error_class": "Validation",
             "error_code": "InvalidRequest"
+          }
+        },
+        {
+          "action": "child_processes",
+          "args": {},
+          "expect": {
+            "result": {
+              "count": 0
+            }
           }
         }
       ],
@@ -401,8 +425,9 @@
       ],
       "forbidden": [
         "no worker session record is created by a refused create",
-        "consent is refused before a spawn specification is parsed",
-        "the advertised worker bit matches the served spawn path"
+        "the capability refusal precedes consent liveness and spawn-specification parsing",
+        "a refused worker create starts no child process",
+        "no build advertises capabilities.worker_sessions true"
       ]
     },
     {
@@ -5454,9 +5479,6 @@
         "fake",
         "real"
       ],
-      "requires": [
-        "worker_sessions"
-      ],
       "setup": {
         "host_grant": true
       },
@@ -5711,7 +5733,9 @@
         "an observer resizes the PTY or bumps the revision",
         "a stale generation mutates the content plane",
         "the content plane is served without a revocable controller lease"
-      ]
+      ],
+      "fake_skip": "d01-amendment-required: worker hosting is not served until an accepted ADR 0019 amendment names worker supervision in the slice and an independent spawn/credential/cleanup security review accepts it",
+      "real_skip": "d01-amendment-required: worker hosting is not served until an accepted ADR 0019 amendment names worker supervision in the slice and an independent spawn/credential/cleanup security review accepts it"
     },
     {
       "id": "V-43",
@@ -9290,7 +9314,7 @@
         "a worker-only create path is reused for a terminal"
       ],
       "requires": [
-        "worker_sessions"
+        "terminal_spawn"
       ]
     },
     {
@@ -9519,7 +9543,7 @@
         "a content refusal echoes bytes"
       ],
       "requires": [
-        "worker_sessions"
+        "terminal_spawn"
       ]
     },
     {
@@ -9656,7 +9680,7 @@
         "subscription succeeds without a live controller lease"
       ],
       "requires": [
-        "worker_sessions"
+        "terminal_spawn"
       ]
     },
     {
@@ -9992,7 +10016,7 @@
         "the fake claims real PTY evidence"
       ],
       "requires": [
-        "worker_sessions"
+        "terminal_spawn"
       ]
     },
     {
@@ -10008,9 +10032,6 @@
       "drivers": [
         "fake",
         "real"
-      ],
-      "requires": [
-        "worker_sessions"
       ],
       "setup": {
         "host_grant": true
@@ -10196,7 +10217,9 @@
         "a stopped session remains observable as running",
         "a stopped session leaves a live lease",
         "a stopped session leaves a reserved or committed journal record"
-      ]
+      ],
+      "fake_skip": "d01-amendment-required: worker hosting is not served until an accepted ADR 0019 amendment names worker supervision in the slice and an independent spawn/credential/cleanup security review accepts it",
+      "real_skip": "d01-amendment-required: worker hosting is not served until an accepted ADR 0019 amendment names worker supervision in the slice and an independent spawn/credential/cleanup security review accepts it"
     }
   ]
 }

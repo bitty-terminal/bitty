@@ -29,7 +29,7 @@ never fork expectations.
       "area": "handshake",
       "decisions": ["D-08"],
       "drivers": ["fake", "real"],
-      "requires": ["worker_sessions"],
+      "requires": ["terminal_spawn"],
       "setup": { "host_grant": false },
       "injected": { "clock_ms": 0, "limits": {} },
       "steps": [],
@@ -53,12 +53,15 @@ never fork expectations.
 - `drivers` names the drivers that must run the vector. A driver that does not
   run it must have a `real_skip`/`fake_skip` reason; the row is recorded as a
   typed skip, never a pass.
-- `requires` names capabilities the served cell must advertise for the vector
-  to run. A driver whose negotiated capability set lacks one records the typed
-  `cell-not-servable: <capability>` skip after preparation, so a real Linux cell
-  whose containment probe selected no mechanism never fails the worker vectors
-  it cannot serve. The reference fake models a served worker cell and always
-  advertises `worker_sessions`. A harness seam (`request_deadline_seam`) is
+- `requires` names capabilities or modeled features the served cell must
+  advertise or provide for the vector to run. A driver whose negotiated
+  capability set lacks one records the typed `cell-not-servable: <requirement>`
+  skip after preparation. `worker_sessions` is `false` in every v0.2.0 build
+  (`D-01`), so the reserved worker vectors skip on both drivers; the accepted
+  1.3 terminal-spawn vectors require the modeled `terminal_spawn` feature, which
+  is `true` only when the containment plan can contain a child. The reference
+  fake models both the reserved worker bit (`false`) and the served terminal
+  plan (`terminal_spawn: true`). A harness seam (`request_deadline_seam`) is
   resolved through the driver's `seams` map, never the wire handshake.
 - `injected` is honored by the fake. The real service uses its process clock and
   compiled limits; a vector that needs injection records a typed real skip. The
@@ -115,22 +118,38 @@ Expectation vocabulary: `ok`, `error_class`, `error_code`, `counts`,
 the response `result`; a leading `result.` is accepted and normalized.
 
 Actions: `restart`, `crash`, `advance_clock`, `oversized_frame`, `partial_frame`,
-`queue_pressure`, `audit`, `file_mode`, `no_tcp_listener`, `daemon_absent`,
-`request_log`, `read_events`, `peer_exit`, and `refusal_burst`. `read_events`
-reads `args.count` pushed frames; `args.events` is an optional per-frame array
-of expectation objects (index-aligned with the frames), and `expect.result` is
-the fallback applied to every frame. `retry_ms` is the only bounded
-settlement: it re-sends the same request until the typed expectation holds or
-the deadline passes, for an effect the service applies on another connection.
+`queue_pressure`, `audit`, `file_mode`, `no_tcp_listener`, `child_processes`,
+`daemon_absent`, `request_log`, `read_events`, `peer_exit`, and
+`refusal_burst`. `child_processes` asserts `expect.result.count` against the
+service's live direct-child count; a failed process-table read fails the row
+rather than reading as zero. The real driver reads the daemon's per-task
+`children` tables and
+`harness::real::tests::a_live_child_is_observable_so_a_zero_child_row_cannot_be_vacuous`
+spawns a short-lived child and asserts the reader sees its pid, so a zero count
+is a measurement rather than a constant. The fake has no process plane; it
+derives the count from its own model instead of returning zero — one child per
+bound, non-terminal session
+(`harness::fake::tests::the_fake_child_count_follows_its_own_session_state`), so
+a refused create that never binds reads zero because the fake models the
+absence, not because the step cannot observe anything. `read_events` reads `args.count` pushed frames;
+`args.events` is an optional per-frame array of expectation objects
+(index-aligned with the frames), and `expect.result` is the fallback applied to
+every frame. `retry_ms` is the only bounded settlement: it re-sends the same
+request until the typed expectation holds or the deadline passes, for an effect
+the service applies on another connection.
 
 ## Evidence
 
 `target/conformance/<cell>.<suite>.json` (`$CARGO_TARGET_DIR` wins) records the
 suite (`fake`, `real`, `parity`), label, cell, version, commit, corpus schema,
-the corpus `frozen` map, instance id, capabilities, effective limits, and one
-row per vector with status, skip reason, deferred requirement, known-defect
-issue, instance id, step count, typed signature, failure step, and failure. The record contains no
-host path, username, socket path, port, token, or capability value.
+the corpus `frozen` map, instance id, capabilities, modeled features, effective
+limits, and one row per vector with status, skip reason, deferred requirement,
+known-defect issue, instance id, step count, typed signature, failure step, and
+failure. The record contains no host path, username, socket path, port, token,
+or capability value. `features` carries driver-modeled service facts that are
+never advertised on the wire (for example `terminal_spawn`, the
+containment-plan gate of the accepted 1.3 terminal-spawn slice); `capabilities`
+stays the exact handshake set.
 
 `<cell>.parity.json` lists the shared vectors compared and the divergences. A
 fake run never closes a real row: the files are separate and the parity report

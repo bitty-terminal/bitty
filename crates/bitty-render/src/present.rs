@@ -660,12 +660,16 @@ impl WorkerShared {
 /// The backend owns the only `Surface`, so it is dropped **before** the exit
 /// signal: a slow destructor then delays the exit marker (and a bounded
 /// `shutdown_bounded` detaches) instead of making `join` overrun its bound.
-/// A panic in configure/present unwinds into the outer `catch_unwind`, drops
-/// the backend here, and still signals exit.
+/// A panic in configure/present unwinds into the outer `catch_unwind`, and the
+/// backend is then dropped inside its own guard: a panicking destructor also
+/// cannot skip the exit signal.
 fn worker_main(shared: Arc<WorkerShared>, backend: Box<dyn PresentBackend>) {
     let mut backend = Some(backend);
     let _ = catch_unwind(AssertUnwindSafe(|| worker_loop(&shared, &mut backend)));
-    drop(backend.take());
+    // A panicking destructor must not skip the exit signal. The panic is
+    // contained here; the worker is already leaving and the embedder observes
+    // a clean exit so `shutdown_bounded` cannot hang.
+    let _ = catch_unwind(AssertUnwindSafe(|| drop(backend.take())));
     shared.mark_exited();
 }
 
@@ -993,6 +997,12 @@ impl Presenter {
     #[must_use]
     pub fn is_worker_parked(&self) -> bool {
         self.shared.parked.load(Ordering::Acquire)
+    }
+
+    /// Number of acknowledgements waiting in the bounded ring.
+    #[must_use]
+    pub fn queued_acks(&self) -> usize {
+        self.shared.lock_acks().len()
     }
 
     /// Frames replaced in the slot before acquisition.

@@ -643,6 +643,23 @@ pub struct Runtime {
     /// Earliest full GPU reattach attempt after the presenter exhausted its
     /// built-in recovery budgets.
     presenter_reattach_at: Option<std::time::Instant>,
+    /// A reattach is required even when no presenter object remains.
+    ///
+    /// `attach_gpu_async` can fail after consuming the last presenter; this
+    /// flag keeps the retry path alive instead of silently staying headless
+    /// until restart.
+    gpu_reattach_required: bool,
+    /// Corrective full repaints requested because the last abandoned worker
+    /// exited (diagnostics/test evidence).
+    forced_repaint_requests: u64,
+    /// A corrective repaint is owed and the next submitted frame carries it.
+    forced_repaint_owed: bool,
+    /// Corrective frames committed after the last abandoned worker exited.
+    ///
+    /// This is the attributable evidence [`Self::forced_repaint_requests`]
+    /// cannot provide: an abandoned worker's own late present is never
+    /// committed, so only a frame submitted to satisfy the request counts.
+    forced_repaint_commits: u64,
     /// Embedder wake callback, forwarded to the presenter so an ack wakes
     /// the event loop immediately instead of waiting for a timer.
     present_waker: Option<bitty_render::present::PresentWake>,
@@ -2133,6 +2150,10 @@ impl Runtime {
             abandoned_workers_alive: 0,
             abandoned_check_at: None,
             presenter_reattach_at: None,
+            gpu_reattach_required: false,
+            forced_repaint_requests: 0,
+            forced_repaint_owed: false,
+            forced_repaint_commits: 0,
             present_waker: None,
             inspect_publishes: std::sync::atomic::AtomicU64::new(0),
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
@@ -2448,6 +2469,10 @@ impl Runtime {
             abandoned_workers_alive: 0,
             abandoned_check_at: None,
             presenter_reattach_at: None,
+            gpu_reattach_required: false,
+            forced_repaint_requests: 0,
+            forced_repaint_owed: false,
+            forced_repaint_commits: 0,
             present_waker: None,
             inspect_publishes: std::sync::atomic::AtomicU64::new(0),
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
@@ -2731,6 +2756,8 @@ impl Runtime {
         self.gpu = Some(gpu);
         self.pending_present = None;
         self.presenter_retry_at = None;
+        self.gpu_reattach_required = false;
+        self.presenter_reattach_at = None;
         self.pending_full_redraw = true;
     }
 
@@ -2753,7 +2780,9 @@ impl Runtime {
     /// Propagates a mirror-construction or presenter-spawn failure. Both the
     /// surface and the GPU context are consumed by this call, so an error
     /// leaves the runtime headless (the desktop embedder logs and continues
-    /// headless rather than risking a half-transferred surface).
+    /// headless rather than risking a half-transferred surface). The reattach
+    /// requirement stays armed, so the embedder retries after the cooldown and
+    /// does not stay headless until restart.
     pub fn attach_gpu_async(
         &mut self,
         gpu: GpuContext,
@@ -2768,10 +2797,19 @@ impl Runtime {
         let palette = self.surface.theme_palette();
         surface.set_theme_palette(palette);
         let mirror = headless_mirror(extent, opacity, palette)?;
-        // One live surface at a time: stop any previous worker before the
-        // replacement surface is created for the same window.
-        self.shutdown_presenter();
-        let presenter = bitty_render::present::Presenter::spawn_gpu(
+        // Build the replacement before dropping an inactive old presenter.
+        // If creation fails, the exhausted presenter (and the reattach retry
+        // state) survives instead of leaving the app permanently headless.
+        // An active presenter should not reach this path (the embedder checks
+        // `has_gpu` first); shut it down first if it does.
+        if self
+            .presenter
+            .as_ref()
+            .is_some_and(bitty_render::present::Presenter::is_active)
+        {
+            self.shutdown_presenter();
+        }
+        let presenter = match bitty_render::present::Presenter::spawn_gpu(
             gpu,
             surface,
             target,
@@ -2779,14 +2817,21 @@ impl Runtime {
             opacity,
             bitty_render::present::PresenterConfig::default(),
             self.present_waker.clone(),
-        )
-        .map_err(RuntimeError::from)?;
+        ) {
+            Ok(presenter) => presenter,
+            Err(err) => {
+                self.note_gpu_reattach_failure();
+                return Err(RuntimeError::from(err));
+            }
+        };
+        self.shutdown_presenter();
         self.surface = mirror;
         self.gpu = None;
         self.presenter = Some(presenter);
         self.pending_present = None;
         self.presenter_retry_at = None;
         self.presenter_reattach_at = None;
+        self.gpu_reattach_required = false;
         self.abandoned_workers_alive = 0;
         self.abandoned_check_at = None;
         self.pending_full_redraw = true;
@@ -2806,10 +2851,13 @@ impl Runtime {
 
     /// Detaches GPU, falling back to headless surface at current extent.
     pub fn detach_gpu(&mut self) {
+        // Preserve the live palette (OSC overrides included), exactly like
+        // resize/attach; `config.theme` is only the base table.
+        let palette = self.surface.theme_palette();
         self.shutdown_presenter();
         if let Some(extent) = self.surface.extent() {
             if let Ok(s) = Surface::headless(extent) {
-                s.set_theme_palette(self.config.theme);
+                s.set_theme_palette(palette);
                 self.surface = s;
             }
         }
@@ -2817,6 +2865,7 @@ impl Runtime {
         self.pending_present = None;
         self.presenter_retry_at = None;
         self.presenter_reattach_at = None;
+        self.gpu_reattach_required = false;
         self.abandoned_workers_alive = 0;
         self.abandoned_check_at = None;
         self.pending_full_redraw = true;
@@ -2837,16 +2886,22 @@ impl Runtime {
 
     /// Whether the embedder should attempt a fresh GPU attach.
     ///
-    /// True only when a presenter exists, its worker is dead, its built-in
-    /// surface-creation budgets are spent, and the bounded reattach cooldown
-    /// elapsed. The call arms the cooldown so one failure cannot make the
-    /// event loop recreate a GPU context every tick.
+    /// True when a reattach is outstanding — the presenter's worker is dead and
+    /// its built-in surface-creation budgets are spent, or a previous reattach
+    /// attempt failed after consuming the last presenter — and the bounded
+    /// reattach cooldown elapsed. The flag survives a failed
+    /// [`Self::attach_gpu_async`], so the app keeps retrying instead of staying
+    /// headless until restart. The call arms the cooldown so one failure
+    /// cannot make the event loop recreate a GPU context every tick.
     pub fn needs_gpu_reattach(&mut self) -> bool {
-        let Some(presenter) = self.presenter.as_mut() else {
-            return false;
-        };
-        if presenter.is_active() || !presenter.is_exhausted() {
-            return false;
+        if !self.gpu_reattach_required {
+            let Some(presenter) = self.presenter.as_ref() else {
+                return false;
+            };
+            if presenter.is_active() || !presenter.is_exhausted() {
+                return false;
+            }
+            self.gpu_reattach_required = true;
         }
         let now = std::time::Instant::now();
         if self.presenter_reattach_at.is_some_and(|at| now < at) {
@@ -2854,6 +2909,17 @@ impl Runtime {
         }
         self.presenter_reattach_at = now.checked_add(self::present::PRESENT_REATTACH_RETRY);
         true
+    }
+
+    /// Records a failed full GPU reattach attempt.
+    ///
+    /// Keeps the requirement alive even when `attach_gpu_async` consumed the
+    /// last presenter, so the embedder retries after the bounded cooldown
+    /// instead of staying headless forever.
+    fn note_gpu_reattach_failure(&mut self) {
+        self.gpu_reattach_required = true;
+        self.presenter_reattach_at =
+            std::time::Instant::now().checked_add(self::present::PRESENT_REATTACH_RETRY);
     }
 
     /// Stops the off-thread presenter with its bounded shutdown.
@@ -2866,6 +2932,7 @@ impl Runtime {
         self.presenter_retry_at = None;
         self.abandoned_workers_alive = 0;
         self.abandoned_check_at = None;
+        self.forced_repaint_owed = false;
     }
 
     /// Current Kitty keyboard flags (7727 bitmask). 0 = legacy.

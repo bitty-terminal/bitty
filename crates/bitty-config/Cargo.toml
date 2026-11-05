@@ -14,8 +14,8 @@ publish = true
 workspace = true
 
 [dependencies]
-bitty-lua = { version = "0.0.32", path = "../bitty-lua" }
-bitty-ui = { version = "0.0.32", path = "../bitty-ui" }
+bitty-lua = { version = "0.0.33", path = "../bitty-lua" }
+bitty-ui = { version = "0.0.33", path = "../bitty-ui" }
 
 [features]
 default = []

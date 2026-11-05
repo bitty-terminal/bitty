@@ -16,6 +16,10 @@ workspace = true
 [features]
 # Read-only VM accounting and safe construction for the explicit regression.
 input-vm-test-support = []
+# bitty#2830: test-only completed-tick seeding and a measured block inside
+# `Runtime::tick`. Enabled by the terminal crate's test builds; a shipped
+# binary has none of the seam.
+hang-gauge-test-support = []
 # CTX-1373 (bitty#2199): opt-in Core-side launch seam for authenticated
 # provider publication. Default-off: the shipped terminal build keeps no
 # TLS, certificate-generation, or crypto-provider surface. Slice 1 ends at

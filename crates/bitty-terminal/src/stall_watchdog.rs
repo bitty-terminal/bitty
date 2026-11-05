@@ -32,14 +32,18 @@
 //!   stall reports again. While the monitor is running, `SIGUSR1` writes on
 //!   demand (rate-limited to one per second) because the owner explicitly
 //!   asked for that sample.
-//! - **Completed ticks count too.** A `Runtime::tick` that outlived
-//!   [`HANG_WATCHDOG_TICK_BOUND`] is a stall whether the monitor sampled it
-//!   while blocked or only after it returned. The runtime publishes the
-//!   measured duration of every completed tick (`tick_count`/`last_tick_ns`),
-//!   so the monitor reports a completed over-bound tick as
-//!   `phase=runtime-tick` with that measured duration. A block the in-flight
-//!   detector already reported is closed by its one recovery line and never
-//!   reported twice.
+//! - **Every retained completed tick counts.** A `Runtime::tick` that
+//!   outlived [`HANG_WATCHDOG_TICK_BOUND`] is a stall whether the monitor
+//!   sampled it while blocked or only after it returned. The runtime keeps
+//!   the last [`TICK_RING_CAPACITY`] `(sequence, duration)` records in a
+//!   lock-free ring; the monitor drains them oldest first and writes one
+//!   `phase=runtime-tick` report per over-bound tick with that measured
+//!   duration. Pending records survive progress changes and are reported
+//!   later if a poll cannot deliver them yet. A block the in-flight detector
+//!   already reported is closed by its one recovery line and never reported
+//!   twice. Records overwritten before a drain are named once by a
+//!   `tick-ring: capacity=… missed=… seq=…` line in the next report, so
+//!   overflow is visible instead of silent.
 //! - **No hot-path work.** A phase mark is one relaxed atomic store plus a
 //!   timestamp. The app publishes its bounded context sample at most twice a
 //!   second, the runtime publishes lock-free gauges on every tick, and the
@@ -197,7 +201,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::logging;
-use bitty_runtime::hang_watchdog::{HangGaugeSnapshot, HangGauges};
+use bitty_runtime::hang_watchdog::{
+    HangGaugeSnapshot, HangGauges, TICK_RING_CAPACITY, TickGap, TickRingDrain,
+};
 
 #[cfg(unix)]
 use signal_hook::SigId;
@@ -665,6 +671,8 @@ struct ReportSample {
     /// Age of the heartbeat the detector decided on (a completed tick names
     /// its measured duration).
     idle: Duration,
+    /// Completed-tick ring span lost to overwrite since the previous report.
+    tick_gap: Option<TickGap>,
 }
 
 /// One rendered stall report, built on the monitor thread only.
@@ -687,6 +695,8 @@ struct StallReport {
     pending: PendingWork,
     /// How long the presented-frame counter had been stuck at report time.
     present_stale_ms: Option<u64>,
+    /// Completed-tick ring span lost before it could be reported.
+    tick_gap: Option<TickGap>,
 }
 
 /// Bounded in-band delivery summary carried by the monitor.
@@ -725,8 +735,21 @@ struct MonitorState {
     last_progress: u64,
     stall_started: Option<Instant>,
     reported: bool,
-    /// Last sampled runtime tick counter (bitty#2830 completed-tick rule).
-    last_tick_count: u64,
+    /// Highest completed-tick sequence consumed from the runtime ring.
+    last_tick_seq: u64,
+    /// Over-bound completed ticks drained but not yet reported, oldest first.
+    ///
+    /// Bounded by [`TICK_RING_CAPACITY`]: one ring drain can add at most that
+    /// many entries, and they are reported on the same poll. Any overflow is
+    /// named by `tick_gap`, never queued.
+    pending_ticks: VecDeque<CompletedTick>,
+    /// Sequence of the tick that completes the active in-flight report.
+    ///
+    /// Set when an in-flight `runtime-tick` report is emitted. The completing
+    /// tick is the same stall and must not be reported again.
+    completion_seq: Option<u64>,
+    /// Completed-tick ring span lost to overwrite since the last report.
+    tick_gap: Option<TickGap>,
     /// Last sampled presented-frame counter (bitty#2830).
     last_presented: u64,
     /// When `last_presented` last moved; the anchor for `present_stale_ms`.
@@ -743,6 +766,26 @@ struct MonitorState {
     reported_at: Option<Instant>,
 }
 
+/// One completed tick waiting for its own report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CompletedTick {
+    /// Runtime sequence number (unique per process run).
+    seq: u64,
+    /// Measured duration of that tick.
+    duration: Duration,
+}
+
+/// Widens `slot` to cover `gap`; the next report names one missing span.
+fn merge_tick_gap(slot: &mut Option<TickGap>, gap: TickGap) {
+    *slot = Some(match *slot {
+        Some(existing) => TickGap {
+            from: existing.from.min(gap.from),
+            to: existing.to.max(gap.to),
+        },
+        None => gap,
+    });
+}
+
 /// One phase-heartbeat sample: the phase, how long its heartbeat has been
 /// still, and the bound that applies to it.
 #[derive(Clone, Copy, Debug)]
@@ -752,27 +795,14 @@ struct StallSample {
     threshold: Duration,
 }
 
-/// Side channels the monitor samples besides the phase heartbeat.
-#[derive(Clone, Copy, Debug, Default)]
-struct PhaseSignals {
-    /// Work still outstanding while the app sits in `ControlFlow::Wait`
-    /// (bitty#2830): a park with a backlog is not a quiet window.
-    parked: bool,
-    /// Measured duration of a completed `Runtime::tick` that outlived
-    /// [`HANG_WATCHDOG_TICK_BOUND`] since the previous sample.
-    completed_tick: Option<Duration>,
-}
-
 /// What the monitor decided after one sample.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MonitorAction {
     /// Nothing to emit.
     None,
-    /// Emit the one report for this continuous stall (`idle` old).
+    /// Emit the one report for this continuous in-flight stall (`idle` old).
     ///
-    /// `phase` is the phase the stall belongs to: the sampled phase for an
-    /// in-flight stall, or [`Phase::RuntimeTick`] for a completed tick that
-    /// outlived its bound.
+    /// `phase` is the sampled phase that stalled.
     Report { idle: Duration, phase: Phase },
     /// The loop made progress again after a reported stall.
     Recovered { stalled_for: Duration },
@@ -780,18 +810,94 @@ enum MonitorAction {
 
 impl MonitorState {
     /// Starts the detector with the first sample already taken.
-    fn new(now: Instant, progress: u64, presented: u64, tick_count: u64) -> Self {
+    fn new(now: Instant, progress: u64, presented: u64, tick_seq: u64) -> Self {
         Self {
             last_progress: progress,
             stall_started: None,
             reported: false,
-            last_tick_count: tick_count,
+            last_tick_seq: tick_seq,
+            pending_ticks: VecDeque::with_capacity(TICK_RING_CAPACITY),
+            completion_seq: None,
+            tick_gap: None,
             last_presented: presented,
             presented_at: Some(now),
             no_present_at: None,
             parked_at: None,
             reported_at: None,
         }
+    }
+
+    /// Drains completed ticks above `bound` into the pending report queue.
+    ///
+    /// Called once per poll before [`Self::evaluate`]. Every retained ring
+    /// record is consumed; only an over-bound duration becomes a pending
+    /// report. Pending entries are kept oldest first and reported on this or a
+    /// later poll, independent of the phase heartbeat, so a progress change
+    /// cannot discard them. The tick that completes an in-flight report is
+    /// matched and dropped here: the in-flight report is already its evidence.
+    fn accept_tick_drain(&mut self, drain: TickRingDrain, bound: Duration) {
+        if let Some(gap) = drain.gap() {
+            merge_tick_gap(&mut self.tick_gap, gap);
+        }
+        for record in drain.records() {
+            if self.completion_seq == Some(record.seq) {
+                self.completion_seq = None;
+                continue;
+            }
+            let duration = Duration::from_nanos(record.duration_ns);
+            if duration < bound {
+                continue;
+            }
+            if self.pending_ticks.len() >= TICK_RING_CAPACITY {
+                // One drain cannot exceed the ring capacity; this guard only
+                // keeps a pathological backlog bounded and names the dropped
+                // evidence instead of growing the monitor.
+                merge_tick_gap(
+                    &mut self.tick_gap,
+                    TickGap {
+                        from: record.seq,
+                        to: record.seq,
+                    },
+                );
+                continue;
+            }
+            self.pending_ticks.push_back(CompletedTick {
+                seq: record.seq,
+                duration,
+            });
+        }
+        self.last_tick_seq = drain.last_seq();
+        // The completion of a reported stall can be overwritten before it is
+        // drained; the gap line is the evidence then, so stop waiting for it.
+        if self
+            .completion_seq
+            .is_some_and(|seq| seq <= self.last_tick_seq)
+        {
+            self.completion_seq = None;
+        }
+    }
+
+    /// Marks a just-emitted in-flight report so its completing tick is not
+    /// reported a second time.
+    fn note_in_flight_report(&mut self, phase: Phase) {
+        if phase == Phase::RuntimeTick {
+            self.completion_seq = Some(self.last_tick_seq.saturating_add(1));
+        }
+    }
+
+    /// Takes the oldest completed tick still waiting for its report.
+    ///
+    /// A completed-tick report names the same stopped frame as the no-present
+    /// detector, so it suppresses that duplicate line for one repeat interval.
+    fn next_completed_report(&mut self, now: Instant) -> Option<CompletedTick> {
+        let tick = self.pending_ticks.pop_front()?;
+        self.reported_at = Some(now);
+        Some(tick)
+    }
+
+    /// Takes the ring-overflow span for the next report.
+    fn take_tick_gap(&mut self) -> Option<TickGap> {
+        self.tick_gap.take()
     }
 
     /// Tracks the presented-frame counter and returns how long it has been
@@ -807,30 +913,6 @@ impl MonitorState {
             return Duration::ZERO;
         }
         now.saturating_duration_since(self.presented_at.unwrap_or(now))
-    }
-
-    /// Returns the measured duration of a `Runtime::tick` that completed since
-    /// the previous sample and outlived `bound`.
-    ///
-    /// The in-flight detector can only report a tick that is still blocked at
-    /// sample time. The runtime publishes every completed tick's duration
-    /// ([`HangGaugeSnapshot::tick_count`] and
-    /// [`HangGaugeSnapshot::last_tick_ns`]), so a block that returned between
-    /// two samples is still a stall with the same measured evidence.
-    /// Each tick is consumed once: the counter update is unconditional, and
-    /// only the completed tick above the bound yields a duration.
-    fn sample_completed_tick(
-        &mut self,
-        tick_count: u64,
-        last_tick_ns: u64,
-        bound: Duration,
-    ) -> Option<Duration> {
-        if tick_count == self.last_tick_count {
-            return None;
-        }
-        self.last_tick_count = tick_count;
-        let duration = Duration::from_nanos(last_tick_ns);
-        (duration >= bound).then_some(duration)
     }
 
     /// Decides whether the stuck frame counter is a reportable state.
@@ -869,34 +951,28 @@ impl MonitorState {
         Some(stale)
     }
 
-    /// Evaluate one sample.
+    /// Evaluate one phase-heartbeat sample.
     ///
-    /// `signals.parked` marks outstanding work published at
-    /// `ControlFlow::Wait`: a park with a backlog is not a quiet window, so it
-    /// stays stall-eligible even though the app called
-    /// [`StallWatchdog::idle`] (bitty#2830).
+    /// `parked` marks outstanding work published at `ControlFlow::Wait`: a
+    /// park with a backlog is not a quiet window, so it stays stall-eligible
+    /// even though the app called [`StallWatchdog::idle`] (bitty#2830).
     ///
-    /// `signals.completed_tick` carries the measured duration of a tick that
-    /// finished since the previous sample above its bound (see
-    /// [`Self::sample_completed_tick`]). Progress advancing past a blocked
-    /// tick must not hide it: if no in-flight sample reported that stall, the
-    /// completed duration is the report. The report is one-shot per tick; a
-    /// tick the in-flight detector already reported is closed by the normal
-    /// recovery line instead.
+    /// Completed ticks are not decided here. [`Self::accept_tick_drain`]
+    /// queues them independently, so a progress change cannot discard an
+    /// over-bound tick (bitty#2830 review F1/F4).
     fn evaluate(
         &mut self,
         now: Instant,
         progress: u64,
         active: bool,
         sample: StallSample,
-        signals: PhaseSignals,
+        parked: bool,
     ) -> MonitorAction {
         let StallSample {
             phase,
             idle,
             threshold,
         } = sample;
-        let parked = signals.parked;
         let active = active || parked;
         if progress != self.last_progress {
             self.last_progress = progress;
@@ -905,20 +981,10 @@ impl MonitorState {
                 .take()
                 .map(|started| now.saturating_duration_since(started));
             let had_report = std::mem::replace(&mut self.reported, false);
-            if let Some(stalled_for) = recovered.filter(|_| had_report) {
-                return MonitorAction::Recovered { stalled_for };
-            }
-            if let Some(duration) = signals.completed_tick {
-                // The block returned before a sample crossed the bound. Its
-                // measured duration is the stall, and the episode is already
-                // over: do not arm the one-shot flag for the next tick.
-                self.reported_at = Some(now);
-                return MonitorAction::Report {
-                    idle: duration,
-                    phase: Phase::RuntimeTick,
-                };
-            }
-            return MonitorAction::None;
+            return match recovered {
+                Some(stalled_for) if had_report => MonitorAction::Recovered { stalled_for },
+                _ => MonitorAction::None,
+            };
         }
         if !active {
             // Idle is expected: no stall, and a threshold crossing that ended
@@ -1498,6 +1564,7 @@ fn monitor_loop(
                     ReportSample {
                         phase: sampled_phase,
                         idle: shared.idle_for(),
+                        tick_gap: state.take_tick_gap(),
                     },
                     now,
                     delivery,
@@ -1518,30 +1585,39 @@ fn monitor_loop(
         let active = shared.active.load(Ordering::Relaxed);
         let idle = shared.idle_for();
         let bound = config.bound_for(phase);
-        // One gauge sample per poll drives the parked-work bitset, the
-        // no-present detector, and the completed-tick rule (bitty#2830).
+        // One gauge sample per poll drives the parked-work bitset and the
+        // no-present detector; the completed-tick ring is drained separately
+        // so every retained tick is retained for its own report (bitty#2830).
         let gauges = shared.gauges.snapshot();
         let pending = PendingWork::from_gauges(&gauges);
-        let completed_tick = state.sample_completed_tick(
-            gauges.tick_count,
-            gauges.last_tick_ns,
-            config.bound_for(Phase::RuntimeTick),
-        );
+        let tick_seq_before = state.last_tick_seq;
+        let drain = shared.gauges.drain_ticks_since(state.last_tick_seq);
+        state.accept_tick_drain(drain, config.bound_for(Phase::RuntimeTick));
+        let drained_completion = state.last_tick_seq > tick_seq_before;
         let stale = state.sample_presented(now, shared.presented_frames.load(Ordering::Relaxed));
-        match state.evaluate(
-            now,
-            progress,
-            active,
-            StallSample {
-                phase,
-                idle,
-                threshold: bound,
-            },
-            PhaseSignals {
-                parked: pending.any(),
-                completed_tick,
-            },
-        ) {
+        // A `runtime-tick` phase mark outlives the tick by a few instructions:
+        // the tick publishes its ring record before the app marks the next
+        // phase. If that completion was drained on this poll, the ring owns
+        // the evidence and a phase report would duplicate it; the pending
+        // completed tick is reported below. A completion not yet visible to
+        // this poll leaves the in-flight detector authoritative.
+        let tick_phase_stale = phase == Phase::RuntimeTick && drained_completion;
+        let action = if tick_phase_stale {
+            MonitorAction::None
+        } else {
+            state.evaluate(
+                now,
+                progress,
+                active,
+                StallSample {
+                    phase,
+                    idle,
+                    threshold: bound,
+                },
+                pending.any(),
+            )
+        };
+        match action {
             MonitorAction::None => {}
             MonitorAction::Report {
                 idle: stalled_for,
@@ -1554,6 +1630,7 @@ fn monitor_loop(
                     ReportSample {
                         phase: report_phase,
                         idle: stalled_for,
+                        tick_gap: state.take_tick_gap(),
                     },
                     now,
                     delivery,
@@ -1566,6 +1643,7 @@ fn monitor_loop(
                     return;
                 }
                 delivery.record(sink(&rendered));
+                state.note_in_flight_report(report_phase);
                 maybe_abort_after_report();
             }
             MonitorAction::Recovered { stalled_for } => {
@@ -1578,6 +1656,30 @@ fn monitor_loop(
                     phase.as_str()
                 )));
             }
+        }
+        // Completed over-bound ticks are independent evidence: a progress
+        // change on this poll must not discard them, and each one gets its own
+        // report oldest first. The tick that completed a reported in-flight
+        // stall was already dropped by `accept_tick_drain`.
+        while let Some(tick) = state.next_completed_report(now) {
+            let report = build_report(
+                shared,
+                config,
+                DiagnosticReason::Stall,
+                ReportSample {
+                    phase: Phase::RuntimeTick,
+                    idle: tick.duration,
+                    tick_gap: state.take_tick_gap(),
+                },
+                now,
+                delivery,
+                Some(stale),
+            );
+            let rendered = render_report(&report);
+            if stop.is_stopped() {
+                return;
+            }
+            delivery.record(sink(&rendered));
         }
         // bitty#2830 hypothesis 2: the phase heartbeat keeps advancing while a
         // hidden surface parses output but never paints. The presented-frame
@@ -1593,6 +1695,7 @@ fn monitor_loop(
                 ReportSample {
                     phase,
                     idle: shared.idle_for(),
+                    tick_gap: state.take_tick_gap(),
                 },
                 now,
                 delivery,
@@ -1726,6 +1829,7 @@ fn build_report(
         threads: totals_snapshot.0,
         totals: totals_snapshot.1,
         delivery,
+        tick_gap: sample.tick_gap,
     }
 }
 
@@ -1926,6 +2030,18 @@ fn render_report(report: &StallReport) -> String {
             .map_or_else(|| String::from("none"), |ms| ms.to_string()),
         report.reason.as_str(),
     );
+    // bitty#2830 review F1: a ring overwrite is explicit evidence, never a
+    // silent loss. One line names the ring size and the missing sequence span.
+    if let Some(gap) = report.tick_gap {
+        let _ = writeln!(
+            out,
+            "  tick-ring: capacity={} missed={} seq={}..{}",
+            TICK_RING_CAPACITY,
+            gap.missed(),
+            gap.from,
+            gap.to,
+        );
+    }
     match &report.context {
         Some(context) => {
             let focus = context
@@ -3954,7 +4070,7 @@ mod tests {
                     idle: Duration::from_secs(60),
                     threshold: DEFAULT_STALL_THRESHOLD,
                 },
-                PhaseSignals::default(),
+                false,
             ),
             MonitorAction::None
         );
@@ -3968,7 +4084,7 @@ mod tests {
                     idle: Duration::from_millis(1999),
                     threshold: DEFAULT_STALL_THRESHOLD,
                 },
-                PhaseSignals::default(),
+                false,
             ),
             MonitorAction::None
         );
@@ -3991,7 +4107,7 @@ mod tests {
                     idle: DEFAULT_STALL_THRESHOLD,
                     threshold: DEFAULT_STALL_THRESHOLD,
                 },
-                PhaseSignals::default(),
+                false,
             ),
             MonitorAction::Report {
                 idle: DEFAULT_STALL_THRESHOLD,
@@ -4009,7 +4125,7 @@ mod tests {
                     idle: Duration::from_secs(7),
                     threshold: DEFAULT_STALL_THRESHOLD,
                 },
-                PhaseSignals::default(),
+                false,
             ),
             MonitorAction::None
         );
@@ -4023,7 +4139,7 @@ mod tests {
                     idle: Duration::from_secs(32),
                     threshold: DEFAULT_STALL_THRESHOLD,
                 },
-                PhaseSignals::default(),
+                false,
             ),
             MonitorAction::None
         );
@@ -4038,7 +4154,7 @@ mod tests {
                     idle: Duration::from_millis(0),
                     threshold: DEFAULT_STALL_THRESHOLD,
                 },
-                PhaseSignals::default(),
+                false,
             ),
             MonitorAction::Recovered {
                 stalled_for: Duration::from_secs(31)
@@ -4054,7 +4170,7 @@ mod tests {
                     idle: Duration::from_millis(0),
                     threshold: DEFAULT_STALL_THRESHOLD,
                 },
-                PhaseSignals::default(),
+                false,
             ),
             MonitorAction::None
         );
@@ -4121,7 +4237,7 @@ mod tests {
                     idle: threshold,
                     threshold,
                 },
-                PhaseSignals::default(),
+                false,
             ),
             MonitorAction::Report {
                 idle: threshold,
@@ -4177,7 +4293,7 @@ mod tests {
                         idle: Duration::from_secs(3600),
                         threshold: DEFAULT_STALL_THRESHOLD,
                     },
-                    PhaseSignals::default(),
+                    false,
                 ),
                 MonitorAction::Report { .. }
             ) {
@@ -4187,100 +4303,163 @@ mod tests {
         assert_eq!(reports, 1, "a continuous stall writes exactly one report");
     }
 
-    /// bitty#2830 (live 2026-11-05): the completed-tick sampler is the second
-    /// evidence source. It reports one over-bound duration per completed tick
-    /// and stays quiet for a tick that returned inside the bound.
+    /// bitty#2830 review F3: the exact old-bug case. The sample that observes
+    /// a completed tick also sees a progress change (the tick's own phase
+    /// marks), and the old early return discarded the measured duration. The
+    /// completed-tick queue must report it anyway.
     #[test]
-    fn completed_tick_sampling_reports_only_over_bound_ticks() {
-        let mut state = MonitorState::new(Instant::now(), 0, 0, 7);
-        let bound = HANG_WATCHDOG_TICK_BOUND;
-        // The same completed tick is never re-sampled.
-        assert_eq!(state.sample_completed_tick(7, 5_000_000_000, bound), None);
-        // One over-bound tick yields its measured duration exactly once.
-        assert_eq!(
-            state.sample_completed_tick(8, 17_490_000_000, bound),
-            Some(Duration::from_millis(17_490))
-        );
-        assert_eq!(state.sample_completed_tick(8, 17_490_000_000, bound), None);
-        // A tick that returned inside the bound is ordinary progress.
-        assert_eq!(state.sample_completed_tick(9, 180_000_000, bound), None);
-        // A later over-bound tick is a new episode.
-        assert_eq!(
-            state.sample_completed_tick(10, 13_090_000_000, bound),
-            Some(Duration::from_millis(13_090))
-        );
-    }
-
-    /// bitty#2830 (live 2026-11-05): the observed shape was
-    /// `block -> ~0.2 s of progress -> block` (17.49 s, then 13.09 s). The
-    /// sample that observes the block is the progress change after it
-    /// returned, so the in-flight `idle` path never sees it. The completed
-    /// tick must still report its measured duration, name `runtime-tick`, and
-    /// report the next block as a new episode.
-    #[test]
-    fn completed_tick_above_the_bound_reports_once_and_repeats() {
+    fn completed_tick_reports_survive_a_progress_change() {
         let start = Instant::now();
-        let mut state = MonitorState::new(start, 1, 0, 10);
+        let gauges = Arc::new(HangGauges::new());
+        let mut state = MonitorState::new(start, 1, 0, 0);
         let bound = HANG_WATCHDOG_TICK_BOUND;
-        let first = Duration::from_millis(17_490);
-        let first_at = start + first;
+        let long = Duration::from_millis(17_490);
+        gauges.record_tick_for_test(long);
+        state.accept_tick_drain(gauges.drain_ticks_since(state.last_tick_seq), bound);
+        // Healthy phase heartbeat: progress advanced past the tick.
         assert_eq!(
             state.evaluate(
-                first_at,
+                start + Duration::from_millis(200),
                 2,
                 true,
                 StallSample {
                     phase: Phase::RuntimeTick,
-                    idle: Duration::ZERO,
+                    idle: Duration::from_millis(200),
                     threshold: bound,
                 },
-                PhaseSignals {
-                    completed_tick: Some(first),
-                    ..PhaseSignals::default()
-                },
-            ),
-            MonitorAction::Report {
-                idle: first,
-                phase: Phase::RuntimeTick,
-            }
-        );
-        // The same completed tick is not reported on the next sample.
-        assert_eq!(
-            state.evaluate(
-                first_at + Duration::from_millis(100),
-                2,
-                true,
-                StallSample {
-                    phase: Phase::RuntimeTick,
-                    idle: Duration::from_millis(100),
-                    threshold: bound,
-                },
-                PhaseSignals::default(),
+                false,
             ),
             MonitorAction::None
         );
-        // The next block is a separate stall episode and reports again.
-        let second = Duration::from_millis(13_090);
-        let second_at = first_at + Duration::from_millis(200) + second;
+        let report = state
+            .next_completed_report(Instant::now())
+            .expect("a progress change must not discard the completed tick");
+        assert_eq!(report.duration, long);
+        assert!(state.next_completed_report(Instant::now()).is_none());
+
+        let shared = Shared::new(Arc::clone(&gauges));
+        let rendered = render_report(&build_report(
+            &shared,
+            WatchdogConfig::with_threshold_ms(10_000),
+            DiagnosticReason::Stall,
+            ReportSample {
+                phase: Phase::RuntimeTick,
+                idle: report.duration,
+                tick_gap: None,
+            },
+            Instant::now(),
+            DeliverySummary::default(),
+            None,
+        ));
+        assert!(
+            rendered.contains("no progress for 17490 ms (threshold 3000 ms, phase=runtime-tick"),
+            "{rendered}"
+        );
+    }
+
+    /// bitty#2830 review F4: a completed tick sampled between `runtime.tick()`
+    /// returning and the next phase mark is consumed by the ring drain but
+    /// retained by the monitor until it is reported. A poll with unchanged
+    /// progress must not drop it.
+    #[test]
+    fn completed_tick_without_a_progress_change_is_retained() {
+        let start = Instant::now();
+        let gauges = Arc::new(HangGauges::new());
+        let mut state = MonitorState::new(start, 1, 0, 0);
+        let bound = HANG_WATCHDOG_TICK_BOUND;
+        let long = Duration::from_millis(13_090);
+        gauges.record_tick_for_test(long);
+        state.accept_tick_drain(gauges.drain_ticks_since(state.last_tick_seq), bound);
         assert_eq!(
             state.evaluate(
-                second_at,
-                3,
+                start + Duration::from_millis(10),
+                1,
                 true,
                 StallSample {
                     phase: Phase::RuntimeTick,
-                    idle: Duration::ZERO,
+                    idle: Duration::from_millis(10),
                     threshold: bound,
                 },
-                PhaseSignals {
-                    completed_tick: Some(second),
-                    ..PhaseSignals::default()
-                },
+                false,
             ),
-            MonitorAction::Report {
-                idle: second,
+            MonitorAction::None
+        );
+        let report = state
+            .next_completed_report(Instant::now())
+            .expect("an unchanged progress sample must retain the tick");
+        assert_eq!(report.duration, long);
+    }
+
+    /// bitty#2830 review F1: every over-bound tick retained by the ring is
+    /// reported, oldest first, and a tick inside the bound is skipped without
+    /// consuming the ones around it.
+    #[test]
+    fn every_over_bound_completed_tick_reports_oldest_first() {
+        let gauges = Arc::new(HangGauges::new());
+        let mut state = MonitorState::new(Instant::now(), 0, 0, 0);
+        let bound = HANG_WATCHDOG_TICK_BOUND;
+        let first = Duration::from_millis(17_490);
+        let second = Duration::from_millis(13_090);
+        gauges.record_tick_for_test(first);
+        gauges.record_tick_for_test(Duration::from_millis(180));
+        gauges.record_tick_for_test(second);
+        state.accept_tick_drain(gauges.drain_ticks_since(state.last_tick_seq), bound);
+        assert_eq!(
+            state.next_completed_report(Instant::now()),
+            Some(CompletedTick {
+                seq: 1,
+                duration: first,
+            })
+        );
+        assert_eq!(
+            state.next_completed_report(Instant::now()),
+            Some(CompletedTick {
+                seq: 3,
+                duration: second,
+            })
+        );
+        assert!(state.next_completed_report(Instant::now()).is_none());
+    }
+
+    /// bitty#2830 review F1: a ring overwrite is named by the next report
+    /// with the ring size and the missing sequence span, once.
+    #[test]
+    fn tick_ring_gap_is_named_once_in_the_next_report() {
+        let gauges = Arc::new(HangGauges::new());
+        for _ in 0..(TICK_RING_CAPACITY + 4) {
+            gauges.record_tick_for_test(Duration::from_millis(1));
+        }
+        let mut state = MonitorState::new(Instant::now(), 0, 0, 0);
+        state.accept_tick_drain(
+            gauges.drain_ticks_since(state.last_tick_seq),
+            HANG_WATCHDOG_TICK_BOUND,
+        );
+        let gap = state.take_tick_gap().expect("overflow must be named");
+        assert_eq!(gap, TickGap { from: 1, to: 4 });
+        assert_eq!(gap.missed(), 4);
+        assert!(
+            state.take_tick_gap().is_none(),
+            "the gap belongs to exactly one report"
+        );
+
+        let shared = Shared::new(Arc::clone(&gauges));
+        let report = build_report(
+            &shared,
+            WatchdogConfig::with_threshold_ms(10_000),
+            DiagnosticReason::Stall,
+            ReportSample {
                 phase: Phase::RuntimeTick,
-            }
+                idle: Duration::from_millis(1),
+                tick_gap: Some(gap),
+            },
+            Instant::now(),
+            DeliverySummary::default(),
+            None,
+        );
+        let rendered = render_report(&report);
+        assert!(
+            rendered.contains("tick-ring: capacity=16 missed=4 seq=1..4"),
+            "{rendered}"
         );
     }
 
@@ -4300,6 +4479,7 @@ mod tests {
             ReportSample {
                 phase: Phase::RuntimeTick,
                 idle: measured,
+                tick_gap: None,
             },
             Instant::now(),
             DeliverySummary::default(),
@@ -4316,12 +4496,13 @@ mod tests {
     }
 
     /// One report per continuous stall still holds when the in-flight
-    /// detector caught the block: the tick's completion is the recovery line,
-    /// never a second report for the same wedge.
+    /// detector caught the block: the ring's completion record is matched and
+    /// dropped, and the progress change is the single recovery line.
     #[test]
-    fn in_flight_tick_report_is_not_duplicated_when_the_tick_returns() {
+    fn in_flight_tick_completion_is_not_reported_twice() {
         let start = Instant::now();
-        let mut state = MonitorState::new(start, 1, 0, 10);
+        let gauges = Arc::new(HangGauges::new());
+        let mut state = MonitorState::new(start, 1, 0, 0);
         let bound = HANG_WATCHDOG_TICK_BOUND;
         assert_eq!(
             state.evaluate(
@@ -4333,14 +4514,26 @@ mod tests {
                     idle: bound,
                     threshold: bound,
                 },
-                PhaseSignals::default(),
+                false,
             ),
             MonitorAction::Report {
                 idle: bound,
                 phase: Phase::RuntimeTick,
             }
         );
+        state.note_in_flight_report(Phase::RuntimeTick);
+        assert_eq!(state.completion_seq, Some(1));
         let long = Duration::from_millis(17_490);
+        gauges.record_tick_for_test(long);
+        state.accept_tick_drain(gauges.drain_ticks_since(state.last_tick_seq), bound);
+        assert!(
+            state.completion_seq.is_none(),
+            "the completing tick must be matched"
+        );
+        assert!(
+            state.next_completed_report(Instant::now()).is_none(),
+            "the in-flight report already covers this tick"
+        );
         assert_eq!(
             state.evaluate(
                 start + long,
@@ -4351,48 +4544,10 @@ mod tests {
                     idle: Duration::ZERO,
                     threshold: bound,
                 },
-                PhaseSignals {
-                    completed_tick: Some(long),
-                    ..PhaseSignals::default()
-                },
+                false,
             ),
             MonitorAction::Recovered {
                 stalled_for: long - bound,
-            }
-        );
-        // The next block's first sample is the progress change that opens a
-        // new episode...
-        let next = start + long + Duration::from_millis(500);
-        assert_eq!(
-            state.evaluate(
-                next,
-                3,
-                true,
-                StallSample {
-                    phase: Phase::RuntimeTick,
-                    idle: Duration::ZERO,
-                    threshold: bound,
-                },
-                PhaseSignals::default(),
-            ),
-            MonitorAction::None
-        );
-        // ...and one bound later the new continuous stall reports again.
-        assert_eq!(
-            state.evaluate(
-                next + bound,
-                3,
-                true,
-                StallSample {
-                    phase: Phase::RuntimeTick,
-                    idle: bound,
-                    threshold: bound,
-                },
-                PhaseSignals::default(),
-            ),
-            MonitorAction::Report {
-                idle: bound,
-                phase: Phase::RuntimeTick,
             }
         );
     }
@@ -5628,6 +5783,7 @@ mod tests {
                 hidden_damage: true,
             },
             present_stale_ms: Some(12_345),
+            tick_gap: None,
         };
         let rendered = render_report(&report);
         assert!(rendered.contains("phase=runtime-tick"), "{rendered}");
@@ -5688,6 +5844,7 @@ mod tests {
             },
             pending: PendingWork::default(),
             present_stale_ms: None,
+            tick_gap: None,
         };
         let rendered = render_report(&report);
         assert!(rendered.len() <= MAX_REPORT_BYTES, "{}", rendered.len());

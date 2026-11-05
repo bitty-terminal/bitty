@@ -53,6 +53,8 @@ pub struct RealDriver {
     /// so the corpus skip path can be exercised on a host that can contain a
     /// child.
     forced_terminal_spawn: Option<bool>,
+    /// The accumulated retention-clock offset written for the test seam.
+    clock_offset_ms: u64,
 }
 
 struct Root {
@@ -381,6 +383,7 @@ impl RealDriver {
             handler_delay_ms: 0,
             handler_delay_method: None,
             forced_terminal_spawn: None,
+            clock_offset_ms: 0,
         }
     }
 
@@ -466,6 +469,7 @@ impl RealDriver {
         self.clients.clear();
         self.requests.clear();
         self.next_id = 1;
+        self.clock_offset_ms = 0;
         self.facts = self.probe()?;
         if self.needs_host_grant {
             self.host_grant = Some(self.mint_host_grant()?);
@@ -535,10 +539,16 @@ impl RealDriver {
             // driver sets the override variables for the vector and passes
             // them to the daemon, so the flag tracks the run rather than a
             // cargo cfg that the test crate cannot observe reliably.
-            seams: std::collections::BTreeMap::from([(
-                "request_deadline_seam".to_owned(),
-                cfg!(feature = "test-seams") && self.request_timeout_ms.is_some(),
-            )]),
+            seams: std::collections::BTreeMap::from([
+                (
+                    "request_deadline_seam".to_owned(),
+                    cfg!(feature = "test-seams") && self.request_timeout_ms.is_some(),
+                ),
+                (
+                    "retention_clock_seam".to_owned(),
+                    cfg!(feature = "test-seams"),
+                ),
+            ]),
         })
     }
 
@@ -1056,9 +1066,52 @@ impl Driver for RealDriver {
         Ok(())
     }
 
-    fn advance_clock(&mut self, _millis: u64) {
-        // The served loop uses a process monotonic clock; no injection point
-        // exists. Vectors that need one are fake-only and record a typed skip.
+    fn advance_clock(&mut self, millis: u64) {
+        // The served loop keeps a process monotonic clock; the test-only
+        // `test-seams` feature adds a file-driven offset to the loop clock.
+        // Writing the accumulated offset is the injection point V-20 uses to
+        // age a retained record past `terminal_retention_ms` without sleeping.
+        self.clock_offset_ms = self.clock_offset_ms.saturating_add(millis);
+        let Some(root) = &self.root else {
+            return;
+        };
+        let endpoint = root.endpoint();
+        let Some(runtime_dir) = endpoint.parent() else {
+            return;
+        };
+        let _ = std::fs::write(
+            runtime_dir.join("bittyd.test-clock-offset"),
+            self.clock_offset_ms.to_string(),
+        );
+    }
+
+    fn cli_stop(&mut self, mode: &str) -> Result<ExitObservation, String> {
+        let root = self.root.as_ref().ok_or_else(|| "no root".to_owned())?;
+        let mut command = Command::new(BITTYD);
+        command.arg("stop");
+        match mode {
+            "refuse" => {}
+            "drain" => {
+                command.arg("--drain");
+            }
+            "force" => {
+                command.arg("--force");
+            }
+            other => return Err(format!("unknown stop mode {other:?}")),
+        }
+        let output = command
+            .env("XDG_RUNTIME_DIR", root.runtime())
+            .env("XDG_STATE_HOME", root.state())
+            .env_remove("BITTYD_ENDPOINT")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|_| "cannot run bittyd stop".to_owned())?;
+        Ok(ExitObservation {
+            code: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        })
     }
 
     fn audit_text(&self) -> String {

@@ -132,6 +132,9 @@ struct FakeSession {
     leases: BTreeMap<String, FakeLease>,
     created_ms: u64,
     last_seen_ms: u64,
+    /// When this record became terminal, for the `terminal_retention_ms`
+    /// collection window (`D-14`). `None` while the session is live.
+    terminalized_ms: Option<u64>,
     terminal_reason: Option<&'static str>,
     cleanup: Option<&'static str>,
     /// Simulated terminal output retained for `session.read` and the content
@@ -262,7 +265,10 @@ impl FakeDriver {
                 .map(|limit| (limit.name().to_owned(), self.limits.effective(limit)))
                 .collect(),
             features: BTreeMap::from([("terminal_spawn".to_owned(), FAKE_TERMINAL_SPAWN)]),
-            seams: BTreeMap::from([("request_deadline_seam".to_owned(), true)]),
+            seams: BTreeMap::from([
+                ("request_deadline_seam".to_owned(), true),
+                ("retention_clock_seam".to_owned(), true),
+            ]),
         }
     }
 
@@ -411,6 +417,7 @@ impl FakeDriver {
             return Outcome::Closed;
         }
         self.sweep_expired();
+        self.collect_retained();
         self.requests.push(RequestRecord {
             method: method.to_owned(),
             params: params.clone(),
@@ -874,6 +881,18 @@ impl FakeDriver {
             .count()
     }
 
+    /// Drop terminal records past the effective `terminal_retention_ms`
+    /// (`D-14`), matching the served collection point.
+    fn collect_retained(&mut self) {
+        let now = self.clock_ms;
+        let retention = self.limits.effective(LimitId::TerminalRetentionMs);
+        self.sessions.retain(|_, session| {
+            !session
+                .terminalized_ms
+                .is_some_and(|terminalized| now.saturating_sub(terminalized) >= retention)
+        });
+    }
+
     fn daemon_stop(&mut self, connection: &str, params: &Value) -> Outcome {
         if !self.has_scope(connection, "daemon.control") {
             return self.refuse("daemon.stop", "Denied", "ScopeViolation", None);
@@ -1140,6 +1159,7 @@ impl FakeDriver {
             leases: BTreeMap::new(),
             created_ms: now,
             last_seen_ms: now,
+            terminalized_ms: None,
             terminal_reason: None,
             cleanup: None,
         };
@@ -2214,6 +2234,7 @@ impl FakeDriver {
         session.pending_grants = 0;
         session.initial_token = None;
         session.state = "terminated";
+        session.terminalized_ms = Some(now);
         session.terminal_reason = Some(reason);
         session.cleanup = Some(if session.generation > 0 {
             "swept"
@@ -2495,6 +2516,26 @@ impl Driver for FakeDriver {
         Err("the fake driver has no process".to_owned())
     }
 
+    fn cli_stop(&mut self, mode: &str) -> Result<ExitObservation, String> {
+        let outcome = self.daemon_stop("operator", &json!({"mode": mode}));
+        let Outcome::Reply(reply) = outcome else {
+            return Err("the fake stop closed the operator connection".to_owned());
+        };
+        let code = if reply.ok {
+            0
+        } else {
+            match reply.error.as_ref().map(|error| error.code.as_str()) {
+                Some("ActiveSessions") => 3,
+                Some("DaemonStopping") => 0,
+                _ => 1,
+            }
+        };
+        Ok(ExitObservation {
+            code,
+            stdout: format!("bittyd: stop ({mode})\n"),
+        })
+    }
+
     fn requests(&self) -> Vec<RequestRecord> {
         self.requests.clone()
     }
@@ -2628,6 +2669,7 @@ mod tests {
                 leases,
                 created_ms: now,
                 last_seen_ms: now,
+                terminalized_ms: None,
                 terminal_reason: None,
                 cleanup: None,
                 content: Vec::new(),

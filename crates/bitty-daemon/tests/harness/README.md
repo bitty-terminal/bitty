@@ -119,7 +119,7 @@ the response `result`; a leading `result.` is accepted and normalized.
 
 Actions: `restart`, `crash`, `advance_clock`, `oversized_frame`, `partial_frame`,
 `queue_pressure`, `audit`, `file_mode`, `no_tcp_listener`, `child_processes`,
-`daemon_absent`, `request_log`, `read_events`, `peer_exit`, and
+`daemon_absent`, `cli_stop`, `request_log`, `read_events`, `peer_exit`, and
 `refusal_burst`. `child_processes` asserts `expect.result.count` against the
 service's live direct-child count; a failed process-table read fails the row
 rather than reading as zero. The real driver reads the daemon's per-task
@@ -131,7 +131,12 @@ derives the count from its own model instead of returning zero — one child per
 bound, non-terminal session
 (`harness::fake::tests::the_fake_child_count_follows_its_own_session_state`), so
 a refused create that never binds reads zero because the fake models the
-absence, not because the step cannot observe anything. `read_events` reads `args.count` pushed frames;
+absence, not because the step cannot observe anything. `cli_stop` runs
+`bittyd stop [--force | --drain]` for `args.mode` and checks
+`exit_code`/`stdout_contains`; the fake driver models the exit mapping, while
+the real driver runs the built binary. `advance_clock` on the real driver
+writes the `test-seams` clock-offset file, which V-20 uses to age a retained
+record past `terminal_retention_ms`. `read_events` reads `args.count` pushed frames;
 `args.events` is an optional per-frame array of expectation objects
 (index-aligned with the frames), and `expect.result` is the fallback applied to
 every frame. `retry_ms` is the only bounded settlement: it re-sends the same

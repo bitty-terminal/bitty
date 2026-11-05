@@ -2429,6 +2429,15 @@
               "limit": 16
             }
           }
+        },
+        {
+          "action": "cli_stop",
+          "args": {
+            "mode": "refuse"
+          },
+          "expect": {
+            "exit_code": 3
+          }
         }
       ],
       "state": [
@@ -2447,9 +2456,217 @@
       ],
       "forbidden": [
         "no session is terminated by a refused stop",
-        "the daemon does not enter stopping"
+        "the daemon does not enter stopping",
+        "the CLI exit is 3 and the daemon keeps serving"
+      ]
+    },
+    {
+      "id": "V-17",
+      "title": "A force stop terminates two sessions with daemon_stop terminal events and reaping",
+      "area": "stop",
+      "decisions": ["D-05"],
+      "drivers": ["real"],
+      "fake_skip": "requires-real-cli-and-event-wire (the reference fake has no CLI process and detaches leases at termination)",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {"major": 1, "minor": 0},
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.host_grant",
+          "params": {
+            "action": "mint"
+          },
+          "capture": {
+            "grant2": "grant"
+          },
+          "expect": {
+            "ok": true,
+            "present": ["grant_id", "grant", "expires_at_ms"]
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {"major": 1, "minor": 0},
+            "host_grant": "@host_grant",
+            "events": true
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v17-create-a"
+          },
+          "capture": {
+            "session_a": "session.session_id",
+            "token_a": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0,
+              "session.attach_count": 0,
+              "replayed": false
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_a",
+            "expected_generation": 0,
+            "control_token": "@token_a",
+            "idempotency_key": "v17-claim-a"
+          },
+          "capture": {
+            "attach_a": "attach_id",
+            "controller_a": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller",
+              "replayed": false,
+              "session.attach_count": 1
+            }
+          }
+        },
+        {
+          "connection": "creator2",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {"major": 1, "minor": 0},
+            "host_grant": "@grant2"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator2",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v17-create-b"
+          },
+          "capture": {
+            "session_b": "session.session_id",
+            "token_b": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0,
+              "session.attach_count": 0,
+              "replayed": false
+            }
+          }
+        },
+        {
+          "connection": "creator2",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_b",
+            "expected_generation": 0,
+            "control_token": "@token_b",
+            "idempotency_key": "v17-claim-b"
+          },
+          "capture": {
+            "attach_b": "attach_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller",
+              "replayed": false,
+              "session.attach_count": 1
+            }
+          }
+        },
+        {
+          "action": "cli_stop",
+          "args": {
+            "mode": "force"
+          },
+          "expect": {
+            "exit_code": 0,
+            "stdout_contains": ["stopped (force)", "2 active session(s)"]
+          }
+        },
+        {
+          "action": "read_events",
+          "connection": "creator",
+          "args": {
+            "count": 2,
+            "events": [
+              {
+                "kind": "session_state",
+                "revision": 2,
+                "attach_id": "@attach_a",
+                "terminal": false
+              },
+              {
+                "kind": "session_terminal",
+                "revision": 3,
+                "attach_id": "@attach_a",
+                "terminal": true,
+                "terminal_marker.state": "terminated",
+                "terminal_marker.reason": "daemon_stop",
+                "terminal_marker.cleanup": "not_started"
+              }
+            ]
+          },
+          "expect": {
+            "closed": true
+          }
+        }
       ],
-      "deferred": "CLI stop exit code is not implemented (the CLI has no stop subcommand); the service-level refuse semantics are covered"
+      "state": [
+        {
+          "action": "request_log",
+          "args": {},
+          "expect": {
+            "request_log": {
+              "no_fields": ["pid"],
+              "method_counts": {
+                "session.create": 2
+              }
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a force stop never leaves a session running",
+        "both terminal events carry daemon_stop and a not_started cleanup",
+        "the CLI exit is 0 for an all-pre-bind force stop"
+      ]
     },
     {
       "id": "V-18",
@@ -2750,6 +2967,171 @@
         "a conflicting fingerprint never overwrites the remembered result"
       ],
       "deferred": "request deadline is a supervisor timer without an injection point; idempotent create dedupe is covered"
+    },
+    {
+      "id": "V-20",
+      "title": "A terminal record past terminal_retention_ms becomes NotFound and leaves the retained count",
+      "area": "retention",
+      "decisions": ["D-14"],
+      "drivers": ["fake", "real"],
+      "requires": ["retention_clock_seam"],
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {"major": 1, "minor": 0},
+            "host_grant": "@host_grant",
+            "events": true
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v20-create"
+          },
+          "capture": {
+            "session_id": "session.session_id",
+            "create_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0,
+              "session.attach_count": 0,
+              "replayed": false
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.attach",
+          "params": {
+            "attach_role": "controller",
+            "session_id": "@session_id",
+            "expected_generation": 0,
+            "control_token": "@create_token",
+            "idempotency_key": "v20-claim"
+          },
+          "capture": {
+            "attach_id": "attach_id",
+            "controller_token": "control_token"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "role": "controller",
+              "replayed": false,
+              "session.attach_count": 1
+            }
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.abort",
+          "params": {
+            "session_id": "@session_id",
+            "reason_class": "cancel",
+            "control_token": "@controller_token",
+            "generation": 0
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "accepted": true,
+              "reason": "consumer_cancel",
+              "cleanup": "not_started",
+              "session.state": "terminated",
+              "session.terminal_reason": "consumer_cancel"
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {"major": 1, "minor": 0},
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "active_sessions": 0,
+              "sessions.terminal": 1
+            }
+          }
+        },
+        {
+          "action": "advance_clock",
+          "args": {
+            "ms": 600001
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "retry_ms": 3000,
+            "ok": false,
+            "error_class": "NotFound",
+            "error_code": "NotFound"
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.status",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "result": {
+              "active_sessions": 0,
+              "sessions.terminal": 0
+            }
+          }
+        }
+      ],
+      "state": [
+        {
+          "connection": "operator",
+          "method": "session.list",
+          "params": null,
+          "expect": {
+            "ok": true,
+            "array_len": {
+              "sessions": 0
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a collected terminal record never resolves",
+        "the retained count drops exactly once",
+        "the event ring and control keys are released with the record"
+      ]
     },
     {
       "id": "V-22",

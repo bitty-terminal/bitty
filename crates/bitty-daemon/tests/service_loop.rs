@@ -182,6 +182,45 @@ fn send_signal(pid: u32, signal: &str) {
     assert!(status.success(), "kill -{signal} {pid} failed");
 }
 
+/// The observed exit and output of one `bittyd stop` invocation.
+#[derive(Debug)]
+struct CliStopObservation {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run `bittyd stop` with the given flags against a throwaway root.
+fn run_cli_stop(root: &TempRoot, flags: &[&str]) -> CliStopObservation {
+    let output = Command::new(BITTYD)
+        .arg("stop")
+        .args(flags)
+        .env("XDG_RUNTIME_DIR", root.runtime())
+        .env("XDG_STATE_HOME", root.state())
+        .env_remove("BITTYD_ENDPOINT")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run bittyd stop");
+    CliStopObservation {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn cli_stop_without_a_daemon_reports_the_absence_and_exits_zero() {
+    let root = TempRoot::new("cli-absent");
+    let observed = run_cli_stop(&root, &[]);
+    assert_eq!(observed.code, 0, "{observed:?}");
+    assert!(
+        observed.stdout.contains("no running daemon"),
+        "{observed:?}"
+    );
+}
+
 struct Client {
     stream: UnixStream,
     next_id: u64,
@@ -3923,6 +3962,205 @@ fn worker_create_keeps_the_scope_then_capability_then_kind_order() {
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
 }
 
+/// Read one length-prefixed JSON frame from a test socket.
+fn read_test_frame(stream: &mut UnixStream) -> Value {
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).expect("frame header");
+    let length = u32::from_be_bytes(header) as usize;
+    let mut payload = vec![0u8; length];
+    stream.read_exact(&mut payload).expect("frame payload");
+    serde_json::from_slice(&payload).expect("frame json")
+}
+
+/// Write one length-prefixed JSON frame to a test socket.
+fn write_test_frame(stream: &mut UnixStream, value: &Value) {
+    let payload = serde_json::to_vec(value).expect("frame json");
+    stream
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .expect("frame header");
+    stream.write_all(&payload).expect("frame payload");
+}
+
+/// Serve one `negotiate` + `stop` pair and return the chosen stop result.
+fn fake_stop_endpoint(root: &TempRoot, result: Value) -> std::thread::JoinHandle<()> {
+    use std::os::unix::net::UnixListener;
+
+    let runtime_dir = root.endpoint().parent().expect("runtime dir").to_path_buf();
+    std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+    std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("runtime mode");
+    let capability = format!("{}\n", "a".repeat(64));
+    std::fs::write(root.capability(), capability).expect("capability file");
+    std::fs::set_permissions(root.capability(), std::fs::Permissions::from_mode(0o600))
+        .expect("capability mode");
+    let listener = UnixListener::bind(root.endpoint()).expect("bind fake endpoint");
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept CLI");
+        let negotiate = read_test_frame(&mut stream);
+        assert_eq!(negotiate["method"], "daemon.negotiate");
+        write_test_frame(
+            &mut stream,
+            &json!({
+                "v": 1,
+                "id": negotiate["id"],
+                "ok": true,
+                "result": {"daemon_instance_id": "0".repeat(32)},
+            }),
+        );
+        let stop = read_test_frame(&mut stream);
+        assert_eq!(stop["method"], "daemon.stop");
+        write_test_frame(
+            &mut stream,
+            &json!({"v": 1, "id": stop["id"], "ok": true, "result": result}),
+        );
+    })
+}
+
+#[test]
+fn cli_stop_maps_an_unverified_worker_to_exit_five() {
+    let root = TempRoot::new("cli-exit-five");
+    let server = fake_stop_endpoint(
+        &root,
+        json!({
+            "accepted": true,
+            "mode": "force",
+            "active_sessions": 1,
+            "terminated": 1,
+            "unverified": 1,
+            "drain_deadline_ms": null,
+        }),
+    );
+    let observed = run_cli_stop(&root, &["--force"]);
+    server.join().expect("fake server");
+    assert_eq!(observed.code, 5, "{observed:?}");
+    assert!(
+        observed.stderr.contains("could not be verified gone"),
+        "{observed:?}"
+    );
+}
+
+#[test]
+fn cli_stop_maps_a_forced_drain_to_exit_four() {
+    let root = TempRoot::new("cli-exit-four");
+    let server = fake_stop_endpoint(
+        &root,
+        json!({
+            "accepted": true,
+            "mode": "drain",
+            "active_sessions": 1,
+            "terminated": 1,
+            "unverified": 0,
+            "drain_forced": true,
+            "drain_deadline_ms": 10_000,
+        }),
+    );
+    let observed = run_cli_stop(&root, &["--drain"]);
+    server.join().expect("fake server");
+    assert_eq!(observed.code, 4, "{observed:?}");
+}
+
+#[test]
+fn cli_stop_refuses_with_active_sessions_and_leaves_the_daemon_serving() {
+    let root = TempRoot::new("cli-refuse");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    let _session = controlled_session(&root, &mut operator, "cli-refuse");
+
+    let observed = run_cli_stop(&root, &[]);
+    assert_eq!(observed.code, 3, "{observed:?}");
+    assert!(observed.stderr.contains("ActiveSessions"), "{observed:?}");
+    let status = operator.call("daemon.status", Value::Null);
+    assert_eq!(status["ok"], true, "{status}");
+    assert_eq!(status["result"]["daemon_state"], "running", "{status}");
+    assert_eq!(status["result"]["active_sessions"], 1, "{status}");
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+#[cfg(feature = "test-seams")]
+#[test]
+fn retention_collects_a_terminal_record_past_the_ttl() {
+    let root = TempRoot::new("retention-clock");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    let minted = operator.call("daemon.host_grant", json!({"action": "mint"}));
+    assert_eq!(minted["ok"], true, "{minted}");
+    let host_grant = minted["result"]["grant"]
+        .as_str()
+        .expect("host grant")
+        .to_owned();
+    let mut creator = Client::connect(&root.endpoint());
+    assert_eq!(creator.negotiate_with(None, Some(&host_grant))["ok"], true);
+    let created = creator.call(
+        "session.create",
+        json!({"kind": "terminal", "idempotency_key": "retention-create"}),
+    );
+    assert_eq!(created["ok"], true, "{created}");
+    let session_id = created["result"]["session"]["session_id"]
+        .as_str()
+        .expect("session id")
+        .to_owned();
+    let create_token = created["result"]["control_token"]
+        .as_str()
+        .expect("create token")
+        .to_owned();
+    let claimed = creator.call(
+        "session.attach",
+        json!({
+            "attach_role": "controller",
+            "session_id": session_id,
+            "expected_generation": 0,
+            "control_token": create_token,
+            "idempotency_key": "retention-claim",
+        }),
+    );
+    assert_eq!(claimed["ok"], true, "{claimed}");
+    let controller_token = claimed["result"]["control_token"]
+        .as_str()
+        .expect("controller token")
+        .to_owned();
+    let aborted = creator.call(
+        "session.abort",
+        json!({
+            "session_id": session_id,
+            "reason_class": "cancel",
+            "generation": 0,
+            "control_token": controller_token,
+        }),
+    );
+    assert_eq!(aborted["ok"], true, "{aborted}");
+    let status = operator.call("daemon.status", Value::Null);
+    assert_eq!(status["result"]["sessions"]["terminal"], 1, "{status}");
+
+    let clock = root
+        .endpoint()
+        .parent()
+        .expect("runtime dir")
+        .join("bittyd.test-clock-offset");
+    std::fs::write(&clock, "600001").expect("write clock offset");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status = operator.call("session.status", json!({"session_id": session_id}));
+        if status["ok"] == false {
+            assert_eq!(status["error"]["code"], "NotFound", "{status}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the retained record is still resolvable: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let status = operator.call("daemon.status", Value::Null);
+    assert_eq!(status["result"]["sessions"]["terminal"], 0, "{status}");
+    assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
 /// bitty#2792: pushed session events on the negotiated connection.
 ///
 /// Every test here opts in with `events: true` at `daemon.negotiate` unless it
@@ -4059,6 +4297,57 @@ mod event_wire {
             .expect("rotated token")
             .to_owned();
         (session_id, attach_id, controller_token, created)
+    }
+
+    #[test]
+    fn cli_force_stop_delivers_the_terminal_frame() {
+        let root = TempRoot::new("cli-force-events");
+        let daemon = Daemon::start(&root);
+        let capability = read_capability(&root);
+        let mut operator = Client::connect(&root.endpoint());
+        assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+        let (mut creator, _) = event_consumer(&root, &mut operator, "cli-force");
+        let created = creator.call(
+            "session.create",
+            json!({"kind": "terminal", "idempotency_key": "cli-force-create"}),
+        );
+        assert_eq!(created["ok"], true, "{created}");
+        let session_id = created["result"]["session"]["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_owned();
+        let claimed = creator.call(
+            "session.attach",
+            json!({
+                "attach_role": "controller",
+                "session_id": session_id,
+                "expected_generation": 0,
+                "control_token": created["result"]["control_token"],
+                "idempotency_key": "cli-force-claim",
+            }),
+        );
+        assert_eq!(claimed["ok"], true, "{claimed}");
+        let attach_id = claimed["result"]["attach_id"]
+            .as_str()
+            .expect("attach id")
+            .to_owned();
+
+        let observed = run_cli_stop(&root, &["--force"]);
+        assert_eq!(observed.code, 0, "{observed:?}");
+        assert!(observed.stdout.contains("stopped (force)"), "{observed:?}");
+
+        let state = recv_event(&mut creator);
+        assert_eq!(state["kind"], "session_state", "{state}");
+        assert_eq!(state["attach_id"], attach_id, "{state}");
+        let terminal = recv_event(&mut creator);
+        assert_eq!(terminal["kind"], "session_terminal", "{terminal}");
+        assert_eq!(terminal["session_id"], session_id, "{terminal}");
+        assert_eq!(
+            terminal["terminal_marker"]["reason"], "daemon_stop",
+            "{terminal}"
+        );
+        assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
     }
 
     #[test]

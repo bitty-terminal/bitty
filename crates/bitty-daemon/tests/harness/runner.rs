@@ -190,6 +190,17 @@ pub trait Driver {
     /// A static message when the invocation cannot be observed.
     fn daemon_absent(&mut self) -> Result<ExitObservation, String>;
 
+    /// Run the `stop` subcommand for `mode` (`refuse`, `drain`, or `force`)
+    /// against this driver's instance.
+    ///
+    /// # Errors
+    ///
+    /// A static message when the driver has no CLI process or the invocation
+    /// cannot be observed.
+    fn cli_stop(&mut self, _mode: &str) -> Result<ExitObservation, String> {
+        Err("this driver has no CLI process".to_owned())
+    }
+
     fn requests(&self) -> Vec<RequestRecord>;
 
     fn facts(&self) -> ServiceFacts;
@@ -619,6 +630,21 @@ fn execute_action(
         }
         "daemon_absent" => {
             let observed = driver.daemon_absent()?;
+            if let Some(code) = step.expect.exit_code {
+                if observed.code != code {
+                    return Err(format!("exit {}, expected {code}", observed.code));
+                }
+            }
+            for needle in &step.expect.stdout_contains {
+                if !observed.stdout.contains(needle) {
+                    return Err(format!("stdout does not contain {needle:?}"));
+                }
+            }
+            Ok(())
+        }
+        "cli_stop" => {
+            let mode = arg_string(step, "mode")?;
+            let observed = driver.cli_stop(mode)?;
             if let Some(code) = step.expect.exit_code {
                 if observed.code != code {
                     return Err(format!("exit {}, expected {code}", observed.code));

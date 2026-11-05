@@ -300,10 +300,11 @@ impl Runtime {
     /// Sanitizes `scale` via [`sanitize_dpi_scale`] (invalid input becomes
     /// 1.0, hostile input clamps to `[MIN_DPI_SCALE, MAX_DPI_SCALE]` — never
     /// panics), reloads the renderer's font at the scaled size through
-    /// `GridRenderer::apply_dpi_scale`, and — when `physical_extent` carries
-    /// a non-zero extent — derives the grid from physical pixels over the
-    /// scaled cells ([`grid_from_surface_extent`]) and reflows state, layout,
-    /// surface, and PTY to match.
+    /// `GridRenderer::apply_dpi_scale`, and — when a non-zero extent is
+    /// available (the `physical_extent` argument, else the configured surface
+    /// extent) — derives the grid from physical pixels over the scaled cells
+    /// ([`grid_from_surface_extent`]) and reflows state, layout, surface, and
+    /// PTY to match.
     ///
     /// Callers holding only cached logical geometry should convert it first
     /// via [`bitty_platform::surface_extent_from_logical`] and pass the
@@ -313,10 +314,10 @@ impl Runtime {
     /// `Resized` event takes precedence either way: [`Self::handle_resize`]
     /// derives from the same live scaled cells.
     ///
-    /// Passing `None` rescales the renderer and forces a full redraw while
-    /// leaving the grid for the next `Resized` (this is what the
-    /// `ScaleFactorChanged` event path does when no window handle is at
-    /// hand).
+    /// Passing `None` rescales the renderer and re-derives the grid from the
+    /// configured surface extent (issue #2896), so the adopted cell never
+    /// leaves a container derived from the previous metric; a following
+    /// `Resized` only refines it with the live physical size.
     ///
     /// Never strands the window: renderer font-load failures keep the
     /// previous cells/grid and still force a full redraw; reflow failures
@@ -335,8 +336,21 @@ impl Runtime {
             return;
         }
         self.scale_factor = ScaleFactor::new_sanitized(sanitized);
-        if let Some(extent) = physical_extent.and_then(bitty_platform::map_resize_to_surface_extent)
-        {
+        // Issue #2896: adopting a new cell metric must re-derive the layout
+        // container with that same metric. The container (window cell count)
+        // is what `present_frames` multiplies back into pixels and what the
+        // grid/PTY row count follows, so a cell that grew while the container
+        // kept its old count (or the reverse) makes the grid taller than the
+        // window by exactly the metric ratio: the cursor-follow viewport then
+        // clips the top rows of a full-screen TUI while the PTY keeps
+        // advertising the stale row count. Callers with no physical extent at
+        // hand (the `ScaleFactorChanged` path when no window handle is
+        // available) therefore fall back to the configured surface extent —
+        // the same reconcile `set_window_padding` already performs. An
+        // explicit zero extent (minimized/occluded) still skips the reflow:
+        // there is no size to derive from until the next `Resized`.
+        let reflow_extent = physical_extent.or_else(|| self.surface.extent());
+        if let Some(extent) = reflow_extent.and_then(bitty_platform::map_resize_to_surface_extent) {
             let (cols, rows) = self.grid_from_physical(extent);
             // Absorb reflow errors after a successful rescale so the adopted
             // renderer cells always win over stranding the window.

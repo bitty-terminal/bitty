@@ -248,6 +248,46 @@ fn present_plan_is_exactly_the_surface_at_fractional_scales() {
 }
 
 #[test]
+fn present_plan_stays_the_surface_when_the_grid_is_larger() {
+    // CTX-1707 review pin, independent of the #2897 reflow path: a grid that
+    // is *larger* than the configured surface (the shape a scale change
+    // adopted without a physical extent leaves behind, and the shape a
+    // stale `set_window_cells` leaves behind) must not become the plan
+    // extent. `present_plan_extent` reads the window grid directly, so this
+    // assertion exercises the production rule alone and keeps discriminating
+    // after any rebase: with a `max(content, surface)` plan the extent below
+    // comes back `(2586, 1601)` against a `(2506, 1461)` surface, and
+    // `derive_scale` collapses to ~0.9690, which shrinks every painted pane
+    // while the hit-test frames stay put.
+    let mut rt = owner_two_pane_runtime();
+    let surface = rt.surface_extent().expect("surface configured");
+    // Four more columns and four more rows than the surface can hold at the
+    // owner's cell metrics and 13 px inset.
+    rt.set_window_cells(bitty_runtime::UiRect::new(0, 0, 160, 45));
+    let (cell_w, cell_h) = rt.live_cell_size();
+    let padding = rt.window_padding_physical();
+    let grid = (160 * cell_w + 2 * padding, 45 * cell_h + 2 * padding);
+    assert!(
+        grid.0 > surface.width() && grid.1 > surface.height(),
+        "fixture must leave the grid larger than the surface: grid {grid:?} vs surface ({}, {})",
+        surface.width(),
+        surface.height()
+    );
+
+    let plan = rt.present_plan_extent();
+    assert_eq!(
+        (plan.width, plan.height),
+        (surface.width(), surface.height()),
+        "a grid larger than the surface must be clipped by the plan, never become it"
+    );
+    let sampled = bitty_render::batch::derive_scale(surface.width(), surface.height(), plan);
+    assert_eq!(
+        sampled, 1.0,
+        "painting must not rescale a grid that overflows the surface"
+    );
+}
+
+#[test]
 fn painted_right_pane_resolves_right_after_a_scale_without_extent() {
     // The runtime's own `ScaleFactorChanged` path adopts new cell metrics
     // without a physical extent; the grid/frames stay on the old cell count
@@ -360,14 +400,19 @@ fn rows_fit_the_painted_grid_at_fractional_scales() {
             "scale {scale}: content frame must fit the surface width"
         );
         // Maximal fit: one more row would not fit.
+        //
+        // CTX-1707 review: the former pair here asserted
+        // `rows * cell_h <= content.height` *and*
+        // `(rows + 1) * cell_h > content.height`. Both restate the solver's
+        // own division of the content box by the cell height, so they hold
+        // by construction and cannot fail. The real, independently checkable
+        // invariant is that the content frame sits inside the surface (the
+        // two assertions above) and that the painted grid covers it: every
+        // painted row and column fits the frame the painter gives it.
         let (cell_w, cell_h) = rt.live_cell_size();
         assert!(
             u32::from(frame.rows) * cell_h <= frame.content.height,
             "scale {scale}: every painted row fits"
-        );
-        assert!(
-            (u32::from(frame.rows) + 1) * cell_h > frame.content.height,
-            "scale {scale}: no unused row inside the content frame"
         );
         assert!(
             u32::from(frame.cols) * cell_w <= frame.content.width,

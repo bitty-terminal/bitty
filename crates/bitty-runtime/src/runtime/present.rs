@@ -34,6 +34,45 @@ const PRESENT_ACKS_PER_TICK: usize = 16;
 /// cadence instead of every tick, while the event loop stays responsive.
 const PRESENT_RECOVERY_RETRY: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// Ceiling for the repeated surface-creation failure backoff.
+///
+/// Invariant: a driver that keeps refusing replacement surfaces is retried at
+/// a bounded, growing cadence (250 ms, 500 ms, 1 s, 2 s) instead of four
+/// surface creations per second forever.
+const PRESENT_RECOVERY_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Backoff after a failed recovery: grows with consecutive creation failures.
+fn recovery_retry_delay(creation_failures: u32) -> std::time::Duration {
+    let shift = creation_failures.min(3);
+    PRESENT_RECOVERY_RETRY
+        .saturating_mul(1u32 << shift)
+        .min(PRESENT_RECOVERY_RETRY_MAX)
+}
+
+/// Poll interval while a worker abandoned by recovery is still alive.
+///
+/// Invariant: a late abandoned present can land after the replacement's
+/// commit, so the embedder wakes at this bounded cadence to notice the last
+/// abandoned worker exit and force one correcting full repaint. Nothing is
+/// submitted while the worker is merely alive.
+const PRESENT_ABANDONED_CHECK: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Cooldown between full GPU reattach attempts after the presenter exhausted
+/// its built-in surface-creation budgets.
+///
+/// Invariant: a dead/exhausted presenter must be allowed to reattach, but the
+/// event loop must not rebuild a GPU context every tick when the compositor or
+/// driver keeps refusing surfaces.
+pub(super) const PRESENT_REATTACH_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Smallest future wake returned by [`Runtime::present_recovery_deadline`].
+///
+/// Invariant: a deadline that has already elapsed must never be returned to
+/// `set_wait_until` (that spins the event loop). If the remaining bound is
+/// zero, wake just far enough in the future for the next tick to run the
+/// stuck/epilogue state machine.
+const PRESENT_MIN_WAKE: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// Commit data for the newest frame submitted to the off-thread presenter.
 ///
 /// Nothing here is published on screen until the worker acknowledges that the
@@ -42,8 +81,22 @@ const PRESENT_RECOVERY_RETRY: std::time::Duration = std::time::Duration::from_mi
 pub(super) struct PendingPresent {
     /// Submission token assigned by the presenter.
     pub(super) token: u64,
-    /// Snapshot generation captured when the frame was built.
-    pub(super) generation: u64,
+    /// Primary grid generation captured when the frame was built.
+    ///
+    /// This is `snapshot.generation`, not the max across origins: committing
+    /// a pane/scene generation the DrawList never contained would mark unseen
+    /// content as presented.
+    pub(super) primary_generation: u64,
+    /// Max generation across origins, for [`PresentStats::generation`].
+    ///
+    /// This is accounting only; it must never advance
+    /// `last_presented_generation` (F2).
+    pub(super) frame_generation: u64,
+    /// Pane session generations captured when the frame was built.
+    pub(super) pane_generations: Vec<(ViewId, u64)>,
+    /// Scene revision observed before the frame was built (`None` when the
+    /// scene store was borrowed at capture; the revision then stays owed).
+    pub(super) scene_revision: Option<u64>,
     /// Decorated leaf allocations of the frame.
     pub(super) allocations: Vec<layout_focus::PresentFrame>,
     /// Focused leaf at capture time.
@@ -2078,6 +2131,12 @@ impl Runtime {
     /// that never resets the mode.
     #[must_use]
     pub fn present_coalescing_deadline(&self) -> Option<std::time::Instant> {
+        // A frame already handed to the presenter satisfies any reveal/
+        // settle deadline; keeping the past deadline armed would spin the
+        // loop until the ack.
+        if self.pending_present.is_some() {
+            return None;
+        }
         if !self.coalesced_pending {
             return None;
         }
@@ -2171,13 +2230,6 @@ impl Runtime {
         // not owed again. The ack wake and the bounded recovery deadline keep
         // the loop live; a nudge would only rebuild a duplicate frame.
         if self.pending_present.is_some() {
-            return false;
-        }
-        if self
-            .presenter
-            .as_ref()
-            .is_some_and(bitty_render::present::Presenter::is_exhausted)
-        {
             return false;
         }
         self.retained_present_work() || self.plugin_scene_owed()
@@ -2277,7 +2329,9 @@ impl Runtime {
         // bitty#2830: remember what the transition cancels *before* the hide
         // arms its own truth repaint, so the repair timer keys on real
         // retained work rather than on the conservative full redraw.
-        let retained = self.pending_full_redraw
+        let pending_in_flight = self.pending_present.take().is_some();
+        let retained = pending_in_flight
+            || self.pending_full_redraw
             || self.pending_paint_redraw
             || self.coalesced_pending
             || self.state.generation() != self.last_presented_generation
@@ -3017,7 +3071,7 @@ impl Runtime {
         // `AboutToWait` would wake immediately and spin. Push the next
         // attempt out on the bounded backoff. A failed present already armed
         // a future deadline, and a successful one cleared it.
-        if stats.is_none() {
+        if stats.is_none() && self.pending_present.is_none() {
             if self.surface_visible {
                 if let Some(deadline) = self.surface_retry.deadline {
                     if now >= deadline {
@@ -3146,16 +3200,6 @@ impl Runtime {
         // wake) re-enters the loop. Damage that arrives meanwhile stays in the
         // generation rings and is picked up when the ack commit returns.
         if self.pending_present.is_some() {
-            return None;
-        }
-        // bitty#2830: a presenter that spent its bounded recovery budget is
-        // not fed new frames. Input, timers, and IPC keep running; a later
-        // presented ack resets the budget and paints normally again.
-        if self
-            .presenter
-            .as_ref()
-            .is_some_and(bitty_render::present::Presenter::is_exhausted)
-        {
             return None;
         }
         let basis = self.collect_tick_basis(now)?;
@@ -3619,6 +3663,18 @@ impl Runtime {
         // `PresentStats::cells_examined`/`glyphs_emitted`.
         let cells_before = self.renderer.counters().cells_examined;
         let glyphs_before = self.renderer.counters().glyphs_emitted;
+        // bitty#2830 review F2: capture the exact generations this frame may
+        // contain. Scene/pane output that arrives after this point is *not* in
+        // the DrawList and must stay owed after the async commit.
+        let scene_revision = self
+            .scene_host
+            .as_ref()
+            .and_then(|host| host.try_borrow().ok().map(|host| host.scene_revision()));
+        let pane_generations: Vec<(ViewId, u64)> = self
+            .pane_sessions
+            .iter()
+            .map(|(view, session)| (*view, session.state.generation()))
+            .collect();
         Some(TickBasis {
             snapshot,
             allocations,
@@ -3632,6 +3688,8 @@ impl Runtime {
             cells_before,
             glyphs_before,
             band_identity,
+            scene_revision,
+            pane_generations,
         })
     }
     /// Composes one leaf's attached scene into the combined frame (CTX-1630).
@@ -7142,43 +7200,54 @@ impl Runtime {
         let presenter = self.presenter.as_ref()?;
         let exhausted = presenter.is_exhausted();
         let inactive = !presenter.is_active();
-        let stuck = presenter
-            .in_flight_age(now)
-            .is_some_and(|age| age >= presenter.stuck_bound());
-        // Bounded recovery budget: once spent, stop creating surfaces and stop
-        // feeding the last worker. A presented frame resets the budget (the
-        // drain below observes it), so a compositor that comes back still
-        // recovers; one that never does cannot grow abandoned threads.
-        if exhausted {
-            self.pending_present = None;
-            self.pending_full_redraw = true;
-            // No present will be attempted while the budget is spent, so a
-            // pending #2570 backoff would only wake the loop to re-arm itself.
-            self.suspend_surface_retry();
-            let acks = self
-                .presenter
-                .as_mut()
-                .map(|presenter| presenter.drain_acks(PRESENT_ACKS_PER_TICK))
-                .unwrap_or_default();
-            let still_exhausted = self
-                .presenter
-                .as_ref()
-                .is_some_and(bitty_render::present::Presenter::is_exhausted);
-            let mut committed = None;
-            for ack in acks {
-                self.apply_present_ack(now, ack, &mut committed);
+        // Stuck recovery is only actionable while surface creation is allowed.
+        // Once the budget is spent the current worker is left in place and
+        // keeps its slot fed: only its presented ack can reset the budget.
+        let stuck = !exhausted
+            && match presenter.in_flight_age(now) {
+                Some(age) => age >= presenter.stuck_bound(),
+                // A frame the worker never started acquiring is only "stuck"
+                // after the same bound; this closes the queue-then-wedge hole
+                // without treating a normal queued frame as stuck.
+                None => {
+                    !presenter.is_paused()
+                        && self.pending_present.as_ref().is_some_and(|pending| {
+                            now.saturating_duration_since(pending.submitted_at)
+                                >= presenter.stuck_bound()
+                        })
+                }
+            };
+        // bitty#2830 F8: notice when the last worker abandoned by recovery has
+        // exited, then force one correcting full repaint. A late abandoned
+        // present may have landed after the replacement's commit.
+        let abandoned_alive = self
+            .presenter
+            .as_mut()
+            .map(bitty_render::present::Presenter::abandoned_alive)
+            .unwrap_or(0);
+        if abandoned_alive > 0 {
+            self.abandoned_workers_alive = abandoned_alive;
+            self.abandoned_check_at = now.checked_add(PRESENT_ABANDONED_CHECK);
+        } else {
+            if self.abandoned_workers_alive > 0 {
+                self.pending_full_redraw = true;
             }
-            if still_exhausted {
-                return committed;
-            }
+            self.abandoned_workers_alive = 0;
+            self.abandoned_check_at = None;
         }
-        // A failed recovery leaves the presenter inactive: retry on a bounded
-        // cadence rather than every tick, and never submit into a dead worker.
+
         if inactive {
             // A dead or failed worker never acked the frame it held: retain
             // every pixel as damage and drop the uncommittable commit state.
             self.pending_present = None;
             self.pending_full_redraw = true;
+            if exhausted {
+                // Built-in recovery is spent; no 250 ms retry loop. The
+                // embedder's reattach path can install a fresh GPU context.
+                self.suspend_surface_retry();
+                self.presenter_retry_at = None;
+                return None;
+            }
             if self.presenter_retry_at.is_some_and(|at| now < at) {
                 return None;
             }
@@ -7191,7 +7260,11 @@ impl Runtime {
                 self.pending_full_redraw = true;
                 self.presenter_retry_at = None;
             } else {
-                self.presenter_retry_at = now.checked_add(PRESENT_RECOVERY_RETRY);
+                let failures = self
+                    .presenter
+                    .as_ref()
+                    .map_or(0, bitty_render::present::Presenter::creation_failures);
+                self.presenter_retry_at = now.checked_add(recovery_retry_delay(failures));
             }
             return None;
         }
@@ -7214,7 +7287,11 @@ impl Runtime {
             self.presenter_retry_at = if recovered.is_ok() {
                 None
             } else {
-                now.checked_add(PRESENT_RECOVERY_RETRY)
+                let failures = self
+                    .presenter
+                    .as_ref()
+                    .map_or(0, bitty_render::present::Presenter::creation_failures);
+                now.checked_add(recovery_retry_delay(failures))
             };
             return None;
         }
@@ -7308,7 +7385,24 @@ impl Runtime {
         now: std::time::Instant,
     ) -> PresentStats {
         self.clear_surface_retry();
-        self.mark_frame_presented(pending.generation);
+        // bitty#2830 review F2: advance exactly the generations captured when
+        // this frame was built. Using the live max (or the live pane/scene
+        // state) would mark output that arrived during the flight as
+        // presented even though it is not in the DrawList.
+        self.last_presented_generation = pending.primary_generation;
+        for (view, generation) in pending.pane_generations {
+            if let Some(session) = self.pane_sessions.get_mut(&view) {
+                session.last_presented_generation = generation;
+            }
+        }
+        if let Some(revision) = pending.scene_revision {
+            self.presented_scene_revision = revision;
+        }
+        self.hidden_repair_at = None;
+        self.coalesced_pending = false;
+        self.coalesced_deadline = None;
+        self.settle_input_at = None;
+        self.settle_burst_at = None;
         self.publish_presented_allocations(pending.allocations, pending.focused);
         self.scene_frame = pending.scene_report;
         self.last_presented_bands = pending.band_identity;
@@ -7317,6 +7411,9 @@ impl Runtime {
         // Pacing measures committed presentation cadence, exactly like the
         // synchronous path (which stamps only ticks that returned `Some`).
         self.last_present_at = Some(now);
+        // Match the synchronous tail: PTY output that presents without input
+        // must refresh the devtools/IPC inspect snapshot too.
+        self.publish_inspect_snapshot();
         PresentStats {
             frame: stats.frame,
             fills: stats.fills,
@@ -7333,7 +7430,7 @@ impl Runtime {
                 .glyphs_emitted
                 .saturating_sub(pending.glyphs_before),
             headless: false,
-            generation: pending.generation,
+            generation: pending.frame_generation,
             images: stats.images,
             backgrounds: pending.backgrounds,
             images_skipped: stats.images_skipped,
@@ -7349,22 +7446,59 @@ impl Runtime {
     /// deadline of a failed recovery.
     #[must_use]
     pub fn present_recovery_deadline(&self) -> Option<std::time::Instant> {
-        if self
-            .presenter
-            .as_ref()
-            .is_some_and(bitty_render::present::Presenter::is_exhausted)
-        {
-            // No more recovery wakes: the presenter waits for a real ack or
-            // user activity instead of polling a compositor that has already
-            // refused every replacement surface.
+        let presenter = self.presenter.as_ref()?;
+        let now = std::time::Instant::now();
+        let mut wake: Option<std::time::Instant> = None;
+        // A hidden surface is never acquired by the worker, so neither the
+        // queued frame nor a pause-returned present may arm a recovery wake.
+        // Reveal itself runs stuck detection on the next tick.
+        if presenter.is_paused() {
+            if let Some(at) = self.abandoned_check_at {
+                return Some(at.max(now + PRESENT_MIN_WAKE));
+            }
             return None;
         }
-        if let (Some(pending), Some(presenter)) =
-            (self.pending_present.as_ref(), self.presenter.as_ref())
-        {
-            return pending.submitted_at.checked_add(presenter.stuck_bound());
+        // Surface-creation recovery only runs while the budget allows it.
+        if presenter.is_exhausted() {
+            // No recovery is possible, but keep a bounded liveness poll while
+            // the last worker still owns an in-flight probe: the ack waker is
+            // the fast path, and this wake prevents a silently parked loop if
+            // the callback is unavailable.
+            let mut wake = None;
+            if self.pending_present.is_some() && presenter.in_flight_age(now).is_some() {
+                wake = Some(now + presenter.stuck_bound());
+            }
+            if let Some(at) = self.abandoned_check_at {
+                let at = at.max(now + PRESENT_MIN_WAKE);
+                wake = Some(wake.map_or(at, |current| current.min(at)));
+            }
+            return wake;
         }
-        self.presenter_retry_at
+        if !presenter.is_exhausted() {
+            if let Some(age) = presenter.in_flight_age(now) {
+                // Anchor the wake to the actual driver wait, not to the submit
+                // instant: a frame can sit queued (paused, worker busy) before
+                // the acquire starts, and a submit-age deadline would already
+                // be in the past by then.
+                let remaining = presenter.stuck_bound().saturating_sub(age);
+                wake = Some(now + remaining.max(PRESENT_MIN_WAKE));
+            } else if let Some(pending) = self.pending_present.as_ref() {
+                if !presenter.is_paused() {
+                    let age = now.saturating_duration_since(pending.submitted_at);
+                    let remaining = presenter.stuck_bound().saturating_sub(age);
+                    wake = Some(now + remaining.max(PRESENT_MIN_WAKE));
+                }
+            }
+            if let Some(at) = self.presenter_retry_at {
+                let at = at.max(now + PRESENT_MIN_WAKE);
+                wake = Some(wake.map_or(at, |current| current.min(at)));
+            }
+        }
+        if let Some(at) = self.abandoned_check_at {
+            let at = at.max(now + PRESENT_MIN_WAKE);
+            wake = Some(wake.map_or(at, |current| current.min(at)));
+        }
+        wake
     }
 
     /// Phase 6 (CTX-0474): synthesize the combined draw list, present it,
@@ -7385,7 +7519,8 @@ impl Runtime {
             cells_before,
             glyphs_before,
             band_identity,
-            full_frame,
+            scene_revision,
+            pane_generations,
             ..
         } = basis;
         self.pending_full_redraw = false;
@@ -7594,10 +7729,10 @@ impl Runtime {
         // `poll_presenter`). `wait` is impossible here: `submit` only takes a
         // short mutex, and a blocked driver call stays on the worker.
         if let Some(presenter) = self.presenter.as_mut() {
-            let damage = bitty_render::present::DamageCarry::from_rects(
-                combined_list.plan.dirty_rects.clone(),
-                full_frame,
-            );
+            // The combined compositor always paints a complete frame, so the
+            // carry is a whole-surface repaint. The backend refuses anything
+            // else (there is no retained base image to merge onto).
+            let damage = bitty_render::present::DamageCarry::full();
             let payload = bitty_render::present::FramePayload {
                 draw_list: Box::new(combined_list),
                 atlas: Some((atlas_texels, dims)),
@@ -7615,9 +7750,17 @@ impl Runtime {
             if retrying {
                 bitty_render::telemetry::retry_attempt();
             }
+            // The reveal/settle deferral is satisfied by this submission: a
+            // still-armed coalesced deadline would point at the past and spin
+            // the loop until the ack.
+            self.coalesced_pending = false;
+            self.coalesced_deadline = None;
             self.pending_present = Some(PendingPresent {
                 token,
-                generation: current_gen,
+                primary_generation: snapshot.generation,
+                frame_generation: current_gen,
+                pane_generations,
+                scene_revision,
                 allocations,
                 focused,
                 scene_report,
@@ -7799,6 +7942,10 @@ struct TickBasis {
     glyphs_before: u64,
     /// Mounted band identity for this frame (CTX-0946 C2, CTX-1332 C-D4/F7).
     band_identity: Vec<crate::runtime::band_host::BandFrameIdentity>,
+    /// Live scene revision observed when this frame's inputs were collected.
+    scene_revision: Option<u64>,
+    /// Pane generations observed when this frame's inputs were collected.
+    pane_generations: Vec<(ViewId, u64)>,
 }
 
 impl TickBasis {
@@ -8157,7 +8304,7 @@ mod present_origin_tests {
         px_span, px_span_usize,
     };
     #[cfg(unix)]
-    use crate::{LayoutNode, Runtime, RuntimeConfig, SplitAxis, View, ViewId};
+    use crate::{LayoutNode, Runtime, RuntimeConfig, View, ViewId};
     use bitty_term_state::{State, TerminalAction};
     #[cfg(unix)]
     use bitty_test_support::require_pty;
@@ -8319,7 +8466,7 @@ mod present_origin_tests {
             .expect("deterministic runtime must build");
         let pane = ViewId::new(2);
         runtime.set_layout(LayoutNode::split(
-            SplitAxis::Horizontal,
+            bitty_ui::SplitAxis::Horizontal,
             0.5,
             LayoutNode::leaf(View::new(ViewId::new(1), 40, 24)),
             LayoutNode::leaf(View::new(pane, 40, 24)),
@@ -12378,6 +12525,13 @@ mod async_present_tests {
             self.cv.notify_all();
         }
 
+        /// Re-arms the gate so a later present blocks again.
+        fn block(&self) {
+            let mut state = self.state.lock().expect("gate poisoned");
+            state.blocked = true;
+            state.released = false;
+        }
+
         fn entered(&self) -> u32 {
             self.state.lock().expect("gate poisoned").entered
         }
@@ -12390,6 +12544,10 @@ mod async_present_tests {
         built: AtomicU32,
         alive: AtomicU32,
         fail_next: AtomicBool,
+        panic_next: AtomicBool,
+        factory_failures: AtomicU32,
+        wakes: AtomicU64,
+        drop_gate: Mutex<Option<Arc<Gate>>>,
     }
 
     impl Control {
@@ -12401,12 +12559,27 @@ mod async_present_tests {
                 built: AtomicU32::new(0),
                 alive: AtomicU32::new(0),
                 fail_next: AtomicBool::new(false),
+                panic_next: AtomicBool::new(false),
+                factory_failures: AtomicU32::new(0),
+                wakes: AtomicU64::new(0),
+                drop_gate: Mutex::new(None),
             })
         }
 
         fn factory(self: &Arc<Self>) -> PresenterFactory {
             let control = Arc::clone(self);
             Arc::new(move |_extent, _opacity| {
+                if control
+                    .factory_failures
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(RenderError::SurfaceCreate(String::from(
+                        "injected factory failure",
+                    )));
+                }
                 control.built.fetch_add(1, Ordering::Relaxed);
                 control.alive.fetch_add(1, Ordering::Relaxed);
                 Ok(Box::new(FakeBackend {
@@ -12429,6 +12602,20 @@ mod async_present_tests {
 
         fn alive(&self) -> u32 {
             self.alive.load(Ordering::Acquire)
+        }
+
+        fn fail_factory(&self, count: u32) {
+            self.factory_failures.store(count, Ordering::Release);
+        }
+
+        fn wake_count(&self) -> u64 {
+            self.wakes.load(Ordering::Acquire)
+        }
+
+        fn block_drop(self: &Arc<Self>) -> Arc<Gate> {
+            let gate = Gate::new(true);
+            *self.drop_gate.lock().expect("drop gate poisoned") = Some(Arc::clone(&gate));
+            gate
         }
     }
 
@@ -12461,6 +12648,9 @@ mod async_present_tests {
             frame: &FramePayload,
         ) -> Result<bitty_render::gpu::PresentStats, bitty_render::gpu::PresentFailure> {
             self.control.gate.enter();
+            if self.control.panic_next.swap(false, Ordering::AcqRel) {
+                panic!("injected presenter panic");
+            }
             if self.control.fail_next.swap(false, Ordering::AcqRel) {
                 return Err(bitty_render::gpu::PresentFailure::Surface {
                     class: bitty_render::gpu::PresentFailureClass::Timeout,
@@ -12478,6 +12668,18 @@ mod async_present_tests {
                 images: 0,
                 images_skipped: 0,
             })
+        }
+    }
+
+    fn render_stats() -> bitty_render::gpu::PresentStats {
+        bitty_render::gpu::PresentStats {
+            frame: 99,
+            fills: 0,
+            rounded_fills: 0,
+            glyphs: 0,
+            headless: false,
+            images: 0,
+            images_skipped: 0,
         }
     }
 
@@ -12717,6 +12919,7 @@ mod async_present_tests {
                 shutdown_bound: Duration::from_millis(20),
                 ack_capacity: 4,
                 recovery_limit: 4,
+                ..PresenterConfig::default()
             },
         );
         runtime.handle_pty_bytes(b"stuck");
@@ -12790,6 +12993,7 @@ mod async_present_tests {
                 ..PresenterConfig::default()
             },
         );
+        let resize_events_before = bitty_render::telemetry::snapshot().resize;
         let extent = PhysicalSize::new(1000, 700);
         runtime.handle_resize(extent).expect("resize reflows");
         assert_eq!(runtime.surface_extent(), Some(extent));
@@ -12811,6 +13015,10 @@ mod async_present_tests {
         let committed = tick_until_committed(&mut runtime, TEST_WAIT).expect("frame commits");
         assert!(!committed.headless);
         assert!(
+            bitty_render::telemetry::snapshot().resize > resize_events_before,
+            "the worker records resize telemetry like Surface::resize"
+        );
+        assert!(
             control
                 .configured
                 .lock()
@@ -12825,6 +13033,9 @@ mod async_present_tests {
     #[test]
     fn shutdown_with_a_blocked_presenter_is_bounded() {
         let control = Control::new(true);
+        // The backend destructor blocks too: the bound must hold for the
+        // acquire wait *and* a slow surface teardown.
+        let drop_gate = control.block_drop();
         let mut runtime = runtime_with(
             &control,
             PresenterConfig {
@@ -12846,11 +13057,12 @@ mod async_present_tests {
         assert!(runtime.presenter.is_none());
 
         control.gate.release();
+        drop_gate.release();
         assert!(wait_until(|| control.alive() == 0, TEST_WAIT));
     }
 
     #[test]
-    fn an_ack_wakes_only_its_own_frame_token() {
+    fn an_ack_wakes_the_registered_embedder_callback() {
         let control = Control::new(false);
         let mut runtime = runtime_with(
             &control,
@@ -12859,24 +13071,23 @@ mod async_present_tests {
                 ..PresenterConfig::default()
             },
         );
-        runtime.handle_pty_bytes(b"token");
+        let wakes = Arc::clone(&control);
+        runtime.set_present_waker(Some(Arc::new(move || {
+            let _ = wakes.wakes.fetch_add(1, Ordering::Relaxed);
+        })));
+        runtime.handle_pty_bytes(b"wake");
         assert!(runtime.tick_at(Instant::now()).is_none());
-        let pending = runtime.pending_present.as_ref().expect("pending");
-        let token = pending.token;
-        assert!(wait_until(|| control.presented() >= 1, TEST_WAIT));
         let committed = tick_until_committed(&mut runtime, TEST_WAIT).expect("commit");
         assert!(committed.generation > 0);
         assert!(
-            runtime
-                .pending_present
-                .as_ref()
-                .is_none_or(|p| p.token > token)
+            control.wake_count() >= 1,
+            "the worker's ack must wake the embedder callback"
         );
         assert!(runtime.shutdown());
     }
 
     #[test]
-    fn stale_ack_for_a_replaced_frame_does_not_roll_state_back() {
+    fn a_stale_ack_cannot_commit_a_newer_pending_frame_or_arm_retry() {
         let control = Control::new(true);
         let mut runtime = runtime_with(
             &control,
@@ -12885,26 +13096,62 @@ mod async_present_tests {
                 ..PresenterConfig::default()
             },
         );
+        // Commit frame 0 first so a realistic stale token exists.
         runtime.handle_pty_bytes(b"one");
         assert!(runtime.tick_at(Instant::now()).is_none());
         assert!(wait_until(|| control.gate.entered() >= 1, TEST_WAIT));
-        let first_generation = runtime
-            .pending_present
-            .as_ref()
-            .expect("pending")
-            .generation;
-
-        // The first frame is still blocked; the runtime cannot submit a newer
-        // one while pending, so simulate the only stale-ack shape: the worker
-        // acked an older token than the pending one after a manual replace.
         control.gate.release();
-        assert!(wait_until(|| control.presented() >= 1, TEST_WAIT));
-        let committed = tick_until_committed(&mut runtime, TEST_WAIT).expect("commit");
-        assert_eq!(committed.generation, first_generation);
-        assert!(runtime.pending_present.is_none());
+        let first = tick_until_committed(&mut runtime, TEST_WAIT).expect("first commit");
 
-        let acks: Vec<PresentAck> = runtime.presenter.as_mut().expect("presenter").drain_acks(4);
-        assert!(acks.is_empty(), "the committed ack was consumed once");
+        // Block frame 1 in flight and capture its token/generation.
+        control.gate.block();
+        runtime.handle_pty_bytes(b"two");
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert!(wait_until(|| control.gate.entered() >= 2, TEST_WAIT));
+        let pending = runtime.pending_present.as_ref().expect("pending");
+        let current_token = pending.token;
+        let current_generation = pending.primary_generation;
+        let stale_token = current_token.wrapping_sub(1);
+        assert_ne!(stale_token, bitty_render::present::PRESENT_NON_FRAME_TOKEN);
+
+        // A presented ack for the older frame and a failure ack for the older
+        // frame must both be ignored: only the newest token may commit or arm
+        // the #2570 retry.
+        let mut committed = None;
+        runtime.apply_present_ack(
+            Instant::now(),
+            PresentAck {
+                token: stale_token,
+                outcome: bitty_render::present::PresentOutcome::Presented(render_stats()),
+            },
+            &mut committed,
+        );
+        assert!(committed.is_none());
+        runtime.apply_present_ack(
+            Instant::now(),
+            PresentAck {
+                token: stale_token,
+                outcome: bitty_render::present::PresentOutcome::Outdated(String::from(
+                    "stale outdoor",
+                )),
+            },
+            &mut committed,
+        );
+        assert!(committed.is_none());
+        assert_eq!(
+            runtime.pending_present.as_ref().expect("pending").token,
+            current_token
+        );
+        assert_eq!(runtime.last_presented_generation, first.generation);
+        assert!(
+            runtime.surface_retry_deadline().is_none(),
+            "a stale failure must not arm the retry"
+        );
+
+        control.gate.release();
+        let second = tick_until_committed(&mut runtime, TEST_WAIT).expect("second commit");
+        assert_eq!(second.generation, current_generation);
+        assert!(second.generation > first.generation);
         assert!(runtime.shutdown());
     }
 
@@ -12924,6 +13171,7 @@ mod async_present_tests {
                     shutdown_bound: Duration::from_millis(20),
                     ack_capacity: 4,
                     recovery_limit: 1,
+                    ..PresenterConfig::default()
                 },
                 None,
             )
@@ -12944,6 +13192,13 @@ mod async_present_tests {
         let presenter = runtime.presenter.as_ref().expect("presenter");
         assert!(presenter.is_exhausted());
         let generation = presenter.generation();
+
+        // The last worker is still fed: its presented ack is the only event
+        // that can reset the surface-creation budget.
+        assert!(
+            runtime.pending_present.is_some(),
+            "the exhausted presenter still submits to its current worker"
+        );
 
         // Later ticks do not create more surfaces and stay fast.
         let started = Instant::now();
@@ -12970,7 +13225,421 @@ mod async_present_tests {
         assert!(runtime.state.generation() > before);
 
         control.gate.release();
-        assert!(wait_until(|| control.alive() <= 1, TEST_WAIT));
+        let committed = tick_until_committed(&mut runtime, TEST_WAIT)
+            .expect("the last worker's probe commits and resets the budget");
+        assert!(committed.generation > 0, "the probe frame carries state");
+        assert!(
+            !runtime
+                .presenter
+                .as_ref()
+                .expect("presenter")
+                .is_exhausted(),
+            "a presented frame resets the surface-creation budget"
+        );
+        runtime
+            .presenter
+            .as_mut()
+            .expect("presenter")
+            .recover()
+            .expect("surface creation works again after the reset");
+        assert!(wait_until(|| control.alive() <= 2, TEST_WAIT));
         let _ = runtime.shutdown_with_timeout(Duration::from_millis(50));
+    }
+
+    #[test]
+    fn hiding_clears_the_pending_commit_and_arms_no_past_deadline() {
+        let control = Control::new(true);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: Duration::from_millis(50),
+                ..PresenterConfig::default()
+            },
+        );
+        runtime.handle_pty_bytes(b"hide");
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert!(wait_until(|| control.gate.entered() >= 1, TEST_WAIT));
+        let deadline = runtime
+            .present_recovery_deadline()
+            .expect("an in-flight present arms a bounded wake");
+        assert!(deadline > Instant::now(), "the wake is never in the past");
+
+        runtime.set_surface_visibility(false);
+        assert!(
+            runtime.pending_present.is_none(),
+            "hiding drops the uncommittable commit state"
+        );
+        assert!(
+            runtime.pending_full_redraw,
+            "the hidden surface retains the full redraw"
+        );
+        assert!(
+            runtime.present_recovery_deadline().is_none(),
+            "a paused surface with no in-flight frame arms no recovery wake"
+        );
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert!(runtime.present_recovery_deadline().is_none());
+
+        control.gate.release();
+        runtime.set_surface_visibility(true);
+        let committed =
+            tick_until_committed(&mut runtime, TEST_WAIT).expect("reveal repaints from truth");
+        assert!(committed.frame > 0);
+        assert!(runtime.shutdown());
+    }
+
+    #[test]
+    fn reveal_with_a_blocked_worker_clears_the_coalesced_deadline() {
+        let control = Control::new(true);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: TEST_WAIT,
+                ..PresenterConfig::default()
+            },
+        );
+        runtime.handle_pty_bytes(b"reveal");
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert!(wait_until(|| control.gate.entered() >= 1, TEST_WAIT));
+
+        runtime.set_surface_visibility(false);
+        runtime.set_surface_visibility(true);
+        assert!(
+            runtime.present_coalescing_deadline().is_some(),
+            "reveal queues a coalesced frame"
+        );
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert!(
+            runtime.present_coalescing_deadline().is_none(),
+            "an async submission satisfies the reveal deadline"
+        );
+        assert!(
+            runtime
+                .present_recovery_deadline()
+                .is_none_or(|deadline| deadline > Instant::now()),
+            "no past recovery wake is handed to set_wait_until"
+        );
+
+        control.gate.release();
+        assert!(tick_until_committed(&mut runtime, TEST_WAIT).is_some());
+        assert!(runtime.shutdown());
+    }
+
+    #[test]
+    fn a_successful_async_submission_does_not_double_the_retry_backoff() {
+        let control = Control::new(false);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: TEST_WAIT,
+                ..PresenterConfig::default()
+            },
+        );
+        control.fail_next.store(true, Ordering::Release);
+        runtime.handle_pty_bytes(b"retry");
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert!(pump_until(
+            &mut runtime,
+            |runtime| runtime.surface_retry_deadline().is_some(),
+            TEST_WAIT
+        ));
+        let failures = runtime.surface_retry.failures;
+        let retry_at = runtime.surface_retry.deadline.expect("retry armed");
+
+        // The retry attempt is submitted while the worker blocks. That is not
+        // another failed present, so the backoff must stay at one step.
+        control.gate.block();
+        assert!(
+            runtime
+                .tick_at(retry_at + Duration::from_millis(1))
+                .is_none()
+        );
+        assert!(runtime.pending_present.is_some());
+        assert_eq!(
+            runtime.surface_retry.failures, failures,
+            "a submission must not re-arm the #2570 backoff"
+        );
+
+        control.gate.release();
+        assert!(tick_until_committed(&mut runtime, TEST_WAIT).is_some());
+        assert!(runtime.shutdown());
+    }
+
+    #[test]
+    fn pane_output_during_the_flight_is_not_marked_presented() {
+        let control = Control::new(true);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: TEST_WAIT,
+                ..PresenterConfig::default()
+            },
+        );
+        let pane = ViewId::new(2);
+        runtime.set_layout(LayoutNode::split(
+            bitty_ui::SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(ViewId::new(1), 40, 12)),
+            LayoutNode::leaf(View::new(ViewId::new(2), 40, 12)),
+        ));
+        runtime
+            .spawn_shell_for_view(pane, "/bin/sh", &[], 10, 5)
+            .expect("pane shell spawns");
+        runtime.handle_pty_bytes(b"primary");
+
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert!(wait_until(|| control.gate.entered() >= 1, TEST_WAIT));
+        let pending = runtime.pending_present.as_ref().expect("pending");
+        let captured_primary = pending.primary_generation;
+        let captured_pane = pending
+            .pane_generations
+            .iter()
+            .find_map(|(view, generation)| (*view == pane).then_some(*generation))
+            .expect("pane generation captured");
+        let pane_generation_before = runtime.pane_sessions[&pane].state.generation();
+
+        // Pane output arrives while the frame is in flight. It is not in the
+        // DrawList and must stay owed after the commit.
+        {
+            let session = runtime.pane_sessions.get_mut(&pane).expect("pane session");
+            let mut parser = Parser::new();
+            let mut actions = Vec::new();
+            parser.advance(b"PANE-FLIGHT", |action| actions.push(action));
+            for action in actions {
+                let _ = session.state.apply(&action);
+            }
+        }
+        let pane_generation_after = runtime.pane_sessions[&pane].state.generation();
+        assert!(pane_generation_after > pane_generation_before);
+
+        control.gate.release();
+        let committed = tick_until_committed(&mut runtime, TEST_WAIT).expect("first commit");
+        assert_eq!(committed.generation, captured_primary);
+        assert_eq!(
+            runtime.last_presented_generation, captured_primary,
+            "the primary advances only to the captured generation"
+        );
+        assert_eq!(
+            runtime.pane_sessions[&pane].last_presented_generation, captured_pane,
+            "pane output during the flight stays owed"
+        );
+
+        let next = tick_until_committed(&mut runtime, TEST_WAIT).expect("pane repaint commits");
+        assert!(next.generation > committed.generation);
+        let state = runtime.live_view_state(pane).expect("pane state");
+        let rows = runtime
+            .find_view(pane)
+            .expect("pane view")
+            .visible_text_rows(state);
+        let painted = rows.join("");
+        assert!(
+            painted.contains("PANE-FLIGHT"),
+            "the pane content is painted: {rows:?}"
+        );
+        assert_eq!(
+            runtime.pane_sessions[&pane].last_presented_generation,
+            pane_generation_after
+        );
+        assert!(
+            runtime.tick_at(Instant::now()).is_none(),
+            "no continuous presents once the pane frame is committed"
+        );
+        assert!(runtime.shutdown());
+    }
+
+    #[test]
+    fn a_resize_keeps_live_osc_colors_in_the_presenter_mirror() {
+        let control = Control::new(false);
+        let mut runtime = runtime_with(&control, PresenterConfig::default());
+        runtime.apply_osc_color(DynamicColorTarget::Background, [1, 2, 3]);
+        let expected = runtime.surface.theme_palette().background;
+        assert_eq!(&expected[..3], &[1, 2, 3]);
+        runtime
+            .handle_resize(PhysicalSize::new(900, 600))
+            .expect("resize reflows");
+        assert_eq!(
+            runtime.surface.theme_palette().background,
+            expected,
+            "the presenter mirror keeps the live OSC background"
+        );
+        assert!(runtime.shutdown());
+    }
+
+    #[test]
+    fn an_async_commit_publishes_the_inspect_snapshot() {
+        let control = Control::new(false);
+        let mut runtime = runtime_with(&control, PresenterConfig::default());
+        let before = runtime.inspect_publish_count();
+        runtime.handle_pty_bytes(b"inspect-async");
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert!(tick_until_committed(&mut runtime, TEST_WAIT).is_some());
+        assert!(
+            runtime.inspect_publish_count() > before,
+            "the async commit publishes the inspect snapshot"
+        );
+        assert!(runtime.shutdown());
+    }
+
+    #[test]
+    fn an_exhausted_dead_presenter_reports_no_gpu_and_requests_reattach() {
+        let control = Control::new(false);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: TEST_WAIT,
+                recovery_limit: 1,
+                ..PresenterConfig::default()
+            },
+        );
+        {
+            let presenter = runtime.presenter.as_mut().expect("presenter");
+            presenter.note_stuck();
+            presenter.recover().expect("one recovery spends the budget");
+            assert!(presenter.is_exhausted());
+        }
+        // Make the replacement worker exit, leaving an exhausted, inactive
+        // presenter behind.
+        control.panic_next.store(true, Ordering::Release);
+        runtime.handle_pty_bytes(b"die");
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert!(wait_until(
+            || !runtime.presenter.as_ref().expect("presenter").is_active(),
+            TEST_WAIT
+        ));
+        assert!(!runtime.has_gpu(), "a dead presenter is not GPU-attached");
+        assert!(runtime.is_headless());
+        assert!(
+            runtime.needs_gpu_reattach(),
+            "the embedder is asked for a fresh GPU attach"
+        );
+        assert!(
+            !runtime.needs_gpu_reattach(),
+            "the reattach cooldown prevents a per-tick GPU context storm"
+        );
+        let _ = runtime.shutdown_with_timeout(Duration::from_millis(50));
+    }
+
+    #[test]
+    fn an_abandoned_worker_exit_forces_a_correcting_frame() {
+        let control = Control::new(true);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: Duration::from_millis(20),
+                shutdown_bound: Duration::from_millis(20),
+                ack_capacity: 4,
+                ..PresenterConfig::default()
+            },
+        );
+        runtime.handle_pty_bytes(b"abandon");
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert!(wait_until(|| control.gate.entered() >= 1, TEST_WAIT));
+        assert!(
+            runtime
+                .tick_at(Instant::now() + Duration::from_millis(50))
+                .is_none()
+        );
+        assert_eq!(
+            runtime
+                .presenter
+                .as_mut()
+                .expect("presenter")
+                .abandoned_alive(),
+            1
+        );
+
+        control.gate.release();
+        let before = control.presented();
+        assert!(pump_until(
+            &mut runtime,
+            |runtime| runtime.abandoned_workers_alive == 0,
+            TEST_WAIT
+        ));
+        // The transition can land in the same tick that commits the
+        // correction, so drive a commit only when one is still outstanding.
+        if runtime.pending_present.is_some() || runtime.pending_full_redraw {
+            assert!(tick_until_committed(&mut runtime, TEST_WAIT).is_some());
+        }
+        assert!(
+            control.presented() > before,
+            "the abandoned-worker exit leaves a correcting frame on screen"
+        );
+        let _ = runtime.shutdown_with_timeout(Duration::from_millis(50));
+    }
+
+    #[test]
+    fn creation_failures_keep_the_worker_and_do_not_spend_recovery_slots() {
+        let control = Control::new(false);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                recovery_limit: 1,
+                stuck_bound: TEST_WAIT,
+                ..PresenterConfig::default()
+            },
+        );
+        control.fail_factory(1);
+        {
+            let presenter = runtime.presenter.as_mut().expect("presenter");
+            assert!(presenter.recover().is_err());
+            assert_eq!(presenter.creation_failures(), 1);
+            assert!(presenter.is_active(), "the current worker is untouched");
+            assert!(
+                !presenter.is_exhausted(),
+                "a creation failure does not spend an abandoned-worker slot"
+            );
+        }
+        let built = control.built.load(Ordering::Acquire);
+        runtime.handle_pty_bytes(b"still");
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert!(tick_until_committed(&mut runtime, TEST_WAIT).is_some());
+        {
+            let presenter = runtime.presenter.as_mut().expect("presenter");
+            assert_eq!(presenter.creation_failures(), 0);
+            presenter
+                .recover()
+                .expect("creation works again after a presented frame");
+        }
+        assert_eq!(control.built.load(Ordering::Acquire), built + 1);
+        let _ = runtime.shutdown_with_timeout(Duration::from_millis(50));
+    }
+
+    #[test]
+    fn commit_advances_the_captured_scene_revision_not_the_live_one() {
+        let control = Control::new(false);
+        let mut runtime = runtime_with(&control, PresenterConfig::default());
+        runtime.presented_scene_revision = 10;
+        let now = Instant::now();
+        let pending = PendingPresent {
+            token: 0,
+            primary_generation: 3,
+            frame_generation: 4,
+            pane_generations: Vec::new(),
+            scene_revision: Some(7),
+            allocations: Vec::new(),
+            focused: None,
+            scene_report: scene_present::SceneFrameReport::default(),
+            band_identity: Vec::new(),
+            band_origins: Vec::new(),
+            kitty_images: 0,
+            backgrounds: 0,
+            cells_before: 0,
+            glyphs_before: 0,
+            submitted_at: now,
+        };
+        let stats = runtime.commit_present(pending, render_stats(), now);
+        assert_eq!(
+            stats.generation, 4,
+            "stats keep the combined frame generation"
+        );
+        assert_eq!(
+            runtime.last_presented_generation, 3,
+            "the primary advances only to its captured generation"
+        );
+        assert_eq!(
+            runtime.presented_scene_revision, 7,
+            "the scene advances only to the revision captured before the build"
+        );
+        assert!(runtime.shutdown());
     }
 }

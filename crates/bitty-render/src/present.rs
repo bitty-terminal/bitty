@@ -95,9 +95,19 @@ pub const PRESENT_ACK_CAPACITY: usize = 32;
 /// worker is actually presented, which resets the budget.
 pub const PRESENT_RECOVERY_LIMIT: u32 = 3;
 
+/// Consecutive replacement-surface creation failures allowed before the
+/// presenter stops trying.
+///
+/// Invariant: a compositor/driver that refuses every new surface cannot make
+/// the event loop create one every retry tick forever. This budget is
+/// separate from [`PRESENT_RECOVERY_LIMIT`]: a failed creation abandons no
+/// worker, so it must not consume the abandoned-thread budget. A presented
+/// frame from the current worker resets both.
+pub const PRESENT_CREATION_FAILURE_LIMIT: u32 = 5;
+
 /// Acknowledgement token used for events that are not a frame outcome (a
-/// configure failure). Frame tokens start at zero, so an impossible value is
-/// reserved here instead of colliding with the first submission.
+/// configure failure). Frame tokens start at zero, so `u64::MAX` is reserved
+/// instead of colliding with the first submission.
 pub const PRESENT_NON_FRAME_TOKEN: u64 = u64::MAX;
 
 /// Maximum damage rectangles carried when a queued frame is replaced.
@@ -175,6 +185,9 @@ impl PresentBackend for GpuSurfaceBackend {
     }
 
     fn present(&mut self, frame: &FramePayload) -> Result<PresentStats, PresentFailure> {
+        // Consume the carry: the worker has no base image to merge a partial
+        // update onto, so only a whole-surface frame is admissible.
+        require_full_damage(&frame.damage).map_err(PresentFailure::Error)?;
         // The surface clear color follows the resolved theme; installing it
         // on the worker keeps theme reloads off the event loop.
         self.surface.set_theme_palette(frame.theme);
@@ -198,7 +211,9 @@ impl PresentBackend for GpuSurfaceBackend {
 /// The runtime's combined frame is a full-surface composite, so a replacement
 /// frame already contains every pixel of the frame it replaced. The carry is
 /// still explicit: a future partial-frame path must merge rather than drop a
-/// superseded frame's damage, and diagnostics can report what was carried.
+/// superseded frame's damage. The production backend refuses frames whose
+/// carry is not `full` (see `require_full_damage`), so today every async frame
+/// is a whole-surface repaint and the union below can never lose pixels.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DamageCarry {
     /// The frame paints the whole surface; individual rects are irrelevant.
@@ -208,6 +223,15 @@ pub struct DamageCarry {
 }
 
 impl DamageCarry {
+    /// A whole-surface repaint carry.
+    #[must_use]
+    pub const fn full() -> Self {
+        Self {
+            full: true,
+            rects: Vec::new(),
+        }
+    }
+
     /// Builds a carry from a frame plan's dirty rects.
     #[must_use]
     pub fn from_rects(rects: Vec<RectPx>, full: bool) -> Self {
@@ -264,10 +288,32 @@ impl DamageCarry {
     }
 }
 
+/// The off-thread backend only paints full-surface frames.
+///
+/// The combined compositor always produces a complete frame, so a carry that
+/// is not `full` would mean a partial update the worker cannot merge safely.
+/// Refusing it keeps the contract honest instead of painting over the old
+/// pixels with an unknown base.
+///
+/// # Errors
+///
+/// [`RenderError::InvalidInput`] when `damage.full` is false.
+fn require_full_damage(damage: &DamageCarry) -> Result<(), RenderError> {
+    if damage.full {
+        Ok(())
+    } else {
+        Err(RenderError::InvalidInput {
+            reason: "off-thread presenter requires a full-surface damage carry",
+        })
+    }
+}
+
 /// One fully assembled frame handed to the presenter worker.
 ///
 /// The UI thread builds and owns this value; after `submit` the worker owns
-/// it exclusively until the acknowledgement is published.
+/// it exclusively until the acknowledgement is published. `damage` must be a
+/// whole-surface carry (the runtime always sends [`DamageCarry::full`]);
+/// partial carries are refused by the backend.
 pub struct FramePayload {
     /// Draw list for this frame (a complete composite).
     pub draw_list: Box<DrawList>,
@@ -323,13 +369,12 @@ impl PresentOutcome {
 /// One bounded acknowledgement for one attempted present.
 #[derive(Debug)]
 pub struct PresentAck {
-    /// Token of the submitted frame this outcome belongs to (`0` for a
-    /// configure failure, which is not a frame outcome).
+    /// Token of the submitted frame this outcome belongs to, or
+    /// [`PRESENT_NON_FRAME_TOKEN`] for an event that is not a frame outcome
+    /// (a configure failure).
     pub token: u64,
     /// Classified outcome.
     pub outcome: PresentOutcome,
-    /// Damage carried by the frame (including superseded frames' damage).
-    pub damage: DamageCarry,
 }
 
 impl PresentAck {
@@ -358,6 +403,9 @@ pub struct PresenterConfig {
     pub ack_capacity: usize,
     /// Consecutive recoveries allowed without a presented frame.
     pub recovery_limit: u32,
+    /// Consecutive surface-creation failures allowed without a presented
+    /// frame (separate from the abandoned-worker budget).
+    pub creation_failure_limit: u32,
 }
 
 impl Default for PresenterConfig {
@@ -367,6 +415,7 @@ impl Default for PresenterConfig {
             shutdown_bound: PRESENT_SHUTDOWN_BOUND,
             ack_capacity: PRESENT_ACK_CAPACITY,
             recovery_limit: PRESENT_RECOVERY_LIMIT,
+            creation_failure_limit: PRESENT_CREATION_FAILURE_LIMIT,
         }
     }
 }
@@ -382,6 +431,9 @@ struct QueuedFrame {
 struct ConfigureRequest {
     extent: PhysicalSize,
     opacity: f32,
+    /// True when this request came from a resize/DPI reflow, so the worker
+    /// records the same `resize` telemetry as the synchronous path.
+    record_resize: bool,
 }
 
 #[derive(Default)]
@@ -401,6 +453,12 @@ struct WorkerShared {
     cv: Condvar,
     paused: AtomicBool,
     stop: AtomicBool,
+    /// True while the worker is blocked in `Condvar::wait` with no job.
+    ///
+    /// Test/diagnostic seam: negative assertions ("paused, so no acquire")
+    /// can synchronise on the worker actually parking instead of sleeping a
+    /// fixed number of milliseconds.
+    parked: AtomicBool,
     acks: Mutex<VecDeque<PresentAck>>,
     ack_capacity: usize,
     wake: Mutex<Option<PresentWake>>,
@@ -428,6 +486,7 @@ impl WorkerShared {
             cv: Condvar::new(),
             paused: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            parked: AtomicBool::new(false),
             acks: Mutex::new(VecDeque::new()),
             ack_capacity: config.ack_capacity.max(1),
             wake: Mutex::new(wake),
@@ -578,24 +637,40 @@ impl WorkerShared {
     }
 
     /// Signals stop and wakes a waiting worker.
+    ///
+    /// The atomic is stored while holding the same mutex the worker checks it
+    /// under, so a stop between the worker's check and its `wait` cannot be
+    /// lost.
     fn request_stop(&self) {
+        let _slot = self.lock_slot();
         self.stop.store(true, Ordering::Release);
+        self.cv.notify_all();
+    }
+
+    /// Clears/sets pause with the slot lock held for the same reason.
+    fn set_paused(&self, paused: bool) {
+        let _slot = self.lock_slot();
+        self.paused.store(paused, Ordering::Release);
         self.cv.notify_all();
     }
 }
 
-/// Sets the exit flag when the worker loop returns or unwinds.
-struct ExitGuard(Arc<WorkerShared>);
-
-impl Drop for ExitGuard {
-    fn drop(&mut self) {
-        self.0.mark_exited();
-    }
+/// Body of the `bitty-present` worker thread.
+///
+/// The backend owns the only `Surface`, so it is dropped **before** the exit
+/// signal: a slow destructor then delays the exit marker (and a bounded
+/// `shutdown_bounded` detaches) instead of making `join` overrun its bound.
+/// A panic in configure/present unwinds into the outer `catch_unwind`, drops
+/// the backend here, and still signals exit.
+fn worker_main(shared: Arc<WorkerShared>, backend: Box<dyn PresentBackend>) {
+    let mut backend = Some(backend);
+    let _ = catch_unwind(AssertUnwindSafe(|| worker_loop(&shared, &mut backend)));
+    drop(backend.take());
+    shared.mark_exited();
 }
 
-/// Body of the `bitty-present` worker thread.
-fn worker_main(shared: Arc<WorkerShared>, mut backend: Box<dyn PresentBackend>) {
-    let _exit = ExitGuard(Arc::clone(&shared));
+/// Worker loop, borrowed so `worker_main` controls drop order.
+fn worker_loop(shared: &Arc<WorkerShared>, backend: &mut Option<Box<dyn PresentBackend>>) {
     loop {
         let (frame, configure) = {
             let mut slot = shared.lock_slot();
@@ -608,22 +683,40 @@ fn worker_main(shared: Arc<WorkerShared>, mut backend: Box<dyn PresentBackend>) 
                 {
                     break;
                 }
+                shared.parked.store(true, Ordering::Release);
                 slot = shared
                     .cv
                     .wait(slot)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
+                shared.parked.store(false, Ordering::Release);
             }
             (slot.frame.take(), slot.configure.take())
         };
 
         if let Some(request) = configure {
-            match backend.configure(request.extent, request.opacity) {
-                Ok(alpha) => shared.alpha_supported.store(alpha, Ordering::Release),
-                Err(err) => shared.push_ack(PresentAck {
-                    token: PRESENT_NON_FRAME_TOKEN,
-                    outcome: PresentOutcome::Error(err.to_string()),
-                    damage: DamageCarry::default(),
-                }),
+            let backend_ref = backend.as_mut().expect("worker backend present");
+            match backend_ref.configure(request.extent, request.opacity) {
+                Ok(alpha) => {
+                    shared.alpha_supported.store(alpha, Ordering::Release);
+                    if request.record_resize {
+                        telemetry::resize();
+                    }
+                }
+                Err(err) => {
+                    // Never present a frame built for the old extent. Ack the
+                    // taken frame as failed (the runtime retains its damage
+                    // and arms the #2570 retry) and exit so recovery builds a
+                    // surface that can actually be configured.
+                    let detail = format!("configure failed: {err}");
+                    let token = frame
+                        .as_ref()
+                        .map_or(PRESENT_NON_FRAME_TOKEN, |frame| frame.token);
+                    shared.push_ack(PresentAck {
+                        token,
+                        outcome: PresentOutcome::Error(detail),
+                    });
+                    return;
+                }
             }
         }
 
@@ -639,8 +732,9 @@ fn worker_main(shared: Arc<WorkerShared>, mut backend: Box<dyn PresentBackend>) 
         }
 
         shared.begin();
+        let backend_ref = backend.as_mut().expect("worker backend present");
         let mut panicked = false;
-        let outcome = match catch_unwind(AssertUnwindSafe(|| backend.present(&frame.frame))) {
+        let outcome = match catch_unwind(AssertUnwindSafe(|| backend_ref.present(&frame.frame))) {
             Ok(Ok(stats)) => PresentOutcome::Presented(stats),
             Ok(Err(PresentFailure::Surface { class, detail })) => match class {
                 PresentFailureClass::Outdated => PresentOutcome::Outdated(detail),
@@ -658,7 +752,6 @@ fn worker_main(shared: Arc<WorkerShared>, mut backend: Box<dyn PresentBackend>) 
         shared.push_ack(PresentAck {
             token: frame.token,
             outcome,
-            damage: frame.frame.damage,
         });
         if panicked {
             // A panicked backend may have poisoned its surface; exit so the
@@ -697,9 +790,17 @@ pub struct Presenter {
     /// handle (not the per-worker shared state) so recovery does not reset
     /// the evidence the watchdog reports.
     stuck_total: u64,
-    /// Consecutive recoveries since the last presented frame, bounded by
-    /// [`PresenterConfig::recovery_limit`].
+    /// Consecutive abandoned workers since the last presented frame, bounded
+    /// by [`PresenterConfig::recovery_limit`].
     consecutive_recoveries: u32,
+    /// Consecutive replacement-surface creation failures, bounded by
+    /// [`PresenterConfig::creation_failure_limit`]. Kept separate from
+    /// `consecutive_recoveries`: a failed creation abandons no worker.
+    creation_failures: u32,
+    /// Workers abandoned on recovery, used to notice when the last one exits
+    /// so the embedder can force one correcting repaint (a late abandoned
+    /// present must not leave a stale frame on screen).
+    abandoned: Vec<std::sync::Weak<WorkerShared>>,
 }
 
 impl std::fmt::Debug for Presenter {
@@ -752,19 +853,26 @@ impl Presenter {
             next_worker_wake: wake,
             stuck_total: 0,
             consecutive_recoveries: 0,
+            creation_failures: 0,
+            abandoned: Vec::new(),
         })
     }
 
     /// Spawns the production presenter from an owned surface and GPU context.
     ///
-    /// The surface is configured once here (before ownership transfer, on the
-    /// calling thread) and then owned exclusively by the worker. Recovery
-    /// creates and configures a new surface through the same factory without
-    /// touching the event-loop thread's state.
+    /// `surface` **must already be configured** for `extent`/`opacity`: the
+    /// embedder does that before transferring ownership (it also needs the
+    /// configure result to decide whether to attach at all). No configure runs
+    /// here. After this call the surface is worker-owned.
+    ///
+    /// The recovery factory runs on the event-loop thread, but it only
+    /// creates and configures a surface; it never calls acquire/present, so it
+    /// cannot hit the explicit-sync timeline wait. It is still an unvalidated
+    /// driver call on the UI thread (see the review notes).
     ///
     /// # Errors
     ///
-    /// Propagates a surface reconfiguration or worker-spawn failure.
+    /// Propagates a worker-spawn failure.
     pub fn spawn_gpu(
         gpu: GpuContext,
         surface: Surface,
@@ -774,9 +882,6 @@ impl Presenter {
         config: PresenterConfig,
         wake: Option<PresentWake>,
     ) -> Result<Self, RenderError> {
-        // Reconfigure through the same path recovery will use, so the first
-        // worker and every replacement see identical state.
-        surface.configure_with_opacity(&gpu, extent, opacity)?;
         let gpu = Arc::new(gpu);
         let factory_gpu = Arc::clone(&gpu);
         let factory_target = target.clone();
@@ -853,15 +958,41 @@ impl Presenter {
         self.stuck_total
     }
 
-    /// True when the bounded recovery budget is spent.
+    /// True when the bounded *surface-creation* budget is spent.
     ///
-    /// The embedder stops submitting and stays responsive until a frame from
-    /// the last worker is actually presented (which resets the budget), so a
-    /// compositor that refuses every replacement surface cannot accumulate
-    /// worker threads indefinitely.
+    /// Only replacement-surface creation stops: the current worker stays
+    /// active and must keep receiving frames, because only a presented frame
+    /// can reset this budget. A spent budget is therefore not a reason to
+    /// refuse `submit`, `present_owed`, or a tick.
     #[must_use]
     pub fn is_exhausted(&self) -> bool {
         self.consecutive_recoveries >= self.config.recovery_limit.max(1)
+            || self.creation_failures >= self.config.creation_failure_limit.max(1)
+    }
+
+    /// Consecutive surface-creation failures (diagnostics/tests).
+    #[must_use]
+    pub fn creation_failures(&self) -> u32 {
+        self.creation_failures
+    }
+
+    /// Backends still owned by workers abandoned during recovery.
+    ///
+    /// The embedder uses this to force one correcting full repaint after the
+    /// last abandoned worker exits: an abandoned present can land after the
+    /// replacement's commit and must not leave a stale frame forever.
+    pub fn abandoned_alive(&mut self) -> usize {
+        self.abandoned.retain(|weak| weak.strong_count() > 0);
+        self.abandoned.len()
+    }
+
+    /// True while the worker is parked in its mailbox wait.
+    ///
+    /// Diagnostic/test seam: a negative assertion ("paused, so no acquire")
+    /// can wait for the worker to actually park instead of sleeping.
+    #[must_use]
+    pub fn is_worker_parked(&self) -> bool {
+        self.shared.parked.load(Ordering::Acquire)
     }
 
     /// Frames replaced in the slot before acquisition.
@@ -885,14 +1016,13 @@ impl Presenter {
     /// A present already blocked in the driver stays blocked off-thread; when
     /// it returns the worker observes the pause and performs no new acquire.
     pub fn pause(&self) {
-        self.shared.paused.store(true, Ordering::Release);
+        self.shared.set_paused(true);
     }
 
     /// Resumes the worker; a queued frame (the latest submitted) is
     /// presented next.
     pub fn resume(&self) {
-        self.shared.paused.store(false, Ordering::Release);
-        self.shared.cv.notify_all();
+        self.shared.set_paused(false);
     }
 
     /// Records one stuck-present episode on the live worker.
@@ -902,12 +1032,26 @@ impl Presenter {
         telemetry::presenter_stuck();
     }
 
-    /// Sends a configure request; the worker applies it before its next
-    /// acquire. Only the newest request is kept.
+    /// Sends an opacity/configure request; the worker applies it before its
+    /// next acquire. Only the newest request is kept.
     pub fn configure(&mut self, extent: PhysicalSize, opacity: f32) {
+        self.queue_configure(extent, opacity, false);
+    }
+
+    /// Sends a resize request; like [`Self::configure`] but records the
+    /// `resize` telemetry the synchronous `Surface::resize` path emits.
+    pub fn resize(&mut self, extent: PhysicalSize, opacity: f32) {
+        self.queue_configure(extent, opacity, true);
+    }
+
+    fn queue_configure(&mut self, extent: PhysicalSize, opacity: f32, record_resize: bool) {
         self.last_extent = extent;
         self.last_opacity = opacity;
-        self.shared.lock_slot().configure = Some(ConfigureRequest { extent, opacity });
+        self.shared.lock_slot().configure = Some(ConfigureRequest {
+            extent,
+            opacity,
+            record_resize,
+        });
         self.shared.cv.notify_all();
     }
 
@@ -917,7 +1061,9 @@ impl Presenter {
     /// Returns the submission token, or `None` when no worker is active (the
     /// caller retains the frame's damage and retries recovery).
     pub fn submit(&mut self, mut frame: FramePayload) -> Option<u64> {
-        if !self.is_active() || self.is_exhausted() {
+        // A spent surface-creation budget must not stop the *current* worker
+        // from being fed: its ack is the only event that can reset the budget.
+        if !self.is_active() {
             return None;
         }
         let token = self.next_token;
@@ -955,28 +1101,42 @@ impl Presenter {
         drop(queue);
         if acks.iter().any(PresentAck::is_presented) {
             self.consecutive_recoveries = 0;
+            self.creation_failures = 0;
         }
+        self.abandoned.retain(|weak| weak.strong_count() > 0);
         acks
     }
 
-    /// Abandons a stuck worker and starts a fresh surface + worker.
+    /// Builds the replacement *before* abandoning the stuck worker, so a
+    /// factory failure neither leaves the process without a worker nor charges
+    /// the abandoned-worker budget. Only a successful replacement consumes
+    /// one recovery slot; creation failures have their own bounded budget.
     ///
     /// The abandoned worker is never joined: it owns its own shared state and
-    /// exits on its own when its blocking call returns. On failure the
-    /// presenter stays inactive and [`Self::recover`] can be retried.
+    /// exits on its own when its blocking call returns. The factory runs on
+    /// the event-loop thread but performs no acquire/present.
     ///
     /// # Errors
     ///
-    /// Propagates the backend factory failure (surface creation/configure).
+    /// Propagates the backend factory failure (surface creation/configure) or
+    /// a worker-spawn failure, and refuses further surface creation when
+    /// either budget is spent.
     pub fn recover(&mut self) -> Result<(), RenderError> {
         if self.is_exhausted() {
             return Err(RenderError::UpstreamGraphics(String::from(
-                "present worker recovery budget exhausted",
+                "present worker surface-creation budget exhausted",
             )));
         }
-        self.consecutive_recoveries = self.consecutive_recoveries.saturating_add(1);
+        let backend = match (self.factory)(self.last_extent, self.last_opacity) {
+            Ok(backend) => backend,
+            Err(err) => {
+                self.creation_failures = self.creation_failures.saturating_add(1);
+                return Err(err);
+            }
+        };
+        self.creation_failures = 0;
         self.abandon_worker();
-        let backend = (self.factory)(self.last_extent, self.last_opacity)?;
+        self.consecutive_recoveries = self.consecutive_recoveries.saturating_add(1);
         let generation = next_generation();
         let shared = Arc::new(WorkerShared::new(
             generation,
@@ -1022,9 +1182,14 @@ impl Presenter {
     }
 
     /// Signals the current worker to stop without waiting.
+    ///
+    /// The abandoned worker's shared state is tracked weakly so the embedder
+    /// can detect when the last abandoned driver call has returned and force
+    /// one correcting repaint.
     fn abandon_worker(&mut self) {
-        self.shared.request_stop();
         if let Some(worker) = self.worker.take() {
+            self.abandoned.push(Arc::downgrade(&self.shared));
+            self.shared.request_stop();
             drop(worker);
         }
     }

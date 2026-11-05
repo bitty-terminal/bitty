@@ -632,9 +632,24 @@ pub struct Runtime {
     pending_present: Option<self::present::PendingPresent>,
     /// Earliest retry after a failed presenter recovery.
     presenter_retry_at: Option<std::time::Instant>,
+    /// Workers abandoned by recovery that have not yet exited.
+    ///
+    /// A late abandoned present can land after the replacement's commit, so
+    /// the runtime tracks this count and forces one correcting full repaint
+    /// when it returns to zero.
+    abandoned_workers_alive: usize,
+    /// Next bounded poll while an abandoned worker is still alive.
+    abandoned_check_at: Option<std::time::Instant>,
+    /// Earliest full GPU reattach attempt after the presenter exhausted its
+    /// built-in recovery budgets.
+    presenter_reattach_at: Option<std::time::Instant>,
     /// Embedder wake callback, forwarded to the presenter so an ack wakes
     /// the event loop immediately instead of waiting for a timer.
     present_waker: Option<bitty_render::present::PresentWake>,
+    /// Successful inspect-snapshot publications (diagnostics/test evidence
+    /// that the async commit reaches the same publication boundary as the
+    /// synchronous present path).
+    inspect_publishes: std::sync::atomic::AtomicU64,
     cold_queue: ColdQueue,
     /// Lock-free gauges published for the process hang watchdog (bitty#2830).
     ///
@@ -1870,6 +1885,12 @@ impl Runtime {
     /// `timeout` for tests and embedders with tighter/looser budgets.
     /// A zero timeout still drops the waker/receivers/`Pty`s promptly and
     /// joins only already-finished threads.
+    ///
+    /// The off-thread presenter is stopped first with its **own**
+    /// `PRESENT_SHUTDOWN_BOUND` (250 ms), independent of `timeout`: a worker
+    /// blocked in the compositor must never extend process teardown, and the
+    /// bound is part of the presenter contract rather than the PTY join
+    /// policy.
     pub fn shutdown_with_timeout(&mut self, timeout: std::time::Duration) -> bool {
         // bitty#2830: stop the off-thread presenter first, with its own
         // bounded wait. A worker blocked in the compositor's acquire is
@@ -2109,7 +2130,11 @@ impl Runtime {
             presenter: None,
             pending_present: None,
             presenter_retry_at: None,
+            abandoned_workers_alive: 0,
+            abandoned_check_at: None,
+            presenter_reattach_at: None,
             present_waker: None,
+            inspect_publishes: std::sync::atomic::AtomicU64::new(0),
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
             hang_gauges: Arc::new(HangGauges::new()),
             plugin_host,
@@ -2420,7 +2445,11 @@ impl Runtime {
             presenter: None,
             pending_present: None,
             presenter_retry_at: None,
+            abandoned_workers_alive: 0,
+            abandoned_check_at: None,
+            presenter_reattach_at: None,
             present_waker: None,
+            inspect_publishes: std::sync::atomic::AtomicU64::new(0),
             cold_queue: ColdQueue::new(config.cold_queue_capacity),
             hang_gauges: Arc::new(HangGauges::new()),
             plugin_host,
@@ -2733,8 +2762,12 @@ impl Runtime {
         extent: PhysicalSize,
         opacity: f32,
     ) -> Result<(), RuntimeError> {
-        surface.set_theme_palette(self.config.theme);
-        let mirror = headless_mirror(extent, opacity, self.config.theme)?;
+        // Carry the live palette (including OSC 4/10/11 dynamic overrides)
+        // onto both the worker surface and the headless mirror; rebuilding the
+        // mirror from `config.theme` would revert the window clear color.
+        let palette = self.surface.theme_palette();
+        surface.set_theme_palette(palette);
+        let mirror = headless_mirror(extent, opacity, palette)?;
         // One live surface at a time: stop any previous worker before the
         // replacement surface is created for the same window.
         self.shutdown_presenter();
@@ -2753,6 +2786,9 @@ impl Runtime {
         self.presenter = Some(presenter);
         self.pending_present = None;
         self.presenter_retry_at = None;
+        self.presenter_reattach_at = None;
+        self.abandoned_workers_alive = 0;
+        self.abandoned_check_at = None;
         self.pending_full_redraw = true;
         Ok(())
     }
@@ -2780,13 +2816,44 @@ impl Runtime {
         self.gpu = None;
         self.pending_present = None;
         self.presenter_retry_at = None;
+        self.presenter_reattach_at = None;
+        self.abandoned_workers_alive = 0;
+        self.abandoned_check_at = None;
         self.pending_full_redraw = true;
     }
 
-    /// Whether a real GPU surface is attached (not headless).
+    /// Whether a real GPU surface is attached and able to present.
+    ///
+    /// An inactive presenter (worker exited, recovery failed) reports
+    /// `false`, which is what lets the embedder retry attachment instead of
+    /// believing a dead surface is live.
     #[must_use]
     pub fn has_gpu(&self) -> bool {
-        self.presenter.is_some() || (self.gpu.is_some() && !self.surface.is_headless())
+        self.presenter
+            .as_ref()
+            .is_some_and(bitty_render::present::Presenter::is_active)
+            || (self.gpu.is_some() && !self.surface.is_headless())
+    }
+
+    /// Whether the embedder should attempt a fresh GPU attach.
+    ///
+    /// True only when a presenter exists, its worker is dead, its built-in
+    /// surface-creation budgets are spent, and the bounded reattach cooldown
+    /// elapsed. The call arms the cooldown so one failure cannot make the
+    /// event loop recreate a GPU context every tick.
+    pub fn needs_gpu_reattach(&mut self) -> bool {
+        let Some(presenter) = self.presenter.as_mut() else {
+            return false;
+        };
+        if presenter.is_active() || !presenter.is_exhausted() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if self.presenter_reattach_at.is_some_and(|at| now < at) {
+            return false;
+        }
+        self.presenter_reattach_at = now.checked_add(self::present::PRESENT_REATTACH_RETRY);
+        true
     }
 
     /// Stops the off-thread presenter with its bounded shutdown.
@@ -2797,6 +2864,8 @@ impl Runtime {
         }
         self.pending_present = None;
         self.presenter_retry_at = None;
+        self.abandoned_workers_alive = 0;
+        self.abandoned_check_at = None;
     }
 
     /// Current Kitty keyboard flags (7727 bitmask). 0 = legacy.
@@ -2885,6 +2954,13 @@ impl Runtime {
         self.inspect_ring.dropped()
     }
 
+    /// Number of inspect-snapshot publications (diagnostic/test seam).
+    #[must_use]
+    pub fn inspect_publish_count(&self) -> u64 {
+        self.inspect_publishes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Publish bounded read-only introspection snapshots to the `BITTY_SOCKET`
     /// live store (CTX-0159, Issue #258).
     ///
@@ -2893,6 +2969,9 @@ impl Runtime {
     /// truth, never writes to the PTY, never blocks). Called on input and on
     /// tick so socket probes observe typed text without screenshots.
     pub fn publish_inspect_snapshot(&self) {
+        let _ = self
+            .inspect_publishes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Issue #2875 scope 6 (a11y/scene contract): the devtools grid-text
         // snapshot is a text projection too, so a painted image that owns no
         // grid cell must show the object-replacement stand-in here rather
@@ -3341,13 +3420,14 @@ impl Runtime {
         self.surface.extent()
     }
 
-    /// Whether the surface is the headless software fake.
+    /// Whether the runtime is presenting through the headless fake.
     ///
-    /// False while the off-thread presenter owns a real Wayland surface; the
-    /// runtime-side mirror is headless but the window is not.
+    /// False while an active off-thread presenter owns a real Wayland
+    /// surface; an inactive/exhausted presenter reports headless so the
+    /// embedder's reattach path can take over.
     #[must_use]
     pub fn is_headless(&self) -> bool {
-        self.presenter.is_none() && self.surface.is_headless()
+        !self.has_gpu()
     }
 
     /// Number of queued cold-path events.

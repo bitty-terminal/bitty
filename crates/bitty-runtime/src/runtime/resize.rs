@@ -489,8 +489,11 @@ impl Runtime {
         // its ack can no longer publish allocations for the new layout.
         if let Some(presenter) = self.presenter.as_mut() {
             let opacity = self.surface.opacity();
-            presenter.configure(surface_extent, opacity);
-            self.surface = super::headless_mirror(surface_extent, opacity, self.config.theme)?;
+            // The live palette (OSC 4/10/11 overrides included) must survive
+            // the mirror replacement; `config.theme` is only the base table.
+            let palette = self.surface.theme_palette();
+            presenter.resize(surface_extent, opacity);
+            self.surface = super::headless_mirror(surface_extent, opacity, palette)?;
             self.pending_present = None;
         } else if let Some(gpu) = self.gpu.as_ref() {
             self.surface

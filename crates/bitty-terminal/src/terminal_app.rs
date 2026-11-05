@@ -139,6 +139,14 @@ impl PresentNudge {
     ) -> Option<std::time::Instant> {
         if let Some(deadline) = wake {
             self.delay = PRESENT_NUDGE_DELAY;
+            // Never hand a past instant to `set_wait_until`: a deadline that
+            // lost the race with the tick would re-enter AboutToWait
+            // immediately and spin at 100% CPU.
+            let deadline = if deadline <= now {
+                now + PRESENT_NUDGE_DELAY
+            } else {
+                deadline
+            };
             return Some(deadline);
         }
         if !owed {
@@ -5089,6 +5097,18 @@ impl TerminalApp {
                 // tick produced a present (frame-on-demand).
                 self.watchdog_phase(Phase::PtyPump);
                 self.poll_pty_pump();
+                // bitty#2830 F11: the presenter exhausted its built-in
+                // surface-creation budgets and its worker is gone. A fresh
+                // GPU context/surface is the only remaining recovery path;
+                // the runtime rate-limits this to one attempt per cooldown.
+                if self.runtime.needs_gpu_reattach() {
+                    if let Some(handle) = self.window.handle.clone() {
+                        crate::logging::info(|| {
+                            String::from("bitty: presenter recovery exhausted; reattaching GPU")
+                        });
+                        self.try_attach_gpu(&handle);
+                    }
+                }
                 self.watchdog_phase(Phase::Reap);
                 if self.reap_exited_shells() == ShellExitOutcome::AppExiting {
                     self.save_session_best_effort("shell-exit");

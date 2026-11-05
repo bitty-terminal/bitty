@@ -14,6 +14,8 @@
 #     `bitty-terminal`): the input-VM boundary regression seam;
 #   - `publication-control-test-support` (`bitty-runtime`): the fixture TLS 1.2
 #     server and the publication-control seam;
+#   - `hang-gauge-test-support` (`bitty-runtime`): the in-tick block seam that
+#     proves a slow tick is measured and reported by the hang watchdog;
 #   - `test-seams` (`bitty-daemon`) and `gui-tests` (`bitty-platform`).
 #
 # Each may be enabled only from `[dev-dependencies]`, or by a test invocation.
@@ -45,6 +47,7 @@ readonly -a test_only_features=(
   "publication-control-test-support"
   "test-seams"
   "gui-tests"
+  "hang-gauge-test-support"
 )
 
 alternation="$(printf '%s\n' "${test_only_features[@]}" | paste -sd '|' -)"

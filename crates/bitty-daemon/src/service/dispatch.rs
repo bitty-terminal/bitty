@@ -2146,10 +2146,11 @@ impl Service {
 
     /// The in-crate spawn tests drive the reserved worker path directly.
     ///
-    /// It is compiled only for unit tests and is never reachable from the wire:
+    /// It is compiled only for the unit tests of this module (which are
+    /// Linux-only, like the served loop) and is never reachable from the wire:
     /// [`Self::session_create`] always passes `false`, so the served
     /// `worker_sessions` truth remains authoritative.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn session_create_with_reserved_worker_path(
         &mut self,
         connection: &mut Connection,

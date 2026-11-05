@@ -29,7 +29,7 @@ never fork expectations.
       "area": "handshake",
       "decisions": ["D-08"],
       "drivers": ["fake", "real"],
-      "requires": ["worker_sessions"],
+      "requires": ["terminal_spawn"],
       "setup": { "host_grant": false },
       "injected": { "clock_ms": 0, "limits": {} },
       "steps": [],
@@ -53,12 +53,15 @@ never fork expectations.
 - `drivers` names the drivers that must run the vector. A driver that does not
   run it must have a `real_skip`/`fake_skip` reason; the row is recorded as a
   typed skip, never a pass.
-- `requires` names capabilities the served cell must advertise for the vector
-  to run. A driver whose negotiated capability set lacks one records the typed
-  `cell-not-servable: <capability>` skip after preparation, so a real Linux cell
-  whose containment probe selected no mechanism never fails the worker vectors
-  it cannot serve. The reference fake models a served worker cell and always
-  advertises `worker_sessions`. A harness seam (`request_deadline_seam`) is
+- `requires` names capabilities or modeled features the served cell must
+  advertise or provide for the vector to run. A driver whose negotiated
+  capability set lacks one records the typed `cell-not-servable: <requirement>`
+  skip after preparation. `worker_sessions` is `false` in every v0.2.0 build
+  (`D-01`), so the reserved worker vectors skip on both drivers; the accepted
+  1.3 terminal-spawn vectors require the modeled `terminal_spawn` feature, which
+  is `true` only when the containment plan can contain a child. The reference
+  fake models both the reserved worker bit (`false`) and the served terminal
+  plan (`terminal_spawn: true`). A harness seam (`request_deadline_seam`) is
   resolved through the driver's `seams` map, never the wire handshake.
 - `injected` is honored by the fake. The real service uses its process clock and
   compiled limits; a vector that needs injection records a typed real skip. The

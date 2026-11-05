@@ -31,13 +31,17 @@
 //! - [`operator`] and [`audit_sink`]: the per-boot operator capability and the
 //!   fail-closed audit writer;
 //! - [`spawn`]: the bounded `session.create` spawn specification;
-//! - [`worker`]: the worker pool, PTY supervision, generation bind, and resize.
+//! - [`worker`]: the reserved worker pool, PTY supervision, generation bind,
+//!   and resize (compiled and unit-tested, not served before the `D-01`
+//!   amendment).
 //!
 //! `bittyd start` binds the per-user endpoint, mints the operator capability,
 //! serves the bitty-ipc v1 envelope, and stops on `daemon.stop` or a signal.
-//! It spawns a worker only on a served cell and only inside a recorded
+//! It spawns a terminal only on a served cell and only inside a recorded
 //! containment identity, signals nothing outside that identity, and opens no
-//! TCP listener. Plain `bittyd` prints status and creates no runtime file.
+//! TCP listener. A worker create is refused with
+//! `Denied/UnsupportedCapability` in every v0.2.0 build (`D-01`). Plain
+//! `bittyd` prints status and creates no runtime file.
 //!
 //! # Ownership and dependency direction
 //!
@@ -53,9 +57,10 @@
 //!
 //! - [`contract::SERVICE_API_VERSION`]: service API `1.3` with minimum client
 //!   minor `0` (contract D-11).
-//! - [`contract::CAPABILITIES`]: `terminal_sessions`, `worker_sessions`
-//!   (compiled for the cell and narrowed to the probed containment plan),
-//!   `events`, `observer_grants`, `control_transfer`, `idempotent_mutations`.
+//! - [`contract::CAPABILITIES`]: `terminal_sessions`, `events`,
+//!   `observer_grants`, `control_transfer`, `idempotent_mutations`, and the
+//!   reserved `worker_sessions` bit that is `false` in every v0.2.0 build
+//!   (`D-01`).
 //! - [`contract::NEGOTIATE_METHOD`] and [`handshake::negotiate`]: the
 //!   `daemon.negotiate` version, capability, and effective-limits half of the
 //!   handshake.
@@ -99,18 +104,21 @@
 //!   (`D-10`, `D-14`).
 //!
 //! A `session.create kind: terminal` with the bounded spawn specification
-//! spawns through the same contained path as `kind: worker` and binds
-//! generation 1; without a specification it keeps the `1.2` registry-only
-//! `created` shape. `session.read`, `session.write`, and `session.subscribe`
-//! serve the terminal content plane under the controller lease; a worker is a
-//! service process and has no terminal content plane.
+//! spawns through the contained path and binds generation 1; without a
+//! specification it keeps the `1.2` registry-only `created` shape.
+//! `session.read`, `session.write`, and `session.subscribe` serve the terminal
+//! content plane under the controller lease. The `kind: worker` path stays
+//! compiled and unit-tested but is not served: every worker create is
+//! `Denied/UnsupportedCapability` until the `D-01` amendment and security
+//! review exist.
 //!
 //! # Deferred, by owning slice
 //!
 //! | Contract area | Owner | Answer today |
 //! | --- | --- | --- |
 //! | Terminal content authority for observers | contract follow-up | content is controller-only; an observer with `terminal.inspect` is `Denied/ControllerRequired` |
-//! | Worker-kind content reads/writes | bitty#2790 follow-up | a worker owns a PTY for resize only; content methods answer `Denied/NotRunning` |
+//! | Worker-kind content reads/writes | bitty#2790 follow-up | a worker owns a PTY for resize only; content methods answer `Denied/NotRunning` once the `D-01` amendment enables hosting |
+//! | Worker hosting | bitty#2608 | reserved: `worker_sessions=false` in every build; worker create is `Denied/UnsupportedCapability` |
 //! | Worker rebind/restart and executable policy | bitty#2790 follow-up | a restarted daemon does not re-attach a worker; the executable allowlist is not enforced |
 //! | Per-connection refusal-audit aggregation | bitty#2603 follow-up | wire-level refusals are budgeted and aggregated; method refusals remain one individual record each |
 //! | Conformance corpus and fake-server parity | bitty#2605 | `tests/harness` corpus, fake and real drivers, parity gate; every shared vector is compared, with no recorded known defect |

@@ -557,10 +557,26 @@ fn start_serves_the_endpoint_and_never_opens_a_tcp_listener() {
         advertised.contains(&"terminal.manage"),
         "the content-plane scope is granted at negotiate"
     );
+    let capabilities = result["capabilities"]
+        .as_object()
+        .expect("capabilities object");
+    let mut advertised: Vec<&str> = capabilities.keys().map(String::as_str).collect();
+    advertised.sort_unstable();
+    let mut accepted = bitty_daemon::contract::CAPABILITY_NAMES.to_vec();
+    accepted.sort_unstable();
     assert_eq!(
-        result["capabilities"]["worker_sessions"],
-        bitty_daemon::worker::WORKER_SESSIONS_SERVED
+        advertised, accepted,
+        "the handshake advertises exactly the accepted capability set"
     );
+    assert_eq!(
+        capabilities["worker_sessions"], false,
+        "D-01 reserves the worker kind in every build"
+    );
+    assert_eq!(capabilities["terminal_sessions"], true);
+    assert_eq!(capabilities["events"], true);
+    assert_eq!(capabilities["observer_grants"], true);
+    assert_eq!(capabilities["control_transfer"], true);
+    assert_eq!(capabilities["idempotent_mutations"], true);
     assert_eq!(
         result["limits"].as_array().expect("limits").len(),
         bitty_daemon::limits::LIMIT_COUNT
@@ -2648,6 +2664,7 @@ fn wait_for_worker_state(operator: &mut Client, session_id: &str, states: &[&str
 }
 
 #[test]
+#[ignore = "D-01: worker hosting is not served until the ADR 0019 amendment and security review"]
 fn a_worker_create_binds_generation_one_and_keeps_its_journal_record_while_live() {
     let root = TempRoot::new("worker-bind");
     let daemon = Daemon::start(&root);
@@ -2721,6 +2738,7 @@ fn a_worker_create_binds_generation_one_and_keeps_its_journal_record_while_live(
 }
 
 #[test]
+#[ignore = "D-01: worker hosting is not served until the ADR 0019 amendment and security review"]
 fn worker_resize_requires_the_controller_lease_and_bumps_the_revision() {
     let root = TempRoot::new("worker-resize");
     let daemon = Daemon::start(&root);
@@ -2845,6 +2863,7 @@ fn worker_resize_requires_the_controller_lease_and_bumps_the_revision() {
 }
 
 #[test]
+#[ignore = "D-01: worker hosting is not served until the ADR 0019 amendment and security review"]
 fn a_worker_create_bind_resize_stop_chain_leaves_no_session_or_child_behind() {
     let root = TempRoot::new("worker-chain");
     let daemon = Daemon::start(&root);
@@ -3298,6 +3317,7 @@ fn terminal_subscribe_requires_the_event_opt_in() {
 }
 
 #[test]
+#[ignore = "D-01: worker hosting is not served until the ADR 0019 amendment and security review"]
 fn a_failed_worker_spawn_leaves_no_journal_record_or_bound_session() {
     let root = TempRoot::new("worker-spawn-fail");
     let daemon = Daemon::start(&root);
@@ -3348,6 +3368,7 @@ fn a_failed_worker_spawn_leaves_no_journal_record_or_bound_session() {
 }
 
 #[test]
+#[ignore = "D-01: worker hosting is not served until the ADR 0019 amendment and security review"]
 fn a_non_executable_worker_program_is_an_exec_refusal_and_leaves_no_record() {
     let root = TempRoot::new("worker-eacces");
     let daemon = Daemon::start(&root);
@@ -3399,6 +3420,7 @@ fn a_non_executable_worker_program_is_an_exec_refusal_and_leaves_no_record() {
 }
 
 #[test]
+#[ignore = "D-01: worker hosting is not served until the ADR 0019 amendment and security review"]
 fn an_unrecognised_executable_format_is_run_by_the_shell_and_never_refused() {
     let root = TempRoot::new("worker-enoexec");
     let daemon = Daemon::start(&root);
@@ -3454,6 +3476,7 @@ fn an_unrecognised_executable_format_is_run_by_the_shell_and_never_refused() {
 }
 
 #[test]
+#[ignore = "D-01: worker hosting is not served until the ADR 0019 amendment and security review"]
 fn a_bad_shebang_is_an_exec_refusal_and_leaves_no_record() {
     let root = TempRoot::new("worker-bad-shebang");
     let daemon = Daemon::start(&root);
@@ -3493,6 +3516,7 @@ fn a_bad_shebang_is_an_exec_refusal_and_leaves_no_record() {
 }
 
 #[test]
+#[ignore = "D-01: worker hosting is not served until the ADR 0019 amendment and security review"]
 fn a_worker_exit_is_recorded_once_with_its_containment_cleanup() {
     let root = TempRoot::new("worker-exit");
     let daemon = Daemon::start(&root);
@@ -3574,6 +3598,21 @@ fn a_worker_exit_is_recorded_once_with_its_containment_cleanup() {
     assert_eq!(replay["result"]["session"]["state"], exited["state"]);
 
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+/// Live child processes of the daemon across its task table.
+///
+/// Linux records a child under the task that created it, so the sum is the
+/// daemon's exact direct-child set. A refused create must leave it unchanged.
+fn daemon_child_count(pid: u32) -> u64 {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return 0;
+    };
+    tasks
+        .flatten()
+        .filter_map(|task| std::fs::read_to_string(task.path().join("children")).ok())
+        .map(|text| text.split_whitespace().count() as u64)
+        .sum()
 }
 
 /// The daemon's own containment window, rebuilt from its advertised limits.
@@ -3667,6 +3706,7 @@ fn session_cgroup_settled(path: &Path) -> bool {
 }
 
 #[test]
+#[ignore = "D-01: worker hosting is not served until the ADR 0019 amendment and security review"]
 fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
     let root = TempRoot::new("worker-descendant");
     let daemon = Daemon::start(&root);
@@ -3766,14 +3806,15 @@ fn a_worker_exit_kills_the_recorded_group_before_the_reap() {
 }
 
 #[test]
-fn worker_create_refuses_without_consent_and_before_an_invalid_kind() {
+fn worker_create_keeps_the_scope_then_capability_then_kind_order() {
     let root = TempRoot::new("worker-consent");
     let daemon = Daemon::start(&root);
     let mut client = Client::connect(&root.endpoint());
     assert_eq!(client.negotiate(None)["ok"], true, "no host grant");
 
-    // The connection holds `process.spawn` but no `session.host`: consent is
-    // the refusal, not a capability one.
+    // The connection holds `process.spawn` but no `session.host`: the stage-6
+    // create scope/consent presence check is the refusal, before the kind is
+    // parsed.
     let consent = client.call(
         "session.create",
         json!({
@@ -3813,6 +3854,30 @@ fn worker_create_refuses_without_consent_and_before_an_invalid_kind() {
     );
     assert_eq!(malformed["ok"], false, "{malformed}");
     assert_eq!(malformed["error"]["code"], "InvalidRequest");
+
+    // With create authority the reserved worker kind is the typed capability
+    // refusal, before the spawn specification is parsed or any process starts.
+    let children_before = daemon_child_count(daemon.pid());
+    let reserved = creator.call(
+        "session.create",
+        json!({
+            "kind": "worker",
+            "idempotency_key": "reserved-worker",
+            "argv": ["/bin/sleep", "60"],
+            "cwd": "/",
+        }),
+    );
+    assert_eq!(reserved["ok"], false, "{reserved}");
+    assert_eq!(reserved["error"]["class"], "Denied");
+    assert_eq!(
+        reserved["error"]["code"], "UnsupportedCapability",
+        "D-01 refuses the worker kind in every build"
+    );
+    assert_eq!(
+        daemon_child_count(daemon.pid()),
+        children_before,
+        "a refused worker create must not add a child process"
+    );
 
     let status = operator.call("daemon.status", Value::Null);
     assert_eq!(status["result"]["active_sessions"], 0);

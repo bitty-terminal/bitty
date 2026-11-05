@@ -506,6 +506,10 @@ impl RealDriver {
             version: bitty_daemon::CRATE_VERSION.to_owned(),
             capabilities,
             limits,
+            features: std::collections::BTreeMap::from([(
+                "terminal_spawn".to_owned(),
+                self.probe_terminal_spawn(&endpoint)?,
+            )]),
             // The seam is present exactly when this run injected it: the
             // driver sets the override variables for the vector and passes
             // them to the daemon, so the flag tracks the run rather than a
@@ -515,6 +519,50 @@ impl RealDriver {
                 cfg!(feature = "test-seams") && self.request_timeout_ms.is_some(),
             )]),
         })
+    }
+
+    /// Whether the running daemon selected a containment plan that can spawn.
+    ///
+    /// The capability bit cannot answer this: `worker_sessions` is `false` in
+    /// every build by `D-01`, while the accepted 1.3 terminal-spawn slice is
+    /// gated by the plan the startup probe selected. `daemon.status` reports
+    /// that plan as the orphan mechanism, so the driver reads it through the
+    /// operator capability instead of assuming a Linux cell is always servable.
+    fn probe_terminal_spawn(&mut self, endpoint: &Path) -> Result<bool, String> {
+        let mut client = Client::connect(endpoint)?;
+        let id = self.next_request_id();
+        client.send(
+            &id,
+            "daemon.negotiate",
+            &json!({
+                "client_version": {"major": 1, "minor": 0},
+                "operator_capability": self.operator_capability,
+            }),
+        )?;
+        match client.recv()? {
+            Outcome::Reply(reply) if reply.ok => {}
+            _ => return Err("terminal-spawn probe handshake refused".to_owned()),
+        }
+        let id = self.next_request_id();
+        client.send(&id, "daemon.status", &Value::Null)?;
+        let mechanism = match client.recv() {
+            Ok(Outcome::Reply(reply)) if reply.ok => reply
+                .result
+                .get("orphans")
+                .and_then(|orphans| orphans.get("mechanism"))
+                .and_then(Value::as_str)
+                .unwrap_or(bitty_daemon::containment::MECHANISM_NONE)
+                .to_owned(),
+            // V-44 injects a 250 ms status handler behind a 100 ms request
+            // bound, so the probe cannot read the mechanism. That vector never
+            // spawns and a refused plan still answers status, so keeping the
+            // served Linux default is safe; every other refusal is an error.
+            _ if self.request_timeout_ms.is_some() => {
+                return Ok(true);
+            }
+            _ => return Err("terminal-spawn probe status refused".to_owned()),
+        };
+        Ok(mechanism != bitty_daemon::containment::MECHANISM_NONE)
     }
 
     fn mint_host_grant(&mut self) -> Result<String, String> {
@@ -615,10 +663,9 @@ impl RealDriver {
 impl RealDriver {
     /// The `worker_sessions` bit this daemon advertised in the readiness probe.
     ///
-    /// The probe negotiates a real connection, so the value follows the
-    /// containment plan the daemon selected at startup, not the compile-time
-    /// cell. A refused plan advertises `false` and the worker vectors record a
-    /// typed `cell-not-servable` skip.
+    /// Contract `D-01` reserves the worker kind, so a served build always
+    /// reports `false`. The value is still read from the real handshake rather
+    /// than hardcoded here, so the vectors would follow an amended build.
     fn worker_sessions(&self) -> bool {
         self.facts
             .capabilities
@@ -1038,6 +1085,15 @@ impl Driver for RealDriver {
         }
     }
 
+    fn child_process_count(&mut self) -> Result<u64, String> {
+        let pid = self
+            .daemon
+            .as_ref()
+            .map(Daemon::pid)
+            .ok_or_else(|| "no daemon".to_owned())?;
+        child_processes(pid)
+    }
+
     fn daemon_absent(&mut self) -> Result<ExitObservation, String> {
         let root = Root::new("absent");
         std::fs::create_dir_all(root.runtime()).map_err(|_| "runtime dir".to_owned())?;
@@ -1145,6 +1201,23 @@ fn seed_orphan_record(root: &Root, seed: Option<&str>) -> Result<(), String> {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .map_err(|_| "cannot chmod the seeded record".to_owned())?;
     Ok(())
+}
+
+/// Live child processes of `pid` across its task table.
+///
+/// Linux records a child under the task that created it, so summing the
+/// per-task `children` files is the daemon's exact direct-child set. A refused
+/// create must leave this unchanged.
+fn child_processes(pid: u32) -> Result<u64, String> {
+    let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map_err(|_| "cannot read the daemon task table".to_owned())?;
+    let mut total = 0u64;
+    for task in tasks.flatten() {
+        if let Ok(text) = std::fs::read_to_string(task.path().join("children")) {
+            total += text.split_whitespace().count() as u64;
+        }
+    }
+    Ok(total)
 }
 
 /// Socket inodes the process holds, plus any of them in a TCP LISTEN row.

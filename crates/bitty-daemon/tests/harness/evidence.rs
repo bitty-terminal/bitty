@@ -68,6 +68,7 @@ pub fn render(evidence: &Evidence<'_>) -> Value {
         "frozen": evidence.frozen,
         "instance_id": evidence.facts.instance_id,
         "capabilities": evidence.facts.capabilities,
+        "features": evidence.facts.features,
         "limits": evidence.facts.limits,
         "counts": {
             "pass": passed,

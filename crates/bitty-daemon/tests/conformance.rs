@@ -42,12 +42,38 @@ fn corpus_is_well_formed_and_frozen() {
             "missing terminal content vector {id}"
         );
     }
-    for id in ["V-03", "V-42", "V-43"] {
-        let vector = corpus.vector(id).expect("worker vector");
+    {
+        let vector = corpus.vector("V-03").expect("worker refusal vector");
+        assert!(
+            vector.requires.is_empty(),
+            "V-03 must run on every real cell, not skip on a capability"
+        );
+    }
+    for id in ["V-42", "V-50"] {
+        let vector = corpus.vector(id).expect("amendment-gated worker vector");
+        assert!(
+            vector.requires.is_empty(),
+            "{id} is gated by the amendment marker, not a cell capability"
+        );
+        for driver in [DriverKind::Fake, DriverKind::Real] {
+            let reason = vector.skip_reason(driver).unwrap_or_default();
+            assert!(
+                reason.starts_with("d01-amendment-required:"),
+                "{id} must carry the explicit D-01 amendment skip for {}",
+                driver.as_str()
+            );
+        }
+    }
+    assert_eq!(
+        corpus.vector("V-43").expect("worker vector").requires,
+        ["worker_sessions"],
+        "V-43 still needs a cell that serves workers, which no build does today"
+    );
+    for id in ["V-45", "V-46", "V-47", "V-49"] {
         assert_eq!(
-            vector.requires,
-            ["worker_sessions"],
-            "{id} must skip on a cell that does not serve workers"
+            corpus.vector(id).expect("terminal content vector").requires,
+            ["terminal_spawn"],
+            "{id} depends on the accepted 1.3 terminal-spawn slice, not workers"
         );
     }
     assert_eq!(
@@ -246,8 +272,13 @@ fn fake_conformance_corpus() {
     let facts = driver.facts();
     assert_eq!(
         facts.capabilities.get("worker_sessions"),
+        Some(&false),
+        "the reference cell honours D-01: the worker kind is reserved"
+    );
+    assert_eq!(
+        facts.features.get("terminal_spawn"),
         Some(&true),
-        "the fake is the reference for a served worker cell"
+        "the reference cell models the accepted 1.3 terminal-spawn slice"
     );
     let evidence = Evidence {
         suite: "fake",
@@ -276,10 +307,10 @@ fn fake_conformance_corpus() {
     assert_eq!(
         skipped,
         [
-            "V-18", "V-39", "V-40", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07", "C-08", "C-12",
-            "C-15", "C-16", "V-49"
+            "V-18", "V-39", "V-40", "V-42", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07", "C-08",
+            "C-12", "C-15", "C-16", "V-49", "V-50"
         ],
-        "the fake suite skips exactly the real-only vectors"
+        "the fake suite skips exactly the real-only and amendment-gated vectors"
     );
 }
 
@@ -316,8 +347,8 @@ fn real_conformance_corpus() {
         .collect();
     assert_eq!(
         skipped,
-        ["V-06", "V-33", "C-10", "F-01"],
-        "only the injected-clock, adapter-owned, and injected-queue vectors skip on Linux"
+        ["V-06", "V-33", "V-42", "C-10", "F-01", "V-50"],
+        "only the injected-clock, adapter-owned, injected-queue, and amendment-gated vectors skip on Linux"
     );
 }
 
@@ -408,25 +439,41 @@ fn fake_and_real_parity() {
     let _ = evidence::write_parity(compared, &divergences, &not_compared);
     assert_no_failures(&fake_rows, "fake");
     assert_no_failures(&real_rows, "real");
-    let real_serves_workers =
-        real.facts().capabilities.get("worker_sessions").copied() == Some(true);
+    assert!(
+        real.facts().capabilities.get("worker_sessions").copied() == Some(false),
+        "D-01: a served build never advertises worker_sessions"
+    );
+    let real_serves_spawn = real
+        .facts()
+        .features
+        .get("terminal_spawn")
+        .copied()
+        .unwrap_or(false);
     let mut expected_not_compared = vec![
-        "V-06", "V-18", "V-33", "V-39", "V-40", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07",
-        "C-08", "C-10", "C-12", "F-01", "C-15", "C-16", "V-49",
+        "V-06", "V-18", "V-33", "V-39", "V-40", "V-42", "V-43", "C-01", "C-02", "C-03", "C-11",
+        "C-07", "C-08", "C-10", "C-12", "F-01", "C-15", "C-16", "V-49", "V-50",
     ];
     if !cfg!(feature = "test-seams") {
         // Without the real seam V-44 is a fake-only row: the real driver
         // records the typed `cell-not-servable: request_deadline_seam` skip.
         expected_not_compared.push("V-44");
     }
-    let expected_compared = if real_serves_workers {
-        if cfg!(feature = "test-seams") { 39 } else { 38 }
-    } else {
-        // A refused containment plan skips the worker vectors on the real
-        // driver; the fake still models a served cell. C-17 runs on both
-        // drivers because it creates a terminal session only.
-        expected_not_compared.extend(["V-03", "V-42", "V-45", "V-46", "V-47", "V-50"]);
-        if cfg!(feature = "test-seams") { 33 } else { 32 }
+    let expected_compared = match (real_serves_spawn, cfg!(feature = "test-seams")) {
+        // The accepted 1.3 terminal-spawn vectors run on both drivers; the
+        // reserved worker vectors are the only amendment-gated rows.
+        (true, true) => 37,
+        (true, false) => 36,
+        // A refused containment plan skips the terminal-spawn vectors on the
+        // real driver; the fake still models a served plan. V-03 runs on both
+        // because it only refuses a worker create.
+        (false, true) => {
+            expected_not_compared.extend(["V-45", "V-46", "V-47", "V-48"]);
+            33
+        }
+        (false, false) => {
+            expected_not_compared.extend(["V-45", "V-46", "V-47", "V-48"]);
+            32
+        }
     };
     expected_not_compared.sort_unstable();
     assert_eq!(

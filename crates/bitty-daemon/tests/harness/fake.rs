@@ -40,11 +40,17 @@ const BASELINE: [&str; 7] = [
 
 /// Whether the reference cell models a served worker plane.
 ///
-/// The fake is the contract reference, not a mirror of the host: it serves the
-/// worker create/resize surface on every platform, so it must advertise that
-/// surface on every platform too. The real driver seeds the compiled cell truth
-/// instead (Linux only in this slice).
-const FAKE_WORKER_SESSIONS: bool = true;
+/// The fake is the contract reference, not a mirror of the host. Contract `D-01`
+/// reserves the worker kind in every v0.2.0 build, so the reference cell
+/// advertises `worker_sessions: false` and refuses worker create with
+/// `Denied/UnsupportedCapability`, matching the real served daemon.
+const FAKE_WORKER_SESSIONS: bool = false;
+
+/// Whether the reference cell models the accepted 1.3 terminal-spawn slice.
+///
+/// The gate is the containment plan, not a wire capability, so the fake models
+/// the served plan for the terminal content vectors.
+const FAKE_TERMINAL_SPAWN: bool = true;
 
 /// The peer identity the reference cell models (`peer_identity`).
 const FAKE_PEER_UID: u32 = 1000;
@@ -255,6 +261,7 @@ impl FakeDriver {
                 .into_iter()
                 .map(|limit| (limit.name().to_owned(), self.limits.effective(limit)))
                 .collect(),
+            features: BTreeMap::from([("terminal_spawn".to_owned(), FAKE_TERMINAL_SPAWN)]),
             seams: BTreeMap::from([("request_deadline_seam".to_owned(), true)]),
         }
     }
@@ -1032,10 +1039,14 @@ impl FakeDriver {
             .and_then(Value::as_str)
             .unwrap_or("terminal");
         // The frozen handler order: kind, consent, then the bounded spawn
-        // specification. The fake models the served cell: a worker create
-        // binds generation 1 without a process.
+        // specification. Contract `D-01` reserves the worker kind, so a worker
+        // create is the typed capability refusal before the host-grant
+        // liveness check and before any spawn-specification parsing.
         if !matches!(kind, "terminal" | "worker") {
             return self.refuse("session.create", "Validation", "InvalidRequest", None);
+        }
+        if kind == "worker" && !FAKE_WORKER_SESSIONS {
+            return self.refuse("session.create", "Denied", "UnsupportedCapability", None);
         }
         let bound = self
             .conn(connection)
@@ -2465,6 +2476,12 @@ impl Driver for FakeDriver {
         Err("the fake driver has no process".to_owned())
     }
 
+    fn child_process_count(&mut self) -> Result<u64, String> {
+        // The reference cell has no process or PTY plane, so a refused create
+        // provably adds no child.
+        Ok(0)
+    }
+
     fn daemon_absent(&mut self) -> Result<ExitObservation, String> {
         Err("the fake driver has no process".to_owned())
     }
@@ -2752,6 +2769,10 @@ mod tests {
         // tied to the build's admission loop. This is the cross-platform
         // guard for V-01/C-14, which assert `capabilities.events: true`.
         assert!(FakeDriver::capability("events", false));
-        assert!(FakeDriver::capability("worker_sessions", false));
+        assert!(
+            !FakeDriver::capability("worker_sessions", true),
+            "the reference cell cannot advertise a worker plane while D-01 is unamended"
+        );
+        assert!(!FakeDriver::capability("worker_sessions", false));
     }
 }

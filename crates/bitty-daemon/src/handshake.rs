@@ -647,8 +647,8 @@ pub struct HandshakeContext {
     /// The capabilities this probed server process advertises.
     ///
     /// A build's [`crate::contract::CAPABILITIES`] are the contract target
-    /// set; the served daemon narrows `worker_sessions` to the containment
-    /// plan its startup probe selected.
+    /// set; `worker_sessions` is `false` in every v0.2.0 build (`D-01`) and
+    /// the served daemon's startup plan can only narrow that bit further.
     pub capabilities: Capabilities,
     /// Effective limits for this run.
     pub limits: Limits,
@@ -690,9 +690,9 @@ pub struct NegotiateResponse {
     pub service_api_version: ServiceApiVersion,
     /// Capabilities fixed for the connection.
     ///
-    /// This is the compiled build set; the served daemon narrows
-    /// `worker_sessions` to its startup containment plan when it builds the
-    /// [`HandshakeResponse`].
+    /// This is the compiled build set; `worker_sessions` is `false` in every
+    /// v0.2.0 build (`D-01`), and the served daemon may only narrow it further
+    /// from its startup containment plan.
     pub capabilities: Capabilities,
     /// Every effective bound and its compiled default and ceiling (`D-14`).
     pub limits: Limits,
@@ -785,9 +785,9 @@ mod tests {
         .expect("1.0 is accepted");
         assert_eq!(response.service_api_version, SERVICE_API_VERSION);
         assert_eq!(response.capabilities, CAPABILITIES);
-        assert_eq!(
-            response.capabilities.worker_sessions,
-            crate::worker::WORKER_SESSIONS_SERVED
+        assert!(
+            !response.capabilities.worker_sessions,
+            "D-01 reserves the worker kind in every v0.2.0 build"
         );
         assert_eq!(
             response.limits.effective(LimitId::MaxSessions),

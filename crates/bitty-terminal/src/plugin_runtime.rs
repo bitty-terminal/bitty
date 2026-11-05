@@ -21,9 +21,9 @@ use std::rc::Rc;
 
 use bitty_runtime::plugin_runtime::{
     BridgeError, CoreTargetInfo, EmptySettings, FsListBackend, KeymapSource, LuaValue,
-    PanelCreateHandler, PanelPinHandler, PanelPinQueue, PluginRuntime, PluginRuntimeConfig,
-    QueuedPinRequest, SnapshotSource, TargetSource, TranscriptHistory, WorkspaceAttention,
-    WorkspaceInfo, WorkspaceSource,
+    PaneCwdSource, PanelCreateHandler, PanelPinHandler, PanelPinQueue, PluginRuntime,
+    PluginRuntimeConfig, QueuedPinRequest, SnapshotSource, TargetSource, TranscriptHistory,
+    WorkspaceAttention, WorkspaceInfo, WorkspaceSource,
 };
 use bitty_runtime::registry::{
     PanelError, PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId,
@@ -53,6 +53,14 @@ pub(crate) struct SnapshotState {
     pub(crate) cursor_visible: bool,
     pub(crate) alternate_screen: bool,
     pub(crate) title: String,
+    /// Decoded `OSC 7` working directory of the focused pane (CTX-1715).
+    ///
+    /// Published from the same host-observed model that serves
+    /// `bitty.terminal.snapshot`; consumed only by
+    /// `process.spawn { cwd = "pane" }`. It is deliberately absent from the
+    /// Lua snapshot table: the spawn resolution is the only reader, so this
+    /// adds no new snapshot field a plugin can read.
+    pub(crate) pane_cwd: Option<PathBuf>,
 }
 
 /// Live committed-snapshot source for `bitty.terminal.snapshot` (CTX-0481).
@@ -80,6 +88,7 @@ impl LiveSnapshot {
                 cursor_visible: true,
                 alternate_screen: false,
                 title: String::new(),
+                pane_cwd: None,
             }),
         }
     }
@@ -103,6 +112,11 @@ impl LiveSnapshot {
             cursor_visible: cursor.visible,
             alternate_screen: state.alt_screen_active(),
             title: state.title().to_string(),
+            // CTX-1715: the focused pane's decoded `OSC 7` directory, read
+            // through the same runtime model that commits the semantic
+            // snapshot. `None` leaves the spawn `pane` semantic unresolvable
+            // (typed refusal), never a host-cwd fallback.
+            pane_cwd: runtime.focused_pane_cwd(),
         };
         self.publish_state(next)
     }
@@ -182,6 +196,19 @@ impl SnapshotSource for LiveSnapshot {
             ));
         }
         Ok(self.to_lua())
+    }
+}
+
+impl PaneCwdSource for LiveSnapshot {
+    /// Working directory of the focused pane as of the last committed tick.
+    ///
+    /// Same published object and same tick as the semantic snapshot
+    /// (CTX-1715): the plugin runtime's spawn backend reads it per dispatch,
+    /// so a pane `cd` is observed without a plugin reload. `None` until the
+    /// first publish, when the focused pane has no report, or when its report
+    /// is not an absolute `file://` path.
+    fn pane_cwd(&self) -> Option<PathBuf> {
+        self.state.borrow().pane_cwd.clone()
     }
 }
 
@@ -746,6 +773,11 @@ pub(crate) fn discover_with_roots(
         settings: Rc::new(EmptySettings),
         snapshot: host_snapshot,
     });
+    // CTX-1715: the same live terminal model also answers the spawn `pane`
+    // working directory. One published object serves both the semantic
+    // snapshot and the spawn resolution, so the child's directory is exactly
+    // the host-observed focused pane and changes without a plugin reload.
+    runtime.set_pane_cwd_source(snapshot.clone());
     // bitty#2781: `#[cfg(test)]` only. Composition-root capability probes
     // assert plugin wiring, not the activation wall window; activation is
     // slice-only and cannot be parked, so a descheduled runner leaves the
@@ -1031,6 +1063,49 @@ mod tests {
             integer_of(&after, "snapshot_generation"),
             live,
             "snapshot_generation must track the same committed generation"
+        );
+    }
+
+    /// Builds the `OSC 7` payload a shell would emit for `dir`.
+    ///
+    /// `file://` URLs always use forward slashes and a Windows drive root is
+    /// written as `/C:/...`, so the separator and leading slash are encoded
+    /// per platform instead of hardcoding a POSIX path.
+    fn osc7_report(dir: &std::path::Path) -> Vec<u8> {
+        let text = dir.to_str().expect("utf-8 dir").replace('\\', "/");
+        let text = if text.starts_with('/') {
+            text
+        } else {
+            format!("/{text}")
+        };
+        format!("\x1b]7;file://{text}\x07").into_bytes()
+    }
+
+    #[test]
+    fn live_snapshot_publishes_the_focused_pane_cwd_for_spawn() {
+        // CTX-1715: the spawn `pane` semantic reads the same published model
+        // as `bitty.terminal.snapshot`; the value is the decoded `OSC 7`
+        // directory of the focused view, not the host process cwd.
+        let dir = std::env::temp_dir();
+        let snapshot = LiveSnapshot::new(80, 24);
+        let mut rt = Runtime::with_defaults().expect("must build");
+        rt.handle_pty_bytes(&osc7_report(&dir));
+        let _ = rt.tick();
+        assert!(snapshot.publish(&rt), "publish commits the report");
+        assert_eq!(
+            snapshot
+                .pane_cwd()
+                .map(|path| std::fs::canonicalize(path).expect("the pane cwd resolves")),
+            Some(std::fs::canonicalize(&dir).expect("the temp dir resolves")),
+            "the pane source serves the decoded focused-pane report"
+        );
+        assert!(
+            snapshot
+                .snapshot("semantic")
+                .expect("scope ok")
+                .get("cwd")
+                .is_none(),
+            "the spawn cwd is not a new snapshot field plugins can read"
         );
     }
 
@@ -1591,6 +1666,7 @@ mod tests {
             cursor_visible: false,
             alternate_screen: true,
             title: String::from("stale"),
+            pane_cwd: None,
         };
         assert!(!snapshot.publish_state(stale));
         let after = snapshot.snapshot("semantic").expect("scope ok");

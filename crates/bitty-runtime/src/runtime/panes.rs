@@ -350,6 +350,31 @@ impl Runtime {
         self.session_pending_cwd(&target)
     }
 
+    /// Decoded `OSC 7` working directory of the focused pane (CTX-1715).
+    ///
+    /// This is the host-observed terminal model behind
+    /// `bitty.process.spawn(argv, { cwd = "pane" })`: the application
+    /// publishes it from the same tick that serves `bitty.terminal.snapshot`,
+    /// and the spawn surface resolves its `pane` semantic through that
+    /// published value. It reuses the same report source as
+    /// [`Self::inherited_cwd_for`] (the focused view's private session, else
+    /// the runtime-global grid when that view paints the primary grid), but
+    /// reads the focused view itself, so no spawn-target exclusion applies.
+    ///
+    /// `None` when no view is focused, no report exists, or the report is not
+    /// an absolute `file://` path. The caller fails closed; this method never
+    /// substitutes the process cwd.
+    #[must_use]
+    pub fn focused_pane_cwd(&self) -> Option<PathBuf> {
+        let focused = self.focused_view()?;
+        let report = match self.pane_sessions.get(&focused) {
+            Some(session) => session.state.cwd_report(),
+            None if self.paints_primary_grid(&focused) => self.state.cwd_report(),
+            None => None,
+        };
+        report.and_then(osc7_cwd_path)
+    }
+
     /// Spawns `program` with `args` as the private shell of layout leaf
     /// `view`, sized to `cols` x `rows` cells.
     ///
@@ -1302,5 +1327,22 @@ mod tests {
     #[test]
     fn percent_decode_keeps_plus_literal() {
         assert_eq!(percent_decode("/a+b").as_deref(), Some(&b"/a+b"[..]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn focused_pane_cwd_reads_the_primary_grid_report() {
+        // CTX-1715: the spawn `pane` semantic reads the focused view's own
+        // report. With only the primary grid present, that is the
+        // runtime-global state, decoded exactly like cwd inheritance.
+        let mut rt = Runtime::with_defaults().expect("headless build");
+        assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
+        rt.handle_pty_bytes(b"\x1b]7;file:///tmp\x07");
+        assert_eq!(rt.focused_pane_cwd(), Some(PathBuf::from("/tmp")));
+
+        // A report that is not an absolute `file://` path is not usable; the
+        // method returns `None` rather than inventing the process cwd.
+        rt.handle_pty_bytes(b"\x1b]7;kitty-shell-cwd://host/etc\x07");
+        assert_eq!(rt.focused_pane_cwd(), None);
     }
 }

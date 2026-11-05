@@ -234,6 +234,41 @@ pub const SPAWN_LUA_MAX_ARGS: usize = 64;
 /// bound precedent; the host allowlist enforces a tighter per-tool count).
 pub const SPAWN_LUA_MAX_ARG_BYTES: usize = 4096;
 
+/// The only `process.spawn` `cwd` value a plugin may select (CTX-1715).
+///
+/// The literal option value that names the working-directory *semantic*:
+/// `bitty.process.spawn(argv, { cwd = "pane" })` asks the host to run the
+/// child in the directory of the terminal pane the plugin is bound to. The
+/// plugin never supplies a path: the host owns resolution, validation, and
+/// the audit record, so the spawn cannot select an unconfined directory.
+pub const SPAWN_CWD_PANE: &str = "pane";
+
+/// Host-selected working-directory semantic for one `process.spawn` call.
+///
+/// Selected by the plugin through the literal `{ cwd = "pane" }` option, or
+/// [`SpawnCwd::HostDefault`] when no option is present. A path never travels
+/// through this type: host resolution happens above the bridge, in
+/// `bitty-runtime::plugin_runtime::spawn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SpawnCwd {
+    /// No `cwd` option: the host keeps its default (no explicit child cwd).
+    #[default]
+    HostDefault,
+    /// `cwd = "pane"`: the host resolves the bound pane's directory.
+    Pane,
+}
+
+impl SpawnCwd {
+    /// Stable label for host diagnostics and audit attribution.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HostDefault => "host-default",
+            Self::Pane => SPAWN_CWD_PANE,
+        }
+    }
+}
+
 /// Maximum bytes of one module name accepted by `require`.
 pub const MODULE_NAME_MAX_BYTES: usize = 128;
 /// Maximum bytes of one `bitty.env` key (CTX-0330, ADR 0006 normative,
@@ -1636,6 +1671,28 @@ pub trait HostServices {
             "host has no process.spawn surface",
         ))
     }
+    /// Spawn with an explicit working-directory semantic (CTX-1715).
+    ///
+    /// [`SpawnCwd::HostDefault`] delegates to [`HostServices::process_spawn`],
+    /// so a host that predates this seam keeps its exact behavior. A host
+    /// that cannot resolve [`SpawnCwd::Pane`] (no pane binding, or the bound
+    /// pane has no usable `OSC 7` report) must fail closed with
+    /// `E_SPAWN_CWD_UNAVAILABLE`; the default does exactly that rather than
+    /// silently running the child in the host process cwd.
+    fn process_spawn_with_cwd(
+        &self,
+        args: &[String],
+        cwd: SpawnCwd,
+    ) -> Result<LuaValue, BridgeError> {
+        match cwd {
+            SpawnCwd::HostDefault => self.process_spawn(args),
+            SpawnCwd::Pane => Err(BridgeError::new(
+                "runtime",
+                "E_SPAWN_CWD_UNAVAILABLE",
+                "host has no pane working-directory binding for process.spawn",
+            )),
+        }
+    }
     /// Expiry-aware `process_spawn` for the spawn bridge timeout path
     /// (CTX-0464).
     ///
@@ -1654,6 +1711,29 @@ pub trait HostServices {
             return Err(BridgeError::timeout());
         }
         self.process_spawn(args)
+    }
+    /// Expiry-aware [`HostServices::process_spawn_with_cwd`] (CTX-1715).
+    ///
+    /// Same check-then-act contract as [`HostServices::process_spawn_with_expiry`]:
+    /// check expiry before delegating (fail-fast) and never deliver a result
+    /// past the deadline. The host still owns killing and reaping the child.
+    /// [`SpawnCwd::HostDefault`] routes through the existing
+    /// [`HostServices::process_spawn_with_expiry`], so a host that already
+    /// implements its own post-wait deadline check keeps that behavior
+    /// verbatim.
+    fn process_spawn_with_cwd_and_expiry(
+        &self,
+        args: &[String],
+        cwd: SpawnCwd,
+        expiry: Instant,
+    ) -> Result<LuaValue, BridgeError> {
+        if Instant::now() > expiry {
+            return Err(BridgeError::timeout());
+        }
+        match cwd {
+            SpawnCwd::HostDefault => self.process_spawn_with_expiry(args, expiry),
+            SpawnCwd::Pane => self.process_spawn_with_cwd(args, SpawnCwd::Pane),
+        }
     }
     /// Current monotonic host time in milliseconds (for timer scheduling).
     fn now_millis(&self) -> u64 {
@@ -4627,20 +4707,20 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                     let value =
                         LuaValue::from_lua(raw, state.limits).map_err(|e| e.to_error(ctx))?;
                     let args = spawn_argv(&value).map_err(|e| e.to_error(ctx))?;
-                    // CTX-1345 review F1: the options table is parsed so an
-                    // unsupported option fails closed with a typed error
-                    // instead of being silently dropped. `{ cwd }` stays
-                    // explicitly rejected until the host can confine a
-                    // plugin-supplied directory to the plugin filesystem
-                    // grant and the `[tools.*]` repo-escape policy.
-                    spawn_options(
+                    // CTX-1715: the options table carries a *semantic* only.
+                    // `{ cwd = "pane" }` selects the host-resolved pane
+                    // directory; every other value, and every unknown key,
+                    // fails closed with `E_DEF_INVALID` before the host call.
+                    let cwd = spawn_options(
                         &LuaValue::from_lua(stack.get(1), state.limits)
                             .map_err(|e| e.to_error(ctx))?,
                     )
                     .map_err(|e| e.to_error(ctx))?;
                     let result = state
                         .bounded_spawn(|expiry| {
-                            state.services.process_spawn_with_expiry(&args, expiry)
+                            state
+                                .services
+                                .process_spawn_with_cwd_and_expiry(&args, cwd, expiry)
                         })
                         .map_err(|e| e.to_error(ctx))?;
                     stack.replace(ctx, result.to_lua(ctx));
@@ -8013,63 +8093,59 @@ fn spawn_argv(value: &LuaValue) -> Result<Vec<String>, BridgeError> {
     Ok(args)
 }
 
-/// Parse the optional `process.spawn` options table (CTX-1345).
+/// Parse the optional `process.spawn` options table (CTX-1715).
 ///
-/// `Nil` means "no options". The bridge recognizes the `cwd` key so it can
-/// reject it explicitly: a plugin-supplied working directory is unconfined
-/// (absolute paths and symlinks escape the plugin's `fs.read` grant and the
-/// `[tools.*]` `-C` repo-escape denial), so Core fails closed with a typed
-/// `E_DEF_INVALID` instead of silently dropping the option and running the
-/// child in the host process cwd. Unknown keys, non-string names, and a
-/// non-string `cwd` also fail closed.
-fn spawn_options(options: &LuaValue) -> Result<(), BridgeError> {
+/// `Nil` means "no options" (`SpawnCwd::HostDefault`). The only recognized
+/// key is `cwd`, and the only accepted value is the literal string
+/// [`SPAWN_CWD_PANE`] (`"pane"`): the plugin selects a host-resolved
+/// *semantic*, never a path. A plugin-supplied path (absolute, relative,
+/// `~`, traversal, a symlink target, or any other spelling), a non-string
+/// value, a non-string key, and every unknown key fail closed with
+/// `E_DEF_INVALID` before the host call. There is no silently ignored
+/// option and no fallback to the host cwd.
+fn spawn_options(options: &LuaValue) -> Result<SpawnCwd, BridgeError> {
     let LuaValue::Table(pairs) = options else {
         return match options {
-            LuaValue::Nil => Ok(()),
+            LuaValue::Nil => Ok(SpawnCwd::HostDefault),
             _ => Err(BridgeError::value(
                 "E_VALUE_TYPE",
                 "process.spawn options must be a table",
             )),
         };
     };
-    // Every recognized option is rejected, so the first key decides the
-    // diagnostic; an empty table means "no options".
-    let Some((key, value)) = pairs.first() else {
-        return Ok(());
-    };
-    let LuaValue::String(name) = key else {
-        return Err(BridgeError::new(
-            "validation",
-            "E_DEF_INVALID",
-            "process.spawn option names must be strings",
-        ));
-    };
-    match name.as_str() {
-        "cwd" => {
-            if !matches!(value, LuaValue::String(_)) {
+    let mut cwd = SpawnCwd::HostDefault;
+    for (key, value) in pairs {
+        let LuaValue::String(name) = key else {
+            return Err(BridgeError::new(
+                "validation",
+                "E_DEF_INVALID",
+                "process.spawn option names must be strings",
+            ));
+        };
+        match name.as_str() {
+            "cwd" => {
+                // The whole point of CTX-1715: a path from the plugin is
+                // never a directory selector. `pane` is the only token the
+                // host accepts, and the host resolves it itself.
+                if !matches!(value, LuaValue::String(token) if token == SPAWN_CWD_PANE) {
+                    return Err(BridgeError::new(
+                        "validation",
+                        "E_DEF_INVALID",
+                        "process.spawn cwd must be the literal string 'pane'",
+                    ));
+                }
+                cwd = SpawnCwd::Pane;
+            }
+            other => {
                 return Err(BridgeError::new(
                     "validation",
                     "E_DEF_INVALID",
-                    "process.spawn cwd must be a string",
+                    format!("process.spawn does not support option '{other}'"),
                 ));
             }
-            // CTX-1345 review F1: no confinement exists that anchors a
-            // plugin-supplied path to the granted filesystem roots or to the
-            // host-observed pane cwd, and `current_dir` follows symlinks.
-            // Reject rather than expose an unconfined directory selector
-            // through the spawn side channel.
-            Err(BridgeError::new(
-                "validation",
-                "E_DEF_INVALID",
-                "process.spawn cwd is not supported: a plugin-controlled working directory cannot be confined to the plugin filesystem grant",
-            ))
         }
-        other => Err(BridgeError::new(
-            "validation",
-            "E_DEF_INVALID",
-            format!("process.spawn does not support option '{other}'"),
-        )),
     }
+    Ok(cwd)
 }
 
 fn required_string<'gc>(

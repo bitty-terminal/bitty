@@ -2934,6 +2934,12 @@ impl Runtime {
         // bitty#2830: bracket the whole tick (including every early return)
         // so the hang watchdog can name the frame that never completed.
         let tick_started = std::time::Instant::now();
+        // Test-support seam: the live compositor fence wait sits inside this
+        // measured region. Test builds only; absent from production.
+        #[cfg(feature = "hang-gauge-test-support")]
+        if let Some(block) = crate::hang_watchdog::take_tick_block_for_test() {
+            std::thread::sleep(block);
+        }
         // Publish the pre-tick queue depths too: a tick that blocks before it
         // returns still leaves the dump with the state that fed it.
         self.publish_hang_gauges();

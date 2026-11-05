@@ -21,10 +21,159 @@
 //! The values are gauges, not event logs: a dump reads the latest published
 //! sample. That makes the fields stale by at most one tick, which is the
 //! correct trade for a diagnostic that must never block or allocate on the
-//! hot path.
+//! hot path. The completed-tick ring is the deliberate exception: it retains
+//! the last [`TICK_RING_CAPACITY`] `(sequence, duration)` records so the
+//! monitor can report every over-bound tick, not only the latest one.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering, fence};
+
+/// Number of completed tick records retained for the hang watchdog.
+///
+/// The monitor drains the ring every poll (100 ms at the default bound), so
+/// sixteen slots cover a burst of ordinary frames after a slow tick. Records
+/// overwritten before a drain are surfaced as a [`TickGap`] instead of being
+/// dropped silently.
+pub const TICK_RING_CAPACITY: usize = 16;
+
+/// One completed tick retained in the bounded ring.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TickRecord {
+    /// Monotonic tick sequence (1-based).
+    pub seq: u64,
+    /// Measured duration of that tick, in nanoseconds.
+    pub duration_ns: u64,
+}
+
+/// A sequence span containing records overwritten before the monitor drained
+/// them.
+///
+/// The span names the *missing* sequences, not the retained ones, so the next
+/// report can state that evidence existed but was lost to ring overflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TickGap {
+    /// First lost sequence number (inclusive).
+    pub from: u64,
+    /// Last lost sequence number (inclusive).
+    pub to: u64,
+}
+
+impl TickGap {
+    /// Length of the span.
+    ///
+    /// A span merged from two gaps includes any retained sequences between
+    /// them, so this is an upper bound on the lost entries.
+    #[must_use]
+    pub const fn missed(self) -> u64 {
+        self.to.saturating_sub(self.from).saturating_add(1)
+    }
+
+    /// Widest span covering both gaps.
+    pub(crate) const fn merged(self, other: Self) -> Self {
+        Self {
+            from: if self.from < other.from {
+                self.from
+            } else {
+                other.from
+            },
+            to: if self.to > other.to {
+                self.to
+            } else {
+                other.to
+            },
+        }
+    }
+}
+
+/// Bounded, allocation-free drain of completed ticks since a sequence.
+///
+/// Records are oldest first. A record is returned only when its slot's
+/// seqlock stamp still matches the expected sequence *before and after* the
+/// duration read, so a slot overwritten by a newer tick is rejected and named
+/// as a gap instead of pairing a stale sequence with a newer duration.
+#[derive(Clone, Debug, Default)]
+pub struct TickRingDrain {
+    records: [TickRecord; TICK_RING_CAPACITY],
+    len: usize,
+    last_seq: u64,
+    gap: Option<TickGap>,
+}
+
+impl TickRingDrain {
+    /// Retained records, oldest first.
+    #[must_use]
+    pub fn records(&self) -> &[TickRecord] {
+        &self.records[..self.len]
+    }
+
+    /// Highest sequence the ring could publish at drain time.
+    ///
+    /// Every sequence up to this value was either returned, named by
+    /// [`Self::gap`], or is the caller's `last_seen` watermark.
+    #[must_use]
+    pub const fn last_seq(&self) -> u64 {
+        self.last_seq
+    }
+
+    /// Span containing sequences overwritten before this drain, when any.
+    #[must_use]
+    pub const fn gap(&self) -> Option<TickGap> {
+        self.gap
+    }
+
+    fn push(&mut self, record: TickRecord) {
+        if self.len < TICK_RING_CAPACITY {
+            self.records[self.len] = record;
+            self.len += 1;
+        }
+    }
+
+    fn note_gap(&mut self, seq: u64) {
+        let gap = TickGap { from: seq, to: seq };
+        self.gap = Some(match self.gap {
+            Some(existing) => existing.merged(gap),
+            None => gap,
+        });
+    }
+}
+
+/// One ring slot.
+///
+/// `stamp` is a seqlock word: `(seq << 1) | writing`. The producer stores the
+/// odd "writing" stamp with `Release`, fences, stores `duration_ns`, and
+/// stores the even sequence stamp with `Release`; the fences are what order
+/// the duration on weak-memory targets. A reader that races a rewrite sees
+/// either an odd stamp or a changed stamp and rejects the pair. The logical
+/// sequence is `stamp >> 1`.
+#[derive(Debug, Default)]
+struct TickRingSlot {
+    stamp: AtomicU64,
+    duration_ns: AtomicU64,
+}
+
+#[cfg(feature = "hang-gauge-test-support")]
+thread_local! {
+    /// One-shot block consumed by the next `Runtime::tick` on this thread.
+    static TEST_TICK_BLOCK: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test-support: blocks the next `Runtime::tick` on this thread inside the
+/// measured region, after `tick_started` is taken.
+///
+/// The live freeze is a compositor fence wait inside `runtime.tick()`; this
+/// seam reproduces its effect on the measured duration without a display.
+/// Test builds only.
+#[cfg(feature = "hang-gauge-test-support")]
+pub fn set_tick_block_for_test(block: std::time::Duration) {
+    TEST_TICK_BLOCK.with(|slot| slot.set(Some(block)));
+}
+
+/// Test-support: consumes the one-shot tick block for this thread.
+#[cfg(feature = "hang-gauge-test-support")]
+pub(crate) fn take_tick_block_for_test() -> Option<std::time::Duration> {
+    TEST_TICK_BLOCK.with(std::cell::Cell::take)
+}
 
 /// Point-in-time copy of [`HangGauges`], rendered by the process watchdog.
 ///
@@ -153,16 +302,22 @@ hidden_damage={}",
 
 /// Atomic gauges shared by the runtime owner thread and the watchdog monitor.
 ///
-/// `Relaxed` ordering is deliberate: each field is an independent monotonic
-/// sample and a dump never needs a coherent cross-field snapshot. A torn
-/// reading would only misattribute one queue depth by one tick, while
-/// `Acquire`/`Release` would add fences to the per-frame path for no
-/// diagnostic gain.
+/// `Relaxed` ordering is deliberate for the display gauges: each field is an
+/// independent monotonic sample and a dump never needs a coherent cross-field
+/// snapshot. A torn reading would only misattribute one queue depth by one
+/// tick, while `Acquire`/`Release` would add fences to the per-frame path for
+/// no diagnostic gain.
+///
+/// The completed-tick ring is the exception: `finish_tick` publishes a slot
+/// with `Release` before the counter that announces the sequence, so the
+/// monitor never pairs a sequence with another tick's duration. See
+/// [`Self::drain_ticks_since`].
 #[derive(Debug, Default)]
 pub struct HangGauges {
     tick_count: AtomicU64,
     last_tick_ns: AtomicU64,
     max_tick_ns: AtomicU64,
+    tick_ring: [TickRingSlot; TICK_RING_CAPACITY],
     pending_input_bytes: AtomicU64,
     pending_input_dropped: AtomicU64,
     cold_queue_len: AtomicU64,
@@ -195,11 +350,16 @@ impl HangGauges {
         Self::default()
     }
 
-    /// Copies every gauge for one bounded report.
+    /// Copies every display gauge for one bounded report.
+    ///
+    /// `tick_count`, `last_tick_ns`, and `max_tick_ns` are report-body values
+    /// here. Detection of a completed over-bound tick must go through
+    /// [`Self::drain_ticks_since`]: the snapshot's counter and last duration
+    /// are independent relaxed reads and are not a pair.
     #[must_use]
     pub fn snapshot(&self) -> HangGaugeSnapshot {
         HangGaugeSnapshot {
-            tick_count: self.tick_count.load(Ordering::Relaxed),
+            tick_count: self.tick_count.load(Ordering::Acquire),
             last_tick_ns: self.last_tick_ns.load(Ordering::Relaxed),
             max_tick_ns: self.max_tick_ns.load(Ordering::Relaxed),
             pending_input_bytes: self.pending_input_bytes.load(Ordering::Relaxed),
@@ -229,10 +389,103 @@ impl HangGauges {
     }
 
     /// Records one completed tick.
+    ///
+    /// Caller contract: exactly one producer (the runtime owner thread) calls
+    /// this; readers never write. The slot uses a seqlock: the odd "writing"
+    /// stamp is stored with `Release`, a `Release` fence orders it before the
+    /// duration, the even sequence stamp is stored with `Release` (ordering
+    /// the duration before it), and only then `tick_count` announces the
+    /// sequence with `Release`.
+    ///
+    /// The fences are load-bearing on weak-memory targets (macOS ARM64 is
+    /// shipped): a `Release` store orders *prior* operations, not the
+    /// following duration store, so without the first fence the duration
+    /// could become visible before the odd stamp. A reader that observes
+    /// sequence `S` in the counter therefore observes the completed slot `S`,
+    /// and a reader that races a rewrite rejects the pair and surfaces a
+    /// [`TickGap`] instead of pairing a sequence with another tick's duration.
+    ///
+    /// `last_tick_ns`, `max_tick_ns`, and `tick_count` remain display values
+    /// for the report body; per-tick decisions use [`Self::drain_ticks_since`].
     pub(crate) fn finish_tick(&self, elapsed_ns: u64) {
-        self.tick_count.fetch_add(1, Ordering::Relaxed);
+        let seq = self.tick_count.load(Ordering::Relaxed).saturating_add(1);
+        let slot = &self.tick_ring[(seq % TICK_RING_CAPACITY as u64) as usize];
+        let stamp = seq << 1;
+        slot.stamp.store(stamp | 1, Ordering::Release);
+        // Release store orders prior operations; the fence makes the odd
+        // stamp visible before the duration on weak-memory targets.
+        fence(Ordering::Release);
+        slot.duration_ns.store(elapsed_ns, Ordering::Relaxed);
+        // The Release store of the even stamp orders the duration before it.
+        slot.stamp.store(stamp, Ordering::Release);
         self.last_tick_ns.store(elapsed_ns, Ordering::Relaxed);
         self.max_tick_ns.fetch_max(elapsed_ns, Ordering::Relaxed);
+        self.tick_count.store(seq, Ordering::Release);
+    }
+
+    /// Drains completed ticks with a sequence greater than `last_seen`.
+    ///
+    /// Oldest first, at most [`TICK_RING_CAPACITY`] records and allocation
+    /// free. Every sequence between `last_seen + 1` and [`TickRingDrain::last_seq`]
+    /// is either returned or covered by [`TickRingDrain::gap`]; the caller
+    /// never silently loses a retained tick. A duration is accepted only when
+    /// the slot's sequence stamp still matches both before and after the read.
+    /// The reader's `Acquire` fence between the duration load and the second
+    /// stamp load is load-bearing: an `Acquire` load orders later operations,
+    /// not the following plain load, so without the fence a rewrite could slip
+    /// between the duration read and the check and pair a newer duration with
+    /// the old sequence. A rewritten slot is rejected and surfaced as a gap.
+    #[must_use]
+    pub fn drain_ticks_since(&self, last_seen: u64) -> TickRingDrain {
+        let mut drain = TickRingDrain {
+            last_seq: last_seen,
+            ..TickRingDrain::default()
+        };
+        let total = self.tick_count.load(Ordering::Acquire);
+        if total <= last_seen {
+            return drain;
+        }
+        let oldest = total
+            .saturating_sub(TICK_RING_CAPACITY as u64)
+            .saturating_add(1);
+        let start = last_seen.saturating_add(1).max(oldest);
+        if start > last_seen.saturating_add(1) {
+            drain.gap = Some(TickGap {
+                from: last_seen.saturating_add(1),
+                to: start.saturating_sub(1),
+            });
+        }
+        for seq in start..=total {
+            let slot = &self.tick_ring[(seq % TICK_RING_CAPACITY as u64) as usize];
+            let stamp = seq << 1;
+            let before = slot.stamp.load(Ordering::Acquire);
+            if before & 1 == 1 || before != stamp {
+                // Overwritten by a newer tick, or the producer is mid-write.
+                drain.note_gap(seq);
+                continue;
+            }
+            let duration_ns = slot.duration_ns.load(Ordering::Relaxed);
+            // Make the duration load visible before the second stamp check;
+            // Acquire alone on `before` does not order the following load.
+            fence(Ordering::Acquire);
+            let after = slot.stamp.load(Ordering::Acquire);
+            if after != before {
+                drain.note_gap(seq);
+                continue;
+            }
+            drain.push(TickRecord { seq, duration_ns });
+        }
+        drain.last_seq = total;
+        drain
+    }
+
+    /// Test-support: records one completed tick without a live runtime.
+    ///
+    /// The runtime's own tick path records the same way; this seam lets the
+    /// watchdog regressions seed a completed over-bound tick deterministically.
+    #[cfg(feature = "hang-gauge-test-support")]
+    pub fn record_tick_for_test(&self, duration: std::time::Duration) {
+        self.finish_tick(u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX));
     }
 
     pub(crate) fn set_pending_input(&self, bytes: usize, dropped: u64) {
@@ -390,6 +643,95 @@ mod tests {
         assert_eq!(snapshot.tick_count, 3);
         assert_eq!(snapshot.last_tick_ns, 2_000_000);
         assert_eq!(snapshot.max_tick_ns, 5_000_000);
+    }
+
+    /// Every completed tick is retained for its own report, oldest first, and
+    /// a drain from the watermark never repeats one.
+    #[test]
+    fn completed_ticks_drain_oldest_first_without_a_gap() {
+        let gauges = HangGauges::new();
+        gauges.finish_tick(1_000);
+        gauges.finish_tick(17_490_000_000);
+        let drain = gauges.drain_ticks_since(0);
+        assert_eq!(
+            drain.records(),
+            &[
+                TickRecord {
+                    seq: 1,
+                    duration_ns: 1_000,
+                },
+                TickRecord {
+                    seq: 2,
+                    duration_ns: 17_490_000_000,
+                },
+            ]
+        );
+        assert_eq!(drain.last_seq(), 2);
+        assert_eq!(drain.gap(), None);
+        let empty = gauges.drain_ticks_since(drain.last_seq());
+        assert!(empty.records().is_empty());
+        assert_eq!(empty.last_seq(), 2);
+        assert_eq!(empty.gap(), None);
+    }
+
+    /// A reader that falls behind by more than the ring capacity loses the
+    /// oldest records, but the loss is named by a contiguous gap span.
+    #[test]
+    fn completed_tick_ring_names_the_overwritten_span() {
+        let gauges = HangGauges::new();
+        for seq in 1..=20u64 {
+            gauges.finish_tick(seq * 1_000);
+        }
+        let drain = gauges.drain_ticks_since(0);
+        assert_eq!(drain.gap(), Some(TickGap { from: 1, to: 4 }));
+        assert_eq!(drain.gap().expect("gap").missed(), 4);
+        let seqs: Vec<u64> = drain.records().iter().map(|record| record.seq).collect();
+        assert_eq!(seqs, (5..=20).collect::<Vec<_>>());
+        assert_eq!(drain.last_seq(), 20);
+    }
+
+    /// The ring keeps the `(seq, duration)` pair intact while a producer
+    /// advances: no duplicate sequence, no out-of-order record, and every
+    /// accepted duration belongs to the sequence it is reported under.
+    #[test]
+    fn completed_tick_ring_stays_paired_under_a_concurrent_producer() {
+        const TICKS: u64 = 5_000;
+        let gauges = Arc::new(HangGauges::new());
+        let producer = {
+            let gauges = Arc::clone(&gauges);
+            std::thread::spawn(move || {
+                for seq in 1..=TICKS {
+                    gauges.finish_tick(seq * 1_000);
+                }
+            })
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut last_seq = 0u64;
+        while last_seq < TICKS {
+            let drain = gauges.drain_ticks_since(last_seq);
+            let mut previous = last_seq;
+            for record in drain.records() {
+                assert!(record.seq > previous, "records must be oldest-first");
+                assert_eq!(
+                    record.duration_ns,
+                    record.seq * 1_000,
+                    "a sequence must never pair with another tick's duration"
+                );
+                assert!(
+                    seen.insert(record.seq),
+                    "sequence {} drained twice",
+                    record.seq
+                );
+                previous = record.seq;
+            }
+            last_seq = drain.last_seq().max(last_seq);
+            if last_seq < TICKS {
+                std::thread::yield_now();
+            }
+        }
+        producer.join().expect("producer thread");
+        assert!(!seen.is_empty());
+        assert!(seen.len() <= TICKS as usize);
     }
 
     #[test]

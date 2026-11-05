@@ -17690,3 +17690,108 @@ fn the_memory_report_dump_writes_once_per_armed_interval() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Collect every watchdog line delivered during `window`.
+fn watchdog_lines(
+    rx: &std::sync::mpsc::Receiver<String>,
+    window: std::time::Duration,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let deadline = std::time::Instant::now() + window;
+    while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match rx.recv_timeout(remaining) {
+            Ok(line) => lines.push(line),
+            Err(_) => break,
+        }
+    }
+    lines
+}
+
+/// Headless app wired to a real monitor with a channel sink (bitty#2830).
+fn watchdog_app(threshold_ms: u64) -> (TerminalApp, std::sync::mpsc::Receiver<String>) {
+    let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+        .expect("default keymaps");
+    let rt = Runtime::with_defaults().expect("headless runtime");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "watchdog-present",
+        maps,
+        SpawnSpec::default(),
+    );
+    app.set_session_persistence(false);
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    app.stall_watchdog = Some(crate::stall_watchdog::StallWatchdog::start_for_test(
+        threshold_ms,
+        std::sync::Arc::clone(app.runtime.hang_gauges()),
+        Box::new(move |line| {
+            let _ = tx.send(line.to_string());
+            crate::stall_watchdog::DeliveryOutcome::Delivered
+        }),
+    ));
+    (app, rx)
+}
+
+/// bitty#2830 (live 2026-11-05): the main thread sat in the explicit-sync
+/// present for 17.49 s while the watchdog log stayed empty. The injected
+/// block now sits inside `Runtime::tick`'s measured region, so the ring sees
+/// the same slow duration the live tick produced.
+///
+/// Threshold 500 ms against a 1.5 s block gives 3x headroom: a pre-tick phase
+/// on a loaded runner would have to exceed the bound on its own to add a
+/// report. The in-flight detector still names `runtime-tick`; the completed
+/// tick is deduplicated, and if the sample misses the block the ring still
+/// reports it as `runtime-tick`.
+#[test]
+fn runtime_tick_block_reports_in_flight_and_is_measured() {
+    let block = std::time::Duration::from_millis(1_500);
+    let (mut app, rx) = watchdog_app(500);
+    bitty_runtime::hang_watchdog::set_tick_block_for_test(block);
+    let _ = app.drive_tick();
+    // The old app-level seam slept before `tick_at`, so this assertion is the
+    // one that proves the injection is inside the measured region.
+    assert!(
+        app.runtime.hang_gauges().snapshot().last_tick_ns
+            >= u64::try_from(block.as_nanos()).unwrap_or(u64::MAX),
+        "the injected block must be inside the measured tick region"
+    );
+    // The real loop parks in `AboutToWait` after the tick; without the idle
+    // mark the test thread's own pause would look like a wedge.
+    app.stall_watchdog.as_ref().expect("fixture monitor").idle();
+    let lines = watchdog_lines(&rx, std::time::Duration::from_millis(400));
+    let reports: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with(crate::stall_watchdog::STALL_REPORT_PREFIX))
+        .collect();
+    assert_eq!(
+        reports.len(),
+        1,
+        "a {block:?} RuntimeTick block must write exactly one report: {lines:?}"
+    );
+    assert!(
+        reports[0].contains("phase=runtime-tick"),
+        "the blocked present must be named: {reports:?}"
+    );
+    assert!(reports[0].contains("reason=stall"), "{reports:?}");
+}
+
+/// The other half of the same contract: a block that returns inside the tick
+/// bound is ordinary progress and writes nothing.
+#[test]
+fn runtime_tick_block_inside_the_bound_stays_quiet() {
+    let (mut app, rx) = watchdog_app(3_000);
+    bitty_runtime::hang_watchdog::set_tick_block_for_test(std::time::Duration::from_millis(5));
+    let _ = app.drive_tick();
+    assert!(
+        app.runtime.hang_gauges().snapshot().last_tick_ns < 3_000_000_000,
+        "the measured tick must stay inside the bound"
+    );
+    app.stall_watchdog.as_ref().expect("fixture monitor").idle();
+    let lines = watchdog_lines(&rx, std::time::Duration::from_millis(300));
+    assert!(
+        lines
+            .iter()
+            .all(|line| !line.starts_with(crate::stall_watchdog::STALL_REPORT_PREFIX)),
+        "a block inside the bound must not report: {lines:?}"
+    );
+}

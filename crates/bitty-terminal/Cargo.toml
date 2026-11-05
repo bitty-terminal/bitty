@@ -105,6 +105,10 @@ dev-tools = []
 input-vm-test-support = ["bitty-platform/input-vm-test-support", "bitty-runtime/input-vm-test-support"]
 
 [dev-dependencies]
+# bitty#2830: the watchdog regressions seed a completed over-bound tick and
+# inject a block inside the measured tick region. Test builds unify the
+# feature; the shipped binary links none of the seam.
+bitty-runtime = { version = "0.0.32", path = "../bitty-runtime", features = ["hang-gauge-test-support"] }
 # Hermetic `ServeContext` constructors and unbound bearer minters (#1519).
 bitty-ipc = { git = "https://github.com/bitty-terminal/bitty-ipc", rev = "9493674", features = ["test-support"] }
 # `bitty#2869` acceptance: the safe-mode I/O-denied harness lives behind this

@@ -126,15 +126,6 @@ fn query_probe_png_oversized_ihdr_answers_einval_like_the_transmit_path() {
 }
 
 #[test]
-fn query_probe_png_still_answers_ok_when_the_decoder_accepts() {
-    // The gate must not over-refuse: a decodable PNG still probes `OK`.
-    let mut rt = make_runtime();
-    let seq = format!("\x1b_Gi=32,f=100,a=q,m=0;{}\x1b\\", red_1x1_png_b64());
-    rt.handle_pty_bytes(seq.as_bytes());
-    assert_eq!(replies(&mut rt), vec![b"\x1b_Gi=32;OK\x1b\\".to_vec()]);
-}
-
-#[test]
 fn query_probe_without_id_is_silent() {
     // Spec-exact: kitty mandates the id on queries (`kitty/graphics.c`
     // `REPORT_ERROR` when `!q_iid`, no reply). No `f=`-echo extension is
@@ -374,7 +365,14 @@ fn query_probe_ok_implies_the_same_payload_paints() {
     // Issue #2875 acceptance: `a=q` may only answer OK for what the paint
     // path actually renders. The probe bytes are then transmitted and
     // displayed verbatim; the frame must carry a blit.
+    //
+    // F5 (#2875 follow-up): both wire shapes live in this one contract
+    // test — raw RGBA (`f=32`) and PNG (`f=100`, where the verdict comes
+    // from the header gate plus a real decode) — so a regression in either
+    // half of the probe/paint contract turns this test red.
     let mut rt = make_runtime();
+
+    // Raw arm.
     let probe = format!("\x1b_Gi=31,f=32,s=2,v=2,a=q,m=0;{}\x1b\\", red_2x2_b64());
     rt.handle_pty_bytes(probe.as_bytes());
     assert_eq!(replies(&mut rt), vec![b"\x1b_Gi=31;OK\x1b\\".to_vec()]);
@@ -388,6 +386,27 @@ fn query_probe_ok_implies_the_same_payload_paints() {
         rt.kitty_last_frame_images(),
         1,
         "an OK probe must name a payload this terminal can paint"
+    );
+
+    // PNG arm: the probe must not over-refuse a decodable payload...
+    let png_probe = format!("\x1b_Gi=32,f=100,a=q,m=0;{}\x1b\\", red_1x1_png_b64());
+    rt.handle_pty_bytes(png_probe.as_bytes());
+    assert_eq!(
+        replies(&mut rt),
+        vec![b"\x1b_Gi=32;OK\x1b\\".to_vec()],
+        "a decodable PNG must probe OK, never over-refuse"
+    );
+    // ...and the same bytes must paint when transmitted.
+    let png_display = format!(
+        "\x1b_Gi=32,f=100,a=T,c=1,r=1,m=0;{}\x1b\\",
+        red_1x1_png_b64()
+    );
+    rt.handle_pty_bytes(png_display.as_bytes());
+    assert!(rt.tick().is_some(), "PNG display forces a present");
+    assert_eq!(
+        rt.kitty_last_frame_images(),
+        2,
+        "the probed PNG must paint alongside the raw arm"
     );
 }
 

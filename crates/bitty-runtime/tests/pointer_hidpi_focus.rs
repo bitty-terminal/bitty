@@ -339,6 +339,8 @@ fn rows_fit_the_painted_grid_at_fractional_scales() {
     for (scale, extent) in extents {
         let mut rt = Runtime::new(owner_config()).expect("runtime builds");
         #[cfg(unix)]
+        bitty_test_support::require_pty!();
+        #[cfg(unix)]
         rt.spawn_shell_with_args("/bin/sh", &["-c", "sleep 5"])
             .expect("shell spawns");
         rt.apply_dpi_scale(scale, Some(extent));

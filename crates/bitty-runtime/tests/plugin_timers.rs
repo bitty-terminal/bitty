@@ -10,10 +10,13 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use bitty_lua::{BridgeError, LuaValue, RC1_WALL_CLOCK_BUDGET_MS};
+use bitty_lua::{
+    BridgeError, ComponentBridgeRequest, ComponentMethod, LuaValue, RC1_WALL_CLOCK_BUDGET_MS,
+};
 use bitty_plugin_host::manifest::PluginId;
 use bitty_runtime::plugin_runtime::{
-    LifecycleState, PluginRuntime, PluginRuntimeConfig, SettingsSource, SnapshotSource,
+    CoreTargetInfo, LifecycleState, PluginRuntime, PluginRuntimeConfig, PluginRuntimeError,
+    SettingsSource, SnapshotSource, TargetSource,
 };
 
 /// Activation wall budget for this harness.
@@ -28,6 +31,16 @@ use bitty_runtime::plugin_runtime::{
 /// `bitty-lua/tests/measurement_lua.rs`, `load_gate.rs`, and
 /// `bar_activation_budget.rs`.
 const HARNESS_WALL_BUDGET_MS: u64 = 10 * RC1_WALL_CLOCK_BUDGET_MS;
+
+/// Wall time the slow snapshot fixture charges inside a timer callback
+/// (bitty#2900).
+///
+/// The host call is charged to the callback's RC-1 wall time (only supervised
+/// spawn waits are credited), so a delay of twice the harness budget crosses
+/// the slice on any runner without depending on CPU speed. It stays far below
+/// `HARNESS_HOST_CALL_DEADLINE_MS`, so the call itself returns normally and
+/// the suspension is the callback budget, not a host-call timeout.
+const SLOW_SNAPSHOT_DELAY: Duration = Duration::from_millis(2 * HARNESS_WALL_BUDGET_MS);
 
 #[derive(Default)]
 struct MapSettings(std::collections::BTreeMap<String, LuaValue>);
@@ -53,6 +66,37 @@ impl SnapshotSource for StaticSnapshot {
     }
 }
 
+/// Snapshot source that charges a deterministic amount of host-call wall time
+/// (bitty#2900). Used to overrun a timer callback's RC-1 slice without a busy
+/// loop or a runner-speed assumption.
+struct SlowSnapshot {
+    value: LuaValue,
+    delay: Duration,
+}
+
+impl SnapshotSource for SlowSnapshot {
+    fn snapshot(&self, scope: &str) -> Result<LuaValue, BridgeError> {
+        if scope != "semantic" {
+            return Err(BridgeError::new(
+                "validation",
+                "E_SNAPSHOT_SCOPE_UNSUPPORTED",
+                "bad scope",
+            ));
+        }
+        std::thread::sleep(self.delay);
+        Ok(self.value.clone())
+    }
+}
+
+/// Fixed live Core target source for the targeting-session cleanup probe.
+struct FixedTargets(Vec<CoreTargetInfo>);
+
+impl TargetSource for FixedTargets {
+    fn targets(&self) -> Result<Vec<CoreTargetInfo>, BridgeError> {
+        Ok(self.0.clone())
+    }
+}
+
 fn temp_dir(tag: &str) -> PathBuf {
     // Unique per test + process so parallel nextest shards never share a dir.
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,6 +109,21 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn runtime(data_dir: PathBuf, roots: Vec<PathBuf>) -> PluginRuntime {
+    runtime_with_snapshot(
+        data_dir,
+        roots,
+        Rc::new(StaticSnapshot(LuaValue::table([
+            ("version", LuaValue::Integer(1)),
+            ("terminal_id", LuaValue::Integer(1)),
+        ]))),
+    )
+}
+
+fn runtime_with_snapshot(
+    data_dir: PathBuf,
+    roots: Vec<PathBuf>,
+    snapshot: Rc<dyn SnapshotSource>,
+) -> PluginRuntime {
     let mut rt = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode: false,
         data_dir: Some(data_dir),
@@ -72,10 +131,7 @@ fn runtime(data_dir: PathBuf, roots: Vec<PathBuf>) -> PluginRuntime {
         bundled_roots: Vec::new(),
         third_party_roots: roots,
         settings: Rc::new(MapSettings::default()),
-        snapshot: Rc::new(StaticSnapshot(LuaValue::table([
-            ("version", LuaValue::Integer(1)),
-            ("terminal_id", LuaValue::Integer(1)),
-        ]))),
+        snapshot,
     });
     // Harness headroom for activation only; see `HARNESS_WALL_BUDGET_MS`.
     rt.set_vm_wall_budget_ms(Some(HARNESS_WALL_BUDGET_MS));
@@ -99,6 +155,54 @@ fn write_plugin(root: &Path, id: &str, init_src: &str) {
         "bitty.commands.register({{ id = \"ok\", title = \"ok\", run = function() return \"ok\" end }})\n{init_src}"
     );
     std::fs::write(plugin.join("lua/init.lua"), body).expect("init");
+}
+
+/// Write a plugin with explicit capabilities and no command registrations.
+fn write_capability_plugin(root: &Path, id: &str, capabilities: &[&str], init_src: &str) {
+    write_full_plugin(root, id, capabilities, &[], &[], "", init_src);
+}
+
+/// Write a plugin with explicit capabilities, commands, events, and an
+/// optional `[services.provided]` body (the failure-path probes).
+fn write_full_plugin(
+    root: &Path,
+    id: &str,
+    capabilities: &[&str],
+    commands: &[&str],
+    events: &[&str],
+    services_toml: &str,
+    init_src: &str,
+) {
+    let plugin = root.join(id);
+    std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+    let caps_toml = capabilities
+        .iter()
+        .map(|capability| format!("{capability} = true"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let commands_toml = commands
+        .iter()
+        .map(|command| format!("\"{id}:{command}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let events_toml = events
+        .iter()
+        .map(|event| format!("\"{event}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let services_section = if services_toml.is_empty() {
+        String::new()
+    } else {
+        format!("{services_toml}\n")
+    };
+    std::fs::write(
+        plugin.join("bitty-plugin.toml"),
+        format!(
+            "[plugin]\nid = \"{id}\"\nname = \"Test\"\nversion = \"0.1.0\"\ndescription = \"test\"\n\n[compat]\nplugin-api = \"^1.0\"\n\n[capabilities]\n{caps_toml}\n\n{services_section}[lazy]\ncommands = [{commands_toml}]\nevents = [{events_toml}]\n"
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(plugin.join("lua/init.lua"), init_src).expect("init");
 }
 
 fn store_get(rt: &PluginRuntime, id: &PluginId, key: &str) -> Option<LuaValue> {
@@ -294,6 +398,386 @@ fn disposed_timers_clear_the_wake() {
     assert_eq!(rt.timer_deadline(), None);
     let far = std::time::Instant::now() + Duration::from_secs(60);
     assert_eq!(rt.pump_due_timers_at(far), 0);
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn timer_callback_wall_overrun_fails_the_generation_without_phantom_fires() {
+    // bitty#2900: a timer callback that overruns RC-1 used to leave the plugin
+    // `Active` with a suspended VM: every later drive was refused, `fired`
+    // still counted phantom work, and the last painted blocks stayed frozen on
+    // screen. The overrun now fails the generation through the same cleanup as
+    // a failed activation, and the reason names the exceeded budget.
+    let data = temp_dir("overrun");
+    let root = temp_dir("overrun-root");
+    let id = PluginId::new("bitty-featured.overrun").expect("id");
+    write_capability_plugin(
+        &root,
+        "bitty-featured.overrun",
+        &["terminal.semantic-read", "ui.rich"],
+        r#"
+        bitty.ui.mount("bottom", { kind = "Text", text = "timer" })
+        bitty.timers.create(100, function()
+          -- The host call charges deterministic wall time; the loop then
+          -- reaches a slice boundary so the drive observes the overrun
+          -- instead of finishing inside the slow host step.
+          bitty.terminal.snapshot({ scope = "semantic" })
+          while true do end
+        end)
+        "#,
+    );
+    let snapshot = Rc::new(SlowSnapshot {
+        value: LuaValue::table([
+            ("version", LuaValue::Integer(1)),
+            ("terminal_id", LuaValue::Integer(1)),
+        ]),
+        delay: SLOW_SNAPSHOT_DELAY,
+    });
+    let mut rt = runtime_with_snapshot(data.clone(), vec![root.clone()], snapshot);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    assert_eq!(rt.ui_blocks().len(), 1, "fixture mounted one UI block");
+    let deadline = rt.timer_deadline().expect("armed");
+
+    // The callback starts, charges the slow host call, and is then aborted by
+    // the wall check: that is one attempted fire, not zero. The generation
+    // must fail in the same pump.
+    assert_eq!(rt.pump_due_timers_at(deadline), 1);
+    let reason = match rt.state(&id) {
+        Some(LifecycleState::Failed(reason)) => reason.clone(),
+        other => panic!("terminal overrun must fail the generation, got {other:?}"),
+    };
+    assert!(
+        reason.contains("RC-1 wall")
+            && reason.contains(&format!("budget_ms={HARNESS_WALL_BUDGET_MS}")),
+        "failure reason must name the exceeded wall budget: {reason}"
+    );
+    assert!(
+        rt.ui_blocks().is_empty(),
+        "failed generation's UI blocks must be cleared"
+    );
+    assert!(
+        rt.services(&id).is_none(),
+        "failed generation must drop its services"
+    );
+    assert!(
+        rt.effective_budgets(&id).is_none(),
+        "failed generation must drop its budgets"
+    );
+    let debug_row = rt
+        .debug_plugins()
+        .into_iter()
+        .find(|row| row.id == id.as_str())
+        .expect("debug row");
+    assert_eq!(debug_row.state, "failed");
+    assert_eq!(rt.timer_deadline(), None, "failed generation arms no wake");
+
+    // The refused drive is not a fire: the same deadline and any later one
+    // select nothing for the failed generation.
+    assert_eq!(rt.pump_due_timers_at(deadline), 0);
+    let far = deadline + Duration::from_secs(3600);
+    assert_eq!(rt.pump_due_timers_at(far), 0);
+    assert_eq!(rt.timer_deadline(), None);
+
+    // Reload from `Failed` is still the documented recovery path.
+    let report = rt.reload(&id).expect("reload from failed");
+    assert_eq!(report.state, LifecycleState::Active);
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn timer_failure_releases_service_annotations_and_component_tickets() {
+    // bitty#2900 review F1-F3: a live generation that fails on a timer must
+    // release the authority a failed activation never acquired: published
+    // service records, the targeting session and its shared annotation
+    // layer, and component tickets/submissions.
+    let data = temp_dir("cleanup");
+    let root = temp_dir("cleanup-root");
+    let id = PluginId::new("bitty-featured.cleanup").expect("id");
+    write_full_plugin(
+        &root,
+        "bitty-featured.cleanup",
+        &[
+            "runtime.inspect",
+            "terminal.semantic-read",
+            "ui.rich",
+            "ui.overlay",
+            "ui.overlay.focus",
+        ],
+        &[],
+        &[],
+        "[services.provided]\n\"timer.health\" = { version = \"1.0.0\", heads = [\"runtime.inspect\"] }",
+        r#"
+        bitty.services.provide("timer.health", {
+          ping = function() return { ok = true } end,
+        })
+        local handle = bitty.ui.mount("overlay", { kind = "Text", text = "targets" })
+        bitty.ui.targets.session_start(handle, 80, { { x = 0, y = 0 } }, { "acme.cmd:panel" })
+        bitty.timers.create(100, function()
+          bitty.terminal.snapshot({ scope = "semantic" })
+          while true do end
+        end)
+        "#,
+    );
+    let snapshot = Rc::new(SlowSnapshot {
+        value: LuaValue::table([("version", LuaValue::Integer(1))]),
+        delay: SLOW_SNAPSHOT_DELAY,
+    });
+    let mut rt = runtime_with_snapshot(data.clone(), vec![root.clone()], snapshot);
+    rt.set_target_source(Rc::new(FixedTargets(vec![CoreTargetInfo {
+        kind: "panel".to_string(),
+        id: 11,
+        workspace: Some(7),
+        rect: Some((1, 2, 20, 10)),
+    }])));
+    let native_records = rt.service_directory().borrow().published_count();
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    assert_eq!(
+        rt.service_directory().borrow().published_count(),
+        native_records + 1,
+        "provider record published"
+    );
+    assert_eq!(
+        rt.service_directory()
+            .borrow()
+            .active_for("timer.health")
+            .len(),
+        1
+    );
+    assert!(
+        rt.target_annotations().is_some(),
+        "fixture published an annotation layer"
+    );
+    let ticket = rt
+        .component_request_queue()
+        .borrow_mut()
+        .enqueue(
+            id.as_str(),
+            "timer-cleanup-hash",
+            ComponentBridgeRequest {
+                component: "net".to_string(),
+                method: ComponentMethod::Get,
+                url: "https://example.invalid/ping".to_string(),
+                headers: Vec::new(),
+                body: None,
+                timeout_ms: 1_000,
+            },
+            Instant::now(),
+        )
+        .expect("enqueue component request");
+    assert_eq!(rt.component_request_queue().borrow().pending(), 1);
+
+    let deadline = rt.timer_deadline().expect("armed");
+    assert_eq!(rt.pump_due_timers_at(deadline), 1);
+    assert!(matches!(rt.state(&id), Some(LifecycleState::Failed(_))));
+    assert!(
+        rt.service_directory()
+            .borrow()
+            .active_for("timer.health")
+            .is_empty(),
+        "a failed generation must not keep a resolvable service record"
+    );
+    assert_eq!(
+        rt.service_directory().borrow().published_count(),
+        native_records,
+        "failure must revoke the provider record"
+    );
+    assert!(
+        rt.target_annotations().is_none(),
+        "failure must clear the shared annotation layer"
+    );
+    assert_eq!(
+        rt.component_request_queue().borrow().pending(),
+        0,
+        "failure must purge queued component submissions"
+    );
+    assert_eq!(rt.component_request_queue().borrow().in_flight(), 0);
+    let poll_error = rt
+        .component_request_queue()
+        .borrow_mut()
+        .poll(id.as_str(), ticket)
+        .expect_err("failed generation's ticket is purged");
+    assert_eq!(poll_error.code, "E_COMPONENT_TICKET");
+
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn timer_due_while_command_parked_is_not_counted_and_stays_active() {
+    // bitty#2900 review F5: a parked command owns the VM for the tick. The
+    // due timer drive is refused before execution, so it is not a fire and
+    // the generation is not failed.
+    let data = temp_dir("parked");
+    let root = temp_dir("parked-root");
+    let id = PluginId::new("bitty-featured.parked").expect("id");
+    write_full_plugin(
+        &root,
+        "bitty-featured.parked",
+        &["terminal.semantic-read"],
+        &["slow"],
+        &[],
+        "",
+        r#"
+        bitty.commands.register({
+          id = "slow",
+          title = "slow",
+          run = function()
+            bitty.terminal.snapshot({ scope = "semantic" })
+            while true do end
+          end,
+        })
+        bitty.timers.create(100, function() bitty.store.set("timer_ran", true) end)
+        "#,
+    );
+    let snapshot = Rc::new(SlowSnapshot {
+        value: LuaValue::table([("version", LuaValue::Integer(1))]),
+        delay: SLOW_SNAPSHOT_DELAY,
+    });
+    let mut rt = runtime_with_snapshot(data.clone(), vec![root.clone()], snapshot);
+    common::install_stub_backend(&mut rt);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    let deadline = rt.timer_deadline().expect("armed");
+    let parked = rt
+        .dispatch_command(&id, "slow", &[])
+        .expect_err("slow command must park");
+    assert!(
+        matches!(parked, PluginRuntimeError::Parked { .. }),
+        "expected a parked command, got {parked:?}"
+    );
+    assert_eq!(rt.parked_command_count(), 1);
+    assert_eq!(rt.pump_due_timers_at(deadline), 0);
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    assert_eq!(store_get(&rt, &id, "timer_ran"), None);
+    rt.dispose(&id).expect("dispose cancels the park");
+    assert_eq!(rt.parked_command_count(), 0);
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn timer_due_after_foreign_suspension_fails_with_refusal_reason() {
+    // bitty#2900 review F4/F5: the suspension can be caused by another
+    // dispatch. A timer drive that never started must not claim the callback
+    // exceeded a budget; it reports the refusal and still fails the
+    // generation.
+    let data = temp_dir("foreign-suspend");
+    let root = temp_dir("foreign-suspend-root");
+    let id = PluginId::new("bitty-featured.foreign-suspend").expect("id");
+    write_full_plugin(
+        &root,
+        "bitty-featured.foreign-suspend",
+        &[],
+        &[],
+        &["terminal.opened"],
+        "",
+        r#"
+        bitty.events.subscribe("terminal.opened", function() while true do end end)
+        bitty.timers.create(10000, function() bitty.store.set("timer_ran", true) end)
+        "#,
+    );
+    let mut rt = runtime(data.clone(), vec![root.clone()]);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    let deadline = rt.timer_deadline().expect("armed");
+    assert_eq!(
+        rt.deliver_event(
+            "terminal.opened",
+            &LuaValue::table([("terminal_id", LuaValue::Integer(1))])
+        ),
+        0,
+        "the overrun event handler does not complete"
+    );
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    assert_eq!(rt.pump_due_timers_at(deadline), 0);
+    let reason = match rt.state(&id) {
+        Some(LifecycleState::Failed(reason)) => reason.clone(),
+        other => panic!("a refused timer drive must fail the generation, got {other:?}"),
+    };
+    assert!(
+        reason.contains("timer drive refused: VM was already suspended"),
+        "refused drive must not claim the timer callback ran: {reason}"
+    );
+    assert!(
+        reason.contains("budget"),
+        "refusal must still name the suspension budget: {reason}"
+    );
+    assert_eq!(rt.timer_deadline(), None);
+    assert_eq!(rt.pump_due_timers_at(deadline), 0);
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn timer_callback_within_budget_keeps_the_generation_active() {
+    // Control for bitty#2900: an ordinary timer that completes inside the
+    // slice keeps firing and never transitions the generation.
+    let data = temp_dir("within-budget");
+    let root = temp_dir("within-budget-root");
+    let id = PluginId::new("bitty-featured.within").expect("id");
+    write_plugin(
+        &root,
+        "bitty-featured.within",
+        r#"
+        bitty.timers.create(100, function() bitty.store.set("first", 1) end)
+        bitty.timers.create(200, function() bitty.store.set("second", 2) end)
+        "#,
+    );
+    let mut rt = runtime(data.clone(), vec![root.clone()]);
+    common::install_stub_backend(&mut rt);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    let first = rt.timer_deadline().expect("armed");
+    assert_eq!(rt.pump_due_timers_at(first), 1);
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    assert_eq!(store_get(&rt, &id, "first"), Some(LuaValue::Integer(1)));
+    let second = rt.timer_deadline().expect("second timer still armed");
+    assert_eq!(rt.pump_due_timers_at(second), 1);
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    assert_eq!(store_get(&rt, &id, "second"), Some(LuaValue::Integer(2)));
+    assert_eq!(rt.timer_deadline(), None);
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn timer_callback_lua_error_is_contained_and_keeps_the_generation_active() {
+    // bitty#2900 classification control: a plain Lua error does not suspend
+    // the VM, so it stays the documented contained failure (the one shot is
+    // consumed, the generation remains usable). Only terminal VM death fails
+    // the plugin.
+    let data = temp_dir("lua-error");
+    let root = temp_dir("lua-error-root");
+    let id = PluginId::new("bitty-featured.lua-error").expect("id");
+    write_plugin(
+        &root,
+        "bitty-featured.lua-error",
+        r#"
+        bitty.timers.create(100, function() error("timer boom") end)
+        bitty.timers.create(200, function() bitty.store.set("after_error", true) end)
+        "#,
+    );
+    let mut rt = runtime(data.clone(), vec![root.clone()]);
+    common::install_stub_backend(&mut rt);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    let first = rt.timer_deadline().expect("armed");
+    assert_eq!(rt.pump_due_timers_at(first), 1);
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    let second = rt.timer_deadline().expect("generation still usable");
+    assert_eq!(rt.pump_due_timers_at(second), 1);
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    assert_eq!(
+        store_get(&rt, &id, "after_error"),
+        Some(LuaValue::Bool(true))
+    );
     let _ = std::fs::remove_dir_all(&data);
     let _ = std::fs::remove_dir_all(&root);
 }

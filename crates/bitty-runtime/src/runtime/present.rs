@@ -2228,7 +2228,10 @@ impl Runtime {
     /// so an idle surface arms nothing and PB-7's zero-periodic-wakeup idle
     /// budget is preserved. A hidden surface is deliberately excluded: its
     /// retained work is covered by [`Self::hidden_repair_deadline`], and a
-    /// nudge there would fight the occlusion gate's idle.
+    /// nudge there would fight the occlusion gate's idle. A dead or failed
+    /// presenter is excluded too: rebuilding a frame it cannot accept would
+    /// only burn the nudge cadence, and its bounded retry or the embedder's
+    /// GPU reattach wake owns liveness instead.
     #[must_use]
     pub fn present_owed(&self) -> bool {
         if !self.surface_visible {
@@ -2238,6 +2241,13 @@ impl Runtime {
         // not owed again. The ack wake and the bounded recovery deadline keep
         // the loop live; a nudge would only rebuild a duplicate frame.
         if self.pending_present.is_some() {
+            return false;
+        }
+        if self
+            .presenter
+            .as_ref()
+            .is_some_and(|presenter| !presenter.is_active())
+        {
             return false;
         }
         self.retained_present_work() || self.plugin_scene_owed()
@@ -7255,9 +7265,12 @@ impl Runtime {
         // its huge in-flight age must not turn every 1 ms wake into another
         // surface-creation attempt.
         let retry_pending = self.presenter_retry_at.is_some_and(|at| now < at);
-        if exhausted && !retry_pending {
-            // A spent budget cannot create another surface; do not leave a
-            // past retry instant behind for the wake computation to clamp.
+        if !retry_pending {
+            // Consume a due (or expired) backoff on every pass, not only when
+            // the budget is spent. This tick's recovery decision is the only
+            // path that may re-arm it; leaving a past instant behind lets a
+            // paused/hidden surface re-arm `now + 1 ms` forever through
+            // `present_recovery_deadline` without ever attempting recovery.
             self.presenter_retry_at = None;
         }
         // Stuck recovery is only actionable while surface creation is allowed
@@ -7269,12 +7282,12 @@ impl Runtime {
             && match presenter.in_flight_age(now) {
                 Some(age) => age >= presenter.stuck_bound(),
                 // A frame the worker never started acquiring is only "stuck"
-                // after the same bound, and never while the worker is parked
-                // in its mailbox: a parked worker with a pending frame is the
-                // window where its `Presented` ack may already be queued.
+                // after the same bound. Acks were drained and applied above,
+                // so any `Presented` ack already queued for this token won the
+                // tick; a still-pending token here means the worker never
+                // acknowledged it and recovery is the only way forward.
                 None => {
                     !presenter.is_paused()
-                        && !presenter.is_worker_parked()
                         && self.pending_present.as_ref().is_some_and(|pending| {
                             now.saturating_duration_since(pending.submitted_at)
                                 >= presenter.stuck_bound()
@@ -7531,9 +7544,11 @@ impl Runtime {
         };
         // A scheduled recovery backoff is the wake that must run. Returning
         // the 1 ms in-flight clamp here would re-enter immediately and defeat
-        // the 250 ms/500 ms/1 s/2 s cadence.
+        // the 250 ms/500 ms/1 s/2 s cadence. An already-expired instant is
+        // consumed by the next `poll_presenter`, never clamped into a wake.
         let retry = self
             .presenter_retry_at
+            .filter(|at| *at > now)
             .map(|at| at.max(now + PRESENT_MIN_WAKE));
         let mut wake: Option<std::time::Instant> = None;
         if presenter.is_paused() {
@@ -13123,9 +13138,6 @@ mod async_present_tests {
     #[test]
     fn shutdown_with_a_blocked_presenter_is_bounded() {
         let control = Control::new(true);
-        // The backend destructor blocks too: the bound must hold for the
-        // acquire wait *and* a slow surface teardown.
-        let drop_gate = control.block_drop();
         let mut runtime = runtime_with(
             &control,
             PresenterConfig {
@@ -13147,14 +13159,48 @@ mod async_present_tests {
         assert!(runtime.presenter.is_none());
 
         control.gate.release();
+        assert!(wait_until(|| control.alive() == 0, TEST_WAIT));
+    }
+
+    #[test]
+    fn shutdown_bounds_a_slow_surface_destructor_after_the_worker_exits() {
+        let control = Control::new(false);
+        let drop_gate = control.block_drop();
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                shutdown_bound: Duration::from_millis(30),
+                ..PresenterConfig::default()
+            },
+        );
+        // No frame is ever submitted: the worker parks, so the only thing that
+        // can delay its exit is the blocking surface destructor. This is the
+        // ordering claim the blocked-present test cannot make (there the bound
+        // is consumed by the acquire wait before teardown even starts).
+        assert!(wait_until(
+            || runtime
+                .presenter
+                .as_ref()
+                .is_some_and(Presenter::is_worker_parked),
+            TEST_WAIT
+        ));
+
+        let started = Instant::now();
+        let _ = runtime.shutdown_with_timeout(Duration::from_millis(10));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a slow destructor must not overrun the shutdown bound (took {elapsed:?})"
+        );
+        assert!(runtime.presenter.is_none());
         assert!(
             wait_until(|| drop_gate.entered() >= 1, TEST_WAIT),
-            "the detached worker reaches the blocking surface destructor"
+            "the detached worker reaches the blocking destructor"
         );
         assert_eq!(
             control.alive(),
             1,
-            "the slow teardown stays off the event-loop thread"
+            "the destructor delay stays off the event-loop thread"
         );
         drop_gate.release();
         assert!(wait_until(|| control.alive() == 0, TEST_WAIT));
@@ -13623,6 +13669,18 @@ mod async_present_tests {
             !runtime.needs_gpu_reattach(),
             "the reattach cooldown prevents a per-tick GPU context storm"
         );
+        // A frame this dead presenter can never accept must not keep the
+        // embedder's bounded present nudge awake on the 50->500 ms cadence.
+        runtime.pending_present = None;
+        runtime.pending_full_redraw = true;
+        assert!(
+            !runtime.present_owed(),
+            "a dead presenter must not rebuild an owed frame"
+        );
+        assert!(
+            runtime.present_recovery_deadline().is_some(),
+            "the reattach wake, not the frame nudge, owns liveness"
+        );
         let _ = runtime.shutdown_with_timeout(Duration::from_millis(50));
     }
 
@@ -13870,6 +13928,71 @@ mod async_present_tests {
     }
 
     #[test]
+    fn an_expired_recovery_backoff_is_consumed_while_the_surface_is_hidden() {
+        let control = Control::new(true);
+        control.fail_factory(1);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: Duration::from_millis(20),
+                shutdown_bound: Duration::from_millis(20),
+                ..PresenterConfig::default()
+            },
+        );
+        runtime.handle_pty_bytes(b"hidden-backoff");
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert!(wait_until(|| control.gate.entered() >= 1, TEST_WAIT));
+
+        let t0 = Instant::now();
+        assert!(runtime.tick_at(t0 + Duration::from_millis(50)).is_none());
+        let retry_at = runtime
+            .presenter_retry_at
+            .expect("the failed stuck replacement arms the backoff");
+        assert_eq!(
+            runtime
+                .presenter
+                .as_ref()
+                .expect("presenter")
+                .creation_failures(),
+            1
+        );
+
+        // The workspace hides before the backoff expires. Hiding pauses the
+        // worker and drops the uncommittable commit state; the late present
+        // then acks against a token nobody waits for.
+        runtime.set_surface_visibility(false);
+        control.gate.release();
+        assert!(wait_until(
+            || runtime
+                .presenter
+                .as_ref()
+                .is_some_and(|presenter| presenter.queued_acks() >= 1),
+            TEST_WAIT
+        ));
+
+        // Past the backoff the hidden tick must consume it instead of
+        // publishing `now + 1 ms` forever.
+        let after = retry_at + Duration::from_millis(50);
+        assert!(runtime.tick_at(after).is_none());
+        assert!(
+            runtime.presenter_retry_at.is_none(),
+            "an expired backoff is consumed, not left for the wake clamp"
+        );
+        assert!(
+            runtime.present_recovery_deadline().is_none(),
+            "a paused surface arms no recovery wake"
+        );
+        // A second timer advance proves the 1 ms wake is not re-armed.
+        assert!(runtime.tick_at(after + Duration::from_millis(5)).is_none());
+        assert!(runtime.presenter_retry_at.is_none());
+        assert!(
+            runtime.present_recovery_deadline().is_none(),
+            "no repeated 1 ms wake after the expired backoff was consumed"
+        );
+        let _ = runtime.shutdown_with_timeout(Duration::from_millis(50));
+    }
+
+    #[test]
     fn a_queued_presented_ack_is_drained_before_the_stuck_decision() {
         let control = Control::new(true);
         let mut runtime = runtime_with(
@@ -13913,6 +14036,98 @@ mod async_present_tests {
             0,
             "no stuck episode was recorded"
         );
+        assert!(runtime.shutdown());
+    }
+
+    #[test]
+    fn a_parked_worker_with_a_lost_ack_is_recovered_once() {
+        let control = Control::new(false);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: Duration::from_millis(200),
+                shutdown_bound: Duration::from_millis(20),
+                ..PresenterConfig::default()
+            },
+        );
+        runtime.handle_pty_bytes(b"settle");
+        assert!(tick_until_committed(&mut runtime, TEST_WAIT).is_some());
+        assert!(wait_until(
+            || runtime
+                .presenter
+                .as_ref()
+                .is_some_and(Presenter::is_worker_parked),
+            TEST_WAIT
+        ));
+
+        // Simulate an ack that never arrives: the runtime still waits on a
+        // token while the worker is parked with an empty mailbox. Nothing can
+        // ever commit it, so the stuck branch is the only way forward.
+        control.gate.block();
+        let submitted_at = Instant::now() - Duration::from_secs(1);
+        runtime.pending_present = Some(PendingPresent {
+            token: 424_242,
+            primary_generation: 1,
+            frame_generation: 1,
+            pane_generations: Vec::new(),
+            scene_revision: None,
+            allocations: Vec::new(),
+            focused: None,
+            scene_report: scene_present::SceneFrameReport::default(),
+            band_identity: Vec::new(),
+            band_origins: Vec::new(),
+            kitty_images: 0,
+            backgrounds: 0,
+            cells_before: 0,
+            glyphs_before: 0,
+            corrective_repaint: false,
+            submitted_at,
+        });
+        let generation = runtime.presenter.as_ref().expect("presenter").generation();
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert_eq!(
+            runtime
+                .presenter
+                .as_ref()
+                .expect("presenter")
+                .stuck_presents(),
+            1,
+            "the lost ack triggers exactly one stuck recovery"
+        );
+        assert_ne!(
+            runtime.presenter.as_ref().expect("presenter").generation(),
+            generation,
+            "the presenter was recovered"
+        );
+        assert!(
+            runtime.pending_present.is_some(),
+            "the corrective frame is submitted to the replacement worker"
+        );
+
+        // Inside the bound no further recovery runs, and the wake is the
+        // stuck bound rather than a 1 ms clamp.
+        let now = Instant::now();
+        assert!(runtime.tick_at(now + Duration::from_millis(1)).is_none());
+        assert!(runtime.tick_at(now + Duration::from_millis(2)).is_none());
+        assert_eq!(
+            runtime
+                .presenter
+                .as_ref()
+                .expect("presenter")
+                .stuck_presents(),
+            1,
+            "a fresh pending frame is not recovered again"
+        );
+        let wake = runtime
+            .present_recovery_deadline()
+            .expect("the fresh frame arms the stuck bound");
+        assert!(
+            wake > now + Duration::from_millis(100),
+            "wake {wake:?} must be the stuck bound, not 1 ms"
+        );
+
+        control.gate.release();
+        assert!(tick_until_committed(&mut runtime, TEST_WAIT).is_some());
         assert!(runtime.shutdown());
     }
 

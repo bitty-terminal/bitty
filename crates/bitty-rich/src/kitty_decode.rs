@@ -375,7 +375,7 @@ fn sniff_png_ihdr(payload: &[u8]) -> Result<(u32, u32), KittyDecodeError> {
 /// Validates a PNG payload's `IHDR` against the decode ceilings without
 /// decoding it (issue #2875 scope 4).
 ///
-/// This is the admission gate [`decode_png`] runs *before* the codec
+/// This is the admission gate `decode_png` runs *before* the codec
 /// allocates: signature and `IHDR` placement, non-zero dimensions, the
 /// per-side and area ceilings, and the RGBA8 byte cap. A protocol support
 /// probe (`a=q`) uses it so its verdict matches what a real transmit would

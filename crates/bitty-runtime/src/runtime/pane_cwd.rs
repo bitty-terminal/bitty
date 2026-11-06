@@ -5,8 +5,8 @@
 //! remote shell, `cat` of a crafted file, a malicious prompt — can report an
 //! arbitrary existing local directory, and the allowlisted child would then
 //! start there. This module resolves the directory from the kernel instead:
-//! the PTY child's own working directory, pinned as a `(dev, ino)` identity so
-//! a later path swap cannot silently retarget the spawn.
+//! the PTY child's own working directory, pinned as an object identity so a
+//! later path swap cannot silently retarget the spawn.
 //!
 //! # Platform rules
 //!
@@ -20,24 +20,43 @@
 //!   with the typed `E_SPAWN_CWD_UNAVAILABLE`; it never falls back to the
 //!   `OSC 7` report.
 //! - **Windows:** ConPTY exposes no cwd query for a running child and this
-//!   module does not retain a process handle, so the same refusal applies.
+//!   module does not retain a process handle, so the same refusal applies to
+//!   [`PaneCwd::from_pty_child`]. A pin the host already owns
+//!   ([`PaneCwd::from_path`]) is still verified at the spawn boundary with the
+//!   Win32 identity primitive, `(volume serial, file index)`, so a swapped or
+//!   deleted directory refuses there exactly as it does on Unix.
 //!
-//! Where the platform *can* name a directory, [`PaneCwd::revalidate`] re-opens
-//! the pinned path and requires the same inode. A swap between observation and
-//! the spawn boundary therefore refuses instead of following the new inode;
-//! the value handed to the child is the path that named the pinned inode at
-//! the boundary check.
+//! Wherever a directory can be identified, [`PaneCwd::revalidate`]
+//! re-identifies the pinned path and requires the identity captured by the
+//! pin. A swap between observation and the spawn boundary therefore refuses
+//! instead of following the replacement; the value handed to the child is the
+//! path that named the pinned directory at the boundary check. Where no
+//! identity can be *proven*, both construction and the boundary check fail
+//! closed (see [`PaneCwdError::Unverifiable`]).
 
 use std::path::{Path, PathBuf};
 
-/// Identity of one directory inode, captured when the pane cwd was pinned.
+/// Identity of one directory object, captured when the pane cwd was pinned.
 ///
-/// Unix keeps `(st_dev, st_ino)`: a path that resolves to a different pair is
-/// a different directory, whatever its spelling. Windows has no portable
-/// stable file identity in `std` at this MSRV, so the field is absent there and
-/// [`PaneCwd::revalidate`] degrades to an existence check — which is sound
-/// because Windows never constructs a [`PaneCwd`] from a PTY child (see the
-/// module docs).
+/// A path is a name, not an identity: the pinned directory can be renamed away
+/// and a different directory can take its name before the spawn boundary. Each
+/// platform therefore records the object's own identity instead of its
+/// spelling.
+///
+/// - **Unix:** `(st_dev, st_ino)`. A path that resolves to a different pair is
+///   a different directory, whatever its spelling.
+/// - **Windows:** `(dwVolumeSerialNumber, nFileIndex)` from
+///   `GetFileInformationByHandle` on a directory handle — the Win32 equivalent
+///   of the same pair. The file index is the volume's own record number for
+///   the object: it survives a rename and changes when the object is replaced,
+///   so an impostor taking the pinned name has a different index.
+///
+/// Both forms are plain integers, so a pin stays `Copy` and cheap to clone, and
+/// no directory handle is held open across the spawn (on Windows an open
+/// handle would block renames and change host behaviour). The Windows pair is
+/// read through `winapi-util` rather than `std::os::windows::fs::MetadataExt`,
+/// whose `volume_serial_number`/`file_index` are still unstable
+/// (`windows_by_handle`, rust-lang/rust#63010) at this workspace's MSRV.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DirIdent {
@@ -45,14 +64,102 @@ struct DirIdent {
     ino: u64,
 }
 
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DirIdent {
+    volume: u64,
+    index: u64,
+}
+
 #[cfg(unix)]
 impl DirIdent {
-    fn of(metadata: &std::fs::Metadata) -> Self {
+    /// Identity of `path` when it names an existing directory.
+    ///
+    /// Symlinks are followed: the identity compared is the directory the path
+    /// actually resolves to, which is exactly the question a spawn boundary
+    /// asks.
+    fn of_path(path: &Path) -> Option<Self> {
         use std::os::unix::fs::MetadataExt;
-        Self {
+        let metadata = std::fs::metadata(path).ok()?;
+        if !metadata.is_dir() {
+            return None;
+        }
+        Some(Self {
             dev: metadata.dev(),
             ino: metadata.ino(),
+        })
+    }
+}
+
+#[cfg(windows)]
+impl DirIdent {
+    /// Identity of `path` when it names an existing directory.
+    ///
+    /// Opens the directory itself (see [`Self::open_directory`]) and asks the
+    /// volume for the object's identity; `GetFileInformationByHandle` is the
+    /// documented way to compare two paths for "same target", including
+    /// directories. Reparse points are followed, matching the Unix rule above.
+    /// The handle is dropped before returning, so the pin never blocks a
+    /// rename.
+    ///
+    /// `None` covers every case where the identity cannot be *proven*: the
+    /// path is missing or is not a directory (a file opens fine under
+    /// `FILE_FLAG_BACKUP_SEMANTICS`), the handle cannot be opened, or the
+    /// filesystem reports file index `0`. Some network and FAT-class
+    /// filesystems synthesise an index or have none at all, and `0` would
+    /// compare equal for unrelated objects; treating it as an identity would
+    /// turn the boundary check into a no-op. A pin is never created from
+    /// `None` and a boundary check that reads `None` refuses, so an
+    /// unprovable directory fails closed instead of degrading to an existence
+    /// check.
+    fn of_path(path: &Path) -> Option<Self> {
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+
+        let handle = Self::open_directory(path)?;
+        let info = winapi_util::file::information(&handle).ok()?;
+        if info.file_attributes() & u64::from(FILE_ATTRIBUTE_DIRECTORY) == 0 {
+            return None;
         }
+        // A volume that reports no file index cannot distinguish two objects,
+        // so `0` is never an identity: fail closed.
+        let index = info.file_index();
+        if index == 0 {
+            return None;
+        }
+        Some(Self {
+            volume: info.volume_serial_number(),
+            index,
+        })
+    }
+
+    /// Opens `path` as a directory handle suitable for
+    /// `GetFileInformationByHandle`.
+    ///
+    /// `FILE_FLAG_BACKUP_SEMANTICS` is what allows a directory to be opened at
+    /// all. The first attempt asks only for `FILE_READ_ATTRIBUTES`, the right
+    /// `GetFileInformationByHandle` needs, so no read or execute permission on
+    /// the directory's contents is required (matching the Unix rule, where
+    /// `stat` needs nothing on the directory itself). The second attempt is a
+    /// plain read handle for paths or volumes that refuse an attribute-only
+    /// open. `None` from either path is a refusal, never an allow.
+    fn open_directory(path: &Path) -> Option<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        };
+
+        if let Ok(handle) = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+        {
+            return Some(handle);
+        }
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .ok()
     }
 }
 
@@ -65,7 +172,7 @@ impl DirIdent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneCwd {
     path: PathBuf,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     ident: DirIdent,
 }
 
@@ -83,33 +190,56 @@ pub enum PaneCwdError {
     /// `" (deleted)"`); a deleted cwd is not usable and must not be handed to
     /// a child.
     Deleted,
+    /// The path names a directory, but this platform or filesystem cannot
+    /// produce a stable identity for it (a Windows volume that reports file
+    /// index `0`, or a target with no identity primitive at all). A pin
+    /// without an identity could not detect a swap at the spawn boundary, so
+    /// the host refuses `cwd = "pane"` rather than degrade to an existence
+    /// check: fail closed, never weaker.
+    Unverifiable,
 }
 
 impl PaneCwd {
     /// Pins an already-known host directory (composition roots and tests).
     ///
-    /// The path must be absolute and name an existing directory; its inode
-    /// identity is recorded so [`Self::revalidate`] can catch a swap. This is
-    /// a *host* constructor: no plugin-facing surface reaches it, and it is
-    /// never fed `OSC 7` text.
+    /// The path must be absolute and name an existing directory; the
+    /// directory's object identity is recorded so [`Self::revalidate`] can
+    /// catch a swap. This is a *host* constructor: no plugin-facing surface
+    /// reaches it, and it is never fed `OSC 7` text.
     ///
     /// # Errors
     ///
     /// [`PaneCwdError::NotADirectory`] for a relative, missing, or
-    /// non-directory path.
+    /// non-directory path, and [`PaneCwdError::Unverifiable`] when the
+    /// platform or filesystem cannot produce a stable identity for the
+    /// directory (fail closed: a pin that cannot detect a swap is not minted).
     pub fn from_path(path: &Path) -> Result<Self, PaneCwdError> {
         if !path.is_absolute() {
             return Err(PaneCwdError::NotADirectory);
         }
-        let metadata = std::fs::metadata(path).map_err(|_| PaneCwdError::NotADirectory)?;
-        if !metadata.is_dir() {
+        let is_dir = std::fs::metadata(path)
+            .map_err(|_| PaneCwdError::NotADirectory)?
+            .is_dir();
+        if !is_dir {
             return Err(PaneCwdError::NotADirectory);
         }
-        Ok(Self {
-            path: path.to_path_buf(),
-            #[cfg(unix)]
-            ident: DirIdent::of(&metadata),
-        })
+        // The shape check above only classifies the error. The pin itself
+        // commits to the identity read below, which is the value the spawn
+        // boundary compares against, so a directory swapped in between is
+        // pinned as the object it is at pin time rather than silently
+        // trusted.
+        #[cfg(any(unix, windows))]
+        {
+            let ident = DirIdent::of_path(path).ok_or(PaneCwdError::Unverifiable)?;
+            Ok(Self {
+                path: path.to_path_buf(),
+                ident,
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(PaneCwdError::Unverifiable)
+        }
     }
 
     /// Pins the live kernel working directory of PTY child `pid`.
@@ -134,39 +264,29 @@ impl PaneCwd {
         &self.path
     }
 
-    /// Whether the pinned path still names the pinned inode.
+    /// Whether the pinned path still names the pinned directory.
     ///
     /// Called at the spawn boundary, after the source observation and before
-    /// the directory reaches a child. `false` means a swap, a rename, or a
-    /// deletion happened in between: the caller must refuse, never re-resolve
-    /// by name. On Unix this re-stats the path and compares `(st_dev,
-    /// st_ino)`; on Windows it checks that the path is still a directory (no
-    /// [`PaneCwd`] is ever captured from a PTY child there, so the weaker
-    /// check never decides a spawn).
+    /// the directory reaches a child. `false` means a swap, a rename, a
+    /// deletion, or an unprovable identity happened in between: the caller
+    /// must refuse, never re-resolve by name. The check re-identifies the path
+    /// with the same platform primitive the pin used — `(st_dev, st_ino)` on
+    /// Unix, `(volume serial, file index)` on Windows — and requires the pair
+    /// recorded by the pin, so an impostor directory that took the pinned name
+    /// has a different identity and is refused (#2948).
     #[must_use]
     pub fn revalidate(&self) -> bool {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         {
-            identity_of(&self.path) == Some(self.ident)
+            DirIdent::of_path(&self.path) == Some(self.ident)
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
-            self.path.is_dir()
+            // No identity primitive on this target: fail closed rather than
+            // degrade to an existence check that a path swap would satisfy.
+            false
         }
     }
-}
-
-/// Identity of `path` when it names an existing directory.
-///
-/// Symlinks are followed: the identity compared is the directory the path
-/// actually resolves to, which is exactly the question a spawn boundary asks.
-#[cfg(unix)]
-fn identity_of(path: &Path) -> Option<DirIdent> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_dir() {
-        return None;
-    }
-    Some(DirIdent::of(&metadata))
 }
 
 /// Linux `/proc` capture. Off Linux both entry points are stubs that refuse,
@@ -282,11 +402,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
-    fn revalidate_refuses_a_path_swapped_for_another_inode() {
+    #[cfg(any(target_os = "linux", windows))]
+    fn revalidate_refuses_a_path_swapped_for_another_directory() {
         // The defect behind #2911: a path is not an identity. After the pin,
         // the directory is moved away and a different one takes its name; the
-        // boundary check must refuse instead of following the new inode.
+        // boundary check must refuse instead of following the replacement.
+        // Windows runs the same case (#2948): the impostor has the same path
+        // and is a real directory, so only the volume serial + file index pair
+        // distinguishes it from the pin.
         let root = scratch("swap");
         let pane = root.join("pane");
         let moved = root.join("pane-moved");
@@ -297,14 +420,14 @@ mod tests {
 
         assert!(
             !pinned.revalidate(),
-            "a different inode at the pinned path must not revalidate"
+            "a different directory at the pinned path must not revalidate"
         );
         assert_eq!(pinned.path(), pane.as_path(), "the pin keeps its path");
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn revalidate_refuses_a_deleted_directory() {
         let root = scratch("deleted");
         let pane = root.join("pane");

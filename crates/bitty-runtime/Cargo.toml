@@ -182,6 +182,16 @@ nix = { workspace = true, features = ["fs", "signal"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+# CTX-1728 (#2948): the pane cwd pin is a directory *identity*, not a name, and
+# the spawn boundary must be able to re-identify the path. `std` exposes
+# `MetadataExt::{volume_serial_number, file_index}` only behind the unstable
+# `windows_by_handle` feature (rust-lang/rust#63010) at this workspace's MSRV,
+# and this crate forbids `unsafe`, so the safe `GetFileInformationByHandle`
+# wrapper is used instead of a raw `windows-sys` call. Already resolved in
+# Cargo.lock (1.0.11) through `walkdir`/`termcolor` on the same `windows-sys`
+# 0.61 line: a new Windows-only edge, no new package version, and `MIT` in its
+# `Unlicense OR MIT` expression keeps ADR-0004 rule 5 satisfied.
+winapi-util = "0.1.11"
 
 
 [dev-dependencies]

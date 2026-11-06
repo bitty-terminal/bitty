@@ -448,6 +448,7 @@ dependencies = [
  "nix 0.31.3",
  "rustix 1.1.6",
  "rustls",
+ "winapi-util",
  "windows-sys 0.61.2",
  "zeroize",
 ]

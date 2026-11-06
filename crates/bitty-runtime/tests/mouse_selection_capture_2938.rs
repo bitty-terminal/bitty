@@ -532,3 +532,45 @@ fn any_tracking_keeps_hover_and_drag_distinct() {
     );
     release(&mut rt, MouseButton::Left);
 }
+
+// ---------------------------------------------------------------------------
+// Merged contract (issue #2939): a live drag keeps its own receiver
+// ---------------------------------------------------------------------------
+
+#[test]
+fn live_drag_keeps_its_receiver_and_held_button_issue_2939() {
+    bitty_test_support::require_pty!();
+    // `focus_follows_mouse` is on by default (issue #2939 made hover focus
+    // ignore capture), so without the drag guard the pointer leaving the
+    // app's pane mid-drag would move the keyboard to the primary pane and
+    // the held-button drag reports would follow it. A captured drag owns the
+    // gesture until its release: focus stays, and the report keeps the held
+    // button clamped at the receiving pane's edge.
+    let mut rt = split_with_app_pane(SGR_BUTTON_TRACKING);
+    assert!(rt.set_focus(PANE));
+
+    rt.handle_cursor_moved(cell_center(&rt, PANE, 1, 1));
+    press(&mut rt, MouseButton::Left);
+    rt.handle_cursor_moved(cell_center(&rt, PRIMARY, 1, 1));
+
+    assert_eq!(
+        rt.focused_view(),
+        Some(PANE),
+        "a held captured drag must not let hover re-home focus"
+    );
+    let clamped = sgr(32, 1, 0, true);
+    let text = wait_for_pane_text(&mut rt, &clamped);
+    assert!(
+        text.contains(&clamped),
+        "the drag must keep the held button at the pane's edge: {text:?}"
+    );
+
+    release(&mut rt, MouseButton::Left);
+    // Released: motion is hover again and follows the pointer (issue #2939).
+    rt.handle_cursor_moved(cell_center(&rt, PRIMARY, 1, 1));
+    assert_eq!(
+        rt.focused_view(),
+        Some(PRIMARY),
+        "after the release hover must follow the pointer again"
+    );
+}

@@ -1712,11 +1712,16 @@ pub(crate) fn spawn_startup_shells(
         }
     };
     logging::info(|| {
+        // `PROGRAM (explicit=…, configured_shell=…)` is a pinned startup
+        // diagnostic (`tests/shell_knob.rs`, CTX-0298): the winning precedence
+        // layer from bitty#2928 is appended in its own trailing group so the
+        // historically matched prefix stays byte-identical.
         format!(
-            "bitty: effective program {:?} (source={}, configured_shell={})",
+            "bitty: effective program {:?} (explicit={}, configured_shell={}) (source={})",
             resolved.program,
-            resolved.source.label(),
-            spawn_spec.config_shell.is_some()
+            spawn_spec.program.is_some(),
+            spawn_spec.config_shell.is_some(),
+            resolved.source.label()
         )
     });
     let spawn_result = if let Some(program) = spawn_spec.program.as_deref() {

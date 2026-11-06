@@ -29,6 +29,7 @@ check() {
 
 package() {
 	install -Dm755 target/release/bitty "$pkgdir"/usr/bin/bitty
+	install -Dm755 target/release/bittyd "$pkgdir"/usr/bin/bittyd
 
 	# Desktop integration and AppStream metadata
 	install -Dm644 packaging/run.bitty.Bitty.desktop "$pkgdir"/usr/share/applications/run.bitty.Bitty.desktop

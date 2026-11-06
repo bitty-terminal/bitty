@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # make-unix-bundle.sh — assemble the versioned Linux binary bundle.
 #
-# Packs the Linux binary as `bin/bitty` together with the desktop entry,
+# Packs the Linux binaries as `bin/bitty` and `bin/bittyd` together with the
+# desktop entry,
 # icons, and AppStream metainfo under `share/`, plus LICENSE, README.md and
 # CHANGELOG.md, into `bitty-<version>-<target>.tar.zst` (REL-07 / issue
 # #1110; binary-compression section of release-distribution.md). Bare
@@ -37,15 +38,17 @@ DRY_RUN=0
 VERSION=""
 TARGET=""
 BINARY=""
+DAEMON=""
 OUTPUT=""
 
 usage() {
 	cat <<'EOF'
-Usage: scripts/make-unix-bundle.sh --version VERSION --target TARGET --binary PATH --output PATH [--dry-run]
+Usage: scripts/make-unix-bundle.sh --version VERSION --target TARGET --binary PATH --daemon PATH --output PATH [--dry-run]
 
   --version VERSION  release version embedded in the bundle name (X.Y.Z)
   --target TARGET    rust target triple (e.g. x86_64-unknown-linux-gnu)
   --binary PATH      Linux bitty binary to pack as bin/bitty
+  --daemon PATH      Linux bittyd binary to pack as bin/bittyd
   --output PATH      bundle path to create (e.g. dist/bitty-0.0.21-x86_64-unknown-linux-gnu.tar.zst)
   --dry-run          validate and stage the payload only; do not write the bundle
 EOF
@@ -68,6 +71,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--binary)
 		BINARY="${2:-}"
+		shift 2
+		;;
+	--daemon)
+		DAEMON="${2:-}"
 		shift 2
 		;;
 	--output)
@@ -95,6 +102,8 @@ done
 [[ "$TARGET" =~ ^[a-z0-9_]+(-[a-z0-9_]+)+$ ]] || die "--target must look like a rust target triple, got: $TARGET"
 [[ -n "$BINARY" ]] || die "--binary is required"
 [[ -f "$BINARY" ]] || die "--binary not found: $BINARY"
+[[ -n "$DAEMON" ]] || die "--daemon is required"
+[[ -f "$DAEMON" ]] || die "--daemon not found: $DAEMON"
 [[ -n "$OUTPUT" ]] || die "--output is required"
 command -v tar >/dev/null 2>&1 || die "tar not found"
 command -v zstd >/dev/null 2>&1 || die "zstd not found"
@@ -132,6 +141,8 @@ done
 
 cp "$BINARY" "$ROOT/bin/bitty"
 chmod 755 "$ROOT/bin/bitty"
+cp "$DAEMON" "$ROOT/bin/bittyd"
+chmod 755 "$ROOT/bin/bittyd"
 for f in "${PAYLOAD[@]}"; do
 	cp "$REPO_ROOT/$f" "$ROOT/$f"
 done
@@ -166,6 +177,7 @@ rm -f "$OUTPUT"
 EXPECTED="$(
 	{
 		echo "$TOPDIR/bin/bitty"
+		echo "$TOPDIR/bin/bittyd"
 		echo "$TOPDIR/LICENSE"
 		echo "$TOPDIR/README.md"
 		echo "$TOPDIR/CHANGELOG.md"

@@ -54,6 +54,7 @@ install -d %{buildroot}%{_datadir}/licenses/%{name}
 install -d %{buildroot}%{_docdir}/%{name}
 
 install -m 0755 bin/bitty %{buildroot}%{_bindir}/bitty
+install -m 0755 bin/bittyd %{buildroot}%{_bindir}/bittyd
 install -m 0644 share/applications/run.bitty.Bitty.desktop %{buildroot}%{_datadir}/applications/run.bitty.Bitty.desktop
 install -m 0644 share/metainfo/run.bitty.Bitty.metainfo.xml %{buildroot}%{_datadir}/metainfo/run.bitty.Bitty.metainfo.xml
 install -m 0644 LICENSE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE

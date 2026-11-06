@@ -35,6 +35,11 @@ package() {
 	install -Dm644 packaging/run.bitty.Bitty.desktop "$pkgdir"/usr/share/applications/run.bitty.Bitty.desktop
 	install -Dm644 packaging/run.bitty.Bitty.metainfo.xml "$pkgdir"/usr/share/metainfo/run.bitty.Bitty.metainfo.xml
 
+	# The per-user systemd unit (packaging/systemd/bittyd.service) is
+	# deliberately not installed: Alpine runs OpenRC and ships no systemd user
+	# manager, so the file would never be loaded. Users start `bittyd start`
+	# directly or under their own supervisor.
+
 	# Application icons
 	for size in 16 32 64 128 256 512; do
 		install -Dm644 "packaging/icons/hicolor/${size}x${size}/apps/bitty.png" \

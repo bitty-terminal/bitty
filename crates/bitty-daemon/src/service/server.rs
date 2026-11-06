@@ -9,9 +9,11 @@
 //!    single-instance `flock`);
 //! 3. mint and persist the per-boot operator capability (`0600` file);
 //! 4. open the owner-private audit sink;
-//! 5. block `SIGTERM`/`SIGINT` and create a signal fd, so the same loop that
-//!    serves requests also runs the signal drain without a signal-handler
-//!    hack.
+//! 5. block `SIGTERM`/`SIGINT`/`SIGHUP` and create a signal fd, so the same
+//!    loop that serves requests also runs the signal drain without a
+//!    signal-handler hack. Only `SIGTERM`/`SIGINT` stop the loop; `SIGHUP` is
+//!    drained and dropped so a daemon started from a terminal outlives that
+//!    terminal (bitty#2920).
 //!
 //! Each accepted connection captures the peer before parsing a frame
 //! ([`crate::peer::PeerGuard::capture`]), gets one server-assigned [`crate::handshake::ClientId`], and starts
@@ -596,6 +598,14 @@ mod unix {
         let mut mask = SigSet::empty();
         mask.add(Signal::SIGTERM);
         mask.add(Signal::SIGINT);
+        // `SIGHUP` is blocked and drained, never acted on: the daemon is a
+        // session host that must survive the terminal which started it
+        // (bitty#2920). Blocking is deliberate instead of `SIG_IGN`, because
+        // an ignored disposition survives `execve`: every shell the daemon
+        // spawns would inherit it and stop reacting to a hangup. The blocked
+        // mask is reset for the child by the process spawn path, so spawned
+        // shells keep the default `SIGHUP` action.
+        mask.add(Signal::SIGHUP);
         pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
             .map_err(|_| ServerError::Signals)?;
         let signal_fd =
@@ -683,14 +693,19 @@ mod unix {
                 .collect();
             drop(poll_fds);
 
-            if signal_ready
-                && signal_fd
-                    .read_signal()
-                    .map_err(|_| ServerError::Signals)?
-                    .is_some()
-            {
-                let _ = service.signal_stop(current);
-                shutting_down = true;
+            if signal_ready {
+                // One signal per wakeup: the fd reports the lowest pending
+                // number first, so a `SIGHUP` that arrives with a `SIGTERM`
+                // is drained here and the next poll iteration takes the stop.
+                if let Some(info) = signal_fd.read_signal().map_err(|_| ServerError::Signals)? {
+                    // A closed terminal hangs up the foreground process group;
+                    // the daemon keeps serving (bitty#2920). Every other
+                    // masked signal (`SIGTERM`, `SIGINT`) starts the drain.
+                    if info.ssi_signo != Signal::SIGHUP as u32 {
+                        let _ = service.signal_stop(current);
+                        shutting_down = true;
+                    }
+                }
             }
 
             if listener_ready && !shutting_down {

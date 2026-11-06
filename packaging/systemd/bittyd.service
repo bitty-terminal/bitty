@@ -1,0 +1,34 @@
+# Bitty session daemon, as a per-user systemd unit (bitty#2920).
+#
+# The daemon is not a system-wide service: it binds a socket inside the
+# invoking user's runtime directory, mints an owner-private operator
+# capability, and hosts that user's terminal sessions. Enable it per user:
+#
+#   systemctl --user enable --now bittyd
+#   loginctl enable-linger "$USER"   # optional: run without an open session
+#
+# `bittyd start` stays in the foreground, which is what `Type=simple` wants;
+# the daemon drains `SIGHUP` without stopping and drains `SIGTERM` to exit.
+
+[Unit]
+Description=Bitty session daemon
+Documentation=https://github.com/bitty-terminal/bitty
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bittyd start
+Restart=on-failure
+RestartSec=2
+# `SIGTERM` goes to the daemon only, so its own session drain runs first; if
+# the unit stop timeout expires, `SIGKILL` reaches every process left in the
+# unit's cgroup.
+KillMode=mixed
+# Hardening that a session host can still work under: it spawns the user's
+# shells, so the home directory must stay writable and visible (no
+# `ProtectHome`), while `/usr`, `/boot`, and `/etc` stay read-only.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=default.target

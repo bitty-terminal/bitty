@@ -276,6 +276,45 @@ across these files and runs `xmllint`, `appstreamcli validate`, and
 covers each drift case. Both run in `just check` and the CI Quality gates job,
 and the release `validate` job reruns the gate.
 
+## systemd user unit (`packaging/systemd/bittyd.service`)
+
+`bittyd start` runs in the foreground and survives a closed terminal (`SIGHUP`
+is drained and ignored), so a supervisor is what keeps it running. The
+per-user unit ships at `/usr/lib/systemd/user/bittyd.service` with
+`Type=simple`, `ExecStart=/usr/bin/bittyd start`, `Restart=on-failure`,
+`RestartSec=2`, `KillMode=mixed`, and the session-host-safe hardening
+`NoNewPrivileges=yes`, `PrivateTmp=yes`, `ProtectSystem=full` (`ProtectHome`
+is deliberately unset: the daemon hosts the user's shells in their home
+directories).
+
+It is a **user** unit, not a system service: the daemon binds a socket in the
+invoking user's runtime directory, mints an owner-private operator capability,
+and hosts that user's sessions. Each user enables their own copy:
+
+```sh
+systemctl --user enable --now bittyd
+loginctl enable-linger "$USER"   # optional: keep it running without a login session
+```
+
+Install destinations by channel:
+
+| Channel                           | Installs the unit                                        |
+| --------------------------------- | -------------------------------------------------------- |
+| `nfpm.yaml` deb/rpm               | yes, `/usr/lib/systemd/user/bittyd.service`              |
+| `nfpm.yaml` archlinux             | yes, `/usr/lib/systemd/user/bittyd.service`              |
+| `nfpm.yaml` apk                   | no: Alpine runs OpenRC and ships no systemd user manager |
+| `packaging/PKGBUILD` (AUR)        | yes, from `packaging/systemd/bittyd.service`             |
+| `packaging/PKGBUILD.bin`          | yes, from the release bundle `share/systemd/user/`       |
+| `packaging/bitty.spec` (RPM/Copr) | yes, from the release bundle `share/systemd/user/`       |
+| `packaging/alpine/APKBUILD`       | no: OpenRC only, recorded in the recipe                  |
+
+The versioned Linux bundle carries it as
+`share/systemd/user/bittyd.service`, which is what the prebuilt recipes
+(`PKGBUILD.bin`, `bitty.spec`) install from. The local syntax gate is
+`systemd-analyze verify --user packaging/systemd/bittyd.service`; no install
+script, `systemctl` enable, or preset ships, because a user unit is enabled per
+user and never by the package.
+
 ## Nix Flake
 
 `flake.nix` provides `packages.default` via `crane` + `rust-overlay` at `1.98.1`, filtered source bounded, no unsafe. Check:
@@ -427,8 +466,9 @@ downloads. The `verify-windows-zip` job unzips on a clean Windows runner and
 runs `bitty.exe --version`.
 
 The versioned Linux bundles pack `bin/bitty` and `bin/bittyd` with `share/`
-(desktop entry, icons, metainfo) plus `LICENSE`, `README.md`, and
-`CHANGELOG.md` under one top-level `bitty-<version>-<target>/` directory
+(desktop entry, icons, metainfo, systemd user unit) plus `LICENSE`,
+`README.md`, and `CHANGELOG.md` under one top-level
+`bitty-<version>-<target>/` directory
 (assembled by `scripts/make-windows-zip.sh`'s sibling
 `scripts/make-unix-bundle.sh`; the bare triple binaries keep shipping for
 now). The `verify-unix-bundle` job expands each archive on a clean Ubuntu

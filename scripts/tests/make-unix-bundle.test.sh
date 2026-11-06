@@ -80,6 +80,7 @@ EXPECTED="$(
 		echo "$TOPDIR/CHANGELOG.md"
 		echo "$TOPDIR/share/applications/run.bitty.Bitty.desktop"
 		echo "$TOPDIR/share/metainfo/run.bitty.Bitty.metainfo.xml"
+		echo "$TOPDIR/share/systemd/user/bittyd.service"
 		for size in 16 32 64 128 256 512; do
 			echo "$TOPDIR/share/icons/hicolor/${size}x${size}/apps/bitty.png"
 		done

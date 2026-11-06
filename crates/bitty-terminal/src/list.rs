@@ -816,14 +816,20 @@ pub fn format_fonts_table(
     if !catalog.supported {
         return String::from("(font discovery unavailable on this platform)\n");
     }
-    let mut out = format!("{}\n", bold("FAMILY STYLE SOURCE", color));
+    let mut out = String::new();
     if catalog.faces.is_empty() {
-        out.push_str("(no fonts found)\n");
+        out.push_str(&format!(
+            "{}\n(no fonts found)\n",
+            bold("FAMILY STYLE SOURCE", color)
+        ));
         return out;
     }
-    for face in &catalog.faces {
-        out.push_str(&format!("{} {} {}\n", face.family, face.style, face.source));
-    }
+    let rows: Vec<Vec<String>> = catalog
+        .faces
+        .iter()
+        .map(|face| vec![face.family.clone(), face.style.clone(), face.source.clone()])
+        .collect();
+    out.push_str(&render_table(&["FAMILY", "STYLE", "SOURCE"], &rows, color));
     if catalog.truncated {
         out.push_str(&format!(
             "(showing {} of {} faces; raise the platform font set or filter externally)\n",
@@ -2492,31 +2498,42 @@ pub fn format_services_envelope(spelling: &str, services: &[ServiceInfo]) -> Str
 #[must_use]
 pub fn format_services_table(services: &[ServiceInfo], no_color: bool) -> String {
     let color = color_enabled(no_color);
-    let mut out = String::new();
-    out.push_str(&format!(
-        "{}\n",
-        bold(
-            "INTERFACE OWNER VERSION PROVIDER BACKING_HEAD GRANT_SOURCE STATUS",
-            color
-        )
-    ));
     if services.is_empty() {
-        out.push_str("(no services)\n");
-        return out;
+        return format!(
+            "{}\n(no services)\n",
+            bold(
+                "INTERFACE OWNER VERSION PROVIDER BACKING_HEAD GRANT_SOURCE STATUS",
+                color
+            )
+        );
     }
-    for s in services {
-        out.push_str(&format!(
-            "{} {} {} {} {} {} {}\n",
-            sanitize_service_cell(&s.interface),
-            sanitize_service_cell(&s.owner),
-            sanitize_service_cell(&s.version),
-            sanitize_service_cell(&s.provider),
-            sanitize_service_cell(&s.backing_head),
-            sanitize_service_cell(&s.grant_source),
-            sanitize_service_cell(&s.status)
-        ));
-    }
-    out
+    let rows: Vec<Vec<String>> = services
+        .iter()
+        .map(|s| {
+            vec![
+                sanitize_service_cell(&s.interface),
+                sanitize_service_cell(&s.owner),
+                sanitize_service_cell(&s.version),
+                sanitize_service_cell(&s.provider),
+                sanitize_service_cell(&s.backing_head),
+                sanitize_service_cell(&s.grant_source),
+                sanitize_service_cell(&s.status),
+            ]
+        })
+        .collect();
+    render_table(
+        &[
+            "INTERFACE",
+            "OWNER",
+            "VERSION",
+            "PROVIDER",
+            "BACKING_HEAD",
+            "GRANT_SOURCE",
+            "STATUS",
+        ],
+        &rows,
+        color,
+    )
 }
 
 /// Render the failure envelope for `instances` runtime/permission errors.
@@ -2661,32 +2678,217 @@ pub fn format_themes_table_with_color(themes: &[ThemeInfo], color: bool) -> Stri
     out
 }
 
+// ---------------------------------------------------------------------------
+// Aligned table rendering
+// ---------------------------------------------------------------------------
+
+/// Table width used when `COLUMNS` is unset, unparsable, or out of range.
+const DEFAULT_TABLE_WIDTH: usize = 100;
+/// Smallest width a fixed column shrinks to before the table may overflow.
+const MIN_COLUMN_WIDTH: usize = 8;
+/// Smallest width the last (free-text) column shrinks to before the fixed
+/// columns start giving way. Identifiers and comma lists stay readable.
+const MIN_FLEX_WIDTH: usize = 24;
+/// Spaces between two columns.
+const COLUMN_GAP: usize = 2;
+
+/// Terminal width for table wrapping.
+///
+/// `COLUMNS` is the only signal available without an ioctl, and a pipe or a
+/// test harness has no terminal at all; the fallback keeps output stable.
+fn table_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|width| (40..=400).contains(width))
+        .unwrap_or(DEFAULT_TABLE_WIDTH)
+}
+
+/// Split one cell into lines of at most `width` characters.
+///
+/// Breaks at the last space or comma that fits, so a comma-joined list keeps
+/// its separators at the end of a line instead of splitting an identifier.
+/// A token longer than the column is hard-split; nothing is dropped.
+fn wrap_cell(text: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    if width == 0 || chars.len() <= width {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        if chars.len() - start <= width {
+            lines.push(chars[start..].iter().collect());
+            break;
+        }
+        let limit = start + width;
+        let mut cut = None;
+        for i in (start + 1..=limit).rev() {
+            if chars[i - 1] == ' ' || chars[i - 1] == ',' || chars[i - 1] == ':' {
+                cut = Some(i);
+                break;
+            }
+        }
+        let end = cut.unwrap_or(limit);
+        let mut line: String = chars[start..end].iter().collect();
+        while line.ends_with(' ') {
+            line.pop();
+        }
+        lines.push(line);
+        start = end;
+        while start < chars.len() && chars[start] == ' ' {
+            start += 1;
+        }
+    }
+    lines
+}
+
+/// Pad a plain (escape-free) cell to `width` characters.
+fn pad_cell(text: &str, width: usize) -> String {
+    let mut cell = text.to_string();
+    let len = text.chars().count();
+    if len < width {
+        cell.push_str(&" ".repeat(width - len));
+    }
+    cell
+}
+
+/// Render an aligned table with a bold header.
+///
+/// Columns are padded to their widest cell; when the natural table is wider
+/// than the terminal the widest columns shrink in turn (never below
+/// [`MIN_COLUMN_WIDTH`]) and their cells wrap onto continuation lines aligned
+/// under the column, so one long value can no longer run every row together.
+fn render_table(header: &[&str], rows: &[Vec<String>], color: bool) -> String {
+    let columns = header.len();
+    if columns == 0 {
+        return String::new();
+    }
+    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate().take(columns) {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+    let gap = COLUMN_GAP * (columns - 1);
+    let mut total: usize = widths.iter().sum::<usize>() + gap;
+    let width = table_width();
+    // The last column carries free text (commands, descriptions, details), so
+    // it gives way first; the fixed columns only shrink once it is at its
+    // floor. Shrinking every column evenly mangles identifiers.
+    let flexible = columns - 1;
+    while total > width && widths[flexible] > MIN_FLEX_WIDTH {
+        widths[flexible] -= 1;
+        total -= 1;
+    }
+    while total > width {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .take(flexible)
+            .max_by_key(|(_, column)| **column)
+        else {
+            break;
+        };
+        if widths[index] <= MIN_COLUMN_WIDTH {
+            break;
+        }
+        widths[index] -= 1;
+        total -= 1;
+    }
+
+    let mut out = String::new();
+    let mut line = String::new();
+    for (index, cell) in header.iter().enumerate() {
+        line.push_str(&pad_cell(cell, widths[index]));
+        if index + 1 < columns {
+            line.push_str(&" ".repeat(COLUMN_GAP));
+        }
+    }
+    out.push_str(&bold(line.trim_end(), color));
+    out.push('\n');
+
+    for row in rows {
+        let wrapped: Vec<Vec<String>> = (0..columns)
+            .map(|index| {
+                row.get(index)
+                    .map(|cell| wrap_cell(cell, widths[index]))
+                    .unwrap_or_else(|| vec![String::new()])
+            })
+            .collect();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        for line_index in 0..height {
+            let mut line = String::new();
+            for (index, cells) in wrapped.iter().enumerate() {
+                let cell = cells.get(line_index).map(String::as_str).unwrap_or("");
+                line.push_str(&pad_cell(cell, widths[index]));
+                if index + 1 < columns {
+                    line.push_str(&" ".repeat(COLUMN_GAP));
+                }
+            }
+            out.push_str(line.trim_end());
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Render plugins as a human table.
+///
+/// The fixed columns are aligned; a plugin's command list is printed on
+/// indented continuation lines wrapped to the terminal width, and one blank
+/// line separates plugins. Putting a 13-command list inside a fifth column
+/// either overflowed the terminal or wrapped every identifier in half.
 #[must_use]
 pub fn format_plugins_table(plugins: &[PluginInfo], no_color: bool) -> String {
     let color = color_enabled(no_color);
-    let mut out = String::new();
-    out.push_str(&format!(
-        "{}\n",
-        bold("ID VERSION BUNDLED ENABLED COMMANDS", color)
-    ));
+    let header = ["ID", "VERSION", "BUNDLED", "ENABLED"];
     if plugins.is_empty() {
-        out.push_str("(no plugins)\n");
-        return out;
+        return format!("{}\n(no plugins)\n", bold(&header.join(" "), color));
     }
-    for p in plugins {
-        out.push_str(&format!(
-            "{} {} {} {} {}\n",
-            p.id,
-            p.version,
-            if p.bundled { "yes" } else { "no" },
-            if p.enabled { "yes" } else { "no" },
-            if p.commands.is_empty() {
-                "-".to_string()
-            } else {
-                p.commands.join(",")
-            }
+    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
+    for plugin in plugins {
+        widths[0] = widths[0].max(plugin.id.chars().count());
+        widths[1] = widths[1].max(plugin.version.chars().count());
+    }
+    let width = table_width();
+    let mut out = String::new();
+    let mut line = String::new();
+    for (index, cell) in header.iter().enumerate() {
+        line.push_str(&pad_cell(cell, widths[index]));
+        line.push_str(&" ".repeat(COLUMN_GAP));
+    }
+    out.push_str(&bold(line.trim_end(), color));
+    out.push('\n');
+
+    for (index, plugin) in plugins.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let mut row = String::new();
+        row.push_str(&pad_cell(&plugin.id, widths[0]));
+        row.push_str(&" ".repeat(COLUMN_GAP));
+        row.push_str(&pad_cell(&plugin.version, widths[1]));
+        row.push_str(&" ".repeat(COLUMN_GAP));
+        row.push_str(&pad_cell(
+            if plugin.bundled { "yes" } else { "no" },
+            widths[2],
         ));
+        row.push_str(&" ".repeat(COLUMN_GAP));
+        row.push_str(if plugin.enabled { "yes" } else { "no" });
+        out.push_str(row.trim_end());
+        out.push('\n');
+        if !plugin.commands.is_empty() {
+            let joined = plugin.commands.join(", ");
+            for wrapped in wrap_cell(&joined, width.saturating_sub(2)) {
+                out.push_str("  ");
+                out.push_str(&wrapped);
+                out.push('\n');
+            }
+        }
     }
     out
 }
@@ -2695,24 +2897,24 @@ pub fn format_plugins_table(plugins: &[PluginInfo], no_color: bool) -> String {
 #[must_use]
 pub fn format_instances_table(instances: &[InstanceInfo], no_color: bool) -> String {
     let color = color_enabled(no_color);
-    let mut out = String::new();
-    out.push_str(&format!("{}\n", bold("INSTANCE SOCKET LIVE DETAIL", color)));
     if instances.is_empty() {
-        out.push_str(
-            "(no instances — start bitty to serve an endpoint, or set BITTY_SOCKET/XDG_RUNTIME_DIR)\n",
+        return format!(
+            "{}\n(no instances — start bitty to serve an endpoint, or set BITTY_SOCKET/XDG_RUNTIME_DIR)\n",
+            bold("INSTANCE SOCKET LIVE DETAIL", color)
         );
-        return out;
     }
-    for inst in instances {
-        out.push_str(&format!(
-            "{} {} {} {}\n",
-            inst.instance,
-            inst.socket,
-            if inst.live { "yes" } else { "no" },
-            inst.detail
-        ));
-    }
-    out
+    let rows: Vec<Vec<String>> = instances
+        .iter()
+        .map(|inst| {
+            vec![
+                inst.instance.clone(),
+                inst.socket.clone(),
+                if inst.live { "yes" } else { "no" }.to_string(),
+                inst.detail.clone(),
+            ]
+        })
+        .collect();
+    render_table(&["INSTANCE", "SOCKET", "LIVE", "DETAIL"], &rows, color)
 }
 
 /// Render actions as a human table (CTX-1127).
@@ -2777,22 +2979,30 @@ pub fn format_actions_table(
 #[must_use]
 pub fn format_keymaps_table(meta: &KeymapMeta, keymaps: &[KeymapInfo], no_color: bool) -> String {
     let color = color_enabled(no_color);
-    let mut out = String::new();
-    out.push_str(&format!(
-        "# mod_key: {} (source: {})\n",
-        meta.mod_key, meta.source
-    ));
-    out.push_str(&format!("{}\n", bold("CHORD ACTION CONTEXT SOURCE", color)));
+    let mut out = format!("# mod_key: {} (source: {})\n", meta.mod_key, meta.source);
     if keymaps.is_empty() {
-        out.push_str("(no keymaps)\n");
+        out.push_str(&format!(
+            "{}\n(no keymaps)\n",
+            bold("CHORD ACTION CONTEXT SOURCE", color)
+        ));
         return out;
     }
-    for k in keymaps {
-        out.push_str(&format!(
-            "{} {} {} {}\n",
-            k.chord, k.action, k.context, k.source
-        ));
-    }
+    let rows: Vec<Vec<String>> = keymaps
+        .iter()
+        .map(|k| {
+            vec![
+                k.chord.clone(),
+                k.action.clone(),
+                k.context.clone(),
+                k.source.clone(),
+            ]
+        })
+        .collect();
+    out.push_str(&render_table(
+        &["CHORD", "ACTION", "CONTEXT", "SOURCE"],
+        &rows,
+        color,
+    ));
     out
 }
 
@@ -4098,10 +4308,10 @@ mod tests {
         assert!(env.contains("goto_split:left"), "envelope: {env:?}");
         let table = format_keymaps_table(&meta, &rows, true);
         assert!(table.contains("mod_key: alt"), "table: {table:?}");
-        assert!(
-            table.contains("CHORD ACTION CONTEXT SOURCE"),
-            "table: {table:?}"
-        );
+        // The header is column-padded, so assert the names, not the spacing.
+        for column in ["CHORD", "ACTION", "CONTEXT", "SOURCE"] {
+            assert!(table.contains(column), "header {column}: {table:?}");
+        }
         assert!(table.contains("alt+h"), "table: {table:?}");
     }
 

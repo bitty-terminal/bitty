@@ -14,7 +14,7 @@ use crate::official::OfficialPlugin;
 pub const SOURCE_REPOSITORY: &str = "https://github.com/bitty-terminal/bitty-plugins";
 
 /// Exact registry commit this catalog was generated from.
-pub const SOURCE_REVISION: &str = "98f8a06a10c2cf50cc1ec264de555f8bca0b66ce";
+pub const SOURCE_REVISION: &str = "62a43a33b1bf3b86e0b78e3b4cb2ba6de22cc77a";
 
 /// Official plugin entries, sorted by canonical id.
 pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[

@@ -40,6 +40,7 @@
 //! ```lua
 //! -- init.lua: wezterm-style, data only.
 //! return {
+//!     config_version = 1, -- top-level shape version; absent means 0 (pre-version)
 //!     theme = "dark", -- alias for appearance.theme
 //!     appearance = { theme = "bitty-dark" }, -- wins over the alias
 //!     font = { family = "JetBrains Mono", size = 13.0 },
@@ -687,6 +688,10 @@ pub struct InputData {
 /// keys are reported via `undeclared` for fail-closed diagnostics.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ConfigData {
+    /// Top-level `config_version` shape version (bitty#2923). Absent means
+    /// the pre-version shape (version `0`); the typed plan carries it as
+    /// `schema_version` so migration has one carrier.
+    pub config_version: Option<u32>,
     /// Top-level `theme` alias.
     pub theme: Option<String>,
     /// `appearance.theme` (wins over the alias when both are present).
@@ -784,7 +789,8 @@ impl ConfigData {
     /// Whether no overrides were declared.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.theme.is_none()
+        self.config_version.is_none()
+            && self.theme.is_none()
             && self.appearance_theme.is_none()
             && self.appearance_colors.is_none()
             && self.animations.is_none()
@@ -1336,6 +1342,16 @@ impl ConfigData {
         let mut out = Self::empty();
         for (key, val) in pairs {
             match key.as_str() {
+                // bitty#2923: top-level shape version. Absent means 0; the
+                // supported range is enforced fail-closed downstream by
+                // `bitty-config` (a newer version is refused, never guessed).
+                "config_version" => {
+                    let raw = expect_integer(key, val)?;
+                    let version = u32::try_from(raw).map_err(|_| {
+                        format!("{key}: expected a non-negative integer (found {raw})")
+                    })?;
+                    out.config_version = Some(version);
+                }
                 "theme" => out.theme = Some(expect_string(key, val)?),
                 "appearance" => {
                     let nested = expect_table(key, val)?;
@@ -2822,6 +2838,29 @@ mod tests {
             let data = eval_ok(code);
             assert!(data.is_empty(), "code: {code:?}");
             assert!(data.undeclared.is_empty());
+        }
+    }
+
+    #[test]
+    fn config_version_extracts_and_absent_means_zero() {
+        let data = eval_ok("return { config_version = 1 }");
+        assert_eq!(data.config_version, Some(1));
+        assert!(!data.is_empty());
+        assert!(data.undeclared.is_empty());
+
+        let absent = eval_ok("return { theme = \"dark\" }");
+        assert_eq!(absent.config_version, None);
+    }
+
+    #[test]
+    fn config_version_must_be_a_non_negative_integer() {
+        for code in [
+            "return { config_version = -1 }",
+            "return { config_version = 1.5 }",
+            "return { config_version = \"1\" }",
+        ] {
+            let message = eval_err(code);
+            assert!(message.contains("config_version"), "{code}: {message}");
         }
     }
 

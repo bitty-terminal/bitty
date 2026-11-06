@@ -14,8 +14,8 @@ use crate::spawn::{looks_like_negative_number, parse_split_token};
 /// `program` is the optional `argv[0]` to spawn inside the PTY. When `None`
 /// the spawn layer resolves to the default shell (`$SHELL`, then the platform
 /// default — `/bin/sh` on Unix, `pwsh.exe`/`powershell.exe`/`cmd.exe` on
-/// Windows, bitty#2928 — via [`resolve_default_shell`]); parsing itself stays
-/// `None` to keep arg parsing pure (CTX-0136).
+/// Windows, bitty#2928 — via [`crate::spawn::resolve_default_shell`]); parsing
+/// itself stays `None` to keep arg parsing pure (CTX-0136).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Args {
     /// When true the binary runs a single headless tick smoke and exits.

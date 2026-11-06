@@ -112,21 +112,21 @@ pub struct AltDragState {
     pub pixel_dy: i32,
 }
 
-/// Active Alt+edge float resize (CTX-1150).
+/// Active Alt+edge float resize (CTX-1150, issue #2945).
 ///
-/// An Alt+Left-press on a structural float border grabs that edge via
+/// An Alt+Left-press on a float border grabs that edge via
 /// [`detect_resize_edge`] (with a [`RESIZE_HANDLE_CELLS`]-cell hit area);
-/// motion resizes the overlay bounds live through [`resize_floating_rect`]
-/// (clamped to view minima and the container) installed via
-/// [`Runtime::set_layout`], so leaf grids and PTY winsize follow exactly
-/// like a keyboard resize. Anchored floats (pinned, detached, mode-floating)
-/// fail soft at grab time and stay on the Alt+drag move path; that deferral
-/// is documented on [`Runtime::begin_float_resize`]. `None` when no resize
-/// is active; cleared on release. Presentation-adjacent but solver-committed
-/// per step (each step is a clamped layout install, never interpolation).
+/// motion resizes the overlay live (clamped to view minima and the
+/// container). Structural overlays reinstall their bounds through
+/// [`Runtime::set_layout`]; anchored floats (pinned, detached, mode-floating
+/// lifts excluded) store the step in the runtime anchor store (issue #2945)
+/// — either way leaf grids and PTY winsize follow exactly like a keyboard
+/// resize. `None` when no resize is active; cleared on release.
+/// Presentation-adjacent but solver-committed per step (each step is a
+/// clamped layout install or a clamped anchor commit, never interpolation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FloatResizeState {
-    /// Grabbed floating leaf (structural overlay only).
+    /// Grabbed floating leaf (structural overlay or anchored float).
     pub leaf: ViewId,
     /// Border the grab holds (edges and corners).
     pub edge: ResizeEdge,
@@ -134,6 +134,11 @@ pub struct FloatResizeState {
     pub anchor_col: i32,
     /// Anchor row (container cells) at grab or last move.
     pub anchor_row: i32,
+    /// True when the grab holds an anchored overlay (pinned or detached
+    /// float, issue #2945): its extent lives in the runtime anchor store
+    /// rather than in layout-tree overlay bounds, so a step writes the
+    /// anchor instead of reinstalling the layout.
+    pub anchored: bool,
 }
 
 /// Active Mod+drag tiled-panel move (issue #1694, CTX-0966; issue #2337).
@@ -531,44 +536,106 @@ impl Runtime {
         self.float_resize.map(|resize| resize.leaf)
     }
 
-    /// Edge under the pointer for a structural float, if any (CTX-1150 hover
+    /// Edge under the pointer for a floating panel, if any (CTX-1150 hover
     /// affordance query).
     ///
     /// Pure query over [`detect_resize_edge`]: resolves the topmost floating
-    /// leaf under `pos` through the present frames, reads its structural
-    /// overlay bounds, and reports which border the pointer grabs. Returns
-    /// `None` over interiors, background, and anchored floats (pinned,
-    /// detached, mode-floating: deferred, see [`Self::begin_float_resize`]).
+    /// leaf under `pos` through the present frames and reports which border
+    /// the pointer grabs — structural overlay bounds for an in-tree overlay,
+    /// the composited anchor rect for a pinned or detached float (issue
+    /// #2945). Returns `None` over interiors, background, and in-tree
+    /// mode-floating lifts (their rect is container-derived with no stored
+    /// extent yet; see [`Self::begin_float_resize`]).
     /// The platform layer currently exposes no cursor-icon setter, so no
     /// caller sets a shape yet; the drag itself works without it (mirrors
     /// [`Self::border_drag_hover_at`]).
     #[must_use]
     pub fn float_resize_hover_at(&self, pos: CursorPosition) -> Option<ResizeEdge> {
         let (leaf, _) = self.cursor_to_present_cell(pos)?;
-        let point = self.cursor_to_layout_point(pos)?;
-        let bounds = self.layout.overlay_bounds_containing(leaf)?;
+        let anchored = self.is_anchored_overlay(leaf);
+        let point = self.floating_resize_point(pos, anchored)?;
+        let bounds = self.floating_resize_bounds(leaf)?;
         detect_resize_edge(bounds, point, RESIZE_HANDLE_CELLS)
     }
 
-    /// Attempts to grab a structural float border for an Alt+edge resize
-    /// (CTX-1150).
+    /// Cell rect a float border grab operates on (issue #2945).
+    ///
+    /// Structural overlays keep their authored layout bounds; anchored
+    /// (pinned/detached) floats report their composited cell rect, which is
+    /// what the present path paints. `None` for every other leaf, including
+    /// in-tree `Floating`/`Scratchpad` lifts whose rect has no stored extent.
+    fn floating_resize_bounds(&self, leaf: ViewId) -> Option<UiRect> {
+        self.layout
+            .overlay_bounds_containing(leaf)
+            .or_else(|| self.anchored_overlay_rect(leaf))
+    }
+
+    /// Container cell under `pos` in overlay-bound space (issue #2945).
+    ///
+    /// Overlay bounds are authored in container cells and placed by the solver
+    /// at `cell * live cell size` with **no** decoration-outer inset, so an
+    /// anchored float's painted edge sits exactly on its cell edge. Mapping an
+    /// anchored grab through [`Self::cursor_to_layout_point`] would therefore
+    /// shift the handle by the decoration inset (most of a cell at shipped
+    /// metrics) and put the visible left/top edge outside its own rect. The
+    /// structural overlay path keeps the historical mapping so its accepted
+    /// geometry tests stay untouched.
+    fn cursor_to_overlay_cell(&self, pos: CursorPosition) -> Option<UiPoint> {
+        if !pos.x.is_finite() || !pos.y.is_finite() {
+            return None;
+        }
+        let live = self.live_cell_metrics();
+        let cell_w = live.width as f64;
+        let cell_h = live.height as f64;
+        if cell_w <= 0.0 || cell_h <= 0.0 {
+            return None;
+        }
+        let pad_px = f64::from(self.window_padding_physical());
+        let x = pos.x - pad_px;
+        let y = pos.y - pad_px;
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let col = (x / cell_w).floor();
+        let row = (y / cell_h).floor();
+        if !(0.0..=f64::from(u16::MAX)).contains(&col)
+            || !(0.0..=f64::from(u16::MAX)).contains(&row)
+        {
+            return None;
+        }
+        Some(UiPoint::new(col as u16, row as u16))
+    }
+
+    /// Cell point for a float border grab, in the space its rect lives in
+    /// (issue #2945).
+    fn floating_resize_point(&self, pos: CursorPosition, anchored: bool) -> Option<UiPoint> {
+        if anchored {
+            self.cursor_to_overlay_cell(pos)
+        } else {
+            self.cursor_to_layout_point(pos)
+        }
+    }
+
+    /// Attempts to grab a float border for an Alt+edge resize (CTX-1150,
+    /// issue #2945).
     ///
     /// Requires Alt held (the Alt+drag move family owns
     /// floats; Super is the compositor's window-drag Mod and must not
     /// grab in-app floats per issue #2140. Shift forces selection per
     /// the CTX-0181 precedent), no active
-    /// drag of any kind, a known cursor over a structural float border
+    /// drag of any kind, and a known cursor over a float border
     /// ([`detect_resize_edge`] with a [`RESIZE_HANDLE_CELLS`]-cell hit
     /// area). The grab focuses the resized pane. Returns `true` when the
     /// resize started (caller consumes the press and skips selection);
     /// `false` leaves all state untouched so the press falls through to the
     /// Alt+drag move (interior) or selection.
     ///
-    /// Anchored floats (pinned, detached, mode-floating) fail soft here on
-    /// purpose: their present size is container-derived with no free rect to
-    /// resize, so the interior move path keeps them. Free-rect resizing for
-    /// those kinds stays a follow-up; this keeps the solver untouched and
-    /// the gesture fail-closed.
+    /// Two float families are grabbable: structural overlays (their
+    /// authored layout bounds are reinstalled per step) and anchored
+    /// floats — pinned leaves and workspace-detached floats — whose extent
+    /// lives in the runtime anchor store (issue #2945). Only in-tree
+    /// `Floating`/`Scratchpad` lifts stay deferred: their rect is
+    /// container-derived and the interior move path keeps them.
     pub fn begin_float_resize(&mut self) -> bool {
         if !self.float_mod_held() {
             return false;
@@ -586,10 +653,11 @@ impl Runtime {
         let Some((leaf, _)) = self.cursor_to_present_cell(cursor) else {
             return false;
         };
-        let Some(point) = self.cursor_to_layout_point(cursor) else {
+        let anchored = self.is_anchored_overlay(leaf);
+        let Some(point) = self.floating_resize_point(cursor, anchored) else {
             return false;
         };
-        let Some(bounds) = self.layout.overlay_bounds_containing(leaf) else {
+        let Some(bounds) = self.floating_resize_bounds(leaf) else {
             return false;
         };
         let Some(edge) = detect_resize_edge(bounds, point, RESIZE_HANDLE_CELLS) else {
@@ -600,6 +668,7 @@ impl Runtime {
             edge,
             anchor_col: i32::from(point.x),
             anchor_row: i32::from(point.y),
+            anchored,
         });
         self.set_focus(leaf);
         self.clear_hover_pending();
@@ -629,7 +698,7 @@ impl Runtime {
         let Some(resize) = self.float_resize else {
             return false;
         };
-        let Some(point) = self.cursor_to_layout_point(pos) else {
+        let Some(point) = self.floating_resize_point(pos, resize.anchored) else {
             return true;
         };
         let dx_raw = i32::from(point.x) - resize.anchor_col;
@@ -637,7 +706,7 @@ impl Runtime {
         if dx_raw == 0 && dy_raw == 0 {
             return true;
         }
-        let Some(current) = self.layout.overlay_bounds_containing(resize.leaf) else {
+        let Some(current) = self.floating_resize_bounds(resize.leaf) else {
             self.float_resize = None;
             return false;
         };
@@ -647,12 +716,27 @@ impl Runtime {
         let dy = dy_raw.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
         let next = resize_floating_rect(current, resize.edge, dx, dy, self.container);
         if next != current {
-            let mut layout = self.layout.clone();
-            if !layout.set_overlay_bounds_containing(resize.leaf, next) {
-                self.float_resize = None;
-                return false;
+            if resize.anchored {
+                // Issue #2945: an anchored float has no overlay bounds in the
+                // tree — the step commits into the runtime anchor store, which
+                // the present composite reads on the next frame. The layout is
+                // untouched (a pinned/detached leaf is never a solver leaf), so
+                // the pane grid and PTY winsize are re-synced explicitly from
+                // the new frame instead of riding `set_layout`.
+                if !self.set_anchored_overlay_rect(resize.leaf, next) {
+                    self.float_resize = None;
+                    return false;
+                }
+                self.sync_pane_geometry();
+                self.pending_full_redraw = true;
+            } else {
+                let mut layout = self.layout.clone();
+                if !layout.set_overlay_bounds_containing(resize.leaf, next) {
+                    self.float_resize = None;
+                    return false;
+                }
+                self.set_layout(layout);
             }
-            self.set_layout(layout);
             // Issue #2789: same release race as the border drag — the final
             // step can commit without a tick, so keep painting the committed
             // bounds until that frame presents.
@@ -664,6 +748,7 @@ impl Runtime {
             edge: resize.edge,
             anchor_col: i32::from(point.x),
             anchor_row: i32::from(point.y),
+            anchored: resize.anchored,
         });
         true
     }

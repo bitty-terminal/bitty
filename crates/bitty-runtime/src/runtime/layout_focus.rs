@@ -1278,6 +1278,10 @@ impl Runtime {
         // solver scales them by the live cell size), so frame the cell
         // container here rather than a pixel area.
         let base = bitty_ui::presentation::float_frame(UiRect::zero(), self.container);
+        // Issue #2945: an Alt+corner/edge resize stores a per-leaf size in
+        // `anchored_sizes`; the permitted origin ranges are recomputed from
+        // that size so a resized panel still cannot leave the container.
+        let size = self.anchored_overlay_size(id, base);
         // CodeRabbit 1883: cascade stacked pins so each one stays visible
         // and clickable instead of fully covering the earlier pins. Offset
         // grows with pin depth and is clamped to the container (degenerate
@@ -1286,16 +1290,16 @@ impl Runtime {
         let max_x = self
             .container
             .x
-            .saturating_add(self.container.width.saturating_sub(base.width));
+            .saturating_add(self.container.width.saturating_sub(size.0));
         let max_y = self
             .container
             .y
-            .saturating_add(self.container.height.saturating_sub(base.height));
+            .saturating_add(self.container.height.saturating_sub(size.1));
         let origin_x = i32::from(base.x) + i32::from(PIN_CASCADE_DX.saturating_mul(step));
         let origin_y = i32::from(base.y) + i32::from(PIN_CASCADE_DY.saturating_mul(step));
         Some(PinnedAnchor {
             origin: (origin_x, origin_y),
-            size: (base.width, base.height),
+            size,
             dx_range: (
                 i32::from(self.container.x) - origin_x,
                 i32::from(max_x) - origin_x,
@@ -1340,20 +1344,22 @@ impl Runtime {
             .position(|fid| fid == id)?;
         let depth = pins_above.saturating_add(position);
         let base = bitty_ui::presentation::float_frame(UiRect::zero(), self.container);
+        // Issue #2945: same per-leaf resize override as pins.
+        let size = self.anchored_overlay_size(id, base);
         let step = u16::try_from(depth).unwrap_or(u16::MAX);
         let max_x = self
             .container
             .x
-            .saturating_add(self.container.width.saturating_sub(base.width));
+            .saturating_add(self.container.width.saturating_sub(size.0));
         let max_y = self
             .container
             .y
-            .saturating_add(self.container.height.saturating_sub(base.height));
+            .saturating_add(self.container.height.saturating_sub(size.1));
         let origin_x = i32::from(base.x) + i32::from(PIN_CASCADE_DX.saturating_mul(step));
         let origin_y = i32::from(base.y) + i32::from(PIN_CASCADE_DY.saturating_mul(step));
         Some(PinnedAnchor {
             origin: (origin_x, origin_y),
-            size: (base.width, base.height),
+            size,
             dx_range: (
                 i32::from(self.container.x) - origin_x,
                 i32::from(max_x) - origin_x,
@@ -1363,6 +1369,114 @@ impl Runtime {
                 i32::from(max_y) - origin_y,
             ),
         })
+    }
+
+    /// Effective cell extent of anchored overlay `id` (issue #2945).
+    ///
+    /// A panel resized by an Alt+corner/edge drag stores its extent in
+    /// `anchored_sizes`; otherwise the container-derived base share wins.
+    /// Never larger than the container, so a stale entry recorded while the
+    /// window was bigger can never push the frame past an edge.
+    fn anchored_overlay_size(&self, id: ViewId, base: UiRect) -> (u16, u16) {
+        match self.anchored_sizes.get(&id).copied() {
+            Some((width, height)) if width > 0 && height > 0 => (
+                width.min(self.container.width.max(1)),
+                height.min(self.container.height.max(1)),
+            ),
+            _ => (base.width, base.height),
+        }
+    }
+
+    /// Composed cell rect of anchored overlay `id` (issue #2945).
+    ///
+    /// The same `origin + clamped re-anchor offset` and effective size the
+    /// present composite uses, in container cells, for a pinned leaf or a
+    /// detached float. `None` when `id` is neither, or when the layout
+    /// already holds it (the composite skips such duplicates). Shared by the
+    /// anchored resize hit-test and its drag step, so the grab and the
+    /// committed extent can never disagree.
+    pub(super) fn anchored_overlay_rect(&self, id: ViewId) -> Option<UiRect> {
+        let (anchor, offsets) = if self.floats.contains(id) {
+            (self.float_anchor(id)?, self.float_offsets.get(&id).copied())
+        } else if self.pinned.contains(id) {
+            (
+                self.pinned_anchor(id)?,
+                self.pinned_offsets.get(&id).copied(),
+            )
+        } else {
+            return None;
+        };
+        let (dx, dy) = offsets.unwrap_or((0, 0));
+        let x = anchor.origin.0 + dx.clamp(anchor.dx_range.0, anchor.dx_range.1);
+        let y = anchor.origin.1 + dy.clamp(anchor.dy_range.0, anchor.dy_range.1);
+        Some(UiRect::new(
+            (x.max(0) as u32).min(u32::from(u16::MAX)) as u16,
+            (y.max(0) as u32).min(u32::from(u16::MAX)) as u16,
+            anchor.size.0,
+            anchor.size.1,
+        ))
+    }
+
+    /// Whether `id` is an anchored overlay (pinned or detached float) whose
+    /// cell rect is composited rather than solved (issue #2945).
+    #[must_use]
+    pub(super) fn is_anchored_overlay(&self, id: ViewId) -> bool {
+        self.floats.contains(id) || self.pinned.contains(id)
+    }
+
+    /// Stores a resized composed rect for anchored overlay `id` (issue #2945).
+    ///
+    /// The rect is the container-cell extent the drag produced: its size
+    /// becomes the stored override and its origin is kept as a re-anchor
+    /// offset relative to the derived anchored origin. Both are clamped
+    /// against the ranges the new size implies, so a shrink can never leave
+    /// the frame parked outside its own margins and a grow can never push it
+    /// past the container. Fail-closed: unknown ids and empty rects change
+    /// nothing. Returns whether anything changed.
+    pub(super) fn set_anchored_overlay_rect(&mut self, id: ViewId, rect: UiRect) -> bool {
+        if !self.is_anchored_overlay(id) || rect.is_empty() {
+            return false;
+        }
+        let size = (
+            rect.width.min(self.container.width.max(1)),
+            rect.height.min(self.container.height.max(1)),
+        );
+        let mut changed = false;
+        if self.anchored_sizes.get(&id).copied() != Some(size) {
+            self.anchored_sizes.insert(id, size);
+            changed = true;
+        }
+        // Re-derive the permitted range against the new extent before the
+        // origin is stored, so the offset and the size always agree.
+        let anchor = if self.floats.contains(id) {
+            self.float_anchor(id)
+        } else {
+            self.pinned_anchor(id)
+        };
+        let Some(anchor) = anchor else {
+            return changed;
+        };
+        let dx = (i32::from(rect.x) - anchor.origin.0).clamp(anchor.dx_range.0, anchor.dx_range.1);
+        let dy = (i32::from(rect.y) - anchor.origin.1).clamp(anchor.dy_range.0, anchor.dy_range.1);
+        let map = if self.floats.contains(id) {
+            &mut self.float_offsets
+        } else {
+            &mut self.pinned_offsets
+        };
+        if map.get(&id).copied().unwrap_or((0, 0)) != (dx, dy) {
+            map.insert(id, (dx, dy));
+            changed = true;
+        }
+        changed
+    }
+
+    /// Drops the stored resize extent of `id` (issue #2945).
+    ///
+    /// Called wherever the re-anchor offset is dropped (unpin, restore,
+    /// discard): a panel that leaves the anchored store returns with default
+    /// anchored geometry.
+    pub(super) fn clear_anchored_overlay_size(&mut self, id: ViewId) {
+        self.anchored_sizes.remove(&id);
     }
 
     /// Live-present View frames in physical pixels (CTX-0294).
@@ -1888,6 +2002,48 @@ impl Runtime {
     #[must_use]
     pub fn cursor_to_present_cell(&self, pos: CursorPosition) -> Option<(ViewId, CellPos)> {
         self.present_cell_in(&self.present_frames(), pos)
+    }
+
+    /// Overlay pane under the last pointer position, if any (issue #2945).
+    ///
+    /// Wheel notches and `Mod+u`/`Mod+i` page scrolls resolve their target
+    /// through this first: a floating panel is composited *over* the focused
+    /// tiling leaf, so "the focused pane" and "the pane the user is pointing
+    /// at" legitimately disagree — and the panel, which is the only surface
+    /// the pointer can see, would otherwise never receive scroll. Tiling
+    /// leaves never overlap, so the base case keeps its long-standing
+    /// focused-pane routing (this returns `None` there) and a tiled pane
+    /// behaves exactly as before. Resolves in present paint order, matching
+    /// the click and hover paths ([`Self::cursor_to_present_cell`]).
+    #[must_use]
+    pub(super) fn pointer_overlay_owner(&self) -> Option<ViewId> {
+        // Cheap gate: without a composited overlay there is nothing for the
+        // pointer rule to add, so the hot path skips the present solve (and
+        // the tiled behaviour stays byte-identical).
+        if self.floats.is_empty() && self.pinned.is_empty() && self.scratchpad.is_empty() {
+            return None;
+        }
+        let pos = self.last_cursor?;
+        let frames = self.present_frames();
+        let (view, _) = self.present_cell_in(&frames, pos)?;
+        frames
+            .iter()
+            .find(|frame| frame.view == view)
+            .filter(|frame| frame.tier.is_some())
+            .map(|frame| frame.view)
+    }
+
+    /// Scroll offset of `view`'s own viewport (issue #2945 observation seam).
+    ///
+    /// Read-only companion to [`Self::scroll_focused_page`] and the wheel
+    /// path: it resolves the same store those paths write (live layout,
+    /// detached floats, and pinned leaves) so a caller can assert that a
+    /// scroll actually moved the pane it targeted instead of re-deriving it
+    /// from the tiling tree, which holds no floating panel. `None` when
+    /// `view` is not live.
+    #[must_use]
+    pub fn presented_scroll_offset(&self, view: ViewId) -> Option<usize> {
+        self.find_view(view).map(|leaf| leaf.scroll_offset())
     }
 
     /// [`Self::cursor_to_present_cell`] against an already-solved frame list.

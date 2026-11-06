@@ -651,6 +651,8 @@ impl Runtime {
         // CTX-1081: a fresh pin starts at the cascade anchor — drop any
         // stale re-anchor offset so a re-pin never inherits a past drag.
         self.pinned_offsets.remove(&id);
+        // Issue #2945: likewise drop any stored corner/edge resize extent.
+        self.clear_anchored_overlay_size(id);
         // Shared post-edit fixups: focus moves off the pinned leaf onto the
         // first surviving leaf and primary-grid ownership follows (a pinned
         // leaf is no longer in any workspace layout). Unlike the scratchpad
@@ -677,6 +679,8 @@ impl Runtime {
             .unpin(&mut self.layout, id)
             .map_err(|error| error.to_string())?;
         self.pinned_offsets.remove(&id);
+        // Issue #2945: unpin returns default anchored geometry, like the drag.
+        self.clear_anchored_overlay_size(id);
         self.focus = Focus::with_focus(id);
         self.after_scratchpad_move(None);
         Ok(id)
@@ -758,6 +762,8 @@ impl Runtime {
         // re-anchor offset so a re-detach never inherits a past drag
         // (mirrors the fresh-pin discipline).
         self.float_offsets.remove(&id);
+        // Issue #2945: a fresh detach starts at the anchored extent too.
+        self.clear_anchored_overlay_size(id);
         // Shared post-edit fixups: focus moves off the detached leaf onto
         // the first surviving leaf, but primary-grid ownership stays on the
         // detached float (CodeRabbit PR #1977): the primary grid and PTY
@@ -790,6 +796,8 @@ impl Runtime {
             .restore(&mut self.layout, id, &allocations, container)
             .map_err(|error| error.to_string())?;
         self.float_offsets.remove(&id);
+        // Issue #2945: restore returns default anchored geometry, like the drag.
+        self.clear_anchored_overlay_size(id);
         self.focus = Focus::with_focus(id);
         self.after_scratchpad_move(None);
         Ok(id)
@@ -863,6 +871,8 @@ impl Runtime {
             return false;
         }
         self.float_offsets.remove(&id);
+        // Issue #2945: the resize extent dies with the discarded panel.
+        self.clear_anchored_overlay_size(id);
         if self.alt_drag.is_some_and(|drag| drag.leaf == id) {
             self.alt_drag = None;
         }
@@ -904,6 +914,8 @@ impl Runtime {
             return false;
         }
         self.pinned_offsets.remove(&id);
+        // Issue #2945: the resize extent dies with the discarded panel.
+        self.clear_anchored_overlay_size(id);
         if self.alt_drag.is_some_and(|drag| drag.leaf == id) {
             self.alt_drag = None;
         }
@@ -1008,6 +1020,7 @@ impl Runtime {
             }
             if slot.floats.discard(id).is_some() {
                 self.float_offsets.remove(&id);
+                self.clear_anchored_overlay_size(id);
                 if self.alt_drag.is_some_and(|drag| drag.leaf == id) {
                     self.alt_drag = None;
                 }
@@ -2013,6 +2026,7 @@ impl Runtime {
             // drop it so a later id reuse (quarantined, but defensive) never
             // inherits a past drag.
             self.float_offsets.remove(&view);
+            self.clear_anchored_overlay_size(view);
         }
         if self.workspaces.is_empty() {
             let fresh_id = self.next_view_id_global();
@@ -2286,6 +2300,14 @@ impl Runtime {
             let focused = self
                 .focused_view()
                 .ok_or_else(|| String::from("no focused pane to move"))?;
+            // Issue #2945: an anchored overlay (pinned leaf or detached
+            // float) is not a layout leaf, but it already lives where the
+            // move is headed — a pin is window-global and a detached float is
+            // in the active slot — so a move onto the active workspace is a
+            // no-op instead of a refusal.
+            if self.is_anchored_overlay(focused) {
+                return Ok(focused);
+            }
             if self.layout.find_leaf(focused).is_none() {
                 return Err(String::from("focused pane not in layout"));
             }
@@ -2294,6 +2316,11 @@ impl Runtime {
         let focused = self
             .focused_view()
             .ok_or_else(|| String::from("no focused pane to move"))?;
+        // Issue #2945: an anchored overlay has no layout leaf to reparent;
+        // move the panel itself and follow focus, exactly like a tiled move.
+        if self.is_anchored_overlay(focused) {
+            return self.move_focused_overlay_to(index, focused, now);
+        }
         let moved_view = self
             .layout
             .find_leaf(focused)
@@ -2362,6 +2389,7 @@ impl Runtime {
                     self.session_primary_cwd = None;
                 }
                 self.float_offsets.remove(&view);
+                self.clear_anchored_overlay_size(view);
             }
             // Remap MRU: drop the removed index, shift higher ones down.
             self.workspace_mru.retain(|&i| i != source_index);
@@ -2537,6 +2565,94 @@ impl Runtime {
         Ok(focused)
     }
 
+    /// Moves the focused anchored overlay to workspace `index` and follows
+    /// focus there (issue #2945).
+    ///
+    /// `Mod+Shift+<n>` is the DEC-0034 cross-workspace move, and a floating
+    /// panel used to fail it closed: `apply_chrome_action` reached
+    /// [`Self::workspace_move_focused_to_one_based`], the focused leaf was
+    /// found outside the live layout, and the move errored — so the gesture
+    /// neither moved anything nor switched the workspace, which reads as "the
+    /// workspace switch is broken" while a float is up.
+    ///
+    /// The two anchored families follow their documented policy:
+    ///
+    /// - a **detached float** is workspace-local, so the panel travels: the
+    ///   stored [`View`] leaves the live float store and lands in the target
+    ///   slot's store with its id, `Floating` mode, and pane session intact
+    ///   (its anchored resize extent and re-anchor offset are keyed by id and
+    ///   follow too), and focus follows to the target exactly like a tiled
+    ///   move.
+    /// - a **pinned leaf** is window-global: there is nothing to reparent, so
+    ///   the window switches to the target and the pin stays composited and
+    ///   focused — the pin policy the issue asks to preserve.
+    ///
+    /// No geometry validation runs for the float case: the panel lands in the
+    /// float store, never in a layout tree, so no split/view-kind conflict can
+    /// arise. Fail-closed with state untouched when the live store does not
+    /// own the focused id.
+    fn move_focused_overlay_to(
+        &mut self,
+        index: usize,
+        focused: ViewId,
+        now: std::time::Instant,
+    ) -> Result<ViewId, String> {
+        let source_index = self.active_workspace;
+        if index == source_index {
+            return Ok(focused);
+        }
+        if index >= self.workspaces.len() {
+            return Err(format!("no such workspace ws:{}", index.saturating_add(1)));
+        }
+        self.clear_hover_pending();
+        if self.pinned.contains(focused) {
+            // Window-global panel: the pin already shows on every workspace,
+            // so the gesture only switches. Focus is re-asserted on the panel
+            // afterwards — the target slot restores its own stashed focus, but
+            // the user was driving this panel and nothing about it moved.
+            self.workspace_switch(index);
+            self.set_focus(focused);
+            self.pending_full_redraw = true;
+            return Ok(focused);
+        }
+        let Some(view) = self.floats.discard(focused) else {
+            return Err(String::from("focused pane not in layout"));
+        };
+        // Persist the source slot with the panel already removed, so no
+        // stashed copy keeps a duplicate of the moved id.
+        self.stash_active_slot();
+        let Some(target) = self.workspaces.get_mut(index) else {
+            // Unreachable after the bounds check above; restore the panel so
+            // the failure cannot destroy it.
+            self.floats.restore_detached(view);
+            return Err(format!("no such workspace ws:{}", index.saturating_add(1)));
+        };
+        target.floats.restore_detached(view);
+        target.focus = Focus::with_focus(focused);
+        // Follow focus to the target workspace (the same contract a tiled
+        // move keeps): the live pair becomes the target slot.
+        self.active_workspace = index;
+        self.load_slot(index);
+        self.rehome_dead_primary();
+        self.mru_front(index);
+        self.spawn_session_pending_for_active();
+        self.refresh_chrome_band();
+        self.sync_primary_geometry();
+        self.sync_pane_geometry();
+        self.invalidate_stale_view_bindings();
+        self.pending_full_redraw = true;
+        self.trigger_animation(AnimationKind::Move, Some(focused), now);
+        let active_name = self.workspaces[index].name.clone();
+        let seq = self.plugin_host.publish_count();
+        let event = Event::new(
+            EventKind::WorkspaceFocused,
+            EventPayload::Text(BoundedText::new_truncated(&active_name)),
+            seq,
+        );
+        self.plugin_host.publish(event);
+        Ok(focused)
+    }
+
     /// Move the focused window to workspace `one_based` (1-based display
     /// position used by the keyboard path). Returns
     /// `(moved_id, from_1based, to_1based)`.
@@ -2582,6 +2698,16 @@ impl Runtime {
         let focused = self
             .focused_view()
             .ok_or_else(|| String::from("no focused pane to move"))?;
+        // Issue #2945: an anchored overlay has no layout leaf to seed the
+        // auto-created workspace with. Moving a panel needs an existing target
+        // (the keyboard path then travels it through
+        // `workspace_move_focused_to_at`); refuse loudly instead of silently
+        // doing nothing.
+        if self.is_anchored_overlay(focused) {
+            return Err(format!(
+                "a floating panel moves only into an existing workspace; create ws{one_based} first"
+            ));
+        }
         let moved_view = self
             .layout
             .find_leaf(focused)
@@ -2638,6 +2764,7 @@ impl Runtime {
                     self.session_primary_cwd = None;
                 }
                 self.float_offsets.remove(&view);
+                self.clear_anchored_overlay_size(view);
             }
             self.workspace_mru.retain(|&i| i != source_index);
             for i in self.workspace_mru.iter_mut() {

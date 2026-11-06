@@ -69,6 +69,14 @@
 #
 # Exit codes: 0 = installed (or plan printed), 1 = install/fetch/verify
 # failure or unsupported platform, 2 = usage error.
+#
+# Install marker (CTX-1719, bitty#2925): after a successful install the script
+# writes $XDG_DATA_HOME/bitty/install.json (fallback ~/.local/share/bitty)
+# with schema, channel, prefix, bin_dir, version, binary_sha256, and
+# installed_at. `bitty upgrade` reads it to detect this install source, and
+# refreshes version/binary_sha256/installed_at after a self-update. The marker
+# is best effort: a failure warns and never fails an install that already
+# succeeded. --dry-run writes no marker.
 set -euo pipefail
 
 export LC_ALL=C
@@ -314,6 +322,59 @@ verify_sidecar() {
   fi
 }
 
+# json_escape <text> — minimal JSON string escaping for marker values
+# (backslash and double quote; the scripts never emit control bytes).
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# write_install_marker — record channel/prefix/version/binary hash/time so
+# `bitty upgrade` can detect this install and refresh the record (CTX-1719).
+# Best effort: the install already succeeded, so a marker failure only warns.
+write_install_marker() {
+  local data_home="${XDG_DATA_HOME:-}"
+  if [[ -z "$data_home" ]]; then
+    if [[ -z "${HOME:-}" ]]; then
+      log "warning: HOME and XDG_DATA_HOME are unset; install marker not written"
+      return 0
+    fi
+    data_home="${HOME}/.local/share"
+  fi
+  local marker_dir="${data_home}/bitty"
+  local marker="${marker_dir}/install.json"
+  local staged="${marker}.tmp.$$"
+  local marker_prefix="${PREFIX:-}"
+  if [[ -z "$marker_prefix" ]]; then
+    marker_prefix="$(dirname "$BIN_DIR")"
+  fi
+  local digest installed_at
+  digest="$(sha256_of_file "$BIN_DIR/bitty")" || {
+    log "warning: could not hash $BIN_DIR/bitty; install marker not written"
+    return 0
+  }
+  installed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)" || installed_at=""
+  mkdir -p "$marker_dir" || {
+    log "warning: could not create $marker_dir; install marker not written"
+    return 0
+  }
+  printf '{\n  "schema": 1,\n  "channel": "script",\n  "prefix": "%s",\n  "bin_dir": "%s",\n  "version": "%s",\n  "binary_sha256": "%s",\n  "installed_at": "%s"\n}\n' \
+    "$(json_escape "$marker_prefix")" \
+    "$(json_escape "$BIN_DIR")" \
+    "$(json_escape "$VERSION")" \
+    "$(json_escape "$digest")" \
+    "$(json_escape "$installed_at")" >"$staged" || {
+    log "warning: could not write $staged; install marker not written"
+    rm -f "$staged"
+    return 0
+  }
+  if ! mv -f "$staged" "$marker"; then
+    log "warning: could not replace $marker; install marker not written"
+    rm -f "$staged"
+    return 0
+  fi
+  log "install marker: $marker"
+}
+
 TAG="$(resolve_tag)"
 VERSION="${TAG#v}"
 TARGET="$(detect_target)"
@@ -415,4 +476,5 @@ if "$BIN_DIR/bitty" --version >/dev/null 2>&1; then
 else
   die "install smoke failed: $BIN_DIR/bitty --version did not run"
 fi
+write_install_marker
 log "ensure $BIN_DIR is on PATH"

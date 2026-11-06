@@ -53,6 +53,12 @@ categories = ["command-line-utilities", "emulators"]
 winit = "0.30.13"
 # Minimal one-shot executor for the composition root and perf trials.
 pollster = "1.0"
+# CTX-1719 (bitty#2925): SHA-256 for `bitty upgrade` release verification.
+# RustCrypto, MIT OR Apache-2.0, rust-version 1.85 == MSRV, no build script,
+# no network/I/O. The 0.11 line is already resolved in the lockfile via the
+# `bitty-network-publication` dev dependency; this makes it a direct
+# composition-root dependency for the upgrade path.
+sha2 = "0.11.0"
 # V-C package signatures (OQ-029, bitty#767): pure-Rust Ed25519
 # (`ed25519-dalek` 2.x, BSD-3-Clause, rust-version 1.81 <= MSRV 1.85,
 # no build script, no network/I/O). Pinned to the 2.x line: the 3.x major

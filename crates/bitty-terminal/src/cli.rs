@@ -212,6 +212,21 @@ pub(crate) struct Args {
     pub(crate) doctor_dry_run: bool,
     /// Unexpected extra positionals in doctor mode (dispatch errors).
     pub(crate) doctor_args: Vec<String>,
+    /// `bitty upgrade` self-update (CTX-1719, bitty#2925). True once the
+    /// first positional `upgrade` word is seen; extra bare positionals land
+    /// in `upgrade_args` and fail closed via usage. A program literally
+    /// named `upgrade` must be invoked as `bitty -- upgrade ...`.
+    pub(crate) upgrade_word: bool,
+    /// `--check`: read-only version comparison (`bitty upgrade --check`).
+    pub(crate) upgrade_check: bool,
+    /// `--dry-run`: print the upgrade plan without downloading or writing.
+    pub(crate) upgrade_dry_run: bool,
+    /// `--yes`: execute a delegated user-scoped package-manager command.
+    pub(crate) upgrade_yes: bool,
+    /// `--rollback`: restore `bitty.prev` for a self-managed install.
+    pub(crate) upgrade_rollback: bool,
+    /// Unexpected extra positionals in upgrade mode (dispatch errors).
+    pub(crate) upgrade_args: Vec<String>,
     /// `bitty run -- COMMAND...` explicit child launch (CTX-0170).
     /// True once the first positional `run` word is seen (subcommand mode);
     /// a program literally named `run` needs `bitty run -- run ...` or the
@@ -534,6 +549,12 @@ impl Args {
             doctor_fix: false,
             doctor_dry_run: false,
             doctor_args: Vec::new(),
+            upgrade_word: false,
+            upgrade_check: false,
+            upgrade_dry_run: false,
+            upgrade_yes: false,
+            upgrade_rollback: false,
+            upgrade_args: Vec::new(),
             run_word: false,
             run_raw: Vec::new(),
             ctl_word: false,
@@ -769,6 +790,10 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
 ///   → installation and compatibility diagnosis plus safe, reversible
 ///   repairs (CTX-0175, CTX-1721, local class, safe mode); a program
 ///   literally named `doctor` needs `bitty -- doctor ...`
+/// - `upgrade [--check] [--dry-run] [--yes] [--rollback]` → install-source
+///   detection and self-update (CTX-1719, local class, safe-mode read-only
+///   paths); a program literally named `upgrade` needs
+///   `bitty -- upgrade ...`
 /// - `list <themes|colors|fonts|plugins|instances|actions|keymaps|services>` → resource enumeration (CTX-0172, CTX-1127, CTX-1467);
 ///   a program literally named `list`/`ls` needs `bitty -- list ...`
 /// - `inspect <target> <value>` → state and ownership (CTX-0173, local
@@ -1147,6 +1172,22 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 // `bitty init --yes`: non-interactive defaults (ignored by
                 // normal startup and the `config` subcommand).
                 out.init_yes = true;
+                // CTX-1719: `bitty upgrade --yes` executes a delegated
+                // user-scoped package-manager command; same token, consumed
+                // only by the upgrade dispatch.
+                out.upgrade_yes = true;
+                i += 1;
+            }
+            "--check" => {
+                // `bitty upgrade --check`: read-only version comparison
+                // (CTX-1719). Ignored by every other dispatch.
+                out.upgrade_check = true;
+                i += 1;
+            }
+            "--rollback" => {
+                // `bitty upgrade --rollback`: restore `bitty.prev`
+                // (CTX-1719). Ignored by every other dispatch.
+                out.upgrade_rollback = true;
                 i += 1;
             }
             "--force" => {
@@ -1432,6 +1473,13 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             }
             "--no-backup" if out.config_cmd == Some(ConfigCommand::Migrate) => {
                 out.config_backup = Some(false);
+                i += 1;
+            }
+            "--dry-run" => {
+                // `bitty upgrade --dry-run`: print the plan, write nothing
+                // (CTX-1719). The guarded profile and migrate arms above keep
+                // their own meaning; every other dispatch ignores this flag.
+                out.upgrade_dry_run = true;
                 i += 1;
             }
             "--from" if out.config_cmd == Some(ConfigCommand::Profile) => {
@@ -1904,6 +1952,42 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     continue;
                 }
 
+                // `bitty upgrade` self-update (first positional only;
+                // CTX-1719, bitty#2925). Flags (`--check`, `--dry-run`,
+                // `--yes`, `--rollback`) compose in any order around the
+                // word. A program literally named `upgrade` needs
+                // `bitty -- upgrade ...`.
+                if !program_set
+                    && !out.upgrade_word
+                    && !out.config_word
+                    && !out.init_word
+                    && !out.doctor_word
+                    && !out.ctl_word
+                    && !out.run_word
+                    && !out.list_word
+                    && !out.inspect_word
+                    && !out.dev_word
+                    && !out.plugin_word
+                    && !out.component_word
+                    && !out.version_word
+                    && !out.completion_word
+                    && !out.shell_init_word
+                    && !out.cmd_word
+                    && !out.x_word
+                    && !out.help_word
+                    && token == "upgrade"
+                {
+                    out.upgrade_word = true;
+                    i += 1;
+                    continue;
+                }
+                if out.upgrade_word {
+                    // Upgrade takes no positionals: fail closed at dispatch.
+                    out.upgrade_args.push(token.clone());
+                    i += 1;
+                    continue;
+                }
+
                 // `bitty list <kind>` enumeration (first positional only;
                 // CTX-0172). `ls` is the stable alias for `list` per
                 // cli-contract-rfc. A program literally named `list`/`ls`
@@ -2368,6 +2452,18 @@ pub(crate) fn help_text() -> String {
                               Exit 0 when all pass (warns allowed), 1 on\n  \
                               recoverable failure, else the strongest\n  \
                               category code (3 config, 5 compat, 8 conflict).\n  \
+            upgrade [--check] [--dry-run] [--yes] [--rollback]  Self-update\n  \
+                              (local class, bitty#2925): detects the install\n  \
+                              source, then either replaces a script/AppImage\n  \
+                              binary atomically (sha256 verified against the\n  \
+                              release SHA256SUMS, previous binary kept as\n  \
+                              bitty.prev) or prints the package manager's\n  \
+                              exact command. --check is read-only (exit 0\n  \
+                              current, 1 update available, allowed under\n  \
+                              --safe); --dry-run writes nothing; --yes runs a\n  \
+                              user-scoped delegated command; system-owned\n  \
+                              installs are never executed (exit 7);\n  \
+                              --rollback restores a verified bitty.prev.\n  \
             config <verb>     Config path|check|show|validate|edit|profile\n  \
                              (--format table|json|jsonl for show/validate;\n  \
                              `bitty config --help` for detail; alias `cfg`)\n  \
@@ -2562,6 +2658,7 @@ pub(crate) fn help_text_short(color: bool) -> String {
             config <verb>           Config path|check|show|validate|migrate|edit|profile (alias cfg)\n  \
             init [FLAGS]            Opt-in guided setup wizard (never auto-runs)\n  \
             doctor [--fix]          Diagnose installation and compatibility (local)\n  \
+            upgrade [--check]       Self-update script/AppImage installs; delegate package managers\n  \
             list <kind>             Enumerate themes|colors|fonts|plugins|instances|actions|keymaps|services (alias ls)\n  \
             inspect <target> <value> Explain state and ownership (command|key|plugin|config|protocol)\n  \
             dev <verb>              Developer tracing, captures, synthesis, dumps, overlays\n  \
@@ -2586,7 +2683,7 @@ pub(crate) fn help_text_short(color: bool) -> String {
     )
 }
 
-/// Canonical subcommand names for `bitty help [cmd]` (16 total, issue #1900).
+/// Canonical subcommand names for `bitty help [cmd]` (17 total, issue #1900).
 ///
 /// Aliases (`cfg`, `ls`, `comp`) map to their canonical help; `component` is
 /// the hidden deprecated alias for `extension` (issue #1959, kept at least
@@ -2602,6 +2699,7 @@ pub(crate) const SUBCOMMANDS: &[(&str, &[&str])] = &[
     ("config", &["cfg"]),
     ("init", &[]),
     ("doctor", &[]),
+    ("upgrade", &[]),
     ("list", &["ls"]),
     ("inspect", &[]),
     ("dev", &[]),
@@ -2617,7 +2715,7 @@ pub(crate) const SUBCOMMANDS: &[(&str, &[&str])] = &[
 
 #[must_use]
 pub(crate) fn help_valid_commands() -> &'static str {
-    "run, ctl, config (cfg), init, doctor, list (ls), inspect, dev, plugin, extension, version, completion (comp), cmd, x, shell-init, help"
+    "run, ctl, config (cfg), init, doctor, upgrade, list (ls), inspect, dev, plugin, extension, version, completion (comp), cmd, x, shell-init, help"
 }
 
 /// Normalize one `bitty help [cmd]` name to its canonical subcommand.
@@ -2645,7 +2743,7 @@ pub(crate) fn help_usage() -> String {
         "usage: bitty help [cmd]\n\
          \n\
          commands:\n\
-         \x20 run, ctl, config (cfg), init, doctor, list (ls), inspect, dev,\n\
+         \x20 run, ctl, config (cfg), init, doctor, upgrade, list (ls), inspect, dev,\n\
          \x20 plugin, extension, version, completion (comp), cmd, x, shell-init, help\n\
          plus actions:\n\
          \x20 +list-themes, +list-colors, +list-fonts, +list-keybinds, +list-actions,\n\

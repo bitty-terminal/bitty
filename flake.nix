@@ -33,7 +33,32 @@
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        src = craneLib.cleanCargoSource ./.;
+        # `craneLib.cleanCargoSource` keeps only Rust sources plus Cargo
+        # metadata (crane `filterCargoSources`: `.rs`, `.toml`, `Cargo.lock`,
+        # `.cargo/config`), so every non-Rust file a crate compiles in is
+        # dropped from the Nix build. Keep those assets on top of the Cargo
+        # fileset:
+        #   - crates/bitty-render/assets: OFL symbols face read by
+        #     `include_bytes!` in `bitty-render/src/embedded.rs` (#2931)
+        #   - terminfo/bitty.ti: terminfo repair source read by
+        #     `include_str!` in `bitty-terminal/src/doctor.rs` (#2924)
+        #   - crates/bitty-terminal/bitty.rc and packaging/icons/bitty.ico:
+        #     Windows icon resource compiled by `crates/bitty-terminal/build.rs`
+        #     on a Windows host (#2929)
+        # Test fixtures stay out: both derivations set `doCheck = false`, so
+        # cargo never compiles the test targets that read them.
+        src = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            (craneLib.fileset.commonCargoSources ./.)
+            # crane's filter also keeps the extension-less `.cargo/config`.
+            (pkgs.lib.fileset.maybeMissing ./.cargo/config)
+            ./crates/bitty-render/assets
+            ./terminfo/bitty.ti
+            ./crates/bitty-terminal/bitty.rc
+            ./packaging/icons/bitty.ico
+          ];
+        };
 
         cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
         version = cargoToml.workspace.package.version or "0.0.31";

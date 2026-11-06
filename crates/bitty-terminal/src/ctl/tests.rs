@@ -2569,10 +2569,13 @@ fn reload_config_json_carries_the_typed_module_record_scoped_to_the_record() {
         path: entry.to_string(),
         kind: "load-error",
         applied: false,
+        dry_run: false,
         changed: Vec::new(),
+        rejected: Vec::new(),
         restart_required: Vec::new(),
         message: Some(String::from("bitty: configuration module refused")),
         module: Some(Box::new(diagnostic)),
+        plan_version: 1,
     };
     let json = reload_config_json(&info);
     let LuaValue::Table(root) = parse_json(&json).expect("reload reply must be one JSON value")
@@ -2604,15 +2607,79 @@ fn reload_config_json_carries_the_typed_module_record_scoped_to_the_record() {
         path: entry.to_string(),
         kind: "load-error",
         applied: false,
+        dry_run: false,
         changed: Vec::new(),
+        rejected: Vec::new(),
         restart_required: Vec::new(),
         message: Some(String::from("bitty: cannot read config")),
         module: None,
+        plan_version: 1,
     };
     assert!(
         !reload_config_json(&plain).contains("\"module\""),
         "a non-module failure must not emit a `module` key"
     );
+}
+
+#[test]
+fn reload_config_json_carries_rejected_paths_plan_version_and_dry_run() {
+    // bitty#2927: the reply is the machine contract for `bitty reload`, so
+    // the running plan version, the rejected dotted paths, and the dry-run
+    // marker must be present and typed (never inferred from the message).
+    let info = crate::config_reload::ReloadOutcomeInfo {
+        path: String::from("(defaults; no file)"),
+        kind: "rejected",
+        applied: false,
+        dry_run: false,
+        changed: Vec::new(),
+        rejected: vec![String::from("window.opacity")],
+        restart_required: Vec::new(),
+        message: Some(String::from(
+            "validation error at 'window.opacity': value out of range",
+        )),
+        module: None,
+        plan_version: 3,
+    };
+    let json = reload_config_json(&info);
+    let LuaValue::Table(root) = parse_json(&json).expect("reload reply must be one JSON value")
+    else {
+        panic!("reload reply must be a JSON object: {json}");
+    };
+    assert_eq!(string_field(&root, "kind"), "rejected");
+    assert!(!bool_field(&root, "applied"));
+    assert!(!bool_field(&root, "dry_run"));
+    assert_eq!(nonnegative_integer_field(&root, "plan_version"), 3);
+    assert!(
+        json.contains("\"rejected\":[\"window.opacity\"]"),
+        "rejected paths must be the dotted field paths: {json}"
+    );
+    assert!(
+        string_field(&root, "message").contains("window.opacity"),
+        "the rejection reason must survive encoding: {json}"
+    );
+
+    // A dry run marks itself and never claims an apply.
+    let preview = crate::config_reload::ReloadOutcomeInfo {
+        path: String::from("(defaults; no file)"),
+        kind: "would-apply",
+        applied: false,
+        dry_run: true,
+        changed: vec![String::from("appearance.theme")],
+        rejected: Vec::new(),
+        restart_required: Vec::new(),
+        message: None,
+        module: None,
+        plan_version: 1,
+    };
+    let json = reload_config_json(&preview);
+    let LuaValue::Table(root) = parse_json(&json).expect("preview reply must be one JSON value")
+    else {
+        panic!("preview reply must be a JSON object: {json}");
+    };
+    assert!(bool_field(&root, "dry_run"));
+    assert!(!bool_field(&root, "applied"));
+    assert_eq!(string_field(&root, "kind"), "would-apply");
+    assert_eq!(nonnegative_integer_field(&root, "plan_version"), 1);
 }
 
 #[test]

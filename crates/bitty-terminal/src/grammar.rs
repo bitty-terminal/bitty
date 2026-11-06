@@ -308,6 +308,19 @@ pub(crate) fn nodes() -> Vec<Node> {
     );
     push_node(
         &mut nodes,
+        "reload",
+        Vec::new(),
+        &[
+            "--dry-run",
+            "--socket",
+            "--instance",
+            "--format",
+            "--no-color",
+        ],
+        false,
+    );
+    push_node(
+        &mut nodes,
         "list",
         names(ListKind::NAMES),
         &["--format", "--socket", "--instance", "--no-color"],

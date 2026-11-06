@@ -18,6 +18,12 @@
 //! as `move`, so a no-button drag never reaches its selection path.
 
 #![forbid(unsafe_code)]
+// Unix-only: the app pane is a real `cat -v` PTY spawned through `/bin/sh`,
+// and `require_pty!` skips only where no PTY backend exists at all (Windows
+// has ConPTY, so it would run these probes against a shell it does not
+// have). Mirrors `mouse_report_panes.rs`; the mode/selection probes that need
+// no PTY keep their coverage on Unix.
+#![cfg(unix)]
 
 use std::time::{Duration, Instant};
 

@@ -225,14 +225,6 @@ fn alt(rt: &mut Runtime, state: PressState) {
     rt.handle_key_event(named_key(NamedKey::Alt, state));
 }
 
-fn content_box(rt: &Runtime) -> (i64, i64) {
-    let (cw, ch) = rt.live_cell_size();
-    (
-        i64::from(rt.container().width) * i64::from(cw),
-        i64::from(rt.container().height) * i64::from(ch),
-    )
-}
-
 #[test]
 fn corner_and_edge_drags_resize_the_floating_panel() {
     let (mut rt, float, _base) = detached_primary_runtime();
@@ -308,6 +300,10 @@ fn corner_and_edge_drags_resize_the_floating_panel() {
     alt(&mut rt, PressState::Released);
 
     // Right edge: a mid-height grab on the right border resizes width only.
+    let container = rt.container();
+    let before = rt
+        .anchored_overlay_cell_rect(float)
+        .expect("a detached float always has a composed cell rect");
     let current = frame_of(&rt, float);
     let cur_left = (current.frame.x.max(0) as u32 / cw.max(1)) as u16;
     let cur_top = (current.frame.y.max(0) as u32 / ch.max(1)) as u16;
@@ -332,23 +328,74 @@ fn corner_and_edge_drags_resize_the_floating_panel() {
         wider.frame.height, current.frame.height,
         "a single-axis edge must not change the other axis"
     );
+    // Hold the step to the committed store rect, not the painted frame: the
+    // present composite clips every overlay layer to the container
+    // (`decoration::layout_bands_inner` → `clip_to`), so a frame can never show
+    // a geometry error and a frame-based check here holds for any stored
+    // extent. A three-cell right-edge drag must move exactly one edge by
+    // exactly three cells.
+    let widened = rt
+        .anchored_overlay_cell_rect(float)
+        .expect("the detached float keeps a composed cell rect");
+    assert_eq!(
+        widened,
+        UiRect::new(before.x, before.y, before.width + 3, before.height,),
+        "the committed rect must follow the dragged edge exactly: {widened:?} from {before:?}"
+    );
     rt.handle_mouse_input(mouse(MouseButton::Left, PressState::Released));
     alt(&mut rt, PressState::Released);
 
     // Every committed extent stays inside the window.
-    let (box_w, box_h) = content_box(&rt);
-    let final_frame = frame_of(&rt, float);
     assert!(
-        i64::from(final_frame.frame.x) >= 0 && i64::from(final_frame.frame.y) >= 0,
-        "the panel keeps its container origin: {final_frame:?}"
+        u32::from(widened.x) + u32::from(widened.width) <= u32::from(container.width),
+        "the stored extent must stay inside the container: {widened:?} in {container:?}"
     );
     assert!(
-        i64::from(final_frame.frame.x) + i64::from(final_frame.frame.width) <= box_w,
-        "the panel must not spill past the window's right edge: {final_frame:?}"
+        u32::from(widened.y) + u32::from(widened.height) <= u32::from(container.height),
+        "the stored extent must stay inside the container: {widened:?} in {container:?}"
     );
-    assert!(
-        i64::from(final_frame.frame.y) + i64::from(final_frame.frame.height) <= box_h,
-        "the panel must not spill past the window's bottom edge: {final_frame:?}"
+
+    // Right edge dragged far past the window edge: the commit must clamp at
+    // the container edge, and only that edge may move. The clipped frame is
+    // identical either way, so only the store can tell the difference.
+    let current = frame_of(&rt, float);
+    let cur_left = (current.frame.x.max(0) as u32 / cw.max(1)) as u16;
+    let cur_top = (current.frame.y.max(0) as u32 / ch.max(1)) as u16;
+    let cur_right = cur_left + (current.frame.width / cw.max(1)) as u16 - 1;
+    let mid_row = cur_top + (current.frame.height / ch.max(1)) as u16 / 2;
+    let grab = cell_center(&rt, cur_right, mid_row);
+    rt.handle_cursor_moved(grab);
+    assert_eq!(
+        rt.float_resize_hover_at(grab),
+        Some(bitty_runtime::ResizeEdge::Right)
+    );
+    alt(&mut rt, PressState::Pressed);
+    rt.handle_mouse_input(mouse(MouseButton::Left, PressState::Pressed));
+    assert!(rt.float_resize_active());
+    rt.handle_cursor_moved(cell_pixel(&rt, container.width + 8, mid_row));
+    rt.handle_mouse_input(mouse(MouseButton::Left, PressState::Released));
+    alt(&mut rt, PressState::Released);
+
+    let clamped = rt
+        .anchored_overlay_cell_rect(float)
+        .expect("the detached float keeps a composed cell rect");
+    assert_eq!(
+        clamped.x, widened.x,
+        "clamping must not slide the un-dragged edge: {clamped:?} from {widened:?}"
+    );
+    assert_eq!(
+        u32::from(clamped.x) + u32::from(clamped.width),
+        u32::from(container.width),
+        "an overshooting right-edge drag commits exactly at the container edge: {clamped:?}"
+    );
+    assert_eq!(
+        clamped.height, widened.height,
+        "a single-axis edge must not change the stored height: {clamped:?}"
+    );
+    assert_eq!(
+        frame_of(&rt, float).tier,
+        Some(OverlayTier::Float),
+        "the clamped panel still paints as a float"
     );
 }
 
@@ -448,11 +495,15 @@ fn mod_shift_number_moves_the_floating_panel_and_switches_workspace() {
     // layout"), so neither the panel nor the workspace moved.
     let mut rt = make_runtime();
     install(&mut rt, two_pane());
+    feed_history(&mut rt, 40);
     rt.workspace_new().expect("second workspace");
     rt.workspace_switch(0);
     rt.float_detach(ViewId::new(1)).expect("detach must apply");
     let float = ViewId::new(1);
     assert!(rt.set_focus(float), "the panel is a focus target");
+    let home_rect = rt
+        .anchored_overlay_cell_rect(float)
+        .expect("the detached float has a composed cell rect");
 
     let (moved, from, to) = rt
         .workspace_move_focused_to_one_based(2)
@@ -488,6 +539,48 @@ fn mod_shift_number_moves_the_floating_panel_and_switches_workspace() {
     );
     rt.workspace_switch(1);
     assert_eq!(rt.floated_views(), vec![float]);
+
+    // …and switching back must restore the *whole* panel, not just its slot
+    // entry. The source slot is stashed while the panel is still focused
+    // unless the move re-homes focus first (WS-INV-19); a dangling stashed
+    // focus then reads as dead on `load_slot` and hands `primary_view` — which
+    // `float_detach` deliberately leaves on the panel — to a source leaf,
+    // leaving the panel blank with nowhere for input to go.
+    let restored = frame_of(&rt, float);
+    assert_eq!(
+        restored.tier,
+        Some(OverlayTier::Float),
+        "the panel comes back as a float"
+    );
+    assert_eq!(
+        rt.focused_view(),
+        Some(float),
+        "the stashed target focus still names the panel"
+    );
+    assert_eq!(
+        rt.primary_view(),
+        Some(float),
+        "the round trip must not move primary ownership off the panel"
+    );
+    assert!(
+        rt.paints_primary_grid(&float),
+        "the panel still paints the grid it owns (grid_of/route_input_bytes precondition)"
+    );
+    assert_eq!(
+        (rt.state().width(), rt.state().height()),
+        (usize::from(restored.cols), usize::from(restored.rows)),
+        "the panel's grid is live and sized to its frame: {restored:?}"
+    );
+    assert_eq!(
+        rt.anchored_overlay_cell_rect(float),
+        Some(home_rect),
+        "the round trip must not move or resize the panel"
+    );
+    let text: String = rt.snapshot().cells.iter().map(|cell| cell.glyph).collect();
+    assert!(
+        text.contains("history 039"),
+        "the panel still shows its live content after the round trip"
+    );
 }
 
 #[test]

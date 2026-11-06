@@ -1417,6 +1417,20 @@ impl Runtime {
         ))
     }
 
+    /// Composed cell rect of anchored overlay `view` (issue #2945 observation
+    /// seam).
+    ///
+    /// Read-only companion to [`Self::anchored_overlay_rect`] for callers that
+    /// must assert the *committed* geometry instead of the painted frame: the
+    /// present composite clips every overlay layer to the container
+    /// (`bitty_ui` decoration, `clip_to`), so a frame never shows an overflow
+    /// even when the stored extent has one. `None` when `view` is neither a
+    /// detached float nor a pinned leaf.
+    #[must_use]
+    pub fn anchored_overlay_cell_rect(&self, view: ViewId) -> Option<UiRect> {
+        self.anchored_overlay_rect(view)
+    }
+
     /// Whether `id` is an anchored overlay (pinned or detached float) whose
     /// cell rect is composited rather than solved (issue #2945).
     #[must_use]

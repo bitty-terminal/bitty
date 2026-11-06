@@ -2078,10 +2078,24 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  bitty-aarch64-
         } else {
             assert_eq!(path, PathBuf::from("/data/bitty/install.json"));
         }
-        let relative = env_map(&[("XDG_DATA_HOME", "relative"), ("HOME", "/home/user")]);
-        let lookup = |key: &str| relative.get(key).cloned();
-        let path = marker_path(&lookup).expect("fallback marker path");
-        if !cfg!(windows) {
+        // `marker_path` resolves under `%LOCALAPPDATA%` on Windows and through
+        // `$XDG_DATA_HOME` / `$HOME/.local/share` elsewhere, so each platform
+        // gets its own literal expectation rather than one shared guess.
+        if cfg!(windows) {
+            let local = env_map(&[("LOCALAPPDATA", "/local")]);
+            let lookup = |key: &str| local.get(key).cloned();
+            let path = marker_path(&lookup).expect("windows marker path");
+            assert!(path.ends_with("bitty/install.json") || path.ends_with("bitty\\install.json"));
+            // Neither a relative `XDG_DATA_HOME` nor `HOME` substitutes for
+            // `LOCALAPPDATA` on Windows: the resolver refuses instead of
+            // guessing a location the installer would not have used.
+            let relative = env_map(&[("XDG_DATA_HOME", "relative"), ("HOME", "/home/user")]);
+            let lookup = |key: &str| relative.get(key).cloned();
+            assert!(marker_path(&lookup).is_none());
+        } else {
+            let relative = env_map(&[("XDG_DATA_HOME", "relative"), ("HOME", "/home/user")]);
+            let lookup = |key: &str| relative.get(key).cloned();
+            let path = marker_path(&lookup).expect("fallback marker path");
             assert_eq!(
                 path,
                 PathBuf::from("/home/user/.local/share/bitty/install.json")

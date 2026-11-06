@@ -9,8 +9,9 @@
 //!
 //! Two entry points share one engine:
 //!
-//! * [`reload_requested`] serves the `bitty ctl` verb `bitty.debug/reloadConfig`
-//!   (an explicit client request), and
+//! * [`reload_requested_with`] serves the `bitty ctl` verb
+//!   `bitty.debug/reloadConfig` (an explicit client request, optionally a
+//!   dry run for `bitty reload --dry-run`), and
 //! * [`poll_file`] is a dependency-free poll watcher on the resolved config
 //!   file, evaluated once per tick from the app's drive loop.
 //!
@@ -103,23 +104,37 @@ impl ReloadOutcome {
 pub(crate) struct ReloadOutcomeInfo {
     /// Resolved config file path, or `(defaults; no file)`.
     pub(crate) path: String,
-    /// Machine-readable kind: `unchanged`, `applied`, `restart-required`,
-    /// `rejected`, `load-error`, or `apply-error`.
+    /// Machine-readable kind: `unchanged`, `applied`, `would-apply`,
+    /// `restart-required`, `rejected`, `load-error`, or `apply-error`.
+    /// `would-apply` appears only for a dry run.
     pub(crate) kind: &'static str,
-    /// Whether the running runtime adopted the change.
+    /// Whether the running runtime adopted the change (always `false` for a
+    /// dry run).
     pub(crate) applied: bool,
-    /// Dotted paths that changed (the report's diff fields).
+    /// Whether this attempt only reported the change list (`bitty reload
+    /// --dry-run`).
+    pub(crate) dry_run: bool,
+    /// Dotted paths that changed (the report's diff fields). For a dry run,
+    /// the paths that would change.
     pub(crate) changed: Vec<String>,
+    /// Dotted paths the plan validation refused. A non-empty list always
+    /// means the running plan was left untouched.
+    pub(crate) rejected: Vec<String>,
     /// Changed live-class fields the running runtime has no adopter for yet;
     /// they are recorded and take effect on the next start.
     pub(crate) restart_required: Vec<String>,
-    /// Detail for `load-error` / `apply-error`; `None` otherwise.
+    /// Detail for `rejected` / `load-error` / `apply-error`; `None`
+    /// otherwise.
     pub(crate) message: Option<String>,
     /// The typed `E_CONFIG_MODULE_*` record behind a `load-error`, when the
     /// failure was a configuration module refusal. The running plan is never
     /// partially adopted; this is the contract's typed outcome for the reload
     /// path.
     pub(crate) module: Option<Box<bitty_config::ConfigModuleDiagnostic>>,
+    /// Monotonic version of the running plan (bitty#2927). Starts at 1 and
+    /// increments each time a reload adopts a changed plan; `unchanged`,
+    /// restart-required, rejected, dry-run, and error attempts keep it.
+    pub(crate) plan_version: u64,
 }
 
 /// Whether the running app adopts `field` live through [`apply_live`].
@@ -684,6 +699,9 @@ struct ReloadContext {
     resolve: Box<dyn Fn() -> Result<ResolvedConfig, crate::config_cli::LoadFailure>>,
     watcher: Option<ConfigFileWatcher>,
     path_label: String,
+    /// Monotonic version of the running plan (bitty#2927): seeded at 1 and
+    /// incremented each time a reload adopts a changed plan.
+    plan_version: u64,
 }
 
 thread_local! {
@@ -745,6 +763,7 @@ fn install_context(
             resolve,
             watcher,
             path_label,
+            plan_version: 1,
         });
     });
 }
@@ -791,16 +810,74 @@ pub(crate) fn install_with_theme_dir(
     install_context(effective, None, resolve, watch, theme_dir);
 }
 
-/// Serve an explicit `bitty ctl` reload against the installed context.
+/// Test-only convenience: a real (non-dry-run) reload against the installed
+/// context.
 ///
 /// Returns `None` when no context is installed, so the caller keeps its
 /// probe-only response (headless/test paths never install a context).
+#[cfg(test)]
 pub(crate) fn reload_requested(runtime: &mut bitty_runtime::Runtime) -> Option<ReloadOutcomeInfo> {
+    reload_requested_with(runtime, false)
+}
+
+/// The reload path with the `bitty reload --dry-run` flag (bitty#2927).
+///
+/// A dry run re-resolves and classifies the config exactly like a real
+/// reload, but never commits the plan and never touches the runtime, so the
+/// reported change list is what the next real reload would adopt.
+pub(crate) fn reload_requested_with(
+    runtime: &mut bitty_runtime::Runtime,
+    dry_run: bool,
+) -> Option<ReloadOutcomeInfo> {
     CONTEXT.with(|slot| {
         let mut slot = slot.borrow_mut();
         let ctx = slot.as_mut()?;
-        Some(ctx.reload_into(runtime))
+        Some(ctx.reload_into(runtime, dry_run))
     })
+}
+
+/// Maximum bytes accepted for `core.config.reload` params.
+pub(crate) const MAX_RELOAD_PARAMS_BYTES: usize = 256;
+
+/// Parse `core.config.reload` params: absent/`{}`/`null` mean a real reload;
+/// `{"dry_run":true}` reports without applying.
+///
+/// Bounded and strict: the params object is flat, carries only `dry_run`, and
+/// any other shape is an `InvalidParams` usage error (never silently ignored).
+pub(crate) fn parse_reload_params(raw: Option<&str>) -> Result<bool, String> {
+    let Some(raw) = raw else {
+        return Ok(false);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "{}" || trimmed == "null" {
+        return Ok(false);
+    }
+    if trimmed.len() > MAX_RELOAD_PARAMS_BYTES {
+        return Err(format!(
+            "reload params too large ({} > {MAX_RELOAD_PARAMS_BYTES} bytes)",
+            trimmed.len()
+        ));
+    }
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .map(str::trim)
+        .ok_or_else(|| String::from("reload params must be a JSON object"))?;
+    let (key, value) = inner
+        .split_once(':')
+        .ok_or_else(|| String::from("reload params must carry a `dry_run` boolean"))?;
+    if key.trim().trim_matches('"') != "dry_run" {
+        return Err(String::from(
+            "reload params accept only the `dry_run` boolean",
+        ));
+    }
+    match value.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!(
+            "reload params.dry_run must be true or false (got {other:?})"
+        )),
+    }
 }
 
 /// The live effective config the runtime currently reflects (CTX-0951).
@@ -906,7 +983,7 @@ fn poll_file_at(runtime: &mut bitty_runtime::Runtime, at: Instant) -> Option<Rel
         if !ctx.watcher.as_mut()?.poll_at(at) {
             return None;
         }
-        let info = ctx.reload_into(runtime);
+        let info = ctx.reload_into(runtime, false);
         // A load/admin error is user-actionable: the rejected edit (including
         // a rejected local theme) leaves the last good palette live, so the
         // diagnostic must not be hidden behind the info gate.
@@ -963,22 +1040,37 @@ impl ReloadContext {
     }
 
     /// Re-resolve, classify, adopt if live, and build the caller-visible info.
-    fn reload_into(&mut self, runtime: &mut bitty_runtime::Runtime) -> ReloadOutcomeInfo {
+    ///
+    /// `dry_run` re-resolves and classifies but never commits the plan or
+    /// touches the runtime (bitty#2927), so `bitty reload --dry-run` reports
+    /// exactly what the next real reload would adopt.
+    fn reload_into(
+        &mut self,
+        runtime: &mut bitty_runtime::Runtime,
+        dry_run: bool,
+    ) -> ReloadOutcomeInfo {
         let resolved = match (self.resolve)() {
             Ok(resolved) => resolved,
             Err(failure) => {
+                let rejected = failure.field().map(str::to_string).into_iter().collect();
                 let (message, module) = failure.into_parts();
                 return ReloadOutcomeInfo {
                     path: self.path_label.clone(),
                     kind: "load-error",
                     applied: false,
+                    dry_run,
                     changed: Vec::new(),
+                    rejected,
                     restart_required: Vec::new(),
                     message: Some(message),
                     module,
+                    plan_version: self.plan_version,
                 };
             }
         };
+        if dry_run {
+            return self.dry_run_info(resolved.effective);
+        }
         let previous = self.engine.current().clone();
         let previous_profile = self.profile.clone();
         let outcome = self.engine.reload(resolved.effective);
@@ -1005,12 +1097,19 @@ impl ReloadContext {
                     path: self.path_label.clone(),
                     kind: "apply-error",
                     applied: false,
+                    dry_run: false,
                     changed: Vec::new(),
+                    rejected: Vec::new(),
                     restart_required: Vec::new(),
                     message: Some(message),
                     module: None,
+                    plan_version: self.plan_version,
                 };
             }
+            // The running plan adopted a changed config: the plan version
+            // advances. Unchanged, restart-required, rejected, and failed
+            // attempts keep it.
+            self.plan_version = self.plan_version.saturating_add(1);
         }
         // Committed (or nothing to adopt): drop the replaced background
         // generation so at most one decoded generation stays resident.
@@ -1022,21 +1121,108 @@ impl ReloadContext {
         if applied {
             self.profile = resolved.profile;
         }
-        let changed: Vec<String> = outcome
-            .report()
+        let report = outcome.report();
+        // A refused plan changed nothing: rejected paths travel in `rejected`,
+        // never in `changed`.
+        let changed: Vec<String> = report
             .diffs
             .iter()
+            .filter(|diff| diff.class != bitty_config::ReloadClass::Rejected)
             .map(|diff| diff.field.clone())
             .collect();
-        let restart_required = self.pending_restart_fields();
+        let rejected: Vec<String> = report
+            .diffs
+            .iter()
+            .filter(|diff| diff.class == bitty_config::ReloadClass::Rejected)
+            .map(|diff| diff.field.clone())
+            .collect();
+        // A rejected plan names its reason in the diff's `after` column.
+        let message = report
+            .diffs
+            .iter()
+            .find(|diff| diff.class == bitty_config::ReloadClass::Rejected)
+            .map(|diff| diff.after.clone());
+        // Restart-pending set: fields the running plan cannot adopt live. For
+        // an accepted restart-required diff the engine keeps the previous
+        // plan, so the launch-vs-current list alone would be empty; add the
+        // refused-to-adopt fields from this report so the reply names them
+        // (bitty#2927: never silently ignored).
+        let mut restart_required = self.pending_restart_fields();
+        if matches!(outcome, ReloadOutcome::RestartRequired(_)) {
+            for diff in &report.diffs {
+                if !adopted_live(diff.class, &diff.field, runtime_adopts)
+                    && !restart_required.contains(&diff.field)
+                {
+                    restart_required.push(diff.field.clone());
+                }
+            }
+        }
         ReloadOutcomeInfo {
             path: self.path_label.clone(),
             kind: outcome.kind(),
             applied,
+            dry_run: false,
             changed,
+            rejected,
             restart_required,
-            message: None,
+            message,
             module: None,
+            plan_version: self.plan_version,
+        }
+    }
+
+    /// Classify a prospective resolution without committing it (dry run).
+    ///
+    /// Uses the same [`bitty_config::diff`] and [`pending_fields`] policy as
+    /// the real path, so the reported change list matches the next apply.
+    fn dry_run_info(&self, incoming: EffectiveConfig) -> ReloadOutcomeInfo {
+        let report = bitty_config::diff(self.engine.current(), &incoming);
+        // A refused plan would change nothing: rejected paths travel in
+        // `rejected`, never in `changed`.
+        let changed: Vec<String> = report
+            .diffs
+            .iter()
+            .filter(|diff| diff.class != bitty_config::ReloadClass::Rejected)
+            .map(|diff| diff.field.clone())
+            .collect();
+        let rejected: Vec<String> = report
+            .diffs
+            .iter()
+            .filter(|diff| diff.class == bitty_config::ReloadClass::Rejected)
+            .map(|diff| diff.field.clone())
+            .collect();
+        let message = report
+            .diffs
+            .iter()
+            .find(|diff| diff.class == bitty_config::ReloadClass::Rejected)
+            .map(|diff| diff.after.clone());
+        // A rejected plan never reaches the restart check: the running plan
+        // is untouched, so nothing is pending.
+        let restart_required = if rejected.is_empty() {
+            pending_fields(&self.launched, &incoming, runtime_adopts)
+        } else {
+            Vec::new()
+        };
+        let kind = if !rejected.is_empty() {
+            "rejected"
+        } else if !restart_required.is_empty() {
+            "restart-required"
+        } else if changed.is_empty() {
+            "unchanged"
+        } else {
+            "would-apply"
+        };
+        ReloadOutcomeInfo {
+            path: self.path_label.clone(),
+            kind,
+            applied: false,
+            dry_run: true,
+            changed,
+            rejected,
+            restart_required,
+            message,
+            module: None,
+            plan_version: self.plan_version,
         }
     }
 }
@@ -2054,11 +2240,104 @@ mod tests {
         );
         assert_eq!(
             current_effective(),
-            Some(baseline),
+            Some(baseline.clone()),
             "an invalid edit must retain the last good plan"
         );
+        // bitty#2927: the rejected path is structural and the running plan
+        // version never advances for a refused edit.
+        assert_eq!(info.rejected, vec![String::from("window.opacity")]);
+        assert_eq!(info.plan_version, 1);
+        assert!(!info.dry_run);
         clear();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dry_run_reports_the_change_list_without_applying_or_bumping_the_version() {
+        // bitty#2927: `bitty reload --dry-run` must classify exactly like the
+        // real path but leave the runtime and the plan version untouched.
+        let dir = temp_dir("dry-run");
+        let path = dir.join("init.lua");
+        std::fs::write(
+            &path,
+            "return { font = { family = \"Mono\", size = 13.0 } }\n",
+        )
+        .expect("write valid config");
+        let mut args = crate::cli::Args::new();
+        args.config_path = Some(path.to_string_lossy().into_owned());
+        let baseline = crate::config_cli::load_app_config(&args)
+            .expect("valid config loads")
+            .effective;
+        let resolver_args = args.clone();
+        clear();
+        install_with(
+            baseline.clone(),
+            Box::new(move || {
+                crate::config_cli::load_app_config_typed(&resolver_args).map(|app| {
+                    crate::config_reload::ResolvedConfig {
+                        effective: app.effective,
+                        profile: app.profile_name,
+                    }
+                })
+            }),
+            Some(path.clone()),
+        );
+        let cfg =
+            crate::config_cli::runtime_config_from_effective(&baseline).expect("runtime config");
+        let mut runtime =
+            bitty_runtime::Runtime::with_deterministic_rasterizer(cfg).expect("runtime");
+
+        std::fs::write(
+            &path,
+            "return { font = { family = \"Mono\", size = 15.5 } }\n",
+        )
+        .expect("write changed config");
+        let preview = reload_requested_with(&mut runtime, true).expect("context installed");
+        assert_eq!(preview.kind, "would-apply", "{preview:?}");
+        assert!(!preview.applied);
+        assert!(preview.dry_run);
+        assert_eq!(preview.changed, vec![String::from("font.size")]);
+        assert!(preview.rejected.is_empty());
+        assert_eq!(preview.plan_version, 1);
+        assert!(
+            (runtime.config().font_size - 13.0).abs() < f32::EPSILON,
+            "a dry run must not touch the runtime"
+        );
+        assert_eq!(current_effective(), Some(baseline));
+
+        // The same change through the real path applies and advances the
+        // plan version the dry run already reported.
+        let applied = reload_requested_with(&mut runtime, false).expect("context installed");
+        assert_eq!(applied.kind, "applied", "{applied:?}");
+        assert!(applied.applied);
+        assert!(!applied.dry_run);
+        assert_eq!(applied.plan_version, 2);
+        assert!((runtime.config().font_size - 15.5).abs() < f32::EPSILON);
+        clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reload_params_are_bounded_and_strict() {
+        assert!(!parse_reload_params(None).expect("absent params"));
+        assert!(!parse_reload_params(Some("{}")).expect("empty object"));
+        assert!(!parse_reload_params(Some(" null ")).expect("null params"));
+        assert!(!parse_reload_params(Some("{\"dry_run\":false}")).expect("explicit false"));
+        assert!(parse_reload_params(Some("{\"dry_run\":true}")).expect("dry run"));
+        assert!(parse_reload_params(Some(" { \"dry_run\" : true } ")).expect("whitespace"));
+        for bad in [
+            "[]",
+            "{\"dry_run\":1}",
+            "{\"other\":true}",
+            "{\"dry_run\":true,\"x\":1}",
+        ] {
+            assert!(parse_reload_params(Some(bad)).is_err(), "{bad:?} must fail");
+        }
+        let oversized = format!(
+            "{{\"dry_run\":{}}}",
+            "true ".repeat(MAX_RELOAD_PARAMS_BYTES)
+        );
+        assert!(parse_reload_params(Some(&oversized)).is_err());
     }
 
     #[test]

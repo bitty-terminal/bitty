@@ -16377,6 +16377,15 @@ fn activation_time_timer_fires_on_the_idle_tick_cycle() {
         settings: Rc::new(MapSettings(settings)),
         snapshot: Rc::new(PinSnapshot),
     });
+    // Debug test builds drive the pinned 4 000-line bar `init.lua`, so widen
+    // only the wall dimension for this harness (the bitty#1744/#1727
+    // treatment, as in `bitty-runtime/tests/bar_clock_tick.rs`). Activation
+    // measured 60 ms against the 50 ms RC-1 slice on a sharded CI runner
+    // while the same test was green on a fast host, so this pins the timer
+    // wiring without pinning the runner's scheduler: production keeps
+    // `RC1_WALL_CLOCK_BUDGET_MS`, still enforced by `bitty-lua` and
+    // `bitty-runtime/tests/bar_activation_budget.rs`.
+    plugin_runtime.set_vm_wall_budget_ms(Some(10 * bitty_lua::RC1_WALL_CLOCK_BUDGET_MS));
     plugin_runtime.discover();
     plugin_runtime.set_workspace_source(Rc::new(PinWorkspaces));
     let bar = bitty_plugin_host::manifest::PluginId::new("bitty-terminal.bar").expect("id");

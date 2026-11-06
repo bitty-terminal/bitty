@@ -963,6 +963,10 @@ impl Runtime {
                 WindowEventKind::CursorLeft => {
                     // Cursor left window: end drag if active (deterministic).
                     self.end_selection_drag_in_place();
+                    // bitty#2938: no release can arrive for a captured drag
+                    // once the pointer is outside the window; drop the held
+                    // button so re-entry hover is not reported as a drag.
+                    self.mouse_drag_button = None;
                     // Issue #2787: a pending entry sync belongs to the surface
                     // the pointer just left; the next enter delivers its own.
                     self.cursor_entry_pending = false;

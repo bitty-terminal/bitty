@@ -13,7 +13,7 @@ use winit::window::{Window as WinitWindow, WindowAttributes, WindowId as WinitWi
 use crate::dpi::{LogicalSize, PhysicalSize, ScaleFactor};
 use crate::error::PlatformError;
 use crate::event::{
-    PlatformEvent, WindowEventKind, WindowId, map_occluded, translate_window_event,
+    ModifiersState, PlatformEvent, WindowEventKind, WindowId, map_occluded, translate_window_event,
 };
 use crate::surface::SurfaceTarget;
 
@@ -775,6 +775,13 @@ struct Registry {
     ids: HashMap<WinitWindowId, WindowId>,
     probes: HashMap<WinitWindowId, Arc<Mutex<OcclusionProbe>>>,
     next_raw_id: u64,
+    /// Last delivered modifier snapshot (bitty#2938).
+    ///
+    /// winit reports modifiers on `ModifiersChanged`, never on `MouseInput`,
+    /// so the adapter keeps the live snapshot and stamps each mouse button
+    /// event with it. `Default` is "none held", matching the pre-first-event
+    /// state.
+    modifiers: ModifiersState,
 }
 
 impl Registry {
@@ -945,9 +952,18 @@ impl<H: AppHandler> ApplicationHandler<WakeEvent> for Adapter<H> {
             }
             return;
         }
-        let Some(kind) = translate_window_event(event) else {
+        let Some(mut kind) = translate_window_event(event) else {
             return;
         };
+        // bitty#2938: winit's `MouseInput` has no modifier payload, so stamp
+        // the click with the live snapshot. The runtime ORs the Shift bit
+        // into its latch, making the selection escape independent of key
+        // event ordering.
+        match &mut kind {
+            WindowEventKind::ModifiersChanged(mods) => self.registry.modifiers = *mods,
+            WindowEventKind::MouseInput(mouse) => mouse.modifiers = self.registry.modifiers,
+            _ => {}
+        }
         // Issue #2570 follow-up: the probe tracks the delivered occlusion
         // state exactly, so a native edge (iOS, X11, Wayland `suspended`) and
         // the synthetic starve edge never double-deliver; a native reveal also

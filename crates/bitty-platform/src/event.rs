@@ -376,16 +376,26 @@ pub struct MouseEvent {
     /// emits [`MOUSE_CLICK_COUNT_DEFAULT`]; the runtime click tracker is the
     /// authority that recomputes the count from press time and cell.
     pub click_count: u8,
+    /// Modifier state at click time (bitty#2938).
+    ///
+    /// winit's `MouseInput` carries no modifiers, so the platform adapter
+    /// stamps the last `ModifiersChanged` snapshot here. The runtime ORs the
+    /// Shift bit into its key-event latch: a click that lands between the
+    /// physical Shift press and its key event still selects instead of being
+    /// reported to a mouse-tracking app.
+    pub modifiers: ModifiersState,
 }
 
 impl MouseEvent {
-    /// Creates a single-click event (the winit translation default).
+    /// Creates a single-click event with no modifiers (the winit translation
+    /// default before the adapter stamps the live snapshot).
     #[must_use]
     pub const fn new(button: MouseButton, state: PressState) -> Self {
         Self {
             button,
             state,
             click_count: MOUSE_CLICK_COUNT_DEFAULT,
+            modifiers: ModifiersState::NONE,
         }
     }
 
@@ -396,6 +406,22 @@ impl MouseEvent {
             button,
             state,
             click_count: Self::normalized_click_count(click_count),
+            modifiers: ModifiersState::NONE,
+        }
+    }
+
+    /// Creates an event with an explicit modifier snapshot (bitty#2938).
+    #[must_use]
+    pub const fn with_modifiers(
+        button: MouseButton,
+        state: PressState,
+        modifiers: ModifiersState,
+    ) -> Self {
+        Self {
+            button,
+            state,
+            click_count: MOUSE_CLICK_COUNT_DEFAULT,
+            modifiers,
         }
     }
 
@@ -549,12 +575,22 @@ pub enum WindowEventKind {
 }
 
 /// Modifier key state snapshot (pressed flags, bounded).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ModifiersState {
     pub shift: bool,
     pub control: bool,
     pub alt: bool,
     pub super_pressed: bool,
+}
+
+impl ModifiersState {
+    /// No modifiers held.
+    pub const NONE: Self = Self {
+        shift: false,
+        control: false,
+        alt: false,
+        super_pressed: false,
+    };
 }
 
 /// IME event (bounded, presentation-only).

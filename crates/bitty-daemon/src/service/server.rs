@@ -113,6 +113,27 @@ mod unix {
         const REQUEST_DEADLINE_OFFSET_ENV: &str = "BITTYD_TEST_REQUEST_DEADLINE_OFFSET_MS";
         const REQUEST_DEADLINE_METHOD_ENV: &str = "BITTYD_TEST_REQUEST_DEADLINE_METHOD";
 
+        /// Test-only retention-clock offset file inside the runtime directory.
+        ///
+        /// The conformance driver writes an offset here to age a retained
+        /// terminal record past `terminal_retention_ms` without waiting a wall
+        /// clock. The file is read only under the test-only `test-seams`
+        /// feature; a shipped binary never looks at it.
+        pub const CLOCK_OFFSET_FILE: &str = "bittyd.test-clock-offset";
+
+        /// Largest accepted retention-clock offset; one day covers the
+        /// compiled retention maximum with room for an additional window.
+        pub const MAX_CLOCK_OFFSET_MS: u64 = 86_400_000;
+
+        /// The retention-clock offset written by the real conformance driver.
+        pub fn clock_offset(path: &std::path::Path) -> u64 {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+                .min(MAX_CLOCK_OFFSET_MS)
+        }
+
         /// The effective `request_timeout_ms` override, when one is set.
         pub fn request_timeout_override() -> Option<u64> {
             std::env::var(REQUEST_TIMEOUT_ENV)
@@ -365,6 +386,8 @@ mod unix {
         Stopped {
             /// The accepted mode.
             mode: StopMode,
+            /// A bound worker could not be verified gone (`D-05` exit `5`).
+            unverified: bool,
         },
         /// A `SIGTERM`/`SIGINT` signal ran the drain policy.
         Signalled,
@@ -584,7 +607,24 @@ mod unix {
             .map_err(|_| ServerError::Io)?;
 
         let start = Instant::now();
-        let now = || MonotonicMs::from_millis(start.elapsed().as_millis() as u64);
+        // The test-only seam adds a file-driven offset to the loop clock, so a
+        // conformance vector can age a retained record past the advertised TTL
+        // without waiting on a wall clock. A shipped binary compiles the plain
+        // monotonic subtraction.
+        #[cfg(feature = "test-seams")]
+        let clock_offset_path = endpoint.runtime_dir().join(test_seams::CLOCK_OFFSET_FILE);
+        let now = || {
+            let elapsed = MonotonicMs::from_millis(start.elapsed().as_millis() as u64);
+            #[cfg(feature = "test-seams")]
+            {
+                let offset = test_seams::clock_offset(&clock_offset_path);
+                MonotonicMs::from_millis(elapsed.as_millis().saturating_add(offset))
+            }
+            #[cfg(not(feature = "test-seams"))]
+            {
+                elapsed
+            }
+        };
         let mut peers: Vec<PeerIo> = Vec::new();
         let mut next_tamper = config.tamper_interval_ms;
         let mut next_sweep = GRANT_SWEEP_INTERVAL_MS;
@@ -741,6 +781,20 @@ mod unix {
             // path never waits for a running worker.
             service.supervise(current);
 
+            // Retained terminal records are collected on the same tick. The
+            // TTL is the effective `terminal_retention_ms`; collection drops
+            // the record, its control keys, and its event ring.
+            service.collect_retained(current);
+
+            // A lease the collection could not serve is closed with
+            // `TerminalEventLost`; the transport retires the owning connection
+            // after the queued frames drain.
+            for peer in &mut peers {
+                if !peer.closed && !service.take_closed_leases_for(&peer.client).is_empty() {
+                    peer.retire();
+                }
+            }
+
             let idle = config.limits.effective(LimitId::TransportIdleMs);
             let negotiate = config.limits.effective(LimitId::NegotiateTimeoutMs);
             for peer in &mut peers {
@@ -826,7 +880,10 @@ mod unix {
         drop(peers);
         let _ = endpoint.close();
         Ok(match service.stop_requested() {
-            Some(mode) => ServerOutcome::Stopped { mode },
+            Some(mode) => ServerOutcome::Stopped {
+                mode,
+                unverified: service.stop_unverified(),
+            },
             None => ServerOutcome::Signalled,
         })
     }
@@ -2210,6 +2267,9 @@ mod unsupported {
         Stopped {
             /// The accepted mode.
             mode: crate::service::dispatch::StopMode,
+            /// A bound worker could not be verified gone; this cell serves no
+            /// worker, so the outcome is always `false`.
+            unverified: bool,
         },
         /// A signal drain.
         Signalled,

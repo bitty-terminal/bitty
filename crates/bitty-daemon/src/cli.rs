@@ -1,10 +1,12 @@
-//! `bittyd` command-line skeleton.
+//! `bittyd` command-line surface.
 //!
 //! This is the whole binary surface:
 //!
 //! - `bittyd start` runs the service loop: it binds the per-user endpoint,
 //!   mints the operator capability, accepts connections, and exits when
 //!   `daemon.stop` or a signal asks it to (bitty#2607);
+//! - `bittyd stop [--force | --drain]` speaks the authenticated endpoint as
+//!   the operator and issues `daemon.stop` (contract `D-05`);
 //! - `bittyd --version` prints the crate version and the contract service
 //!   version, then exits 0;
 //! - `bittyd --help` prints usage and exits 0;
@@ -12,15 +14,16 @@
 //!   binds an endpoint, creates a socket, or writes a runtime file;
 //! - anything else is a usage error and exits 2.
 //!
-//! Exit codes: `0` success (including "already running", where the desired
-//! state already holds), `1` internal failure before a listener accepted,
-//! `2` usage, `6` endpoint tamper. Codes `3`, `4`, and `5` are the contract's
-//! `daemon.stop` outcome codes; a running worker is terminated inside its
-//! containment identity before the exit, so a clean stop is `0`.
+//! Exit codes (`D-05`): `0` success (including "already running" and a stop
+//! with no active sessions), `1` internal failure, `2` usage, `3` active
+//! sessions on a default stop, `4` a drain deadline forced the remainder,
+//! `5` a worker could not be verified gone, `6` endpoint tamper or a failed
+//! authentication invariant.
 //!
 //! Parsing and rendering are pure so the behavior is testable without spawning
 //! the process; [`run`] writes the rendered strings, runs the service for
-//! `start`, and maps the outcome to an [`ExitCode`].
+//! `start`, issues the operator stop for `stop`, and maps the outcome to an
+//! [`ExitCode`].
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -28,8 +31,10 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use crate::CRATE_VERSION;
+use crate::client::{self, StopError, StopReply};
 use crate::contract::{BINARY_NAME, SERVICE_API_VERSION};
 use crate::seam::SeamStatus;
+use crate::service::dispatch::StopMode;
 use crate::service::server::{self, ServerConfig, ServerError, ServerOutcome};
 
 /// Successful invocation.
@@ -41,7 +46,16 @@ pub const EXIT_USAGE: u8 = 2;
 /// Internal failure before any listener accepted a connection.
 pub const EXIT_INTERNAL: u8 = 1;
 
-/// Endpoint tamper (contract exit code `6`).
+/// A default stop refused because sessions are active (`D-05`).
+pub const EXIT_ACTIVE_SESSIONS: u8 = 3;
+
+/// A drain deadline forced the remainder (`D-05`).
+pub const EXIT_DRAIN_FORCED: u8 = 4;
+
+/// A worker could not be verified gone (`D-05`).
+pub const EXIT_UNVERIFIED_WORKER: u8 = 5;
+
+/// Endpoint tamper or a failed authentication invariant (contract exit `6`).
 pub const EXIT_TAMPER: u8 = 6;
 
 /// One parsed `bittyd` invocation.
@@ -55,6 +69,8 @@ pub enum Invocation {
     Status,
     /// Run the service loop.
     Start,
+    /// Issue an authenticated operator stop over the served endpoint.
+    Stop(StopMode),
 }
 
 /// A rejected argument list.
@@ -92,14 +108,16 @@ pub struct Rendered {
 
 /// Parse `bittyd` arguments (without the program name).
 ///
-/// The seam accepts at most one argument. Multiple arguments are rejected
-/// instead of silently ignoring all but the first, so a future flag cannot be
-/// mistaken for a supported one.
+/// `stop` takes at most one mode flag: the default is `refuse`, `--force` is
+/// the immediate `force` mode, and `--drain` is the grace-period `drain` mode.
+/// A second flag, an unknown flag, or a flag on another subcommand is a usage
+/// error. Multiple bare arguments are rejected instead of silently ignoring
+/// all but the first, so a future flag cannot be mistaken for a supported one.
 ///
 /// # Errors
 ///
-/// Returns [`UsageError`] for an unknown argument, a non-UTF-8 argument, or
-/// more than one argument.
+/// Returns [`UsageError`] for an unknown argument or flag, a non-UTF-8
+/// argument, or more arguments than the subcommand accepts.
 pub fn parse_args<I, S>(args: I) -> Result<Invocation, UsageError>
 where
     I: IntoIterator<Item = S>,
@@ -109,21 +127,47 @@ where
     let Some(first) = args.next() else {
         return Ok(Invocation::Status);
     };
+    let first = first.as_ref();
+    let Some(first) = first.to_str() else {
+        return Err(UsageError::new(format!(
+            "argument is not valid UTF-8: '{}'",
+            first.to_string_lossy()
+        )));
+    };
+    if first != "stop" {
+        if let Some(extra) = args.next() {
+            return Err(UsageError::new(format!(
+                "unexpected extra argument '{}'",
+                extra.as_ref().to_string_lossy()
+            )));
+        }
+        return match first {
+            "--version" | "-V" => Ok(Invocation::Version),
+            "--help" | "-h" => Ok(Invocation::Help),
+            "start" => Ok(Invocation::Start),
+            argument => Err(UsageError::new(format!("unknown argument '{argument}'"))),
+        };
+    }
+
+    let Some(flag) = args.next() else {
+        return Ok(Invocation::Stop(StopMode::Refuse));
+    };
     if let Some(extra) = args.next() {
         return Err(UsageError::new(format!(
             "unexpected extra argument '{}'",
             extra.as_ref().to_string_lossy()
         )));
     }
-    match first.as_ref().to_str() {
-        Some("--version" | "-V") => Ok(Invocation::Version),
-        Some("--help" | "-h") => Ok(Invocation::Help),
-        Some("start") => Ok(Invocation::Start),
-        Some(argument) => Err(UsageError::new(format!("unknown argument '{argument}'"))),
-        None => Err(UsageError::new(format!(
-            "argument is not valid UTF-8: '{}'",
-            first.as_ref().to_string_lossy()
-        ))),
+    let flag = flag.as_ref().to_str().ok_or_else(|| {
+        UsageError::new(format!(
+            "stop flag is not valid UTF-8: '{}'",
+            flag.as_ref().to_string_lossy()
+        ))
+    })?;
+    match flag {
+        "--force" => Ok(Invocation::Stop(StopMode::Force)),
+        "--drain" => Ok(Invocation::Stop(StopMode::Drain)),
+        argument => Err(UsageError::new(format!("unknown stop flag '{argument}'"))),
     }
 }
 
@@ -131,15 +175,20 @@ where
 #[must_use]
 pub fn usage() -> String {
     format!(
-        "usage: {BINARY_NAME} [start | --version | --help]\n\
+        "usage: {BINARY_NAME} [start | stop [--force | --drain] | --version | --help]\n\
          \n\
          With no arguments, {BINARY_NAME} prints the session-host status and exits\n\
          0 without binding an endpoint. `{BINARY_NAME} start` binds the per-user\n\
          endpoint and serves the bitty-ipc v1 service until daemon.stop or a\n\
-         SIGTERM/SIGINT drain.\n\
+         SIGTERM/SIGINT drain. `{BINARY_NAME} stop` asks the running daemon to\n\
+         stop when no session is active; `--drain` requests the contract drain\n\
+         mode, and `--force` terminates every session immediately. The stop path\n\
+         uses the authenticated per-user endpoint; there is no TCP fallback.\n\
          \n\
-         exit codes: 0 ok or already running, 1 startup failure, 2 usage error,\n\
-         6 endpoint tamper\n"
+         exit codes: 0 ok, already running, or no daemon; 1 startup or transport\n\
+         failure; 2 usage error; 3 active sessions on a default stop; 4 drain\n\
+         deadline forced the remainder; 5 a worker could not be verified gone;\n\
+         6 endpoint tamper or a failed authentication invariant\n"
     )
 }
 
@@ -173,6 +222,13 @@ where
             stdout: String::new(),
             stderr: String::new(),
         },
+        Ok(Invocation::Stop(_)) => Rendered {
+            // `run` intercepts `Stop`: the exchange needs the endpoint, so the
+            // pure renderer never performs it.
+            exit_code: EXIT_OK,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
         Err(error) => Rendered {
             exit_code: EXIT_USAGE,
             stdout: String::new(),
@@ -185,6 +241,7 @@ where
 pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     match parse_args(args) {
         Ok(Invocation::Start) => run_start(),
+        Ok(Invocation::Stop(mode)) => run_stop(mode),
         Ok(invocation) => write_rendered(rendered_invocation(invocation)),
         Err(error) => write_rendered(usage_error(error)),
     }
@@ -197,9 +254,10 @@ fn run_start() -> ExitCode {
         Err(error) => return report(error),
     };
     match server::run(config) {
-        Ok(ServerOutcome::Stopped { mode }) => {
+        Ok(ServerOutcome::Stopped { mode, unverified }) => {
+            let code = stopped_exit_code(mode, unverified);
             report_text(&format!("{BINARY_NAME}: stopped ({mode})\n"));
-            ExitCode::from(EXIT_OK)
+            ExitCode::from(code)
         }
         Ok(ServerOutcome::Signalled) => {
             report_text(&format!("{BINARY_NAME}: stopped (signal drain)\n"));
@@ -219,6 +277,80 @@ fn run_start() -> ExitCode {
             ExitCode::from(EXIT_OK)
         }
         Err(error) => report(error),
+    }
+}
+
+/// Issue one authenticated `daemon.stop` and map its result to an exit code.
+fn run_stop(mode: StopMode) -> ExitCode {
+    match client::stop(mode) {
+        Ok(reply) => {
+            let code = stop_reply_exit_code(&reply);
+            report_text(&format!(
+                "{BINARY_NAME}: stopped ({}) with {} active session(s)\n",
+                reply.mode, reply.active_sessions
+            ));
+            if reply.unverified > 0 {
+                report_error(&format!(
+                    "{BINARY_NAME}: {} worker(s) could not be verified gone\n",
+                    reply.unverified
+                ));
+            }
+            ExitCode::from(code)
+        }
+        Err(StopError::Absent) => {
+            report_text(&format!("{BINARY_NAME}: no running daemon\n"));
+            ExitCode::from(EXIT_OK)
+        }
+        Err(error) => {
+            let code = stop_error_exit_code(&error);
+            report_error(&format!("{BINARY_NAME}: stop: {error}\n"));
+            ExitCode::from(code)
+        }
+    }
+}
+
+/// The `D-05` exit code for the `bittyd start` process after an accepted stop.
+///
+/// A force stop that left a worker unverified is exit `5`; every other
+/// accepted stop is `0`. A signal drain is mapped separately and stays `0` in
+/// this slice.
+#[must_use]
+pub fn stopped_exit_code(mode: StopMode, unverified: bool) -> u8 {
+    if mode == StopMode::Force && unverified {
+        EXIT_UNVERIFIED_WORKER
+    } else {
+        EXIT_OK
+    }
+}
+
+/// The `D-05` exit code for an accepted `daemon.stop`.
+///
+/// `force` is `0`, or `5` when a worker could not be verified gone. `drain` is
+/// `0`, or `4` when the deadline forced the remainder. `refuse` is `0`.
+#[must_use]
+pub fn stop_reply_exit_code(reply: &StopReply) -> u8 {
+    match reply.mode {
+        StopMode::Refuse => EXIT_OK,
+        StopMode::Drain if reply.drain_forced => EXIT_DRAIN_FORCED,
+        StopMode::Drain => EXIT_OK,
+        StopMode::Force if reply.unverified > 0 => EXIT_UNVERIFIED_WORKER,
+        StopMode::Force => EXIT_OK,
+    }
+}
+
+/// The `D-05` exit code for a refused or failed stop exchange.
+#[must_use]
+pub fn stop_error_exit_code(error: &StopError) -> u8 {
+    match error {
+        StopError::Absent => EXIT_OK,
+        StopError::Authentication => EXIT_TAMPER,
+        StopError::Refused { code, .. } if code == "ActiveSessions" => EXIT_ACTIVE_SESSIONS,
+        StopError::Refused { code, .. } if code == "DaemonStopping" => EXIT_OK,
+        StopError::UnsupportedPlatform
+        | StopError::InvalidEndpoint
+        | StopError::Refused { .. }
+        | StopError::Transport
+        | StopError::Protocol => EXIT_INTERNAL,
     }
 }
 
@@ -263,6 +395,11 @@ fn rendered_invocation(invocation: Invocation) -> Rendered {
             stderr: String::new(),
         },
         Invocation::Start => Rendered {
+            exit_code: EXIT_OK,
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+        Invocation::Stop(_) => Rendered {
             exit_code: EXIT_OK,
             stdout: String::new(),
             stderr: String::new(),
@@ -315,7 +452,7 @@ mod tests {
         assert!(
             result
                 .stdout
-                .contains("exit codes: 0 ok or already running, 1 startup failure, 2 usage error,")
+                .contains("3 active sessions on a default stop; 4 drain")
         );
     }
 
@@ -342,6 +479,100 @@ mod tests {
             parse_args(["start", "--quiet"]),
             Err(UsageError::new("unexpected extra argument '--quiet'"))
         );
+    }
+
+    #[test]
+    fn stop_parses_the_three_contract_modes() {
+        assert_eq!(parse_args(["stop"]), Ok(Invocation::Stop(StopMode::Refuse)));
+        assert_eq!(
+            parse_args(["stop", "--force"]),
+            Ok(Invocation::Stop(StopMode::Force))
+        );
+        assert_eq!(
+            parse_args(["stop", "--drain"]),
+            Ok(Invocation::Stop(StopMode::Drain))
+        );
+        assert_eq!(
+            parse_args(["stop", "--force", "--drain"]),
+            Err(UsageError::new("unexpected extra argument '--drain'"))
+        );
+        assert_eq!(
+            parse_args(["stop", "--all"]),
+            Err(UsageError::new("unknown stop flag '--all'"))
+        );
+        assert_eq!(
+            parse_args(["--force"]),
+            Err(UsageError::new("unknown argument '--force'"))
+        );
+    }
+
+    fn stop_reply(mode: StopMode, unverified: u64, drain_forced: bool) -> StopReply {
+        StopReply {
+            mode,
+            active_sessions: 0,
+            terminated: 0,
+            unverified,
+            drain_forced,
+        }
+    }
+
+    #[test]
+    fn stop_exit_codes_match_d05() {
+        assert_eq!(
+            stop_reply_exit_code(&stop_reply(StopMode::Refuse, 0, false)),
+            EXIT_OK
+        );
+        assert_eq!(
+            stop_reply_exit_code(&stop_reply(StopMode::Force, 0, false)),
+            EXIT_OK
+        );
+        assert_eq!(
+            stop_reply_exit_code(&stop_reply(StopMode::Force, 1, false)),
+            EXIT_UNVERIFIED_WORKER
+        );
+        assert_eq!(
+            stop_reply_exit_code(&stop_reply(StopMode::Drain, 0, false)),
+            EXIT_OK
+        );
+        assert_eq!(
+            stop_reply_exit_code(&stop_reply(StopMode::Drain, 0, true)),
+            EXIT_DRAIN_FORCED
+        );
+    }
+
+    #[test]
+    fn stop_refusal_exit_codes_match_d05() {
+        let active = StopError::Refused {
+            class: "Denied".to_owned(),
+            code: "ActiveSessions".to_owned(),
+            counts: Some((2, 16)),
+        };
+        assert_eq!(stop_error_exit_code(&active), EXIT_ACTIVE_SESSIONS);
+        assert_eq!(
+            stop_error_exit_code(&StopError::Refused {
+                class: "Denied".to_owned(),
+                code: "DaemonStopping".to_owned(),
+                counts: None,
+            }),
+            EXIT_OK
+        );
+        assert_eq!(
+            stop_error_exit_code(&StopError::Authentication),
+            EXIT_TAMPER
+        );
+        assert_eq!(stop_error_exit_code(&StopError::Absent), EXIT_OK);
+        assert_eq!(stop_error_exit_code(&StopError::Transport), EXIT_INTERNAL);
+    }
+
+    #[test]
+    fn a_forced_stop_with_an_unverified_worker_exits_five() {
+        assert_eq!(stopped_exit_code(StopMode::Force, false), EXIT_OK);
+        assert_eq!(
+            stopped_exit_code(StopMode::Force, true),
+            EXIT_UNVERIFIED_WORKER
+        );
+        assert_eq!(stopped_exit_code(StopMode::Refuse, false), EXIT_OK);
+        assert_eq!(stopped_exit_code(StopMode::Drain, false), EXIT_OK);
     }
 
     #[test]

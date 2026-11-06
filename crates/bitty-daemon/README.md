@@ -173,7 +173,12 @@ file, and owns only metadata.
 - Terminal states are immutable. A terminal record is retained (never live,
   never revived) until `terminal_retention_ms` or
   `max_retained_terminal_records` collects it in deterministic
-  `(terminalized_at, session_id)` order.
+  `(terminalized_at, session_id)` order. The served loop calls
+  `Service::collect_retained` on every poll tick, so the advertised
+  `terminal_retention_ms` is enforced rather than only compiled: collection
+  removes the record and its control keys and releases the session's event
+  ring, per-lease queues, and pinned terminal event. A lease the dropped ring
+  could not notify is closed with `TerminalEventLost`, never dropped silently.
 - A live session's `terminal_id` is unique; a retained terminal record may share
   it. Refusals (`max_sessions`, `session_record_bytes`, duplicate terminal id)
   are whole: no partial record, no counter change.
@@ -614,7 +619,7 @@ the compiled cell; there is no silent fallback and no weaker transport:
 | Plan                 | Selection                                                                                                      | Cleanup claim | Signals                                         |
 | -------------------- | -------------------------------------------------------------------------------------------------------------- | ------------- | ----------------------------------------------- |
 | `cgroup_v2`          | delegated cgroup v2 root (`/proc/self/cgroup` + writable `cgroup.procs`/`cgroup.kill` + a create/remove probe) | `swept`       | members from `cgroup.procs`, then `cgroup.kill` |
-| `subreaper_fallback` | `PR_SET_CHILD_SUBREAPER` confirmed by read-back when cgroup delegation is unavailable                          | `unverified`  | the exact pidfd and the recorded process group  |
+| `subreaper_fallback` | `PR_SET_CHILD_SUBREAPER` confirmed by read-back when cgroup delegation is unavailable                          | `swept` when verified | the leader pidfd, the recorded group, and descendant pidfds recorded before a stop |
 | `none`               | no cgroup v2 and no subreaper, or a non-Linux cell                                                             | none          | no spawn; typed refusal                         |
 
 Linux x86_64 is the first cell. A per-session cgroup is created **before** the
@@ -629,11 +634,16 @@ requires an empty `cgroup.procs` **and** `cgroup.events` `populated 0` and a
 successful subtree removal; an already-absent subtree is already reaped. A
 missing `populated` line is unproved emptiness, never a sweep.
 
-The subreaper fallback is consciously weaker: a `setsid` descendant can leave
-the recorded process group, so the fallback reports `unverified` even after it
-kills and reaps what it recorded. It never claims a sweep. A Linux host with
-neither mechanism refuses the spawn with a typed error rather than running an
-uncontained child.
+The subreaper fallback is weaker than a cgroup, but a stop verifies the claim
+the contract defines. Before the first signal it records a pidfd for every live
+descendant, including a child that left the group with `setsid`; `swept`
+requires the recorded group empty, the recorded leader pidfd exited, and every
+recorded descendant pidfd exited. A survivor fails that check and reports
+`unverified`; an unreadable `/proc` or a missing pidfd is also `unverified`.
+A natural exit is observed after the tree has already detached, so that path
+stays `unverified` until it can be scanned before the exit; only the stop path
+claims a verified sweep. A Linux host with neither mechanism refuses the spawn
+with a typed error rather than running an uncontained child.
 
 `daemon.orphans.verify` is served on Linux x86_64 when startup selected an
 enforced plan and opened the journal. The method takes an optional `action`:
@@ -713,7 +723,8 @@ recorded decoy, a reserved record left by a crash before commit, and a real
 recorded cgroup orphan that the journal reaps and verifies. The probe line is the enforced plan and the cleanup it may
 claim. On the development host (CachyOS, cgroup v2 with a delegated user scope)
 the probe selected `cgroup_v2` and the live tests passed with `swept` cleanup;
-the decoy was never signalled and the subreaper path reported `unverified`.
+the decoy was never signalled. The forced subreaper tests verify a clean tree as
+`swept` and report a `setsid` survivor as `unverified`.
 Tests must not be read as a cross-cell claim.
 
 ## Worker spawn, generation 1, and resize (bitty#2790)
@@ -775,8 +786,10 @@ signals the recorded identity while the unreaped zombie still reserves its
 process-group id, then reaps the leader and drains the recorded group. It never
 blocks the service loop for a running worker. On exit it signals the recorded
 identity once (not a pid), then settles the cleanup class through the plan: a
-verified-empty cgroup subtree is `swept` and its journal record is removed; the
-subreaper fallback is `unverified` and its record is quarantined for the
+verified-empty cgroup subtree, or a subreaper tree whose recorded group is
+empty, leader pidfd exited, and every pre-signal descendant pidfd exited, is
+`swept` and its journal record is removed; a survivor or a natural exit that
+could not be scanned is `unverified` and its record is quarantined for the
 retention window. A failed spawn terminalizes the session as
 `failed`/`spawn_failed` at generation 0, with the cleanup class the plan could
 prove (`not_started` before a child existed, `swept` or `unverified` after one
@@ -1246,6 +1259,13 @@ limit triples, the orphan object (its five class counts exist only on a served
 cell), and
 `tcp_listeners` (see the service-loop note above).
 
+`daemon.stop` also returns `unverified`, the number of bound workers the
+containment check could not prove gone. It is `0` for a registry-only or
+pre-bind stop, for a cgroup subtree verified empty, and for a subreaper tree
+whose group is empty, leader pidfd exited, and every pre-signal descendant
+pidfd exited. A `setsid` survivor, a missing pidfd, or an unreadable `/proc`
+leaves the cleanup `unverified` and counts toward exit code `5` on either plan.
+
 ### Served metadata fields (bitty#2806)
 
 Service `1.2` adds optional response keys only. Service `1.3` adds three
@@ -1436,17 +1456,31 @@ for every shared, non-known-defect vector and fails on any divergence.
 
 ```text
 bittyd start       # bind the endpoint and serve until daemon.stop or a signal
+bittyd stop        # refuse when a session is active; exit 3, daemon keeps serving
+bittyd stop --drain # request the contract drain mode
+bittyd stop --force # terminate every session now and exit
 bittyd --version   # crate version + contract service API, exit 0
 bittyd --help      # usage, exit 0
 bittyd             # status only: no endpoint bound, no runtime file, exit 0
 bittyd <other>     # usage error, exit 2
 ```
 
-Exit codes: `0` success (including "already running", where the desired state
-holds), `1` startup failure before a listener accepted, `2` usage, `6` endpoint
-tamper. `3`, `4`, and `5` are the contract's `daemon.stop` outcome codes; a
-running worker is terminated under its containment identity and recorded before
-the exit, so a clean stop is still `0`.
+`stop` is an operator client on the same `0600` Unix endpoint and the same
+`SCM_CREDENTIALS`/operator-capability negotiation as every other privileged
+request. It loads `bittyd.operator` through `OperatorStore::load_from`, so a
+symlinked, foreign-owned, or non-`0600` file fails closed; there is no TCP or
+out-of-band signal path.
+
+Exit codes: `0` success (including "already running" and a stop with no active
+sessions or no running daemon), `1` startup or transport failure, `2` usage,
+`3` active sessions on a default stop, `4` a drain deadline forced the
+remainder, `5` a worker could not be verified gone, `6` endpoint tamper or a
+failed authentication invariant. The accepted stop response carries
+`unverified`, which is `5` on `--force`; `drain` is `0` unless the response
+carries the additive `drain_forced` key. The current served loop terminates a
+drain's remainder when it accepts the stop, so it never sets that key; the
+`drain` wait is the contract's open service-loop gap and is tracked outside this
+slice.
 
 ## Dependency direction
 
@@ -1504,6 +1538,9 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
   content-frame budget, and the envelope-ready `session_content` frame.
 - `src/operator.rs` — the per-boot operator capability (`0600` file, mint,
   load, constant-time verify, redacted `Debug`).
+- `src/client.rs` — the operator CLI's authenticated `bittyd stop` exchange:
+  endpoint resolution, `0600` capability load, `SCM_CREDENTIALS`, and the
+  bounded `daemon.negotiate` + `daemon.stop` frames. No second transport.
 - `src/audit_sink.rs` — the owner-private rotating audit file and the
   fail-closed admission gate.
 - `src/service/scopes.rs` — the `session.*` / `daemon.*` scope registry and the

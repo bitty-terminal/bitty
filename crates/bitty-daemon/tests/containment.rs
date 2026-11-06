@@ -11,6 +11,7 @@
 use std::io::{BufRead as _, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use bitty_daemon::containment::{
@@ -25,6 +26,20 @@ use bitty_daemon::platform::PlatformCell;
 use bitty_daemon::registry::{CleanupClass, MonotonicMs, SessionId};
 
 static NEXT: AtomicU32 = AtomicU32::new(0);
+
+/// Serialize the process-spawning containment tests.
+///
+/// The subreaper plan attributes a post-spawn direct child to the session's
+/// tree, so a decoy or orphan spawned by a parallel test in the same process
+/// would correctly (but irrelevantly) make that stop unverified. The daemon is
+/// single-threaded in production; this lock gives the tests the same shape.
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn report() -> Option<ContainmentReport> {
     let report = ContainmentReport::probe();
@@ -97,6 +112,7 @@ fn assert_cleanup(report: &ContainmentReport, outcome: CleanupOutcome) {
 
 #[test]
 fn a_child_that_ignores_sigterm_is_contained_and_killed() {
+    let _serial = serial();
     let Some(report) = report() else {
         return;
     };
@@ -117,6 +133,7 @@ fn a_child_that_ignores_sigterm_is_contained_and_killed() {
 
 #[test]
 fn a_forked_grandchild_is_contained() {
+    let _serial = serial();
     let Some(report) = report() else {
         return;
     };
@@ -143,6 +160,7 @@ fn a_forked_grandchild_is_contained() {
 
 #[test]
 fn a_recorded_decoy_is_never_signalled() {
+    let _serial = serial();
     let Some(report) = report() else {
         return;
     };
@@ -167,7 +185,8 @@ fn a_recorded_decoy_is_never_signalled() {
 }
 
 #[test]
-fn the_subreaper_fallback_kills_the_recorded_tree_and_never_claims_a_sweep() {
+fn the_subreaper_fallback_verifies_the_recorded_tree_swept() {
+    let _serial = serial();
     let report = ContainmentReport::subreaper(
         PlatformCell::current(),
         Some("forced by the test".to_owned()),
@@ -194,13 +213,75 @@ fn the_subreaper_fallback_kills_the_recorded_tree_and_never_claims_a_sweep() {
     let grandchild: u32 = line.trim().parse().expect("grandchild pid is numeric");
 
     let outcome = child.terminate(limits());
-    assert_eq!(outcome.class(), CleanupClass::Unverified);
+    assert_eq!(outcome.class(), CleanupClass::Swept);
     assert!(wait_reaped(pid));
     assert!(wait_gone(grandchild));
 }
 
 #[test]
+fn the_subreaper_fallback_reports_a_setsid_survivor_unverified() {
+    let _serial = serial();
+    let report = ContainmentReport::subreaper(
+        PlatformCell::current(),
+        Some("forced by the test".to_owned()),
+    );
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("setsid sleep 30 & echo $!; wait")
+        .stdout(Stdio::piped());
+    let mut child = match spawn(&report, &name(), &mut command, limits()) {
+        Ok(child) => child,
+        Err(ContainmentError::Subreaper(_)) => {
+            eprintln!("subreaper unavailable in this environment; typed skip");
+            return;
+        }
+        Err(error) => panic!("fallback spawn failed: {error}"),
+    };
+    let pid = child.identity().pid().get();
+    let stdout = child.take_stdout().expect("piped stdout");
+    let mut line = String::new();
+    BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("survivor pid");
+    let survivor: u32 = line.trim().parse().expect("survivor pid is numeric");
+    // Wait until `setsid` has actually left the recorded group; otherwise the
+    // group kill can land before it detaches and the test would have no
+    // survivor to report.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let stat = std::fs::read_to_string(format!("/proc/{survivor}/stat")).unwrap_or_default();
+        let detached = stat.rsplit_once(')').is_some_and(|(_, rest)| {
+            let fields: Vec<&str> = rest.split_whitespace().collect();
+            fields.get(2).and_then(|pgrp| pgrp.parse::<u32>().ok()) == Some(survivor)
+                && fields.get(3).and_then(|sid| sid.parse::<u32>().ok()) == Some(survivor)
+        });
+        if detached {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let outcome = child.terminate(limits());
+    assert_eq!(
+        outcome.class(),
+        CleanupClass::Unverified,
+        "a setsid escape leaves a survivor outside the recorded group"
+    );
+    assert!(wait_reaped(pid), "the leader was not reaped");
+    assert!(
+        alive(survivor),
+        "the escaped descendant must survive the kill"
+    );
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(survivor.to_string())
+        .status();
+}
+
+#[test]
 fn the_subreaper_fallback_kills_a_descendant_that_ignores_sigterm() {
+    let _serial = serial();
     // The leader exits on SIGTERM while a descendant ignores it. The leader is
     // kept unreaped through the grace window so the recorded process group
     // cannot be recycled, and the escalation still reaches the descendant.
@@ -231,7 +312,7 @@ fn the_subreaper_fallback_kills_a_descendant_that_ignores_sigterm() {
     assert!(alive(descendant));
 
     let outcome = child.terminate(limits());
-    assert_eq!(outcome.class(), CleanupClass::Unverified);
+    assert_eq!(outcome.class(), CleanupClass::Swept);
     assert!(wait_reaped(pid), "the leader was not reaped");
     assert!(
         wait_reaped(descendant),
@@ -241,6 +322,7 @@ fn the_subreaper_fallback_kills_a_descendant_that_ignores_sigterm() {
 
 #[test]
 fn a_double_forked_setsid_child_with_closed_stdio_is_contained() {
+    let _serial = serial();
     let Some(report) = report() else {
         return;
     };
@@ -286,6 +368,7 @@ fn a_double_forked_setsid_child_with_closed_stdio_is_contained() {
 
 #[test]
 fn a_reserved_record_from_a_crash_is_reaped_through_its_subtree() {
+    let _serial = serial();
     // The crash-injection analogue for C-13: a reserved record with no
     // committed pid whose subtree already holds a live member is still
     // actionable through the pre-created cgroup.
@@ -355,6 +438,7 @@ fn a_reserved_record_from_a_crash_is_reaped_through_its_subtree() {
 
 #[test]
 fn a_refused_plan_spawns_nothing() {
+    let _serial = serial();
     let report = ContainmentReport::refused(
         PlatformCell::current(),
         ContainmentRefusal::UnsupportedPlatform {
@@ -369,6 +453,7 @@ fn a_refused_plan_spawns_nothing() {
 
 #[test]
 fn a_short_on_demand_budget_defers_one_record_and_the_next_pass_reaps_it() {
+    let _serial = serial();
     let report = ContainmentReport::probe();
     let Some(root) = report.cgroup_root() else {
         eprintln!("cgroup unavailable; typed skip");
@@ -494,6 +579,7 @@ fn a_short_on_demand_budget_defers_one_record_and_the_next_pass_reaps_it() {
 
 #[test]
 fn a_real_recorded_cgroup_orphan_is_reaped_and_verified() {
+    let _serial = serial();
     let report = ContainmentReport::probe();
     let Some(root) = report.cgroup_root() else {
         eprintln!("cgroup unavailable; typed skip");

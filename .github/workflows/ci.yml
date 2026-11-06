@@ -354,6 +354,12 @@ jobs:
         if: matrix.shard == 1
         run: cargo test -p bitty-daemon --test conformance --features test-seams --locked
 
+      # CTX-1716: the retention service-loop row uses the debug-only
+      # `test-seams` clock offset, so the sharded run above never executes it.
+      - name: Run bittyd retention seam test
+        if: matrix.shard == 1
+        run: cargo test -p bitty-daemon --test service_loop --features test-seams --locked retention_collects_a_terminal_record_past_the_ttl
+
       - name: Upload bittyd conformance evidence (fake)
         if: always() && matrix.shard == 1
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

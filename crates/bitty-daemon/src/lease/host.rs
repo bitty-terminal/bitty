@@ -786,13 +786,34 @@ impl SessionHost {
     pub fn collect_retained(&mut self, now: MonotonicMs) -> Vec<SessionId> {
         let collected = self.registry.collect_retained(now);
         for session_id in &collected {
-            if let Some(state) = self.sessions.remove(session_id) {
-                for attach_id in state.leases.keys() {
-                    self.lease_sessions.remove(attach_id);
-                }
-            }
+            self.forget_retained(*session_id);
+        }
+        // The registry enforces its retained-record cap when a terminal record
+        // is inserted, before this tick can observe the eviction. Drop the host
+        // state of any record the registry no longer resolves so per-session
+        // leases cannot outlive it.
+        let evicted: Vec<SessionId> = self
+            .sessions
+            .keys()
+            .copied()
+            .filter(|session_id| self.registry.snapshot(*session_id).is_none())
+            .collect();
+        for session_id in evicted {
+            self.forget_retained(session_id);
         }
         collected
+    }
+
+    /// Drop the host state of one collected or evicted session record.
+    ///
+    /// Every attach id in the record is unbound, so no lease can resolve to the
+    /// session after this call.
+    pub fn forget_retained(&mut self, session_id: SessionId) {
+        if let Some(state) = self.sessions.remove(&session_id) {
+            for attach_id in state.leases.keys() {
+                self.lease_sessions.remove(attach_id);
+            }
+        }
     }
 
     /// Attach an observer lease.

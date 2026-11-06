@@ -14,7 +14,7 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, read_dir, read_to_string};
 use std::io;
 use std::os::unix::process::CommandExt as _;
 use std::process::{Child, Command, ExitStatus};
@@ -302,7 +302,10 @@ fn spawn_subreaper(
     Ok(ContainedChild {
         child,
         identity,
-        scope: Scope::Subreaper { pgid },
+        scope: Scope::Subreaper {
+            pgid,
+            pidfd: PidFd::open(pid).ok(),
+        },
     })
 }
 
@@ -349,7 +352,12 @@ fn observe_identity(pid: u32) -> Option<ProcessIdentity> {
 #[derive(Debug)]
 enum Scope {
     Cgroup(SessionCgroup),
-    Subreaper { pgid: ProcessGroupId },
+    Subreaper {
+        pgid: ProcessGroupId,
+        /// The recorded leader handle. `None` means it could not be opened;
+        /// the plan then cannot claim a verified sweep for this child.
+        pidfd: Option<PidFd>,
+    },
 }
 
 /// One child whose whole-tree identity was established before it ran.
@@ -442,7 +450,7 @@ impl ContainedChild {
     /// process group and adopts the leader's reparented descendants; both are
     /// drained without blocking.
     pub fn drain_recorded(&self) {
-        if let Scope::Subreaper { pgid } = &self.scope {
+        if let Scope::Subreaper { pgid, .. } = &self.scope {
             drain_group(pgid.get());
             drain_adopted(self.identity.pid().get());
         }
@@ -458,15 +466,16 @@ impl ContainedChild {
     pub fn signal(&self, signal: Signal) -> usize {
         match &self.scope {
             Scope::Cgroup(cgroup) => cgroup.signal_members(signal).map_or(0, |pids| pids.len()),
-            Scope::Subreaper { pgid } => {
+            Scope::Subreaper { pgid, pidfd, .. } => {
                 if !identity_matches(self.identity) {
                     return 0;
                 }
                 let mut signalled = 0;
-                if let Ok(pidfd) = PidFd::open(self.identity.pid().get()) {
-                    if pidfd.send_signal(signal).is_ok() {
-                        signalled += 1;
-                    }
+                if pidfd
+                    .as_ref()
+                    .is_some_and(|pidfd| pidfd.send_signal(signal).is_ok())
+                {
+                    signalled += 1;
                 }
                 if let Ok(raw) = i32::try_from(pgid.get()) {
                     if nix::sys::signal::killpg(nix::unistd::Pid::from_raw(raw), signal).is_ok() {
@@ -481,9 +490,11 @@ impl ContainedChild {
     /// Settle the containment identity after the direct child was reaped.
     ///
     /// Returns `Some(cleanup)` once the plan can classify the whole tree:
-    /// `swept` when the cgroup subtree is empty and removed, `unverified` for
-    /// the subreaper fallback (a process group never proves a whole tree), and
-    /// `None` while a killed cgroup subtree still has members. Never waits.
+    /// `swept` when the cgroup subtree is empty and removed, or when the
+    /// subreaper recorded group is empty, the leader pidfd reports exit, and
+    /// no descendant was adopted after the spawn; `unverified` when any of
+    /// those checks fails; and `None` while a killed cgroup subtree still has
+    /// members. Never waits.
     #[must_use]
     pub fn sweep_if_empty(&mut self) -> Option<CleanupOutcome> {
         match &mut self.scope {
@@ -501,10 +512,18 @@ impl ContainedChild {
                 }),
                 Ok(false) | Err(_) => None,
             },
-            Scope::Subreaper { .. } => Some(CleanupOutcome {
-                class: CleanupClass::Unverified,
-                signalled: 0,
-            }),
+            Scope::Subreaper { .. } => {
+                // A natural exit has already detached the descendants to this
+                // subreaper before the poll tick observes it. Without a
+                // pre-signal descendant scan this path cannot prove the tree
+                // empty, so it stays conservative. A stop scans descendants
+                // before it signals; see `terminate`.
+                drain_adopted(self.identity.pid().get());
+                Some(CleanupOutcome {
+                    class: CleanupClass::Unverified,
+                    signalled: 0,
+                })
+            }
         }
     }
 
@@ -512,14 +531,19 @@ impl ContainedChild {
     ///
     /// Sends `SIGTERM`, waits [`ContainmentLimits::term_grace`], sends
     /// `SIGKILL` through the cgroup or the pidfd plus recorded process group,
-    /// waits [`ContainmentLimits::kill_wait`], and reaps the child. Only the
-    /// cgroup plan can return [`CleanupClass::Swept`].
+    /// waits [`ContainmentLimits::kill_wait`], and reaps the child. The cgroup
+    /// plan and the subreaper plan both claim [`CleanupClass::Swept`] only
+    /// when their respective whole-tree check verifies empty.
     pub fn terminate(&mut self, limits: ContainmentLimits) -> CleanupOutcome {
         match &mut self.scope {
             Scope::Cgroup(cgroup) => term_cgroup(cgroup, &mut self.child, limits),
-            Scope::Subreaper { pgid } => {
-                term_subreaper(self.identity, *pgid, &mut self.child, limits)
-            }
+            Scope::Subreaper { pgid, pidfd } => term_subreaper(
+                self.identity,
+                *pgid,
+                pidfd.as_ref(),
+                &mut self.child,
+                limits,
+            ),
         }
     }
 }
@@ -562,21 +586,14 @@ fn term_cgroup(
 fn term_subreaper(
     identity: ProcessIdentity,
     pgid: ProcessGroupId,
+    pidfd: Option<&PidFd>,
     child: &mut Child,
     limits: ContainmentLimits,
 ) -> CleanupOutcome {
     let pid = identity.pid();
-    // Open the pidfd before checking the identity: the pidfd pins whatever
-    // process currently holds the pid, and the identity check then proves that
-    // pinned process is the recorded one. A pid reused between the observation
-    // and the open is refused instead of signalled.
-    let Ok(pidfd) = PidFd::open(pid.get()) else {
-        let _ = child.try_wait();
-        return CleanupOutcome {
-            class: CleanupClass::Unverified,
-            signalled: 0,
-        };
-    };
+    // The stored pidfd pins the recorded process. If it could not be opened,
+    // the plan can still signal the recorded group but cannot verify the
+    // leader's exit, so the cleanup stays `unverified`.
     // The process may already be gone; only an exact identity earns a signal.
     if !identity_matches(identity) {
         let _ = child.try_wait();
@@ -585,8 +602,17 @@ fn term_subreaper(
             signalled: 0,
         };
     }
+    // Record every live descendant before the first signal. A `setsid` child
+    // leaves the process group but is still a descendant at this point; its
+    // pidfd later proves whether the stop reached it. If the leader is no
+    // longer running or the scan cannot read `/proc`, the sweep is unproved.
+    let descendants = if leader_running(pid.get()) {
+        descendant_pidfds(pid.get())
+    } else {
+        None
+    };
     let mut signalled = 0;
-    let term_sent = pidfd.send_signal(Signal::SIGTERM).is_ok();
+    let term_sent = pidfd.is_some_and(|pidfd| pidfd.send_signal(Signal::SIGTERM).is_ok());
     if term_sent {
         signalled += 1;
         if let Ok(raw) = i32::try_from(pgid.get()) {
@@ -599,7 +625,9 @@ fn term_subreaper(
     // kill below lands. Reaping the leader first would let the group id be
     // recycled and leak the descendant.
     let _ = wait_bounded(limits.term_grace(), limits, || !leader_running(pid.get()));
-    let _ = pidfd.send_signal(Signal::SIGKILL);
+    if let Some(pidfd) = pidfd {
+        let _ = pidfd.send_signal(Signal::SIGKILL);
+    }
     if let Ok(raw) = i32::try_from(pgid.get()) {
         let _ = nix::sys::signal::killpg(nix::unistd::Pid::from_raw(raw), Signal::SIGKILL);
     }
@@ -613,11 +641,39 @@ fn term_subreaper(
         drain_adopted(pid.get());
         !group_has_members(pgid.get())
     });
-    // A process group is never a whole-tree proof.
     CleanupOutcome {
-        class: CleanupClass::Unverified,
+        class: if subreaper_swept(pgid, pidfd, descendants.as_deref()) {
+            CleanupClass::Swept
+        } else {
+            CleanupClass::Unverified
+        },
         signalled,
     }
+}
+
+/// Verify the subreaper whole-tree claim for one stop.
+///
+/// The recorded group must be empty, the leader pidfd must report exit, and
+/// every descendant pidfd recorded before the first signal must report exit.
+/// `None` means the pre-signal scan failed (or the leader was already gone), so
+/// the tree cannot be proved and the cleanup is never a sweep.
+fn subreaper_swept(
+    pgid: ProcessGroupId,
+    pidfd: Option<&PidFd>,
+    descendants: Option<&[PidFd]>,
+) -> bool {
+    let (Some(pidfd), Some(descendants)) = (pidfd, descendants) else {
+        return false;
+    };
+    if !pidfd.has_exited().unwrap_or(false) {
+        return false;
+    }
+    if group_has_members(pgid.get()) {
+        return false;
+    }
+    descendants
+        .iter()
+        .all(|descendant| descendant.has_exited().unwrap_or(false))
 }
 
 /// Whether the recorded leader can still run, without reaping it.
@@ -699,6 +755,54 @@ fn live_children() -> BTreeSet<u32> {
     LIVE_CHILDREN
         .lock()
         .map_or_else(|_| BTreeSet::new(), |live| live.clone())
+}
+
+/// Every direct child of this process across its threads, from `/proc`.
+///
+/// The daemon is single-threaded; iterating the task directory keeps the read
+/// correct for a test harness that spawns from several threads. An unreadable
+/// task or children file returns `None` so the caller never treats a failed
+/// read as an empty set.
+fn children_of(pid: u32) -> Option<BTreeSet<u32>> {
+    let tasks = read_dir(format!("/proc/{pid}/task")).ok()?;
+    let mut children = BTreeSet::new();
+    for task in tasks {
+        let task = task.ok()?;
+        let text = read_to_string(task.path().join("children")).ok()?;
+        for field in text.split_whitespace() {
+            if let Ok(child) = field.parse::<u32>() {
+                children.insert(child);
+            }
+        }
+    }
+    Some(children)
+}
+
+/// Pin every live descendant of `root` before a stop signals the tree.
+///
+/// The scan follows `/proc/<pid>/task/*/children`, so a descendant that has
+/// already left the recorded process group with `setsid` is still found while
+/// its parent is alive. A pid that vanished between the listing and
+/// `pidfd_open` is already gone; any other open failure makes the scan
+/// unproved and returns `None`.
+fn descendant_pidfds(root: u32) -> Option<Vec<PidFd>> {
+    let mut queue = vec![root];
+    let mut seen = BTreeSet::new();
+    let mut descendants = Vec::new();
+    while let Some(pid) = queue.pop() {
+        for child in children_of(pid)? {
+            if !seen.insert(child) {
+                continue;
+            }
+            match PidFd::open(child) {
+                Ok(pidfd) => descendants.push(pidfd),
+                Err(error) if error.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32) => {}
+                Err(_) => return None,
+            }
+            queue.push(child);
+        }
+    }
+    Some(descendants)
 }
 
 impl Drop for ContainedChild {

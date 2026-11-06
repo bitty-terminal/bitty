@@ -393,6 +393,28 @@ impl PidFd {
         }
         Ok(())
     }
+
+    /// Whether the pinned process has exited.
+    ///
+    /// A pidfd becomes readable when the process exits; `poll(2)` with a zero
+    /// timeout peeks at that state without blocking or reaping.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OS error from `poll(2)`.
+    pub(super) fn has_exited(&self) -> io::Result<bool> {
+        let mut fds = [nix::poll::PollFd::new(
+            self.0.as_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        match nix::poll::poll(&mut fds, 0u16) {
+            Ok(0) => Ok(false),
+            Ok(_) => Ok(fds[0]
+                .revents()
+                .is_some_and(|events| events.contains(nix::poll::PollFlags::POLLIN))),
+            Err(error) => Err(io::Error::from(error)),
+        }
+    }
 }
 
 #[cfg(test)]

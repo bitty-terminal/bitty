@@ -37,11 +37,15 @@
 //!
 //! `bittyd start` binds the per-user endpoint, mints the operator capability,
 //! serves the bitty-ipc v1 envelope, and stops on `daemon.stop` or a signal.
-//! It spawns a terminal only on a served cell and only inside a recorded
-//! containment identity, signals nothing outside that identity, and opens no
-//! TCP listener. A worker create is refused with
-//! `Denied/UnsupportedCapability` in every v0.2.0 build (`D-01`). Plain
-//! `bittyd` prints status and creates no runtime file.
+//! `bittyd stop [--force | --drain]` reaches the same endpoint as the operator:
+//! it loads the owner-private capability, negotiates, and issues `daemon.stop`
+//! with the contract's exit codes (`D-05`). A terminal record is collected by
+//! the served loop once `terminal_retention_ms` elapses. The daemon spawns a
+//! terminal only on a served cell and only inside a recorded containment
+//! identity, signals nothing outside that identity, and opens no TCP listener.
+//! A worker create is refused with `Denied/UnsupportedCapability` in every
+//! v0.2.0 build (`D-01`). Plain `bittyd` prints status and creates no runtime
+//! file.
 //!
 //! # Ownership and dependency direction
 //!
@@ -130,6 +134,7 @@
 pub mod audit;
 pub mod audit_sink;
 pub mod cli;
+pub mod client;
 pub mod codes;
 pub mod containment;
 pub mod content;

@@ -800,6 +800,9 @@ impl SessionRegistry {
     /// # Errors
     ///
     /// Refuses on an unknown or terminal session.
+    // Only the Linux supervision pass observes worker liveness through the
+    // lease host, so the sole caller is behind that cfg.
+    #[cfg(target_os = "linux")]
     pub(crate) fn observe_worker(
         &mut self,
         session_id: SessionId,

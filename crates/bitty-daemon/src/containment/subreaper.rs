@@ -1,11 +1,14 @@
 //! `PR_SET_CHILD_SUBREAPER` for the documented containment fallback.
 //!
 //! The flag makes this daemon the reaper for orphaned descendants of its
-//! children, so a daemonized grandchild is not lost to init. It is a fallback,
-//! not a containment identity: a process group can be escaped with `setsid`,
-//! and the subreaper cannot prove a whole tree gone without a kernel-scoped
-//! identity. The fallback therefore reports `unverified` cleanup and only the
-//! cgroup plan may claim `swept` (contract `D-04`, `D-06`).
+//! children, so a daemonized grandchild is not lost to init. A stop records a
+//! pidfd for every live descendant before it signals, then claims `swept` only
+//! when the recorded process group is empty, the leader pidfd reports exit,
+//! and every recorded descendant pidfd reports exit. A `setsid` survivor is
+//! still a descendant at scan time, so it fails the check; an unreadable
+//! `/proc` or a missing pidfd makes the cleanup `unverified` rather than
+//! assuming a sweep. A natural exit is observed after the tree detaches and
+//! stays `unverified`.
 
 use nix::sys::prctl;
 

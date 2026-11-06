@@ -619,7 +619,7 @@ the compiled cell; there is no silent fallback and no weaker transport:
 | Plan                 | Selection                                                                                                      | Cleanup claim | Signals                                         |
 | -------------------- | -------------------------------------------------------------------------------------------------------------- | ------------- | ----------------------------------------------- |
 | `cgroup_v2`          | delegated cgroup v2 root (`/proc/self/cgroup` + writable `cgroup.procs`/`cgroup.kill` + a create/remove probe) | `swept`       | members from `cgroup.procs`, then `cgroup.kill` |
-| `subreaper_fallback` | `PR_SET_CHILD_SUBREAPER` confirmed by read-back when cgroup delegation is unavailable                          | `unverified`  | the exact pidfd and the recorded process group  |
+| `subreaper_fallback` | `PR_SET_CHILD_SUBREAPER` confirmed by read-back when cgroup delegation is unavailable                          | `swept` when verified | the leader pidfd, the recorded group, and descendant pidfds recorded before a stop |
 | `none`               | no cgroup v2 and no subreaper, or a non-Linux cell                                                             | none          | no spawn; typed refusal                         |
 
 Linux x86_64 is the first cell. A per-session cgroup is created **before** the
@@ -634,11 +634,16 @@ requires an empty `cgroup.procs` **and** `cgroup.events` `populated 0` and a
 successful subtree removal; an already-absent subtree is already reaped. A
 missing `populated` line is unproved emptiness, never a sweep.
 
-The subreaper fallback is consciously weaker: a `setsid` descendant can leave
-the recorded process group, so the fallback reports `unverified` even after it
-kills and reaps what it recorded. It never claims a sweep. A Linux host with
-neither mechanism refuses the spawn with a typed error rather than running an
-uncontained child.
+The subreaper fallback is weaker than a cgroup, but a stop verifies the claim
+the contract defines. Before the first signal it records a pidfd for every live
+descendant, including a child that left the group with `setsid`; `swept`
+requires the recorded group empty, the recorded leader pidfd exited, and every
+recorded descendant pidfd exited. A survivor fails that check and reports
+`unverified`; an unreadable `/proc` or a missing pidfd is also `unverified`.
+A natural exit is observed after the tree has already detached, so that path
+stays `unverified` until it can be scanned before the exit; only the stop path
+claims a verified sweep. A Linux host with neither mechanism refuses the spawn
+with a typed error rather than running an uncontained child.
 
 `daemon.orphans.verify` is served on Linux x86_64 when startup selected an
 enforced plan and opened the journal. The method takes an optional `action`:
@@ -718,7 +723,8 @@ recorded decoy, a reserved record left by a crash before commit, and a real
 recorded cgroup orphan that the journal reaps and verifies. The probe line is the enforced plan and the cleanup it may
 claim. On the development host (CachyOS, cgroup v2 with a delegated user scope)
 the probe selected `cgroup_v2` and the live tests passed with `swept` cleanup;
-the decoy was never signalled and the subreaper path reported `unverified`.
+the decoy was never signalled. The forced subreaper tests verify a clean tree as
+`swept` and report a `setsid` survivor as `unverified`.
 Tests must not be read as a cross-cell claim.
 
 ## Worker spawn, generation 1, and resize (bitty#2790)
@@ -780,8 +786,10 @@ signals the recorded identity while the unreaped zombie still reserves its
 process-group id, then reaps the leader and drains the recorded group. It never
 blocks the service loop for a running worker. On exit it signals the recorded
 identity once (not a pid), then settles the cleanup class through the plan: a
-verified-empty cgroup subtree is `swept` and its journal record is removed; the
-subreaper fallback is `unverified` and its record is quarantined for the
+verified-empty cgroup subtree, or a subreaper tree whose recorded group is
+empty, leader pidfd exited, and every pre-signal descendant pidfd exited, is
+`swept` and its journal record is removed; a survivor or a natural exit that
+could not be scanned is `unverified` and its record is quarantined for the
 retention window. A failed spawn terminalizes the session as
 `failed`/`spawn_failed` at generation 0, with the cleanup class the plan could
 prove (`not_started` before a child existed, `swept` or `unverified` after one
@@ -1253,11 +1261,10 @@ cell), and
 
 `daemon.stop` also returns `unverified`, the number of bound workers the
 containment check could not prove gone. It is `0` for a registry-only or
-pre-bind stop and for the pidfd subreaper plan, whose advertised cleanup claim
-is `unverified` for every terminal transition; a structural fallback limitation
-is not an exit-`5` failure. On the cgroup v2 plan, a worker that was verified
-gone keeps the clean result (`swept`), and only a cleanup that could not prove
-the sweep counts toward exit code `5`.
+pre-bind stop, for a cgroup subtree verified empty, and for a subreaper tree
+whose group is empty, leader pidfd exited, and every pre-signal descendant
+pidfd exited. A `setsid` survivor, a missing pidfd, or an unreadable `/proc`
+leaves the cleanup `unverified` and counts toward exit code `5` on either plan.
 
 ### Served metadata fields (bitty#2806)
 

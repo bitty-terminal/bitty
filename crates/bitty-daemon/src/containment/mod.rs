@@ -7,7 +7,7 @@
 //! | Plan | Mechanism | Whole-tree proof | Cleanup claim |
 //! | --- | --- | --- | --- |
 //! | `ContainmentKind::CgroupV2` | delegated cgroup v2 subtree | `cgroup.procs` empty and `cgroup.events` `populated 0` | `swept` |
-//! | `ContainmentKind::Subreaper` | `PR_SET_CHILD_SUBREAPER` + recorded process group | recorded pids gone, no adopted child | `unverified` (always) |
+//! | `ContainmentKind::Subreaper` | `PR_SET_CHILD_SUBREAPER` + recorded process group | recorded group empty, leader pidfd exited, every pre-signal descendant pidfd exited | `swept` when verified, else `unverified` |
 //! | `ContainmentKind::Refused` | none | none | no spawn, typed refusal |
 //!
 //! The fallback is deliberately weaker and says so. A process group alone can
@@ -220,9 +220,12 @@ impl std::error::Error for ContainmentRefusal {}
 /// The selected containment mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainmentKind {
-    /// Delegated cgroup v2 subtree; the only plan that can claim `swept`.
+    /// Delegated cgroup v2 subtree; one of the two plans that can claim
+    /// `swept`.
     CgroupV2,
-    /// `PR_SET_CHILD_SUBREAPER` plus the recorded process group.
+    /// `PR_SET_CHILD_SUBREAPER` plus the recorded process group, the leader
+    /// pidfd, and descendant pidfds recorded before a stop signals; claims
+    /// `swept` only when all of them verify gone.
     Subreaper,
     /// No mechanism; the daemon must not spawn a contained child.
     Refused,
@@ -249,8 +252,7 @@ impl ContainmentKind {
     #[must_use]
     pub const fn cleanup_claim(self) -> &'static str {
         match self {
-            Self::CgroupV2 => "swept",
-            Self::Subreaper => "unverified",
+            Self::CgroupV2 | Self::Subreaper => "swept",
             Self::Refused => "none",
         }
     }
@@ -469,11 +471,7 @@ impl ContainmentReport {
     /// The claim this plan can make about cleanup.
     #[must_use]
     pub const fn cleanup_claim(&self) -> &'static str {
-        match self.kind {
-            ContainmentKind::CgroupV2 => "swept",
-            ContainmentKind::Subreaper => "unverified",
-            ContainmentKind::Refused => "none",
-        }
+        self.kind.cleanup_claim()
     }
 
     /// Render the one-line status used by `bittyd` and diagnostics.
@@ -485,7 +483,7 @@ impl ContainmentReport {
             }
             ContainmentKind::Subreaper => {
                 let reason = self.fallback_reason.as_deref().unwrap_or("no reason");
-                format!("{MECHANISM_SUBREAPER} (enforced; cleanup unverified; {reason})")
+                format!("{MECHANISM_SUBREAPER} (enforced; cleanup swept when verified; {reason})")
             }
             ContainmentKind::Refused => {
                 let reason = self
@@ -524,18 +522,18 @@ mod tests {
     }
 
     #[test]
-    fn the_fallback_reports_unverified_and_the_reason() {
+    fn the_fallback_claims_a_verified_sweep_and_reports_the_reason() {
         let report =
             ContainmentReport::subreaper(PlatformCell::LinuxX86_64, Some("no delegation".into()));
         assert_eq!(report.kind(), ContainmentKind::Subreaper);
-        assert_eq!(report.cleanup_claim(), "unverified");
+        assert_eq!(report.cleanup_claim(), "swept");
         assert_eq!(report.fallback_reason(), Some("no delegation"));
         assert!(report.summary().contains("subreaper_fallback"));
-        assert!(report.summary().contains("unverified"));
+        assert!(report.summary().contains("swept when verified"));
     }
 
     #[test]
-    fn cgroup_is_the_only_swept_claim() {
+    fn both_enforced_plans_claim_a_swept_cleanup() {
         let report = ContainmentReport::cgroup_v2(
             PlatformCell::LinuxX86_64,
             PathBuf::from("/sys/fs/cgroup/probe"),
@@ -580,7 +578,7 @@ mod tests {
         assert_eq!(report.cell(), PlatformCell::current());
         match report.kind() {
             ContainmentKind::CgroupV2 => assert_eq!(report.cleanup_claim(), "swept"),
-            ContainmentKind::Subreaper => assert_eq!(report.cleanup_claim(), "unverified"),
+            ContainmentKind::Subreaper => assert_eq!(report.cleanup_claim(), "swept"),
             ContainmentKind::Refused => {
                 assert!(report.refusal().is_some());
                 assert!(!report.is_enforced());

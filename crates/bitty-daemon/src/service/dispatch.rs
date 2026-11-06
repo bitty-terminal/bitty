@@ -69,7 +69,7 @@ use crate::audit::{
 };
 use crate::audit_sink::{AuditSink, AuditWriter};
 use crate::codes::RefusalCode;
-use crate::containment::{ContainmentKind, ContainmentReport, ExecRefusalKind};
+use crate::containment::{ContainmentReport, ExecRefusalKind};
 use crate::content::{CONTENT_FRAME_BYTES, ContentFrame};
 use crate::contract::{CAPABILITIES, Capabilities};
 use crate::events::{
@@ -163,18 +163,6 @@ struct TerminationReport {
     terminated: u64,
     /// Bound workers the containment check could not prove gone (`D-05`).
     unverified: u64,
-}
-
-/// Whether one stop cleanup is an unverified worker for `D-05` exit `5`.
-///
-/// `None` means the pool held no worker handle, so no worker existed to
-/// verify; that is not an unverified worker. `Some(Unverified)` is an exit-5
-/// condition only on a plan that can claim a verified sweep (cgroup v2). The
-/// pidfd subreaper plan advertises `cleanup: unverified` for every terminal
-/// transition by design (`containment` module table), so treating its normal
-/// stop as exit `5` would fail every stop on that supported fallback.
-fn stop_worker_unverified(plan: ContainmentKind, cleanup: Option<CleanupClass>) -> bool {
-    matches!(cleanup, Some(CleanupClass::Unverified)) && plan == ContainmentKind::CgroupV2
 }
 
 /// A static refusal.
@@ -807,8 +795,6 @@ impl Service {
                 self.closed_leases.push(close);
             }
             let host = &self.host;
-            self.pending_frames
-                .retain(|attach_id, _| host.session_for_lease(*attach_id).is_some());
             self.content_subscriptions
                 .retain(|attach_id, _| host.session_for_lease(*attach_id).is_some());
             // A terminal transition already retires these stores; the removal
@@ -2093,14 +2079,18 @@ impl Service {
             {
                 continue;
             }
-            let worker_cleanup = self.workers.terminate(session_id);
-            if stop_worker_unverified(self.containment.kind(), worker_cleanup) {
+            // This branch only sees `Running`/`Stopping` sessions, so a
+            // missing handle is a bound session whose worker was lost, never a
+            // session that never started (`Created` is handled above). Keep the
+            // conservative class so the terminal record and journal quarantine
+            // still describe the unverified tree.
+            let cleanup = self
+                .workers
+                .terminate(session_id)
+                .unwrap_or(CleanupClass::Unverified);
+            if cleanup == CleanupClass::Unverified {
                 report.unverified = report.unverified.saturating_add(1);
             }
-            // A missing handle is not an unverified worker: the session never
-            // had a worker to verify, so its terminal record is `not_started`
-            // and any stale journal record is removed rather than quarantined.
-            let cleanup = worker_cleanup.unwrap_or(CleanupClass::NotStarted);
             let _ = self.workers.forget(session_id);
             let _ = self.orphans.settle(session_id, cleanup, now);
             if let Ok(Termination::Completed(notice)) = self.host.record_termination(
@@ -6358,6 +6348,8 @@ mod tests {
             )
             .expect("attach");
         let token = claimed["control_token"].as_str().expect("token").to_owned();
+        let attach =
+            AttachId::parse(claimed["attach_id"].as_str().expect("attach id")).expect("attach id");
         let aborted = service
             .dispatch(
                 &mut creator,
@@ -6408,9 +6400,15 @@ mod tests {
         );
         assert_eq!(service.events.revision(parsed), None);
         assert_eq!(service.events.backlog_len(parsed), 0);
-        assert!(!service.initial_tokens.contains_key(&parsed));
-        assert!(!service.session_keys.contains_key(&parsed));
-        assert!(!service.observer_grant_ids.contains_key(&parsed));
+        assert!(
+            service
+                .closed_leases
+                .iter()
+                .any(|close| close.attach_id == attach
+                    && close.reason == crate::events::LeaseCloseReason::TerminalEventLost),
+            "the still-attached lease is closed with TerminalEventLost, never dropped: {:?}",
+            service.closed_leases
+        );
 
         let error = service
             .dispatch(
@@ -6435,28 +6433,7 @@ mod tests {
     }
 
     #[test]
-    fn only_a_verified_sweep_plan_counts_an_unverified_worker() {
-        assert!(stop_worker_unverified(
-            ContainmentKind::CgroupV2,
-            Some(CleanupClass::Unverified)
-        ));
-        assert!(!stop_worker_unverified(
-            ContainmentKind::Subreaper,
-            Some(CleanupClass::Unverified)
-        ));
-        assert!(!stop_worker_unverified(ContainmentKind::CgroupV2, None));
-        assert!(!stop_worker_unverified(
-            ContainmentKind::CgroupV2,
-            Some(CleanupClass::Swept)
-        ));
-        assert!(!stop_worker_unverified(
-            ContainmentKind::CgroupV2,
-            Some(CleanupClass::NotStarted)
-        ));
-    }
-
-    #[test]
-    fn stopping_without_a_worker_reports_no_unverified_worker() {
+    fn stopping_without_a_session_reports_no_unverified_worker() {
         {
             let (mut service, _dir) = service();
             let mut operator = operator_connection(&mut service);
@@ -6489,7 +6466,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_subreaper_worker_keeps_its_structural_unverified_cleanup_without_exit_five() {
+    fn a_subreaper_worker_with_no_survivors_sweeps_and_does_not_exit_five() {
         let cell = crate::platform::PlatformCell::current();
         let (mut service, _dir) = service_with_containment(
             Limits::default(),
@@ -6528,9 +6505,72 @@ mod tests {
         assert_eq!(terminal["session"]["state"], "terminated");
         assert_eq!(terminal["session"]["terminal_reason"], "daemon_stop");
         assert_eq!(
-            terminal["session"]["cleanup"], "unverified",
-            "the subreaper plan still advertises its structural cleanup claim"
+            terminal["session"]["cleanup"], "swept",
+            "a clean subreaper tree verifies empty"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_lost_worker_handle_terminalizes_unverified_and_quarantines_the_record() {
+        let cell = crate::platform::PlatformCell::current();
+        let report = ContainmentReport::subreaper(cell, Some("subreaper test".to_owned()));
+        let journal_dir = tempfile::tempdir().expect("journal dir");
+        std::fs::set_permissions(
+            journal_dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("chmod");
+        let supervisor = OrphanSupervisor::open(
+            journal_dir.path().join("orphans"),
+            &crate::orphan::OrphanJournalLimits::default(),
+            &report,
+            crate::containment::ContainmentLimits::default(),
+        )
+        .expect("served supervisor");
+        let (mut service, _dir) = service_with_containment(Limits::default(), supervisor, report);
+        let mut operator = operator_connection(&mut service);
+        let (_creator, session_id, _attach) = spawned_controller_session(
+            &mut service,
+            &mut operator,
+            "lost-handle",
+            json!(["/bin/cat"]),
+            false,
+        );
+
+        // Simulate the lost handle: the worker is settled outside the service,
+        // but its committed journal record is deliberately not settled.
+        let parsed = SessionId::parse(&session_id).expect("session id");
+        assert!(service.workers.forget(parsed).is_some());
+
+        let stopped = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::DaemonStop,
+                &json!({"mode": "force"}),
+                MonotonicMs::from_millis(20),
+            )
+            .expect("force stop");
+        assert_eq!(stopped["terminated"], 1, "{stopped}");
+        assert_eq!(stopped["unverified"], 1, "{stopped}");
+        assert!(service.stop_unverified());
+
+        let terminal = service
+            .dispatch(
+                &mut operator,
+                ServiceMethod::SessionStatus,
+                &json!({"session_id": session_id}),
+                MonotonicMs::from_millis(21),
+            )
+            .expect("status");
+        assert_eq!(terminal["session"]["state"], "terminated");
+        assert_eq!(terminal["session"]["cleanup"], "unverified");
+        let status = service.orphans.status_json();
+        assert_eq!(
+            status["records"]["unverified"], 1,
+            "the committed record is quarantined, not removed: {status}"
+        );
+        assert_eq!(status["records"]["committed"], 0, "{status}");
     }
 
     #[test]
@@ -8333,6 +8373,104 @@ mod tests {
         assert!(
             !service.pending_frames.contains_key(&observer_attach),
             "a closed connection drops its pending final frames"
+        );
+    }
+
+    /// Retention must not drop another session's queued final frame.
+    ///
+    /// The frame belongs to a detached lease, so the host no longer resolves
+    /// that attach id; keying the collector by host lookup would erase a D-10
+    /// control frame for a live session while collecting an unrelated retained
+    /// record.
+    #[test]
+    fn retention_collection_keeps_another_sessions_pending_final_frame() {
+        let (mut service, _dir) = service();
+        let mut operator = operator_connection(&mut service);
+
+        // A doomed terminal record that the TTL sweep will collect.
+        let (mut creator_a, session_a, claimed_a) =
+            controller_session(&mut service, &mut operator, "retention-final-a");
+        let token_a = claimed_a["control_token"]
+            .as_str()
+            .expect("controller token")
+            .to_owned();
+        let aborted = service
+            .dispatch(
+                &mut creator_a,
+                ServiceMethod::SessionAbort,
+                &json!({
+                    "session_id": session_a,
+                    "reason_class": "cancel",
+                    "control_token": token_a,
+                    "generation": 0,
+                }),
+                MonotonicMs::from_millis(12),
+            )
+            .expect("abort doomed record");
+        assert_eq!(aborted["accepted"], true);
+
+        // A live session with a revoked observer lease whose final frame is
+        // waiting for the observer's next delivery pass.
+        let (mut creator_b, session_b, claimed_b) =
+            controller_session(&mut service, &mut operator, "retention-final-b");
+        let controller_b = claimed_b["control_token"]
+            .as_str()
+            .expect("controller token")
+            .to_owned();
+        let minted = service
+            .dispatch(
+                &mut creator_b,
+                ServiceMethod::SessionGrant,
+                &json!({"session_id": session_b, "idempotency_key": "retention-final-grant"}),
+                MonotonicMs::from_millis(13),
+            )
+            .expect("observer grant");
+        let grant = minted["grant"].as_str().expect("grant").to_owned();
+        let mut observer = consumer();
+        negotiate_ok(&mut service, &mut observer, 14);
+        let attached = service
+            .dispatch(
+                &mut observer,
+                ServiceMethod::SessionAttach,
+                &json!({
+                    "attach_role": "observer",
+                    "session_id": session_b,
+                    "observer_grant": grant,
+                }),
+                MonotonicMs::from_millis(15),
+            )
+            .expect("observer attach");
+        let observer_attach =
+            AttachId::parse(attached["attach_id"].as_str().expect("attach id")).expect("attach id");
+        service
+            .dispatch(
+                &mut creator_b,
+                ServiceMethod::SessionDetach,
+                &json!({
+                    "attach_id": observer_attach.as_hex(),
+                    "control_token": controller_b,
+                }),
+                MonotonicMs::from_millis(16),
+            )
+            .expect("revoke observer");
+        assert!(service.pending_frames.contains_key(&observer_attach));
+
+        assert_eq!(
+            service.collect_retained(MonotonicMs::from_millis(12 + 600_000)),
+            1
+        );
+        assert!(
+            service.pending_frames.contains_key(&observer_attach),
+            "retention of another session must not drop this control frame"
+        );
+        assert_eq!(service.route_final_frames(&mut observer), 1);
+        let frames = observer.take_pending_frames();
+        assert!(
+            frames
+                .iter()
+                .any(|event| event.kind == EventKind::LeaseRevoked
+                    && event.attach_id == Some(observer_attach)),
+            "the observer receives its revoked-lease frame after collection: {frames:?}"
         );
     }
 

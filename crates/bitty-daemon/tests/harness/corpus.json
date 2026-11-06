@@ -2462,7 +2462,7 @@
     },
     {
       "id": "V-17",
-      "title": "A force stop terminates two sessions with daemon_stop terminal events and reaping",
+      "title": "A force stop terminates two registry-only terminal sessions with daemon_stop events",
       "area": "stop",
       "decisions": ["D-05"],
       "drivers": ["real"],
@@ -2561,7 +2561,8 @@
           "method": "daemon.negotiate",
           "params": {
             "client_version": {"major": 1, "minor": 0},
-            "host_grant": "@grant2"
+            "host_grant": "@grant2",
+            "events": true
           },
           "expect": {
             "ok": true
@@ -2646,6 +2647,33 @@
           "expect": {
             "closed": true
           }
+        },
+        {
+          "action": "read_events",
+          "connection": "creator2",
+          "args": {
+            "count": 2,
+            "events": [
+              {
+                "kind": "session_state",
+                "revision": 2,
+                "attach_id": "@attach_b",
+                "terminal": false
+              },
+              {
+                "kind": "session_terminal",
+                "revision": 3,
+                "attach_id": "@attach_b",
+                "terminal": true,
+                "terminal_marker.state": "terminated",
+                "terminal_marker.reason": "daemon_stop",
+                "terminal_marker.cleanup": "not_started"
+              }
+            ]
+          },
+          "expect": {
+            "closed": true
+          }
         }
       ],
       "state": [
@@ -2664,9 +2692,10 @@
       ],
       "forbidden": [
         "a force stop never leaves a session running",
-        "both terminal events carry daemon_stop and a not_started cleanup",
+        "each terminal event carries daemon_stop and a not_started cleanup",
         "the CLI exit is 0 for an all-pre-bind force stop"
-      ]
+      ],
+      "deferred": "Real whole-tree reaping is deferred until worker hosting is enabled (D-01); V-17 uses registry-only terminal records"
     },
     {
       "id": "V-18",

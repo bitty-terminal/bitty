@@ -51,6 +51,25 @@ What each script installs:
 - FreeBSD (Tier 2): not a bootstrap target — manual download from the
   release page instead.
 
+## Upgrading
+
+Both scripts write an install marker (`$XDG_DATA_HOME/bitty/install.json`,
+`%LOCALAPPDATA%\bitty\install.json` on Windows) so `bitty upgrade` can detect
+the install source:
+
+```sh
+bitty upgrade --check      # current vs published release (read-only)
+bitty upgrade              # script/AppImage: verify and replace atomically
+bitty upgrade --rollback   # restore bitty.prev
+```
+
+Package-manager installs are delegated: `bitty upgrade` prints the exact
+command (and runs it only for user-scoped Homebrew/Scoop/AUR with `--yes`);
+system-owned apt/dnf/rpm/pacman/Nix installs are never executed and exit `7`.
+Windows re-runs the installer because a running `.exe` cannot be replaced.
+The full detection table, trust model, and rollback rules are in
+[`upgrade.md`](upgrade.md).
+
 ## Package managers
 
 - **Arch Linux (AUR)**: `paru -S bitty-bin` (prebuilt, recommended) or

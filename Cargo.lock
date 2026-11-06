@@ -502,6 +502,7 @@ dependencies = [
  "bitty-vt",
  "nix 0.31.3",
  "pollster",
+ "sha2",
  "signal-hook",
  "windows-sys 0.61.2",
 ]

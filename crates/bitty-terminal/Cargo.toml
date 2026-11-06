@@ -75,6 +75,9 @@ bitty-rich = { version = "0.0.33", path = "../bitty-rich" }
 bitty-term-state = { version = "0.0.33", path = "../bitty-term-state" }
 bitty-vt = { version = "0.0.33", path = "../bitty-vt" }
 pollster = { workspace = true }
+# CTX-1719 (bitty#2925): `bitty upgrade` verifies release assets against the
+# published `SHA256SUMS` before replacing a self-managed binary.
+sha2 = { workspace = true }
 # CTX-1265 (#2136): Unix TTY single-keypress picker navigation. `nix` (already
 # workspace-pinned) provides the safe termios/poll wrappers: cbreak mode
 # (ICANON/ECHO off, ISIG kept) plus readiness polling for ESC disambiguation.

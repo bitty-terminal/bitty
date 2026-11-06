@@ -296,7 +296,7 @@ pub(crate) fn nodes() -> Vec<Node> {
         &mut nodes,
         "doctor",
         Vec::new(),
-        &["--format", "--no-color"],
+        &["--format", "--no-color", "--fix", "--dry-run"],
         false,
     );
     push_node(
@@ -495,6 +495,14 @@ mod tests {
                 }
                 assert!(node.contains(&flag), "{name} missing {flag}");
             }
+        }
+    }
+
+    #[test]
+    fn doctor_node_offers_repair_flags() {
+        let node = candidates_for("doctor").expect("doctor node");
+        for flag in ["--format", "--no-color", "--fix", "--dry-run"] {
+            assert!(node.contains(&flag), "doctor missing {flag}");
         }
     }
 

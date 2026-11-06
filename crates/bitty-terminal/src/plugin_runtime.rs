@@ -29,7 +29,7 @@ use bitty_runtime::registry::{
     PanelError, PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId,
 };
 use bitty_runtime::scene_host::SceneHost;
-use bitty_runtime::{E_UI_UNAVAILABLE, TargetAnchorSummary, ViewId, WorkspaceSummary};
+use bitty_runtime::{E_UI_UNAVAILABLE, PaneCwd, TargetAnchorSummary, ViewId, WorkspaceSummary};
 
 /// Environment override for a local-path development plugin root.
 ///
@@ -53,14 +53,22 @@ pub(crate) struct SnapshotState {
     pub(crate) cursor_visible: bool,
     pub(crate) alternate_screen: bool,
     pub(crate) title: String,
-    /// Decoded `OSC 7` working directory of the focused pane (CTX-1715).
+    /// Pinned kernel working directory of the focused pane's PTY child
+    /// (CTX-1715, issue #2911).
     ///
     /// Published from the same host-observed model that serves
     /// `bitty.terminal.snapshot`; consumed only by
     /// `process.spawn { cwd = "pane" }`. It is deliberately absent from the
     /// Lua snapshot table: the spawn resolution is the only reader, so this
     /// adds no new snapshot field a plugin can read.
-    pub(crate) pane_cwd: Option<PathBuf>,
+    ///
+    /// The value is the PTY child's live kernel cwd pinned to a directory
+    /// identity, never the pane's `OSC 7` report: the report is untrusted PTY
+    /// output that any program in the pane can forge. `None` (no child, no
+    /// provable kernel cwd, or a platform without a kernel cwd query) leaves
+    /// the `pane` semantic unresolvable, which the spawn surface turns into a
+    /// typed refusal instead of a host-cwd fallback.
+    pub(crate) pane_cwd: Option<PaneCwd>,
 }
 
 /// Live committed-snapshot source for `bitty.terminal.snapshot` (CTX-0481).
@@ -112,11 +120,13 @@ impl LiveSnapshot {
             cursor_visible: cursor.visible,
             alternate_screen: state.alt_screen_active(),
             title: state.title().to_string(),
-            // CTX-1715: the focused pane's decoded `OSC 7` directory, read
-            // through the same runtime model that commits the semantic
-            // snapshot. `None` leaves the spawn `pane` semantic unresolvable
-            // (typed refusal), never a host-cwd fallback.
-            pane_cwd: runtime.focused_pane_cwd(),
+            // CTX-1715 / #2911: the focused pane's PTY-child kernel cwd,
+            // pinned to a directory identity and read through the same runtime
+            // model that commits the semantic snapshot. The pane's OSC 7
+            // report is never a source here. `None` leaves the spawn `pane`
+            // semantic unresolvable (typed refusal), never a host-cwd
+            // fallback.
+            pane_cwd: runtime.focused_pane_child_cwd(),
         };
         self.publish_state(next)
     }
@@ -200,14 +210,16 @@ impl SnapshotSource for LiveSnapshot {
 }
 
 impl PaneCwdSource for LiveSnapshot {
-    /// Working directory of the focused pane as of the last committed tick.
+    /// Pinned kernel cwd of the focused pane's PTY child as of the last
+    /// committed tick.
     ///
     /// Same published object and same tick as the semantic snapshot
     /// (CTX-1715): the plugin runtime's spawn backend reads it per dispatch,
     /// so a pane `cd` is observed without a plugin reload. `None` until the
-    /// first publish, when the focused pane has no report, or when its report
-    /// is not an absolute `file://` path.
-    fn pane_cwd(&self) -> Option<PathBuf> {
+    /// first publish, when the focused pane owns no PTY child, when the
+    /// kernel cwd is unreadable or deleted, or when the platform cannot query
+    /// it. The pane's `OSC 7` report is never consulted (#2911).
+    fn pane_cwd(&self) -> Option<PaneCwd> {
         self.state.borrow().pane_cwd.clone()
     }
 }
@@ -1082,22 +1094,20 @@ mod tests {
     }
 
     #[test]
-    fn live_snapshot_publishes_the_focused_pane_cwd_for_spawn() {
-        // CTX-1715: the spawn `pane` semantic reads the same published model
-        // as `bitty.terminal.snapshot`; the value is the decoded `OSC 7`
-        // directory of the focused view, not the host process cwd.
+    fn live_snapshot_publishes_no_pane_cwd_without_a_pty_child() {
+        // #2911: the spawn `pane` semantic is the PTY child's kernel cwd. A
+        // headless runtime owns no child, so a well-formed OSC 7 report must
+        // not become the published pane directory: the spawn refuses instead.
         let dir = std::env::temp_dir();
         let snapshot = LiveSnapshot::new(80, 24);
         let mut rt = Runtime::with_defaults().expect("must build");
         rt.handle_pty_bytes(&osc7_report(&dir));
         let _ = rt.tick();
-        assert!(snapshot.publish(&rt), "publish commits the report");
+        assert!(snapshot.publish(&rt), "publish commits the state");
         assert_eq!(
-            snapshot
-                .pane_cwd()
-                .map(|path| std::fs::canonicalize(path).expect("the pane cwd resolves")),
-            Some(std::fs::canonicalize(&dir).expect("the temp dir resolves")),
-            "the pane source serves the decoded focused-pane report"
+            snapshot.pane_cwd(),
+            None,
+            "an OSC 7 report is not a spawn cwd source"
         );
         assert!(
             snapshot
@@ -1107,6 +1117,71 @@ mod tests {
                 .is_none(),
             "the spawn cwd is not a new snapshot field plugins can read"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_snapshot_publishes_the_pty_child_cwd_for_spawn() {
+        // #2911: with a real PTY child, the published value is that child's
+        // kernel cwd -- and a contradicting OSC 7 report does not move it.
+        // Revert proof: the pre-fix publish read the report, so the value
+        // below is `reported` instead of `real` and the assert fails.
+        let root = std::env::temp_dir().join(format!(
+            "bitty-live-pane-cwd-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let real = root.join("real");
+        let reported = root.join("reported");
+        std::fs::create_dir_all(&real).expect("real dir");
+        std::fs::create_dir_all(&reported).expect("reported dir");
+
+        let snapshot = LiveSnapshot::new(80, 24);
+        let mut rt = Runtime::with_defaults().expect("must build");
+        rt.spawn_shell_with_args(
+            "sh",
+            &["-c", &format!("cd '{}' && exec sleep 60", real.display())],
+        )
+        .expect("spawn the pane shell");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let _ = rt.tick();
+            snapshot.publish(&rt);
+            let served = snapshot
+                .pane_cwd()
+                .map(|pinned| pinned.path().to_path_buf());
+            if served.as_deref() == Some(real.as_path()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane child must reach its directory: {served:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        rt.handle_pty_bytes(&osc7_report(&reported));
+        let _ = rt.tick();
+        snapshot.publish(&rt);
+        assert_eq!(
+            snapshot
+                .pane_cwd()
+                .map(|pinned| pinned.path().to_path_buf()),
+            Some(real.clone()),
+            "the PTY child's cwd wins over the pane report"
+        );
+        assert!(
+            snapshot
+                .snapshot("semantic")
+                .expect("scope ok")
+                .get("cwd")
+                .is_none(),
+            "the spawn cwd is not a new snapshot field plugins can read"
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
     /// Host-call deadline for the composition-root probes (bitty#2432,

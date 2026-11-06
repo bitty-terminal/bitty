@@ -149,6 +149,7 @@ pub mod log_throttle;
 pub mod memory;
 pub mod mouse_chrome;
 pub mod mouse_encode;
+pub mod pane_cwd;
 pub mod panel_rules;
 pub mod panes;
 pub mod plaintext_url;

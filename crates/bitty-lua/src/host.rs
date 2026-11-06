@@ -1675,10 +1675,10 @@ pub trait HostServices {
     ///
     /// [`SpawnCwd::HostDefault`] delegates to [`HostServices::process_spawn`],
     /// so a host that predates this seam keeps its exact behavior. A host
-    /// that cannot resolve [`SpawnCwd::Pane`] (no pane binding, or the bound
-    /// pane has no usable `OSC 7` report) must fail closed with
-    /// `E_SPAWN_CWD_UNAVAILABLE`; the default does exactly that rather than
-    /// silently running the child in the host process cwd.
+    /// that cannot resolve [`SpawnCwd::Pane`] (no pane binding, or no provable
+    /// PTY-child kernel cwd — never the pane's untrusted `OSC 7` report) must
+    /// fail closed with `E_SPAWN_CWD_UNAVAILABLE`; the default does exactly
+    /// that rather than silently running the child in the host process cwd.
     fn process_spawn_with_cwd(
         &self,
         args: &[String],

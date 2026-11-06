@@ -283,6 +283,7 @@ pub use runtime::help::{HELP_MAX_ROWS, HELP_PANEL_FOOTER, HELP_PANEL_TITLE};
 pub use runtime::layout_focus::{
     HYPERLINK_PREVIEW_MAX_CHARS, HoveredHyperlink, PanelSplitPlan, PresentFrame,
 };
+pub use runtime::pane_cwd::{PaneCwd, PaneCwdError};
 pub use runtime::plaintext_url::{HoveredPlaintextUrl, PlaintextUrlSpan};
 pub use runtime::plugin::{SystemUrlOpener, UrlOpener};
 pub use runtime::session::{

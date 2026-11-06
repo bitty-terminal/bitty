@@ -21,6 +21,7 @@ use bitty_lua::{BoundedExecution, HostServices, LuaValue, LuaVm, MarshallingLimi
 fn gate_vm(id: impl Into<String>) -> LuaVm {
     build_plugin_vm(id, Some(VmBudgets::default())).expect("default budgets are valid")
 }
+use bitty_runtime::PaneCwd;
 use bitty_runtime::plugin_runtime::services::{
     EmptySettings, NotificationQueue, PaneCwdSource, PluginServices, UnavailableSnapshot,
 };
@@ -30,20 +31,22 @@ use bitty_runtime::plugin_runtime::store::PluginStore;
 /// Test pane source with a caller-controlled directory.
 #[derive(Default)]
 struct StaticPaneCwd {
-    path: RefCell<Option<PathBuf>>,
+    pinned: RefCell<Option<PaneCwd>>,
 }
 
 impl StaticPaneCwd {
     fn new(path: PathBuf) -> Self {
         Self {
-            path: RefCell::new(Some(path)),
+            pinned: RefCell::new(Some(
+                PaneCwd::from_path(&path).expect("fixture directory must pin"),
+            )),
         }
     }
 }
 
 impl PaneCwdSource for StaticPaneCwd {
-    fn pane_cwd(&self) -> Option<PathBuf> {
-        self.path.borrow().clone()
+    fn pane_cwd(&self) -> Option<PaneCwd> {
+        self.pinned.borrow().clone()
     }
 }
 

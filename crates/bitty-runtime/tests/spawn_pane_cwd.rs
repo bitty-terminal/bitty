@@ -1,18 +1,19 @@
-//! CTX-1715 / bitty#2909: host-derived, confined `process.spawn { cwd =
-//! "pane" }` through the real plugin runtime.
+//! CTX-1715 / bitty#2909, issue #2911: host-derived, confined `process.spawn
+//! { cwd = "pane" }` through the real plugin runtime.
 //!
 //! These probes activate a real local-path package, dispatch a registered
 //! command, and run the real `[tools.git]` backend (subject to the same
-//! Landlock confinement as production on Linux). The pane directory is
-//! supplied by a [`PaneCwdSource`]: most tests control it directly, while the
-//! security-review probes feed the real host-observed model — raw `OSC 7`
-//! pane bytes and a focused session-less view — so the untrusted channel and
-//! the fail-closed focus case are covered without a test seam substituting a
-//! path.
+//! Landlock confinement as production on Linux). The pane directory is the
+//! PTY child's kernel cwd: most tests publish a pin they control, while the
+//! security-review probes drive the real host-observed model -- raw `OSC 7`
+//! pane bytes plus a real PTY child -- so the untrusted channel is proven
+//! inert and the fail-closed cases stay covered without a test seam
+//! substituting a path a pane could have named.
 //!
 //! The acceptance shape is the git-panel one: the child's working directory
 //! is the pane's, the host process cwd is not consulted, a plugin path is
-//! refused before spawn, and a missing binding/capability is a typed refusal.
+//! refused before spawn, a report cannot move the child, and a missing
+//! binding/capability is a typed refusal.
 
 #![forbid(unsafe_code)]
 
@@ -27,37 +28,47 @@ use bitty_runtime::plugin_runtime::{
     EmptySettings, LifecycleState, PaneCwdSource, PluginRuntime, PluginRuntimeConfig,
     SnapshotSource, UnavailableSnapshot,
 };
-use bitty_runtime::{LayoutNode, Runtime, SplitAxis, View, ViewId};
+use bitty_runtime::{LayoutNode, PaneCwd, Runtime, SplitAxis, View, ViewId};
 
 const PROBE_ID: &str = "bitty-featured.pane-cwd-probe";
 
 /// Source the test controls, mirroring the application's published model.
 #[derive(Default)]
 struct SharedPaneCwd {
-    path: RefCell<Option<PathBuf>>,
+    pinned: RefCell<Option<PaneCwd>>,
 }
 
 impl SharedPaneCwd {
+    /// Publishes `path` pinned as the pane directory (host-owned source).
     fn set(&self, path: PathBuf) {
-        *self.path.borrow_mut() = Some(path);
+        let pinned = PaneCwd::from_path(&path).expect("fixture directory must pin");
+        *self.pinned.borrow_mut() = Some(pinned);
+    }
+
+    /// Publishes a pin captured before a path swap (#2911 probes).
+    // Only the Linux swap probe holds a pre-swap pin, so the helper must be
+    // gated too: an ungated copy is dead code off Linux and fails `-D warnings`.
+    #[cfg(target_os = "linux")]
+    fn set_pinned(&self, pinned: PaneCwd) {
+        *self.pinned.borrow_mut() = Some(pinned);
     }
 }
 
 impl PaneCwdSource for SharedPaneCwd {
-    fn pane_cwd(&self) -> Option<PathBuf> {
-        self.path.borrow().clone()
+    fn pane_cwd(&self) -> Option<PaneCwd> {
+        self.pinned.borrow().clone()
     }
 }
 
-/// Adapter over the real host-observed terminal model, so a test can prove
-/// the resolver reads exactly what a pane program reported over `OSC 7`.
+/// Adapter over the real host-observed terminal model, so a probe can prove
+/// the resolver reads the PTY child and not the pane's `OSC 7` report.
 struct RuntimePaneCwd {
     runtime: Rc<RefCell<Runtime>>,
 }
 
 impl PaneCwdSource for RuntimePaneCwd {
-    fn pane_cwd(&self) -> Option<PathBuf> {
-        self.runtime.borrow().focused_pane_cwd()
+    fn pane_cwd(&self) -> Option<PaneCwd> {
+        self.runtime.borrow().focused_pane_child_cwd()
     }
 }
 
@@ -312,24 +323,50 @@ fn plugin_without_the_spawn_capability_gets_a_capability_denial() {
 
 #[test]
 #[cfg(target_os = "linux")]
-fn raw_osc7_pane_report_is_the_resolution_source() {
-    // CTX-1715 security review: the resolver's input is the untrusted pane
-    // `OSC 7` channel, fed end to end from raw terminal bytes through the
-    // host-observed model into the real spawn backend. No test seam supplies
-    // the path directly: the bytes a pane program emits select the directory.
-    let root = scratch("osc7-source");
-    let repo = git_repo(&root.join("pane"), "osc7-source", "osc7.txt");
+fn raw_osc7_pane_report_cannot_select_the_spawn_cwd() {
+    // Issue #2911: the pane's `OSC 7` report is untrusted PTY output -- a
+    // remote shell or `cat` of a crafted file can print any existing local
+    // path. The child must still start in the real PTY child's directory.
+    // Revert proof: the pre-fix resolver read the report, so the git toplevel
+    // below is the reported repository instead of the real one.
+    let root = scratch("osc7-inert");
+    let real = git_repo(&root.join("real"), "real", "real.txt");
+    let reported = git_repo(&root.join("reported"), "reported", "reported.txt");
     write_probe(&root, &["process.spawn:git"]);
 
     let terminal = Rc::new(RefCell::new(
         Runtime::with_defaults().expect("headless terminal"),
     ));
-    terminal.borrow_mut().handle_pty_bytes(&osc7(&repo));
-    assert_eq!(
-        terminal.borrow().focused_pane_cwd().as_deref(),
-        Some(repo.as_path()),
-        "the raw OSC 7 report is the decoded resolution source"
-    );
+    {
+        let mut rt = terminal.borrow_mut();
+        rt.spawn_shell_with_args(
+            "sh",
+            &["-c", &format!("cd '{}' && exec sleep 60", real.display())],
+        )
+        .expect("spawn the pane shell");
+        // The pane prints a directory it does not occupy.
+        rt.handle_pty_bytes(&osc7(&reported));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let served = rt
+                .focused_pane_child_cwd()
+                .map(|pinned| pinned.path().to_path_buf());
+            if served.as_deref() == Some(real.as_path()) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane child must reach its directory: {served:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            rt.focused_pane_child_cwd()
+                .map(|pinned| pinned.path().to_path_buf()),
+            Some(real.clone()),
+            "the raw OSC 7 report cannot replace the PTY child's directory"
+        );
+    }
 
     let mut runtime =
         runtime_with_source(&root, Some(Rc::new(RuntimePaneCwd { runtime: terminal })));
@@ -337,18 +374,52 @@ fn raw_osc7_pane_report_is_the_resolution_source() {
     let (toplevel, status) = output.split_once('|').expect("two sections");
     assert_eq!(
         Path::new(toplevel.trim()),
-        repo.as_path(),
-        "the child must run in the directory the raw OSC 7 report named"
+        real.as_path(),
+        "the child must run in the PTY child's directory, not the reported one"
     );
-    assert!(status.contains("osc7.txt"), "{status:?}");
+    assert!(status.contains("real.txt"), "{status:?}");
+    assert!(!status.contains("reported.txt"), "{status:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn pane_directory_swapped_after_observation_refuses_the_spawn() {
+    // #2911: the resolved directory is pinned to an inode, not a name. When
+    // the pinned directory is replaced between the pane observation and the
+    // dispatch, the host refuses instead of running git in whatever now owns
+    // the name. Revert proof: resolving the recorded path alone runs git in
+    // `impostor` and reports its toplevel instead of refusing.
+    let root = scratch("swap");
+    let real = git_repo(&root.join("real"), "real", "real.txt");
+    let impostor = git_repo(&root.join("impostor"), "impostor", "impostor.txt");
+    write_probe(&root, &["process.spawn:git"]);
+    let pane = Rc::new(SharedPaneCwd::default());
+    pane.set_pinned(PaneCwd::from_path(&real).expect("pin the pane directory"));
+    let mut runtime = runtime(&root, Some(pane));
+
+    // Sanity: the untouched pin serves the real repository.
+    let first = dispatch(&mut runtime).expect_string("run");
+    assert!(first.contains("real.txt"), "{first:?}");
+
+    // Swap the directory behind the pin.
+    let moved = root.join("real-moved");
+    std::fs::rename(&real, &moved).expect("move the pinned directory aside");
+    std::fs::rename(&impostor, &real).expect("impostor takes the pinned name");
+    let second = dispatch(&mut runtime).expect_string("run");
+    assert_eq!(
+        second, "ERR:E_SPAWN_CWD_UNAVAILABLE",
+        "a swapped pane directory must refuse, not follow the replacement"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
 fn focused_view_without_a_terminal_session_refuses_pane_cwd() {
     // CTX-1715 security review: a focused view with no terminal session (a
-    // panel-like surface) has no pane report. The resolver must refuse rather
-    // than fall back to the primary grid's report or the host process cwd.
+    // panel-like surface) owns no PTY child, so it has no provable directory.
+    // The resolver must refuse rather than fall back to the primary grid's
+    // report or the host process cwd.
     let root = scratch("no-session");
     let primary = root.join("primary");
     std::fs::create_dir_all(&primary).expect("primary dir");
@@ -363,7 +434,7 @@ fn focused_view_without_a_terminal_session_refuses_pane_cwd() {
         rt.handle_pty_bytes(&osc7(&primary));
         assert!(rt.primary_cwd().is_some(), "primary report is present");
         // ...but focus moves to a session-less non-primary view: no private
-        // pane session, so there is no report for the resolver to use.
+        // pane session, so there is no PTY child to resolve.
         rt.set_layout(LayoutNode::split(
             SplitAxis::Horizontal,
             0.5,
@@ -372,7 +443,7 @@ fn focused_view_without_a_terminal_session_refuses_pane_cwd() {
         ));
         assert!(rt.set_focus(ViewId::new(2)), "focus the session-less view");
         assert_eq!(
-            rt.focused_pane_cwd(),
+            rt.focused_pane_child_cwd(),
             None,
             "a session-less focused view has no pane cwd"
         );

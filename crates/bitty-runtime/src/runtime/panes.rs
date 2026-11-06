@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use super::layout_focus::PresentFrame;
+use super::pane_cwd::PaneCwd;
 use super::*;
 
 /// One split pane's private shell session (CTX-0176).
@@ -350,29 +351,41 @@ impl Runtime {
         self.session_pending_cwd(&target)
     }
 
-    /// Decoded `OSC 7` working directory of the focused pane (CTX-1715).
+    /// Pinned kernel working directory of the focused pane (issue #2911).
     ///
     /// This is the host-observed terminal model behind
-    /// `bitty.process.spawn(argv, { cwd = "pane" })`: the application
-    /// publishes it from the same tick that serves `bitty.terminal.snapshot`,
-    /// and the spawn surface resolves its `pane` semantic through that
-    /// published value. It reuses the same report source as
-    /// [`Self::inherited_cwd_for`] (the focused view's private session, else
-    /// the runtime-global grid when that view paints the primary grid), but
-    /// reads the focused view itself, so no spawn-target exclusion applies.
+    /// `bitty.process.spawn(argv, { cwd = "pane" })` after #2911: the
+    /// application publishes it from the same tick that serves
+    /// `bitty.terminal.snapshot`, and the spawn surface resolves its `pane`
+    /// semantic through that published value.
     ///
-    /// `None` when no view is focused, no report exists, or the report is not
-    /// an absolute `file://` path. The caller fails closed; this method never
-    /// substitutes the process cwd.
+    /// The directory comes from the PTY child, not from the pane's `OSC 7`
+    /// report: [`PaneCwd::from_pty_child`] reads `/proc/<pid>/cwd` on Linux and
+    /// pins its inode. `OSC 7` is untrusted PTY output — any program in the
+    /// pane can report any existing local path — so it is never consulted
+    /// here. The focused view's private session supplies the child; a
+    /// session-less view that paints the primary grid uses the primary PTY,
+    /// and any other session-less view has no child of its own.
+    ///
+    /// `None` when no view is focused, the focused view owns no PTY child,
+    /// the child is already reaped (its pid may be reused), the kernel cwd is
+    /// unreadable or deleted, or the platform cannot prove a child's cwd
+    /// (`PaneCwdError::Unsupported`: macOS, the BSDs, Windows). The caller
+    /// fails closed; this method never substitutes the process cwd and never
+    /// falls back to the report.
     #[must_use]
-    pub fn focused_pane_cwd(&self) -> Option<PathBuf> {
+    pub fn focused_pane_child_cwd(&self) -> Option<PaneCwd> {
         let focused = self.focused_view()?;
-        let report = match self.pane_sessions.get(&focused) {
-            Some(session) => session.state.cwd_report(),
-            None if self.paints_primary_grid(&focused) => self.state.cwd_report(),
-            None => None,
+        let pty = match self.pane_sessions.get(&focused) {
+            Some(session) => &session.pty,
+            None if self.paints_primary_grid(&focused) => self.pty.as_ref()?,
+            None => return None,
         };
-        report.and_then(osc7_cwd_path)
+        // A reaped child's pid is reusable: never read a stranger's cwd.
+        if pty.is_reaped() {
+            return None;
+        }
+        PaneCwd::from_pty_child(pty.pid()?).ok()
     }
 
     /// Spawns `program` with `args` as the private shell of layout leaf
@@ -1356,18 +1369,71 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn focused_pane_cwd_reads_the_primary_grid_report() {
-        // CTX-1715: the spawn `pane` semantic reads the focused view's own
-        // report. With only the primary grid present, that is the
-        // runtime-global state, decoded exactly like cwd inheritance.
+    fn focused_pane_child_cwd_has_no_answer_without_a_pty_child() {
+        // #2911: the spawn `pane` semantic is terminal truth, not terminal
+        // output. A headless runtime owns no PTY child, so even a well-formed
+        // `OSC 7` report yields no pane directory: the caller refuses instead
+        // of running a child wherever the report pointed.
         let mut rt = Runtime::with_defaults().expect("headless build");
         assert_eq!(rt.focused_view(), Some(ViewId::new(1)));
         rt.handle_pty_bytes(b"\x1b]7;file:///tmp\x07");
-        assert_eq!(rt.focused_pane_cwd(), Some(PathBuf::from("/tmp")));
+        assert!(
+            rt.focused_pane_child_cwd().is_none(),
+            "an OSC 7 report is not a resolution source"
+        );
+    }
 
-        // A report that is not an absolute `file://` path is not usable; the
-        // method returns `None` rather than inventing the process cwd.
-        rt.handle_pty_bytes(b"\x1b]7;kitty-shell-cwd://host/etc\x07");
-        assert_eq!(rt.focused_pane_cwd(), None);
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn focused_pane_child_cwd_ignores_a_contradicting_osc7_report() {
+        // #2911 discrimination: the focused pane's child really sits in
+        // `real`, while the pane prints an OSC 7 report naming `reported`. The
+        // resolved directory must be the child's kernel cwd. Revert proof: the
+        // pre-fix resolver returned the report, so this assert sees `reported`
+        // instead of `real` and fails.
+        let root = std::env::temp_dir().join(format!(
+            "bitty-pane-truth-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ));
+        let real = root.join("real");
+        let reported = root.join("reported");
+        std::fs::create_dir_all(&real).expect("real dir");
+        std::fs::create_dir_all(&reported).expect("reported dir");
+
+        let mut rt = Runtime::with_defaults().expect("build");
+        rt.spawn_shell_with_args(
+            "sh",
+            &["-c", &format!("cd '{}' && exec sleep 60", real.display())],
+        )
+        .expect("spawn the pane shell");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(pinned) = rt.focused_pane_child_cwd() {
+                if pinned.path() == real.as_path() {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane child must reach its directory"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        rt.handle_pty_bytes(format!("\x1b]7;file://{}\x07", reported.display()).as_bytes());
+        let pinned = rt
+            .focused_pane_child_cwd()
+            .expect("the pane child's cwd is provable");
+        assert_eq!(
+            pinned.path(),
+            real.as_path(),
+            "the PTY child's cwd wins over the report"
+        );
+        assert!(pinned.revalidate(), "the live pin still matches");
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

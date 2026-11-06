@@ -48,6 +48,7 @@ use bitty_ui::{PanelId, Point, UiNodeId, WorkspaceId};
 
 use crate::runtime::band_slots::{UiSlotPlacement, ui_slot_placement, unsupported_slot_error};
 use crate::runtime::fx::{FxPulseQueue, QueuedFxPulse};
+use crate::runtime::pane_cwd::PaneCwd;
 use bitty_plugin_host::{
     FsBridgeError, FsCaps, FsGate, HISTORY_READ_VERSION, HistoryDenialKind, HistoryGate,
     HistoryGrant, HistoryScope, HistorySource, PluginId, ProvidedService, QueryOp, SnapshotQuery,
@@ -248,22 +249,30 @@ pub trait SnapshotSource {
 }
 
 /// Host-observed working directory of the terminal pane a plugin is bound to
-/// (CTX-1715).
+/// (CTX-1715, issue #2911).
 ///
 /// The same live model that serves [`SnapshotSource`] publishes this value
 /// once per tick (`LiveSnapshot` in the application), so a pane cwd change is
 /// observed without a plugin reload and plugin calls never reach the runtime
-/// directly. Implementations return a *decoded* `OSC 7` path (absolute, as
-/// reported by the pane); canonicalization, control-byte rejection, the byte
-/// bound, and the directory check happen in
-/// [`spawn`](super::spawn) before the path reaches a child.
+/// directly.
 ///
-/// `None` means "no usable binding right now" — no focused pane, no report,
-/// or a report that is not an absolute `file://` path. Callers fail closed
-/// with `E_SPAWN_CWD_UNAVAILABLE`; they never substitute the host process cwd.
+/// The value is **terminal truth, not terminal output**: it is the PTY
+/// child's kernel working directory, pinned as a directory identity
+/// ([`PaneCwd`]). The pane's `OSC 7` report is untrusted PTY output — any
+/// program in the pane can name any existing local path — so implementations
+/// must not derive this value from it. Canonicalization, control-byte
+/// rejection, the byte bound, the directory check, and the identity
+/// re-validation happen in [`spawn`](super::spawn) before the path reaches a
+/// child.
+///
+/// `None` means "no provable binding right now" — no focused pane, no PTY
+/// child, a reaped child, an unreadable or deleted kernel cwd, or a platform
+/// without a kernel cwd query (macOS, the BSDs, Windows). Callers fail closed
+/// with `E_SPAWN_CWD_UNAVAILABLE`; they never substitute the host process cwd
+/// and never fall back to the report.
 pub trait PaneCwdSource {
-    /// Working directory of the bound pane, when observed.
-    fn pane_cwd(&self) -> Option<PathBuf>;
+    /// Pinned working directory of the bound pane, when the host can prove it.
+    fn pane_cwd(&self) -> Option<PaneCwd>;
 }
 
 /// Read-only workspace source for `bitty.workspace.list()` (CTX-0889).

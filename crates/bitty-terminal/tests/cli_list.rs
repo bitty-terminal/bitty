@@ -876,8 +876,21 @@ fn list_services_registered_rows_carry_frozen_keys() {
     let table = fixture.run(&["list", "services"]);
     assert_eq!(table.status.code(), Some(0));
     let text = stdout(&table);
-    assert!(
-        text.contains("INTERFACE OWNER VERSION PROVIDER BACKING_HEAD GRANT_SOURCE STATUS"),
+    // Columns are padded to their widest cell, so assert the header names in
+    // order rather than their exact spacing.
+    let header = text.lines().next().unwrap_or_default();
+    let columns: Vec<&str> = header.split_whitespace().collect();
+    assert_eq!(
+        columns,
+        [
+            "INTERFACE",
+            "OWNER",
+            "VERSION",
+            "PROVIDER",
+            "BACKING_HEAD",
+            "GRANT_SOURCE",
+            "STATUS"
+        ],
         "header: {text:?}"
     );
     assert!(text.contains("calc.add"), "row: {text:?}");

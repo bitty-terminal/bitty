@@ -1,17 +1,92 @@
-//! Default shell resolution and spawn helpers (CTX-0136).
+//! Default shell resolution and spawn helpers (CTX-0136, bitty#2928).
+
+use std::fmt;
 
 use bitty_runtime::{Runtime, SplitAxis, ViewId};
 
 // ---------------------------------------------------------------------------
-// Default shell resolution (CTX-0136)
+// Default shell resolution (CTX-0136, bitty#2928)
 // ---------------------------------------------------------------------------
 
-/// Fallback shell when `$SHELL` is unset or blank.
+/// POSIX fallback shell: the last Unix layer of the default chain and the
+/// retry target for a configured or `$SHELL` program that cannot spawn.
 ///
-/// POSIX default. Windows keeps the same fallback for now; the ConPTY default
-/// slice may refine this without changing the resolver contract (pure/total,
-/// no env/fs access — the caller injects `$SHELL`).
+/// Windows has no `/bin/sh`; the last layer there is the first
+/// [`PLATFORM_SHELL_CANDIDATES`] entry that resolves on `PATH` (bitty#2928).
 pub(crate) const FALLBACK_SHELL: &str = "/bin/sh";
+
+/// Ordered platform default candidates for the child shell (bitty#2928).
+///
+/// A fresh Windows install sets neither `terminal.shell` nor `$SHELL`, so the
+/// chain must end in a program that exists there: PowerShell 7+ when
+/// installed, else Windows PowerShell, else the command interpreter every
+/// Windows host ships. Unix keeps the POSIX fallback, unchanged.
+#[cfg(windows)]
+pub(crate) const PLATFORM_SHELL_CANDIDATES: &[&str] = &["pwsh.exe", "powershell.exe", "cmd.exe"];
+#[cfg(not(windows))]
+pub(crate) const PLATFORM_SHELL_CANDIDATES: &[&str] = &[FALLBACK_SHELL];
+
+/// Which precedence layer chose the default program (bitty#2928).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShellSource {
+    /// Explicit CLI `PROGRAM`, used verbatim.
+    Explicit,
+    /// Configured `terminal.shell`.
+    Configured,
+    /// `$SHELL`.
+    Environment,
+    /// Platform default candidate resolved on `PATH`.
+    PlatformDefault,
+}
+
+impl ShellSource {
+    /// Stable label for logs, `bitty doctor`, and failure messages.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Explicit => "cli program",
+            Self::Configured => "terminal.shell",
+            Self::Environment => "$SHELL",
+            Self::PlatformDefault => "platform default",
+        }
+    }
+}
+
+/// The resolved default child program plus the layer that chose it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedShell {
+    /// Direct `argv[0]`; absolute when it came from a `PATH` lookup.
+    pub(crate) program: String,
+    /// Precedence layer that chose `program`.
+    pub(crate) source: ShellSource,
+}
+
+/// Typed failure: no candidate in the default chain resolved to a program.
+///
+/// Reachable only on Windows: a Unix host's platform default is the POSIX
+/// fallback, returned without a filesystem probe exactly as before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnresolvedDefaultShell {
+    /// Candidates tried, in order.
+    pub(crate) tried: Vec<&'static str>,
+}
+
+impl fmt::Display for UnresolvedDefaultShell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "no default child shell: none of ")?;
+        for (index, candidate) in self.tried.iter().enumerate() {
+            if index > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{candidate:?}")?;
+        }
+        write!(
+            f,
+            " resolved on PATH; set terminal.shell or pass a program argument"
+        )
+    }
+}
+
+impl std::error::Error for UnresolvedDefaultShell {}
 
 /// Validates a configured `terminal.shell` value as a direct `argv[0]`.
 ///
@@ -32,109 +107,218 @@ pub(crate) fn configured_shell_argv0(configured: Option<&str>) -> Option<&str> {
     Some(trimmed)
 }
 
-/// Resolves the default shell chain from injected values: configured
-/// `terminal.shell` first when present and usable, then `$SHELL`, else
-/// [`FALLBACK_SHELL`].
+/// Picks the default program from injected values (bitty#2928).
 ///
-/// Pure and total for unit testing (no env/fs/net). Every candidate is
-/// trimmed but never split, joined, or interpolated; `$SHELL` is trusted
-/// only as a binary path. A blank or control-laden configured value fails
-/// closed to `$SHELL` (CTX-0298).
-pub(crate) fn resolve_default_shell<'a>(
-    config_shell: Option<&'a str>,
-    shell_env: Option<&'a str>,
-) -> &'a str {
+/// Precedence: configured `terminal.shell` > `$SHELL` > the first entry in
+/// `candidates` that `lookup` resolves. Pure and total: the caller injects
+/// both the candidate list and the lookup, so tests never touch the
+/// environment, the filesystem, or the network. Every candidate is trimmed
+/// but never split, joined, or interpolated; `$SHELL` is trusted only as a
+/// binary path, and a blank or control-laden configured value fails closed
+/// to `$SHELL` (CTX-0298).
+pub(crate) fn select_default_shell(
+    config_shell: Option<&str>,
+    shell_env: Option<&str>,
+    candidates: &[&'static str],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<ResolvedShell, UnresolvedDefaultShell> {
     if let Some(configured) = configured_shell_argv0(config_shell) {
-        return configured;
+        return Ok(ResolvedShell {
+            program: configured.to_string(),
+            source: ShellSource::Configured,
+        });
     }
-    match shell_env {
-        Some(s) if !s.trim().is_empty() => s.trim(),
-        _ => FALLBACK_SHELL,
+    if let Some(env) = shell_env.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(ResolvedShell {
+            program: env.to_string(),
+            source: ShellSource::Environment,
+        });
+    }
+    for candidate in candidates {
+        if let Some(program) = lookup(candidate) {
+            return Ok(ResolvedShell {
+                program,
+                source: ShellSource::PlatformDefault,
+            });
+        }
+    }
+    Err(UnresolvedDefaultShell {
+        tried: candidates.to_vec(),
+    })
+}
+
+/// Resolves the default child program for this host (bitty#2928):
+/// configured `terminal.shell` > `$SHELL` > platform default.
+///
+/// The platform default is [`FALLBACK_SHELL`] on Unix (returned as-is, no
+/// filesystem probe — byte-identical to the historical chain) and the first
+/// [`PLATFORM_SHELL_CANDIDATES`] entry on `PATH` on Windows, resolved with
+/// the same bounded lookup `bitty doctor` uses.
+pub(crate) fn resolve_default_shell(
+    config_shell: Option<&str>,
+    shell_env: Option<&str>,
+) -> Result<ResolvedShell, UnresolvedDefaultShell> {
+    select_default_shell(
+        config_shell,
+        shell_env,
+        PLATFORM_SHELL_CANDIDATES,
+        platform_lookup,
+    )
+}
+
+/// Resolves the platform default candidate `name` to a spawnable program.
+///
+/// Unix: the POSIX fallback is returned unchanged, so a missing `/bin/sh`
+/// still surfaces as a spawn failure instead of a resolution failure.
+/// Windows: bounded `PATH` search, so a bare candidate name is only used
+/// when it actually exists.
+fn platform_lookup(name: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let path_env = std::env::var("PATH").ok();
+        crate::doctor::find_on_path_with(path_env.as_deref(), name)
+            .map(|path| path.to_string_lossy().into_owned())
+    }
+    #[cfg(not(windows))]
+    {
+        Some(name.to_string())
     }
 }
 
 /// Resolves the program to spawn: an explicit `program` unchanged when
 /// present, else the default shell chain (configured `terminal.shell` >
-/// `$SHELL` > [`FALLBACK_SHELL`]).
+/// `$SHELL` > platform default).
 ///
-/// Pure and total; the caller reads `std::env::var("SHELL")` and the
-/// effective config once and injects them so tests never touch the
-/// environment.
-pub(crate) fn resolve_spawn_program<'a>(
-    program: Option<&'a str>,
-    config_shell: Option<&'a str>,
-    shell_env: Option<&'a str>,
-) -> &'a str {
+pub(crate) fn resolve_spawn_program(
+    program: Option<&str>,
+    config_shell: Option<&str>,
+    shell_env: Option<&str>,
+) -> Result<ResolvedShell, UnresolvedDefaultShell> {
     match program {
-        Some(program) => program,
+        Some(program) => Ok(ResolvedShell {
+            program: program.to_string(),
+            source: ShellSource::Explicit,
+        }),
         None => resolve_default_shell(config_shell, shell_env),
     }
 }
 
+/// The retry target for a configured or `$SHELL` program that cannot spawn:
+/// the platform default on its own (bitty#2928).
+fn platform_default_shell() -> Result<ResolvedShell, UnresolvedDefaultShell> {
+    select_default_shell(None, None, PLATFORM_SHELL_CANDIDATES, platform_lookup)
+}
+
+/// Why the startup shell did not start (bitty#2928).
+#[derive(Debug)]
+pub(crate) enum StartupShellError {
+    /// The default chain resolved to nothing; startup cannot continue.
+    Unresolved(UnresolvedDefaultShell),
+    /// The program resolved but the PTY spawn failed.
+    Spawn {
+        /// Program attempted last (direct `argv[0]`).
+        program: String,
+        /// Underlying runtime failure.
+        error: bitty_runtime::RuntimeError,
+    },
+}
+
+impl StartupShellError {
+    /// True when startup must stop instead of continuing without a child: an
+    /// unresolvable default is never a headless-smoke case (bitty#2928).
+    pub(crate) fn is_fatal(&self) -> bool {
+        matches!(self, Self::Unresolved(_))
+    }
+}
+
+impl fmt::Display for StartupShellError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unresolved(err) => err.fmt(f),
+            Self::Spawn { program, error } => {
+                write!(f, "child shell {program:?} failed to start: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StartupShellError {}
+
+impl From<UnresolvedDefaultShell> for StartupShellError {
+    fn from(value: UnresolvedDefaultShell) -> Self {
+        Self::Unresolved(value)
+    }
+}
+
 /// Spawns the default shell chain (configured `terminal.shell`, else
-/// `$SHELL`, else [`FALLBACK_SHELL`]) inside `runtime`.
+/// `$SHELL`, else the platform default) inside `runtime`.
 ///
-/// Tries the resolved default first; when the resolved default is not
-/// [`FALLBACK_SHELL`] and its spawn fails, retries once with
-/// [`FALLBACK_SHELL`] before surfacing the error. Callers log and continue
-/// without a child on error so headless smoke still ticks.
+/// Tries the resolved default first; when it differs from the platform
+/// default and its spawn fails, retries once with the platform default
+/// before surfacing the error. Callers decide whether to continue without a
+/// child: an unresolvable default is fatal, a failed spawn is fail-soft
+/// unless `--fail-loud` (CTX-0481).
 pub(crate) fn spawn_default_shell(
     runtime: &mut Runtime,
     config_shell: Option<&str>,
     shell_env: Option<&str>,
-) -> Result<(), bitty_runtime::RuntimeError> {
-    let default = resolve_default_shell(config_shell, shell_env);
-    spawn_with_fallback(|candidate, _| runtime.spawn_shell(candidate), default)
+) -> Result<(), StartupShellError> {
+    let resolved = resolve_default_shell(config_shell, shell_env)?;
+    let fallback = platform_default_shell()?;
+    spawn_with_fallback(
+        |candidate| runtime.spawn_shell(candidate),
+        &resolved.program,
+        &fallback.program,
+    )
+    .map_err(|(program, error)| StartupShellError::Spawn { program, error })
 }
 
 /// Spawn core with the startup fallback chain: try `default` first; when it
-/// differs from [`FALLBACK_SHELL`] and fails, retry once with the fallback
-/// before surfacing the error. The `spawn` closure performs the direct-argv
-/// exec into the target session (primary shell or one split pane). Callers
-/// log and continue without a child on error so headless smoke still ticks.
+/// differs from `fallback` and fails, retry once with `fallback` before
+/// surfacing the error. The `spawn` closure performs the direct-argv exec
+/// into the target session (primary shell or one split pane). Returns the
+/// program attempted last alongside its failure so the caller can name it.
 fn spawn_with_fallback(
-    mut spawn: impl FnMut(&str, &[&str]) -> Result<(), bitty_runtime::RuntimeError>,
+    mut spawn: impl FnMut(&str) -> Result<(), bitty_runtime::RuntimeError>,
     default: &str,
-) -> Result<(), bitty_runtime::RuntimeError> {
-    let no_args: &[&str] = &[];
-    match spawn(default, no_args) {
+    fallback: &str,
+) -> Result<(), (String, bitty_runtime::RuntimeError)> {
+    match spawn(default) {
         Ok(()) => {
             crate::logging::info(|| format!("bitty: spawned default shell {default:?}"));
             Ok(())
         }
-        Err(err) if default != FALLBACK_SHELL => {
+        Err(err) if default != fallback => {
             crate::logging::warn(|| {
                 format!(
-                    "bitty: spawn_shell({default:?}) failed: {err} — trying fallback {FALLBACK_SHELL:?}"
+                    "bitty: spawn_shell({default:?}) failed: {err} — trying fallback {fallback:?}"
                 )
             });
-            match spawn(FALLBACK_SHELL, no_args) {
+            match spawn(fallback) {
                 Ok(()) => {
-                    crate::logging::info(|| {
-                        format!("bitty: spawned fallback shell {FALLBACK_SHELL:?}")
-                    });
+                    crate::logging::info(|| format!("bitty: spawned fallback shell {fallback:?}"));
                     Ok(())
                 }
                 Err(fallback_err) => {
                     crate::logging::warn(|| {
-                        format!("bitty: spawn_shell({FALLBACK_SHELL:?}) failed: {fallback_err}")
+                        format!("bitty: spawn_shell({fallback:?}) failed: {fallback_err}")
                     });
-                    Err(fallback_err)
+                    Err((fallback.to_string(), fallback_err))
                 }
             }
         }
         Err(err) => {
             crate::logging::warn(|| format!("bitty: spawn_shell({default:?}) failed: {err}"));
-            Err(err)
+            Err((default.to_string(), err))
         }
     }
 }
 
 /// Frozen spawn recipe so every split leaf replays the exact startup
 /// resolution (explicit program verbatim, else the default-shell chain:
-/// configured `terminal.shell` > `$SHELL` > `/bin/sh`). Captured once at
-/// startup from CLI args + effective config + `$SHELL`; values are direct
-/// argv throughout, never split, joined, or interpolated.
+/// configured `terminal.shell` > `$SHELL` > platform default, bitty#2928).
+/// Captured once at startup from CLI args + effective config + `$SHELL`;
+/// values are direct argv throughout, never split, joined, or interpolated.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SpawnSpec {
     pub(crate) program: Option<String>,
@@ -146,16 +330,14 @@ pub(crate) struct SpawnSpec {
 impl SpawnSpec {
     /// Resolves `(program, args)` exactly as startup does: the explicit
     /// program wins verbatim with its tail args, otherwise the default shell
-    /// chain from the injected configured shell and `$SHELL` values. Pure;
-    /// the caller reads config/env once and injects them.
-    pub(crate) fn resolve(&self) -> (String, Vec<String>) {
+    /// chain from the injected configured shell and `$SHELL` values. The
+    /// platform default layer resolves on `PATH` on Windows, so a pane can
+    /// fail to resolve only when startup itself would have failed.
+    pub(crate) fn resolve(&self) -> Result<(String, Vec<String>), UnresolvedDefaultShell> {
         match self.program.as_deref() {
-            Some(program) => (program.to_string(), self.program_args.clone()),
-            None => (
-                resolve_default_shell(self.config_shell.as_deref(), self.shell_env.as_deref())
-                    .to_string(),
-                Vec::new(),
-            ),
+            Some(program) => Ok((program.to_string(), self.program_args.clone())),
+            None => resolve_default_shell(self.config_shell.as_deref(), self.shell_env.as_deref())
+                .map(|resolved| (resolved.program, Vec::new())),
         }
     }
 }
@@ -163,7 +345,7 @@ impl SpawnSpec {
 /// Spawns the [`SpawnSpec`] program as leaf `view`'s private shell, sized to
 /// `cols` x `rows` cells (CTX-0176). Same sandbox as startup: direct argv,
 /// explicit program verbatim with no fallback, default shell with the
-/// [`FALLBACK_SHELL`] retry. Failures are logged by the fallback core and
+/// platform-default retry. Failures are logged by the fallback core and
 /// returned so the caller degrades loudly: the pane then stays empty
 /// (CTX-0359: never a silent mirror of another pane's grid).
 pub(crate) fn spawn_pane_shell(
@@ -188,16 +370,28 @@ pub(crate) fn spawn_pane_shell_in(
     rows: u16,
     cwd: Option<&std::path::Path>,
 ) -> Result<(), bitty_runtime::RuntimeError> {
-    let (program, args) = spec.resolve();
+    let (program, args) = spec.resolve().map_err(|err| {
+        // Startup already resolved this chain, so a failure here is a
+        // late-environment change (a removed `PATH` entry). The pane stays
+        // empty and the message names the candidates that were tried.
+        crate::logging::warn(|| format!("bitty: pane shell not spawned: {err}"));
+        bitty_runtime::RuntimeError::Pty(err.to_string())
+    })?;
     if spec.program.is_some() {
         // Explicit program: verbatim, no fallback (startup parity).
         let tail: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         return runtime.spawn_shell_for_view_in(view, &program, &tail, cols, rows, cwd);
     }
+    let fallback = platform_default_shell().map_err(|err| {
+        crate::logging::warn(|| format!("bitty: pane shell not spawned: {err}"));
+        bitty_runtime::RuntimeError::Pty(err.to_string())
+    })?;
     spawn_with_fallback(
-        |candidate, _| runtime.spawn_shell_for_view_in(view, candidate, &[], cols, rows, cwd),
+        |candidate| runtime.spawn_shell_for_view_in(view, candidate, &[], cols, rows, cwd),
         &program,
+        &fallback.program,
     )
+    .map_err(|(_program, error)| error)
 }
 
 /// Spawns a private shell for every layout leaf except the focused one

@@ -76,6 +76,7 @@ fn table_output_lists_every_check_and_summary() {
         "pty",
         "terminfo",
         "shell",
+        "shell-default",
         "images",
         "plugins",
     ] {

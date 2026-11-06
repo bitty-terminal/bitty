@@ -12,9 +12,10 @@ use crate::spawn::{looks_like_negative_number, parse_split_token};
 /// Owned argument bag for the composition root.
 ///
 /// `program` is the optional `argv[0]` to spawn inside the PTY. When `None`
-/// the spawn layer resolves to the default shell (`$SHELL` or `/bin/sh` via
-/// [`resolve_default_shell`); parsing itself stays `None` to keep arg parsing
-/// pure (CTX-0136).
+/// the spawn layer resolves to the default shell (`$SHELL`, then the platform
+/// default — `/bin/sh` on Unix, `pwsh.exe`/`powershell.exe`/`cmd.exe` on
+/// Windows, bitty#2928 — via [`crate::spawn::resolve_default_shell`]); parsing
+/// itself stays `None` to keep arg parsing pure (CTX-0136).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Args {
     /// When true the binary runs a single headless tick smoke and exits.
@@ -45,8 +46,8 @@ pub(crate) struct Args {
     pub(crate) version: bool,
     /// Optional explicit program to spawn via `Runtime::spawn_shell`.
     /// When `None`, the spawn layer falls back to the default shell chain
-    /// ([`crate::spawn::resolve_default_shell`]: configured `terminal.shell` > `$SHELL` >
-    /// `/bin/sh`); explicit values are used verbatim.
+    /// ([`crate::spawn::resolve_default_shell`]: configured `terminal.shell` >
+    /// `$SHELL` > platform default); explicit values are used verbatim.
     pub(crate) program: Option<String>,
     /// Extra argv tail for the program (reserved; not yet forwarded to
     /// `PtyBuilder::arg` because `Runtime::spawn_shell` currently takes a
@@ -2534,7 +2535,9 @@ pub(crate) fn help_text() -> String {
          Arguments:\n  \
            PROGRAM          Program to spawn inside the PTY (direct argv[0],\n  \
                             no shell interpolation). When omitted defaults to\n  \
-                            $SHELL or /bin/sh; --headless still ticks.\n\
+                            $SHELL, else the platform default (/bin/sh on\n  \
+                            Unix; PowerShell or cmd on Windows); --headless\n  \
+                            still ticks.\n\
          \n\
          Layout:\n  \
            The app constructs a LayoutNode via bitty-ui and calls Runtime::set_layout.\n  \
@@ -2676,7 +2679,8 @@ pub(crate) fn help_text_short(color: bool) -> String {
             help [cmd]              Show this help, or per-command help (alias for --help)\n\
           \n\
           {arguments}\n  \
-            PROGRAM             Program to spawn in the PTY (default $SHELL or /bin/sh)\n\
+            PROGRAM             Program to spawn in the PTY (default $SHELL,\n\
+                                else the platform default shell)\n\
           \n\
           Run `bitty --help -v` for all flags, or `bitty <command> --help` for detail.\n",
         crate::version::version_semver()

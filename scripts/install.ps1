@@ -778,9 +778,24 @@ try {
     $iconSource = $destIcon
   }
   Write-BittyLog "icon source: $iconSource"
-  $versionOutput = & $destExe --version 2>&1
-  if ($LASTEXITCODE -ne 0) {
-    throw "install smoke failed: $destExe --version exited $LASTEXITCODE"
+  # #2929: bitty.exe links as a Windows GUI-subsystem binary, and PowerShell
+  # runs a GUI-subsystem child asynchronously: a bare `& $destExe --version`
+  # returns before the process exits, never sets $LASTEXITCODE (reading it
+  # under StrictMode throws), and can hand back an empty version line. Run the
+  # smoke as an explicit process so the exit code and the captured output are
+  # the real ones.
+  $smokeOut = Join-Path $stage 'smoke.stdout'
+  $smokeErr = Join-Path $stage 'smoke.stderr'
+  $smoke = Start-Process -FilePath $destExe -ArgumentList '--version' -Wait -PassThru `
+    -NoNewWindow -RedirectStandardOutput $smokeOut -RedirectStandardError $smokeErr
+  $versionOutput = [string](Get-Content -LiteralPath $smokeOut -Raw -ErrorAction SilentlyContinue)
+  $versionOutput = $versionOutput.Trim()
+  if ($smoke.ExitCode -ne 0) {
+    $smokeDiagnostics = [string](Get-Content -LiteralPath $smokeErr -Raw -ErrorAction SilentlyContinue)
+    throw "install smoke failed: $destExe --version exited $($smoke.ExitCode): $($smokeDiagnostics.Trim())"
+  }
+  if ($versionOutput -notmatch 'bitty \S+') {
+    throw "install smoke failed: $destExe --version printed no version line: '$versionOutput'"
   }
   Write-BittyLog "smoke OK: $versionOutput"
   $markerPrefix = Split-Path -Path $InstallDir -Parent

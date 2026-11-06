@@ -29,7 +29,7 @@
 use std::io;
 use std::mem::size_of;
 use std::os::windows::io::{
-    AsHandle as _, AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle,
+    AsHandle as _, AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle, RawHandle,
 };
 use std::ptr;
 
@@ -38,8 +38,9 @@ use windows_sys::Win32::Foundation::{
     WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Console::{
-    COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, PSEUDOCONSOLE_INHERIT_CURSOR,
-    ResizePseudoConsole,
+    ATTACH_PARENT_PROCESS, AttachConsole, COORD, ClosePseudoConsole, CreatePseudoConsole,
+    GetStdHandle, HPCON, PSEUDOCONSOLE_INHERIT_CURSOR, ResizePseudoConsole, STD_HANDLE,
+    SetStdHandle,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -644,4 +645,44 @@ pub(crate) fn wait_for_exit(process: BorrowedHandle<'_>) -> io::Result<u32> {
     // signaled.
     check(unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) })?;
     Ok(code)
+}
+
+/// Attaches this process to the console of the process that started it
+/// (bitty#2929).
+///
+/// Fails when the parent has no console (a Start Menu/Search launch); that is
+/// an expected outcome, not an error condition for the caller.
+pub(crate) fn attach_parent_console() -> io::Result<()> {
+    // SAFETY: `AttachConsole` takes the documented `ATTACH_PARENT_PROCESS`
+    // sentinel and has no out-parameters, so no pointer or caller buffer
+    // crosses the boundary.
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// True when the process has no standard handle for `which` (bitty#2929).
+///
+/// A GUI-subsystem process launched by a shell, and any process launched by a
+/// launcher without `STARTF_USESTDHANDLES`, starts with null standard handles.
+pub(crate) fn standard_stream_missing(which: STD_HANDLE) -> bool {
+    // SAFETY: `GetStdHandle` only reads the process handle-table entry named
+    // by the documented `STD_*_HANDLE` constant; it writes no memory.
+    let handle = unsafe { GetStdHandle(which) };
+    handle.is_null() || handle == INVALID_HANDLE_VALUE
+}
+
+/// Points standard stream `which` at `handle` (bitty#2929).
+///
+/// `handle` is borrowed from the caller's live device: `SetStdHandle` stores
+/// it and does not take ownership, so the caller keeps it open.
+pub(crate) fn set_standard_stream(which: STD_HANDLE, handle: RawHandle) -> io::Result<()> {
+    // SAFETY: `handle` is a live handle borrowed from the caller; the call
+    // stores it in the process handle table and takes no ownership, and no
+    // out-parameter is involved.
+    if unsafe { SetStdHandle(which, handle as HANDLE) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }

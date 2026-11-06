@@ -122,8 +122,8 @@ of the service surface.
 
 | Item                 | Value                                                                                                                                                                | Where                                                                         |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| Service API version  | `{major: 1, minor: 3}`                                                                                                                                               | `contract::SERVICE_API_VERSION`                                               |
-| Minimum client minor | `0` (`1.0..=1.3` accepted)                                                                                                                                           | `contract::MIN_CLIENT_MINOR`                                                  |
+| Service API version  | `{major: 1, minor: 4}`                                                                                                                                               | `contract::SERVICE_API_VERSION`                                               |
+| Minimum client minor | `0` (`1.0..=1.4` accepted)                                                                                                                                           | `contract::MIN_CLIENT_MINOR`                                                  |
 | Capabilities         | `terminal_sessions`, `events`, `observer_grants`, `control_transfer`, `idempotent_mutations` enabled; `worker_sessions` reserved and `false` in every build (`D-01`) | `contract::CAPABILITIES`, `worker::WORKER_SESSIONS_SERVED`                    |
 | Handshake method     | `daemon.negotiate`                                                                                                                                                   | `contract::NEGOTIATE_METHOD`                                                  |
 | Negotiation rule     | same major, client minor in `[min_client_minor, server_minor]`; every other case is `VersionMismatch` before any operation                                           | `handshake::negotiate`                                                        |
@@ -524,8 +524,9 @@ per-session stream cannot disagree. Source: contract `D-10`, `D-12`, `D-14`,
   is frozen by `D-04`, while closing a lease on it is stream-only.
 - `daemon_stopping` is a daemon-scoped control frame: it is queued to every live
   lease without a revision bump and is not part of a session backlog.
-- `last_worker_seen_at` is absent: a terminal session has no supervision liveness
-  signal, so the stream reports none.
+- `last_worker_seen_at_ms` is absent for a registry-only terminal, which has no
+  supervision liveness signal; a spawned terminal reports the last pass that
+  observed its worker alive.
 - The compiled `D-14` table advertises these caps as
   `{effective, default, system_max}`; per-connection queue/backlog counters in
   `daemon.status` remain a follow-up, and bitty#2605 adds the V-21, V-23, C-04,
@@ -1094,7 +1095,7 @@ and `daemon_state`.
   file, so a missing file and a wrong bearer are indistinguishable.
 - A `host_grant` that cannot be consumed adds no scope and does not close the
   connection; `session.create` then returns `Denied/ConsentRequired`.
-- A version outside `1.0..=1.3` is `VersionMismatch` and closes. A second
+- A version outside `1.0..=1.4` is `VersionMismatch` and closes. A second
   negotiate, or any frame read before the negotiate request, is
   `Denied/AlreadyNegotiated` and closes after the refusal frame is flushed.
   The gate runs after the per-frame wire version and before the rate limiter,
@@ -1276,7 +1277,7 @@ working.
 
 | Method                                    | Added key(s)                                                                  | Rule                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ----------------------------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| every method returning a `session` object | `controller_present` (bool), `pending_observer_grants` (u16)                  | presence only: the controller's `attach_id` is never served. The count is bounded by `max_pending_observer_grants_per_session`; a terminal session serves `0` for both because no lease or grant it still stores can be used.                                                                                                                                                                                                                                                                                                                                                               |
+| every method returning a `session` object | `controller_present` (bool), `pending_observer_grants` (u16)                  | presence only in an ordinary view: the controller's `attach_id` is never served there, while the operator all-session view's `attached_leases` (service 1.4) names live leases separately. The count is bounded by `max_pending_observer_grants_per_session`; a terminal session serves `0` for both because no lease or grant it still stores can be used.                                                                                                                                                                                                                                                                                                                                                               |
 | every method returning a `session` object | `spawn_failure` (string)                                                      | present exactly when `terminal_reason` is `spawn_failed` (bitty#2790). A static class, never a message and never an errno number: `pty_allocation`, `exec_permission_denied`, `exec_not_executable`, `exec_not_found`, `spawn_error`, `bind_deadline`, `not_bindable`, `bind_timeout`, or `post_spawn_refusal`. `cleanup` still carries what the plan could prove; the pair is what tells an `exec` refusal from a PTY allocation failure. The pushed `session_terminal` marker keeps its frozen envelope and does not carry the class, so a client that needs it reads the session object. |
 | `session.list` operator view              | `owner: {uid, pid}`                                                           | only with `daemon.inspect`, and only as the two numeric facts captured at create. An ordinary view omits the key (omit, never `null`); no path, argv, gid, or start time is retained or served. `session.status` never carries it.                                                                                                                                                                                                                                                                                                                                                          |
 | `session.attach` fresh success            | `scopes` (array)                                                              | the connection's effective lease scopes: the same service-then-transport names and order as the handshake `scopes`. A keyed controller replay does not re-assert them.                                                                                                                                                                                                                                                                                                                                                                                                                      |
@@ -1292,6 +1293,35 @@ can close are the `session.status`/`session.list` controller-presence and
 pending-grant rows, the operator owner-peer row, the `session.attach` lease-scope
 row (the backlog row was already delivered by bitty#2792), the heartbeat
 `server_monotonic_ms` row, and the `daemon_pid`/uptime and orphan-class rows.
+
+### Served session record (service 1.4, bitty#2918)
+
+Service `1.4` serves the accepted record's origin, worker, timestamp, and exit
+fields. Every key is additive: a `1.0` through `1.3` client that ignores
+unknown fields keeps working, and `min_client_minor` stays `0`.
+
+| Key                      | Type          | Rule                                                                                                                                                                                                                  |
+| ------------------------ | ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `created_by_kind`        | string        | `consumer`, `operator`, or `daemon`. Always present.                                                                                                                                                                  |
+| `state_changed_at_ms`    | u64           | Server monotonic time of the last `state_revision` bump. It never moves for a heartbeat, lease renewal, or worker-liveness observation.                                                                               |
+| `last_worker_seen_at_ms` | u64           | Present only after a worker bound and a supervision pass observed it alive. Absent for a registry-only session; never a client heartbeat.                                                                             |
+| `worker_handle`          | 32-hex string | Present only after generation `1`. An opaque correlation handle minted by the registry, not a pid and not a signal target.                                                                                            |
+| `exit_code`              | u8            | Present exactly on a `worker_exit` terminal record.                                                                                                                                                                   |
+| `signal`                 | u32           | Present exactly on a `worker_signal` terminal record.                                                                                                                                                                 |
+| `owner_client_id`        | 32-hex string | Operator view only. The server-assigned client id of the creating connection, following the owner-peer rule.                                                                                                          |
+| `requested_by`           | object        | Operator view only. `{kind, client_id?}` where `kind` is `consumer`, `operator`, or `daemon`; `client_id` is present exactly for a client or operator request. Present only once a terminal transition was requested. |
+| `attached_leases`        | array         | Operator view only. Live leases in attach-id order: `{attach_id, client_id?, role, attached_at_ms, last_seen_at_ms, lease_expires_at_ms}`. An empty array when no lease is live.                                      |
+
+Absence is the only "not applicable" form: a key that does not apply is omitted,
+never `null`. In particular `last_worker_seen_at_ms` and `worker_handle` are
+absent before a worker binds; `exit_code` and `signal` are mutually exclusive
+and both absent for a reason with no wait status (`consumer_cancel`,
+`consumer_timeout`, `operator_abort`, `daemon_stop`, `host_shutdown`,
+`spawn_failed`, or `supervision_failed`); and `requested_by` is absent for a
+natural exit, a worker signal, a spawn failure, or a supervision failure. The
+existing `attached` boolean is unchanged: the live list is a separate key, so
+the addition stays wire-additive. The operator keys are omitted from an ordinary
+`session.status` and `session.list` view, exactly like the owner peer.
 
 ### Audit sink
 

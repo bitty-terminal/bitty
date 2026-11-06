@@ -32,8 +32,11 @@ pub const SERVICE_API_MAJOR: u16 = 1;
 /// client remains in the accepted range because `min_client_minor` is `0`.
 /// `1.3` serves the terminal session spawn and the terminal content plane
 /// (`session.read`, `session.write`, `session.subscribe`) with the
-/// `terminal.inspect` and `terminal.input` transport grants.
-pub const SERVICE_API_MINOR: u16 = 3;
+/// `terminal.inspect` and `terminal.input` transport grants. `1.4` serves the
+/// accepted session record's worker, origin, requester, timestamp, and exit
+/// fields as additive keys, with the identity keys restricted to the operator
+/// all-session view (bitty#2918).
+pub const SERVICE_API_MINOR: u16 = 4;
 
 /// Lowest client minor the server accepts for [`SERVICE_API_MAJOR`] (`D-11`:
 /// `min_client_minor` starts at `0` for `1.0`).
@@ -155,7 +158,7 @@ impl ServiceApiVersion {
             && client.minor <= self.minor
     }
 
-    /// The accepted client range, for diagnostics (`1.0..=1.3`).
+    /// The accepted client range, for diagnostics (`1.0..=1.4`).
     #[must_use]
     pub fn client_range(self) -> String {
         format!(
@@ -232,11 +235,11 @@ mod tests {
     #[test]
     fn service_version_matches_the_accepted_contract() {
         assert_eq!(SERVICE_API_MAJOR, 1);
-        assert_eq!(SERVICE_API_MINOR, 3);
+        assert_eq!(SERVICE_API_MINOR, 4);
         assert_eq!(MIN_CLIENT_MINOR, 0);
-        assert_eq!(SERVICE_API_VERSION, ServiceApiVersion::new(1, 3, 0));
-        assert_eq!(SERVICE_API_VERSION.to_string(), "1.3");
-        assert_eq!(SERVICE_API_VERSION.client_range(), "1.0..=1.3");
+        assert_eq!(SERVICE_API_VERSION, ServiceApiVersion::new(1, 4, 0));
+        assert_eq!(SERVICE_API_VERSION.to_string(), "1.4");
+        assert_eq!(SERVICE_API_VERSION.client_range(), "1.0..=1.4");
     }
 
     #[test]
@@ -248,7 +251,7 @@ mod tests {
         assert!(server.accepts(ClientVersion::new(1, 1)));
         assert!(server.accepts(ClientVersion::new(1, 2)));
         assert!(server.accepts(ClientVersion::new(1, 3)));
-        assert!(!server.accepts(ClientVersion::new(1, 4)));
+        assert!(!server.accepts(ClientVersion::new(1, 5)));
 
         let wider = ServiceApiVersion::new(1, 4, 2);
         assert!(!wider.accepts(ClientVersion::new(1, 1)));

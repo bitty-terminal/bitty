@@ -790,6 +790,12 @@ impl WorkerPool {
                         worker.child.drain_recorded();
                     }
                 }
+                if worker.exit.is_none() {
+                    // This pass observed the worker alive, which is the
+                    // contract's worker liveness signal. It is not a client
+                    // heartbeat and never bumps `state_revision`.
+                    host.observe_worker(session_id, now);
+                }
                 if let Some(snapshot) = host.snapshot(session_id, now) {
                     if worker.exit.is_none() && snapshot.state == LifecycleState::Stopping {
                         let Some(stop) = host.stop_view(session_id, now) else {

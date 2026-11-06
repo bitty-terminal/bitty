@@ -18,9 +18,10 @@ use std::fmt;
 
 use super::id::{DaemonInstanceId, Entropy, ID_GENERATION_ATTEMPTS, OsEntropy, SessionId};
 use super::session::{
-    CleanupClass, LifecycleState, MonotonicMs, OwnerPeer, SessionKind, SessionRecord,
-    SessionSnapshot, TerminalId, TerminalOutcome, TerminalReason,
+    CleanupClass, LifecycleState, MonotonicMs, OriginKind, OwnerPeer, Requester, SessionKind,
+    SessionRecord, SessionSnapshot, TerminalId, TerminalOutcome, TerminalReason, WorkerHandle,
 };
+use crate::handshake::ClientId;
 use crate::limits::{LimitId, Limits};
 
 /// Default live-session bound (`D-14` `max_sessions`).
@@ -526,8 +527,11 @@ impl SessionRegistry {
         };
 
         let session_id = self.generate_session_id()?;
-        let record =
+        let mut record =
             SessionRecord::new_kind(session_id, kind, terminal_id, request.owner_peer, now);
+        let worker_handle = WorkerHandle::generate_with(self.entropy.as_mut())
+            .map_err(|_| RegistryRefusal::IdGenerationFailed)?;
+        record.set_worker_handle(worker_handle);
         let bytes = record.record_bytes();
         if bytes > self.limits.session_record_bytes {
             return Err(RegistryRefusal::SessionRecordTooLarge {
@@ -609,8 +613,10 @@ impl SessionRegistry {
 
         record.generation = generation;
         record.state_revision = revision;
+        record.state_changed_at = now;
         record.state = LifecycleState::Running;
         record.last_seen = now;
+        record.observe_worker(now);
         Ok(record.snapshot())
     }
 
@@ -647,6 +653,7 @@ impl SessionRegistry {
 
         record.attach_count = attach_count;
         record.state_revision = revision;
+        record.state_changed_at = now;
         record.last_seen = now;
         Ok(record.snapshot())
     }
@@ -686,6 +693,7 @@ impl SessionRegistry {
             .ok_or(RegistryRefusal::RevisionOverflow)?;
         record.attach_count -= 1;
         record.state_revision = revision;
+        record.state_changed_at = now;
         record.last_seen = now;
         Ok(record.snapshot())
     }
@@ -723,6 +731,7 @@ impl SessionRegistry {
             .checked_add(1)
             .ok_or(RegistryRefusal::RevisionOverflow)?;
         record.state_revision = revision;
+        record.state_changed_at = now;
         record.last_seen = now;
         Ok(record.snapshot())
     }
@@ -748,6 +757,65 @@ impl SessionRegistry {
         }
         record.last_seen = now;
         Ok(record.snapshot())
+    }
+
+    /// Store the create-time origin facts without a revision bump.
+    ///
+    /// The service layer calls this once, immediately after
+    /// [`Self::create_kind`] and before the create response is rendered, so the
+    /// origin is part of revision `0` rather than a second visible mutation. A
+    /// no-op when the record is unknown or already terminal.
+    pub fn note_origin(
+        &mut self,
+        session_id: SessionId,
+        owner_client_id: Option<ClientId>,
+        created_by_kind: OriginKind,
+    ) {
+        if let Some(record) = self.live.get_mut(&session_id) {
+            if !record.state.is_terminal() {
+                record.note_origin(owner_client_id, created_by_kind);
+            }
+        }
+    }
+
+    /// Store the actor that requested the terminal transition.
+    ///
+    /// This is metadata, not a snapshot-visible mutation: it does not bump
+    /// `state_revision`. The service calls it after a stop is accepted and
+    /// before the terminal transition completes, so the frozen record names
+    /// the requester. A no-op when the record is unknown or already terminal.
+    pub fn note_requester(&mut self, session_id: SessionId, requester: Requester) {
+        if let Some(record) = self.live.get_mut(&session_id) {
+            if !record.state.is_terminal() {
+                record.note_requester(requester);
+            }
+        }
+    }
+
+    /// Refresh the worker liveness timestamp without a revision bump.
+    ///
+    /// The supervision pass calls this for every worker it observes alive. It
+    /// is not a client heartbeat and never advances `state_revision`.
+    ///
+    /// # Errors
+    ///
+    /// Refuses on an unknown or terminal session.
+    pub(crate) fn observe_worker(
+        &mut self,
+        session_id: SessionId,
+        now: MonotonicMs,
+    ) -> Result<(), RegistryRefusal> {
+        if !self.live.contains_key(&session_id) {
+            return Err(self.lookup_refusal(session_id));
+        }
+        let record = self.live.get_mut(&session_id).expect("checked above");
+        if record.state.is_terminal() {
+            return Err(RegistryRefusal::NotRunning {
+                state: record.state,
+            });
+        }
+        record.observe_worker(now);
+        Ok(())
     }
 
     /// Record one snapshot-visible mutation owned by another layer (`D-03`).
@@ -783,6 +851,7 @@ impl SessionRegistry {
             .checked_add(1)
             .ok_or(RegistryRefusal::RevisionOverflow)?;
         record.state_revision = revision;
+        record.state_changed_at = now;
         record.last_seen = now;
         Ok(record.snapshot())
     }
@@ -816,6 +885,7 @@ impl SessionRegistry {
             .ok_or(RegistryRefusal::RevisionOverflow)?;
         record.state = LifecycleState::Stopping;
         record.state_revision = revision;
+        record.state_changed_at = now;
         record.last_seen = now;
         Ok(record.snapshot())
     }
@@ -843,6 +913,7 @@ impl SessionRegistry {
         let mut record = self.live.remove(&session_id).expect("checked above");
         record.state = target;
         record.state_revision = revision;
+        record.state_changed_at = now;
         record.terminal_reason = Some(outcome.reason());
         record.spawn_failure = outcome.spawn_failure();
         record.exit = outcome.exit();

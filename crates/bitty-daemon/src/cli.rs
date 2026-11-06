@@ -440,7 +440,7 @@ mod tests {
         assert_eq!(result.exit_code, EXIT_OK);
         assert!(result.stderr.is_empty());
         assert!(result.stdout.contains(CRATE_VERSION));
-        assert!(result.stdout.contains("service API 1.3"));
+        assert!(result.stdout.contains("service API 1.4"));
     }
 
     #[test]

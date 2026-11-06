@@ -2618,6 +2618,31 @@ impl Runtime {
         let Some(view) = self.floats.discard(focused) else {
             return Err(String::from("focused pane not in layout"));
         };
+        // WS-INV-19 (#2945): re-home focus off the moved id BEFORE the source
+        // slot is mirrored, exactly like the tiled move above. `self.focus`
+        // still names the panel that just left this workspace, so stashing
+        // here would persist a dangling focus id; the next `load_slot` clamp
+        // (CTX-1077) would read it as dead and hand `primary_view` — which
+        // `float_detach` deliberately leaves on the panel — to a source leaf.
+        // Switching back would then present a blank panel whose input routes
+        // nowhere (`grid_of` fails closed). Primary ownership itself does not
+        // move: the panel travels and keeps painting the grid it owns.
+        let survivor = self
+            .layout
+            .leaf_ids()
+            .into_iter()
+            .next()
+            .or_else(|| self.floats.paint_ids().last().copied())
+            .or_else(|| self.pinned.ids().last().copied());
+        match survivor {
+            Some(next) => {
+                self.focus = Focus::with_focus(next);
+                // CTX-0532: the source promotion is a focus transition;
+                // attribute the input-mode caches like the tiled path does.
+                self.sync_mode_caches_to_focus();
+            }
+            None => self.focus.clear(),
+        }
         // Persist the source slot with the panel already removed, so no
         // stashed copy keeps a duplicate of the moved id.
         self.stash_active_slot();

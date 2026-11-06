@@ -337,7 +337,7 @@ use config_cli::{
 /// (CTX-0481, issue #762): distinct from the usage (2) and generic
 /// event-loop (1) paths only by intent, but the non-zero code is the
 /// contract headless/CI callers check.
-const EXIT_STARTUP: i32 = 1;
+pub(crate) const EXIT_STARTUP: i32 = 1;
 
 /// Fail-loud policy for one startup step (CTX-0481).
 ///
@@ -347,6 +347,17 @@ const EXIT_STARTUP: i32 = 1;
 /// read as a green headless run.
 fn fail_loud_exit(fail_loud: bool, step_failed: bool) -> Option<i32> {
     (fail_loud && step_failed).then_some(EXIT_STARTUP)
+}
+
+/// Whether startup defers the shell spawn until the window's first grid
+/// (CTX-1719).
+///
+/// Only an interactive windowed run has a compositor size to wait for.
+/// `--headless` and `--test-mode` never create a window, so they keep the
+/// immediate spawn at the configured grid (and the `DisplayUnavailable`
+/// fallback spawns eagerly on its own fresh runtime).
+pub(crate) fn defers_startup_spawn(headless: bool, test_mode: bool) -> bool {
+    !headless && !test_mode
 }
 
 /// Fail-loud policy for an attempted-but-unavailable IPC servo (CTX-0481).
@@ -1265,10 +1276,23 @@ fn main() {
             runtime.set_ipc_socket_path(path);
         }
     }
-    let startup_spawn_failed = spawn_startup_shells(&mut runtime, &args, &spawn_spec);
-    if let Some(code) = fail_loud_exit(args.fail_loud, startup_spawn_failed) {
-        eprintln!("bitty: startup failed (--fail-loud): PTY shell startup did not complete");
-        std::process::exit(code);
+    // CTX-1719: a windowed run defers the primary and pane shell spawn until
+    // the window's first committed grid. Before this, the PTY was created at
+    // the runtime's configured 80x24 default (no window existed yet) and was
+    // resized only after the compositor mapped the window. A program that
+    // samples TIOCGWINSZ once at startup (Hermes Agent) then lays out an
+    // 80x24 UI inside a much larger pane for its whole lifetime, leaving the
+    // lower rows blank and the input box far above the bottom edge. Headless
+    // and test-mode runs have no window to wait for, so they keep the
+    // immediate spawn (the headless `DisplayUnavailable` fallback below also
+    // spawns eagerly on its own fresh runtime).
+    let defer_startup_spawn = defers_startup_spawn(args.headless, args.test_mode);
+    if !defer_startup_spawn {
+        let startup_spawn_failed = spawn_startup_shells(&mut runtime, &spawn_spec);
+        if let Some(code) = fail_loud_exit(args.fail_loud, startup_spawn_failed) {
+            eprintln!("bitty: startup failed (--fail-loud): PTY shell startup did not complete");
+            std::process::exit(code);
+        }
     }
 
     // `bitty --test-mode`: deterministic headless E2E servo (CTX-0506,
@@ -1380,6 +1404,11 @@ fn main() {
     // W-103 S-5 (CTX-0929): latch the safe recovery flag so the composer
     // cutover selects the retained Core path without consulting a VM.
     .with_safe_mode(args.safe);
+    // CTX-1719: the windowed path deferred the shell spawn above; hand the
+    // recipe to the app so the first committed window grid sizes the PTY.
+    if defer_startup_spawn {
+        app.defer_startup_shells(args.fail_loud);
+    }
     // CTX-0167: the synthetic demo pump stays off in real sessions so
     // startup shows only the shell. Opt-in debug only (`BITTY_DEMO_PUMP=1`).
     // CTX-0926 (W-100 first slice, W-71 observability boundary): the pump is
@@ -1476,7 +1505,7 @@ fn main() {
         // Re-apply layout and focus in fallback so headless smoke proves the same composition
         // that real mode would have driven via the window (TERM-APP-003 / CTX-0553).
         apply_startup_layout_and_focus(&mut rt, &args);
-        let fallback_spawn_failed = spawn_startup_shells(&mut rt, &args, &spawn_spec);
+        let fallback_spawn_failed = spawn_startup_shells(&mut rt, &spawn_spec);
         // CTX-0481: the DisplayUnavailable fallback must not turn a
         // `--fail-loud` shell failure into a green smoke.
         if let Some(code) = fail_loud_exit(args.fail_loud, fallback_spawn_failed) {
@@ -1573,29 +1602,30 @@ pub(crate) fn apply_startup_layout_and_focus(runtime: &mut Runtime, args: &cli::
 /// Spawns the primary shell and any layout pane shells (TERM-APP-003 / CTX-0553).
 ///
 /// Returns `true` if any startup shell spawn failed (for `--fail-loud` handling).
-pub(crate) fn spawn_startup_shells(
-    runtime: &mut Runtime,
-    args: &cli::Args,
-    spawn_spec: &SpawnSpec,
-) -> bool {
+///
+/// CTX-1719: the recipe comes entirely from [`SpawnSpec`] so the windowed
+/// startup path can defer this call until the first committed window grid
+/// (see [`crate::terminal_app::TerminalApp::spawn_deferred_startup_shells`])
+/// without threading the CLI arguments into the app.
+pub(crate) fn spawn_startup_shells(runtime: &mut Runtime, spawn_spec: &SpawnSpec) -> bool {
     let effective = resolve_spawn_program(
-        args,
+        spawn_spec.program.as_deref(),
         spawn_spec.config_shell.as_deref(),
         spawn_spec.shell_env.as_deref(),
     );
     logging::info(|| {
         format!(
             "bitty: effective program {effective:?} (explicit={}, configured_shell={})",
-            args.program.is_some(),
+            spawn_spec.program.is_some(),
             spawn_spec.config_shell.is_some()
         )
     });
-    let spawn_result = if let Some(program) = args.program.as_deref() {
-        let tail: Vec<&str> = args.program_args.iter().map(|s| s.as_str()).collect();
+    let spawn_result = if spawn_spec.program.is_some() {
+        let tail: Vec<&str> = spawn_spec.program_args.iter().map(String::as_str).collect();
         if tail.is_empty() {
-            runtime.spawn_shell(program)
+            runtime.spawn_shell(effective)
         } else {
-            runtime.spawn_shell_with_args(program, &tail)
+            runtime.spawn_shell_with_args(effective, &tail)
         }
     } else {
         spawn_default_shell(

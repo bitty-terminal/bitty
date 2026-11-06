@@ -76,10 +76,10 @@ pub fn validate_stack(layers: &[LayeredPlan]) -> Result<(), ConfigError> {
 pub fn collect_diagnostics(plan: &ConfigPlan) -> Vec<ConfigError> {
     let mut out = Vec::new();
     if let Some(v) = plan.schema_version {
-        if v > crate::migration::CURRENT_SCHEMA_VERSION {
-            out.push(ConfigError::SchemaVersionUnsupported {
+        if v > crate::migration::CURRENT_CONFIG_VERSION {
+            out.push(ConfigError::ConfigVersionUnsupported {
                 found: v,
-                supported: crate::migration::CURRENT_SCHEMA_VERSION,
+                supported: crate::migration::CURRENT_CONFIG_VERSION,
             });
         }
     }

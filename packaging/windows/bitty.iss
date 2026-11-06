@@ -19,7 +19,8 @@
 ;     The release workflow resolves it from the tag, the workflow input, or
 ;     the Cargo workspace version, in that order.
 ;   MySourceDir  — absolute directory staging bitty.exe plus LICENSE,
-;     README.md, and CHANGELOG.md (the portable-ZIP payload). Absolute
+;     README.md, and CHANGELOG.md (the portable-ZIP payload without
+;     bitty.ico, which only install.ps1 uses). Absolute
 ;     because relative Source paths resolve against the script directory.
 ;
 ; Unsigned 0.1.0: no SignTool is configured below (only a commented stub for

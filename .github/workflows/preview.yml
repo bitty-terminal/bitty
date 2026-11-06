@@ -533,7 +533,7 @@ jobs:
           if ($dirs.Count -ne 0) {
             throw "unexpected directories in archive root: $($dirs.Name -join ', ')"
           }
-          $expected = @('bitty.exe', 'LICENSE', 'README.md', 'CHANGELOG.md')
+          $expected = @('bitty.exe', 'bitty.ico', 'LICENSE', 'README.md', 'CHANGELOG.md')
           $actual = @(Get-ChildItem -Path $dest -File | ForEach-Object { $_.Name })
           if (Compare-Object $expected $actual) {
             throw "archive contents mismatch: $($actual -join ', ')"

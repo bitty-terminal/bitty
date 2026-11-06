@@ -90,7 +90,9 @@ impl MouseConfigPlan {
 /// layers and core defaults.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ConfigPlan {
-    /// Schema version of this plan. If absent, assumed `0` for migration.
+    /// Terminal-config shape version (`config_version` in the returned Lua
+    /// table). `None` is the pre-version shape, assumed `0` for migration;
+    /// [`crate::CURRENT_CONFIG_VERSION`] is the supported maximum.
     pub schema_version: Option<u32>,
     /// Font configuration.
     pub font: Option<FontConfig>,
@@ -317,10 +319,10 @@ impl ConfigPlan {
     /// Validate present fields and reject any undeclared fields.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if let Some(v) = self.schema_version {
-            if v > CURRENT_SCHEMA_VERSION {
-                return Err(ConfigError::SchemaVersionUnsupported {
+            if v > crate::migration::CURRENT_CONFIG_VERSION {
+                return Err(ConfigError::ConfigVersionUnsupported {
                     found: v,
-                    supported: CURRENT_SCHEMA_VERSION,
+                    supported: crate::migration::CURRENT_CONFIG_VERSION,
                 });
             }
         }

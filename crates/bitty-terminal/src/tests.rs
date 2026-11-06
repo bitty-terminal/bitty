@@ -1728,15 +1728,25 @@ fn bare_args_resolve_to_default_shell_chain() {
     let parsed = parse_args(&args_of(&["bitty"]));
     assert_eq!(parsed.program, None);
     assert_eq!(
-        resolve_spawn_program(&parsed, Some("/bin/zsh"), Some("/bin/fish")),
+        resolve_spawn_program(
+            parsed.program.as_deref(),
+            Some("/bin/zsh"),
+            Some("/bin/fish")
+        ),
         "/bin/zsh"
     );
     assert_eq!(
-        resolve_spawn_program(&parsed, None, Some("/bin/fish")),
+        resolve_spawn_program(parsed.program.as_deref(), None, Some("/bin/fish")),
         "/bin/fish"
     );
-    assert_eq!(resolve_spawn_program(&parsed, None, None), "/bin/sh");
-    assert_eq!(resolve_spawn_program(&parsed, None, Some("")), "/bin/sh");
+    assert_eq!(
+        resolve_spawn_program(parsed.program.as_deref(), None, None),
+        "/bin/sh"
+    );
+    assert_eq!(
+        resolve_spawn_program(parsed.program.as_deref(), None, Some("")),
+        "/bin/sh"
+    );
 }
 
 #[test]
@@ -1746,14 +1756,25 @@ fn explicit_program_arg_stays_identical() {
     assert_eq!(parsed.program_args, vec!["-l"]);
     // Explicit program wins over any injected configured shell + $SHELL.
     assert_eq!(
-        resolve_spawn_program(&parsed, Some("/bin/zsh"), Some("/bin/bash")),
+        resolve_spawn_program(
+            parsed.program.as_deref(),
+            Some("/bin/zsh"),
+            Some("/bin/bash")
+        ),
         "fish"
     );
-    assert_eq!(resolve_spawn_program(&parsed, None, None), "fish");
+    assert_eq!(
+        resolve_spawn_program(parsed.program.as_deref(), None, None),
+        "fish"
+    );
 
     let parsed = parse_args(&args_of(&["bitty", "/bin/bash"]));
     assert_eq!(
-        resolve_spawn_program(&parsed, Some("/bin/zsh"), Some("/bin/fish")),
+        resolve_spawn_program(
+            parsed.program.as_deref(),
+            Some("/bin/zsh"),
+            Some("/bin/fish")
+        ),
         "/bin/bash"
     );
 }
@@ -11833,6 +11854,148 @@ fn new_split_spawns_private_shell_and_close_tears_it_down() {
     assert_eq!(app.runtime.leaf_count(), 2);
     assert!(!app.runtime.has_pane_session(&ViewId::new(3)));
     assert_eq!(app.runtime.pane_count(), 0);
+}
+
+/// CTX-1719: only an interactive windowed run defers the startup spawn.
+///
+/// Headless and test-mode runs have no window to wait for; they must keep
+/// creating the PTY immediately so the headless smoke and the E2E servo stay
+/// deterministic.
+#[test]
+fn only_a_windowed_run_defers_the_startup_shell_spawn() {
+    assert!(defers_startup_spawn(false, false));
+    assert!(!defers_startup_spawn(true, false));
+    assert!(!defers_startup_spawn(false, true));
+    assert!(!defers_startup_spawn(true, true));
+}
+
+/// Polls the real PTY pump until the primary grid holds `needle`, bounded by
+/// a wall-clock deadline so a broken spawn fails the test instead of hanging.
+#[cfg(unix)]
+fn primary_text_until(app: &mut TerminalApp, needle: &str) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let _ = app.poll_pty_pump();
+        let snapshot = app.runtime.snapshot();
+        let grid = bitty_runtime::inspect::grid_text_from_snapshot_with_images(
+            &snapshot,
+            snapshot.height,
+            snapshot.width,
+            &[],
+        );
+        let text = grid.lines.join("\n");
+        if text.contains(needle) || std::time::Instant::now() >= deadline {
+            return text;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// CTX-1719 regression: the primary PTY is created only after the window's
+/// first grid is committed, so the child's **first** `TIOCGWINSZ` already
+/// reports the painted cells.
+///
+/// On the previous ordering the PTY existed at the runtime's 80x24 config
+/// default before the window was mapped and was resized only afterwards; a
+/// program that samples the size once at startup (Hermes Agent) then laid out
+/// an 80x24 UI inside the larger pane for its whole lifetime.
+#[test]
+#[cfg(unix)]
+fn deferred_startup_spawn_hands_the_child_the_committed_window_grid() {
+    require_pty!();
+    // Scale 1.0 and fractional 1.6, both far larger than the 80x24 default.
+    for (scale, final_extent) in [
+        (1.0_f64, bitty_platform::PhysicalSize::new(1600, 920)),
+        (1.6_f64, bitty_platform::PhysicalSize::new(2505, 1496)),
+    ] {
+        let rt = Runtime::new(bitty_runtime::RuntimeConfig {
+            cell_width: 10,
+            cell_height: 22,
+            window_padding: 8,
+            ..bitty_runtime::RuntimeConfig::default()
+        })
+        .expect("runtime builds");
+        let mut app = TerminalApp::with_theme(
+            rt,
+            bitty_config::theme::DEFAULT_THEME_NAME,
+            "default",
+            Vec::new(),
+            SpawnSpec {
+                program: Some("/bin/sh".to_string()),
+                program_args: vec!["-c".to_string(), "stty size; sleep 30".to_string()],
+                shell_env: None,
+                config_shell: None,
+            },
+        );
+        app.runtime
+            .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
+        // Window creation adopts the live cell metric and the compositor's
+        // `Resized` reflows the grid — both before any spawn.
+        app.runtime.apply_dpi_scale(scale, Some(final_extent));
+        let committed = app.runtime.snapshot();
+        assert!(
+            committed.width > 80 && committed.height > 24,
+            "scale {scale}: fixture must exceed the 80x24 default, got {}x{}",
+            committed.width,
+            committed.height
+        );
+        app.defer_startup_shells(false);
+        assert!(
+            !app.spawn_deferred_startup_shells(),
+            "scale {scale}: the spawn must wait for the window grid edge"
+        );
+        app.startup_grid_ready = true;
+        assert!(
+            app.spawn_deferred_startup_shells(),
+            "scale {scale}: the deferred spawn must run once the grid is known"
+        );
+        assert!(
+            !app.spawn_deferred_startup_shells(),
+            "scale {scale}: the deferred spawn must never run twice"
+        );
+
+        let expected = format!("{} {}", committed.height, committed.width);
+        let text = primary_text_until(&mut app, &expected);
+        let first = text.lines().next().unwrap_or_default().trim();
+        assert_eq!(
+            first, expected,
+            "scale {scale}: the child's first size read must be the committed grid \
+             (never the 80x24 config default); grid was:\n{text}"
+        );
+    }
+}
+
+/// CTX-1719: a window that never reports a size must not leave the session
+/// shell-less — the deferred spawn releases at the bounded deadline.
+#[test]
+#[cfg(unix)]
+fn deferred_startup_spawn_falls_back_when_no_resize_arrives() {
+    require_pty!();
+    let rt = Runtime::with_defaults().expect("must build");
+    let mut app = TerminalApp::with_theme(
+        rt,
+        bitty_config::theme::DEFAULT_THEME_NAME,
+        "default",
+        Vec::new(),
+        SpawnSpec {
+            program: Some("/bin/sh".to_string()),
+            program_args: vec!["-c".to_string(), "exit 0".to_string()],
+            shell_env: None,
+            config_shell: None,
+        },
+    );
+    app.runtime
+        .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
+    app.defer_startup_shells(false);
+    assert!(
+        !app.spawn_deferred_startup_shells(),
+        "without a grid edge the spawn must wait for the deadline"
+    );
+    app.startup_spawn_deadline = Some(std::time::Instant::now());
+    assert!(
+        app.spawn_deferred_startup_shells(),
+        "the deadline must release the deferred spawn"
+    );
 }
 
 /// Writes an executable fake shell that records its own execution in

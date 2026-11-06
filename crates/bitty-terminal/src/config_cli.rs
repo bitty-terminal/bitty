@@ -1216,13 +1216,16 @@ fn builtin_app_config() -> Result<AppConfig, String> {
 
 /// Short usage for `bitty config` (stderr, fail-closed exit 2).
 pub(crate) fn config_usage() -> String {
-    "usage: bitty config <path|check|show|validate|edit|profile> [--format table|json|jsonl] [--config PATH] [--profile NAME]\n\
+    "usage: bitty config <path|check|show|validate|migrate|edit|profile> [--format table|json|jsonl] [--config PATH] [--profile NAME]\n\
      \n\
      verbs:\n\
      \x20 path      print the resolved config file path\n\
      \x20 check     load + validate; print per-key sources (cli/file/profile/default)\n\
      \x20 show      load + validate; same rows, JSON carries layer attribution\n\
      \x20 validate  load + validate only; exit 2 when invalid, no key dump\n\
+     \x20 migrate   apply config_version transforms and rewrite the file\n\
+     \x20           [--dry-run] [--backup|--no-backup] (--backup is the default;\n\
+     \x20           --safe refuses: safe mode never writes)\n\
      \x20 edit      open the file in $VISUAL/$EDITOR (vi fallback), then validate\n\
      \x20           (--safe is rejected: safe mode never reads the edited file)\n\
      \x20 profile   manage named profiles\n\
@@ -1399,6 +1402,18 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
             return 2;
         }
     };
+    // bitty#2923: `--dry-run` / `--backup` belong to `config migrate`.
+    // Parsing is guarded by the verb, so reaching here with them set on
+    // another verb is a usage error, not a silently ignored flag.
+    if cmd != ConfigCommand::Migrate && (args.config_dry_run || args.config_backup.is_some()) {
+        eprintln!(
+            "bitty config {}: --dry-run/--backup are only valid for `config migrate`\n{}",
+            cmd.name(),
+            config_usage()
+        );
+        return 2;
+    }
+
     // `config edit --safe` would edit a file that safe mode then ignores:
     // validation would silently check the built-in config instead of the
     // edited bytes. Reject it rather than report a false success.
@@ -1452,6 +1467,21 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
                             "bitty: using fallback '{}' (canonical is 'init.lua')",
                             probe.path.display()
                         );
+                    }
+                }
+                // bitty#2923: report the file's declared shape version and,
+                // when older, the one-line migration hint. An unversioned
+                // file is version 0 (the pre-version shape) and still loads.
+                if let Some(path) = file_path.as_deref() {
+                    if let Ok(version) = bitty_config::file::load_config_version(path) {
+                        let value = version.unwrap_or(0);
+                        let rendered = if value < bitty_config::CURRENT_CONFIG_VERSION {
+                            format!("{value} (migration available: bitty config migrate)")
+                        } else {
+                            value.to_string()
+                        };
+                        let source = if version.is_some() { "file" } else { "default" };
+                        println!("{}", check_row("config_version", rendered, source));
                     }
                 }
                 // Profile identity first so per-key `profile: <path>`
@@ -2199,6 +2229,7 @@ pub(crate) fn run_config_subcommand(cmd: ConfigCommand, args: &Args) -> i32 {
         },
         // Handled before the positional rejection above; kept exhaustive.
         ConfigCommand::Profile => crate::profile::run_profile_subcommand(args),
+        ConfigCommand::Migrate => run_config_migrate(args, format),
         ConfigCommand::Validate => run_config_validate(args, format),
         ConfigCommand::Edit => run_config_edit(args, format),
     }
@@ -2556,13 +2587,14 @@ fn config_show_envelope(command: &str, loaded: &LoadedConfig) -> String {
     let _ = std::fmt::Write::write_fmt(
         &mut out,
         format_args!(
-            "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"config\",\"valid\":true,\"path\":{},\"profile\":{},\"count\":{},\"truncated\":{},\"keys\":[",
+            "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"config\",\"valid\":true,\"path\":{},\"profile\":{},\"config_version\":{},\"count\":{},\"truncated\":{},\"keys\":[",
             crate::list::json_escape(command),
             config_path_json(file_path),
             loaded.profile_name.as_deref().map_or_else(
                 || String::from("null"),
                 |name| format!("\"{}\"", crate::list::json_escape(name))
             ),
+            config_version_json(loaded),
             rows.len(),
             truncated
         ),
@@ -2639,27 +2671,33 @@ fn run_config_show_json(args: &Args, cmd: ConfigCommand, format: ConfigFormat) -
 
 /// `bitty config validate` / `+validate-config`.
 ///
-/// Text mode prints nothing on success (script-friendly) and the loader error
-/// on stderr when invalid. JSON mode always emits the stable envelope.
+/// Text mode prints one `config_version` line on success (bitty#2923) and the
+/// loader error on stderr when invalid. JSON mode always emits the stable
+/// envelope with the declared version.
 fn run_config_validate(args: &Args, format: ConfigFormat) -> i32 {
     let command = config_command_spelling(args, ConfigCommand::Validate);
     match load_merged_config_typed(args) {
         Ok(loaded) => {
+            let file_path = loaded
+                .probed
+                .as_ref()
+                .filter(|probe| probe.path.exists())
+                .map(|probe| probe.path.as_path());
             if format == ConfigFormat::Json {
-                let file_path = loaded
-                    .probed
-                    .as_ref()
-                    .filter(|probe| probe.path.exists())
-                    .map(|probe| probe.path.as_path());
                 println!(
-                    "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"config\",\"valid\":true,\"path\":{},\"profile\":{},\"diagnostics\":[]}}}}",
+                    "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"config\",\"valid\":true,\"path\":{},\"profile\":{},\"config_version\":{},\"diagnostics\":[]}}}}",
                     crate::list::json_escape(&command),
                     config_path_json(file_path),
                     loaded.profile_name.as_deref().map_or_else(
                         || String::from("null"),
                         |name| format!("\"{}\"", crate::list::json_escape(name))
-                    )
+                    ),
+                    config_version_json(&loaded)
                 );
+            } else if let Some(path) = file_path {
+                if let Ok(version) = bitty_config::file::load_config_version(path) {
+                    println!("{}", config_version_line(version));
+                }
             }
             0
         }
@@ -2677,6 +2715,584 @@ fn run_config_validate(args: &Args, format: ConfigFormat) -> i32 {
             2
         }
     }
+}
+
+/// Bounded collision search for a migration backup sibling.
+const MIGRATE_MAX_BACKUP_ATTEMPTS: u32 = 100;
+
+/// Bounded collision search for an exclusive temporary sibling.
+const MIGRATE_MAX_TEMP_ATTEMPTS: u32 = 16;
+
+/// Process-local suffix source for atomic temporary siblings.
+static MIGRATE_TEMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Renders the file's declared `config_version` for a JSON envelope.
+///
+/// `null` means no file participated; `0` means the file omitted the key
+/// (the pre-version shape).
+fn config_version_json(loaded: &LoadedConfig) -> String {
+    let Some(path) = loaded
+        .probed
+        .as_ref()
+        .filter(|probe| probe.path.exists())
+        .map(|probe| probe.path.as_path())
+    else {
+        return String::from("null");
+    };
+    match bitty_config::file::load_config_version(path) {
+        Ok(version) => version.unwrap_or(0).to_string(),
+        Err(_) => String::from("null"),
+    }
+}
+
+/// One-line text report of a file's declared version (bitty#2923).
+fn config_version_line(version: Option<u32>) -> String {
+    let value = version.unwrap_or(0);
+    if value < bitty_config::CURRENT_CONFIG_VERSION {
+        format!("config_version {value} (migration available: bitty config migrate)")
+    } else {
+        format!("config_version {value} (current)")
+    }
+}
+
+/// Resolves the file `config migrate` rewrites.
+///
+/// `--profile NAME` selects `profiles/<name>.lua`; otherwise `--config` /
+/// `BITTY_CONFIG` / the default probe select the user file. The two selectors
+/// are mutually exclusive so a typo never migrates the wrong file.
+fn resolve_migrate_target(args: &Args) -> Result<std::path::PathBuf, String> {
+    let profile = args
+        .profile
+        .as_deref()
+        .filter(|name| !name.trim().is_empty());
+    if let Some(name) = profile {
+        if args
+            .config_path
+            .as_deref()
+            .is_some_and(|path| !path.trim().is_empty())
+        {
+            return Err(String::from(
+                "bitty config migrate: choose either --config PATH or --profile NAME",
+            ));
+        }
+        return bitty_config::file::profile_file_path(name)
+            .map_err(|err| format!("bitty config migrate: invalid --profile '{name}': {err}"));
+    }
+    let env = std::env::var("BITTY_CONFIG").ok();
+    let explicit =
+        bitty_config::file::resolve_config_explicit(args.config_path.as_deref(), env.as_deref());
+    let probed = bitty_config::file::probe_config_path(explicit.as_deref()).ok_or_else(|| {
+        String::from("bitty config migrate: no config root ($XDG_CONFIG_HOME or $HOME unset)")
+    })?;
+    Ok(probed.path)
+}
+
+/// Size-bounded read of the file about to be migrated.
+fn read_migrate_source(path: &std::path::Path) -> Result<String, String> {
+    let meta = std::fs::metadata(path).map_err(|err| {
+        format!(
+            "bitty config migrate: no readable config file at '{}': {err}",
+            path.display()
+        )
+    })?;
+    if !meta.is_file() {
+        return Err(format!(
+            "bitty config migrate: '{}' is not a regular file",
+            path.display()
+        ));
+    }
+    if meta.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
+        return Err(format!(
+            "bitty config migrate: '{}' exceeds {} bytes",
+            path.display(),
+            bitty_config::file::MAX_CONFIG_FILE_BYTES
+        ));
+    }
+    std::fs::read_to_string(path).map_err(|err| {
+        format!(
+            "bitty config migrate: cannot read '{}': {err}",
+            path.display()
+        )
+    })
+}
+
+/// Prints a typed migration failure (JSON envelope on stdout when requested).
+fn migrate_fail(
+    command: &str,
+    path: Option<&std::path::Path>,
+    format: ConfigFormat,
+    code: &str,
+    message: &str,
+    exit: i32,
+) -> i32 {
+    if format == ConfigFormat::Json {
+        println!(
+            "{}",
+            config_migrate_error_envelope(command, path, code, message)
+        );
+    }
+    eprintln!("{message}");
+    exit
+}
+
+/// Renders a failed `config migrate` envelope.
+fn config_migrate_error_envelope(
+    command: &str,
+    path: Option<&std::path::Path>,
+    code: &str,
+    message: &str,
+) -> String {
+    let message = bounded_message(message);
+    format!(
+        "{{\"v\":1,\"command\":\"{}\",\"ok\":false,\"error\":{{\"class\":\"config\",\"code\":\"{}\",\"message\":\"{}\"}},\"result\":{{\"kind\":\"config-migration\",\"path\":{},\"changes\":[],\"diagnostics\":[{{\"severity\":\"error\",\"message\":\"{}\"}}]}}}}",
+        crate::list::json_escape(command),
+        crate::list::json_escape(code),
+        crate::list::json_escape(&message),
+        config_path_json(path),
+        crate::list::json_escape(&message)
+    )
+}
+
+/// Fields of one successful `config migrate` report.
+struct MigrateReport<'a> {
+    /// Invoked command spelling (`config migrate`).
+    command: &'a str,
+    /// File that was inspected or rewritten.
+    path: &'a std::path::Path,
+    /// Declared source version.
+    from: u32,
+    /// Target version.
+    to: u32,
+    /// True when the file was not written.
+    dry_run: bool,
+    /// Backup path when one was written.
+    backup: Option<&'a std::path::Path>,
+    /// Per-key change list.
+    changes: &'a [bitty_config::ConfigChange],
+    /// True when the file was actually rewritten.
+    migrated: bool,
+}
+
+/// Renders a successful `config migrate` envelope.
+fn config_migrate_envelope(report: &MigrateReport<'_>) -> String {
+    let MigrateReport {
+        command,
+        path,
+        from,
+        to,
+        dry_run,
+        backup,
+        changes,
+        migrated,
+    } = report;
+    let mut out = String::with_capacity(1024);
+    let _ = std::fmt::Write::write_fmt(
+        &mut out,
+        format_args!(
+            "{{\"v\":1,\"command\":\"{}\",\"ok\":true,\"result\":{{\"kind\":\"config-migration\",\"path\":{},\"from\":{from},\"to\":{to},\"dry_run\":{dry_run},\"migrated\":{migrated},\"backup\":{},\"changes\":[",
+            crate::list::json_escape(command),
+            config_path_json(Some(path)),
+            config_path_json(*backup)
+        ),
+    );
+    for (index, change) in changes.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let from = change.from.as_deref().map_or_else(
+            || String::from("null"),
+            |value| format!("\"{}\"", crate::list::json_escape(value)),
+        );
+        let to = change.to.as_deref().map_or_else(
+            || String::from("null"),
+            |value| format!("\"{}\"", crate::list::json_escape(value)),
+        );
+        let _ = std::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(
+                "{{\"key\":\"{}\",\"from\":{from},\"to\":{to}}}",
+                crate::list::json_escape(&change.key)
+            ),
+        );
+    }
+    out.push_str("]}}");
+    out
+}
+
+/// `bitty config migrate [--dry-run] [--backup|--no-backup]`.
+///
+/// Loads the selected file, computes the versioned change list, prints it,
+/// and rewrites the file atomically only when not `--dry-run`. A file already
+/// at [`bitty_config::CURRENT_CONFIG_VERSION`] is a no-op that never touches
+/// the filesystem. Safe mode refuses because it never writes.
+fn run_config_migrate(args: &Args, format: ConfigFormat) -> i32 {
+    let command = config_command_spelling(args, ConfigCommand::Migrate);
+    let dry_run = args.config_dry_run;
+    let want_backup = args.config_backup.unwrap_or(true);
+    if args.safe {
+        return migrate_fail(
+            &command,
+            None,
+            format,
+            "E_SAFE_UNSUPPORTED",
+            "bitty config migrate: --safe is not supported (safe mode never writes; run without --safe)",
+            2,
+        );
+    }
+    let target = match resolve_migrate_target(args) {
+        Ok(path) => path,
+        Err(message) => return migrate_fail(&command, None, format, "E_CONFIG_PATH", &message, 2),
+    };
+    let content = match read_migrate_source(&target) {
+        Ok(content) => content,
+        Err(message) => {
+            return migrate_fail(
+                &command,
+                Some(&target),
+                format,
+                "E_CONFIG_PATH",
+                &message,
+                2,
+            );
+        }
+    };
+    let profile_selected = args
+        .profile
+        .as_deref()
+        .is_some_and(|name| !name.trim().is_empty());
+    let kind = if profile_selected {
+        bitty_config::LayerKind::Profile
+    } else {
+        bitty_config::LayerKind::User
+    };
+    let source = bitty_config::ConfigSource::new(kind, Some(target.display().to_string()));
+    let plan = match bitty_config::file::parse_lua_config(&content, &source) {
+        Ok(plan) => plan,
+        Err(err) => {
+            let code = match err {
+                bitty_config::ConfigError::ConfigVersionUnsupported { .. } => "E_CONFIG_VERSION",
+                _ => "E_CONFIG_INVALID",
+            };
+            return migrate_fail(&command, Some(&target), format, code, &err.to_string(), 2);
+        }
+    };
+    let from = plan.effective_schema_version();
+    let current = bitty_config::CURRENT_CONFIG_VERSION;
+    if from == current {
+        if format == ConfigFormat::Json {
+            println!(
+                "{}",
+                config_migrate_envelope(&MigrateReport {
+                    command: &command,
+                    path: &target,
+                    from,
+                    to: current,
+                    dry_run,
+                    backup: None,
+                    changes: &[],
+                    migrated: false,
+                })
+            );
+        } else {
+            println!(
+                "bitty config migrate: '{}' is at config_version {from} (nothing to migrate)",
+                target.display()
+            );
+        }
+        return 0;
+    }
+    if from > current {
+        let message = format!(
+            "config_version {from} is not supported (max {current}); this build cannot read a newer config shape"
+        );
+        return migrate_fail(
+            &command,
+            Some(&target),
+            format,
+            "E_CONFIG_VERSION",
+            &message,
+            2,
+        );
+    }
+    // Run the transform table even though version 1 only stamps the version:
+    // it keeps the CLI on the same pipeline as the loader and makes a future
+    // gap fail closed here too.
+    if let Err(err) = bitty_config::migrate(plan.clone()) {
+        return migrate_fail(
+            &command,
+            Some(&target),
+            format,
+            "E_CONFIG_MIGRATION",
+            &err.to_string(),
+            2,
+        );
+    }
+    let changes = bitty_config::config_changes(&plan);
+    // Version 1 has no key renames, so stamping the source is a complete
+    // transform. A future transform that renames keys must add a Lua
+    // serializer before this command can persist it; refuse rather than
+    // write a version stamp that hides the unapplied change.
+    if changes.iter().any(|change| change.key != "config_version") {
+        return migrate_fail(
+            &command,
+            Some(&target),
+            format,
+            "E_CONFIG_MIGRATION",
+            "bitty config migrate: this build cannot serialize field transforms; migrate manually",
+            2,
+        );
+    }
+    let rewritten = match bitty_config::stamp_config_version(&content, current) {
+        Ok(rewritten) => rewritten,
+        Err(err) => {
+            return migrate_fail(
+                &command,
+                Some(&target),
+                format,
+                "E_CONFIG_MIGRATION",
+                &err.to_string(),
+                2,
+            );
+        }
+    };
+    if let Err(err) = bitty_config::file::parse_lua_config(&rewritten, &source) {
+        let message =
+            format!("bitty config migrate: rewritten config is invalid ({err}); refusing to write");
+        return migrate_fail(
+            &command,
+            Some(&target),
+            format,
+            "E_CONFIG_MIGRATION",
+            &message,
+            2,
+        );
+    }
+    if format == ConfigFormat::Table {
+        for change in &changes {
+            println!("{}", change.render());
+        }
+    }
+    if dry_run {
+        if format == ConfigFormat::Table {
+            println!(
+                "bitty config migrate: dry run, '{}' not written",
+                target.display()
+            );
+        } else {
+            println!(
+                "{}",
+                config_migrate_envelope(&MigrateReport {
+                    command: &command,
+                    path: &target,
+                    from,
+                    to: current,
+                    dry_run: true,
+                    backup: None,
+                    changes: &changes,
+                    migrated: false,
+                })
+            );
+        }
+        return 0;
+    }
+    let backup = if want_backup {
+        match write_migrate_backup(&target, from) {
+            Ok(path) => Some(path),
+            Err(message) => {
+                return migrate_fail(
+                    &command,
+                    Some(&target),
+                    format,
+                    "E_CONFIG_BACKUP",
+                    &message,
+                    1,
+                );
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(message) = replace_config_atomically(&target, &rewritten, |_| Ok(())) {
+        return migrate_fail(
+            &command,
+            Some(&target),
+            format,
+            "E_CONFIG_WRITE",
+            &message,
+            1,
+        );
+    }
+    if format == ConfigFormat::Table {
+        println!(
+            "bitty config migrate: migrated '{}' from config_version {from} to {current}",
+            target.display()
+        );
+        if let Some(backup) = &backup {
+            println!("backup: '{}'", backup.display());
+        }
+    } else {
+        println!(
+            "{}",
+            config_migrate_envelope(&MigrateReport {
+                command: &command,
+                path: &target,
+                from,
+                to: current,
+                dry_run: false,
+                backup: backup.as_deref(),
+                changes: &changes,
+                migrated: true,
+            })
+        );
+    }
+    0
+}
+
+/// Copies the current bytes to `<file>.bak-<from-version>` (or a numbered
+/// suffix when taken), using exclusive creation so a recovery copy is never
+/// overwritten.
+fn write_migrate_backup(target: &std::path::Path, from: u32) -> Result<std::path::PathBuf, String> {
+    let previous = std::fs::read(target).map_err(|err| {
+        format!(
+            "bitty config migrate: cannot read '{}' for backup: {err}",
+            target.display()
+        )
+    })?;
+    let name = target.file_name().map_or_else(
+        || String::from("config.lua"),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    for attempt in 0..=MIGRATE_MAX_BACKUP_ATTEMPTS {
+        let candidate = if attempt == 0 {
+            target.with_file_name(format!("{name}.bak-{from}"))
+        } else {
+            target.with_file_name(format!("{name}.bak-{from}.{attempt}"))
+        };
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(mut file) => {
+                use std::io::Write as _;
+                file.write_all(&previous).map_err(|err| {
+                    format!(
+                        "bitty config migrate: cannot write backup '{}': {err}",
+                        candidate.display()
+                    )
+                })?;
+                file.sync_all().map_err(|err| {
+                    format!(
+                        "bitty config migrate: cannot sync backup '{}': {err}",
+                        candidate.display()
+                    )
+                })?;
+                return Ok(candidate);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "bitty config migrate: cannot create backup '{}': {err}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "bitty config migrate: exhausted {MIGRATE_MAX_BACKUP_ATTEMPTS} backup names beside '{}'",
+        target.display()
+    ))
+}
+
+/// Writes `content` to a unique sibling, syncs it, preserves the target mode,
+/// then renames over the target (the rename is the commit point).
+///
+/// `before_rename` runs after the bytes are durable and before the commit; a
+/// test injects a failure there to prove the original file stays intact. On
+/// any failure the temporary sibling is removed.
+fn replace_config_atomically<F>(
+    target: &std::path::Path,
+    content: &str,
+    before_rename: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&std::path::Path) -> Result<(), String>,
+{
+    use std::io::Write as _;
+    let meta = std::fs::metadata(target).map_err(|err| {
+        format!(
+            "bitty config migrate: cannot inspect '{}': {err}",
+            target.display()
+        )
+    })?;
+    let name = target.file_name().map_or_else(
+        || String::from("config.lua"),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let mut temp = None;
+    for attempt in 0..MIGRATE_MAX_TEMP_ATTEMPTS {
+        let sequence = MIGRATE_TEMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let candidate = target.with_file_name(format!(
+            "{name}.tmp-{}-{sequence}-{attempt}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temp = Some((candidate, file));
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(format!(
+                    "bitty config migrate: cannot create temporary file beside '{}': {err}",
+                    target.display()
+                ));
+            }
+        }
+    }
+    let Some((temp_path, mut file)) = temp else {
+        return Err(format!(
+            "bitty config migrate: exhausted temporary names beside '{}'",
+            target.display()
+        ));
+    };
+    let result = (|| {
+        file.write_all(content.as_bytes()).map_err(|err| {
+            format!(
+                "bitty config migrate: cannot write '{}': {err}",
+                temp_path.display()
+            )
+        })?;
+        file.sync_all().map_err(|err| {
+            format!(
+                "bitty config migrate: cannot sync '{}': {err}",
+                temp_path.display()
+            )
+        })?;
+        drop(file);
+        std::fs::set_permissions(&temp_path, meta.permissions()).map_err(|err| {
+            format!(
+                "bitty config migrate: cannot preserve mode on '{}': {err}",
+                temp_path.display()
+            )
+        })?;
+        before_rename(&temp_path)?;
+        std::fs::rename(&temp_path, target).map_err(|err| {
+            format!(
+                "bitty config migrate: cannot replace '{}': {err}",
+                target.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 /// Runs the editor and returns its path/name, or a stable failure.
@@ -3381,6 +3997,64 @@ mod startup_tests {
         ));
         std::fs::create_dir_all(&dir).expect("scratch dir");
         dir
+    }
+
+    #[test]
+    fn atomic_migration_write_failure_leaves_original_intact() {
+        let dir = scratch_dir("migrate-atomic-fail");
+        let path = dir.join("init.lua");
+        let original = "return { font = { family = \"Mono\" } }\n";
+        std::fs::write(&path, original).expect("write original");
+        let error = replace_config_atomically(
+            &path,
+            "return { config_version = 1, font = { family = \"Mono\" } }\n",
+            |_| Err(String::from("injected before rename")),
+        )
+        .expect_err("injected failure must surface");
+        assert!(error.contains("injected before rename"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("original still readable"),
+            original,
+            "the original file must stay byte-identical"
+        );
+        let leftovers = std::fs::read_dir(&dir)
+            .expect("scratch dir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(leftovers, 0, "the temporary sibling must be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_migration_write_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("migrate-atomic-mode");
+        let path = dir.join("init.lua");
+        std::fs::write(&path, "return {}\n").expect("write original");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("set mode");
+        replace_config_atomically(&path, "return { config_version = 1 }\n", |_| Ok(()))
+            .expect("atomic write");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "the replacement keeps the original mode");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_version_line_reports_migration_only_when_older() {
+        assert_eq!(
+            config_version_line(None),
+            "config_version 0 (migration available: bitty config migrate)"
+        );
+        assert_eq!(
+            config_version_line(Some(bitty_config::CURRENT_CONFIG_VERSION)),
+            "config_version 1 (current)"
+        );
     }
 
     #[test]

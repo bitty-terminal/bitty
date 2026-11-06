@@ -351,7 +351,8 @@ registry/uninstall scripting for the same bar.
   `/DMyAppVersion=X.Y.Z` (release workflow: tag, then workflow input, then
   the Cargo workspace version — never hardcoded) and the payload stages from
   `/DMySourceDir=<absolute stage>` carrying `bitty.exe` plus `LICENSE`,
-  `README.md`, and `CHANGELOG.md` (the portable-ZIP payload).
+  `README.md`, and `CHANGELOG.md` (the portable-ZIP payload without
+  `bitty.ico`, which only the bootstrap script uses).
 - Wizard: `WizardStyle=modern`, per-user default (`PrivilegesRequired=lowest`
   with a per-user/per-machine dialog override), `x64compatible` only.
   `[Tasks]` offers the `desktopicon` opt-in on the standard Additional Icons
@@ -560,14 +561,48 @@ Rationale per OS:
   executable file and is already the Homebrew fetch artifact. The DMG stays
   the manual-download path.
 - Windows x64 fetches the portable ZIP (`scripts/make-windows-zip.sh`,
-  verified by `verify-windows-zip`): `bitty.exe` plus docs at the archive
-  root, expanded with `Expand-Archive`. Windows arm64 fetches the bare
-  `bitty-aarch64-pc-windows-msvc.exe` because the ZIP matrix builds x64 only;
-  both arches install first-class, only the container differs until the ZIP
-  matrix extends (recorded follow-up, not a parity gap).
+  verified by `verify-windows-zip`): `bitty.exe`, the display icon
+  `bitty.ico`, and docs at the archive root, expanded with `Expand-Archive`.
+  Windows arm64 fetches the bare `bitty-aarch64-pc-windows-msvc.exe` because
+  the ZIP matrix builds x64 only; both arches install first-class, only the
+  container differs until the ZIP matrix extends (recorded follow-up, not a
+  parity gap).
 - FreeBSD Tier 2 is not a bootstrap target: no `install.sh` path serves the
   `bitty-<VERSION>-x86_64-unknown-freebsd.tar.xz`; it stays manual download
   and scripts fail closed there with guidance.
+
+### Windows app-list entry and display icon (CTX-1720, #2926)
+
+`install.ps1` registers a per-user app-list entry at
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Bitty` with
+`DisplayName`, `DisplayVersion`, `Publisher`, `InstallLocation`,
+`DisplayIcon`, `EstimatedSize` (KB), `NoModify=1`, `NoRepair=1`, and an
+`UninstallString` that runs a generated `uninstall.ps1` through the inbox
+Windows PowerShell 5.1 (`-NoProfile -ExecutionPolicy Bypass -File`). The key
+path is fixed, so a re-install updates `DisplayVersion`/`EstimatedSize` in
+place instead of adding a second entry. HKCU only: the installer never
+elevates and never writes HKLM.
+
+The uninstaller removes the entry, the Start Menu shortcut, the exact user
+`Path` entry the installer added (recorded in `bitty-install-state.json` next
+to the exe, so a pre-existing user entry is never touched), the shipped
+`bitty.ico`, and the install directory. `-NoRegistry` skips the app-list entry
+but still writes the uninstaller.
+
+The shortcut and `DisplayIcon` point at `bitty.ico`, which ships in the
+portable ZIP (`packaging/icons/bitty.ico`, archived as `bitty.ico`). It is a
+six-size ICO (16/32/48/64/128/256) assembled from the hand-tuned
+`packaging/icons/hicolor/<size>/apps/bitty.png` frames, with 48 px derived
+from the 64 px frame. Regenerate it after changing the hicolor icons:
+
+```sh
+python3 scripts/make-windows-ico.py
+```
+
+arm64 installs a bare exe with no `.ico` in the payload, so their shortcut
+falls back to the executable icon; bitty#2929 embeds the mascot in `bitty.exe`
+and switches both Windows channels to `bitty.exe,0`, after which the `.ico`
+copy is only a portable-payload convenience.
 
 ### Channel download sources (CTX-1413, #1847)
 

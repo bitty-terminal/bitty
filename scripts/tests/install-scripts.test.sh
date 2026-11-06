@@ -175,6 +175,9 @@ fi
 # CTX-1681 (#2863): Windows Search only indexes Start Menu shortcuts and
 # registered apps, so the script must create Bitty.lnk and update the user
 # Path (with WM_SETTINGCHANGE broadcast) rather than logging an intent.
+# CTX-1720 (#2926): the same visibility requirement covers the app-list
+# entry and its generated uninstaller; the live HKCU round-trip runs on the
+# Windows CI leg, these needles keep the contract pinned on Linux too.
 if [[ ! -f "$PS1_SCRIPT" ]]; then
   echo "FAIL: $PS1_SCRIPT missing (PowerShell has no in-repo precedent; placed alongside install.sh)" >&2
   FAIL=1
@@ -185,7 +188,10 @@ else
     'Expand-Archive' 'Get-FileHash' \
     'Microsoft\Windows\Start Menu\Programs' 'Bitty.lnk' 'WScript.Shell' \
     'CreateShortcut' 'SendMessageTimeout' 'WM_SETTINGCHANGE' \
-    'HKCU:\Environment' '-NoShortcut' '-NoPathUpdate'; do
+    'HKCU:\Environment' '-NoShortcut' '-NoPathUpdate' \
+    'CurrentVersion\Uninstall\Bitty' 'DisplayIcon' 'EstimatedSize' \
+    'NoModify' 'NoRepair' 'UninstallString' 'uninstall.ps1' \
+    '-NoRegistry' 'bitty.ico'; do
     if ! grep -qF -- "$needle" "$PS1_SCRIPT"; then
       echo "FAIL: install.ps1 missing '$needle'" >&2
       FAIL=1

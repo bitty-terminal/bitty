@@ -1255,9 +1255,10 @@ const MAX_SALVAGE_DROPS: usize = 32;
 /// Parses Lua config content into a [`ConfigPlan`] via the shared
 /// `bitty-lua` sandbox (same budgets as plugins).
 ///
-/// `source` is used for error attribution. The returned plan has
-/// `schema_version: None` (implicit 0); callers run [`crate::migrate`]
-/// before merging (see [`load_user_layer`]).
+/// `source` is used for error attribution. The returned plan carries the
+/// file's declared `config_version` as `schema_version` (`None` = implicit
+/// version `0`); callers run [`crate::migrate`] before merging (see
+/// [`load_user_layer`]).
 ///
 /// Strict: any invalid element rejects the whole layer with its exact error.
 /// The app-start path uses [`parse_lua_config_salvaging`] instead.
@@ -3038,7 +3039,7 @@ fn build_plan_from_data(
     };
 
     let plan = ConfigPlan {
-        schema_version: None,
+        schema_version: data.config_version,
         font,
         window,
         terminal,
@@ -3218,6 +3219,22 @@ fn shape_error_to_config_error(message: &str, src_desc: &str) -> ConfigError {
 /// - Parser/validation errors from [`parse_lua_config`].
 pub fn load_user_layer(path: &Path) -> Result<LayeredPlan, ConfigError> {
     load_layer_with_kind(path, LayerKind::User)
+}
+
+/// Reads the declared terminal-config version without migrating it.
+///
+/// `None` means the file omitted `config_version` (the pre-version shape,
+/// version `0`). The full parse/validation pipeline runs, so a newer version
+/// still fails closed with [`ConfigError::ConfigVersionUnsupported`].
+///
+/// # Errors
+///
+/// Same as [`load_user_layer`] (the file must exist).
+pub fn load_config_version(path: &Path) -> Result<Option<u32>, ConfigError> {
+    let content = read_config_file(path)?;
+    let source = ConfigSource::new(LayerKind::User, Some(path.display().to_string()));
+    let plan = parse_lua_config(&content, &source)?;
+    Ok(plan.schema_version)
 }
 
 /// Startup variant of [`load_user_layer`] (CTX-1490, issue #2580).

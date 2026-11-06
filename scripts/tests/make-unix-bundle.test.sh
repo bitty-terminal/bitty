@@ -45,12 +45,15 @@ TOPDIR="bitty-$VERSION-$TARGET"
 FAKE_BIN="$TMP_BASE/bitty-fixture"
 printf '#!/bin/sh\necho "bitty %s"\n' "$VERSION" >"$FAKE_BIN"
 chmod +x "$FAKE_BIN"
+FAKE_DAEMON="$TMP_BASE/bittyd-fixture"
+printf '#!/bin/sh\necho "bittyd %s"\n' "$VERSION" >"$FAKE_DAEMON"
+chmod +x "$FAKE_DAEMON"
 
 OUT="$TMP_BASE/$TOPDIR.tar.zst"
 
 # --- dry-run stages the payload without writing the bundle ---
 if "$SCRIPT" --version "$VERSION" --target "$TARGET" \
-	--binary "$FAKE_BIN" --output "$OUT" --dry-run >/dev/null 2>&1; then
+	--binary "$FAKE_BIN" --daemon "$FAKE_DAEMON" --output "$OUT" --dry-run >/dev/null 2>&1; then
 	if [[ -e "$OUT" ]]; then
 		fail "dry-run wrote the bundle"
 	else
@@ -62,7 +65,7 @@ fi
 
 # --- real assembly ---
 if ! "$SCRIPT" --version "$VERSION" --target "$TARGET" \
-	--binary "$FAKE_BIN" --output "$OUT" >/dev/null 2>&1; then
+	--binary "$FAKE_BIN" --daemon "$FAKE_DAEMON" --output "$OUT" >/dev/null 2>&1; then
 	fail "assembly exited non-zero"
 fi
 [[ -f "$OUT" ]] || fail "bundle not created"
@@ -71,6 +74,7 @@ fi
 EXPECTED="$(
 	{
 		echo "$TOPDIR/bin/bitty"
+		echo "$TOPDIR/bin/bittyd"
 		echo "$TOPDIR/LICENSE"
 		echo "$TOPDIR/README.md"
 		echo "$TOPDIR/CHANGELOG.md"
@@ -114,6 +118,17 @@ if [[ "$BIN_OUT" == *"$VERSION"* ]]; then
 else
 	fail "version mismatch: $BIN_OUT"
 fi
+if [[ -x "$EXTRACT/$TOPDIR/bin/bittyd" ]]; then
+	pass "bin/bittyd is executable after extraction"
+else
+	fail "bin/bittyd lost its executable bit"
+fi
+DAEMON_OUT="$("$EXTRACT/$TOPDIR/bin/bittyd" --version)"
+if [[ "$DAEMON_OUT" == *"$VERSION"* ]]; then
+	pass "extracted daemon reports version ($DAEMON_OUT)"
+else
+	fail "daemon version mismatch: $DAEMON_OUT"
+fi
 for f in LICENSE README.md CHANGELOG.md; do
 	if cmp -s "$f" "$EXTRACT/$TOPDIR/$f"; then
 		pass "$f matches the repo file"
@@ -132,11 +147,12 @@ expect_fail() {
 		pass "rejects invalid input ($why)"
 	fi
 }
-expect_fail "missing version" --target "$TARGET" --binary "$FAKE_BIN" --output "$OUT"
-expect_fail "bad version" --version "0.0" --target "$TARGET" --binary "$FAKE_BIN" --output "$OUT"
-expect_fail "missing target" --version "$VERSION" --binary "$FAKE_BIN" --output "$OUT"
-expect_fail "bad target" --version "$VERSION" --target "not a triple!!" --binary "$FAKE_BIN" --output "$OUT"
-expect_fail "missing binary" --version "$VERSION" --target "$TARGET" --binary "$TMP_BASE/nope" --output "$OUT"
+expect_fail "missing version" --target "$TARGET" --binary "$FAKE_BIN" --daemon "$FAKE_DAEMON" --output "$OUT"
+expect_fail "bad version" --version "0.0" --target "$TARGET" --binary "$FAKE_BIN" --daemon "$FAKE_DAEMON" --output "$OUT"
+expect_fail "missing target" --version "$VERSION" --binary "$FAKE_BIN" --daemon "$FAKE_DAEMON" --output "$OUT"
+expect_fail "bad target" --version "$VERSION" --target "not a triple!!" --binary "$FAKE_BIN" --daemon "$FAKE_DAEMON" --output "$OUT"
+expect_fail "missing binary" --version "$VERSION" --target "$TARGET" --binary "$TMP_BASE/nope" --daemon "$FAKE_DAEMON" --output "$OUT"
+expect_fail "missing daemon" --version "$VERSION" --target "$TARGET" --binary "$FAKE_BIN" --daemon "$TMP_BASE/nope" --output "$OUT"
 
 if [[ "$FAIL" -ne 0 ]]; then
 	echo "make-unix-bundle.test: FAIL" >&2

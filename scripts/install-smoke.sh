@@ -129,6 +129,7 @@ fi
 command -v docker >/dev/null 2>&1 || die "docker not found (needed to run the clean-container smoke)"
 
 smoke='bitty --version
+bittyd --version
 env -u TERM -u DISPLAY -u WAYLAND_DISPLAY bitty doctor
 env -u TERM -u DISPLAY -u WAYLAND_DISPLAY bitty --headless'
 

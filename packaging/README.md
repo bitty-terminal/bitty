@@ -415,12 +415,13 @@ no installer); the bare `.exe` assets keep shipping for Scoop and direct
 downloads. The `verify-windows-zip` job unzips on a clean Windows runner and
 runs `bitty.exe --version`.
 
-The versioned Linux bundles pack `bin/bitty` with `share/` (desktop entry,
-icons, metainfo) plus `LICENSE`, `README.md`, and `CHANGELOG.md` under one
-top-level `bitty-<version>-<target>/` directory (assembled by
-`scripts/make-windows-zip.sh`'s sibling `scripts/make-unix-bundle.sh`; the
-bare triple binaries keep shipping for now). The `verify-unix-bundle` job
-expands each archive on a clean Ubuntu runner and runs `bin/bitty --version`.
+The versioned Linux bundles pack `bin/bitty` and `bin/bittyd` with `share/`
+(desktop entry, icons, metainfo) plus `LICENSE`, `README.md`, and
+`CHANGELOG.md` under one top-level `bitty-<version>-<target>/` directory
+(assembled by `scripts/make-windows-zip.sh`'s sibling
+`scripts/make-unix-bundle.sh`; the bare triple binaries keep shipping for
+now). The `verify-unix-bundle` job expands each archive on a clean Ubuntu
+runner and runs `bin/bitty --version` and `bin/bittyd --version`.
 
 Plus nfpm packaging for linux x64/aarch64, a runtime-dependency gate (`ldd` + `readelf -d` vs the declared per-distro deps) for the x64 glibc and musl packages, clean-container install smoke jobs for Ubuntu/Fedora/Arch/Alpine, and optional AUR/Homebrew/Scoop bumps gated on secrets. Only legs that passed and publishes that completed successfully count as support evidence (see `Support evidence` above); a build-only cell without a `verify-*` leg stays best-effort.
 
@@ -545,10 +546,13 @@ Rationale per OS:
 
 - Linux fetches the versioned `.tar.zst` bundle, not the bare triple binary.
   The bundle (`scripts/make-unix-bundle.sh`, verified by `verify-unix-bundle`)
-  carries `bin/bitty` plus the desktop entry, icons, AppStream metainfo, and
-  `LICENSE`/`README.md`/`CHANGELOG.md` under one top-level directory; the bare
-  binary has no desktop integration. `install.sh` extracts `bin/bitty` and
-  installs `share/` alongside it. Musl/Alpine uses its own native-musl bundle,
+  carries `bin/bitty` and `bin/bittyd` plus the desktop entry, icons,
+  AppStream metainfo, and `LICENSE`/`README.md`/`CHANGELOG.md` under one
+  top-level directory; the bare binary has no desktop integration.
+  `install.sh` extracts both binaries and installs `share/` alongside them.
+  The session host ships on Linux cells only: the macOS and Windows builds
+  select the `refused` containment plan, so a daemon there could not create a
+  session. Musl/Alpine uses its own native-musl bundle,
   never the glibc one.
 - macOS fetches the bare per-arch binary, not the Universal DMG. The DMG is an
   interactive drag-to-install image (`hdiutil` mount plus Finder copy),

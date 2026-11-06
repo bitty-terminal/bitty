@@ -91,11 +91,19 @@
           doCheck = false;
           cargoExtraArgs = "-p bitty-terminal";
         });
+        # The session host is a separate binary in the same workspace. It is
+        # built as its own derivation so a consumer can install either one.
+        bittyd = craneLib.buildPackage (commonArgs // {
+          cargoArtifacts = null;
+          doCheck = false;
+          cargoExtraArgs = "-p bitty-daemon";
+        });
       in
       {
         packages = {
           default = bitty;
           bitty = bitty;
+          bittyd = bittyd;
         };
 
         apps = {

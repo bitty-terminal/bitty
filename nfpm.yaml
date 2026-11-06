@@ -17,6 +17,10 @@ contents:
     dst: /usr/bin/bitty
     file_info:
       mode: 0755
+  - src: ./target/release/bittyd
+    dst: /usr/bin/bittyd
+    file_info:
+      mode: 0755
   - src: ./LICENSE
     dst: /usr/share/licenses/bitty/LICENSE
   - src: ./README.md

@@ -79,6 +79,9 @@ jobs:
           echo '#!/bin/sh
           echo "bitty 0.0.1"' > target/release/bitty
           chmod +x target/release/bitty
+          echo '#!/bin/sh
+          echo "bittyd 0.0.1"' > target/release/bittyd
+          chmod +x target/release/bittyd
           tic -x -o target/terminfo terminfo/bitty.ti
       - name: Validate nfpm (deb/rpm/apk/archlinux)
         run: |
@@ -294,13 +297,13 @@ jobs:
           PKG_CONFIG_PATH_aarch64_unknown_linux_gnu: /usr/lib/aarch64-linux-gnu/pkgconfig
           PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu: /usr/lib/aarch64-linux-gnu/pkgconfig
           PKG_CONFIG_SYSROOT_DIR_aarch64_unknown_linux_gnu: /
-        run: cargo build --release --locked -p bitty-terminal --target ${{ matrix.target }}
+        run: cargo build --release --locked -p bitty-terminal -p bitty-daemon --target ${{ matrix.target }}
 
       - name: Build bitty binary (native)
         if: matrix.target != 'aarch64-unknown-linux-gnu'
         env:
           RUSTFLAGS: ${{ steps.release-flags.outputs.flags }}
-        run: cargo build --release --locked -p bitty-terminal --target ${{ matrix.target }}
+        run: cargo build --release --locked -p bitty-terminal -p bitty-daemon --target ${{ matrix.target }}
 
       # CTX-2402: the fail-closed builder-path gate. Stripping cannot remove
       # panic-location paths, so this proves the remap actually applied on
@@ -315,6 +318,9 @@ jobs:
             bin="${bin}.exe"
           fi
           bash scripts/check-release-paths.sh --binary "$bin"
+          if [[ "$TARGET" == *linux* ]]; then
+            bash scripts/check-release-paths.sh --binary "target/${TARGET}/release/bittyd"
+          fi
 
       # CTX-0502: host-cross is verified (#819), so a wrong-architecture
       # artifact must fail here instead of being renamed, packaged, and
@@ -365,6 +371,22 @@ jobs:
           else
             shasum -a 256 "dist/bitty-${TARGET}${EXT}" | tee "dist/bitty-${TARGET}${EXT}.sha256"
           fi
+          # The session host ships on Linux cells only: elsewhere the
+          # containment plan is `refused`, so a daemon there could not create a
+          # session (the platform-cell matrix records that).
+          if [[ "$TARGET" == *linux* ]]; then
+            DAEMON="target/${TARGET}/release/bittyd"
+            if [[ ! -f "$DAEMON" ]]; then
+              echo "::error::Daemon binary $DAEMON not found"
+              exit 1
+            fi
+            cp "$DAEMON" "dist/bittyd-${TARGET}"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "dist/bittyd-${TARGET}" | tee "dist/bittyd-${TARGET}.sha256"
+            else
+              shasum -a 256 "dist/bittyd-${TARGET}" | tee "dist/bittyd-${TARGET}.sha256"
+            fi
+          fi
 
       - name: Package (nfpm) - Linux only
         if: contains(matrix.packagers, 'deb')
@@ -381,6 +403,7 @@ jobs:
           echo "$GOPATH_BIN" >> "$GITHUB_PATH"
           mkdir -p target/release dist
           cp "target/${{ matrix.target }}/release/bitty" target/release/bitty
+          cp "target/${{ matrix.target }}/release/bittyd" target/release/bittyd
           # Stage the compiled terminfo entry for the nFPM mapping
           # (nfpm.yaml maps ./target/terminfo/b/bitty). Each packaging job
           # runs in its own workspace, so the validate job's tic output is
@@ -482,13 +505,16 @@ jobs:
         env:
           RUSTFLAGS: "-C target-feature=-crt-static ${{ steps.release-flags.outputs.flags }}"
         shell: bash
-        run: cargo build --release --locked -p bitty-terminal
+        run: cargo build --release --locked -p bitty-terminal -p bitty-daemon
 
       # CTX-2402: same fail-closed builder-path gate as the glibc/macOS/Windows
       # legs; the musl target ships in the .apk.
       - name: Check release binary has no builder paths
         shell: bash
-        run: bash scripts/check-release-paths.sh --binary target/release/bitty
+        run: |
+          set -euo pipefail
+          bash scripts/check-release-paths.sh --binary target/release/bitty
+          bash scripts/check-release-paths.sh --binary target/release/bittyd
 
       - name: Rename artifact
         shell: bash
@@ -497,6 +523,8 @@ jobs:
           mkdir -p dist
           cp target/release/bitty dist/bitty-x86_64-unknown-linux-musl
           sha256sum dist/bitty-x86_64-unknown-linux-musl | tee dist/bitty-x86_64-unknown-linux-musl.sha256
+          cp target/release/bittyd dist/bittyd-x86_64-unknown-linux-musl
+          sha256sum dist/bittyd-x86_64-unknown-linux-musl | tee dist/bittyd-x86_64-unknown-linux-musl.sha256
 
       - name: Assert the binary is musl, not glibc
         shell: bash
@@ -1223,6 +1251,7 @@ jobs:
             --version "$VERSION" \
             --target "${{ matrix.target }}" \
             --binary "dist/bitty-${{ matrix.target }}" \
+            --daemon "dist/bittyd-${{ matrix.target }}" \
             --output "$BUNDLE"
           sha256sum "$BUNDLE" | tee "$BUNDLE.sha256"
 
@@ -1323,9 +1352,22 @@ jobs:
             # leave a bare "gnu"/"musl". The inner expansion is quoted so it is
             # matched literally rather than treated as a glob pattern.
             target="${base#"bitty-${version}-"}"
+            daemon="$dest/$base/bin/bittyd"
+            if [[ ! -x "$daemon" ]]; then
+              echo "::error::$base bin/bittyd missing or not executable" >&2
+              exit 1
+            fi
             case "$target" in
               x86_64-unknown-linux-gnu)
                 scripts/check-version-output.sh "$version" "$exe"
+                # `bittyd --version` prints the crate and the service API
+                # version on separate lines, so the one-line terminal check
+                # does not apply; assert the release version appears.
+                daemon_version="$("$daemon" --version)"
+                if [[ "$daemon_version" != *"$version"* ]]; then
+                  echo "::error::$base bittyd --version does not report $version: $daemon_version" >&2
+                  exit 1
+                fi
                 ;;
               x86_64-unknown-linux-musl)
                 # The musl bundle is built with `-crt-static` disabled so that

@@ -2968,6 +2968,7 @@ mod tests {
 
     /// Recursive snapshot (relative path, kind, length, mtime, bytes) used to
     /// prove `--dry-run` never writes.
+    #[cfg(unix)]
     #[derive(Debug, PartialEq, Eq)]
     struct SnapshotEntry {
         path: PathBuf,
@@ -2977,6 +2978,7 @@ mod tests {
         bytes: Option<Vec<u8>>,
     }
 
+    #[cfg(unix)]
     fn snapshot(root: &Path) -> Vec<SnapshotEntry> {
         fn walk(root: &Path, dir: &Path, out: &mut Vec<SnapshotEntry>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -3025,6 +3027,7 @@ mod tests {
         listener
     }
 
+    #[cfg(unix)]
     fn test_env(root: &Path) -> RepairEnv {
         RepairEnv {
             runtime_dir: Some(root.join("run")),

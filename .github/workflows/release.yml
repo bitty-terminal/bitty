@@ -922,7 +922,7 @@ jobs:
           if ($dirs.Count -ne 0) {
             throw "unexpected directories in archive root: $($dirs.Name -join ', ')"
           }
-          $expected = @('bitty.exe', 'LICENSE', 'README.md', 'CHANGELOG.md')
+          $expected = @('bitty.exe', 'bitty.ico', 'LICENSE', 'README.md', 'CHANGELOG.md')
           $actual = @(Get-ChildItem -Path $dest -File | ForEach-Object { $_.Name })
           if (Compare-Object $expected $actual) {
             throw "archive contents mismatch: $($actual -join ', ')"
@@ -941,7 +941,8 @@ jobs:
   # Windows x64 setup installer (CTX-1064 / #1810): Inno Setup 6 wizard
   # compiled on windows-latest (choco install, no paid infra). Input is the
   # x86_64 MSVC executable from `build` plus LICENSE/README.md/CHANGELOG.md
-  # (the portable-ZIP payload); the version resolves exactly like `windows-zip`
+  # (the portable-ZIP payload minus bitty.ico, which only install.ps1 uses);
+  # the version resolves exactly like `windows-zip`
   # (tag > workflow input > Cargo workspace version), never hardcoded. The
   # 0.1.0 installer is intentionally unsigned (paid signing deferred past
   # 0.2.0 per the owner decision on #1810): no SignTool is configured and the

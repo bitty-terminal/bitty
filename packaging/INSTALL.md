@@ -45,8 +45,9 @@ What each script installs:
 - macOS x86_64/arm64: the bare per-arch binary (the DMG is interactive and
   unsuitable for headless install; the same binary is the Homebrew fetch
   artifact).
-- Windows x64: the portable ZIP (`bitty.exe` + LICENSE/README/CHANGELOG).
-  Windows arm64: the bare exe (the ZIP matrix builds x64 only).
+- Windows x64: the portable ZIP (`bitty.exe` + `bitty.ico` +
+  LICENSE/README/CHANGELOG). Windows arm64: the bare exe (the ZIP matrix
+  builds x64 only), so its shortcut falls back to the executable icon.
 - FreeBSD (Tier 2): not a bootstrap target — manual download from the
   release page instead.
 
@@ -112,22 +113,34 @@ shell path. They differ in packaging and removal.
 | Channel                              | Start Menu                                           | PATH                                         | Uninstall                |
 | ------------------------------------ | ---------------------------------------------------- | -------------------------------------------- | ------------------------ |
 | `setup.exe` (Inno Setup)             | `Bitty` shortcut, plus an opt-in Desktop shortcut    | not modified                                 | Apps & Features -> Bitty |
-| PowerShell one-liner (`install.ps1`) | `Bitty.lnk`                                          | user `Path` gains `%LOCALAPPDATA%\bitty\bin` | manual steps below       |
+| PowerShell one-liner (`install.ps1`) | `Bitty.lnk`                                          | user `Path` gains `%LOCALAPPDATA%\bitty\bin` | Apps & Features -> Bitty |
 | Scoop                                | `Bitty` shortcut from the manifest `shortcuts` entry | `bitty` shim on the Scoop shim path          | `scoop uninstall bitty`  |
 
 The PowerShell one-liner creates `Bitty.lnk` in
-`%APPDATA%\Microsoft\Windows\Start Menu\Programs` and appends the install
-directory to the user `Path` (`HKCU\Environment`), then broadcasts
-`WM_SETTINGCHANGE`; already-open shells still need a restart. Both actions are
-best-effort: on failure the installer warns and prints the manual step instead
-of failing the install. Scripted installs can skip them with `-NoShortcut` and
-`-NoPathUpdate`:
+`%APPDATA%\Microsoft\Windows\Start Menu\Programs`, appends the install
+directory to the user `Path` (`HKCU\Environment`) with a `WM_SETTINGCHANGE`
+broadcast (already-open shells still need a restart), and registers a per-user
+app-list entry under
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Bitty` so
+Settings -> Apps -> Installed apps shows Bitty with its version and an
+Uninstall button. The shortcut and the app-list entry point at the shipped
+`bitty.ico`; when the payload has no icon (arm64 bare exe, until #2929 embeds
+it in `bitty.exe`) they fall back to the executable icon. Each action is
+best-effort: on failure the installer warns and prints the manual step
+instead of failing the install. Scripted installs can skip them with
+`-NoShortcut`, `-NoPathUpdate`, and `-NoRegistry`:
 
 ```powershell
-iex "& { $(irm https://cdn.bitty.run/install/install.ps1) } -Version 0.0.23 -NoShortcut -NoPathUpdate"
+iex "& { $(irm https://cdn.bitty.run/install/install.ps1) } -Version 0.0.23 -NoShortcut -NoPathUpdate -NoRegistry"
 ```
 
-Manual uninstall for the PowerShell one-liner:
+Uninstall the PowerShell one-liner through Settings -> Apps -> Installed apps
+-> Bitty -> Uninstall. That runs the generated `uninstall.ps1` next to
+`bitty.exe`, which removes the app-list entry, `Bitty.lnk`, the exact user
+`Path` entry the installer added (never one you already had), and the install
+directory. Installs made with `-NoRegistry` have no app-list entry; run
+`%LOCALAPPDATA%\bitty\bin\uninstall.ps1` yourself, or remove those items by
+hand:
 
 1. Delete `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Bitty.lnk`.
 2. Remove `%LOCALAPPDATA%\bitty\bin` from the user `Path` (Settings -> System

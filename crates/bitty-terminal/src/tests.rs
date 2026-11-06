@@ -7,10 +7,13 @@ use super::*;
 use crate::config_cli::{
     runtime_config_from_effective, runtime_config_from_effective_with_warnings,
 };
+#[cfg(windows)]
+use crate::spawn::PLATFORM_SHELL_CANDIDATES;
+use crate::spawn::{ResolvedShell, ShellSource, select_default_shell};
 use bitty_platform::{PlatformEvent, WindowEventKind};
-// Only the POSIX-shell live-spawn test below uses this (`#[cfg(unix)]`);
-// without the gate the import is unused on Windows.
-#[cfg(unix)]
+// Live-spawn tests are platform-gated: POSIX-shell ones (`/bin/sh`) stay
+// `#[cfg(unix)]`, the Windows default-shell spawn test is `#[cfg(windows)]`.
+#[cfg(any(unix, windows))]
 use bitty_test_support::require_pty;
 
 fn args_of(words: &[&str]) -> Vec<String> {
@@ -1642,14 +1645,129 @@ fn ipc_socket_path_stored_unless_headless_without_test_mode() {
     assert!(super::should_store_ipc_socket_path(true, true));
 }
 
+/// Program the default chain selects on this host, for terse assertions.
+fn resolved_program(config_shell: Option<&str>, shell_env: Option<&str>) -> String {
+    resolve_default_shell(config_shell, shell_env)
+        .expect("the platform default layer always resolves in the test environment")
+        .program
+}
+
+/// Program the platform default layer alone resolves to on this host.
+fn platform_default_program() -> String {
+    resolved_program(None, None)
+}
+
+/// Program [`resolve_spawn_program`] selects, for terse assertions.
+fn resolved_spawn_program(
+    args: &crate::cli::Args,
+    config_shell: Option<&str>,
+    shell_env: Option<&str>,
+) -> String {
+    resolve_spawn_program(args.program.as_deref(), config_shell, shell_env)
+        .expect("the platform default layer always resolves in the test environment")
+        .program
+}
+
 #[test]
-fn default_shell_prefers_shell_env_when_no_configured_shell() {
-    assert_eq!(resolve_default_shell(None, None), "/bin/sh");
-    assert_eq!(resolve_default_shell(None, Some("/bin/fish")), "/bin/fish");
-    assert_eq!(resolve_default_shell(None, Some("/bin/bash")), "/bin/bash");
+fn select_default_shell_prefers_configured_then_env_then_platform() {
+    // bitty#2928: the pure selector, with an injected candidate list and
+    // lookup, so the Windows ordering is proven on every host.
+    let candidates = ["pwsh.exe", "powershell.exe", "cmd.exe"];
+    let first_wins = |name: &str| Some(format!("/resolved/{name}"));
+
+    let configured =
+        select_default_shell(Some("/bin/zsh"), Some("/bin/fish"), &candidates, first_wins)
+            .expect("configured shell resolves");
     assert_eq!(
-        resolve_default_shell(None, Some("/usr/bin/zsh")),
-        "/usr/bin/zsh"
+        configured,
+        ResolvedShell {
+            program: "/bin/zsh".to_string(),
+            source: ShellSource::Configured,
+        }
+    );
+
+    let environment = select_default_shell(None, Some("/bin/fish"), &candidates, first_wins)
+        .expect("$SHELL resolves");
+    assert_eq!(environment.source, ShellSource::Environment);
+    assert_eq!(environment.program, "/bin/fish");
+
+    let platform = select_default_shell(None, None, &candidates, first_wins)
+        .expect("the first candidate resolves");
+    assert_eq!(platform.source, ShellSource::PlatformDefault);
+    assert_eq!(platform.program, "/resolved/pwsh.exe");
+
+    // Only the last candidate exists: the selector skips the missing ones in
+    // order instead of failing.
+    let only_cmd =
+        |name: &str| (name == "cmd.exe").then(|| String::from("C:\\Windows\\System32\\cmd.exe"));
+    let platform =
+        select_default_shell(None, None, &candidates, only_cmd).expect("cmd.exe resolves");
+    assert_eq!(platform.program, "C:\\Windows\\System32\\cmd.exe");
+    assert_eq!(platform.source, ShellSource::PlatformDefault);
+}
+
+#[test]
+fn select_default_shell_fails_with_every_candidate_named() {
+    // bitty#2928: an unresolved chain is a typed error that names every
+    // program it tried, never a silent headless tick.
+    let err = select_default_shell(
+        None,
+        None,
+        &["pwsh.exe", "powershell.exe", "cmd.exe"],
+        |_| None,
+    )
+    .expect_err("no candidate resolves");
+    assert_eq!(err.tried, vec!["pwsh.exe", "powershell.exe", "cmd.exe"]);
+    let message = err.to_string();
+    for candidate in &err.tried {
+        assert!(
+            message.contains(candidate),
+            "message names {candidate}: {message}"
+        );
+    }
+    assert!(message.contains("terminal.shell"), "{message}");
+}
+
+#[test]
+#[cfg(not(windows))]
+fn default_shell_prefers_shell_env_when_no_configured_shell() {
+    assert_eq!(resolved_program(None, None), "/bin/sh");
+    assert_eq!(resolved_program(None, Some("/bin/fish")), "/bin/fish");
+    assert_eq!(resolved_program(None, Some("/bin/bash")), "/bin/bash");
+    assert_eq!(resolved_program(None, Some("/usr/bin/zsh")), "/usr/bin/zsh");
+    // The POSIX fallback is the platform default layer, not a spawn guess.
+    let resolved = resolve_default_shell(None, None).expect("posix fallback");
+    assert_eq!(resolved.source, ShellSource::PlatformDefault);
+}
+
+#[test]
+#[cfg(windows)]
+fn default_shell_resolves_the_first_windows_candidate_on_path() {
+    // bitty#2928: Windows sets neither `terminal.shell` nor `$SHELL`, so the
+    // chain must resolve a program that exists there. Order is fixed:
+    // pwsh.exe, powershell.exe, cmd.exe.
+    let resolved = resolve_default_shell(None, None).expect("Windows ships cmd.exe");
+    assert_eq!(resolved.source, ShellSource::PlatformDefault);
+    let matched = PLATFORM_SHELL_CANDIDATES
+        .iter()
+        .position(|candidate| resolved.program.to_lowercase().ends_with(candidate))
+        .unwrap_or_else(|| {
+            panic!(
+                "resolved program {:?} is not one of {:?}",
+                resolved.program, PLATFORM_SHELL_CANDIDATES
+            )
+        });
+    for earlier in &PLATFORM_SHELL_CANDIDATES[..matched] {
+        assert!(
+            crate::doctor::find_on_path(earlier).is_none(),
+            "{earlier:?} exists, so it must win over {:?}",
+            resolved.program
+        );
+    }
+    assert!(
+        std::path::Path::new(&resolved.program).is_file(),
+        "the resolved program exists: {:?}",
+        resolved.program
     );
 }
 
@@ -1657,57 +1775,55 @@ fn default_shell_prefers_shell_env_when_no_configured_shell() {
 fn default_shell_prefers_configured_terminal_shell_over_env() {
     // CTX-0298: the effective `terminal.shell` outranks $SHELL.
     assert_eq!(
-        resolve_default_shell(Some("/bin/zsh"), Some("/bin/fish")),
+        resolved_program(Some("/bin/zsh"), Some("/bin/fish")),
         "/bin/zsh"
     );
     assert_eq!(
-        resolve_default_shell(Some("  /bin/zsh  "), Some("/bin/fish")),
+        resolved_program(Some("  /bin/zsh  "), Some("/bin/fish")),
         "/bin/zsh"
     );
-    assert_eq!(resolve_default_shell(Some("/bin/zsh"), None), "/bin/zsh");
+    assert_eq!(resolved_program(Some("/bin/zsh"), None), "/bin/zsh");
 }
 
 #[test]
 fn default_shell_fails_closed_on_unusable_configured_shell() {
     // CTX-0298: blank/oversized/control-laden configured values never
-    // reach execve; they fall through to $SHELL, then /bin/sh.
+    // reach execve; they fall through to $SHELL, then the platform default.
     for bad in ["", "   ", "\t\n ", "/bin/z\nsh", "/bin/zsh\u{7}"] {
         assert_eq!(
-            resolve_default_shell(Some(bad), Some("/bin/fish")),
+            resolved_program(Some(bad), Some("/bin/fish")),
             "/bin/fish",
             "configured {bad:?} fails closed to $SHELL"
         );
-        assert_eq!(resolve_default_shell(Some(bad), None), "/bin/sh");
+        assert_eq!(
+            resolved_program(Some(bad), None),
+            platform_default_program()
+        );
     }
     // Edge whitespace is trimmed, not rejected: the normalized path runs.
     assert_eq!(
-        resolve_default_shell(Some("/bin/zsh\n"), Some("/bin/fish")),
+        resolved_program(Some("/bin/zsh\n"), Some("/bin/fish")),
         "/bin/zsh"
     );
     let overlong = "a".repeat(bitty_config::types::MAX_SHELL_LEN + 1);
     assert_eq!(
-        resolve_default_shell(Some(&overlong), Some("/bin/fish")),
+        resolved_program(Some(&overlong), Some("/bin/fish")),
         "/bin/fish"
     );
 }
 
 #[test]
 fn default_shell_falls_back_when_env_missing_or_blank() {
-    assert_eq!(resolve_default_shell(None, Some("")), "/bin/sh");
-    assert_eq!(resolve_default_shell(None, Some("   ")), "/bin/sh");
-    assert_eq!(resolve_default_shell(None, Some("\t\n ")), "/bin/sh");
+    let platform = platform_default_program();
+    assert_eq!(resolved_program(None, Some("")), platform);
+    assert_eq!(resolved_program(None, Some("   ")), platform);
+    assert_eq!(resolved_program(None, Some("\t\n ")), platform);
 }
 
 #[test]
 fn default_shell_trims_surrounding_whitespace() {
-    assert_eq!(
-        resolve_default_shell(None, Some("  /bin/fish  ")),
-        "/bin/fish"
-    );
-    assert_eq!(
-        resolve_default_shell(Some("  /bin/fish  "), None),
-        "/bin/fish"
-    );
+    assert_eq!(resolved_program(None, Some("  /bin/fish  ")), "/bin/fish");
+    assert_eq!(resolved_program(Some("  /bin/fish  "), None), "/bin/fish");
 }
 
 #[test]
@@ -1728,25 +1844,16 @@ fn bare_args_resolve_to_default_shell_chain() {
     let parsed = parse_args(&args_of(&["bitty"]));
     assert_eq!(parsed.program, None);
     assert_eq!(
-        resolve_spawn_program(
-            parsed.program.as_deref(),
-            Some("/bin/zsh"),
-            Some("/bin/fish")
-        ),
+        resolved_spawn_program(&parsed, Some("/bin/zsh"), Some("/bin/fish")),
         "/bin/zsh"
     );
     assert_eq!(
-        resolve_spawn_program(parsed.program.as_deref(), None, Some("/bin/fish")),
+        resolved_spawn_program(&parsed, None, Some("/bin/fish")),
         "/bin/fish"
     );
-    assert_eq!(
-        resolve_spawn_program(parsed.program.as_deref(), None, None),
-        "/bin/sh"
-    );
-    assert_eq!(
-        resolve_spawn_program(parsed.program.as_deref(), None, Some("")),
-        "/bin/sh"
-    );
+    let platform = platform_default_program();
+    assert_eq!(resolved_spawn_program(&parsed, None, None), platform);
+    assert_eq!(resolved_spawn_program(&parsed, None, Some("")), platform);
 }
 
 #[test]
@@ -1754,27 +1861,21 @@ fn explicit_program_arg_stays_identical() {
     let parsed = parse_args(&args_of(&["bitty", "--", "fish", "-l"]));
     assert_eq!(parsed.program.as_deref(), Some("fish"));
     assert_eq!(parsed.program_args, vec!["-l"]);
-    // Explicit program wins over any injected configured shell + $SHELL.
-    assert_eq!(
-        resolve_spawn_program(
-            parsed.program.as_deref(),
-            Some("/bin/zsh"),
-            Some("/bin/bash")
-        ),
-        "fish"
-    );
-    assert_eq!(
-        resolve_spawn_program(parsed.program.as_deref(), None, None),
-        "fish"
-    );
+    // Explicit program wins over any injected configured shell + $SHELL, and
+    // is never routed through a `PATH` lookup (bitty#2928).
+    let resolved = resolve_spawn_program(
+        parsed.program.as_deref(),
+        Some("/bin/zsh"),
+        Some("/bin/bash"),
+    )
+    .expect("explicit program resolves");
+    assert_eq!(resolved.program, "fish");
+    assert_eq!(resolved.source, ShellSource::Explicit);
+    assert_eq!(resolved_spawn_program(&parsed, None, None), "fish");
 
     let parsed = parse_args(&args_of(&["bitty", "/bin/bash"]));
     assert_eq!(
-        resolve_spawn_program(
-            parsed.program.as_deref(),
-            Some("/bin/zsh"),
-            Some("/bin/fish")
-        ),
+        resolved_spawn_program(&parsed, Some("/bin/zsh"), Some("/bin/fish")),
         "/bin/bash"
     );
 }
@@ -11742,7 +11843,7 @@ fn spawn_spec_resolve_prefers_explicit_program() {
         config_shell: Some("/bin/zsh".to_string()),
     };
     assert_eq!(
-        spec.resolve(),
+        spec.resolve().expect("explicit program resolves"),
         ("/bin/fish".to_string(), vec!["-l".to_string()])
     );
 }
@@ -11750,35 +11851,50 @@ fn spawn_spec_resolve_prefers_explicit_program() {
 #[test]
 fn spawn_spec_resolve_defaults_to_configured_shell_env_then_fallback() {
     // CTX-0176/CTX-0298: no explicit program resolves exactly like
-    // startup — configured `terminal.shell`, then `$SHELL`, then /bin/sh.
+    // startup — configured `terminal.shell`, then `$SHELL`, then the
+    // platform default (bitty#2928: /bin/sh on Unix, pwsh/powershell/cmd on
+    // Windows).
+    let platform = platform_default_program();
     let spec = SpawnSpec {
         program: None,
         program_args: vec!["-l".to_string()],
         shell_env: Some("/bin/bash".to_string()),
         config_shell: Some("/bin/zsh".to_string()),
     };
-    assert_eq!(spec.resolve(), ("/bin/zsh".to_string(), Vec::new()));
+    assert_eq!(
+        spec.resolve().expect("configured shell resolves"),
+        ("/bin/zsh".to_string(), Vec::new())
+    );
     let spec = SpawnSpec {
         program: None,
         program_args: vec!["-l".to_string()],
         shell_env: Some("/bin/bash".to_string()),
         config_shell: None,
     };
-    assert_eq!(spec.resolve(), ("/bin/bash".to_string(), Vec::new()));
+    assert_eq!(
+        spec.resolve().expect("$SHELL resolves"),
+        ("/bin/bash".to_string(), Vec::new())
+    );
     let spec = SpawnSpec {
         program: None,
         program_args: Vec::new(),
         shell_env: None,
         config_shell: None,
     };
-    assert_eq!(spec.resolve(), ("/bin/sh".to_string(), Vec::new()));
+    assert_eq!(
+        spec.resolve().expect("platform default resolves"),
+        (platform.clone(), Vec::new())
+    );
     let spec = SpawnSpec {
         program: None,
         program_args: Vec::new(),
         shell_env: Some("   ".to_string()),
         config_shell: Some(" \n ".to_string()),
     };
-    assert_eq!(spec.resolve(), ("/bin/sh".to_string(), Vec::new()));
+    assert_eq!(
+        spec.resolve().expect("platform default resolves"),
+        (platform, Vec::new())
+    );
 }
 
 #[test]
@@ -12100,6 +12216,37 @@ fn spawn_default_shell_falls_back_when_configured_shell_missing() {
         Some("/bin/sh"),
     );
     assert!(result.is_ok(), "fallback /bin/sh spawns: {result:?}");
+    assert!(rt.has_pty(), "fallback shell owns the primary PTY");
+}
+
+#[test]
+#[cfg(windows)]
+fn spawn_default_shell_starts_a_child_on_windows() {
+    // bitty#2928 acceptance on Windows CI: with neither `terminal.shell` nor
+    // `$SHELL` set, the resolved platform default (pwsh.exe, powershell.exe,
+    // or cmd.exe) must start a real child instead of failing on /bin/sh.
+    require_pty!();
+    let mut rt = Runtime::with_defaults().expect("must build");
+    let result = spawn_default_shell(&mut rt, None, None);
+    assert!(result.is_ok(), "Windows default shell spawns: {result:?}");
+    assert!(
+        rt.has_pty(),
+        "the Windows default shell owns the primary PTY"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn spawn_default_shell_reports_a_typed_error_for_a_missing_program() {
+    // bitty#2928: a program that cannot start is named in the typed error,
+    // and the platform default still rescues the launch.
+    require_pty!();
+    let mut rt = Runtime::with_defaults().expect("must build");
+    let result = spawn_default_shell(&mut rt, Some("bitty-2928-nonexistent-shell.exe"), None);
+    assert!(
+        result.is_ok(),
+        "the platform default rescues a missing configured shell: {result:?}"
+    );
     assert!(rt.has_pty(), "fallback shell owns the primary PTY");
 }
 

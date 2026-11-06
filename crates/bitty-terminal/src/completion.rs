@@ -941,8 +941,10 @@ mod tests {
     fn scripts_offer_nested_paths_not_only_top_level() {
         let bash = completion_script(CompletionShell::Bash);
         assert!(
-            bash.contains(r#""config") candidates="path check show validate edit profile"#)
-                || bash.contains(r#""config") candidates="path check show validate edit profile "#),
+            bash.contains(r#""config") candidates="path check show validate migrate edit profile"#)
+                || bash.contains(
+                    r#""config") candidates="path check show validate migrate edit profile "#
+                ),
             "bash offers config verbs: {bash}"
         );
         assert!(

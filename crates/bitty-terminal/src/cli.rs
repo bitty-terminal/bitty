@@ -123,6 +123,12 @@ pub(crate) struct Args {
     /// `--format` shape for `bitty config show|validate` (CTX-1467).
     /// Raw on purpose: validated fail-closed at config dispatch.
     pub(crate) config_format: Option<String>,
+    /// `bitty config migrate --dry-run` (bitty#2923): compute and print the
+    /// change list without writing the file.
+    pub(crate) config_dry_run: bool,
+    /// `bitty config migrate --backup` / `--no-backup` (bitty#2923).
+    /// `None` means the default (backup enabled).
+    pub(crate) config_backup: Option<bool>,
     /// `--json` was requested (CTX-1589). Normalized after parsing into
     /// [`Self::config_format`] when a `config` subcommand is present; a
     /// bare `--json` stays an unknown-flag usage error elsewhere.
@@ -419,6 +425,9 @@ pub(crate) enum ConfigCommand {
     Show,
     /// Load + validate only; nonzero on invalid (CTX-1467).
     Validate,
+    /// Apply versioned `config_version` transforms and rewrite the file
+    /// (bitty#2923; `--dry-run`, `--backup`/`--no-backup`).
+    Migrate,
     /// Open the file in `$VISUAL`/`$EDITOR` (never overwrites existing).
     Edit,
     /// Named-profile management (`list`, `show`, `use`, `path`). The
@@ -434,6 +443,7 @@ impl ConfigCommand {
         ("check", Self::Check),
         ("show", Self::Show),
         ("validate", Self::Validate),
+        ("migrate", Self::Migrate),
         ("edit", Self::Edit),
         ("profile", Self::Profile),
     ];
@@ -453,6 +463,7 @@ impl ConfigCommand {
             Self::Check => "check",
             Self::Show => "show",
             Self::Validate => "validate",
+            Self::Migrate => "migrate",
             Self::Edit => "edit",
             Self::Profile => "profile",
         }
@@ -489,6 +500,8 @@ impl Args {
             config_word: false,
             config_args: Vec::new(),
             config_format: None,
+            config_dry_run: false,
+            config_backup: None,
             config_json: false,
             profile_dry_run: false,
             profile_from: None,
@@ -1381,6 +1394,19 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 // CTX-1693: profile write verbs report the validated
                 // prospective change without mutating the filesystem.
                 out.profile_dry_run = true;
+                i += 1;
+            }
+            "--dry-run" if out.config_cmd == Some(ConfigCommand::Migrate) => {
+                // bitty#2923: print the change list without writing.
+                out.config_dry_run = true;
+                i += 1;
+            }
+            "--backup" if out.config_cmd == Some(ConfigCommand::Migrate) => {
+                out.config_backup = Some(true);
+                i += 1;
+            }
+            "--no-backup" if out.config_cmd == Some(ConfigCommand::Migrate) => {
+                out.config_backup = Some(false);
                 i += 1;
             }
             "--from" if out.config_cmd == Some(ConfigCommand::Profile) => {
@@ -2479,7 +2505,7 @@ pub(crate) fn help_text_short(color: bool) -> String {
           {subcommands}\n  \
             run -- COMMAND...       Explicit child launch (local)\n  \
             ctl <resource> <verb>   Control a running instance (runtime)\n  \
-            config <verb>           Config path|check|show|validate|edit|profile (alias cfg)\n  \
+            config <verb>           Config path|check|show|validate|migrate|edit|profile (alias cfg)\n  \
             init [FLAGS]            Opt-in guided setup wizard (never auto-runs)\n  \
             doctor                  Diagnose installation and compatibility (local)\n  \
             list <kind>             Enumerate themes|colors|fonts|plugins|instances|actions|keymaps|services (alias ls)\n  \

@@ -123,7 +123,10 @@ pub use merge::{
     MergeClass, MergeConflict, MergedConfig, merge_class_for, merge_layers, resolve_profile_chain,
     safe_merged, try_merge_layers,
 };
-pub use migration::{CURRENT_SCHEMA_VERSION, migrate, needs_migration};
+pub use migration::{
+    CONFIG_TRANSFORMS, CURRENT_CONFIG_VERSION, CURRENT_SCHEMA_VERSION, ConfigChange,
+    ConfigTransform, config_changes, migrate, needs_migration, stamp_config_version,
+};
 pub use panel_rules::{
     MAX_PANEL_RULES, PanelPresentation, PanelSpawnRule, command_line_for, find_match,
     matches_regex, validate_regex_pattern,

@@ -105,6 +105,22 @@ pub enum ConfigError {
         /// Reason.
         message: String,
     },
+    /// The terminal config declares a `config_version` newer than this build.
+    ConfigVersionUnsupported {
+        /// Found version.
+        found: u32,
+        /// Maximum supported version.
+        supported: u32,
+    },
+    /// A terminal config version transform failed or is missing.
+    ConfigMigrationFailed {
+        /// Source version.
+        from: u32,
+        /// Target version.
+        to: u32,
+        /// Reason.
+        message: String,
+    },
     /// Project trust check failed.
     TrustViolation {
         /// Reason.
@@ -140,9 +156,10 @@ impl ConfigError {
             Self::MergeConflict { .. } => ErrorClass::Merge,
             Self::NonOverridable { .. } => ErrorClass::Policy,
             Self::CycleDetected { .. } | Self::ProfileNotFound { .. } => ErrorClass::Resolution,
-            Self::SchemaVersionUnsupported { .. } | Self::MigrationFailed { .. } => {
-                ErrorClass::Migration
-            }
+            Self::SchemaVersionUnsupported { .. }
+            | Self::MigrationFailed { .. }
+            | Self::ConfigVersionUnsupported { .. }
+            | Self::ConfigMigrationFailed { .. } => ErrorClass::Migration,
             Self::Module { .. } => ErrorClass::Resolution,
             Self::TrustViolation { .. } | Self::InvalidInput { .. } => ErrorClass::Trust,
             Self::ReloadRejected { .. } => ErrorClass::Reload,
@@ -217,6 +234,16 @@ impl fmt::Display for ConfigError {
             ),
             Self::MigrationFailed { from, to, message } => {
                 write!(f, "migration {from} -> {to} failed: {message}")
+            }
+            Self::ConfigVersionUnsupported { found, supported } => write!(
+                f,
+                "config_version {found} is not supported (max {supported}); this build cannot read a newer config shape"
+            ),
+            Self::ConfigMigrationFailed { from, to, message } => {
+                write!(
+                    f,
+                    "config_version migration {from} -> {to} failed: {message}"
+                )
             }
             Self::TrustViolation { message } => write!(f, "trust violation: {message}"),
             Self::ReloadRejected { message } => write!(f, "reload rejected: {message}"),

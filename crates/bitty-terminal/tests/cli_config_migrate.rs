@@ -28,6 +28,14 @@ fn scratch_root(tag: &str) -> PathBuf {
     dir
 }
 
+/// Escapes one path for a JSON string literal (`\` and `"` are escaped).
+///
+/// Windows scratch paths carry separators that JSON must double, so a raw
+/// `display()` string never appears verbatim in the envelope.
+fn json_string(raw: &str) -> String {
+    raw.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn init_path(root: &Path) -> PathBuf {
     root.join("bitty").join("init.lua")
 }
@@ -362,7 +370,7 @@ fn json_format_reports_the_change_list_and_backup() {
     assert!(
         text.contains(&format!(
             "\"backup\":\"{}\"",
-            path.with_file_name("init.lua.bak-0").display()
+            json_string(&path.with_file_name("init.lua.bak-0").display().to_string())
         )),
         "the envelope must report the backup path: {text:?}"
     );

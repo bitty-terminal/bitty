@@ -99,7 +99,7 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.git-panel",
         name: "Git Panel",
         repository: "https://github.com/bitty-terminal/git-panel.git",
-        pin: "494e0e9cc27d1d5a8d4d1abe9f4207c0b60e8a8f",
+        pin: "6aa7965e7b5e4bb4bfa64d49cda8f59e1617986c",
         manifest_hash: "sha256:2d4ebbe92f3acb5ffa87dee15d81c75f5e1ef889940c504cad6f8a7533d1effe",
         compat_bitty: Some(">=0.0.24"),
         compat_plugin_api: Some("^1.0"),

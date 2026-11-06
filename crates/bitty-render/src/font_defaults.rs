@@ -155,24 +155,72 @@ where
     }
 }
 
+/// Ordering key for the deterministic monospaced pick: primary family name,
+/// then PostScript name, so the choice is stable across discovery order and
+/// the persistent index.
+fn face_order(face: &fontdb::FaceInfo) -> (&str, &str) {
+    let family = face
+        .families
+        .first()
+        .map_or("", |(family, _)| family.as_str());
+    (family, face.post_script_name.as_str())
+}
+
+/// Resolves the generic monospace face `db` can actually hand to the shaper.
+///
+/// `Family::Monospace` is a *name* lookup in `fontdb`: it matches the alias
+/// string the database carries, which is fontdb's platform-neutral default
+/// (`Courier New`) until fontconfig discovery overlays the host alias. A host
+/// whose alias is unset, stale, or names a face that is not installed — a
+/// container image with fonts but no fontconfig configuration, for example —
+/// therefore misses on the generic query while holding perfectly usable
+/// monospaced faces. Blanking every cell there is a product defect, so the
+/// miss falls through to the installed monospaced faces (`face_order` picks
+/// the first in family/PostScript order). The embedded symbols face is never
+/// a text primary: its families are icon ranges, not text.
+///
+/// Bounded: one `fontdb` query, and a single face scan only when that misses.
+#[must_use]
+pub(crate) fn generic_monospace_face(db: &Database) -> Option<fontdb::ID> {
+    let generic = [Family::Monospace];
+    let alias = Query {
+        families: &generic,
+        weight: Weight::NORMAL,
+        style: Style::Normal,
+        stretch: Stretch::Normal,
+    };
+    db.query(&alias).or_else(|| {
+        db.faces()
+            .filter(|face| face.monospaced)
+            .filter(|face| {
+                !face
+                    .families
+                    .iter()
+                    .any(|(family, _)| family.eq_ignore_ascii_case(EMBEDDED_SYMBOLS_FAMILY))
+            })
+            .min_by(|left, right| face_order(left).cmp(&face_order(right)))
+            .map(|face| face.id)
+    })
+}
+
 /// True when `db` resolves `family` by name.
 ///
 /// Uses the same query shape as the rasterizer's face loading (normal weight
 /// and slant), so a present result means `load_font` would find a face. The
-/// CSS generic `monospace` is resolved through `Family::Monospace` — the
-/// same generic substitution `SwashSingle::load_font` performs — so the
-/// documented chain entry is not reported as missing.
+/// CSS generic `monospace` is resolved through the same substitution
+/// `SwashSingle::load_font` performs (`generic_monospace_face`) — so the
+/// documented chain entry is not reported as missing on a host whose
+/// fontconfig alias points at nothing while monospaced faces are installed.
 #[must_use]
 pub fn family_present(db: &Database, family: &str) -> bool {
     let generic = matches!(
         family.trim().to_ascii_lowercase().as_str(),
         "monospace" | "mono" | "fixed"
     );
-    let families = [if generic {
-        Family::Monospace
-    } else {
-        Family::Name(family)
-    }];
+    if generic {
+        return generic_monospace_face(db).is_some();
+    }
+    let families = [Family::Name(family)];
     let query = Query {
         families: &families,
         weight: Weight::NORMAL,
@@ -313,7 +361,14 @@ pub fn probe_chain(config: &FontConfig) -> ChainProbe {
             .loaded_face_family(primary)
             .unwrap_or_else(|| resolution.family.clone()),
     );
-    probe.substituted = resolution.substituted;
+    // `substituted` follows the face that actually loaded, not just the
+    // platform-preference list: a family the host does not have can come back
+    // as a generic monospace substitution (a bare container), and doctor must
+    // not report that under the configured name.
+    probe.substituted = probe
+        .resolved
+        .as_deref()
+        .is_some_and(|face| !face.eq_ignore_ascii_case(&probe.configured));
     let point_size = config.size;
     probe.uncovered = count_uncovered(PROBE_CODEPOINTS.iter().copied(), |c| {
         let Ok(key) = RasterKey::new(c, primary, point_size) else {
@@ -416,6 +471,71 @@ mod tests {
         assert!(report.examples.iter().all(|c| *c == '\u{FFFD}'));
     }
 
+    /// Test-only database with `faces` = `(family, monospaced)` and fontdb's
+    /// platform-neutral generic aliases (no fontconfig overlay), i.e. the
+    /// `monospace` alias names no installed face. That is the CI container's
+    /// condition, reproduced without touching the host font configuration.
+    fn synthetic_db(faces: &[(&str, bool)]) -> Database {
+        let index = crate::font_index::FontIndex {
+            faces: faces
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, (family, monospaced))| crate::font_index::IndexFace {
+                        path: std::path::PathBuf::from(format!("/nonexistent/{index}.ttf")),
+                        face_index: 0,
+                        families: vec![(*family).to_string()],
+                        post_script_name: format!("{}-Regular", family.replace(' ', "")),
+                        style: 0,
+                        weight: 400,
+                        stretch: 5,
+                        monospaced: *monospaced,
+                        file_size: 0,
+                        mtime_secs: -1,
+                        mtime_nanos: 0,
+                    },
+                )
+                .collect(),
+            generic: crate::font_index::GenericFamilies::default(),
+        };
+        crate::font_index::database_from_index(&index)
+    }
+
+    #[test]
+    fn generic_monospace_reports_an_installed_face_when_the_alias_is_missing() {
+        // Issue #2931 CI: the runner has DejaVu Sans Mono installed but no
+        // fontconfig alias, so `Family::Monospace` (fontdb's platform default
+        // "Courier New") matched nothing and the whole chain reported
+        // `monospace absent` while a usable monospaced face sat in the
+        // database. Reporting it missing is also what starved the primary
+        // load, so both must agree on the substitution.
+        let db = synthetic_db(&[("Proportional Serif", false), ("DejaVu Sans Mono", true)]);
+        assert_eq!(db.family_name(&Family::Monospace), "Courier New");
+        assert!(!family_present(&db, "Courier New"));
+        assert!(family_present(&db, "monospace"));
+        assert!(family_present(&db, "mono"));
+        let face = generic_monospace_face(&db).expect("installed monospaced face must resolve");
+        assert_eq!(
+            db.face(face).map(|face| face.families[0].0.clone()),
+            Some("DejaVu Sans Mono".to_string())
+        );
+    }
+
+    #[test]
+    fn generic_monospace_never_picks_the_embedded_symbols_face() {
+        // The embedded face is registered in the same database and is built
+        // monospaced here (the shipped flag is not what guards this): picking
+        // it as a text primary would paint every cell as an icon, so it stays
+        // out of the generic text substitution.
+        let db = synthetic_db(&[(EMBEDDED_SYMBOLS_FAMILY, true), ("Adwaita Mono", true)]);
+        assert_eq!(db.family_name(&Family::Monospace), "Courier New");
+        let face = generic_monospace_face(&db).expect("a text monospaced face must resolve");
+        assert_eq!(
+            db.face(face).map(|face| face.families[0].0.clone()),
+            Some("Adwaita Mono".to_string())
+        );
+    }
+
     #[test]
     fn probe_reports_the_resolved_chain_on_a_fonted_host() {
         // Host-dependent by nature (a fontless CI image skips), but the
@@ -433,5 +553,33 @@ mod tests {
         assert!(probe.pua_covered);
         assert!(!probe.attempts.is_empty());
         assert!(probe.uncovered.probed > 0);
+    }
+
+    #[test]
+    fn probe_resolves_a_stand_in_when_the_configured_family_is_absent() {
+        // The CI condition in the small: the configured family is not
+        // installed, so the primary load must still land on a real face
+        // (the generic monospace substitution) instead of reporting no face
+        // and rendering blank cells.
+        if SwashSingle::new().is_err() {
+            eprintln!("skipped: no system fonts on this host");
+            return;
+        }
+        let absent = "No Such Family XYZ";
+        let probe = probe_chain(&FontConfig {
+            family: absent.to_string(),
+            ..Default::default()
+        });
+        assert!(!probe.primary_present, "{probe:?}");
+        let resolved = probe
+            .resolved
+            .as_deref()
+            .expect("a fonted host must still load a stand-in primary");
+        assert_ne!(resolved, absent, "{probe:?}");
+        assert!(probe.substituted, "a stand-in is a substitution: {probe:?}");
+        assert!(!probe.attempts.is_empty(), "{probe:?}");
+        assert!(probe.embedded_present, "{probe:?}");
+        assert!(probe.pua_covered, "{probe:?}");
+        assert!(probe.uncovered.probed > 0, "{probe:?}");
     }
 }

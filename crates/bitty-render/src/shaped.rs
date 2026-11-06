@@ -1387,17 +1387,14 @@ impl GlyphRasterizer for SwashSingle {
         // when the configured family was absent; the shaped stack must not
         // regress to "primary not found" on a bare host that only ships a
         // system monospace, so the same substitution happens here (CTX-1607).
-        // `load_system_fonts` resolves the generic family's concrete name.
-        let id = self.db.query(&request).or_else(|| {
-            let generic = [Family::Monospace];
-            let substitute = Query {
-                families: &generic,
-                weight,
-                style: style_attr,
-                ..Default::default()
-            };
-            self.db.query(&substitute)
-        });
+        // `generic_monospace_face` keeps that promise when the fontconfig
+        // alias itself names nothing installed (a container with fonts but no
+        // fontconfig configuration): the host's monospaced faces still load
+        // instead of every cell going blank.
+        let id = self
+            .db
+            .query(&request)
+            .or_else(|| crate::font_defaults::generic_monospace_face(&self.db));
         let id = id.ok_or_else(|| RenderError::FontNotFound(query.family.clone()))?;
         // Reloads re-query already-loaded faces: reuse the handle instead
         // of appending a duplicate entry (the bound below guards genuinely

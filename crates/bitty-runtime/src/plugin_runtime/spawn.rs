@@ -97,22 +97,24 @@
 //!   `<= 16 KiB` (`tool_dispatch::MAX_TOOL_ARGS_BYTES`).
 //! - `cwd`: a host-selected semantic only ([`SpawnCwd`]). The plugin may
 //!   request `pane` (`bitty.process.spawn(argv, { cwd = "pane" })`); the
-//!   host resolves the **globally focused view's** `OSC 7` directory at call
+//!   host resolves the **globally focused view's** PTY-child directory at call
 //!   time, validates it (absolute, bounded, control-free, canonicalized,
 //!   existing directory), and records the resolved path in the audit entry.
 //!   The plugin cannot supply a path (CTX-1345 rejected one; CTX-1715
-//!   replaced the rejection with the semantic), but `OSC 7` is an untrusted
-//!   pane channel: any pane program, or displayed content that emits it, can
-//!   influence the report, and focus/terminal/write capabilities can steer
-//!   the focused pane. `pane` without a binding, session, or usable report
-//!   fails closed as `Denied[SpawnCwdUnavailable]`, never as a silent
-//!   host-cwd fallback. The cwd is a *starting directory*:
+//!   replaced the rejection with the semantic), and the resolution source is
+//!   terminal truth rather than terminal output (issue #2911): the PTY
+//!   child's kernel cwd, pinned as a directory identity, never the pane's
+//!   `OSC 7` report — that report is untrusted PTY output any pane program or
+//!   displayed content can forge. `pane` without a binding, a PTY child, or a
+//!   provable kernel cwd fails closed as `Denied[SpawnCwdUnavailable]`, never
+//!   as a silent host-cwd fallback and never as a reported-path guess. The
+//!   cwd is a *starting directory*:
 //!   `process.spawn:git` is itself a repository-read capability, so the
 //!   child reads the pane tree with the user's OS authority (the plugin
 //!   API's reads still follow `fs` grants) and the inherited exec
 //!   confinement is unchanged. Repo metadata (`.git`/`core.worktree`) is a
-//!   separate channel that the argv denials do not close; `.git` policy and
-//!   an inode-bound cwd are tracked follow-ups.
+//!   separate channel that the argv denials do not close; `.git` policy is a
+//!   tracked follow-up.
 //! - Env: at most `64` explicit entries with [`EnvVar`] grammar
 //!   (`devtools::MAX_INPUT_RING`, `auth`/`ctl` field bounds).
 //! - Timeout `1..=30_000` ms, default `5_000` ms
@@ -196,6 +198,7 @@ use crate::execution_jobs::{
     DispatchScope, JobId, ToolJobSupervisor, job_principal, spawn_supervised,
     truncate_to_budget_tail,
 };
+use crate::runtime::pane_cwd::PaneCwd;
 
 /// Panel-path per-stream output budget (`8 KiB`).
 ///
@@ -854,7 +857,8 @@ pub const SPAWN_CWD_UNAVAILABLE_CODE: &str = "SpawnCwdUnavailable";
 
 /// One host-resolved, validated working directory for a mediated spawn.
 ///
-/// The only constructor is [`HostCwd::resolve`], which is private to this
+/// The only constructors are [`HostCwd::from_pane`] (the spawn path) and
+/// [`HostCwd::from_path`] (shape validation), both private to this
 /// module: the string is the canonicalized absolute path of an existing
 /// directory, bounded by [`MAX_EXEC_CWD_BYTES`], free of NUL/control bytes,
 /// and free of traversal components. No plugin-facing surface carries this
@@ -864,10 +868,29 @@ pub const SPAWN_CWD_UNAVAILABLE_CODE: &str = "SpawnCwdUnavailable";
 struct HostCwd(String);
 
 impl HostCwd {
+    /// Re-check the pinned identity, then validate the path shape.
+    ///
+    /// This is the only constructor the spawn path uses (issue #2911). The
+    /// pane directory arrives as a [`PaneCwd`] pinned to a directory inode, so
+    /// the boundary check is an identity check, not a name check: if the path
+    /// now resolves to a different inode (a swap or rename between the pane
+    /// observation and this dispatch), the spawn is refused instead of
+    /// following the replacement. Nothing a pane prints can influence either
+    /// step.
+    fn from_pane(pane: &PaneCwd) -> Result<Self, IpcError> {
+        if !pane.revalidate() {
+            return Err(cwd_unavailable(
+                "the pane working directory changed identity before the spawn",
+            ));
+        }
+        Self::from_path(pane.path())
+    }
+
     /// Canonicalize and validate one host-observed pane directory.
     ///
-    /// The raw path comes from the host's `OSC 7` model (never from plugin
-    /// input). Every rule fails closed:
+    /// The path comes from the host's pinned PTY-child directory (never from
+    /// plugin input and never from the pane's `OSC 7` report). Every rule
+    /// fails closed:
     ///
     /// 1. valid UTF-8, non-empty, `<= MAX_EXEC_CWD_BYTES`;
     /// 2. absolute;
@@ -878,7 +901,7 @@ impl HostCwd {
     ///
     /// Errors never echo the path: the plugin must not learn host paths from
     /// a refusal (its only path exposure is the child's own output).
-    fn resolve(path: &Path) -> Result<Self, IpcError> {
+    fn from_path(path: &Path) -> Result<Self, IpcError> {
         let raw = path
             .to_str()
             .ok_or_else(|| cwd_unavailable("the pane working directory is not valid UTF-8"))?;
@@ -1173,7 +1196,9 @@ impl SpawnService {
     ///
     /// The source is the same live terminal model that serves
     /// `bitty.terminal.snapshot` (the application's `LiveSnapshot`), wired
-    /// once at composition. Without it, `cwd = "pane"` fails closed with
+    /// once at composition. It publishes the focused pane's PTY-child kernel
+    /// cwd pinned to a directory identity (issue #2911), never the pane's
+    /// `OSC 7` report. Without it, `cwd = "pane"` fails closed with
     /// `Denied[SpawnCwdUnavailable]`; the host process cwd is never a
     /// fallback. The source is read per dispatch, so a pane cwd change is
     /// observed without rebuilding the service or reloading the plugin.
@@ -1571,23 +1596,25 @@ impl SpawnService {
         })
     }
 
-    /// Resolve the bound pane's working directory (CTX-1715).
+    /// Resolve the bound pane's working directory (CTX-1715, issue #2911).
     ///
     /// Reads the host-observed source per dispatch (so a pane change is
     /// observed without a reload) and validates it through
-    /// [`HostCwd::resolve`]. A missing binding, a missing `OSC 7` report, and
-    /// an unusable path all fail closed with `Denied[SpawnCwdUnavailable]`,
-    /// never with a silent host-cwd fallback.
+    /// [`HostCwd::from_pane`], which re-checks the pinned directory identity
+    /// before any path reaches a child. A missing binding, no provable PTY
+    /// child directory, a directory swapped since the observation, and an
+    /// unusable path all fail closed with `Denied[SpawnCwdUnavailable]`, never
+    /// with a silent host-cwd fallback.
     fn resolve_pane_cwd(&self) -> Result<HostCwd, IpcError> {
         let Some(source) = self.pane_cwd.as_ref() else {
             return Err(cwd_unavailable(
                 "host has no pane working-directory binding for process.spawn",
             ));
         };
-        let path = source
-            .pane_cwd()
-            .ok_or_else(|| cwd_unavailable("the bound pane has no working-directory report"))?;
-        HostCwd::resolve(&path)
+        let pane = source.pane_cwd().ok_or_else(|| {
+            cwd_unavailable("the bound pane has no provable PTY child working directory")
+        })?;
+        HostCwd::from_pane(&pane)
     }
 }
 
@@ -1919,13 +1946,18 @@ pub fn git_spawn_backend(plugin_id: impl Into<String>) -> super::services::Spawn
 /// never supply a path, and the resolved canonical directory is recorded in
 /// the spawn audit ledger.
 ///
+/// The directory is terminal truth, not terminal output (issue #2911): the
+/// focused pane's PTY-child kernel cwd, pinned to a directory identity and
+/// re-validated at the spawn boundary, never the pane's `OSC 7` report. A
+/// reported path, a swapped directory, and a deleted directory all refuse.
+///
 /// The cwd is a starting directory, not a filesystem grant.
 /// `process.spawn:git` is itself a repository-read capability: the child
 /// reads the pane tree with the user's OS authority, not through the plugin's
 /// `fs` grants (the plugin API's reads still follow those grants), and the
 /// inherited exec confinement is unchanged. `-C`, `--git-dir`, and
 /// `--work-tree` stay denied for argv, but repository metadata is a separate
-/// channel; `.git` policy and an inode-bound cwd are tracked follow-ups.
+/// channel; `.git` policy is a tracked follow-up.
 #[must_use]
 pub fn git_spawn_backend_with_pane_cwd(
     plugin_id: impl Into<String>,
@@ -2278,18 +2310,30 @@ mod tests {
     /// Test pane source reading a path the test controls (CTX-1715).
     #[derive(Default)]
     struct SharedPaneCwd {
-        path: std::cell::RefCell<Option<std::path::PathBuf>>,
+        pinned: std::cell::RefCell<Option<PaneCwd>>,
     }
 
     impl SharedPaneCwd {
+        /// Publishes `path` pinned as the pane directory (a host-owned source).
         fn set(&self, path: std::path::PathBuf) {
-            *self.path.borrow_mut() = Some(path);
+            let pinned = PaneCwd::from_path(&path).expect("fixture directory must pin");
+            *self.pinned.borrow_mut() = Some(pinned);
+        }
+
+        /// Publishes a pin held from before a path swap (#2911 probes).
+        fn set_pinned(&self, pinned: PaneCwd) {
+            *self.pinned.borrow_mut() = Some(pinned);
+        }
+
+        /// Publishes nothing: the host can prove no pane directory.
+        fn clear(&self) {
+            *self.pinned.borrow_mut() = None;
         }
     }
 
     impl PaneCwdSource for SharedPaneCwd {
-        fn pane_cwd(&self) -> Option<std::path::PathBuf> {
-            self.path.borrow().clone()
+        fn pane_cwd(&self) -> Option<PaneCwd> {
+            self.pinned.borrow().clone()
         }
     }
 
@@ -2466,38 +2510,84 @@ mod tests {
     }
 
     #[test]
-    fn pane_cwd_validation_refusals_are_typed_and_audited_as_denies() {
-        // Relative, missing, and non-directory reports never reach a child;
-        // the refusal is the dedicated code and the audit records a deny with
-        // no cwd (nothing resolved).
-        let root = unique_marker("pane-cwd-invalid");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("root");
-        let file = root.join("file");
-        std::fs::write(&file, b"x").expect("file");
+    fn pane_cwd_without_a_provable_directory_is_typed_and_audited_as_a_deny() {
+        // #2911: an unprovable pane directory (no PTY child, no kernel cwd)
+        // never reaches a child and never falls back to the host cwd. The
+        // refusal is the dedicated code and the audit records a deny with no
+        // cwd (nothing resolved).
         let source = Rc::new(SharedPaneCwd::default());
         let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
         let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)))
             .with_pane_cwd(source.clone());
         let request = allowed_request("cwd").with_cwd(SpawnCwd::Pane);
 
-        for (tag, path) in [
-            ("relative", std::path::PathBuf::from("relative/dir")),
-            ("missing", root.join("missing")),
-            ("file", file.clone()),
-        ] {
-            source.set(path);
-            let error = dispatch_ok(&mut service, &request, 410)
-                .expect_err("an unusable pane directory must refuse");
-            assert!(denies_unavailable_cwd(&error), "{tag}: {error:?}");
-        }
+        source.clear();
+        let error = dispatch_ok(&mut service, &request, 410)
+            .expect_err("an unprovable pane directory must refuse");
+        assert!(denies_unavailable_cwd(&error), "{error:?}");
+        let entries: Vec<_> = service.tool_audit().iter().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].decision,
+            bitty_plugin_host::tools::ToolSpawnDecision::Deny
+        );
+        assert!(
+            entries[0].cwd.is_none(),
+            "nothing resolved, nothing recorded"
+        );
+        assert!(service.is_empty(), "no refused spawn is tracked");
+    }
+
+    #[test]
+    fn pane_cwd_deleted_or_swapped_after_observation_refuses() {
+        // #2911: the pin is a directory identity, not a name. Deleting the
+        // directory, or replacing its name with a different directory, between
+        // the pane observation and the spawn boundary must refuse -- never run
+        // in the replacement and never fall back to the host cwd. Revert
+        // proof: resolving the recorded path alone would hand the impostor
+        // directory to the child.
+        let root = unique_marker("pane-cwd-swap");
+        let _ = std::fs::remove_dir_all(&root);
+        let pane = root.join("pane");
+        let moved = root.join("pane-moved");
+        std::fs::create_dir_all(&pane).expect("pane dir");
+
+        let source = Rc::new(SharedPaneCwd::default());
+        let seen: SeenCalls = Rc::new(RefCell::new(Vec::new()));
+        let mut service = SpawnService::new(Box::new(StubAuthorizer::allowing(seen)))
+            .with_pane_cwd(source.clone());
+        let request = allowed_request("cwd").with_cwd(SpawnCwd::Pane);
+
+        source.set_pinned(PaneCwd::from_path(&pane).expect("pin the pane"));
+        dispatch_ok(&mut service, &request, 411).expect("the untouched pin still serves the child");
+
+        // Swap: the pinned inode moves aside and a different directory takes
+        // the recorded name.
+        std::fs::rename(&pane, &moved).expect("move the pinned directory aside");
+        std::fs::create_dir_all(&pane).expect("impostor at the pinned path");
+        let error = dispatch_ok(&mut service, &request, 412)
+            .expect_err("a swapped pane directory must refuse");
+        assert!(denies_unavailable_cwd(&error), "{error:?}");
+
+        // Deleted: the recorded directory no longer exists at all.
+        let gone = root.join("gone");
+        std::fs::create_dir_all(&gone).expect("gone dir");
+        source.set_pinned(PaneCwd::from_path(&gone).expect("pin the doomed directory"));
+        std::fs::remove_dir_all(&gone).expect("delete the pinned directory");
+        let error = dispatch_ok(&mut service, &request, 413)
+            .expect_err("a deleted pane directory must refuse");
+        assert!(denies_unavailable_cwd(&error), "{error:?}");
+
         let entries: Vec<_> = service.tool_audit().iter().collect();
         assert_eq!(entries.len(), 3);
-        assert!(entries.iter().all(|entry| {
+        assert_eq!(
+            entries[0].decision,
+            bitty_plugin_host::tools::ToolSpawnDecision::Allow
+        );
+        assert!(entries[1..].iter().all(|entry| {
             entry.decision == bitty_plugin_host::tools::ToolSpawnDecision::Deny
                 && entry.cwd.is_none()
         }));
-        assert!(service.is_empty(), "no refused spawn is tracked");
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 
@@ -3052,13 +3142,13 @@ mod tests {
         let repo = std::fs::canonicalize(root.join("repo")).expect("canonical repo");
         let nested = repo.join("nested");
 
-        let resolved = HostCwd::resolve(&nested).expect("absolute existing dir");
+        let resolved = HostCwd::from_path(&nested).expect("absolute existing dir");
         assert_eq!(resolved.as_str(), nested.to_str().expect("utf-8 fixture"));
 
         // `.`/`..` resolve through canonicalization; the recorded value is
         // the physical directory, never the un-normalized spelling.
         let dotted = repo.join("nested/..");
-        let resolved = HostCwd::resolve(&dotted).expect("traversal canonicalizes");
+        let resolved = HostCwd::from_path(&dotted).expect("traversal canonicalizes");
         assert_eq!(resolved.as_str(), repo.to_str().expect("utf-8 fixture"));
         assert!(!resolved.as_str().contains(".."));
 
@@ -3073,7 +3163,7 @@ mod tests {
             ("over-bound", repo.join("a".repeat(MAX_EXEC_CWD_BYTES))),
         ];
         for (tag, path) in cases {
-            match HostCwd::resolve(&path) {
+            match HostCwd::from_path(&path) {
                 Ok(resolved) => panic!("{tag}: unexpectedly resolved '{}'", resolved.as_str()),
                 Err(error) => assert!(denies_unavailable_cwd(&error), "{tag}: {error:?}"),
             }
@@ -3089,7 +3179,7 @@ mod tests {
         std::fs::create_dir_all(root.join("real")).expect("fixture dir");
         let link = root.join("link");
         std::os::unix::fs::symlink(root.join("real"), &link).expect("symlink");
-        let resolved = HostCwd::resolve(&link).expect("symlink to a directory");
+        let resolved = HostCwd::from_path(&link).expect("symlink to a directory");
         assert_eq!(
             resolved.as_str(),
             std::fs::canonicalize(root.join("real"))

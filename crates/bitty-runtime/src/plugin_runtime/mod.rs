@@ -1554,11 +1554,15 @@ impl PluginRuntime {
     /// source, and `bitty.process.spawn(argv, { cwd = "pane" })` resolves
     /// through it per call. The production source is the application's live
     /// terminal model (the same `LiveSnapshot` that serves
-    /// `bitty.terminal.snapshot`), so a pane directory change is observed
-    /// without a plugin reload. Installing the source grants nothing: the
-    /// `process.spawn:git` capability and consent gates still decide every
-    /// call, and a generation activated without this source refuses `pane`
-    /// with a typed `E_SPAWN_CWD_UNAVAILABLE`.
+    /// `bitty.terminal.snapshot`), which publishes the focused pane's
+    /// **PTY-child kernel cwd** pinned to a directory identity (issue #2911) —
+    /// never the pane's `OSC 7` report, which is untrusted PTY output. A pane
+    /// directory change is therefore observed without a plugin reload.
+    /// Installing the source grants nothing: the `process.spawn:git`
+    /// capability and consent gates still decide every call, and a generation
+    /// activated without this source — or whose focused pane has no provable
+    /// child directory — refuses `pane` with a typed
+    /// `E_SPAWN_CWD_UNAVAILABLE`.
     pub fn set_pane_cwd_source(&mut self, source: Rc<dyn PaneCwdSource>) {
         self.pane_cwd = Some(source);
     }

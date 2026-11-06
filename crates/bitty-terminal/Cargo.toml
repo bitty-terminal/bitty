@@ -96,7 +96,7 @@ windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
 # bitty#2929: the reviewed Win32 FFI boundary (`bitty-winjob`) owns the only
 # Windows `unsafe` in the workspace, so the GUI-subsystem console adoption
 # lives there and this crate stays `#![forbid(unsafe_code)]`.
-bitty-winjob = { version = "0.0.33", path = "../bitty-winjob" }
+bitty-winjob = { version = "0.0.34", path = "../bitty-winjob" }
 
 # bitty#2929: compiles `bitty.rc` (the application icon) into the Windows
 # executable. Build-dependency, so non-Windows hosts never compile it.

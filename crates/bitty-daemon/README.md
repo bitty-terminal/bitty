@@ -616,11 +616,11 @@ Containment is a whole-tree identity, not a pid and not a process-group
 convention. `containment::ContainmentReport::probe()` returns a typed plan for
 the compiled cell; there is no silent fallback and no weaker transport:
 
-| Plan                 | Selection                                                                                                      | Cleanup claim | Signals                                         |
-| -------------------- | -------------------------------------------------------------------------------------------------------------- | ------------- | ----------------------------------------------- |
-| `cgroup_v2`          | delegated cgroup v2 root (`/proc/self/cgroup` + writable `cgroup.procs`/`cgroup.kill` + a create/remove probe) | `swept`       | members from `cgroup.procs`, then `cgroup.kill` |
+| Plan                 | Selection                                                                                                      | Cleanup claim         | Signals                                                                            |
+| -------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------- | ---------------------------------------------------------------------------------- |
+| `cgroup_v2`          | delegated cgroup v2 root (`/proc/self/cgroup` + writable `cgroup.procs`/`cgroup.kill` + a create/remove probe) | `swept`               | members from `cgroup.procs`, then `cgroup.kill`                                    |
 | `subreaper_fallback` | `PR_SET_CHILD_SUBREAPER` confirmed by read-back when cgroup delegation is unavailable                          | `swept` when verified | the leader pidfd, the recorded group, and descendant pidfds recorded before a stop |
-| `none`               | no cgroup v2 and no subreaper, or a non-Linux cell                                                             | none          | no spawn; typed refusal                         |
+| `none`               | no cgroup v2 and no subreaper, or a non-Linux cell                                                             | none                  | no spawn; typed refusal                                                            |
 
 Linux x86_64 is the first cell. A per-session cgroup is created **before** the
 spawn, and the child writes its own pid into `cgroup.procs` from a `pre_exec`

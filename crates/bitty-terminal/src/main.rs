@@ -273,6 +273,7 @@ mod plugin_runtime;
 mod plus;
 mod prefix_dispatch;
 mod profile;
+mod reload;
 mod runtime_inspect;
 mod storage_backends;
 mod storage_component_host;
@@ -404,6 +405,28 @@ fn ipc_serve_failure_exit(
 /// receive their instance's socket.
 fn should_store_ipc_socket_path(headless: bool, test_mode: bool) -> bool {
     !headless || test_mode
+}
+
+/// Install the live-reload context shared by the windowed event loop and the
+/// deterministic test-mode servo (CTX-0814, bitty#2927).
+///
+/// The explicit `bitty ctl config reload` / `bitty reload` request and the
+/// per-tick config-file poll both read this context on the main thread that
+/// owns `Runtime`; without it the control verb keeps its probe-only reply.
+/// `--safe` selects the built-in config with every external layer disabled, so
+/// it installs nothing and a reload stays probe-only there.
+fn install_reload_context(args: &cli::Args, app: &config_cli::AppConfig) {
+    if args.safe {
+        return;
+    }
+    config_reload::install(
+        args.clone(),
+        app.effective.clone(),
+        app.file_path.clone(),
+        // bitty#2814: the profile startup loaded (explicit request, else the
+        // selector) seeds the running identity reads report.
+        app.profile_name.clone(),
+    );
 }
 
 fn main() {
@@ -637,6 +660,10 @@ fn main() {
                     println!("{}", upgrade::upgrade_usage());
                     std::process::exit(0);
                 }
+                Some("reload") => {
+                    print!("{}", reload::reload_help_text());
+                    std::process::exit(0);
+                }
                 Some("list") => {
                     println!("{}", list::list_help_text(raw));
                     std::process::exit(0);
@@ -814,6 +841,15 @@ fn main() {
     // usage errors (exit 2).
     if args.ctl_word {
         std::process::exit(ctl::run_cli(&args));
+    }
+
+    // `bitty reload` applies the running instance's config (bitty#2927,
+    // runtime class). Dispatched before config load and GUI startup like
+    // `ctl`: it targets a live instance over IPC and never loads this
+    // process's config. `--help` never needs an instance; parse failures are
+    // usage errors (exit 2).
+    if args.reload_word {
+        std::process::exit(reload::run_cli(&args));
     }
 
     // `bitty list <kind>` enumeration (CTX-0172). Local kinds never touch
@@ -1363,6 +1399,12 @@ fn main() {
     // `bitty.debug/testExit` verb applies; grants no new authority.
     // Takes precedence over `--headless` (the loop is the point).
     if args.test_mode {
+        // bitty#2927: the deterministic servo runs the same live-reload path
+        // as the windowed app, so `bitty reload` (and the integration test
+        // behind it) can assert an applied change against a real Runtime.
+        // `--safe` keeps the probe-only reply (built-in config, no external
+        // layers).
+        install_reload_context(&args, &app_config);
         std::process::exit(test_mode::run(&mut runtime));
     }
 
@@ -1502,16 +1544,7 @@ fn main() {
     // ctl verb keeps its probe-only reply. `--safe` selects the built-in
     // config with every external layer disabled, so it installs nothing and
     // a reload stays probe-only there.
-    if !args.safe {
-        config_reload::install(
-            args.clone(),
-            app_config.effective.clone(),
-            app_config.file_path.clone(),
-            // bitty#2814: the profile startup loaded (explicit request, else
-            // the selector) seeds the running identity reads report.
-            app_config.profile_name.clone(),
-        );
-    }
+    install_reload_context(&args, &app_config);
     // Issue #2570: capture the next silent disappearance with a bounded
     // panic report even when the opt-in stall watchdog is off. Installed for
     // the interactive event loop; a `DisplayUnavailable` fallback still records

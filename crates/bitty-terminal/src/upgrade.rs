@@ -1883,10 +1883,12 @@ mod tests {
     use std::collections::HashMap;
 
     /// Self-removing scratch directory.
+    #[cfg(unix)]
     struct Scratch {
         path: PathBuf,
     }
 
+    #[cfg(unix)]
     impl Scratch {
         fn new(tag: &str) -> Self {
             use std::sync::atomic::{AtomicU64, Ordering};
@@ -1905,6 +1907,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
@@ -1927,6 +1930,7 @@ mod tests {
             .expect("chmod stub");
     }
 
+    #[cfg(unix)]
     fn detect_with(
         exe: PathBuf,
         path_dirs: Vec<PathBuf>,

@@ -1741,15 +1741,71 @@ pub const DEFAULT_WINDOW_PADDING: u32 = 8;
 /// depend on `bitty-config`); the pairing is pinned by the app-level test.
 pub const MAX_WINDOW_PADDING: u32 = 64;
 
-/// Default font family: Nerd-Font-patched JetBrains Mono.
+/// Default font family for the running platform (issue #2931).
 ///
-/// Matches the CTX-0157 acceptance probe (`JetBrainsMono Nerd Font 12pt`
-/// side-by-side vs ghostty must show no material difference) and renders
-/// starship/opencode Nerd glyphs out of the box. System `monospace` remains
-/// in the chain via [`FONT_FALLBACK_CHAIN`], so bare installs
-/// without the Nerd font still start (headless fallback path in
-/// `bitty-runtime`).
+/// Linux keeps the CTX-0157 acceptance face (`JetBrainsMono Nerd Font 12pt`
+/// side-by-side vs ghostty must show no material difference). The Windows and
+/// macOS values are faces the OS ships, so a stock install never starts on a
+/// missing primary; the Nerd-font icons those systems lack are covered by the
+/// embedded [`EMBEDDED_SYMBOLS_FAMILY`] face instead.
+///
+/// This is the *configured* default, not necessarily the loaded face: when
+/// the configured family equals this constant, the renderer resolves the
+/// first installed entry of [`DEFAULT_FONT_FAMILY_CANDIDATES`] (so a Windows
+/// host with Cascadia Mono installed loads it instead of Consolas, and a Mac
+/// with SF Mono loads it instead of Menlo). Any other configured family is
+/// used verbatim — `terminal.font.family` and `--font-family` stay
+/// authoritative.
+#[cfg(target_os = "linux")]
 pub const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
+/// Default font family on macOS (see [`DEFAULT_FONT_FAMILY`]).
+#[cfg(target_os = "macos")]
+pub const DEFAULT_FONT_FAMILY: &str = "Menlo";
+/// Default font family on Windows (see [`DEFAULT_FONT_FAMILY`]).
+#[cfg(windows)]
+pub const DEFAULT_FONT_FAMILY: &str = "Consolas";
+/// Default font family on other targets (see [`DEFAULT_FONT_FAMILY`]).
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
+
+/// Installed-face preference order behind [`DEFAULT_FONT_FAMILY`].
+///
+/// The renderer tries these in order and loads the first face the host font
+/// database resolves. [`DEFAULT_FONT_FAMILY`] is always one of the entries:
+/// the guaranteed face that ships with the OS (Consolas, Menlo) or the
+/// documented Linux face, so a missing preferred face never resolves below
+/// the configured default. Resolution only applies while the configured
+/// family equals [`DEFAULT_FONT_FAMILY`]; an explicit
+/// `font.family`/`--font-family` bypasses it.
+///
+/// `monospace` is deliberately absent: `fontdb` resolves generic aliases
+/// through `Family::Monospace`, not `Family::Name`, and this list is queried
+/// by name (the documented chain keeps `monospace` for the per-glyph walk).
+#[cfg(target_os = "linux")]
+pub const DEFAULT_FONT_FAMILY_CANDIDATES: &[&str] = &["JetBrainsMono Nerd Font", "JetBrains Mono"];
+/// Installed-face preference order on macOS (see
+/// [`DEFAULT_FONT_FAMILY_CANDIDATES`]): SF Mono ships with Xcode only, Menlo
+/// ships with the OS.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_FONT_FAMILY_CANDIDATES: &[&str] = &["SF Mono", "Menlo"];
+/// Installed-face preference order on Windows (see
+/// [`DEFAULT_FONT_FAMILY_CANDIDATES`]): Cascadia Mono ships with Windows 11
+/// and Windows Terminal, Consolas ships with every Windows.
+#[cfg(windows)]
+pub const DEFAULT_FONT_FAMILY_CANDIDATES: &[&str] = &["Cascadia Mono", "Consolas"];
+/// Installed-face preference order on other targets (see
+/// [`DEFAULT_FONT_FAMILY_CANDIDATES`]).
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+pub const DEFAULT_FONT_FAMILY_CANDIDATES: &[&str] = &["JetBrainsMono Nerd Font", "JetBrains Mono"];
+
+/// Family name of the embedded symbols-only Nerd face (issue #2931).
+///
+/// The face lives in `bitty-render` (`assets/bitty-symbols-nerd.ttf`,
+/// registered as a `fontdb` binary source), but the name is declared here so
+/// every platform chain can append it without `bitty-config` depending on the
+/// renderer. It is a distinct name on purpose: a host-installed family of the
+/// same name would otherwise shadow (or be shadowed by) the embedded face.
+pub const EMBEDDED_SYMBOLS_FAMILY: &str = "Bitty Symbols Nerd";
 
 /// Default point size: 12pt on Linux.
 ///
@@ -1836,6 +1892,13 @@ pub const MAX_FONT_FEATURE_LEN: usize = 16;
 /// through; `Noto Sans Symbols 2` covers `2800-28ff` and resolves via
 /// fontconfig (`fc-match "Noto Sans Symbols 2"`). Ships in `noto-fonts`,
 /// already an `optdepend` in `packaging/PKGBUILD` — no new dependency.
+///
+/// Linux/BSD only: macOS and Windows have no `Noto Sans Symbols 2` in their
+/// stock font set, so those chains use the platform symbol face
+/// (`Apple Symbols` / `Segoe UI Symbol`) instead of a dead entry. The
+/// embedded [`EMBEDDED_SYMBOLS_FAMILY`] face covers the same braille range
+/// everywhere as a last resort.
+#[cfg(not(any(target_os = "macos", windows)))]
 pub const SYMBOLS_FALLBACK_FAMILY: &str = "Noto Sans Symbols 2";
 
 /// CJK-capable fallback family for the running platform (CTX-0961, issue
@@ -1885,20 +1948,33 @@ pub const EMOJI_FALLBACK_FAMILY: &str = "Noto Color Emoji";
 /// `DejaVu Sans Mono` (widely available, covers box drawing + block
 /// elements `U+2580-U+259F`) -> [`CJK_FALLBACK_FAMILY`] (covers CJK Unified
 /// Ideographs such as `U+6F22`/`U+5B57`; CTX-0961, issue #1666) ->
-/// [`SYMBOLS_FALLBACK_FAMILY`] (covers braille patterns `U+2800-U+28FF`
-/// for TUI graphs such as btop) -> [`EMOJI_FALLBACK_FAMILY`]
+/// `Noto Sans Symbols 2` (covers braille patterns `U+2800-U+28FF` for TUI
+/// graphs such as btop; Linux/BSD only) -> [`EMOJI_FALLBACK_FAMILY`]
 /// (emoji-presentation scalars the mono/symbols faces miss, for example
-/// `U+2699 GEAR`). Mirrors ghostty (embedded JetBrains Mono variable +
+/// `U+2699 GEAR`) -> [`EMBEDDED_SYMBOLS_FAMILY`] (the embedded
+/// symbols-only Nerd face: PUA icons `U+E000-U+F8FF`, box drawing, block
+/// elements, braille). Mirrors ghostty (embedded JetBrains Mono variable +
 /// symbols-only Nerd fallback, always present) and kitty (`font_family =
 /// "monospace"` + builtin Nerd font, `set_font_family(...,
 /// add_builtin_nerd_font=True)`).
 ///
-/// macOS and Windows substitute their system equivalents (Menlo/Monaco,
+/// The embedded face is **last on every platform** (issue #2931): it is
+/// additive, so it never shadows a host face that already covers a scalar
+/// (a user's Nerd-patched primary keeps winning), and emoji-presentation
+/// scalars still resolve through the platform emoji face before it. On a
+/// stock Windows/macOS install every host tail misses the PUA range, so the
+/// embedded face is the one that paints statusline/bar/devtools icons.
+///
+/// macOS and Windows use their system equivalents (Menlo/SF Mono/Monaco,
 /// Apple Braille, Apple Symbols, Apple Color Emoji; Consolas/Cascadia Mono,
-/// Segoe UI Symbol, Segoe UI Emoji); every chain is a fixed, deterministic,
-/// bounded list (`<= MAX_FALLBACK_FAMILIES` tails, `<= MAX_FALLBACK_DEPTH`
-/// total), never a runtime enumeration. Platform fontconfig/CoreText/
-/// DirectWrite enumeration policy remains an open question under ADR-0004.
+/// Segoe UI Symbol, Segoe UI Emoji). `Arial Unicode MS` was removed: it ships
+/// with Microsoft Office, not the OS, so it was a dead entry on a stock
+/// install. `Noto Sans Symbols 2` is likewise absent from the Windows/macOS
+/// chains (their symbol faces cover braille) and is only declared for
+/// Linux/BSD. Every chain is a fixed, deterministic, bounded list
+/// (`<= MAX_FALLBACK_FAMILIES` tails, `<= MAX_FALLBACK_DEPTH` total), never a
+/// runtime enumeration. Platform fontconfig/CoreText/DirectWrite enumeration
+/// policy remains an open question under ADR-0004.
 ///
 /// Per-glyph coverage fallback is implemented by
 /// `bitty-render::fallback::FallbackRasterizer`, which walks this chain on
@@ -1917,31 +1993,31 @@ pub const FONT_FALLBACK_CHAIN: &[&str] = &[
     CJK_FALLBACK_FAMILY,
     SYMBOLS_FALLBACK_FAMILY,
     EMOJI_FALLBACK_FAMILY,
+    EMBEDDED_SYMBOLS_FAMILY,
 ];
 
 /// Documented fallback stack on macOS (see [`FONT_FALLBACK_CHAIN`]).
 #[cfg(target_os = "macos")]
 pub const FONT_FALLBACK_CHAIN: &[&str] = &[
     DEFAULT_FONT_FAMILY,
-    "Menlo",
+    "SF Mono",
     "Monaco",
     CJK_FALLBACK_FAMILY,
     "Apple Braille",
     "Apple Symbols",
     EMOJI_FALLBACK_FAMILY,
-    "Arial Unicode MS",
+    EMBEDDED_SYMBOLS_FAMILY,
 ];
 
 /// Documented fallback stack on Windows (see [`FONT_FALLBACK_CHAIN`]).
 #[cfg(windows)]
 pub const FONT_FALLBACK_CHAIN: &[&str] = &[
     DEFAULT_FONT_FAMILY,
-    "Consolas",
     "Cascadia Mono",
     CJK_FALLBACK_FAMILY,
     "Segoe UI Symbol",
     EMOJI_FALLBACK_FAMILY,
-    "Arial Unicode MS",
+    EMBEDDED_SYMBOLS_FAMILY,
 ];
 
 /// Documented fallback stack on other targets (see [`FONT_FALLBACK_CHAIN`]).
@@ -1952,6 +2028,7 @@ pub const FONT_FALLBACK_CHAIN: &[&str] = &[
     CJK_FALLBACK_FAMILY,
     SYMBOLS_FALLBACK_FAMILY,
     EMOJI_FALLBACK_FAMILY,
+    EMBEDDED_SYMBOLS_FAMILY,
 ];
 
 /// One parsed OpenType feature override (CTX-0957, issue #1666).
@@ -4781,7 +4858,14 @@ mod tests {
     fn font_defaults_match_ghostty_linux_acceptance() {
         let d = FontConfig::default();
         assert_eq!(d.family, DEFAULT_FONT_FAMILY);
+        // Platform default primary (issue #2931): Linux keeps the CTX-0157
+        // acceptance face; Windows/macOS ship an OS-present face.
+        #[cfg(target_os = "linux")]
         assert_eq!(d.family, "JetBrainsMono Nerd Font");
+        #[cfg(target_os = "macos")]
+        assert_eq!(d.family, "Menlo");
+        #[cfg(windows)]
+        assert_eq!(d.family, "Consolas");
         assert!((d.size - 12.0).abs() < f32::EPSILON);
         assert!((d.line_height - 1.375).abs() < f32::EPSILON);
         assert!((d.letter_spacing - 2.0).abs() < f32::EPSILON);
@@ -4789,6 +4873,39 @@ mod tests {
         // raster truth (CTX-0237: advance 10, line 22).
         assert_eq!(d.default_effective_cell(), (10, 22));
         assert_eq!(d.effective_cell(8, 16), (10, 22));
+    }
+
+    #[test]
+    fn font_default_primary_candidates_are_platform_aware() {
+        // Issue #2931: the configured default is the guaranteed face, and
+        // the preference list starts with the face to prefer when installed.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(DEFAULT_FONT_FAMILY, "JetBrainsMono Nerd Font");
+            assert_eq!(
+                DEFAULT_FONT_FAMILY_CANDIDATES,
+                &["JetBrainsMono Nerd Font", "JetBrains Mono"]
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(DEFAULT_FONT_FAMILY, "Menlo");
+            assert_eq!(DEFAULT_FONT_FAMILY_CANDIDATES, &["SF Mono", "Menlo"]);
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(DEFAULT_FONT_FAMILY, "Consolas");
+            assert_eq!(
+                DEFAULT_FONT_FAMILY_CANDIDATES,
+                &["Cascadia Mono", "Consolas"]
+            );
+        }
+        // The configured default is always one of the candidates, so
+        // resolution never leaves the configured face out of the attempt.
+        assert!(
+            DEFAULT_FONT_FAMILY_CANDIDATES.contains(&DEFAULT_FONT_FAMILY),
+            "configured default must be a candidate"
+        );
     }
 
     #[test]
@@ -4813,7 +4930,7 @@ mod tests {
         assert_eq!(chain.iter().filter(|f| *f == "monospace").count(), 1);
         // No duplicates when the primary is already a tail (case-insensitive).
         let nerd = FontConfig {
-            family: "  jetbrainsmono nerd font  ".into(),
+            family: format!("  {}  ", DEFAULT_FONT_FAMILY.to_lowercase()),
             ..Default::default()
         };
         let chain = nerd.fallback_chain();
@@ -4834,6 +4951,14 @@ mod tests {
             "tails {tails} exceed MAX_FALLBACK_FAMILIES"
         );
         assert!(FONT_FALLBACK_CHAIN.len() <= MAX_FALLBACK_DEPTH);
+        // Issue #2931: the embedded symbols face is last on every platform
+        // and the Linux/BSD symbols tail is declared only where it exists.
+        assert_eq!(
+            FONT_FALLBACK_CHAIN.last().copied(),
+            Some(EMBEDDED_SYMBOLS_FAMILY)
+        );
+        assert!(!FONT_FALLBACK_CHAIN.contains(&"Arial Unicode MS"));
+        #[cfg(not(any(target_os = "macos", windows)))]
         assert_eq!(SYMBOLS_FALLBACK_FAMILY, "Noto Sans Symbols 2");
         // No duplicate families in the pinned order.
         for (i, a) in FONT_FALLBACK_CHAIN.iter().enumerate() {

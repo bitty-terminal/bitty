@@ -975,10 +975,13 @@ pub struct RuntimeConfig {
     pub cold_queue_capacity: usize,
     /// Font family used by the renderer; whitespace-trimmed on validation.
     ///
-    /// Default `crate::font_default_family` (`JetBrainsMono Nerd Font`):
-    /// Nerd-patched for starship/opencode glyphs, matching the CTX-0157
-    /// ghostty side-by-side acceptance at 12pt. System `monospace` remains
-    /// the ultimate fallback (see `bitty-config` `FONT_FALLBACK_CHAIN`).
+    /// Default `crate::font_default_family`: the platform default (the
+    /// Nerd-patched JetBrains face on Linux, Menlo on macOS, Consolas on
+    /// Windows), matching the CTX-0157 ghostty side-by-side acceptance at
+    /// 12pt. System `monospace` remains the ultimate fallback (see
+    /// `bitty-config` `FONT_FALLBACK_CHAIN`), and the embedded symbols face
+    /// covers the Nerd icon range on hosts without a patched font (issue
+    /// #2931).
     pub font_family: String,
     /// Font point size; must be finite and within `(0, 3999]`.
     pub font_size: f32,
@@ -1322,7 +1325,24 @@ pub const DEFAULT_CELL_WIDTH: u32 = 9;
 /// Default cell height in logical pixels (CTX-0157 breathing-room cell).
 pub const DEFAULT_CELL_HEIGHT: u32 = 19;
 
-/// Default font family (CTX-0157 acceptance probe).
+/// Default font family for the running platform (issue #2931).
+///
+/// Mirrors `bitty_config::types::DEFAULT_FONT_FAMILY` by value (the runtime
+/// owns no `bitty-config` dependency): the Nerd-patched JetBrains face on
+/// Linux, OS-shipped Menlo on macOS, and OS-shipped Consolas on Windows. The
+/// renderer resolves the platform preference (SF Mono / Cascadia Mono) when
+/// the configured family equals this default; see
+/// `bitty_render::font_defaults`.
+#[cfg(target_os = "linux")]
+pub const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
+/// Default font family on macOS (see [`DEFAULT_FONT_FAMILY`]).
+#[cfg(target_os = "macos")]
+pub const DEFAULT_FONT_FAMILY: &str = "Menlo";
+/// Default font family on Windows (see [`DEFAULT_FONT_FAMILY`]).
+#[cfg(windows)]
+pub const DEFAULT_FONT_FAMILY: &str = "Consolas";
+/// Default font family on other targets (see [`DEFAULT_FONT_FAMILY`]).
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub const DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
 
 /// Returns the default font family.

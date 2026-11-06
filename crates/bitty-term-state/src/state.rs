@@ -1080,6 +1080,18 @@ impl State {
         self.alt_screen != AltScreen::Off
     }
 
+    /// Drops the mouse-tracking mode (bitty#2938).
+    ///
+    /// The pointer-capture decision reads this register. A TUI that enabled
+    /// `?1000`/`?1002`/`?1003` and never sent the matching reset would keep
+    /// owning every drag after its screen or process is gone, so the runtime
+    /// clears the mode on alternate-screen exit and when it observes the
+    /// child dead. The coordinate encoding is left untouched: it is inert
+    /// without tracking and belongs to the app that set it.
+    pub fn clear_mouse_tracking(&mut self) {
+        self.modes.mouse_tracking = None;
+    }
+
     /// The window/icon title.
     #[must_use]
     pub fn title(&self) -> &str {
@@ -3765,6 +3777,14 @@ impl State {
                 self.charsets = save.charsets;
                 self.modes = save.modes;
             }
+            // bitty#2938: the primary snapshot restores whatever tracking mode
+            // was live at alt-screen entry. A TUI that enabled tracking and
+            // never sent the matching `?1000l`/`?1002l`/`?1003l` would keep
+            // capturing every drag after it leaves the alternate screen (the
+            // restored register would say tracking is on). The alt screen is
+            // the normative owner of tracking, so exit drops it instead of
+            // resurrecting the pre-entry state.
+            self.modes.mouse_tracking = None;
             self.enhanced_keyboard_stash = alt_enhanced;
             self.alt_screen = AltScreen::Off;
             // Alt-screen placements die with the session (restoring main

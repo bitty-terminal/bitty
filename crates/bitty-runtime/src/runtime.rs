@@ -1575,6 +1575,13 @@ pub struct Runtime {
     bell_observed: u64,
     // Input/Pointer RFC (CTX-0107) state for single-window slice
     enhanced_keyboard_flags: u32,
+    /// Button whose press a mouse-tracking app received (bitty#2938).
+    ///
+    /// Drag motion must carry the held button's identity (`ESC[<32;..M` for
+    /// the left button) so apps can tell a drag from hover; `?1002` reports
+    /// motion only while this is set. Cleared on the matching release and on
+    /// capture loss (pointer leaves the window, window loses focus).
+    mouse_drag_button: Option<MouseButton>,
     shift_pressed: bool,
     control_pressed: bool,
     alt_pressed: bool,
@@ -2308,6 +2315,7 @@ impl Runtime {
             plugin_notifications_dropped: 0,
             bell_observed: 0,
             enhanced_keyboard_flags: 0,
+            mouse_drag_button: None,
             shift_pressed: false,
             control_pressed: false,
             alt_pressed: false,
@@ -2628,6 +2636,7 @@ impl Runtime {
             plugin_notifications_dropped: 0,
             bell_observed: 0,
             enhanced_keyboard_flags: 0,
+            mouse_drag_button: None,
             shift_pressed: false,
             control_pressed: false,
             alt_pressed: false,

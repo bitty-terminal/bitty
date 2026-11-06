@@ -570,7 +570,12 @@ impl Runtime {
     /// on child exit) instead of freezing on a stale grid with
     /// silently-dropped input.
     pub fn primary_exit_status(&mut self) -> Option<bitty_pty::ExitStatus> {
-        self.pty.as_mut().and_then(|p| p.try_wait().ok()?)
+        let status = self.pty.as_mut().and_then(|p| p.try_wait().ok()?)?;
+        // bitty#2938: the dead shell's mode register must not keep capturing
+        // the pointer (same stale-capture class as `pane_try_wait`).
+        self.state.clear_mouse_tracking();
+        self.sync_mode_caches_to_focus();
+        Some(status)
     }
 
     /// Whether a live session's terminal output has ended (reader EOF or

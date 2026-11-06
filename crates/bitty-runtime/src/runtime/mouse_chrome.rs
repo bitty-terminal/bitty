@@ -1606,8 +1606,11 @@ impl Runtime {
     /// owner resolves in present paint order (a visible float, including a
     /// mode-floating leaf, wins over the base beneath it), matching the
     /// click the selection path is about to apply.
-    pub(super) fn focus_pointer_pane_before_capture(&mut self) {
-        if self.shift_pressed || self.alt_pressed || self.super_pressed {
+    pub(super) fn focus_pointer_pane_before_capture(&mut self, shift_override: bool) {
+        // `shift_override` is the click's own modifier snapshot OR the key
+        // latch (bitty#2938): a Shift+press must never move focus even when
+        // the latch missed the physical press.
+        if shift_override || self.alt_pressed || self.super_pressed {
             return;
         }
         let Some(pos) = self.last_cursor else {

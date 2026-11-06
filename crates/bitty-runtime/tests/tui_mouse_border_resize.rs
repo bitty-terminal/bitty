@@ -242,12 +242,14 @@ fn any_motion_drag_away_from_chrome_still_reaches_the_app() {
     assert_eq!(rt.pending_input(), b"\x1b[<0;8;6M");
     rt.drain_pending_input();
 
-    // One cell right: button `3` + motion bit (`32`) = `35`.
+    // One cell right: the held left button (`0`) + motion bit (`32`) = `32`.
+    // bitty#2938: drag motion keeps the button identity; `35` is the
+    // no-button (hover) code and apps classify it as `move`, not `drag`.
     rt.handle_cursor_moved(content_cell_center(&rt, ViewId::new(1), 5, 8));
     assert_eq!(
         rt.pending_input(),
-        b"\x1b[<35;9;6M",
-        "1003 motion away from chrome must keep reporting"
+        b"\x1b[<32;9;6M",
+        "1003 motion away from chrome must keep reporting the held button"
     );
     rt.drain_pending_input();
 

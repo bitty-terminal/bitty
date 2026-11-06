@@ -1045,8 +1045,17 @@ impl Runtime {
         if self.copy_mode.is_some() || self.search_mode {
             return;
         }
-        // Shift override always forces selection path.
-        let shift_override = self.shift_pressed;
+        // Shift override always forces selection path. bitty#2938: a click
+        // carries its own modifier snapshot from the platform, so the escape
+        // works even when the key-event latch missed the press (a click that
+        // arrives between the physical Shift press and its key event).
+        let shift_override = self.shift_pressed || event.modifiers.shift;
+        // bitty#2938: a physical release ends the captured drag regardless of
+        // where the event routes (chrome, modal, selection, or the app). A
+        // stale held button would otherwise turn the next hover into a drag.
+        if event.state == PressState::Released && self.mouse_drag_button == Some(event.button) {
+            self.mouse_drag_button = None;
+        }
         // CTX-0946 C1: a plugin edge band is Core chrome outside every
         // terminal frame — consume a press on it before the focus-then-
         // capture decision below so no capturing app ever sees it (the
@@ -1070,7 +1079,7 @@ impl Runtime {
             MouseButton::Left | MouseButton::Right | MouseButton::Middle
         ) && event.state == PressState::Pressed
         {
-            self.focus_pointer_pane_before_capture();
+            self.focus_pointer_pane_before_capture(shift_override);
         }
         // Issues #1759/#1760 (R-005/OQ-004): Ctrl/Cmd+Left over a safe
         // hyperlink is a terminal gesture, never child input. OSC 8 and
@@ -1249,6 +1258,13 @@ impl Runtime {
                 };
                 let bytes = super::mouse_encode::encode_mouse(format, report);
                 self.push_input_bytes(bytes.as_slice());
+                // bitty#2938: the app received this press, so it owns the
+                // pointer until the matching release; drag motion reports
+                // this button's identity. A press consumed by Core chrome
+                // above never sets the latch (the app saw no press).
+                if event.state == PressState::Pressed {
+                    self.mouse_drag_button = Some(event.button);
+                }
             }
             // Still update last_cursor tracking but do not start selection.
             // CTX-0166: a captured click must still dismiss any stale
@@ -1489,22 +1505,49 @@ impl Runtime {
         self.focused_modes().mouse_tracking.is_some()
     }
 
-    /// Pane that owns pointer motion reports at `pos` (issue #2939).
+    /// Receiver of a pointer-motion report at `pos` (issues #2939, bitty#2938).
     ///
-    /// Motion is the only pointer report that describes hover, so it follows
-    /// the pane under the pointer: a capturing pane keeps receiving its own
-    /// hover bytes after a hover or keyboard focus change moved the keyboard
+    /// A live captured drag owns motion until its release: the press routed
+    /// exclusively to the pane that received it (bitty#2938), so drag motion
+    /// keeps reporting there — with the held button's identity and that
+    /// pane's own grid cells, clamped at its edge — instead of following a
+    /// later pointer move. Hover activation never re-homes focus mid-drag
+    /// (`?1002` reports motion only while a button is held), so the keyboard
+    /// owner is still the pane the press reached.
+    ///
+    /// With no button held, motion describes hover, so it follows the pane
+    /// under the pointer: a capturing pane keeps receiving its own hover
+    /// bytes after a hover or keyboard focus change moved the keyboard
     /// elsewhere, and a hover that enters a capturing pane reports there
     /// immediately. When the pointer is over a pane that does not request
     /// any-event motion (a plain shell, a gap band, or the window padding),
-    /// the focused pane stays the owner, preserving the clamped
+    /// the focused pane stays the receiver, preserving the clamped
     /// focus-routed report the tracking app already had.
     ///
     /// Shift keeps forcing the selection path (CTX-0181), so it owns no
     /// motion report.
-    pub(super) fn motion_report_owner(&self, pos: CursorPosition) -> Option<ViewId> {
+    pub(super) fn motion_report_owner(
+        &self,
+        pos: CursorPosition,
+        drag_button: Option<MouseButton>,
+    ) -> Option<ViewId> {
         if self.shift_pressed {
             return None;
+        }
+        // bitty#2938: `?1002` (Button) reports motion only while a button is
+        // held, so a live drag latch arms it; `?1003` (Any) always reports;
+        // `1000`/`X10` never report motion at all.
+        if drag_button.is_some() {
+            return self.focused_view().filter(|view| {
+                self.session_state_for(*view).is_some_and(|state| {
+                    matches!(
+                        state.modes().mouse_tracking,
+                        Some(
+                            bitty_vt::MouseTrackingMode::Any | bitty_vt::MouseTrackingMode::Button
+                        )
+                    )
+                })
+            });
         }
         if let Some((pointer_view, _)) = self.cursor_to_present_cell(pos) {
             if self.view_tracks_motion(pointer_view) {
@@ -1643,18 +1686,30 @@ impl Runtime {
         // Issue #2787: the entry re-sync is not motion, so it never moves
         // focus (a window that re-appears under a resting pointer keeps the
         // pane the user left focused).
-        if !entry_sync {
+        //
+        // bitty#2938: a captured app drag owns the pointer gesture until its
+        // release, exactly like the Core drags above — hover must not re-home
+        // focus mid-gesture. Issue #2939 otherwise moves the keyboard out of
+        // the pane the press routed to, and the drag's held-button reports
+        // (and their clamped cells) would follow it.
+        if !entry_sync && self.mouse_drag_button.is_none() {
             self.hover_focus_at_at(pos, now);
         }
-        // Motion reporting for 1003 (Any): the report belongs to the pane
-        // under the pointer (issue #2939), not to the keyboard owner, so a
-        // captured pane keeps its hover bytes when focus moved elsewhere and
-        // a hover that enters a capturing pane reports there immediately.
-        // CTX-0532: the receiver's own modes frame the report (primary
-        // fallback for session-less leaves). CTX-0566: any encoding frames
-        // the motion; X10 and the other legacy encodings carry no button
-        // identity, only the motion bit.
-        if let Some(owner) = self.motion_report_owner(pos) {
+        // Motion reporting for `?1003` (Any) and `?1002` (Button/drag).
+        //
+        // bitty#2938: while a captured press is live the report must carry the
+        // *held* button's identity (`ESC[<32;..M` for the left button).
+        // Sending the "no button" code 3 (`ESC[<35;..M`) makes every drag look
+        // like hover, so a TUI that implements its own text selection
+        // (opencode/opentui classifies button-3 motion as `move`) never starts
+        // a selection. `?1002` reports motion only while a button is held, so
+        // the drag latch arms that mode; `?1003` reports hover as code 3 and
+        // drags with the held button.
+        //
+        // CTX-0566: any encoding frames the motion; X10 and the other legacy
+        // encodings carry no button identity, only the motion bit.
+        let drag_button = self.mouse_drag_button;
+        if let Some(owner) = self.motion_report_owner(pos, drag_button) {
             let format = self.session_state_for(owner).map(|state| {
                 super::mouse_encode::MouseFormat::from_encoding(
                     state.modes().mouse_coordinate_encoding,
@@ -1666,10 +1721,11 @@ impl Runtime {
                 let cell = self
                     .cursor_to_owner_cell(owner, pos)
                     .unwrap_or_else(|| self.cursor_to_cell(pos));
-                // Motion reports carry the "no button" code (`3`); the motion
-                // flag adds the `+32` motion bit in every encoding.
+                // Held button identity, else the "no button" code (`3`); the
+                // motion flag adds the `+32` motion bit in every encoding.
+                let button = drag_button.map_or(3, mouse_button_code);
                 let report = super::mouse_encode::MouseReport {
-                    button: 3,
+                    button,
                     modifiers: self.mouse_modifier_bits(),
                     motion: true,
                     release: false,
@@ -1680,6 +1736,14 @@ impl Runtime {
                 // Bounded: drop if PTY queue full, never block.
                 self.route_input_bytes_to(owner, bytes.as_slice());
             }
+        }
+        // A register that no longer tracks anything owns no drag: drop a
+        // held-button latch whose app reset (or vanished) mid-drag, so a
+        // later app cannot inherit it as a phantom drag (bitty#2938). A live
+        // drag never re-homes focus, so the keyboard owner is still the pane
+        // that received the press (issue #2939).
+        if self.mouse_drag_button.is_some() && !self.should_capture_mouse() {
+            self.mouse_drag_button = None;
         }
         // Issues #1759/#1760: refresh both hover states on every motion
         // (OSC 8 first; plaintext yields where OSC 8 claims the cell).
@@ -2075,6 +2139,9 @@ impl Runtime {
         // with it (a focus change ends the gesture).
         if !focused {
             self.clear_band_press();
+            // bitty#2938: focus loss ends a captured drag (no release will
+            // reach this window); re-entry motion must not report it.
+            self.mouse_drag_button = None;
             // CTX-1505: a paste-confirming Enter belongs to the old focused
             // surface. Do not let its delayed repeat/release swallow a later
             // Enter after focus returns.

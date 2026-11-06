@@ -854,8 +854,19 @@ impl Runtime {
     /// external-editor host polls this once per event-loop tick to detect
     /// editor exit and round the edited buffer back.
     pub fn pane_try_wait(&mut self, view: &ViewId) -> Option<bitty_pty::ExitStatus> {
-        let sess = self.pane_sessions.get_mut(view)?;
-        sess.pty.try_wait().ok()?
+        // bitty#2938: the pane keeps its grid (scrollback) after the child
+        // dies, so a mouse-tracking app that exited without its matching
+        // reset would leave the register capturing every drag. The exit
+        // observation is the authoritative teardown point for input modes.
+        let status = self.pane_sessions.get_mut(view).and_then(|sess| {
+            let status = sess.pty.try_wait().ok()??;
+            sess.state.clear_mouse_tracking();
+            Some(status)
+        });
+        if status.is_some() {
+            self.sync_mode_caches_to_focus();
+        }
+        status
     }
 
     /// Current kernel winsize of the leaf's PTY, when the session exists.

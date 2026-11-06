@@ -1162,6 +1162,20 @@ impl Runtime {
             .is_some_and(|state| state.modes().mouse_tracking.is_some())
     }
 
+    /// Whether leaf `view`'s app requests any-event motion reports (`1003`),
+    /// with the same attribution rule as [`Self::view_tracks_mouse`].
+    ///
+    /// Issue #2939: pointer motion describes hover, so the motion path
+    /// resolves its receiver by the pane under the pointer instead of by
+    /// keyboard focus. Only `Any` requests unsolicited motion; `1000`/`1002`
+    /// report motion only while a button is held, which the drag and
+    /// selection paths own.
+    pub(super) fn view_tracks_motion(&self, view: ViewId) -> bool {
+        self.session_state_for(view).is_some_and(|state| {
+            state.modes().mouse_tracking == Some(bitty_vt::MouseTrackingMode::Any)
+        })
+    }
+
     /// Whether the focused pane's grid is on the alternate screen.
     ///
     /// Mirrors [`Self::focused_modes`] attribution (CTX-0532): alternate

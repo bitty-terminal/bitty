@@ -3110,6 +3110,14 @@ impl Runtime {
             || self.pinned.contains(id)
             || self.floats.contains(id)
         {
+            // Issue #2939: remember where the pane was entered. A click or a
+            // hover leaves the pointer inside the target frame, which becomes
+            // the pane's focus point for directional focus when hover is off.
+            // Recorded unconditionally and validated at use time, so this
+            // costs no present solve on the focus path.
+            if let Some(pos) = self.last_cursor {
+                self.focus_point = Some((id, pos));
+            }
             // Focusing a detached float also raises its paint stack entry.
             // The store keeps detach order separately, so this cannot alter
             // the float's anchored geometry.
@@ -3186,12 +3194,27 @@ impl Runtime {
     ///
     /// Ranking is spatial, not center-to-center distance (issue #2444): a
     /// pane counts only when it lies fully beyond the focused pane's facing
-    /// edge on the movement axis. Among those, panes whose perpendicular
-    /// interval overlaps the focused pane win over disjoint ones; within a
-    /// tier the nearest facing edge, then the nearest perpendicular center,
-    /// then stable focus order decide. This makes `Mod+j` in an L-shaped
-    /// layout pick the pane directly below instead of a taller neighbor
-    /// whose center happens to be closer.
+    /// edge on the movement axis.
+    ///
+    /// Issue #2939 (Hyprland-like `movefocus`): among those, the candidates
+    /// whose perpendicular span contains the source's **focus point** form
+    /// the first tier. The focus point is the live pointer while
+    /// [`crate::config::RuntimeConfig::focus_follows_mouse`] is enabled and
+    /// the pointer is inside the source pane, otherwise the point recorded
+    /// when the pane last gained focus (a click or hover leaves it where the
+    /// pane was entered), otherwise the frame centre. Containment is
+    /// inclusive on both ends, so a point exactly on a shared edge is
+    /// claimed by both neighbours and the stable-order tie-break decides.
+    /// Panes whose perpendicular interval merely overlaps the source come
+    /// next, then disjoint panes: they keep the layout reachable when the
+    /// point falls in a gap band or outside every candidate.
+    ///
+    /// Within a separated tier the nearest facing edge wins, then the
+    /// nearest distance from the focus point (0 for a containing pane, the
+    /// gap to the nearest span end otherwise), then stable focus order, then
+    /// `ViewId`. This makes `Mod+l` in a tall-left + stacked-right layout
+    /// land on the right pane at the pointer's height instead of the pane
+    /// nearest the source's geometric centre.
     ///
     /// Overlay panels need a fallback because anchored floats and pins are
     /// centered over the layout and therefore overlap every tile: when no
@@ -3214,7 +3237,16 @@ impl Runtime {
         }
         let tiled = self.layout.leaf_ids();
         let current_is_tiled = tiled.contains(&current);
+        // Issue #2939: intent is measured from the point the user is looking
+        // at, on the axis perpendicular to the movement.
+        let point = self.spatial_focus_point(current, current_frame.frame);
+        let point_perpendicular = match dir {
+            FocusDirection::Up | FocusDirection::Down => point.0,
+            FocusDirection::Left | FocusDirection::Right => point.1,
+            FocusDirection::Next | FocusDirection::Prev => point.0,
+        };
 
+        let mut containing: Vec<SpatialCandidate> = Vec::new();
         let mut aligned: Vec<SpatialCandidate> = Vec::new();
         let mut disjoint: Vec<SpatialCandidate> = Vec::new();
         let mut overlapping: Vec<SpatialCandidate> = Vec::new();
@@ -3234,13 +3266,29 @@ impl Runtime {
                     perpendicular_overlap,
                     perpendicular_distance,
                 }) => {
+                    let (span_start, span_end) = perpendicular_span(frame.frame, dir);
+                    // Inclusive containment: a focus point exactly on a
+                    // shared edge belongs to both neighbours, and the stable
+                    // order tie-break picks deterministically.
+                    let contains =
+                        point_perpendicular >= span_start && point_perpendicular <= span_end;
+                    let point_distance = if contains {
+                        0
+                    } else {
+                        (point_perpendicular - span_start)
+                            .abs()
+                            .min((point_perpendicular - span_end).abs())
+                    };
                     let candidate = SpatialCandidate {
                         view: frame.view,
                         order,
                         distance: edge_distance,
+                        point_distance,
                         perpendicular_distance,
                     };
-                    if perpendicular_overlap > 0 {
+                    if contains {
+                        containing.push(candidate);
+                    } else if perpendicular_overlap > 0 {
                         aligned.push(candidate);
                     } else {
                         disjoint.push(candidate);
@@ -3260,6 +3308,7 @@ impl Runtime {
                         view: frame.view,
                         order,
                         distance: center_distance,
+                        point_distance: 0,
                         perpendicular_distance,
                     });
                 }
@@ -3267,10 +3316,11 @@ impl Runtime {
             }
         }
 
-        for group in [&mut aligned, &mut disjoint, &mut overlapping] {
+        for group in [&mut containing, &mut aligned, &mut disjoint] {
             sort_spatial(group);
         }
-        for group in [&aligned, &disjoint, &overlapping] {
+        sort_spatial_by_center(&mut overlapping);
+        for group in [&containing, &aligned, &disjoint, &overlapping] {
             if let Some(candidate) = group.first() {
                 return Some(candidate.view);
             }
@@ -3283,6 +3333,62 @@ impl Runtime {
         (!current_is_tiled)
             .then(|| self.focus_cycle_neighbor(ids, FocusDirection::Next))
             .flatten()
+    }
+
+    /// Point that directional focus measures intent from, in doubled frame
+    /// space (physical pixels with the window padding removed, times two).
+    ///
+    /// Issue #2939: Hyprland resolves `movefocus` against the cursor, and the
+    /// same intent applies here. The live pointer wins while
+    /// [`crate::config::RuntimeConfig::focus_follows_mouse`] is enabled and
+    /// the pointer is inside the source frame, because that is what the user
+    /// is looking at. With hover off — or the pointer outside the source —
+    /// the point recorded when the pane last gained focus is used (a click or
+    /// a hover leaves it where the pane was entered). The frame centre is the
+    /// final fallback for a pane that never saw the pointer.
+    ///
+    /// Recorded points are validated against the source frame at use time,
+    /// so a stale entry (focus moved by keyboard while the pointer was over
+    /// another pane) can never place the point outside its own pane.
+    fn spatial_focus_point(
+        &self,
+        source: ViewId,
+        frame: bitty_render::geometry::RectPx,
+    ) -> (i64, i64) {
+        // Doubled coordinates keep an odd-sized frame's centre exact (the
+        // same trick `spatial_relation` uses for its centers): a half-pixel
+        // centre must not collapse into a false tie.
+        let x0 = 2 * i64::from(frame.x);
+        let y0 = 2 * i64::from(frame.y);
+        let x1 = x0 + 2 * i64::from(frame.width);
+        let y1 = y0 + 2 * i64::from(frame.height);
+        let inside =
+            |point: (i64, i64)| point.0 >= x0 && point.0 < x1 && point.1 >= y0 && point.1 < y1;
+        let centre = (x0 + (x1 - x0) / 2, y0 + (y1 - y0) / 2);
+        let to_frame = |pos: CursorPosition| {
+            let pad = f64::from(self.window_padding_physical());
+            (
+                ((pos.x - pad) * 2.0).round() as i64,
+                ((pos.y - pad) * 2.0).round() as i64,
+            )
+        };
+        if self.config.focus_follows_mouse {
+            if let Some(pos) = self.last_cursor {
+                let point = to_frame(pos);
+                if inside(point) {
+                    return point;
+                }
+            }
+        }
+        if let Some((view, pos)) = self.focus_point {
+            if view == source {
+                let point = to_frame(pos);
+                if inside(point) {
+                    return point;
+                }
+            }
+        }
+        centre
     }
 
     /// Container rect (cell coordinates) that the layout is reflowed into.
@@ -3781,7 +3887,11 @@ struct SpatialCandidate {
     /// Facing-edge distance along the movement axis (or center distance for
     /// the overlay overlap fallback).
     distance: i64,
-    /// Perpendicular center distance; breaks equal edge distances.
+    /// Distance from the source's focus point to this pane's perpendicular
+    /// span, `0` when the span contains the point (issue #2939).
+    point_distance: i64,
+    /// Perpendicular center distance; the overlay overlap fallback keeps
+    /// ranking by it (a centered overlay has no meaningful focus point).
     perpendicular_distance: i64,
 }
 
@@ -3911,9 +4021,25 @@ fn overlap_1d(a0: i64, a1: i64, b0: i64, b1: i64) -> i64 {
     a1.min(b1).saturating_sub(a0.max(b0)).max(0)
 }
 
-/// Deterministic spatial ranking: nearest facing edge, then nearest
-/// perpendicular center, then stable focus order, then `ViewId`.
+/// Deterministic spatial ranking for separated panes (issue #2939): nearest
+/// facing edge, then nearest distance from the source's focus point, then
+/// stable focus order, then `ViewId`.
 fn sort_spatial(candidates: &mut [SpatialCandidate]) {
+    candidates.sort_by(|a, b| {
+        a.distance
+            .cmp(&b.distance)
+            .then_with(|| a.point_distance.cmp(&b.point_distance))
+            .then_with(|| a.order.cmp(&b.order))
+            .then_with(|| a.view.cmp(&b.view))
+    });
+}
+
+/// Ranking for the centered-overlay fallback, unchanged from issue #2444:
+/// nearest center along the movement axis, then nearest perpendicular
+/// center, then stable focus order, then `ViewId`. An overlay is centered
+/// over the tiled layout by construction, so it has no focus point to
+/// compare against.
+fn sort_spatial_by_center(candidates: &mut [SpatialCandidate]) {
     candidates.sort_by(|a, b| {
         a.distance
             .cmp(&b.distance)
@@ -3921,6 +4047,20 @@ fn sort_spatial(candidates: &mut [SpatialCandidate]) {
             .then_with(|| a.order.cmp(&b.order))
             .then_with(|| a.view.cmp(&b.view))
     });
+}
+
+/// Perpendicular span of `rect` for `dir`, in doubled frame-space pixels
+/// (see [`Runtime::spatial_focus_point`]).
+fn perpendicular_span(rect: bitty_render::geometry::RectPx, dir: FocusDirection) -> (i64, i64) {
+    let x0 = 2 * i64::from(rect.x);
+    let y0 = 2 * i64::from(rect.y);
+    let x1 = x0 + 2 * i64::from(rect.width);
+    let y1 = y0 + 2 * i64::from(rect.height);
+    match dir {
+        FocusDirection::Up | FocusDirection::Down => (x0, x1),
+        FocusDirection::Left | FocusDirection::Right => (y0, y1),
+        FocusDirection::Next | FocusDirection::Prev => (0, 0),
+    }
 }
 
 #[cfg(test)]
@@ -4563,50 +4703,80 @@ mod tests {
     }
 
     #[test]
-    fn spatial_candidates_rank_by_edge_then_center_then_order_issue_2444() {
-        // Edge distance dominates a closer perpendicular center.
+    fn spatial_candidates_rank_by_edge_then_point_then_order_issue_2939() {
+        // Edge distance dominates a nearer focus point (issue #2939 keeps
+        // the issue-#2444 edge rule and swaps the perpendicular key).
         let mut candidates = [
             SpatialCandidate {
                 view: ViewId::new(9),
                 order: 0,
                 distance: 10,
+                point_distance: 0,
                 perpendicular_distance: 0,
             },
             SpatialCandidate {
                 view: ViewId::new(3),
                 order: 1,
                 distance: 0,
+                point_distance: 500,
                 perpendicular_distance: 500,
             },
         ];
         sort_spatial(&mut candidates);
         assert_eq!(candidates[0].view, ViewId::new(3));
 
-        // Equal distance: nearest perpendicular center, then stable order.
+        // Equal edge: nearest focus point, then stable order.
         let mut candidates = [
             SpatialCandidate {
                 view: ViewId::new(9),
                 order: 2,
                 distance: 0,
-                perpendicular_distance: 10,
+                point_distance: 10,
+                perpendicular_distance: 0,
             },
             SpatialCandidate {
                 view: ViewId::new(3),
                 order: 1,
                 distance: 0,
-                perpendicular_distance: 10,
+                point_distance: 10,
+                perpendicular_distance: 0,
             },
             SpatialCandidate {
                 view: ViewId::new(5),
                 order: 0,
                 distance: 0,
-                perpendicular_distance: 4,
+                point_distance: 4,
+                perpendicular_distance: 0,
             },
         ];
         sort_spatial(&mut candidates);
         assert_eq!(candidates[0].view, ViewId::new(5));
         assert_eq!(candidates[1].view, ViewId::new(3));
         assert_eq!(candidates[2].view, ViewId::new(9));
+    }
+
+    #[test]
+    fn overlay_ranking_keeps_center_distance_issue_2939() {
+        // The centered-overlay fallback has no focus point: it still ranks
+        // by center distance, then stable order.
+        let mut candidates = [
+            SpatialCandidate {
+                view: ViewId::new(9),
+                order: 1,
+                distance: 4,
+                point_distance: 0,
+                perpendicular_distance: 40,
+            },
+            SpatialCandidate {
+                view: ViewId::new(3),
+                order: 0,
+                distance: 4,
+                point_distance: 0,
+                perpendicular_distance: 10,
+            },
+        ];
+        sort_spatial_by_center(&mut candidates);
+        assert_eq!(candidates[0].view, ViewId::new(3));
     }
 
     /// CTX-0603 (#1165): two whole-tree writes inside one `layout_mut`

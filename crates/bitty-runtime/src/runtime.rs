@@ -1212,6 +1212,15 @@ pub struct Runtime {
     /// transient pass-through never steals focus. Presentation-only: never
     /// grid truth.
     hover_pending: Option<HoverPending>,
+    /// Point at which the focused pane last gained focus (issue #2939).
+    ///
+    /// Physical cursor position in window space, recorded on every focus
+    /// transition so directional focus can use the point the user actually
+    /// entered the pane at when `mouse.focus_follows_mouse` is off (no live
+    /// pointer intent). Containment is validated against the source frame at
+    /// use time, so a stale entry never places the point outside its pane.
+    /// Presentation-only: never grid truth.
+    focus_point: Option<(ViewId, CursorPosition)>,
     /// Renderer-side panel animation tracker (RFC-0002, CTX-0341).
     ///
     /// Presentation-only chrome transitions (open/close/focus/workspace) with
@@ -2214,6 +2223,7 @@ impl Runtime {
             float_resize: None,
             content_geometry_commit_unpresented: false,
             hover_pending: None,
+            focus_point: None,
             animator: PanelAnimator::new(config.animations),
             fx: FxPulseTracker::new(),
             closing_frames: Vec::new(),
@@ -2534,6 +2544,7 @@ impl Runtime {
             float_resize: None,
             content_geometry_commit_unpresented: false,
             hover_pending: None,
+            focus_point: None,
             animator: PanelAnimator::new(config.animations),
             fx: FxPulseTracker::new(),
             closing_frames: Vec::new(),

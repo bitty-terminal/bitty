@@ -205,6 +205,11 @@ pub(crate) struct Args {
     pub(crate) doctor_format: Option<String>,
     /// `--no-color`: disable ANSI coloring in doctor table output.
     pub(crate) doctor_no_color: bool,
+    /// `--fix`: apply only provably safe, reversible repairs (CTX-1721).
+    /// Parsed globally; consumed only by the doctor dispatch.
+    pub(crate) doctor_fix: bool,
+    /// `--dry-run` in doctor mode: print the repair receipts without writing.
+    pub(crate) doctor_dry_run: bool,
     /// Unexpected extra positionals in doctor mode (dispatch errors).
     pub(crate) doctor_args: Vec<String>,
     /// `bitty run -- COMMAND...` explicit child launch (CTX-0170).
@@ -526,6 +531,8 @@ impl Args {
             doctor_word: false,
             doctor_format: None,
             doctor_no_color: false,
+            doctor_fix: false,
+            doctor_dry_run: false,
             doctor_args: Vec::new(),
             run_word: false,
             run_raw: Vec::new(),
@@ -758,8 +765,9 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
 ///   wizard (#243, CTX-0149; guided config surface CTX-0345; profile-backed
 ///   output and presets CTX-1404/CTX-1420); a program literally named `init`
 ///   needs `bitty -- init ...`
-/// - `doctor [--format table|json|jsonl] [--no-color]` → installation and
-///   compatibility diagnosis (CTX-0175, local class, safe mode); a program
+/// - `doctor [--format table|json|jsonl] [--no-color] [--fix [--dry-run]]`
+///   → installation and compatibility diagnosis plus safe, reversible
+///   repairs (CTX-0175, CTX-1721, local class, safe mode); a program
 ///   literally named `doctor` needs `bitty -- doctor ...`
 /// - `list <themes|colors|fonts|plugins|instances|actions|keymaps|services>` → resource enumeration (CTX-0172, CTX-1127, CTX-1467);
 ///   a program literally named `list`/`ls` needs `bitty -- list ...`
@@ -771,6 +779,9 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
 ///   ignored by startup)
 /// - `--no-color` → disable ANSI coloring in doctor/list table output
 ///   (accepted by inspect for parity; its tables are plain text)
+/// - `--fix` / `--dry-run` → doctor repairs (CTX-1721): apply only safe,
+///   reversible fixes; `--dry-run` prints the receipts without writing.
+///   `--dry-run` is also accepted by `config profile` write verbs.
 /// - `--yes` / `--force` / init value flags are init-only (parsed globally,
 ///   consumed by the init dispatch; ignored by normal startup)
 /// - `--` → treat the rest as program argv verbatim
@@ -1113,6 +1124,13 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 out.safe = true;
                 i += 1;
             }
+            "--fix" => {
+                // CTX-1721: `bitty doctor --fix` safe repairs. Parsed globally
+                // (it composes before or after the `doctor` word); consumed
+                // only by the doctor dispatch and refused under `--safe`.
+                out.doctor_fix = true;
+                i += 1;
+            }
             "--fail-loud" => {
                 out.fail_loud = true;
                 i += 1;
@@ -1394,6 +1412,13 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                 // CTX-1693: profile write verbs report the validated
                 // prospective change without mutating the filesystem.
                 out.profile_dry_run = true;
+                i += 1;
+            }
+            "--dry-run" if out.doctor_word => {
+                // CTX-1721: `bitty doctor --fix --dry-run` prints the same
+                // repair receipts without writing. Only valid with `--fix`
+                // (the doctor dispatch fails closed otherwise).
+                out.doctor_dry_run = true;
                 i += 1;
             }
             "--dry-run" if out.config_cmd == Some(ConfigCommand::Migrate) => {
@@ -2188,6 +2213,13 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
             out.unknown_flag = Some(String::from("--json"));
         }
     }
+    // CTX-1721: `--fix` is doctor-only. Outside `doctor` it keeps the
+    // unknown-flag failure (exit 2) instead of being silently ignored by a
+    // normal launch. (`--dry-run` is only recorded in doctor or `config
+    // profile` mode, so it needs no normalization.)
+    if out.doctor_fix && !out.doctor_word && out.unknown_flag.is_none() {
+        out.unknown_flag = Some(String::from("--fix"));
+    }
     out
 }
 
@@ -2268,6 +2300,15 @@ pub(crate) fn help_text() -> String {
                --instance ID   Ctl target instance (global or per-`ctl` flag).\n  \
                  --no-color     Disable ANSI coloring in doctor/list table output\n  \
                                (accepted by inspect for parity; its tables are plain)\n  \
+                 --fix           Doctor only: apply provably safe, reversible\n  \
+                               repairs (stale instance socket, missing bitty\n  \
+                               terminfo entry, profile selector pointing at a\n  \
+                               missing profile); anything else is a hint with\n  \
+                               the exact manual command; refused under --safe\n  \
+                               (exit 7)\n  \
+                 --dry-run       Doctor only (with --fix): print the same\n  \
+                               repair receipts without writing; also accepted\n  \
+                               by `config profile` write verbs\n  \
                --           End of flags; remaining tokens are PROGRAM argv\n\
          \n\
           Subcommands (CLI-first management, DEC-0007):\n  \
@@ -2308,10 +2349,22 @@ pub(crate) fn help_text() -> String {
                               --no-print-shell-init controls the shell-init\n  \
                               handoff line (default prints); --no-plugins\n  \
                               selects none.\n  \
-            doctor [--format SHAPE] [--no-color]  Diagnose installation and\n  \
-                              compatibility (local class, safe mode): binary,\n  \
-                              config, keymaps, fonts, display, GPU, clipboard,\n  \
-                              PTY, terminfo, shell, images, plugins.\n  \
+            doctor [--format SHAPE] [--no-color] [--fix [--dry-run]]\n  \
+                              Diagnose installation and compatibility (local\n  \
+                              class, safe mode): binary, config, keymaps, fonts,\n  \
+                              display, GPU, clipboard, PTY, terminfo, shell,\n  \
+                              images, plugins.\n  \
+                              --fix applies only provably safe, reversible\n  \
+                              repairs: a stale instance socket that no server\n  \
+                              answers, a missing bitty terminfo entry compiled\n  \
+                              into the user terminfo dir ($XDG_DATA_HOME/\n  \
+                              terminfo or ~/.terminfo, never /usr/share), and a\n  \
+                              persisted profile selector reset to `default`\n  \
+                              when its profile is missing (previous selector\n  \
+                              kept as <file>.bak). Moved config keys stay a hint\n  \
+                              for `bitty config migrate`. --dry-run prints the\n  \
+                              receipts without writing; --safe refuses --fix\n  \
+                              (exit 7).\n  \
                               Exit 0 when all pass (warns allowed), 1 on\n  \
                               recoverable failure, else the strongest\n  \
                               category code (3 config, 5 compat, 8 conflict).\n  \
@@ -2440,6 +2493,7 @@ pub(crate) fn help_text() -> String {
             bitty -- /bin/cat -A\n  \
            bitty doctor\n  \
            bitty doctor --format json\n  \
+           bitty doctor --fix --dry-run\n  \
            bitty plugin list\n  \
            bitty plugin install bitty-terminal.shell-integration --yes\n",
         crate::version::version_semver()
@@ -2507,7 +2561,7 @@ pub(crate) fn help_text_short(color: bool) -> String {
             ctl <resource> <verb>   Control a running instance (runtime)\n  \
             config <verb>           Config path|check|show|validate|migrate|edit|profile (alias cfg)\n  \
             init [FLAGS]            Opt-in guided setup wizard (never auto-runs)\n  \
-            doctor                  Diagnose installation and compatibility (local)\n  \
+            doctor [--fix]          Diagnose installation and compatibility (local)\n  \
             list <kind>             Enumerate themes|colors|fonts|plugins|instances|actions|keymaps|services (alias ls)\n  \
             inspect <target> <value> Explain state and ownership (command|key|plugin|config|protocol)\n  \
             dev <verb>              Developer tracing, captures, synthesis, dumps, overlays\n  \

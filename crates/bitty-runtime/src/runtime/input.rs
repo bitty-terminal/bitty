@@ -806,30 +806,36 @@ impl Runtime {
     /// only buffered headless (`false`, session-less non-primary leaf or no
     /// live writer at all).
     fn route_input_bytes(&mut self, bytes: &[u8]) -> bool {
-        let focused = self.focus.focused().or(self.primary_view);
-        match focused {
-            Some(focused) => {
-                if let Some(sess) = self.pane_sessions.get_mut(&focused) {
-                    let (dropped, flush_failed) = write_input_best_effort(&mut sess.writer, bytes);
-                    self.record_input_write_loss(dropped, flush_failed);
-                    return true;
-                }
-                // CTX-0359: only the primary owner leaf may fall back to
-                // the runtime-global writer. A session-less non-owner
-                // (spawn failure, or a recipe-less leaf created before the
-                // primary attached) has no shell of its own; typing there
-                // must never reach another view's shell (previous workspace
-                // primary included), so it buffers headless instead.
-                if Some(focused) != self.primary_view {
-                    self.buffer_input_headless(bytes);
-                    return false;
-                }
-            }
+        match self.focus.focused().or(self.primary_view) {
+            Some(focused) => self.route_input_bytes_to(focused, bytes),
             // No focused view: nothing owns input; never leak to a shell.
             None => {
                 self.buffer_input_headless(bytes);
-                return false;
+                false
             }
+        }
+    }
+
+    /// Routes already-encoded input bytes to one specific leaf's shell.
+    ///
+    /// Issue #2939: pointer-owned reports (motion) must reach the pane the
+    /// pointer is over even when the keyboard belongs to another pane, so the
+    /// router takes an explicit target. The fail-closed rules are identical
+    /// to [`Self::route_input_bytes`]: only the primary owner leaf may fall
+    /// back to the runtime-global writer, and a session-less non-owner leaf
+    /// buffers headless instead of leaking into another view's shell
+    /// (CTX-0359).
+    ///
+    /// Returns whether the bytes reached a live PTY writer.
+    fn route_input_bytes_to(&mut self, view: ViewId, bytes: &[u8]) -> bool {
+        if let Some(sess) = self.pane_sessions.get_mut(&view) {
+            let (dropped, flush_failed) = write_input_best_effort(&mut sess.writer, bytes);
+            self.record_input_write_loss(dropped, flush_failed);
+            return true;
+        }
+        if Some(view) != self.primary_view {
+            self.buffer_input_headless(bytes);
+            return false;
         }
         if let Some(writer) = self.pty_writer.as_mut() {
             let (dropped, flush_failed) = write_input_best_effort(writer, bytes);
@@ -1499,6 +1505,59 @@ impl Runtime {
         self.focused_modes().mouse_tracking.is_some()
     }
 
+    /// Receiver of a pointer-motion report at `pos` (issues #2939, bitty#2938).
+    ///
+    /// A live captured drag owns motion until its release: the press routed
+    /// exclusively to the pane that received it (bitty#2938), so drag motion
+    /// keeps reporting there — with the held button's identity and that
+    /// pane's own grid cells, clamped at its edge — instead of following a
+    /// later pointer move. Hover activation never re-homes focus mid-drag
+    /// (`?1002` reports motion only while a button is held), so the keyboard
+    /// owner is still the pane the press reached.
+    ///
+    /// With no button held, motion describes hover, so it follows the pane
+    /// under the pointer: a capturing pane keeps receiving its own hover
+    /// bytes after a hover or keyboard focus change moved the keyboard
+    /// elsewhere, and a hover that enters a capturing pane reports there
+    /// immediately. When the pointer is over a pane that does not request
+    /// any-event motion (a plain shell, a gap band, or the window padding),
+    /// the focused pane stays the receiver, preserving the clamped
+    /// focus-routed report the tracking app already had.
+    ///
+    /// Shift keeps forcing the selection path (CTX-0181), so it owns no
+    /// motion report.
+    pub(super) fn motion_report_owner(
+        &self,
+        pos: CursorPosition,
+        drag_button: Option<MouseButton>,
+    ) -> Option<ViewId> {
+        if self.shift_pressed {
+            return None;
+        }
+        // bitty#2938: `?1002` (Button) reports motion only while a button is
+        // held, so a live drag latch arms it; `?1003` (Any) always reports;
+        // `1000`/`X10` never report motion at all.
+        if drag_button.is_some() {
+            return self.focused_view().filter(|view| {
+                self.session_state_for(*view).is_some_and(|state| {
+                    matches!(
+                        state.modes().mouse_tracking,
+                        Some(
+                            bitty_vt::MouseTrackingMode::Any | bitty_vt::MouseTrackingMode::Button
+                        )
+                    )
+                })
+            });
+        }
+        if let Some((pointer_view, _)) = self.cursor_to_present_cell(pos) {
+            if self.view_tracks_motion(pointer_view) {
+                return Some(pointer_view);
+            }
+        }
+        self.focused_view()
+            .filter(|view| self.view_tracks_motion(*view))
+    }
+
     /// Handles the pointer entering the window (issue #2787).
     ///
     /// winit pushes `CursorEntered` followed by exactly one `CursorMoved` at
@@ -1627,57 +1686,63 @@ impl Runtime {
         // Issue #2787: the entry re-sync is not motion, so it never moves
         // focus (a window that re-appears under a resting pointer keeps the
         // pane the user left focused).
-        if !entry_sync {
+        //
+        // bitty#2938: a captured app drag owns the pointer gesture until its
+        // release, exactly like the Core drags above — hover must not re-home
+        // focus mid-gesture. Issue #2939 otherwise moves the keyboard out of
+        // the pane the press routed to, and the drag's held-button reports
+        // (and their clamped cells) would follow it.
+        if !entry_sync && self.mouse_drag_button.is_none() {
             self.hover_focus_at_at(pos, now);
         }
-        // Motion reporting for 1003 (Any) or 1002 (Button/drag): encode as
-        // motion when capture active. CTX-0532: motion reads the focused
-        // pane's modes (primary fallback). CTX-0566: any encoding frames the
-        // motion; the legacy encodings collapse a release to button 3 but
-        // keep the motion bit.
+        // Motion reporting for `?1003` (Any) and `?1002` (Button/drag).
         //
-        // bitty#2938: the report must carry the *held* button's identity
-        // while a captured drag is live (`ESC[<32;..M` for the left button).
-        // Sending the "no button" code 3 (`ESC[<35;..M`) makes every drag
-        // look like hover, so a TUI that implements its own text selection
-        // (opencode/opentui classifies button-3 motion as `move`) never
-        // starts a selection. `?1002` reports motion only while a button is
-        // held; `?1003` reports hover as code 3 and drags with the button.
-        let focused_modes = self.focused_modes();
-        let tracking = focused_modes.mouse_tracking;
+        // bitty#2938: while a captured press is live the report must carry the
+        // *held* button's identity (`ESC[<32;..M` for the left button).
+        // Sending the "no button" code 3 (`ESC[<35;..M`) makes every drag look
+        // like hover, so a TUI that implements its own text selection
+        // (opencode/opentui classifies button-3 motion as `move`) never starts
+        // a selection. `?1002` reports motion only while a button is held, so
+        // the drag latch arms that mode; `?1003` reports hover as code 3 and
+        // drags with the held button.
+        //
+        // CTX-0566: any encoding frames the motion; X10 and the other legacy
+        // encodings carry no button identity, only the motion bit.
         let drag_button = self.mouse_drag_button;
-        let motion_reported = match tracking {
-            Some(bitty_vt::MouseTrackingMode::Any) => true,
-            Some(bitty_vt::MouseTrackingMode::Button) => drag_button.is_some(),
-            Some(bitty_vt::MouseTrackingMode::X10 | bitty_vt::MouseTrackingMode::Normal) | None => {
-                false
+        if let Some(owner) = self.motion_report_owner(pos, drag_button) {
+            let format = self.session_state_for(owner).map(|state| {
+                super::mouse_encode::MouseFormat::from_encoding(
+                    state.modes().mouse_coordinate_encoding,
+                )
+            });
+            if let Some(format) = format {
+                // The receiver's own grid cells, clamped at its edge
+                // (CTX-0804), never a sibling pane's cell.
+                let cell = self
+                    .cursor_to_owner_cell(owner, pos)
+                    .unwrap_or_else(|| self.cursor_to_cell(pos));
+                // Held button identity, else the "no button" code (`3`); the
+                // motion flag adds the `+32` motion bit in every encoding.
+                let button = drag_button.map_or(3, mouse_button_code);
+                let report = super::mouse_encode::MouseReport {
+                    button,
+                    modifiers: self.mouse_modifier_bits(),
+                    motion: true,
+                    release: false,
+                    col: cell.col,
+                    row: cell.row,
+                };
+                let bytes = super::mouse_encode::encode_mouse(format, report);
+                // Bounded: drop if PTY queue full, never block.
+                self.route_input_bytes_to(owner, bytes.as_slice());
             }
-        };
-        let capture = !self.shift_pressed && motion_reported;
-        if capture {
-            let format = super::mouse_encode::MouseFormat::from_encoding(
-                focused_modes.mouse_coordinate_encoding,
-            );
-            let cell = self.mouse_report_cell(pos);
-            // Held button identity, else the "no button" code (`3`); the
-            // motion flag adds the `+32` motion bit in every encoding.
-            let button = drag_button.map_or(3, mouse_button_code);
-            let report = super::mouse_encode::MouseReport {
-                button,
-                modifiers: self.mouse_modifier_bits(),
-                motion: true,
-                release: false,
-                col: cell.col,
-                row: cell.row,
-            };
-            let bytes = super::mouse_encode::encode_mouse(format, report);
-            // Bounded: drop if PTY queue full, never block
-            self.push_input_bytes(bytes.as_slice());
         }
         // A register that no longer tracks anything owns no drag: drop a
         // held-button latch whose app reset (or vanished) mid-drag, so a
-        // later app cannot inherit it as a phantom drag (bitty#2938).
-        if tracking.is_none() && self.mouse_drag_button.is_some() {
+        // later app cannot inherit it as a phantom drag (bitty#2938). A live
+        // drag never re-homes focus, so the keyboard owner is still the pane
+        // that received the press (issue #2939).
+        if self.mouse_drag_button.is_some() && !self.should_capture_mouse() {
             self.mouse_drag_button = None;
         }
         // Issues #1759/#1760: refresh both hover states on every motion

@@ -1573,6 +1573,8 @@ extern "bitty init" [
 extern "bitty doctor" [
     --format: string
     --no-color
+    --fix
+    --dry-run
     --help(-h)
     --version(-V)
     --verbose

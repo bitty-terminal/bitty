@@ -316,7 +316,23 @@ impl SwashSingle {
     /// stack: a host with no text font must degrade to headless, not render
     /// every character as an icon.
     pub fn new() -> Result<Self, RenderError> {
-        let db = system_db();
+        Self::over_shared_database(system_db())
+    }
+
+    /// Builds a session over an already-fetched shared database.
+    ///
+    /// Same contract as [`SwashSingle::new`], but for callers that already
+    /// hold the database: doctor's chain probe resolves the primary against
+    /// one database and must report the face that database loads, so handing
+    /// the snapshot in keeps the report and the load from disagreeing.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::FontNotFound`] under the same conditions as
+    /// [`SwashSingle::new`]: no discovered face, or only the embedded symbols
+    /// face (a host with no text font must degrade to headless, not paint
+    /// every cell as an icon).
+    pub(crate) fn over_shared_database(db: Arc<Database>) -> Result<Self, RenderError> {
         let embedded_only = db.len() == 1
             && crate::font_defaults::family_present(&db, crate::embedded::EMBEDDED_SYMBOLS_FAMILY);
         if db.is_empty() || embedded_only {

@@ -404,7 +404,8 @@ pub struct FontChainInput {
     pub resolved: Option<String>,
     /// True when the configured primary itself is installed.
     pub primary_present: bool,
-    /// True when `resolved` differs from `configured`.
+    /// True when the platform preference list substituted another installed
+    /// face for the configured one (labeled "platform default" in the detail).
     pub substituted: bool,
     /// Considered faces in order, with availability.
     pub attempts: Vec<(String, bool)>,

@@ -8,6 +8,24 @@
 //! (Wayland/X11), GPU presence, clipboard backends, PTY availability,
 //! terminfo, shell integration, image protocols, and plugin safe-mode state.
 //!
+//! # Repairs (`--fix`)
+//!
+//! `bitty doctor --fix [--dry-run]` applies only repairs that are provably
+//! safe and reversible (CTX-1721, bitty#2924):
+//!
+//! - remove a stale instance socket that no server answers (owner/mode
+//!   verified first; a socket that connects is never touched);
+//! - install the bundled `bitty` terminfo entry into the user database
+//!   (`$XDG_DATA_HOME/terminfo`, else `~/.terminfo`; never `/usr/share`);
+//! - reset a persisted profile selector that points at a missing profile to
+//!   `default`, keeping a `.bak` backup of the previous selector.
+//!
+//! Everything else is reported as a `hint` with the exact manual command and
+//! is never applied. A key moved by a migration stays a hint for
+//! `bitty config migrate` (bitty#2923) instead of a second migration path.
+//! `--dry-run` emits the same receipts without writing. `--safe` refuses
+//! `--fix` with [`DoctorFixError::SafeMode`] (exit `7`, the permission class).
+//!
 //! # Output and exit codes
 //!
 //! `--format table` (default) is human output and not a machine contract.
@@ -30,7 +48,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------
@@ -730,6 +748,13 @@ pub struct DoctorReport {
     pub version: String,
     /// Ordered check rows.
     pub checks: Vec<DoctorCheck>,
+    /// Repair receipts from `--fix` (empty outside fix mode).
+    pub fixes: Vec<FixReceipt>,
+    /// Typed `--fix` refusal (`--safe`), which owns the exit code.
+    pub fix_error: Option<DoctorFixError>,
+    /// True when `--fix` was requested (the table always prints the repair
+    /// section, including "nothing to do").
+    pub fix_requested: bool,
 }
 
 impl DoctorReport {
@@ -751,23 +776,38 @@ impl DoctorReport {
         out
     }
 
-    /// Process exit code: `0` when nothing fails, else the strongest failing
-    /// category code (`1` for generic failures).
+    /// Process exit code: a `--fix` refusal owns the code, else `0` when
+    /// nothing fails, else the strongest failing category code (`1` for
+    /// generic failures, including a failed repair).
+    ///
+    /// A repair that succeeded does not rewrite the diagnostic row it
+    /// addresses: this run still reports what it found, and the next run is
+    /// clean.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
+        if let Some(error) = self.fix_error {
+            return error.code();
+        }
         let mut worst = EXIT_OK;
         for check in &self.checks {
             if check.status == DoctorStatus::Fail && check.code > worst {
                 worst = check.code;
             }
         }
+        for receipt in &self.fixes {
+            let code = receipt.exit_code();
+            if code > worst {
+                worst = code;
+            }
+        }
         worst
     }
 
-    /// Machine `ok` flag: true only when nothing fails.
+    /// Machine `ok` flag: true only when nothing fails and `--fix` was not
+    /// refused.
     #[must_use]
     pub fn ok(&self) -> bool {
-        self.exit_code() == EXIT_OK
+        self.fix_error.is_none() && self.exit_code() == EXIT_OK
     }
 
     /// Worst failing check for the JSON error object (`None` when ok).
@@ -818,7 +858,837 @@ pub fn assemble_report(inputs: &DoctorInputs) -> DoctorReport {
             check_image_protocols(),
             check_plugins_safe_mode(),
         ],
+        fixes: Vec::new(),
+        fix_error: None,
+        fix_requested: false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Repairs (`--fix`, CTX-1721 / bitty#2924)
+// ---------------------------------------------------------------------------
+
+/// Bundled terminfo source compiled by the terminfo repair.
+///
+/// Compile-time inclusion keeps the repair available in packaged builds that
+/// ship only the compiled entry, and guarantees the bytes match this revision
+/// (the same file `scripts/check-terminfo.sh` audits).
+pub const BUNDLED_TERMINFO_SOURCE: &str = include_str!("../../../terminfo/bitty.ti");
+
+/// Repair outcome, carried by [`FixReceipt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixOutcome {
+    /// The repair wrote its change.
+    Applied,
+    /// `--dry-run`: the receipt describes the change without writing.
+    WouldApply,
+    /// Not provably safe: `hint` carries the exact manual command.
+    Hint,
+    /// The repair was attempted and failed; `code` carries the exit class.
+    Failed,
+}
+
+impl FixOutcome {
+    /// Machine token used in table and JSON output.
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::WouldApply => "would-apply",
+            Self::Hint => "hint",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// One typed repair receipt: what changed, from/to, and the undo.
+///
+/// `changed` names the target (socket/config path); `from`/`to` describe the
+/// value transition; `undo` is the exact reversal. Hints carry the manual
+/// command in `hint` and leave `changed`/`from`/`to`/`undo` empty because
+/// nothing was touched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FixReceipt {
+    /// Stable repair id (`instance-socket`, `terminfo`, `profile-selector`,
+    /// `config-key`).
+    pub id: &'static str,
+    /// Applied / would-apply / hint / failed.
+    pub outcome: FixOutcome,
+    /// Target that changed (path), empty for hints.
+    pub changed: String,
+    /// Previous value/state.
+    pub from: String,
+    /// New value/state.
+    pub to: String,
+    /// Exact reversal of the change.
+    pub undo: String,
+    /// Manual command when the repair is a hint.
+    pub hint: String,
+    /// Evidence detail (verified owner/mode, compile output, error text).
+    pub detail: String,
+    /// Exit class for a failed repair (`0` otherwise).
+    pub code: i32,
+}
+
+impl FixReceipt {
+    fn applied(
+        id: &'static str,
+        changed: String,
+        from: String,
+        to: String,
+        undo: String,
+        detail: String,
+    ) -> Self {
+        Self {
+            id,
+            outcome: FixOutcome::Applied,
+            changed,
+            from,
+            to,
+            undo,
+            hint: String::new(),
+            detail,
+            code: 0,
+        }
+    }
+
+    fn would_apply(
+        id: &'static str,
+        changed: String,
+        from: String,
+        to: String,
+        undo: String,
+        detail: String,
+    ) -> Self {
+        Self {
+            outcome: FixOutcome::WouldApply,
+            ..Self::applied(id, changed, from, to, undo, detail)
+        }
+    }
+
+    fn hint(id: &'static str, hint: String, detail: String) -> Self {
+        Self {
+            id,
+            outcome: FixOutcome::Hint,
+            changed: String::new(),
+            from: String::new(),
+            to: String::new(),
+            undo: String::new(),
+            hint,
+            detail,
+            code: 0,
+        }
+    }
+
+    fn failed(id: &'static str, code: i32, changed: String, detail: String) -> Self {
+        Self {
+            id,
+            outcome: FixOutcome::Failed,
+            changed,
+            from: String::new(),
+            to: String::new(),
+            undo: String::new(),
+            hint: String::new(),
+            detail,
+            code,
+        }
+    }
+
+    /// Exit code contributed by this receipt (`0` unless failed).
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        if self.outcome == FixOutcome::Failed {
+            self.code
+        } else {
+            EXIT_OK
+        }
+    }
+}
+
+/// Typed `--fix` refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoctorFixError {
+    /// `--fix` under `--safe`: safe mode never writes.
+    SafeMode,
+}
+
+impl DoctorFixError {
+    /// Exit code: the permission class (`7`), because `--safe` denies writes.
+    #[must_use]
+    pub fn code(self) -> i32 {
+        EXIT_PERM
+    }
+
+    /// Envelope error class for the machine output.
+    #[must_use]
+    pub fn class(self) -> &'static str {
+        "Denied"
+    }
+
+    /// Stable machine error code.
+    #[must_use]
+    pub fn token(self) -> &'static str {
+        "safe-mode-refused"
+    }
+
+    /// User-facing message.
+    #[must_use]
+    pub fn message(self) -> &'static str {
+        "bitty doctor: --fix is refused in --safe mode (safe mode never writes)"
+    }
+}
+
+/// Filesystem roots the repairs are allowed to touch.
+///
+/// Injected so tests never read the real environment. Production builds use
+/// [`RepairEnv::from_process`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RepairEnv {
+    /// `XDG_RUNTIME_DIR` (instance sockets live under `<base>/bitty`).
+    pub runtime_dir: Option<PathBuf>,
+    /// Explicit `XDG_DATA_HOME` (terminfo fallback: `<base>/terminfo`).
+    pub data_home: Option<PathBuf>,
+    /// `HOME` (terminfo fallback: `<home>/.terminfo`).
+    pub home: Option<PathBuf>,
+    /// Effective uid used for endpoint verification.
+    pub uid: u32,
+}
+
+impl RepairEnv {
+    /// Live environment snapshot (never fails; missing values stay `None`).
+    #[must_use]
+    pub fn from_process() -> Self {
+        let non_empty = |key: &str| {
+            std::env::var_os(key)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        };
+        Self {
+            runtime_dir: non_empty("XDG_RUNTIME_DIR"),
+            data_home: non_empty("XDG_DATA_HOME"),
+            home: non_empty("HOME"),
+            uid: bitty_ipc::current_unix_uid().unwrap_or(0),
+        }
+    }
+
+    /// Instance socket directory: `<XDG_RUNTIME_DIR or /run/user/<uid>>/bitty`.
+    #[cfg(unix)]
+    fn socket_leaf_dir(&self) -> Option<PathBuf> {
+        let base = self
+            .runtime_dir
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", self.uid)));
+        Some(base.join(bitty_ipc::devtools::SOCKET_LEAF_DIR))
+    }
+
+    /// No Unix sockets (or Windows pipes) are repaired here.
+    #[cfg(not(unix))]
+    fn socket_leaf_dir(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// User terminfo database: explicit `XDG_DATA_HOME` wins (the mandated
+    /// XDG location), else the ncurses default `~/.terminfo`. Never
+    /// `/usr/share/terminfo`.
+    #[must_use]
+    pub fn terminfo_dir(&self) -> Option<PathBuf> {
+        match (&self.data_home, &self.home) {
+            (Some(data_home), _) => Some(data_home.join("terminfo")),
+            (None, Some(home)) => Some(home.join(".terminfo")),
+            (None, None) => None,
+        }
+    }
+}
+
+/// Quarantine-then-verify removal of a dead socket (CTX-0792 discipline).
+///
+/// The path is renamed to a hidden sibling first, so the object that is
+/// inspected and removed is exactly the object that was probed: a server that
+/// binds a replacement at the original name after the probe is never unlinked.
+/// The quarantined object must still match the captured endpoint identity
+/// (device, inode, owner, `0600`, no symlink); any change restores it (only
+/// when the original name is free) and refuses the repair.
+#[cfg(unix)]
+fn remove_dead_socket(
+    path: &Path,
+    identity: bitty_ipc::devtools::SocketEndpointIdentity,
+    uid: u32,
+) -> Result<(), (i32, String)> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err((
+            EXIT_GENERIC,
+            "socket path has no usable file name".to_string(),
+        ));
+    };
+    let mut quarantine = path.to_path_buf();
+    let mut placed = false;
+    for _ in 0..8 {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        quarantine = path.with_file_name(format!(
+            ".{name}.doctor-quarantine-{}-{seq}",
+            std::process::id()
+        ));
+        if quarantine.symlink_metadata().is_err() {
+            placed = true;
+            break;
+        }
+    }
+    if !placed {
+        return Err((
+            EXIT_GENERIC,
+            "cannot allocate a quarantine name for the stale socket".to_string(),
+        ));
+    }
+    std::fs::rename(path, &quarantine).map_err(|err| {
+        (
+            io_exit_code(&err, EXIT_GENERIC),
+            format!("cannot quarantine stale socket: {err}"),
+        )
+    })?;
+    let matches = quarantine.symlink_metadata().is_ok_and(|meta| {
+        !meta.file_type().is_symlink()
+            && meta.dev() == identity.dev
+            && meta.ino() == identity.ino
+            && meta.uid() == uid
+            && meta.mode() & 0o777 == 0o600
+    });
+    if !matches {
+        // Never clobber a replacement bound at the original name.
+        if !path.exists() {
+            let _ = std::fs::rename(&quarantine, path);
+        }
+        return Err((
+            EXIT_GENERIC,
+            format!(
+                "quarantined socket identity changed; left at {} for manual inspection",
+                quarantine.display()
+            ),
+        ));
+    }
+    std::fs::remove_file(&quarantine).map_err(|err| {
+        if !path.exists() {
+            let _ = std::fs::rename(&quarantine, path);
+        }
+        (
+            io_exit_code(&err, EXIT_GENERIC),
+            format!("cannot remove quarantined stale socket: {err}"),
+        )
+    })
+}
+
+/// Removes every stale instance socket under `dir`.
+///
+/// A candidate is removed only when all of these hold:
+///
+/// - it is a `.sock` entry whose endpoint verifies (parent `0700`, socket
+///   `0600`, both owned by `uid`, no symlink) — a foreign endpoint is a hint,
+///   never touched;
+/// - `connect` fails with `ConnectionRefused`, proving no server accepts on
+///   that inode (there is no pid file to consult);
+/// - the endpoint identity (device + inode) is unchanged immediately before
+///   `remove_file`, so a rebind between check and removal aborts the repair.
+///
+/// A socket that connects is live and is never touched.
+#[cfg(unix)]
+#[must_use]
+pub fn fix_stale_instance_sockets(dir: &Path, uid: u32, dry_run: bool) -> Vec<FixReceipt> {
+    use std::os::unix::net::UnixStream;
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut receipts = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("sock") {
+            continue;
+        }
+        let Some(path_str) = path.to_str() else {
+            continue;
+        };
+        let Some(instance) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        let identity = match bitty_ipc::devtools::verify_socket_endpoint_for_connect(path_str, uid)
+        {
+            Ok(identity) => identity,
+            Err(err) => {
+                let hint = format!(
+                    "inspect {path_str} manually: run `bitty ctl instance list` and remove it only if no instance owns it"
+                );
+                receipts.push(FixReceipt::hint(
+                    "instance-socket",
+                    hint,
+                    format!("endpoint not provably safe ({err})"),
+                ));
+                continue;
+            }
+        };
+        match UnixStream::connect(&path) {
+            // A socket that answers is live: never touch it.
+            Ok(_) => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Err(err) => {
+                receipts.push(FixReceipt::hint(
+                    "instance-socket",
+                    format!(
+                        "inspect {path_str} manually: connect failed with {err} (not provably stale)"
+                    ),
+                    format!("cannot prove no server answers ({err})"),
+                ));
+                continue;
+            }
+        }
+        let unchanged = bitty_ipc::devtools::verify_socket_endpoint_for_connect(path_str, uid)
+            .is_ok_and(|current| current == identity);
+        if !unchanged {
+            receipts.push(FixReceipt::hint(
+                "instance-socket",
+                format!("re-run `bitty doctor --fix`: {path_str} changed while it was checked"),
+                "socket endpoint identity changed between check and removal".to_string(),
+            ));
+            continue;
+        }
+        let changed = path.display().to_string();
+        let from = "stale socket (connect refused; no server answering)".to_string();
+        let to = "removed".to_string();
+        let undo = format!("start bitty with --instance {instance} to recreate the socket");
+        let detail = format!("endpoint verified (owner uid {uid}, mode 0600); no live server");
+        if dry_run {
+            receipts.push(FixReceipt::would_apply(
+                "instance-socket",
+                changed,
+                from,
+                to,
+                undo,
+                detail,
+            ));
+            continue;
+        }
+        match remove_dead_socket(&path, identity, uid) {
+            Ok(()) => receipts.push(FixReceipt::applied(
+                "instance-socket",
+                changed,
+                from,
+                to,
+                undo,
+                detail,
+            )),
+            Err((code, message)) => receipts.push(FixReceipt::failed(
+                "instance-socket",
+                code,
+                changed,
+                message,
+            )),
+        }
+    }
+    receipts
+}
+
+/// Windows/non-Unix: no filesystem sockets are repaired.
+#[cfg(not(unix))]
+#[must_use]
+pub fn fix_stale_instance_sockets(_dir: &Path, _uid: u32, _dry_run: bool) -> Vec<FixReceipt> {
+    Vec::new()
+}
+
+/// Candidate paths `tic` may use for one entry (flat, first-letter, hex).
+fn terminfo_entry_candidates(dir: &Path, term: &str) -> Vec<PathBuf> {
+    let mut out = vec![dir.join(term)];
+    if let Some(first) = term.chars().next() {
+        out.push(dir.join(first.to_string()).join(term));
+        out.push(dir.join(format!("{:x}", u32::from(first))).join(term));
+    }
+    out
+}
+
+/// Whether `term` is already installed in the user terminfo database `dir`.
+#[must_use]
+pub fn terminfo_entry_installed(dir: &Path, term: &str) -> bool {
+    terminfo_entry_candidates(dir, term)
+        .iter()
+        .any(|path| path.is_file())
+}
+
+/// First installed path for `term` in `dir` (evidence for receipts).
+fn installed_terminfo_path(dir: &Path, term: &str) -> Option<PathBuf> {
+    terminfo_entry_candidates(dir, term)
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+/// Maps a filesystem failure to its exit class: permission is `7`, anything
+/// else uses the caller's repair class.
+fn io_exit_code(err: &std::io::Error, fallback: i32) -> i32 {
+    if err.kind() == std::io::ErrorKind::PermissionDenied {
+        EXIT_PERM
+    } else {
+        fallback
+    }
+}
+
+/// Compiles [`BUNDLED_TERMINFO_SOURCE`] into `dir` with `tic`.
+///
+/// The source is staged as a hidden temp file inside `dir` (the only place
+/// this repair may write) and removed afterwards. `tic` runs through
+/// [`run_bounded`] (no shell, no pipes, kill by PID on timeout). Failures
+/// carry their exit class (`7` permission, `5` compatibility).
+fn install_bundled_terminfo(dir: &Path) -> Result<PathBuf, (i32, String)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    std::fs::create_dir_all(dir).map_err(|err| {
+        (
+            io_exit_code(&err, EXIT_COMPAT),
+            format!("cannot create terminfo directory {}: {err}", dir.display()),
+        )
+    })?;
+    let staged = dir.join(format!(
+        ".bitty-doctor-terminfo-{}-{}.ti",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        std::fs::write(&staged, BUNDLED_TERMINFO_SOURCE).map_err(|err| {
+            (
+                io_exit_code(&err, EXIT_COMPAT),
+                format!("cannot stage terminfo source: {err}"),
+            )
+        })?;
+        let dir_str = dir.to_str().ok_or_else(|| {
+            (
+                EXIT_COMPAT,
+                "terminfo directory is not valid UTF-8".to_string(),
+            )
+        })?;
+        let staged_str = staged.to_str().ok_or_else(|| {
+            (
+                EXIT_COMPAT,
+                "staged terminfo source is not valid UTF-8".to_string(),
+            )
+        })?;
+        let Some(output) = run_bounded("tic", &["-x", "-o", dir_str, staged_str], 10) else {
+            return Err((
+                EXIT_COMPAT,
+                "`tic` is unavailable or timed out; install ncurses".to_string(),
+            ));
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err((
+                EXIT_COMPAT,
+                format!("`tic` failed: {}", truncate(stderr.trim(), 200)),
+            ));
+        }
+        installed_terminfo_path(dir, "bitty").ok_or_else(|| {
+            (
+                EXIT_COMPAT,
+                "`tic` reported success but wrote no entry".to_string(),
+            )
+        })
+    })();
+    let _ = std::fs::remove_file(&staged);
+    result
+}
+
+/// Installs the bundled `bitty` terminfo entry when `TERM` has no entry.
+///
+/// Returns `None` when the entry is already installed (idempotent) or when
+/// nothing can be repaired without guessing. A non-`bitty` `TERM` is a hint:
+/// the bundled source only defines `bitty`, so installing it would not make
+/// that `TERM` resolve.
+#[must_use]
+pub fn fix_missing_terminfo(
+    term: Option<&str>,
+    data_home: Option<&Path>,
+    home: Option<&Path>,
+    dry_run: bool,
+) -> Option<FixReceipt> {
+    let term = term.map(str::trim).filter(|value| !value.is_empty())?;
+    let dir = match (data_home, home) {
+        (Some(data_home), _) => data_home.join("terminfo"),
+        (None, Some(home)) => home.join(".terminfo"),
+        (None, None) => {
+            return Some(FixReceipt::hint(
+                "terminfo",
+                "set XDG_DATA_HOME or HOME, then re-run `bitty doctor --fix`".to_string(),
+                "no user terminfo root is available".to_string(),
+            ));
+        }
+    };
+    if terminfo_entry_installed(&dir, term) {
+        return None;
+    }
+    if term != "bitty" {
+        return Some(FixReceipt::hint(
+            "terminfo",
+            format!(
+                "install the `{term}` entry for your terminal, or export TERM=bitty inside bitty"
+            ),
+            format!(
+                "the bundled source only defines `bitty`; installing it would not make TERM={term} resolve"
+            ),
+        ));
+    }
+    let target = dir.join("b").join("bitty");
+    if find_on_path("tic").is_none() {
+        return Some(FixReceipt::hint(
+            "terminfo",
+            format!(
+                "install ncurses (tic), then run `tic -x -o {} terminfo/bitty.ti`",
+                dir.display()
+            ),
+            "`tic` not found on PATH".to_string(),
+        ));
+    }
+    if dry_run {
+        return Some(FixReceipt::would_apply(
+            "terminfo",
+            target.display().to_string(),
+            "no `bitty` terminfo entry".to_string(),
+            format!("compiled into {}", dir.display()),
+            format!("rm -f '{}'", target.display()),
+            "bundled terminfo/bitty.ti compiles with `tic -x`".to_string(),
+        ));
+    }
+    match install_bundled_terminfo(&dir) {
+        Ok(installed) => Some(FixReceipt::applied(
+            "terminfo",
+            installed.display().to_string(),
+            "no `bitty` terminfo entry".to_string(),
+            format!("compiled into {}", dir.display()),
+            format!("rm -f '{}'", installed.display()),
+            terminfo_install_detail(&dir),
+        )),
+        Err((code, detail)) => Some(FixReceipt::failed(
+            "terminfo",
+            code,
+            target.display().to_string(),
+            detail,
+        )),
+    }
+}
+
+/// Explains where the entry landed and how to make ncurses search it.
+fn terminfo_install_detail(dir: &Path) -> String {
+    let default_search = dir.file_name().is_some_and(|name| name == ".terminfo");
+    if default_search {
+        format!(
+            "installed into {} (searched by ncurses by default)",
+            dir.display()
+        )
+    } else {
+        format!(
+            "installed into {}; add TERMINFO_DIRS={} to search the XDG location",
+            dir.display(),
+            dir.display()
+        )
+    }
+}
+
+/// Resets a persisted profile selector that points at a missing profile.
+///
+/// The rewrite goes through [`crate::init::write_init_config`], which backs
+/// the previous selector up to a collision-free `<file>.bak[.N]` before
+/// replacing it, so the receipt's undo is a byte-exact restore. `default` is
+/// only written when `profiles/default.lua` exists; otherwise the repair
+/// cannot produce a loadable selector and stays a hint.
+#[must_use]
+pub fn fix_profile_selector(
+    selector: &Path,
+    profiles_dir: &Path,
+    dry_run: bool,
+) -> Option<FixReceipt> {
+    let meta = std::fs::symlink_metadata(selector).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return None;
+    }
+    if meta.len() > bitty_config::file::MAX_CONFIG_FILE_BYTES as u64 {
+        return Some(FixReceipt::hint(
+            "profile-selector",
+            format!(
+                "inspect {} manually: it exceeds the {} byte config bound",
+                selector.display(),
+                bitty_config::file::MAX_CONFIG_FILE_BYTES
+            ),
+            "selector is too large to parse safely".to_string(),
+        ));
+    }
+    let content = std::fs::read_to_string(selector).ok()?;
+    let source = bitty_config::plan::ConfigSource::new(
+        bitty_config::plan::LayerKind::User,
+        Some(selector.display().to_string()),
+    );
+    // A legacy file (no selector) is not this repair's target; the config
+    // check owns that message. A parse error likewise stays a diagnostic.
+    let plan = bitty_config::file::parse_lua_config(&content, &source).ok()?;
+    let selected = plan.selector?.profile;
+    let selected_path = profiles_dir.join(format!("{selected}.lua"));
+    if selected_path.is_file() {
+        return None;
+    }
+    if selected == "default" {
+        return Some(FixReceipt::hint(
+            "profile-selector",
+            format!(
+                "run `bitty init` to create {}, or `bitty config profile use NAME` to select an existing profile",
+                selected_path.display()
+            ),
+            "the selector already names `default`, but that profile is missing".to_string(),
+        ));
+    }
+    let default_path = profiles_dir.join("default.lua");
+    if !default_path.is_file() {
+        return Some(FixReceipt::hint(
+            "profile-selector",
+            format!(
+                "run `bitty init` to create {}, then `bitty config profile use default`",
+                default_path.display()
+            ),
+            format!("selected profile `{selected}` is missing and no default profile exists"),
+        ));
+    }
+    let Some(rewritten) = crate::profile::rewrite_selector_profile(&content, "default") else {
+        return Some(FixReceipt::hint(
+            "profile-selector",
+            format!(
+                "edit {} and set exactly one top-level `profile = \"default\"`",
+                selector.display()
+            ),
+            "no single top-level `profile = \"...\"` assignment to rewrite".to_string(),
+        ));
+    };
+    let changed = selector.display().to_string();
+    let from = format!(
+        "profile = \"{selected}\" (missing: {})",
+        selected_path.display()
+    );
+    let to = "profile = \"default\"".to_string();
+    if dry_run {
+        return Some(FixReceipt::would_apply(
+            "profile-selector",
+            changed,
+            from,
+            to,
+            format!("keep the current bytes of {}", selector.display()),
+            "profiles/default.lua exists; selector parses and the rewrite validates".to_string(),
+        ));
+    }
+    // Preflight write access so a permission failure maps to the permission
+    // class without mutating content (append open writes nothing).
+    if let Err(err) = std::fs::OpenOptions::new().append(true).open(selector) {
+        let code = if err.kind() == std::io::ErrorKind::PermissionDenied {
+            EXIT_PERM
+        } else {
+            EXIT_CONFIG
+        };
+        return Some(FixReceipt::failed(
+            "profile-selector",
+            code,
+            changed,
+            format!("cannot write selector: {err}"),
+        ));
+    }
+    match crate::init::write_init_config(selector, &rewritten, true) {
+        Ok(outcome) => {
+            let undo = match outcome.backup {
+                Some(backup) => format!(
+                    "restore the previous selector: cp '{}' '{}'",
+                    backup.display(),
+                    selector.display()
+                ),
+                None => format!(
+                    "restore the previous selector bytes of {}",
+                    selector.display()
+                ),
+            };
+            Some(FixReceipt::applied(
+                "profile-selector",
+                changed,
+                from,
+                to,
+                undo,
+                "selector rewritten; comments and overrides preserved".to_string(),
+            ))
+        }
+        Err(crate::init::InitWriteError::Refused(message)) => Some(FixReceipt::failed(
+            "profile-selector",
+            EXIT_CONFIG,
+            changed,
+            format!("selector rewrite refused: {message}"),
+        )),
+        Err(crate::init::InitWriteError::Io(message)) => Some(FixReceipt::failed(
+            "profile-selector",
+            EXIT_CONFIG,
+            changed,
+            format!("selector rewrite failed: {message}"),
+        )),
+    }
+}
+
+/// A key moved by a migration stays a hint until `bitty config migrate`
+/// (bitty#2923) exists; doctor never grows a second migration path.
+#[must_use]
+pub fn hint_moved_config_key(config_error: &str) -> Option<FixReceipt> {
+    let lowered = config_error.to_ascii_lowercase();
+    if !lowered.contains("undeclared field") && !lowered.contains("migrat") {
+        return None;
+    }
+    Some(FixReceipt::hint(
+        "config-key",
+        "run `bitty config migrate` to move legacy keys to their current names".to_string(),
+        truncate(config_error, 300),
+    ))
+}
+
+/// Computes the repair receipts for one `--fix` run.
+///
+/// Pure over injected roots and observed diagnostics: every repair is a
+/// named function with its own receipt, and anything not provably safe
+/// becomes a hint. `dry_run` never writes.
+#[must_use]
+pub fn plan_repairs(
+    config_path: Option<&Path>,
+    config_error: Option<&str>,
+    term: Option<&str>,
+    terminfo_missing: bool,
+    env: &RepairEnv,
+    dry_run: bool,
+) -> Vec<FixReceipt> {
+    let mut receipts = Vec::new();
+    if let Some(dir) = env.socket_leaf_dir() {
+        receipts.extend(fix_stale_instance_sockets(&dir, env.uid, dry_run));
+    }
+    if terminfo_missing {
+        if let Some(receipt) =
+            fix_missing_terminfo(term, env.data_home.as_deref(), env.home.as_deref(), dry_run)
+        {
+            receipts.push(receipt);
+        }
+    }
+    if let Some(path) = config_path {
+        if let Some(parent) = path.parent() {
+            let profiles_dir = parent.join(bitty_config::file::PROFILES_DIR_NAME);
+            if let Some(receipt) = fix_profile_selector(path, &profiles_dir, dry_run) {
+                receipts.push(receipt);
+            }
+        }
+    }
+    if let Some(error) = config_error {
+        if let Some(receipt) = hint_moved_config_key(error) {
+            receipts.push(receipt);
+        }
+    }
+    receipts
 }
 
 // ---------------------------------------------------------------------------
@@ -864,10 +1734,35 @@ impl DoctorFormat {
     }
 }
 
-/// Short usage for `bitty doctor` (stderr, fail-closed exit 2).
+/// Usage and flag list for `bitty doctor` (stderr on misuse; stdout for
+/// `bitty doctor --help`).
 #[must_use]
 pub fn doctor_usage() -> String {
-    "usage: bitty doctor [--format table|json|jsonl] [--no-color] [--config PATH] [--profile NAME]"
+    "usage: bitty doctor [--format table|json|jsonl] [--no-color] [--config PATH] [--profile NAME] [--fix [--dry-run]]\n\
+     \n\
+     \x20 --format SHAPE  table|json|jsonl (default table; JSON carries the same\n\
+     \x20                 checks and repair receipts)\n\
+     \x20 --no-color      disable ANSI coloring in table output\n\
+     \x20 --config PATH   explicit user config file (init.lua)\n\
+     \x20 --profile NAME  named profile layered under the user file\n\
+     \x20 --fix           apply only provably safe, reversible repairs; anything\n\
+     \x20                 else is reported as a hint with the exact manual command\n\
+     \x20 --dry-run       with --fix: print the same receipts without writing\n\
+     \x20 --safe          refuses --fix with exit 7 (safe mode never writes)\n\
+     \n\
+     Repairs applied by --fix (each has an undo in its receipt):\n\
+     \x20 stale instance socket  remove <XDG_RUNTIME_DIR>/bitty/<id>.sock when the\n\
+     \x20                        endpoint verifies and no server answers; a socket\n\
+     \x20                        that connects is never touched\n\
+     \x20 missing terminfo       compile terminfo/bitty.ti into the user terminfo\n\
+     \x20                        dir ($XDG_DATA_HOME/terminfo, else ~/.terminfo;\n\
+     \x20                        never /usr/share)\n\
+     \x20 broken profile         reset the persisted selector to `default` when the\n\
+     \x20 selector               selected profile is missing; the previous selector\n\
+     \x20                        is kept as <file>.bak\n\
+     \n\
+     Hints, never applied: a config key moved by a migration (run\n\
+     `bitty config migrate`), unverifiable sockets, and non-bitty TERM entries."
         .to_string()
 }
 
@@ -916,18 +1811,57 @@ pub fn format_json(report: &DoctorReport) -> String {
         "{{\"v\":1,\"command\":\"doctor\",\"ok\":{}",
         report.ok()
     );
-    if let Some(worst) = report.worst_failure() {
+    if let Some(error) = report.fix_error {
         let _ = write!(
             out,
             ",\"error\":{{\"class\":\"{}\",\"code\":\"{}\",\"message\":\"{}\"}}",
-            error_class_for(worst.code),
-            json_escape(worst.id),
-            json_escape(if worst.hint.is_empty() {
-                &worst.detail
-            } else {
-                &worst.hint
-            }),
+            error.class(),
+            error.token(),
+            json_escape(error.message()),
         );
+    } else {
+        // A failed repair competes with the worst failing check for the error
+        // object: the strongest class wins, matching `exit_code`.
+        let mut error_object = report.worst_failure().map(|worst| {
+            (
+                worst.code,
+                error_class_for(worst.code),
+                worst.id,
+                if worst.hint.is_empty() {
+                    worst.detail.clone()
+                } else {
+                    worst.hint.clone()
+                },
+            )
+        });
+        if let Some(repair) = report
+            .fixes
+            .iter()
+            .filter(|receipt| receipt.outcome == FixOutcome::Failed)
+            .max_by_key(|receipt| receipt.exit_code())
+        {
+            let code = repair.exit_code();
+            if error_object
+                .as_ref()
+                .is_none_or(|(current, ..)| code > *current)
+            {
+                error_object = Some((
+                    code,
+                    error_class_for(code),
+                    repair.id,
+                    repair.detail.clone(),
+                ));
+            }
+        }
+        if let Some((_, class, code, message)) = error_object {
+            let _ = write!(
+                out,
+                ",\"error\":{{\"class\":\"{}\",\"code\":\"{}\",\"message\":\"{}\"}}",
+                class,
+                json_escape(code),
+                json_escape(&message),
+            );
+        }
     }
     let _ = write!(
         out,
@@ -954,6 +1888,25 @@ pub fn format_json(report: &DoctorReport) -> String {
             json_escape(check.label),
             json_escape(&check.hint),
             json_escape(&check.detail),
+        );
+    }
+    out.push_str("],\"fixes\":[");
+    for (i, receipt) in report.fixes.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let _ = write!(
+            out,
+            "{{\"id\":\"{}\",\"outcome\":\"{}\",\"code\":{},\"changed\":\"{}\",\"from\":\"{}\",\"to\":\"{}\",\"undo\":\"{}\",\"hint\":\"{}\",\"detail\":\"{}\"}}",
+            json_escape(receipt.id),
+            receipt.outcome.token(),
+            receipt.exit_code(),
+            json_escape(&receipt.changed),
+            json_escape(&receipt.from),
+            json_escape(&receipt.to),
+            json_escape(&receipt.undo),
+            json_escape(&receipt.hint),
+            json_escape(&receipt.detail),
         );
     }
     out.push_str("]}}");
@@ -994,6 +1947,52 @@ fn table_row(check: &DoctorCheck, no_color: bool) -> String {
     }
 }
 
+/// Renders one repair receipt for table output.
+fn fix_table_row(receipt: &FixReceipt, no_color: bool) -> String {
+    const GREEN: &str = "\u{1b}[32m";
+    const CYAN: &str = "\u{1b}[36m";
+    const YELLOW: &str = "\u{1b}[33m";
+    const RED: &str = "\u{1b}[31m";
+    const RESET: &str = "\u{1b}[0m";
+    let token = match receipt.outcome {
+        FixOutcome::Applied => "APPLIED",
+        FixOutcome::WouldApply => "DRY-RUN",
+        FixOutcome::Hint => "HINT",
+        FixOutcome::Failed => "FAILED",
+    };
+    let colored = if no_color {
+        token.to_string()
+    } else {
+        let color = match receipt.outcome {
+            FixOutcome::Applied => GREEN,
+            FixOutcome::WouldApply => CYAN,
+            FixOutcome::Hint => YELLOW,
+            FixOutcome::Failed => RED,
+        };
+        format!("{color}{token}{RESET}")
+    };
+    let mut out = if receipt.outcome == FixOutcome::Hint {
+        format!("[{}] {:<16} {}", colored, receipt.id, receipt.hint)
+    } else if receipt.changed.is_empty() {
+        format!("[{}] {:<16} {}", colored, receipt.id, receipt.detail)
+    } else {
+        format!("[{}] {:<16} {}", colored, receipt.id, receipt.changed)
+    };
+    if !receipt.from.is_empty() {
+        out.push_str(&format!("\n             from: {}", receipt.from));
+    }
+    if !receipt.to.is_empty() {
+        out.push_str(&format!("\n             to: {}", receipt.to));
+    }
+    if !receipt.undo.is_empty() {
+        out.push_str(&format!("\n             undo: {}", receipt.undo));
+    }
+    if !receipt.detail.is_empty() && receipt.outcome != FixOutcome::Hint {
+        out.push_str(&format!("\n             note: {}", receipt.detail));
+    }
+    out
+}
+
 /// Renders human table output (not a machine contract).
 #[must_use]
 pub fn format_table(report: &DoctorReport, no_color: bool) -> String {
@@ -1002,6 +2001,33 @@ pub fn format_table(report: &DoctorReport, no_color: bool) -> String {
     for check in &report.checks {
         out.push_str(&table_row(check, no_color));
         out.push('\n');
+    }
+    if report.fix_requested {
+        out.push_str("repairs:\n");
+        if report.fixes.is_empty() {
+            out.push_str("  nothing to do\n");
+        } else {
+            for receipt in &report.fixes {
+                out.push_str("  ");
+                out.push_str(&fix_table_row(receipt, no_color));
+                out.push('\n');
+            }
+        }
+        let mut applied = 0;
+        let mut planned = 0;
+        let mut hints = 0;
+        let mut failed = 0;
+        for receipt in &report.fixes {
+            match receipt.outcome {
+                FixOutcome::Applied => applied += 1,
+                FixOutcome::WouldApply => planned += 1,
+                FixOutcome::Hint => hints += 1,
+                FixOutcome::Failed => failed += 1,
+            }
+        }
+        out.push_str(&format!(
+            "repairs: {applied} applied, {planned} dry-run, {hints} hint, {failed} failed\n"
+        ));
     }
     out.push_str(&format!(
         "summary: {} pass, {} warn, {} fail (exit {})\n",
@@ -1300,7 +2326,18 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
         .filter(|value| !value.is_empty());
     let terminfo_found = match term.as_deref() {
         None => None,
-        Some(name) => probe_terminfo(name),
+        Some(name) => {
+            // `infocmp` only searches the system database plus TERMINFO /
+            // ~/.terminfo; an entry installed by `--fix` into the user
+            // database is still present evidence for this check.
+            let installed = RepairEnv::from_process()
+                .terminfo_dir()
+                .is_some_and(|dir| terminfo_entry_installed(&dir, name));
+            match probe_terminfo(name) {
+                Some(false) if installed => Some(true),
+                other => other,
+            }
+        }
     };
     let shell = std::env::var("SHELL")
         .ok()
@@ -1368,8 +2405,54 @@ pub(crate) fn run_cli(args: &Args) -> i32 {
             return EXIT_USAGE;
         }
     };
+    if args.doctor_dry_run && !args.doctor_fix {
+        eprintln!("bitty doctor: --dry-run requires --fix\n{}", doctor_usage());
+        return EXIT_USAGE;
+    }
+    // Safe mode never writes: refuse `--fix` with the typed permission-class
+    // error before any probe or repair runs.
+    if args.doctor_fix && args.safe {
+        let error = DoctorFixError::SafeMode;
+        match format {
+            DoctorFormat::Table => eprintln!("{}", error.message()),
+            DoctorFormat::Json | DoctorFormat::Jsonl => {
+                // No probe runs: the refusal is total, so the envelope is
+                // built without touching the environment.
+                let report = DoctorReport {
+                    version: version_semver().to_string(),
+                    checks: Vec::new(),
+                    fixes: Vec::new(),
+                    fix_error: Some(error),
+                    fix_requested: true,
+                };
+                println!("{}", format_json(&report));
+            }
+        }
+        return error.code();
+    }
     let inputs = collect_doctor_inputs(args);
-    let report = assemble_report(&inputs);
+    let mut report = assemble_report(&inputs);
+    if args.doctor_fix {
+        report.fix_requested = true;
+        let config_path = resolved_doctor_config_path(args);
+        let module_detail;
+        let config_error = match &inputs.config {
+            ConfigInput::Invalid(message) => Some(message.as_str()),
+            ConfigInput::Module { diagnostic } => {
+                module_detail = diagnostic.render();
+                Some(module_detail.as_str())
+            }
+            ConfigInput::Missing | ConfigInput::Ok { .. } => None,
+        };
+        report.fixes = plan_repairs(
+            config_path.as_deref(),
+            config_error,
+            inputs.term.as_deref(),
+            inputs.terminfo_found == Some(false),
+            &RepairEnv::from_process(),
+            args.doctor_dry_run,
+        );
+    }
     match format {
         DoctorFormat::Table => {
             let no_color = args.doctor_no_color || std::env::var("NO_COLOR").is_ok();
@@ -1380,6 +2463,16 @@ pub(crate) fn run_cli(args: &Args) -> i32 {
         }
     }
     report.exit_code()
+}
+
+/// Resolves the user config file exactly like the loader: explicit
+/// `--config` > `BITTY_CONFIG` > XDG probe. Used only to locate the persisted
+/// selector for the repair; the loader itself owns validation.
+fn resolved_doctor_config_path(args: &Args) -> Option<PathBuf> {
+    let env = std::env::var("BITTY_CONFIG").ok();
+    let explicit =
+        bitty_config::file::resolve_config_explicit(args.config_path.as_deref(), env.as_deref());
+    bitty_config::file::probe_config_path(explicit.as_deref()).map(|probed| probed.path)
 }
 
 #[cfg(test)]
@@ -1844,6 +2937,411 @@ mod tests {
             start.elapsed() < Duration::from_secs(10),
             "kill took too long: {:?}",
             start.elapsed()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // `--fix` repairs (CTX-1721 / bitty#2924)
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Unique scratch root (pid + atomic counter; parallel-safe).
+    fn scratch_root(tag: &str) -> PathBuf {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "bitty-doctor-fix-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("scratch root");
+        path
+    }
+
+    fn write_file(path: &Path, contents: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("parent dir");
+        }
+        std::fs::write(path, contents).expect("write fixture");
+    }
+
+    /// Recursive snapshot (relative path, kind, length, mtime, bytes) used to
+    /// prove `--dry-run` never writes.
+    #[derive(Debug, PartialEq, Eq)]
+    struct SnapshotEntry {
+        path: PathBuf,
+        kind: &'static str,
+        len: u64,
+        modified: Option<std::time::SystemTime>,
+        bytes: Option<Vec<u8>>,
+    }
+
+    fn snapshot(root: &Path) -> Vec<SnapshotEntry> {
+        fn walk(root: &Path, dir: &Path, out: &mut Vec<SnapshotEntry>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                let is_dir = meta.is_dir();
+                out.push(SnapshotEntry {
+                    path: relative,
+                    kind: if is_dir { "dir" } else { "file" },
+                    len: meta.len(),
+                    modified: meta.modified().ok(),
+                    bytes: if is_dir {
+                        None
+                    } else {
+                        std::fs::read(&path).ok()
+                    },
+                });
+                if is_dir {
+                    walk(root, &path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(root, root, &mut out);
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        out
+    }
+
+    /// Binds a Unix socket with the verified `0700` dir / `0600` socket modes.
+    #[cfg(unix)]
+    fn bind_socket(path: &Path) -> std::os::unix::net::UnixListener {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = path.parent().expect("socket parent");
+        std::fs::create_dir_all(dir).expect("socket dir");
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .expect("socket dir mode");
+        let listener = std::os::unix::net::UnixListener::bind(path).expect("bind socket");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .expect("socket mode");
+        listener
+    }
+
+    fn test_env(root: &Path) -> RepairEnv {
+        RepairEnv {
+            runtime_dir: Some(root.join("run")),
+            data_home: Some(root.join("data")),
+            home: Some(root.join("home")),
+            uid: bitty_ipc::current_unix_uid().unwrap_or(0),
+        }
+    }
+
+    fn selector_fixture(root: &Path) -> (PathBuf, PathBuf, String) {
+        let config = root.join("config").join("init.lua");
+        let original = "-- selector\nreturn {\n    format = \"bitty-profile-v1\",\n    profile = \"work\",\n    -- keep me\n    window = { opacity = 0.9 },\n}\n".to_string();
+        write_file(&config, &original);
+        let profiles = config.parent().expect("config parent").join("profiles");
+        write_file(&profiles.join("default.lua"), "return {}\n");
+        (config, profiles, original)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_instance_socket_removed_and_live_socket_untouched() {
+        let root = scratch_root("socket");
+        let leaf = root.join("bitty");
+        let live_path = leaf.join("live.sock");
+        let live = bind_socket(&live_path);
+        let stale_path = leaf.join("stale.sock");
+        drop(bind_socket(&stale_path));
+        let uid = bitty_ipc::current_unix_uid().expect("uid");
+
+        let receipts = fix_stale_instance_sockets(&leaf, uid, false);
+        assert_eq!(receipts.len(), 1, "receipts: {receipts:?}");
+        let receipt = &receipts[0];
+        assert_eq!(receipt.id, "instance-socket");
+        assert_eq!(receipt.outcome, FixOutcome::Applied);
+        assert!(receipt.changed.ends_with("stale.sock"), "{receipt:?}");
+        assert_eq!(receipt.to, "removed");
+        assert!(receipt.undo.contains("--instance stale"), "{receipt:?}");
+        assert!(!stale_path.exists(), "stale socket must be removed");
+        assert!(live_path.exists(), "a live socket must never be touched");
+        // The live socket still answers after the scan.
+        assert!(std::os::unix::net::UnixStream::connect(&live_path).is_ok());
+        drop(live);
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn terminfo_installs_into_temp_xdg_and_is_idempotent() {
+        if find_on_path("tic").is_none() {
+            eprintln!("skip terminfo repair: tic not on PATH");
+            return;
+        }
+        let root = scratch_root("terminfo");
+        let data_home = root.join("data");
+        let dir = data_home.join("terminfo");
+        let receipt = fix_missing_terminfo(Some("bitty"), Some(&data_home), None, false)
+            .expect("first run must repair");
+        assert_eq!(receipt.outcome, FixOutcome::Applied, "{receipt:?}");
+        assert!(
+            terminfo_entry_installed(&dir, "bitty"),
+            "entry must be installed: {receipt:?}"
+        );
+        assert!(
+            receipt.changed.starts_with(&dir.display().to_string()),
+            "installed under the temp XDG root: {receipt:?}"
+        );
+        assert!(receipt.undo.contains("rm -f"), "undo: {receipt:?}");
+        // Second run is idempotent: no receipt, no write.
+        assert_eq!(
+            fix_missing_terminfo(Some("bitty"), Some(&data_home), None, false),
+            None
+        );
+        // Undo path: removing the installed entry makes the repair necessary
+        // again.
+        let installed = PathBuf::from(&receipt.changed);
+        std::fs::remove_file(&installed).expect("undo remove");
+        assert!(!terminfo_entry_installed(&dir, "bitty"));
+        assert!(
+            fix_missing_terminfo(Some("bitty"), Some(&data_home), None, false).is_some(),
+            "undo must re-expose the missing entry"
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn non_bitty_term_is_a_hint_not_an_install() {
+        let root = scratch_root("terminfo-other");
+        let data_home = root.join("data");
+        let receipt = fix_missing_terminfo(Some("xterm-256color"), Some(&data_home), None, false)
+            .expect("hint");
+        assert_eq!(receipt.outcome, FixOutcome::Hint);
+        assert!(receipt.hint.contains("TERM=bitty"), "{receipt:?}");
+        assert!(!data_home.join("terminfo").exists(), "must not write");
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn profile_selector_reset_reports_previous_value_and_undo() {
+        let root = scratch_root("selector");
+        let (config, profiles, original) = selector_fixture(&root);
+
+        let receipt =
+            fix_profile_selector(&config, &profiles, false).expect("selector repair receipt");
+        assert_eq!(receipt.outcome, FixOutcome::Applied, "{receipt:?}");
+        assert_eq!(receipt.id, "profile-selector");
+        assert!(receipt.from.contains("\"work\""), "{receipt:?}");
+        assert_eq!(receipt.to, "profile = \"default\"");
+        assert!(
+            receipt.undo.contains(".bak"),
+            "undo names the backup: {receipt:?}"
+        );
+
+        let updated = std::fs::read_to_string(&config).expect("read selector");
+        assert!(updated.contains("profile = \"default\""), "{updated}");
+        assert!(
+            updated.contains("-- keep me"),
+            "comments preserved: {updated}"
+        );
+        assert!(
+            updated.contains("opacity = 0.9"),
+            "overrides preserved: {updated}"
+        );
+        assert_eq!(
+            fix_profile_selector(&config, &profiles, false),
+            None,
+            "second run reports nothing to do"
+        );
+
+        // Undo path: the backup named by the receipt restores the exact bytes.
+        let backup = receipt
+            .undo
+            .split('\'')
+            .nth(1)
+            .map(PathBuf::from)
+            .expect("backup path in undo");
+        std::fs::copy(&backup, &config).expect("restore backup");
+        assert_eq!(std::fs::read_to_string(&config).expect("read"), original);
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn profile_selector_without_default_profile_is_a_hint() {
+        let root = scratch_root("selector-nodefault");
+        let config = root.join("config").join("init.lua");
+        write_file(
+            &config,
+            "return { format = \"bitty-profile-v1\", profile = \"work\" }\n",
+        );
+        let profiles = root.join("config").join("profiles");
+        std::fs::create_dir_all(&profiles).expect("profiles dir");
+        let receipt = fix_profile_selector(&config, &profiles, false).expect("hint receipt");
+        assert_eq!(receipt.outcome, FixOutcome::Hint, "{receipt:?}");
+        assert!(receipt.hint.contains("bitty init"), "{receipt:?}");
+        assert_eq!(
+            std::fs::read_to_string(&config).expect("read"),
+            "return { format = \"bitty-profile-v1\", profile = \"work\" }\n",
+            "a hint must not write"
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn moved_config_key_is_a_hint_for_config_migrate() {
+        let receipt = hint_moved_config_key("undeclared field 'window.pad' from user:init.lua")
+            .expect("hint");
+        assert_eq!(receipt.id, "config-key");
+        assert_eq!(receipt.outcome, FixOutcome::Hint);
+        assert!(receipt.hint.contains("bitty config migrate"), "{receipt:?}");
+        assert!(receipt.changed.is_empty(), "a hint changes nothing");
+        assert!(hint_moved_config_key("font.size: expected number").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dry_run_writes_nothing() {
+        let root = scratch_root("dry-run");
+        let env = test_env(&root);
+        let leaf = root.join("run").join("bitty");
+        let stale_path = leaf.join("stale.sock");
+        drop(bind_socket(&stale_path));
+        let (config, _profiles, _original) = selector_fixture(&root);
+
+        let before = snapshot(&root);
+        let receipts = plan_repairs(Some(&config), None, Some("bitty"), true, &env, true);
+        let after = snapshot(&root);
+        assert_eq!(before, after, "dry-run must not write anything");
+        assert!(
+            receipts
+                .iter()
+                .any(|receipt| receipt.id == "instance-socket"
+                    && receipt.outcome == FixOutcome::WouldApply),
+            "dry-run must describe the socket repair: {receipts:?}"
+        );
+        assert!(
+            receipts
+                .iter()
+                .any(|receipt| receipt.id == "profile-selector"
+                    && receipt.outcome == FixOutcome::WouldApply),
+            "dry-run must describe the selector repair: {receipts:?}"
+        );
+        assert!(stale_path.exists(), "dry-run must keep the stale socket");
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn second_fix_run_reports_nothing_to_do() {
+        let root = scratch_root("second-run");
+        let env = test_env(&root);
+        let leaf = root.join("run").join("bitty");
+        let stale_path = leaf.join("stale.sock");
+        drop(bind_socket(&stale_path));
+        let (config, _profiles, _original) = selector_fixture(&root);
+        // Pre-install a terminfo entry so the repair has nothing to compile.
+        write_file(
+            &root.join("data").join("terminfo").join("b").join("bitty"),
+            "",
+        );
+
+        let first = plan_repairs(Some(&config), None, Some("bitty"), true, &env, false);
+        assert!(
+            first
+                .iter()
+                .any(|receipt| receipt.id == "instance-socket"
+                    && receipt.outcome == FixOutcome::Applied),
+            "first run repairs the socket: {first:?}"
+        );
+        assert!(
+            first.iter().any(|receipt| receipt.id == "profile-selector"
+                && receipt.outcome == FixOutcome::Applied),
+            "first run repairs the selector: {first:?}"
+        );
+        let second = plan_repairs(Some(&config), None, Some("bitty"), true, &env, false);
+        assert!(
+            second.is_empty(),
+            "second run reports nothing to do: {second:?}"
+        );
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn safe_fix_is_refused_with_typed_error_and_exit_seven() {
+        let mut args = Args::new();
+        args.doctor_word = true;
+        args.doctor_fix = true;
+        args.safe = true;
+        args.doctor_format = Some("json".to_string());
+        assert_eq!(run_cli(&args), EXIT_PERM);
+        assert_eq!(DoctorFixError::SafeMode.code(), EXIT_PERM);
+        assert_eq!(DoctorFixError::SafeMode.class(), "Denied");
+        assert_eq!(DoctorFixError::SafeMode.token(), "safe-mode-refused");
+        assert!(DoctorFixError::SafeMode.message().contains("--safe"));
+    }
+
+    #[test]
+    fn dry_run_without_fix_is_a_usage_error() {
+        let mut args = Args::new();
+        args.doctor_word = true;
+        args.doctor_dry_run = true;
+        assert_eq!(run_cli(&args), EXIT_USAGE);
+    }
+
+    #[test]
+    fn report_exit_code_includes_failed_repairs() {
+        let mut report = assemble_report(&healthy_inputs());
+        report.fix_requested = true;
+        report.fixes.push(FixReceipt::failed(
+            "instance-socket",
+            EXIT_PERM,
+            "bitty/default.sock".to_string(),
+            "permission denied".to_string(),
+        ));
+        assert_eq!(report.exit_code(), EXIT_PERM);
+        assert!(!report.ok());
+        // A failed repair owns the JSON error object when it is the strongest
+        // class (the healthy fixture has no failing check).
+        let json = format_json(&report);
+        assert!(json.contains("\"ok\":false"), "{json}");
+        assert!(json.contains("\"class\":\"Denied\""), "{json}");
+        assert!(json.contains("\"code\":\"instance-socket\""), "{json}");
+        // Hints never change the exit code.
+        report.fixes = vec![FixReceipt::hint(
+            "config-key",
+            "run it".to_string(),
+            String::new(),
+        )];
+        assert_eq!(report.exit_code(), EXIT_OK);
+    }
+
+    #[test]
+    fn json_carries_repair_receipts() {
+        let mut report = assemble_report(&healthy_inputs());
+        report.fix_requested = true;
+        report.fixes.push(FixReceipt::applied(
+            "terminfo",
+            "terminfo/b/bitty".to_string(),
+            "no `bitty` terminfo entry".to_string(),
+            "compiled into terminfo".to_string(),
+            "rm -f 'terminfo/b/bitty'".to_string(),
+            "installed into terminfo".to_string(),
+        ));
+        let json = format_json(&report);
+        assert!(json.contains("\"fixes\":["), "{json}");
+        for key in [
+            "\"id\":\"terminfo\"",
+            "\"outcome\":\"applied\"",
+            "\"changed\":\"terminfo/b/bitty\"",
+            "\"from\":\"no `bitty` terminfo entry\"",
+            "\"to\":\"compiled into terminfo\"",
+            "\"undo\":\"rm -f 'terminfo/b/bitty'\"",
+            "\"detail\":\"installed into terminfo\"",
+        ] {
+            assert!(json.contains(key), "missing {key}: {json}");
+        }
+        assert_eq!(
+            json.chars().filter(|c| *c == '{').count(),
+            json.chars().filter(|c| *c == '}').count(),
+            "unbalanced: {json}"
         );
     }
 }

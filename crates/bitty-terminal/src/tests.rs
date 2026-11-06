@@ -6724,9 +6724,51 @@ fn doctor_usage_names_format_and_checks() {
     assert!(usage.contains("doctor"));
     assert!(usage.contains("--format"));
     assert!(usage.contains("table|json|jsonl"));
+    assert!(usage.contains("--fix"), "repair flag: {usage}");
+    assert!(usage.contains("--dry-run"), "dry-run flag: {usage}");
+    assert!(usage.contains("--safe"), "safe refusal: {usage}");
+    assert!(
+        usage.contains("bitty config migrate"),
+        "moved-key hint: {usage}"
+    );
     let help = help_text();
     assert!(help.contains("doctor"));
     assert!(help.contains("--format"));
+    assert!(help.contains("--fix"));
+    assert!(help.contains("--dry-run"));
+}
+
+#[test]
+fn doctor_fix_flags_parse_before_and_after_the_word() {
+    let p = parse_args(&args_of(&["bitty", "doctor", "--fix", "--dry-run"]));
+    assert!(p.doctor_word);
+    assert!(p.doctor_fix);
+    assert!(p.doctor_dry_run);
+
+    // `--fix` composes before the word (global parse), `--dry-run` after it.
+    let p = parse_args(&args_of(&["bitty", "--fix", "doctor", "--dry-run"]));
+    assert!(p.doctor_word);
+    assert!(p.doctor_fix);
+    assert!(p.doctor_dry_run);
+
+    // `--safe` is an independent flag; the dispatch owns the refusal.
+    let p = parse_args(&args_of(&["bitty", "doctor", "--safe", "--fix"]));
+    assert!(p.safe);
+    assert!(p.doctor_fix);
+
+    // Without `--fix`, `--dry-run` still parses (the dispatch fails closed).
+    let p = parse_args(&args_of(&["bitty", "doctor", "--dry-run"]));
+    assert!(p.doctor_dry_run);
+    assert!(!p.doctor_fix);
+
+    // Plain doctor runs keep both repairs off.
+    let p = parse_args(&args_of(&["bitty", "doctor"]));
+    assert!(!p.doctor_fix);
+    assert!(!p.doctor_dry_run);
+
+    // `--fix` outside `doctor` stays a usage error, never a silent no-op.
+    let p = parse_args(&args_of(&["bitty", "--fix"]));
+    assert_eq!(p.unknown_flag.as_deref(), Some("--fix"));
 }
 
 #[test]

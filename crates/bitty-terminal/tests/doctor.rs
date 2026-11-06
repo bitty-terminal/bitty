@@ -238,3 +238,70 @@ fn invalid_config_file_trips_config_gate() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn safe_fix_is_refused_with_exit_seven() {
+    let output = spawn_doctor(&["doctor", "--safe", "--fix", "--format", "json"], &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "--safe --fix must exit 7: {}",
+        stdout_text(&output)
+    );
+    let stdout = stdout_text(&output);
+    assert!(stdout.contains("\"ok\":false"), "ok flag: {stdout}");
+    assert!(
+        stdout.contains("\"class\":\"Denied\""),
+        "error class: {stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"safe-mode-refused\""),
+        "typed error code: {stdout}"
+    );
+    assert!(stdout.contains("\"fixes\":[]"), "no repair ran: {stdout}");
+}
+
+#[test]
+fn dry_run_carries_receipts_without_writing() {
+    // Isolated runtime/data/config roots: the repair scan must not touch the
+    // operator's real instance dir, terminfo database, or config file.
+    let root =
+        std::env::temp_dir().join(format!("bitty-doctor-fix-dry-run-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("scratch root");
+    let config = root.join("init.lua");
+    std::fs::write(&config, "return {}\n").expect("config fixture");
+    let runtime = root.join("run");
+    let data = root.join("data");
+    let home = root.join("home");
+    std::fs::create_dir_all(&runtime).expect("runtime dir");
+    std::fs::create_dir_all(&data).expect("data dir");
+    std::fs::create_dir_all(&home).expect("home dir");
+    let config_arg = format!("--config={}", config.display());
+    let output = spawn_doctor(
+        &[
+            "doctor",
+            "--fix",
+            "--dry-run",
+            "--format",
+            "json",
+            config_arg.as_str(),
+        ],
+        &[
+            ("XDG_RUNTIME_DIR", runtime.to_str().expect("utf8")),
+            ("XDG_DATA_HOME", data.to_str().expect("utf8")),
+            ("HOME", home.to_str().expect("utf8")),
+        ],
+    );
+    let stdout = stdout_text(&output);
+    assert!(stdout.contains("\"fixes\":["), "receipts: {stdout}");
+    assert!(
+        !stdout.contains("\"outcome\":\"applied\""),
+        "dry-run must not apply: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&config).expect("config unchanged"),
+        "return {}\n"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}

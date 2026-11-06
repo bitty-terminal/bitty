@@ -1616,6 +1616,53 @@ extern "bitty doctor" [
     --no-print-shell-init
     --no-shell-init
 ]
+extern "bitty upgrade" [
+    --check
+    --dry-run
+    --rollback
+    --yes
+    --help(-h)
+    --version(-V)
+    --verbose
+    --log-level: string
+    --headless
+    --test-mode
+    --safe
+    --fail-loud
+    --no-splash
+    --split
+    --split-ratio: string
+    --stack
+    --overlay
+    --layout: string
+    --focus: string
+    --config: string
+    --profile: string
+    --theme: string
+    --font-family: string
+    --font-size: string
+    --opacity: string
+    --format: string
+    --socket: string
+    --instance: string
+    --no-color
+    --force
+    --scrollback: string
+    --close-confirm: string
+    --gaps-in: string
+    --gaps-out: string
+    --border: string
+    --radius: string
+    --plugins: string
+    --no-plugins
+    --with-components
+    --no-with-components
+    --no-components
+    --without-components
+    --print-shell-init
+    --no-print-shell-init
+    --no-shell-init
+]
 extern "bitty list" [
     --format: string
     --socket: string
@@ -2594,6 +2641,7 @@ extern "bitty help config" []
 extern "bitty help cfg" []
 extern "bitty help init" []
 extern "bitty help doctor" []
+extern "bitty help upgrade" []
 extern "bitty help list" []
 extern "bitty help ls" []
 extern "bitty help inspect" []

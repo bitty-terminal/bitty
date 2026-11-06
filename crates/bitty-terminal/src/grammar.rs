@@ -301,6 +301,13 @@ pub(crate) fn nodes() -> Vec<Node> {
     );
     push_node(
         &mut nodes,
+        "upgrade",
+        Vec::new(),
+        &["--check", "--dry-run", "--rollback", "--yes"],
+        false,
+    );
+    push_node(
+        &mut nodes,
         "list",
         names(ListKind::NAMES),
         &["--format", "--socket", "--instance", "--no-color"],

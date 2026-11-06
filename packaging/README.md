@@ -43,6 +43,16 @@ by `bash scripts/tests/check-package-manifests.test.sh` (`just package-manifests
 
 Debian and Ubuntu users can install via the R2-backed APT repository (see `packaging/debian.md`). Fedora and Enterprise Linux users can install via Fedora Copr (see `packaging/fedora.md`). OpenSUSE consumes RPMs two ways: the release `nfpm` RPM passes `rpm -qip` and a local `zypper install` check, and `packaging/opensuse/bitty.spec` is the OBS source recipe that publishes a zypper repository (see `packaging/opensuse/README.md` and `packaging/opensuse.md`). No release `verify-install` leg covers OpenSUSE, so both stay best-effort, not supported. Alpine is apk-based; the apk is a native musl build (see `packaging/alpine.md`).
 
+## Upgrading installed builds
+
+`bitty upgrade` detects the install source (install-script marker, AppImage,
+Homebrew, Scoop, AUR, pacman, apt, dnf/rpm, Nix) and either replaces a
+self-managed binary atomically after verifying the release `SHA256SUMS`, or
+prints the owning package manager's exact command. System-owned channels are
+never executed and exit `7`; Windows re-runs the installer because a running
+`.exe` cannot be replaced. See [`upgrade.md`](upgrade.md) for the detection
+table, marker schema, trust model, and rollback.
+
 ## Repairing a published channel
 
 When a release tag is already public but a derived channel failed (for example

@@ -263,6 +263,7 @@ mod profile;
 mod runtime_inspect;
 mod storage_backends;
 mod storage_component_host;
+mod upgrade;
 mod version;
 
 mod list;
@@ -457,6 +458,19 @@ fn main() {
         println!("{}", doctor::doctor_usage());
         std::process::exit(0);
     }
+    // `bitty upgrade --help` shows the upgrade contract (local class: no
+    // instance, no config, no plugin VM, no network).
+    if args.help && args.upgrade_word {
+        if let Some(flag) = args.unknown_flag.as_deref() {
+            eprintln!(
+                "bitty upgrade: unknown flag '{flag}'\n{}",
+                upgrade::upgrade_usage()
+            );
+            std::process::exit(2);
+        }
+        println!("{}", upgrade::upgrade_usage());
+        std::process::exit(0);
+    }
     // `bitty list --help` shows list help (never needs an instance or VM);
     // `bitty inspect --help` shows inspect help; bare `--help` shows the
     // top-level help.
@@ -590,6 +604,10 @@ fn main() {
                 }
                 Some("doctor") => {
                     println!("{}", doctor::doctor_usage());
+                    std::process::exit(0);
+                }
+                Some("upgrade") => {
+                    println!("{}", upgrade::upgrade_usage());
                     std::process::exit(0);
                 }
                 Some("list") => {
@@ -753,6 +771,13 @@ fn main() {
     // (exit 3), not a startup abort, and no plugin VM is ever loaded.
     if args.doctor_word {
         std::process::exit(doctor::run_cli(&args));
+    }
+
+    // `bitty upgrade` install-source detection and self-update (CTX-1719,
+    // bitty#2925; local class, safe-mode read-only paths). Runs before
+    // config load: it needs no config, no instance, and no plugin VM.
+    if args.upgrade_word {
+        std::process::exit(upgrade::run_cli(&args));
     }
 
     // `bitty ctl` runtime control (CTX-0171, runtime class). Dispatched

@@ -97,6 +97,13 @@
 .NOTES
   PowerShell 5.1 and 7+ compatible. No Rust toolchain needed. Fail-closed on
   checksum mismatch, unsupported arch, or non-Windows hosts.
+
+  Install marker (CTX-1719, bitty#2925): after a successful install the script
+  writes %LOCALAPPDATA%\bitty\install.json with schema, channel, prefix,
+  bin_dir, version, binary_sha256, and installed_at. `bitty upgrade` reads it
+  to detect this install source. On Windows a self-update cannot replace a
+  running bitty.exe, so `bitty upgrade` prints this installer's command and
+  exits 7 instead. The marker is best effort and -DryRun writes none.
 #>
 [CmdletBinding()]
 param(
@@ -592,6 +599,44 @@ function Get-BittyArtifact {
   throw "no bootstrap artifact for target: $ShortTarget"
 }
 
+function Write-BittyInstallMarker {
+  param(
+    [string]$Channel,
+    [string]$Prefix,
+    [string]$BinDir,
+    [string]$VersionBare,
+    [string]$BinaryPath
+  )
+  $localAppData = "$env:LocalAppData"
+  if ([string]::IsNullOrWhiteSpace($localAppData)) {
+    Write-BittyLog 'warning: LocalAppData is not set; install marker not written'
+    return
+  }
+  $markerDir = Join-Path $localAppData 'bitty'
+  $markerPath = Join-Path $markerDir 'install.json'
+  $marker = [ordered]@{
+    schema        = 1
+    channel       = $Channel
+    prefix        = $Prefix
+    bin_dir       = $BinDir
+    version       = $VersionBare
+    binary_sha256 = (Get-FileHash -Path $BinaryPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    installed_at  = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  }
+  try {
+    if (-not (Test-Path $markerDir)) {
+      New-Item -ItemType Directory -Path $markerDir -Force | Out-Null
+    }
+    $staged = "$markerPath.$PID.tmp"
+    $json = ($marker | ConvertTo-Json) + [Environment]::NewLine
+    [System.IO.File]::WriteAllText($staged, $json, [System.Text.UTF8Encoding]::new($false))
+    Move-Item -Path $staged -Destination $markerPath -Force
+    Write-BittyLog "install marker: $markerPath"
+  } catch {
+    Write-BittyLog "warning: could not write install marker ${markerPath}: $($_.Exception.Message)"
+  }
+}
+
 # Non-Windows hosts fail closed with guidance (PowerShell Core runs cross-platform).
 $onWindows = $true
 try {
@@ -738,6 +783,9 @@ try {
     throw "install smoke failed: $destExe --version exited $LASTEXITCODE"
   }
   Write-BittyLog "smoke OK: $versionOutput"
+  $markerPrefix = Split-Path -Path $InstallDir -Parent
+  Write-BittyInstallMarker -Channel 'script' -Prefix $markerPrefix -BinDir $InstallDir `
+    -VersionBare $versionBare -BinaryPath $destExe
   if ($NoShortcut) {
     Write-BittyLog 'skipping the Start Menu shortcut (-NoShortcut)'
     Write-BittyLog "manual step: create a shortcut to $destExe in the Start Menu"

@@ -1,6 +1,7 @@
-//! `bitty-winjob`: the narrow, reviewed Win32 Job Object adapter behind
-//! Bitty's Windows owned-process-tree backend (CTX-0903, DEC-0083;
-//! detached lifetime CTX-0997, DEC-0102).
+//! `bitty-winjob`: the narrow, reviewed Win32 adapter behind Bitty's Windows
+//! owned-process-tree backend (CTX-0903, DEC-0083; detached lifetime
+//! CTX-0997, DEC-0102) and the parent-console adoption of the GUI-subsystem
+//! `bitty` binary (bitty#2929).
 //!
 //! This crate is to Windows what `rustix` (Linux) and `nix` (macOS) are to
 //! `bitty-pty`'s owned-tree backends: the one place system calls are made,
@@ -29,6 +30,11 @@
 //!   no adopt-after-start window at all.
 //! - `process_is_running` and `terminate_process`: single-pid helpers
 //!   for liveness probes and last-resort cleanup.
+//! - `adopt_parent_console`: attaches the GUI-subsystem `bitty` binary to the
+//!   console of the shell that started it and points missing standard streams
+//!   at that console (or at `NUL` when there is none), so `bitty --version`,
+//!   `--help`, `doctor`, `list`, `ctl`, and error output still print while a
+//!   Start Menu/Search launch allocates no console (bitty#2929).
 //!
 //! No raw `HANDLE` or pointer crosses the public API: handles are
 //! `std::os::windows::io::OwnedHandle` values owned by the types above.
@@ -48,10 +54,15 @@ mod ffi;
 mod conpty;
 
 #[cfg(windows)]
+mod console;
+
+#[cfg(windows)]
 mod job;
 
 #[cfg(windows)]
 pub use conpty::{ChildSpec, ConPtyChild, ConPtyMaster};
+#[cfg(windows)]
+pub use console::{ConsoleStreams, adopt_parent_console};
 #[cfg(windows)]
 pub use job::{
     CREATE_SUSPENDED_FLAG, JobMember, JobObject, process_is_running, resume_suspended_process,

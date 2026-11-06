@@ -1,0 +1,11 @@
+// Application icon resource for the Windows executable (bitty#2929).
+//
+// Compiled by `build.rs` through `embed-resource` on Windows targets only, so
+// Explorer, Windows Search, and the Start Menu shortcut show the Bitty icon
+// instead of a generic executable one. The icon file is generated from
+// `packaging/icons/hicolor/256x256/apps/bitty.png` (16/24/32/48/64/128/256 px
+// entries).
+//
+// Paths here are resolved relative to this file's directory (the crate root),
+// which is also the build script's working directory.
+1 ICON "../../packaging/icons/bitty.ico"

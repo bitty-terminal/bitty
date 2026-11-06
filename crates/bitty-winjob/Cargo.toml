@@ -1,6 +1,6 @@
 [package]
 name = "bitty-winjob"
-description = "Narrow reviewed Win32 Job Object adapter for Bitty owned process trees"
+description = "Narrow reviewed Win32 adapter for Bitty: job objects, ConPTY spawn, console adoption"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

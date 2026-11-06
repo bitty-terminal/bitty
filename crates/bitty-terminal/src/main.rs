@@ -214,13 +214,24 @@
 //! # Security
 //!
 //! - No `unsafe` is required. The workspace denies `unsafe_code`; this binary
-//!   enforces `#![forbid(unsafe_code)]` with no exception.
+//!   enforces `#![forbid(unsafe_code)]` with no exception. The two Win32 calls
+//!   the Windows console adoption needs (`AttachConsole`, `SetStdHandle`) live
+//!   in the reviewed `bitty-winjob` FFI boundary, not here (bitty#2929).
 //! - No upstream type (`portable-pty`, `vte`, `winit`, `wgpu`) appears in any
 //!   public signature — the binary has no library API, and all library
 //!   boundaries are behind `bitty-runtime` / `bitty-platform` owned types.
 //! - No shell interpolation. `spawn_shell` takes a direct `argv[0]` via
 //!   `PtyBuilder`, never a shell string.
 
+// bitty#2929: build the Windows binary as a GUI-subsystem executable so a
+// Start Menu/Search launch never allocates a console window (Windows Terminal)
+// before the Bitty window appears. This is the alacritty mechanism
+// (`#![windows_subsystem = "windows"]` + `AttachConsole(ATTACH_PARENT_PROCESS)`
+// at startup) rather than `/SUBSYSTEM:WINDOWS` link args, because it is
+// visible in the entry-point source, needs no per-target rustflags, and
+// applies to the `bitty` binary only. `not(test)` keeps the unit-test harness
+// a console process so `cargo test` output stays capturable on Windows.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
 use std::rc::Rc;
@@ -396,6 +407,17 @@ fn should_store_ipc_socket_path(headless: bool, test_mode: bool) -> bool {
 }
 
 fn main() {
+    // bitty#2929: `bitty.exe` links as a GUI-subsystem binary, so a Start
+    // Menu/Search launch never flashes a console window. A shell launch gets
+    // no console either, so adopt the parent console before the first byte of
+    // output: `--version`, `--help`, `doctor`, `list`, `ctl`, and every error
+    // message keep printing there. Streams the parent already wired (a pipe,
+    // `> out.txt`) are left alone. The outcome is deliberately not consumed:
+    // adoption is best-effort, and stderr may not exist yet to report it. A
+    // launcher start keeps the XDG crash-report file sink.
+    #[cfg(windows)]
+    let _ = bitty_winjob::adopt_parent_console();
+
     let raw: Vec<String> = std::env::args().collect();
     if stall_watchdog::handle_state_writer(&raw) {
         return;

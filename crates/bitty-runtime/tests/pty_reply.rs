@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use bitty_runtime::Runtime;
+use bitty_runtime::{Runtime, RuntimeConfig};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -232,7 +232,21 @@ fn reply_loop_does_not_block_hot_path_and_is_fail_closed() {
 const FASTFETCH_FONT_QUERY: &[u8] = b"\x1bP+q6b697474792d71756572792d666f6e745f66616d696c79\
 ;6b697474792d71756572792d666f6e745f73697a65\x1b\\";
 
-const DEFAULT_FAMILY_HEX: &[u8] = b"4a6574427261696e734d6f6e6f204e65726420466f6e74"; // JetBrainsMono Nerd Font
+/// Lowercase hex of the configured default family, as the reply carries it.
+///
+/// Derived from `RuntimeConfig::default()` instead of pinned: the default
+/// family is platform-specific (Menlo on macOS, Consolas on Windows, issue
+/// #2931), and what this test protects is the fastfetch framing — the family
+/// bytes, hex-encoded — not which face the platform ships.
+fn default_family_hex() -> Vec<u8> {
+    use std::fmt::Write as _;
+    let family = RuntimeConfig::default().font_family;
+    let mut hex = String::with_capacity(family.len() * 2);
+    for byte in family.bytes() {
+        write!(hex, "{byte:02x}").expect("hex digits into a String");
+    }
+    hex.into_bytes()
+}
 
 #[test]
 fn kitty_font_query_answers_exact_bytes_once() {
@@ -242,7 +256,7 @@ fn kitty_font_query_answers_exact_bytes_once() {
     let replies = rt.take_replies();
     assert_eq!(replies.len(), 2, "one answer per requested key");
     let mut expected_family = b"\x1bP1+rkitty-query-font_family=".to_vec();
-    expected_family.extend_from_slice(DEFAULT_FAMILY_HEX);
+    expected_family.extend_from_slice(&default_family_hex());
     expected_family.extend_from_slice(b"\x1b\\");
     assert_eq!(&*replies[0], expected_family.as_slice());
     assert_eq!(
@@ -369,7 +383,7 @@ fn real_pty_kitty_font_query_writes_once() {
 
     rt.handle_pty_bytes(FASTFETCH_FONT_QUERY);
     let expected = b"\x1bP1+rkitty-query-font_family=".len()
-        + DEFAULT_FAMILY_HEX.len()
+        + default_family_hex().len()
         + 2
         + b"\x1bP1+rkitty-query-font_size=3132\x1b\\".len();
     let written = rt.write_replies();

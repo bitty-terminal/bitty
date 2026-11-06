@@ -3,30 +3,44 @@
 //! These are host-font tests: a container with no discoverable font cannot
 //! shape and legitimately falls back, so each test skips in that case
 //! instead of failing the default-selection contract.
+//!
+//! "The host has the face" is decided by the resolver, not by a successful
+//! `load_font`: since issue #2931 an absent family loads a monospaced stand-in,
+//! so a loaded face no longer means the configured family is installed.
 
 use bitty_config::types::LigaturePolicy;
 use bitty_render::{FontQuery, FontStyle, GlyphRasterizer, SwashSingle};
+use bitty_runtime::config::DEFAULT_FONT_FAMILY;
 use bitty_runtime::{Runtime, RuntimeConfig, TextStack, TextStackPreference};
 
-const DEFAULT_FAMILY: &str = "JetBrainsMono Nerd Font";
-
+/// True when the renderer will paint with a face the host actually has.
+///
+/// The platform default resolves through `DEFAULT_FONT_FAMILY_CANDIDATES`
+/// (issue #2931), so this asks the resolver — the same database and candidate
+/// list `SwashSingle::load_font` uses — whether any candidate exists.
+/// `ResolvedPrimary::installed() == false` means `load_font` falls back to the
+/// generic monospaced stand-in (`DejaVu Sans Mono` on the CI image): a usable
+/// text face, but not the documented default and with no programming
+/// ligatures, so these contracts have nothing to assert on such a host.
 fn host_fonts_available(family: &str) -> bool {
-    let Ok(mut shaped) = SwashSingle::new() else {
+    if !bitty_render::font_defaults::resolve_primary(family).installed() {
         return false;
-    };
-    shaped
-        .load_font(&FontQuery {
-            family: family.to_string(),
-            style: FontStyle::Normal,
-            point_size: 12.0,
+    }
+    SwashSingle::new()
+        .and_then(|mut shaped| {
+            shaped.load_font(&FontQuery {
+                family: family.to_string(),
+                style: FontStyle::Normal,
+                point_size: 12.0,
+            })
         })
         .is_ok()
 }
 
 #[test]
 fn default_runtime_selects_the_shaped_stack() {
-    if !host_fonts_available(DEFAULT_FAMILY) {
-        eprintln!("skipped: no system font stack for the default family");
+    if !host_fonts_available(DEFAULT_FONT_FAMILY) {
+        eprintln!("skipped: no installed face for the default family (only a stand-in loads)");
         return;
     }
     let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless runtime builds");
@@ -112,14 +126,18 @@ fn first_two_cells_pixels(rt: &Runtime) -> Vec<u8> {
 
 #[test]
 fn shaped_default_disables_ligatures_when_configured() {
-    // The CI macOS image resolves the default family to a system monospace
-    // without programming ligatures, so there is nothing to disable there.
+    // The OS-shipped platform defaults (Menlo on macOS, Consolas on Windows)
+    // carry no `->` ligature, and the preference faces (SF Mono, Cascadia
+    // Mono) are absent from the CI images, so the resolved primary has no
+    // programming ligature to disable there.
     if cfg!(target_os = "macos") || cfg!(windows) {
-        eprintln!("skipped: the CI font stack has no programming ligatures on this platform");
+        eprintln!("skipped: the host default face has no programming ligatures on this platform");
         return;
     }
-    if !host_fonts_available(DEFAULT_FAMILY) {
-        eprintln!("skipped: no system font stack for the default family");
+    if !host_fonts_available(DEFAULT_FONT_FAMILY) {
+        eprintln!(
+            "skipped: no installed face for the default family (a stand-in has no ligatures)"
+        );
         return;
     }
     let render = |policy: LigaturePolicy| {

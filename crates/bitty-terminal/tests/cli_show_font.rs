@@ -79,9 +79,14 @@ fn show_font_prints_built_in_default_without_explicit_family() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // The built-in default family is platform-specific (issue #2931), so the
+    // probe must echo whatever the shipped default is, not the Linux face.
     assert_eq!(
         stdout(&out),
-        "font_family: JetBrainsMono Nerd Font\nfont_size: 12\n"
+        format!(
+            "font_family: {}\nfont_size: 12\n",
+            bitty_config::types::DEFAULT_FONT_FAMILY
+        )
     );
 }
 

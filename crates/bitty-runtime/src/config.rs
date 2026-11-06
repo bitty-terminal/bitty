@@ -2997,7 +2997,7 @@ mod tests {
             (DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT)
         );
         assert_eq!((DEFAULT_CELL_WIDTH, DEFAULT_CELL_HEIGHT), (9, 19));
-        assert_eq!(cfg.font_family, "JetBrainsMono Nerd Font");
+        assert_eq!(cfg.font_family, DEFAULT_FONT_FAMILY);
         assert!((cfg.font_size - 12.0).abs() < f32::EPSILON);
     }
 

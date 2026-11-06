@@ -91,6 +91,22 @@ pub struct ResolvedPrimary {
     pub attempts: Vec<FaceAttempt>,
 }
 
+impl ResolvedPrimary {
+    /// True when the host font database has one of the attempted faces.
+    ///
+    /// This is the only honest answer to "is the configured family really
+    /// installed?": `SwashSingle::load_font` succeeds for an absent family by
+    /// loading a monospaced stand-in ([`generic_monospace_face`]), so a loaded
+    /// face says nothing about which family it came from. `false` here means
+    /// the renderer paints with that stand-in, so a caller asserting a
+    /// property of the configured face (programming ligatures, advance
+    /// widths, Nerd icons) has nothing to assert on this host.
+    #[must_use]
+    pub fn installed(&self) -> bool {
+        self.attempts.iter().any(|attempt| attempt.present)
+    }
+}
+
 /// Resolves the primary family against the process-wide font database.
 ///
 /// See the module docs: preference resolution only applies while the
@@ -398,6 +414,7 @@ mod tests {
         // Nerd-patched JetBrains face on Linux — when installed.
         let resolution = resolve_with(DEFAULT_FONT_FAMILY, |family| family == preferred_face());
         assert_eq!(resolution.family, preferred_face());
+        assert!(resolution.installed());
         assert_eq!(
             resolution.substituted,
             preferred_face() != DEFAULT_FONT_FAMILY
@@ -415,6 +432,7 @@ mod tests {
         let resolution = resolve_with(DEFAULT_FONT_FAMILY, |family| family == DEFAULT_FONT_FAMILY);
         assert_eq!(resolution.family, DEFAULT_FONT_FAMILY);
         assert!(!resolution.substituted);
+        assert!(resolution.installed());
         let expected_attempts = DEFAULT_FONT_FAMILY_CANDIDATES
             .iter()
             .position(|candidate| *candidate == DEFAULT_FONT_FAMILY)
@@ -451,6 +469,10 @@ mod tests {
         let resolution = resolve_with(DEFAULT_FONT_FAMILY, |_| false);
         assert_eq!(resolution.family, DEFAULT_FONT_FAMILY);
         assert!(!resolution.substituted);
+        assert!(
+            !resolution.installed(),
+            "no candidate is installed, so the renderer will paint a stand-in"
+        );
         assert!(resolution.attempts.iter().all(|attempt| !attempt.present));
     }
 

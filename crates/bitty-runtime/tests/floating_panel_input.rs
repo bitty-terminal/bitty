@@ -26,7 +26,9 @@ use bitty_platform::{
     PressState, ScrollDelta,
 };
 use bitty_runtime::{
-    LayoutNode, OverlayTier, PresentFrame, Runtime, RuntimeConfig, SplitAxis, UiRect, View, ViewId,
+    LayoutNode, OverlayTier, PaneAttachment, PaneRoute, PaneSnapshot, PinnedSnapshot, PresentFrame,
+    PresentationMode, Runtime, RuntimeConfig, SESSION_FORMAT_VERSION, SessionSnapshot, SplitAxis,
+    UiRect, View, ViewId, WorkspaceSnapshot,
 };
 
 fn make_runtime() -> Runtime {
@@ -351,7 +353,7 @@ fn corner_and_edge_drags_resize_the_floating_panel() {
 }
 
 #[test]
-fn oversized_inward_drag_clamps_to_the_pane_minimum() {
+fn oversized_inward_drag_clamps_width_to_the_pane_minimum() {
     let (mut rt, float, _base) = detached_primary_runtime();
     let home = frame_of(&rt, float);
     let (cw, ch) = rt.live_cell_size();
@@ -372,9 +374,17 @@ fn oversized_inward_drag_clamps_to_the_pane_minimum() {
     assert!(rt.float_resize_active());
     rt.handle_cursor_moved(cell_pixel(&rt, right, top + 1));
     let squeezed = frame_of(&rt, float);
-    assert!(
-        squeezed.cols >= 1 && squeezed.rows >= 1,
-        "a degenerate drag keeps at least one cell: {squeezed:?}"
+    // The grabbed edge only moves the left border, so the committed width
+    // lands on exactly `View::MIN_COLS` while the height keeps the home
+    // extent. `>= 1` would be vacuous here: 1 *is* the minimum.
+    assert_eq!(
+        squeezed.cols,
+        View::MIN_COLS,
+        "an oversized inward drag clamps the width to exactly the pane minimum: {squeezed:?}"
+    );
+    assert_eq!(
+        squeezed.rows, home.rows,
+        "a left-edge drag must not change the height: {squeezed:?}"
     );
     assert!(
         squeezed.frame.width < home.frame.width,
@@ -576,5 +586,140 @@ fn tiled_panes_keep_focused_pane_scroll_routing() {
         offset(&rt, ViewId::new(1)),
         0,
         "the tile under the pointer is not scrolled instead"
+    );
+}
+
+#[test]
+fn anchored_resize_resizes_the_primary_grid_the_panel_owns() {
+    // `float_detach` deliberately keeps primary-grid ownership on the float, so
+    // the grid and PTY winsize the panel paints live in `state`/`pty`, never in
+    // `pane_sessions`. A corner drag must resize them together with the frame:
+    // a frame that grows while its shell keeps the old grid is the reported
+    // regression (nothing reflows, no SIGWINCH).
+    let (mut rt, float, _base) = detached_primary_runtime();
+    assert_eq!(
+        rt.primary_view(),
+        Some(float),
+        "the detached float keeps primary ownership"
+    );
+    assert!(
+        rt.paints_primary_grid(&float),
+        "the panel is session-less, so it paints the primary grid"
+    );
+    let home = frame_of(&rt, float);
+    assert_eq!(
+        (rt.state().width(), rt.state().height()),
+        (usize::from(home.cols), usize::from(home.rows)),
+        "the primary grid starts at the painted size"
+    );
+
+    let (cw, ch) = rt.live_cell_size();
+    let left = (home.frame.x.max(0) as u32 / cw.max(1)) as u16;
+    let top = (home.frame.y.max(0) as u32 / ch.max(1)) as u16;
+    let grab = cell_center(&rt, left, top);
+    rt.handle_cursor_moved(grab);
+    assert_eq!(
+        rt.float_resize_hover_at(grab),
+        Some(bitty_runtime::ResizeEdge::TopLeft),
+        "the panel corner must hit-test as a corner handle"
+    );
+    alt(&mut rt, PressState::Pressed);
+    rt.handle_mouse_input(mouse(MouseButton::Left, PressState::Pressed));
+    assert!(rt.float_resize_active(), "the corner grab starts a resize");
+    rt.handle_cursor_moved(cell_pixel(
+        &rt,
+        left.saturating_sub(2),
+        top.saturating_sub(1),
+    ));
+
+    let grown = frame_of(&rt, float);
+    assert!(
+        grown.cols > home.cols && grown.rows > home.rows,
+        "the drag grew the painted grid: {grown:?} from {home:?}"
+    );
+    assert_eq!(
+        (rt.state().width(), rt.state().height()),
+        (usize::from(grown.cols), usize::from(grown.rows)),
+        "the primary grid must follow the committed frame mid-drag"
+    );
+    rt.handle_mouse_input(mouse(MouseButton::Left, PressState::Released));
+    alt(&mut rt, PressState::Released);
+}
+
+#[test]
+fn restore_drops_the_stored_resize_extent() {
+    // The corner/edge resize extent is presentation-only and keyed by panel
+    // id. A restore re-installs the same ids from the snapshot, so it must drop
+    // the extents with the re-anchor offsets — otherwise the restored panel
+    // presents at a size recorded before the restore.
+    let mut rt = make_runtime();
+    install(&mut rt, two_pane());
+    rt.pin_floating(ViewId::new(2)).expect("pin must apply");
+    let pinned = ViewId::new(2);
+    assert_eq!(rt.pinned_views(), vec![pinned]);
+    let home = frame_of(&rt, pinned);
+
+    // Alt+grab the top-left corner and drag it inward: the pin shrinks.
+    let (cw, ch) = rt.live_cell_size();
+    let left = (home.frame.x.max(0) as u32 / cw.max(1)) as u16;
+    let top = (home.frame.y.max(0) as u32 / ch.max(1)) as u16;
+    let grab = cell_center(&rt, left, top);
+    rt.handle_cursor_moved(grab);
+    alt(&mut rt, PressState::Pressed);
+    rt.handle_mouse_input(mouse(MouseButton::Left, PressState::Pressed));
+    assert!(rt.float_resize_active(), "the pin corner must resize");
+    rt.handle_cursor_moved(cell_pixel(&rt, left + 4, top + 2));
+    rt.handle_mouse_input(mouse(MouseButton::Left, PressState::Released));
+    alt(&mut rt, PressState::Released);
+    let resized = frame_of(&rt, pinned);
+    assert!(
+        resized.frame.width < home.frame.width && resized.frame.height < home.frame.height,
+        "the drag shrank the pin: {resized:?} from {home:?}"
+    );
+
+    // A snapshot that re-installs the same id as a pin (no extent is
+    // persisted) must present at the default anchored share again.
+    let pane = |id: u64| PaneSnapshot {
+        view: ViewId::new(id),
+        cwd: None,
+        scrollback: Vec::new(),
+        attach: Some(PaneAttachment::Detached),
+        route: PaneRoute::Terminal,
+        mode: PresentationMode::Tiled,
+    };
+    let snap = SessionSnapshot {
+        version: SESSION_FORMAT_VERSION,
+        workspaces: vec![WorkspaceSnapshot {
+            seq: 1,
+            name: "ws1".to_string(),
+            layout: LayoutNode::split(
+                SplitAxis::Horizontal,
+                0.5,
+                LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)),
+                LayoutNode::leaf(View::new(ViewId::new(3), 80, 24)),
+            ),
+            focus: Some(ViewId::new(1)),
+            panes: vec![pane(1), pane(3)],
+            floats: Vec::new(),
+        }],
+        active: 0,
+        mru: vec![0],
+        pinned: vec![PinnedSnapshot {
+            view: View::with_presentation(pinned, 80, 24, PresentationMode::Floating),
+            cwd: None,
+            scrollback: Vec::new(),
+            attach: PaneAttachment::Detached,
+            anchor: None,
+            after: true,
+        }],
+    };
+    rt.apply_session_snapshot(&snap)
+        .expect("snapshot must apply");
+    assert_eq!(rt.pinned_views(), vec![pinned], "the pin is restored");
+    let restored = frame_of(&rt, pinned);
+    assert_eq!(
+        (restored.frame.width, restored.frame.height),
+        (home.frame.width, home.frame.height),
+        "a restored pin must present at the default anchored share: {restored:?} vs {home:?}"
     );
 }

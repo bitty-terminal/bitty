@@ -680,12 +680,16 @@ impl Runtime {
     ///
     /// The cell delta since the grab (or last move) flows through
     /// [`resize_floating_rect`] — the same clamped geometry the unit tests
-    /// pin (view minima, container clip) — installed via
-    /// [`Runtime::set_layout`] so leaf Views, pane sessions, and the primary
-    /// grid reflow exactly like a keyboard resize (live grid and PTY follow;
-    /// no deferral). Overshoot clamps fail-closed; a zero delta keeps the
-    /// resize armed with no redraw. When the layout no longer owns the leaf
-    /// (closed mid-drag) the resize ends fail-soft and `false` is returned.
+    /// pin (view minima, container clip). A structural overlay installs it
+    /// via [`Runtime::set_layout`]; an anchored float (pinned or detached)
+    /// commits it into the runtime anchor store and re-syncs the pane
+    /// sessions and the primary grid explicitly. Either way leaf Views,
+    /// pane sessions, and the primary grid/PTY winsize reflow with the
+    /// committed frame exactly like a keyboard resize (live grid and PTY
+    /// follow; no deferral). Overshoot clamps fail-closed; a zero delta
+    /// keeps the resize armed with no redraw. When the layout no longer owns
+    /// the leaf (closed mid-drag) the resize ends fail-soft and `false` is
+    /// returned.
     ///
     /// Returns `true` when a resize was active (caller consumes the motion).
     pub fn update_float_resize(&mut self, pos: CursorPosition) -> bool {
@@ -721,12 +725,22 @@ impl Runtime {
                 // tree — the step commits into the runtime anchor store, which
                 // the present composite reads on the next frame. The layout is
                 // untouched (a pinned/detached leaf is never a solver leaf), so
-                // the pane grid and PTY winsize are re-synced explicitly from
-                // the new frame instead of riding `set_layout`.
+                // the grids and PTY winsizes are re-synced explicitly from the
+                // new frame instead of riding `set_layout`.
+                //
+                // The store call validates before it mutates (unknown id or
+                // empty rect refuse without a write), so a refused step leaves
+                // the committed extent and both syncs untouched.
                 if !self.set_anchored_overlay_rect(resize.leaf, next) {
                     self.float_resize = None;
                     return false;
                 }
+                // The primary grid and primary PTY live in `state`/`pty`, not
+                // in `pane_sessions`, and `float_detach` deliberately keeps
+                // primary ownership on the detached float — so for the common
+                // corner-drag case (the float paints the primary shell) only
+                // this sync resizes the shell and delivers SIGWINCH.
+                self.sync_primary_geometry();
                 self.sync_pane_geometry();
                 self.pending_full_redraw = true;
             } else {

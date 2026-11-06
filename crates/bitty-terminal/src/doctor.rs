@@ -2946,10 +2946,20 @@ mod tests {
 
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    /// Unique scratch root (pid + atomic counter; parallel-safe).
+    /// Short, unique scratch root (pid + atomic counter; parallel-safe).
+    ///
+    /// Unix socket paths are bounded by `SUN_LEN` (104 bytes on macOS) and
+    /// macOS `temp_dir()` (`/var/folders/…/T`, which resolves to the longer
+    /// `/private/var/…`) leaves no room for the `run/bitty/<instance>.sock`
+    /// fixtures, so socket fixtures anchor under the short `/tmp` spelling of
+    /// the same volume there.
     fn scratch_root(tag: &str) -> PathBuf {
         static SEQ: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
+        #[cfg(target_os = "macos")]
+        let base = PathBuf::from("/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let base = std::env::temp_dir();
+        let path = base.join(format!(
             "bitty-doctor-fix-{tag}-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)

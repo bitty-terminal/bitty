@@ -2,8 +2,6 @@
 
 use bitty_runtime::{Runtime, SplitAxis, ViewId};
 
-use crate::cli::Args;
-
 // ---------------------------------------------------------------------------
 // Default shell resolution (CTX-0136)
 // ---------------------------------------------------------------------------
@@ -55,7 +53,7 @@ pub(crate) fn resolve_default_shell<'a>(
     }
 }
 
-/// Resolves the program to spawn: the explicit `args.program` unchanged when
+/// Resolves the program to spawn: an explicit `program` unchanged when
 /// present, else the default shell chain (configured `terminal.shell` >
 /// `$SHELL` > [`FALLBACK_SHELL`]).
 ///
@@ -63,14 +61,13 @@ pub(crate) fn resolve_default_shell<'a>(
 /// effective config once and injects them so tests never touch the
 /// environment.
 pub(crate) fn resolve_spawn_program<'a>(
-    args: &'a Args,
+    program: Option<&'a str>,
     config_shell: Option<&'a str>,
     shell_env: Option<&'a str>,
 ) -> &'a str {
-    if let Some(program) = args.program.as_deref() {
-        program
-    } else {
-        resolve_default_shell(config_shell, shell_env)
+    match program {
+        Some(program) => program,
+        None => resolve_default_shell(config_shell, shell_env),
     }
 }
 

@@ -30,6 +30,16 @@ use crate::stall_watchdog::{Phase, StallWatchdog, WatchdogContext};
 /// hold at [`bitty_runtime::PRESENT_SETTLE_MAX`] under a continuous producer.
 pub(crate) const PRESENT_SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
 
+/// How long the windowed startup path waits for a window resize before it
+/// creates the shell PTYs anyway (CTX-1719).
+///
+/// The deferred spawn normally runs on the first `AboutToWait` after the
+/// compositor's `Resized`, within one frame. This bound only covers a window
+/// that never reports a size: the session must still get its shell instead of
+/// waiting forever.
+pub(crate) const STARTUP_SPAWN_WINDOW_MAX: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
 /// First retry delay for a parked plugin command's resume wake (bitty#2830).
 ///
 /// A parked command resumes one RC-1 wall window per cold tick. Re-arming the
@@ -934,6 +944,30 @@ pub(crate) struct TerminalApp {
     /// Frozen startup spawn recipe so `new_split` leaves replay the exact
     /// program/shell resolution (CTX-0176).
     pub(crate) spawn_spec: SpawnSpec,
+    /// Deferred startup shell spawn (CTX-1719).
+    ///
+    /// A windowed run must not create the primary PTY before the window has a
+    /// grid: the runtime's configured 80x24 default would be the child's
+    /// first `TIOCGWINSZ`, and a program that samples it once at startup
+    /// (Hermes Agent) then lays out a 80x24 UI inside a larger pane forever.
+    /// `Some(fail_loud)` while the spawn is owed; the first committed window
+    /// grid consumes it (see [`Self::spawn_deferred_startup_shells`]).
+    /// `None` when startup spawned eagerly (headless, test mode, tests).
+    pub(crate) pending_startup_spawn: Option<PendingStartupSpawn>,
+    /// A live window resize has been applied since the window existed.
+    ///
+    /// The deferred spawn waits for this edge: winit delivers the
+    /// compositor's real size as a `Resized` event. A window that never
+    /// materializes (headless fallback inside the event loop) sets it too:
+    /// there is no better grid to wait for.
+    pub(crate) startup_grid_ready: bool,
+    /// Deadline for the deferred startup spawn to wait for a window resize
+    /// (CTX-1719).
+    ///
+    /// A compositor that never delivers a `Resized` (or a window that is
+    /// created without one) must not leave the session shell-less: once this
+    /// bound passes, the spawn proceeds at whatever grid the runtime holds.
+    pub(crate) startup_spawn_deadline: Option<std::time::Instant>,
     /// Stderr verbosity gate (CTX-0190). Default [`LogLevel::Warn`] (quiet):
     /// per-frame `bitty tick` lines require `Debug`/`Trace`. User-facing key
     /// info (paste confirm/cancel, startup summary) and warnings/errors
@@ -1059,6 +1093,18 @@ pub(crate) struct PendingExit {
     pub(crate) exit_code: u32,
 }
 
+/// Deferred startup shell spawn (CTX-1719).
+///
+/// A windowed run creates the primary and pane PTYs only after the window's
+/// first grid is committed, so the child's first `TIOCGWINSZ` reports the
+/// cells the painter shows rather than the runtime's configured default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PendingStartupSpawn {
+    /// `--fail-loud`: a failed spawn exits with [`crate::EXIT_STARTUP`]
+    /// instead of continuing without a child.
+    pub(crate) fail_loud: bool,
+}
+
 /// Coalesced config-reload edge (issue #1828; at most one per tick).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingConfigReload {
@@ -1125,6 +1171,9 @@ impl TerminalApp {
             hidden_repair_probe_at: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
+            pending_startup_spawn: None,
+            startup_grid_ready: false,
+            startup_spawn_deadline: None,
             log_level: LogLevel::default_level(),
             session_persistence: true,
             live_snapshot: None,
@@ -1184,6 +1233,9 @@ impl TerminalApp {
             hidden_repair_probe_at: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
+            pending_startup_spawn: None,
+            startup_grid_ready: false,
+            startup_spawn_deadline: None,
             log_level: LogLevel::default_level(),
             session_persistence: true,
             live_snapshot: None,
@@ -1206,6 +1258,65 @@ impl TerminalApp {
             pending_input_commands: std::collections::VecDeque::new(),
             pending_input_commands_dropped: 0,
         }
+    }
+
+    /// Defers the startup shell spawn until the window's first grid (CTX-1719).
+    ///
+    /// The windowed startup path calls this instead of spawning immediately:
+    /// the PTY must be created at the grid the painter will show, never at
+    /// the runtime's configured default. [`Self::spawn_deferred_startup_shells`]
+    /// consumes the request once the event loop has applied the window's
+    /// first resize.
+    pub(crate) fn defer_startup_shells(&mut self, fail_loud: bool) {
+        self.pending_startup_spawn = Some(PendingStartupSpawn { fail_loud });
+        self.startup_grid_ready = false;
+        self.startup_spawn_deadline = Some(std::time::Instant::now() + STARTUP_SPAWN_WINDOW_MAX);
+    }
+
+    /// Spawns the deferred primary and pane shells at the committed grid.
+    ///
+    /// Returns `true` when this call performed the spawn. A no-op while no
+    /// spawn is owed or the window's grid is not known yet, so the event loop
+    /// can call it unconditionally. On `--fail-loud` a failed spawn exits
+    /// with [`crate::EXIT_STARTUP`], matching the eager startup path.
+    pub(crate) fn spawn_deferred_startup_shells(&mut self) -> bool {
+        if self.pending_startup_spawn.is_none() {
+            return false;
+        }
+        if !self.startup_grid_ready {
+            // Bounded safety net: a compositor that never delivers a resize
+            // must not leave the session shell-less. After the window the
+            // grid we have is the best available one.
+            let expired = self
+                .startup_spawn_deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+            if !expired {
+                return false;
+            }
+            crate::logging::warn(|| {
+                String::from(
+                    "bitty: no window resize before the startup spawn deadline; spawning at the current grid",
+                )
+            });
+        }
+        let Some(pending) = self.pending_startup_spawn.take() else {
+            return false;
+        };
+        let failed = crate::spawn_startup_shells(&mut self.runtime, &self.spawn_spec);
+        if pending.fail_loud && failed {
+            eprintln!("bitty: startup failed (--fail-loud): PTY shell startup did not complete");
+            std::process::exit(crate::EXIT_STARTUP);
+        }
+        let snapshot = self.runtime.snapshot();
+        crate::logging::info(|| {
+            format!(
+                "bitty: deferred startup shell spawned at grid {}x{} (has_pty={})",
+                snapshot.width,
+                snapshot.height,
+                self.runtime.has_pty()
+            )
+        });
+        true
     }
 
     /// Attaches the synthetic demo pump to an existing app (CTX-0167).
@@ -5022,6 +5133,10 @@ impl TerminalApp {
                     // even when running without a window system but not in
                     // explicit --headless mode.
                     let _ = self.drive_tick();
+                    // CTX-1719: no window means no compositor size will ever
+                    // arrive; release the deferred startup spawn instead of
+                    // waiting forever for a resize that cannot come.
+                    self.startup_grid_ready = true;
                 }
             }
             PlatformEvent::Window { window_id: _, kind } => {
@@ -5068,6 +5183,13 @@ impl TerminalApp {
                         } else {
                             let _ = self.drive_tick();
                         }
+                        // CTX-1719: the runtime applied the window's resize
+                        // above (`handle_platform_event` -> `handle_resize`),
+                        // so its grid is the painted one and the deferred
+                        // startup spawn can run on the next `AboutToWait`.
+                        if self.window.handle.is_some() {
+                            self.startup_grid_ready = true;
+                        }
                     }
                     WindowEventKind::RedrawRequested => {
                         // bitty#2830 hypothesis 2: while the gate is closed a
@@ -5095,6 +5217,11 @@ impl TerminalApp {
                 // Per winit docs this is a good place to do per-frame work.
                 // Poll PTY pump again and drive tick; request redraw only when
                 // tick produced a present (frame-on-demand).
+                //
+                // CTX-1719: the window's first grid is committed by now, so
+                // this is the earliest point where the deferred startup PTYs
+                // can be created at the size the painter shows.
+                self.spawn_deferred_startup_shells();
                 self.watchdog_phase(Phase::PtyPump);
                 self.poll_pty_pump();
                 // bitty#2830 F11: the presenter exhausted its built-in

@@ -2832,7 +2832,7 @@ mod tests {
         let report = assemble_report(&healthy_inputs());
         assert_eq!(report.exit_code(), EXIT_OK);
         assert!(report.ok());
-        assert_eq!(report.checks.len(), 14);
+        assert_eq!(report.checks.len(), 15);
         assert!(report.checks.iter().all(|c| c.status == DoctorStatus::Pass
             || c.id == "images"
             || c.id == "config"
@@ -2840,7 +2840,7 @@ mod tests {
         // images is informational-warn by design; everything else passes.
         let summary = report.summary();
         assert_eq!(summary.fail, 0);
-        assert_eq!(summary.pass + summary.warn, 14);
+        assert_eq!(summary.pass + summary.warn, 15);
     }
 
     #[test]

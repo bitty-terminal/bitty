@@ -663,6 +663,93 @@ fn timer_due_while_command_parked_is_not_counted_and_stays_active() {
 }
 
 #[test]
+fn timer_due_while_command_parked_stays_armed_and_fires_after_resume() {
+    // bitty#2899: a refused timer drive must not consume the one-shot. A
+    // parked command owns the VM for the tick, so the due timer keeps its
+    // deadline and fires once the park clears. Consuming it would silently
+    // delete a pending tick, and a plugin's finite activation chain (the bar
+    // pre-arms 32 one-shot ticks) would then die one refused pump at a time
+    // until its cadence stopped for good.
+    let data = temp_dir("parked-keep");
+    let root = temp_dir("parked-keep-root");
+    let id = PluginId::new("bitty-featured.parkedkeep").expect("id");
+    write_full_plugin(
+        &root,
+        "bitty-featured.parkedkeep",
+        &["terminal.semantic-read"],
+        &["slow"],
+        &[],
+        "",
+        r#"
+        bitty.commands.register({
+          id = "slow",
+          title = "slow",
+          run = function()
+            for _ = 1, 3 do
+              pcall(bitty.terminal.snapshot, { scope = "semantic" })
+            end
+            return "done"
+          end,
+        })
+        bitty.timers.create(100, function() bitty.store.set("timer_ran", true) end)
+        "#,
+    );
+    let snapshot = Rc::new(SlowSnapshot {
+        value: LuaValue::table([("version", LuaValue::Integer(1))]),
+        delay: SLOW_SNAPSHOT_DELAY,
+    });
+    let mut rt = runtime_with_snapshot(data.clone(), vec![root.clone()], snapshot);
+    common::install_stub_backend(&mut rt);
+    rt.discover();
+    rt.activate(&id).expect("activate");
+    let deadline = rt.timer_deadline().expect("armed");
+    let parked = rt
+        .dispatch_command(&id, "slow", &[])
+        .expect_err("slow command must park");
+    assert!(
+        matches!(parked, PluginRuntimeError::Parked { .. }),
+        "expected a parked command, got {parked:?}"
+    );
+    assert_eq!(
+        rt.pump_due_timers_at(deadline),
+        0,
+        "a refused drive is not a fire"
+    );
+    assert_eq!(
+        rt.timer_deadline(),
+        Some(deadline),
+        "the refused one-shot keeps its deadline for a later pump"
+    );
+    assert_eq!(store_get(&rt, &id, "timer_ran"), None);
+    // Resume the parked command on the cold phase until it completes.
+    for _ in 0..200 {
+        if rt.parked_command_count() == 0 {
+            break;
+        }
+        let _ = rt.pump_parked_commands();
+    }
+    assert_eq!(rt.parked_command_count(), 0, "the command completes");
+    assert_eq!(rt.state(&id), Some(&LifecycleState::Active));
+    assert_eq!(
+        rt.pump_due_timers_at(deadline),
+        1,
+        "the kept one-shot fires once the park clears"
+    );
+    assert_eq!(
+        store_get(&rt, &id, "timer_ran"),
+        Some(LuaValue::Bool(true)),
+        "the callback ran"
+    );
+    assert_eq!(
+        rt.timer_deadline(),
+        None,
+        "a fired one-shot leaves no wake (zero-submit preserved)"
+    );
+    let _ = std::fs::remove_dir_all(&data);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn timer_due_after_foreign_suspension_fails_with_refusal_reason() {
     // bitty#2900 review F4/F5: the suspension can be caused by another
     // dispatch. A timer drive that never started must not claim the callback

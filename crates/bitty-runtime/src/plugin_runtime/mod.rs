@@ -2287,37 +2287,70 @@ impl PluginRuntime {
             if fired >= 512 {
                 break;
             }
-            self.timer_deadlines.remove(&(plugin.clone(), handle));
-            self.timer_fired.insert((plugin.clone(), handle));
             let callback = self.live_timer_callback(&plugin, handle);
             let vm = self.entries.get(&plugin).and_then(|entry| entry.vm.clone());
             let active = self
                 .entries
                 .get(&plugin)
                 .is_some_and(|entry| entry.state == LifecycleState::Active);
-            // CTX-1247: prune the fired row before invoking the callback so
-            // a callback-created timer reuses the freed 64-cap slot (at-cap
-            // chains would otherwise fail `E_DEF_LIMIT` even though the
-            // one-shot deadline is gone). The callback was cloned above, so
-            // pruning cannot lose it; on consume contention the
-            // `timer_fired` entry is kept fail-closed.
-            self.consume_fired_timer(&plugin, handle);
-            let mut terminal = None;
-            if active {
-                if let (Some(vm), Some(callback)) = (vm, callback) {
-                    if let Ok(mut vm_ref) = vm.try_borrow_mut() {
-                        if let Some(reason) = vm_ref.suspend_reason().cloned() {
-                            // Refused drive: the VM was already unusable, so
-                            // the callback never ran. Fail the generation
-                            // without a phantom fire, and keep the reason
-                            // attributed to the dispatch that suspended it.
-                            terminal = Some((reason, true));
-                        } else if vm_ref.is_parked() {
-                            // The parked command owns the VM this tick; a
-                            // timer drive is refused before execution, so it
-                            // is not a fire either. The one-shot stays
-                            // consumed, matching prior containment.
-                        } else {
+            // bitty#2899: decide whether this drive can start *before* the
+            // one-shot is consumed. A refusal must leave the timer armed for
+            // a later pump: consuming it here silently deletes a pending
+            // tick, and a plugin's finite activation chain (the bar pre-arms
+            // 32) then dies one refused pump at a time until the plugin's
+            // cadence stops for good.
+            let drive = match (active, vm.as_ref(), callback) {
+                (false, _, _) | (_, None, _) | (_, _, None) => Drive::Stale,
+                (true, Some(vm), Some(callback)) => match vm.try_borrow() {
+                    Err(_) => Drive::Deferred,
+                    Ok(vm_ref) => match vm_ref.suspend_reason().cloned() {
+                        Some(reason) => Drive::Terminal(reason),
+                        None if vm_ref.is_parked() => {
+                            // The parked command owns the VM this tick. The
+                            // timer stays armed and fires once the park
+                            // clears (`pump_parked_commands` on the same cold
+                            // phase); it is not a fire, so it is not counted.
+                            Drive::Deferred
+                        }
+                        None => Drive::Ready(callback),
+                    },
+                },
+            };
+            match drive {
+                Drive::Deferred => break,
+                Drive::Stale => {
+                    // The generation or the capture row is gone; drop the
+                    // stale deadline so it can never wake the loop again.
+                    self.timer_deadlines.remove(&(plugin, handle));
+                    continue;
+                }
+                Drive::Terminal(reason) => {
+                    self.timer_deadlines.remove(&(plugin.clone(), handle));
+                    self.timer_fired.insert((plugin.clone(), handle));
+                    self.consume_fired_timer(&plugin, handle);
+                    // Refused drive: the VM was already unusable, so the
+                    // callback never ran. Fail the generation without a
+                    // phantom fire, and keep the reason attributed to the
+                    // dispatch that suspended it.
+                    self.fail_runtime(&plugin, timer_terminal_reason(&reason, true));
+                    self.sync_timer_cancels();
+                    self.sync_new_timers(now);
+                    continue;
+                }
+                Drive::Ready(callback) => {
+                    self.timer_deadlines.remove(&(plugin.clone(), handle));
+                    self.timer_fired.insert((plugin.clone(), handle));
+                    // CTX-1247: prune the fired row before invoking the
+                    // callback so a callback-created timer reuses the freed
+                    // 64-cap slot (at-cap chains would otherwise fail
+                    // `E_DEF_LIMIT` even though the one-shot deadline is
+                    // gone). The callback was cloned above, so pruning
+                    // cannot lose it; on consume contention the
+                    // `timer_fired` entry is kept fail-closed.
+                    self.consume_fired_timer(&plugin, handle);
+                    let mut terminal = None;
+                    if let Some(vm) = vm.as_ref() {
+                        if let Ok(mut vm_ref) = vm.try_borrow_mut() {
                             match vm_ref.call_function(&callback, &[]) {
                                 Ok(_) => fired += 1,
                                 Err(_) => {
@@ -2341,10 +2374,10 @@ impl PluginRuntime {
                             }
                         }
                     }
+                    if let Some((reason, refused)) = terminal {
+                        self.fail_runtime(&plugin, timer_terminal_reason(&reason, refused));
+                    }
                 }
-            }
-            if let Some((reason, refused)) = terminal {
-                self.fail_runtime(&plugin, timer_terminal_reason(&reason, refused));
             }
             self.sync_timer_cancels();
             self.sync_new_timers(now);
@@ -4711,6 +4744,24 @@ fn lifecycle_error(id: &PluginId, detail: &str) -> PluginRuntimeError {
         plugin: id.to_string(),
         detail: detail.to_string(),
     }
+}
+
+/// Whether one due one-shot timer can be driven by this pump pass (bitty#2899).
+///
+/// The pump decides *before* consuming the one-shot, so a refused drive never
+/// deletes a pending tick. `Deferred` leaves the deadline armed and ends the
+/// pass; `Stale` drops a deadline whose generation or capture row is gone;
+/// `Terminal` fails the generation on an already-suspended VM.
+enum Drive {
+    /// The VM is free: consume the one-shot and invoke `callback`.
+    Ready(bitty_lua::StashedFunction),
+    /// The VM cannot be entered this pass (parked command or borrow
+    /// contention). The timer keeps its deadline for a later pump.
+    Deferred,
+    /// The generation or the capture row is gone; the deadline is dead.
+    Stale,
+    /// The VM is already terminally suspended; the generation fails.
+    Terminal(SuspendReason),
 }
 
 /// Host-authored [`LifecycleState::Failed`] reason for a terminal timer

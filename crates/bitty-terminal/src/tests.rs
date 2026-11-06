@@ -16287,6 +16287,158 @@ fn plugin_timer_deadline_none_when_unarmed_preserves_zero_submit() {
 }
 
 #[test]
+fn activation_time_timer_fires_on_the_idle_tick_cycle() {
+    // bitty#2899 regression: the bar's clock froze on a live window because
+    // nothing fired its activation-armed one-shot ticks while the window was
+    // idle. The runtime pump was proven correct in isolation (#2901), so this
+    // pins the live wiring: a timer registered during activation must arm the
+    // app's idle wake and fire on the `drive_tick` cycle that wake delivers,
+    // with the rendered band republished and the frame presented.
+    //
+    // The pinned bar (`crates/bitty-runtime/tests/bar-pin`) is driven with its
+    // shipped module plan, so this is the real clock chain shape: one tick per
+    // module cadence, all armed while the activation window is open.
+    use bitty_runtime::plugin_runtime::{
+        LuaValue, PluginRuntime, PluginRuntimeConfig, SettingsSource,
+    };
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+
+    struct PinSnapshot;
+    impl bitty_runtime::plugin_runtime::SnapshotSource for PinSnapshot {
+        fn snapshot(
+            &self,
+            _scope: &str,
+        ) -> Result<LuaValue, bitty_runtime::plugin_runtime::BridgeError> {
+            Ok(LuaValue::table([
+                ("version", LuaValue::Integer(1)),
+                ("zones", LuaValue::array(vec![])),
+            ]))
+        }
+    }
+    struct PinWorkspaces;
+    impl bitty_runtime::plugin_runtime::services::WorkspaceSource for PinWorkspaces {
+        fn workspaces(
+            &self,
+        ) -> Result<
+            Vec<bitty_runtime::plugin_runtime::WorkspaceInfo>,
+            bitty_runtime::plugin_runtime::BridgeError,
+        > {
+            Ok((1..=2)
+                .map(|id| bitty_runtime::plugin_runtime::WorkspaceInfo {
+                    id,
+                    name: format!("ws{id}"),
+                    active: id == 1,
+                    panel_count: 1,
+                    scratchpad_count: 0,
+                    scratchpad_occupied: false,
+                    attention: Default::default(),
+                })
+                .collect())
+        }
+    }
+    struct MapSettings(BTreeMap<String, LuaValue>);
+    impl SettingsSource for MapSettings {
+        fn get(&self, key: &str) -> Option<LuaValue> {
+            self.0.get(key).cloned()
+        }
+    }
+    fn module_list(values: &[&str]) -> LuaValue {
+        LuaValue::array(
+            values
+                .iter()
+                .map(|value| LuaValue::String((*value).to_string()))
+                .collect(),
+        )
+    }
+
+    let mut settings = BTreeMap::new();
+    settings.insert("show".to_string(), LuaValue::Bool(true));
+    settings.insert("modules_left".to_string(), module_list(&["workspaces"]));
+    settings.insert("modules_center".to_string(), module_list(&["clock"]));
+    settings.insert(
+        "modules_right".to_string(),
+        module_list(&["network", "cpu", "memory", "battery"]),
+    );
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("bitty-runtime")
+        .join("tests")
+        .join("bar-pin");
+    let data = std::env::temp_dir().join(format!("ctx1737-bar-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data);
+    std::fs::create_dir_all(&data).expect("data dir");
+    let mut plugin_runtime = PluginRuntime::new(PluginRuntimeConfig {
+        safe_mode: false,
+        data_dir: Some(data.clone()),
+        store_root: None,
+        bundled_roots: Vec::new(),
+        third_party_roots: vec![root],
+        settings: Rc::new(MapSettings(settings)),
+        snapshot: Rc::new(PinSnapshot),
+    });
+    plugin_runtime.discover();
+    plugin_runtime.set_workspace_source(Rc::new(PinWorkspaces));
+    let bar = bitty_plugin_host::manifest::PluginId::new("bitty-terminal.bar").expect("id");
+    plugin_runtime.activate(&bar).expect("pinned bar activates");
+    let mut app = editor_test_app().with_plugin_runtime(Some(plugin_runtime));
+
+    let band_version = |app: &TerminalApp| {
+        app.plugin_runtime
+            .as_ref()
+            .expect("runtime")
+            .ui_blocks()
+            .first()
+            .map(|block| block.3)
+            .expect("bar mounts one band")
+    };
+
+    // Activation armed the module chain: the app must hand the loop a wake at
+    // its earliest deadline instead of parking on plain `Wait`.
+    let armed = app
+        .plugin_timer_deadline()
+        .expect("activation timer arms a wake");
+    let activation_now = std::time::Instant::now();
+    assert!(
+        armed > activation_now,
+        "the earliest module cadence must be a future wake"
+    );
+
+    // Settle the activation frame with the clock frozen before the deadline.
+    app.test_now = Some(activation_now);
+    let _ = app.drive_tick();
+    let before = band_version(&app);
+    assert_eq!(
+        app.plugin_timer_deadline(),
+        Some(armed),
+        "a pump before the deadline keeps the wake armed"
+    );
+
+    // The idle wake lands: the same cold cycle must fire the due ticks, repaint
+    // the band, and present the frame (this is what the frozen clock lost).
+    app.test_now = Some(armed);
+    let presented = app.drive_tick().is_some();
+    let after = band_version(&app);
+    assert!(
+        after > before,
+        "the due activation timers must re-render the band ({before} -> {after})"
+    );
+    assert!(
+        presented,
+        "a timer-driven band change must present the frame"
+    );
+    let next = app
+        .plugin_timer_deadline()
+        .expect("the chain keeps a wake armed past the fired tick");
+    assert!(
+        next > armed,
+        "the next cadence stays armed after the fire: {next:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+#[test]
 fn plugin_timer_deadline_armed_while_pending() {
     // A far-future timer arms a wake but does not fire on this tick.
     let (mut app, id, root) = timer_test_app(

@@ -283,9 +283,11 @@ is drained and ignored), so a supervisor is what keeps it running. The
 per-user unit ships at `/usr/lib/systemd/user/bittyd.service` with
 `Type=simple`, `ExecStart=/usr/bin/bittyd start`, `Restart=on-failure`,
 `RestartSec=2`, `KillMode=mixed`, and the session-host-safe hardening
-`NoNewPrivileges=yes`, `PrivateTmp=yes`, `ProtectSystem=full` (`ProtectHome`
-is deliberately unset: the daemon hosts the user's shells in their home
-directories).
+`ProtectSystem=full` (`ProtectHome` is deliberately unset: the daemon hosts the
+user's shells in their home directories). `NoNewPrivileges` and `PrivateTmp`
+are deliberately not set: every hosted shell inherits them, and they break it —
+`sudo`/`su`/setuid helpers fail under the first, and the second hides
+`/tmp/.X11-unix` and the tmux/screen sockets the user's session already owns.
 
 It is a **user** unit, not a system service: the daemon binds a socket in the
 invoking user's runtime directory, mints an owner-private operator capability,

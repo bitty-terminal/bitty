@@ -603,8 +603,10 @@ mod unix {
         // (bitty#2920). Blocking is deliberate instead of `SIG_IGN`, because
         // an ignored disposition survives `execve`: every shell the daemon
         // spawns would inherit it and stop reacting to a hangup. The blocked
-        // mask is reset for the child by the process spawn path, so spawned
-        // shells keep the default `SIGHUP` action.
+        // mask is inherited by the child the same way, so the PTY spawn path
+        // clears the mask and resets every resettable disposition to the
+        // default before `exec` (`containment::reset_child_signal_state`), and
+        // spawned shells keep the default `SIGHUP` action.
         mask.add(Signal::SIGHUP);
         pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
             .map_err(|_| ServerError::Signals)?;

@@ -14,6 +14,9 @@
 //!
 //! - mouse press, release, motion, and wheel reports carry the receiving
 //!   pane's own grid cells, clamped (never dropped) at its edge;
+//! - motion (`1003`) reports belong to the pane under the pointer, so a
+//!   captured pane keeps its hover bytes when the keyboard focus sits
+//!   elsewhere (issue #2939);
 //! - a left press on another pane moves focus first when a mouse-tracking
 //!   app is involved, so the click reaches the pane it landed on;
 //! - hyperlink activation resolves the link in the clicked pane's grid.
@@ -38,6 +41,7 @@ use bitty_runtime::{
 
 const PRIMARY: ViewId = ViewId::new(1);
 const PANE: ViewId = ViewId::new(2);
+const SECOND: ViewId = ViewId::new(3);
 
 /// Upper bound for a report to round-trip through the pane's PTY echo.
 const ECHO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -99,9 +103,41 @@ fn cell_center(rt: &Runtime, view: ViewId, row: u16, col: u16) -> CursorPosition
 }
 
 fn pane_text(rt: &Runtime) -> String {
-    rt.pane_snapshot(&PANE)
+    pane_text_of(rt, PANE)
+}
+
+/// [`pane_text`] for any spawned pane.
+fn pane_text_of(rt: &Runtime, view: ViewId) -> String {
+    rt.pane_snapshot(&view)
         .map(|snap| snap.cells.iter().map(|cell| cell.glyph).collect())
         .unwrap_or_default()
+}
+
+/// Two real `cat -v` panes (`2` and `3`) beside the headless primary, both
+/// running `modes`, so pointer routing between two capturing apps is
+/// observable end to end.
+fn two_app_panes(modes: &[u8], config: RuntimeConfig) -> Runtime {
+    let mut rt = Runtime::new(config).expect("headless build");
+    rt.set_layout(LayoutNode::split(
+        SplitAxis::Horizontal,
+        1.0 / 3.0,
+        LayoutNode::leaf(View::new(PRIMARY, 80, 24)),
+        LayoutNode::split(
+            SplitAxis::Horizontal,
+            0.5,
+            LayoutNode::leaf(View::new(PANE, 80, 24)),
+            LayoutNode::leaf(View::new(SECOND, 80, 24)),
+        ),
+    ));
+    rt.force_headless_clipboard();
+    for view in [PANE, SECOND] {
+        let frame = frame_of(&rt, view);
+        rt.spawn_shell_for_view(view, "/bin/sh", &["-c", "cat -v"], frame.cols, frame.rows)
+            .expect("spawn app pane");
+        rt.handle_pane_bytes(view, modes);
+    }
+    rt.handle_pty_bytes(b"primary text");
+    rt
 }
 
 /// Pumps the pane until its echoed text contains `needle` or the timeout
@@ -178,7 +214,16 @@ fn press_and_release_report_the_pane_own_cells() {
 #[test]
 fn motion_reports_clamp_at_the_receiving_pane_edge() {
     bitty_test_support::require_pty!();
-    let mut rt = split_with_app_pane(SGR_ANY_MOTION);
+    // Focus-follows is off here: this pins the coordinate mapping for the
+    // pane that keeps the keyboard while the pointer leaves it (issue #2939
+    // moves hover focus, and with it the motion receiver, otherwise).
+    let mut rt = split_with_app_pane_config(
+        SGR_ANY_MOTION,
+        RuntimeConfig {
+            focus_follows_mouse: false,
+            ..RuntimeConfig::default()
+        },
+    );
     assert!(rt.set_focus(PANE));
 
     rt.handle_cursor_moved(cell_center(&rt, PANE, 1, 5));
@@ -198,6 +243,41 @@ fn motion_reports_clamp_at_the_receiving_pane_edge() {
     assert!(
         text.contains(&clamped),
         "motion outside the pane clamps at its edge; pane text: {text:?}"
+    );
+}
+
+#[test]
+fn motion_reports_follow_the_pointer_pane_not_keyboard_focus() {
+    // Issue #2939: a captured pane keeps its own hover bytes when the
+    // keyboard belongs to another pane. Both panes request `1003`; the
+    // pointer sits in `PANE` while `SECOND` holds focus. Routing motion by
+    // the focused pane (the pre-fix behavior) echoed a clamped report in
+    // `SECOND` and left `PANE` silent.
+    bitty_test_support::require_pty!();
+    let mut rt = two_app_panes(
+        SGR_ANY_MOTION,
+        RuntimeConfig {
+            focus_follows_mouse: false,
+            ..RuntimeConfig::default()
+        },
+    );
+    assert!(rt.set_focus(SECOND));
+
+    rt.handle_cursor_moved(cell_center(&rt, PANE, 1, 5));
+    let inside = sgr(35, 1, 5, true);
+    let text = wait_for_pane_text(&mut rt, &inside);
+    assert!(
+        text.contains(&inside),
+        "the pane under the pointer must receive its own motion report; pane text: {text:?}"
+    );
+    assert!(
+        !pane_text_of(&rt, SECOND).contains("^[[<35;"),
+        "the keyboard-focused pane must not receive motion for another pane"
+    );
+    assert_eq!(
+        rt.focused_view(),
+        Some(SECOND),
+        "motion routing must not move focus on its own"
     );
 }
 

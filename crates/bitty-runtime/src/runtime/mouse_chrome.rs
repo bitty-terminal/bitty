@@ -1643,16 +1643,19 @@ impl Runtime {
     /// with a positive delay the candidate is recorded and
     /// [`Self::apply_hover_deadline`] commits it once `now` reaches the
     /// deadline. Moving to a different candidate re-arms the dwell clock.
+    ///
+    /// Issue #2939: the decision is pointer-driven and never consults mouse
+    /// capture. The raw pointer position resolves to a pane before any
+    /// capture routing, so a mouse-tracking app (`1000`/`1002`/`1003`) can
+    /// neither hold focus once the pointer leaves it nor keep hover from
+    /// entering it. Capture only decides where *reports* go
+    /// ([`Self::motion_report_owner`]); it owns no focus authority.
     pub(super) fn hover_focus_at_at(&mut self, pos: CursorPosition, now: Instant) {
         // Issue #2787: a window that does not own the keyboard never moves its
         // own focus owner from pointer state. Without this, an unfocused window
         // under the pointer (compositor focus-follows-mouse off) would drift
         // from the pane the user left focused before focus ever returns.
         if !self.focused || !self.config.focus_follows_mouse || self.shift_pressed {
-            self.hover_pending = None;
-            return;
-        }
-        if self.should_capture_mouse() {
             self.hover_pending = None;
             return;
         }

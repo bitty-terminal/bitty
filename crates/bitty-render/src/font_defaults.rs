@@ -96,7 +96,7 @@ impl ResolvedPrimary {
     ///
     /// This is the only honest answer to "is the configured family really
     /// installed?": `SwashSingle::load_font` succeeds for an absent family by
-    /// loading a monospaced stand-in ([`generic_monospace_face`]), so a loaded
+    /// loading a monospaced stand-in (`generic_monospace_face`), so a loaded
     /// face says nothing about which family it came from. `false` here means
     /// the renderer paints with that stand-in, so a caller asserting a
     /// property of the configured face (programming ligatures, advance

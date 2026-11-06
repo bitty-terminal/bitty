@@ -1,8 +1,9 @@
 //! CTX-1607: the shaped `harfrust`/`swash` stack is the production default.
 //!
-//! These are host-font tests: a container with no discoverable font cannot
-//! shape and legitimately falls back, so each test skips in that case
-//! instead of failing the default-selection contract.
+//! Default selection is asserted unconditionally: `select_renderer` picks the
+//! shaped stack whenever `SwashSingle::new()` initializes, whatever family the
+//! host has installed. Only the ligature tests need a ligature-bearing face
+//! and skip when the resolver reports none.
 //!
 //! "The host has the face" is decided by the resolver, not by a successful
 //! `load_font`: since issue #2931 an absent family loads a monospaced stand-in,
@@ -14,6 +15,11 @@ use bitty_runtime::config::DEFAULT_FONT_FAMILY;
 use bitty_runtime::{Runtime, RuntimeConfig, TextStack, TextStackPreference};
 
 /// True when the renderer will paint with a face the host actually has.
+///
+/// Only the ligature tests consult this: disabling a ligature is only
+/// observable on a face that has one, so a stand-in host has nothing to
+/// assert. Default stack selection does not depend on it — see
+/// `default_runtime_selects_the_shaped_stack`.
 ///
 /// The platform default resolves through `DEFAULT_FONT_FAMILY_CANDIDATES`
 /// (issue #2931), so this asks the resolver — the same database and candidate
@@ -39,10 +45,11 @@ fn host_fonts_available(family: &str) -> bool {
 
 #[test]
 fn default_runtime_selects_the_shaped_stack() {
-    if !host_fonts_available(DEFAULT_FONT_FAMILY) {
-        eprintln!("skipped: no installed face for the default family (only a stand-in loads)");
-        return;
-    }
+    // No host-face gate: `select_renderer` chooses the shaped stack whenever
+    // `SwashSingle::new()` initializes, regardless of which family resolves
+    // (the fallback chain paints whatever the host has). Gating this on the
+    // configured family being installed is what silently removed the
+    // shaped-default contract from CI images.
     let mut rt = Runtime::new(RuntimeConfig::default()).expect("headless runtime builds");
     assert_eq!(
         rt.text_stack(),

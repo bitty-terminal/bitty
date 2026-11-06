@@ -219,6 +219,17 @@ pub(crate) fn generic_monospace_face(db: &Database) -> Option<fontdb::ID> {
     })
 }
 
+/// True when `db` resolves the family the config asked for.
+///
+/// Deliberately not derived from [`ResolvedPrimary::attempts`]: the resolver
+/// returns at the first installed candidate, so on a host where a preference
+/// face wins (SF Mono on macOS, Cascadia Mono on Windows 11) the configured
+/// family — Menlo, Consolas — never appears in that truncated list even
+/// though the host ships it.
+fn configured_family_present(db: &Database, resolution: &ResolvedPrimary) -> bool {
+    family_present(db, &resolution.configured)
+}
+
 /// True when `db` resolves `family` by name.
 ///
 /// Uses the same query shape as the rasterizer's face loading (normal weight
@@ -295,7 +306,10 @@ pub struct ChainProbe {
     pub resolved: Option<String>,
     /// True when the configured primary itself is installed.
     pub primary_present: bool,
-    /// True when the loaded primary differs from the configured one.
+    /// True when the platform preference list picked another installed face
+    /// than the configured one (SF Mono for Menlo, Cascadia Mono for Consolas).
+    /// A generic monospace stand-in for an absent family is not a
+    /// substitution.
     pub substituted: bool,
     /// Faces considered in order (preference candidates, then chain tails).
     pub attempts: Vec<FaceAttempt>,
@@ -321,12 +335,12 @@ pub struct ChainProbe {
 pub fn probe_chain(config: &FontConfig) -> ChainProbe {
     let db = crate::shaped::system_db();
     let resolution = resolve_primary_in(&db, &config.family);
-    let primary_present = resolution
-        .attempts
-        .iter()
-        .find(|attempt| attempt.family.eq_ignore_ascii_case(&resolution.configured))
-        .map(|attempt| attempt.present)
-        .unwrap_or(false);
+    // The configured family, asked of the database directly: `attempts` stops
+    // at the winning candidate, so a preference face (SF Mono, Cascadia Mono)
+    // hides the configured one (Menlo, Consolas) from that list. Inferring
+    // presence from `attempts` made doctor tell macOS/Windows users to install
+    // the font their OS ships.
+    let primary_present = configured_family_present(&db, &resolution);
     let mut attempts = resolution.attempts.clone();
     for family in config.fallback_tails() {
         if attempts
@@ -377,14 +391,12 @@ pub fn probe_chain(config: &FontConfig) -> ChainProbe {
             .loaded_face_family(primary)
             .unwrap_or_else(|| resolution.family.clone()),
     );
-    // `substituted` follows the face that actually loaded, not just the
-    // platform-preference list: a family the host does not have can come back
-    // as a generic monospace substitution (a bare container), and doctor must
-    // not report that under the configured name.
-    probe.substituted = probe
-        .resolved
-        .as_deref()
-        .is_some_and(|face| !face.eq_ignore_ascii_case(&probe.configured));
+    // `substituted` means the platform-preference list chose another installed
+    // face (SF Mono for Menlo, Cascadia Mono for Consolas). Deriving it from
+    // "the loaded face differs from the configured one" mislabels a generic
+    // monospace stand-in for an absent explicit family as a platform default;
+    // `resolution` already tracks the real case.
+    probe.substituted = resolution.substituted;
     let point_size = config.size;
     probe.uncovered = count_uncovered(PROBE_CODEPOINTS.iter().copied(), |c| {
         let Ok(key) = RasterKey::new(c, primary, point_size) else {
@@ -524,6 +536,54 @@ mod tests {
     }
 
     #[test]
+    fn configured_primary_is_present_when_a_preferred_face_wins() {
+        // The macOS / Windows 11 shape: the preference face (SF Mono,
+        // Cascadia Mono) is installed, so `resolve_with` returns at the first
+        // candidate and the configured family (Menlo, Consolas) never enters
+        // `attempts` — although the host ships it. Doctor must not tell that
+        // user to install the font their OS already has.
+        let db = synthetic_db(&[("SF Mono", true), ("Menlo", true)]);
+        let resolution = ResolvedPrimary {
+            configured: "Menlo".to_string(),
+            family: "SF Mono".to_string(),
+            substituted: true,
+            attempts: vec![FaceAttempt {
+                family: "SF Mono".to_string(),
+                present: true,
+            }],
+        };
+        assert!(
+            resolution
+                .attempts
+                .iter()
+                .all(|attempt| !attempt.family.eq_ignore_ascii_case("Menlo")),
+            "precondition: the winning candidate truncates the attempt list"
+        );
+        assert!(
+            configured_family_present(&db, &resolution),
+            "the configured family is installed even though it is not attempted"
+        );
+    }
+
+    #[test]
+    fn configured_primary_stays_absent_when_only_a_stand_in_loads() {
+        // The other direction: a stand-in face loading says nothing about the
+        // configured family, so presence must still be false and doctor must
+        // still ask for the missing font.
+        let db = synthetic_db(&[("DejaVu Sans Mono", true)]);
+        let resolution = ResolvedPrimary {
+            configured: "No Such Family XYZ".to_string(),
+            family: "No Such Family XYZ".to_string(),
+            substituted: false,
+            attempts: vec![FaceAttempt {
+                family: "No Such Family XYZ".to_string(),
+                present: false,
+            }],
+        };
+        assert!(!configured_family_present(&db, &resolution));
+    }
+
+    #[test]
     fn generic_monospace_reports_an_installed_face_when_the_alias_is_missing() {
         // Issue #2931 CI: the runner has DejaVu Sans Mono installed but no
         // fontconfig alias, so `Family::Monospace` (fontdb's platform default
@@ -598,7 +658,10 @@ mod tests {
             .as_deref()
             .expect("a fonted host must still load a stand-in primary");
         assert_ne!(resolved, absent, "{probe:?}");
-        assert!(probe.substituted, "a stand-in is a substitution: {probe:?}");
+        assert!(
+            !probe.substituted,
+            "a generic stand-in is not a platform-default substitution: {probe:?}"
+        );
         assert!(!probe.attempts.is_empty(), "{probe:?}");
         assert!(probe.embedded_present, "{probe:?}");
         assert!(probe.pua_covered, "{probe:?}");

@@ -204,9 +204,19 @@ pub enum GlyphSource {
 static SYSTEM_DB: OnceLock<Arc<Database>> = OnceLock::new();
 
 /// Returns the shared system database, loading the index on first use.
+///
+/// The embedded symbols face (issue #2931) is registered here, once, so every
+/// consumer of the shared database — face loading, dynamic fallback, the
+/// catalog, and doctor — sees it as an ordinary `Source::Binary` face under
+/// `EMBEDDED_SYMBOLS_FAMILY`. Registration costs one in-memory parse; the
+/// bytes are compiled in and never touch the filesystem.
 pub(crate) fn system_db() -> Arc<Database> {
     SYSTEM_DB
-        .get_or_init(|| Arc::new(crate::font_index::system_database()))
+        .get_or_init(|| {
+            let mut db = crate::font_index::system_database();
+            crate::embedded::register_face(&mut db);
+            Arc::new(db)
+        })
         .clone()
 }
 
@@ -301,10 +311,15 @@ impl SwashSingle {
     /// [`RenderError::FontNotFound`] when no system face was discovered
     /// (bare install with no font stack — the caller falls back to the
     /// deterministic headless rasterizer, same as a failed platform stack
-    /// before).
+    /// before). The embedded symbols face is registered in the same database
+    /// (issue #2931), so "only the embedded face" still counts as no system
+    /// stack: a host with no text font must degrade to headless, not render
+    /// every character as an icon.
     pub fn new() -> Result<Self, RenderError> {
         let db = system_db();
-        if db.is_empty() {
+        let embedded_only = db.len() == 1
+            && crate::font_defaults::family_present(&db, crate::embedded::EMBEDDED_SYMBOLS_FAMILY);
+        if db.is_empty() || embedded_only {
             return Err(RenderError::FontNotFound(
                 "no system fonts discovered".to_string(),
             ));
@@ -364,6 +379,26 @@ impl SwashSingle {
     #[cfg(test)]
     pub(crate) fn loaded_face_count(&self) -> usize {
         self.faces.len()
+    }
+
+    /// Primary family name of a loaded face, for diagnostics (issue #2931).
+    ///
+    /// Returns the family the font database reports for the face behind
+    /// `font`, which is the *actual* face a query resolved to — not
+    /// necessarily the queried name (a missing family can resolve through the
+    /// generic monospace substitution, and the platform default resolves to a
+    /// preference candidate). `None` for a stale handle or a face without a
+    /// family name. Bounded by the session's loaded-face map.
+    #[must_use]
+    pub fn loaded_face_family(&self, font: FontId) -> Option<String> {
+        let id = self
+            .by_db_id
+            .iter()
+            .find_map(|(id, handle)| (*handle == font).then_some(*id))?;
+        self.db
+            .face(id)
+            .and_then(|info| info.families.first())
+            .map(|(family, _)| family.clone())
     }
 
     /// Resolves a session handle back to its stored face.
@@ -1334,7 +1369,13 @@ impl GlyphRasterizer for SwashSingle {
     fn load_font(&mut self, query: &FontQuery) -> Result<FontId, RenderError> {
         query.validate()?;
         let (weight, style_attr) = style_attrs(&query.style);
-        let families = [Family::Name(query.family.as_str())];
+        // Platform default primary (issue #2931): when the configured family
+        // is the platform default, load the first installed preference
+        // candidate (Cascadia Mono / SF Mono / the Nerd-patched JetBrains
+        // face) instead of blindly querying the guaranteed fallback. Any
+        // explicit family is used verbatim, so config stays authoritative.
+        let resolved = crate::font_defaults::resolve_primary_in(&self.db, &query.family);
+        let families = [Family::Name(resolved.family.as_str())];
         let request = Query {
             families: &families,
             weight,
@@ -1346,17 +1387,14 @@ impl GlyphRasterizer for SwashSingle {
         // when the configured family was absent; the shaped stack must not
         // regress to "primary not found" on a bare host that only ships a
         // system monospace, so the same substitution happens here (CTX-1607).
-        // `load_system_fonts` resolves the generic family's concrete name.
-        let id = self.db.query(&request).or_else(|| {
-            let generic = [Family::Monospace];
-            let substitute = Query {
-                families: &generic,
-                weight,
-                style: style_attr,
-                ..Default::default()
-            };
-            self.db.query(&substitute)
-        });
+        // `generic_monospace_face` keeps that promise when the fontconfig
+        // alias itself names nothing installed (a container with fonts but no
+        // fontconfig configuration): the host's monospaced faces still load
+        // instead of every cell going blank.
+        let id = self
+            .db
+            .query(&request)
+            .or_else(|| crate::font_defaults::generic_monospace_face(&self.db));
         let id = id.ok_or_else(|| RenderError::FontNotFound(query.family.clone()))?;
         // Reloads re-query already-loaded faces: reuse the handle instead
         // of appending a duplicate entry (the bound below guards genuinely

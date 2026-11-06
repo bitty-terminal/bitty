@@ -9743,7 +9743,7 @@ fn init_render_default_and_vim() {
     let lua = render_init_lua(&base);
     assert_nested_appearance("profile default", &lua, "dark");
     assert_four_space_indent("profile default", &lua);
-    assert!(lua.contains("JetBrainsMono Nerd Font"));
+    assert!(lua.contains(bitty_config::types::DEFAULT_FONT_FAMILY));
     assert!(lua.contains("shell = \"/bin/bash\""));
     assert!(lua.contains("scrollback = 10000"));
     assert!(lua.contains("gaps_in = 6"));

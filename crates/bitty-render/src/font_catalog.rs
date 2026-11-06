@@ -211,6 +211,20 @@ mod tests {
     }
 
     #[test]
+    fn catalog_reports_the_embedded_face() {
+        // Issue #2931: the compiled-in symbols face is a normal catalog row
+        // with the `embedded` source, on every host.
+        let catalog = system_face_catalog(MAX_CATALOG_FACES, &[]);
+        assert!(
+            catalog.faces.iter().any(|face| {
+                face.family == crate::embedded::EMBEDDED_SYMBOLS_FAMILY && face.source == "embedded"
+            }),
+            "embedded face missing from the catalog: {:?}",
+            catalog.faces
+        );
+    }
+
+    #[test]
     fn unsupported_cap_still_reports_supported_target() {
         // The host running the test suite is supported; the catalog contract
         // (sorted, unique, capped) is asserted only when rows exist so the

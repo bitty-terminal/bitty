@@ -374,8 +374,8 @@ pub fn check_fonts(tool_available: bool, families: &[(&str, bool)]) -> DoctorChe
             "fonts",
             "Font availability",
             format!(
-                "install the missing families (notably `{}` from `noto-fonts` for braille TUI graphs)",
-                missing.first().unwrap_or(&"Noto Sans Symbols 2")
+                "install the missing families (first: `{}`); on Arch, `noto-fonts` provides the braille symbols face",
+                missing.first().unwrap_or(&"monospace")
             ),
             format!(
                 "{}/{} resolve ({}); missing: {}",
@@ -387,6 +387,171 @@ pub fn check_fonts(tool_available: bool, families: &[(&str, bool)]) -> DoctorChe
         )
     }
 }
+
+/// Font-chain resolution and coverage probe (issue #2931).
+///
+/// `configured` is the effective `font.family`; `resolved` is the face the
+/// renderer actually loaded (a platform-default substitution such as
+/// Cascadia Mono for Consolas, or `None` when nothing loaded). `attempts`
+/// lists every considered face in order with availability, and the remaining
+/// fields describe the embedded symbols face and the bounded uncovered
+/// sample.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FontChainInput {
+    /// Effective configured primary family.
+    pub configured: String,
+    /// Face the chain loaded, or `None` when no primary resolved.
+    pub resolved: Option<String>,
+    /// True when the configured primary itself is installed.
+    pub primary_present: bool,
+    /// True when `resolved` differs from `configured`.
+    pub substituted: bool,
+    /// Considered faces in order, with availability.
+    pub attempts: Vec<(String, bool)>,
+    /// Family name of the embedded symbols face.
+    pub embedded_family: String,
+    /// True when the embedded face is registered.
+    pub embedded_present: bool,
+    /// True when the embedded face maps the PUA icon range start.
+    pub pua_covered: bool,
+    /// Probed scalars with no covering face.
+    pub uncovered_total: usize,
+    /// Up to a few uncovered example scalars.
+    pub uncovered_examples: Vec<char>,
+    /// Scalars probed (the counter's denominator).
+    pub probed: usize,
+}
+
+impl FontChainInput {
+    /// Builds the doctor input from a renderer chain probe.
+    #[must_use]
+    pub fn from_probe(probe: &bitty_render::font_defaults::ChainProbe) -> Self {
+        Self {
+            configured: probe.configured.clone(),
+            resolved: probe.resolved.clone(),
+            primary_present: probe.primary_present,
+            substituted: probe.substituted,
+            attempts: probe
+                .attempts
+                .iter()
+                .map(|attempt| (attempt.family.clone(), attempt.present))
+                .collect(),
+            embedded_family: probe.embedded_family.clone(),
+            embedded_present: probe.embedded_present,
+            pua_covered: probe.pua_covered,
+            uncovered_total: probe.uncovered.total,
+            uncovered_examples: probe.uncovered.examples.clone(),
+            probed: probe.uncovered.probed,
+        }
+    }
+}
+
+/// Font chain the terminal will actually resolve (issue #2931).
+///
+/// Reports the configured primary, every attempted face, and the face
+/// actually used; flags a missing primary; states whether the embedded
+/// symbols face covers the PUA icon range; and surfaces the bounded count of
+/// probed scalars that fell through the whole chain. Always advisory: the
+/// fallback walk still renders, so this row warns and never fails the run.
+#[must_use]
+pub fn check_font_chain(input: &FontChainInput) -> DoctorCheck {
+    if input.configured.trim().is_empty() {
+        return DoctorCheck::warn(
+            "font-chain",
+            "Font chain",
+            "run `bitty doctor` with a readable config so the font chain can be resolved"
+                .to_string(),
+            "font chain not probed".to_string(),
+        );
+    }
+    let mut detail = format!("configured {:?} -> ", input.configured.trim());
+    if input.attempts.is_empty() {
+        detail.push_str("no faces attempted");
+    } else {
+        let listed: Vec<String> = input
+            .attempts
+            .iter()
+            .take(MAX_CHAIN_ATTEMPTS)
+            .map(|(family, present)| {
+                format!(
+                    "{family} ({})",
+                    if *present { "present" } else { "missing" }
+                )
+            })
+            .collect();
+        detail.push_str(&listed.join(", "));
+        if input.attempts.len() > MAX_CHAIN_ATTEMPTS {
+            detail.push_str(", ...");
+        }
+    }
+    match input.resolved.as_deref() {
+        Some(face) if input.substituted => {
+            detail.push_str(&format!(" -> using {face} (platform default)"));
+        }
+        Some(face) => detail.push_str(&format!(" -> using {face}")),
+        None => detail.push_str(" -> no face loaded"),
+    }
+    if input.pua_covered {
+        detail.push_str(&format!(
+            "; PUA icons covered by embedded {:?} (U+E000, U+E0B0, U+F017)",
+            input.embedded_family
+        ));
+    } else if input.embedded_present {
+        detail.push_str("; embedded symbols face is missing PUA coverage");
+    } else {
+        detail.push_str("; embedded symbols face not registered");
+    }
+    if input.uncovered_total > 0 {
+        let examples: Vec<String> = input
+            .uncovered_examples
+            .iter()
+            .take(MAX_UNCOVERED_EXAMPLES)
+            .map(|c| format!("U+{:04X}", u32::from(*c)))
+            .collect();
+        let noun = if input.uncovered_total == 1 {
+            "glyph has"
+        } else {
+            "glyphs have"
+        };
+        detail.push_str(&format!(
+            "; {} {noun} no covering face of {} probed",
+            input.uncovered_total, input.probed
+        ));
+        if !examples.is_empty() {
+            detail.push_str(&format!(" (e.g. {})", examples.join(", ")));
+        }
+    }
+    if input.resolved.is_some()
+        && input.primary_present
+        && input.pua_covered
+        && input.uncovered_total == 0
+    {
+        return DoctorCheck::pass("font-chain", "Font chain", detail);
+    }
+    let hint = if !input.primary_present {
+        match input.resolved.as_deref() {
+            Some(face) => format!(
+                "install `{}` or keep `font.family` on the resolved `{face}`",
+                input.configured.trim()
+            ),
+            None => format!(
+                "install a monospace font; the configured `{}` did not load",
+                input.configured.trim()
+            ),
+        }
+    } else if !input.pua_covered {
+        "the embedded symbols face did not cover U+E000; report this as a doctor bug".to_string()
+    } else {
+        "install a font covering the listed codepoints to close the remaining tofu".to_string()
+    };
+    DoctorCheck::warn("font-chain", "Font chain", hint, detail)
+}
+
+/// Maximum attempted faces named in the `font-chain` detail line.
+const MAX_CHAIN_ATTEMPTS: usize = 6;
+
+/// Maximum uncovered example codepoints named in the `font-chain` detail.
+const MAX_UNCOVERED_EXAMPLES: usize = 3;
 
 /// Text-stack preference and optional shaped-stack probe (CTX-1607).
 ///
@@ -702,6 +867,9 @@ pub struct DoctorInputs {
     pub font_tool_available: bool,
     /// Ordered `(family, present)` probe results.
     pub families: Vec<(String, bool)>,
+    /// Resolved font chain, embedded-face coverage, and tofu counter
+    /// (issue #2931).
+    pub font_chain: FontChainInput,
     /// Text-stack preference plus the shaped-stack probe (CTX-1607).
     pub text_stack: TextStackInput,
     /// `WAYLAND_DISPLAY` value.
@@ -840,6 +1008,7 @@ pub fn assemble_report(inputs: &DoctorInputs) -> DoctorReport {
             check_config(&inputs.config),
             check_keymaps(&inputs.keymaps),
             check_fonts(inputs.font_tool_available, &family_refs),
+            check_font_chain(&inputs.font_chain),
             check_text_stack(&inputs.text_stack),
             check_display(
                 inputs.wayland.as_deref(),
@@ -2129,13 +2298,44 @@ pub fn find_on_path(name: &str) -> Option<PathBuf> {
 
 /// Probes one font family via `fc-match` (bounded). Returns `None` when the
 /// tool is missing or the probe timed out (caller degrades to warn).
+///
+/// `fc-match` exits 0 even for an unknown name (it returns the best
+/// fallback), so the resolved family list is compared with the request:
+/// "No Such Mono" resolving to `Noto Sans Mono` is a miss, not a hit.
+/// Generic aliases (`monospace`, `sans-serif`, ...) are always a hit by
+/// definition — their whole purpose is to resolve to a concrete face.
 #[must_use]
 pub fn probe_font(family: &str) -> Option<bool> {
-    if family.trim().is_empty() {
+    let family = family.trim();
+    if family.is_empty() {
         return Some(false);
     }
-    let out = run_bounded("fc-match", &[family], 3)?;
-    Some(out.status.success())
+    let out = run_bounded("fc-match", &["--format=%{family}", family], 3)?;
+    if !out.status.success() {
+        return Some(false);
+    }
+    Some(font_match_resolves(
+        family,
+        &String::from_utf8_lossy(&out.stdout),
+    ))
+}
+
+/// True when an `fc-match --format=%{family}` result names the request.
+///
+/// Pure so the probe's semantics are testable without fontconfig.
+#[must_use]
+pub fn font_match_resolves(requested: &str, resolved_families: &str) -> bool {
+    let requested = requested.trim();
+    let generic = matches!(
+        requested.to_ascii_lowercase().as_str(),
+        "monospace" | "mono" | "fixed" | "sans-serif" | "sans" | "serif"
+    );
+    if generic {
+        return true;
+    }
+    resolved_families
+        .split(',')
+        .any(|name| name.trim().eq_ignore_ascii_case(requested))
 }
 
 /// Probes a terminfo entry via `infocmp` (bounded). `None` means the tool is
@@ -2233,52 +2433,65 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
         Ok(path) => (true, path.display().to_string()),
         Err(_) => (false, String::new()),
     };
-    let (config, keymaps, font_chain, font_probe) = match load_merged_config_typed(args) {
-        Ok(loaded) => {
-            let file_path = loaded
-                .probed
-                .as_ref()
-                .filter(|probe| probe.path.exists())
-                .map(|probe| probe.path.clone());
-            let config = if let Some(path) = file_path.as_ref() {
-                ConfigInput::Ok {
-                    source: format!("file: {}", path.display()),
-                }
-            } else if let Some(path) = loaded.profile_path.as_ref() {
-                ConfigInput::Ok {
-                    source: format!("profile: {}", path.display()),
-                }
-            } else {
-                ConfigInput::Missing
-            };
-            let keymaps = match bitty_config::keymap::resolve_keymaps(&loaded.merged.effective) {
-                Ok(maps) => KeymapInput::Ok(maps.len()),
-                Err(err) => KeymapInput::Err(err.to_string()),
-            };
-            let chain = loaded.merged.effective.font.fallback_chain();
-            let probe = (
-                loaded.merged.effective.font.family.clone(),
-                loaded.merged.effective.font.size,
-            );
-            (config, keymaps, chain, Some(probe))
-        }
-        Err(failure) => {
-            let chain: Vec<String> = bitty_config::types::FONT_FALLBACK_CHAIN
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect();
-            let config = match failure.module_diagnostic() {
-                Some(diagnostic) => ConfigInput::Module {
-                    diagnostic: Box::new(diagnostic.clone()),
-                },
-                None => ConfigInput::Invalid(failure.message),
-            };
-            (config, KeymapInput::Skipped, chain, None)
-        }
+    let (config, keymaps, font_chain, font_probe, font_config) =
+        match load_merged_config_typed(args) {
+            Ok(loaded) => {
+                let file_path = loaded
+                    .probed
+                    .as_ref()
+                    .filter(|probe| probe.path.exists())
+                    .map(|probe| probe.path.clone());
+                let config = if let Some(path) = file_path.as_ref() {
+                    ConfigInput::Ok {
+                        source: format!("file: {}", path.display()),
+                    }
+                } else if let Some(path) = loaded.profile_path.as_ref() {
+                    ConfigInput::Ok {
+                        source: format!("profile: {}", path.display()),
+                    }
+                } else {
+                    ConfigInput::Missing
+                };
+                let keymaps = match bitty_config::keymap::resolve_keymaps(&loaded.merged.effective)
+                {
+                    Ok(maps) => KeymapInput::Ok(maps.len()),
+                    Err(err) => KeymapInput::Err(err.to_string()),
+                };
+                let font_config = loaded.merged.effective.font.clone();
+                let chain = font_config.fallback_chain();
+                let probe = (font_config.family.clone(), font_config.size);
+                (config, keymaps, chain, Some(probe), Some(font_config))
+            }
+            Err(failure) => {
+                let chain: Vec<String> = bitty_config::types::FONT_FALLBACK_CHAIN
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect();
+                let config = match failure.module_diagnostic() {
+                    Some(diagnostic) => ConfigInput::Module {
+                        diagnostic: Box::new(diagnostic.clone()),
+                    },
+                    None => ConfigInput::Invalid(failure.message),
+                };
+                (config, KeymapInput::Skipped, chain, None, None)
+            }
+        };
+    // Issue #2931: resolve the chain the renderer would use (configured
+    // primary -> attempted faces -> face actually loaded), the embedded
+    // symbols face's PUA coverage, and the bounded tofu counter. The probe
+    // loads faces, so it runs once here and every row reads the result.
+    let font_chain_input = match font_config.as_ref() {
+        Some(cfg) => FontChainInput::from_probe(&bitty_render::font_defaults::probe_chain(cfg)),
+        None => FontChainInput::default(),
     };
     let font_tool_available = find_on_path("fc-match").is_some();
+    // `fc-match` exits 0 even for unknown names (it returns a fallback), so
+    // it can only speak for system families. The embedded symbols face is
+    // compiled in, not a system font: its presence and coverage are reported
+    // by the `font-chain` row instead.
     let families: Vec<(String, bool)> = font_chain
         .into_iter()
+        .filter(|family| family != bitty_render::embedded::EMBEDDED_SYMBOLS_FAMILY)
         .map(|family| {
             let present = probe_font(&family).unwrap_or(false);
             (family, present)
@@ -2364,6 +2577,7 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
         keymaps,
         font_tool_available,
         families,
+        font_chain: font_chain_input,
         text_stack,
         wayland,
         x11,
@@ -2496,6 +2710,19 @@ mod tests {
                 ("DejaVu Sans Mono".to_string(), true),
                 ("Noto Sans Symbols 2".to_string(), true),
             ],
+            font_chain: FontChainInput {
+                configured: "JetBrainsMono Nerd Font".to_string(),
+                resolved: Some("JetBrainsMono Nerd Font".to_string()),
+                primary_present: true,
+                substituted: false,
+                attempts: vec![("JetBrainsMono Nerd Font".to_string(), true)],
+                embedded_family: "Bitty Symbols Nerd".to_string(),
+                embedded_present: true,
+                pua_covered: true,
+                uncovered_total: 0,
+                uncovered_examples: Vec::new(),
+                probed: 15,
+            },
             text_stack: TextStackInput {
                 preference: bitty_runtime::TextStackPreference::Auto,
                 invalid_env: false,
@@ -2521,7 +2748,7 @@ mod tests {
         let report = assemble_report(&healthy_inputs());
         assert_eq!(report.exit_code(), EXIT_OK);
         assert!(report.ok());
-        assert_eq!(report.checks.len(), 13);
+        assert_eq!(report.checks.len(), 14);
         assert!(report.checks.iter().all(|c| c.status == DoctorStatus::Pass
             || c.id == "images"
             || c.id == "config"
@@ -2529,7 +2756,7 @@ mod tests {
         // images is informational-warn by design; everything else passes.
         let summary = report.summary();
         assert_eq!(summary.fail, 0);
-        assert_eq!(summary.pass + summary.warn, 13);
+        assert_eq!(summary.pass + summary.warn, 14);
     }
 
     #[test]
@@ -2704,6 +2931,135 @@ mod tests {
     }
 
     #[test]
+    fn font_chain_reports_resolved_face_and_pua_coverage() {
+        let mut input = FontChainInput {
+            configured: "Menlo".to_string(),
+            resolved: Some("Menlo".to_string()),
+            primary_present: true,
+            attempts: vec![
+                ("SF Mono".to_string(), false),
+                ("Menlo".to_string(), true),
+                ("Monaco".to_string(), true),
+            ],
+            embedded_family: "Bitty Symbols Nerd".to_string(),
+            embedded_present: true,
+            pua_covered: true,
+            probed: 15,
+            ..Default::default()
+        };
+        let check = check_font_chain(&input);
+        assert_eq!(check.id, "font-chain");
+        assert_eq!(check.status, DoctorStatus::Pass, "{}", check.detail);
+        // Configured -> attempted -> actually used, all named.
+        assert!(
+            check.detail.contains("configured \"Menlo\""),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("SF Mono (missing)"),
+            "{}",
+            check.detail
+        );
+        assert!(check.detail.contains("using Menlo"), "{}", check.detail);
+        assert!(
+            check
+                .detail
+                .contains("PUA icons covered by embedded \"Bitty Symbols Nerd\""),
+            "{}",
+            check.detail
+        );
+        // A missing configured primary is flagged even when substituted.
+        input.configured = "Consolas".to_string();
+        input.primary_present = false;
+        input.resolved = Some("Cascadia Mono".to_string());
+        input.substituted = true;
+        let substituted = check_font_chain(&input);
+        assert_eq!(substituted.status, DoctorStatus::Warn);
+        assert!(
+            substituted
+                .detail
+                .contains("using Cascadia Mono (platform default)"),
+            "{}",
+            substituted.detail
+        );
+        assert!(
+            substituted.hint.contains("install `Consolas`"),
+            "{}",
+            substituted.hint
+        );
+    }
+
+    #[test]
+    fn font_chain_counter_reports_uncovered_glyphs() {
+        let input = FontChainInput {
+            configured: "Menlo".to_string(),
+            resolved: Some("Menlo".to_string()),
+            primary_present: true,
+            substituted: false,
+            attempts: vec![("Menlo".to_string(), true)],
+            embedded_family: "Bitty Symbols Nerd".to_string(),
+            embedded_present: true,
+            pua_covered: true,
+            uncovered_total: 2,
+            uncovered_examples: vec!['\u{1F600}', '\u{2603}'],
+            probed: 15,
+        };
+        let check = check_font_chain(&input);
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert!(
+            check
+                .detail
+                .contains("2 glyphs have no covering face of 15 probed"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("U+1F600") && check.detail.contains("U+2603"),
+            "{}",
+            check.detail
+        );
+        // Singular grammar for one uncovered scalar.
+        let single = FontChainInput {
+            uncovered_total: 1,
+            uncovered_examples: vec!['\u{F8FF}'],
+            ..input
+        };
+        let check = check_font_chain(&single);
+        assert!(
+            check.detail.contains("1 glyph has no covering face"),
+            "{}",
+            check.detail
+        );
+    }
+
+    #[test]
+    fn font_chain_without_a_readable_config_is_not_probed() {
+        let check = check_font_chain(&FontChainInput::default());
+        assert_eq!(check.status, DoctorStatus::Warn);
+        assert!(check.detail.contains("not probed"), "{}", check.detail);
+    }
+
+    #[test]
+    fn font_probe_rejects_fc_match_fallbacks() {
+        // `fc-match` always answers; only an answer that names the request is
+        // a hit (issue #2931: doctor must flag a missing primary).
+        assert!(font_match_resolves(
+            "JetBrainsMono Nerd Font",
+            "JetBrainsMono Nerd Font,JetBrainsMono NF"
+        ));
+        assert!(font_match_resolves(
+            "noto sans symbols 2",
+            "Noto Sans Symbols 2"
+        ));
+        assert!(!font_match_resolves("No Such Mono", "Noto Sans Mono"));
+        assert!(!font_match_resolves("No Such Mono", ""));
+        // Generic aliases resolve by definition.
+        assert!(font_match_resolves("monospace", "Noto Sans Mono"));
+        assert!(font_match_resolves("sans-serif", "DejaVu Sans"));
+    }
+
+    #[test]
     fn fonts_partial_is_warn_and_none_is_fail() {
         let partial = check_fonts(true, &[("Mono", true), ("Noto Sans Symbols 2", false)]);
         assert_eq!(partial.status, DoctorStatus::Warn);
@@ -2835,6 +3191,7 @@ mod tests {
             "config",
             "keymaps",
             "fonts",
+            "font-chain",
             "text-stack",
             "display",
             "gpu",

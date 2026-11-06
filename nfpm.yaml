@@ -23,6 +23,8 @@ contents:
       mode: 0755
   - src: ./LICENSE
     dst: /usr/share/licenses/bitty/LICENSE
+  - src: ./LICENSES/bitty-symbols-nerd.txt
+    dst: /usr/share/licenses/bitty/bitty-symbols-nerd.txt
   - src: ./README.md
     dst: /usr/share/doc/bitty/README.md
   - src: ./CHANGELOG.md

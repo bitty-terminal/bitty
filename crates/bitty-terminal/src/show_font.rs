@@ -155,10 +155,15 @@ mod tests {
 
     #[test]
     fn default_font_renders_stable_lines() {
+        // The default family is platform-specific (Menlo/Consolas on the OS
+        // vendors, issue #2931): print the shipped default, not a pinned one.
         let text = render_font(&FontConfig::default()).expect("default font");
         assert_eq!(
             text,
-            "font_family: JetBrainsMono Nerd Font\nfont_size: 12\n"
+            format!(
+                "font_family: {}\nfont_size: 12\n",
+                bitty_config::types::DEFAULT_FONT_FAMILY
+            )
         );
     }
 

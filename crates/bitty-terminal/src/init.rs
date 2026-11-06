@@ -910,15 +910,27 @@ const INIT_EXAMPLE_KEYMAPS: &str = concat!(
     "},\n",
 );
 
-const INIT_FONT_DEFAULTS: &str = concat!(
-    "font = {\n",
-    "    family = \"JetBrainsMono Nerd Font\",\n",
-    "    size = 12,\n",
-    "    line_height = 1.375,\n",
-    "    letter_spacing = 2.0,\n",
-    "    disable_ligatures = \"never\",\n",
-    "},\n",
-);
+/// Commented font defaults for the generated profile and the `config edit`
+/// starter.
+///
+/// The family is the shipped platform default (issue #2931), not a pinned
+/// Linux face: a macOS/Windows profile that documented `JetBrainsMono Nerd
+/// Font` would point at a family the host does not ship, and an explicit
+/// family bypasses the platform preference resolution.
+fn init_font_defaults() -> String {
+    format!(
+        concat!(
+            "font = {{\n",
+            "    family = \"{}\",\n",
+            "    size = 12,\n",
+            "    line_height = 1.375,\n",
+            "    letter_spacing = 2.0,\n",
+            "    disable_ligatures = \"never\",\n",
+            "}},\n",
+        ),
+        bitty_config::types::DEFAULT_FONT_FAMILY
+    )
+}
 
 const INIT_DECORATION_DEFAULTS: &str = concat!(
     "decoration = {\n",
@@ -1331,7 +1343,7 @@ pub(crate) fn init_documented_font_defaults() -> String {
         4,
         "-- (0 < size <= 128). Optional keys carry their shipped defaults.",
     );
-    out.push_str(&init_block(INIT_FONT_DEFAULTS, 4, true));
+    out.push_str(&init_block(&init_font_defaults(), 4, true));
     out
 }
 

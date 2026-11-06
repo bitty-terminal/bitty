@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # make-windows-zip.sh — assemble the Windows x86_64 portable ZIP.
 #
-# Packs the x86_64 MSVC binary as `bitty.exe` together with LICENSE, README.md
-# and CHANGELOG.md at the archive root, so users unzip and run without an
-# installer (CTX-0455 / 034 item 10). The build artifact name
+# Packs the x86_64 MSVC binary as `bitty.exe` together with the Windows
+# display icon (`bitty.ico`, from packaging/icons/bitty.ico), LICENSE,
+# README.md and CHANGELOG.md at the archive root, so users unzip and run
+# without an installer (CTX-0455 / 034 item 10). The icon lets install.ps1
+# point the Start Menu shortcut and the app-list DisplayIcon at the mascot
+# instead of the generic executable icon (bitty#2926). The build artifact name
 # (`bitty-x86_64-pc-windows-msvc.exe`) is a build detail, never the user-facing
 # name. The archive is built from a fixed payload list, so no glob can pull in
 # unexpected files.
@@ -20,6 +23,9 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PAYLOAD=("LICENSE" "README.md" "CHANGELOG.md")
+# Display icon archived as `bitty.ico` at the archive root; the source lives
+# under packaging/icons/ so it stays next to the other platform icons.
+ICON="packaging/icons/bitty.ico"
 DRY_RUN=0
 
 VERSION=""
@@ -89,11 +95,13 @@ fi
 for f in "${PAYLOAD[@]}"; do
 	[[ -f "$REPO_ROOT/$f" ]] || die "payload file not found: $f"
 done
+[[ -f "$REPO_ROOT/$ICON" ]] || die "payload file not found: $ICON (regenerate with scripts/make-windows-ico.py)"
 
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/bitty-zip.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 
 cp "$EXE" "$STAGE/bitty.exe"
+cp "$REPO_ROOT/$ICON" "$STAGE/bitty.ico"
 for f in "${PAYLOAD[@]}"; do
 	cp "$REPO_ROOT/$f" "$STAGE/$f"
 done
@@ -102,7 +110,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
 	echo "make-windows-zip: dry-run payload:"
 	find "$STAGE" -maxdepth 1 -type f -print | sort
 	echo "make-windows-zip: dry-run would run:"
-	echo "  (cd $STAGE && zip -X -9 -q $OUTPUT bitty.exe ${PAYLOAD[*]})"
+	echo "  (cd $STAGE && zip -X -9 -q $OUTPUT bitty.exe bitty.ico ${PAYLOAD[*]})"
 	echo "make-windows-zip: dry-run PASS (version=$VERSION)"
 	exit 0
 fi
@@ -110,9 +118,9 @@ fi
 mkdir -p "$(dirname "$OUTPUT")"
 # zip updates an existing archive in place, so start from a clean path.
 rm -f "$OUTPUT"
-(cd "$STAGE" && zip -X -9 -q "$OUTPUT" bitty.exe "${PAYLOAD[@]}")
+(cd "$STAGE" && zip -X -9 -q "$OUTPUT" bitty.exe bitty.ico "${PAYLOAD[@]}")
 
-EXPECTED="$(printf '%s\n' bitty.exe "${PAYLOAD[@]}" | LC_ALL=C sort)"
+EXPECTED="$(printf '%s\n' bitty.exe bitty.ico "${PAYLOAD[@]}" | LC_ALL=C sort)"
 ACTUAL="$(unzip -Z1 "$OUTPUT" | LC_ALL=C sort)"
 if [[ "$ACTUAL" != "$EXPECTED" ]]; then
 	die "unexpected archive entries:

@@ -820,6 +820,38 @@ pub fn check_shell(shell: Option<&str>, exists: bool, executable: bool) -> Docto
     }
 }
 
+/// Default child shell: the program a bare `bitty` launch spawns
+/// (bitty#2928).
+///
+/// Reports the same chain the spawn layer resolves — configured
+/// `terminal.shell` > `$SHELL` > platform default — so a Windows host without
+/// `$SHELL` no longer reads as "falls back to /bin/sh". An unresolved chain is
+/// a failure: startup refuses to continue without a child.
+#[must_use]
+pub fn check_default_shell(input: &DefaultShellInput) -> DoctorCheck {
+    match input {
+        DefaultShellInput::Resolved { program, source } => DoctorCheck::pass(
+            "shell-default",
+            "Default child shell",
+            format!("spawns {program:?} (source: {source})"),
+        ),
+        DefaultShellInput::Unresolved { tried } => DoctorCheck::fail(
+            "shell-default",
+            "Default child shell",
+            EXIT_GENERIC,
+            format!(
+                "install one of {} or set terminal.shell; startup refuses to continue without a child shell",
+                tried
+                    .iter()
+                    .map(|candidate| format!("{candidate:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            format!("none of {} resolved on PATH", tried.join(", ")),
+        ),
+    }
+}
+
 /// Image protocols, reported honestly: kitty graphics and iTerm2 inline
 /// images are supported as bounded subsets (paint-capable images paint;
 /// kitty transmit-only and unknown actions store without painting) and sixel
@@ -897,6 +929,31 @@ pub struct DoctorInputs {
     pub shell_exists: bool,
     /// Whether the shell path is executable.
     pub shell_executable: bool,
+    /// Program startup would spawn when no CLI `PROGRAM` is given
+    /// (bitty#2928): configured `terminal.shell` > `$SHELL` > platform
+    /// default, resolved through the spawn layer's own chain.
+    pub default_shell: DefaultShellInput,
+}
+
+/// Outcome of resolving the default child shell for `bitty doctor`.
+///
+/// Mirrors [`crate::spawn::resolve_default_shell`] as an owned, printable
+/// value so the report never re-runs the `PATH` lookup while rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefaultShellInput {
+    /// The chain resolved to a program.
+    Resolved {
+        /// Direct `argv[0]` startup would spawn.
+        program: String,
+        /// Precedence layer that chose it (`terminal.shell`, `$SHELL`,
+        /// platform default).
+        source: &'static str,
+    },
+    /// No candidate resolved; startup fails with this list.
+    Unresolved {
+        /// Candidate names that were tried, in order.
+        tried: Vec<&'static str>,
+    },
 }
 
 /// Outcome counts.
@@ -1025,6 +1082,7 @@ pub fn assemble_report(inputs: &DoctorInputs) -> DoctorReport {
                 inputs.shell_exists,
                 inputs.shell_executable,
             ),
+            check_default_shell(&inputs.default_shell),
             check_image_protocols(),
             check_plugins_safe_mode(),
         ],
@@ -2434,7 +2492,7 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
         Ok(path) => (true, path.display().to_string()),
         Err(_) => (false, String::new()),
     };
-    let (config, keymaps, font_chain, font_probe, font_config) =
+    let (config, keymaps, font_chain, font_probe, font_config, config_shell) =
         match load_merged_config_typed(args) {
             Ok(loaded) => {
                 let file_path = loaded
@@ -2461,7 +2519,18 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
                 let font_config = loaded.merged.effective.font.clone();
                 let chain = font_config.fallback_chain();
                 let probe = (font_config.family.clone(), font_config.size);
-                (config, keymaps, chain, Some(probe), Some(font_config))
+                // bitty#2928: the configured shell is the first layer of the
+                // default chain, so doctor must resolve with it to report the
+                // program startup would actually spawn.
+                let config_shell = loaded.merged.effective.terminal.shell.clone();
+                (
+                    config,
+                    keymaps,
+                    chain,
+                    Some(probe),
+                    Some(font_config),
+                    config_shell,
+                )
             }
             Err(failure) => {
                 let chain: Vec<String> = bitty_config::types::FONT_FALLBACK_CHAIN
@@ -2474,7 +2543,7 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
                     },
                     None => ConfigInput::Invalid(failure.message),
                 };
-                (config, KeymapInput::Skipped, chain, None, None)
+                (config, KeymapInput::Skipped, chain, None, None, None)
             }
         };
     // Issue #2931: resolve the chain the renderer would use (configured
@@ -2570,6 +2639,16 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
             (exists, executable)
         }
     };
+    // bitty#2928: resolve through the spawn layer's own chain so the reported
+    // program and the spawned program can never disagree.
+    let default_shell =
+        match crate::spawn::resolve_default_shell(config_shell.as_deref(), shell.as_deref()) {
+            Ok(resolved) => DefaultShellInput::Resolved {
+                program: resolved.program,
+                source: resolved.source.label(),
+            },
+            Err(err) => DefaultShellInput::Unresolved { tried: err.tried },
+        };
     DoctorInputs {
         version,
         exe_ok,
@@ -2592,6 +2671,7 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
         shell,
         shell_exists,
         shell_executable,
+        default_shell,
     }
 }
 
@@ -2741,6 +2821,10 @@ mod tests {
             shell: Some("/bin/bash".to_string()),
             shell_exists: true,
             shell_executable: true,
+            default_shell: DefaultShellInput::Resolved {
+                program: "/bin/bash".to_string(),
+                source: "terminal.shell",
+            },
         }
     }
 
@@ -2749,7 +2833,7 @@ mod tests {
         let report = assemble_report(&healthy_inputs());
         assert_eq!(report.exit_code(), EXIT_OK);
         assert!(report.ok());
-        assert_eq!(report.checks.len(), 14);
+        assert_eq!(report.checks.len(), 15);
         assert!(report.checks.iter().all(|c| c.status == DoctorStatus::Pass
             || c.id == "images"
             || c.id == "config"
@@ -2757,7 +2841,7 @@ mod tests {
         // images is informational-warn by design; everything else passes.
         let summary = report.summary();
         assert_eq!(summary.fail, 0);
-        assert_eq!(summary.pass + summary.warn, 14);
+        assert_eq!(summary.pass + summary.warn, 15);
     }
 
     #[test]
@@ -3200,6 +3284,7 @@ mod tests {
             "pty",
             "terminfo",
             "shell",
+            "shell-default",
             "images",
             "plugins",
         ] {
@@ -3215,6 +3300,34 @@ mod tests {
         // Color enabled: PASS rows carry green.
         let colored = format_table(&report, false);
         assert!(colored.contains('\u{1b}'), "color missing: {colored:?}");
+    }
+
+    #[test]
+    fn default_child_shell_row_reports_the_program_and_fails_when_unresolved() {
+        // bitty#2928: doctor must name the program a bare launch spawns, and
+        // an unresolved chain must be a failure (startup refuses to continue).
+        let resolved = check_default_shell(&DefaultShellInput::Resolved {
+            program: "C:\\Program Files\\PowerShell\\7\\pwsh.exe".to_string(),
+            source: "platform default",
+        });
+        assert_eq!(resolved.status, DoctorStatus::Pass);
+        assert_eq!(resolved.id, "shell-default");
+        assert!(
+            resolved.detail.contains("pwsh.exe") && resolved.detail.contains("platform default"),
+            "{resolved:?}"
+        );
+
+        let unresolved = check_default_shell(&DefaultShellInput::Unresolved {
+            tried: vec!["pwsh.exe", "powershell.exe", "cmd.exe"],
+        });
+        assert_eq!(unresolved.status, DoctorStatus::Fail);
+        assert_eq!(unresolved.code, EXIT_GENERIC);
+        for candidate in ["pwsh.exe", "powershell.exe", "cmd.exe"] {
+            assert!(
+                unresolved.hint.contains(candidate),
+                "action names {candidate}: {unresolved:?}"
+            );
+        }
     }
 
     #[test]

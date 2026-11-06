@@ -1650,6 +1650,34 @@ jobs:
         shell: bash
         run: cargo nextest run --workspace --locked --profile ci
 
+      # bitty#2929: `bitty.exe` now links as a GUI-subsystem executable so a
+      # Start Menu/Search launch never flashes a console window. The Rust test
+      # `windows_subsystem` asserts the PE subsystem and piped output; this step
+      # repeats the CLI contract through a shell-launched process with
+      # redirection, which is what `bitty --version > out.txt` does in
+      # PowerShell (a parent-wired stream the startup console adoption must
+      # preserve). The no-console launcher path needs a real desktop run.
+      - name: Assert GUI subsystem and console output (bitty#2929)
+        shell: pwsh
+        run: |
+          $exe = Join-Path (Get-Location) 'target\debug\bitty.exe'
+          if (-not (Test-Path $exe)) {
+            cargo build -p bitty-terminal --bin bitty --locked
+            if ($LASTEXITCODE -ne 0) { throw 'cargo build -p bitty-terminal failed' }
+          }
+          $out = Join-Path $env:RUNNER_TEMP 'bitty-version.out.txt'
+          $err = Join-Path $env:RUNNER_TEMP 'bitty-version.err.txt'
+          $proc = Start-Process -FilePath $exe -ArgumentList '--version' -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $out -RedirectStandardError $err
+          if ($proc.ExitCode -ne 0) {
+            throw "bitty --version exited $($proc.ExitCode): $(Get-Content -Raw $err)"
+          }
+          $text = (Get-Content -Raw $out).Trim()
+          if ($text -notmatch '^bitty ') {
+            throw "bitty --version printed '$text' (stderr: $(Get-Content -Raw $err))"
+          }
+          Write-Host "bitty --version => $text"
+
       - name: Run doctests
         shell: bash
         run: cargo test --workspace --doc --locked

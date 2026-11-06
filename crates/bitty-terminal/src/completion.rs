@@ -569,10 +569,34 @@ if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {{
     $global:_BittyValueFlags = @({values})
     $global:_BittyHelper = {{
         param([string[]]$HelperArgs)
+        # bitty#2929 links bitty.exe as a GUI-subsystem binary, and PowerShell
+        # runs a GUI-subsystem child asynchronously: `& bitty ...` returns
+        # before the child exits and before its pipe is drained, so a captured
+        # helper silently reads back empty (and `$LASTEXITCODE` stays stale).
+        # Own the process here instead - explicit redirection plus
+        # `WaitForExit` - so the candidates arrive whatever the subsystem is.
         try {{
-            $lines = @(& bitty @HelperArgs 2>$null)
-            if ($LASTEXITCODE -ne 0) {{ return @() }}
-            return @($lines | Where-Object {{ $null -ne $_ -and "$_".Length -gt 0 }})
+            # Helper arguments are generated constants (`+list-profiles`,
+            # `+list-plugins`, `--installed`), so plain quoting is exact.
+            $argumentLine = ($HelperArgs | ForEach-Object {{ '"' + $_ + '"' }}) -join ' '
+            $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $startInfo.FileName = 'bitty'
+            $startInfo.Arguments = $argumentLine
+            $startInfo.UseShellExecute = $false
+            $startInfo.CreateNoWindow = $true
+            $startInfo.RedirectStandardInput = $true
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            $process = [System.Diagnostics.Process]::Start($startInfo)
+            $process.StandardInput.Close()
+            # Drain stderr concurrently: a helper usage error must never fill
+            # the pipe buffer and deadlock the stdout read.
+            $diagnostics = $process.StandardError.ReadToEndAsync()
+            $text = $process.StandardOutput.ReadToEnd()
+            $process.WaitForExit()
+            $null = $diagnostics
+            if ($process.ExitCode -ne 0) {{ return @() }}
+            return @($text -split '\r?\n' | Where-Object {{ $_.Length -gt 0 }})
         }} catch {{
             return @()
         }}
@@ -1062,13 +1086,39 @@ mod tests {
         }
         let pwsh = completion_script(CompletionShell::Powershell);
         assert!(
-            pwsh.contains("2>$null"),
-            "PowerShell must silence helper stderr"
+            pwsh.contains("RedirectStandardError = $true"),
+            "PowerShell must keep helper stderr out of the candidate list"
         );
         assert!(
-            pwsh.contains("catch") && pwsh.contains("LASTEXITCODE"),
+            pwsh.contains("catch") && pwsh.contains("ExitCode"),
             "PowerShell must fail soft when the helper is missing or fails"
         );
+    }
+
+    /// bitty#2929 links `bitty.exe` as a GUI-subsystem binary, and PowerShell
+    /// runs a GUI-subsystem child asynchronously: `& bitty ...` returns before
+    /// the child's pipe is drained, so a captured call reads back empty. The
+    /// helper must own the child's lifetime instead of relying on PowerShell's
+    /// native-command capture.
+    #[test]
+    fn powershell_helper_owns_the_process_lifetime() {
+        let script = completion_script(CompletionShell::Powershell);
+        assert!(
+            !script.contains("& bitty @HelperArgs"),
+            "PowerShell must not depend on native-command capture of a GUI child"
+        );
+        for needle in [
+            "[System.Diagnostics.Process]::Start",
+            "RedirectStandardOutput = $true",
+            "RedirectStandardError = $true",
+            "WaitForExit()",
+            "ExitCode",
+        ] {
+            assert!(
+                script.contains(needle),
+                "PowerShell helper must own the child process: {needle} missing"
+            );
+        }
     }
 
     #[test]

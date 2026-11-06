@@ -91,8 +91,10 @@
 //!    delegate to the layout's deterministic adjacency.
 //! 6. **Spawn shell** via [`Runtime::spawn_shell`](bitty_runtime::Runtime::spawn_shell)
 //!    for the explicit program argument, or via the default shell chain
-//!    (configured `terminal.shell` > `$SHELL` > `/bin/sh`, see
-//!    [`crate::spawn::resolve_default_shell`]) when no program is given. The program is
+//!    (configured `terminal.shell` > `$SHELL` > platform default, see
+//!    [`crate::spawn::resolve_default_shell`]; bitty#2928: `pwsh.exe`,
+//!    `powershell.exe`, then `cmd.exe` on Windows, `/bin/sh` elsewhere) when
+//!    no program is given. The program is
 //!    taken as a direct
 //!    `argv[0]` without shell interpolation (P0 posture). Every additional
 //!    leaf owns its own shell via
@@ -212,13 +214,24 @@
 //! # Security
 //!
 //! - No `unsafe` is required. The workspace denies `unsafe_code`; this binary
-//!   enforces `#![forbid(unsafe_code)]` with no exception.
+//!   enforces `#![forbid(unsafe_code)]` with no exception. The two Win32 calls
+//!   the Windows console adoption needs (`AttachConsole`, `SetStdHandle`) live
+//!   in the reviewed `bitty-winjob` FFI boundary, not here (bitty#2929).
 //! - No upstream type (`portable-pty`, `vte`, `winit`, `wgpu`) appears in any
 //!   public signature — the binary has no library API, and all library
 //!   boundaries are behind `bitty-runtime` / `bitty-platform` owned types.
 //! - No shell interpolation. `spawn_shell` takes a direct `argv[0]` via
 //!   `PtyBuilder`, never a shell string.
 
+// bitty#2929: build the Windows binary as a GUI-subsystem executable so a
+// Start Menu/Search launch never allocates a console window (Windows Terminal)
+// before the Bitty window appears. This is the alacritty mechanism
+// (`#![windows_subsystem = "windows"]` + `AttachConsole(ATTACH_PARENT_PROCESS)`
+// at startup) rather than `/SUBSYSTEM:WINDOWS` link args, because it is
+// visible in the entry-point source, needs no per-target rustflags, and
+// applies to the `bitty` binary only. `not(test)` keeps the unit-test harness
+// a console process so `cargo test` output stays capturable on Windows.
+#![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 #![forbid(unsafe_code)]
 
 use std::rc::Rc;
@@ -288,7 +301,10 @@ use config_cli::{
 use init::run_init_subcommand;
 use layout_cmd::{apply_focus, demo_pump_enabled_from_env, run_headless_smoke};
 use logging::effective_log_level;
-use spawn::{SpawnSpec, resolve_spawn_program, spawn_default_shell, spawn_startup_pane_shells};
+use spawn::{
+    SpawnSpec, StartupShellError, resolve_spawn_program, spawn_default_shell,
+    spawn_startup_pane_shells,
+};
 use terminal_app::TerminalApp;
 
 #[cfg(test)]
@@ -391,6 +407,17 @@ fn should_store_ipc_socket_path(headless: bool, test_mode: bool) -> bool {
 }
 
 fn main() {
+    // bitty#2929: `bitty.exe` links as a GUI-subsystem binary, so a Start
+    // Menu/Search launch never flashes a console window. A shell launch gets
+    // no console either, so adopt the parent console before the first byte of
+    // output: `--version`, `--help`, `doctor`, `list`, `ctl`, and every error
+    // message keep printing there. Streams the parent already wired (a pipe,
+    // `> out.txt`) are left alone. The outcome is deliberately not consumed:
+    // adoption is best-effort, and stderr may not exist yet to report it. A
+    // launcher start keeps the XDG crash-report file sink.
+    #[cfg(windows)]
+    let _ = bitty_winjob::adopt_parent_console();
+
     let raw: Vec<String> = std::env::args().collect();
     if stall_watchdog::handle_state_writer(&raw) {
         return;
@@ -1265,8 +1292,11 @@ fn main() {
     // Single-window vertical slice: one PTY per leaf, one shell each.
     // Explicit program spawns verbatim (with tail args via spawn_shell_with_args);
     // bare invocation resolves to the default shell chain (configured
-    // `terminal.shell` > $SHELL > /bin/sh, CTX-0298).
-    // Headless CI still succeeds even if spawn fails (bounded synthetic smoke).
+    // `terminal.shell` > $SHELL > platform default, CTX-0298 / bitty#2928:
+    // `pwsh.exe`, `powershell.exe`, then `cmd.exe` on Windows, `/bin/sh`
+    // elsewhere).
+    // Headless CI still succeeds if a resolved program fails to spawn (bounded
+    // synthetic smoke); an unresolvable default is fatal instead.
     // `$SHELL` and the effective configured shell are read once here and
     // injected into the pure resolver so arg handling stays testable; both are
     // trusted only as binary paths, never split.
@@ -1313,8 +1343,15 @@ fn main() {
     // spawns eagerly on its own fresh runtime).
     let defer_startup_spawn = defers_startup_spawn(args.headless, args.test_mode);
     if !defer_startup_spawn {
-        let startup_spawn_failed = spawn_startup_shells(&mut runtime, &spawn_spec);
-        if let Some(code) = fail_loud_exit(args.fail_loud, startup_spawn_failed) {
+        let startup_spawn = spawn_startup_shells(&mut runtime, &spawn_spec);
+        // bitty#2928: an unresolvable default child shell is fatal even
+        // without `--fail-loud` — a headless tick is not a working terminal.
+        // A resolved program that fails to spawn stays fail-soft.
+        if let Some(err) = startup_spawn.error.as_ref().filter(|err| err.is_fatal()) {
+            eprintln!("bitty: startup failed: {err}");
+            std::process::exit(EXIT_STARTUP);
+        }
+        if let Some(code) = fail_loud_exit(args.fail_loud, startup_spawn.failed()) {
             eprintln!("bitty: startup failed (--fail-loud): PTY shell startup did not complete");
             std::process::exit(code);
         }
@@ -1530,10 +1567,16 @@ fn main() {
         // Re-apply layout and focus in fallback so headless smoke proves the same composition
         // that real mode would have driven via the window (TERM-APP-003 / CTX-0553).
         apply_startup_layout_and_focus(&mut rt, &args);
-        let fallback_spawn_failed = spawn_startup_shells(&mut rt, &spawn_spec);
+        let fallback_spawn = spawn_startup_shells(&mut rt, &spawn_spec);
+        // bitty#2928: same fatal rule as the primary path — an unresolvable
+        // default never reads as a green headless smoke.
+        if let Some(err) = fallback_spawn.error.as_ref().filter(|err| err.is_fatal()) {
+            eprintln!("bitty: startup failed: {err}");
+            std::process::exit(EXIT_STARTUP);
+        }
         // CTX-0481: the DisplayUnavailable fallback must not turn a
         // `--fail-loud` shell failure into a green smoke.
-        if let Some(code) = fail_loud_exit(args.fail_loud, fallback_spawn_failed) {
+        if let Some(code) = fail_loud_exit(args.fail_loud, fallback_spawn.failed()) {
             eprintln!("bitty: startup failed (--fail-loud): PTY shell startup did not complete");
             std::process::exit(code);
         }
@@ -1624,34 +1667,74 @@ pub(crate) fn apply_startup_layout_and_focus(runtime: &mut Runtime, args: &cli::
     }
 }
 
+/// Outcome of [`spawn_startup_shells`] (bitty#2928).
+pub(crate) struct StartupSpawnOutcome {
+    /// Typed failure of the primary shell, when it did not start.
+    pub(crate) error: Option<StartupShellError>,
+    /// Pane shells that failed to start (each already warned).
+    pub(crate) pane_failures: usize,
+}
+
+impl StartupSpawnOutcome {
+    /// True when any requested startup shell failed (the `--fail-loud`
+    /// trigger, CTX-0481).
+    pub(crate) fn failed(&self) -> bool {
+        self.error.is_some() || self.pane_failures > 0
+    }
+}
+
 /// Spawns the primary shell and any layout pane shells (TERM-APP-003 / CTX-0553).
 ///
-/// Returns `true` if any startup shell spawn failed (for `--fail-loud` handling).
+/// Returns the typed failure instead of a bare flag (bitty#2928): an
+/// unresolvable default is fatal even without `--fail-loud`, while a resolved
+/// program that fails to spawn stays fail-soft and is reported with its name.
 ///
 /// CTX-1719: the recipe comes entirely from [`SpawnSpec`] so the windowed
 /// startup path can defer this call until the first committed window grid
 /// (see [`crate::terminal_app::TerminalApp::spawn_deferred_startup_shells`])
 /// without threading the CLI arguments into the app.
-pub(crate) fn spawn_startup_shells(runtime: &mut Runtime, spawn_spec: &SpawnSpec) -> bool {
-    let effective = resolve_spawn_program(
+pub(crate) fn spawn_startup_shells(
+    runtime: &mut Runtime,
+    spawn_spec: &SpawnSpec,
+) -> StartupSpawnOutcome {
+    let resolved = match resolve_spawn_program(
         spawn_spec.program.as_deref(),
         spawn_spec.config_shell.as_deref(),
         spawn_spec.shell_env.as_deref(),
-    );
+    ) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            logging::warn(|| format!("bitty: {err}"));
+            return StartupSpawnOutcome {
+                error: Some(StartupShellError::Unresolved(err)),
+                pane_failures: 0,
+            };
+        }
+    };
     logging::info(|| {
+        // `PROGRAM (explicit=…, configured_shell=…)` is a pinned startup
+        // diagnostic (`tests/shell_knob.rs`, CTX-0298): the winning precedence
+        // layer from bitty#2928 is appended in its own trailing group so the
+        // historically matched prefix stays byte-identical.
         format!(
-            "bitty: effective program {effective:?} (explicit={}, configured_shell={})",
+            "bitty: effective program {:?} (explicit={}, configured_shell={}) (source={})",
+            resolved.program,
             spawn_spec.program.is_some(),
-            spawn_spec.config_shell.is_some()
+            spawn_spec.config_shell.is_some(),
+            resolved.source.label()
         )
     });
-    let spawn_result = if spawn_spec.program.is_some() {
+    let spawn_result = if let Some(program) = spawn_spec.program.as_deref() {
         let tail: Vec<&str> = spawn_spec.program_args.iter().map(String::as_str).collect();
         if tail.is_empty() {
-            runtime.spawn_shell(effective)
+            runtime.spawn_shell(program)
         } else {
-            runtime.spawn_shell_with_args(effective, &tail)
+            runtime.spawn_shell_with_args(program, &tail)
         }
+        .map_err(|error| StartupShellError::Spawn {
+            program: program.to_string(),
+            error,
+        })
     } else {
         spawn_default_shell(
             runtime,
@@ -1674,15 +1757,21 @@ pub(crate) fn spawn_startup_shells(runtime: &mut Runtime, spawn_spec: &SpawnSpec
             // Best-effort with loud warnings by default. Skipped when the
             // primary spawn failed: the same resolution would fail the same
             // way per leaf.
-            spawn_startup_pane_shells(runtime, spawn_spec) > 0
+            StartupSpawnOutcome {
+                error: None,
+                pane_failures: spawn_startup_pane_shells(runtime, spawn_spec),
+            }
         }
         Err(err) => {
             logging::warn(|| {
                 format!(
-                    "bitty: PTY spawn failed for {effective:?}: {err} — continuing without child (headless tick still proves path)"
+                    "bitty: PTY spawn failed: {err} — continuing without child (headless tick still proves path)"
                 )
             });
-            true
+            StartupSpawnOutcome {
+                error: Some(err),
+                pane_failures: 0,
+            }
         }
     }
 }

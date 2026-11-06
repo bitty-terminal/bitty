@@ -1302,8 +1302,14 @@ impl TerminalApp {
         let Some(pending) = self.pending_startup_spawn.take() else {
             return false;
         };
-        let failed = crate::spawn_startup_shells(&mut self.runtime, &self.spawn_spec);
-        if pending.fail_loud && failed {
+        let spawn = crate::spawn_startup_shells(&mut self.runtime, &self.spawn_spec);
+        // bitty#2928: an unresolvable default is fatal here too, even when the
+        // windowed start was not `--fail-loud`.
+        if let Some(err) = spawn.error.as_ref().filter(|err| err.is_fatal()) {
+            eprintln!("bitty: startup failed: {err}");
+            std::process::exit(crate::EXIT_STARTUP);
+        }
+        if pending.fail_loud && spawn.failed() {
             eprintln!("bitty: startup failed (--fail-loud): PTY shell startup did not complete");
             std::process::exit(crate::EXIT_STARTUP);
         }

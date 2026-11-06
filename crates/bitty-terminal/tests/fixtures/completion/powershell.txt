@@ -10,10 +10,34 @@ if (-not (Test-Path variable:global:_BittyCompletionRegistered)) {
     $global:_BittyValueFlags = @('--log-level','--split-ratio','--layout','--focus','--config','--profile','--theme','--font-family','--font-size','--opacity','--format','--socket','--instance','--scrollback','--close-confirm','--gaps-in','--gaps-out','--border','--radius','--plugins','--cwd','--env','--title','--scope','--terminal','--family','--cap','--iterations','--rows','--cols','--version','--digest','--distro')
     $global:_BittyHelper = {
         param([string[]]$HelperArgs)
+        # bitty#2929 links bitty.exe as a GUI-subsystem binary, and PowerShell
+        # runs a GUI-subsystem child asynchronously: `& bitty ...` returns
+        # before the child exits and before its pipe is drained, so a captured
+        # helper silently reads back empty (and `$LASTEXITCODE` stays stale).
+        # Own the process here instead - explicit redirection plus
+        # `WaitForExit` - so the candidates arrive whatever the subsystem is.
         try {
-            $lines = @(& bitty @HelperArgs 2>$null)
-            if ($LASTEXITCODE -ne 0) { return @() }
-            return @($lines | Where-Object { $null -ne $_ -and "$_".Length -gt 0 })
+            # Helper arguments are generated constants (`+list-profiles`,
+            # `+list-plugins`, `--installed`), so plain quoting is exact.
+            $argumentLine = ($HelperArgs | ForEach-Object { '"' + $_ + '"' }) -join ' '
+            $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $startInfo.FileName = 'bitty'
+            $startInfo.Arguments = $argumentLine
+            $startInfo.UseShellExecute = $false
+            $startInfo.CreateNoWindow = $true
+            $startInfo.RedirectStandardInput = $true
+            $startInfo.RedirectStandardOutput = $true
+            $startInfo.RedirectStandardError = $true
+            $process = [System.Diagnostics.Process]::Start($startInfo)
+            $process.StandardInput.Close()
+            # Drain stderr concurrently: a helper usage error must never fill
+            # the pipe buffer and deadlock the stdout read.
+            $diagnostics = $process.StandardError.ReadToEndAsync()
+            $text = $process.StandardOutput.ReadToEnd()
+            $process.WaitForExit()
+            $null = $diagnostics
+            if ($process.ExitCode -ne 0) { return @() }
+            return @($text -split '\r?\n' | Where-Object { $_.Length -gt 0 })
         } catch {
             return @()
         }

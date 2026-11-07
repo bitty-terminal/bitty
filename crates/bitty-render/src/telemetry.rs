@@ -27,7 +27,7 @@ use std::time::Instant;
 
 /// Number of tracked counters; must match the field order in
 /// [`SurfaceTelemetrySnapshot`].
-const COUNTER_SLOTS: usize = 16;
+const COUNTER_SLOTS: usize = 17;
 
 const CONFIGURE_OK: usize = 0;
 const CONFIGURE_ERR: usize = 1;
@@ -45,6 +45,7 @@ const RETRY_FAILURES: usize = 12;
 const RETRY_ATTEMPTS: usize = 13;
 const RETRY_RECOVERIES: usize = 14;
 const RETRY_LAST_DELAY_MS: usize = 15;
+const PRESENT_UNCONFIRMED: usize = 16;
 
 /// Last surface event recorded, stored as one byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,6 +67,7 @@ enum LastEvent {
     RetryArmed = 13,
     RetryAttempt = 14,
     RetryRecovered = 15,
+    PresentUnconfirmed = 16,
 }
 
 impl LastEvent {
@@ -86,6 +88,7 @@ impl LastEvent {
             13 => Self::RetryArmed,
             14 => Self::RetryAttempt,
             15 => Self::RetryRecovered,
+            16 => Self::PresentUnconfirmed,
             _ => Self::None,
         }
     }
@@ -108,6 +111,7 @@ impl LastEvent {
             Self::RetryArmed => "retry-armed",
             Self::RetryAttempt => "retry-attempt",
             Self::RetryRecovered => "retry-recovered",
+            Self::PresentUnconfirmed => "present-unconfirmed",
         }
     }
 }
@@ -171,6 +175,13 @@ pub struct SurfaceTelemetrySnapshot {
     pub presenter_coalesced: u64,
     /// Acknowledgements dropped because the bounded ack ring was full.
     pub presenter_acks_dropped: u64,
+    /// Committed presents whose compositor confirmation never arrived within
+    /// the verification bound (bitty#2989).
+    ///
+    /// A present can report success and still never reach the screen (a lost
+    /// frame callback, a dropped buffer). Each miss forces one corrective
+    /// repaint, so this counts bounded recovery episodes, not frames.
+    pub present_unconfirmed: u64,
     /// Last recorded event name, stable for reports.
     pub last_event: &'static str,
 }
@@ -201,6 +212,7 @@ impl Default for SurfaceTelemetrySnapshot {
             presenter_recoveries: 0,
             presenter_coalesced: 0,
             presenter_acks_dropped: 0,
+            present_unconfirmed: 0,
             last_event: "none",
         }
     }
@@ -372,6 +384,12 @@ pub fn retry_recovered() {
     record(LastEvent::RetryRecovered, Some(RETRY_RECOVERIES));
 }
 
+/// A committed present was not confirmed by the compositor within the bound
+/// and one corrective repaint is being forced (bitty#2989).
+pub fn present_unconfirmed() {
+    record(LastEvent::PresentUnconfirmed, Some(PRESENT_UNCONFIRMED));
+}
+
 /// Copy the process-wide surface telemetry slot.
 #[must_use]
 pub fn snapshot() -> SurfaceTelemetrySnapshot {
@@ -409,6 +427,7 @@ pub fn snapshot() -> SurfaceTelemetrySnapshot {
         presenter_recoveries: PRESENT_RECOVERIES.load(Ordering::Relaxed),
         presenter_coalesced: PRESENT_COALESCED.load(Ordering::Relaxed),
         presenter_acks_dropped: PRESENT_ACKS_DROPPED.load(Ordering::Relaxed),
+        present_unconfirmed: COUNTERS[PRESENT_UNCONFIRMED].load(Ordering::Relaxed),
         last_event: LastEvent::from_u8(LAST_EVENT.load(Ordering::Relaxed)).as_str(),
     }
 }
@@ -438,6 +457,7 @@ mod tests {
         retry_rearmed(200);
         retry_attempt();
         retry_recovered();
+        present_unconfirmed();
 
         let after = snapshot();
         assert!(after.configure_ok > before.configure_ok);
@@ -454,6 +474,7 @@ mod tests {
         assert!(after.retry_failures > before.retry_failures);
         assert!(after.retry_attempts > before.retry_attempts);
         assert!(after.retry_recoveries > before.retry_recoveries);
+        assert!(after.present_unconfirmed > before.present_unconfirmed);
         // `retry_rearmed` ran last: it refreshes the armed delay but is not a
         // failed present, so it must not be what moves `retry_failures`.
         assert_eq!(after.retry_last_delay_ms, 200);
@@ -462,7 +483,7 @@ mod tests {
 
     #[test]
     fn every_event_has_a_stable_name() {
-        for raw in 0u8..=15 {
+        for raw in 0u8..=16 {
             let event = LastEvent::from_u8(raw);
             assert_eq!(event as u8, raw);
             assert!(!event.as_str().is_empty());

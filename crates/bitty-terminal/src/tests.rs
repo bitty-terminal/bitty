@@ -1139,6 +1139,47 @@ return {}
         );
     }
 
+    /// bitty#2989: a committed frame the compositor never confirms must wake
+    /// the loop at its bound; otherwise the loop parks with the older frame on
+    /// screen and nothing re-presents it.
+    #[test]
+    fn about_to_wait_arms_the_present_confirm_deadline() {
+        let mut fixture = Fixture::new("present-confirm-wake");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        fixture.app.test_present_confirm_deadline = Some(deadline);
+        let operations = about_to_wait_operations(&mut fixture);
+        assert!(
+            operations.iter().any(
+                |operation| matches!(operation, RecordingOperation::WaitUntil(at) if *at == deadline)
+            ),
+            "AboutToWait must arm the compositor-confirmation wake: {operations:?}"
+        );
+    }
+
+    /// bitty#2989: the served redraw is the compositor's confirmation, and it
+    /// must clear the bound so a healthy window never rebuilds the frame.
+    #[test]
+    fn a_served_redraw_confirms_the_committed_present() {
+        let mut fixture = Fixture::new("present-confirm-redraw");
+        fixture
+            .app
+            .runtime
+            .arm_present_confirmation_at(std::time::Instant::now());
+        assert!(
+            fixture.app.runtime.present_confirm_deadline().is_some(),
+            "precondition: a committed frame is awaiting confirmation"
+        );
+        let _ = fixture.platform_event(PlatformEvent::Window {
+            window_id: WindowId::from_raw_public(1),
+            kind: WindowEventKind::RedrawRequested,
+        });
+        assert_eq!(
+            fixture.app.runtime.present_confirm_deadline(),
+            None,
+            "a served frame callback confirms the committed frame"
+        );
+    }
+
     /// One `AboutToWait` turn on the real handler, returning the recorded
     /// loop-control operations (bitty#2830 wiring tests).
     fn about_to_wait_operations(fixture: &mut Fixture) -> Vec<RecordingOperation> {

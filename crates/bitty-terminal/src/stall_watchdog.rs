@@ -2126,7 +2126,7 @@ fn render_report(report: &StallReport) -> String {
             // longer blocks the event loop.
             let _ = writeln!(
                 out,
-                "  presenter: in_flight={} in_flight_since_ms={} in_flight_ms={} stuck_presents={} recoveries={} coalesced={} acks_dropped={}",
+                "  presenter: in_flight={} in_flight_since_ms={} in_flight_ms={} stuck_presents={} recoveries={} coalesced={} acks_dropped={} unconfirmed={}",
                 surface.presenter_in_flight,
                 surface.presenter_in_flight_since_ms,
                 surface.presenter_in_flight_ms,
@@ -2134,6 +2134,7 @@ fn render_report(report: &StallReport) -> String {
                 surface.presenter_recoveries,
                 surface.presenter_coalesced,
                 surface.presenter_acks_dropped,
+                surface.present_unconfirmed,
             );
             let _ = writeln!(
                 out,

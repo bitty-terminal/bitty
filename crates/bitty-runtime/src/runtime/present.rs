@@ -75,6 +75,26 @@ pub(super) const PRESENT_REATTACH_RETRY: std::time::Duration = std::time::Durati
 /// stuck/epilogue state machine.
 const PRESENT_MIN_WAKE: std::time::Duration = std::time::Duration::from_millis(1);
 
+/// Bound for the compositor to confirm a committed present (bitty#2989).
+///
+/// Invariant: a present that reports success can still never reach the screen
+/// (a dropped commit, a lost frame callback). Damage is consumed by then, so
+/// nothing is owed and the loop parks with the older frame visible. A visible
+/// Wayland surface serves its frame callback within one repaint cycle (16.7 ms
+/// at 60 Hz); this bound tolerates dropped frames, compositor stalls, and
+/// scheduling jitter with a wide margin, sits above the platform's occlusion
+/// probe so a genuinely hidden surface is handled by the visibility gate
+/// first, and stays far below the multi-second stale spans the defect reports.
+const PRESENT_CONFIRM_BOUND: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Corrective repaints allowed for consecutive unconfirmed presents.
+///
+/// Invariant: a compositor that never confirms again must not be repainted
+/// every bound forever. Three attempts cover a transient stall without
+/// turning a permanently broken surface into a periodic frame source; the
+/// stuck/failed-present recovery owns that surface instead.
+const PRESENT_CONFIRM_REPAIR_LIMIT: u32 = 3;
+
 /// Commit data for the newest frame submitted to the off-thread presenter.
 ///
 /// Nothing here is published on screen until the worker acknowledges that the
@@ -2269,6 +2289,107 @@ impl Runtime {
         }
     }
 
+    /// Deadline by which the compositor must confirm the last committed frame
+    /// (bitty#2989).
+    ///
+    /// Armed when a real frame commits, cleared by
+    /// [`Self::note_present_confirmed`] when the embedder observes the
+    /// compositor's frame callback, and consumed by the runtime's own
+    /// confirmation check when it fires. `None` in the healthy steady state (a
+    /// served callback clears it within one frame) and while hidden, so an
+    /// idle window arms nothing.
+    #[must_use]
+    pub fn present_confirm_deadline(&self) -> Option<std::time::Instant> {
+        if !self.surface_visible {
+            return None;
+        }
+        self.present_confirm_at
+    }
+
+    /// Records that the compositor served a frame callback (bitty#2989).
+    ///
+    /// The embedder calls this when a redraw request issued after a present is
+    /// answered: a served callback proves the compositor sampled the surface,
+    /// so the frame just committed is on screen. Clears the verification bound
+    /// and the corrective-repaint budget; a no-op when nothing is pending.
+    pub fn note_present_confirmed(&mut self) {
+        self.present_confirm_at = None;
+        self.present_confirm_misses = 0;
+    }
+
+    /// Arms the compositor-confirmation bound for a committed real frame.
+    ///
+    /// Headless presents have no compositor to confirm them and never arm
+    /// this.
+    fn arm_present_confirmation(&mut self, now: std::time::Instant) {
+        self.present_confirm_at = now.checked_add(PRESENT_CONFIRM_BOUND);
+    }
+
+    /// Test-only seam: arms the confirmation bound without a GPU frame.
+    ///
+    /// The app-level wiring test drives the `RedrawRequested` → confirmation
+    /// handoff deterministically; production arms this only from a real
+    /// commit.
+    #[doc(hidden)]
+    pub fn arm_present_confirmation_at(&mut self, now: std::time::Instant) {
+        self.arm_present_confirmation(now);
+    }
+
+    /// Drops any outstanding confirmation (new surface incarnation, hide).
+    fn clear_present_confirmation(&mut self) {
+        self.present_confirm_at = None;
+    }
+
+    /// Forces one corrective repaint when a committed frame was not confirmed
+    /// within [`PRESENT_CONFIRM_BOUND`] (bitty#2989).
+    ///
+    /// This is the missing half of the failed-present retry (#2570): a present
+    /// that reports success but never reaches the screen consumes its damage,
+    /// leaves nothing owed, and parks the loop with the older frame visible.
+    /// The bound is the only remaining evidence, so the frame is rebuilt and
+    /// presented once; the next commit re-arms the bound, and a served
+    /// callback clears it. The repair budget bounds a surface that never
+    /// confirms again.
+    fn check_present_confirmation(&mut self, now: std::time::Instant) {
+        let Some(deadline) = self.present_confirm_at else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+        self.present_confirm_at = None;
+        if self.pending_present.is_some() {
+            // The newest frame is with the presenter: its commit re-arms this
+            // bound, and the stuck-present bound owns a worker that never acks.
+            // Counting a miss here would force a duplicate repaint once the
+            // in-flight frame lands.
+            return;
+        }
+        if !self.surface_visible {
+            // The occlusion gate keeps the damage and re-presents on reveal;
+            // forcing a frame here would only burn the repair budget.
+            return;
+        }
+        if self.present_confirm_misses >= PRESENT_CONFIRM_REPAIR_LIMIT {
+            // A surface that never confirms again is the stuck/failed-present
+            // recovery's job, not a periodic repaint.
+            return;
+        }
+        self.present_confirm_misses = self.present_confirm_misses.saturating_add(1);
+        self.pending_full_redraw = true;
+        self.forced_repaint_requests = self.forced_repaint_requests.saturating_add(1);
+        if self.presenter.is_some() {
+            // Consumed by the next submission, which marks it corrective.
+            self.forced_repaint_owed = true;
+        }
+        bitty_render::telemetry::present_unconfirmed();
+        eprintln!(
+            "bitty: present unconfirmed by the compositor (misses={}, bound={} ms); forcing a corrective repaint",
+            self.present_confirm_misses,
+            PRESENT_CONFIRM_BOUND.as_millis(),
+        );
+    }
+
     /// Bounded self-heal wake for a hidden surface with retained work.
     ///
     /// bitty#2830 hypothesis 2: `set_surface_visibility_at(false)` keeps the
@@ -2391,6 +2512,9 @@ impl Runtime {
             // let its old deadline win over the reveal's next-frame queue;
             // hidden ticks also must not re-arm it.
             self.suspend_surface_retry();
+            // bitty#2989: a hidden surface cannot be confirmed; the reveal
+            // frame re-arms the bound after it commits.
+            self.clear_present_confirmation();
             // Retain the cancelled presentation as damage, exactly as before,
             // and arm the bounded self-heal only when something real was
             // retained (bitty#2830 hypothesis 2). A clean hide arms nothing.
@@ -3085,6 +3209,10 @@ impl Runtime {
         // the frame gates. A committed frame is this tick's present even when
         // `tick_at_inner` has no new frame to build.
         let committed = self.poll_presenter(now);
+        // bitty#2989: a committed frame the compositor never confirmed is the
+        // one case that leaves nothing owed and no retry armed. Consume the
+        // bound before the gates so the corrective frame is built this tick.
+        self.check_present_confirmation(now);
         let stats = self.tick_at_inner(now).or(committed);
         self.publish_hang_gauges();
         self.hang_gauges
@@ -7300,6 +7428,10 @@ impl Runtime {
             // every pixel as damage and drop the uncommittable commit state.
             self.pending_present = None;
             self.pending_full_redraw = true;
+            // bitty#2989: a dead worker never committed the frame, so no
+            // compositor confirmation is owed for it; the stuck/dead presenter
+            // gauges own this failure, not the unconfirmed-present counter.
+            self.clear_present_confirmation();
             if exhausted {
                 // Built-in recovery is spent; no retry loop. The embedder's
                 // reattach path can install a fresh GPU context.
@@ -7358,6 +7490,9 @@ impl Runtime {
                 self.pending_present = None;
                 self.pending_full_redraw = true;
                 self.presenter_retry_at = None;
+                // bitty#2989: the stuck-present gauge owns this failure; the
+                // abandoned frame never committed, so no confirmation is owed.
+                self.clear_present_confirmation();
                 let alive = self
                     .presenter
                     .as_mut()
@@ -7439,6 +7574,9 @@ impl Runtime {
     fn fail_async_present(&mut self, now: std::time::Instant, detail: &str, draw_error: bool) {
         self.pending_present = None;
         self.pending_full_redraw = true;
+        // bitty#2989: the failed-present retry owns this frame; it never
+        // committed, so it must not also count as an unconfirmed present.
+        self.clear_present_confirmation();
         let delay = self.arm_surface_retry(now);
         bitty_render::telemetry::retry_armed(delay.as_millis() as u64);
         let error = if draw_error {
@@ -7491,6 +7629,11 @@ impl Runtime {
         // Pacing measures committed presentation cadence, exactly like the
         // synchronous path (which stamps only ticks that returned `Some`).
         self.last_present_at = Some(now);
+        // bitty#2989: a real frame is on its way to the compositor. The
+        // embedder clears this bound when the compositor serves the frame
+        // callback for it; a bound that fires first forces one corrective
+        // repaint.
+        self.arm_present_confirmation(now);
         // Match the synchronous tail: PTY output that presents without input
         // must refresh the devtools/IPC inspect snapshot too.
         self.publish_inspect_snapshot();
@@ -7882,6 +8025,8 @@ impl Runtime {
                     delay,
                 );
                 self.pending_full_redraw = true;
+                // bitty#2989: the failed-present retry owns this frame.
+                self.clear_present_confirmation();
                 return None;
             }
             if let Some(gpu) = self.gpu.as_ref() {
@@ -7912,6 +8057,8 @@ impl Runtime {
                         bitty_render::telemetry::retry_armed(delay.as_millis() as u64);
                         self.note_surface_present_failure(&err, delay);
                         self.pending_full_redraw = true;
+                        // bitty#2989: the failed-present retry owns this frame.
+                        self.clear_present_confirmation();
                         return None;
                     }
                 }
@@ -7946,6 +8093,13 @@ impl Runtime {
         };
         self.mark_frame_presented(snapshot.generation);
         self.publish_presented_allocations(allocations, focused);
+        // bitty#2989: a real (non-headless) synchronous present is committed to
+        // the compositor but not yet confirmed by it. The embedder clears this
+        // bound when the compositor serves the frame callback; a headless
+        // present has no compositor and never arms it.
+        if !stats.headless {
+            self.arm_present_confirmation(now);
+        }
         // CTX-1630: the scene report and its accessibility projection describe
         // exactly this presented frame. A deferred/failed present keeps the
         // previous report, matching the frame still on screen.
@@ -13058,6 +13212,200 @@ mod async_present_tests {
         assert!(
             wait_until(|| control.alive() == 1, TEST_WAIT),
             "the abandoned worker exits when its blocking call returns"
+        );
+        assert!(runtime.shutdown());
+    }
+
+    /// bitty#2989 regression: a present that reports success but never reaches
+    /// the compositor must be re-presented on the verification bound, without
+    /// waiting for an unrelated event.
+    ///
+    /// The fake backend acks `Presented` (the frame "succeeded"), and the test
+    /// never serves the compositor's frame callback - exactly the reported
+    /// shape where damage is consumed, nothing is owed, and the loop parks
+    /// with the older frame on screen.
+    #[test]
+    fn an_unconfirmed_present_is_repainted_once_the_bound_elapses() {
+        let control = Control::new(false);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: TEST_WAIT,
+                ..PresenterConfig::default()
+            },
+        );
+        runtime.handle_pty_bytes(b"stale frame");
+        let first = tick_until_committed(&mut runtime, TEST_WAIT).expect("the first frame commits");
+        assert_eq!(control.presented(), 1);
+
+        // The committed frame owes a compositor confirmation, and the runtime
+        // believes it is idle: nothing else is armed.
+        let deadline = runtime
+            .present_confirm_deadline()
+            .expect("a committed frame arms the confirmation bound");
+        assert!(deadline > Instant::now());
+        assert!(
+            !runtime.present_owed(),
+            "damage is consumed, so the old paths arm nothing"
+        );
+
+        let unconfirmed_before = bitty_render::telemetry::snapshot().present_unconfirmed;
+        // The embedder's wake fires at the bound. No sleep: the tick clock is
+        // advanced to the deadline.
+        assert!(
+            runtime.tick_at(deadline).is_none(),
+            "the corrective frame is submitted, not committed inline"
+        );
+        assert!(
+            runtime.pending_present.is_some(),
+            "the retained frame was rebuilt and re-presented"
+        );
+        assert!(
+            bitty_render::telemetry::snapshot().present_unconfirmed > unconfirmed_before,
+            "the recovery is counted in the surface telemetry"
+        );
+        let repair =
+            tick_until_committed(&mut runtime, TEST_WAIT).expect("the corrective frame commits");
+        assert!(repair.frame > first.frame, "a new frame reached the worker");
+        assert_eq!(control.presented(), 2);
+        assert!(
+            runtime.present_confirm_deadline().is_some(),
+            "the corrective frame arms its own confirmation"
+        );
+        assert!(runtime.shutdown());
+    }
+
+    /// The healthy half of bitty#2989: a served frame callback disarms the
+    /// bound, so an idle, clean terminal presents nothing extra.
+    #[test]
+    fn a_confirmed_present_arms_no_repair() {
+        let control = Control::new(false);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: TEST_WAIT,
+                ..PresenterConfig::default()
+            },
+        );
+        runtime.handle_pty_bytes(b"healthy");
+        tick_until_committed(&mut runtime, TEST_WAIT).expect("the frame commits");
+        let deadline = runtime
+            .present_confirm_deadline()
+            .expect("a committed frame arms the confirmation bound");
+
+        // The compositor serves the redraw request issued after the present.
+        runtime.note_present_confirmed();
+        assert_eq!(
+            runtime.present_confirm_deadline(),
+            None,
+            "a served callback disarms the bound"
+        );
+        let unconfirmed_before = bitty_render::telemetry::snapshot().present_unconfirmed;
+        assert!(runtime.tick_at(deadline).is_none());
+        assert!(
+            runtime.pending_present.is_none(),
+            "a confirmed present never rebuilds a frame"
+        );
+        assert_eq!(
+            control.presented(),
+            1,
+            "no extra frame on a clean idle window"
+        );
+        assert_eq!(
+            bitty_render::telemetry::snapshot().present_unconfirmed,
+            unconfirmed_before,
+            "a confirmed present is never counted as unconfirmed"
+        );
+        assert!(runtime.shutdown());
+    }
+
+    /// A surface that never confirms again must not be repainted every bound
+    /// forever: the repair budget bounds the corrective presents.
+    #[test]
+    fn an_unconfirming_surface_stops_after_the_repair_budget() {
+        let control = Control::new(false);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: TEST_WAIT,
+                ..PresenterConfig::default()
+            },
+        );
+        runtime.handle_pty_bytes(b"never confirms");
+        tick_until_committed(&mut runtime, TEST_WAIT).expect("the first frame commits");
+
+        let mut repairs = 0u32;
+        for _ in 0..(PRESENT_CONFIRM_REPAIR_LIMIT + 2) {
+            let Some(deadline) = runtime.present_confirm_deadline() else {
+                break;
+            };
+            assert!(runtime.tick_at(deadline).is_none());
+            if runtime.pending_present.is_none() {
+                // Budget spent: no corrective frame was rebuilt.
+                break;
+            }
+            repairs = repairs.saturating_add(1);
+            tick_until_committed(&mut runtime, TEST_WAIT).expect("the corrective frame commits");
+        }
+        assert_eq!(
+            repairs, PRESENT_CONFIRM_REPAIR_LIMIT,
+            "the corrective present is bounded, not periodic"
+        );
+        assert_eq!(
+            runtime.present_confirm_deadline(),
+            None,
+            "a spent budget arms no further wake"
+        );
+        assert!(runtime.shutdown());
+    }
+
+    /// A confirmation that comes due while a newer frame is still with the
+    /// presenter is not a miss: that frame's commit re-arms the bound, and the
+    /// stuck-present bound owns a worker that never acks.
+    #[test]
+    fn a_confirmation_due_with_a_frame_in_flight_is_not_a_miss() {
+        let control = Control::new(false);
+        let mut runtime = runtime_with(
+            &control,
+            PresenterConfig {
+                stuck_bound: TEST_WAIT,
+                ..PresenterConfig::default()
+            },
+        );
+        runtime.handle_pty_bytes(b"first");
+        tick_until_committed(&mut runtime, TEST_WAIT).expect("the first frame commits");
+        let deadline = runtime
+            .present_confirm_deadline()
+            .expect("a committed frame arms the confirmation bound");
+
+        // A second frame is submitted and its acquire blocks past the bound.
+        control.gate.block();
+        runtime.handle_pty_bytes(b"second");
+        assert!(runtime.tick_at(Instant::now()).is_none());
+        assert!(wait_until(|| control.gate.entered() >= 2, TEST_WAIT));
+        let unconfirmed_before = bitty_render::telemetry::snapshot().present_unconfirmed;
+
+        assert!(runtime.tick_at(deadline).is_none());
+        assert!(
+            runtime.pending_present.is_some(),
+            "the in-flight frame is still with the presenter"
+        );
+        assert_eq!(
+            bitty_render::telemetry::snapshot().present_unconfirmed,
+            unconfirmed_before,
+            "an in-flight frame is not an unconfirmed present"
+        );
+        assert_eq!(
+            runtime.present_confirm_deadline(),
+            None,
+            "the in-flight frame's commit re-arms the bound"
+        );
+
+        control.gate.release();
+        tick_until_committed(&mut runtime, TEST_WAIT).expect("the in-flight frame commits");
+        assert!(
+            runtime.present_confirm_deadline().is_some(),
+            "its commit arms a fresh confirmation"
         );
         assert!(runtime.shutdown());
     }

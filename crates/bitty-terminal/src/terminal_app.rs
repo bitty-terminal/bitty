@@ -930,6 +930,12 @@ pub(crate) struct TerminalApp {
     /// query is exercised against a real rejection in `bitty-runtime`.
     #[cfg(test)]
     pub(crate) test_present_owed: Option<bool>,
+    /// Test-only clock for the plugin timer pump (bitty#2899).
+    ///
+    /// Production pumps at `Instant::now()`; the idle-wake regression drives
+    /// an activation-time timer to its deadline without sleeping.
+    #[cfg(test)]
+    pub(crate) test_now: Option<std::time::Instant>,
     /// When the current hidden-surface repair probe asked the compositor for
     /// a redraw (bitty#2830 hypothesis 2).
     ///
@@ -1168,6 +1174,8 @@ impl TerminalApp {
             test_surface_retry_deadline: None,
             #[cfg(test)]
             test_present_owed: None,
+            #[cfg(test)]
+            test_now: None,
             hidden_repair_probe_at: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
@@ -1230,6 +1238,8 @@ impl TerminalApp {
             test_surface_retry_deadline: None,
             #[cfg(test)]
             test_present_owed: None,
+            #[cfg(test)]
+            test_now: None,
             hidden_repair_probe_at: None,
             chrome: crate::chrome_keys::ChromeState::new(keymaps),
             spawn_spec,
@@ -2781,9 +2791,15 @@ impl TerminalApp {
     /// on the input hot path). Returns the number of callbacks that ran.
     /// No-op without a plugin runtime or due timers.
     fn pump_plugin_timers(&mut self) -> usize {
+        #[cfg(test)]
+        let test_now = self.test_now;
         let Some(plugin_runtime) = self.plugin_runtime.as_mut() else {
             return 0;
         };
+        #[cfg(test)]
+        if let Some(now) = test_now {
+            return plugin_runtime.pump_due_timers_at(now);
+        }
         plugin_runtime.pump_due_timers()
     }
 

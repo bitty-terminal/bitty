@@ -18,11 +18,40 @@ const BITTY_BIN: &str = env!("CARGO_BIN_EXE_bitty");
 fn run_bitty(args: &[&str], extra_env: &[(&str, &str)]) -> Output {
     let mut cmd = Command::new(BITTY_BIN);
     cmd.args(args);
+    // Table widths come from `COLUMNS`; a developer shell exporting it would
+    // silently change every expected line. Tests that need a specific width
+    // pass `COLUMNS` explicitly through `extra_env`.
+    cmd.env_remove("COLUMNS");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
     cmd.output()
         .unwrap_or_else(|err| panic!("spawn {BITTY_BIN:?} {args:?}: {err}"))
+}
+
+/// Display width of `text` in terminal cells.
+///
+/// Same model the renderer pads with: wide clusters (CJK, emoji) take two
+/// cells, combining marks none. A test that counted scalars here could not see
+/// the skew this file is meant to catch.
+fn display_width(text: &str) -> usize {
+    bitty_term_state::split_clusters(text)
+        .into_iter()
+        .map(|cluster| {
+            usize::from(bitty_term_state::cluster_cell_width(
+                cluster,
+                bitty_term_state::AmbiguousWidth::Narrow,
+            ))
+        })
+        .sum()
+}
+
+/// Display offset of `needle` inside `line`, in terminal cells.
+fn cell_offset(line: &str, needle: &str) -> usize {
+    let at = line
+        .find(needle)
+        .unwrap_or_else(|| panic!("{needle:?} missing from {line:?}"));
+    display_width(&line[..at])
 }
 
 fn run_bitty_isolated(args: &[&str]) -> Output {
@@ -798,8 +827,14 @@ impl ServicesFixture {
     }
 
     fn run(&self, args: &[&str]) -> Output {
+        self.run_with_env(args, &[])
+    }
+
+    fn run_with_env(&self, args: &[&str], extra_env: &[(&str, &str)]) -> Output {
         let env = self.env();
-        let refs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let mut refs: Vec<(&str, &str)> =
+            env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        refs.extend(extra_env.iter().copied());
         let output = run_bitty(args, &refs);
         assert_eq!(
             output.status.code(),
@@ -876,12 +911,66 @@ fn list_services_registered_rows_carry_frozen_keys() {
     let table = fixture.run(&["list", "services"]);
     assert_eq!(table.status.code(), Some(0));
     let text = stdout(&table);
-    assert!(
-        text.contains("INTERFACE OWNER VERSION PROVIDER BACKING_HEAD GRANT_SOURCE STATUS"),
+    // Exact header at the documented 100-column default: every column is
+    // padded to its widest cell, so the body lines up under the names.
+    let mut lines = text.lines();
+    let header = lines.next().unwrap_or_default();
+    assert_eq!(
+        header, "INTERFACE  OWNER   VERSION  PROVIDER     BACKING_HEAD     GRANT_SOURCE  STATUS",
         "header: {text:?}"
     );
+    // The owner cell starts at the header's OWNER offset, in display cells.
+    let owner_at = cell_offset(header, "OWNER");
+    assert_eq!(owner_at, 11, "header: {header:?}");
+    let row = lines.next().unwrap_or_default();
+    assert_eq!(cell_offset(row, "xuepoo"), owner_at, "row: {row:?}");
     assert!(text.contains("calc.add"), "row: {text:?}");
     assert!(text.contains("xuepoo.calc"), "row: {text:?}");
+}
+
+#[test]
+fn list_services_table_fits_a_narrow_terminal() {
+    // COLUMNS=40 is inside the advertised 40..=400 range: the header and every
+    // cell must fit it. Before the fix the header alone was 71 cells and the
+    // terminal hard-wrapped it, breaking the alignment the table exists for.
+    let fixture = ServicesFixture::new("narrow");
+    fixture.write_plugin("xuepoo.calc", CALC_SERVICES, "runtime.inspect = true\n");
+    let table = fixture.run_with_env(&["list", "services"], &[("COLUMNS", "40")]);
+    let text = stdout(&table);
+    assert!(!text.trim().is_empty(), "table must not be empty");
+    for line in text.lines() {
+        assert!(
+            display_width(line) <= 40,
+            "line is {} cells at COLUMNS=40: {line:?}",
+            display_width(line)
+        );
+    }
+    // Identifiers are truncated with a marker, never split mid-token.
+    assert!(!text.contains("rminal"), "mid-token split: {text:?}");
+}
+
+#[test]
+fn list_plugins_table_fits_a_narrow_terminal() {
+    // The plugin id/version columns took no budget before the fix: rows were
+    // 57 cells wide at COLUMNS=40.
+    let (_data_home, data_home_str) = isolated_data_home("narrow");
+    let output = run_bitty(
+        &["list", "plugins"],
+        &[("XDG_DATA_HOME", &data_home_str), ("COLUMNS", "40")],
+    );
+    assert_eq!(output.status.code(), Some(0), "{:?}", stderr(&output));
+    let text = stdout(&output);
+    for line in text.lines() {
+        assert!(
+            display_width(line) <= 40,
+            "line is {} cells at COLUMNS=40: {line:?}",
+            display_width(line)
+        );
+    }
+    // The id column takes the budget: truncated with a visible marker instead
+    // of pushing the row past the edge.
+    assert!(text.contains('…'), "id must be visibly truncated: {text:?}");
+    assert!(text.contains("bitty-termin"), "id prefix: {text:?}");
 }
 
 #[test]

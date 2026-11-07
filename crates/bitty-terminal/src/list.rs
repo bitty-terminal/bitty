@@ -812,17 +812,30 @@ pub fn format_fonts_table(
     catalog: &bitty_render::font_catalog::FaceCatalog,
     no_color: bool,
 ) -> String {
-    let color = color_enabled(no_color);
+    format_fonts_table_with_width(catalog, color_enabled(no_color), table_width())
+}
+
+fn format_fonts_table_with_width(
+    catalog: &bitty_render::font_catalog::FaceCatalog,
+    color: bool,
+    width: usize,
+) -> String {
     if !catalog.supported {
         return String::from("(font discovery unavailable on this platform)\n");
     }
-    let mut out = format!("{}\n", bold("FAMILY STYLE SOURCE", color));
+    let header = ["FAMILY", "STYLE", "SOURCE"];
+    let rows: Vec<Vec<String>> = catalog
+        .faces
+        .iter()
+        .map(|face| vec![face.family.clone(), face.style.clone(), face.source.clone()])
+        .collect();
+    // Family names come from fontconfig and are frequently CJK, so the columns
+    // are measured in display cells: a wide family occupies two cells per
+    // glyph and would otherwise shift STYLE and SOURCE to the right.
+    let mut out = render_table_with_width(&header, &rows, color, width);
     if catalog.faces.is_empty() {
         out.push_str("(no fonts found)\n");
         return out;
-    }
-    for face in &catalog.faces {
-        out.push_str(&format!("{} {} {}\n", face.family, face.style, face.source));
     }
     if catalog.truncated {
         out.push_str(&format!(
@@ -2491,30 +2504,27 @@ pub fn format_services_envelope(spelling: &str, services: &[ServiceInfo]) -> Str
 /// safely.
 #[must_use]
 pub fn format_services_table(services: &[ServiceInfo], no_color: bool) -> String {
-    let color = color_enabled(no_color);
-    let mut out = String::new();
-    out.push_str(&format!(
-        "{}\n",
-        bold(
-            "INTERFACE OWNER VERSION PROVIDER BACKING_HEAD GRANT_SOURCE STATUS",
-            color
-        )
-    ));
+    format_services_table_with_width(services, color_enabled(no_color), table_width())
+}
+
+fn format_services_table_with_width(services: &[ServiceInfo], color: bool, width: usize) -> String {
+    let rows: Vec<Vec<String>> = services
+        .iter()
+        .map(|s| {
+            vec![
+                sanitize_service_cell(&s.interface),
+                sanitize_service_cell(&s.owner),
+                sanitize_service_cell(&s.version),
+                sanitize_service_cell(&s.provider),
+                sanitize_service_cell(&s.backing_head),
+                sanitize_service_cell(&s.grant_source),
+                sanitize_service_cell(&s.status),
+            ]
+        })
+        .collect();
+    let mut out = render_table_with_width(&SERVICES_HEADER, &rows, color, width);
     if services.is_empty() {
         out.push_str("(no services)\n");
-        return out;
-    }
-    for s in services {
-        out.push_str(&format!(
-            "{} {} {} {} {} {} {}\n",
-            sanitize_service_cell(&s.interface),
-            sanitize_service_cell(&s.owner),
-            sanitize_service_cell(&s.version),
-            sanitize_service_cell(&s.provider),
-            sanitize_service_cell(&s.backing_head),
-            sanitize_service_cell(&s.grant_source),
-            sanitize_service_cell(&s.status)
-        ));
     }
     out
 }
@@ -2661,32 +2671,383 @@ pub fn format_themes_table_with_color(themes: &[ThemeInfo], color: bool) -> Stri
     out
 }
 
+// ---------------------------------------------------------------------------
+// Aligned table rendering
+// ---------------------------------------------------------------------------
+
+/// Table width used when `COLUMNS` is unset, unparsable, or out of range.
+const DEFAULT_TABLE_WIDTH: usize = 100;
+/// Smallest width a column shrinks to while the table still has to be laid
+/// out. Four cells hold an abbreviated header (`IN…`), so a column stays
+/// identifiable even on a terminal too narrow for its full name.
+const MIN_COLUMN_WIDTH: usize = 4;
+/// Smallest width the last (free-text) column shrinks to before the fixed
+/// columns start giving way. Identifiers and comma lists stay readable.
+const MIN_FLEX_WIDTH: usize = 24;
+/// Spaces between two columns.
+const COLUMN_GAP: usize = 2;
+/// Gap used when [`COLUMN_GAP`] alone would push a line past the budget.
+const MIN_COLUMN_GAP: usize = 1;
+/// Column headers of the `list services` table.
+const SERVICES_HEADER: [&str; 7] = [
+    "INTERFACE",
+    "OWNER",
+    "VERSION",
+    "PROVIDER",
+    "BACKING_HEAD",
+    "GRANT_SOURCE",
+    "STATUS",
+];
+
+/// Terminal width for table wrapping.
+///
+/// `COLUMNS` is the only signal available without an ioctl, and a pipe or a
+/// test harness has no terminal at all; the fallback keeps output stable.
+/// Renderers take the width as a parameter, so every table below is also
+/// reproducible from a test.
+fn table_width() -> usize {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|width| (40..=400).contains(width))
+        .unwrap_or(DEFAULT_TABLE_WIDTH)
+}
+
+/// Cell width of one grapheme cluster, in the grid's width model.
+fn cluster_width(cluster: &str) -> usize {
+    usize::from(bitty_term_state::cluster_cell_width(
+        cluster,
+        bitty_term_state::AmbiguousWidth::Narrow,
+    ))
+}
+
+/// Display width of `text` in terminal cells.
+///
+/// Wide clusters (CJK, emoji) occupy two cells and combining marks occupy
+/// none, so measuring by scalar count puts every later column at the wrong
+/// offset: a `日本語フォント` family skews the rest of the row by seven cells.
+/// This is the same model the terminal grid pads cells with, not a second one.
+fn display_width(text: &str) -> usize {
+    bitty_term_state::split_clusters(text)
+        .into_iter()
+        .map(cluster_width)
+        .sum()
+}
+
+/// Shorten `text` to at most `width` display cells, marking the cut with `…`.
+///
+/// Used wherever a value cannot fit: a token is either shown whole (possibly
+/// on a continuation line) or shown truncated with a visible marker, never
+/// silently cut in half and continued on the next line.
+fn truncate_cell(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if display_width(text) <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for cluster in bitty_term_state::split_clusters(text) {
+        let cells = cluster_width(cluster);
+        if used + cells > width - 1 {
+            break;
+        }
+        out.push_str(cluster);
+        used += cells;
+    }
+    out.push('…');
+    out
+}
+
+/// Whether a line may end just after `cluster`.
+///
+/// Only separators that end a whole token are break points: a space or the
+/// comma of a comma-joined list. `:` is deliberately absent — splitting
+/// `bitty-terminal.bar:audio-toggle` after the namespace separator fragments a
+/// command name exactly like the character-level cuts this renderer removed.
+fn is_wrap_break(cluster: &str) -> bool {
+    cluster == " " || cluster == ","
+}
+
+/// Split one cell into lines of at most `width` display cells.
+///
+/// Breaks land after the last space or comma that fits, so a comma-joined list
+/// keeps its separators at the end of a line. When a single token is wider
+/// than the column there is no break opportunity inside the budget, and the
+/// token is truncated with an ellipsis instead of being split mid-word:
+/// `bitty-terminal.calc` must never render as `bitty-te` / `rminal.c` / `alc`.
+/// Truncation is the deliberate trade — a line wider than the terminal
+/// hard-wraps and loses the column alignment this table exists for, so the
+/// visible `…` is the better failure.
+fn wrap_cell(text: &str, width: usize) -> Vec<String> {
+    if text.is_empty() || width == 0 {
+        return vec![String::new()];
+    }
+    let clusters = bitty_term_state::split_clusters(text);
+    let mut cumulative = Vec::with_capacity(clusters.len() + 1);
+    let mut running = 0usize;
+    cumulative.push(0);
+    for cluster in &clusters {
+        running += cluster_width(cluster);
+        cumulative.push(running);
+    }
+    if running <= width {
+        return vec![text.to_string()];
+    }
+    let total = running;
+    let mut lines: Vec<String> = Vec::new();
+    let mut start = 0;
+    while start < clusters.len() {
+        // The rest of the cell fits on one last line.
+        if total - cumulative[start] <= width {
+            lines.push(clusters[start..].concat().trim_end_matches(' ').to_string());
+            break;
+        }
+        let mut end = start;
+        while end < clusters.len() && cumulative[end + 1] - cumulative[start] <= width {
+            end += 1;
+        }
+        if end == start {
+            // A cluster wider than the whole column (a double-width glyph in a
+            // one-cell column); nothing can be placed before it.
+            lines.push(truncate_cell(&clusters[start..].concat(), width));
+            break;
+        }
+        let mut cut = None;
+        for index in (start + 1..=end).rev() {
+            if is_wrap_break(clusters[index - 1]) {
+                cut = Some(index);
+                break;
+            }
+        }
+        let Some(cut) = cut else {
+            // No separator inside the budget: this token alone is wider than
+            // the column, so truncate it rather than hard-split it.
+            let token_end = clusters[start..]
+                .iter()
+                .position(|cluster| *cluster == " ")
+                .map_or(clusters.len(), |offset| start + offset);
+            let token = clusters[start..token_end].concat();
+            lines.push(truncate_cell(&token, width));
+            start = token_end;
+            while start < clusters.len() && clusters[start] == " " {
+                start += 1;
+            }
+            continue;
+        };
+        lines.push(
+            clusters[start..cut]
+                .concat()
+                .trim_end_matches(' ')
+                .to_string(),
+        );
+        start = cut;
+        while start < clusters.len() && clusters[start] == " " {
+            start += 1;
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Pad a plain (escape-free) cell to `width` display cells.
+fn pad_cell(text: &str, width: usize) -> String {
+    let used = display_width(text);
+    let mut cell = text.to_string();
+    if used < width {
+        cell.push_str(&" ".repeat(width - used));
+    }
+    cell
+}
+
+/// Cells one rendered line occupies with `widths` and `gap`.
+fn line_width(widths: &[usize], gap: usize) -> usize {
+    widths.iter().sum::<usize>() + gap * widths.len().saturating_sub(1)
+}
+
+/// Choose column widths and the inter-column gap so one line fits `width`.
+///
+/// The last column carries free text (commands, descriptions, details), so it
+/// gives way first; the fixed columns shrink only once it is at its floor, and
+/// never below [`MIN_COLUMN_WIDTH`]. Gaps narrow before a column goes under
+/// that floor. A table whose columns cannot all reach the floor (seven frozen
+/// service columns on a 40-cell terminal) spreads the remaining budget evenly;
+/// cells are then truncated with an ellipsis, so a rendered line never exceeds
+/// the terminal width.
+fn plan_columns(natural: &[usize], width: usize) -> (Vec<usize>, usize) {
+    let columns = natural.len();
+    if columns == 0 {
+        return (Vec::new(), 0);
+    }
+    let mut widths = natural.to_vec();
+    let mut gap = COLUMN_GAP;
+    let flexible = columns - 1;
+    while line_width(&widths, gap) > width && widths[flexible] > MIN_FLEX_WIDTH {
+        widths[flexible] -= 1;
+    }
+    while line_width(&widths, gap) > width {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .take(flexible)
+            .max_by_key(|(_, column)| **column)
+        else {
+            break;
+        };
+        if widths[index] <= MIN_COLUMN_WIDTH {
+            break;
+        }
+        widths[index] -= 1;
+    }
+    if columns > 1 && line_width(&widths, gap) > width {
+        gap = MIN_COLUMN_GAP;
+    }
+    if line_width(&widths, gap) > width {
+        // Everything is at the floor and the line is still too wide: share
+        // what is left evenly instead of overflowing the terminal.
+        let free = width.saturating_sub(gap * (columns - 1));
+        let base = free / columns;
+        let extra = free % columns;
+        for (index, column) in widths.iter_mut().enumerate() {
+            *column = base + usize::from(index < extra);
+        }
+    }
+    (widths, gap)
+}
+
+/// Wrap and pad one logical row into rendered lines.
+///
+/// Every cell is wrapped to its own budget, then padded, so a cell that spills
+/// onto continuation lines keeps the following columns aligned instead of
+/// shifting them.
+fn render_cells(cells: &[String], widths: &[usize], gap: usize) -> Vec<String> {
+    let wrapped: Vec<Vec<String>> = widths
+        .iter()
+        .enumerate()
+        .map(|(index, width)| {
+            cells
+                .get(index)
+                .map(|cell| wrap_cell(cell, *width))
+                .unwrap_or_else(|| vec![String::new()])
+        })
+        .collect();
+    let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+    (0..height)
+        .map(|line_index| {
+            let mut line = String::new();
+            for (index, lines) in wrapped.iter().enumerate() {
+                let cell = lines.get(line_index).map(String::as_str).unwrap_or("");
+                line.push_str(&pad_cell(cell, widths[index]));
+                if index + 1 < wrapped.len() {
+                    line.push_str(&" ".repeat(gap));
+                }
+            }
+            line.trim_end().to_string()
+        })
+        .collect()
+}
+
+/// Render an aligned table with a bold header at an explicit width.
+///
+/// Columns are padded to their widest cell's display width; when the natural
+/// table is wider than `width` the columns shrink per [`plan_columns`] and
+/// every cell — header included — wraps within its column, so no rendered
+/// line can exceed `width`.
+fn render_table_with_width(
+    header: &[&str],
+    rows: &[Vec<String>],
+    color: bool,
+    width: usize,
+) -> String {
+    let columns = header.len();
+    if columns == 0 {
+        return String::new();
+    }
+    let mut natural: Vec<usize> = header.iter().map(|cell| display_width(cell)).collect();
+    for row in rows {
+        for (index, cell) in row.iter().enumerate().take(columns) {
+            natural[index] = natural[index].max(display_width(cell));
+        }
+    }
+    let (widths, gap) = plan_columns(&natural, width);
+    let header_cells: Vec<String> = header.iter().map(|cell| (*cell).to_string()).collect();
+    let mut out = String::new();
+    for line in render_cells(&header_cells, &widths, gap) {
+        out.push_str(&bold(&line, color));
+        out.push('\n');
+    }
+    for row in rows {
+        for line in render_cells(row, &widths, gap) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Render just the header, for the empty-state tables.
+fn render_header(header: &[&str], color: bool, width: usize) -> String {
+    render_table_with_width(header, &[], color, width)
+}
+
 /// Render plugins as a human table.
+///
+/// The fixed columns are aligned; a plugin's command list is printed on
+/// indented continuation lines wrapped to the terminal width, and one blank
+/// line separates plugins. Putting a 13-command list inside a fifth column
+/// either overflowed the terminal or wrapped every identifier in half.
 #[must_use]
 pub fn format_plugins_table(plugins: &[PluginInfo], no_color: bool) -> String {
-    let color = color_enabled(no_color);
+    format_plugins_table_with_width(plugins, color_enabled(no_color), table_width())
+}
+
+fn format_plugins_table_with_width(plugins: &[PluginInfo], color: bool, width: usize) -> String {
+    let header = ["ID", "VERSION", "BUNDLED", "ENABLED"];
+    let mut natural: Vec<usize> = header.iter().map(|cell| display_width(cell)).collect();
+    for plugin in plugins {
+        natural[0] = natural[0].max(display_width(&plugin.id));
+        natural[1] = natural[1].max(display_width(&plugin.version));
+    }
+    // The id/version columns take the same budget as every other table: a
+    // plugin id longer than the terminal used to push the whole row past the
+    // edge, because only the command list was wrapped.
+    let (widths, gap) = plan_columns(&natural, width);
+    let header_cells: Vec<String> = header.iter().map(|cell| (*cell).to_string()).collect();
     let mut out = String::new();
-    out.push_str(&format!(
-        "{}\n",
-        bold("ID VERSION BUNDLED ENABLED COMMANDS", color)
-    ));
+    for line in render_cells(&header_cells, &widths, gap) {
+        out.push_str(&bold(&line, color));
+        out.push('\n');
+    }
     if plugins.is_empty() {
         out.push_str("(no plugins)\n");
         return out;
     }
-    for p in plugins {
-        out.push_str(&format!(
-            "{} {} {} {} {}\n",
-            p.id,
-            p.version,
-            if p.bundled { "yes" } else { "no" },
-            if p.enabled { "yes" } else { "no" },
-            if p.commands.is_empty() {
-                "-".to_string()
-            } else {
-                p.commands.join(",")
+
+    for (index, plugin) in plugins.iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let row = vec![
+            plugin.id.clone(),
+            plugin.version.clone(),
+            if plugin.bundled { "yes" } else { "no" }.to_string(),
+            if plugin.enabled { "yes" } else { "no" }.to_string(),
+        ];
+        for line in render_cells(&row, &widths, gap) {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        if !plugin.commands.is_empty() {
+            let joined = plugin.commands.join(", ");
+            for wrapped in wrap_cell(&joined, width.saturating_sub(2)) {
+                out.push_str("  ");
+                out.push_str(&wrapped);
+                out.push('\n');
             }
-        ));
+        }
     }
     out
 }
@@ -2694,23 +3055,33 @@ pub fn format_plugins_table(plugins: &[PluginInfo], no_color: bool) -> String {
 /// Render instances as a human table.
 #[must_use]
 pub fn format_instances_table(instances: &[InstanceInfo], no_color: bool) -> String {
-    let color = color_enabled(no_color);
-    let mut out = String::new();
-    out.push_str(&format!("{}\n", bold("INSTANCE SOCKET LIVE DETAIL", color)));
+    format_instances_table_with_width(instances, color_enabled(no_color), table_width())
+}
+
+fn format_instances_table_with_width(
+    instances: &[InstanceInfo],
+    color: bool,
+    width: usize,
+) -> String {
+    let rows: Vec<Vec<String>> = instances
+        .iter()
+        .map(|inst| {
+            vec![
+                inst.instance.clone(),
+                inst.socket.clone(),
+                if inst.live { "yes" } else { "no" }.to_string(),
+                inst.detail.clone(),
+            ]
+        })
+        .collect();
+    let mut out = render_table_with_width(
+        &["INSTANCE", "SOCKET", "LIVE", "DETAIL"],
+        &rows,
+        color,
+        width,
+    );
     if instances.is_empty() {
-        out.push_str(
-            "(no instances — start bitty to serve an endpoint, or set BITTY_SOCKET/XDG_RUNTIME_DIR)\n",
-        );
-        return out;
-    }
-    for inst in instances {
-        out.push_str(&format!(
-            "{} {} {} {}\n",
-            inst.instance,
-            inst.socket,
-            if inst.live { "yes" } else { "no" },
-            inst.detail
-        ));
+        out.push_str("(no instances — start bitty to serve an endpoint, or set BITTY_SOCKET/XDG_RUNTIME_DIR)\n");
     }
     out
 }
@@ -2776,23 +3147,34 @@ pub fn format_actions_table(
 /// same meta as the JSON envelope. Rows are `chord action context source`.
 #[must_use]
 pub fn format_keymaps_table(meta: &KeymapMeta, keymaps: &[KeymapInfo], no_color: bool) -> String {
-    let color = color_enabled(no_color);
-    let mut out = String::new();
-    out.push_str(&format!(
-        "# mod_key: {} (source: {})\n",
-        meta.mod_key, meta.source
-    ));
-    out.push_str(&format!("{}\n", bold("CHORD ACTION CONTEXT SOURCE", color)));
+    format_keymaps_table_with_width(meta, keymaps, color_enabled(no_color), table_width())
+}
+
+fn format_keymaps_table_with_width(
+    meta: &KeymapMeta,
+    keymaps: &[KeymapInfo],
+    color: bool,
+    width: usize,
+) -> String {
+    let mut out = format!("# mod_key: {} (source: {})\n", meta.mod_key, meta.source);
+    let header = ["CHORD", "ACTION", "CONTEXT", "SOURCE"];
     if keymaps.is_empty() {
+        out.push_str(&render_header(&header, color, width));
         out.push_str("(no keymaps)\n");
         return out;
     }
-    for k in keymaps {
-        out.push_str(&format!(
-            "{} {} {} {}\n",
-            k.chord, k.action, k.context, k.source
-        ));
-    }
+    let rows: Vec<Vec<String>> = keymaps
+        .iter()
+        .map(|k| {
+            vec![
+                k.chord.clone(),
+                k.action.clone(),
+                k.context.clone(),
+                k.source.clone(),
+            ]
+        })
+        .collect();
+    out.push_str(&render_table_with_width(&header, &rows, color, width));
     out
 }
 
@@ -4096,11 +4478,22 @@ mod tests {
         );
         assert!(env.contains("\"chord\":\"alt+h\""), "envelope: {env:?}");
         assert!(env.contains("goto_split:left"), "envelope: {env:?}");
-        let table = format_keymaps_table(&meta, &rows, true);
+        let table = format_keymaps_table_with_width(&meta, &rows, false, 100);
         assert!(table.contains("mod_key: alt"), "table: {table:?}");
-        assert!(
-            table.contains("CHORD ACTION CONTEXT SOURCE"),
-            "table: {table:?}"
+        // Exact header spacing at a fixed width: the columns are padded to
+        // their widest chord/action, which is what aligns the body.
+        assert_eq!(
+            table.lines().nth(1).unwrap_or_default(),
+            "CHORD                 ACTION                   CONTEXT  SOURCE",
+            "header: {table:?}"
+        );
+        // The body starts the second column at the header's offset.
+        let action_at = cell_offset(table.lines().nth(1).unwrap_or_default(), "ACTION");
+        let first_row = table.lines().nth(2).unwrap_or_default();
+        assert_eq!(
+            cell_offset(first_row, "workspace_prev"),
+            action_at,
+            "row: {first_row:?}"
         );
         assert!(table.contains("alt+h"), "table: {table:?}");
     }
@@ -4323,12 +4716,23 @@ mod tests {
 
     #[test]
     fn services_table_empty_hint_and_header() {
-        let table = format_services_table(&[], true);
-        assert!(
-            table.contains("INTERFACE OWNER VERSION PROVIDER BACKING_HEAD GRANT_SOURCE STATUS"),
-            "header names every frozen key: {table:?}"
+        let table = format_services_table_with_width(&[], false, 100);
+        // Exact spacing: padding (not a single-space join) is what keeps the
+        // body aligned under the header, so the assertion pins it.
+        assert_eq!(
+            table,
+            "INTERFACE  OWNER  VERSION  PROVIDER  BACKING_HEAD  GRANT_SOURCE  STATUS\n(no services)\n",
+            "header names every frozen key with column padding: {table:?}"
         );
-        assert!(table.contains("(no services)"), "empty hint: {table:?}");
+        // The empty state takes the same width budget as a populated table.
+        let narrow = format_services_table_with_width(&[], false, 40);
+        for line in narrow.lines() {
+            assert!(
+                display_width(line) <= 40,
+                "narrow header over budget: {line:?}"
+            );
+        }
+        assert!(narrow.contains("(no services)"), "empty hint: {narrow:?}");
     }
 
     #[test]
@@ -4345,5 +4749,228 @@ mod tests {
         );
         let usage = list_usage();
         assert!(usage.contains("services"), "usage must name services");
+    }
+
+    /// Rows shaped like `list services` output, with an identifier long enough
+    /// to expose mid-token splitting at narrow widths.
+    fn services_probe_rows() -> Vec<Vec<String>> {
+        [
+            [
+                "calc.add",
+                "xuepoo",
+                "1.0.0",
+                "bitty-terminal.calc",
+                "runtime.inspect",
+                "manifest",
+                "active",
+            ],
+            [
+                "font.enumerate",
+                "bitty-terminal",
+                "2.3.4",
+                "bitty-terminal.fonts",
+                "fontconfig.scan",
+                "declared",
+                "degraded",
+            ],
+        ]
+        .iter()
+        .map(|row| row.iter().map(|cell| (*cell).to_string()).collect())
+        .collect()
+    }
+
+    /// Display offset of `needle` inside `line`, in terminal cells.
+    fn cell_offset(line: &str, needle: &str) -> usize {
+        let at = line
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} missing from {line:?}"));
+        display_width(&line[..at])
+    }
+
+    #[test]
+    fn table_layout_display_width_measures_clusters_not_scalars() {
+        assert_eq!(display_width("calc.add"), 8);
+        // Seven wide glyphs: fourteen cells, not seven scalars.
+        assert_eq!(display_width("日本語フォント"), 14);
+        // A combining acute rides on its base: one cell, not two.
+        assert_eq!(display_width("e\u{301}"), 1);
+        // A half-width katakana stays one cell.
+        assert_eq!(display_width("ｶﾀｶﾅ"), 4);
+        // Truncation marks itself and never exceeds the budget.
+        assert_eq!(truncate_cell("bitty-terminal.calc", 8), "bitty-t…");
+        assert_eq!(display_width(&truncate_cell("日本語フォント", 7)), 7);
+        assert_eq!(truncate_cell("abc", 8), "abc");
+    }
+
+    #[test]
+    fn table_layout_wraps_tokens_and_keeps_separators() {
+        // A token wider than the column is truncated, never hard-split.
+        assert_eq!(wrap_cell("bitty-terminal.calc", 8), vec!["bitty-t…"]);
+        // A comma list breaks after its separators, keeping every item.
+        assert_eq!(
+            wrap_cell("calc.add, calc.sub, calc.mul, calc.div", 12),
+            vec!["calc.add,", "calc.sub,", "calc.mul,", "calc.div"]
+        );
+        // Wide clusters are budgeted per cell; a wide token without separators
+        // is truncated (never split) and the marker still fits the budget.
+        assert_eq!(wrap_cell("日本語フォント", 4), vec!["日…"]);
+        assert_eq!(display_width("日本語フォント"), 14);
+        assert_eq!(wrap_cell("日本語 フォント", 8), vec!["日本語", "フォント"]);
+        assert_eq!(wrap_cell("", 10), vec![""]);
+        assert_eq!(wrap_cell("abc", 0), vec![""]);
+    }
+
+    #[test]
+    fn table_layout_renders_exact_columns_at_wide_terminal() {
+        let table = render_table_with_width(&SERVICES_HEADER, &services_probe_rows(), false, 200);
+        assert_eq!(
+            table,
+            concat!(
+                "INTERFACE       OWNER           VERSION  PROVIDER              BACKING_HEAD     GRANT_SOURCE  STATUS\n",
+                "calc.add        xuepoo          1.0.0    bitty-terminal.calc   runtime.inspect  manifest      active\n",
+                "font.enumerate  bitty-terminal  2.3.4    bitty-terminal.fonts  fontconfig.scan  declared      degraded\n",
+            ),
+            "table: {table:?}"
+        );
+        // Second column starts where the header puts it, in display cells.
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(cell_offset(lines[0], "OWNER"), 16);
+        assert_eq!(cell_offset(lines[1], "xuepoo"), 16);
+        assert_eq!(cell_offset(lines[0], "PROVIDER"), 41);
+        assert_eq!(cell_offset(lines[1], "bitty-terminal.calc"), 41);
+        assert_eq!(cell_offset(lines[2], "bitty-terminal.fonts"), 41);
+    }
+
+    #[test]
+    fn table_layout_cjk_family_keeps_later_columns_aligned() {
+        let rows: Vec<Vec<String>> = [("日本語フォント", "Regular"), ("Noto Sans", "Bold")]
+            .iter()
+            .map(|(family, style)| {
+                vec![
+                    (*family).to_string(),
+                    (*style).to_string(),
+                    "fontconfig".to_string(),
+                ]
+            })
+            .collect();
+        let table = render_table_with_width(&["FAMILY", "STYLE", "SOURCE"], &rows, false, 100);
+        assert_eq!(
+            table,
+            concat!(
+                "FAMILY          STYLE    SOURCE\n",
+                "日本語フォント  Regular  fontconfig\n",
+                "Noto Sans       Bold     fontconfig\n",
+            ),
+            "table: {table:?}"
+        );
+        // The wide family occupies 14 cells, so STYLE starts at 16 for every
+        // row — scalar counting would have put it at 9 on the header and 9 on
+        // the CJK row while the printed glyphs took 14 (`list.rs` F1).
+        let lines: Vec<&str> = table.lines().collect();
+        assert_eq!(cell_offset(lines[0], "STYLE"), 16);
+        assert_eq!(cell_offset(lines[0], "SOURCE"), 25);
+        assert_eq!(cell_offset(lines[1], "Regular"), 16);
+        assert_eq!(cell_offset(lines[1], "fontconfig"), 25);
+        assert_eq!(cell_offset(lines[2], "fontconfig"), 25);
+    }
+
+    #[test]
+    fn table_layout_never_exceeds_the_width_budget() {
+        let services = services_probe_rows();
+        let plugins = probe_plugins();
+        for width in [40usize, 50, 60, 80, 100, 200] {
+            for table in [
+                render_table_with_width(&SERVICES_HEADER, &services, false, width),
+                format_plugins_table_with_width(&plugins, false, width),
+                format_services_table_with_width(&[], false, width),
+            ] {
+                for line in table.lines() {
+                    assert!(
+                        display_width(line) <= width,
+                        "line {} cells > budget {width}: {line:?} in {table:?}",
+                        display_width(line)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_layout_truncates_long_identifiers_instead_of_splitting() {
+        let table = render_table_with_width(&SERVICES_HEADER, &services_probe_rows(), false, 40);
+        // The reviewed defect: `bitty-terminal.calc` split into `bitty-te` /
+        // `rminal.c` / `alc` by an 8-cell floor.
+        assert!(!table.contains("rminal"), "mid-token split: {table:?}");
+        assert!(!table.contains("bitty-te"), "mid-token split: {table:?}");
+        assert!(table.contains('…'), "truncation must be visible: {table:?}");
+        for line in table.lines() {
+            assert!(display_width(line) <= 40, "over budget: {line:?}");
+        }
+        // The header wraps to the same budget rather than running off-screen
+        // (it used to print 71 columns at COLUMNS=40).
+        let header = table.lines().next().unwrap_or_default();
+        assert!(
+            display_width(header) <= 40,
+            "header over budget: {header:?}"
+        );
+        assert_eq!(header, "INT… OWN… VER… PRO… BAC… GRA… STATUS");
+    }
+
+    /// Plugin rows shaped like `list plugins`, with a long id and a long
+    /// command list.
+    fn probe_plugins() -> Vec<PluginInfo> {
+        vec![
+            PluginInfo {
+                id: "bitty-terminal.very-long-plugin-identifier".to_string(),
+                name: "test".to_string(),
+                version: "0.12.3".to_string(),
+                description: "test".to_string(),
+                bundled: true,
+                enabled: true,
+                commands: vec![
+                    "bitty-terminal.very-long-plugin-identifier:ping".to_string(),
+                    "bitty-terminal.very-long-plugin-identifier:version".to_string(),
+                ],
+            },
+            PluginInfo {
+                id: "bitty-terminal.calc".to_string(),
+                name: "test".to_string(),
+                version: "1.0.0".to_string(),
+                description: "test".to_string(),
+                bundled: false,
+                enabled: false,
+                commands: Vec::new(),
+            },
+        ]
+    }
+
+    #[test]
+    fn table_layout_plugins_fit_a_narrow_terminal() {
+        let table = format_plugins_table_with_width(&probe_plugins(), false, 40);
+        for line in table.lines() {
+            assert!(display_width(line) <= 40, "over budget: {line:?}");
+        }
+        // Fixed columns took the budget too: the id is truncated with a
+        // marker, not pushed past the edge (57-column rows at COLUMNS=40).
+        assert!(
+            table.contains('…'),
+            "id must be visibly truncated: {table:?}"
+        );
+        assert!(!table.contains("rminal.calc"), "mid-token split: {table:?}");
+        // Command continuations stay indented and inside the budget.
+        for line in table.lines().filter(|line| line.starts_with("  ")) {
+            assert!(display_width(line) <= 40, "command over budget: {line:?}");
+        }
+    }
+
+    #[test]
+    fn table_layout_empty_services_header_fits_and_is_padded() {
+        // Covered by `services_table_empty_hint_and_header`; kept as the
+        // narrow-terminal case for the empty path.
+        let narrow = format_services_table_with_width(&[], false, 40);
+        for line in narrow.lines() {
+            assert!(display_width(line) <= 40, "over budget: {line:?}");
+        }
+        assert!(narrow.contains("(no services)"), "hint: {narrow:?}");
     }
 }

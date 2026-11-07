@@ -80,10 +80,10 @@ pub const MAX_CMD_FORMAT_LEN: usize = 16;
 ///
 /// Shared with the binding surface ([`bitty_config::MAX_JSON_ARGS_BYTES`]):
 /// `bitty cmd` and `command:<owner:command> -- '<json>'` accept the same
-/// documents under the same bound (issue #2965).
+/// documents under the same bound (issue #2965). The depth bound is the same
+/// shared value and lives with the validator
+/// ([`bitty_config::MAX_JSON_ARGS_DEPTH`]).
 pub const MAX_CMD_ARGS_BYTES: usize = bitty_config::MAX_JSON_ARGS_BYTES;
-/// Maximum nesting depth accepted in the args blob (wire rule parity: 32).
-pub const MAX_CMD_ARGS_DEPTH: usize = bitty_config::MAX_JSON_ARGS_DEPTH;
 
 // ---------------------------------------------------------------------------
 // Qualified-id validation (shared with `bitty x`)
@@ -149,7 +149,8 @@ pub(crate) fn validate_qualified_id(id: &str) -> Result<(), String> {
 
 /// Validate the raw JSON argument blob structurally (no JSON parser in the
 /// workspace: balanced `{}`/`[]` with string awareness, single root value of
-/// object/array shape, depth capped at [`MAX_CMD_ARGS_DEPTH`]).
+/// object/array shape, depth capped at
+/// [`bitty_config::MAX_JSON_ARGS_DEPTH`]).
 ///
 /// Delegates to the one implementation shared with the binding surface
 /// ([`bitty_config::validate_json_args_blob`], issue #2965): `bitty cmd` and
@@ -500,7 +501,10 @@ mod tests {
         assert!(validate_args_blob("{\"a\": \"unterminated}").is_err());
         assert!(validate_args_blob("printenv FOO").is_err());
         assert!(validate_args_blob("").is_err());
-        let deep = format!("{{\"a\": {}}}", "[1, ".repeat(MAX_CMD_ARGS_DEPTH + 1));
+        let deep = format!(
+            "{{\"a\": {}}}",
+            "[1, ".repeat(bitty_config::MAX_JSON_ARGS_DEPTH + 1)
+        );
         assert!(validate_args_blob(&deep).is_err());
     }
 

@@ -5,9 +5,16 @@
 //! `bitty-plugins-docs`
 //! `specifications/plugin-reuse-and-providers.md`
 //! (`Accepted [tools.git] contract (v1)`, CTX-0425): seven read-only verbs
-//! with bounded output. This module is pure validation — no I/O, no process
+//! with bounded output. This module is validation and policy — no process
 //! spawning, no VM. The spawn execution surface itself is CTX-0445; this
 //! module provides the fail-closed predicates that surface must call.
+//!
+//! The one exception to "no I/O" is the repository metadata probe
+//! ([`plan_git_spawn`] / [`resolve_git_repository`], CTX-1733): before an
+//! allowlisted `git` verb runs it reads the authorized tree's `.git` entry and
+//! config so a planted gitfile or `core.worktree` cannot point the child at a
+//! repository outside the plugin's `fs` grants. It reads only, never writes and
+//! never spawns, and takes every root from its caller.
 //!
 //! Security boundary: allowlist bypass is a sandbox escape. Every predicate
 //! fails closed (deny-by-default, explicit `false`, no silent pass).
@@ -132,6 +139,15 @@ pub const DENIED_SPAWN_ENV_VARS: &[&str] = &[
     // Repo-identity escape, env form of the denied `--git-dir`/`--work-tree`.
     "GIT_DIR",
     "GIT_WORK_TREE",
+    // Repository-metadata escape (CTX-1733): each of these redirects a part of
+    // the repository the child reads (git dir, index, object store, discovery
+    // ceiling) without touching argv, which would defeat the `.git` metadata
+    // policy for a spawn whose cwd is otherwise inside the grant.
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
 ];
 
 /// Denied environment-variable name prefixes (numbered families).
@@ -367,6 +383,781 @@ pub fn is_tool_spawn_allowed(tool: &str, args: &[String]) -> bool {
     false
 }
 
+// ── repository metadata policy (CTX-1733, issue #2912) ────────────────────
+//
+// The argv denials (`-C`, `--git-dir`, `--work-tree`) close argv-selected
+// directories, but repository *metadata* is a separate channel: a plugin able
+// to write the pane tree can plant a `.git` gitfile or set `core.worktree` in
+// `.git/config`, and `git status`/`git show`/`git diff` then read a repository
+// outside the plugin's `fs` grants. [`plan_git_spawn`] is the enforcement
+// point: before any allowlisted verb runs it resolves the repository the child
+// *would* use from the authorized cwd and refuses with a typed
+// [`GitMetadataRefusal`] when that resolution escapes the grant.
+//
+// Resolution rules (fail-closed, git-compatible where it matters):
+//
+// - discovery walks the authorized cwd's ancestors, first `.git` wins, exactly
+//   like git's own discovery — so a repository nested *above* the cwd is
+//   found and policed instead of silently read;
+// - a `.git` directory is the git directory, and its `core.worktree` (if any)
+//   is the work tree;
+// - a `.git` *file* (`gitdir: <path>`) and a `.git` symlink both name a git
+//   directory elsewhere, so that target is what must stay inside the grant;
+//   its work tree is the directory holding the gitfile unless `core.worktree`
+//   says otherwise;
+// - every resolved path (repo root, git directory, work tree, include target)
+//   must be inside the authorized cwd or one of the caller's grant roots;
+// - `.git/config` directives the probe will not follow (`include` /
+//   `includeIf`, which can import a config that sets `core.worktree`) are
+//   refused rather than read: the pane repository's config is
+//   plugin-writable, so following its includes would re-open the channel;
+// - the same check runs on `.git/config.worktree` (the file
+//   `extensions.worktreeConfig` adds), on `.git/commondir`, and on
+//   `objects/info/alternates`, because each of those redirects part of the
+//   repository the child reads; `objects/info/http-alternates` is refused
+//   outright, since its entries are remote URLs no containment test can hold
+//   inside the grant.
+//
+// This is the one place in this otherwise pure module that reads the
+// filesystem. It never writes and never spawns; every root comes from the
+// caller (host-resolved from the plugin's manifest/effective grants), so no
+// host path is hardcoded.
+
+/// Environment variable that carries git's optional-lock switch.
+pub const GIT_OPTIONAL_LOCKS_VAR: &str = "GIT_OPTIONAL_LOCKS";
+
+/// Value that makes read-only verbs skip optional locks.
+///
+/// `git status` otherwise refreshes and writes `.git/index`, i.e. a read-only
+/// verb mutates plugin-writable repository metadata, and it can also fail on a
+/// read-only tree. Every allowlisted verb is read-only, so the mediated spawn
+/// sets this unconditionally.
+pub const GIT_OPTIONAL_LOCKS_DISABLED: &str = "0";
+
+/// Read-only child environment for an allowlisted `git` verb (CTX-1733).
+///
+/// The spawn surface clears the environment and passes exactly these pairs:
+/// [`is_safe_spawn_env`] stays true for them (they are not denied names), and
+/// they carry no secret value.
+pub const GIT_READ_ONLY_SPAWN_ENV: &[(&str, &str)] =
+    &[(GIT_OPTIONAL_LOCKS_VAR, GIT_OPTIONAL_LOCKS_DISABLED)];
+
+/// Owned form of [`GIT_READ_ONLY_SPAWN_ENV`] for a spawn request.
+#[must_use]
+pub fn git_read_only_spawn_env() -> Vec<(String, String)> {
+    GIT_READ_ONLY_SPAWN_ENV
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect()
+}
+
+/// Maximum ancestor hops walked while discovering the repository root.
+///
+/// A bound keeps a hostile deep tree from turning the probe into unbounded
+/// work; exceeding it fails closed rather than guessing.
+pub const MAX_GIT_DISCOVERY_DEPTH: usize = 64;
+
+/// Maximum bytes read from a `.git` gitfile.
+pub const MAX_GITFILE_BYTES: u64 = 4 * 1024;
+
+/// Maximum bytes read from a repository-local `.git/config`.
+pub const MAX_GIT_CONFIG_BYTES: u64 = 64 * 1024;
+
+/// Why an allowlisted `git` spawn was refused by the metadata policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GitMetadataRefusalKind {
+    /// The authorized cwd is not an absolute path, so no repository can be
+    /// proved to be inside a grant.
+    AuthorizedCwdNotAbsolute,
+    /// The authorized cwd, a gitfile, or a `config` exists but cannot be
+    /// read/parsed, so the repository the child would use cannot be proven
+    /// safe. Fail-closed: an unprovable repository is refused.
+    MetadataUnreadable,
+    /// A `.git` gitfile (or `.git` symlink) names a git directory outside the
+    /// grant.
+    GitDirOutsideGrant,
+    /// `.git/config` sets `core.worktree` (with or without `core.bare`) to a
+    /// directory outside the grant.
+    WorktreeOutsideGrant,
+    /// A repository discovered above the authorized cwd has its root outside
+    /// the grant.
+    ParentRepoOutsideGrant,
+    /// The object store is redirected outside the grant (`objects/info/alternates`,
+    /// `objects/info/http-alternates`), so `log`/`show`/`diff` would read
+    /// objects that live elsewhere.
+    ObjectStoreOutsideGrant,
+    /// `.git/config` carries an `include`/`includeIf` directive, a config
+    /// channel the probe will not follow.
+    ConfigIncludeRefused,
+    /// The authorized cwd is nested deeper than [`MAX_GIT_DISCOVERY_DEPTH`], so
+    /// the repository git would discover cannot be proven to be inside the
+    /// grant.
+    DiscoveryBoundExceeded,
+}
+
+impl GitMetadataRefusalKind {
+    /// Stable label, used verbatim in audit detail.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthorizedCwdNotAbsolute => "authorized cwd is not absolute",
+            Self::MetadataUnreadable => "repository metadata unreadable",
+            Self::GitDirOutsideGrant => "git directory outside the grant",
+            Self::WorktreeOutsideGrant => "core.worktree outside the grant",
+            Self::ParentRepoOutsideGrant => "repository root outside the grant",
+            Self::ObjectStoreOutsideGrant => "object store outside the grant",
+            Self::ConfigIncludeRefused => "config include refused",
+            Self::DiscoveryBoundExceeded => "repository discovery bound exceeded",
+        }
+    }
+}
+
+impl std::fmt::Display for GitMetadataRefusalKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Typed refusal of a `git` spawn whose repository metadata escapes the grant.
+///
+/// Typed, never string-matched: callers branch on [`Self::kind`] and keep
+/// [`Self::path`] (the refused path, already sanitised for audit) for the
+/// record. Both are host-authored — the path is derived from the authorized
+/// cwd and the grants, never from plugin bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitMetadataRefusal {
+    kind: GitMetadataRefusalKind,
+    path: String,
+}
+
+impl GitMetadataRefusal {
+    /// Build a refusal, sanitising and clamping the refused path for audit.
+    #[must_use]
+    pub fn new(kind: GitMetadataRefusalKind, path: &std::path::Path) -> Self {
+        let rendered = sanitize_audit_path(&path.display().to_string());
+        Self {
+            kind,
+            path: clamp_text(&rendered, MAX_TOOL_SPAWN_CWD_BYTES),
+        }
+    }
+
+    /// Which metadata channel was refused.
+    #[must_use]
+    pub const fn kind(&self) -> GitMetadataRefusalKind {
+        self.kind
+    }
+
+    /// The refused path, sanitised for audit (no `Cf`, no `Cc`).
+    #[must_use]
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Bounded audit detail naming the refused channel and path.
+    #[must_use]
+    pub fn audit_detail(&self) -> String {
+        format!(
+            "git repository metadata refused ({}): '{}'",
+            self.kind.as_str(),
+            self.path
+        )
+    }
+}
+
+impl std::fmt::Display for GitMetadataRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.audit_detail())
+    }
+}
+
+/// Typed refusal of the whole pre-spawn plan step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitSpawnRefusal {
+    /// The argv is not an allowlisted `[tools.git]` invocation
+    /// ([`is_allowed_git_args`]).
+    NotAllowlisted,
+    /// The argv is allowlisted but the repository metadata the child would
+    /// read is not inside the grant.
+    Metadata(GitMetadataRefusal),
+}
+
+impl GitSpawnRefusal {
+    /// Audit detail naming the refused path for the metadata case.
+    #[must_use]
+    pub fn audit_detail(&self) -> String {
+        match self {
+            Self::NotAllowlisted => "git spawn refused: argv not allowlisted".to_string(),
+            Self::Metadata(refusal) => refusal.audit_detail(),
+        }
+    }
+
+    /// The refused path, for the metadata case.
+    #[must_use]
+    pub fn refused_path(&self) -> Option<&str> {
+        match self {
+            Self::NotAllowlisted => None,
+            Self::Metadata(refusal) => Some(refusal.path()),
+        }
+    }
+}
+
+impl std::fmt::Display for GitSpawnRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.audit_detail())
+    }
+}
+
+/// The repository the child would use, all paths inside the grant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRepoBinding {
+    /// Repository root (the directory holding the `.git` entry git would use).
+    pub repo_root: std::path::PathBuf,
+    /// Git directory (`<root>/.git` or a gitfile/symlink target).
+    pub git_dir: std::path::PathBuf,
+    /// `core.worktree`, when the config selects a work tree other than the
+    /// repository root. Absent means the root itself is the work tree.
+    pub work_tree: Option<std::path::PathBuf>,
+    /// `core.bare`: a bare repository has no work tree, so work-tree verbs
+    /// fail in git itself rather than reading a tree.
+    pub bare: bool,
+}
+
+/// A fully gated `git` spawn: authorized cwd, unchanged allowlisted argv, the
+/// read-only child environment, and the resolved repository (if any).
+///
+/// [`Self::cwd`] is the **authorized** directory: the canonical path the host
+/// permitted for this child. It is not proof of the child's actual cwd — a
+/// path swapped between authorization and `spawn` is not detected here — and
+/// it must be recorded as the authorized value, never as evidence of where
+/// the process ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitSpawnPlan {
+    /// Authorized working directory (see the type docs: authorized, not
+    /// observed).
+    pub cwd: std::path::PathBuf,
+    /// The allowlisted argv, unchanged.
+    pub args: Vec<String>,
+    /// Closed child environment for a read-only verb
+    /// ([`GIT_READ_ONLY_SPAWN_ENV`]).
+    pub env: Vec<(String, String)>,
+    /// Resolved repository, or `None` when no `.git` exists in the cwd or any
+    /// ancestor (git then fails on its own; no metadata is read outside the
+    /// grant).
+    pub repo: Option<GitRepoBinding>,
+}
+
+/// Plan one allowlisted `git` spawn under the metadata policy (CTX-1733).
+///
+/// Two gates, in order: [`is_allowed_git_args`] (verb/flag allowlist, unchanged
+/// by this function) and [`resolve_git_repository`] (the `.git` metadata
+/// channel). A refusal is a typed [`GitSpawnRefusal`] and the spawn must not
+/// happen; the allowed result carries the read-only env so the surface cannot
+/// forget `GIT_OPTIONAL_LOCKS=0`.
+///
+/// `authorized_cwd` is the host-resolved pane directory; `grant_roots` are the
+/// host-resolved absolute roots the plugin may read (manifest/effective `fs`
+/// grants). Both are caller-supplied: this function hardcodes no host path and
+/// derives nothing from the plugin. The child is assumed to run under
+/// `env_clear()` plus [`GIT_READ_ONLY_SPAWN_ENV`], so `GIT_DIR`,
+/// `GIT_WORK_TREE`, and the other denied names cannot redirect discovery.
+///
+/// # Errors
+///
+/// [`GitSpawnRefusal::NotAllowlisted`] for argv outside the accepted contract,
+/// [`GitSpawnRefusal::Metadata`] when the repository the child would use is not
+/// provably inside the grant.
+pub fn plan_git_spawn(
+    args: &[String],
+    authorized_cwd: &std::path::Path,
+    grant_roots: &[std::path::PathBuf],
+) -> Result<GitSpawnPlan, GitSpawnRefusal> {
+    if !is_tool_spawn_allowed(ACCEPTED_TOOL_GIT, args) {
+        return Err(GitSpawnRefusal::NotAllowlisted);
+    }
+    let repo =
+        resolve_git_repository(authorized_cwd, grant_roots).map_err(GitSpawnRefusal::Metadata)?;
+    Ok(GitSpawnPlan {
+        cwd: authorized_cwd.to_path_buf(),
+        args: args.to_vec(),
+        env: git_read_only_spawn_env(),
+        repo,
+    })
+}
+
+/// Resolve the repository the child would use from `authorized_cwd`, failing
+/// closed when that resolution leaves the authorized cwd or the grants.
+///
+/// # Errors
+///
+/// A [`GitMetadataRefusal`] naming the escaping channel and path.
+pub fn resolve_git_repository(
+    authorized_cwd: &std::path::Path,
+    grant_roots: &[std::path::PathBuf],
+) -> Result<Option<GitRepoBinding>, GitMetadataRefusal> {
+    if authorized_cwd.as_os_str().is_empty() || !authorized_cwd.is_absolute() {
+        return Err(GitMetadataRefusal::new(
+            GitMetadataRefusalKind::AuthorizedCwdNotAbsolute,
+            authorized_cwd,
+        ));
+    }
+    for (hop, dir) in authorized_cwd.ancestors().enumerate() {
+        if hop >= MAX_GIT_DISCOVERY_DEPTH {
+            // Fail closed at the bound: beyond it, an ancestor repository
+            // could exist unproven.
+            return Err(GitMetadataRefusal::new(
+                GitMetadataRefusalKind::DiscoveryBoundExceeded,
+                authorized_cwd,
+            ));
+        }
+        let meta_path = dir.join(".git");
+        let meta = match std::fs::symlink_metadata(&meta_path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                return Err(GitMetadataRefusal::new(
+                    GitMetadataRefusalKind::MetadataUnreadable,
+                    &meta_path,
+                ));
+            }
+        };
+        let is_gitfile = !meta.is_dir();
+        let git_dir = if is_gitfile {
+            resolve_gitfile_target(&meta_path, meta.file_type().is_symlink())?
+        } else {
+            meta_path.clone()
+        };
+        // Git's own discovery: the repository root is the directory holding
+        // the `.git` entry. The authorized cwd is inside the grant by
+        // construction; an *ancestor* root has to prove it is too, or a
+        // repository above the pane would be read on the plugin's behalf.
+        if dir != authorized_cwd && !path_within_grant(authorized_cwd, grant_roots, dir) {
+            return Err(GitMetadataRefusal::new(
+                GitMetadataRefusalKind::ParentRepoOutsideGrant,
+                dir,
+            ));
+        }
+        if !path_within_grant(authorized_cwd, grant_roots, &git_dir) {
+            return Err(GitMetadataRefusal::new(
+                GitMetadataRefusalKind::GitDirOutsideGrant,
+                &git_dir,
+            ));
+        }
+        // Both config files git may read: the repository config and, when
+        // `extensions.worktreeConfig` is on, `config.worktree`. `core.worktree`
+        // in either one selects the tree the child reads, so both are checked.
+        let config = read_core_config(&git_dir.join("config"))?;
+        let worktree_config = read_core_config(&git_dir.join("config.worktree"))?;
+        for config in [&config, &worktree_config] {
+            if let Some(include) = config.include.as_deref() {
+                return Err(GitMetadataRefusal::new(
+                    GitMetadataRefusalKind::ConfigIncludeRefused,
+                    std::path::Path::new(include),
+                ));
+            }
+        }
+        let mut work_tree = None;
+        for config in [&config, &worktree_config] {
+            if let Some(raw) = config.worktree.as_deref() {
+                let resolved = resolve_worktree(&git_dir, raw);
+                if !path_within_grant(authorized_cwd, grant_roots, &resolved) {
+                    return Err(GitMetadataRefusal::new(
+                        GitMetadataRefusalKind::WorktreeOutsideGrant,
+                        &resolved,
+                    ));
+                }
+                // `config.worktree` wins over `config`, matching git.
+                work_tree = Some(resolved);
+            }
+        }
+        // Metadata pointer files: git follows them to the real git dir or
+        // object store, so their targets are exactly as sensitive as a
+        // gitfile target.
+        check_metadata_pointer(
+            &git_dir.join("commondir"),
+            &git_dir,
+            authorized_cwd,
+            grant_roots,
+            GitMetadataRefusalKind::GitDirOutsideGrant,
+        )?;
+        check_metadata_pointer(
+            &git_dir.join("objects").join("info").join("alternates"),
+            &git_dir.join("objects"),
+            authorized_cwd,
+            grant_roots,
+            GitMetadataRefusalKind::ObjectStoreOutsideGrant,
+        )?;
+        reject_http_alternates(&git_dir)?;
+        return Ok(Some(GitRepoBinding {
+            repo_root: dir.to_path_buf(),
+            git_dir,
+            work_tree,
+            bare: config.bare || worktree_config.bare,
+        }));
+    }
+    Ok(None)
+}
+
+/// Resolve a `core.worktree` value the way git does: relative values are taken
+/// from the git directory, absolute values as given.
+fn resolve_worktree(git_dir: &std::path::Path, raw: &str) -> std::path::PathBuf {
+    let candidate = std::path::Path::new(raw);
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        git_dir.join(candidate)
+    }
+}
+
+/// Refuse a metadata pointer file (`commondir`, `objects/info/alternates`)
+/// whose targets leave the grant.
+///
+/// Missing is legitimate; unreadable fails closed. `alternates` is one path per
+/// line, resolved (per git) against `base`; `commondir` is a single path.
+fn check_metadata_pointer(
+    pointer: &std::path::Path,
+    base: &std::path::Path,
+    authorized_cwd: &std::path::Path,
+    grant_roots: &[std::path::PathBuf],
+    kind: GitMetadataRefusalKind,
+) -> Result<(), GitMetadataRefusal> {
+    let text = match read_bounded_text(pointer, MAX_GIT_CONFIG_BYTES) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Ok(()),
+        Err(()) => {
+            return Err(GitMetadataRefusal::new(
+                GitMetadataRefusalKind::MetadataUnreadable,
+                pointer,
+            ));
+        }
+    };
+    for line in text.lines() {
+        let entry = line.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let candidate = std::path::Path::new(entry);
+        let resolved = if candidate.is_absolute() {
+            candidate.to_path_buf()
+        } else {
+            base.join(candidate)
+        };
+        if !path_within_grant(authorized_cwd, grant_roots, &resolved) {
+            return Err(GitMetadataRefusal::new(kind, &resolved));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse `objects/info/http-alternates`.
+///
+/// The entries are URLs, not filesystem paths, so there is no containment test
+/// that could keep them inside the grant: a repository-local file that names a
+/// remote object store is refused outright.
+fn reject_http_alternates(git_dir: &std::path::Path) -> Result<(), GitMetadataRefusal> {
+    let path = git_dir.join("objects").join("info").join("http-alternates");
+    match read_bounded_text(&path, MAX_GIT_CONFIG_BYTES) {
+        Ok(None) => Ok(()),
+        Ok(Some(text)) => {
+            if text.lines().all(|line| line.trim().is_empty()) {
+                Ok(())
+            } else {
+                Err(GitMetadataRefusal::new(
+                    GitMetadataRefusalKind::ObjectStoreOutsideGrant,
+                    &path,
+                ))
+            }
+        }
+        Err(()) => Err(GitMetadataRefusal::new(
+            GitMetadataRefusalKind::MetadataUnreadable,
+            &path,
+        )),
+    }
+}
+
+/// Resolve the git directory named by a `.git` gitfile or `.git` symlink.
+///
+/// Both channels move the git directory away from the pane tree, which is the
+/// escape this exists to police; the target is resolved relative to the entry
+/// that named it, per git's gitfile contract.
+fn resolve_gitfile_target(
+    meta_path: &std::path::Path,
+    is_symlink: bool,
+) -> Result<std::path::PathBuf, GitMetadataRefusal> {
+    let unreadable =
+        || GitMetadataRefusal::new(GitMetadataRefusalKind::MetadataUnreadable, meta_path);
+    let base = meta_path
+        .parent()
+        .map_or_else(|| meta_path.to_path_buf(), std::path::Path::to_path_buf);
+    let raw = if is_symlink {
+        std::fs::read_link(meta_path).map_err(|_| unreadable())?
+    } else {
+        let text = match read_bounded_text(meta_path, MAX_GITFILE_BYTES) {
+            Ok(Some(text)) => text,
+            _ => return Err(unreadable()),
+        };
+        let trimmed = text.trim();
+        let rest = trimmed.strip_prefix("gitdir:").ok_or_else(unreadable)?;
+        std::path::PathBuf::from(rest.trim())
+    };
+    if raw.as_os_str().is_empty() {
+        return Err(unreadable());
+    }
+    if raw.is_absolute() {
+        Ok(raw)
+    } else {
+        Ok(base.join(raw))
+    }
+}
+
+/// Parsed `core.*` facts plus any config-include directive.
+#[derive(Debug, Default)]
+struct CoreConfig {
+    worktree: Option<String>,
+    bare: bool,
+    include: Option<String>,
+}
+
+/// Read and parse `<git_dir>/config`, if it exists.
+///
+/// A missing config is legitimate (a repository works without one); anything
+/// that exists but cannot be read, is not a regular file (a symlinked config is
+/// refused rather than followed), or is over [`MAX_GIT_CONFIG_BYTES`] fails
+/// closed.
+fn read_core_config(path: &std::path::Path) -> Result<CoreConfig, GitMetadataRefusal> {
+    match read_bounded_text(path, MAX_GIT_CONFIG_BYTES) {
+        Ok(Some(text)) => Ok(parse_core_config(&text)),
+        Ok(None) => Ok(CoreConfig::default()),
+        Err(()) => Err(GitMetadataRefusal::new(
+            GitMetadataRefusalKind::MetadataUnreadable,
+            path,
+        )),
+    }
+}
+
+/// Read at most `limit` bytes of regular-file text.
+///
+/// `Ok(None)` means the file does not exist; `Err(())` means it exists but
+/// cannot be used (non-regular file, unreadable, over the limit, or not UTF-8).
+fn read_bounded_text(path: &std::path::Path, limit: u64) -> Result<Option<String>, ()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    if !meta.is_file() || meta.len() > limit {
+        return Err(());
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => String::from_utf8(bytes).map(Some).map_err(|_| ()),
+        Err(_) => Err(()),
+    }
+}
+
+/// Minimal git-config reader for the metadata policy.
+///
+/// Deliberately narrow: section headers, `key = value` pairs, git's comment
+/// rule (a `#`/`;` at line start or after whitespace ends the value), and
+/// double-quoted values with the standard escapes. It extracts only what the
+/// policy needs — `core.worktree`, `core.bare`, and the presence of an
+/// `include`/`includeIf` path — and never writes.
+fn parse_core_config(text: &str) -> CoreConfig {
+    let mut config = CoreConfig::default();
+    let mut section = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            let name = rest
+                .split([']', ' ', '\t'])
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            section = name;
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = parse_config_value(value);
+        match section.as_str() {
+            "core" => match key.as_str() {
+                "worktree" => config.worktree = Some(value),
+                "bare" => {
+                    config.bare = matches!(value.as_str(), "true" | "yes" | "on" | "1");
+                }
+                _ => {}
+            },
+            // `include` and `includeif` both import another config file,
+            // which can carry `core.worktree`; the probe refuses to follow
+            // them rather than parse a second, plugin-reachable file.
+            section
+                if (section == "include" || section.starts_with("includeif"))
+                    && key == "path"
+                    && config.include.is_none() =>
+            {
+                config.include = Some(value);
+            }
+            _ => {}
+        }
+    }
+    config
+}
+
+/// Parse one config value: trim, cut a trailing comment, unquote.
+fn parse_config_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut end = trimmed.len();
+    for (index, ch) in trimmed.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '#' | ';' if !quoted => {
+                let preceded_by_space = index > 0
+                    && trimmed[..index]
+                        .chars()
+                        .next_back()
+                        .is_some_and(char::is_whitespace);
+                if preceded_by_space {
+                    end = index;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let value = trimmed[..end].trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(value);
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Whether `candidate` is inside `cwd` or one of the grant roots.
+///
+/// Lexical normalisation plus canonicalisation when the path exists, so a
+/// symlink cannot present as an in-grant path while resolving elsewhere.
+fn path_within_grant(
+    authorized_cwd: &std::path::Path,
+    grant_roots: &[std::path::PathBuf],
+    candidate: &std::path::Path,
+) -> bool {
+    let candidate = resolve_for_compare(candidate);
+    if candidate.starts_with(resolve_for_compare(authorized_cwd)) {
+        return true;
+    }
+    grant_roots
+        .iter()
+        .any(|root| candidate.starts_with(resolve_for_compare(root)))
+}
+
+/// Compare-ready form of a path: lexical normalisation, then canonicalisation
+/// when possible.
+fn resolve_for_compare(path: &std::path::Path) -> std::path::PathBuf {
+    let lexical = normalize_lexically(path);
+    std::fs::canonicalize(&lexical).unwrap_or(lexical)
+}
+
+/// Resolve `.` and `..` without touching the filesystem.
+///
+/// `..` at a filesystem root is the root itself, matching path resolution.
+fn normalize_lexically(path: &std::path::Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() && !path.is_absolute() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Whether `c` is a Unicode `Format` (`Cf`) code point.
+///
+/// Curated `Cf` table: this crate takes no Unicode-tables dependency, and every
+/// range below is `Cf` (Unicode 15) or a deprecated format block a renderer may
+/// still honour. Bidi overrides (`U+202A..=U+202E`), the zero-width family
+/// (`U+200B..=U+200F`), and invisible tag characters are the audit-spoofing
+/// classes this exists to remove.
+#[must_use]
+pub fn is_audit_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{06DD}'
+            | '\u{070F}'
+            | '\u{08E2}'
+            | '\u{180E}'
+            | '\u{110BD}'
+            | '\u{110CD}'
+            | '\u{E0001}'
+            | '\u{FEFF}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{13430}'..='\u{1343F}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0020}'..='\u{E007F}'
+    )
+}
+
+/// Make text about to be recorded in an audit record bidi-safe.
+///
+/// A recorded directory name can be plugin-influenced. A right-to-left override
+/// (`U+202E`) makes the record read as a different path than the one acted on,
+/// and a zero-width joiner (`U+200D`) can hide a segment boundary; both are
+/// `Cf`, so they are **removed** rather than escaped. `Cc` characters
+/// (newlines included) become `?` so a recorded name cannot forge a log line.
+#[must_use]
+pub fn sanitize_audit_path(text: &str) -> String {
+    text.chars()
+        .filter_map(|c| {
+            if is_audit_format_char(c) {
+                None
+            } else if c.is_control() {
+                Some('?')
+            } else {
+                Some(c)
+            }
+        })
+        .collect()
+}
+
 // ── audit ledger (CTX-1152, issue #1985) ──────────────────────────────────
 
 /// Maximum tool-spawn audit entries retained ([`ToolSpawnLedger`], drop-oldest).
@@ -460,10 +1251,13 @@ pub struct ToolSpawnEntry {
     pub args_omitted: usize,
     /// Host-resolved working directory for this spawn, when the host resolved
     /// one (CTX-1715). Never plugin-supplied: the value is the canonical
-    /// directory the host authorized for the child, recorded for attribution.
-    /// It is not proof of the child's actual cwd on failure or under a path
-    /// swap. `None` means the host default (no child cwd) or a decision that
-    /// preceded resolution.
+    /// **authorized** path — the directory the host permitted for the child —
+    /// recorded for attribution. It is *not* proof of the child's actual cwd
+    /// (a path swapped between authorization and spawn is not detected here),
+    /// and it must never be read as evidence of where the process ran.
+    /// `Cf`/`Cc` characters are stripped/replaced before it is recorded
+    /// (CTX-1733, [`sanitize_audit_path`]). `None` means the host default
+    /// (no child cwd) or a decision that preceded resolution.
     pub cwd: Option<String>,
     /// Bounded host-authored detail (tool/caller/counts/cwd only, never env).
     pub detail: String,
@@ -514,7 +1308,9 @@ impl ToolSpawnLedger {
     /// default / a decision that preceded resolution). It is never a
     /// plugin-supplied path: the plugin selects only the `pane` semantic and
     /// the host resolves it. The recorded copy is clamped to
-    /// [`MAX_TOOL_SPAWN_CWD_BYTES`]; clamping never affects authorization.
+    /// [`MAX_TOOL_SPAWN_CWD_BYTES`] and sanitised by [`sanitize_audit_path`]
+    /// (CTX-1733); neither affects authorization, and the value stays the
+    /// *authorized* path, never proof of the child's actual cwd.
     ///
     /// # Logging
     ///
@@ -533,7 +1329,36 @@ impl ToolSpawnLedger {
         } else {
             ToolSpawnDecision::Deny
         };
-        self.push(decision, tool, args, caller, cwd);
+        self.push(decision, tool, args, caller, cwd, None);
+    }
+
+    /// Record a `git` spawn refused by the repository metadata policy
+    /// (CTX-1733, issue #2912).
+    ///
+    /// Exactly one `Deny` entry, with the refused channel and path in the
+    /// detail — the path comes from [`GitMetadataRefusal`], which sanitises it
+    /// for audit, so a plugin-influenced directory name cannot spoof the
+    /// record with bidi overrides or zero-width characters.
+    ///
+    /// # Logging
+    ///
+    /// Log-tainted: arguments must be attribution (args/caller/cwd/refusal),
+    /// never environment values.
+    pub fn push_git_metadata_refusal(
+        &mut self,
+        args: &[String],
+        caller: &str,
+        authorized_cwd: Option<&str>,
+        refusal: &GitMetadataRefusal,
+    ) {
+        self.push(
+            ToolSpawnDecision::Deny,
+            ACCEPTED_TOOL_GIT,
+            args,
+            caller,
+            authorized_cwd,
+            Some(&refusal.audit_detail()),
+        );
     }
 
     /// Bounded append shared by both outcomes.
@@ -544,6 +1369,7 @@ impl ToolSpawnLedger {
         args: &[String],
         caller: &str,
         cwd: Option<&str>,
+        extra_detail: Option<&str>,
     ) {
         if self.entries.len() >= MAX_TOOL_SPAWN_AUDIT_ENTRIES {
             self.entries.pop_front();
@@ -554,18 +1380,22 @@ impl ToolSpawnLedger {
         let kept: Vec<String> = args
             .iter()
             .take(MAX_TOOL_SPAWN_AUDIT_ARGS)
-            .map(|arg| clamp_text(arg, MAX_TOOL_SPAWN_ARG_PREVIEW_BYTES))
+            .map(|arg| clamp_text(&sanitize_audit_path(arg), MAX_TOOL_SPAWN_ARG_PREVIEW_BYTES))
             .collect();
         let args_omitted = args.len().saturating_sub(kept.len());
         let tool = clamp_text(tool, TOOL_NAME_MAX_LEN);
         let caller = clamp_text(caller, MAX_TOOL_SPAWN_CALLER_BYTES);
-        let cwd = cwd.map(|path| clamp_text(path, MAX_TOOL_SPAWN_CWD_BYTES));
+        let cwd = cwd.map(|path| clamp_text(&sanitize_audit_path(path), MAX_TOOL_SPAWN_CWD_BYTES));
         let cwd_detail = match cwd.as_deref() {
             Some(path) => format!(", cwd '{path}'"),
             None => String::new(),
         };
+        let extra_detail = match extra_detail {
+            Some(extra) => format!("; {extra}"),
+            None => String::new(),
+        };
         let detail = format!(
-            "tool spawn {decision} '{tool}' by '{caller}' ({} args, {args_omitted} omitted{cwd_detail})",
+            "tool spawn {decision} '{tool}' by '{caller}' ({} args, {args_omitted} omitted{cwd_detail}){extra_detail}",
             kept.len(),
         );
         self.entries.push_back(ToolSpawnEntry {
@@ -1617,5 +2447,687 @@ mod tests {
             "caller over bound"
         );
         assert!(entry.tool.len() <= TOOL_NAME_MAX_LEN, "tool over bound");
+    }
+
+    // ── repository metadata policy (CTX-1733, issue #2912) ──
+
+    use std::path::{Path, PathBuf};
+
+    /// Unique scratch root under the platform temp dir.
+    fn scratch(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let root = std::env::temp_dir().join(format!(
+            "bitty-git-metadata-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("scratch root");
+        root
+    }
+
+    /// Real `git` with the ambient repository location scrubbed.
+    ///
+    /// The test process can run under a hook that exports `GIT_DIR` (or one of
+    /// the metadata redirects this policy denies), which would override the
+    /// fixture's own repository; scrubbing makes every fixture hermetic.
+    fn test_git() -> std::process::Command {
+        let mut command = std::process::Command::new("git");
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CEILING_DIRECTORIES",
+        ] {
+            command.env_remove(var);
+        }
+        command
+    }
+
+    /// Real repository at `dir`.
+    fn git_init(dir: &Path) {
+        std::fs::create_dir_all(dir).expect("repo dir");
+        let status = test_git()
+            .arg("init")
+            .arg("--quiet")
+            .arg(dir)
+            .status()
+            .expect("git must be available for these probes");
+        assert!(status.success(), "git init must succeed");
+    }
+
+    /// Commit an empty marker commit so the fixture's history is readable.
+    fn git_commit(dir: &Path, message: &str) {
+        let status = test_git()
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "policy-probe")
+            .env("GIT_AUTHOR_EMAIL", "policy-probe@example.invalid")
+            .env("GIT_COMMITTER_NAME", "policy-probe")
+            .env("GIT_COMMITTER_EMAIL", "policy-probe@example.invalid")
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                message,
+            ])
+            .status()
+            .expect("git commit");
+        assert!(status.success(), "fixture commit must succeed");
+    }
+
+    /// First ancestor of `dir` (excluding `dir` itself) that carries a `.git`
+    /// entry, i.e. the repository git would discover from `dir`.
+    fn ancestor_git(dir: &Path) -> Option<PathBuf> {
+        dir.ancestors()
+            .skip(1)
+            .map(|ancestor| ancestor.join(".git"))
+            .find(|candidate| std::fs::symlink_metadata(candidate).is_ok())
+    }
+
+    fn append_config(repo_git_dir: &Path, text: &str) {
+        let path = repo_git_dir.join("config");
+        let mut config = std::fs::read_to_string(&path).expect("repo config");
+        config.push_str(text);
+        std::fs::write(&path, config).expect("write repo config");
+    }
+
+    fn metadata_refusal(refusal: GitSpawnRefusal) -> GitMetadataRefusal {
+        match refusal {
+            GitSpawnRefusal::Metadata(refusal) => refusal,
+            GitSpawnRefusal::NotAllowlisted => {
+                panic!("the argv is allowlisted; the metadata gate must be the refuser")
+            }
+        }
+    }
+
+    #[test]
+    fn git_metadata_refuses_gitfile_pointing_outside_the_grant() {
+        let root = scratch("gitfile-escape");
+        let grant = root.join("grant");
+        let pane = grant.join("pane");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&pane).expect("pane");
+        git_init(&outside);
+        let target = outside.join(".git");
+        std::fs::write(pane.join(".git"), format!("gitdir: {}\n", target.display()))
+            .expect("planted gitfile");
+
+        let refusal = metadata_refusal(
+            plan_git_spawn(&spawn_args(&["status"]), &pane, &[grant])
+                .expect_err("a gitfile naming an out-of-grant git dir must be refused"),
+        );
+        assert_eq!(refusal.kind(), GitMetadataRefusalKind::GitDirOutsideGrant);
+        assert!(
+            refusal.path().ends_with("outside/.git"),
+            "the refused path names the gitfile target: {}",
+            refusal.path()
+        );
+        assert!(
+            refusal
+                .audit_detail()
+                .contains("git directory outside the grant")
+        );
+    }
+
+    #[test]
+    fn planted_gitfile_reads_an_out_of_grant_repository_without_the_policy() {
+        // Threat proof, not policy proof: with no metadata gate an allowlisted
+        // verb running in the pane really does read the out-of-grant
+        // repository, which is the defect the policy above closes.
+        let root = scratch("threat-proof");
+        let grant = root.join("grant");
+        let pane = grant.join("pane");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&pane).expect("pane");
+        git_init(&outside);
+        std::fs::write(outside.join("secret.txt"), b"outside the grant").expect("outside file");
+        git_commit(&outside, "outside-grant-commit");
+        std::fs::write(
+            pane.join(".git"),
+            format!("gitdir: {}\n", outside.join(".git").display()),
+        )
+        .expect("planted gitfile");
+
+        // `log` is one of the seven allowlisted verbs, and it reads the history
+        // that exists only in the out-of-grant repository.
+        let output = test_git()
+            .current_dir(&pane)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("git must be available");
+        assert!(
+            output.status.success(),
+            "git follows the planted gitfile: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("outside-grant-commit"),
+            "the allowlisted verb reads the out-of-grant history: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        // The policy refuses exactly that spawn.
+        let refusal = metadata_refusal(
+            plan_git_spawn(
+                &spawn_args(&["status", "--porcelain"]),
+                &pane,
+                std::slice::from_ref(&grant),
+            )
+            .expect_err("the planted gitfile is the escape the policy closes"),
+        );
+        assert_eq!(refusal.kind(), GitMetadataRefusalKind::GitDirOutsideGrant);
+    }
+
+    #[test]
+    fn git_metadata_refuses_core_worktree_outside_the_grant() {
+        let root = scratch("worktree-escape");
+        let grant = root.join("grant");
+        let repo = grant.join("repo");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        git_init(&repo);
+
+        // Absolute `core.worktree` outside the grant.
+        append_config(
+            &repo.join(".git"),
+            &format!("\n[core]\n\tworktree = {}\n", outside.display()),
+        );
+        let refusal = metadata_refusal(
+            plan_git_spawn(
+                &spawn_args(&["status"]),
+                &repo,
+                std::slice::from_ref(&grant),
+            )
+            .expect_err("core.worktree outside the grant must be refused"),
+        );
+        assert_eq!(refusal.kind(), GitMetadataRefusalKind::WorktreeOutsideGrant);
+        assert!(
+            refusal.path().ends_with("outside"),
+            "the refused path names the work tree: {}",
+            refusal.path()
+        );
+
+        // Relative `core.worktree` is resolved against the git dir, so a
+        // `..`-walk that lands outside the grant is the same escape.
+        append_config(&repo.join(".git"), "\tworktree = ../../../outside\n");
+        let refusal = metadata_refusal(
+            plan_git_spawn(
+                &spawn_args(&["status"]),
+                &repo,
+                std::slice::from_ref(&grant),
+            )
+            .expect_err("relative core.worktree escaping the grant must be refused"),
+        );
+        assert_eq!(refusal.kind(), GitMetadataRefusalKind::WorktreeOutsideGrant);
+
+        // `core.bare` with a work tree elsewhere is the same channel.
+        append_config(
+            &repo.join(".git"),
+            &format!("\tbare = true\n\tworktree = {}\n", outside.display()),
+        );
+        let refusal = metadata_refusal(
+            plan_git_spawn(&spawn_args(&["status"]), &repo, &[grant])
+                .expect_err("core.bare with an out-of-grant work tree must be refused"),
+        );
+        assert_eq!(refusal.kind(), GitMetadataRefusalKind::WorktreeOutsideGrant);
+    }
+
+    #[test]
+    fn git_metadata_refuses_bare_without_worktree_is_allowed() {
+        // A bare repository with no work tree cannot read a work tree at all:
+        // git itself refuses work-tree verbs, so the spawn is not an escape.
+        let root = scratch("bare");
+        let repo = root.join("repo");
+        git_init(&repo);
+        append_config(&repo.join(".git"), "\tbare = true\n");
+        let plan = plan_git_spawn(&spawn_args(&["log", "--oneline"]), &repo, &[root])
+            .expect("a bare repo with no work tree has nothing outside the grant to read");
+        let binding = plan.repo.expect("repo resolved");
+        assert!(binding.bare);
+        assert!(binding.work_tree.is_none());
+    }
+
+    #[test]
+    fn git_metadata_refuses_config_include() {
+        let root = scratch("include");
+        let grant = root.join("grant");
+        let repo = grant.join("repo");
+        let outside = root.join("outside.cfg");
+        git_init(&repo);
+        std::fs::write(&outside, b"[core]\n\tworktree = /tmp\n").expect("outside config");
+        append_config(
+            &repo.join(".git"),
+            &format!("\n[include]\n\tpath = {}\n", outside.display()),
+        );
+
+        let refusal = metadata_refusal(
+            plan_git_spawn(&spawn_args(&["status"]), &repo, &[grant])
+                .expect_err("a config include is a channel the probe will not follow"),
+        );
+        assert_eq!(refusal.kind(), GitMetadataRefusalKind::ConfigIncludeRefused);
+        assert!(refusal.path().ends_with("outside.cfg"));
+    }
+
+    #[test]
+    fn git_metadata_refuses_unparsable_gitfile() {
+        let root = scratch("bad-gitfile");
+        git_init(&root);
+        let pane = root.join("pane");
+        std::fs::create_dir_all(&pane).expect("pane");
+        std::fs::write(pane.join(".git"), b"not a gitfile\n").expect("hostile gitfile");
+        let refusal = metadata_refusal(
+            plan_git_spawn(&spawn_args(&["status"]), &pane, &[root])
+                .expect_err("an unparsable gitfile must fail closed"),
+        );
+        assert_eq!(refusal.kind(), GitMetadataRefusalKind::MetadataUnreadable);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_metadata_refuses_symlinked_git_dir_outside_the_grant() {
+        let root = scratch("symlink-escape");
+        let grant = root.join("grant");
+        let pane = grant.join("pane");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&pane).expect("pane");
+        git_init(&outside);
+        std::os::unix::fs::symlink(outside.join(".git"), pane.join(".git"))
+            .expect("planted .git symlink");
+        let refusal = metadata_refusal(
+            plan_git_spawn(&spawn_args(&["status"]), &pane, &[grant])
+                .expect_err("a .git symlink to an out-of-grant git dir must be refused"),
+        );
+        assert_eq!(refusal.kind(), GitMetadataRefusalKind::GitDirOutsideGrant);
+    }
+
+    #[test]
+    fn git_metadata_refuses_repository_root_above_the_grant() {
+        // A nested cwd has no `.git` of its own; git would walk up to the
+        // parent repository. That is legitimate only when the root is inside
+        // the grant.
+        let root = scratch("parent-root");
+        let repo = root.join("repo");
+        git_init(&repo);
+        let nested = repo.join("nested");
+        std::fs::create_dir_all(&nested).expect("nested");
+        let refusal = metadata_refusal(
+            plan_git_spawn(
+                &spawn_args(&["status"]),
+                &nested,
+                std::slice::from_ref(&nested),
+            )
+            .expect_err("a repository root outside the grant must be refused"),
+        );
+        assert_eq!(
+            refusal.kind(),
+            GitMetadataRefusalKind::ParentRepoOutsideGrant
+        );
+        assert!(
+            refusal.path().ends_with("repo"),
+            "the refused path names the out-of-grant root: {}",
+            refusal.path()
+        );
+    }
+
+    #[test]
+    fn git_metadata_refuses_object_store_and_commondir_escapes() {
+        let root = scratch("pointer-escape");
+        let grant = root.join("grant");
+        let repo = grant.join("repo");
+        let outside = root.join("outside");
+        git_init(&outside);
+        git_init(&repo);
+        let info = repo.join(".git").join("objects").join("info");
+        std::fs::create_dir_all(&info).expect("objects/info");
+
+        // Object store redirected outside the grant: `log`/`show`/`diff`
+        // would read objects that live there.
+        std::fs::write(
+            info.join("alternates"),
+            format!("{}\n", outside.join(".git").join("objects").display()),
+        )
+        .expect("alternates");
+        let refusal = metadata_refusal(
+            plan_git_spawn(
+                &spawn_args(&["log", "--oneline"]),
+                &repo,
+                std::slice::from_ref(&grant),
+            )
+            .expect_err("an out-of-grant object store must be refused"),
+        );
+        assert_eq!(
+            refusal.kind(),
+            GitMetadataRefusalKind::ObjectStoreOutsideGrant
+        );
+        assert!(refusal.path().ends_with("objects"));
+
+        // A remote object store has no containment test that can hold it.
+        std::fs::remove_file(info.join("alternates")).expect("clear alternates");
+        std::fs::write(
+            info.join("http-alternates"),
+            b"https://example.invalid/objects\n",
+        )
+        .expect("http-alternates");
+        let refusal = metadata_refusal(
+            plan_git_spawn(&spawn_args(&["log"]), &repo, std::slice::from_ref(&grant))
+                .expect_err("a remote object store must be refused"),
+        );
+        assert_eq!(
+            refusal.kind(),
+            GitMetadataRefusalKind::ObjectStoreOutsideGrant
+        );
+        std::fs::remove_file(info.join("http-alternates")).expect("clear http-alternates");
+
+        // `commondir` relocates the git directory itself.
+        std::fs::write(
+            repo.join(".git").join("commondir"),
+            format!("{}\n", outside.join(".git").display()),
+        )
+        .expect("commondir");
+        let refusal = metadata_refusal(
+            plan_git_spawn(
+                &spawn_args(&["status"]),
+                &repo,
+                std::slice::from_ref(&grant),
+            )
+            .expect_err("an out-of-grant commondir must be refused"),
+        );
+        assert_eq!(refusal.kind(), GitMetadataRefusalKind::GitDirOutsideGrant);
+    }
+
+    #[test]
+    fn git_metadata_refuses_config_worktree_file_escape() {
+        // `extensions.worktreeConfig` makes git read `.git/config.worktree`,
+        // which can carry `core.worktree` just like the main config.
+        let root = scratch("config-worktree");
+        let grant = root.join("grant");
+        let repo = grant.join("repo");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside");
+        git_init(&repo);
+        std::fs::write(
+            repo.join(".git").join("config.worktree"),
+            format!("[core]\n\tworktree = {}\n", outside.display()),
+        )
+        .expect("config.worktree");
+        let refusal = metadata_refusal(
+            plan_git_spawn(
+                &spawn_args(&["status"]),
+                &repo,
+                std::slice::from_ref(&grant),
+            )
+            .expect_err("core.worktree in config.worktree must be refused"),
+        );
+        assert_eq!(refusal.kind(), GitMetadataRefusalKind::WorktreeOutsideGrant);
+        assert!(refusal.path().ends_with("outside"));
+    }
+
+    #[test]
+    fn git_metadata_refuses_a_tree_deeper_than_the_discovery_bound() {
+        // Past the bound the repository git would discover cannot be proven to
+        // be inside the grant, so the probe fails closed instead of guessing.
+        let root = scratch("too-deep");
+        let mut deep = root.clone();
+        for _ in 0..=MAX_GIT_DISCOVERY_DEPTH {
+            deep.push("d");
+        }
+        std::fs::create_dir_all(&deep).expect("deep tree");
+        let refusal = metadata_refusal(
+            plan_git_spawn(&spawn_args(&["status"]), &deep, std::slice::from_ref(&root))
+                .expect_err("a tree beyond the discovery bound cannot be proven safe"),
+        );
+        assert_eq!(
+            refusal.kind(),
+            GitMetadataRefusalKind::DiscoveryBoundExceeded
+        );
+    }
+
+    #[test]
+    fn git_metadata_allows_nested_cwd_inside_an_in_grant_repository() {
+        let root = scratch("nested-ok");
+        let grant = root.join("grant");
+        git_init(&grant);
+        let nested = grant.join("nested");
+        std::fs::create_dir_all(&nested).expect("nested");
+        let plan = plan_git_spawn(
+            &spawn_args(&["status"]),
+            &nested,
+            std::slice::from_ref(&grant),
+        )
+        .expect("the parent repository is inside the grant");
+        let binding = plan.repo.expect("repo resolved");
+        assert_eq!(binding.repo_root, grant);
+        assert_eq!(binding.git_dir, grant.join(".git"));
+    }
+
+    #[test]
+    fn git_metadata_allows_in_grant_repository_and_the_verb_runs() {
+        let root = scratch("in-grant");
+        let grant = root.join("grant");
+        git_init(&grant);
+        std::fs::write(grant.join("tracked.txt"), b"fixture").expect("fixture file");
+
+        let plan = plan_git_spawn(
+            &spawn_args(&["status", "--porcelain"]),
+            &grant,
+            std::slice::from_ref(&grant),
+        )
+        .expect("an in-grant repository must still be allowed");
+        let binding = plan.repo.as_ref().expect("repo resolved");
+        assert_eq!(binding.repo_root, grant);
+        assert_eq!(binding.git_dir, grant.join(".git"));
+        assert!(binding.work_tree.is_none());
+        assert!(!binding.bare);
+        assert_eq!(plan.cwd, grant, "the plan records the authorized cwd");
+
+        // The constructed command really runs the gated verb.
+        let mut command = test_git();
+        command.current_dir(&plan.cwd);
+        command.args(&plan.args);
+        for (name, value) in &plan.env {
+            command.env(name, value);
+        }
+        let output = command.output().expect("git must be available");
+        assert!(
+            output.status.success(),
+            "the gated verb must run: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "?? tracked.txt",
+            "status reports the untracked fixture"
+        );
+    }
+
+    #[test]
+    fn git_metadata_allows_no_repository_at_all() {
+        let root = scratch("no-repo");
+        // The platform temp dir can itself live inside a repository (the
+        // TMPDIR of this workspace does), so derive the expected answer from
+        // the fixture instead of assuming an empty environment: no ancestor
+        // repository means git fails on its own; an ancestor repository the
+        // grant does not cover is refused, exactly like the parent-root case.
+        match ancestor_git(&root) {
+            None => {
+                let plan =
+                    plan_git_spawn(&spawn_args(&["status"]), &root, std::slice::from_ref(&root))
+                        .expect("no repository reads nothing outside the grant");
+                assert!(plan.repo.is_none());
+            }
+            Some(outer) => {
+                let refusal = metadata_refusal(
+                    plan_git_spawn(&spawn_args(&["status"]), &root, std::slice::from_ref(&root))
+                        .expect_err("an ancestor repository outside the grant must be refused"),
+                );
+                assert_eq!(
+                    refusal.kind(),
+                    GitMetadataRefusalKind::ParentRepoOutsideGrant
+                );
+                assert_eq!(Path::new(refusal.path()), outer.parent().expect("repo dir"));
+            }
+        }
+    }
+
+    #[test]
+    fn git_metadata_refuses_relative_authorized_cwd() {
+        let plan = plan_git_spawn(
+            &spawn_args(&["status"]),
+            Path::new("relative/pane"),
+            &[PathBuf::from("/tmp")],
+        );
+        assert_eq!(
+            plan,
+            Err(GitSpawnRefusal::Metadata(GitMetadataRefusal::new(
+                GitMetadataRefusalKind::AuthorizedCwdNotAbsolute,
+                Path::new("relative/pane"),
+            )))
+        );
+    }
+
+    #[test]
+    fn git_metadata_refuses_before_the_allowlist_does_not_run() {
+        let root = scratch("not-allowlisted");
+        assert_eq!(
+            plan_git_spawn(&spawn_args(&["push", "origin"]), &root, &[]),
+            Err(GitSpawnRefusal::NotAllowlisted)
+        );
+        assert_eq!(
+            plan_git_spawn(&spawn_args(&["log", "-C", "/tmp"]), &root, &[]),
+            Err(GitSpawnRefusal::NotAllowlisted)
+        );
+    }
+
+    #[test]
+    fn git_spawn_env_disables_optional_locks_for_read_only_verbs() {
+        let root = scratch("optional-locks");
+        git_init(&root);
+        let plan = plan_git_spawn(&spawn_args(&["status"]), &root, std::slice::from_ref(&root))
+            .expect("an in-grant repository is gated, not refused");
+        assert_eq!(
+            plan.env,
+            vec![(
+                GIT_OPTIONAL_LOCKS_VAR.to_string(),
+                GIT_OPTIONAL_LOCKS_DISABLED.to_string()
+            )],
+            "the only child env entry is the optional-lock switch"
+        );
+        assert_eq!(git_read_only_spawn_env(), plan.env);
+        assert_eq!(GIT_READ_ONLY_SPAWN_ENV.len(), 1);
+        assert!(
+            is_safe_spawn_env(&plan.env),
+            "the read-only env must not carry a denied variable name"
+        );
+        assert!(
+            !env_name_is_denied(GIT_OPTIONAL_LOCKS_VAR),
+            "GIT_OPTIONAL_LOCKS must stay passable: it is the hardening, not a vector"
+        );
+    }
+
+    #[test]
+    fn git_metadata_redirect_env_names_are_denied() {
+        for name in [
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CEILING_DIRECTORIES",
+        ] {
+            assert!(
+                !is_safe_spawn_env(&[(name.to_string(), "/tmp/evil".to_string())]),
+                "{name} redirects repository metadata and must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_detail_is_bidi_safe() {
+        // Real bidi override (U+202E) and zero-width joiner (U+200D) in a
+        // plugin-influenced directory name, plus a newline that would forge a
+        // log line.
+        let hostile = "repo\u{202E}gpj.exe\u{200D}/pane\nforged";
+        assert!(is_audit_format_char('\u{202E}'));
+        assert!(is_audit_format_char('\u{200D}'));
+        assert!(!is_audit_format_char('a'));
+        let cleaned = sanitize_audit_path(hostile);
+        assert_eq!(cleaned, "repogpj.exe/pane?forged");
+        assert!(!cleaned.chars().any(is_audit_format_char));
+
+        let mut ledger = ToolSpawnLedger::new();
+        ledger.push_decision_with_cwd(
+            "git",
+            &spawn_args(&["status", "hostile\u{202E}arg"]),
+            "bidi-probe",
+            true,
+            Some(hostile),
+        );
+        let entry = ledger.iter().next().expect("exactly one entry");
+        assert!(!entry.detail.contains('\u{202E}'));
+        assert!(!entry.detail.contains('\u{200D}'));
+        assert!(!entry.detail.contains('\n'));
+        let recorded_cwd = entry.cwd.as_deref().expect("cwd recorded");
+        assert!(!recorded_cwd.contains('\u{202E}'));
+        assert!(!recorded_cwd.contains('\u{200D}'));
+        assert!(
+            entry.args.iter().all(|arg| !arg.contains('\u{202E}')),
+            "arg previews are sanitised too"
+        );
+    }
+
+    #[test]
+    fn metadata_refusal_records_the_refused_path_in_the_ledger() {
+        let root = scratch("refusal-audit");
+        let grant = root.join("grant");
+        let pane = grant.join("pane");
+        // The refused path carries a bidi override, so the recorded detail
+        // proves the sanitisation runs on the refusal path as well.
+        let outside = root.join("out\u{202E}side");
+        std::fs::create_dir_all(&pane).expect("pane");
+        git_init(&outside);
+        std::fs::write(
+            pane.join(".git"),
+            format!("gitdir: {}\n", outside.join(".git").display()),
+        )
+        .expect("planted gitfile");
+
+        let refusal = metadata_refusal(
+            plan_git_spawn(&spawn_args(&["status"]), &pane, &[grant])
+                .expect_err("out-of-grant gitfile must be refused"),
+        );
+        assert!(
+            !refusal.path().contains('\u{202E}'),
+            "the refusal path is sanitised: {}",
+            refusal.path()
+        );
+        assert!(refusal.path().contains("outside"));
+
+        let mut ledger = ToolSpawnLedger::new();
+        ledger.push_git_metadata_refusal(
+            &spawn_args(&["status"]),
+            "git-panel",
+            Some(&pane.display().to_string()),
+            &refusal,
+        );
+        assert_eq!(ledger.len(), 1);
+        let entry = ledger.iter().next().expect("exactly one entry");
+        assert_eq!(entry.decision, ToolSpawnDecision::Deny);
+        assert_eq!(entry.tool, "git");
+        assert!(
+            entry.detail.contains("git directory outside the grant"),
+            "the detail names the refused channel: {}",
+            entry.detail
+        );
+        assert!(
+            entry.detail.contains("cwd '"),
+            "the detail keeps the authorized cwd: {}",
+            entry.detail
+        );
+        assert!(!entry.detail.contains('\u{202E}'));
     }
 }

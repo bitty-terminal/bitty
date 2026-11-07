@@ -299,10 +299,14 @@ pub use secrets::{
 };
 pub use tools::{
     ACCEPTED_TOOL_GIT, DENIED_SPAWN_ENV_PREFIXES, DENIED_SPAWN_ENV_VARS, GIT_ALLOWED_SUBCOMMANDS,
-    MAX_GIT_ARG_BYTES, MAX_GIT_ARGS, MAX_GIT_TOTAL_BYTES, MAX_TOOL_SPAWN_ARG_PREVIEW_BYTES,
+    GIT_OPTIONAL_LOCKS_DISABLED, GIT_OPTIONAL_LOCKS_VAR, GIT_READ_ONLY_SPAWN_ENV,
+    GitMetadataRefusal, GitMetadataRefusalKind, GitRepoBinding, GitSpawnPlan, GitSpawnRefusal,
+    MAX_GIT_ARG_BYTES, MAX_GIT_ARGS, MAX_GIT_CONFIG_BYTES, MAX_GIT_DISCOVERY_DEPTH,
+    MAX_GIT_TOTAL_BYTES, MAX_GITFILE_BYTES, MAX_TOOL_SPAWN_ARG_PREVIEW_BYTES,
     MAX_TOOL_SPAWN_AUDIT_ARGS, MAX_TOOL_SPAWN_AUDIT_ENTRIES, MAX_TOOL_SPAWN_CALLER_BYTES,
     MAX_TOOL_SPAWN_CWD_BYTES, PAYLOAD_MAX_BYTES, ToolSpawnDecision, ToolSpawnEntry,
-    ToolSpawnLedger, check_tool_spawn, is_accepted_tool, is_allowed_git_args, is_safe_spawn_env,
-    is_tool_spawn_allowed, is_valid_tool_name,
+    ToolSpawnLedger, check_tool_spawn, git_read_only_spawn_env, is_accepted_tool,
+    is_allowed_git_args, is_audit_format_char, is_safe_spawn_env, is_tool_spawn_allowed,
+    is_valid_tool_name, plan_git_spawn, resolve_git_repository, sanitize_audit_path,
 };
 pub use trust_levels::{CapabilityDomain, MAX_TRUST_LABEL_BYTES, TrustLevel};

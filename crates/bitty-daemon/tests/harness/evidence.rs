@@ -47,6 +47,7 @@ pub fn render(evidence: &Evidence<'_>) -> Value {
             "driver": row.driver.as_str(),
             "status": row.status.as_str(),
             "skip_reason": row.skip_reason,
+            "skipped_assertions": row.skipped_assertions,
             "deferred": row.deferred,
             "known_defect": row.known_defect,
             "instance_id": row.instance_id,
@@ -56,6 +57,11 @@ pub fn render(evidence: &Evidence<'_>) -> Value {
             "failure": row.failure,
         }));
     }
+    let assertion_skips: usize = evidence
+        .rows
+        .iter()
+        .map(|row| row.skipped_assertions.len())
+        .sum();
     json!({
         "schema": SCHEMA,
         "suite": evidence.suite,
@@ -69,12 +75,14 @@ pub fn render(evidence: &Evidence<'_>) -> Value {
         "instance_id": evidence.facts.instance_id,
         "capabilities": evidence.facts.capabilities,
         "features": evidence.facts.features,
+        "diagnostics": evidence.facts.diagnostics,
         "limits": evidence.facts.limits,
         "counts": {
             "pass": passed,
             "skip": skipped,
             "fail": failed,
             "known_defect": known,
+            "skipped_assertions": assertion_skips,
             "total": evidence.rows.len(),
         },
         "vectors": rows,

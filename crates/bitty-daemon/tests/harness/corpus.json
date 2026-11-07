@@ -2355,6 +2355,9 @@
       "requires": [
         "terminal_spawn"
       ],
+      "gated_assertions": {
+        "session.cleanup": "verified_cleanup_sweep"
+      },
       "fake_skip": "requires-real-process-exit: the reference fake models an echo terminal and no child wait status",
       "setup": {
         "host_grant": true
@@ -2540,6 +2543,9 @@
       "requires": [
         "terminal_spawn"
       ],
+      "gated_assertions": {
+        "session.cleanup": "verified_cleanup_sweep"
+      },
       "fake_skip": "requires-real-process-exit: the reference fake models an echo terminal and no child wait status",
       "setup": {
         "host_grant": true

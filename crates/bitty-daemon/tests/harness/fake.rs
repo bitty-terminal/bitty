@@ -288,11 +288,18 @@ impl FakeDriver {
                 .into_iter()
                 .map(|limit| (limit.name().to_owned(), self.limits.effective(limit)))
                 .collect(),
-            features: BTreeMap::from([("terminal_spawn".to_owned(), FAKE_TERMINAL_SPAWN)]),
+            features: BTreeMap::from([
+                ("terminal_spawn".to_owned(), FAKE_TERMINAL_SPAWN),
+                // The fake models the whole-tree sweep claim it reports: a
+                // generation-0 cancel is `not_started` and every bound
+                // generation is `swept`, with no real process table to prove.
+                ("verified_cleanup_sweep".to_owned(), FAKE_TERMINAL_SPAWN),
+            ]),
             seams: BTreeMap::from([
                 ("request_deadline_seam".to_owned(), true),
                 ("retention_clock_seam".to_owned(), true),
             ]),
+            diagnostics: BTreeMap::new(),
         }
     }
 

@@ -65,6 +65,18 @@ pub struct Vector {
     /// cell whose containment probe selected no mechanism refuses the worker
     /// path, while the reference fake always models a served worker cell.
     pub requires: Vec<String>,
+    /// Result paths whose exact value needs a capability the cell may not
+    /// serve, as `path -> requirement`.
+    ///
+    /// A vector that asserts a property with one sub-assertion weaker than the
+    /// rest (V-14/V-15 assert a `swept` cleanup next to the record's stability)
+    /// names the capability that sub-assertion needs. A driver whose facts
+    /// model the capability `true` asserts the value exactly; a driver that
+    /// models it `false` records a typed `requires-<requirement>` assertion
+    /// skip instead of comparing the value, because the cell cannot prove it.
+    /// A driver that does not model the capability at all fails the row: an
+    /// unmetered capability name must never read as a silent skip.
+    pub gated_assertions: BTreeMap<String, String>,
     pub host_grant: bool,
     /// A journal record the driver seeds before starting the daemon.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -297,6 +309,24 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => return Err(fail("requires is not an array".to_owned())),
     };
+    let gated_assertions = match value.get("gated_assertions") {
+        None | Some(Value::Null) => BTreeMap::new(),
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(path, requirement)| {
+                let requirement = requirement
+                    .as_str()
+                    .ok_or_else(|| fail(format!("gated_assertions.{path} is not a string")))?;
+                if requirement.is_empty() {
+                    return Err(fail(format!(
+                        "gated_assertions.{path} names no requirement"
+                    )));
+                }
+                Ok((path.clone(), requirement.to_owned()))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?,
+        Some(_) => return Err(fail("gated_assertions is not an object".to_owned())),
+    };
     let setup = object(value, "setup").map_err(fail)?;
     let host_grant = match setup.get("host_grant") {
         None | Some(Value::Null) => false,
@@ -380,6 +410,19 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
             )));
         }
     }
+    // A gate must name a result path the row actually asserts: a typo would
+    // otherwise skip nothing and read as a full-strength row.
+    for path in gated_assertions.keys() {
+        let asserted = steps
+            .iter()
+            .chain(state.iter())
+            .any(|step| step.expect.result.contains_key(path));
+        if !asserted {
+            return Err(fail(format!(
+                "gated assertion {path} is not asserted by any step"
+            )));
+        }
+    }
     let known_defect = match value.get("known_defect") {
         None | Some(Value::Null) => None,
         Some(defect) => {
@@ -429,6 +472,7 @@ fn parse_vector(value: &Value) -> Result<Vector, String> {
         decisions,
         drivers,
         requires,
+        gated_assertions,
         host_grant,
         orphan_record,
         injected,

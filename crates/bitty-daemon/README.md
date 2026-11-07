@@ -1405,11 +1405,13 @@ Both drivers run the same expectations and write separate evidence files under
 ```
 
 Each row records the vector id, driver, status (`pass`, `skip`,
-`known-defect`, `fail`), typed skip reason, deferred requirement, daemon
+`known-defect`, `fail`), typed skip reason, any typed
+`<path>: requires-<capability>` assertion skips, deferred requirement, daemon
 instance id, and a step signature (`ok`, refusal class/code, or closed). The
-file records the crate version, commit, cell, advertised capabilities, and the
-effective limits from the handshake, never a host path, username, socket path,
-port, token, or capability value.
+file records the crate version, commit, cell, advertised capabilities, modeled
+features and their `containment.*` diagnostics, and the effective limits from
+the handshake, never a host path, username, socket path, port, token, or
+capability value.
 
 Corpus rules:
 
@@ -1453,18 +1455,27 @@ Corpus rules:
 - the corpus carries one row per accepted-contract vector (`V-01`–`V-34`,
   `C-01`–`C-19`) and answers every one either with a real assertion or a typed
   skip: `V-14`/`V-15` prove a signal death and a natural exit end in a swept
-  cleanup with an immutable record and no rebind; `V-21` serves the retained
-  backlog on a reattach; `V-28` scans for a TCP listener; `C-09` walks the
-  scope matrix and the one-code-per-missing-authority rule; `C-14` proves the
-  refusal flood is aggregated with its suppressed count and histogram; `C-17`
-  keeps resize controller-only and bumps the revision; `C-19` mints, consumes,
-  revokes, and refuses a host consent grant. `V-25` (second uid), `V-26`
-  (endpoint tamper), `V-27` (Windows pipe), `V-29`/`V-30` (adapter-owned),
-  `C-12` (child descriptor scan), `C-15` (plugin host), `C-16` (per-message
-  credentials), and `C-18` (full key store) record a typed skip naming the
-  capability this harness cannot reach; they never read as a pass. Corpus
-  extensions keep their own ids (`V-35`+, `C-20`+, `F-01`) so a contract id is
-  never reused for a different property;
+  cleanup with an immutable record and no rebind; the cleanup comparison is
+  gated on `verified_cleanup_sweep`, which the driver models only when
+  `daemon.status` reports the delegated `cgroup_v2` plan, so a cell on the
+  `subreaper_fallback` records a typed
+  `session.cleanup: requires-verified_cleanup_sweep` assertion skip while the
+  re-read stability, retry, and no-revival assertions still run. That is the
+  GitHub-hosted runner's cell today: its job runs in a root-owned `system.slice`
+  cgroup the daemon's delegation probe refuses, so the natural-exit sweep stays
+  `unverified` by design (the evidence file's `containment.*` diagnostics name
+  the exact refusal); `V-21` serves
+  the retained backlog on a reattach; `V-28` scans for a TCP listener; `C-09`
+  walks the scope matrix and the one-code-per-missing-authority rule; `C-14`
+  proves the refusal flood is aggregated with its suppressed count and
+  histogram; `C-17` keeps resize controller-only and bumps the revision; `C-19`
+  mints, consumes, revokes, and refuses a host consent grant. `V-25` (second
+  uid), `V-26` (endpoint tamper), `V-27` (Windows pipe), `V-29`/`V-30`
+  (adapter-owned), `C-12` (child descriptor scan), `C-15` (plugin host), `C-16`
+  (per-message credentials), and `C-18` (full key store) record a typed skip
+  naming the capability this harness cannot reach; they never read as a pass.
+  Corpus extensions keep their own ids (`V-35`+, `C-20`+, `F-01`) so a contract
+  id is never reused for a different property;
 - `V-45`–`V-48` pin the terminal content plane on both drivers: a terminal
   create with a spawn specification binds generation 1 and serves bounded
   read/write; an observer lease is `ControllerRequired`; a non-opted

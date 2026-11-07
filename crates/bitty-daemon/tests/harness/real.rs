@@ -31,6 +31,36 @@ const IO_BUDGET: Duration = Duration::from_secs(10);
 
 static NEXT_ROOT: AtomicU32 = AtomicU32::new(0);
 
+/// What the served daemon reports about its own containment plan.
+///
+/// `daemon.status` names the selected mechanism, the cleanup claim the plan can
+/// make, and, for the fallback, why the stronger plan was unavailable. Those
+/// three strings are the only honest source for the cell's capability: a hosted
+/// runner and a developer host are both `linux-x86_64`, and only this answer
+/// distinguishes a delegated cgroup subtree from the subreaper fallback.
+struct ContainmentStatus {
+    mechanism: String,
+    claim: String,
+    fallback: Option<String>,
+}
+
+impl ContainmentStatus {
+    /// Whether the plan can contain a child at all.
+    fn spawns(&self) -> bool {
+        self.mechanism != bitty_daemon::containment::MECHANISM_NONE
+    }
+
+    /// Whether the plan can prove a whole-tree sweep after a natural exit.
+    ///
+    /// Only the delegated cgroup v2 subtree can: its `sweep_if_empty` verifies
+    /// `cgroup.procs` empty and removes the subtree. The subreaper fallback sees
+    /// a natural exit after the descendants already detached, so the daemon's
+    /// own `sweep_if_empty` reports `unverified` there by design.
+    fn proves_sweep(&self) -> bool {
+        self.mechanism == bitty_daemon::containment::MECHANISM_CGROUP_V2
+    }
+}
+
 /// The real-service driver.
 pub struct RealDriver {
     root: Option<Root>,
@@ -525,16 +555,37 @@ impl RealDriver {
                 limits.insert(name.to_owned(), effective);
             }
         }
+        let containment = self.probe_containment(&endpoint)?;
+        let serves_spawn = self
+            .forced_terminal_spawn
+            .unwrap_or_else(|| containment.spawns());
+        let mut diagnostics = std::collections::BTreeMap::from([
+            (
+                "containment.mechanism".to_owned(),
+                containment.mechanism.clone(),
+            ),
+            ("containment.claim".to_owned(), containment.claim.clone()),
+        ]);
+        if let Some(fallback) = containment.fallback.clone() {
+            diagnostics.insert("containment.fallback".to_owned(), fallback);
+        }
         Ok(ServiceFacts {
             instance_id,
             cell: evidence::cell(),
             version: bitty_daemon::CRATE_VERSION.to_owned(),
             capabilities,
             limits,
-            features: std::collections::BTreeMap::from([(
-                "terminal_spawn".to_owned(),
-                self.probe_terminal_spawn(&endpoint)?,
-            )]),
+            features: std::collections::BTreeMap::from([
+                ("terminal_spawn".to_owned(), serves_spawn),
+                // A `swept` cleanup after a natural exit needs a whole-tree
+                // proof this cell can carry. Only the delegated cgroup v2
+                // subtree can: the subreaper fallback observes the exit after
+                // the tree detached and reports `unverified` by design.
+                (
+                    "verified_cleanup_sweep".to_owned(),
+                    self.forced_terminal_spawn.is_none() && containment.proves_sweep(),
+                ),
+            ]),
             // The seam is present exactly when this run injected it: the
             // driver sets the override variables for the vector and passes
             // them to the daemon, so the flag tracks the run rather than a
@@ -549,19 +600,28 @@ impl RealDriver {
                     cfg!(feature = "test-seams"),
                 ),
             ]),
+            diagnostics,
         })
     }
 
-    /// Whether the running daemon selected a containment plan that can spawn.
+    /// The containment facts the running daemon reports about itself.
     ///
-    /// The capability bit cannot answer this: `worker_sessions` is `false` in
-    /// every build by `D-01`, while the accepted 1.3 terminal-spawn slice is
-    /// gated by the plan the startup probe selected. `daemon.status` reports
-    /// that plan as the orphan mechanism, so the driver reads it through the
-    /// operator capability instead of assuming a Linux cell is always servable.
-    fn probe_terminal_spawn(&mut self, endpoint: &Path) -> Result<bool, String> {
-        if let Some(forced) = self.forced_terminal_spawn {
-            return Ok(forced);
+    /// The wire capability set cannot answer this: `worker_sessions` is `false`
+    /// in every build by `D-01`, while the accepted 1.3 terminal-spawn slice is
+    /// gated by the plan the startup probe selected. `daemon.status` names that
+    /// plan as the orphan mechanism, the cleanup claim it can make, and why the
+    /// stronger plan was unavailable, so the driver reads the daemon's own
+    /// answer instead of assuming a Linux cell is always servable or always
+    /// able to prove a sweep.
+    fn probe_containment(&mut self, endpoint: &Path) -> Result<ContainmentStatus, String> {
+        if self.forced_terminal_spawn.is_some() {
+            // The simulation models a refused plan; the real daemon still runs
+            // with the host's plan, and the modeled facts must not borrow it.
+            return Ok(ContainmentStatus {
+                mechanism: "modeled-refusal".to_owned(),
+                claim: "none".to_owned(),
+                fallback: Some("modeled refusal for the parity gate".to_owned()),
+            });
         }
         let mut client = Client::connect(endpoint)?;
         let id = self.next_request_id();
@@ -579,24 +639,40 @@ impl RealDriver {
         }
         let id = self.next_request_id();
         client.send(&id, "daemon.status", &Value::Null)?;
-        let mechanism = match client.recv() {
-            Ok(Outcome::Reply(reply)) if reply.ok => reply
-                .result
-                .get("orphans")
-                .and_then(|orphans| orphans.get("mechanism"))
-                .and_then(Value::as_str)
-                .unwrap_or(bitty_daemon::containment::MECHANISM_NONE)
-                .to_owned(),
+        let orphans = match client.recv() {
+            Ok(Outcome::Reply(reply)) if reply.ok => {
+                reply.result.get("orphans").cloned().unwrap_or(Value::Null)
+            }
             // V-44 injects a 250 ms status handler behind a 100 ms request
             // bound, so the probe cannot read the mechanism. That vector never
-            // spawns and a refused plan still answers status, so keeping the
-            // served Linux default is safe; every other refusal is an error.
+            // spawns; a plan that refused still answers status, so the served
+            // default stays, while the sweep capability stays unproven and the
+            // row that needs it records its typed assertion skip.
             _ if self.request_timeout_ms.is_some() => {
-                return Ok(true);
+                return Ok(ContainmentStatus {
+                    mechanism: "unreadable".to_owned(),
+                    claim: "unreadable".to_owned(),
+                    fallback: None,
+                });
             }
             _ => return Err("terminal-spawn probe status refused".to_owned()),
         };
-        Ok(mechanism != bitty_daemon::containment::MECHANISM_NONE)
+        Ok(ContainmentStatus {
+            mechanism: orphans
+                .get("mechanism")
+                .and_then(Value::as_str)
+                .unwrap_or(bitty_daemon::containment::MECHANISM_NONE)
+                .to_owned(),
+            claim: orphans
+                .get("claim")
+                .and_then(Value::as_str)
+                .unwrap_or("none")
+                .to_owned(),
+            fallback: orphans
+                .get("fallback")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
     }
 
     fn mint_host_grant(&mut self) -> Result<String, String> {

@@ -244,6 +244,45 @@ fn corpus_is_well_formed_and_frozen() {
         let vector = corpus.vector(id).expect("stop vector");
         assert_eq!(vector.decisions, ["D-05"], "{id} decisions");
     }
+    // The lifecycle pair keeps `swept` as the expected cleanup and gates only
+    // the comparison on the capability: the row must never carry a weakened
+    // value (or an accepted set) where the cell can prove the sweep.
+    for id in ["V-14", "V-15"] {
+        let vector = corpus.vector(id).expect("lifecycle vector");
+        assert_eq!(
+            vector
+                .gated_assertions
+                .get("session.cleanup")
+                .map(String::as_str),
+            Some("verified_cleanup_sweep"),
+            "{id} must gate only the cleanup sub-assertion"
+        );
+        let cleanup_values: Vec<&Value> = vector
+            .steps
+            .iter()
+            .chain(vector.state.iter())
+            .filter_map(|step| step.expect.result.get("session.cleanup"))
+            .collect();
+        assert!(
+            !cleanup_values.is_empty(),
+            "{id} asserts a cleanup class in at least one step"
+        );
+        assert!(
+            cleanup_values.iter().all(|value| *value == "swept"),
+            "{id} must still expect a swept cleanup, not a set that accepts unverified"
+        );
+        let other_assertions = vector
+            .steps
+            .iter()
+            .chain(vector.state.iter())
+            .flat_map(|step| step.expect.result.keys())
+            .filter(|path| path.as_str() != "session.cleanup")
+            .count();
+        assert!(
+            other_assertions > 0,
+            "{id} keeps the assertions that do not depend on the sweep"
+        );
+    }
     let retention = corpus.vector("V-20").expect("retention vector");
     assert_eq!(retention.decisions, ["D-14"], "V-20 decisions");
     assert_eq!(
@@ -372,6 +411,7 @@ fn not_equal_any_rejects_duplicate_ids() {
     vars.insert("a_sid".to_owned(), Value::String("a".repeat(32)));
     vars.insert("b_sid".to_owned(), Value::String("b".repeat(32)));
     let mut driver = FakeDriver::new();
+    let no_gates = BTreeMap::new();
     let reply = |id: &str| {
         Outcome::Reply(Reply {
             ok: true,
@@ -385,7 +425,8 @@ fn not_equal_any_rejects_duplicate_ids() {
             &reply(&"a".repeat(32)),
             &mut driver,
             "client",
-            &vars
+            &vars,
+            &no_gates
         )
         .is_err(),
         "a duplicate of the first id must fail"
@@ -396,7 +437,8 @@ fn not_equal_any_rejects_duplicate_ids() {
             &reply(&"b".repeat(32)),
             &mut driver,
             "client",
-            &vars
+            &vars,
+            &no_gates
         )
         .is_err(),
         "a duplicate of the second id must fail"
@@ -407,7 +449,8 @@ fn not_equal_any_rejects_duplicate_ids() {
             &reply(&"c".repeat(32)),
             &mut driver,
             "client",
-            &vars
+            &vars,
+            &no_gates
         )
         .is_ok(),
         "a distinct id must pass"
@@ -519,6 +562,48 @@ fn real_conformance_corpus() {
         rows.iter().all(|row| row.driver == DriverKind::Real),
         "the real suite never carries a fake row"
     );
+    // The cleanup sub-assertion of V-14/V-15 is compared only where the cell
+    // can prove a whole-tree sweep; every other assertion in those rows is
+    // full strength. The expectation follows the daemon's own mechanism, so a
+    // hosted runner that falls back to the subreaper records the typed
+    // assertion skip instead of a silent pass.
+    let sweep_verified = facts
+        .features
+        .get("verified_cleanup_sweep")
+        .copied()
+        .expect("the real driver models the sweep capability");
+    let assertion_skips: Vec<(&str, &str)> = rows
+        .iter()
+        .flat_map(|row| {
+            row.skipped_assertions
+                .iter()
+                .map(move |skip| (row.id.as_str(), skip.as_str()))
+        })
+        .collect();
+    let expected_assertion_skips: Vec<(&str, &str)> = if sweep_verified {
+        Vec::new()
+    } else {
+        // A cell that cannot prove the sweep still runs the row (the stop
+        // path needs only an enforced plan); a cell with no plan at all skips
+        // the row outright, and the skip list below freezes that case.
+        let ran = ["V-14", "V-15"].iter().all(|id| {
+            rows.iter()
+                .any(|row| row.id == *id && row.status == RowStatus::Pass)
+        });
+        if ran {
+            vec![
+                ("V-14", "session.cleanup: requires-verified_cleanup_sweep"),
+                ("V-15", "session.cleanup: requires-verified_cleanup_sweep"),
+            ]
+        } else {
+            Vec::new()
+        }
+    };
+    assert_eq!(
+        assertion_skips, expected_assertion_skips,
+        "the gated cleanup assertion must be compared exactly where the cell can \
+         prove the sweep, and recorded as a typed skip everywhere else"
+    );
     let skipped: Vec<&str> = rows
         .iter()
         .filter(|row| row.status == RowStatus::Skip)
@@ -557,6 +642,7 @@ fn real_conformance_corpus() {
             skip_reason: Some(
                 "cell-not-servable (the served loop is Linux-only in this slice)".to_owned(),
             ),
+            skipped_assertions: Vec::new(),
             deferred: vector.deferred.clone(),
             known_defect: None,
             instance_id: String::new(),

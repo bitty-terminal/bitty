@@ -1444,10 +1444,27 @@ Corpus rules:
   are excluded from the parity gate, and fail the suite if they pass or fail at
   another step so the marker cannot rot; the corpus currently carries none
   (V-07/bitty#2768 and C-04/bitty#2767 were fixed and their markers removed);
-- `C-17` pins the additive `1.2` metadata on both drivers: controller
+- `C-25` pins the additive `1.2` metadata on both drivers: controller
   presence and the pending-grant count (mint, consume, and post-terminal), the
   operator-only owner peer, attach scopes and server clock, the heartbeat
-  clock, and the daemon pid, uptime, and orphan-class keys;
+  clock, and the daemon pid, uptime, and orphan-class keys. It was `C-17`
+  before the contract-ID realignment below; `C-17` now carries the contract's
+  controller-only resize row;
+- the corpus carries one row per accepted-contract vector (`V-01`–`V-34`,
+  `C-01`–`C-19`) and answers every one either with a real assertion or a typed
+  skip: `V-14`/`V-15` prove a signal death and a natural exit end in a swept
+  cleanup with an immutable record and no rebind; `V-21` serves the retained
+  backlog on a reattach; `V-28` scans for a TCP listener; `C-09` walks the
+  scope matrix and the one-code-per-missing-authority rule; `C-14` proves the
+  refusal flood is aggregated with its suppressed count and histogram; `C-17`
+  keeps resize controller-only and bumps the revision; `C-19` mints, consumes,
+  revokes, and refuses a host consent grant. `V-25` (second uid), `V-26`
+  (endpoint tamper), `V-27` (Windows pipe), `V-29`/`V-30` (adapter-owned),
+  `C-12` (child descriptor scan), `C-15` (plugin host), `C-16` (per-message
+  credentials), and `C-18` (full key store) record a typed skip naming the
+  capability this harness cannot reach; they never read as a pass. Corpus
+  extensions keep their own ids (`V-35`+, `C-20`+, `F-01`) so a contract id is
+  never reused for a different property;
 - `V-45`–`V-48` pin the terminal content plane on both drivers: a terminal
   create with a spawn specification binds generation 1 and serves bounded
   read/write; an observer lease is `ControllerRequired`; a non-opted

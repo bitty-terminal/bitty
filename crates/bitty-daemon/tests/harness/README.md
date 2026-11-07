@@ -81,6 +81,31 @@ never fork expectations.
   exists to rule out. A step without a typed expectation is rejected, so a
   vector cannot assert only "no crash".
 
+## Contract coverage
+
+`conformance.rs` carries `CONTRACT_VECTORS`, a table of every vector the
+accepted contract names (`V-01`–`V-34`, `C-01`–`C-19`) with the corpus `area`
+that marks its intent. `corpus_is_well_formed_and_frozen` asserts:
+
+- every required id is present exactly once (the parser also rejects a
+  duplicate id, and the test fails with `the corpus reuses the vector id`);
+- each row's `area` is the contract's area for that id, so a contract id cannot
+  silently carry another property;
+- every id outside the table sits in the extension namespace (`V-35`+, `C-20`+,
+  `F-01`), so an extension can never squat on a contract id.
+
+`coverage_gaps` is a pure function and
+`the_coverage_gate_reports_the_missing_or_misplaced_vector` pins both failure
+shapes: deleting one required row (or moving its `area`) makes the gate fail
+naming that id, not a count. A contract addition therefore lands as a table row
+plus a corpus row, and the failure is the missing id.
+
+A row the cell cannot serve is a typed skip, never a pass: `real_skip` /
+`fake_skip` carry the reason, `requires` names an advertised capability, a
+modeled feature, or a harness seam, and `deferred` records the contract half a
+row does not reach yet (for example `V-21`'s truncation marker, which needs an
+event-ring bound seam).
+
 ## Steps
 
 A step has exactly one of `method` (with `connection` and `params`) or

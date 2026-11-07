@@ -8922,6 +8922,93 @@ claims = []
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Write one plugin package whose `init.lua` registers `commands` with an
+    /// args schema that accepts the empty object and a result that reports it
+    /// ran (issue #2965 review). The dispatch-boundary test needs a callee that
+    /// *would* answer a bare `{}` dispatch, so falling back to one after an
+    /// unparsable document is observable instead of indistinguishable from a
+    /// silent refusal.
+    fn write_bare_ok_plugin(root: &std::path::Path, id: &str, command: &str) {
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Bare Args Test\"\nversion = \"0.1.0\"\n\
+                 description = \"empty-args invocation test\"\n\n\
+                 [compat]\nbitty = \">=0.0.1\"\nplugin-api = \"^1.0\"\n\n\
+                 [capabilities]\n\n\
+                 [lazy]\ncommands = [\"{id}:{command}\"]\nevents = []\n",
+            ),
+        )
+        .expect("manifest");
+        std::fs::write(
+            plugin.join("lua/init.lua"),
+            format!(
+                "bitty.commands.register({{\n\
+                 \x20 id = \"{command}\",\n\
+                 \x20 title = \"Bare: ran\",\n\
+                 \x20 args_schema = {{ type = \"object\" }},\n\
+                 \x20 result_schema = {{ type = \"string\" }},\n\
+                 \x20 run = function(args) return \"ran\" end,\n\
+                 }})\n\
+                 return {{}}\n",
+            ),
+        )
+        .expect("init");
+    }
+
+    #[test]
+    fn invoke_command_binding_with_unparsable_args_refuses_at_dispatch() {
+        // Issue #2965 review: the config gate is structural, so a document
+        // such as `{"a":}` (balanced brackets, one root value, not JSON) is
+        // accepted by `ChromeAction::parse` and reaches dispatch. The
+        // dispatch-boundary branch must refuse it there and dispatch nothing —
+        // in particular it must never fall back to the argument-free `{}`
+        // dispatch, which this callee accepts (a fallback would surface a
+        // result on the banner).
+        use crate::composer_owner::fixture;
+        use bitty_config::ChromeAction;
+        const OWNER: &str = "bitty-featured.bare";
+        let root = fixture::temp_dir("invoke-command-unparsable-args");
+        write_bare_ok_plugin(&root, OWNER, "run");
+        let mut plugin_runtime = fixture::runtime_for(vec![root.clone()]);
+        plugin_runtime.discover();
+        let id = bitty_plugin_host::manifest::PluginId::new(OWNER).expect("id");
+        plugin_runtime.activate(&id).expect("activate");
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        // Config accepts the document: the gate is not a JSON parser.
+        let action = ChromeAction::parse(r#"command:bitty-featured.bare:run -- {"a":}"#)
+            .expect("structurally valid document");
+        let ChromeAction::InvokeCommand(ref invocation) = action else {
+            panic!("the args form must parse as an invocation");
+        };
+        assert_eq!(invocation.args_json(), Some(r#"{"a":}"#));
+        // Dispatch refuses it before any plugin code runs.
+        assert!(
+            !app.apply_chrome_action(action),
+            "a refused invocation is not an applied chrome action"
+        );
+        assert_eq!(
+            app.runtime.notification_banner(),
+            None,
+            "an unparsable document must never become a bare empty-object dispatch"
+        );
+        // Discriminator: the same command does surface a result for `{}`, so
+        // the assertion above cannot pass because dispatch is broken.
+        let bare = ChromeAction::parse(r#"command:bitty-featured.bare:run -- {}"#)
+            .expect("empty object parses");
+        assert!(!app.apply_chrome_action(bare));
+        assert_eq!(
+            app.runtime.notification_banner().as_deref(),
+            Some("bitty-featured.bare:run: ran"),
+            "the callee would have answered a bare dispatch"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn invoke_command_binding_with_unparsable_args_fails_closed() {
         // Issue #2965 defense in depth: configuration rejects a malformed args

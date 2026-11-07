@@ -34,7 +34,7 @@ const REAPER_PIDINFO_VALID: c_uint = 0x0000_0001;
 const REAPER_PIDINFO_ZOMBIE: c_uint = 0x0000_0008;
 
 /// `REAPER_PIDINFO_EXITING`: the descendant is exiting but not yet dead.
-pub(crate) const REAPER_PIDINFO_EXITING: c_uint = 0x0000_0020;
+const REAPER_PIDINFO_EXITING: c_uint = 0x0000_0020;
 
 /// `struct procctl_reaper_status` from `sys/procctl.h`.
 ///

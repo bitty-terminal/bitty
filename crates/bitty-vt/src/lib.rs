@@ -105,10 +105,11 @@ pub use action::{
     ControlChar, ControlStringKind, ControlStringReject, Count, CursorStyle, Direction,
     DynamicColorOp, DynamicColorTarget, EnhancedKeyboardOp, EnhancedKeyboardSetMode,
     EraseDisplayMode, EraseLineMode, GraphemeCell, Hyperlink, KittyNotificationChunk,
-    KittyPayloadType, MAX_OSC4_OPS, MAX_OSC22_SHAPES, Mode, MouseCoordinateEncoding,
-    MouseTrackingMode, Notification, NotificationSource, PaletteColorOp, PaletteOp, PointerShape,
-    PointerShapeOp, Rgb, Row, SequenceKind, StatusKind, TabTargets, TerminalAction, UnderlineStyle,
-    UnrecognizedSequence, ZoneKind,
+    KittyPayloadType, MAX_OSC4_OPS, MAX_OSC22_SHAPES, MODIFY_OTHER_KEYS_MAX_LEVEL, Mode,
+    ModifyOtherKeysOp, MouseCoordinateEncoding, MouseTrackingMode, Notification,
+    NotificationSource, PaletteColorOp, PaletteOp, PointerShape, PointerShapeOp, Rgb, Row,
+    SequenceKind, StatusKind, TabTargets, TerminalAction, UnderlineStyle, UnrecognizedSequence,
+    ZoneKind,
 };
 pub use bounded::{BoundedBytes, BoundedString};
 pub use iterm2_osc::{

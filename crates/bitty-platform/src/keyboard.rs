@@ -38,6 +38,14 @@
 //!   them under the negotiated flags (CTX-0947) for the runtime's enhanced
 //!   path. The legacy path here is the
 //!   byte-identical fallback when the protocol is off.
+//! - xterm `modifyOtherKeys` (Pp = 4) is the compatible sibling of the Kitty
+//!   protocol: [`encode_key_event_modify_other_keys`] emits
+//!   `CSI 27 ; {1+mask} ; {codepoint} ~` for ordinary keys and appends the
+//!   modifier parameter to keys that already have their own CSI form. It is
+//!   the only negotiated form that survives tmux and the VS Code terminal.
+//!   Precedence is Kitty first: a non-zero Kitty flag register wins and the
+//!   `modifyOtherKeys` level is ignored (kitty itself dropped the xterm
+//!   option), then the level, then the legacy bytes.
 //!
 //! # Kitty coverage declaration (CTX-0755, Issue #1362)
 //!
@@ -932,6 +940,288 @@ fn kitty_key_frame(
 #[allow(dead_code)]
 const fn encoded_len_bound() -> usize {
     MAX_ENCODED_LEN
+}
+
+// ---------------------------------------------------------------------------
+// xterm `modifyOtherKeys` encoder (Pp = 4)
+// ---------------------------------------------------------------------------
+
+/// Maximum bytes of one xterm `modifyOtherKeys` frame.
+///
+/// Same per-key bound as [`MAX_KITTY_FRAME_BYTES`]: the longest legal frame
+/// (`CSI 27 ; 33 ; 1114111 ~`) is 20 bytes, so 64 leaves ample room and the
+/// drop-not-truncate rule stays identical for both negotiated protocols.
+pub const MAX_MODIFY_OTHER_KEYS_FRAME_BYTES: usize = 64;
+
+/// Highest xterm `modifyOtherKeys` level this encoder implements.
+///
+/// Mirrors the parser-side bound (`bitty_vt::MODIFY_OTHER_KEYS_MAX_LEVEL`):
+/// levels `0` (off), `1` ("user") and `2` ("all modifiers"). The parser
+/// rejects anything higher, and the encoder fails closed for it too, so an
+/// unimplemented level never silently degrades into a different encoding.
+/// The constant is repeated here because `bitty-platform` is the encoder
+/// layer and does not depend on the parser crate.
+pub const MODIFY_OTHER_KEYS_MAX_LEVEL: u8 = 2;
+
+/// xterm modifier bits used by the `modifyOtherKeys` parameter.
+///
+/// The wire parameter is `1 + mask` with shift `1`, alt `2`, control `4`,
+/// super `8`, hyper `16`, meta `32`. Shift/alt/control match xterm's own
+/// `MOD_SHIFT`/`MOD_ALT`/`MOD_CTRL` bit values (its "Modifier codes" table
+/// maps `Alt` to `3 = 1 + 2` and `Ctrl` to `5 = 1 + 4`); the super/hyper/meta
+/// extension keeps the same positional order the Kitty protocol uses.
+pub const XTERM_MOD_SHIFT: u32 = 1 << 0;
+/// xterm modifier bit: alt.
+pub const XTERM_MOD_ALT: u32 = 1 << 1;
+/// xterm modifier bit: control.
+pub const XTERM_MOD_CTRL: u32 = 1 << 2;
+/// xterm modifier bit: super.
+pub const XTERM_MOD_SUPER: u32 = 1 << 3;
+/// xterm modifier bit: hyper.
+pub const XTERM_MOD_HYPER: u32 = 1 << 4;
+/// xterm modifier bit: meta.
+pub const XTERM_MOD_META: u32 = 1 << 5;
+
+/// Key class of an xterm "ordinary key" for `modifyOtherKeys` gating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XtermOrdinaryKey {
+    /// Any key that produces text (characters and `Space`).
+    Text,
+    /// `Enter` (`CR`, codepoint 13).
+    Enter,
+    /// `Tab` (`HT`, codepoint 9).
+    Tab,
+    /// `Escape` (`ESC`, codepoint 27).
+    Escape,
+    /// `Backspace` (`DEL`, codepoint 127).
+    Backspace,
+}
+
+impl XtermOrdinaryKey {
+    /// The codepoint xterm puts in the third parameter (`input_char` in
+    /// `input.c`: the keysym when below 256, otherwise the key's single
+    /// byte, otherwise its Unicode value). `Text` supplies the value the key
+    /// produces, so `Shift+a` reports `A` (65) and `Ctrl+a` reports `a` (97),
+    /// exactly as xterm reports the keysym it looked up.
+    const fn codepoint(self, text: Option<u32>) -> Option<u32> {
+        match self {
+            Self::Text => text,
+            Self::Enter => Some(13),
+            Self::Tab => Some(9),
+            Self::Escape => Some(27),
+            Self::Backspace => Some(127),
+        }
+    }
+}
+
+/// Classifies `event` as an xterm ordinary key, or `None` for keys outside
+/// that bucket.
+///
+/// xterm's `TypeOfKeysym` routes cursor keys, the editing keypad, function
+/// keys, keypad keys, modifier keys and "special" keys to their own
+/// `modify*Keys` resources; only the remaining ordinary keys can reach
+/// `ModifyOtherKeys`. Numpad-located keys are filtered out by the caller
+/// because xterm handles them through `modifyKeypadKeys` (which sends the
+/// plain keypad byte, never a `CSI 27` frame).
+fn xterm_ordinary_key(event: &KeyEvent) -> Option<(XtermOrdinaryKey, Option<u32>)> {
+    match &event.logical_key {
+        LogicalKey::Character(chars) => {
+            let codepoint = chars.chars().next().map(u32::from);
+            Some((XtermOrdinaryKey::Text, codepoint))
+        }
+        LogicalKey::Named(named) => {
+            let key = match named {
+                NamedKey::Space => XtermOrdinaryKey::Text,
+                NamedKey::Enter => XtermOrdinaryKey::Enter,
+                NamedKey::Tab => XtermOrdinaryKey::Tab,
+                NamedKey::Escape => XtermOrdinaryKey::Escape,
+                NamedKey::Backspace => XtermOrdinaryKey::Backspace,
+                _ => return None,
+            };
+            let codepoint = if key == XtermOrdinaryKey::Text {
+                Some(32)
+            } else {
+                None
+            };
+            Some((key, codepoint))
+        }
+        LogicalKey::Dead(_) | LogicalKey::Unidentified => None,
+    }
+}
+
+/// Decides whether `level` escape-codes this ordinary key with `modifiers`.
+///
+/// Mirrors xterm's `ModifyOtherKeys` switch (`input.c`), transcribed to the
+/// documented levels:
+///
+/// - level 1 ("the usual shift- and control-modifiers work as expected, but
+///   other modifiers (such as alt- and meta-modifiers) cause ordinary keys to
+///   be encoded as if they were function-keys"): `Enter`/`Tab`/`Escape`
+///   escape-code once any modifier is held (`result = (modify_parm != 0)`);
+///   `Backspace` keeps its legacy byte (`case XK_BackSpace: result = False`);
+///   text keys escape-code only when a modifier the legacy encoding cannot
+///   express is held, so pure shift (the glyph already carries it) and pure
+///   control (the C0 byte already carries it) stay legacy.
+/// - level 2 ("all of the modifiers apply"): every ordinary key escape-codes
+///   with any modifier; `Backspace` joins only with control held
+///   (`case 2: case XK_BackSpace: if computeMaskedModifier(state,
+///   ControlMask) result = True`).
+fn xterm_level_encodes(level: u8, key: XtermOrdinaryKey, modifiers: u32) -> bool {
+    match level {
+        1 => match key {
+            XtermOrdinaryKey::Enter | XtermOrdinaryKey::Tab | XtermOrdinaryKey::Escape => true,
+            XtermOrdinaryKey::Backspace => false,
+            XtermOrdinaryKey::Text => modifiers != XTERM_MOD_SHIFT && modifiers != XTERM_MOD_CTRL,
+        },
+        2 => match key {
+            XtermOrdinaryKey::Backspace => modifiers & XTERM_MOD_CTRL != 0,
+            XtermOrdinaryKey::Text
+            | XtermOrdinaryKey::Enter
+            | XtermOrdinaryKey::Tab
+            | XtermOrdinaryKey::Escape => true,
+        },
+        _ => false,
+    }
+}
+
+/// Maps a named key that keeps its own xterm control sequence to that
+/// sequence's base parameters and final byte, so a modifier can be appended
+/// as `CSI {params} ; {1+mask} {final}`.
+///
+/// xterm encodes function-key modifiers "as parameters appended before the
+/// final character of the control sequence", forcing a first parameter of
+/// `1` when the unmodified form has none ("force modifier to 2nd param"), and
+/// "the SS3 sent before F1 through F4 is altered to CSI when sending a
+/// function key modifier as a parameter". The base values match
+/// [`encode_named_key`]; the cursor keys, the VT220 editing keypad
+/// (`Insert`/`Delete`/`PageUp`/`PageDown`) and `F1`..`F20` are covered.
+///
+/// Returns `None` for every other key: ordinary keys go through
+/// `CSI 27 ; ...`, and `F21`..`F35` have no legacy sequence at all.
+fn xterm_modified_functional_key(named: NamedKey) -> Option<(&'static str, u8)> {
+    let pair = match named {
+        NamedKey::ArrowUp => ("1", b'A'),
+        NamedKey::ArrowDown => ("1", b'B'),
+        NamedKey::ArrowRight => ("1", b'C'),
+        NamedKey::ArrowLeft => ("1", b'D'),
+        NamedKey::Home => ("1", b'H'),
+        NamedKey::End => ("1", b'F'),
+        NamedKey::Insert => ("2", b'~'),
+        NamedKey::Delete => ("3", b'~'),
+        NamedKey::PageUp => ("5", b'~'),
+        NamedKey::PageDown => ("6", b'~'),
+        NamedKey::F1 => ("1", b'P'),
+        NamedKey::F2 => ("1", b'Q'),
+        NamedKey::F3 => ("1", b'R'),
+        NamedKey::F4 => ("1", b'S'),
+        NamedKey::F5 => ("15", b'~'),
+        NamedKey::F6 => ("17", b'~'),
+        NamedKey::F7 => ("18", b'~'),
+        NamedKey::F8 => ("19", b'~'),
+        NamedKey::F9 => ("20", b'~'),
+        NamedKey::F10 => ("21", b'~'),
+        NamedKey::F11 => ("23", b'~'),
+        NamedKey::F12 => ("24", b'~'),
+        NamedKey::F13 => ("25", b'~'),
+        NamedKey::F14 => ("26", b'~'),
+        NamedKey::F15 => ("28", b'~'),
+        NamedKey::F16 => ("29", b'~'),
+        NamedKey::F17 => ("31", b'~'),
+        NamedKey::F18 => ("32", b'~'),
+        NamedKey::F19 => ("33", b'~'),
+        NamedKey::F20 => ("34", b'~'),
+        _ => return None,
+    };
+    Some(pair)
+}
+
+/// Builds one `CSI 27 ; {1+mask} ; {codepoint} ~` frame, bounded and
+/// drop-not-truncate.
+fn modify_other_keys_frame(modifiers: u32, codepoint: u32) -> Option<Vec<u8>> {
+    let frame = format!("\x1b[27;{};{}~", modifiers + 1, codepoint).into_bytes();
+    if frame.len() <= MAX_MODIFY_OTHER_KEYS_FRAME_BYTES {
+        Some(frame)
+    } else {
+        None
+    }
+}
+
+/// Builds one `CSI {params} ; {1+mask} {final}` frame for a key that keeps
+/// its own xterm form, bounded and drop-not-truncate.
+fn modify_functional_key_frame(params: &str, final_byte: u8, modifiers: u32) -> Option<Vec<u8>> {
+    let mut frame = format!("\x1b[{params};{}", modifiers + 1).into_bytes();
+    frame.push(final_byte);
+    if frame.len() <= MAX_MODIFY_OTHER_KEYS_FRAME_BYTES {
+        Some(frame)
+    } else {
+        None
+    }
+}
+
+/// Encodes `event` under xterm's `modifyOtherKeys` option (Pp = 4).
+///
+/// Pure, headless, and deterministic: no display server, window, or OS state
+/// is consulted beyond `event`, the `modifiers` bitmask (`XTERM_MOD_*`, the
+/// same positional layout as `KITTY_MOD_*`), and the negotiated `level`
+/// (`CSI > 4 ; Ps m`).
+///
+/// Returns `Some(frame)` when the xterm form applies and `None` when the
+/// caller must use the legacy encoder instead:
+///
+/// - `level == 0` (off) or a level above the implemented maximum;
+/// - synthetic events and key releases (the `CSI 27` form carries no event
+///   type, so a release must stay silent like the legacy path);
+/// - no modifier held (`min_mod` defaults to `1`; level 3, which escape-codes
+///   unmodified keys, is not implemented);
+/// - ordinary keys that the level keeps on the legacy path (see
+///   [`xterm_level_encodes`]);
+/// - keys outside both the functional table and the ordinary bucket.
+///
+/// Keys with their own xterm control sequence (cursor keys, `Home`/`End`,
+/// the editing keypad, `F1`..`F20`) keep that sequence and gain the modifier
+/// parameter, as xterm's `modifyCursorKeys`/`modifyFunctionKeys` do when
+/// `modifyOtherKeys` is active ("result = True" in `allowModifierParm`).
+/// Every other ordinary key is sent as `CSI 27 ; {1+mask} ; {codepoint} ~`
+/// with the codepoint the key produces.
+///
+/// Every emitted frame is bounded to [`MAX_MODIFY_OTHER_KEYS_FRAME_BYTES`];
+/// an over-bound frame yields `None` (drop), never a truncated sequence.
+pub fn encode_key_event_modify_other_keys(
+    event: &KeyEvent,
+    modifiers: u32,
+    level: u8,
+) -> Option<Vec<u8>> {
+    // Level 0 is off; levels above the implemented maximum fail closed rather
+    // than being clamped into a different encoding.
+    if level == 0 || level > MODIFY_OTHER_KEYS_MAX_LEVEL {
+        return None;
+    }
+    if event.is_synthetic || event.state != PressState::Pressed {
+        return None;
+    }
+    // xterm's `min_mod` defaults to 1: unmodified keys never escape-code
+    // (that is level 3, which is not implemented).
+    if modifiers == 0 {
+        return None;
+    }
+    // Numpad-located keys belong to xterm's `modifyKeypadKeys` resource,
+    // which keeps the plain keypad byte and never appends a modifier, so they
+    // stay on the legacy path here.
+    if event.location == KeyLocation::Numpad {
+        return None;
+    }
+
+    if let LogicalKey::Named(named) = &event.logical_key {
+        if let Some((params, final_byte)) = xterm_modified_functional_key(*named) {
+            return modify_functional_key_frame(params, final_byte, modifiers);
+        }
+    }
+
+    let (key, text) = xterm_ordinary_key(event)?;
+    if !xterm_level_encodes(level, key, modifiers) {
+        return None;
+    }
+    modify_other_keys_frame(modifiers, key.codepoint(text)?)
 }
 
 #[cfg(test)]
@@ -1862,5 +2152,179 @@ mod tests {
         .expect("frame must be emitted");
         assert!(frame.len() <= MAX_KITTY_FRAME_BYTES);
         assert_eq!(*frame.last().unwrap(), b'u');
+    }
+
+    #[test]
+    fn kitty_shift_enter_under_disambiguate_is_csi_13_2u() {
+        // The exact sequence a TUI relies on to tell Shift+Enter (insert a
+        // newline) from Enter (submit). Previously uncovered: only the bare
+        // Enter and Ctrl+M paths had regression tests.
+        let enter = kitty_named(NamedKey::Enter, PressState::Pressed);
+        assert_eq!(
+            encode_key_event_kitty_protocol(&enter, KITTY_MOD_SHIFT, KITTY_FLAG_DISAMBIGUATE),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // xterm modifyOtherKeys (Pp = 4) encoder tests.
+    // ------------------------------------------------------------------
+
+    fn mok_shift_enter() -> KeyEvent {
+        kitty_named(NamedKey::Enter, PressState::Pressed)
+    }
+
+    #[test]
+    fn modify_other_keys_level_one_encodes_shift_enter() {
+        // xterm level 1: `Enter` escape-codes whenever a modifier is held
+        // (`case XK_Return: result = (modify_parm != 0)`), so Shift+Enter
+        // stops colliding with the bare `\r` submit.
+        assert_eq!(
+            encode_key_event_modify_other_keys(&mok_shift_enter(), XTERM_MOD_SHIFT, 1),
+            Some(b"\x1b[27;2;13~".to_vec())
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_level_two_encodes_ctrl_a() {
+        // Level 2 ("all of the modifiers apply"): the codepoint is the value
+        // the key produces (`a` = 97) and the modifier parameter is `1 + 4`.
+        let ctrl_a = kitty_char("a", None, PressState::Pressed, false);
+        assert_eq!(
+            encode_key_event_modify_other_keys(&ctrl_a, XTERM_MOD_CTRL, 2),
+            Some(b"\x1b[27;5;97~".to_vec())
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_arrow_keeps_its_csi_form_with_the_modifier() {
+        // Cursor keys keep their own xterm sequence and gain the modifier
+        // parameter ("parameters appended before the final character").
+        let up = kitty_named(NamedKey::ArrowUp, PressState::Pressed);
+        assert_eq!(
+            encode_key_event_modify_other_keys(&up, XTERM_MOD_SHIFT, 1),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+        // SS3 forms are altered to CSI when a modifier is appended.
+        let f1 = kitty_named(NamedKey::F1, PressState::Pressed);
+        assert_eq!(
+            encode_key_event_modify_other_keys(&f1, XTERM_MOD_CTRL, 2),
+            Some(b"\x1b[1;5P".to_vec())
+        );
+        // Keys that already carry a numeric parameter append to it.
+        let delete = kitty_named(NamedKey::Delete, PressState::Pressed);
+        assert_eq!(
+            encode_key_event_modify_other_keys(&delete, XTERM_MOD_CTRL, 1),
+            Some(b"\x1b[3;5~".to_vec())
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_unmodified_text_stays_legacy() {
+        // min_mod defaults to 1: an unmodified key never escape-codes (that
+        // is xterm level 3, which is not implemented).
+        let a = kitty_char("a", Some("a"), PressState::Pressed, false);
+        assert_eq!(encode_key_event_modify_other_keys(&a, 0, 2), None);
+        // And level 0 means the option is off.
+        assert_eq!(
+            encode_key_event_modify_other_keys(&a, XTERM_MOD_CTRL, 0),
+            None
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_level_one_keeps_shift_and_ctrl_text_legacy() {
+        // "the usual shift- and control-modifiers work as expected": the
+        // glyph already carries shift and the C0 byte already carries
+        // control, so both stay on the legacy path at level 1.
+        let a = kitty_char("a", None, PressState::Pressed, false);
+        assert_eq!(
+            encode_key_event_modify_other_keys(&a, XTERM_MOD_SHIFT, 1),
+            None
+        );
+        assert_eq!(
+            encode_key_event_modify_other_keys(&a, XTERM_MOD_CTRL, 1),
+            None
+        );
+        // Alt (a modifier with no legacy encoding for ordinary keys) escapes
+        // the key, and so does the control+shift combination.
+        assert_eq!(
+            encode_key_event_modify_other_keys(&a, XTERM_MOD_ALT, 1),
+            Some(b"\x1b[27;3;97~".to_vec())
+        );
+        assert_eq!(
+            encode_key_event_modify_other_keys(&a, XTERM_MOD_CTRL | XTERM_MOD_SHIFT, 1),
+            Some(b"\x1b[27;6;97~".to_vec())
+        );
+        // Backspace keeps its legacy byte at level 1 and joins only with
+        // control at level 2.
+        let backspace = kitty_named(NamedKey::Backspace, PressState::Pressed);
+        assert_eq!(
+            encode_key_event_modify_other_keys(&backspace, XTERM_MOD_CTRL, 1),
+            None
+        );
+        assert_eq!(
+            encode_key_event_modify_other_keys(&backspace, XTERM_MOD_CTRL, 2),
+            Some(b"\x1b[27;5;127~".to_vec())
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_rejects_unimplemented_levels_and_events() {
+        let a = kitty_char("a", None, PressState::Pressed, false);
+        // Level 3 and beyond fail closed instead of being clamped.
+        assert_eq!(
+            encode_key_event_modify_other_keys(&a, XTERM_MOD_CTRL, 3),
+            None
+        );
+        assert_eq!(
+            encode_key_event_modify_other_keys(&a, XTERM_MOD_CTRL, u8::MAX),
+            None
+        );
+        // Releases and synthetic events carry no xterm encoding.
+        let release = kitty_char("a", None, PressState::Released, false);
+        assert_eq!(
+            encode_key_event_modify_other_keys(&release, XTERM_MOD_CTRL, 2),
+            None
+        );
+        let synthetic = make_char("a", None, PressState::Pressed, true);
+        assert_eq!(
+            encode_key_event_modify_other_keys(&synthetic, XTERM_MOD_CTRL, 2),
+            None
+        );
+        // Numpad-located keys belong to xterm's `modifyKeypadKeys` resource
+        // and keep the plain keypad byte.
+        let keypad_enter = kitty_named_located(
+            NamedKey::Enter,
+            KeyLocation::Numpad,
+            PressState::Pressed,
+            false,
+        );
+        assert_eq!(
+            encode_key_event_modify_other_keys(&keypad_enter, XTERM_MOD_SHIFT, 2),
+            None
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_frame_is_hard_bounded() {
+        // Every frame stays inside the per-key bound and keeps its trailer.
+        let frames = [
+            encode_key_event_modify_other_keys(
+                &kitty_char("\u{1F600}", None, PressState::Pressed, false),
+                XTERM_MOD_SHIFT | XTERM_MOD_ALT | XTERM_MOD_CTRL,
+                2,
+            ),
+            encode_key_event_modify_other_keys(
+                &kitty_named(NamedKey::F20, PressState::Pressed),
+                XTERM_MOD_SHIFT | XTERM_MOD_ALT | XTERM_MOD_CTRL | XTERM_MOD_META,
+                2,
+            ),
+        ];
+        for frame in frames {
+            let frame = frame.expect("frame must be emitted");
+            assert!(frame.len() <= MAX_MODIFY_OTHER_KEYS_FRAME_BYTES);
+            assert_eq!(*frame.last().unwrap(), b'~');
+        }
     }
 }

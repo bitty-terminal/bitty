@@ -30,6 +30,19 @@
 //! (`bitty ctl ...`) where one exists. No IPC frame is sent, no instance is
 //! touched, and no plugin code is loaded on this path.
 //!
+//! Plugin commands (`bitty-terminal.search:search`, …) cannot be dispatched
+//! here yet even with a live instance (issue #2965): the plugin runtime is
+//! owned by the running app's main thread, so the request needs a
+//! `bitty.debug/*` wire method that (a) the pinned `bitty-ipc` control-scope
+//! map authorizes and (b) the main-thread drain can apply against a
+//! `PluginRuntime`. Neither half exists: `bitty_ipc::ctl::
+//! required_scope_for_ctl_method` refuses any method it does not know, and the
+//! drain in `ctl::apply` receives only `&mut bitty_runtime::Runtime`. Until
+//! both land, the reachable argument-carrying path is a bound chord
+//! (`command:<owner:command> -- '<json>'`, see
+//! [`bitty_config::CommandInvocation`]), and this verb keeps its documented
+//! fail-closed exit 6 rather than pretending to dispatch.
+//!
 //! # Exit codes (stable taxonomy)
 //!
 //! - `0` success (help only in this slice).
@@ -64,9 +77,13 @@ pub const MAX_CMD_ID_LEN: usize = 128;
 /// Maximum bytes for a `--format` value.
 pub const MAX_CMD_FORMAT_LEN: usize = 16;
 /// Maximum bytes for the raw JSON argument blob (bounded parser input).
-pub const MAX_CMD_ARGS_BYTES: usize = 65_536;
+///
+/// Shared with the binding surface ([`bitty_config::MAX_JSON_ARGS_BYTES`]):
+/// `bitty cmd` and `command:<owner:command> -- '<json>'` accept the same
+/// documents under the same bound (issue #2965).
+pub const MAX_CMD_ARGS_BYTES: usize = bitty_config::MAX_JSON_ARGS_BYTES;
 /// Maximum nesting depth accepted in the args blob (wire rule parity: 32).
-pub const MAX_CMD_ARGS_DEPTH: usize = 32;
+pub const MAX_CMD_ARGS_DEPTH: usize = bitty_config::MAX_JSON_ARGS_DEPTH;
 
 // ---------------------------------------------------------------------------
 // Qualified-id validation (shared with `bitty x`)
@@ -133,69 +150,14 @@ pub(crate) fn validate_qualified_id(id: &str) -> Result<(), String> {
 /// Validate the raw JSON argument blob structurally (no JSON parser in the
 /// workspace: balanced `{}`/`[]` with string awareness, single root value of
 /// object/array shape, depth capped at [`MAX_CMD_ARGS_DEPTH`]).
+///
+/// Delegates to the one implementation shared with the binding surface
+/// ([`bitty_config::validate_json_args_blob`], issue #2965): `bitty cmd` and
+/// `command:<owner:command> -- '<json>'` can never accept different documents
+/// for the same command. The reasons are reused verbatim, so this verb's
+/// diagnostics are unchanged.
 pub(crate) fn validate_args_blob(blob: &str) -> Result<(), String> {
-    if blob.len() > MAX_CMD_ARGS_BYTES {
-        return Err(format!(
-            "args blob too large ({} bytes, max {MAX_CMD_ARGS_BYTES})",
-            blob.len()
-        ));
-    }
-    let trimmed = blob.trim();
-    if trimmed.is_empty() {
-        return Err(String::from("args blob must not be empty"));
-    }
-    let opener = trimmed.as_bytes()[0];
-    if opener != b'{' && opener != b'[' {
-        return Err(String::from(
-            "args blob must be a JSON object or array (e.g. -- '{\"terminal_id\": \"t:4\"}')",
-        ));
-    }
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut stack: Vec<u8> = Vec::new();
-    for &b in trimmed.as_bytes() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match b {
-            b'"' => in_string = true,
-            b'{' => {
-                stack.push(b'}');
-                depth += 1;
-            }
-            b'[' => {
-                stack.push(b']');
-                depth += 1;
-            }
-            b'}' | b']' => {
-                if stack.pop() != Some(b) {
-                    return Err(String::from("args blob has unbalanced brackets"));
-                }
-                depth = depth.saturating_sub(1);
-            }
-            _ => {}
-        }
-        if depth > MAX_CMD_ARGS_DEPTH {
-            return Err(format!(
-                "args blob nests too deep (max {MAX_CMD_ARGS_DEPTH})"
-            ));
-        }
-    }
-    if in_string {
-        return Err(String::from("args blob has an unterminated string"));
-    }
-    if !stack.is_empty() {
-        return Err(String::from("args blob has unbalanced brackets"));
-    }
-    Ok(())
+    bitty_config::validate_json_args_blob(blob)
 }
 
 // ---------------------------------------------------------------------------

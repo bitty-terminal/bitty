@@ -164,6 +164,33 @@ pub const MAX_ACTION_LEN: usize = 320;
 /// plus one `:` separator plus a command id of at most 128 bytes).
 pub const MAX_INVOKE_COMMAND_LEN: usize = 257;
 
+/// Maximum bytes of the raw JSON args blob carried by one `command:` action
+/// (CTX-2965, issue #2965).
+///
+/// Smaller than the CLI's [`crate::MAX_JSON_ARGS_BYTES`] on purpose: a binding
+/// lives in a config file that is re-read on every reload and rendered in the
+/// help overlay, so a binding carries a command's *identity arguments*
+/// (`panel`, `needle`, `path`), not a bulk document. The structural rules are
+/// the shared ones ([`crate::validate_json_args_blob`]), so a blob accepted
+/// here is accepted by `bitty cmd` and vice versa.
+pub const MAX_INVOKE_ARGS_BYTES: usize = 4096;
+
+/// Byte separator between a `command:` target and its JSON args blob.
+///
+/// Deliberately the same spelling `bitty cmd <qualified-id> -- '<json>'` uses
+/// for the identical payload: one convention, two surfaces, so a user can move
+/// a working `bitty cmd` invocation into a binding verbatim.
+pub const INVOKE_ARGS_SEPARATOR: &str = " -- ";
+
+/// Maximum raw action string length for the argument-carrying `command:` form.
+///
+/// [`MAX_ACTION_LEN`] bounds every closed-catalog action. The `command:` form
+/// appends an args blob, so it gets its own bound composed of the pieces the
+/// grammar allows: `command:` head, [`MAX_INVOKE_COMMAND_LEN`] target,
+/// [`INVOKE_ARGS_SEPARATOR`], and [`MAX_INVOKE_ARGS_BYTES`].
+pub const MAX_COMMAND_ACTION_LEN: usize =
+    "command:".len() + MAX_INVOKE_COMMAND_LEN + INVOKE_ARGS_SEPARATOR.len() + MAX_INVOKE_ARGS_BYTES;
+
 /// Maximum focus id accepted by the `focus:<n>` action.
 pub const MAX_FOCUS_ID: u64 = 256;
 
@@ -641,6 +668,115 @@ impl SplitDir {
     }
 }
 
+/// One `command:<owner:command>` invocation payload: the qualified target and,
+/// optionally, the JSON args document the command is called with (CTX-2965,
+/// issue #2965).
+///
+/// # Why a separate payload type
+///
+/// `bitty cmd <qualified-id> -- '<json>'` and the binding form
+/// `command:<owner:command> -- '<json>'` carry the *same* payload, so the
+/// grammar, bounds, and structural validation are shared
+/// ([`crate::validate_json_args_blob`]). The typed Lua value is built by the
+/// dispatch owner, which is the only layer with a JSON parser
+/// (`bitty_runtime::plugin_runtime::store::parse_json`); `bitty-config` stays
+/// parser-free and hands the raw document across.
+///
+/// # Bounds (fail closed at parse)
+///
+/// - `target`: `owner:command`, 1..=[`MAX_INVOKE_COMMAND_LEN`] bytes, one
+///   colon, no whitespace or NUL.
+/// - `args_json`: `None` (empty object `{}` at dispatch) or one JSON object/
+///   array text of at most [`MAX_INVOKE_ARGS_BYTES`] bytes passing
+///   [`crate::validate_json_args_blob`].
+///
+/// A binding whose blob fails validation never becomes a `ChromeAction`: the
+/// config layer rejects it with the `keymaps[].action` field path before any
+/// input path can see it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CommandInvocation {
+    /// Qualified `owner:command` target (never carries the args blob).
+    target: String,
+    /// Raw JSON args document, when the binding supplies one.
+    args_json: Option<String>,
+}
+
+impl CommandInvocation {
+    /// An argument-free invocation: dispatch validates it as the empty
+    /// object `{}`, exactly like the pre-args `command:<owner:command>` form.
+    #[must_use]
+    pub fn new(target: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+            args_json: None,
+        }
+    }
+
+    /// An invocation carrying a raw JSON args document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] naming `keymaps[].action` when the blob exceeds
+    /// [`MAX_INVOKE_ARGS_BYTES`] or fails the shared structural validation, so
+    /// a hand-built action (plugin suggestion, test fixture) can never smuggle
+    /// an unvalidated document past the parser.
+    pub fn with_args(
+        target: impl Into<String>,
+        args_json: impl Into<String>,
+    ) -> Result<Self, ConfigError> {
+        let args_json = args_json.into();
+        if args_json.len() > MAX_INVOKE_ARGS_BYTES {
+            return Err(ConfigError::validation(
+                "keymaps[].action",
+                format!(
+                    "command args blob too large ({} bytes, max {MAX_INVOKE_ARGS_BYTES})",
+                    args_json.len()
+                ),
+            ));
+        }
+        crate::validate_json_args_blob(&args_json).map_err(|reason| {
+            ConfigError::validation(
+                "keymaps[].action",
+                format!("invalid command args blob: {reason}"),
+            )
+        })?;
+        Ok(Self {
+            target: target.into(),
+            args_json: Some(args_json),
+        })
+    }
+
+    /// Qualified `owner:command` target.
+    #[must_use]
+    pub fn target(&self) -> &str {
+        &self.target
+    }
+
+    /// Raw JSON args document, when the binding supplies one.
+    #[must_use]
+    pub fn args_json(&self) -> Option<&str> {
+        self.args_json.as_deref()
+    }
+
+    /// Whether the binding carries an args document.
+    #[must_use]
+    pub fn has_args(&self) -> bool {
+        self.args_json.is_some()
+    }
+}
+
+impl From<String> for CommandInvocation {
+    fn from(target: String) -> Self {
+        Self::new(target)
+    }
+}
+
+impl From<&str> for CommandInvocation {
+    fn from(target: &str) -> Self {
+        Self::new(target)
+    }
+}
+
 /// Chrome action invoked by a bound chord.
 ///
 /// Every variant maps onto existing `Runtime`/`LayoutNode` APIs (focus moves,
@@ -888,20 +1024,32 @@ pub enum ChromeAction {
     /// opts in with e.g. `{ chord = "alt+p", action = "toggle_pinned" }`.
     TogglePinned,
     /// Invoke one registered plugin command (`command:<owner:command>`,
-    /// alias `invoke_command:<owner:command>`; CTX-1035 issue #1829).
+    /// alias `invoke_command:<owner:command>`; CTX-1035 issue #1829), optionally
+    /// with a JSON args document (`command:<owner:command> -- '<json>'`;
+    /// CTX-2965 issue #2965).
     ///
     /// The generic host-mediated invocation path behind palette selection:
     /// the app parses the qualified name and routes it through the plugin
     /// runtime's deny-by-default dispatch (undeclared and foreign-qualified
     /// names refused, args validated against the callee schema, failures
-    /// contained — never a host crash). Keybindings carry no arguments, so
-    /// the invocation validates as the empty object `{}`; commands whose
-    /// args schema requires properties (e.g. a mandatory `filter`) refuse
-    /// the chord loudly. Manual bind only, never in [`DEFAULT_KEYMAPS`]
-    /// (same byte-identical discipline as [`Self::OpenComposer`]); the user
-    /// opts in with e.g.
-    /// `{ chord = "ctrl+alt+p", action = "command:bitty-featured.devtools:plugins" }`.
-    InvokeCommand(String),
+    /// contained — never a host crash). A bare binding carries no arguments, so
+    /// the invocation validates as the empty object `{}`; commands whose args
+    /// schema requires properties refuse the chord loudly. The
+    /// [`CommandInvocation::with_args`] form carries the same JSON document
+    /// `bitty cmd <qualified-id> -- '<json>'` accepts, so a command with a
+    /// required `needle`/`panel`/`path` argument is reachable from a chord:
+    ///
+    /// ```toml
+    /// [[keymaps]]
+    /// chord = "ctrl+alt+s"
+    /// action = "command:bitty-terminal.search:search -- {\"panel\":\"p:1\",\"needle\":\"NEEDLE\"}"
+    /// context = "global"
+    /// ```
+    ///
+    /// Manual bind only, never in [`DEFAULT_KEYMAPS`] (same byte-identical
+    /// discipline as [`Self::OpenComposer`]); the argument-free user form is
+    /// e.g. `{ chord = "ctrl+alt+p", action = "command:bitty-featured.devtools:plugins" }`.
+    InvokeCommand(CommandInvocation),
 }
 
 impl ChromeAction {
@@ -914,17 +1062,29 @@ impl ChromeAction {
                 "must not be empty",
             ));
         }
-        if trimmed.len() > MAX_ACTION_LEN {
-            return Err(ConfigError::validation(
-                "keymaps[].action",
-                format!("must be <= {MAX_ACTION_LEN} bytes"),
-            ));
-        }
         let lowered = trimmed.to_ascii_lowercase();
         let (head, arg) = match lowered.split_once(':') {
             Some((h, a)) => (h.trim(), Some(a.trim())),
             None => (lowered.as_str(), None),
         };
+        // CTX-2965 (issue #2965): the argument-carrying `command:` form appends
+        // a JSON args document, so it is bounded by [`MAX_COMMAND_ACTION_LEN`]
+        // instead of the closed-catalog [`MAX_ACTION_LEN`]. Every other form
+        // keeps the byte-identical 320-byte rule.
+        let command_form = matches!(head, "command" | "invoke_command" | "run_command");
+        if command_form {
+            if trimmed.len() > MAX_COMMAND_ACTION_LEN {
+                return Err(ConfigError::validation(
+                    "keymaps[].action",
+                    format!("must be <= {MAX_COMMAND_ACTION_LEN} bytes"),
+                ));
+            }
+        } else if trimmed.len() > MAX_ACTION_LEN {
+            return Err(ConfigError::validation(
+                "keymaps[].action",
+                format!("must be <= {MAX_ACTION_LEN} bytes"),
+            ));
+        }
         match head {
             "goto_split" => {
                 let dir = require_dir_arg(arg, trimmed)?;
@@ -1100,8 +1260,16 @@ impl ChromeAction {
                 Ok(Self::TogglePinned)
             }
             "command" | "invoke_command" | "run_command" => {
-                let target = require_invoke_command(arg, trimmed)?;
-                Ok(Self::InvokeCommand(target))
+                // Original-case tail: the head/arg split above lowered the
+                // whole action, which is right for every closed-catalog
+                // spelling but would destroy JSON string values (`needle`,
+                // `path`). The offset is a byte split at the first `:`, so the
+                // original slice is exactly the same span.
+                let tail = trimmed
+                    .split_once(':')
+                    .map(|(_, tail)| tail.trim())
+                    .unwrap_or_default();
+                Ok(Self::InvokeCommand(parse_invoke_command(tail, trimmed)?))
             }
             _ => Err(ConfigError::validation(
                 "keymaps[].action",
@@ -1152,7 +1320,13 @@ impl ChromeAction {
             Self::TogglePalette => "toggle_palette".to_string(),
             Self::ToggleFloating => "toggle_floating".to_string(),
             Self::TogglePinned => "toggle_pinned".to_string(),
-            Self::InvokeCommand(qualified) => format!("command:{qualified}"),
+            Self::InvokeCommand(invocation) => match invocation.args_json() {
+                None => format!("command:{}", invocation.target()),
+                Some(blob) => format!(
+                    "command:{}{INVOKE_ARGS_SEPARATOR}{blob}",
+                    invocation.target()
+                ),
+            },
         }
     }
 
@@ -1286,7 +1460,7 @@ pub fn all_chrome_actions() -> Vec<ChromeAction> {
         ChromeAction::TogglePalette,
         ChromeAction::ToggleFloating,
         ChromeAction::TogglePinned,
-        ChromeAction::InvokeCommand("example.owner:example-command".to_string()),
+        ChromeAction::InvokeCommand("example.owner:example-command".to_string().into()),
     ]
 }
 
@@ -1464,6 +1638,50 @@ fn require_workspace_index(arg: Option<&str>, raw: &str) -> Result<u64, ConfigEr
             format!("action '{raw}' needs a workspace index (e.g. 'workspace_focus:2')"),
         )),
     }
+}
+
+/// Parse a `command:` action tail into a [`CommandInvocation`] (CTX-2965).
+///
+/// Grammar (whitespace-tolerant between the parts, exact on the `--` token):
+///
+/// ```text
+/// <owner:command>[ -- <json-object-or-array>]
+/// ```
+///
+/// `tail` is the original-case remainder after the `command:` head, so the
+/// JSON document keeps its case. The target half is validated by
+/// [`require_invoke_command`] (one colon, no whitespace, bounded); the args
+/// half by the shared [`crate::validate_json_args_blob`] plus
+/// [`MAX_INVOKE_ARGS_BYTES`], so a malformed document fails closed at config
+/// parse instead of reaching dispatch.
+fn parse_invoke_command(tail: &str, raw: &str) -> Result<CommandInvocation, ConfigError> {
+    let (target, rest) = match tail.split_once(char::is_whitespace) {
+        Some((target, rest)) => (target, Some(rest.trim())),
+        None => (tail, None),
+    };
+    let target = require_invoke_command(Some(target), raw)?;
+    let Some(rest) = rest else {
+        return Ok(CommandInvocation::new(target));
+    };
+    let Some(blob) = rest.strip_prefix("--") else {
+        return Err(invoke_separator_error(raw));
+    };
+    let blob = blob.trim();
+    if blob.is_empty() {
+        return Err(invoke_separator_error(raw));
+    }
+    CommandInvocation::with_args(target, blob)
+}
+
+/// The one diagnostic for a malformed `command:` args separator.
+fn invoke_separator_error(raw: &str) -> ConfigError {
+    ConfigError::validation(
+        "keymaps[].action",
+        format!(
+            "action '{raw}' needs `{INVOKE_ARGS_SEPARATOR}<json>` after the qualified command \
+             (e.g. 'command:bitty-terminal.search:search{INVOKE_ARGS_SEPARATOR}{{\"panel\":\"p:1\",\"needle\":\"x\"}}')"
+        ),
+    )
 }
 
 /// Require a `command:<owner:command>` invocation target (CTX-1035).
@@ -3202,7 +3420,7 @@ mod tests {
             let action = ChromeAction::parse(raw).expect("parses");
             assert_eq!(
                 action,
-                ChromeAction::InvokeCommand("bitty-featured.devtools:plugins".to_string()),
+                ChromeAction::InvokeCommand("bitty-featured.devtools:plugins".to_string().into()),
                 "raw {raw:?} must parse"
             );
             assert_eq!(
@@ -3244,6 +3462,138 @@ mod tests {
                 .any(|m| matches!(m.action, ChromeAction::InvokeCommand(_))),
             "defaults must not bind command: invocations"
         );
+    }
+
+    #[test]
+    fn invoke_command_carries_a_json_args_document() {
+        // CTX-2965 (issue #2965): a binding may carry the same JSON args
+        // document `bitty cmd <qualified-id> -- '<json>'` accepts, so a
+        // command whose schema requires arguments (search:search,
+        // file-manager:rename, bar module actions) is reachable from a chord.
+        //
+        // The document is preserved byte-for-byte: the head/arg split lowers
+        // the action for the closed vocabulary, so a case-destroying slice
+        // would silently change `NEEDLE` into `needle` and break the very
+        // command this form exists for.
+        let raw = r#"command:bitty-terminal.search:search -- {"panel":"p:1","needle":"NEEDLE"}"#;
+        let action = ChromeAction::parse(raw).expect("args form parses");
+        let ChromeAction::InvokeCommand(invocation) = &action else {
+            panic!("args form must parse as an invocation");
+        };
+        assert_eq!(invocation.target(), "bitty-terminal.search:search");
+        assert_eq!(
+            invocation.args_json(),
+            Some(r#"{"panel":"p:1","needle":"NEEDLE"}"#),
+            "the args document keeps its case and spacing"
+        );
+        assert!(invocation.has_args());
+        // Canonical spelling round-trips, and re-parsing it is a fixpoint:
+        // `config show` / `bitty list keymaps` can echo a binding verbatim.
+        let canonical = action.canonical();
+        assert_eq!(canonical, raw);
+        assert_eq!(
+            ChromeAction::parse(&canonical).expect("canonical re-parses"),
+            action
+        );
+        // Both aliases accept args, and whitespace around the separator is
+        // tolerated (the `--` token itself is exact).
+        for alias in ["invoke_command", "run_command"] {
+            let raw = format!("{alias}:owner:cmd --   {}", r#"{"a":1}"#);
+            let action = ChromeAction::parse(&raw).expect("alias args form parses");
+            let ChromeAction::InvokeCommand(invocation) = &action else {
+                panic!("alias must parse as an invocation");
+            };
+            assert_eq!(invocation.args_json(), Some(r#"{"a":1}"#), "raw {raw:?}");
+            assert_eq!(action.canonical(), r#"command:owner:cmd -- {"a":1}"#);
+        }
+        // Array-rooted documents are accepted by the shared structural rules
+        // (the callee schema decides whether an array is a valid argument).
+        let array = ChromeAction::parse(r#"command:owner:cmd -- [1,2]"#).expect("array parses");
+        let ChromeAction::InvokeCommand(invocation) = &array else {
+            panic!("array form must parse as an invocation");
+        };
+        assert_eq!(invocation.args_json(), Some("[1,2]"));
+        // A bare target stays the argument-free form.
+        let bare = ChromeAction::parse("command:owner:cmd").expect("bare parses");
+        let ChromeAction::InvokeCommand(invocation) = &bare else {
+            panic!("bare form must parse as an invocation");
+        };
+        assert_eq!(invocation.args_json(), None);
+        assert!(!invocation.has_args());
+    }
+
+    #[test]
+    fn malformed_invoke_args_fail_closed_at_parse() {
+        // CTX-2965: a binding whose args document is not one bounded JSON
+        // object/array never becomes a `ChromeAction`, so no input path can
+        // dispatch a half-understood document. Same structural rules as
+        // `bitty cmd`.
+        for raw in [
+            // Separator present, document missing or malformed.
+            "command:owner:cmd --",
+            "command:owner:cmd --   ",
+            "command:owner:cmd {\"a\":1}",
+            "command:owner:cmd -x {\"a\":1}",
+            // Document fails the shared structural gate.
+            "command:owner:cmd -- {",
+            "command:owner:cmd -- {\"a\":1",
+            "command:owner:cmd -- 1",
+            "command:owner:cmd -- \"text\"",
+            // Target half still has to be a qualified name.
+            "command: -- {\"a\":1}",
+            "command:a:b:c -- {\"a\":1}",
+        ] {
+            let error = ChromeAction::parse(raw).expect_err("must fail closed");
+            assert!(
+                error.to_string().contains("keymaps[].action"),
+                "raw {raw:?} must name the action field: {error}"
+            );
+        }
+        // The args bound is the binding bound, not the CLI's bulk bound.
+        let over = format!(
+            "command:owner:cmd -- {{\"a\":\"{}\"}}",
+            "x".repeat(MAX_INVOKE_ARGS_BYTES)
+        );
+        let error = ChromeAction::parse(&over).expect_err("over-long args must fail");
+        assert!(
+            error.to_string().contains("too large") || error.to_string().contains("must be <="),
+            "got {error}"
+        );
+        // A hand-built invocation cannot smuggle an unvalidated document past
+        // the parser either.
+        assert!(CommandInvocation::with_args("owner:cmd", "{bad").is_err());
+        assert!(CommandInvocation::with_args("owner:cmd", "{}").is_ok());
+    }
+
+    #[test]
+    fn invoke_args_bound_is_per_form_not_global() {
+        // CTX-2965: the argument-carrying form gets its own byte bound so a
+        // real `file-manager:rename` payload (path + src + dst) fits, while
+        // every closed-catalog action keeps the documented 320-byte rule.
+        let payload = format!(
+            r#"{{"path":"/home/u/project/{}","src":"a.txt","dst":"b.txt"}}"#,
+            "deep-segment/".repeat(20)
+        );
+        let raw = format!("command:bitty-terminal.file-manager:rename -- {payload}");
+        assert!(
+            raw.len() > MAX_ACTION_LEN,
+            "fixture must exceed the closed-catalog bound ({} bytes)",
+            raw.len()
+        );
+        assert!(raw.len() <= MAX_COMMAND_ACTION_LEN);
+        let action = ChromeAction::parse(&raw).expect("a long but valid binding parses");
+        assert_eq!(action.canonical(), raw);
+        // A closed-catalog action past 320 bytes still fails with that bound.
+        let long_focus = format!("focus:{}", "9".repeat(MAX_ACTION_LEN));
+        let error = ChromeAction::parse(&long_focus).expect_err("must fail");
+        assert!(
+            error.to_string().contains("must be <= 320 bytes"),
+            "got {error}"
+        );
+        // The command form itself is bounded, so an absurd binding fails
+        // closed instead of growing the config parse.
+        let over = format!("command:owner:cmd -- {{\"a\":\"{}\"}}", "x".repeat(8192));
+        assert!(ChromeAction::parse(&over).is_err());
     }
 
     #[test]

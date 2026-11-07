@@ -334,12 +334,14 @@ impl KeymapSource for UnavailableKeymaps {
 /// parsed [`ChromeAction`]), never from raw configuration text. A Core action
 /// contributes its static description as `title`; an
 /// [`ChromeAction::InvokeCommand`] contributes only the validated qualified
-/// target as `command`. Any row that fails [`KeymapRow::new`] validation is
-/// dropped by [`keymap_rows`] instead of echoed.
+/// target as `command` (the canonical `action` spelling keeps any args
+/// document, so `bitty list keymaps` shows the binding verbatim). Any row that
+/// fails [`KeymapRow::new`] validation is dropped by [`keymap_rows`] instead of
+/// echoed.
 #[must_use]
 pub fn keymap_row(binding: &ResolvedKeymap) -> Option<KeymapRow> {
     let (title, command) = match &binding.action {
-        ChromeAction::InvokeCommand(target) => (None, Some(target.clone())),
+        ChromeAction::InvokeCommand(invocation) => (None, Some(invocation.target().to_string())),
         action => (Some(action.description().to_string()), None),
     };
     KeymapRow::new(

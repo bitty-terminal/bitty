@@ -1379,8 +1379,8 @@ impl TerminalApp {
         use bitty_config::ChromeAction as A;
         let scratchpad = matches!(
             &action,
-            A::InvokeCommand(qualified)
-                if qualified.as_str() == bitty_runtime::SCRATCHPAD_CMD_TOGGLE
+            A::InvokeCommand(invocation)
+                if invocation.target() == bitty_runtime::SCRATCHPAD_CMD_TOGGLE
         );
         if scratchpad {
             return self.apply_chrome_action(action);
@@ -1551,7 +1551,8 @@ impl TerminalApp {
                     }
                 }
             }
-            A::InvokeCommand(qualified) => {
+            A::InvokeCommand(invocation) => {
+                let qualified = invocation.target();
                 // CTX-1241 (issue #2091): the core-owned scratchpad toggle
                 // stays reachable with no plugin runtime alive. Every other
                 // qualified name keeps the host-mediated invocation path
@@ -1562,11 +1563,15 @@ impl TerminalApp {
                     return false;
                 }
                 // CTX-1035 (#1829): the generic host-mediated invocation
-                // path. The chord carries no arguments, so the invocation
-                // validates as the empty object `{}`; undeclared and
-                // foreign-qualified names, args-schema refusals, and callee
-                // failures all land here as loud diagnostics with terminal
-                // state untouched (never a host crash, never PTY bytes).
+                // path. Issue #2965: a binding may carry a JSON args document
+                // (`command:<owner:command> -- '<json>'`); it is materialized
+                // here, at the dispatch owner, and validated against the
+                // callee schema by the same deny-by-default dispatcher. A
+                // binding without one validates as the empty object `{}`.
+                // Undeclared and foreign-qualified names, args-schema
+                // refusals, and callee failures all land here as loud
+                // diagnostics with terminal state untouched (never a host
+                // crash, never PTY bytes).
                 // CTX-1125 (devtools#10 item 1): a successful dispatch
                 // surfaces its result on the bounded banner like every
                 // other command dispatch (band clicks, composer verbs), so
@@ -1574,7 +1579,16 @@ impl TerminalApp {
                 // a real host. The qualified name parsed before dispatch,
                 // so the split below always succeeds; a missed split keeps
                 // the diagnostic and skips only the banner.
-                match self.invoke_plugin_command(&qualified, &Self::empty_command_args()) {
+                let args = match Self::command_args(invocation.args_json()) {
+                    Ok(args) => args,
+                    Err(diagnostic) => {
+                        eprintln!(
+                            "warning: keymap command:{qualified} refused ({diagnostic}) — ignoring"
+                        );
+                        return false;
+                    }
+                };
+                match self.invoke_plugin_command(qualified, &args) {
                     Ok(result) => {
                         if let Some((owner, command)) = qualified.split_once(':') {
                             self.surface_dispatch_result(owner, command, &result);
@@ -5985,7 +5999,8 @@ mod tests {
         let mut app = workspace_test_app();
         app.runtime.set_layout(two_pane_layout());
         assert!(app.runtime.set_focus(ViewId::new(1)));
-        let toggle = ChromeAction::InvokeCommand(bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string());
+        let toggle =
+            ChromeAction::InvokeCommand(bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string().into());
         assert!(
             !app.apply_chrome_action(toggle.clone()),
             "hide is not a close"
@@ -6028,7 +6043,7 @@ mod tests {
         // or fullscreen leaf would silently return as tiled).
         use bitty_config::ChromeAction;
         let toggle =
-            || ChromeAction::InvokeCommand(bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string());
+            || ChromeAction::InvokeCommand(bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string().into());
         let mut app = workspace_test_app();
         app.runtime
             .set_layout(LayoutNode::leaf(View::new(ViewId::new(1), 80, 24)));
@@ -6082,7 +6097,7 @@ mod tests {
         );
         let before = format!("{:?}", app.runtime.layout());
         app.apply_chrome_action(ChromeAction::InvokeCommand(
-            bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string(),
+            bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string().into(),
         ));
         assert!(
             !app.runtime.scratchpad_occupied(),
@@ -6122,7 +6137,7 @@ mod tests {
             "backed-up tree holds both leaves"
         );
         app.apply_chrome_action(ChromeAction::InvokeCommand(
-            bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string(),
+            bitty_runtime::SCRATCHPAD_CMD_TOGGLE.to_string().into(),
         ));
         assert!(
             !app.chrome.zoom.is_zoomed(&app.runtime),
@@ -8662,7 +8677,7 @@ claims = []
         assert_eq!(result, LuaValue::String("2 plugins active".to_string()));
         // Keybinding action: runs the same path, never a window close.
         assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(
-            "bitty-featured.devtools:plugins".to_string()
+            "bitty-featured.devtools:plugins".to_string().into()
         )));
         // Undeclared and foreign-qualified names are refused, terminal
         // state untouched.
@@ -8676,7 +8691,9 @@ claims = []
                 .invoke_plugin_command(target, &TerminalApp::empty_command_args())
                 .expect_err("unknown must fail");
             assert!(!error.is_empty(), "target {target} needs a diagnostic");
-            assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(target.to_string())));
+            assert!(
+                !app.apply_chrome_action(ChromeAction::InvokeCommand(target.to_string().into()))
+            );
         }
         // Detached runtime fails closed on both the entry and the action.
         app = app.with_plugin_runtime(None);
@@ -8688,7 +8705,7 @@ claims = []
             .expect_err("detached runtime must fail");
         assert!(error.contains("gone"), "got {error}");
         assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(
-            "bitty-featured.devtools:plugins".to_string()
+            "bitty-featured.devtools:plugins".to_string().into()
         )));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -8750,7 +8767,7 @@ claims = []
         assert_eq!(app.runtime.notifications_os_undelivered(), 0);
         assert_eq!(app.runtime.notification_banner(), None);
         assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(
-            "bitty-featured.devtools:plugins".to_string()
+            "bitty-featured.devtools:plugins".to_string().into()
         )));
         assert_eq!(
             app.runtime.notification_banner().as_deref(),
@@ -8782,12 +8799,163 @@ claims = []
         );
         // A refused chord admits nothing: the live banner is untouched.
         assert!(!app.apply_chrome_action(ChromeAction::InvokeCommand(
-            "bitty-featured.devtools:missing".to_string()
+            "bitty-featured.devtools:missing".to_string().into()
         )));
         assert_eq!(
             app.runtime.notification_banner().as_deref(),
             Some("bitty-featured.devtools:plugins: 2 plugins active"),
             "a refused dispatch must not disturb the banner"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #2965: argument-carrying plugin commands from a bound chord.
+    // -----------------------------------------------------------------------
+
+    /// Write one plugin package whose `init.lua` registers `commands` with an
+    /// explicit required-string args schema (issue #2965).
+    fn write_args_echo_plugin(root: &std::path::Path, id: &str, command: &str) {
+        let plugin = root.join(id);
+        std::fs::create_dir_all(plugin.join("lua")).expect("dirs");
+        std::fs::write(
+            plugin.join("bitty-plugin.toml"),
+            format!(
+                "[plugin]\nid = \"{id}\"\nname = \"Args Echo Test\"\nversion = \"0.1.0\"\n\
+                 description = \"argument-carrying invocation test\"\n\n\
+                 [compat]\nbitty = \">=0.0.1\"\nplugin-api = \"^1.0\"\n\n\
+                 [capabilities]\n\n\
+                 [lazy]\ncommands = [\"{id}:{command}\"]\nevents = []\n",
+            ),
+        )
+        .expect("manifest");
+        // `needle` is REQUIRED (minLength 1, additionalProperties=false), so
+        // the empty-object invocation the pre-#2965 chord dispatched is
+        // refused by the schema gate: the command is unreachable without args.
+        std::fs::write(
+            plugin.join("lua/init.lua"),
+            format!(
+                "bitty.commands.register({{\n\
+                 \x20 id = \"{command}\",\n\
+                 \x20 title = \"Args: echo\",\n\
+                 \x20 args_schema = {{ type = \"object\", properties = {{ needle = {{ type = \"string\", minLength = 1, maxLength = 64 }} }}, required = {{ \"needle\" }}, additionalProperties = false }},\n\
+                 \x20 result_schema = {{ type = \"string\" }},\n\
+                 \x20 run = function(args) return \"seen:\" .. args.needle end,\n\
+                 }})\n\
+                 return {{}}\n",
+            ),
+        )
+        .expect("init");
+    }
+
+    #[test]
+    fn invoke_command_binding_carries_args_to_a_command_that_requires_them() {
+        // Issue #2965: a plugin command whose args schema requires a property
+        // was unreachable from every UI path — the chord dispatched `{}` and
+        // the schema gate refused it. The binding form
+        // `command:<owner:command> -- '<json>'` now carries the same JSON
+        // document `bitty cmd <qualified-id> -- '<json>'` accepts, through the
+        // real parse -> action -> dispatch chain.
+        use crate::composer_owner::fixture;
+        use bitty_config::ChromeAction;
+        const OWNER: &str = "bitty-featured.search";
+        let root = fixture::temp_dir("invoke-command-args");
+        write_args_echo_plugin(&root, OWNER, "search");
+        let mut plugin_runtime = fixture::runtime_for(vec![root.clone()]);
+        plugin_runtime.discover();
+        let id = bitty_plugin_host::manifest::PluginId::new(OWNER).expect("id");
+        plugin_runtime.activate(&id).expect("activate");
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        // Pre-condition (the issue's repro): an argument-free invocation of a
+        // command that requires `needle` is refused by the args schema, so the
+        // test below cannot pass on the old empty-object behavior.
+        let bare = app
+            .invoke_plugin_command(
+                "bitty-featured.search:search",
+                &TerminalApp::empty_command_args(),
+            )
+            .expect_err("the schema requires `needle`, so `{}` must be refused");
+        assert!(
+            bare.contains("E_DEF_INVALID") || bare.contains("schema"),
+            "got {bare}"
+        );
+        assert_eq!(
+            app.runtime.notification_banner(),
+            None,
+            "a refused dispatch admits nothing"
+        );
+        // The binding carries the argument. Build the action through the real
+        // config grammar (not by hand) so the assertion covers parse too.
+        let action =
+            ChromeAction::parse(r#"command:bitty-featured.search:search -- {"needle":"NEEDLE"}"#)
+                .expect("args binding parses");
+        assert!(!app.apply_chrome_action(action));
+        assert_eq!(
+            app.runtime.notification_banner().as_deref(),
+            Some("bitty-featured.search:search: seen:NEEDLE"),
+            "the callee must observe the binding's argument (case preserved)"
+        );
+        // The same binding with a document the schema rejects (wrong type)
+        // still fails closed at the callee schema, with nothing surfaced.
+        let wrong_type =
+            ChromeAction::parse(r#"command:bitty-featured.search:search -- {"needle":7}"#)
+                .expect("structurally valid, semantically wrong");
+        assert!(!app.apply_chrome_action(wrong_type));
+        assert_eq!(
+            app.runtime.notification_banner().as_deref(),
+            Some("bitty-featured.search:search: seen:NEEDLE"),
+            "a schema refusal must not disturb the banner"
+        );
+        // An unknown command with an args document is still refused (the args
+        // path never widens the deny-by-default name check).
+        let unknown =
+            ChromeAction::parse(r#"command:bitty-featured.search:missing -- {"needle":"x"}"#)
+                .expect("parses");
+        assert!(!app.apply_chrome_action(unknown));
+        assert_eq!(
+            app.runtime.notification_banner().as_deref(),
+            Some("bitty-featured.search:search: seen:NEEDLE"),
+            "an unknown name must not surface a result"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn invoke_command_binding_with_unparsable_args_fails_closed() {
+        // Issue #2965 defense in depth: configuration rejects a malformed args
+        // document at parse (covered by the bitty-config tests), so the only
+        // way to reach dispatch with one is a hand-built `ChromeAction`. That
+        // path must refuse to dispatch — no plugin code, no banner, no panic.
+        use crate::composer_owner::fixture;
+        use bitty_config::{ChromeAction, CommandInvocation};
+        const OWNER: &str = "bitty-featured.search";
+        let root = fixture::temp_dir("invoke-command-bad-args");
+        write_args_echo_plugin(&root, OWNER, "search");
+        let mut plugin_runtime = fixture::runtime_for(vec![root.clone()]);
+        plugin_runtime.discover();
+        let id = bitty_plugin_host::manifest::PluginId::new(OWNER).expect("id");
+        plugin_runtime.activate(&id).expect("activate");
+        let maps = bitty_config::resolve_keymaps(&bitty_config::EffectiveConfig::default())
+            .expect("defaults");
+        let mut app = help_test_app(maps).with_plugin_runtime(Some(plugin_runtime));
+        // `CommandInvocation::with_args` refuses an unbalanced document...
+        assert!(CommandInvocation::with_args(OWNER.to_string() + ":search", "{bad").is_err());
+        // ...and an invocation built before that gate existed (or by a future
+        // caller that skips it) still cannot dispatch: the dispatch owner
+        // refuses the unparsable document.
+        let error = TerminalApp::command_args(Some("{bad")).expect_err("must refuse");
+        assert!(error.contains("invalid command args JSON"), "got {error}");
+        assert_eq!(app.runtime.notification_banner(), None);
+        // The application layer is intact: a valid binding still serves after
+        // the refusal.
+        let ok = ChromeAction::parse(r#"command:bitty-featured.search:search -- {"needle":"ok"}"#)
+            .expect("parses");
+        assert!(!app.apply_chrome_action(ok));
+        assert_eq!(
+            app.runtime.notification_banner().as_deref(),
+            Some("bitty-featured.search:search: seen:ok")
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -8904,7 +9072,7 @@ claims = []
         assert_eq!(
             action,
             Some(ChromeAction::InvokeCommand(
-                SUGGESTION_QUALIFIED.to_string()
+                SUGGESTION_QUALIFIED.to_string().into()
             ))
         );
         // The live input path dispatches it and surfaces the command result
@@ -8972,7 +9140,7 @@ claims = []
         assert_eq!(
             app.match_plugin_binding(chord),
             Some(ChromeAction::InvokeCommand(
-                SUGGESTION_QUALIFIED.to_string()
+                SUGGESTION_QUALIFIED.to_string().into()
             ))
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -9061,7 +9229,7 @@ claims = []
         assert_eq!(
             app.match_plugin_binding(super_question),
             Some(ChromeAction::InvokeCommand(
-                SUGGESTION_QUALIFIED.to_string()
+                SUGGESTION_QUALIFIED.to_string().into()
             )),
             "the Mod slot moves the alt gesture to super"
         );
@@ -9077,7 +9245,7 @@ claims = []
         assert_eq!(
             app.match_plugin_binding(fixed),
             Some(ChromeAction::InvokeCommand(
-                SUGGESTION_QUALIFIED.to_string()
+                SUGGESTION_QUALIFIED.to_string().into()
             ))
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -9117,7 +9285,7 @@ claims = []
         assert_eq!(
             app.match_plugin_binding(key('k')),
             Some(ChromeAction::InvokeCommand(
-                SUGGESTION_QUALIFIED.to_string()
+                SUGGESTION_QUALIFIED.to_string().into()
             ))
         );
         for (c, tag) in [
@@ -9207,7 +9375,7 @@ claims = []
             (
                 DispatchPriority::Plugin,
                 Some(ChromeAction::InvokeCommand(
-                    SUGGESTION_QUALIFIED.to_string()
+                    SUGGESTION_QUALIFIED.to_string().into()
                 ))
             )
         );
@@ -9243,7 +9411,7 @@ claims = []
             super_held: false,
         };
         let suggestion = Some(ChromeAction::InvokeCommand(
-            SUGGESTION_QUALIFIED.to_string(),
+            SUGGESTION_QUALIFIED.to_string().into(),
         ));
         assert_eq!(app.match_plugin_binding(chord), suggestion);
         // Suspend (disable): the suggestion is parked, not lost.
@@ -9370,7 +9538,9 @@ claims = []
         assert_eq!(
             app.match_plugin_binding(chord),
             Some(ChromeAction::InvokeCommand(
-                "bitty-featured.alpha-fixture:toggle-help".to_string()
+                "bitty-featured.alpha-fixture:toggle-help"
+                    .to_string()
+                    .into()
             ))
         );
         {
@@ -9404,7 +9574,9 @@ claims = []
         assert_eq!(
             app.match_plugin_binding(chord),
             Some(ChromeAction::InvokeCommand(
-                "bitty-featured.alpha-fixture:toggle-help".to_string()
+                "bitty-featured.alpha-fixture:toggle-help"
+                    .to_string()
+                    .into()
             ))
         );
         let _ = std::fs::remove_dir_all(&root);

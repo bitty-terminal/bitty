@@ -1009,9 +1009,9 @@ return {}
         for index in 0..=crate::terminal_app::INPUT_COMMAND_QUEUE_CAPACITY {
             fixture
                 .app
-                .enqueue_input_command(bitty_config::ChromeAction::InvokeCommand(format!(
-                    "{PLUGIN}:missing{index}"
-                )));
+                .enqueue_input_command(bitty_config::ChromeAction::InvokeCommand(
+                    format!("{PLUGIN}:missing{index}").into(),
+                ));
         }
         assert_eq!(
             fixture.app.pump_cold_commands(),
@@ -1029,7 +1029,7 @@ return {}
         );
         fixture
             .app
-            .enqueue_input_command(bitty_config::ChromeAction::InvokeCommand(oversize));
+            .enqueue_input_command(bitty_config::ChromeAction::InvokeCommand(oversize.into()));
         assert_eq!(
             fixture.app.pump_cold_commands(),
             0,
@@ -14942,7 +14942,7 @@ fn live_reload_adopts_keymaps_leader_hints_and_opacity_on_the_app() {
         super_held: true,
     };
     let suggestion = Some(ChromeAction::InvokeCommand(
-        "bitty-featured.help-fixture:toggle-help".to_string(),
+        "bitty-featured.help-fixture:toggle-help".to_string().into(),
     ));
     assert_eq!(app.chrome.mod_key, ModKey::Alt);
     assert_eq!(app.match_plugin_binding(alt_question), suggestion);

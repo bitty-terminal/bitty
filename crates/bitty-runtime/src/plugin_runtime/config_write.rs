@@ -501,8 +501,14 @@ pub struct ConfigPreviewToken {
 pub struct ConfigSetOutcome {
     /// Whether the durable user layer changed (`false` for a no-op).
     pub applied: bool,
-    /// Reload marker: `auto` means the app's config watcher re-reads the
-    /// user layer on the next tick; `none` means nothing changed.
+    /// What the running process will do with the written value.
+    ///
+    /// - `auto`: the value is adopted live; the app's config watcher re-reads
+    ///   the user layer on the next tick and the running plan follows it.
+    /// - `restart`: the value is persisted but the running plan cannot adopt
+    ///   it live, so it takes effect on the next start. The plugin must not
+    ///   present it as live (bitty#2972).
+    /// - `none`: nothing changed.
     pub reload: &'static str,
 }
 

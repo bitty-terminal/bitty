@@ -41,18 +41,23 @@ modules:
       - install -Dm755 -t /app/bin bin/bitty
       - cp -a share/. /app/share/
       - tic -x -o /app/share/terminfo terminfo/bitty.ti
+    # The url and sha256 of each source move together: refresh both from the
+    # `*.sha256` sidecar published alongside that release's bundle asset. Never
+    # point these at a tag or asset that has not been published yet — the pins
+    # would then disagree with what is downloadable and the manifest cannot
+    # build. The refresh happens at release time, after the assets are up.
     sources:
       - type: archive
         archive-type: tar-zst
         strip-components: 1
-        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.35/bitty-0.0.35-x86_64-unknown-linux-gnu.tar.zst
-        sha256: 42e324669063a15b33e270eb8f3880bfba0a320854e8c82a2ab9eae24f75ccc3
+        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.34/bitty-0.0.34-x86_64-unknown-linux-gnu.tar.zst
+        sha256: 364b83d12f619bd468bc6c4a0c23b08175751da3536e0f1d92cba330445f1d26
         only-arches:
           - x86_64
       - type: archive
         archive-type: tar-zst
         strip-components: 1
-        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.35/bitty-0.0.35-aarch64-unknown-linux-gnu.tar.zst
-        sha256: c5f392873993b103c76c931046581c6c81865b954b58b49c13d9d839392425d2
+        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.34/bitty-0.0.34-aarch64-unknown-linux-gnu.tar.zst
+        sha256: f2306aed306c7d8cc1a2fab21b5f5bfc0cb3e0a6bdf5ad17302478c3711c5e55
         only-arches:
           - aarch64

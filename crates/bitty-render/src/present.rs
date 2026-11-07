@@ -47,6 +47,27 @@
 //! when the driver call actually runs). The ring drops its oldest entry when
 //! full (counted as `presenter_acks_dropped`); the newest outcome always
 //! survives, which is the one that decides the next action.
+//!
+//! ## Ack ownership and the configure-failure case
+//!
+//! The **presenter worker** owns every acknowledgement: it is the only
+//! component that runs `configure`/acquire/present, so the event-loop thread
+//! never synthesises one. One ack describes **one submitted frame** and
+//! carries that frame's [`PresentAck::token`]; consumers therefore attribute
+//! acks by token, never by arrival position (several acks can be waiting in
+//! the ring, and a superseded frame's ack can arrive after a newer one).
+//!
+//! A configure request is not a frame. A configure that fails while a frame
+//! was taken with it acknowledges **that frame's token** as `error`, because
+//! a frame built for the old extent must never be presented. A configure that
+//! fails with **no waiting frame** — the common case, since `configure` and
+//! `resize` are sent on their own, ahead of the next frame — publishes **no
+//! ack at all**: there is no frame to attribute it to, and a synthetic
+//! tokenless ack would break the one-ack-per-submitted-frame mapping every
+//! consumer relies on (it could be observed ahead of the ack for a frame
+//! submitted moments later, bitty#2980). The worker exits instead, and that
+//! exit is the signal: the embedder observes `is_active() == false`, retains
+//! the damage, and rebuilds a surface that can actually be configured.
 
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -104,11 +125,6 @@ pub const PRESENT_RECOVERY_LIMIT: u32 = 3;
 /// worker, so it must not consume the abandoned-thread budget. A presented
 /// frame from the current worker resets both.
 pub const PRESENT_CREATION_FAILURE_LIMIT: u32 = 5;
-
-/// Acknowledgement token used for events that are not a frame outcome (a
-/// configure failure). Frame tokens start at zero, so `u64::MAX` is reserved
-/// instead of colliding with the first submission.
-pub const PRESENT_NON_FRAME_TOKEN: u64 = u64::MAX;
 
 /// Maximum damage rectangles carried when a queued frame is replaced.
 ///
@@ -369,9 +385,11 @@ impl PresentOutcome {
 /// One bounded acknowledgement for one attempted present.
 #[derive(Debug)]
 pub struct PresentAck {
-    /// Token of the submitted frame this outcome belongs to, or
-    /// [`PRESENT_NON_FRAME_TOKEN`] for an event that is not a frame outcome
-    /// (a configure failure).
+    /// Token of the submitted frame this outcome belongs to.
+    ///
+    /// Ack ownership: the presenter worker publishes an ack only for a frame
+    /// it actually took from the mailbox, so every ack names a submission.
+    /// Consumers match on this token; arrival order carries no meaning.
     pub token: u64,
     /// Classified outcome.
     pub outcome: PresentOutcome,
@@ -707,18 +725,29 @@ fn worker_loop(shared: &Arc<WorkerShared>, backend: &mut Option<Box<dyn PresentB
                     }
                 }
                 Err(err) => {
-                    // Never present a frame built for the old extent. Ack the
-                    // taken frame as failed (the runtime retains its damage
-                    // and arms the #2570 retry) and exit so recovery builds a
-                    // surface that can actually be configured.
-                    let detail = format!("configure failed: {err}");
-                    let token = frame
-                        .as_ref()
-                        .map_or(PRESENT_NON_FRAME_TOKEN, |frame| frame.token);
-                    shared.push_ack(PresentAck {
-                        token,
-                        outcome: PresentOutcome::Error(detail),
-                    });
+                    // Never present a frame built for the old extent.
+                    //
+                    // Ack ownership (bitty#2980): the worker is the only
+                    // component that may publish an ack, and an ack always
+                    // names the frame it belongs to. When a frame was taken
+                    // with this failing configure, ack *that frame's* token as
+                    // failed so the runtime retains its damage and arms the
+                    // #2570 retry. When no frame was taken — `configure` and
+                    // `resize` are sent on their own tick — there is nothing
+                    // to attribute an ack to, so publish none. A synthetic
+                    // tokenless ack here would be observable ahead of the ack
+                    // for a frame submitted moments later, and callers that
+                    // read "the next ack" would mis-attribute it.
+                    //
+                    // The exit below is the signal for that case: the
+                    // embedder sees `is_active() == false`, keeps the damage,
+                    // and recovery builds a surface that can be configured.
+                    if let Some(frame) = frame.as_ref() {
+                        shared.push_ack(PresentAck {
+                            token: frame.token,
+                            outcome: PresentOutcome::Error(format!("configure failed: {err}")),
+                        });
+                    }
                     return;
                 }
             }
@@ -1104,6 +1133,11 @@ impl Presenter {
     ///
     /// A presented frame proves the surface works again, so it resets the
     /// bounded recovery budget.
+    ///
+    /// Attribute the results by [`PresentAck::token`]: the ring holds one ack
+    /// per frame the worker took, and their arrival order is not a
+    /// submission order a caller may rely on (a coalesced-away or superseded
+    /// frame can be acknowledged after a newer one).
     pub fn drain_acks(&mut self, max: usize) -> Vec<PresentAck> {
         let mut queue = self.shared.lock_acks();
         let take = max.min(queue.len());

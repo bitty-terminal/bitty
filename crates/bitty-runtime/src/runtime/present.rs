@@ -7384,6 +7384,11 @@ impl Runtime {
 
     /// Applies one worker acknowledgement to the runtime's present state.
     ///
+    /// Acks are attributed **by token, never by arrival position**: every ack
+    /// names the submitted frame it describes (the render worker publishes no
+    /// tokenless ack, including on a configure failure that carried no frame —
+    /// that case is reported by the worker exiting instead, bitty#2980).
+    ///
     /// Only the newest submitted token may commit: older acks describe a frame
     /// the UI already superseded, so publishing their geometry would roll the
     /// committed layout backwards. The newest token either commits the frame
@@ -7395,13 +7400,6 @@ impl Runtime {
         ack: bitty_render::present::PresentAck,
         committed: &mut Option<PresentStats>,
     ) {
-        if ack.token() == bitty_render::present::PRESENT_NON_FRAME_TOKEN {
-            // A configure failure is not a frame outcome: surface state is
-            // unknown, so retain everything and let the next present (or the
-            // #2570 retry) surface the real failure.
-            self.pending_full_redraw = true;
-            return;
-        }
         let newest = self
             .pending_present
             .as_ref()
@@ -13257,7 +13255,6 @@ mod async_present_tests {
         let current_token = pending.token;
         let current_generation = pending.primary_generation;
         let stale_token = current_token.wrapping_sub(1);
-        assert_ne!(stale_token, bitty_render::present::PRESENT_NON_FRAME_TOKEN);
 
         // A presented ack for the older frame and a failure ack for the older
         // frame must both be ignored: only the newest token may commit or arm

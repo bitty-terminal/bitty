@@ -329,6 +329,34 @@ fn drain_until(presenter: &mut Presenter, count: usize, timeout: Duration) -> Ve
     acks
 }
 
+/// Waits until an ack carrying `token` arrives, discarding any other ack.
+///
+/// Acks are attributed **by token, never by arrival position**: the worker
+/// publishes exactly one ack per frame it took, and a superseded frame's ack
+/// can arrive first. bitty#2980 was a test that read "the next ack" as "my
+/// frame's ack" and reported the (then tokenless) configure-failure ack as a
+/// frame-token mismatch.
+///
+/// Only for tests that expect exactly one ack: every drained ack that does not
+/// carry `token` is dropped. A test with several acks in flight must drain
+/// them together and then match each by token (see
+/// `a_configure_failure_never_presents_the_old_extent_frame`).
+fn drain_token(presenter: &mut Presenter, token: u64, timeout: Duration) -> Option<PresentAck> {
+    let mut found = None;
+    wait_until(
+        || {
+            for ack in presenter.drain_acks(16) {
+                if ack.token() == token {
+                    found = Some(ack);
+                }
+            }
+            found.is_some()
+        },
+        timeout,
+    );
+    found
+}
+
 #[test]
 fn submit_never_waits_for_a_blocked_present() {
     let control = FakeControl::new(true);
@@ -770,30 +798,110 @@ fn creation_failures_do_not_charge_the_abandoned_worker_budget() {
 #[test]
 fn a_configure_failure_never_presents_the_old_extent_frame() {
     let control = FakeControl::new(false);
-    let mut presenter = spawn(&control, false, PresenterConfig::default());
+    // Frame 0 blocks inside the acquire, so the failing configure and the
+    // frame it must fail are taken from the mailbox together. Without the
+    // gate the worker can legitimately take the configure alone (that case is
+    // covered by `a_configure_failure_without_a_frame_publishes_no_ack`).
+    let mut presenter = spawn(&control, true, PresenterConfig::default());
+    let first = presenter
+        .submit(frame(1, Vec::new()))
+        .expect("frame 0 is queued");
+    assert!(
+        control.gate.wait_entered(1, TEST_WAIT),
+        "frame 0 reaches the blocked acquire"
+    );
+
     control.fail_configure_once();
     presenter.configure(PhysicalSize::new(1024, 768), 1.0);
-    assert!(presenter.submit(frame(1, Vec::new())).is_some());
-    let acks = drain_until(&mut presenter, 1, TEST_WAIT);
-    assert_eq!(acks.len(), 1);
-    assert_eq!(acks[0].token(), 0, "the frame's own token is acknowledged");
+    let second = presenter
+        .submit(frame(2, Vec::new()))
+        .expect("frame 1 is queued behind the blocked acquire");
+    control.gate.release();
+
+    // Both acks are attributed BY TOKEN: the first ack in the ring is not
+    // necessarily the frame the caller is waiting for.
+    let acks = drain_until(&mut presenter, 2, TEST_WAIT);
+    assert_eq!(acks.len(), 2, "one ack per taken frame, no extra ack");
+    let first_ack = acks
+        .iter()
+        .find(|ack| ack.token() == first)
+        .expect("frame 0 is acknowledged");
+    assert!(first_ack.is_presented(), "frame 0 is presented");
+
+    let second_ack = acks
+        .iter()
+        .find(|ack| ack.token() == second)
+        .expect("frame 1 is acknowledged with its own token");
+    assert_eq!(
+        second_ack.token(),
+        second,
+        "the frame's own token is acknowledged"
+    );
     assert!(
         matches!(
-            acks[0].outcome,
+            second_ack.outcome,
             PresentOutcome::Error(ref detail) if detail.contains("configure failed")
         ),
         "the taken frame is failed, not presented with the old configuration"
     );
-    assert_eq!(control.presented(), 0, "nothing was presented");
+    assert_eq!(control.presented(), 1, "only frame 0 was presented");
     assert!(
         wait_until(|| !presenter.is_active(), TEST_WAIT),
         "the worker exits for recovery instead of acquiring with stale state"
     );
+    assert_eq!(
+        presenter.queued_acks(),
+        0,
+        "one ack per taken frame: no extra ack arrives after the worker exits"
+    );
 
     presenter.recover().expect("recovery builds a fresh worker");
-    assert!(presenter.submit(frame(2, Vec::new())).is_some());
-    let acks = drain_until(&mut presenter, 1, TEST_WAIT);
-    assert!(acks[0].is_presented());
+    let token = presenter
+        .submit(frame(3, Vec::new()))
+        .expect("the fresh worker accepts a frame");
+    let ack = drain_token(&mut presenter, token, TEST_WAIT).expect("the fresh frame is presented");
+    assert!(ack.is_presented());
+    assert!(presenter.shutdown_bounded(Duration::from_millis(500)));
+}
+
+/// A configure that fails while no frame is waiting is not a frame outcome.
+///
+/// `configure`/`resize` are sent on their own tick, ahead of the next frame,
+/// so this is the ordinary shape of a configure failure. The worker must not
+/// publish a synthetic (tokenless) ack for it: that ack would be observable
+/// ahead of the ack for a frame submitted moments later, and would break the
+/// one-ack-per-submitted-frame mapping. The worker's exit is the signal, and
+/// the next `submit` is refused instead of being absorbed by a dead worker.
+#[test]
+fn a_configure_failure_without_a_frame_publishes_no_ack() {
+    let control = FakeControl::new(false);
+    let mut presenter = spawn(&control, false, PresenterConfig::default());
+    control.fail_configure_once();
+    presenter.configure(PhysicalSize::new(1024, 768), 1.0);
+    assert!(
+        wait_until(|| !presenter.is_active(), TEST_WAIT),
+        "the worker applies the failing configure and exits for recovery"
+    );
+    assert_eq!(
+        presenter.queued_acks(),
+        0,
+        "a configure that carried no frame publishes no ack"
+    );
+    assert!(
+        presenter.drain_acks(16).is_empty(),
+        "nothing is left to attribute to a frame"
+    );
+    assert!(
+        presenter.submit(frame(1, Vec::new())).is_none(),
+        "a dead worker refuses the frame so the caller keeps its damage"
+    );
+
+    presenter.recover().expect("recovery builds a fresh worker");
+    let token = presenter
+        .submit(frame(1, Vec::new()))
+        .expect("the fresh worker accepts a frame");
+    let ack = drain_token(&mut presenter, token, TEST_WAIT).expect("the frame is presented");
+    assert!(ack.is_presented());
     assert!(presenter.shutdown_bounded(Duration::from_millis(500)));
 }
 

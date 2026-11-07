@@ -1983,11 +1983,13 @@ impl Surface {
                 // blits (the CTX-0253 F3 skip gate is retired). A non-zero
                 // skip count means individual blits were refused fail-closed
                 // (malformed, over the device texture limit, or over a
-                // per-frame bound); warn and report so a divergence from the
-                // CPU compositors is never silent.
+                // per-frame bound), or a color glyph's atlas slot could not be
+                // addressed (bitty#2994: that glyph alone is dropped); warn
+                // and report so a divergence from the CPU compositors is never
+                // silent.
                 if images_skipped > 0 {
                     eprintln!(
-                        "bitty: real-GPU present skipped {images_skipped} image/background blit(s) (fail-closed: malformed or over budget; headless CPU blends them)"
+                        "bitty: real-GPU present skipped {images_skipped} image/background/color-glyph blit(s) (fail-closed: malformed, unaddressable, or over budget; headless CPU blends them)"
                     );
                 }
                 frame.present();

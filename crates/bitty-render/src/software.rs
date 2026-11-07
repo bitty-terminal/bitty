@@ -506,7 +506,9 @@ impl SurfaceRgba {
 /// # Errors
 ///
 /// [`RenderError::InvalidInput`] when an atlas instance exists but no atlas
-/// was supplied, or when an inline mask violates its own dimensions.
+/// was supplied (a caller wiring bug). Glyph-level defects — an inline mask
+/// that disagrees with its dimensions, a slot outside its atlas — drop only
+/// the instance that names them.
 pub fn draw_list_onto(
     list: &crate::grid::DrawList,
     atlas: Option<(&[u8], crate::atlas::AtlasDims)>,
@@ -523,11 +525,16 @@ pub fn draw_list_onto(
 /// atlases are distinct inputs. A color instance without an atlas is refused
 /// (fail-closed) exactly like a coverage instance.
 ///
+/// A *glyph-level* defect is dropped alone (bitty#2994): a placement that
+/// falls outside its atlas — the shape a stale slot takes after the atlas was
+/// reset — or an inline mask that disagrees with its own dimensions skips that
+/// one instance and the rest of the list still paints. Only a missing atlas
+/// payload (a caller wiring bug, not a glyph defect) refuses the list.
+///
 /// # Errors
 ///
 /// [`RenderError::InvalidInput`] when an atlas instance exists but the
-/// matching atlas was not supplied, or when a mask/atlas payload violates its
-/// own dimensions.
+/// matching atlas was not supplied.
 pub fn draw_list_onto_color(
     list: &crate::grid::DrawList,
     atlas: Option<(&[u8], crate::atlas::AtlasDims)>,
@@ -587,32 +594,16 @@ pub fn draw_list_onto_color(
                         reason: "color atlas instance requires color atlas texels",
                     });
                 };
-                let stride = usize::from(dims.width);
-                let slot_w = usize::from(slot.width);
-                let slot_h = usize::from(slot.height);
-                for row in 0..slot_h {
-                    let Some(start) = (usize::from(slot.y) + row)
-                        .checked_mul(stride)
-                        .and_then(|offset| offset.checked_add(usize::from(slot.x)))
-                        .and_then(|index| index.checked_mul(4))
-                    else {
-                        return Err(RenderError::InvalidInput {
-                            reason: "color atlas slot offset overflows the address space bound",
-                        });
-                    };
-                    let Some(end) = start.checked_add(slot_w.saturating_mul(4)) else {
-                        return Err(RenderError::InvalidInput {
-                            reason: "color atlas slot range overflows the address space bound",
-                        });
-                    };
-                    let Some(row_data) = texels.get(start..end) else {
-                        return Err(RenderError::InvalidInput {
-                            reason: "color atlas slot exceeds color atlas texels",
-                        });
-                    };
+                // bitty#2994: an unaddressable placement drops only this
+                // instance. The whole slot is validated first so the paint
+                // loop is infallible and a glyph is never half-painted.
+                let Some(rows) = color_slot_rows(texels, dims, slot) else {
+                    continue;
+                };
+                for (row, row_data) in rows.enumerate() {
                     surface.blend_rgba_image(
                         row_data,
-                        u32::try_from(slot_w).unwrap_or(0),
+                        u32::from(slot.width),
                         1,
                         glyph.dest[0],
                         glyph.dest[1] + i32::try_from(row).unwrap_or(0),
@@ -625,35 +616,11 @@ pub fn draw_list_onto_color(
                         reason: "atlas instance requires atlas texels",
                     });
                 };
-                let stride = usize::from(dims.width);
-                let Some(mask_len) = usize::from(slot.width).checked_mul(usize::from(slot.height))
-                else {
-                    return Err(RenderError::InvalidInput {
-                        reason: "atlas slot dimensions overflow the address space bound",
-                    });
+                // bitty#2994: same per-glyph contract as the color branch; a
+                // coverage slot outside the atlas drops that instance only.
+                let Some(mask) = coverage_slot_mask(texels, dims, slot) else {
+                    continue;
                 };
-                let mut mask = Vec::with_capacity(mask_len);
-                for row in 0..usize::from(slot.height) {
-                    let Some(start) = (usize::from(slot.y) + row)
-                        .checked_mul(stride)
-                        .and_then(|offset| offset.checked_add(usize::from(slot.x)))
-                    else {
-                        return Err(RenderError::InvalidInput {
-                            reason: "atlas slot offset overflows the address space bound",
-                        });
-                    };
-                    let Some(end) = start.checked_add(usize::from(slot.width)) else {
-                        return Err(RenderError::InvalidInput {
-                            reason: "atlas slot range overflows the address space bound",
-                        });
-                    };
-                    let Some(row_data) = texels.get(start..end) else {
-                        return Err(RenderError::InvalidInput {
-                            reason: "atlas slot exceeds atlas texels",
-                        });
-                    };
-                    mask.extend_from_slice(row_data);
-                }
                 surface.blend_coverage_mask_clipped(
                     &mask,
                     slot.width.into(),
@@ -669,15 +636,13 @@ pub fn draw_list_onto_color(
                 width,
                 height,
             } => {
+                // bitty#2994: a mask that disagrees with its own dimensions is
+                // this instance's defect; the rest of the line still paints.
                 let Some(mask_len) = (*width as usize).checked_mul(*height as usize) else {
-                    return Err(RenderError::InvalidInput {
-                        reason: "inline mask dimensions overflow the address space bound",
-                    });
+                    continue;
                 };
                 if mask.len() != mask_len {
-                    return Err(RenderError::InvalidInput {
-                        reason: "inline mask length does not match its dimensions",
-                    });
+                    continue;
                 }
                 surface.blend_coverage_mask_clipped(
                     mask,
@@ -705,6 +670,59 @@ pub fn draw_list_onto_color(
         );
     }
     Ok(())
+}
+
+/// Rows of one color-atlas placement, or `None` when the placement cannot be
+/// addressed at all (bitty#2994).
+///
+/// Every row is validated before any pixel is blended, so a stale or
+/// overflowed slot is dropped whole — never half-painted, never a panic.
+fn color_slot_rows<'a>(
+    texels: &'a [u8],
+    dims: crate::atlas::AtlasDims,
+    slot: &'a crate::atlas::AtlasSlot,
+) -> Option<impl Iterator<Item = &'a [u8]> + 'a> {
+    let stride = usize::from(dims.width);
+    let height = usize::from(dims.height);
+    let slot_w = usize::from(slot.width);
+    let slot_h = usize::from(slot.height);
+    let expected = stride.checked_mul(height)?.checked_mul(4)?;
+    let right = usize::from(slot.x).checked_add(slot_w)?;
+    let bottom = usize::from(slot.y).checked_add(slot_h)?;
+    if slot_w == 0 || slot_h == 0 || right > stride || bottom > height {
+        return None;
+    }
+    if texels.len() < expected {
+        return None;
+    }
+    Some((0..slot_h).map(move |row| {
+        let start = ((usize::from(slot.y) + row) * stride + usize::from(slot.x)) * 4;
+        &texels[start..start + slot_w * 4]
+    }))
+}
+
+/// Flattened coverage of one atlas placement, or `None` when the placement
+/// cannot be addressed (bitty#2994).
+fn coverage_slot_mask(
+    texels: &[u8],
+    dims: crate::atlas::AtlasDims,
+    slot: &crate::atlas::AtlasSlot,
+) -> Option<Vec<u8>> {
+    let stride = usize::from(dims.width);
+    let height = usize::from(dims.height);
+    let slot_w = usize::from(slot.width);
+    let slot_h = usize::from(slot.height);
+    let right = usize::from(slot.x).checked_add(slot_w)?;
+    let bottom = usize::from(slot.y).checked_add(slot_h)?;
+    if slot_w == 0 || slot_h == 0 || right > stride || bottom > height {
+        return None;
+    }
+    let mut mask = Vec::with_capacity(slot_w.checked_mul(slot_h)?);
+    for row in 0..slot_h {
+        let start = (usize::from(slot.y) + row) * stride + usize::from(slot.x);
+        mask.extend_from_slice(texels.get(start..start + slot_w)?);
+    }
+    Some(mask)
 }
 
 const fn premultiply_byte(color: u8, alpha: u8) -> u8 {

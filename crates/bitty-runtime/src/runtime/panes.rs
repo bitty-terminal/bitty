@@ -1245,8 +1245,10 @@ impl Runtime {
 /// non-UTF-8 decoded bytes.
 ///
 /// Shared with the session-restore spawn-cwd fallback (CTX-0393), which
-/// replays a captured report through the same validation.
-pub(super) fn osc7_cwd_path(report: &str) -> Option<PathBuf> {
+/// replays a captured report through the same validation, and with the
+/// plugin semantic snapshot (issue #2962), which publishes the decoded
+/// focused-pane cwd as bounded observation data.
+pub fn osc7_cwd_path(report: &str) -> Option<PathBuf> {
     let rest = report.strip_prefix("file://")?;
     let slash = rest.find('/')?;
     let decoded = String::from_utf8(percent_decode(&rest[slash..])?).ok()?;

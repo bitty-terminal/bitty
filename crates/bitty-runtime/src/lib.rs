@@ -284,6 +284,7 @@ pub use runtime::layout_focus::{
     HYPERLINK_PREVIEW_MAX_CHARS, HoveredHyperlink, PanelSplitPlan, PresentFrame,
 };
 pub use runtime::pane_cwd::{PaneCwd, PaneCwdError};
+pub use runtime::panes::osc7_cwd_path;
 pub use runtime::plaintext_url::{HoveredPlaintextUrl, PlaintextUrlSpan};
 pub use runtime::plugin::{SystemUrlOpener, UrlOpener};
 pub use runtime::session::{

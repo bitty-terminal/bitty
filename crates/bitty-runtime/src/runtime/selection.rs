@@ -471,6 +471,22 @@ impl Runtime {
         grid_of(&self.pane_sessions, self.primary_view, &self.state, view)
     }
 
+    /// Live grid backing the focused view, if any.
+    ///
+    /// The focused view's private pane session when it owns one, otherwise the
+    /// primary grid when the focused view paints it (CTX-0359 precedence).
+    /// `None` when no view is focused or the focused session-less view owns no
+    /// grid. Read-only and O(1).
+    ///
+    /// The composition root uses it to publish the semantic snapshot's
+    /// `OSC 7`/`OSC 133` observation for the focused terminal (issue #2962).
+    /// It only reads committed state and grants nothing.
+    #[must_use]
+    pub fn focused_state(&self) -> Option<&State> {
+        self.focused_view()
+            .and_then(|view| self.session_state_for(view))
+    }
+
     /// Live grid backing `view` **and** its membership in the active layout.
     ///
     /// `None` when `view` is not a leaf of the current tree (closed, on

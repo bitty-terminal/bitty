@@ -155,6 +155,7 @@ fn the_coverage_gate_reports_the_missing_or_misplaced_vector() {
 #[test]
 fn corpus_is_well_formed_and_frozen() {
     let corpus = Corpus::load().expect("the embedded corpus parses");
+    assert_eq!(corpus.vectors.len(), 83, "corpus size changed");
     let mut ids = std::collections::BTreeSet::new();
     for vector in &corpus.vectors {
         assert!(
@@ -193,6 +194,12 @@ fn corpus_is_well_formed_and_frozen() {
             "{} sits in the contract namespace without a contract row",
             vector.id
         );
+    }
+    for id in [
+        "C-01", "C-02", "C-03", "C-04", "C-05", "C-06", "C-07", "C-08", "C-12", "C-13", "C-14",
+        "C-15", "C-16", "C-17",
+    ] {
+        assert!(corpus.vector(id).is_some(), "missing Core vector {id}");
     }
     for id in ["V-45", "V-46", "V-47", "V-48", "V-49"] {
         assert!(
@@ -484,7 +491,8 @@ fn fake_conformance_corpus() {
         [
             "V-14", "V-15", "V-17", "V-18", "V-21", "V-25", "V-26", "V-27", "V-28", "V-29", "V-30",
             "V-39", "V-40", "V-42", "V-43", "C-01", "C-02", "C-03", "C-13", "C-14", "C-15", "C-16",
-            "C-18", "C-07", "C-08", "C-12", "C-20", "C-23", "C-24", "V-49", "V-50", "V-55", "V-56"
+            "C-18", "C-07", "C-08", "C-12", "C-20", "C-23", "C-24", "V-49", "V-50", "V-55", "V-56",
+            "V-57"
         ],
         "the fake suite skips exactly the real-only, adapter-owned, cell-specific, and amendment-gated vectors"
     );
@@ -629,9 +637,9 @@ fn compare_corpus_rows(
 fn expected_parity(real_serves_spawn: bool, test_seams: bool) -> (usize, Vec<&'static str>) {
     let mut expected_not_compared = vec![
         "V-06", "V-14", "V-15", "V-17", "V-18", "V-21", "V-25", "V-26", "V-27", "V-28", "V-29",
-        "V-30", "V-33", "V-39", "V-40", "V-42", "V-43", "V-49", "V-50", "V-55", "V-56", "C-01",
-        "C-02", "C-03", "C-07", "C-08", "C-10", "C-12", "C-13", "C-14", "C-15", "C-16", "C-18",
-        "C-20", "C-23", "C-24", "F-01",
+        "V-30", "V-33", "V-39", "V-40", "V-42", "V-43", "V-49", "V-50", "V-55", "V-56", "V-57",
+        "C-01", "C-02", "C-03", "C-07", "C-08", "C-10", "C-12", "C-13", "C-14", "C-15", "C-16",
+        "C-18", "C-20", "C-23", "C-24", "F-01",
     ];
     if !test_seams {
         // Without the real seams V-20 and V-44 are fake-only rows: the real

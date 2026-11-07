@@ -13704,6 +13704,95 @@
         "a natural signal never names a client or operator requester",
         "no terminal text or child pid in the record"
       ]
+    },
+    {
+      "id": "V-57",
+      "title": "A drain stop with a live session forces the remainder and the CLI exits 4",
+      "area": "stop",
+      "decisions": ["D-05"],
+      "drivers": ["real"],
+      "fake_skip": "requires-real-cli-and-live-session (the reference fake has no CLI process)",
+      "setup": {
+        "host_grant": true
+      },
+      "injected": {
+        "clock_ms": 0,
+        "limits": {}
+      },
+      "steps": [
+        {
+          "connection": "creator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {"major": 1, "minor": 0},
+            "host_grant": "@host_grant"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "connection": "creator",
+          "method": "session.create",
+          "params": {
+            "kind": "terminal",
+            "idempotency_key": "v57-create"
+          },
+          "capture": {
+            "session_id": "session.session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "created",
+              "session.generation": 0,
+              "session.attach_count": 0,
+              "replayed": false
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "daemon.negotiate",
+          "params": {
+            "client_version": {"major": 1, "minor": 0},
+            "operator_capability": "@operator_capability"
+          },
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "action": "cli_stop",
+          "args": {
+            "mode": "drain"
+          },
+          "expect": {
+            "exit_code": 4,
+            "stdout_contains": ["stopped (drain) with 1 active session(s)"]
+          }
+        }
+      ],
+      "state": [
+        {
+          "action": "request_log",
+          "args": {},
+          "expect": {
+            "request_log": {
+              "no_fields": ["pid"],
+              "method_counts": {
+                "session.create": 1
+              }
+            }
+          }
+        }
+      ],
+      "forbidden": [
+        "a drain that meets a live session reports exit 4, never 0",
+        "the accepted result carries drain_forced instead of only a deadline",
+        "no drain ends with a session still non-terminal"
+      ],
+      "deferred": "The drain grace wait is still deferred: the served loop forces the remainder in the same pass and reports it through drain_forced (bitty#2957)"
     }
   ]
 }

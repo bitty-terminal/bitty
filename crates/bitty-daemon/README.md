@@ -1475,6 +1475,10 @@ Corpus rules:
   `V-49` is real-only: a spawned terminal delivers a `session_content` frame on
   the event wire over the real PTY; the fake records the typed
   `requires-real-pty` skip;
+- `V-57` is real-only: `bittyd stop --drain` against a live session forces the
+  remainder, the accepted result carries `drain_forced`, and the operator CLI
+  exits `4` (bitty#2957). The fake records the typed
+  `requires-real-cli-and-live-session` skip;
 - `V-03` runs on both drivers and pins `D-01` directly: the handshake advertises
   `worker_sessions: false`, a consent-bearing worker create (with or without a
   spawn specification) answers `Denied/UnsupportedCapability`, no session record
@@ -1552,7 +1556,7 @@ file.
 ```text
 bittyd start       # bind the endpoint and serve until daemon.stop or a signal
 bittyd stop        # refuse when a session is active; exit 3, daemon keeps serving
-bittyd stop --drain # request the contract drain mode
+bittyd stop --drain # drain; exit 4 when a live session had to be forced
 bittyd stop --force # terminate every session now and exit
 bittyd --version   # crate version + contract service API, exit 0
 bittyd --help      # usage, exit 0
@@ -1569,13 +1573,52 @@ out-of-band signal path.
 Exit codes: `0` success (including "already running" and a stop with no active
 sessions or no running daemon), `1` startup or transport failure, `2` usage,
 `3` active sessions on a default stop, `4` a drain deadline forced the
-remainder, `5` a worker could not be verified gone, `6` endpoint tamper or a
-failed authentication invariant. The accepted stop response carries
-`unverified`, which is `5` on `--force`; `drain` is `0` unless the response
-carries the additive `drain_forced` key. The current served loop terminates a
-drain's remainder when it accepts the stop, so it never sets that key; the
-`drain` wait is the contract's open service-loop gap and is tracked outside this
-slice.
+remainder, `5` a worker could not be verified gone, `6` endpoint tamper, a
+failed authentication invariant, or an endpoint this account may not use. That
+is the closed set the binary returns, and `bittyd --help`, this section, and
+`D-05` carry the same list.
+
+The accepted stop response carries `unverified`, which is `5` on `--force`, and
+`drain_forced`, which is `4` on `--drain`. The served loop has no drain wait
+yet: an accepted `drain` terminates every live session in the same pass instead
+of holding them for `drain_grace_ms`, so any session it terminated had its
+remainder forced and it reports `drain_forced: true`. A drain that found nothing
+live reports `false` and exits `0`. The `drain` grace itself remains the
+contract's open service-loop gap, tracked outside this slice.
+
+Exit-code evidence on the real driver (bitty#2957): every code in the closed set
+has a vector that produces it from the built binary. `tests/conformance.rs`
+`V-57` drives `bittyd stop --drain` against a live session and pins exit `4`;
+`tests/service_loop.rs` pins `1` (unusable endpoint path), `2`
+(`tests/binary.rs` usage), `3` (active-session refusal), `5` (forced stop with an
+unverified remainder, against a scripted endpoint in
+`cli_stop_maps_an_unverified_worker_to_exit_five`), `6` (daemon endpoint tamper,
+and a channel this account may not use), and `0` (no daemon, and a clean drain).
+
+Dated notes (2026-11-07, bitty#2957):
+
+- **Exit `7` is not a `bittyd` code.** The only `7 = permission denied` row in
+  the documentation belongs to the `bitty` CLI's *candidate* table in
+  `interfaces/cli.md`, whose remaining rows (`3` configuration, `4` plugin, `5`
+  compatibility, `6` IPC/runtime unavailable) contradict `D-05`'s numbering, so
+  it does not describe this binary. The accepted session-host contract closes
+  the daemon set at `0`-`6`. Implementing a separate permission code would also
+  change pinned behaviour: the P0 evidence campaign recorded an operator
+  capability file at mode `0644` as exit `6`, and `D-05` names the
+  authentication invariant as code `6`.
+- **The permission class that used to collapse into `1` is now `6`.** A bound
+  endpoint the OS refuses this account (another account's socket, or a mode
+  that denies the caller) is a refused peer authentication, not an internal
+  failure: `client::stop` maps `EACCES`/`EPERM` to that class and the CLI
+  returns `6`. `tests/service_loop.rs`
+  `cli_stop_on_a_channel_this_account_may_not_use_exits_six` pins it.
+- **Exit `5` has no real-daemon vector.** `unverified` requires a containment
+  plan that committed a child and then could not prove the identity empty; the
+  served Linux cell reaps a `/bin/cat`-class child deterministically, so the
+  condition cannot be produced without a hostile containment plan. The mapping
+  is pinned at the client boundary by the real binary against a scripted
+  endpoint, and the remainder is a real-daemon gap of the worker slice, not of
+  the CLI.
 
 ## Dependency direction
 

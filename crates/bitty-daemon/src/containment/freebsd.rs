@@ -11,11 +11,18 @@
 //! - the leader was observed exited without being reaped (`waitid(WNOWAIT)`),
 //! - every recorded descendant is absent from the reaper's pid list or marked
 //!   exiting/dead,
+//! - the reaper lists no live descendant this session cannot attribute to
+//!   another session — which is what covers a descendant created after the
+//!   pre-signal scan, including one that left the group with `setsid`,
 //! - and `PROC_REAP_STATUS` still reports this daemon as the owner.
 //!
-//! A setsid descendant created after the pre-signal scan, an unreadable pid
-//! list, or a group that still has a member stays `unverified`. No pid outside
-//! the recorded set is signalled.
+//! An unreadable pid list, a group that still has a member, or a live
+//! descendant the daemon cannot attribute to another session stays
+//! `unverified`. No pid outside the recorded set is signalled.
+//!
+//! This plan is selected by [`probe`], but the daemon does not yet reach it:
+//! the served spawn path is Linux-only (`worker::spawn_path_served`), so the
+//! plan is implemented and unit-tested here, not enforced by `bittyd`.
 
 use std::io;
 use std::os::unix::process::CommandExt as _;
@@ -31,7 +38,8 @@ use crate::registry::CleanupClass;
 
 use super::freebsd_sys;
 use super::posix::{
-    drain_adopted, drain_group, forget_child, group_has_members, remember_child, signal_group,
+    drain_adopted, drain_group, forget_child, group_has_members, live_children, remember_child,
+    signal_group,
 };
 use super::{
     CleanupOutcome, ContainmentError, ContainmentKind, ContainmentLimits, ContainmentRecord,
@@ -127,7 +135,11 @@ pub fn spawn_with(
         return Err(ContainmentError::Uncontained(CleanupClass::Unverified));
     }
     remember_child(pid);
-    Ok(ContainedChild { child, group })
+    Ok(ContainedChild {
+        child,
+        group,
+        reaped: false,
+    })
 }
 
 fn observed_group(pid: u32) -> Option<ProcessGroupId> {
@@ -141,6 +153,12 @@ fn observed_group(pid: u32) -> Option<ProcessGroupId> {
 pub struct ContainedChild {
     child: Child,
     group: ProcessGroupId,
+    /// Whether this handle already reaped the leader.
+    ///
+    /// A reap frees the leader's pid, and with it the group id minted from
+    /// that pid, so a signal sent afterwards could reach an unrelated group.
+    /// Every stop and probe below refuses to signal once this is set.
+    reaped: bool,
 }
 
 impl ContainedChild {
@@ -168,7 +186,9 @@ impl ContainedChild {
     ///
     /// Propagates a wait failure.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait()
+        let status = self.child.wait()?;
+        self.reaped = true;
+        Ok(status)
     }
 
     /// Take the child's standard output, when it was piped.
@@ -183,7 +203,7 @@ impl ContainedChild {
     ///
     /// Propagates a `try_wait` failure other than an already-reaped child.
     pub fn has_exited(&mut self) -> io::Result<bool> {
-        self.child.try_wait().map(|status| status.is_some())
+        self.try_wait().map(|status| status.is_some())
     }
 
     /// Non-blocking wait: the exit status once the direct child has exited.
@@ -192,7 +212,11 @@ impl ContainedChild {
     ///
     /// Propagates a wait failure.
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.reaped = true;
+        }
+        Ok(status)
     }
 
     /// Whether the direct child has exited, without reaping it.
@@ -253,8 +277,14 @@ impl ContainedChild {
     ///
     /// Records the session subtree from the reaper before the first signal,
     /// sends `SIGTERM`, waits the grace window, sends `SIGKILL`, and verifies
-    /// the group empty plus every recorded descendant gone. `swept` requires
-    /// all of that and a reaper status that still names this daemon.
+    /// the group empty, every recorded descendant gone, and no live
+    /// descendant this session cannot attribute to another session. `swept`
+    /// requires all of that and a reaper status that still names this daemon.
+    ///
+    /// Nothing is signalled once this handle has reaped the leader: the reap
+    /// frees the pid, and the recorded group id with it, so `killpg` could
+    /// then reach a group the daemon never minted. A stop that finds the
+    /// leader already reaped reports `unverified` and signals nothing.
     pub fn terminate(&mut self, limits: ContainmentLimits) -> CleanupOutcome {
         let leader = self.child.id();
         if !self.group_is_ours() {
@@ -266,8 +296,9 @@ impl ContainedChild {
         }
         // Record the whole session subtree before the first signal. A
         // descendant that already left the group is still under the leader
-        // here, so its pid is captured; if the list cannot be read the stop
-        // cannot prove a sweep.
+        // here, so its pid is captured; a descendant created later is not,
+        // and is covered by the post-kill `subtree_settled` check instead.
+        // If the list cannot be read the stop cannot prove a sweep.
         let descendants = recorded_descendants(leader);
         let mut signalled = 0;
         if signal_group(self.group.get(), Some(Signal::SIGTERM)) {
@@ -279,12 +310,15 @@ impl ContainedChild {
         }
         let proven = wait_bounded(limits.kill_wait(), limits, || {
             drain_adopted(leader);
-            self.leader_exited() && descendants.as_deref().is_some_and(descendants_gone)
+            self.leader_exited()
+                && descendants.as_deref().is_some_and(descendants_gone)
+                && subtree_settled(leader)
         });
         let leader_exited = self.leader_exited();
         // Reap the leader only after the kill landed and the exit was peeked;
         // until then the zombie keeps the recorded group id reserved.
         let reaped = matches!(self.child.try_wait(), Ok(Some(_)));
+        self.reaped |= reaped;
         drain_group(self.group.get());
         let group_gone = !group_has_members(self.group.get());
         let reaper_owned = freebsd_sys::status().is_ok_and(|status| status.owned_by_current());
@@ -294,6 +328,7 @@ impl ContainedChild {
             && group_gone
             && reaper_owned
             && descendants.as_deref().is_some_and(descendants_gone)
+            && subtree_settled(leader)
         {
             CleanupClass::Swept
         } else {
@@ -302,17 +337,24 @@ impl ContainedChild {
         CleanupOutcome { class, signalled }
     }
 
-    /// Whether the recorded leader still belongs to the recorded group.
+    /// Whether the recorded leader may still be signalled exactly.
     ///
-    /// A leader that already exited answers `true` while the group still has
-    /// a member: the group id cannot be reused until the last member is gone,
-    /// so signalling it stays exact.
+    /// A leader this handle has already reaped frees its pid, and the group
+    /// id minted from it, so nothing about the recorded group is provable
+    /// afterwards. An unreaped leader is either alive in the recorded group or
+    /// a zombie, and a zombie keeps its pid — and therefore the group id —
+    /// reserved, so `killpg` on the recorded group stays exact for both.
     fn group_is_ours(&self) -> bool {
+        if self.reaped {
+            return false;
+        }
         let Ok(raw) = i32::try_from(self.child.id()) else {
             return false;
         };
         match getpgid(Some(Pid::from_raw(raw))) {
             Ok(pgid) => u32::try_from(pgid.as_raw()).ok() == Some(self.group.get()),
+            // An exited but unreaped leader may already answer `ESRCH`; the
+            // zombie still reserves the recorded group id.
             Err(nix::errno::Errno::ESRCH) => true,
             Err(_) => false,
         }
@@ -366,23 +408,51 @@ fn descendants_gone(pids: &[u32]) -> bool {
     })
 }
 
+/// Whether the reaper lists no live descendant this session cannot rule out.
+///
+/// This is the check the recorded-pid snapshot cannot make: a descendant
+/// created after the snapshot can leave the recorded group with
+/// `setsid`/`setpgid`, so neither the group probe nor the recorded list names
+/// it, yet the daemon's reaper still lists it. Re-enumerating after the kill
+/// closes that window.
+///
+/// An entry is attributed to another session only when its `subtree` lane —
+/// the direct child of this daemon the entry descends from, or the entry's own
+/// pid once it was reparented to the daemon — names a live
+/// [`ContainedChild`] of another session. Everything else, including anything
+/// still under `leader`, is treated as this session's, so a live stranger
+/// keeps the stop `unverified` rather than proving a sweep it cannot back. A
+/// failed enumeration is `false`.
+fn subtree_settled(leader: u32) -> bool {
+    let Ok(entries) = freebsd_sys::descendants(MAX_REAPER_DESCENDANTS) else {
+        return false;
+    };
+    let mut others = live_children();
+    // The leader is still registered while this stop runs; its own subtree is
+    // exactly what this session has to prove gone.
+    others.remove(&leader);
+    entries.iter().all(|entry| {
+        entry.not_running() || {
+            let subtree = u32::try_from(entry.subtree).unwrap_or(0);
+            subtree != leader && others.contains(&subtree)
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::process::Stdio;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
     use std::time::Duration;
 
     use super::*;
+    use crate::containment::posix::serial_spawn;
 
     /// Serialize the process-spawning tests: the reaper role is process-wide,
     /// so a descendant spawned by a parallel test would appear in this
     /// session's enumeration and correctly make the stop unverified.
-    static SPAWN_LOCK: Mutex<()> = Mutex::new(());
-
     fn serial() -> MutexGuard<'static, ()> {
-        SPAWN_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        serial_spawn()
     }
 
     fn report() -> ContainmentReport {
@@ -478,6 +548,100 @@ mod tests {
             child.sweep_if_empty().map(CleanupOutcome::class),
             Some(CleanupClass::Unverified),
             "a natural exit has no pre-signal descendant snapshot"
+        );
+    }
+
+    /// The leader reaps first, so the recorded group id it minted is free.
+    ///
+    /// Signalling after that reap can reach a group the daemon never created.
+    /// The plan must refuse: nothing signalled, `unverified`.
+    #[test]
+    fn a_stop_after_this_handle_reaped_the_leader_signals_nothing() {
+        let _serial = serial();
+        let report = report();
+        let mut command = Command::new("/bin/sh");
+        // The leader exits and leaves a live member in the recorded group, so
+        // the group still answers `killpg` after the leader was reaped.
+        command
+            .args([
+                "-c",
+                "(trap '' TERM; while :; do sleep 0.05; done) & exit 0",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_with(
+            &report,
+            "bittyd-test-reaped-leader",
+            &mut command,
+            limits(),
+            SessionMode::ProcessGroup,
+        )
+        .expect("a contained spawn");
+        let group = child.process_group();
+        let _ = child.wait().expect("reap the leader");
+        let outcome = child.terminate(limits());
+        // End the descendant through the recorded group before asserting, so a
+        // failing assertion cannot leave it running.
+        signal_group(group.get(), Some(Signal::SIGKILL));
+        assert_eq!(
+            outcome.signalled(),
+            0,
+            "the recorded group must not be signalled once its leader was reaped"
+        );
+        assert_eq!(outcome.class(), CleanupClass::Unverified, "{report}");
+    }
+
+    /// A descendant created after the pre-signal snapshot leaves the group.
+    ///
+    /// Neither the group probe nor the recorded pid list names it, so only the
+    /// reaper's post-kill enumeration can prove the tree empty. The stop must
+    /// stay `unverified` instead of reporting a sweep over a live process.
+    #[test]
+    fn a_descendant_that_setsids_after_the_snapshot_keeps_the_stop_unverified() {
+        use nix::sys::signal::kill;
+
+        let _serial = serial();
+        let report = report();
+        let escapee =
+            std::env::temp_dir().join(format!("bittyd-freebsd-escapee-{}", std::process::id()));
+        // The helper starts inside the recorded group and, after the snapshot
+        // is taken, moves its own child into a new session with `setsid`.
+        let script = format!(
+            "trap '' TERM; (sleep 0.2; setsid sh -c 'echo $$ > {}; exec sleep 30') & while :; do sleep 0.05; done",
+            escapee.display()
+        );
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &script])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_with(
+            &report,
+            "bittyd-test-escapee",
+            &mut command,
+            // A grace window wider than the helper's delay, so the escape
+            // happens before the kill lands.
+            ContainmentLimits::new(Duration::from_secs(1), Duration::from_millis(300)),
+            SessionMode::ProcessGroup,
+        )
+        .expect("a contained spawn");
+        let outcome = child.terminate(ContainmentLimits::new(
+            Duration::from_secs(1),
+            Duration::from_millis(300),
+        ));
+        let escaped = std::fs::read_to_string(&escapee)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok());
+        let _ = std::fs::remove_file(&escapee);
+        if let Some(pid) = escaped {
+            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
+        }
+        assert_eq!(
+            outcome.class(),
+            CleanupClass::Unverified,
+            "a descendant that left the group after the snapshot cannot be proven gone"
         );
     }
 }

@@ -617,11 +617,23 @@ Containment is a whole-tree identity, not a pid and not a process-group
 convention. `containment::ContainmentReport::probe()` returns a typed plan for
 the compiled cell; there is no silent fallback and no weaker transport:
 
-| Plan                 | Selection                                                                                                      | Cleanup claim         | Signals                                                                            |
-| -------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------- | ---------------------------------------------------------------------------------- |
-| `cgroup_v2`          | delegated cgroup v2 root (`/proc/self/cgroup` + writable `cgroup.procs`/`cgroup.kill` + a create/remove probe) | `swept`               | members from `cgroup.procs`, then `cgroup.kill`                                    |
-| `subreaper_fallback` | `PR_SET_CHILD_SUBREAPER` confirmed by read-back when cgroup delegation is unavailable                          | `swept` when verified | the leader pidfd, the recorded group, and descendant pidfds recorded before a stop |
-| `none`               | no cgroup v2 and no subreaper, or a non-Linux cell                                                             | none                  | no spawn; typed refusal                                                            |
+| Plan                 | Selection                                                                                                      | Cleanup claim         | Signals                                                                            | Reachable from the served spawn path |
+| -------------------- | -------------------------------------------------------------------------------------------------------------- | --------------------- | ---------------------------------------------------------------------------------- | ------------------------------------ |
+| `cgroup_v2`          | delegated cgroup v2 root (`/proc/self/cgroup` + writable `cgroup.procs`/`cgroup.kill` + a create/remove probe) | `swept`               | members from `cgroup.procs`, then `cgroup.kill`                                    | yes                                  |
+| `subreaper_fallback` | `PR_SET_CHILD_SUBREAPER` confirmed by read-back when cgroup delegation is unavailable                          | `swept` when verified | the leader pidfd, the recorded group, and descendant pidfds recorded before a stop | yes                                  |
+| `windows_job`        | `CreateJobObject` + a suspended child assigned before it resumes; `ActiveProcesses` zero ends the tree         | `swept` when verified | `TerminateJobObject`, then a bounded `ActiveProcesses` wait                         | no — implemented-only (unwired)      |
+| `freebsd_reaper`     | `procctl(PROC_REAP_ACQUIRE)` reaper + the recorded process group                                              | `swept` when verified | the recorded group, then the reaper's subtree count                                | no — implemented-only (unwired)      |
+| `process_group`      | macOS only: the recorded process group, no reaper                                                              | `group-signalled`     | the recorded group                                                                 | no — implemented-only (unwired)      |
+| `none`               | no mechanism on the compiled cell, or the probe refused                                                        | none                  | no spawn; typed refusal                                                            | yes (it refuses)                     |
+
+The three non-Linux plans are **implemented-only (unwired)**: `probe()` selects
+them so the cell reports what its mechanism can prove, and each plan has unit
+tests, but the daemon does not yet spawn through them. The served spawn path is
+`worker::spawn_path_served`, which is `cfg!(target_os = "linux")`, and
+`service::dispatch` refuses `session.create` with `UnsupportedCapability`
+before any spawn on a cell it does not serve; `service::server` exports the
+Linux-only `unix` module and a stub elsewhere. Porting the PTY spawn path to
+those cells is the follow-up that makes them reachable.
 
 Linux x86_64 is the first cell. A per-session cgroup is created **before** the
 spawn, and the child writes its own pid into `cgroup.procs` from a `pre_exec`
@@ -687,13 +699,16 @@ record whose wait is clamped is deferred: it keeps its `reserved`/`committed`
 class (visible in the response counts), is never quarantined for the expiry,
 and is retried by the next call.
 
-Every other cell (including macOS and Windows) returns
-`Denied/UnsupportedCapability`; `daemon.status` reports
-`orphans: {verify: "unsupported_capability"}`. Windows has a designed job-object
-boundary (one job per session, `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, a
-current-user-only DACL) that needs the reviewed `bitty-winjob` Win32 seam and a
-native-runner campaign; it is not approximated here. macOS has no containment
-implementation in this slice.
+`daemon.orphans.verify` stays Linux-only: only the cgroup and subreaper plans
+record a durable identity (boot id, start time, process group read from
+`/proc`) the journal can re-check after a restart
+(`ContainmentKind::verifies_orphans`). Every other cell returns
+`Denied/UnsupportedCapability`, and `daemon.status` reports
+`orphans: {verify: "unsupported_capability"}`. Windows, FreeBSD, and macOS now
+have real containment plans (`windows_job`, `freebsd_reaper`, `process_group`)
+that the startup probe selects and that are unit-tested on their own cells, but
+none of them is on the served spawn path yet, so no orphan record of theirs is
+served either.
 
 Threat-model and evidence references: `T-21` (orphan reaping through a
 containment identity), `P0-AC-023` (child scope limitation), and `ME-05`

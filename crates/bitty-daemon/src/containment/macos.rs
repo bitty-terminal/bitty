@@ -6,6 +6,10 @@
 //! prove a whole tree. It signals the recorded group, observes it gone, and
 //! reports the dedicated `D-05` cleanup class `group-signalled`; it never
 //! claims `swept` and never signals a pid it did not record.
+//!
+//! This plan is selected by [`probe`], but the daemon does not yet reach it:
+//! the served spawn path is Linux-only (`worker::spawn_path_served`), so the
+//! plan is implemented and unit-tested here, not enforced by `bittyd`.
 
 use std::io;
 use std::os::unix::process::CommandExt as _;
@@ -78,7 +82,11 @@ pub fn spawn_with(
         let _ = child.wait();
         return Err(ContainmentError::Uncontained(CleanupClass::Unverified));
     }
-    Ok(ContainedChild { child, group })
+    Ok(ContainedChild {
+        child,
+        group,
+        reaped: false,
+    })
 }
 
 fn observed_group(pid: u32) -> Option<ProcessGroupId> {
@@ -93,6 +101,12 @@ fn observed_group(pid: u32) -> Option<ProcessGroupId> {
 pub struct ContainedChild {
     child: Child,
     group: ProcessGroupId,
+    /// Whether this handle already reaped the leader.
+    ///
+    /// A reap frees the leader's pid, and with it the group id minted from
+    /// that pid, so a later signal could reach an unrelated group. Every stop
+    /// below refuses to signal once this is set.
+    reaped: bool,
 }
 
 impl ContainedChild {
@@ -120,7 +134,9 @@ impl ContainedChild {
     ///
     /// Propagates a wait failure.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        self.child.wait()
+        let status = self.child.wait()?;
+        self.reaped = true;
+        Ok(status)
     }
 
     /// Take the child's standard output, when it was piped.
@@ -135,7 +151,7 @@ impl ContainedChild {
     ///
     /// Propagates a `try_wait` failure other than an already-reaped child.
     pub fn has_exited(&mut self) -> io::Result<bool> {
-        self.child.try_wait().map(|status| status.is_some())
+        self.try_wait().map(|status| status.is_some())
     }
 
     /// Non-blocking wait: the exit status once the direct child has exited.
@@ -144,7 +160,11 @@ impl ContainedChild {
     ///
     /// Propagates a wait failure.
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        self.child.try_wait()
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.reaped = true;
+        }
+        Ok(status)
     }
 
     /// Nothing to drain beyond the recorded group.
@@ -180,16 +200,19 @@ impl ContainedChild {
     /// Terminate the recorded process group with a bounded escalation.
     ///
     /// Sends `SIGTERM`, waits [`ContainmentLimits::term_grace`], sends
-    /// `SIGKILL`, reaps the leader, and drains the group. It reports
+    /// `SIGKILL`, then reaps the leader inside the bounded window. It reports
     /// `group-signalled` only when the group is observed gone after the
-    /// signals; a group that still has a member is `unverified`. The leader is
-    /// kept unreaped through both signals so its pid, and therefore the
-    /// recorded group id, cannot be reused before the kill lands.
+    /// signals; a group that still has a member is `unverified`.
+    ///
+    /// Both signals are sent while this handle still holds the unreaped
+    /// leader, so the leader's pid, and therefore the recorded group id,
+    /// stays reserved. A stop that finds the leader already reaped signals
+    /// nothing: the reap freed that id and it may already name another group.
     pub fn terminate(&mut self, limits: ContainmentLimits) -> CleanupOutcome {
         if !self.group_is_ours() {
-            // The recorded pid now belongs to a different process (or is
-            // gone); the group may have been reused. Signal nothing and let
-            // the caller keep the conservative class.
+            // The recorded pid now belongs to a different process, was
+            // already reaped, or is gone; the group may have been reused.
+            // Signal nothing and let the caller keep the conservative class.
             let _ = self.child.try_wait();
             return CleanupOutcome {
                 class: CleanupClass::Unverified,
@@ -208,20 +231,16 @@ impl ContainedChild {
             signalled += 1;
         }
         // The kill is already on its way to the recorded group; reap the
-        // leader inside the bounded window so the group can be observed empty.
-        // `try_wait` consumes the exit status, so record the reap where it
-        // happens instead of asking again after the loop.
-        let mut reaped = false;
+        // leader inside the bounded window so the group can be observed
+        // empty. Nothing is signalled after this point.
+        let mut reaped = self.reaped;
         let _ = wait_bounded(limits.kill_wait(), limits, || {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                reaped = true;
+            if !reaped {
+                reaped = matches!(self.child.try_wait(), Ok(Some(_)));
             }
-            drain_group(self.group.get());
             !group_has_members(self.group.get())
         });
-        if !reaped {
-            reaped = matches!(self.child.try_wait(), Ok(Some(_)));
-        }
+        self.reaped |= reaped;
         let gone = !group_has_members(self.group.get());
         CleanupOutcome {
             class: if gone && reaped && signalled > 0 {
@@ -233,20 +252,24 @@ impl ContainedChild {
         }
     }
 
-    /// Whether the recorded leader still belongs to the recorded group.
+    /// Whether the recorded leader may still be signalled exactly.
     ///
-    /// A reused pid usually lands in another group; the check refuses to
-    /// signal then. A leader that already exited answers `false` (ESRCH), but
-    /// its group may still hold recorded members, so callers treat that as a
-    /// reason to stay conservative rather than as proof of a sweep.
+    /// A leader this handle has already reaped frees its pid, and the group id
+    /// minted from it, so nothing about the recorded group is provable
+    /// afterwards. An unreaped leader usually answers with the recorded group;
+    /// one that already exited answers `ESRCH`, and while its zombie still
+    /// reserves the id the recorded group cannot have been reused.
     fn group_is_ours(&self) -> bool {
+        if self.reaped {
+            return false;
+        }
         let Ok(raw) = i32::try_from(self.child.id()) else {
             return false;
         };
         match getpgid(Some(Pid::from_raw(raw))) {
             Ok(pgid) => u32::try_from(pgid.as_raw()).ok() == Some(self.group.get()),
-            // The leader already exited; while the recorded group still has a
-            // member its id cannot be reused, so signalling it stays exact.
+            // The leader exited but is not reaped; while it is a zombie the
+            // recorded group id cannot be reused.
             Err(nix::errno::Errno::ESRCH) => true,
             Err(_) => false,
         }
@@ -351,5 +374,45 @@ mod tests {
             Some(CleanupClass::Unverified),
             "no signal was sent, so `group-signalled` would be a lie"
         );
+    }
+
+    /// The leader is reaped before the stop, so the group id it minted is free.
+    ///
+    /// A signal sent after that reap can reach a group the daemon never
+    /// created. The plan must refuse: nothing signalled, `unverified`.
+    #[test]
+    fn a_stop_after_this_handle_reaped_the_leader_signals_nothing() {
+        let report = report();
+        let mut command = Command::new("/bin/sh");
+        // The leader exits and leaves a live member in the recorded group, so
+        // the group still answers `killpg` after the leader was reaped.
+        command
+            .args([
+                "-c",
+                "(trap '' TERM; while :; do sleep 0.05; done) & exit 0",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = spawn_with(
+            &report,
+            "bittyd-test-reaped-leader",
+            &mut command,
+            limits(),
+            SessionMode::ProcessGroup,
+        )
+        .expect("a contained spawn");
+        let group = child.process_group();
+        let _ = child.wait().expect("reap the leader");
+        let outcome = child.terminate(limits());
+        // End the descendant through the recorded group before asserting, so a
+        // failing assertion cannot leave it running.
+        signal_group(group.get(), Some(Signal::SIGKILL));
+        assert_eq!(
+            outcome.signalled(),
+            0,
+            "the recorded group must not be signalled once its leader was reaped"
+        );
+        assert_eq!(outcome.class(), CleanupClass::Unverified, "{report}");
     }
 }

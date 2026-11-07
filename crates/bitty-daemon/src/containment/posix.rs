@@ -113,6 +113,26 @@ pub(crate) fn drain_adopted(except: u32) {
     }
 }
 
+/// Serialize the tests that spawn a child in a recorded process group.
+///
+/// The FreeBSD sweep verdict enumerates every descendant the process-wide
+/// reaper can see, so a child spawned by a parallel test would appear in this
+/// session's list and correctly keep the stop `unverified`. The Linux adopted
+/// drain has the same scope. Every POSIX leg takes this one lock in its
+/// process-group tests, so no test observes another test's child.
+#[cfg(all(
+    test,
+    any(target_os = "linux", target_os = "freebsd", target_os = "macos")
+))]
+pub(crate) fn serial_spawn() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::Mutex;
+
+    static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+    SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -124,6 +144,7 @@ mod tests {
     fn a_signalled_group_is_observed_gone() {
         use std::process::{Command, Stdio};
 
+        let _serial = serial_spawn();
         // A short-lived child in its own group: minted by the caller, not
         // resolved by name.
         let mut command = Command::new("sleep");

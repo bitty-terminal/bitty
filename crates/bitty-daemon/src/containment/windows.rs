@@ -10,6 +10,10 @@
 //!
 //! Every Win32 call stays behind the reviewed `bitty-winjob` adapter; this
 //! module composes its safe API and adds no FFI.
+//!
+//! This plan is selected by [`probe`], but the daemon does not yet reach it:
+//! the served spawn path is Linux-only (`worker::spawn_path_served`), so the
+//! plan is implemented and unit-tested here, not enforced by `bittyd`.
 
 use std::io;
 use std::os::windows::process::CommandExt as _;
@@ -223,8 +227,9 @@ impl ContainedChild {
     /// Terminate the job tree with a bounded verification window.
     ///
     /// Windows has no graceful signal for an arbitrary process, so the stop
-    /// terminates the job immediately. `swept` requires `ActiveProcesses` to
-    /// reach zero and the direct child to be reaped; anything else is
+    /// terminates the job immediately. `swept` requires the job's
+    /// `ActiveProcesses` to reach zero **and** the leader's exit to be
+    /// observed on its own handle before anything is reaped; anything else is
     /// `unverified`.
     pub fn terminate(&mut self, limits: ContainmentLimits) -> CleanupOutcome {
         let signalled = self
@@ -232,26 +237,35 @@ impl ContainedChild {
             .active_processes()
             .map_or(0, |active| usize::try_from(active).unwrap_or(usize::MAX));
         let _ = self.job.terminate(JOB_TERMINATION_EXIT_CODE);
-        // Drain first, reap second. The job's accounting settles while the
-        // leader's process handle is still open: the `bitty-winjob` contract
-        // test observes the same order (`member.exit_code()` then
-        // `active_processes() == 0`, then `child.wait()`). Reaping inside this
-        // wait closed the handle first and the job never reported empty, which
-        // turned a real sweep into `unverified` on a Windows runner.
+        // `ActiveProcesses` and the leader's process object do not settle in
+        // one order: the accounting can read zero while the process handle is
+        // not signalled yet. A verdict taken from one non-blocking `try_wait`
+        // there reads `Ok(None)` and turns a real sweep into `unverified`
+        // (bitty#2982, Windows runner: `Unverified` with `signalled=1` after
+        // 22 ms). Wait for both signals, and only then reap: the open
+        // `JobMember` handle keeps the process object, and its pid, alive
+        // across the wait.
         let drained = wait_bounded(limits.kill_wait(), limits, || {
-            self.job.active_processes().is_ok_and(|active| active == 0)
+            self.leader_exited() && self.job.active_processes().is_ok_and(|active| active == 0)
         });
         if !drained {
             // A member created in the termination window may still be alive;
-            // one more terminate is safe, and the final query below stays
+            // one more terminate is safe, and the final queries below stay
             // fail-closed.
             let _ = self.job.terminate(JOB_TERMINATION_EXIT_CODE);
         }
-        // `try_wait` consumes the exit status, so ask exactly once.
-        let reaped = matches!(self.child.try_wait(), Ok(Some(_)));
+        let leader_exited = self.leader_exited();
+        // Reap only what the non-consuming handle already reported gone, so
+        // the verdict never rests on a `try_wait` that merely lost the race.
+        // `wait` cannot block here: the leader's process object is signalled.
+        let reaped = if leader_exited {
+            self.child.wait().is_ok()
+        } else {
+            matches!(self.child.try_wait(), Ok(Some(_)))
+        };
         let empty = self.job.active_processes().is_ok_and(|active| active == 0);
         CleanupOutcome {
-            class: if empty && reaped {
+            class: if empty && reaped && leader_exited {
                 CleanupClass::Swept
             } else {
                 CleanupClass::Unverified

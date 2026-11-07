@@ -361,8 +361,7 @@ pub fn check_fonts(tool_available: bool, families: &[(&str, bool)]) -> DoctorChe
             "fonts",
             "Font availability",
             EXIT_GENERIC,
-            "install a monospace font plus Noto Symbols 2 (package `noto-fonts` on Arch) so TUI graphs render"
-                .to_string(),
+            font_remediation(HintPlatform::current()).to_string(),
             format!("0/{total} fallback families resolve"),
         )
     } else {
@@ -374,8 +373,9 @@ pub fn check_fonts(tool_available: bool, families: &[(&str, bool)]) -> DoctorChe
             "fonts",
             "Font availability",
             format!(
-                "install the missing families (first: `{}`); on Arch, `noto-fonts` provides the braille symbols face",
-                missing.first().unwrap_or(&"monospace")
+                "install the missing families (first: `{}`); {}",
+                missing.first().unwrap_or(&"monospace"),
+                font_remediation(HintPlatform::current())
             ),
             format!(
                 "{}/{} resolve ({}); missing: {}",
@@ -726,6 +726,91 @@ pub fn check_clipboard(found: &[&str]) -> DoctorCheck {
     }
 }
 
+/// Host platform a remediation hint is written for.
+///
+/// Hints name the remediation the platform actually needs (bitty#2974): a
+/// missing `/dev/ptmx` on FreeBSD is a kernel module that was not loaded, not
+/// a permissions problem, and the font packages have different names. The
+/// platform is a compile-time property of the binary, so the hint is selected
+/// once and the text stays a plain `&'static str`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HintPlatform {
+    /// Linux and other unix hosts with a `devpts`-style PTY multiplexer.
+    Linux,
+    /// FreeBSD, where `pty(4)` is a loadable module.
+    FreeBsd,
+    /// macOS, where PTYs are kernel-provided.
+    MacOs,
+    /// Windows, where the console host provides ConPTY.
+    Windows,
+    /// Any other target: name no command rather than invent one.
+    Other,
+}
+
+impl HintPlatform {
+    /// The platform this binary was built for.
+    #[must_use]
+    pub const fn current() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Linux
+        } else if cfg!(target_os = "freebsd") {
+            Self::FreeBsd
+        } else if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Remediation hint for a host without a usable PTY multiplexer.
+///
+/// Hints only: `doctor` never loads a kernel module or installs a package.
+#[must_use]
+pub const fn pty_remediation(platform: HintPlatform) -> &'static str {
+    match platform {
+        HintPlatform::Linux => {
+            "no PTY multiplexer found: check that /dev/ptmx exists and is world-writable and that devpts is mounted"
+        }
+        HintPlatform::FreeBsd => {
+            "no PTY multiplexer found: the pty module is not loaded; run `kldload pty` and set pty_load=\"YES\" in /boot/loader.conf so it survives a reboot"
+        }
+        HintPlatform::MacOs => {
+            "no PTY multiplexer found: PTYs are kernel-provided; check that /dev/ptmx exists and is readable and that the process is not sandboxed away from /dev"
+        }
+        HintPlatform::Windows => {
+            "no PTY multiplexer found: ConPTY needs Windows 10 1809 or newer; update Windows or run on a supported build"
+        }
+        HintPlatform::Other => {
+            "no PTY multiplexer found on this platform; report the platform to the Bitty issue tracker"
+        }
+    }
+}
+
+/// Remediation hint for a host whose font fallback chain is incomplete.
+///
+/// Hints only: `doctor` never installs packages.
+#[must_use]
+pub const fn font_remediation(platform: HintPlatform) -> &'static str {
+    match platform {
+        HintPlatform::Linux => {
+            "install a monospace font plus Noto Symbols 2 (`noto-fonts` on Arch provides the symbols face) so TUI graphs render"
+        }
+        HintPlatform::FreeBsd => {
+            "install a monospace font plus Noto Symbols 2 with `pkg install dejavu noto-basic` so TUI graphs render"
+        }
+        HintPlatform::MacOs => {
+            "install a monospace font plus Noto Symbols 2 with your package manager or by adding them to ~/Library/Fonts so TUI graphs render"
+        }
+        HintPlatform::Windows => {
+            "install a monospace font plus Noto Symbols 2 with winget or the vendor installers so TUI graphs render"
+        }
+        HintPlatform::Other => "install a monospace font plus Noto Symbols 2 so TUI graphs render",
+    }
+}
+
 /// PTY availability. Unix checks `/dev/ptmx`; Windows reports ConPTY.
 #[must_use]
 pub fn check_pty(available: bool, detail: &str) -> DoctorCheck {
@@ -736,8 +821,7 @@ pub fn check_pty(available: bool, detail: &str) -> DoctorCheck {
             "pty",
             "PTY support",
             EXIT_GENERIC,
-            "no PTY multiplexer found: check /dev/ptmx permissions or use ConPTY on Windows"
-                .to_string(),
+            pty_remediation(HintPlatform::current()).to_string(),
             detail.to_string(),
         )
     }
@@ -3153,6 +3237,71 @@ mod tests {
         assert_eq!(none.code, EXIT_GENERIC);
         let no_tool = check_fonts(false, &[]);
         assert_eq!(no_tool.status, DoctorStatus::Warn);
+    }
+
+    #[test]
+    fn pty_remediation_names_the_platform_module_and_not_a_permission_fix() {
+        // FreeBSD's missing /dev/ptmx is an unloaded kernel module, not a mode
+        // problem, so the hint must name `kldload pty` (bitty#2974).
+        let freebsd = pty_remediation(HintPlatform::FreeBsd);
+        assert!(freebsd.contains("kldload pty"), "{freebsd}");
+        assert!(freebsd.contains("pty_load"), "{freebsd}");
+        assert!(!freebsd.contains("world-writable"), "{freebsd}");
+
+        let linux = pty_remediation(HintPlatform::Linux);
+        assert!(linux.contains("/dev/ptmx"), "{linux}");
+        assert!(linux.contains("devpts"), "{linux}");
+
+        let windows = pty_remediation(HintPlatform::Windows);
+        assert!(windows.contains("ConPTY"), "{windows}");
+        assert!(windows.contains("1809"), "{windows}");
+
+        let macos = pty_remediation(HintPlatform::MacOs);
+        assert!(macos.contains("/dev/ptmx"), "{macos}");
+    }
+
+    #[test]
+    fn font_remediation_names_the_platform_package_command() {
+        let freebsd = font_remediation(HintPlatform::FreeBsd);
+        assert!(
+            freebsd.contains("pkg install dejavu noto-basic"),
+            "{freebsd}"
+        );
+
+        let linux = font_remediation(HintPlatform::Linux);
+        assert!(linux.contains("noto-fonts"), "{linux}");
+        assert!(!linux.contains("pkg install"), "{linux}");
+
+        // Unknown platforms get a hint without an invented command.
+        let other = font_remediation(HintPlatform::Other);
+        assert!(!other.contains('`'), "{other}");
+    }
+
+    #[test]
+    fn failed_pty_check_carries_the_current_platform_hint() {
+        let check = check_pty(false, "/dev/ptmx missing");
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert_eq!(check.code, EXIT_GENERIC);
+        assert_eq!(check.hint, pty_remediation(HintPlatform::current()));
+        let expected = if cfg!(target_os = "linux") {
+            HintPlatform::Linux
+        } else if cfg!(target_os = "freebsd") {
+            HintPlatform::FreeBsd
+        } else if cfg!(target_os = "macos") {
+            HintPlatform::MacOs
+        } else if cfg!(target_os = "windows") {
+            HintPlatform::Windows
+        } else {
+            HintPlatform::Other
+        };
+        assert_eq!(HintPlatform::current(), expected);
+    }
+
+    #[test]
+    fn failed_font_check_carries_the_current_platform_hint() {
+        let check = check_fonts(true, &[("Mono", false)]);
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert_eq!(check.hint, font_remediation(HintPlatform::current()));
     }
 
     #[test]

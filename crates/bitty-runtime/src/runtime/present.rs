@@ -2328,10 +2328,11 @@ impl Runtime {
 
     /// Test seam: arms the confirmation bound without a GPU frame.
     ///
-    /// `#[cfg(test)]` cannot reach this: the wiring test that drives the
-    /// `RedrawRequested` → confirmation handoff lives in `bitty-terminal`, so
-    /// the seam has to exist in this crate's non-test build. Production arms
-    /// the bound only from a real commit; nothing else calls this.
+    /// A `cfg(test)` attribute cannot gate this: the wiring test that drives
+    /// the `RedrawRequested` → confirmation handoff lives in `bitty-terminal`,
+    /// and a dependency is compiled without the test cfg, so the seam has to
+    /// exist in this crate's non-test build. Production arms the bound only
+    /// from a real commit; nothing else calls this.
     #[doc(hidden)]
     pub fn arm_present_confirmation_for_test(&mut self, now: std::time::Instant) {
         self.arm_present_confirmation(now);

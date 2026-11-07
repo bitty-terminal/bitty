@@ -2103,7 +2103,10 @@ impl Service {
                 .workers
                 .terminate(session_id)
                 .unwrap_or(CleanupClass::Unverified);
-            if cleanup == CleanupClass::Unverified {
+            if matches!(
+                cleanup,
+                CleanupClass::Unverified | CleanupClass::GroupSignalled
+            ) {
                 report.unverified = report.unverified.saturating_add(1);
             }
             let _ = self.workers.forget(session_id);

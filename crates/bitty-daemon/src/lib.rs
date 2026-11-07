@@ -98,9 +98,11 @@
 //! - [`orphan::OrphanJournal`]: the two-phase bounded orphan journal, the
 //!   recorded uid and containment identity, and the exact-identity
 //!   [`orphan::OrphanReaper`] seam (`D-06`).
-//! - [`containment`]: the typed cgroup v2 delegation probe, per-session cgroup
-//!   containment, the `PR_SET_CHILD_SUBREAPER` fallback with its `unverified`
-//!   cleanup claim, and typed refusals on every other cell (`D-06`, `D-15`).
+//! - [`containment`]: the typed platform probes and plans — Linux cgroup v2
+//!   with the `PR_SET_CHILD_SUBREAPER` fallback, the Windows kill-on-close job
+//!   object, the FreeBSD `procctl(2)` reaper, and the macOS process-group plan
+//!   with its `group-signalled` cleanup class — plus typed refusals on every
+//!   other cell (`D-06`, `D-15`).
 //! - [`orphan::OrphanSupervisor`]: the served `daemon.orphans.verify`
 //!   implementation; counts by class, no pid, idempotent (`D-06`).
 //! - [`content`]: the bounded terminal byte buffer, the hex codec, the

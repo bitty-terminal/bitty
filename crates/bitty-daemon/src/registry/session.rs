@@ -194,6 +194,10 @@ impl fmt::Display for TerminalReason {
 pub enum CleanupClass {
     /// The whole containment identity was terminated and verified gone.
     Swept,
+    /// The recorded process group was signalled and observed gone, but a
+    /// reparented or re-sessioned descendant is not provably covered
+    /// (cleanup class `D-05`, stable name `group-signalled`).
+    GroupSignalled,
     /// The daemon could not verify the whole containment identity.
     Unverified,
     /// No worker process was ever spawned.
@@ -206,6 +210,7 @@ impl CleanupClass {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Swept => "swept",
+            Self::GroupSignalled => "group-signalled",
             Self::Unverified => "unverified",
             Self::NotStarted => "not_started",
         }
@@ -1247,5 +1252,13 @@ mod tests {
             long.record_bytes() - short.record_bytes(),
             TERMINAL_ID_MAX_BYTES - 1
         );
+    }
+
+    #[test]
+    fn the_group_signalled_cleanup_has_a_stable_contract_spelling() {
+        assert_eq!(CleanupClass::GroupSignalled.as_str(), "group-signalled");
+        assert_eq!(CleanupClass::Swept.as_str(), "swept");
+        assert_eq!(CleanupClass::Unverified.as_str(), "unverified");
+        assert_eq!(CleanupClass::NotStarted.as_str(), "not_started");
     }
 }

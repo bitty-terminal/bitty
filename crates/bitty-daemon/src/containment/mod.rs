@@ -1,57 +1,94 @@
 //! Process containment for the `bittyd` session host (contract `D-06`,
-//! `D-15`; bitty#2791).
+//! `D-15`; bitty#2791, bitty#2949).
 //!
 //! Containment is a whole-tree identity, never a bare pid or a process-group
-//! convention. This module exposes one typed probe and two enforced plans:
+//! convention. This module owns the platform-neutral vocabulary; one
+//! per-OS module owns the probe, spawn, and kill path:
 //!
 //! | Plan | Mechanism | Whole-tree proof | Cleanup claim |
 //! | --- | --- | --- | --- |
 //! | `ContainmentKind::CgroupV2` | delegated cgroup v2 subtree | `cgroup.procs` empty and `cgroup.events` `populated 0` | `swept` |
 //! | `ContainmentKind::Subreaper` | `PR_SET_CHILD_SUBREAPER` + recorded process group | recorded group empty, leader pidfd exited, every pre-signal descendant pidfd exited | `swept` when verified, else `unverified` |
+//! | `ContainmentKind::WindowsJob` | one kill-on-close job object per session | every member assigned before it runs; `ActiveProcesses` zero after termination | `swept` when verified |
+//! | `ContainmentKind::FreebsdReaper` | `procctl(PROC_REAP_ACQUIRE)` reaper + recorded process group | recorded group empty and no live recorded descendant in the reaper's pid list | `swept` when verified |
+//! | `ContainmentKind::ProcessGroup` | recorded process group only (macOS) | the group is signalled and observed gone; a reparented or re-sessioned descendant is not covered | `group-signalled` (`D-05`) |
 //! | `ContainmentKind::Refused` | none | none | no spawn, typed refusal |
 //!
-//! The fallback is deliberately weaker and says so. A process group alone can
-//! never prove a whole tree (`setsid`/`setpgid` escapes it), so the subreaper
-//! plan kills only what it recorded and reports `unverified` instead of
-//! claiming `swept`. Only the cgroup plan can produce a verified sweep.
+//! The fallback plans are deliberately weaker and say so. A process group
+//! alone can never prove a whole tree (`setsid`/`setpgid` escapes it), so the
+//! subreaper plan kills only what it recorded and reports `unverified` when a
+//! check fails. macOS has no reaper, so its plan reports the dedicated
+//! `group-signalled` cleanup class instead of borrowing `swept`. Only a plan
+//! whose verification covers the whole recorded tree can produce a verified
+//! sweep.
 //!
-//! Selection is explicit: [`ContainmentReport::probe`] returns the plan it selected with the
-//! reason the stronger plan was unavailable. There is no silent downgrade, no
-//! name/pattern lookup, and no pid signal for a process the daemon did not
-//! record.
+//! Selection is explicit: [`ContainmentReport::probe`] returns the plan it
+//! selected with the reason a stronger plan was unavailable. There is no
+//! silent downgrade, no name/pattern lookup, and no pid signal for a process
+//! the daemon did not record.
 //!
-//! Platform cells other than Linux return
-//! [`ContainmentRefusal::UnsupportedPlatform`]. Windows has a designed job
-//! object boundary (one job per session, `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`,
-//! DACL owned by the current user) that needs the reviewed Win32 seam in
-//! `bitty-winjob` plus a native-runner campaign; macOS has no containment
-//! implementation in this slice. Both refuse rather than approximate.
+//! # Platform cells
+//!
+//! - Linux: delegated cgroup v2, falling back to the subreaper plan.
+//! - Windows: one job object per session, created before the spawn, with the
+//!   child assigned while suspended (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
+//! - FreeBSD: the daemon acquires the `procctl(2)` reaper role so orphaned
+//!   descendants reparent to it, and records the child's process group.
+//! - macOS: the recorded process group only; it must not claim `swept`.
+//! - Any other cell, or a Windows build whose job object cannot be created,
+//!   returns [`ContainmentRefusal::UnsupportedPlatform`].
+//!
+//! The FreeBSD `procctl(2)` calls need raw FFI and no safe wrapper exists for
+//! `PROC_REAP_*`. Following the `bitty-sandbox` and `bitty-winjob` precedent,
+//! the crate root keeps `#![deny(unsafe_code)]` and only the private
+//! `freebsd_sys` module is allowed it, with every block carrying a `SAFETY`
+//! rationale and a safe API above it.
 
 use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::limits::{LimitId, Limits};
+use crate::orphan::identity::ProcessGroupId;
 use crate::platform::PlatformCell;
+use crate::registry::CleanupClass;
 
 #[cfg(target_os = "linux")]
 mod cgroup;
 #[cfg(target_os = "linux")]
 mod child;
 mod exec;
+#[cfg(target_os = "freebsd")]
+mod freebsd;
+#[cfg(target_os = "freebsd")]
+#[allow(unsafe_code)]
+mod freebsd_sys;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "linux")]
 mod linux_sys;
+#[cfg(target_os = "macos")]
+mod macos;
+mod plan;
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
+mod posix;
 #[cfg(target_os = "linux")]
 mod subreaper;
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "windows",
+    target_os = "freebsd",
+    target_os = "macos"
+)))]
+mod unsupported;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(target_os = "linux")]
 pub use self::cgroup::{CGROUP2_MOUNT, CgroupError, CgroupRefusal, CgroupRoot, SessionCgroup};
 #[cfg(target_os = "linux")]
 pub(crate) use self::child::drain_adopted_children;
-#[cfg(target_os = "linux")]
-pub use self::child::{
-    CleanupOutcome, ContainedChild, ContainmentError, SessionMode, spawn, spawn_with,
-};
 pub use self::exec::{ExecRefusal, ExecRefusalKind};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use self::linux_sys::test_signal_state;
@@ -62,6 +99,7 @@ pub(crate) use self::linux_sys::{
 };
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use self::linux_sys::{drop_cloexec_before_exec, inheritable_probe_descriptor};
+pub use self::plan::ContainedChild;
 #[cfg(target_os = "linux")]
 pub use self::subreaper::{SubreaperGuard, SubreaperRefusal};
 
@@ -94,8 +132,27 @@ pub const MECHANISM_CGROUP_V2: &str = "cgroup_v2";
 /// Stable diagnostic name of the subreaper fallback.
 pub const MECHANISM_SUBREAPER: &str = "subreaper_fallback";
 
+/// Stable diagnostic name of the Windows job-object plan.
+pub const MECHANISM_WINDOWS_JOB: &str = "windows_job";
+
+/// Stable diagnostic name of the FreeBSD `procctl(2)` reaper plan.
+pub const MECHANISM_FREEBSD_REAPER: &str = "freebsd_reaper";
+
+/// Stable diagnostic name of the macOS process-group plan.
+pub const MECHANISM_PROCESS_GROUP: &str = "process_group";
+
 /// Stable diagnostic name of a refused probe.
 pub const MECHANISM_NONE: &str = "none";
+
+/// Cleanup class of a plan that verified the whole recorded tree gone.
+pub const CLEANUP_SWEPT: &str = "swept";
+
+/// Cleanup class `D-05`: the recorded process group was signalled and observed
+/// gone, but a reparented or re-sessioned descendant is not provably covered.
+pub const CLEANUP_GROUP_SIGNALLED: &str = "group-signalled";
+
+/// Cleanup class of a plan that started nothing.
+pub const CLEANUP_NONE: &str = "none";
 
 /// Prefix every session cgroup name must carry.
 pub const SESSION_CGROUP_PREFIX: &str = "bittyd-";
@@ -222,13 +279,25 @@ impl std::error::Error for ContainmentRefusal {}
 /// The selected containment mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainmentKind {
-    /// Delegated cgroup v2 subtree; one of the two plans that can claim
-    /// `swept`.
+    /// Delegated cgroup v2 subtree; one of the plans that can claim `swept`.
     CgroupV2,
     /// `PR_SET_CHILD_SUBREAPER` plus the recorded process group, the leader
     /// pidfd, and descendant pidfds recorded before a stop signals; claims
     /// `swept` only when all of them verify gone.
     Subreaper,
+    /// One kill-on-close Windows job object per session; the child is
+    /// assigned before it runs and `swept` requires the job's active process
+    /// count to reach zero.
+    WindowsJob,
+    /// The FreeBSD `procctl(2)` reaper plus the recorded process group;
+    /// claims `swept` only when the group is empty and the reaper lists no
+    /// live recorded descendant.
+    FreebsdReaper,
+    /// The recorded process group only. It can signal the group and observe
+    /// it gone, but a reparented or re-sessioned descendant is not provably
+    /// covered, so it reports [`CLEANUP_GROUP_SIGNALLED`] (`D-05`), never
+    /// `swept`.
+    ProcessGroup,
     /// No mechanism; the daemon must not spawn a contained child.
     Refused,
 }
@@ -240,13 +309,36 @@ impl ContainmentKind {
         match self {
             Self::CgroupV2 => MECHANISM_CGROUP_V2,
             Self::Subreaper => MECHANISM_SUBREAPER,
+            Self::WindowsJob => MECHANISM_WINDOWS_JOB,
+            Self::FreebsdReaper => MECHANISM_FREEBSD_REAPER,
+            Self::ProcessGroup => MECHANISM_PROCESS_GROUP,
             Self::Refused => MECHANISM_NONE,
         }
     }
 
     /// Whether this plan can enforce a whole-tree kill.
+    ///
+    /// A process-group-only plan can signal the group but cannot prove a
+    /// reparented or re-sessioned descendant is covered, so it is not a
+    /// whole-tree mechanism.
     #[must_use]
     pub const fn is_enforced(self) -> bool {
+        matches!(
+            self,
+            Self::CgroupV2 | Self::Subreaper | Self::WindowsJob | Self::FreebsdReaper
+        )
+    }
+
+    /// Whether the served orphan verifier can re-check this plan's records
+    /// after a restart.
+    ///
+    /// Only the Linux cgroup and subreaper plans record a durable identity the
+    /// journal can re-verify: a boot id, a start time, and a process group
+    /// read from `/proc`. A Windows job handle is process-local (kill-on-close
+    /// already ended the tree at a crash), and the FreeBSD/macOS process-group
+    /// records have no observable start time in this slice.
+    #[must_use]
+    pub const fn verifies_orphans(self) -> bool {
         matches!(self, Self::CgroupV2 | Self::Subreaper)
     }
 
@@ -254,8 +346,11 @@ impl ContainmentKind {
     #[must_use]
     pub const fn cleanup_claim(self) -> &'static str {
         match self {
-            Self::CgroupV2 | Self::Subreaper => "swept",
-            Self::Refused => "none",
+            Self::CgroupV2 | Self::Subreaper | Self::WindowsJob | Self::FreebsdReaper => {
+                CLEANUP_SWEPT
+            }
+            Self::ProcessGroup => CLEANUP_GROUP_SIGNALLED,
+            Self::Refused => CLEANUP_NONE,
         }
     }
 }
@@ -271,7 +366,8 @@ impl fmt::Display for ContainmentKind {
 /// A cgroup record names the delegated subtree created before the spawn; a
 /// subreaper record has no pre-spawn identity, which is exactly why a reserved
 /// subreaper record is quarantined after a crash instead of being reaped by
-/// pid.
+/// pid. The process-group records carry the group once the child exists; the
+/// reserved (pre-spawn) form has no group yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContainmentRecord {
     /// A per-session cgroup v2 subtree.
@@ -281,6 +377,22 @@ pub enum ContainmentRecord {
     },
     /// The subreaper fallback: no path, no pre-spawn identity.
     Subreaper,
+    /// A Windows job object. The job handle is process-local; the record only
+    /// names the mechanism, and kill-on-close means a daemon crash cannot
+    /// leave a job member running.
+    WindowsJob,
+    /// The FreeBSD reaper fallback: the recorded process group, absent before
+    /// the child exists.
+    FreebsdReaper {
+        /// The recorded process group.
+        process_group: Option<ProcessGroupId>,
+    },
+    /// The macOS process-group plan: the recorded group, absent before the
+    /// child exists.
+    ProcessGroup {
+        /// The recorded process group.
+        process_group: Option<ProcessGroupId>,
+    },
 }
 
 impl ContainmentRecord {
@@ -296,12 +408,44 @@ impl ContainmentRecord {
         Self::Subreaper
     }
 
+    /// Build a Windows job record.
+    #[must_use]
+    pub const fn windows_job() -> Self {
+        Self::WindowsJob
+    }
+
+    /// Build a FreeBSD reaper record, with the group once it is known.
+    #[must_use]
+    pub const fn freebsd_reaper(process_group: Option<ProcessGroupId>) -> Self {
+        Self::FreebsdReaper { process_group }
+    }
+
+    /// Build a macOS process-group record, with the group once it is known.
+    #[must_use]
+    pub const fn process_group(process_group: Option<ProcessGroupId>) -> Self {
+        Self::ProcessGroup { process_group }
+    }
+
     /// The recorded cgroup path, when this is a cgroup record.
     #[must_use]
     pub fn cgroup_path(&self) -> Option<&Path> {
         match self {
             Self::Cgroup { path } => Some(path),
-            Self::Subreaper => None,
+            Self::Subreaper
+            | Self::WindowsJob
+            | Self::FreebsdReaper { .. }
+            | Self::ProcessGroup { .. } => None,
+        }
+    }
+
+    /// The recorded process group, when the mechanism records one.
+    #[must_use]
+    pub const fn recorded_process_group(&self) -> Option<ProcessGroupId> {
+        match self {
+            Self::FreebsdReaper { process_group } | Self::ProcessGroup { process_group } => {
+                *process_group
+            }
+            Self::Cgroup { .. } | Self::Subreaper | Self::WindowsJob => None,
         }
     }
 
@@ -311,6 +455,9 @@ impl ContainmentRecord {
         match self {
             Self::Cgroup { .. } => MECHANISM_CGROUP_V2,
             Self::Subreaper => MECHANISM_SUBREAPER,
+            Self::WindowsJob => MECHANISM_WINDOWS_JOB,
+            Self::FreebsdReaper { .. } => MECHANISM_FREEBSD_REAPER,
+            Self::ProcessGroup { .. } => MECHANISM_PROCESS_GROUP,
         }
     }
 }
@@ -328,56 +475,15 @@ pub struct ContainmentReport {
 impl ContainmentReport {
     /// Probe this process's containment capability.
     ///
-    /// On Linux this creates and removes a probe cgroup under the delegated
-    /// root (a write that proves delegation rather than assuming it). A cgroup
-    /// failure falls back to the subreaper only when that mechanism is actually
-    /// available; otherwise the report is
-    /// [`ContainmentKind::Refused`] with both reasons recorded.
+    /// Each cell probes its own mechanism: Linux creates and removes a probe
+    /// cgroup under the delegated root (a write that proves delegation rather
+    /// than assuming it); Windows creates and drops a probe job object;
+    /// FreeBSD acquires the `procctl(2)` reaper role; macOS needs no setup for
+    /// its process-group plan. A failed probe returns
+    /// [`ContainmentKind::Refused`] with [`ContainmentRefusal::UnsupportedPlatform`].
     #[must_use]
     pub fn probe() -> Self {
-        #[cfg(target_os = "linux")]
-        {
-            let cell = PlatformCell::current();
-            match CgroupRoot::detect() {
-                Ok(root) => Self {
-                    cell,
-                    kind: ContainmentKind::CgroupV2,
-                    refusal: None,
-                    fallback_reason: None,
-                    cgroup_root: Some(root.path().to_path_buf()),
-                },
-                Err(cgroup_refusal) => match SubreaperGuard::enable() {
-                    Ok(_) => Self {
-                        cell,
-                        kind: ContainmentKind::Subreaper,
-                        refusal: None,
-                        fallback_reason: Some(cgroup_refusal.to_string()),
-                        cgroup_root: None,
-                    },
-                    Err(subreaper_refusal) => Self {
-                        cell,
-                        kind: ContainmentKind::Refused,
-                        refusal: Some(ContainmentRefusal::NoMechanism {
-                            cgroup: cgroup_refusal.to_string(),
-                            subreaper: subreaper_refusal.to_string(),
-                        }),
-                        fallback_reason: None,
-                        cgroup_root: None,
-                    },
-                },
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let cell = PlatformCell::current();
-            Self {
-                cell,
-                kind: ContainmentKind::Refused,
-                refusal: Some(ContainmentRefusal::UnsupportedPlatform { cell }),
-                fallback_reason: None,
-                cgroup_root: None,
-            }
-        }
+        self::plan::probe()
     }
 
     /// Build a report that claims nothing because this invocation did not
@@ -430,6 +536,42 @@ impl ContainmentReport {
             refusal: None,
             fallback_reason: None,
             cgroup_root: Some(root),
+        }
+    }
+
+    /// Build a Windows job report for tests.
+    #[must_use]
+    pub fn windows_job(cell: PlatformCell) -> Self {
+        Self {
+            cell,
+            kind: ContainmentKind::WindowsJob,
+            refusal: None,
+            fallback_reason: None,
+            cgroup_root: None,
+        }
+    }
+
+    /// Build a FreeBSD reaper report for tests.
+    #[must_use]
+    pub fn freebsd_reaper(cell: PlatformCell) -> Self {
+        Self {
+            cell,
+            kind: ContainmentKind::FreebsdReaper,
+            refusal: None,
+            fallback_reason: None,
+            cgroup_root: None,
+        }
+    }
+
+    /// Build a macOS process-group report for tests.
+    #[must_use]
+    pub fn process_group(cell: PlatformCell) -> Self {
+        Self {
+            cell,
+            kind: ContainmentKind::ProcessGroup,
+            refusal: None,
+            fallback_reason: None,
+            cgroup_root: None,
         }
     }
 
@@ -487,6 +629,15 @@ impl ContainmentReport {
                 let reason = self.fallback_reason.as_deref().unwrap_or("no reason");
                 format!("{MECHANISM_SUBREAPER} (enforced; cleanup swept when verified; {reason})")
             }
+            ContainmentKind::WindowsJob => format!(
+                "{MECHANISM_WINDOWS_JOB} (enforced; cleanup swept when the job verifies empty)"
+            ),
+            ContainmentKind::FreebsdReaper => format!(
+                "{MECHANISM_FREEBSD_REAPER} (enforced; cleanup swept when the reaper verifies the group empty)"
+            ),
+            ContainmentKind::ProcessGroup => format!(
+                "{MECHANISM_PROCESS_GROUP} (not enforced; cleanup {CLEANUP_GROUP_SIGNALLED}; a re-sessioned descendant is not provably covered)"
+            ),
             ContainmentKind::Refused => {
                 let reason = self
                     .refusal
@@ -502,6 +653,209 @@ impl fmt::Display for ContainmentReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.summary())
     }
+}
+
+/// A spawn failure. Every variant refuses the spawn; none leaves an
+/// uncontained child running.
+#[derive(Debug)]
+pub enum ContainmentError {
+    /// The probe selected no mechanism.
+    Refused(ContainmentRefusal),
+    /// The cgroup plan failed before a child existed.
+    #[cfg(target_os = "linux")]
+    Cgroup(CgroupError),
+    /// The subreaper fallback is unavailable.
+    #[cfg(target_os = "linux")]
+    Subreaper(SubreaperRefusal),
+    /// `spawn` itself failed; no child was created.
+    Spawn(io::Error),
+    /// `exec` refused the program (`EACCES`, `ENOEXEC`, or `ENOENT`). No child
+    /// ran, so this is a distinct typed refusal instead of an untyped spawn
+    /// error (bitty#2790).
+    Exec(ExecRefusal),
+    /// The child's identity could not be observed. The child existed and was
+    /// terminated; the carried class is what the cleanup could prove
+    /// (`unverified` for the process-group plan).
+    IdentityUnavailable(CleanupClass),
+    /// The child ran but was outside the plan's recorded identity. The child
+    /// existed and was terminated; the carried class is what the cleanup could
+    /// prove (`swept` or `unverified`).
+    Uncontained(CleanupClass),
+}
+
+impl ContainmentError {
+    /// The cleanup class observed while the failed spawn was abandoned.
+    ///
+    /// A refusal, a pre-fork failure, an `exec` refusal, or an unavailable
+    /// mechanism started nothing ([`CleanupClass::NotStarted`]); a failure
+    /// after the fork reports what the plan could prove about the child it
+    /// killed.
+    #[must_use]
+    pub const fn cleanup(&self) -> CleanupClass {
+        match self {
+            Self::Refused(_) | Self::Spawn(_) | Self::Exec(_) => CleanupClass::NotStarted,
+            #[cfg(target_os = "linux")]
+            Self::Cgroup(_) | Self::Subreaper(_) => CleanupClass::NotStarted,
+            Self::IdentityUnavailable(cleanup) | Self::Uncontained(cleanup) => *cleanup,
+        }
+    }
+}
+
+impl fmt::Display for ContainmentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Refused(refusal) => write!(formatter, "containment refused: {refusal}"),
+            #[cfg(target_os = "linux")]
+            Self::Cgroup(error) => write!(formatter, "cgroup containment failed: {error}"),
+            #[cfg(target_os = "linux")]
+            Self::Subreaper(error) => write!(formatter, "subreaper unavailable: {error}"),
+            Self::Spawn(error) => write!(formatter, "spawn failed: {error}"),
+            Self::Exec(refusal) => write!(formatter, "{refusal}"),
+            Self::IdentityUnavailable(cleanup) => write!(
+                formatter,
+                "spawned child identity could not be observed; cleanup {}",
+                cleanup.as_str()
+            ),
+            Self::Uncontained(cleanup) => write!(
+                formatter,
+                "spawned child escaped the recorded containment identity; cleanup {}",
+                cleanup.as_str()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ContainmentError {}
+
+#[cfg(target_os = "linux")]
+impl From<CgroupError> for ContainmentError {
+    fn from(error: CgroupError) -> Self {
+        Self::Cgroup(error)
+    }
+}
+
+impl From<io::Error> for ContainmentError {
+    fn from(error: io::Error) -> Self {
+        Self::Spawn(error)
+    }
+}
+
+/// Turn a failed `Command::spawn` into the typed refusal it carries.
+///
+/// `std` reports the child-side `exec` errno through the close-on-exec pipe,
+/// so an `EACCES`/`ENOEXEC`/`ENOENT` here means no child ever ran. Every other
+/// errno (a fork refusal, a `pre_exec` failure) stays the untyped
+/// [`ContainmentError::Spawn`]. On a cell with no `exec` (Windows) the
+/// classifier returns `None` and every failure stays untyped.
+pub(crate) fn classify_spawn_error(error: io::Error) -> ContainmentError {
+    match ExecRefusal::from_spawn_error(&error) {
+        Some(refusal) => ContainmentError::Exec(refusal),
+        None => ContainmentError::Spawn(error),
+    }
+}
+
+/// Poll `done` until it reports success or `window` elapses.
+///
+/// The poll interval is [`ContainmentLimits::poll`], clamped to the remaining
+/// window so a short final slice does not oversleep.
+pub(crate) fn wait_bounded(
+    window: Duration,
+    limits: ContainmentLimits,
+    mut done: impl FnMut() -> bool,
+) -> bool {
+    let deadline = Instant::now() + window;
+    loop {
+        if done() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(limits.poll().min(deadline.saturating_duration_since(now)));
+    }
+}
+
+/// What a terminal cleanup could prove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CleanupOutcome {
+    class: CleanupClass,
+    signalled: usize,
+}
+
+impl CleanupOutcome {
+    /// The cleanup class (`swept`, `group-signalled`, `unverified`,
+    /// `not_started`).
+    #[must_use]
+    pub const fn class(self) -> CleanupClass {
+        self.class
+    }
+
+    /// How many recorded members received a signal. Never a pid list.
+    #[must_use]
+    pub const fn signalled(self) -> usize {
+        self.signalled
+    }
+}
+
+/// How the spawned child relates to its process group and session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionMode {
+    /// The daemon puts the child in a fresh process group
+    /// (`setpgid(0, 0)`), which is the POSIX containment identity. Ignored by
+    /// the Windows job plan, whose identity is the job itself.
+    ProcessGroup,
+    /// The caller's `pre_exec` establishes a new session (`setsid`), so the
+    /// child is already a session and process-group leader. Used by the PTY
+    /// spawn path, where `setsid` must run before `setpgid`.
+    NewSession,
+}
+
+/// Spawn a command inside the selected containment plan.
+///
+/// `name` must be unique per live session and carry the
+/// [`SESSION_CGROUP_PREFIX`] prefix; the caller derives it from the daemon
+/// instance and session ids, never from user text. `limits` bounds the
+/// escalation used by the failure path that abandons a child whose identity
+/// could not be observed.
+///
+/// # Errors
+///
+/// Refuses a non-enforced plan, an invalid name, a cgroup creation/membership
+/// failure, or a spawn failure. A child that fails the membership check is
+/// killed through its recorded identity before the error returns.
+pub fn spawn(
+    report: &ContainmentReport,
+    name: &str,
+    command: &mut std::process::Command,
+    limits: ContainmentLimits,
+) -> Result<ContainedChild, ContainmentError> {
+    spawn_with(report, name, command, limits, SessionMode::ProcessGroup)
+}
+
+/// Spawn with an explicit [`SessionMode`].
+///
+/// # Errors
+///
+/// The same refusals as [`spawn`].
+pub fn spawn_with(
+    report: &ContainmentReport,
+    name: &str,
+    command: &mut std::process::Command,
+    limits: ContainmentLimits,
+    mode: SessionMode,
+) -> Result<ContainedChild, ContainmentError> {
+    if report.kind() == ContainmentKind::Refused {
+        return Err(ContainmentError::Refused(
+            report
+                .refusal()
+                .cloned()
+                .unwrap_or(ContainmentRefusal::UnsupportedPlatform {
+                    cell: report.cell(),
+                }),
+        ));
+    }
+    self::plan::spawn_with(report, name, command, limits, mode)
 }
 
 #[cfg(test)]
@@ -546,6 +900,60 @@ mod tests {
     }
 
     #[test]
+    fn the_windows_job_plan_claims_a_verified_sweep() {
+        let report = ContainmentReport::windows_job(PlatformCell::WindowsX86_64);
+        assert_eq!(report.kind(), ContainmentKind::WindowsJob);
+        assert_eq!(report.kind().as_str(), MECHANISM_WINDOWS_JOB);
+        assert_eq!(report.cleanup_claim(), CLEANUP_SWEPT);
+        assert!(report.is_enforced());
+        assert!(report.summary().contains("windows_job"));
+        assert!(report.summary().contains("swept"));
+    }
+
+    #[test]
+    fn the_freebsd_reaper_plan_claims_a_verified_sweep() {
+        let report = ContainmentReport::freebsd_reaper(PlatformCell::FreeBsdX86_64);
+        assert_eq!(report.kind(), ContainmentKind::FreebsdReaper);
+        assert_eq!(report.kind().as_str(), MECHANISM_FREEBSD_REAPER);
+        assert_eq!(report.cleanup_claim(), CLEANUP_SWEPT);
+        assert!(report.is_enforced());
+        assert!(report.summary().contains("freebsd_reaper"));
+        assert!(report.summary().contains("swept"));
+    }
+
+    #[test]
+    fn the_macos_process_group_plan_never_claims_a_sweep() {
+        let report = ContainmentReport::process_group(PlatformCell::MacosArm64);
+        assert_eq!(report.kind(), ContainmentKind::ProcessGroup);
+        assert_eq!(report.kind().as_str(), MECHANISM_PROCESS_GROUP);
+        assert_eq!(report.cleanup_claim(), CLEANUP_GROUP_SIGNALLED);
+        assert_eq!(report.cleanup_claim(), "group-signalled");
+        assert!(
+            !report.is_enforced(),
+            "a process group cannot prove a whole tree"
+        );
+        assert!(report.summary().contains("group-signalled"));
+        assert!(report.summary().contains("not provably covered"));
+    }
+
+    #[test]
+    fn only_the_linux_plans_verify_orphan_records() {
+        assert!(ContainmentKind::CgroupV2.verifies_orphans());
+        assert!(ContainmentKind::Subreaper.verifies_orphans());
+        for kind in [
+            ContainmentKind::WindowsJob,
+            ContainmentKind::FreebsdReaper,
+            ContainmentKind::ProcessGroup,
+            ContainmentKind::Refused,
+        ] {
+            assert!(
+                !kind.verifies_orphans(),
+                "{kind} has no durable identity to re-check"
+            );
+        }
+    }
+
+    #[test]
     fn records_round_trip_their_mechanism_without_argv_or_content() {
         let record = ContainmentRecord::cgroup("/sys/fs/cgroup/bittyd-a/b");
         assert_eq!(record.mechanism(), MECHANISM_CGROUP_V2);
@@ -558,11 +966,40 @@ mod tests {
             MECHANISM_SUBREAPER
         );
         assert!(ContainmentRecord::subreaper().cgroup_path().is_none());
+        assert_eq!(
+            ContainmentRecord::windows_job().mechanism(),
+            MECHANISM_WINDOWS_JOB
+        );
+        assert!(
+            ContainmentRecord::windows_job()
+                .recorded_process_group()
+                .is_none()
+        );
+
+        let group = ProcessGroupId::new(4242).expect("nonzero group");
+        let reaper = ContainmentRecord::freebsd_reaper(Some(group));
+        assert_eq!(reaper.mechanism(), MECHANISM_FREEBSD_REAPER);
+        assert_eq!(reaper.recorded_process_group(), Some(group));
+        assert!(reaper.cgroup_path().is_none());
+        let process_group = ContainmentRecord::process_group(Some(group));
+        assert_eq!(process_group.mechanism(), MECHANISM_PROCESS_GROUP);
+        assert_eq!(process_group.recorded_process_group(), Some(group));
+        assert!(
+            ContainmentRecord::process_group(None)
+                .recorded_process_group()
+                .is_none(),
+            "the reserved form has no group yet"
+        );
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "freebsd",
+        target_os = "macos"
+    )))]
     #[test]
-    fn a_non_linux_cell_refuses_with_unsupported_platform() {
+    fn an_unsupported_cell_refuses_with_unsupported_platform() {
         let report = ContainmentReport::probe();
         assert_eq!(report.kind(), ContainmentKind::Refused);
         assert!(!report.is_enforced());
@@ -585,6 +1022,57 @@ mod tests {
                 assert!(report.refusal().is_some());
                 assert!(!report.is_enforced());
             }
+            other => panic!("Linux selected a foreign plan: {other}"),
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn the_live_probe_selects_the_job_plan_or_a_typed_refusal() {
+        let report = ContainmentReport::probe();
+        assert_eq!(report.cell(), PlatformCell::current());
+        match report.kind() {
+            ContainmentKind::WindowsJob => {
+                assert_eq!(report.cleanup_claim(), CLEANUP_SWEPT);
+                assert!(report.is_enforced());
+            }
+            ContainmentKind::Refused => {
+                assert!(matches!(
+                    report.refusal(),
+                    Some(ContainmentRefusal::UnsupportedPlatform { cell }) if *cell == report.cell()
+                ));
+            }
+            other => panic!("Windows selected a foreign plan: {other}"),
+        }
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn the_live_probe_selects_the_reaper_plan_or_a_typed_refusal() {
+        let report = ContainmentReport::probe();
+        assert_eq!(report.cell(), PlatformCell::current());
+        match report.kind() {
+            ContainmentKind::FreebsdReaper => {
+                assert_eq!(report.cleanup_claim(), CLEANUP_SWEPT);
+                assert!(report.is_enforced());
+            }
+            ContainmentKind::Refused => {
+                assert!(matches!(
+                    report.refusal(),
+                    Some(ContainmentRefusal::UnsupportedPlatform { cell }) if *cell == report.cell()
+                ));
+            }
+            other => panic!("FreeBSD selected a foreign plan: {other}"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_live_probe_selects_the_process_group_plan() {
+        let report = ContainmentReport::probe();
+        assert_eq!(report.cell(), PlatformCell::current());
+        assert_eq!(report.kind(), ContainmentKind::ProcessGroup);
+        assert_eq!(report.cleanup_claim(), CLEANUP_GROUP_SIGNALLED);
+        assert!(!report.is_enforced());
     }
 }

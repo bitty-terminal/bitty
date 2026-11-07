@@ -25,8 +25,11 @@ pub const HELP_PANEL_FOOTER: &str = "Esc closes | repeat toggle closes";
 /// The resolved table caps user entries at
 /// [`bitty_config::types::MAX_KEYMAPS`]; rows beyond this cap are dropped
 /// oldest-last (defaults sort first by identity, so shipped rows survive).
-/// Each row caps at `MAX_CHORD_LEN + MAX_ACTION_LEN + 2` bytes by
-/// construction, so worst-case retention is bounded (~33 KiB).
+/// A closed-catalog row caps at `MAX_CHORD_LEN + MAX_ACTION_LEN + 2` bytes by
+/// construction, while a `command:` row carrying an args document caps at
+/// `MAX_CHORD_LEN + MAX_COMMAND_ACTION_LEN + 2` (~4.4 KiB), so worst-case
+/// retention is bounded at ~1.1 MiB (a closed-catalog map alone allows
+/// ~96 KiB).
 pub const HELP_MAX_ROWS: usize = 256;
 /// Minimum panel inner width in cells (below this the view is too narrow
 /// to list anything legible, so the paint is skipped).

@@ -129,7 +129,7 @@ fn activation_publishes_the_generation_suggestion() {
     assert_eq!(directory.generation_of(OWNER), Some(1));
     assert_eq!(
         directory.action_for(alt('?'), ModKey::Alt),
-        Some(ChromeAction::InvokeCommand(QUALIFIED.to_string()))
+        Some(ChromeAction::InvokeCommand(QUALIFIED.to_string().into()))
     );
     // The configured Mod slot applies at lookup time, never at capture.
     assert_eq!(directory.action_for(alt('?'), ModKey::Super), None);
@@ -217,7 +217,7 @@ fn grammar_failures_with_a_valid_target_never_publish() {
     };
     assert_eq!(
         directory.action_for(valid, ModKey::Alt),
-        Some(ChromeAction::InvokeCommand(QUALIFIED.to_string()))
+        Some(ChromeAction::InvokeCommand(QUALIFIED.to_string().into()))
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -236,7 +236,7 @@ fn suspend_parks_resume_restores_and_dispose_revokes() {
     runtime.discover();
     let id = pid(OWNER);
     runtime.activate(&id).expect("activate");
-    let suggestion = Some(ChromeAction::InvokeCommand(QUALIFIED.to_string()));
+    let suggestion = Some(ChromeAction::InvokeCommand(QUALIFIED.to_string().into()));
     {
         let directory = runtime.suggested_bindings().borrow();
         assert_eq!(directory.action_for(alt('?'), ModKey::Alt), suggestion);
@@ -278,7 +278,7 @@ fn reload_publishes_the_new_generation_only() {
         assert_eq!(directory.generation_of(OWNER), Some(2));
         assert_eq!(
             directory.action_for(alt('?'), ModKey::Alt),
-            Some(ChromeAction::InvokeCommand(QUALIFIED.to_string()))
+            Some(ChromeAction::InvokeCommand(QUALIFIED.to_string().into()))
         );
         assert_eq!(directory.active().len(), 1);
     }
@@ -336,7 +336,7 @@ fn conflicting_owners_resolve_deterministically() {
     assert_eq!(
         directory.action_for(alt('?'), ModKey::Alt),
         Some(ChromeAction::InvokeCommand(
-            "alpha.plugin:toggle".to_string()
+            "alpha.plugin:toggle".to_string().into()
         )),
         "lexical owner order wins regardless of activation order"
     );

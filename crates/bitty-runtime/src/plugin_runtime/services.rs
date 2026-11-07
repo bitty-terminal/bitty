@@ -334,12 +334,16 @@ impl KeymapSource for UnavailableKeymaps {
 /// parsed [`ChromeAction`]), never from raw configuration text. A Core action
 /// contributes its static description as `title`; an
 /// [`ChromeAction::InvokeCommand`] contributes only the validated qualified
-/// target as `command`. Any row that fails [`KeymapRow::new`] validation is
+/// target as `command`, while the canonical `action` spelling carries any args
+/// document verbatim (`command:owner:cmd -- '{"a":1}'`, issue #2965).
+/// [`KeymapRow`] accepts that spelling, so an argument-carrying binding is
+/// listed — by `bitty list keymaps` and by `bitty.keymaps.list()` — instead of
+/// being dropped. Any row that still fails [`KeymapRow::new`] validation is
 /// dropped by [`keymap_rows`] instead of echoed.
 #[must_use]
 pub fn keymap_row(binding: &ResolvedKeymap) -> Option<KeymapRow> {
     let (title, command) = match &binding.action {
-        ChromeAction::InvokeCommand(target) => (None, Some(target.clone())),
+        ChromeAction::InvokeCommand(invocation) => (None, Some(invocation.target().to_string())),
         action => (Some(action.description().to_string()), None),
     };
     KeymapRow::new(
@@ -12432,6 +12436,46 @@ mod history_tests {
     /// Look for a forbidden field value in a page's Lua conversion.
     fn page_contains(page: &KeymapPage, needle: &str) -> bool {
         format!("{:?}", page.to_lua()).contains(needle)
+    }
+
+    #[test]
+    fn keymaps_list_keeps_an_argument_carrying_command_row() {
+        // Issue #2965 review: `keymap_row` feeds the canonical action — which
+        // now contains `" -- <json>"` — into `KeymapRow::new`. A rule that
+        // refused any whitespace in `action` dropped every argument-carrying
+        // binding from the plugin-facing listing with no diagnostic. The row
+        // must survive, verbatim, with the bare target in `command`.
+        let args_action =
+            r#"command:bitty-featured.search:search -- {"needle":"a b","panel":"p:1"}"#;
+        let args_binding = binding("alt+g", args_action, false);
+        let row = keymap_row(&args_binding).expect("an args binding keeps its row");
+        assert_eq!(row.action, args_action, "the listing echoes it verbatim");
+        assert_eq!(
+            row.command.as_deref(),
+            Some("bitty-featured.search:search"),
+            "`command` stays the qualified target, never the document"
+        );
+        assert!(row.title.is_none());
+
+        // The same row through the public call path: addressable, pageable,
+        // and inside the response budget.
+        let (services, source) = keymap_services(true);
+        let mut rows = keymap_fixture();
+        rows.push(args_binding);
+        *source.0.borrow_mut() = rows;
+        let page = services
+            .keymaps_list(&KeymapQuery::default())
+            .expect("list");
+        assert_eq!(page.total, 6, "the args row is addressable");
+        assert_eq!(page.entries.len(), 6, "the args row is not dropped");
+        assert!(page.fits_budget());
+        let listed = page
+            .entries
+            .iter()
+            .find(|entry| entry.command.as_deref() == Some("bitty-featured.search:search"))
+            .expect("the args row is listed");
+        assert_eq!(listed.chord, "alt+g");
+        assert_eq!(listed.action, args_action);
     }
 
     #[test]

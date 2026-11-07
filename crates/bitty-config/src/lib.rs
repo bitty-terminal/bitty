@@ -81,6 +81,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod args_json;
 pub mod error;
 pub mod file;
 #[cfg(feature = "io-denied-harness")]
@@ -101,10 +102,11 @@ pub mod types;
 pub mod validation;
 pub mod wheel;
 
+pub use args_json::{MAX_JSON_ARGS_BYTES, MAX_JSON_ARGS_DEPTH, validate_json_args_blob};
 pub use bitty_lua::{ConfigModuleCode, ConfigModuleDiagnostic, ConfigModulePhase};
 pub use error::{ConfigError, ErrorClass};
 pub use keymap::{
-    Chord, ChromeAction, HintConfig, KeyName, KeyRef, LEADER_DEFAULT_CHORD_RAW,
+    Chord, ChromeAction, CommandInvocation, HintConfig, KeyName, KeyRef, LEADER_DEFAULT_CHORD_RAW,
     LEADER_TIMEOUT_MS_DEFAULT, LEADER_TIMEOUT_MS_MAX, LEADER_TIMEOUT_MS_MIN,
     LEADER_WINDOWS_FALLBACK_CHORDS_RAW, LeaderPlatform, LeaderPoll, LeaderState, ModKey,
     MouseButtonBinding, PREFIX_KEYWORD, PrefixBinding, ResolvedKeymap, ResolvedLeader, SplitDir,

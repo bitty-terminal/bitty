@@ -3445,13 +3445,14 @@ impl TerminalApp {
     /// counter, never a silent drop. The queued action is re-run by
     /// [`Self::pump_cold_commands`], so no authority is captured here.
     pub(crate) fn enqueue_input_command(&mut self, action: bitty_config::ChromeAction) {
-        if let bitty_config::ChromeAction::InvokeCommand(qualified) = &action {
-            if qualified.len() > bitty_config::keymap::MAX_INVOKE_COMMAND_LEN {
+        if let bitty_config::ChromeAction::InvokeCommand(invocation) = &action {
+            if invocation.target().len() > bitty_config::keymap::MAX_INVOKE_COMMAND_LEN {
                 self.pending_input_commands_dropped =
                     self.pending_input_commands_dropped.saturating_add(1);
                 crate::logging::warn(|| {
                     format!(
-                        "bitty: input command '{qualified}' dropped (target exceeds {} bytes)",
+                        "bitty: input command '{}' dropped (target exceeds {} bytes)",
+                        invocation.target(),
                         bitty_config::keymap::MAX_INVOKE_COMMAND_LEN
                     )
                 });
@@ -3709,6 +3710,29 @@ impl TerminalApp {
     /// such as `bitty-featured.devtools:plugins` directly.
     pub(crate) fn empty_command_args() -> LuaValue {
         LuaValue::Table(Vec::new())
+    }
+
+    /// Materialize a binding's args payload for one invocation (issue #2965).
+    ///
+    /// `args_json` is the raw document a `command:<owner:command> -- '<json>'`
+    /// binding carries; `bitty-config` validated it structurally at parse time
+    /// ([`bitty_config::validate_json_args_blob`]), so this conversion is the
+    /// only place it becomes a typed Lua value. `None` keeps the pre-args
+    /// behavior: the empty object `{}`, which every argument-free command's
+    /// schema accepts.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed with a diagnostic instead of dispatching a partially
+    /// understood document: an unparsable blob (only reachable from a
+    /// hand-built `ChromeAction`, since configuration rejects one at parse) or
+    /// a document the runtime's JSON parser refuses. No plugin code runs.
+    pub(crate) fn command_args(args_json: Option<&str>) -> Result<LuaValue, String> {
+        let Some(args_json) = args_json else {
+            return Ok(Self::empty_command_args());
+        };
+        bitty_runtime::plugin_runtime::store::parse_json(args_json)
+            .map_err(|reason| format!("invalid command args JSON ({reason})"))
     }
 
     /// Invoke one registered plugin command by qualified name

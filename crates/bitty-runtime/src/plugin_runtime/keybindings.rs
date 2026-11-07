@@ -325,7 +325,12 @@ impl SuggestedBindingDirectory {
                 }
                 let chord = mod_key.apply_to(binding.chord);
                 if keyref.matches(&chord) || unshifted.is_some_and(|base| base.matches(&chord)) {
-                    return Some(ChromeAction::InvokeCommand(binding.qualified.clone()));
+                    // Issue #2965: plugin suggestions carry no arguments; a
+                    // user binding may, and its payload rides the same
+                    // `ChromeAction::InvokeCommand` into dispatch.
+                    return Some(ChromeAction::InvokeCommand(
+                        binding.qualified.clone().into(),
+                    ));
                 }
             }
         }
@@ -373,7 +378,9 @@ mod tests {
         directory.publish("help", 3, vec![binding("help", 3, "alt+?", "help:toggle")]);
         assert_eq!(
             directory.action_for(alt_question(), ModKey::Alt),
-            Some(ChromeAction::InvokeCommand("help:toggle".to_string()))
+            Some(ChromeAction::InvokeCommand(
+                "help:toggle".to_string().into()
+            ))
         );
         assert!(
             directory
@@ -454,7 +461,9 @@ mod tests {
         };
         assert_eq!(
             directory.action_for(alt_slash, ModKey::Alt),
-            Some(ChromeAction::InvokeCommand("help:toggle".to_string()))
+            Some(ChromeAction::InvokeCommand(
+                "help:toggle".to_string().into()
+            ))
         );
     }
 
@@ -471,7 +480,9 @@ mod tests {
         );
         assert_eq!(
             directory.action_for(alt_question(), ModKey::Alt),
-            Some(ChromeAction::InvokeCommand("help:toggle".to_string()))
+            Some(ChromeAction::InvokeCommand(
+                "help:toggle".to_string().into()
+            ))
         );
         // The shadowed suggestion is reported, never silently dropped.
         let conflicts = directory.drain_conflicts();
@@ -498,7 +509,9 @@ mod tests {
         // Deterministic lexical owner order, independent of activation order.
         assert_eq!(
             directory.action_for(alt_question(), ModKey::Alt),
-            Some(ChromeAction::InvokeCommand("alpha:toggle".to_string()))
+            Some(ChromeAction::InvokeCommand(
+                "alpha:toggle".to_string().into()
+            ))
         );
         assert_eq!(directory.active().len(), 2);
         // One diagnostic for the colliding chord, naming the real winner and

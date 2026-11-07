@@ -173,7 +173,9 @@ impl ContainedChild {
     ///
     /// macOS has no `waitid(2)` in the safe surface, so the plan peeks at the
     /// kernel's process status instead: a zombie status means the leader
-    /// exited and stays unreaped. A zombie keeps its pid, and therefore the
+    /// exited and stays unreaped. The probe passes the zombie-inclusive
+    /// `proc_pidinfo` selector, so an unreaped child is reported as `SZOMB`
+    /// rather than `ESRCH`. A zombie keeps its pid, and therefore the
     /// process-group id minted from it, reserved, so the recorded group can
     /// still be signalled after a natural exit without racing a reused id.
     #[must_use]

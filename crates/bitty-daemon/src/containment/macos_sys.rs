@@ -11,9 +11,10 @@
 //! The `arg` argument is XNU's zombie selector, not padding. For
 //! `PROC_PIDTBSDINFO`, `proc_info` sets `findzomb` only when `arg` is nonzero
 //! and otherwise calls `proc_find(pid)`, which does not return a zombie. The
-//! production probe currently passes `0`; [`observe_leader_with_arg`] lets the
-//! macOS test compare `0` and `1` on a real unreaped child so the selector's
-//! effect is visible in the failure message.
+//! production probe passes `1`, so the kernel falls back to
+//! `proc_find_zombref(pid)` and reports `SZOMB`; [`observe_leader_with_arg`]
+//! lets the macOS test compare both selectors on a real unreaped child so the
+//! selector's effect is visible in the failure message.
 //!
 //! Following the `bitty-sandbox`, `bitty-winjob`, and `freebsd_sys`
 //! precedent, the crate root keeps `#![deny(unsafe_code)]` and only this
@@ -26,6 +27,13 @@ use std::fmt;
 use std::mem::size_of;
 
 use nix::libc;
+
+/// The `arg` value that makes XNU resolve an unreaped zombie.
+///
+/// XNU's `proc_info` sets `findzomb` for `PROC_PIDTBSDINFO` only when `arg` is
+/// nonzero; `arg = 0` calls `proc_find(pid)`, which does not return a zombie.
+/// `arg = 1` falls back to `proc_find_zombref(pid)` and reports `SZOMB`.
+const ZOMBIE_INCLUSIVE_ARG: u64 = 1;
 
 /// One `proc_pidinfo(PROC_PIDTBSDINFO)` observation.
 ///
@@ -137,11 +145,13 @@ pub(crate) fn observe_leader_with_arg(pid: u32, arg: u64) -> LeaderObservation {
 /// Observe `pid` with the production selector.
 #[must_use]
 pub(crate) fn observe_leader(pid: u32) -> LeaderObservation {
-    observe_leader_with_arg(pid, 0)
+    observe_leader_with_arg(pid, ZOMBIE_INCLUSIVE_ARG)
 }
 
 /// Whether `pid` has exited and waits to be reaped.
 ///
+/// The production selector is zombie-inclusive, so a child that exited and was
+/// not reaped is observed with `pbi_status == SZOMB` instead of `ESRCH`.
 /// Returns `false` when the status cannot be read: an unreadable status never
 /// proves an exit, so the caller keeps its existing state instead of acting on
 /// an observation it does not have.

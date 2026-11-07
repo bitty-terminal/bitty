@@ -17,8 +17,11 @@
 //! Exit codes (`D-05`): `0` success (including "already running" and a stop
 //! with no active sessions), `1` internal failure, `2` usage, `3` active
 //! sessions on a default stop, `4` a drain deadline forced the remainder,
-//! `5` a worker could not be verified gone, `6` endpoint tamper or a failed
-//! authentication invariant.
+//! `5` a worker could not be verified gone, `6` endpoint tamper, a failed
+//! authentication invariant, or an endpoint this account may not use. That is
+//! the closed set the binary can return; there is no `7`. The permission class
+//! a system-owned channel produces is exit `6`, because the peer cannot be
+//! authenticated through it.
 //!
 //! Parsing and rendering are pure so the behavior is testable without spawning
 //! the process; [`run`] writes the rendered strings, runs the service for
@@ -55,7 +58,8 @@ pub const EXIT_DRAIN_FORCED: u8 = 4;
 /// A worker could not be verified gone (`D-05`).
 pub const EXIT_UNVERIFIED_WORKER: u8 = 5;
 
-/// Endpoint tamper or a failed authentication invariant (contract exit `6`).
+/// Endpoint tamper, a failed authentication invariant, or an endpoint this
+/// account may not use (contract exit `6`).
 pub const EXIT_TAMPER: u8 = 6;
 
 /// One parsed `bittyd` invocation.
@@ -188,7 +192,9 @@ pub fn usage() -> String {
          exit codes: 0 ok, already running, or no daemon; 1 startup or transport\n\
          failure; 2 usage error; 3 active sessions on a default stop; 4 drain\n\
          deadline forced the remainder; 5 a worker could not be verified gone;\n\
-         6 endpoint tamper or a failed authentication invariant\n"
+         6 endpoint tamper, a failed authentication invariant, or an endpoint\n\
+         this account may not use. `--drain` exits 4 when it has to terminate a\n\
+         live session; it is the only drain outcome this build serves.\n"
     )
 }
 
@@ -326,7 +332,8 @@ pub fn stopped_exit_code(mode: StopMode, unverified: bool) -> u8 {
 /// The `D-05` exit code for an accepted `daemon.stop`.
 ///
 /// `force` is `0`, or `5` when a worker could not be verified gone. `drain` is
-/// `0`, or `4` when the deadline forced the remainder. `refuse` is `0`.
+/// `0`, or `4` when the served loop reports that it forced the remainder.
+/// `refuse` is `0`.
 #[must_use]
 pub fn stop_reply_exit_code(reply: &StopReply) -> u8 {
     match reply.mode {
@@ -339,11 +346,15 @@ pub fn stop_reply_exit_code(reply: &StopReply) -> u8 {
 }
 
 /// The `D-05` exit code for a refused or failed stop exchange.
+///
+/// A channel this account may not use is the same authentication-invariant
+/// class as an unsafe capability file, so both are exit `6`. There is no
+/// separate permission code: `D-05` closes the set at `0`-`6`.
 #[must_use]
 pub fn stop_error_exit_code(error: &StopError) -> u8 {
     match error {
         StopError::Absent => EXIT_OK,
-        StopError::Authentication => EXIT_TAMPER,
+        StopError::Authentication | StopError::Permission => EXIT_TAMPER,
         StopError::Refused { code, .. } if code == "ActiveSessions" => EXIT_ACTIVE_SESSIONS,
         StopError::Refused { code, .. } if code == "DaemonStopping" => EXIT_OK,
         StopError::UnsupportedPlatform
@@ -560,8 +571,29 @@ mod tests {
             stop_error_exit_code(&StopError::Authentication),
             EXIT_TAMPER
         );
+        assert_eq!(stop_error_exit_code(&StopError::Permission), EXIT_TAMPER);
         assert_eq!(stop_error_exit_code(&StopError::Absent), EXIT_OK);
         assert_eq!(stop_error_exit_code(&StopError::Transport), EXIT_INTERNAL);
+    }
+
+    #[test]
+    fn the_help_text_names_the_closed_exit_set() {
+        let text = usage();
+        for code in [
+            "0 ok",
+            "1 startup",
+            "2 usage",
+            "3 active",
+            "4 drain",
+            "5 a worker",
+            "6 endpoint",
+        ] {
+            assert!(text.contains(code), "help must pin {code:?}: {text}");
+        }
+        assert!(
+            !text.contains("7 "),
+            "the closed set has no 7 in help: {text}"
+        );
     }
 
     #[test]

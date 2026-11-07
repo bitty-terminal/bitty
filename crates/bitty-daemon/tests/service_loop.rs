@@ -194,17 +194,31 @@ struct CliStopObservation {
 
 /// Run `bittyd stop` with the given flags against a throwaway root.
 fn run_cli_stop(root: &TempRoot, flags: &[&str]) -> CliStopObservation {
-    let output = Command::new(BITTYD)
+    run_cli_stop_resolving(root, flags, None)
+}
+
+/// Run `bittyd stop` with the given flags, optionally overriding the endpoint
+/// path the way an alternate runtime root would.
+fn run_cli_stop_resolving(
+    root: &TempRoot,
+    flags: &[&str],
+    endpoint: Option<&str>,
+) -> CliStopObservation {
+    let mut command = Command::new(BITTYD);
+    command
         .arg("stop")
         .args(flags)
         .env("XDG_RUNTIME_DIR", root.runtime())
         .env("XDG_STATE_HOME", root.state())
-        .env_remove("BITTYD_ENDPOINT")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("run bittyd stop");
+        .stderr(Stdio::piped());
+    if let Some(path) = endpoint {
+        command.env("BITTYD_ENDPOINT", path);
+    } else {
+        command.env_remove("BITTYD_ENDPOINT");
+    }
+    let output = command.output().expect("run bittyd stop");
     CliStopObservation {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -4114,6 +4128,88 @@ fn cli_stop_refuses_with_active_sessions_and_leaves_the_daemon_serving() {
     assert_eq!(status["result"]["daemon_state"], "running", "{status}");
     assert_eq!(status["result"]["active_sessions"], 1, "{status}");
     assert_eq!(stop_cleanly(&root, daemon).code(), Some(0));
+}
+
+/// A drain that meets a live session has to force the remainder: the served
+/// loop terminates it in the same pass instead of waiting out the grace, so the
+/// accepted result carries `drain_forced` and the CLI returns the documented
+/// exit `4` (`D-05`). This is the code that used to be unreachable.
+#[test]
+fn cli_drain_with_a_live_session_forces_the_remainder_and_exits_four() {
+    let root = TempRoot::new("cli-drain-forced");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+    let session = controlled_session(&root, &mut operator, "cli-drain-forced");
+
+    let observed = run_cli_stop(&root, &["--drain"]);
+    assert_eq!(observed.code, 4, "{observed:?}");
+    assert!(
+        observed
+            .stdout
+            .contains("stopped (drain) with 1 active session(s)"),
+        "{observed:?}"
+    );
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+    let _ = session.session_id;
+}
+
+/// A drain with nothing to force is exit `0`: the same key stays `false`, so
+/// the reachable-`4` fix does not turn every drain into a forced one.
+#[test]
+fn cli_drain_without_a_live_session_exits_zero() {
+    let root = TempRoot::new("cli-drain-clean");
+    let daemon = Daemon::start(&root);
+    let observed = run_cli_stop(&root, &["--drain"]);
+    assert_eq!(observed.code, 0, "{observed:?}");
+    assert!(
+        observed
+            .stdout
+            .contains("stopped (drain) with 0 active session(s)"),
+        "{observed:?}"
+    );
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+}
+
+/// An endpoint this account may not use is the authentication-invariant class
+/// (`D-05` exit `6`), not an internal failure. The socket is mode `0000`, so the
+/// kernel refuses the connection before any frame exists.
+#[test]
+fn cli_stop_on_a_channel_this_account_may_not_use_exits_six() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    let root = TempRoot::new("cli-permission");
+    std::fs::create_dir_all(root.endpoint().parent().expect("runtime dir")).expect("runtime dir");
+    std::fs::set_permissions(
+        root.endpoint().parent().expect("runtime dir"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .expect("runtime mode");
+    let _listener = UnixListener::bind(root.endpoint()).expect("bind endpoint");
+    std::fs::set_permissions(root.endpoint(), std::fs::Permissions::from_mode(0o000))
+        .expect("deny the endpoint to its own user");
+
+    let observed = run_cli_stop(&root, &[]);
+    assert_eq!(observed.code, 6, "{observed:?}");
+    assert!(
+        observed.stderr.contains("not accessible to this account"),
+        "{observed:?}"
+    );
+}
+
+/// An unusable endpoint path is exit `1`: the failure happens before a listener
+/// is ever consulted, which is exactly what `D-05` reserves code `1` for.
+#[test]
+fn cli_stop_with_an_unusable_endpoint_path_exits_one() {
+    let root = TempRoot::new("cli-invalid-endpoint");
+    let observed = run_cli_stop_resolving(&root, &[], Some("relative/bittyd.sock"));
+    assert_eq!(observed.code, 1, "{observed:?}");
+    assert!(
+        observed.stderr.contains("endpoint path is unusable"),
+        "{observed:?}"
+    );
 }
 
 #[cfg(feature = "test-seams")]

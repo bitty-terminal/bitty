@@ -898,6 +898,20 @@ pub struct Runtime {
     /// population. Dropped on restore: restore re-inserts a fresh split
     /// with default geometry. Presentation-only: never grid truth.
     float_offsets: std::collections::HashMap<ViewId, (i32, i32)>,
+    /// Corner/edge resize sizes for anchored overlays (issue #2945).
+    ///
+    /// Pinned and detached floats derive their present geometry from
+    /// [`Runtime::pinned_anchor`]/[`Runtime::float_anchor`] (a centered
+    /// container share plus the cascade), so a free-rect resize has nowhere to
+    /// land in the layout tree. An Alt+corner/edge drag therefore stores the
+    /// resized cell extent here, keyed by [`ViewId`] (ids are unique across the
+    /// pinned store and every workspace float store, so one map serves both
+    /// families). The anchors read it back and recompute the permitted origin
+    /// ranges from it, so a resized panel still cannot leave the container.
+    /// Bounded by the live-leaf population; dropped on unpin/restore/discard,
+    /// exactly like the re-anchor offsets. Presentation-only: never grid
+    /// truth (leaf Views and PTY winsize follow the composited frame).
+    anchored_sizes: std::collections::HashMap<ViewId, (u16, u16)>,
     /// Monotonic high-water mark of every [`ViewId`] ever installed in a
     /// layout (CTX-0536, issue #923).
     ///
@@ -2369,6 +2383,7 @@ impl Runtime {
             pinned_offsets: std::collections::HashMap::new(),
             floats: FloatStore::new(),
             float_offsets: std::collections::HashMap::new(),
+            anchored_sizes: std::collections::HashMap::new(),
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,
@@ -2690,6 +2705,7 @@ impl Runtime {
             pinned_offsets: std::collections::HashMap::new(),
             floats: FloatStore::new(),
             float_offsets: std::collections::HashMap::new(),
+            anchored_sizes: std::collections::HashMap::new(),
             view_id_high_water: 0,
             session_pending: BTreeMap::new(),
             session_primary_cwd: None,

@@ -1888,6 +1888,13 @@ impl Service {
         }
         let terminated = self.terminate_all(DaemonStopCause::DaemonStop, now);
         self.stop_unverified = terminated.unverified > 0;
+        // The served loop has no drain wait yet: an accepted `drain` terminates
+        // every live session in the same pass instead of holding them for
+        // `drain_grace_ms`, so any session it terminated had its remainder
+        // forced by the deadline. The additive key is what the operator CLI
+        // reads to report `D-05` exit `4`; a drain that found nothing live
+        // reports `false` and leaves the exit at `0`.
+        let drain_forced = mode == StopMode::Drain && terminated.terminated > 0;
         self.flush_events(now);
         self.stop_requested = Some(mode);
         self.record(
@@ -1906,6 +1913,7 @@ impl Service {
             "active_sessions": active,
             "terminated": terminated.terminated,
             "unverified": terminated.unverified,
+            "drain_forced": drain_forced,
             "drain_deadline_ms": self.drain_deadline_ms,
         }))
     }

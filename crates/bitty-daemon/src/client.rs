@@ -48,9 +48,9 @@ pub struct StopReply {
     pub terminated: u64,
     /// Bound workers the daemon could not verify gone (`D-05` exit `5`).
     pub unverified: u64,
-    /// Whether a drain deadline forced the remainder. The accepted `1.3`
-    /// result does not carry this field yet, so a served daemon reports
-    /// `false`; the parser keeps the mapping ready for the additive key.
+    /// Whether a drain deadline forced the remainder. The served loop reports
+    /// this key on every accepted stop, so a `--drain` that had to terminate a
+    /// live session returns exit `4` instead of `0`.
     pub drain_forced: bool,
 }
 
@@ -66,6 +66,12 @@ pub enum StopError {
     /// The capability file is unsafe or unreadable while an endpoint answers;
     /// this is an authentication invariant failure, never a weaker attempt.
     Authentication,
+    /// The endpoint exists but this account may not use it: the OS refused the
+    /// connection (`EACCES`/`EPERM`), which is what a channel bound by another
+    /// account reports. It is the same authentication-invariant exit class as
+    /// [`StopError::Authentication`] (`D-05` exit `6`) and never a transport
+    /// fallback.
+    Permission,
     /// The daemon refused the request with a typed code.
     Refused {
         /// The static refusal class.
@@ -90,6 +96,10 @@ impl std::fmt::Display for StopError {
             }
             Self::InvalidEndpoint => formatter.write_str("the bittyd endpoint path is unusable"),
             Self::Authentication => formatter.write_str("operator authentication failed"),
+            Self::Permission => formatter.write_str(
+                "the daemon endpoint is not accessible to this account, so the peer \
+                 cannot be authenticated",
+            ),
             Self::Refused {
                 class,
                 code,
@@ -113,9 +123,9 @@ impl std::error::Error for StopError {}
 ///
 /// # Errors
 ///
-/// Returns [`StopError`] for an absent endpoint, an unsafe capability file, a
-/// typed daemon refusal, or a transport/protocol failure. No caller input is
-/// echoed in the error.
+/// Returns [`StopError`] for an absent endpoint, an unsafe capability file, an
+/// endpoint this account may not use, a typed daemon refusal, or a
+/// transport/protocol failure. No caller input is echoed in the error.
 pub fn stop(mode: StopMode) -> Result<StopReply, StopError> {
     #[cfg(not(unix))]
     {
@@ -154,6 +164,12 @@ fn stop_unix(mode: StopMode) -> Result<StopReply, StopError> {
             ) =>
         {
             return Err(StopError::Absent);
+        }
+        // A bound endpoint this account may not use (another account's socket,
+        // a mode that denies the caller) is a refused peer authentication, not
+        // an internal failure: report it as the contract's exit `6` class.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(StopError::Permission);
         }
         Err(_) => return Err(StopError::Transport),
     };

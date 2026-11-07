@@ -29,7 +29,7 @@ use harness::real::RealDriver;
 #[test]
 fn corpus_is_well_formed_and_frozen() {
     let corpus = Corpus::load().expect("the embedded corpus parses");
-    assert_eq!(corpus.vectors.len(), 65, "corpus size changed");
+    assert_eq!(corpus.vectors.len(), 66, "corpus size changed");
     for id in [
         "C-01", "C-02", "C-03", "C-04", "C-05", "C-06", "C-07", "C-08", "C-12", "C-13", "C-14",
         "C-15", "C-16", "C-17",
@@ -325,7 +325,7 @@ fn fake_conformance_corpus() {
         skipped,
         [
             "V-17", "V-18", "V-39", "V-40", "V-42", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07",
-            "C-08", "C-12", "C-15", "C-16", "V-49", "V-50", "V-55", "V-56"
+            "C-08", "C-12", "C-15", "C-16", "V-49", "V-50", "V-55", "V-56", "V-57"
         ],
         "the fake suite skips exactly the real-only and amendment-gated vectors"
     );
@@ -468,7 +468,7 @@ fn expected_parity(real_serves_spawn: bool, test_seams: bool) -> (usize, Vec<&'s
     let mut expected_not_compared = vec![
         "V-06", "V-17", "V-18", "V-33", "V-39", "V-40", "V-42", "V-43", "C-01", "C-02", "C-03",
         "C-11", "C-07", "C-08", "C-10", "C-12", "F-01", "C-15", "C-16", "V-49", "V-50", "V-55",
-        "V-56",
+        "V-56", "V-57",
     ];
     if !test_seams {
         // Without the real seams V-20 and V-44 are fake-only rows: the real

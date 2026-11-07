@@ -16,9 +16,11 @@
 
 use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
+use bitty_ipc::MAX_SNAPSHOT_ZONES;
+use bitty_rich::shell::ShellIntegration;
 use bitty_runtime::plugin_runtime::{
     BridgeError, CoreTargetInfo, EmptySettings, FsListBackend, KeymapSource, LuaValue,
     PaneCwdSource, PanelCreateHandler, PanelPinHandler, PanelPinQueue, PluginRuntime,
@@ -30,6 +32,7 @@ use bitty_runtime::registry::{
 };
 use bitty_runtime::scene_host::SceneHost;
 use bitty_runtime::{E_UI_UNAVAILABLE, PaneCwd, TargetAnchorSummary, ViewId, WorkspaceSummary};
+use bitty_term_state::{State, ZoneKind};
 
 /// Environment override for a local-path development plugin root.
 ///
@@ -38,11 +41,23 @@ use bitty_runtime::{E_UI_UNAVAILABLE, PaneCwd, TargetAnchorSummary, ViewId, Work
 /// `--safe`.
 pub(crate) const PLUGIN_ROOT_ENV: &str = "BITTY_PLUGIN_DIR";
 
+/// One bounded semantic zone published into the Lua snapshot.
+///
+/// `kind` is the accepted RFC vocabulary name; the Lua `range` is degenerate
+/// (`start_line = end_line = 0`, explicitly unanchored), exactly like the IPC
+/// snapshot service (`bitty-runtime::host_bridge`). `cwd` is the pane's pinned
+/// kernel working directory, carried only by the newest zone (issue #2962).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticZoneSummary {
+    pub(crate) kind: &'static str,
+    pub(crate) cwd: Option<String>,
+}
+
 /// Committed snapshot values published from the live runtime (CTX-0481).
 ///
-/// Small and `Copy`-free on purpose: the tick loop rebuilds it from cheap
-/// `State` reads (generation, cursor, title) and commits it atomically, so
-/// plugins never observe torn or frozen data.
+/// Small and `Copy`-free on purpose: the tick loop rebuilds it from bounded
+/// `State` reads (generation, cursor, title, the newest semantic zones) and
+/// commits it atomically, so plugins never observe torn or frozen data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SnapshotState {
     pub(crate) generation: u64,
@@ -53,6 +68,21 @@ pub(crate) struct SnapshotState {
     pub(crate) cursor_visible: bool,
     pub(crate) alternate_screen: bool,
     pub(crate) title: String,
+    /// Bounded semantic zones of the focused terminal, oldest first
+    /// (issue #2962).
+    ///
+    /// Derived from the same committed `OSC 133` zone log the IPC snapshot
+    /// service serves, newest [`MAX_SNAPSHOT_ZONES`] only. The newest zone
+    /// carries the pane directory in `metadata.cwd`, so a plugin can resolve
+    /// the directory the documented Plugin API v1 surface exposes.
+    ///
+    /// The cwd is the pinned PTY-child kernel cwd (review 5811186131 finding
+    /// 2), rendered `~/...` when it is below the home: it is never the pane's
+    /// `OSC 7` report, which any program in the pane can forge and which
+    /// `bitty.fs.list` would accept back as a request. Values remain
+    /// observation data: they carry no authority, and the fs gate still
+    /// decides every call.
+    pub(crate) zones: Vec<SemanticZoneSummary>,
     /// Pinned kernel working directory of the focused pane's PTY child
     /// (CTX-1715, issue #2911).
     ///
@@ -80,12 +110,23 @@ pub(crate) struct SnapshotState {
 /// which run on the same thread.
 pub(crate) struct LiveSnapshot {
     state: RefCell<SnapshotState>,
+    /// Environment-derived home the `bitty.fs` bridge resolves `~` against.
+    ///
+    /// The semantic snapshot renders the pinned PTY-child cwd relative to this
+    /// same root, so a plugin can hand `zones[].metadata.cwd` straight back to
+    /// `bitty.fs.list` (issue #2962). The path is canonicalized at
+    /// construction when the filesystem admits it, because the kernel cwd is
+    /// already symlink-free: a symlinked `$HOME` would otherwise never prefix
+    /// the real cwd and every published value would stay absolute, which
+    /// `bitty.fs.list` rejects as hostile. `None` publishes the absolute path
+    /// instead; the fs bridge still applies its own request grammar.
+    home: Option<PathBuf>,
 }
 
 impl LiveSnapshot {
     /// Committed state before the first publish: generation 0, initial
     /// geometry, empty title.
-    pub(crate) fn new(cols: usize, rows: usize) -> Self {
+    pub(crate) fn new(cols: usize, rows: usize, home: Option<PathBuf>) -> Self {
         Self {
             state: RefCell::new(SnapshotState {
                 generation: 0,
@@ -96,8 +137,12 @@ impl LiveSnapshot {
                 cursor_visible: true,
                 alternate_screen: false,
                 title: String::new(),
+                zones: Vec::new(),
                 pane_cwd: None,
             }),
+            // Canonical when resolvable; the raw path stays the fallback so a
+            // home that does not exist yet still renders lexically.
+            home: home.map(|path| std::fs::canonicalize(&path).unwrap_or(path)),
         }
     }
 
@@ -109,6 +154,13 @@ impl LiveSnapshot {
     pub(crate) fn publish(&self, runtime: &bitty_runtime::Runtime) -> bool {
         let state = runtime.state();
         let cursor = state.cursor();
+        // CTX-1715 / #2911: the focused pane's PTY-child kernel cwd, pinned to
+        // a directory identity and read through the same runtime model that
+        // commits the semantic snapshot. The pane's OSC 7 report is never a
+        // source here. `None` leaves both the zone cwd and the spawn `pane`
+        // semantic unresolvable (typed refusal / absent field), never a
+        // host-cwd or report fallback.
+        let pane_cwd = runtime.focused_pane_child_cwd();
         let next = SnapshotState {
             generation: state.generation(),
             // Live grid dims (the config keeps the startup geometry; a
@@ -120,13 +172,21 @@ impl LiveSnapshot {
             cursor_visible: cursor.visible,
             alternate_screen: state.alt_screen_active(),
             title: state.title().to_string(),
-            // CTX-1715 / #2911: the focused pane's PTY-child kernel cwd,
-            // pinned to a directory identity and read through the same runtime
-            // model that commits the semantic snapshot. The pane's OSC 7
-            // report is never a source here. `None` leaves the spawn `pane`
-            // semantic unresolvable (typed refusal), never a host-cwd
-            // fallback.
-            pane_cwd: runtime.focused_pane_child_cwd(),
+            // Issue #2962 / review 5811186131 finding 2: the semantic
+            // snapshot's zone view follows the focused terminal (Plugin API
+            // v1 Lua Surface RFC: without `terminal_id` the snapshot targets
+            // the focused view's attached terminal). The committed primary
+            // state stays the fallback when no focused view resolves to a
+            // live grid. `OSC 133` markers are untrusted observation data; the
+            // cwd rendered into the newest zone is the pinned PTY-child cwd
+            // above, never the pane's `OSC 7` report, and it is rendered
+            // relative to the same home `bitty.fs` resolves `~` against.
+            zones: semantic_zones(
+                runtime.focused_state().unwrap_or(state),
+                pane_cwd.as_ref().map(PaneCwd::path),
+                self.home.as_deref(),
+            ),
+            pane_cwd,
         };
         self.publish_state(next)
     }
@@ -188,9 +248,126 @@ impl LiveSnapshot {
                 LuaValue::table([("alternate_screen", LuaValue::Bool(state.alternate_screen))]),
             ),
             ("title", LuaValue::String(state.title.clone())),
-            ("zones", LuaValue::array(Vec::new())),
+            (
+                "zones",
+                LuaValue::array(state.zones.iter().map(zone_to_lua).collect()),
+            ),
         ])
     }
+}
+
+/// Lua projection of one bounded semantic zone.
+///
+/// Shape is the accepted Plugin API v1 `zones[i]` form: `kind`, a degenerate
+/// `range` (the IPC snapshot service is unanchored too), and `metadata.cwd`
+/// only on the newest zone that carries a report (issue #2962).
+fn zone_to_lua(zone: &SemanticZoneSummary) -> LuaValue {
+    let mut pairs = vec![
+        (
+            LuaValue::String("kind".to_string()),
+            LuaValue::String(zone.kind.to_string()),
+        ),
+        (
+            LuaValue::String("range".to_string()),
+            LuaValue::table([
+                ("start_line", LuaValue::Integer(0)),
+                ("end_line", LuaValue::Integer(0)),
+            ]),
+        ),
+    ];
+    if let Some(cwd) = &zone.cwd {
+        pairs.push((
+            LuaValue::String("metadata".to_string()),
+            LuaValue::table([("cwd", LuaValue::String(cwd.clone()))]),
+        ));
+    }
+    LuaValue::Table(pairs)
+}
+
+/// Bounded semantic-zone projection of one committed terminal state.
+///
+/// Reads committed `State` only, exactly like the IPC snapshot service: the
+/// newest [`MAX_SNAPSHOT_ZONES`] `OSC 133` markers, oldest first. The newest
+/// zone carries `metadata.cwd` rendered from `pane_cwd` — the pinned kernel
+/// working directory of the focused pane's PTY child — relative to `home`
+/// (issue #2962, review 5811186131 finding 2). The `OSC 7` cwd report the
+/// shell prints is deliberately not a source: any program in the pane can
+/// forge it, and `bitty.fs.list` accepts exactly the `~/...` grammar it would
+/// be rendered into, so an untrusted report would steer plugin requests.
+///
+/// A terminal with a pinned cwd but no `OSC 133` marker yields one `unknown`
+/// zone, so the cwd stays observable; a terminal with neither yields no zone
+/// and no cwd. Bounds stay the accepted ones: the state's `ZONE_RECORDS_MAX`
+/// and the snapshot's [`MAX_SNAPSHOT_ZONES`].
+fn semantic_zones(
+    state: &State,
+    pane_cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> Vec<SemanticZoneSummary> {
+    let cwd = pane_cwd.map(|path| logical_cwd(path, home));
+    let mut zones: Vec<SemanticZoneSummary> = ShellIntegration::zones(state)
+        .into_iter()
+        .rev()
+        .take(MAX_SNAPSHOT_ZONES)
+        .rev()
+        .map(|record| SemanticZoneSummary {
+            kind: zone_kind_name(record.kind),
+            cwd: None,
+        })
+        .collect();
+    if let Some(newest) = zones.last_mut() {
+        newest.cwd = cwd;
+    } else if let Some(cwd) = cwd {
+        zones.push(SemanticZoneSummary {
+            kind: "unknown",
+            cwd: Some(cwd),
+        });
+    }
+    zones
+}
+
+/// RFC zone-kind name for one committed marker.
+fn zone_kind_name(kind: ZoneKind) -> &'static str {
+    match kind {
+        ZoneKind::PromptStart => "prompt",
+        ZoneKind::InputStart => "input",
+        ZoneKind::OutputStart => "command",
+        ZoneKind::OutputEnd => "output",
+    }
+}
+
+/// Render one pinned pane directory for the plugin-facing zone metadata.
+///
+/// Home-relative (`~/...`) when the path is lexically below `home`: that is
+/// the request form `bitty.fs` accepts, and the official plugins hand this
+/// value straight back to `bitty.fs.list`. Every other path keeps its
+/// absolute spelling. Purely lexical, no filesystem access: the input is the
+/// PTY child's kernel cwd, so nothing is resolved, invented, or dropped, and
+/// a `..` segment is never rendered as home-relative (the kernel cwd cannot
+/// contain one).
+fn logical_cwd(path: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home {
+        if let Ok(rest) = path.strip_prefix(home) {
+            let mut segments = Vec::new();
+            let mut clean = true;
+            for component in rest.components() {
+                match component {
+                    Component::Normal(name) => match name.to_str() {
+                        Some(name) => segments.push(name),
+                        None => clean = false,
+                    },
+                    _ => clean = false,
+                }
+            }
+            if clean {
+                if segments.is_empty() {
+                    return "~".to_string();
+                }
+                return format!("~/{}", segments.join("/"));
+            }
+        }
+    }
+    path.to_string_lossy().into_owned()
 }
 
 impl SnapshotSource for LiveSnapshot {
@@ -772,7 +949,9 @@ pub(crate) fn discover_with_roots(
         return None;
     }
     let data_dir = data_home().map(|base| base.join("bitty").join("plugins-state"));
-    let snapshot = Rc::new(LiveSnapshot::new(cols, rows));
+    // Issue #2962: the semantic snapshot renders its `OSC 7` cwd relative to
+    // the same home the `bitty.fs` bridge resolves `~` against below.
+    let snapshot = Rc::new(LiveSnapshot::new(cols, rows, fs_home.clone()));
     let host_snapshot: Rc<dyn SnapshotSource> = snapshot.clone();
     let mut runtime = PluginRuntime::new(PluginRuntimeConfig {
         safe_mode,
@@ -1052,7 +1231,7 @@ mod tests {
         // for the process lifetime, so plugins never observed committed
         // state advancing. The live source tracks the committed runtime
         // generation.
-        let snapshot = LiveSnapshot::new(80, 24);
+        let snapshot = LiveSnapshot::new(80, 24, None);
         let before = generation_of(&snapshot.snapshot("semantic").expect("scope ok"));
         let mut rt = Runtime::with_defaults().expect("must build");
         rt.handle_pty_bytes(b"ctx-0481-live-snapshot\r\n");
@@ -1099,7 +1278,7 @@ mod tests {
         // headless runtime owns no child, so a well-formed OSC 7 report must
         // not become the published pane directory: the spawn refuses instead.
         let dir = std::env::temp_dir();
-        let snapshot = LiveSnapshot::new(80, 24);
+        let snapshot = LiveSnapshot::new(80, 24, None);
         let mut rt = Runtime::with_defaults().expect("must build");
         rt.handle_pty_bytes(&osc7_report(&dir));
         let _ = rt.tick();
@@ -1126,6 +1305,7 @@ mod tests {
         // kernel cwd -- and a contradicting OSC 7 report does not move it.
         // Revert proof: the pre-fix publish read the report, so the value
         // below is `reported` instead of `real` and the assert fails.
+        bitty_test_support::require_pty!();
         let root = std::env::temp_dir().join(format!(
             "bitty-live-pane-cwd-{}-{}",
             std::process::id(),
@@ -1138,7 +1318,7 @@ mod tests {
         std::fs::create_dir_all(&real).expect("real dir");
         std::fs::create_dir_all(&reported).expect("reported dir");
 
-        let snapshot = LiveSnapshot::new(80, 24);
+        let snapshot = LiveSnapshot::new(80, 24, None);
         let mut rt = Runtime::with_defaults().expect("must build");
         rt.spawn_shell_with_args(
             "sh",
@@ -1182,6 +1362,245 @@ mod tests {
             "the spawn cwd is not a new snapshot field plugins can read"
         );
         std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Zones array of a semantic snapshot, in Lua array order.
+    ///
+    /// Only the live-PTY probes below read the published table; the
+    /// source-level probes call [`semantic_zones`] directly, so this stays
+    /// gated with them instead of dead code on other platforms.
+    #[cfg(target_os = "linux")]
+    fn zones_of(snapshot: &LuaValue) -> Vec<&LuaValue> {
+        match snapshot.get("zones") {
+            Some(LuaValue::Table(pairs)) => pairs.iter().map(|(_, value)| value).collect(),
+            other => panic!("snapshot zones must be an array, got {other:?}"),
+        }
+    }
+
+    /// Newest zone cwd of a semantic snapshot, when one is carried.
+    ///
+    /// Gated with [`zones_of`]: only the live-PTY probes read it.
+    #[cfg(target_os = "linux")]
+    fn newest_zone_cwd(snapshot: &LuaValue) -> Option<String> {
+        zones_of(snapshot).iter().rev().find_map(|zone| {
+            zone.get("metadata")
+                .and_then(|metadata| metadata.get("cwd"))
+                .and_then(|cwd| match cwd {
+                    LuaValue::String(cwd) => Some(cwd.clone()),
+                    _ => None,
+                })
+        })
+    }
+
+    /// Unique scratch root for the semantic-cwd probes.
+    ///
+    /// Portable on purpose: only the probes that need a real PTY child are
+    /// `linux`-gated, and the source-level probes build the same paths on
+    /// every platform.
+    fn semantic_cwd_root(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bitty-semantic-cwd-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos())
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn semantic_snapshot_reports_the_pinned_pane_cwd_not_the_osc7_report() {
+        // Issue #2962 / review 5811186131 finding 2: `LiveSnapshot::to_lua`
+        // always published `zones = {}`, so a plugin could never learn the
+        // pane directory and the official file-manager/git-panel failed with
+        // E_SCOPE_UNAVAILABLE. The newest zone must carry the pane cwd
+        // home-relative so `bitty.fs.list` accepts it back -- but it must be
+        // the PTY child's kernel cwd, not the `OSC 7` report, which any
+        // program in the pane can forge and which feeds the same `~/...`
+        // request grammar.
+        //
+        // Revert proof: with the report as the source, `spoofed` (what the
+        // child prints) is published instead of `real` (where the kernel says
+        // it lives), and the loop below times out on the wrong value.
+        bitty_test_support::require_pty!();
+        let root = semantic_cwd_root("pty");
+        let real = root.join("real");
+        let spoofed = root.join("spoofed");
+        std::fs::create_dir_all(&real).expect("real dir");
+        std::fs::create_dir_all(&spoofed).expect("spoofed dir");
+
+        let snapshot = LiveSnapshot::new(80, 24, Some(root.clone()));
+        let mut rt = Runtime::with_defaults().expect("must build");
+        rt.spawn_shell_with_args(
+            "sh",
+            &[
+                "-c",
+                "cd \"$1\" && printf '\\033]7;file://%s\\007' \"$2\" && exec sleep 60",
+                "sh",
+                real.to_str().expect("utf-8 real dir"),
+                spoofed.to_str().expect("utf-8 spoofed dir"),
+            ],
+        )
+        .expect("spawn the pane shell");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let _ = rt.poll_pty();
+            let _ = rt.tick();
+            snapshot.publish(&rt);
+            let served = newest_zone_cwd(&snapshot.snapshot("semantic").expect("scope ok"));
+            // The test is only meaningful once the forged report is actually
+            // in the committed state: otherwise it would pass on a run where
+            // the shell's `printf` never arrived.
+            let report_in_state =
+                ShellIntegration::cwd(rt.state()).is_some_and(|report| report.contains("spoofed"));
+            if served.as_deref() == Some("~/real") && report_in_state {
+                break;
+            }
+            assert!(
+                served.as_deref() != Some("~/spoofed"),
+                "the pane's OSC 7 report must never become the published cwd"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane child must publish its kernel cwd with the forged report in \
+                 state: {served:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let value = snapshot.snapshot("semantic").expect("scope ok");
+        let zones = zones_of(&value);
+        assert!(!zones.is_empty(), "the pane cwd must be observable");
+        for zone in &zones {
+            assert!(zone.get("kind").is_some(), "every zone carries a kind");
+            assert!(zone.get("range").is_some(), "every zone carries a range");
+        }
+        let cwd = newest_zone_cwd(&value).expect("newest zone cwd");
+        assert_eq!(cwd, "~/real");
+        assert_ne!(cwd, "~/spoofed", "the report is not a cwd source");
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn semantic_snapshot_zone_cwd_is_never_the_osc7_report() {
+        // Review 5811186131 finding 2, source-level: a well-formed `OSC 7`
+        // report with no pinned PTY-child cwd publishes no cwd at all, and a
+        // pinned cwd wins over a contradicting report in the same state.
+        //
+        // Revert proof: both assertions fail while `semantic_zones` reads
+        // `ShellIntegration::cwd` -- the report's path becomes the cwd.
+        let root = semantic_cwd_root("report");
+        let real = root.join("real");
+        let spoofed = root.join("spoofed");
+        std::fs::create_dir_all(&real).expect("real dir");
+        std::fs::create_dir_all(&spoofed).expect("spoofed dir");
+
+        let mut rt = Runtime::with_defaults().expect("must build");
+        rt.handle_pty_bytes(&osc7_report(&spoofed));
+        let _ = rt.tick();
+        let state = rt.state();
+
+        // No pinned cwd: the report must not surface.
+        assert!(
+            semantic_zones(state, None, Some(&root)).is_empty(),
+            "an OSC 7 report alone must not fabricate a zone or a cwd"
+        );
+
+        // A pinned cwd wins over the report, rendered home-relative.
+        let zones = semantic_zones(state, Some(&real), Some(&root));
+        assert_eq!(zones.len(), 1, "the cwd alone yields one unknown zone");
+        assert_eq!(zones[0].kind, "unknown");
+        assert_eq!(zones[0].cwd.as_deref(), Some("~/real"));
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn semantic_snapshot_publishes_the_pinned_cwd_without_any_report() {
+        // Review 5811186131 finding 2, other direction: the pane cwd does not
+        // depend on the shell reporting anything. A child that never emits
+        // `OSC 7` still has a kernel cwd, and that is what the newest zone
+        // carries.
+        //
+        // Revert proof: with the report as the source this publishes `None`
+        // (the child prints nothing) and the assertion fails.
+        bitty_test_support::require_pty!();
+        let root = semantic_cwd_root("silent");
+        let pane = root.join("pane");
+        std::fs::create_dir_all(&pane).expect("pane dir");
+
+        let snapshot = LiveSnapshot::new(80, 24, Some(root.clone()));
+        let mut rt = Runtime::with_defaults().expect("must build");
+        rt.spawn_shell_with_args(
+            "sh",
+            &[
+                "-c",
+                "cd \"$1\" && exec sleep 60",
+                "sh",
+                pane.to_str().expect("utf-8 dir"),
+            ],
+        )
+        .expect("spawn the pane shell");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let _ = rt.poll_pty();
+            let _ = rt.tick();
+            snapshot.publish(&rt);
+            let served = newest_zone_cwd(&snapshot.snapshot("semantic").expect("scope ok"));
+            if served.as_deref() == Some("~/pane") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pane child must publish its kernel cwd without reporting: {served:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    /// Renders a pinned cwd below a symlinked home (review 5811186131 risk
+    /// 6).
+    ///
+    /// The kernel cwd is symlink-free by construction, so a `$HOME` that is
+    /// itself a symlink would never prefix it and every published value would
+    /// stay absolute -- which `bitty.fs.list` rejects as hostile. The snapshot
+    /// canonicalizes the home once at construction for exactly that reason.
+    ///
+    /// Revert proof: without the canonicalization the strip fails and the
+    /// rendered value is the absolute path, so the assertion fails.
+    #[cfg(unix)]
+    #[test]
+    fn semantic_snapshot_renders_a_pinned_cwd_below_a_symlinked_home() {
+        let real = semantic_cwd_root("symlink-real");
+        let link = semantic_cwd_root("symlink-home");
+        let pane = real.join("pane");
+        std::fs::create_dir_all(&pane).expect("pane dir");
+        std::os::unix::fs::symlink(&real, &link).expect("home symlink");
+
+        let snapshot = LiveSnapshot::new(80, 24, Some(link.clone()));
+        let pinned = std::fs::canonicalize(&pane).expect("canonical pane");
+        // The kernel reports the resolved path, never the link's spelling.
+        assert_eq!(
+            snapshot.home.as_deref(),
+            Some(
+                std::fs::canonicalize(&real)
+                    .expect("canonical home")
+                    .as_path()
+            ),
+            "the home is canonicalized once at construction"
+        );
+
+        let mut rt = Runtime::with_defaults().expect("must build");
+        rt.handle_pty_bytes(b"symlinked-home\r\n");
+        let _ = rt.tick();
+        let zones = semantic_zones(rt.state(), Some(&pinned), snapshot.home.as_deref());
+        assert_eq!(zones.len(), 1, "the cwd alone yields one unknown zone");
+        assert_eq!(zones[0].cwd.as_deref(), Some("~/pane"));
+        std::fs::remove_dir_all(&real).expect("cleanup real");
+        let _ = std::fs::remove_file(&link);
     }
 
     /// Host-call deadline for the composition-root probes (bitty#2432,
@@ -1723,7 +2142,7 @@ mod tests {
 
     #[test]
     fn live_snapshot_refuses_generation_regression() {
-        let snapshot = LiveSnapshot::new(80, 24);
+        let snapshot = LiveSnapshot::new(80, 24, None);
         let mut rt = Runtime::with_defaults().expect("must build");
         rt.handle_pty_bytes(b"advance\r\n");
         let _ = rt.tick();
@@ -1741,6 +2160,7 @@ mod tests {
             cursor_visible: false,
             alternate_screen: true,
             title: String::from("stale"),
+            zones: Vec::new(),
             pane_cwd: None,
         };
         assert!(!snapshot.publish_state(stale));

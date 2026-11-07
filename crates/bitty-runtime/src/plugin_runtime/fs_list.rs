@@ -40,9 +40,30 @@
 //!   missing in-grant leaf never distinguishes an out-of-grant target that
 //!   exists from one that does not.
 //!
-//! Relative grants (no `~` root) have no stable host base and therefore
-//! resolve to no usable grant: the call fails closed instead of guessing a
-//! working directory.
+//! # Rootless grants
+//!
+//! A `fs.read:` pattern with no `~` root (`**`, `docs/**`, `docs*/**`) names
+//! no directory in the host's address space: it is relative. The accepted
+//! matcher both gates share (`FilesystemScope`) never lets a relative pattern
+//! cover a `~`-rooted request, and a `~`-rooted request is the only request
+//! form this backend accepts, so such a pattern authorizes nothing here. It is
+//! denied with `E_FS_MISSING_GRANT` and an explicit anchor diagnostic rather
+//! than being anchored at the request.
+//!
+//! Anchoring at the request is what this backend must never do: `request/**`
+//! always covers `request`, so the coverage test becomes tautological and the
+//! untrusted caller chooses the grant width. `fs.read:**` anchored at the
+//! request would enumerate the whole home tree (minus the home root, the
+//! sensitive names, and symlinked directories): exactly the breadth the
+//! manifest validator refuses as overbroad when it is spelled `~/**`. Denying
+//! instead keeps the two gates in agreement on the same grant string: the
+//! anchor of every usable grant is its own declared literal root below the
+//! host home, and nothing else.
+//!
+//! Rejecting these patterns at install time (so a plugin is never told "3/3
+//! granted" for a grant the runtime cannot use, issue #2963) belongs to the
+//! `bitty-plugin-host` manifest validator, which owns capability expansion;
+//! the runtime stays fail-closed and diagnostic until that lands.
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
@@ -120,7 +141,8 @@ impl FsListBackend {
     /// # Errors
     ///
     /// `E_DEF_LIMIT`/`E_DEF_INVALID` for an out-of-range page bound,
-    /// `E_FS_MISSING_GRANT` when no usable read grant exists,
+    /// `E_FS_MISSING_GRANT` when no usable read grant exists (including a
+    /// declared grant that is not `~`-rooted, which names no anchor),
     /// `E_FS_HOSTILE_PATTERN` for traversal/absolute/device shapes,
     /// `E_FS_SENSITIVE_PATH` for a sensitive prefix, `E_FS_SCOPE_MISMATCH`
     /// for an out-of-grant prefix or a symlink escape, `E_TIMEOUT` when the
@@ -166,11 +188,16 @@ impl FsListBackend {
 
         // Grant checks precede the sensitive-path check, matching `FsGate`:
         // an out-of-scope caller learns nothing about sensitive state.
-        let scopes = self.grant_scopes(granted);
-        if scopes.is_empty() {
-            return Err(denial(FsBridgeDenialKind::MissingGrant));
+        let resolved = self.grant_scopes(granted);
+        if resolved.scopes.is_empty() {
+            return Err(if resolved.unanchored {
+                unanchored_grant_denial()
+            } else {
+                denial(FsBridgeDenialKind::MissingGrant)
+            });
         }
-        let covering: Vec<&GrantScope> = scopes
+        let covering: Vec<&GrantScope> = resolved
+            .scopes
             .iter()
             .filter(|scope| scope.scope.allows(&logical))
             .collect();
@@ -274,27 +301,36 @@ impl FsListBackend {
     /// Build usable `fs.read:` scopes with canonical literal roots.
     ///
     /// A grant is usable only when its pattern passes the accepted scope
-    /// matcher (hostile/invalid patterns are skipped), is `~`-rooted (the
-    /// only root with a stable real-path base), and its literal prefix
-    /// resolves through the approved-path policy.
-    fn grant_scopes(&self, granted: &[String]) -> Vec<GrantScope> {
+    /// matcher (hostile/invalid patterns are skipped), is `~`-rooted (a
+    /// rootless pattern is reported through [`GrantResolution::unanchored`]
+    /// instead of being anchored at the caller's request), and its literal
+    /// prefix resolves through the approved-path policy.
+    fn grant_scopes(&self, granted: &[String]) -> GrantResolution {
         let mut scopes = Vec::new();
+        let mut unanchored = false;
         for capability in granted {
             let Some(pattern) = capability.strip_prefix(FS_READ_HEAD) else {
                 continue;
             };
-            let Some(pattern) = normalize_grant_pattern(pattern) else {
+            let Some(normalized) = normalize_grant_pattern(pattern) else {
+                // Hostile, malformed, or rootless: unusable either way. A
+                // declared pattern that only lacks a home root is worth a
+                // diagnostic, because the install path accepted it.
+                if is_unanchored_grant_pattern(pattern) {
+                    unanchored = true;
+                }
                 continue;
             };
-            let Ok(scope) = FilesystemScope::from_patterns(std::slice::from_ref(&pattern)) else {
+            let Ok(scope) = FilesystemScope::from_patterns(std::slice::from_ref(&normalized))
+            else {
                 continue;
             };
-            let Some(root) = self.literal_root(&pattern) else {
+            let Some(root) = self.literal_root(&normalized) else {
                 continue;
             };
             scopes.push(GrantScope { scope, root });
         }
-        scopes
+        GrantResolution { scopes, unanchored }
     }
 
     /// Canonical real root of a grant's literal prefix (`~/docs/**` ->
@@ -364,6 +400,18 @@ struct GrantScope {
     root: PathBuf,
 }
 
+/// Outcome of resolving one generation's `fs.read:` grants.
+struct GrantResolution {
+    /// Grants anchored at their own declared literal root below the home.
+    scopes: Vec<GrantScope>,
+    /// Whether at least one declared `fs.read:` pattern carries no home root
+    /// and therefore cannot be anchored at any declared root. Such a grant is
+    /// unusable (it authorizes nothing home-rooted at either gate), so the
+    /// denial names the anchor problem instead of looking like an absent
+    /// grant.
+    unanchored: bool,
+}
+
 impl GrantScope {
     fn root_covers(&self, canonical: &Path) -> bool {
         canonical == self.root || canonical.starts_with(&self.root)
@@ -409,6 +457,16 @@ fn normalize_request_path(path: &str) -> Option<String> {
 }
 
 /// Normalize one `fs.read:` grant pattern to `~/...` form.
+///
+/// Only a `~`-rooted pattern is usable: it keeps its own root, and the
+/// declared literal prefix below the home is the anchor every later check
+/// uses. A rootless (relative) pattern names no directory of its own, and the
+/// accepted [`FilesystemScope`] matcher never lets a relative pattern cover a
+/// `~`-rooted request either, so this returns `None` for it instead of
+/// anchoring it at the request: a caller-derived anchor would make the
+/// coverage test tautological and hand the caller the grant width. `~user`
+/// spellings, absolute patterns, traversal, and leading separators keep
+/// failing closed for the same reason.
 fn normalize_grant_pattern(pattern: &str) -> Option<String> {
     if pattern.is_empty() || pattern.contains('\0') {
         return None;
@@ -429,9 +487,32 @@ fn normalize_grant_pattern(pattern: &str) -> Option<String> {
         .copied()
         .collect();
     if normalized.first() != Some(&"~") {
+        // Rootless or `~user`: neither names the host home this backend
+        // resolves `~` against, so neither can be anchored here.
         return None;
     }
     Some(normalized.join("/"))
+}
+
+/// Whether `pattern` is a declared `fs.read:` pattern that only lacks a home
+/// root, i.e. one the install path accepts but no request can use.
+///
+/// Mirrors the normalization rules above so the answer stays "rootless" for
+/// exactly the patterns [`normalize_grant_pattern`] refuses for that reason;
+/// hostile shapes (absolute, `~user`, traversal, leading separator) are false
+/// so their denials keep the plain missing-grant shape.
+fn is_unanchored_grant_pattern(pattern: &str) -> bool {
+    if pattern.is_empty() || pattern.contains('\0') {
+        return false;
+    }
+    let segments: Vec<&str> = pattern.split(['/', '\\']).collect();
+    if segments.contains(&"..") || pattern.starts_with('~') {
+        return false;
+    }
+    let first_real = segments
+        .iter()
+        .position(|segment| !segment.is_empty() && *segment != ".");
+    first_real == Some(0)
 }
 
 /// Whether a grant segment contains glob syntax.
@@ -589,6 +670,23 @@ pub(super) fn denial(kind: FsBridgeDenialKind) -> BridgeError {
     )
 }
 
+/// Denial for a declared `fs.read:` grant that carries no home root.
+///
+/// The code is the family's missing-grant code (there is no distinct accepted
+/// code for an unusable spelling), but the message names the anchor problem so
+/// a manifest that installs `fs.read:**` produces a diagnostic instead of a
+/// silent-looking absence. It carries no pattern or path bytes: the caller
+/// already knows its own grant text, and a denial must never become a
+/// filesystem oracle.
+fn unanchored_grant_denial() -> BridgeError {
+    BridgeError::new(
+        "runtime",
+        FsBridgeDenialKind::MissingGrant.code(),
+        "fs.read grant is not home-rooted ('~/...') and cannot be anchored; \
+         no listing is authorized",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,6 +836,101 @@ mod tests {
         let error = list_with_generous_deadline(&backend, &grant("~/docs/**"), "/etc", 16)
             .expect_err("absolute prefix must deny");
         assert_eq!(error.code, "E_FS_HOSTILE_PATTERN");
+    }
+
+    /// Issue #2963, review 5811186131 finding 1: a rootless `fs.read:`
+    /// pattern names no directory of its own, so nothing may anchor it at the
+    /// caller's request. `fs.read:**` must not enumerate the requested
+    /// directory (or any other), and the reason is not local to this backend:
+    /// the accepted [`FilesystemScope`] matcher refuses the very same grant
+    /// text for a `~`-rooted request, so both gates deny it.
+    ///
+    /// Revert proof: with the request-derived anchor restored, the loop below
+    /// succeeds at `~/pane` (the pre-fix behaviour) instead of denying.
+    #[test]
+    fn rootless_glob_grant_cannot_anchor_at_the_requested_directory() {
+        let home = temp_home("rootless-glob");
+        let _cleanup = FixtureCleanup(home.clone());
+        touch(&home, "pane/a.txt", "a");
+        touch(&home, "pane/sub/b.txt", "b");
+        touch(&home, "outside/secret.txt", "secret");
+        let backend = FsListBackend::new(&home);
+
+        // Every requested directory exists here, so an anchor at the request
+        // would resolve and the coverage test would pass.
+        for request in ["~/pane", "~/pane/sub", "~/outside"] {
+            let error = list_with_generous_deadline(&backend, &grant("**"), request, 16)
+                .expect_err("a rootless `**` grant must not list anything");
+            assert_eq!(error.code, "E_FS_MISSING_GRANT", "request {request}");
+            assert!(
+                error.message.contains("cannot be anchored"),
+                "the denial names the anchor problem, got: {}",
+                error.message
+            );
+        }
+
+        // The bare home root is not even a valid request (it is an overbroad
+        // request shape), so no grant spelling can enumerate the whole tree.
+        let error = list_with_generous_deadline(&backend, &grant("**"), "~", 16)
+            .expect_err("the bare home root is a hostile request");
+        assert_eq!(error.code, "E_FS_HOSTILE_PATTERN");
+
+        // A glob in the first segment is the shape that made a request anchor
+        // tautological: `request/**` covers `request` by construction. It
+        // stays unusable for the same reason.
+        for pattern in ["*/**", "pan*/**", "?ane/**"] {
+            let error = list_with_generous_deadline(&backend, &grant(pattern), "~/pane", 16)
+                .expect_err("a rootless pattern must not be anchored at the request");
+            assert_eq!(error.code, "E_FS_MISSING_GRANT", "pattern {pattern}");
+        }
+
+        // Both gates read the same grant text: the accepted matcher does not
+        // let a relative pattern cover a `~`-rooted request either, so denying
+        // here is agreement rather than a new, local interpretation.
+        for pattern in ["**", "*/**", "docs/**"] {
+            let scope = FilesystemScope::from_patterns(&[pattern.to_string()])
+                .expect("the accepted matcher validates the pattern");
+            assert!(
+                !scope.allows("~/pane"),
+                "`{pattern}` must not cover a `~`-rooted request at FsGate"
+            );
+        }
+
+        // The denial is about the grant, not the fixture: the same request
+        // lists under a home-rooted grant of the same shape.
+        let entries = list_with_generous_deadline(&backend, &grant("~/pane/**"), "~/pane", 16)
+            .expect("a home-rooted grant lists the same directory");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["~/pane/a.txt", "~/pane/sub"]);
+    }
+
+    /// A rootless grant cannot reach anything outside a declared root: the
+    /// grant is inert, so the caller cannot pick a request that widens it, and
+    /// no sibling of the request becomes visible (review 5811186131 finding 1,
+    /// "a rootless `**` grant cannot enumerate outside the declared root").
+    #[test]
+    fn rootless_grant_enumerates_nothing_outside_a_declared_root() {
+        let home = temp_home("rootless-inert");
+        let _cleanup = FixtureCleanup(home.clone());
+        touch(&home, "pane/a.txt", "a");
+        touch(&home, "documents/notes.txt", "n");
+        touch(&home, "work/todo.txt", "t");
+        let backend = FsListBackend::new(&home);
+
+        // A usable grant plus an unusable one: the usable one still authorizes
+        // its own subtree, and the unusable one adds nothing beside it.
+        let mixed = vec!["fs.read:**".to_string(), "fs.read:~/pane/**".to_string()];
+        let entries = list_with_generous_deadline(&backend, &mixed, "~/pane", 16)
+            .expect("the home-rooted grant still authorizes its subtree");
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["~/pane/a.txt"]);
+
+        // The siblings the rootless grant would have reached stay denied.
+        for request in ["~/documents", "~/work"] {
+            let error = list_with_generous_deadline(&backend, &mixed, request, 16)
+                .expect_err("the rootless grant adds no coverage");
+            assert_eq!(error.code, "E_FS_SCOPE_MISMATCH", "request {request}");
+        }
     }
 
     #[cfg(unix)]
@@ -1178,22 +1371,46 @@ mod tests {
         assert_eq!(error.code, "E_FS_SENSITIVE_PATH");
     }
 
+    /// Grants that carry no usable anchor fail closed (review 5811186131
+    /// finding 3: this test used to assert a case that denied both with and
+    /// without the request anchor, so it pinned nothing).
+    ///
+    /// The literal-first rootless spelling is denied here for the same reason
+    /// as the glob-first one; the discriminating case is the glob-first
+    /// spelling (`**` at `~/docs`, which exists), because that is the shape a
+    /// request anchor used to make succeed. Revert proof: with the request
+    /// anchor restored, the `**` call below returns a page instead of
+    /// `E_FS_MISSING_GRANT`.
     #[test]
     fn relative_and_overbroad_grants_fail_closed() {
         let home = temp_home("relative");
         touch(&home, "docs/a.txt", "a");
         let backend = FsListBackend::new(&home);
 
-        // A relative grant has no stable real-path base.
+        // A rootless sub-pattern names no root: it is never resolved against
+        // the requested directory (or the process working directory).
         let error =
             list_with_generous_deadline(&backend, &["fs.read:docs/**".to_string()], "~/docs", 16)
-                .expect_err("relative grant must not map");
+                .expect_err("rootless grant must not map");
+        assert_eq!(error.code, "E_FS_MISSING_GRANT");
+
+        // Discriminating case: the requested directory exists, so an anchor
+        // at the request would cover it and list `~/docs/a.txt`.
+        let error =
+            list_with_generous_deadline(&backend, &["fs.read:**".to_string()], "~/docs", 16)
+                .expect_err("a rootless `**` must not cover the requested directory");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
 
         // An overbroad home grant is hostile at grant construction.
         let error =
             list_with_generous_deadline(&backend, &["fs.read:~/**".to_string()], "~/docs", 16)
                 .expect_err("overbroad grant must not map");
+        assert_eq!(error.code, "E_FS_MISSING_GRANT");
+
+        // A maliciously spelled rootless grant is skipped, never widened.
+        let error =
+            list_with_generous_deadline(&backend, &["fs.read:./**".to_string()], "~/docs", 16)
+                .expect_err("a leading no-op run pins the pattern relative, not home-rooted");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
 
         // A malformed pattern is skipped, never widened.
@@ -1204,6 +1421,18 @@ mod tests {
             16,
         )
         .expect_err("traversal grant must not map");
+        assert_eq!(error.code, "E_FS_MISSING_GRANT");
+
+        // `~user` names a foreign home, which this backend never resolves.
+        let error =
+            list_with_generous_deadline(&backend, &["fs.read:~other/**".to_string()], "~/docs", 16)
+                .expect_err("a foreign home must not map");
+        assert_eq!(error.code, "E_FS_MISSING_GRANT");
+
+        // An absolute grant pattern is hostile before any anchor is chosen.
+        let error =
+            list_with_generous_deadline(&backend, &["fs.read:/etc/**".to_string()], "~/docs", 16)
+                .expect_err("an absolute grant must not map");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
     }
 }

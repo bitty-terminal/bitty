@@ -933,6 +933,27 @@ mod tests {
         (error, elapsed, calls)
     }
 
+    /// Deadline budget for the socket-level drain tests.
+    ///
+    /// The production shape gives one absolute deadline to the handshake and
+    /// the event wait, so the budget must cover a real X11 handshake over a
+    /// unix socketpair. A 20 ms budget made these tests fail on a saturated CI
+    /// runner (the handshake itself timed out, panicking before the drain
+    /// started); 500 ms still proves the drain ends at the deadline instead of
+    /// looping on a readable socket, without racing the handshake.
+    const EVENT_WAIT_TEST_BUDGET: Duration = Duration::from_millis(500);
+
+    /// Allowance for the drain to notice the deadline after the socket has
+    /// already been filled by the fake server.
+    ///
+    /// `poll_for_event` returns every event the socket already buffered before
+    /// it reaches the deadline-checking `read`, so the return time is the
+    /// budget plus one backlog drain. The backlog size is fixed by the socket
+    /// buffers (a few hundred events), and draining it measured ~110 ms here,
+    /// so 400 ms still fails a loop that never observes the deadline while
+    /// staying independent of how loaded the runner is.
+    const EVENT_WAIT_TEST_OVERSHOOT: Duration = Duration::from_millis(400);
+
     // F1 (CTX-1366 review2): x11rb's `poll_for_event` loops `Stream::read`
     // until `WouldBlock`; a socket that stays readable makes one call
     // unbounded unless `DeadlineStream::read` enforces the deadline. This is
@@ -940,7 +961,7 @@ mod tests {
     // over a real socket rather than a closure stub.
     #[test]
     fn incr_event_flood_is_cut_off_by_the_read_level_deadline() {
-        let budget = Duration::from_millis(20);
+        let budget = EVENT_WAIT_TEST_BUDGET;
         let (error, elapsed, calls) = run_event_wait(budget, true, STAGE_INCR);
         assert!(
             matches!(
@@ -958,7 +979,7 @@ mod tests {
             "returned before the deadline: {elapsed:?}"
         );
         assert!(
-            elapsed < budget + Duration::from_millis(100),
+            elapsed < budget + EVENT_WAIT_TEST_OVERSHOOT,
             "the read loop outlived the deadline by draining the flood backlog: {elapsed:?}"
         );
     }
@@ -966,7 +987,7 @@ mod tests {
     // The same event-fetch bound serves the `SelectionNotify` wait.
     #[test]
     fn selection_event_flood_is_cut_off_by_the_read_level_deadline() {
-        let budget = Duration::from_millis(20);
+        let budget = EVENT_WAIT_TEST_BUDGET;
         let (error, elapsed, calls) = run_event_wait(budget, true, STAGE_SELECTION);
         assert!(
             matches!(
@@ -980,7 +1001,7 @@ mod tests {
         );
         assert!(calls > 0, "the drain never fetched an event");
         assert!(
-            elapsed < budget + Duration::from_millis(100),
+            elapsed < budget + EVENT_WAIT_TEST_OVERSHOOT,
             "the read loop outlived the deadline by draining the flood backlog: {elapsed:?}"
         );
     }
@@ -991,7 +1012,7 @@ mod tests {
     // immediate transport error).
     #[test]
     fn event_wait_observes_the_deadline_without_a_flood() {
-        let budget = Duration::from_millis(20);
+        let budget = EVENT_WAIT_TEST_BUDGET;
         let (error, elapsed, _calls) = run_event_wait(budget, false, STAGE_INCR);
         assert!(
             matches!(

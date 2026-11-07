@@ -2555,11 +2555,17 @@ fn every_control_method_maps_a_stale_token_at_a_vacant_control() {
     );
     assert_eq!(aborted["ok"], true, "{aborted}");
 
+    // Diagnostics for the forced stop's exit code: a `Running`/`Stopping`
+    // session whose worker handle is already gone is counted `unverified`, so
+    // the pre-stop session counts belong in the failure message.
+    let before_stop = operator.call("daemon.status", Value::Null);
+    let stopped = operator.call("daemon.stop", json!({"mode": "force"}));
+    assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(
-        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
-        true
+        daemon.wait_within(Duration::from_secs(10)).code(),
+        Some(0),
+        "before stop: {before_stop}; stop: {stopped}"
     );
-    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
 }
 
 #[test]

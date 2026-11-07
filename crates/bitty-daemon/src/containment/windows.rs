@@ -232,14 +232,13 @@ impl ContainedChild {
             .active_processes()
             .map_or(0, |active| usize::try_from(active).unwrap_or(usize::MAX));
         let _ = self.job.terminate(JOB_TERMINATION_EXIT_CODE);
-        // `try_wait` consumes the exit status: a second call after the loop
-        // already reaped the child answers `Ok(None)`, which would turn a
-        // verified sweep into `unverified`. Record the reap where it happens.
-        let mut reaped = false;
+        // Drain first, reap second. The job's accounting settles while the
+        // leader's process handle is still open: the `bitty-winjob` contract
+        // test observes the same order (`member.exit_code()` then
+        // `active_processes() == 0`, then `child.wait()`). Reaping inside this
+        // wait closed the handle first and the job never reported empty, which
+        // turned a real sweep into `unverified` on a Windows runner.
         let drained = wait_bounded(limits.kill_wait(), limits, || {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                reaped = true;
-            }
             self.job.active_processes().is_ok_and(|active| active == 0)
         });
         if !drained {
@@ -248,9 +247,8 @@ impl ContainedChild {
             // fail-closed.
             let _ = self.job.terminate(JOB_TERMINATION_EXIT_CODE);
         }
-        if !reaped {
-            reaped = matches!(self.child.try_wait(), Ok(Some(_)));
-        }
+        // `try_wait` consumes the exit status, so ask exactly once.
+        let reaped = matches!(self.child.try_wait(), Ok(Some(_)));
         let empty = self.job.active_processes().is_ok_and(|active| active == 0);
         CleanupOutcome {
             class: if empty && reaped {
@@ -333,7 +331,12 @@ mod tests {
         assert_eq!(child.containment().mechanism(), "windows_job");
         assert!(!child.leader_exited(), "the resumed child must be running");
         let outcome = child.terminate(limits());
-        assert_eq!(outcome.class(), CleanupClass::Swept, "{report}");
+        assert_eq!(
+            outcome.class(),
+            CleanupClass::Swept,
+            "{report} signalled={}",
+            outcome.signalled()
+        );
         assert!(outcome.signalled() >= 1, "the job held at least the leader");
         assert!(
             child.sweep_if_empty().is_some(),

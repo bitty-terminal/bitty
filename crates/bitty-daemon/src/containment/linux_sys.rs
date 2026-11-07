@@ -9,6 +9,10 @@
 //! - `Command::pre_exec` plus `setsid(2)` and `ioctl(TIOCSCTTY)`, so a PTY
 //!   worker is a session and process-group leader whose controlling terminal
 //!   is the PTY slave on fd 0;
+//! - `Command::pre_exec` plus `pthread_sigmask(3)` and `sigaction(2)`, so the
+//!   worker starts with an empty signal mask and the default disposition for
+//!   every resettable signal, instead of the daemon's blocked mask and the
+//!   ignored dispositions a service manager hands it;
 //! - `pidfd_open(2)` and `pidfd_send_signal(2)`, so an orphan reap pins the
 //!   exact process and cannot signal a reused pid;
 //! - `close_range(2)` in the child, so the worker's descriptor table is
@@ -54,6 +58,129 @@ pub(crate) fn establish_controlling_terminal(command: &mut Command) {
             }
             Ok(())
         });
+    }
+}
+
+/// The highest signal number `reset_child_signal_state` considers.
+///
+/// The kernel's `_NSIG` is 64 on Linux; the loop covers `1..=64` and skips the
+/// numbers the C library reserves for itself, which refuse `sigaction(2)`.
+const LAST_RESETTABLE_SIGNAL: i32 = 64;
+
+/// Restore the child's signal mask and dispositions to the POSIX defaults.
+///
+/// No signal property other than the disposition survives `execve(2)`, and
+/// neither a blocked mask nor `SIG_IGN` is reset by it. Both are inherited from
+/// the daemon, so a hosted shell would start with `SIGTERM`/`SIGINT`/`SIGHUP`
+/// blocked (the daemon's own mask, bitty#2920) and with `SIGPIPE`/`SIGXFSZ`
+/// ignored (the service manager's SysV compatibility default, which systemd
+/// documents for every service). A shell that keeps that state never sees the
+/// hangup that should end it and dies only on `SIGKILL`.
+///
+/// The hook runs between fork and exec and only calls async-signal-safe
+/// functions: `pthread_sigmask(3)` and `sigaction(2)`, with no allocation and
+/// no lock.
+pub(crate) fn reset_child_signal_state(command: &mut Command) {
+    // SAFETY: `pre_exec` runs in the forked child between fork and exec. The
+    // closure calls `pthread_sigmask(3)` and `sigaction(2)` only: both are
+    // async-signal-safe, and it allocates nothing and touches no Rust data
+    // structure or lock. Returning an error aborts the exec and is reported to
+    // the parent by `std`.
+    unsafe {
+        command.pre_exec(clear_inherited_signal_state);
+    }
+}
+
+/// The child-side reset registered by [`reset_child_signal_state`].
+fn clear_inherited_signal_state() -> io::Result<()> {
+    use nix::sys::signal::{
+        SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, pthread_sigmask, sigaction,
+    };
+
+    // An empty mask unblocks every signal the daemon blocked for its own
+    // signal fd. `pthread_sigmask` is used instead of `sigprocmask` because the
+    // child is single-threaded after `fork` anyway and this is the call POSIX
+    // names async-signal-safe in every implementation.
+    let empty = SigSet::empty();
+    pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&empty), None).map_err(io::Error::from)?;
+
+    // `execve(2)` keeps `SIG_IGN` but resets a handler to the default, so only
+    // an ignored disposition can survive into the shell. Resetting every
+    // signal whose disposition may change covers the service manager's
+    // `SIGPIPE`/`SIGXFSZ` ignore and anything else the daemon inherited,
+    // instead of enumerating the ones known today.
+    let default = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+    for signo in 1..=LAST_RESETTABLE_SIGNAL {
+        // `SIGKILL` and `SIGSTOP` have no settable disposition, and the
+        // numbers the C library reserves are not in `Signal`; the fallible
+        // conversion drops both without a second list to keep in sync.
+        let Ok(signal) = Signal::try_from(signo) else {
+            continue;
+        };
+        // SAFETY: `sigaction(2)` takes a fully initialized action and returns
+        // -1 on error; no pointer outlives the call. A refusal (`EINVAL` for a
+        // signal with no settable disposition) leaves the inherited state,
+        // which is the default for that signal anyway.
+        let _ = unsafe { sigaction(signal, &default) };
+    }
+    Ok(())
+}
+
+/// Test-only fixtures for the child signal-state reset (bitty#2920).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_signal_state {
+    use nix::sys::signal::{
+        SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal, pthread_sigmask, sigaction,
+    };
+
+    /// The daemon's own blocked mask plus the ignored dispositions a service
+    /// manager installs, applied to the calling thread.
+    ///
+    /// `pthread_sigmask` is per thread and `fork` inherits the forking
+    /// thread's mask and dispositions, so this is exactly the state a hosted
+    /// shell would inherit without the child-side reset. The guard restores
+    /// both on drop.
+    pub(crate) struct InheritedSignalState {
+        previous_mask: SigSet,
+        previous_ignored: [(Signal, SigAction); 2],
+    }
+
+    impl InheritedSignalState {
+        /// Install the inherited state, or fail the test.
+        pub(crate) fn install() -> Self {
+            let mut mask = SigSet::empty();
+            mask.add(Signal::SIGTERM);
+            mask.add(Signal::SIGINT);
+            mask.add(Signal::SIGHUP);
+            let mut previous_mask = SigSet::empty();
+            pthread_sigmask(SigmaskHow::SIG_BLOCK, Some(&mask), Some(&mut previous_mask))
+                .expect("block the daemon's signals");
+            // systemd sets `SIGPIPE`/`SIGXFSZ` to `SIG_IGN` for every service.
+            // `SIGXFSZ` is the one a Rust child does not re-ignore itself, so
+            // both are installed and both are restored.
+            let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+            let mut previous_ignored = [(Signal::SIGPIPE, ignore), (Signal::SIGXFSZ, ignore)];
+            for (signal, action) in &mut previous_ignored {
+                // SAFETY: `sigaction(2)` takes a fully initialized action; the
+                // previous action is restored on drop.
+                *action = unsafe { sigaction(*signal, &ignore) }.expect("ignore the signal");
+            }
+            Self {
+                previous_mask,
+                previous_ignored,
+            }
+        }
+    }
+
+    impl Drop for InheritedSignalState {
+        fn drop(&mut self) {
+            pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&self.previous_mask), None)
+                .expect("restore the test thread's mask");
+            for (signal, action) in &self.previous_ignored {
+                // SAFETY: the action is the one this guard replaced.
+                let _ = unsafe { sigaction(*signal, action) };
+            }
+        }
     }
 }
 

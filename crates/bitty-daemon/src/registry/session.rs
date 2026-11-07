@@ -11,6 +11,7 @@
 use std::fmt;
 
 use super::id::{Entropy, SessionId, random_hex};
+use crate::handshake::ClientId;
 
 /// Maximum bytes in a client-supplied `terminal_id` (contract `D-02`,
 /// `terminal_id_bytes`).
@@ -597,6 +598,120 @@ impl MonotonicMs {
     }
 }
 
+/// What created a session, or which actor requested its terminal transition
+/// (`created_by_kind`, `requested_by`).
+///
+/// The accepted record distinguishes a consumer request, an operator request,
+/// and a daemon-initiated transition. The registry stores the class, never a
+/// peer path, command line, or capability value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OriginKind {
+    /// A connection acting with consumer authority.
+    Consumer,
+    /// A connection presenting the operator capability.
+    Operator,
+    /// The daemon itself (a daemon stop or host shutdown).
+    Daemon,
+}
+
+impl OriginKind {
+    /// Contract spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Consumer => "consumer",
+            Self::Operator => "operator",
+            Self::Daemon => "daemon",
+        }
+    }
+}
+
+impl fmt::Display for OriginKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The actor that requested a session's terminal transition (`requested_by`).
+///
+/// The value is operator-visible identity data: it names the server-assigned
+/// client id of the requesting connection, or no client id when the daemon
+/// itself requested the transition. It never carries a peer path, command
+/// line, or capability value, and it is never authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Requester {
+    kind: OriginKind,
+    client_id: Option<ClientId>,
+}
+
+impl Requester {
+    /// A consumer connection requested the transition.
+    #[must_use]
+    pub const fn consumer(client_id: ClientId) -> Self {
+        Self {
+            kind: OriginKind::Consumer,
+            client_id: Some(client_id),
+        }
+    }
+
+    /// An operator connection requested the transition.
+    #[must_use]
+    pub const fn operator(client_id: ClientId) -> Self {
+        Self {
+            kind: OriginKind::Operator,
+            client_id: Some(client_id),
+        }
+    }
+
+    /// The daemon itself requested the transition.
+    #[must_use]
+    pub const fn daemon() -> Self {
+        Self {
+            kind: OriginKind::Daemon,
+            client_id: None,
+        }
+    }
+
+    /// The requesting actor class.
+    #[must_use]
+    pub const fn kind(self) -> OriginKind {
+        self.kind
+    }
+
+    /// The server-assigned client id, present exactly for a client request.
+    #[must_use]
+    pub const fn client_id(self) -> Option<ClientId> {
+        self.client_id
+    }
+}
+
+/// An opaque worker-correlation handle (`worker_handle`).
+///
+/// It is minted by the registry, is not a pid, and is not a signal target. A
+/// client uses it only to correlate supervision facts for the worker bound to
+/// its session; no authority derives from it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WorkerHandle(String);
+
+impl WorkerHandle {
+    /// Mint a 32-character lowercase hex handle.
+    pub(crate) fn generate_with(entropy: &mut dyn Entropy) -> Result<Self, super::id::IdError> {
+        random_hex(entropy).map(Self)
+    }
+
+    /// The canonical 32-character lowercase hex spelling.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for WorkerHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 /// The read-only snapshot of one session (`D-03`, "Status and list").
 ///
 /// The lease layer ([`crate::lease::SessionHost`]) composes the live
@@ -631,8 +746,9 @@ pub struct SessionSnapshot {
     ///
     /// The registry does not own leases, so its raw snapshot reports `false`;
     /// [`crate::lease::SessionHost`] composes the live value. This is presence
-    /// only: the controller's `attach_id` is never served, so a status read
-    /// cannot become a handle oracle.
+    /// only: an ordinary view never serves the controller's `attach_id`, so a
+    /// status read cannot become a handle oracle. The operator all-session view
+    /// lists live leases separately in `attached_leases`.
     pub controller_present: bool,
     /// Authenticated owner peer facts captured at create.
     ///
@@ -641,6 +757,39 @@ pub struct SessionSnapshot {
     /// (`daemon.inspect`) serves the uid and pid. The registry never
     /// authorizes on these facts.
     pub owner_peer: Option<OwnerPeer>,
+    /// Server-assigned client id of the creating connection.
+    ///
+    /// Operator-only identity data, following the owner-peer rule: an ordinary
+    /// `session.status` or `session.list` response omits it, while the
+    /// operator view serves the canonical 32-hex value.
+    pub owner_client_id: Option<ClientId>,
+    /// Whether a consumer, an operator, or the daemon created the session.
+    pub created_by_kind: OriginKind,
+    /// The actor that requested the terminal transition, once one was
+    /// requested.
+    ///
+    /// Absent for a natural worker exit, a worker signal, a spawn failure, or
+    /// a supervision failure: no client or operator requested those. Present
+    /// while a requested stop is in progress and frozen into the terminal
+    /// record. Operator-only identity data, like [`Self::owner_client_id`].
+    pub requested_by: Option<Requester>,
+    /// Latest worker liveness signal, if supervision provides one.
+    ///
+    /// Set when the worker binds and refreshed by each supervision pass that
+    /// observes the worker alive. Absent for a registry-only session, which
+    /// has no worker, and never a client heartbeat.
+    pub last_worker_seen_at: Option<MonotonicMs>,
+    /// When `state` or the snapshot-visible lease state last changed.
+    ///
+    /// It advances with every `state_revision` bump and never for a heartbeat
+    /// or a lease renewal, so a display can show the last visible mutation
+    /// without using it for ordering or fencing.
+    pub state_changed_at: MonotonicMs,
+    /// Opaque correlation handle for the bound worker.
+    ///
+    /// Absent before generation `1`: a session that never bound a worker has
+    /// no worker to correlate. Not a pid and not a signal target.
+    pub worker_handle: Option<WorkerHandle>,
     /// Terminal reason, present exactly in a terminal state.
     pub terminal_reason: Option<TerminalReason>,
     /// Spawn-refusal class, present exactly on a `spawn_failed` terminal
@@ -667,6 +816,12 @@ pub(crate) struct SessionRecord {
     pub(crate) state_revision: u64,
     pub(crate) attach_count: u16,
     owner_peer: Option<OwnerPeer>,
+    owner_client_id: Option<ClientId>,
+    created_by_kind: OriginKind,
+    requested_by: Option<Requester>,
+    last_worker_seen: Option<MonotonicMs>,
+    pub(crate) state_changed_at: MonotonicMs,
+    worker_handle: Option<WorkerHandle>,
     pub(crate) terminal_reason: Option<TerminalReason>,
     pub(crate) spawn_failure: Option<SpawnFailure>,
     pub(crate) exit: ExitInformation,
@@ -694,6 +849,12 @@ impl SessionRecord {
             state_revision: 0,
             attach_count: 0,
             owner_peer,
+            owner_client_id: None,
+            created_by_kind: OriginKind::Consumer,
+            requested_by: None,
+            last_worker_seen: None,
+            state_changed_at: now,
+            worker_handle: None,
             terminal_reason: None,
             spawn_failure: None,
             exit: ExitInformation::NotApplicable,
@@ -709,6 +870,31 @@ impl SessionRecord {
         &self.terminal_id
     }
 
+    /// Store the create-time origin facts.
+    pub(crate) fn note_origin(
+        &mut self,
+        owner_client_id: Option<ClientId>,
+        created_by_kind: OriginKind,
+    ) {
+        self.owner_client_id = owner_client_id;
+        self.created_by_kind = created_by_kind;
+    }
+
+    /// Store the worker handle minted for this session.
+    pub(crate) fn set_worker_handle(&mut self, handle: WorkerHandle) {
+        self.worker_handle = Some(handle);
+    }
+
+    /// Record the actor that requested the terminal transition.
+    pub(crate) fn note_requester(&mut self, requester: Requester) {
+        self.requested_by = Some(requester);
+    }
+
+    /// Refresh the worker liveness timestamp without a revision bump.
+    pub(crate) fn observe_worker(&mut self, now: MonotonicMs) {
+        self.last_worker_seen = Some(now);
+    }
+
     /// Accounted record bytes: the fixed in-memory record plus the variable
     /// identifier bytes it owns.
     ///
@@ -717,7 +903,12 @@ impl SessionRecord {
     /// deterministic for a given record; the structured owner peer is inline
     /// and has no variable payload.
     pub(crate) fn record_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.terminal_id.as_str().len()
+        std::mem::size_of::<Self>()
+            + self.terminal_id.as_str().len()
+            + self
+                .worker_handle
+                .as_ref()
+                .map_or(0, |handle| handle.as_str().len())
     }
 
     /// A read-only snapshot with the derived attach flag.
@@ -733,6 +924,16 @@ impl SessionRecord {
             attached: self.attach_count > 0,
             controller_present: false,
             owner_peer: self.owner_peer,
+            owner_client_id: self.owner_client_id,
+            created_by_kind: self.created_by_kind,
+            requested_by: self.requested_by,
+            last_worker_seen_at: self.last_worker_seen,
+            state_changed_at: self.state_changed_at,
+            worker_handle: if self.generation > 0 {
+                self.worker_handle.clone()
+            } else {
+                None
+            },
             terminal_reason: self.terminal_reason,
             spawn_failure: self.spawn_failure,
             exit: self.exit,

@@ -114,24 +114,7 @@ pub fn execute_ctl(request: &CtlRequest, targeting: &CtlTargeting) -> i32 {
     }
 
     // Resolve the live target (exit 6 on missing/ambiguous).
-    let env_socket = std::env::var("BITTY_SOCKET").ok();
-    let env_instance = std::env::var("BITTY_INSTANCE_ID").ok();
-    let env_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
-    #[cfg(unix)]
-    // Portable uid: `/proc/self` metadata is Linux-only (absent on macOS,
-    // where it fell back to 0 and failed endpoint verification against a
-    // user-owned socket dir). `current_unix_uid` is per-platform
-    // (rustix on Linux, nix elsewhere).
-    let uid = bitty_ipc::current_unix_uid().unwrap_or(0);
-    #[cfg(not(unix))]
-    let uid = 0u32;
-    let target = match resolve_ctl_target(
-        targeting,
-        env_socket.as_deref(),
-        env_instance.as_deref(),
-        env_xdg.as_deref(),
-        uid,
-    ) {
+    let target = match resolve_target(targeting) {
         Ok(t) => t,
         Err(message) => {
             if emit_json {
@@ -184,7 +167,12 @@ pub fn execute_ctl(request: &CtlRequest, targeting: &CtlTargeting) -> i32 {
         }
         _ => request.wire_params(),
     };
-    match ctl_roundtrip(&target.socket_path, method, params.as_deref(), uid) {
+    match ctl_roundtrip(
+        &target.socket_path,
+        method,
+        params.as_deref(),
+        current_uid(),
+    ) {
         Err(message) => {
             if emit_json {
                 println!(
@@ -198,6 +186,249 @@ pub fn execute_ctl(request: &CtlRequest, targeting: &CtlTargeting) -> i32 {
         }
         Ok(outcome) => render_outcome(&outcome, registry, targeting, request, &target),
     }
+}
+
+/// Resolve the live target shared by `ctl` and `reload`.
+///
+/// Impure (process env + filesystem discovery); the exit-6 text is the RFC's
+/// "no live instance / ambiguous instance" contract.
+fn resolve_target(targeting: &CtlTargeting) -> Result<ResolvedTarget, String> {
+    let env_socket = std::env::var("BITTY_SOCKET").ok();
+    let env_instance = std::env::var("BITTY_INSTANCE_ID").ok();
+    let env_xdg = std::env::var("XDG_RUNTIME_DIR").ok();
+    resolve_ctl_target(
+        targeting,
+        env_socket.as_deref(),
+        env_instance.as_deref(),
+        env_xdg.as_deref(),
+        current_uid(),
+    )
+}
+
+/// Portable uid: `/proc/self` metadata is Linux-only (absent on macOS, where
+/// it fell back to 0 and failed endpoint verification against a user-owned
+/// socket dir). `current_unix_uid` is per-platform (rustix on Linux, nix
+/// elsewhere).
+fn current_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        bitty_ipc::current_unix_uid().unwrap_or(0)
+    }
+    #[cfg(not(unix))]
+    {
+        0u32
+    }
+}
+
+/// Execute `bitty reload` (bitty#2927): one `core.config.reload` round-trip
+/// with the reload-specific result contract.
+///
+/// The alias sends the same registry verb as `bitty ctl config reload`, so
+/// scope, bounds, and the apply path are unchanged. Differences are output
+/// only: the reply's `changed` / `rejected` / `restart_required` /
+/// `plan_version` fields drive a reload-shaped report, and a rejected or
+/// failed plan exits 3 with the dotted field path instead of reading as a
+/// successful control call.
+pub fn execute_reload(targeting: &CtlTargeting, dry_run: bool) -> i32 {
+    /// Registry id for the envelope (`core.config.reload`).
+    const REGISTRY: &str = "core.config.reload";
+    let emit_json = matches!(targeting.format, CtlFormat::Json | CtlFormat::Jsonl);
+
+    let target = match resolve_target(targeting) {
+        Ok(target) => target,
+        Err(message) => {
+            let message = message.replacen("bitty ctl: ", "bitty reload: ", 1);
+            if emit_json {
+                println!(
+                    "{}",
+                    format_failure(REGISTRY, "Unavailable", "NoInstance", &message)
+                );
+            } else {
+                eprintln!("{message}");
+                eprintln!(
+                    "bitty reload: no live instance to reload — start bitty first, \
+                     or pass --socket PATH / --instance ID"
+                );
+            }
+            return EXIT_RUNTIME;
+        }
+    };
+
+    let params = dry_run.then(|| String::from("{\"dry_run\":true}"));
+    let outcome = match ctl_roundtrip(
+        &target.socket_path,
+        bitty_ipc::ctl::METHOD_RELOAD_CONFIG,
+        params.as_deref(),
+        current_uid(),
+    ) {
+        Ok(outcome) => outcome,
+        Err(message) => {
+            if emit_json {
+                println!(
+                    "{}",
+                    format_failure(REGISTRY, "Unavailable", "Transport", &message)
+                );
+            } else {
+                eprintln!("{message}");
+                eprintln!(
+                    "bitty reload: no live instance to reload — start bitty first, \
+                     or pass --socket PATH / --instance ID"
+                );
+            }
+            return EXIT_RUNTIME;
+        }
+    };
+
+    if !outcome.ok {
+        let class = class_for_server_error(&outcome.category, &outcome.code);
+        let exit = exit_for_server_error(&outcome.category, &outcome.code);
+        if emit_json {
+            println!(
+                "{}",
+                format_failure(REGISTRY, class, &outcome.code, &outcome.message)
+            );
+        } else {
+            eprintln!(
+                "bitty reload: {} ({}/{})",
+                outcome.message, class, outcome.code
+            );
+        }
+        return exit;
+    }
+
+    render_reload_outcome(&outcome.result_json, targeting, dry_run, &target)
+}
+
+/// Render the `core.config.reload` result with reload semantics.
+///
+/// A reply without a reload context (`probed: true`, no `reloaded`) is the
+/// instance's honest "I cannot apply a reload" answer (`--safe`); it exits 6
+/// rather than reporting success. Rejected, load-error, and apply-error
+/// kinds exit 3 and name the dotted field path when the server supplied one.
+fn render_reload_outcome(
+    result_json: &str,
+    targeting: &CtlTargeting,
+    dry_run: bool,
+    target: &ResolvedTarget,
+) -> i32 {
+    /// Registry id for the envelope (`core.config.reload`).
+    const REGISTRY: &str = "core.config.reload";
+    let emit_json = matches!(targeting.format, CtlFormat::Json | CtlFormat::Jsonl);
+
+    if extract_bool(result_json, "reloaded").is_none()
+        && extract_bool(result_json, "probed") == Some(true)
+    {
+        let message = String::from(
+            "the running instance does not serve live reload (it was started with --safe); \
+             restart it without --safe and retry",
+        );
+        if emit_json {
+            println!(
+                "{}",
+                format_failure(REGISTRY, "Unavailable", "ReloadUnavailable", &message)
+            );
+        } else {
+            eprintln!("bitty reload: {message}");
+        }
+        return EXIT_RUNTIME;
+    }
+
+    let Some(kind) = extract_string_from(result_json, "kind") else {
+        let message = String::from("the instance returned an unexpected reload reply");
+        if emit_json {
+            println!(
+                "{}",
+                format_failure(REGISTRY, "Unavailable", "ReloadUnavailable", &message)
+            );
+        } else {
+            eprintln!("bitty reload: {message}");
+        }
+        return EXIT_RUNTIME;
+    };
+    let changed = extract_string_array(result_json, "changed").unwrap_or_default();
+    let restart = extract_string_array(result_json, "restart_required").unwrap_or_default();
+    let rejected = extract_string_array(result_json, "rejected").unwrap_or_default();
+    let server_message = extract_string_from(result_json, "message").unwrap_or_default();
+    let path = extract_string_from(result_json, "path").unwrap_or_default();
+
+    if matches!(kind.as_str(), "rejected" | "load-error" | "apply-error") {
+        let detail = match (rejected.is_empty(), server_message.is_empty()) {
+            (false, false) => format!("rejected at {}: {server_message}", rejected.join(", ")),
+            (false, true) => format!("rejected at {}", rejected.join(", ")),
+            (true, false) => server_message,
+            (true, true) => format!("config reload failed ({path})"),
+        };
+        let code = match kind.as_str() {
+            "rejected" => "ReloadRejected",
+            "apply-error" => "ConfigApplyError",
+            _ => "ConfigLoadError",
+        };
+        if emit_json {
+            println!("{}", format_failure(REGISTRY, "ConfigError", code, &detail));
+        } else {
+            eprintln!("bitty reload: {detail}");
+        }
+        return EXIT_CONFIG;
+    }
+
+    if emit_json {
+        println!("{}", format_success(REGISTRY, result_json));
+        return EXIT_OK;
+    }
+    print!(
+        "{}",
+        render_reload_table(
+            &kind,
+            dry_run,
+            extract_number(result_json, "plan_version"),
+            &changed,
+            &restart,
+            &path,
+            &target.instance,
+        )
+    );
+    EXIT_OK
+}
+
+/// Human table for a successful reload (not a machine contract).
+fn render_reload_table(
+    kind: &str,
+    dry_run: bool,
+    plan_version: Option<u64>,
+    changed: &[String],
+    restart: &[String],
+    path: &str,
+    instance: &str,
+) -> String {
+    let mut out = String::new();
+    let headline = if dry_run { "dry run" } else { kind };
+    match plan_version {
+        Some(version) => out.push_str(&format!(
+            "reload {headline} on {instance} — plan v{version}\n"
+        )),
+        None => out.push_str(&format!("reload {headline} on {instance}\n")),
+    }
+    if !path.is_empty() {
+        out.push_str(&format!("  config: {path}\n"));
+    }
+    if changed.is_empty() {
+        if kind == "unchanged" {
+            out.push_str("  no settings changed\n");
+        }
+    } else {
+        let label = if dry_run {
+            "would change"
+        } else if kind == "restart-required" {
+            "differs"
+        } else {
+            "changed"
+        };
+        out.push_str(&format!("  {label}: {}\n", changed.join(", ")));
+    }
+    if !restart.is_empty() {
+        out.push_str(&format!("  restart required: {}\n", restart.join(", ")));
+    }
+    out
 }
 
 /// Render an IPC outcome per format and map to the stable exit code.
@@ -387,14 +618,40 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
             ));
         }
         CtlRequest::ConfigReload => {
-            out.push_str(&format!(
-                "config probe on {} — result: {result_json}\n",
-                target.instance
-            ));
-            out.push_str(
-                "(probe-only: the file was resolved and validated, not applied; \
-                 live theme/font hot-swap is a follow-up)\n",
-            );
+            // CTX-0814/#1397 + bitty#2927: an instance with a live-reload
+            // context applies the change; without one (headless tests,
+            // `--safe`) the reply stays probe-only. Never present a probe as
+            // an applied reload.
+            if extract_bool(result_json, "reloaded") == Some(true) {
+                let kind = extract_string_from(result_json, "kind").unwrap_or_default();
+                out.push_str(&format!("config {kind} on {}", target.instance));
+                if let Some(version) = extract_number(result_json, "plan_version") {
+                    out.push_str(&format!(" — plan v{version}"));
+                }
+                out.push('\n');
+                let changed = extract_string_array(result_json, "changed").unwrap_or_default();
+                if !changed.is_empty() {
+                    out.push_str(&format!("  changed: {}\n", changed.join(", ")));
+                }
+                let restart =
+                    extract_string_array(result_json, "restart_required").unwrap_or_default();
+                if !restart.is_empty() {
+                    out.push_str(&format!("  restart required: {}\n", restart.join(", ")));
+                }
+                let rejected = extract_string_array(result_json, "rejected").unwrap_or_default();
+                if !rejected.is_empty() {
+                    out.push_str(&format!("  rejected: {}\n", rejected.join(", ")));
+                }
+            } else {
+                out.push_str(&format!(
+                    "config probe on {} — result: {result_json}\n",
+                    target.instance
+                ));
+                out.push_str(
+                    "(probe-only: this instance has no live-reload context, e.g. --safe; \
+                     the file was resolved, not applied)\n",
+                );
+            }
         }
         CtlRequest::InstanceList => {
             out.push_str(result_json);

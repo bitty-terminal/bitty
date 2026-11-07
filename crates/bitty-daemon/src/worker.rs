@@ -790,6 +790,12 @@ impl WorkerPool {
                         worker.child.drain_recorded();
                     }
                 }
+                if worker.exit.is_none() {
+                    // This pass observed the worker alive, which is the
+                    // contract's worker liveness signal. It is not a client
+                    // heartbeat and never bumps `state_revision`.
+                    host.observe_worker(session_id, now);
+                }
                 if let Some(snapshot) = host.snapshot(session_id, now) {
                     if worker.exit.is_none() && snapshot.state == LifecycleState::Stopping {
                         let Some(stop) = host.stop_view(session_id, now) else {
@@ -1024,6 +1030,11 @@ impl PtyCommand {
         command.stdin(stdin);
         command.stdout(stdout);
         command.stderr(stderr);
+        // The daemon blocks `SIGTERM`/`SIGINT`/`SIGHUP` for its own signal fd
+        // and a service manager leaves `SIGPIPE`/`SIGXFSZ` ignored; neither
+        // state is reset by `execve`, so the child must clear both before it
+        // becomes the user's shell (bitty#2920).
+        crate::containment::reset_child_signal_state(&mut command);
         // The child establishes the session and takes the PTY slave as its
         // controlling terminal inside the one documented syscall seam.
         crate::containment::establish_controlling_terminal(&mut command);
@@ -2046,5 +2057,130 @@ mod tests {
             "a service worker is not a terminal content owner"
         );
         let _ = pool.terminate(session);
+    }
+
+    /// A hosted shell must start with the daemon's signal state cleared.
+    ///
+    /// The daemon blocks `SIGTERM`/`SIGINT`/`SIGHUP` behind its signal fd and
+    /// a service manager leaves `SIGPIPE`/`SIGXFSZ` ignored; neither is reset
+    /// by `execve`, so without the child-side hook every hosted process keeps
+    /// them and a hangup or a termination request is never delivered. The
+    /// probe is this same binary re-executed through the production spawn
+    /// path, so nothing (a shell in particular, which sets its own mask)
+    /// stands between the daemon's fork and the observation (bitty#2920).
+    #[test]
+    fn a_spawned_session_clears_the_inherited_signal_mask_and_dispositions() {
+        /// The end marker the probe writes before it signals itself.
+        const END: &str = "SIGNAL_STATE_END";
+        /// The `SigIgn` bit of `SIGXFSZ` (signal 25): the ignored disposition
+        /// systemd sets for services that a Rust child does not re-set.
+        const SIGXFSZ_BIT: u64 = 1 << 24;
+
+        let _inherited = crate::containment::test_signal_state::InheritedSignalState::install();
+        let limits = Limits::default();
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let report = dir.path().join("signal-state");
+        let exe = std::env::current_exe().expect("the test binary");
+        let argv = [
+            exe.to_str().expect("a UTF-8 test binary path"),
+            "--exact",
+            "worker::tests::signal_state_probe",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ];
+        let env = [
+            BITTY_SIGNAL_STATE_PROBE.to_owned(),
+            format!("BITTY_SIGNAL_STATE_OUT={}", report.display()),
+        ];
+        let env: Vec<&str> = env.iter().map(String::as_str).collect();
+        let (mut pool, session) = spawn_test_worker_with_env(&limits, &argv, &env);
+
+        // The probe writes its report and then terminates itself. Waiting for
+        // the exit instead of reading the PTY keeps the observation off the
+        // terminal drain: by the time the child is gone, every write it made
+        // is in the report.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let exited = loop {
+            let child = &mut pool
+                .workers
+                .get_mut(&session)
+                .expect("the bound worker")
+                .child;
+            if child.try_wait().expect("wait for the probe").is_some() {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let text = std::fs::read_to_string(&report).expect("the probe report");
+        assert!(exited, "the probe did not exit: {text}");
+
+        let field = |name: &str| -> u64 {
+            let line = text
+                .lines()
+                .find(|line| line.starts_with(name))
+                .unwrap_or_else(|| panic!("no {name} line in the probe report: {text}"));
+            let (_, value) = line.split_once(' ').expect("a probe field");
+            u64::from_str_radix(value.trim(), 16).expect("a hexadecimal signal mask")
+        };
+
+        assert!(
+            text.contains(END),
+            "the probe did not report a complete signal state: {text}"
+        );
+        assert_eq!(
+            field("SIGBLK"),
+            0,
+            "the hosted process inherited the daemon's blocked mask: {text}"
+        );
+        assert_eq!(
+            field("SIGIGN") & SIGXFSZ_BIT,
+            0,
+            "the hosted process inherited an ignored `SIGXFSZ`: {text}"
+        );
+        assert!(
+            !text.contains("SURVIVED"),
+            "a termination request did not end the hosted process: {text}"
+        );
+        let _ = pool.terminate(session);
+    }
+
+    /// The environment marker that turns this test binary into the child probe
+    /// for [`a_spawned_session_clears_the_inherited_signal_mask_and_dispositions`].
+    const BITTY_SIGNAL_STATE_PROBE: &str = "BITTY_SIGNAL_STATE_PROBE=1";
+
+    /// The child-side half of
+    /// [`a_spawned_session_clears_the_inherited_signal_mask_and_dispositions`].
+    ///
+    /// It reports the mask and the ignored set that survived `exec`, then
+    /// raises `SIGTERM` on itself. A process that inherited the daemon's
+    /// blocked mask is still running when `raise` returns and records
+    /// `SURVIVED`; one with a cleared mask dies there.
+    #[test]
+    #[ignore = "child probe spawned by a_spawned_session_clears_the_inherited_signal_mask"]
+    fn signal_state_probe() {
+        if std::env::var_os("BITTY_SIGNAL_STATE_PROBE").is_none() {
+            return;
+        }
+        let report_path = std::env::var("BITTY_SIGNAL_STATE_OUT").expect("the probe report path");
+        let status = std::fs::read_to_string(format!("/proc/{}/status", std::process::id()))
+            .expect("the probe's own status");
+        let mut report = String::new();
+        for (label, prefix) in [("SIGBLK", "SigBlk:"), ("SIGIGN", "SigIgn:")] {
+            let line = status
+                .lines()
+                .find(|line| line.starts_with(prefix))
+                .expect("a signal-state field");
+            let (_, value) = line.split_once(':').expect("a signal-state value");
+            report.push_str(&format!("{label} {}\n", value.trim()));
+        }
+        report.push_str("SIGNAL_STATE_END\n");
+        std::fs::write(&report_path, &report).expect("the probe report");
+
+        nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).expect("raise SIGTERM");
+        std::fs::write(&report_path, format!("{report}SURVIVED\n")).expect("the probe report");
     }
 }

@@ -3,8 +3,9 @@
 #
 # Packs the Linux binaries as `bin/bitty` and `bin/bittyd` together with the
 # desktop entry,
-# icons, and AppStream metainfo under `share/`, plus LICENSE, README.md and
-# CHANGELOG.md, into `bitty-<version>-<target>.tar.zst` (REL-07 / issue
+# icons, AppStream metainfo, and the per-user systemd unit under `share/`, plus
+# LICENSE, README.md and CHANGELOG.md, into
+# `bitty-<version>-<target>.tar.zst` (REL-07 / issue
 # #1110; binary-compression section of release-distribution.md). Bare
 # target-triple binaries keep shipping for now; the versioned bundle is the
 # primary long-term artifact. Windows uses the portable ZIP and macOS the
@@ -32,6 +33,7 @@ PAYLOAD=("LICENSE" "README.md" "CHANGELOG.md")
 ICON_SIZES=(16 32 64 128 256 512)
 DESKTOP_FILE="packaging/run.bitty.Bitty.desktop"
 METAINFO_FILE="packaging/run.bitty.Bitty.metainfo.xml"
+SYSTEMD_UNIT_FILE="packaging/systemd/bittyd.service"
 TERMINFO_FILE="terminfo/bitty.ti"
 DRY_RUN=0
 
@@ -120,6 +122,7 @@ for f in "${PAYLOAD[@]}"; do
 done
 [[ -f "$REPO_ROOT/$DESKTOP_FILE" ]] || die "payload file not found: $DESKTOP_FILE"
 [[ -f "$REPO_ROOT/$METAINFO_FILE" ]] || die "payload file not found: $METAINFO_FILE"
+[[ -f "$REPO_ROOT/$SYSTEMD_UNIT_FILE" ]] || die "payload file not found: $SYSTEMD_UNIT_FILE"
 [[ -f "$REPO_ROOT/$TERMINFO_FILE" ]] || die "payload file not found: $TERMINFO_FILE"
 for size in "${ICON_SIZES[@]}"; do
 	[[ -f "$REPO_ROOT/packaging/icons/hicolor/${size}x${size}/apps/bitty.png" ]] ||
@@ -134,6 +137,7 @@ trap 'rm -rf "$STAGE"' EXIT
 
 ROOT="$STAGE/$TOPDIR"
 mkdir -p "$ROOT/bin" "$ROOT/share/applications" "$ROOT/share/metainfo" \
+	"$ROOT/share/systemd/user" \
 	"$ROOT/share/icons/hicolor/scalable/apps" "$ROOT/terminfo"
 for size in "${ICON_SIZES[@]}"; do
 	mkdir -p "$ROOT/share/icons/hicolor/${size}x${size}/apps"
@@ -148,6 +152,7 @@ for f in "${PAYLOAD[@]}"; do
 done
 cp "$REPO_ROOT/$DESKTOP_FILE" "$ROOT/share/applications/"
 cp "$REPO_ROOT/$METAINFO_FILE" "$ROOT/share/metainfo/"
+cp "$REPO_ROOT/$SYSTEMD_UNIT_FILE" "$ROOT/share/systemd/user/bittyd.service"
 cp "$REPO_ROOT/$TERMINFO_FILE" "$ROOT/terminfo/bitty.ti"
 for size in "${ICON_SIZES[@]}"; do
 	cp "$REPO_ROOT/packaging/icons/hicolor/${size}x${size}/apps/bitty.png" \
@@ -183,6 +188,7 @@ EXPECTED="$(
 		echo "$TOPDIR/CHANGELOG.md"
 		echo "$TOPDIR/share/applications/run.bitty.Bitty.desktop"
 		echo "$TOPDIR/share/metainfo/run.bitty.Bitty.metainfo.xml"
+		echo "$TOPDIR/share/systemd/user/bittyd.service"
 		for size in "${ICON_SIZES[@]}"; do
 			echo "$TOPDIR/share/icons/hicolor/${size}x${size}/apps/bitty.png"
 		done

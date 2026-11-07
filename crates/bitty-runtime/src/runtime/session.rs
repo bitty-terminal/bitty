@@ -1308,6 +1308,12 @@ impl Runtime {
             self.floats.raise_to_top(focused);
         }
         self.float_offsets.clear();
+        // Issue #2945 (review): the corner/edge resize extents are the other
+        // presentation-only per-panel-id map, so restore drops them with the
+        // re-anchor offsets — the shared map covers pin and detached-float ids
+        // alike, and a restored panel must present at its default anchored
+        // share instead of an extent recorded before the restore.
+        self.anchored_sizes.clear();
         // CTX-1082: a restore installs a whole new world, so the pinned
         // store is replaced wholesale in snapshot pin order (present-time
         // paint order) with the recorded unpin anchors. The Alt+drag

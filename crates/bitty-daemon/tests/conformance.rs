@@ -29,7 +29,7 @@ use harness::real::RealDriver;
 #[test]
 fn corpus_is_well_formed_and_frozen() {
     let corpus = Corpus::load().expect("the embedded corpus parses");
-    assert_eq!(corpus.vectors.len(), 59, "corpus size changed");
+    assert_eq!(corpus.vectors.len(), 65, "corpus size changed");
     for id in [
         "C-01", "C-02", "C-03", "C-04", "C-05", "C-06", "C-07", "C-08", "C-12", "C-13", "C-14",
         "C-15", "C-16", "C-17",
@@ -40,6 +40,12 @@ fn corpus_is_well_formed_and_frozen() {
         assert!(
             corpus.vector(id).is_some(),
             "missing terminal content vector {id}"
+        );
+    }
+    for id in ["V-51", "V-52", "V-53", "V-54", "V-55", "V-56"] {
+        assert!(
+            corpus.vector(id).is_some(),
+            "missing session-record vector {id}"
         );
     }
     {
@@ -319,7 +325,7 @@ fn fake_conformance_corpus() {
         skipped,
         [
             "V-17", "V-18", "V-39", "V-40", "V-42", "V-43", "C-01", "C-02", "C-03", "C-11", "C-07",
-            "C-08", "C-12", "C-15", "C-16", "V-49", "V-50"
+            "C-08", "C-12", "C-15", "C-16", "V-49", "V-50", "V-55", "V-56"
         ],
         "the fake suite skips exactly the real-only and amendment-gated vectors"
     );
@@ -461,7 +467,8 @@ fn compare_corpus_rows(
 fn expected_parity(real_serves_spawn: bool, test_seams: bool) -> (usize, Vec<&'static str>) {
     let mut expected_not_compared = vec![
         "V-06", "V-17", "V-18", "V-33", "V-39", "V-40", "V-42", "V-43", "C-01", "C-02", "C-03",
-        "C-11", "C-07", "C-08", "C-10", "C-12", "F-01", "C-15", "C-16", "V-49", "V-50",
+        "C-11", "C-07", "C-08", "C-10", "C-12", "F-01", "C-15", "C-16", "V-49", "V-50", "V-55",
+        "V-56",
     ];
     if !test_seams {
         // Without the real seams V-20 and V-44 are fake-only rows: the real
@@ -469,17 +476,18 @@ fn expected_parity(real_serves_spawn: bool, test_seams: bool) -> (usize, Vec<&'s
         expected_not_compared.extend(["V-20", "V-44"]);
     }
     let expected_compared = match (real_serves_spawn, test_seams) {
-        (true, true) => 38,
-        (true, false) => 36,
+        (true, true) => 42,
+        (true, false) => 40,
         // The terminal-spawn vectors skip on the refused cell. V-48 needs no
-        // process or containment plan, so it stays compared.
+        // process or containment plan, so it stays compared. V-52 needs a
+        // bound worker, so it joins them.
         (false, true) => {
-            expected_not_compared.extend(["V-45", "V-46", "V-47"]);
-            35
+            expected_not_compared.extend(["V-45", "V-46", "V-47", "V-52"]);
+            38
         }
         (false, false) => {
-            expected_not_compared.extend(["V-45", "V-46", "V-47"]);
-            33
+            expected_not_compared.extend(["V-45", "V-46", "V-47", "V-52"]);
+            36
         }
     };
     expected_not_compared.sort_unstable();

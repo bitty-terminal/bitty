@@ -253,6 +253,15 @@ pub(crate) struct Args {
     /// Global `--instance` before the `ctl` word (merged at dispatch).
     pub(crate) ctl_instance_pre: Option<String>,
 
+    /// `bitty reload` (bitty#2927, runtime class). True once the first
+    /// positional `reload` word is seen; a program literally named `reload`
+    /// needs `bitty -- reload ...`. Tokens after the word land verbatim in
+    /// [`Self::reload_raw`] for [`crate::reload::parse_reload_request`].
+    pub(crate) reload_word: bool,
+    /// Raw tokens after the `reload` word (flags only; no positionals).
+    /// Empty until `reload_word` is set.
+    pub(crate) reload_raw: Vec<String>,
+
     /// `bitty list <kind>` enumeration (CTX-0172). True once the first
     /// positional `list`/`ls` word is seen; a program literally named
     /// `list`/`ls` must be invoked as `bitty -- list ...`.
@@ -562,6 +571,8 @@ impl Args {
             ctl_raw: Vec::new(),
             ctl_socket_pre: None,
             ctl_instance_pre: None,
+            reload_word: false,
+            reload_raw: Vec::new(),
 
             list_word: false,
             list_spelling: String::from("list"),
@@ -795,6 +806,11 @@ fn push_verbatim_new_word(out: &mut Args, raw: &[String], i: usize) -> Option<us
 ///   detection and self-update (CTX-1719, local class, safe-mode read-only
 ///   paths); a program literally named `upgrade` needs
 ///   `bitty -- upgrade ...`
+/// - `reload [--dry-run] [--socket PATH] [--instance ID] [--format SHAPE]` →
+///   apply the running instance's config (bitty#2927, runtime class); a
+///   program literally named `reload` needs `bitty -- reload ...`. Tokens
+///   after the word are kept verbatim for
+///   [`crate::reload::parse_reload_request`].
 /// - `list <themes|colors|fonts|plugins|instances|actions|keymaps|services>` → resource enumeration (CTX-0172, CTX-1127, CTX-1467);
 ///   a program literally named `list`/`ls` needs `bitty -- list ...`
 /// - `inspect <target> <value>` → state and ownership (CTX-0173, local
@@ -1989,6 +2005,38 @@ pub(crate) fn parse_args(raw: &[String]) -> Args {
                     continue;
                 }
 
+                // `bitty reload` applies the running instance's config (first
+                // positional only; bitty#2927). Flags (`--dry-run`,
+                // `--socket`, `--instance`, `--format`) compose after the
+                // word and are kept verbatim for
+                // [`crate::reload::parse_reload_request`]. A program
+                // literally named `reload` needs `bitty -- reload ...`.
+                if !program_set
+                    && !out.reload_word
+                    && !out.config_word
+                    && !out.init_word
+                    && !out.doctor_word
+                    && !out.upgrade_word
+                    && !out.ctl_word
+                    && !out.run_word
+                    && !out.list_word
+                    && !out.inspect_word
+                    && !out.dev_word
+                    && !out.plugin_word
+                    && !out.component_word
+                    && !out.version_word
+                    && !out.completion_word
+                    && !out.shell_init_word
+                    && !out.cmd_word
+                    && !out.x_word
+                    && !out.help_word
+                    && token == "reload"
+                {
+                    out.reload_word = true;
+                    out.reload_raw.extend_from_slice(&raw[i + 1..]);
+                    break;
+                }
+
                 // `bitty list <kind>` enumeration (first positional only;
                 // CTX-0172). `ls` is the stable alias for `list` per
                 // cli-contract-rfc. A program literally named `list`/`ls`
@@ -2372,17 +2420,17 @@ pub(crate) fn help_text() -> String {
                               Precedence: CLI flags > file > profile > defaults;\n  \
                               each flag overrides only its own field (siblings\n  \
                               keep file values).\n  \
-                 --format SHAPE  Doctor/ctl/list/inspect/plugin/extension/version/cmd/x\n  \
+                 --format SHAPE  Doctor/ctl/reload/list/inspect/plugin/extension/version/cmd/x\n  \
                                output shape:\n  \
                                table|json|jsonl (default table; parsed globally,\n  \
                                consumed by `bitty doctor`, `bitty ctl`,\n  \
-                               `bitty list`, `bitty inspect`,\n  \
+                               `bitty reload`, `bitty list`, `bitty inspect`,\n  \
                                 `bitty plugin list|info`, `bitty extension list`, `bitty version`,\n  \
                                `bitty cmd`, and `bitty x` (`bitty completion` and\n  \
                                `bitty shell-init` emit scripts and ignore it; ignored by startup).\n\
-               --socket PATH   Ctl target socket (global `bitty --socket P ctl ...`\n  \
+               --socket PATH   Ctl/reload target socket (global `bitty --socket P ctl ...`\n  \
                               or `bitty ctl --socket P ...`; bypasses discovery).\n  \
-               --instance ID   Ctl target instance (global or per-`ctl` flag).\n  \
+               --instance ID   Ctl/reload target instance (global or per-command flag).\n  \
                  --no-color     Disable ANSI coloring in doctor/list table output\n  \
                                (accepted by inspect for parity; its tables are plain)\n  \
                  --fix           Doctor only: apply provably safe, reversible\n  \
@@ -2465,6 +2513,20 @@ pub(crate) fn help_text() -> String {
                               user-scoped delegated command; system-owned\n  \
                               installs are never executed (exit 7);\n  \
                               --rollback restores a verified bitty.prev.\n  \
+            reload [--dry-run] [--socket P] [--instance ID] [--format SHAPE]\n  \
+                              Apply the running instance's config now (runtime\n  \
+                              class, bitty#2927): re-reads init.lua plus the\n  \
+                              active profile through the same plan/validation\n  \
+                              path as startup, then adopts the live subset\n  \
+                              atomically. Applies theme/palette, font family\n  \
+                              and size, keymaps, leader, appearance and\n  \
+                              statusline options; workspaces, windows, panes,\n  \
+                              their PTYs and scrollback are preserved. A\n  \
+                              change the runtime cannot adopt live is reported\n  \
+                              as restart-required, never silently ignored.\n  \
+                              --dry-run reports the change list without\n  \
+                              applying. Exit 0 applied/unchanged, 3 rejected\n  \
+                              (typed dotted field path), 6 no live instance.\n  \
             config <verb>     Config path|check|show|validate|edit|profile\n  \
                              (--format table|json|jsonl for show/validate;\n  \
                              `bitty config --help` for detail; alias `cfg`)\n  \
@@ -2650,8 +2712,8 @@ pub(crate) fn help_text_short(color: bool) -> String {
                --config PATH           Explicit user config file (init.lua)\n  \
                --profile NAME          Named profile layered under the user file\n  \
                --theme NAME            CLI theme override for one launch\n  \
-               --socket PATH           Control target socket (with ctl / list instances)\n  \
-               --instance ID           Control target instance (with ctl / list instances)\n  \
+               --socket PATH           Control target socket (with ctl / reload / list instances)\n  \
+               --instance ID           Control target instance (with ctl / reload / list instances)\n  \
                --no-color              Disable ANSI coloring (also honors NO_COLOR)\n  \
                --                      End of flags; remaining tokens are PROGRAM argv\n\
          \n\
@@ -2662,6 +2724,7 @@ pub(crate) fn help_text_short(color: bool) -> String {
             init [FLAGS]            Opt-in guided setup wizard (never auto-runs)\n  \
             doctor [--fix]          Diagnose installation and compatibility (local)\n  \
             upgrade [--check]       Self-update script/AppImage installs; delegate package managers\n  \
+            reload [--dry-run]      Apply the running instance's config now (runtime)\n  \
             list <kind>             Enumerate themes|colors|fonts|plugins|instances|actions|keymaps|services (alias ls)\n  \
             inspect <target> <value> Explain state and ownership (command|key|plugin|config|protocol)\n  \
             dev <verb>              Developer tracing, captures, synthesis, dumps, overlays\n  \
@@ -2687,7 +2750,7 @@ pub(crate) fn help_text_short(color: bool) -> String {
     )
 }
 
-/// Canonical subcommand names for `bitty help [cmd]` (17 total, issue #1900).
+/// Canonical subcommand names for `bitty help [cmd]` (18 total, issue #1900).
 ///
 /// Aliases (`cfg`, `ls`, `comp`) map to their canonical help; `component` is
 /// the hidden deprecated alias for `extension` (issue #1959, kept at least
@@ -2704,6 +2767,7 @@ pub(crate) const SUBCOMMANDS: &[(&str, &[&str])] = &[
     ("init", &[]),
     ("doctor", &[]),
     ("upgrade", &[]),
+    ("reload", &[]),
     ("list", &["ls"]),
     ("inspect", &[]),
     ("dev", &[]),
@@ -2719,7 +2783,7 @@ pub(crate) const SUBCOMMANDS: &[(&str, &[&str])] = &[
 
 #[must_use]
 pub(crate) fn help_valid_commands() -> &'static str {
-    "run, ctl, config (cfg), init, doctor, upgrade, list (ls), inspect, dev, plugin, extension, version, completion (comp), cmd, x, shell-init, help"
+    "run, ctl, config (cfg), init, doctor, upgrade, reload, list (ls), inspect, dev, plugin, extension, version, completion (comp), cmd, x, shell-init, help"
 }
 
 /// Normalize one `bitty help [cmd]` name to its canonical subcommand.
@@ -2747,7 +2811,7 @@ pub(crate) fn help_usage() -> String {
         "usage: bitty help [cmd]\n\
          \n\
          commands:\n\
-         \x20 run, ctl, config (cfg), init, doctor, upgrade, list (ls), inspect, dev,\n\
+         \x20 run, ctl, config (cfg), init, doctor, upgrade, reload, list (ls), inspect, dev,\n\
          \x20 plugin, extension, version, completion (comp), cmd, x, shell-init, help\n\
          plus actions:\n\
          \x20 +list-themes, +list-colors, +list-fonts, +list-keybinds, +list-actions,\n\

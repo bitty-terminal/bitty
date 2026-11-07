@@ -26,7 +26,9 @@
 //! - a stopping daemon refuses a pipelined mutation on the same drain;
 //! - the pre-authentication byte budget closes a dribbled frame and writes one
 //!   aggregated audit record;
-//! - `SIGTERM`/`SIGINT` drain to exit `0`, and endpoint tamper exits `6`.
+//! - `SIGTERM`/`SIGINT` drain to exit `0`, `SIGHUP` is drained without
+//!   stopping the loop (a closed terminal does not kill the daemon), and
+//!   endpoint tamper exits `6`.
 //!
 //! Linux is the only servable cell in this slice; the test is gated on it.
 
@@ -1414,6 +1416,36 @@ fn sigterm_and_sigint_drain_to_exit_zero() {
 }
 
 #[test]
+fn sighup_does_not_stop_a_running_service_loop() {
+    let root = TempRoot::new("signal-hup");
+    let daemon = Daemon::start(&root);
+    let capability = read_capability(&root);
+    let mut operator = Client::connect(&root.endpoint());
+    assert_eq!(operator.negotiate(Some(&capability))["ok"], true);
+
+    // A terminal closing hangs up its foreground process group. The daemon
+    // must keep serving: the assertion is a real request afterwards, not only
+    // "the process still exists", because a wedged drain loop would also be
+    // alive. Two hangups coalesce in one drain window.
+    send_signal(daemon.pid(), "HUP");
+    send_signal(daemon.pid(), "HUP");
+    let status = operator.call("daemon.status", Value::Null);
+    assert_eq!(status["ok"], true, "{status}");
+    assert!(
+        root.endpoint().exists(),
+        "the endpoint stays bound after SIGHUP"
+    );
+
+    // The stop contract is unchanged: `SIGTERM` still drains to exit `0`.
+    send_signal(daemon.pid(), "TERM");
+    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
+    assert!(
+        !root.endpoint().exists(),
+        "the socket is removed after SIGTERM"
+    );
+}
+
+#[test]
 fn endpoint_tamper_exits_six() {
     let root = TempRoot::new("tamper");
     let daemon = Daemon::start(&root);
@@ -2523,11 +2555,17 @@ fn every_control_method_maps_a_stale_token_at_a_vacant_control() {
     );
     assert_eq!(aborted["ok"], true, "{aborted}");
 
+    // Diagnostics for the forced stop's exit code: a `Running`/`Stopping`
+    // session whose worker handle is already gone is counted `unverified`, so
+    // the pre-stop session counts belong in the failure message.
+    let before_stop = operator.call("daemon.status", Value::Null);
+    let stopped = operator.call("daemon.stop", json!({"mode": "force"}));
+    assert_eq!(stopped["ok"], true, "{stopped}");
     assert_eq!(
-        operator.call("daemon.stop", json!({"mode": "force"}))["ok"],
-        true
+        daemon.wait_within(Duration::from_secs(10)).code(),
+        Some(0),
+        "before stop: {before_stop}; stop: {stopped}"
     );
-    assert_eq!(daemon.wait_within(Duration::from_secs(10)).code(), Some(0));
 }
 
 #[test]

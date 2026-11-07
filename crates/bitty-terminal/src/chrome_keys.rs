@@ -5590,6 +5590,54 @@ mod tests {
     }
 
     #[test]
+    fn chrome_mod_shift_number_moves_a_focused_floating_panel() {
+        // Issue #2945: the shipped `Mod+Shift+<n>` gesture (DEC-0034
+        // cross-workspace move) used to warn "focused pane not in layout" and
+        // do nothing while a floating panel held focus, so the workspace never
+        // switched. The panel now travels into the target workspace and focus
+        // follows, exactly like a tiled move.
+        use bitty_config::ChromeAction;
+        let mut app = workspace_test_app();
+        assert!(drive_mod_char(&mut app, "t", false, true, false, false));
+        assert_eq!(app.runtime.workspace_count(), 2);
+        assert!(drive_mod_char(&mut app, "1", false, true, false, false));
+        assert_eq!(app.runtime.active_workspace_index(), 0);
+        app.runtime.set_layout(two_pane_layout());
+        let focused = app.runtime.focused_view().expect("seed focus");
+        app.apply_chrome_action(ChromeAction::ToggleFloating);
+        assert_eq!(app.runtime.floated_views(), vec![focused]);
+        assert!(
+            app.runtime.set_focus(focused),
+            "the detached panel is a focus target"
+        );
+
+        // Physical Mod+Shift+2 arrives as `@` with Shift held.
+        assert!(
+            drive_mod_char(&mut app, "@", false, true, true, false),
+            "the move gesture is chrome-owned while a float is focused"
+        );
+        assert!(
+            app.runtime.drain_pending_input().is_empty(),
+            "the shifted symbol must never reach the shell"
+        );
+        assert_eq!(
+            app.runtime.active_workspace_index(),
+            1,
+            "the gesture switches to the target workspace"
+        );
+        assert_eq!(
+            app.runtime.floated_views(),
+            vec![focused],
+            "the panel moved into the target workspace"
+        );
+        assert_eq!(
+            app.runtime.focused_view(),
+            Some(focused),
+            "focus follows the panel"
+        );
+    }
+
+    #[test]
     fn chrome_close_view_discards_focused_float_issue_2141() {
         // Issue #2141: a focused detached float is outside the live layout,
         // so the tiled close path would warn and leave the empty bordered

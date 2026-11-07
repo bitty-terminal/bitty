@@ -1959,7 +1959,16 @@ impl Runtime {
                         let scrolled_view = if selection_drag {
                             self.selection_owner()
                         } else {
-                            self.focused_view().or(Some(ViewId::new(1)))
+                            // Issue #2945: a floating panel is composited over
+                            // the focused tiling leaf, so the wheel must
+                            // address the overlay under the pointer first;
+                            // otherwise the visible panel never scrolls and
+                            // the hidden pane behind it does. Tiling leaves
+                            // never overlap, so the focused fallback keeps
+                            // the long-standing routing there.
+                            self.pointer_overlay_owner()
+                                .or_else(|| self.focused_view())
+                                .or(Some(ViewId::new(1)))
                         };
                         // #1338 fail-closed: the alternate screen owns no
                         // scrollback view, so a wheel that reached this
@@ -2051,10 +2060,13 @@ impl Runtime {
         // that owns the selection (a Shift+press can own a non-focused
         // split/float); the range is re-tracked across the page exactly like
         // a wheel scroll. Without a drag the focused pane stays authoritative.
+        // Issue #2945: a floating panel under the pointer outranks the focused
+        // tiling leaf it covers — the same rule the wheel applies, so paging
+        // and scrolling can never address different panes.
         let target = if self.is_selection_dragging() {
             self.selection_owner()
         } else {
-            self.focused_view()
+            self.pointer_overlay_owner().or_else(|| self.focused_view())
         };
         let Some(target) = target else {
             return false;

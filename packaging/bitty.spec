@@ -50,11 +50,13 @@ install -d %{buildroot}%{_bindir}
 install -d %{buildroot}%{_datadir}/applications
 install -d %{buildroot}%{_datadir}/metainfo
 install -d %{buildroot}%{_datadir}/terminfo
+install -d %{buildroot}%{_prefix}/lib/systemd/user
 install -d %{buildroot}%{_datadir}/licenses/%{name}
 install -d %{buildroot}%{_docdir}/%{name}
 
 install -m 0755 bin/bitty %{buildroot}%{_bindir}/bitty
 install -m 0755 bin/bittyd %{buildroot}%{_bindir}/bittyd
+install -m 0644 share/systemd/user/bittyd.service %{buildroot}%{_prefix}/lib/systemd/user/bittyd.service
 install -m 0644 share/applications/run.bitty.Bitty.desktop %{buildroot}%{_datadir}/applications/run.bitty.Bitty.desktop
 install -m 0644 share/metainfo/run.bitty.Bitty.metainfo.xml %{buildroot}%{_datadir}/metainfo/run.bitty.Bitty.metainfo.xml
 install -m 0644 LICENSE %{buildroot}%{_datadir}/licenses/%{name}/LICENSE
@@ -77,6 +79,8 @@ tic -x -o %{buildroot}%{_datadir}/terminfo terminfo/bitty.ti
 %doc %{_docdir}/%{name}/README.md
 %doc %{_docdir}/%{name}/CHANGELOG.md
 %{_bindir}/bitty
+%{_bindir}/bittyd
+%{_prefix}/lib/systemd/user/bittyd.service
 %{_datadir}/applications/run.bitty.Bitty.desktop
 %{_datadir}/metainfo/run.bitty.Bitty.metainfo.xml
 %{_datadir}/icons/hicolor/*/apps/bitty.*

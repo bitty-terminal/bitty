@@ -33,6 +33,26 @@ contents:
     dst: /usr/share/applications/run.bitty.Bitty.desktop
   - src: ./packaging/run.bitty.Bitty.metainfo.xml
     dst: /usr/share/metainfo/run.bitty.Bitty.metainfo.xml
+  # Per-user systemd unit (bitty#2920). nfpm matches `packager` exactly against
+  # one packager name (no multi-value filter), so the deb, rpm, and archlinux
+  # packages each carry their own entry. The apk is deliberately absent:
+  # Alpine runs OpenRC and ships no systemd user manager, so the file would
+  # never be loaded there (see packaging/alpine/APKBUILD).
+  - src: ./packaging/systemd/bittyd.service
+    dst: /usr/lib/systemd/user/bittyd.service
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: ./packaging/systemd/bittyd.service
+    dst: /usr/lib/systemd/user/bittyd.service
+    packager: rpm
+    file_info:
+      mode: 0644
+  - src: ./packaging/systemd/bittyd.service
+    dst: /usr/lib/systemd/user/bittyd.service
+    packager: archlinux
+    file_info:
+      mode: 0644
   - src: ./packaging/icons/hicolor/16x16/apps/bitty.png
     dst: /usr/share/icons/hicolor/16x16/apps/bitty.png
   - src: ./packaging/icons/hicolor/32x32/apps/bitty.png

@@ -14,7 +14,7 @@ use crate::official::OfficialPlugin;
 pub const SOURCE_REPOSITORY: &str = "https://github.com/bitty-terminal/bitty-plugins";
 
 /// Exact registry commit this catalog was generated from.
-pub const SOURCE_REVISION: &str = "62a43a33b1bf3b86e0b78e3b4cb2ba6de22cc77a";
+pub const SOURCE_REVISION: &str = "bad9843b06a47cb164b54bdc5e068db1cf31d149";
 
 /// Official plugin entries, sorted by canonical id.
 pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
@@ -44,7 +44,7 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.bar",
         name: "Unified Bar",
         repository: "https://github.com/bitty-terminal/bar.git",
-        pin: "0fa151395fe9d9d8b3b9dc4ba047eb13fa7b45c4",
+        pin: "ecd408ee5668fe4f29ffeb7424d2ecb5bcaf102f",
         manifest_hash: "sha256:651cd54d78f0f85d8db5faf745fa12b10f4a12703029b7d8646140816535c0c8",
         compat_bitty: Some(">=0.0.24"),
         compat_plugin_api: Some("^1.0"),

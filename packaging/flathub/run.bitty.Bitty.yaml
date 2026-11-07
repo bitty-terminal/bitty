@@ -41,18 +41,23 @@ modules:
       - install -Dm755 -t /app/bin bin/bitty
       - cp -a share/. /app/share/
       - tic -x -o /app/share/terminfo terminfo/bitty.ti
+    # Each `url` and its `sha256` are refreshed together, after that release's
+    # bundle assets are published: the digest comes from the asset's `*.sha256`
+    # sidecar of the same tag (see README.md, "Refresh procedure"). Never move
+    # the pins ahead of the assets — a url without matching digests fails
+    # flatpak-builder's checksum verification.
     sources:
       - type: archive
         archive-type: tar-zst
         strip-components: 1
-        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.35/bitty-0.0.35-x86_64-unknown-linux-gnu.tar.zst
+        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.34/bitty-0.0.34-x86_64-unknown-linux-gnu.tar.zst
         sha256: 42e324669063a15b33e270eb8f3880bfba0a320854e8c82a2ab9eae24f75ccc3
         only-arches:
           - x86_64
       - type: archive
         archive-type: tar-zst
         strip-components: 1
-        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.35/bitty-0.0.35-aarch64-unknown-linux-gnu.tar.zst
+        url: https://github.com/bitty-terminal/bitty/releases/download/v0.0.34/bitty-0.0.34-aarch64-unknown-linux-gnu.tar.zst
         sha256: c5f392873993b103c76c931046581c6c81865b954b58b49c13d9d839392425d2
         only-arches:
           - aarch64

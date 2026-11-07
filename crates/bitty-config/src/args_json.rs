@@ -10,13 +10,18 @@
 //! Both pick the blob up as **text** from an untrusted boundary, so both need
 //! the same bounded structural check *before* any parser sees it. The check is
 //! deliberately structural, not semantic: balanced `{}`/`[]` with string
-//! awareness, exactly one root object/array value, no unterminated string, and
-//! a depth cap. The typed value is produced later by the owning layer's JSON
-//! parser (`bitty_runtime::plugin_runtime::store::parse_json`), which never
-//! sees a document that failed this gate.
+//! awareness, exactly one root object/array value with no trailing bytes, no
+//! unterminated string, and a depth cap. The typed value is produced later by
+//! the owning layer's JSON parser
+//! (`bitty_runtime::plugin_runtime::store::parse_json`), which never sees a
+//! document that failed this gate.
 //!
-//! One implementation, one set of bounds: a binding and the CLI can never
-//! accept different documents for the same command.
+//! One implementation, one set of structural rules. The size bound is per
+//! surface: this validator accepts up to [`MAX_JSON_ARGS_BYTES`] for
+//! `bitty cmd`, while a keymap binding additionally caps its blob at the
+//! smaller [`crate::keymap::MAX_INVOKE_ARGS_BYTES`] before calling here. A
+//! binding bound is therefore a strict subset of the CLI's: every document a
+//! binding accepts the CLI accepts too, but not the reverse.
 
 /// Maximum bytes for a raw JSON args blob (bounded parser input).
 pub const MAX_JSON_ARGS_BYTES: usize = 65_536;
@@ -29,10 +34,12 @@ pub const MAX_JSON_ARGS_DEPTH: usize = 32;
 /// # Errors
 ///
 /// Returns a bounded English reason for a blob that is empty, too large, not
-/// rooted at an object/array, unbalanced, unterminated inside a string, or
-/// nested deeper than [`MAX_JSON_ARGS_DEPTH`]. The caller names its own field
-/// or verb in the diagnostic; the reasons here are surface-neutral so every
-/// caller can reuse them verbatim.
+/// rooted at an object/array, unbalanced, terminated before its root value
+/// closes or carries bytes past the root value (two documents, a trailing
+/// token, ...), unterminated inside a string, or nested deeper than
+/// [`MAX_JSON_ARGS_DEPTH`]. The caller names its own field or verb in the
+/// diagnostic; the reasons here are surface-neutral so every caller can reuse
+/// them verbatim.
 pub fn validate_json_args_blob(blob: &str) -> Result<(), String> {
     if blob.len() > MAX_JSON_ARGS_BYTES {
         return Err(format!(
@@ -54,7 +61,11 @@ pub fn validate_json_args_blob(blob: &str) -> Result<(), String> {
     let mut in_string = false;
     let mut escaped = false;
     let mut stack: Vec<u8> = Vec::new();
-    for &b in trimmed.as_bytes() {
+    // Byte offset just past the `}`/`]` that closes the root value. Everything
+    // after it must be whitespace: `{"a":1} {"b":2}` and `{"a":1} trailing`
+    // are two values / a value plus junk, not one argument document.
+    let mut root_end: Option<usize> = None;
+    for (index, &b) in trimmed.as_bytes().iter().enumerate() {
         if in_string {
             if escaped {
                 escaped = false;
@@ -80,6 +91,9 @@ pub fn validate_json_args_blob(blob: &str) -> Result<(), String> {
                     return Err(String::from("args blob has unbalanced brackets"));
                 }
                 depth = depth.saturating_sub(1);
+                if depth == 0 && root_end.is_none() {
+                    root_end = Some(index + 1);
+                }
             }
             _ => {}
         }
@@ -95,7 +109,15 @@ pub fn validate_json_args_blob(blob: &str) -> Result<(), String> {
     if !stack.is_empty() {
         return Err(String::from("args blob has unbalanced brackets"));
     }
-    Ok(())
+    match root_end {
+        Some(end) if trimmed[end..].trim().is_empty() => Ok(()),
+        Some(_) => Err(String::from(
+            "args blob must hold exactly one root value (bytes follow its closing bracket)",
+        )),
+        // The opener rule above guarantees a root value; reaching here means
+        // the scan never closed it, which the stack check already refused.
+        None => Err(String::from("args blob has unbalanced brackets")),
+    }
 }
 
 #[cfg(test)]
@@ -128,6 +150,30 @@ mod tests {
                 "blob {blob:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn refuses_more_than_one_root_value_or_trailing_bytes() {
+        // `-- {"a":1} {"b":2}` and `-- {"a":1} trailing` are not one argument
+        // document; accepting them here would move the refusal from config
+        // load to the keypress (the dispatch-side JSON parser rejects them).
+        for blob in [
+            "{\"a\":1} {\"b\":2}",
+            "{\"a\":1} -- {\"b\":2}",
+            "{\"a\":1} trailing",
+            "{\"a\":1}]",
+            "[] []",
+            "[1] 2",
+        ] {
+            let error = validate_json_args_blob(blob).expect_err("must be refused");
+            assert!(
+                error.contains("exactly one root value") || error.contains("unbalanced"),
+                "blob {blob:?}: {error}"
+            );
+        }
+        // One root value with surrounding whitespace is still one document.
+        assert!(validate_json_args_blob("  {\"a\":1}\n\t").is_ok());
+        assert!(validate_json_args_blob("{}\n").is_ok());
     }
 
     #[test]

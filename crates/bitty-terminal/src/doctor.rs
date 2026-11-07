@@ -26,6 +26,15 @@
 //! `--dry-run` emits the same receipts without writing. `--safe` refuses
 //! `--fix` with [`DoctorFixError::SafeMode`] (exit `7`, the permission class).
 //!
+//! # Platform remediation text (bitty#2974)
+//!
+//! A failed `pty` or `fonts` check names the manual step that fixes it on
+//! *this* host: the FreeBSD `pty(4)` module load plus its `sysrc` boot
+//! persistence, and the host distribution's own font package set
+//! ([`RemediationPlatform`]). The text is advisory only — it never changes a
+//! status, the exit taxonomy, or what doctor is willing to run, and an
+//! unrecognised platform names no package command at all.
+//!
 //! # Output and exit codes
 //!
 //! `--format table` (default) is human output and not a machine contract.
@@ -184,6 +193,154 @@ impl DoctorCheck {
 }
 
 // ---------------------------------------------------------------------------
+// Platform remediation text (bitty#2974)
+// ---------------------------------------------------------------------------
+
+/// Host platform family that owns the install remediation text.
+///
+/// Remediation is advisory only: the platform selects which manual command a
+/// hint names, and never changes a check's status, exit-code class, or the
+/// fact that doctor runs nothing privileged itself. [`Self::Other`] means the
+/// host is not one of the families below, and then a hint names no package
+/// command at all — a wrong command is worse than none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemediationPlatform {
+    /// FreeBSD (`pkg`, loadable kernel modules).
+    FreeBsd,
+    /// Arch Linux and its derivatives (`pacman`).
+    Arch,
+    /// Debian/Ubuntu family (`apt`).
+    Debian,
+    /// Fedora/RHEL family (`dnf`).
+    Fedora,
+    /// macOS, Windows, or an unrecognised Linux distribution: no remediation
+    /// text, because naming another platform's package manager would be wrong.
+    Other,
+}
+
+impl RemediationPlatform {
+    /// Platform this build runs on.
+    ///
+    /// The operating system comes from the compile-time target, exactly like
+    /// the rest of the platform code in this workspace. A Linux distribution
+    /// family is not part of a target triple, so it is read from the
+    /// distribution's own `/etc/os-release` declaration (with the upstream
+    /// fallback `/usr/lib/os-release`) — never from `uname` and never guessed
+    /// from a host path. Every other target is [`Self::Other`].
+    #[must_use]
+    pub fn host() -> Self {
+        if cfg!(target_os = "freebsd") {
+            return Self::FreeBsd;
+        }
+        if cfg!(target_os = "linux") {
+            return os_release_family(os_release_contents().as_deref());
+        }
+        Self::Other
+    }
+
+    /// Manual step for a missing PTY multiplexer, or `None` when this platform
+    /// needs no platform-specific step.
+    ///
+    /// FreeBSD builds `pty(4)` as a loadable kernel module: a minimal install
+    /// has no `/dev/ptmx` until the module is loaded, and the load must be
+    /// persisted or the next boot loses it again. Doctor prints both lines and
+    /// never runs either.
+    #[must_use]
+    pub fn pty_remediation(self) -> Option<&'static str> {
+        match self {
+            Self::FreeBsd => Some(
+                "on FreeBSD the pty(4) module is not built into the kernel: run `kldload pty`, then persist it with `sysrc kld_list+=pty` so /dev/ptmx survives the next boot",
+            ),
+            _ => None,
+        }
+    }
+
+    /// Manual step for missing font families, or `None` on an unknown host.
+    ///
+    /// Each command is the distribution's own package set for a monospace
+    /// face plus Noto Symbols 2 (the braille/symbol fallback): FreeBSD `pkg`,
+    /// Arch `pacman`, Debian/Ubuntu `apt`, Fedora `dnf`.
+    #[must_use]
+    pub fn fonts_remediation(self) -> Option<&'static str> {
+        match self {
+            Self::FreeBsd => Some("on FreeBSD: `pkg install dejavu noto-basic`"),
+            Self::Arch => Some("on Arch Linux: `pacman -S ttf-dejavu noto-fonts`"),
+            Self::Debian => Some("on Debian/Ubuntu: `apt install fonts-dejavu fonts-noto-core`"),
+            Self::Fedora => {
+                Some("on Fedora: `dnf install dejavu-sans-mono-fonts google-noto-sans-fonts`")
+            }
+            Self::Other => None,
+        }
+    }
+}
+
+/// Reads the Linux distribution identity from the standard os-release file.
+///
+/// `/etc/os-release` is the distribution's own declaration and the first path
+/// systemd defines; `/usr/lib/os-release` is the documented fallback. Both are
+/// OS-interface paths, not host configuration.
+fn os_release_contents() -> Option<String> {
+    ["/etc/os-release", "/usr/lib/os-release"]
+        .iter()
+        .find_map(|path| std::fs::read_to_string(path).ok())
+}
+
+/// Maps os-release contents to the package-manager family that serves it.
+///
+/// `ID` is authoritative; `ID_LIKE` covers derivatives that declare their
+/// parent instead of a family name. Anything unrecognised (including `None`,
+/// when the file is unreadable) is [`RemediationPlatform::Other`], so a hint
+/// stays silent rather than naming the wrong package manager.
+#[must_use]
+pub fn os_release_family(text: Option<&str>) -> RemediationPlatform {
+    let Some(text) = text else {
+        return RemediationPlatform::Other;
+    };
+    let mut id: Option<String> = None;
+    let mut id_like: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_matches('"').trim_matches('\'');
+        match key.trim() {
+            "ID" => id = Some(value.to_ascii_lowercase()),
+            "ID_LIKE" => id_like = Some(value.to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    if let Some(family) = id.as_deref().and_then(os_release_id_family) {
+        return family;
+    }
+    for token in id_like.as_deref().unwrap_or_default().split_whitespace() {
+        if let Some(family) = os_release_id_family(token) {
+            return family;
+        }
+    }
+    RemediationPlatform::Other
+}
+
+/// One os-release identifier to its package-manager family.
+fn os_release_id_family(id: &str) -> Option<RemediationPlatform> {
+    match id {
+        "arch" | "archarm" | "cachyos" | "endeavouros" | "garuda" | "manjaro" => {
+            Some(RemediationPlatform::Arch)
+        }
+        "debian" | "kali" | "linuxmint" | "pop" | "raspbian" | "ubuntu" => {
+            Some(RemediationPlatform::Debian)
+        }
+        "almalinux" | "centos" | "fedora" | "ol" | "rhel" | "rocky" => {
+            Some(RemediationPlatform::Fedora)
+        }
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pure check constructors (fixture-injectable, unit-tested)
 // ---------------------------------------------------------------------------
 
@@ -323,9 +480,15 @@ pub fn check_keymaps(input: &KeymapInput) -> DoctorCheck {
 /// `tool_available` tells whether `fc-match` exists at all; `families` is the
 /// ordered `(family, present)` probe result. All present passes; some missing
 /// warns (fallback still renders); none present fails generic (headless still
-/// works, hence recoverable `1`, not a category gate).
+/// works, hence recoverable `1`, not a category gate). Missing families name
+/// the host platform's own package command (bitty#2974); an unknown platform
+/// names none.
 #[must_use]
-pub fn check_fonts(tool_available: bool, families: &[(&str, bool)]) -> DoctorCheck {
+pub fn check_fonts(
+    platform: RemediationPlatform,
+    tool_available: bool,
+    families: &[(&str, bool)],
+) -> DoctorCheck {
     if !tool_available {
         return DoctorCheck::warn(
             "fonts",
@@ -361,8 +524,14 @@ pub fn check_fonts(tool_available: bool, families: &[(&str, bool)]) -> DoctorChe
             "fonts",
             "Font availability",
             EXIT_GENERIC,
-            "install a monospace font plus Noto Symbols 2 (package `noto-fonts` on Arch) so TUI graphs render"
-                .to_string(),
+            match platform.fonts_remediation() {
+                Some(step) => format!(
+                    "install a monospace font plus Noto Symbols 2 so TUI graphs render; {step}"
+                ),
+                None => {
+                    "install a monospace font plus Noto Symbols 2 so TUI graphs render".to_string()
+                }
+            },
             format!("0/{total} fallback families resolve"),
         )
     } else {
@@ -370,13 +539,18 @@ pub fn check_fonts(tool_available: bool, families: &[(&str, bool)]) -> DoctorChe
             .iter()
             .filter_map(|(name, ok)| if *ok { None } else { Some(*name) })
             .collect();
+        let mut hint = format!(
+            "install the missing families (first: `{}`)",
+            missing.first().unwrap_or(&"monospace")
+        );
+        if let Some(step) = platform.fonts_remediation() {
+            hint.push_str("; ");
+            hint.push_str(step);
+        }
         DoctorCheck::warn(
             "fonts",
             "Font availability",
-            format!(
-                "install the missing families (first: `{}`); on Arch, `noto-fonts` provides the braille symbols face",
-                missing.first().unwrap_or(&"monospace")
-            ),
+            hint,
             format!(
                 "{}/{} resolve ({}); missing: {}",
                 present.len(),
@@ -727,19 +901,22 @@ pub fn check_clipboard(found: &[&str]) -> DoctorCheck {
 }
 
 /// PTY availability. Unix checks `/dev/ptmx`; Windows reports ConPTY.
+///
+/// A failure keeps the generic permission/ConPTY hint and adds the host
+/// platform's own remediation when one is known (bitty#2974: FreeBSD loads
+/// `pty(4)` as a kernel module). The extra text is advisory — status, code,
+/// and exit taxonomy are unchanged.
 #[must_use]
-pub fn check_pty(available: bool, detail: &str) -> DoctorCheck {
+pub fn check_pty(platform: RemediationPlatform, available: bool, detail: &str) -> DoctorCheck {
     if available {
         DoctorCheck::pass("pty", "PTY support", detail.to_string())
     } else {
-        DoctorCheck::fail(
-            "pty",
-            "PTY support",
-            EXIT_GENERIC,
-            "no PTY multiplexer found: check /dev/ptmx permissions or use ConPTY on Windows"
-                .to_string(),
-            detail.to_string(),
-        )
+        let base = "no PTY multiplexer found: check /dev/ptmx permissions or use ConPTY on Windows";
+        let hint = match platform.pty_remediation() {
+            Some(step) => format!("{base}; {step}"),
+            None => base.to_string(),
+        };
+        DoctorCheck::fail("pty", "PTY support", EXIT_GENERIC, hint, detail.to_string())
     }
 }
 
@@ -915,6 +1092,10 @@ pub struct DoctorInputs {
     pub dri_cards: usize,
     /// Clipboard helpers found on PATH.
     pub clipboard_backends: Vec<String>,
+    /// Platform family that owns the install remediation text (bitty#2974).
+    /// [`RemediationPlatform::Other`] makes a failed pty/fonts hint name no
+    /// package command instead of guessing one.
+    pub platform: RemediationPlatform,
     /// PTY multiplexer available.
     pub pty_available: bool,
     /// PTY evidence detail.
@@ -1065,7 +1246,7 @@ pub fn assemble_report(inputs: &DoctorInputs) -> DoctorReport {
             check_binary(&inputs.version, inputs.exe_ok, &inputs.exe_detail),
             check_config(&inputs.config),
             check_keymaps(&inputs.keymaps),
-            check_fonts(inputs.font_tool_available, &family_refs),
+            check_fonts(inputs.platform, inputs.font_tool_available, &family_refs),
             check_font_chain(&inputs.font_chain),
             check_text_stack(&inputs.text_stack),
             check_display(
@@ -1075,7 +1256,7 @@ pub fn assemble_report(inputs: &DoctorInputs) -> DoctorReport {
             ),
             check_gpu(inputs.dri_cards),
             check_clipboard(&clipboard_refs),
-            check_pty(inputs.pty_available, &inputs.pty_detail),
+            check_pty(inputs.platform, inputs.pty_available, &inputs.pty_detail),
             check_terminfo(inputs.term.as_deref(), inputs.terminfo_found),
             check_shell(
                 inputs.shell.as_deref(),
@@ -2664,6 +2845,9 @@ fn collect_doctor_inputs(args: &Args) -> DoctorInputs {
         session_type,
         dri_cards,
         clipboard_backends,
+        // bitty#2974: hints name this host's own package manager; an
+        // unrecognised platform yields no package command.
+        platform: RemediationPlatform::host(),
         pty_available,
         pty_detail,
         term,
@@ -2814,6 +2998,8 @@ mod tests {
             session_type: Some("wayland".to_string()),
             dri_cards: 1,
             clipboard_backends: vec!["wl-copy".to_string()],
+            // Deterministic fixture: hint tests select a platform explicitly.
+            platform: RemediationPlatform::Other,
             pty_available: true,
             pty_detail: "/dev/ptmx present".to_string(),
             term: Some("bitty".to_string()),
@@ -3146,13 +3332,197 @@ mod tests {
 
     #[test]
     fn fonts_partial_is_warn_and_none_is_fail() {
-        let partial = check_fonts(true, &[("Mono", true), ("Noto Sans Symbols 2", false)]);
+        let partial = check_fonts(
+            RemediationPlatform::Other,
+            true,
+            &[("Mono", true), ("Noto Sans Symbols 2", false)],
+        );
         assert_eq!(partial.status, DoctorStatus::Warn);
-        let none = check_fonts(true, &[("Mono", false), ("Noto Sans Symbols 2", false)]);
+        let none = check_fonts(
+            RemediationPlatform::Other,
+            true,
+            &[("Mono", false), ("Noto Sans Symbols 2", false)],
+        );
         assert_eq!(none.status, DoctorStatus::Fail);
         assert_eq!(none.code, EXIT_GENERIC);
-        let no_tool = check_fonts(false, &[]);
+        let no_tool = check_fonts(RemediationPlatform::Other, false, &[]);
         assert_eq!(no_tool.status, DoctorStatus::Warn);
+        // The missing-tool warn names the prerequisite, not a font package.
+        assert!(no_tool.hint.contains("fontconfig"), "{}", no_tool.hint);
+    }
+
+    #[test]
+    fn pty_failure_names_the_freebsd_module_remediation() {
+        // bitty#2974: the FreeBSD campaign saw `pty FAIL - /dev/ptmx missing`
+        // with no next step; the row must name the module load and its boot
+        // persistence, and detection/code must stay exactly as they were.
+        let check = check_pty(RemediationPlatform::FreeBsd, false, "/dev/ptmx missing");
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert_eq!(check.code, EXIT_GENERIC);
+        assert!(check.hint.contains("kldload pty"), "{}", check.hint);
+        assert!(check.hint.contains("sysrc kld_list+=pty"), "{}", check.hint);
+        assert!(
+            check.hint.contains("check /dev/ptmx permissions"),
+            "the generic hint stays: {}",
+            check.hint
+        );
+        // Advisory only: doctor never claims to run a privileged command.
+        assert!(!check.hint.contains("--fix"), "{}", check.hint);
+    }
+
+    #[test]
+    fn pty_failure_outside_freebsd_names_no_module_command() {
+        for platform in [
+            RemediationPlatform::Arch,
+            RemediationPlatform::Debian,
+            RemediationPlatform::Fedora,
+            RemediationPlatform::Other,
+        ] {
+            let check = check_pty(platform, false, "/dev/ptmx missing");
+            assert_eq!(check.status, DoctorStatus::Fail, "{platform:?}");
+            assert_eq!(check.code, EXIT_GENERIC, "{platform:?}");
+            assert!(
+                !check.hint.contains("kldload") && !check.hint.contains("sysrc"),
+                "{platform:?} must not name the FreeBSD module: {}",
+                check.hint
+            );
+        }
+        // A passing check never carries remediation text.
+        let ok = check_pty(RemediationPlatform::FreeBsd, true, "/dev/ptmx present");
+        assert_eq!(ok.status, DoctorStatus::Pass);
+        assert!(ok.hint.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn fonts_failure_names_the_platform_package_command() {
+        // bitty#2974: every supported family names its own package set.
+        let cases = [
+            (
+                RemediationPlatform::FreeBsd,
+                "pkg install dejavu noto-basic",
+            ),
+            (RemediationPlatform::Arch, "pacman -S ttf-dejavu noto-fonts"),
+            (
+                RemediationPlatform::Debian,
+                "apt install fonts-dejavu fonts-noto-core",
+            ),
+            (
+                RemediationPlatform::Fedora,
+                "dnf install dejavu-sans-mono-fonts google-noto-sans-fonts",
+            ),
+        ];
+        for (platform, command) in cases {
+            let check = check_fonts(
+                platform,
+                true,
+                &[("JetBrains Mono", false), ("Noto Sans Symbols 2", false)],
+            );
+            assert_eq!(check.status, DoctorStatus::Fail, "{platform:?}");
+            assert_eq!(check.code, EXIT_GENERIC, "{platform:?}");
+            assert!(
+                check.hint.contains(command),
+                "{platform:?} must name {command:?}: {}",
+                check.hint
+            );
+            assert!(
+                check.detail.contains("0/2"),
+                "{platform:?} detail: {}",
+                check.detail
+            );
+        }
+    }
+
+    #[test]
+    fn fonts_failure_on_an_unknown_platform_names_no_package_command() {
+        let check = check_fonts(
+            RemediationPlatform::Other,
+            true,
+            &[("JetBrains Mono", false)],
+        );
+        assert_eq!(check.status, DoctorStatus::Fail);
+        assert_eq!(check.code, EXIT_GENERIC);
+        assert!(
+            check.hint.contains("install a monospace font"),
+            "{}",
+            check.hint
+        );
+        for command in ["pacman", "apt ", "dnf ", "pkg install"] {
+            assert!(
+                !check.hint.contains(command),
+                "an unknown platform must not name {command:?}: {}",
+                check.hint
+            );
+        }
+        // The partial-missing warn row follows the same rule.
+        let partial = check_fonts(
+            RemediationPlatform::Other,
+            true,
+            &[("JetBrains Mono", true), ("Noto Sans Symbols 2", false)],
+        );
+        assert_eq!(partial.status, DoctorStatus::Warn);
+        assert!(
+            !partial.hint.contains("noto-fonts"),
+            "an unknown platform must not name an Arch package: {}",
+            partial.hint
+        );
+        let arch = check_fonts(
+            RemediationPlatform::Arch,
+            true,
+            &[("JetBrains Mono", true), ("Noto Sans Symbols 2", false)],
+        );
+        assert!(
+            arch.hint.contains("pacman -S ttf-dejavu noto-fonts"),
+            "{}",
+            arch.hint
+        );
+    }
+
+    #[test]
+    fn os_release_selects_the_package_manager_family() {
+        let cases = [
+            ("ID=arch\nID_LIKE=archlinux\n", RemediationPlatform::Arch),
+            ("ID=cachyos\n", RemediationPlatform::Arch),
+            ("ID=\"manjaro\"\n", RemediationPlatform::Arch),
+            ("ID=ubuntu\nID_LIKE=debian\n", RemediationPlatform::Debian),
+            ("ID=debian\n", RemediationPlatform::Debian),
+            (
+                "ID=my-distro\nID_LIKE=\"debian ubuntu\"\n",
+                RemediationPlatform::Debian,
+            ),
+            ("ID=fedora\n", RemediationPlatform::Fedora),
+            (
+                "ID=someos\nID_LIKE=\"rhel centos\"\n",
+                RemediationPlatform::Fedora,
+            ),
+            ("ID=nixos\n", RemediationPlatform::Other),
+            ("# no ID here\nNAME=Unknown\n", RemediationPlatform::Other),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(os_release_family(Some(text)), expected, "{text:?}");
+        }
+        // An unreadable/absent os-release never guesses a package manager.
+        assert_eq!(os_release_family(None), RemediationPlatform::Other);
+    }
+
+    #[test]
+    fn table_output_carries_the_pty_and_font_remediation() {
+        // The hint line is the only user-visible surface for remediation, so
+        // the table must print it verbatim.
+        let mut inputs = healthy_inputs();
+        inputs.platform = RemediationPlatform::FreeBsd;
+        inputs.pty_available = false;
+        inputs.pty_detail = "/dev/ptmx missing".to_string();
+        inputs.families = vec![("JetBrains Mono".to_string(), false)];
+        let report = assemble_report(&inputs);
+        let table = format_table(&report, true);
+        assert!(table.contains("sysrc kld_list+=pty"), "{table}");
+        assert!(table.contains("pkg install dejavu noto-basic"), "{table}");
+        // The JSON envelope carries the same text in its `hint` field.
+        let json = format_json(&report);
+        assert!(json.contains("sysrc kld_list+=pty"), "{json}");
+        assert!(json.contains("pkg install dejavu noto-basic"), "{json}");
+        // Remediation never changes the exit taxonomy.
+        assert_eq!(report.exit_code(), EXIT_GENERIC);
     }
 
     #[test]

@@ -171,8 +171,10 @@ pub const MAX_INVOKE_COMMAND_LEN: usize = 257;
 /// lives in a config file that is re-read on every reload and rendered in the
 /// help overlay, so a binding carries a command's *identity arguments*
 /// (`panel`, `needle`, `path`), not a bulk document. The structural rules are
-/// the shared ones ([`crate::validate_json_args_blob`]), so a blob accepted
-/// here is accepted by `bitty cmd` and vice versa.
+/// the shared ones ([`crate::validate_json_args_blob`]), so this bound is a
+/// strict subset of the CLI's: any blob accepted here is accepted by
+/// `bitty cmd`, but a blob between this bound and the CLI's is accepted only
+/// by the CLI.
 pub const MAX_INVOKE_ARGS_BYTES: usize = 4096;
 
 /// Byte separator between a `command:` target and its JSON args blob.
@@ -1469,9 +1471,10 @@ pub fn all_chrome_actions() -> Vec<ChromeAction> {
 /// Mouse buttons share the chrome-action vocabulary used by
 /// `keymaps[].action`: `none` disables the button (the default for
 /// right-click), any [`ChromeAction`] spelling runs through the same dispatch
-/// path as a bound chord. Parsing is bounded by
-/// [`MAX_ACTION_LEN`] through [`ChromeAction::parse`] and fails closed with
-/// the owning field path (`mouse.right` / `mouse.middle`).
+/// path as a bound chord. Parsing goes through [`ChromeAction::parse`], which
+/// bounds a closed-catalog action by [`MAX_ACTION_LEN`] and the
+/// argument-carrying `command:` form by [`MAX_COMMAND_ACTION_LEN`], and fails
+/// closed with the owning field path (`mouse.right` / `mouse.middle`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum MouseButtonBinding {
     /// Explicit no-op: the button is consumed as host chrome, emits no PTY
@@ -1642,14 +1645,16 @@ fn require_workspace_index(arg: Option<&str>, raw: &str) -> Result<u64, ConfigEr
 
 /// Parse a `command:` action tail into a [`CommandInvocation`] (CTX-2965).
 ///
-/// Grammar (whitespace-tolerant between the parts, exact on the `--` token):
+/// Grammar (whitespace-tolerant around the parts, exact on the `--` token):
 ///
 /// ```text
 /// <owner:command>[ -- <json-object-or-array>]
 /// ```
 ///
 /// `tail` is the original-case remainder after the `command:` head, so the
-/// JSON document keeps its case. The target half is validated by
+/// JSON document keeps its case; the target half is lowercased (the qualified
+/// name is case-insensitive input, and `PluginId` plus the dispatcher match it
+/// in lowercase). The target half is validated by
 /// [`require_invoke_command`] (one colon, no whitespace, bounded); the args
 /// half by the shared [`crate::validate_json_args_blob`] plus
 /// [`MAX_INVOKE_ARGS_BYTES`], so a malformed document fails closed at config
@@ -1659,14 +1664,20 @@ fn parse_invoke_command(tail: &str, raw: &str) -> Result<CommandInvocation, Conf
         Some((target, rest)) => (target, Some(rest.trim())),
         None => (tail, None),
     };
-    let target = require_invoke_command(Some(target), raw)?;
+    // `--` is a real token (issue #2965 review): `--{"a":1}` is not the
+    // separator plus a document, it is a malformed target tail.
+    let lowered_target = target.to_ascii_lowercase();
+    let target = require_invoke_command(Some(&lowered_target), raw)?;
     let Some(rest) = rest else {
         return Ok(CommandInvocation::new(target));
     };
-    let Some(blob) = rest.strip_prefix("--") else {
+    let Some(after_dashes) = rest.strip_prefix("--") else {
         return Err(invoke_separator_error(raw));
     };
-    let blob = blob.trim();
+    if !after_dashes.starts_with(char::is_whitespace) {
+        return Err(invoke_separator_error(raw));
+    }
+    let blob = after_dashes.trim();
     if blob.is_empty() {
         return Err(invoke_separator_error(raw));
     }
@@ -2141,8 +2152,10 @@ pub fn match_keymap(maps: &[ResolvedKeymap], key: KeyRef) -> Option<ChromeAction
 /// every Mod chord) changes the popup by construction — there is no
 /// hardcoded copy to drift. The app regenerates these rows from its live
 /// `keymaps` table on every show. Bounded: one row per table entry (user
-/// tables cap at [`crate::types::MAX_KEYMAPS`]) and each row caps at
-/// `MAX_CHORD_LEN + MAX_ACTION_LEN + 2` bytes.
+/// tables cap at [`crate::types::MAX_KEYMAPS`]); a closed-catalog row caps at
+/// `MAX_CHORD_LEN + MAX_ACTION_LEN + 2` bytes, while a `command:` row carrying
+/// an args document caps at `MAX_CHORD_LEN + MAX_COMMAND_ACTION_LEN + 2`
+/// (~4.4 KiB), so a full 256-row overlay worst-cases at ~1.1 MiB.
 #[must_use]
 pub fn help_rows_from_keymaps(maps: &[ResolvedKeymap]) -> Vec<String> {
     maps.iter()
@@ -3523,6 +3536,42 @@ mod tests {
     }
 
     #[test]
+    fn invoke_command_target_is_lowercased_while_args_keep_their_case() {
+        // CTX-2965 review: the args tail is sliced from the original-case
+        // action, which must not stop the *target* half from being lowered.
+        // A mixed-case qualified name was lowered (and therefore dispatched)
+        // before the args form existed; `PluginId` rejects mixed case and the
+        // dispatcher matches lowercase names only, so keeping the original
+        // case would make `command:Bitty-Featured.Devtools:Plugins` resolve to
+        // a target that can never be invoked.
+        let action = ChromeAction::parse(
+            r#"command:Bitty-Featured.Devtools:Plugins -- {"Note":"KeepCase"}"#,
+        )
+        .expect("mixed-case args form parses");
+        let ChromeAction::InvokeCommand(invocation) = &action else {
+            panic!("must parse as an invocation");
+        };
+        assert_eq!(invocation.target(), "bitty-featured.devtools:plugins");
+        assert_eq!(
+            invocation.args_json(),
+            Some(r#"{"Note":"KeepCase"}"#),
+            "the document is data, never an identifier: its case must survive"
+        );
+        assert_eq!(
+            action.canonical(),
+            r#"command:bitty-featured.devtools:plugins -- {"Note":"KeepCase"}"#
+        );
+        // The argument-free form takes the same lowering.
+        let bare = ChromeAction::parse("command:Bitty-Featured.Devtools:Plugins")
+            .expect("mixed-case bare form parses");
+        let ChromeAction::InvokeCommand(invocation) = &bare else {
+            panic!("must parse as an invocation");
+        };
+        assert_eq!(invocation.target(), "bitty-featured.devtools:plugins");
+        assert_eq!(invocation.args_json(), None);
+    }
+
+    #[test]
     fn malformed_invoke_args_fail_closed_at_parse() {
         // CTX-2965: a binding whose args document is not one bounded JSON
         // object/array never becomes a `ChromeAction`, so no input path can
@@ -3534,11 +3583,19 @@ mod tests {
             "command:owner:cmd --   ",
             "command:owner:cmd {\"a\":1}",
             "command:owner:cmd -x {\"a\":1}",
+            // `--` is a token, not a prefix: `--{...}` has no separator.
+            "command:owner:cmd --{\"a\":1}",
+            "command:owner:cmd --[]",
             // Document fails the shared structural gate.
             "command:owner:cmd -- {",
             "command:owner:cmd -- {\"a\":1",
             "command:owner:cmd -- 1",
             "command:owner:cmd -- \"text\"",
+            // Exactly one root value: a second document or a trailing token
+            // is refused at parse, not deferred to the keypress.
+            "command:owner:cmd -- {\"a\":1} {\"b\":2}",
+            "command:owner:cmd -- {\"a\":1} -- {\"b\":2}",
+            "command:owner:cmd -- {\"a\":1} trailing",
             // Target half still has to be a qualified name.
             "command: -- {\"a\":1}",
             "command:a:b:c -- {\"a\":1}",

@@ -83,8 +83,12 @@
 //!   the server requires an absolute, existing directory and names it in
 //!   the receipt). Without `--cwd` the pane inherits the focused pane's
 //!   `OSC 7` cwd.
-//! - `config reload` validates the config file and reports its path;
-//!   live theme/font hot-swap is a follow-up (the response names this).
+//! - `config reload` re-reads and validates the config file and, when the
+//!   app installed a live-reload context, applies the live subset (theme,
+//!   font, keymaps, appearance, views); without a context (headless,
+//!   `--safe`) the reply is probe-only and names that. `bitty reload` is the
+//!   top-level alias with a reload-shaped result and exit contract
+//!   (bitty#2927).
 //! - Terminal output is untrusted observation data, never instructions.
 
 #![forbid(unsafe_code)]
@@ -215,7 +219,7 @@ pub use apply::{drain_global_control_queue_with, method_mutates_layout};
 pub use client::{
     CtlIpcOutcome, ResolvedTarget, ctl_roundtrip, list_live_instances, resolve_ctl_target,
 };
-pub use render::execute_ctl;
+pub use render::{execute_ctl, execute_reload};
 pub use request::{
     CtlFormat, CtlParseError, CtlRequest, CtlTargeting, METHOD_LIST_PANELS, ctl_help_text,
     ctl_usage, parse_ctl_request,

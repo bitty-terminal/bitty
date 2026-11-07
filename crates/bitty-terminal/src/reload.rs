@@ -30,13 +30,17 @@
 //! re-spawned and no layout is rebuilt. A changed field the runtime cannot
 //! adopt live is reported as `restart-required` and stays at its launch value.
 //!
-//! The installed plugin set is not part of that plan (bitty#2969). The plugin
-//! store is read by startup discovery only; the plugin host can rebuild one
-//! generation but `PluginRuntime::reload` is teardown-then-rebuild (a failed
-//! load leaves the plugin disposed, not unchanged) and enabling needs a
-//! whole-store `discover()` pass. A store change since launch is therefore
-//! reported as `restart-required` with the affected plugin ids and exits 4,
-//! never a silent no-op; `bitty plugin enable|disable` prints the same hint.
+//! The plugin set is not part of that plan (bitty#2969). It has two persisted
+//! sources, and a running instance applies neither without a restart: the
+//! installed plugin store, read by startup discovery only, and the managed
+//! bundled ledger (`bitty-plugins.lua`), which `bitty plugin enable|disable`
+//! writes for bundled ids and no startup pass reads. The plugin host can
+//! rebuild one generation but `PluginRuntime::reload` is teardown-then-rebuild
+//! (a failed load leaves the plugin disposed, not unchanged) and enabling needs
+//! a whole-store `discover()` pass. A change in either source since launch is
+//! therefore reported as `restart-required` with the affected plugin ids and
+//! exits 4, never a silent no-op; `bitty plugin enable|disable` prints the same
+//! hint.
 //!
 //! A daemon-owned, debounced, per-file watcher is the `bittyd` follow-up and
 //! is not part of this command: `bitty reload` is an explicit, scriptable
@@ -49,8 +53,9 @@
 //! - `2` usage error (unknown flag, stray positional, bad `--format`).
 //! - `3` rejected / load error / apply error: the running plan is untouched
 //!   and the diagnostic names the dotted field path.
-//! - `4` the installed plugin set changed since launch and only a restart can
-//!   apply it: the reply names the affected plugin ids under
+//! - `4` the plugin set changed since launch and only a restart can apply it
+//!   (an installed package) or nothing can (a bundled id, whose body ships with
+//!   the build): the reply names the affected plugin ids under
 //!   `plugins_restart_required` and never reads as an applied reload.
 //! - `6` runtime unavailable (no live instance, ambiguous instance, transport
 //!   failure, or an instance that does not serve live reload, e.g. `--safe`).
@@ -135,10 +140,12 @@ pub fn reload_usage() -> String {
          Applies theme/palette, font family and size, keymaps, Leader, appearance\n\
          and statusline options; workspaces, windows, panes, their PTYs and\n\
          scrollback are preserved. A change the runtime cannot adopt live is\n\
-         reported as restart-required, never silently ignored. The installed\n\
-         plugin set (bitty plugin enable|disable) is not part of the config\n\
+         reported as restart-required, never silently ignored. The plugin set\n\
+         plugin set (bitty plugin enable|disable: installed packages and the bundled\n\
+         ledger) is not part of the config\n\
          plan: a change since launch is reported as restart-required with the\n\
-         plugin ids and exits 4 — restart bitty to apply it.\n\
+         plugin ids and exits 4 (an installed package applies on the next\n\
+         start; a bundled id stays a ledger entry).\n\
          \n\
          Exit codes: 0 applied/unchanged/dry-run/restart-required (config);\n\
          \x20 2 usage; 3 rejected (dotted field path); 4 plugin-set restart;\n\
@@ -187,11 +194,12 @@ pub fn reload_help_text() -> String {
           \x20 not a contract.\n\
           \n\
           Plugin set: `bitty plugin enable|disable` edits the installed plugin\n\
-          \x20 store, which the running instance reads only at startup. A change\n\
-          \x20 since launch cannot be applied live (the plugin host's generation\n\
-          \x20 rebuild is teardown-then-rebuild and re-discovery is a whole-store\n\
-          \x20 pass), so it is reported as restart-required with the affected ids\n\
-          \x20 and exits 4. The running plugin generations are never touched.\n\
+          \x20 store or the managed bundled ledger (bitty-plugins.lua); the\n\
+          \x20 running instance re-reads neither. A change since launch cannot\n\
+          \x20 be applied live (the plugin host's generation rebuild is\n\
+          \x20 teardown-then-rebuild and re-discovery is a whole-store pass), so\n\
+          \x20 it is reported as restart-required with the affected ids and\n\
+          \x20 exits 4. The running plugin generations are never touched.\n\
           \n\
           Exit codes: exit 0 applied/unchanged/dry-run, or restart-required for\n\
           \x20 config fields; exit 2 usage; exit 3 rejected or load/apply error;\n\

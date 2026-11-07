@@ -462,7 +462,8 @@ fn render_reload_table(
     }
     if !plugins.is_empty() {
         out.push_str(&format!(
-            "  restart required (plugin set): {}\n  restart bitty to apply the plugin-set change\n",
+            "  restart required (plugin set): {}\n  restart bitty to apply an \
+             installed-package change (a bundled id is ledger-only)\n",
             plugins.join(", ")
         ));
     }
@@ -1104,9 +1105,14 @@ mod tests {
             "{table}"
         );
         assert!(table.contains("restart bitty to apply"), "{table}");
+        assert!(
+            table.contains("a bundled id is ledger-only"),
+            "the table must not promise a restart applies a bundled id: {table}"
+        );
         assert_eq!(
             reload_exit(&[String::from("xuepoo.fixture")], false),
-            crate::reload::EXIT_RESTART
+            4,
+            "a pending plugin set exits the literal restart code"
         );
         assert_eq!(
             reload_exit(&[String::from("xuepoo.fixture")], true),

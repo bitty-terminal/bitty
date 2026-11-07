@@ -5686,7 +5686,7 @@ pub fn run_plugin_subcommand(
                         let changed = result.changed;
                         let code = finish_mutation(&path, state, result, output);
                         if code == EXIT_OK && changed {
-                            write_restart_hint(output);
+                            write_managed_restart_hint(output);
                         }
                         if code == EXIT_OK {
                             let manifest = bundled_manifest(id).ok();
@@ -5728,7 +5728,7 @@ pub fn run_plugin_subcommand(
                         let changed = result.changed;
                         let code = finish_mutation(&path, state, result, output);
                         if code == EXIT_OK && changed {
-                            write_restart_hint(output);
+                            write_managed_restart_hint(output);
                         }
                         code
                     }
@@ -7656,17 +7656,35 @@ fn write_next_steps(
     );
 }
 
-/// Tell the user a plugin-set change does not reach a running instance.
+/// Tell the user an installed-package enable/disable cannot reach a running
+/// instance.
 ///
 /// The installed plugin store is read by startup discovery only, so
-/// `bitty reload` cannot apply an enable/disable (bitty#2969): it reports the
-/// pending set as restart-required. Printing the same hint here closes the
-/// "enable, then nothing happens" trap the CLI's next steps used to leave.
-fn write_restart_hint(output: &mut dyn std::io::Write) {
+/// `bitty reload` cannot apply the change (bitty#2969): a restart is the only
+/// way to load the new generation, and the reload reports the pending set as
+/// restart-required. Printing the hint here closes the "enable, then nothing
+/// happens" trap the CLI's next steps used to leave.
+fn write_store_restart_hint(output: &mut dyn std::io::Write) {
     let _ = writeln!(
         output,
         "bitty plugin: a running instance keeps its current plugin generations; \
          restart bitty to apply (a reload reports the pending plugin set as restart-required)"
+    );
+}
+
+/// Tell the user a bundled-plugin enable/disable was recorded only.
+///
+/// Bundled plugin bodies ship with the bitty build, so the managed ledger entry
+/// is desired state, not a live generation to replace: no restart applies it to
+/// a running instance either. The reload promise is the part this hint may
+/// state, and `bitty reload` keeps it for a bundled id exactly like a store
+/// change (bitty#2969).
+fn write_managed_restart_hint(output: &mut dyn std::io::Write) {
+    let _ = writeln!(
+        output,
+        "bitty plugin: recorded in the bundled-plugin ledger; a running instance \
+         keeps its current plugin set (a reload reports the pending plugin set as \
+         restart-required, exit 4)"
     );
 }
 
@@ -7695,7 +7713,7 @@ fn set_store_enabled(
                 }
             );
             if changed {
-                write_restart_hint(output);
+                write_store_restart_hint(output);
             }
             if enabled {
                 // Best-effort store manifest for next steps (a missing index
@@ -11477,12 +11495,21 @@ mod tests {
             !out.contains("enable: bitty plugin enable bitty-terminal.shell-integration"),
             "{out}"
         );
-        // bitty#2969: the enable must say a running instance needs a restart.
-        assert!(out.contains("restart bitty to apply"), "{out}");
+        // bitty#2969: a bundled enable is ledger-only, so the hint must state
+        // exactly that and name the reload report — never promise that a
+        // restart applies a bundled body (it ships with the build, there is no
+        // live generation to replace). The reload behaviour this sentence
+        // promises is proven by
+        // `reload_reports_a_bundled_plugin_set_change_as_restart_required`.
+        assert!(
+            out.contains("recorded in the bundled-plugin ledger"),
+            "{out}"
+        );
         assert!(
             out.contains("reports the pending plugin set as restart-required"),
             "{out}"
         );
+        assert!(!out.contains("restart bitty to apply"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

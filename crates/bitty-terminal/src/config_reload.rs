@@ -689,10 +689,12 @@ impl From<EffectiveConfig> for ResolvedConfig {
 
 /// The enabled installed-plugin set the instance launched with (bitty#2969).
 ///
-/// `root` is the resolved plugin store the instance discovered at startup;
-/// `enabled` is the sorted list of store records that were enabled then. The
-/// set is a launch-time baseline only: a later `bitty plugin enable|disable`
-/// rewrites the store index, and a reload reports the difference.
+/// Two sources make up the enabled plugin set. `root`/`enabled` is the
+/// installed package store startup discovery reads; `ledger`/`managed_enabled`
+/// is the managed bundled ledger (`bitty-plugins.lua`) that
+/// `bitty plugin install|enable|disable` records desired state in and no
+/// startup pass reads. Both are a launch-time baseline only: a later mutation
+/// rewrites its file, and a reload reports the difference.
 #[derive(Debug, Clone)]
 struct PluginSetSnapshot {
     /// Resolved plugin store root at launch (`None` when the environment had
@@ -700,6 +702,12 @@ struct PluginSetSnapshot {
     root: Option<PathBuf>,
     /// Sorted, de-duplicated plugin ids enabled in that store at launch.
     enabled: Vec<String>,
+    /// Managed bundled ledger the instance launched against (`None` when it
+    /// could not be resolved or read, so bundled ids are not compared).
+    ledger: Option<PathBuf>,
+    /// Sorted, de-duplicated bundled plugin ids the ledger recorded as enabled
+    /// at launch.
+    managed_enabled: Vec<String>,
 }
 
 /// Read the enabled plugin ids from an installed plugin store index.
@@ -729,21 +737,84 @@ fn enabled_store_plugins(root: Option<&Path>) -> Option<Vec<String>> {
     }
 }
 
+/// Read the enabled bundled ids from the managed ledger.
+///
+/// The ledger (`bitty-plugins.lua`) is the desired-state record
+/// `bitty plugin install|enable|disable` writes for bundled ids; no startup
+/// discovery pass reads it, so it must be read here. An absent ledger is an
+/// empty set (nothing installed), and a malformed one reports `None` for the
+/// same reason as [`enabled_store_plugins`]: an integrity failure must never
+/// become a fabricated plugin-set change.
+fn enabled_managed_plugins(ledger: Option<&Path>) -> Option<Vec<String>> {
+    let ledger = ledger?;
+    match crate::plugin::load_state_for_inspect(ledger) {
+        Ok(state) => {
+            let mut enabled: Vec<String> = state
+                .ids()
+                .filter(|id| state.get(id.as_str()).is_some_and(|record| record.enabled))
+                .cloned()
+                .collect();
+            enabled.sort();
+            enabled.dedup();
+            Some(enabled)
+        }
+        Err(error) => {
+            crate::logging::warn(|| {
+                format!("bitty: plugin ledger unreadable; plugin set not compared: {error}")
+            });
+            None
+        }
+    }
+}
+
+/// The managed ledger path for the running instance.
+///
+/// Resolved through the same resolver `bitty plugin enable|disable` uses
+/// (explicit `--config`/`BITTY_CONFIG` parent, else the XDG config root), so a
+/// CLI mutation and the launch baseline read one file. `None` (no config root)
+/// leaves bundled ids out of the comparison.
+fn managed_ledger_path(config_path: Option<&str>) -> Option<PathBuf> {
+    crate::plugin::init_plugin_state_path(
+        config_path,
+        std::env::var("BITTY_CONFIG").ok().as_deref(),
+        std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+    .ok()
+}
+
 /// Record the enabled plugin set the running instance launched with.
 ///
 /// Called once by `main` after startup plugin discovery, so a later
-/// `bitty reload` can compare the installed store against what the instance
-/// actually launched with (bitty#2969). A missing reload context (`--safe`,
-/// headless paths, tests) or an unreadable index leaves plugin-set tracking
-/// off: the reload never invents a change it cannot prove.
-pub(crate) fn record_launch_plugin_set() {
+/// `bitty reload` can compare the persisted plugin set against what the
+/// instance actually launched with (bitty#2969). A missing reload context
+/// (`--safe`, headless paths, tests) or an unreadable index leaves plugin-set
+/// tracking off: the reload never invents a change it cannot prove.
+pub(crate) fn record_launch_plugin_set(config_path: Option<&str>) {
     let root = crate::plugin_runtime::store_root();
     let Some(enabled) = enabled_store_plugins(root.as_deref()) else {
         return;
     };
+    // The managed ledger holds the bundled half of the set: `bitty plugin
+    // enable|disable` on a bundled id writes only that file (no store record
+    // exists for it), and nothing reads it at startup, so the launch value
+    // must be captured here or the reload can never see the difference.
+    let resolved = managed_ledger_path(config_path);
+    let (ledger, managed_enabled) = match resolved {
+        Some(path) => match enabled_managed_plugins(Some(&path)) {
+            Some(managed_enabled) => (Some(path), managed_enabled),
+            None => (None, Vec::new()),
+        },
+        None => (None, Vec::new()),
+    };
     CONTEXT.with(|slot| {
         if let Some(ctx) = slot.borrow_mut().as_mut() {
-            ctx.plugins_launched = Some(PluginSetSnapshot { root, enabled });
+            ctx.plugins_launched = Some(PluginSetSnapshot {
+                root,
+                enabled,
+                ledger,
+                managed_enabled,
+            });
         }
     });
 }
@@ -797,6 +868,11 @@ pub(crate) fn install(
     // file, because `--theme local:<name>` can select a file directly and a
     // directory that does not exist yet becomes observable on creation.
     let theme_dir = bitty_config::local_themes_dir();
+    // bitty#2969: both halves of the launch plugin set are read from the
+    // environment, so capture the explicit config path before `args` moves
+    // into the resolver: `bitty plugin enable|disable` resolves the managed
+    // ledger from the same `--config`/`BITTY_CONFIG` value.
+    let config_path = args.config_path.clone();
     let resolve: Box<dyn Fn() -> Result<ResolvedConfig, crate::config_cli::LoadFailure>> =
         Box::new(move || {
             crate::config_cli::load_app_config_typed(&args).map(|app| ResolvedConfig {
@@ -806,10 +882,11 @@ pub(crate) fn install(
         });
     install_context(effective, profile, resolve, file_path, theme_dir);
     // bitty#2969: the context is installed after startup plugin discovery, so
-    // this is the moment the enabled store set the instance runs with is
-    // known. A later `bitty plugin enable|disable` rewrites the store index
-    // and the reload reports the difference as restart-required.
-    record_launch_plugin_set();
+    // this is the moment the enabled plugin set the instance runs with is
+    // known. A later `bitty plugin enable|disable` rewrites the store index or
+    // the managed ledger and the reload reports the difference as
+    // restart-required.
+    record_launch_plugin_set(config_path.as_deref());
 }
 
 /// Install the process-wide context (shared by production and tests).
@@ -894,7 +971,29 @@ pub(crate) fn install_with_theme_dir(
 pub(crate) fn set_launch_plugin_set(root: Option<PathBuf>, enabled: Vec<String>) {
     CONTEXT.with(|slot| {
         if let Some(ctx) = slot.borrow_mut().as_mut() {
-            ctx.plugins_launched = Some(PluginSetSnapshot { root, enabled });
+            ctx.plugins_launched = Some(PluginSetSnapshot {
+                root,
+                enabled,
+                ledger: None,
+                managed_enabled: Vec::new(),
+            });
+        }
+    });
+}
+
+/// Seed the managed-ledger half of the launch plugin set (tests only).
+///
+/// Keeps the installed-store half [`set_launch_plugin_set`] captured, so a test
+/// proves both sources are compared. Production records it from the environment
+/// through [`record_launch_plugin_set`].
+#[cfg(test)]
+pub(crate) fn set_launch_managed_plugins(ledger: PathBuf, enabled: Vec<String>) {
+    CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow_mut().as_mut() {
+            if let Some(snapshot) = ctx.plugins_launched.as_mut() {
+                snapshot.ledger = Some(ledger);
+                snapshot.managed_enabled = enabled;
+            }
         }
     });
 }
@@ -1119,6 +1218,25 @@ fn pending_fields(
         .collect()
 }
 
+/// Ids whose enabled state differs between a launch baseline and the current
+/// value of the same source.
+///
+/// `None` (a source that cannot be read) reports nothing: an integrity failure
+/// must never become a fabricated plugin-set change. The caller merges the
+/// per-source lists, so a store and a ledger that both know an id still report
+/// it once.
+fn pending_plugin_ids(launched: &[String], current: Option<Vec<String>>) -> Vec<String> {
+    let Some(current) = current else {
+        return Vec::new();
+    };
+    let launched: std::collections::BTreeSet<&str> = launched.iter().map(String::as_str).collect();
+    let current: std::collections::BTreeSet<&str> = current.iter().map(String::as_str).collect();
+    launched
+        .symmetric_difference(&current)
+        .map(|id| (*id).to_string())
+        .collect()
+}
+
 impl ReloadContext {
     /// Live-class fields whose accepted value differs from the launch value
     /// but that the runtime cannot adopt live: they stay pending until restart
@@ -1128,27 +1246,31 @@ impl ReloadContext {
         pending_fields(&self.launched, self.engine.current(), runtime_adopts)
     }
 
-    /// Plugin ids whose enabled state in the installed store differs from the
-    /// set the instance launched with (bitty#2969).
+    /// Plugin ids whose enabled state differs from the set the instance
+    /// launched with (bitty#2969).
     ///
-    /// Empty when plugin-set tracking is not installed (tests, `--safe`) or
-    /// when the store index cannot be read: an integrity failure must never
-    /// become a fabricated plugin-set change.
+    /// Covers both stores of the set: the installed package index startup
+    /// discovery read, and the managed ledger `bitty plugin enable|disable`
+    /// writes for bundled ids. Empty when plugin-set tracking is not installed
+    /// (tests, `--safe`) or when a source cannot be read: an integrity failure
+    /// must never become a fabricated plugin-set change.
     fn pending_plugin_set(&self) -> Vec<String> {
         let Some(launched) = self.plugins_launched.as_ref() else {
             return Vec::new();
         };
-        let Some(current) = enabled_store_plugins(launched.root.as_deref()) else {
-            return Vec::new();
-        };
-        let launched: std::collections::BTreeSet<&str> =
-            launched.enabled.iter().map(String::as_str).collect();
-        let current: std::collections::BTreeSet<&str> =
-            current.iter().map(String::as_str).collect();
-        launched
-            .symmetric_difference(&current)
-            .map(|id| (*id).to_string())
-            .collect()
+        let mut pending = pending_plugin_ids(
+            &launched.enabled,
+            enabled_store_plugins(launched.root.as_deref()),
+        );
+        if launched.ledger.is_some() {
+            pending.extend(pending_plugin_ids(
+                &launched.managed_enabled,
+                enabled_managed_plugins(launched.ledger.as_deref()),
+            ));
+        }
+        pending.sort();
+        pending.dedup();
+        pending
     }
 
     /// Re-resolve, classify, adopt if live, and build the caller-visible info.
@@ -2881,6 +3003,140 @@ mod tests {
             info.plugins_restart_required,
             vec![String::from("xuepoo.fixture")]
         );
+
+        clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Write a managed bundled ledger with one record for `id`.
+    ///
+    /// Uses the real bundled manifest hash, so the record is exactly what
+    /// `bitty plugin install <id>` writes (the reader re-validates nothing, but
+    /// a hash mismatch would make the fixture diverge from production).
+    fn write_managed_ledger(path: &Path, id: &str, enabled: bool) {
+        let manifest =
+            bitty_plugin_host::bundled::bundled_manifest_for(id).expect("bundled manifest");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("ledger dir");
+        }
+        let text = format!(
+            "return {{\n    state_version = 1,\n    plugins = {{\n\
+             \x20       [\"{id}\"] = {{\n\
+             \x20           source = \"bundled\",\n\
+             \x20           manifest_hash = \"{}\",\n\
+             \x20           enabled = {enabled},\n\
+             \x20           granted = {{}},\n\
+             \x20           denied = {{}},\n\
+             \x20       }},\n\
+             \x20   }},\n\
+             }}\n",
+            manifest.manifest_hash()
+        );
+        std::fs::write(path, text).expect("write managed ledger");
+    }
+
+    #[test]
+    fn reload_reports_a_bundled_plugin_set_change_as_restart_required() {
+        // Review finding on #2973: a bundled id is recorded only in the managed
+        // ledger (the runtime is built with no bundled root), so a store-only
+        // baseline reported `unchanged` while `bitty plugin enable <bundled id>`
+        // promised a restart-required reload. The ledger is part of the launch
+        // set now, so the promise holds.
+        const ID: &str = "bitty-terminal.shell-integration";
+        let dir = temp_dir("plugin-bundled-ledger");
+        let store = dir.join("store");
+        write_plugin_index(&store, "xuepoo.fixture", false);
+        let ledger = dir.join("config").join("bitty-plugins.lua");
+        write_managed_ledger(&ledger, ID, false);
+        let baseline = bitty_config::fallback_builtin();
+        install_plugin_context(&baseline, &store, Vec::new());
+        set_launch_managed_plugins(ledger.clone(), Vec::new());
+        let mut runtime = deterministic_runtime(&baseline);
+
+        let unchanged = reload_requested_with(&mut runtime, false).expect("context installed");
+        assert_eq!(unchanged.kind, "unchanged", "{unchanged:?}");
+        assert!(
+            unchanged.plugins_restart_required.is_empty(),
+            "a disabled bundled record is not part of the running set"
+        );
+
+        // `bitty plugin enable bitty-terminal.shell-integration` flips only the
+        // ledger: the reload must classify the plugin set as changed.
+        write_managed_ledger(&ledger, ID, true);
+        let info = reload_requested_with(&mut runtime, false).expect("context installed");
+        assert_eq!(info.kind, "restart-required", "{info:?}");
+        assert!(!info.applied, "a restart-required attempt never applies");
+        assert_eq!(info.plugins_restart_required, vec![String::from(ID)]);
+        assert!(info.changed.is_empty(), "no config field changed");
+        assert_eq!(
+            info.plan_version, 1,
+            "a restart-required attempt keeps the plan version"
+        );
+
+        // The dry run reports the same pending set without applying anything.
+        let preview = reload_requested_with(&mut runtime, true).expect("context installed");
+        assert_eq!(preview.kind, "restart-required", "{preview:?}");
+        assert!(preview.dry_run);
+        assert_eq!(preview.plugins_restart_required, vec![String::from(ID)]);
+
+        // Disabling it again returns to the launch set: nothing is pending, so
+        // the comparison is against the baseline rather than "the ledger moved".
+        write_managed_ledger(&ledger, ID, false);
+        let back = reload_requested_with(&mut runtime, false).expect("context installed");
+        assert_eq!(back.kind, "unchanged", "{back:?}");
+        assert!(back.plugins_restart_required.is_empty());
+
+        clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reload_reports_a_disabled_bundled_plugin_as_restart_required() {
+        // The symmetric case: a bundled id the ledger recorded as enabled at
+        // launch is pending once it is disabled.
+        const ID: &str = "bitty-terminal.shell-integration";
+        let dir = temp_dir("plugin-bundled-disable");
+        let store = dir.join("store");
+        write_plugin_index(&store, "xuepoo.fixture", false);
+        let ledger = dir.join("config").join("bitty-plugins.lua");
+        write_managed_ledger(&ledger, ID, true);
+        let baseline = bitty_config::fallback_builtin();
+        install_plugin_context(&baseline, &store, Vec::new());
+        set_launch_managed_plugins(ledger.clone(), vec![String::from(ID)]);
+        let mut runtime = deterministic_runtime(&baseline);
+
+        let unchanged = reload_requested_with(&mut runtime, false).expect("context installed");
+        assert_eq!(unchanged.kind, "unchanged", "{unchanged:?}");
+        assert!(unchanged.plugins_restart_required.is_empty());
+
+        write_managed_ledger(&ledger, ID, false);
+        let info = reload_requested_with(&mut runtime, false).expect("context installed");
+        assert_eq!(info.kind, "restart-required", "{info:?}");
+        assert_eq!(info.plugins_restart_required, vec![String::from(ID)]);
+
+        clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reload_ignores_an_unreadable_managed_ledger() {
+        // A corrupt ledger must never become a fabricated plugin-set change:
+        // the reload stays `unchanged` and reports no pending id.
+        const ID: &str = "bitty-terminal.shell-integration";
+        let dir = temp_dir("plugin-bundled-corrupt");
+        let store = dir.join("store");
+        write_plugin_index(&store, "xuepoo.fixture", false);
+        let ledger = dir.join("config").join("bitty-plugins.lua");
+        write_managed_ledger(&ledger, ID, false);
+        let baseline = bitty_config::fallback_builtin();
+        install_plugin_context(&baseline, &store, Vec::new());
+        set_launch_managed_plugins(ledger.clone(), Vec::new());
+        let mut runtime = deterministic_runtime(&baseline);
+
+        std::fs::write(&ledger, b"return { not a ledger }").expect("corrupt ledger");
+        let info = reload_requested_with(&mut runtime, false).expect("context installed");
+        assert_eq!(info.kind, "unchanged", "{info:?}");
+        assert!(info.plugins_restart_required.is_empty());
 
         clear();
         let _ = std::fs::remove_dir_all(dir);

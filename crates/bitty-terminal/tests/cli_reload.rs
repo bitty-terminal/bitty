@@ -256,6 +256,7 @@ mod live {
                 .env("XDG_DATA_HOME", dir.path())
                 .env("XDG_RUNTIME_DIR", dir.path())
                 .env("HOME", dir.path())
+                .env_remove("BITTY_CONFIG")
                 .current_dir(dir.path())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -326,11 +327,21 @@ mod live {
                 .env("XDG_DATA_HOME", self._dir.path())
                 .env("XDG_RUNTIME_DIR", self._dir.path())
                 .env("HOME", self._dir.path())
+                .env_remove("BITTY_CONFIG")
                 .env_remove("BITTY_SOCKET")
                 .env_remove("BITTY_INSTANCE_ID")
                 .env_remove("BITTY_CTL_ELEVATE");
             cmd.output()
                 .unwrap_or_else(|err| panic!("spawn {BITTY_BIN:?} {args:?}: {err}"))
+        }
+
+        /// The instance's isolated plugin store index (byte-for-byte compare).
+        fn store_index(&self) -> PathBuf {
+            self._dir
+                .path()
+                .join("bitty")
+                .join("plugins")
+                .join("current.json")
         }
 
         /// `bitty reload --socket <s> ...`.
@@ -634,6 +645,7 @@ mod live {
             "enable must say the running instance needs a restart: {:?}",
             stdout(&enable)
         );
+        let index_before = std::fs::read(instance.store_index()).expect("store index");
 
         // A dry run reports the same pending set and keeps the documented
         // dry-run exit 0 (nothing was attempted).
@@ -682,12 +694,14 @@ mod live {
             "the table must name the plugin and the restart: {table_text:?}"
         );
 
-        // The running instance never activated the plugin: the reload is a
-        // report, not a silent (or partial) apply.
-        let log = instance.stderr_tail();
-        assert!(
-            !log.contains(&format!("plugin '{PLUGIN}' active")),
-            "reload must not activate the plugin live: {log}"
+        // The reload is a report, not an apply: it must not rewrite the plugin
+        // set the CLI persisted. (An "active" log line is not observable here —
+        // the fixture has no package tree, so activation is never attempted —
+        // which is why this asserts on the persisted set instead.)
+        let index_after = std::fs::read(instance.store_index()).expect("store index");
+        assert_eq!(
+            index_after, index_before,
+            "a reload must never rewrite the installed plugin set"
         );
 
         // A second reload keeps reporting the same pending set (the running
@@ -698,6 +712,139 @@ mod live {
         assert!(
             again_text.contains("\"plan_version\":1"),
             "a restart-required attempt keeps the plan version: {again_text:?}"
+        );
+    }
+
+    #[test]
+    fn reload_reports_a_bundled_plugin_set_change_as_restart_required() {
+        // Review finding on #2973: `bitty plugin enable <bundled id>` writes
+        // only the managed ledger ($XDG_CONFIG_HOME/bitty/bitty-plugins.lua).
+        // The runtime has no bundled root, so the store-only launch baseline
+        // reported `unchanged` / exit 0 while the CLI hint promised a
+        // restart-required reload. This drives the finding's exact sequence:
+        // enable a bundled plugin through the real CLI, then `bitty reload`.
+        const PLUGIN: &str = "bitty-terminal.shell-integration";
+        let mut instance = LiveInstance::spawn("return {}\n");
+        instance.wait_for_socket();
+        instance.wait_for_terminal_list();
+
+        // Offline bundled install (compiled-in catalog, no package tree). The
+        // fresh record starts enabled, so disabling it restores the launch set.
+        let install = instance.run_in(&["plugin", "install", PLUGIN, "--yes"]);
+        assert_eq!(
+            install.status.code(),
+            Some(0),
+            "bundled install failed: stdout={:?} stderr={:?}",
+            stdout(&install),
+            stderr(&install)
+        );
+        let disable = instance.run_in(&["plugin", "disable", PLUGIN]);
+        assert_eq!(
+            disable.status.code(),
+            Some(0),
+            "bundled disable failed: stdout={:?} stderr={:?}",
+            stdout(&disable),
+            stderr(&disable)
+        );
+        assert!(
+            stdout(&disable).contains("recorded in the bundled-plugin ledger"),
+            "a bundled disable must not promise that a restart applies it: {:?}",
+            stdout(&disable)
+        );
+
+        // Back at the launch set: nothing is pending, so the reload is clean.
+        let clean = instance.reload(&["--format", "json"]);
+        let clean_text = stdout(&clean);
+        assert_eq!(
+            clean.status.code(),
+            Some(0),
+            "a bundled plugin absent from the launch set must reload cleanly, \
+             stdout={clean_text:?} stderr={:?}",
+            stderr(&clean)
+        );
+        assert!(
+            clean_text.contains("\"kind\":\"unchanged\""),
+            "no bundled plugin change: {clean_text:?}"
+        );
+        assert!(
+            clean_text.contains("\"plugins_restart_required\":[]"),
+            "an unchanged bundled set reports no pending ids: {clean_text:?}"
+        );
+
+        // The finding's sequence: `bitty plugin enable <bundled id>`.
+        let enable = instance.run_in(&["plugin", "enable", PLUGIN]);
+        assert_eq!(
+            enable.status.code(),
+            Some(0),
+            "bundled enable failed: stdout={:?} stderr={:?}",
+            stdout(&enable),
+            stderr(&enable)
+        );
+        assert!(
+            stdout(&enable).contains("recorded in the bundled-plugin ledger"),
+            "a bundled enable must say it is ledger-only: {:?}",
+            stdout(&enable)
+        );
+
+        // The reload must now report the pending bundled id and exit 4.
+        let reload = instance.reload(&["--format", "json"]);
+        let text = stdout(&reload);
+        assert_eq!(
+            reload.status.code(),
+            Some(4),
+            "a bundled plugin-set change must exit 4, stdout={text:?} stderr={:?} server:\n{}",
+            stderr(&reload),
+            instance.stderr_tail()
+        );
+        for expected in [
+            "\"ok\":true",
+            "\"applied\":false",
+            "\"kind\":\"restart-required\"",
+            "\"plan_version\":1",
+        ] {
+            assert!(text.contains(expected), "missing {expected}: {text:?}");
+        }
+        assert!(
+            array_contains(&text, "plugins_restart_required", PLUGIN),
+            "the reply must name the bundled plugin: {text:?}"
+        );
+
+        // A dry run reports the same pending set and keeps the documented
+        // dry-run exit 0.
+        let preview = instance.reload(&["--dry-run", "--format", "json"]);
+        let preview_text = stdout(&preview);
+        assert_eq!(
+            preview.status.code(),
+            Some(0),
+            "a dry run keeps exit 0, stdout={preview_text:?}"
+        );
+        assert!(
+            preview_text.contains("\"kind\":\"restart-required\"")
+                && array_contains(&preview_text, "plugins_restart_required", PLUGIN),
+            "the dry run must report the pending bundled set: {preview_text:?}"
+        );
+
+        // Disabling it again returns to the launch set: the verdict follows the
+        // persisted set, not "the ledger changed at some point".
+        let redisable = instance.run_in(&["plugin", "disable", PLUGIN]);
+        assert_eq!(
+            redisable.status.code(),
+            Some(0),
+            "bundled disable failed: stdout={:?} stderr={:?}",
+            stdout(&redisable),
+            stderr(&redisable)
+        );
+        let back = instance.reload(&["--format", "json"]);
+        let back_text = stdout(&back);
+        assert_eq!(
+            back.status.code(),
+            Some(0),
+            "a bundled set back at its launch shape must reload cleanly, {back_text:?}"
+        );
+        assert!(
+            back_text.contains("\"kind\":\"unchanged\"")
+                && back_text.contains("\"plugins_restart_required\":[]"),
+            "disabling back to the launch set leaves nothing pending: {back_text:?}"
         );
     }
 }

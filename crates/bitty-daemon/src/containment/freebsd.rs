@@ -369,9 +369,21 @@ fn descendants_gone(pids: &[u32]) -> bool {
 #[cfg(test)]
 mod tests {
     use std::process::Stdio;
+    use std::sync::{Mutex, MutexGuard};
     use std::time::Duration;
 
     use super::*;
+
+    /// Serialize the process-spawning tests: the reaper role is process-wide,
+    /// so a descendant spawned by a parallel test would appear in this
+    /// session's enumeration and correctly make the stop unverified.
+    static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+    fn serial() -> MutexGuard<'static, ()> {
+        SPAWN_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn report() -> ContainmentReport {
         ContainmentReport::freebsd_reaper(PlatformCell::current())
@@ -409,6 +421,7 @@ mod tests {
 
     #[test]
     fn a_contained_child_is_its_own_group_and_a_stop_verifies_a_sweep() {
+        let _serial = serial();
         let report = report();
         let mut command = Command::new("/bin/sh");
         command
@@ -440,6 +453,7 @@ mod tests {
 
     #[test]
     fn a_natural_exit_stays_unverified() {
+        let _serial = serial();
         let report = report();
         let mut command = Command::new("/bin/sh");
         command

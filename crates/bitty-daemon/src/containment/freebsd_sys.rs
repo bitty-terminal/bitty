@@ -27,17 +27,14 @@ use libc::{c_uint, c_void, pid_t};
 /// `REAPER_STATUS_OWNED`: this process is the reaper for its descendants.
 const REAPER_STATUS_OWNED: c_uint = 0x0000_0001;
 
-/// `REAPER_PIDINFO_VALID`: the entry describes a live descendant.
+/// `REAPER_PIDINFO_VALID`: the entry describes a descendant.
 const REAPER_PIDINFO_VALID: c_uint = 0x0000_0001;
 
+/// `REAPER_PIDINFO_ZOMBIE`: the descendant has exited and waits to be reaped.
+const REAPER_PIDINFO_ZOMBIE: c_uint = 0x0000_0008;
+
 /// `REAPER_PIDINFO_EXITING`: the descendant is exiting but not yet dead.
-pub(crate) const REAPER_PIDINFO_EXITING: c_uint = 0x0000_0010;
-
-/// `REAPER_PIDINFO_DEAD`: the descendant is a zombie waiting to be reaped.
-pub(crate) const REAPER_PIDINFO_DEAD: c_uint = 0x0000_0020;
-
-/// First enumeration buffer. The reaper grows it once on `ENOMEM`.
-const INITIAL_DESCENDANTS: usize = 64;
+pub(crate) const REAPER_PIDINFO_EXITING: c_uint = 0x0000_0020;
 
 /// `struct procctl_reaper_status` from `sys/procctl.h`.
 ///
@@ -73,6 +70,15 @@ impl ReaperStatus {
     pub(crate) fn owned_by_current(self) -> bool {
         self.flags & REAPER_STATUS_OWNED != 0 && self.reaper == current_pid_signed()
     }
+
+    /// The total number of processes this reaper can reap.
+    ///
+    /// `PROC_REAP_GETPIDS` never reports its own truncation, so this count
+    /// sizes the enumeration and a sentinel slot detects growth between the
+    /// two calls.
+    pub(crate) fn descendants(self) -> u32 {
+        self.descendants
+    }
 }
 
 /// `struct procctl_reaper_pidinfo` from `sys/procctl.h`.
@@ -85,9 +91,9 @@ pub(crate) struct ReaperPidInfo {
     pub(crate) subtree: pid_t,
     /// `REAPER_PIDINFO_*` flags.
     pub(crate) flags: c_uint,
-    /// ABI padding lane.
+    /// ABI padding lanes.
     #[allow(dead_code)]
-    pad0: c_uint,
+    pad0: [c_uint; 15],
 }
 
 impl ReaperPidInfo {
@@ -96,7 +102,7 @@ impl ReaperPidInfo {
             pid: 0,
             subtree: 0,
             flags: 0,
-            pad0: 0,
+            pad0: [0; 15],
         }
     }
 
@@ -107,12 +113,13 @@ impl ReaperPidInfo {
 
     /// Whether the descendant is exiting or already a zombie.
     pub(crate) fn not_running(self) -> bool {
-        self.flags & (REAPER_PIDINFO_EXITING | REAPER_PIDINFO_DEAD) != 0
+        self.flags & (REAPER_PIDINFO_EXITING | REAPER_PIDINFO_ZOMBIE) != 0
     }
 }
 
 /// `struct procctl_reaper_pids` from `sys/procctl.h`.
 #[repr(C)]
+#[allow(dead_code)]
 struct ReaperPids {
     count: c_uint,
     pad0: [c_uint; 15],
@@ -170,47 +177,49 @@ pub(crate) fn acquire() -> io::Result<()> {
 
 /// Enumerate the reaper's descendants with `PROC_REAP_GETPIDS`.
 ///
-/// `max` bounds one allocation; a kernel answer larger than the bound is an
-/// error, never a truncated list. An empty answer is `Ok(Vec::new())`.
+/// `PROC_REAP_GETPIDS` caps the copy-out at the caller's `rp_count` and does
+/// not report truncation, so this function sizes the buffer from
+/// `PROC_REAP_STATUS` plus one sentinel slot. If the sentinel is also filled,
+/// the descendant set grew between the two calls, and the call fails closed
+/// instead of returning a truncated list. `max` bounds one allocation; an
+/// answer larger than the bound is an error, never a partial proof.
 pub(crate) fn descendants(max: usize) -> io::Result<Vec<ReaperPidInfo>> {
-    let bound = max.max(1);
-    let mut capacity = INITIAL_DESCENDANTS.min(bound);
-    let mut buffer = vec![ReaperPidInfo::new(); capacity];
-    loop {
-        let mut query = ReaperPids {
-            count: u32::try_from(capacity).unwrap_or(u32::MAX),
-            pad0: [0; 15],
-            pids: buffer.as_mut_ptr(),
-        };
-        // SAFETY: `PROC_REAP_GETPIDS` reads `rp_count` as the buffer length
-        // and writes at most that many `procctl_reaper_pidinfo` entries
-        // through `rp_pids`, which points at `buffer`'s `capacity` elements.
-        let result = unsafe {
-            libc::procctl(
-                libc::P_PID,
-                current_pid(),
-                libc::PROC_REAP_GETPIDS,
-                ptr::from_mut(&mut query).cast::<c_void>(),
-            )
-        };
-        if result == 0 {
-            let filled = usize::try_from(query.count).unwrap_or(0).min(buffer.len());
-            buffer.truncate(filled);
-            return Ok(buffer);
-        }
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ENOMEM) {
-            return Err(error);
-        }
-        let required = usize::try_from(query.count).unwrap_or(0);
-        if required <= capacity || required > bound {
-            return Err(io::Error::other(
-                "the reaper pid list does not fit the configured bound",
-            ));
-        }
-        capacity = required;
-        buffer.resize(capacity, ReaperPidInfo::new());
+    let status = status()?;
+    let total = usize::try_from(status.descendants()).unwrap_or(usize::MAX);
+    let capacity = total.saturating_add(1);
+    if capacity > max.max(1) {
+        return Err(io::Error::other(
+            "the reaper pid list exceeds the configured bound",
+        ));
     }
+    let mut buffer = vec![ReaperPidInfo::new(); capacity];
+    let mut query = ReaperPids {
+        count: u32::try_from(capacity).unwrap_or(u32::MAX),
+        pad0: [0; 15],
+        pids: buffer.as_mut_ptr(),
+    };
+    // SAFETY: `PROC_REAP_GETPIDS` reads `rp_count` as the array length and
+    // writes at most that many `procctl_reaper_pidinfo` entries through
+    // `rp_pids`, which points at `buffer`'s `capacity` elements.
+    let result = unsafe {
+        libc::procctl(
+            libc::P_PID,
+            current_pid(),
+            libc::PROC_REAP_GETPIDS,
+            ptr::from_mut(&mut query).cast::<c_void>(),
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let filled = buffer.iter().take_while(|entry| entry.valid()).count();
+    if filled == capacity {
+        return Err(io::Error::other(
+            "the reaper pid list grew past the status snapshot",
+        ));
+    }
+    buffer.truncate(filled);
+    Ok(buffer)
 }
 
 /// The status a fresh acquisition must report, for tests and diagnostics.
@@ -225,26 +234,31 @@ mod tests {
     #[test]
     fn the_reaper_structs_match_the_freebsd_abi_widths() {
         // `sys/procctl.h` fixes these sizes: three `u_int` lanes, two
-        // `pid_t`s, and fifteen padding lanes for the status; four 32-bit
-        // lanes for one pid info.
+        // `pid_t`s, and fifteen padding lanes for the status; three 32-bit
+        // lanes plus fifteen padding lanes for one pid info.
         assert_eq!(std::mem::size_of::<ReaperStatus>(), 80);
-        assert_eq!(std::mem::size_of::<ReaperPidInfo>(), 16);
+        assert_eq!(std::mem::size_of::<ReaperPidInfo>(), 72);
         assert_eq!(std::mem::align_of::<ReaperStatus>(), 4);
         assert_eq!(std::mem::align_of::<ReaperPidInfo>(), 4);
     }
 
+    fn ensure_reaper() {
+        if !is_reaper() {
+            acquire().expect("the reaper role is available to an unprivileged process");
+        }
+        assert!(is_reaper());
+    }
+
     #[test]
     fn acquiring_the_reaper_role_is_idempotent() {
-        acquire().expect("the reaper role is available to an unprivileged process");
-        assert!(is_reaper());
+        ensure_reaper();
         // A second probe path must not fail on an already-acquired role.
-        if status().is_ok_and(ReaperStatus::owned_by_current) {
-            assert!(is_reaper());
-        }
+        assert!(is_reaper());
     }
 
     #[test]
     fn the_pid_list_is_bounded() {
+        ensure_reaper();
         // No descendants are required for the shape check: the call either
         // returns an empty list or a list no larger than the bound.
         let entries = descendants(4096).expect("the reaper list is readable");

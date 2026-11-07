@@ -35,9 +35,10 @@ use harness::real::RealDriver;
 /// keep their own namespace (`V-35`+, `C-20`+, `F-01`) so they can never be
 /// mistaken for a contract row.
 ///
-/// `C-10` is the one area that is not the contract's own label: the contract
-/// row is the observer-grant store (single use, TTL, revoke) and the corpus row
-/// proves its injected-clock expiry half, `counters`.
+/// `C-10` carries the contract's own area, `Attach`: the row is the
+/// observer-grant store's injected-clock half (single use, TTL, expiry,
+/// revoke), and the area is the contract matrix label rather than a
+/// description of the fake-only arm.
 const CONTRACT_VECTORS: [(&str, &str); 53] = [
     ("V-01", "handshake"),
     ("V-02", "handshake"),
@@ -82,7 +83,7 @@ const CONTRACT_VECTORS: [(&str, &str); 53] = [
     ("C-07", "audit"),
     ("C-08", "absence"),
     ("C-09", "authorization"),
-    ("C-10", "counters"),
+    ("C-10", "attach"),
     ("C-11", "control"),
     ("C-12", "child-scope"),
     ("C-13", "orphans"),

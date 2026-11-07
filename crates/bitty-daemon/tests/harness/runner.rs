@@ -889,8 +889,22 @@ pub fn check_expect(
             }
         }
     }
+    check_result_relations(expect, &reply.result, vars)?;
+    if expect.closed && !driver.expect_eof(connection) {
+        return Err("expected the connection to close after the refusal".to_owned());
+    }
+    Ok(())
+}
+
+/// Check the expectations that relate the reply to a captured variable or to
+/// another field of the same reply.
+///
+/// `not_equal`, `not_equal_any`, and `path_equal` all compare live values, so a
+/// missing variable or a missing path is a failure: none of them can pass by
+/// asserting nothing.
+pub fn check_result_relations(expect: &Expect, result: &Value, vars: &Vars) -> Result<(), String> {
     for (path, variable) in &expect.not_equal {
-        let actual = path_get(&reply.result, path).ok_or_else(|| format!("missing path {path}"))?;
+        let actual = path_get(result, path).ok_or_else(|| format!("missing path {path}"))?;
         let expected = vars
             .get(variable.trim_start_matches('@'))
             .ok_or_else(|| format!("unknown variable {variable}"))?;
@@ -899,7 +913,7 @@ pub fn check_expect(
         }
     }
     for (path, variables) in &expect.not_equal_any {
-        let actual = path_get(&reply.result, path).ok_or_else(|| format!("missing path {path}"))?;
+        let actual = path_get(result, path).ok_or_else(|| format!("missing path {path}"))?;
         for variable in variables {
             let expected = vars
                 .get(variable.trim_start_matches('@'))
@@ -909,8 +923,12 @@ pub fn check_expect(
             }
         }
     }
-    if expect.closed && !driver.expect_eof(connection) {
-        return Err("expected the connection to close after the refusal".to_owned());
+    for (path, other) in &expect.path_equal {
+        let actual = path_get(result, path).ok_or_else(|| format!("missing path {path}"))?;
+        let counterpart = path_get(result, other).ok_or_else(|| format!("missing path {other}"))?;
+        if actual != counterpart {
+            return Err(format!("{path} is {actual}, {other} is {counterpart}"));
+        }
     }
     Ok(())
 }
@@ -1081,4 +1099,74 @@ pub fn path_get<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
         };
     }
     Some(current)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn expect_with_path_equal(path: &str, other: &str) -> Expect {
+        let mut expect = Expect::default();
+        expect.path_equal.insert(path.to_owned(), other.to_owned());
+        expect
+    }
+
+    #[test]
+    fn path_equal_accepts_two_matching_paths() {
+        let result = json!({
+            "earliest_revision": 3,
+            "backlog": [{"revision": 3}, {"revision": 4}],
+        });
+        check_result_relations(
+            &expect_with_path_equal("earliest_revision", "backlog.0.revision"),
+            &result,
+            &Vars::new(),
+        )
+        .expect("the gap marker names the first replayed revision");
+    }
+
+    #[test]
+    fn path_equal_fails_when_the_gap_marker_names_a_dropped_revision() {
+        let result = json!({
+            "earliest_revision": 1,
+            "backlog": [{"revision": 3}, {"revision": 4}],
+        });
+        let error = check_result_relations(
+            &expect_with_path_equal("earliest_revision", "backlog.0.revision"),
+            &result,
+            &Vars::new(),
+        )
+        .expect_err("a gap marker below the first served revision must fail");
+        assert!(
+            error.contains("earliest_revision is 1"),
+            "the failure must name the marker and what it holds: {error}"
+        );
+    }
+
+    #[test]
+    fn path_equal_fails_when_a_named_path_is_missing() {
+        let result = json!({ "earliest_revision": 1, "backlog": [] });
+        let error = check_result_relations(
+            &expect_with_path_equal("earliest_revision", "backlog.0.revision"),
+            &result,
+            &Vars::new(),
+        )
+        .expect_err("an absent replayed revision must fail, not pass vacuously");
+        assert!(
+            error.contains("missing path backlog.0.revision"),
+            "the failure must name the missing path: {error}"
+        );
+    }
+
+    #[test]
+    fn not_equal_still_fails_on_an_unknown_variable() {
+        let mut expect = Expect::default();
+        expect
+            .not_equal
+            .insert("session_id".to_owned(), "@absent".to_owned());
+        let error = check_result_relations(&expect, &json!({ "session_id": "aa" }), &Vars::new())
+            .expect_err("a missing variable must fail");
+        assert!(error.contains("unknown variable @absent"), "{error}");
+    }
 }

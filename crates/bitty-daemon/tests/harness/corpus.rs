@@ -144,6 +144,13 @@ pub struct Expect {
     pub distinct: Vec<String>,
     pub not_equal: BTreeMap<String, String>,
     pub not_equal_any: BTreeMap<String, Vec<String>>,
+    /// Two result paths that must hold the same value.
+    ///
+    /// A claim that relates two fields of one reply: the gap marker
+    /// `earliest_revision` must name the first revision the attach replay
+    /// actually served, so the pair is asserted instead of each field against
+    /// a literal.
+    pub path_equal: BTreeMap<String, String>,
     pub request_log: Option<RequestLogExpect>,
     pub exit_code: Option<i32>,
     pub stdout_contains: Vec<String>,
@@ -167,6 +174,7 @@ impl Expect {
             || !self.distinct.is_empty()
             || !self.not_equal.is_empty()
             || !self.not_equal_any.is_empty()
+            || !self.path_equal.is_empty()
             || self.request_log.is_some()
             || self.exit_code.is_some()
             || self.file_mode.is_some()
@@ -500,6 +508,7 @@ fn parse_expect(value: &Value) -> Result<Expect, String> {
         distinct: optional_string_array(value, "distinct")?,
         not_equal: string_map(value, "not_equal")?,
         not_equal_any: string_list_map(value, "not_equal_any")?,
+        path_equal: string_map(value, "path_equal")?,
         request_log: None,
         exit_code: optional_i32(value, "exit_code")?,
         stdout_contains: optional_string_array(value, "stdout_contains")?,
@@ -524,6 +533,19 @@ fn parse_expect(value: &Value) -> Result<Expect, String> {
     expect.hex_len = normalize_values(expect.hex_len);
     expect.not_equal = normalize_values(expect.not_equal);
     expect.not_equal_any = normalize_values(expect.not_equal_any);
+    expect.path_equal = expect
+        .path_equal
+        .into_iter()
+        .map(|(path, other)| (normalize_path(&path), normalize_path(&other)))
+        .collect();
+    for (path, other) in &expect.path_equal {
+        if path.is_empty() || other.is_empty() {
+            return Err("path_equal names an empty path".to_owned());
+        }
+        if path == other {
+            return Err(format!("path_equal compares {path} to itself"));
+        }
+    }
     expect.present = expect
         .present
         .iter()

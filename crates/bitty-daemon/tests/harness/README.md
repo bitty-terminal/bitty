@@ -138,7 +138,7 @@ Expectation vocabulary: `ok`, `error_class`, `error_code`, `counts`,
 `closed` (EOF after the reply), `transport` (`"closed"` when no reply arrives),
 `result`, `result_min`, `present`, `absent`, `array` (exact), `array_len`,
 `min_array_len`, `hex_len`, `distinct`, `not_equal`, `not_equal_any`,
-`request_log`,
+`path_equal`, `request_log`,
 `exit_code`, `stdout_contains`, `file_mode`, and `audit`. Paths are relative to
 the response `result`; a leading `result.` is accepted and normalized.
 

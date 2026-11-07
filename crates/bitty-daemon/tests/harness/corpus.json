@@ -2406,7 +2406,8 @@
             "cwd": "@cwd"
           },
           "capture": {
-            "session_id": "session.session_id"
+            "session_id": "session.session_id",
+            "create_token": "control_token"
           },
           "expect": {
             "ok": true,
@@ -2424,6 +2425,11 @@
           "method": "session.status",
           "params": {
             "session_id": "@session_id"
+          },
+          "capture": {
+            "record_worker_handle": "session.worker_handle",
+            "record_changed_at": "session.state_changed_at_ms",
+            "record_revision": "session.state_revision"
           },
           "expect": {
             "ok": true,
@@ -2459,8 +2465,15 @@
               "session.state": "failed",
               "session.signal": 9,
               "session.cleanup": "swept",
-              "session.generation": 1
-            }
+              "session.generation": 1,
+              "session.terminal_reason": "worker_signal",
+              "session.worker_handle": "@record_worker_handle",
+              "session.state_changed_at_ms": "@record_changed_at",
+              "session.state_revision": "@record_revision"
+            },
+            "absent": [
+              "session.exit_code"
+            ]
           }
         },
         {
@@ -2471,7 +2484,8 @@
             "idempotency_key": "v14-retry"
           },
           "capture": {
-            "retry_session_id": "session.session_id"
+            "retry_session_id": "session.session_id",
+            "retry_token": "control_token"
           },
           "expect": {
             "ok": true,
@@ -2480,7 +2494,28 @@
               "session.generation": 0
             },
             "not_equal": {
-              "session.session_id": "@session_id"
+              "session.session_id": "@session_id",
+              "control_token": "@create_token"
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "failed",
+              "session.terminal_reason": "worker_signal",
+              "session.generation": 1,
+              "session.cleanup": "swept",
+              "session.signal": 9,
+              "session.worker_handle": "@record_worker_handle",
+              "session.state_changed_at_ms": "@record_changed_at",
+              "session.state_revision": "@record_revision"
             }
           }
         }
@@ -2556,7 +2591,8 @@
             "cwd": "@cwd"
           },
           "capture": {
-            "session_id": "session.session_id"
+            "session_id": "session.session_id",
+            "create_token": "control_token"
           },
           "expect": {
             "ok": true,
@@ -2574,6 +2610,11 @@
           "method": "session.status",
           "params": {
             "session_id": "@session_id"
+          },
+          "capture": {
+            "record_worker_handle": "session.worker_handle",
+            "record_changed_at": "session.state_changed_at_ms",
+            "record_revision": "session.state_revision"
           },
           "expect": {
             "ok": true,
@@ -2610,7 +2651,10 @@
               "session.terminal_reason": "worker_exit",
               "session.exit_code": 3,
               "session.cleanup": "swept",
-              "session.generation": 1
+              "session.generation": 1,
+              "session.worker_handle": "@record_worker_handle",
+              "session.state_changed_at_ms": "@record_changed_at",
+              "session.state_revision": "@record_revision"
             },
             "absent": [
               "session.signal"
@@ -2625,7 +2669,8 @@
             "idempotency_key": "v15-retry"
           },
           "capture": {
-            "retry_session_id": "session.session_id"
+            "retry_session_id": "session.session_id",
+            "retry_token": "control_token"
           },
           "expect": {
             "ok": true,
@@ -2634,7 +2679,28 @@
               "session.generation": 0
             },
             "not_equal": {
-              "session.session_id": "@session_id"
+              "session.session_id": "@session_id",
+              "control_token": "@create_token"
+            }
+          }
+        },
+        {
+          "connection": "operator",
+          "method": "session.status",
+          "params": {
+            "session_id": "@session_id"
+          },
+          "expect": {
+            "ok": true,
+            "result": {
+              "session.state": "exited",
+              "session.terminal_reason": "worker_exit",
+              "session.generation": 1,
+              "session.cleanup": "swept",
+              "session.exit_code": 3,
+              "session.worker_handle": "@record_worker_handle",
+              "session.state_changed_at_ms": "@record_changed_at",
+              "session.state_revision": "@record_revision"
             }
           }
         }
@@ -3503,7 +3569,7 @@
     },
     {
       "id": "V-21",
-      "title": "A reattach serves the session snapshot with a bounded, ordered backlog",
+      "title": "A reattach serves the session snapshot with a bounded, ordered backlog whose gap marker names the first replayed revision",
       "area": "reattach",
       "decisions": [
         "D-10"
@@ -3519,7 +3585,7 @@
         "clock_ms": 0,
         "limits": {}
       },
-      "deferred": "bitty#2917: the truncation marker needs an event-ring bound seam; the compiled ring is not reachable from the corpus",
+      "deferred": "bitty#2917: the truncated-ring arm still needs an event-ring bound seam; the untruncated gap marker (`earliest_revision`) is asserted here",
       "steps": [
         {
           "connection": "operator",
@@ -3583,7 +3649,8 @@
           },
           "capture": {
             "controller_attach": "attach_id",
-            "controller_token": "control_token"
+            "controller_token": "control_token",
+            "controller_earliest": "earliest_revision"
           },
           "expect": {
             "ok": true,
@@ -3593,13 +3660,20 @@
             },
             "present": [
               "backlog",
-              "backlog_truncated"
+              "backlog_truncated",
+              "earliest_revision"
             ],
             "min_array_len": {
               "backlog": 1
             },
             "hex_len": {
               "attach_id": 32
+            },
+            "path_equal": {
+              "earliest_revision": "backlog.0.revision"
+            },
+            "result_min": {
+              "earliest_revision": 1
             }
           }
         },
@@ -3664,11 +3738,13 @@
             "ok": true,
             "result": {
               "role": "observer",
-              "backlog_truncated": false
+              "backlog_truncated": false,
+              "earliest_revision": "@controller_earliest"
             },
             "present": [
               "backlog",
               "backlog_truncated",
+              "earliest_revision",
               "session"
             ],
             "min_array_len": {
@@ -3676,6 +3752,12 @@
             },
             "hex_len": {
               "attach_id": 32
+            },
+            "path_equal": {
+              "earliest_revision": "backlog.0.revision"
+            },
+            "result_min": {
+              "earliest_revision": 1
             }
           }
         }
@@ -10008,7 +10090,7 @@
     {
       "id": "C-10",
       "title": "An expired observer grant bumps the revision once and never again (injected clock)",
-      "area": "counters",
+      "area": "attach",
       "decisions": [
         "D-03"
       ],

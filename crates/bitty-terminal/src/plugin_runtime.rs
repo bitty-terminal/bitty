@@ -31,9 +31,7 @@ use bitty_runtime::registry::{
     PanelError, PanelRegistryConfig, PanelRuntime, PanelType, WorkspaceId,
 };
 use bitty_runtime::scene_host::SceneHost;
-use bitty_runtime::{
-    E_UI_UNAVAILABLE, PaneCwd, TargetAnchorSummary, ViewId, WorkspaceSummary,
-};
+use bitty_runtime::{E_UI_UNAVAILABLE, PaneCwd, TargetAnchorSummary, ViewId, WorkspaceSummary};
 use bitty_term_state::{State, ZoneKind};
 
 /// Environment override for a local-path development plugin root.
@@ -1367,6 +1365,11 @@ mod tests {
     }
 
     /// Zones array of a semantic snapshot, in Lua array order.
+    ///
+    /// Only the live-PTY probes below read the published table; the
+    /// source-level probes call [`semantic_zones`] directly, so this stays
+    /// gated with them instead of dead code on other platforms.
+    #[cfg(target_os = "linux")]
     fn zones_of(snapshot: &LuaValue) -> Vec<&LuaValue> {
         match snapshot.get("zones") {
             Some(LuaValue::Table(pairs)) => pairs.iter().map(|(_, value)| value).collect(),
@@ -1375,6 +1378,9 @@ mod tests {
     }
 
     /// Newest zone cwd of a semantic snapshot, when one is carried.
+    ///
+    /// Gated with [`zones_of`]: only the live-PTY probes read it.
+    #[cfg(target_os = "linux")]
     fn newest_zone_cwd(snapshot: &LuaValue) -> Option<String> {
         zones_of(snapshot).iter().rev().find_map(|zone| {
             zone.get("metadata")
@@ -1446,8 +1452,8 @@ mod tests {
             // The test is only meaningful once the forged report is actually
             // in the committed state: otherwise it would pass on a run where
             // the shell's `printf` never arrived.
-            let report_in_state = ShellIntegration::cwd(rt.state())
-                .is_some_and(|report| report.contains("spoofed"));
+            let report_in_state =
+                ShellIntegration::cwd(rt.state()).is_some_and(|report| report.contains("spoofed"));
             if served.as_deref() == Some("~/real") && report_in_state {
                 break;
             }
@@ -1579,7 +1585,11 @@ mod tests {
         // The kernel reports the resolved path, never the link's spelling.
         assert_eq!(
             snapshot.home.as_deref(),
-            Some(std::fs::canonicalize(&real).expect("canonical home").as_path()),
+            Some(
+                std::fs::canonicalize(&real)
+                    .expect("canonical home")
+                    .as_path()
+            ),
             "the home is canonicalized once at construction"
         );
 

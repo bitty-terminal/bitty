@@ -321,7 +321,8 @@ impl FsListBackend {
                 }
                 continue;
             };
-            let Ok(scope) = FilesystemScope::from_patterns(std::slice::from_ref(&normalized)) else {
+            let Ok(scope) = FilesystemScope::from_patterns(std::slice::from_ref(&normalized))
+            else {
                 continue;
             };
             let Some(root) = self.literal_root(&normalized) else {
@@ -1407,13 +1408,9 @@ mod tests {
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
 
         // A maliciously spelled rootless grant is skipped, never widened.
-        let error = list_with_generous_deadline(
-            &backend,
-            &["fs.read:./**".to_string()],
-            "~/docs",
-            16,
-        )
-        .expect_err("a leading no-op run pins the pattern relative, not home-rooted");
+        let error =
+            list_with_generous_deadline(&backend, &["fs.read:./**".to_string()], "~/docs", 16)
+                .expect_err("a leading no-op run pins the pattern relative, not home-rooted");
         assert_eq!(error.code, "E_FS_MISSING_GRANT");
 
         // A malformed pattern is skipped, never widened.

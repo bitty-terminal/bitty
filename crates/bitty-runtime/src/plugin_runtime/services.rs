@@ -3822,9 +3822,13 @@ impl PluginServices {
         // concurrent edit between preview and set cannot commit a different
         // change under the same approval.
         match backend.apply(&self.plugin_id, &change, &candidate_digest) {
-            Ok(ConfigApplyOutcome::Applied { .. }) => Ok(ConfigSetOutcome {
+            // bitty#2972: the reply must describe what the running process
+            // will actually do. A value the backend classifies as needing a
+            // restart is persisted but never adopted live, so reporting
+            // `auto` there would silently pretend the change is live.
+            Ok(ConfigApplyOutcome::Applied { pending_restart }) => Ok(ConfigSetOutcome {
                 applied: true,
-                reload: "auto",
+                reload: if pending_restart { "restart" } else { "auto" },
             }),
             Ok(ConfigApplyOutcome::Unchanged) => Ok(ConfigSetOutcome {
                 applied: false,
@@ -12528,6 +12532,20 @@ mod history_tests {
                 previews: RefCell::new(Vec::new()),
                 calls: RefCell::new(Vec::new()),
                 outcome: ConfigApplyOutcome::Applied {
+                    pending_restart: false,
+                },
+                failure: None,
+                nonce: Cell::new(0),
+                stale: Cell::new(false),
+            })
+        }
+
+        /// A backend that persists the value but cannot adopt it live.
+        fn applied_pending_restart() -> Rc<Self> {
+            Rc::new(Self {
+                previews: RefCell::new(Vec::new()),
+                calls: RefCell::new(Vec::new()),
+                outcome: ConfigApplyOutcome::Applied {
                     pending_restart: true,
                 },
                 failure: None,
@@ -12841,6 +12859,30 @@ mod history_tests {
         assert_eq!(error.code, "E_CONFIG_STALE");
         assert_eq!(backend.call_count(), 1);
         assert_eq!(error.class, "runtime");
+    }
+
+    #[test]
+    fn config_set_reports_restart_when_the_value_needs_one() {
+        // bitty#2972: a persisted value the running plan cannot adopt live is
+        // never reported as an `auto` adoption.
+        let backend = RecordingConfigBackend::applied_pending_restart();
+        let services = config_services(Some(Rc::clone(&backend)));
+        let preview = services
+            .config_preview("terminal.scrollback", &LuaValue::Integer(20_000))
+            .expect("preview");
+        let outcome = services
+            .config_set(
+                "terminal.scrollback",
+                &LuaValue::Integer(20_000),
+                &preview.digest,
+            )
+            .expect("applied");
+        assert!(outcome.applied);
+        assert_eq!(
+            outcome.reload, "restart",
+            "a restart-required value must not claim a live adoption"
+        );
+        assert_eq!(backend.call_count(), 1);
     }
 
     #[test]

@@ -38,9 +38,10 @@
 //! | ID  | Dimension                         | Default                              | Enforcement point |
 //! |-----|-----------------------------------|--------------------------------------|---------------------|
 //! | RC-1 | per-VM instruction budget       | `RC1_INSTRUCTION_BUDGET = 10_000_000` | `Fuel` counter with per-slice cap (`SLICE_FUEL = 1024`); exceed => fail-closed suspend |
-//! | RC-1 | per-VM wall-clock budget        | `RC1_WALL_CLOCK_BUDGET_MS = 50 ms`   | charged `Instant` deadline checked after every slice; resumable command callbacks park at the limit and resume on a later cold tick, and every callback is bounded at completion by `RC1_CALLBACK_CEILING_MS` (5250 ms) |
+//! | RC-1 | per-VM wall-clock budget        | `RC1_WALL_CLOCK_BUDGET_MS = 50 ms`   | charged `Instant` deadline checked after every slice; resumable command callbacks park at the limit and resume on a later cold tick, and every callback is bounded at completion by `RC1_CALLBACK_CEILING_MS` (5450 ms) |
 //! | RC-1 | warning threshold               | `RC1_WARNING_MS = 8 ms`              | sets `warning_triggered` flag, counted, does not suspend |
 //! | RC-1 | store commit I/O credit         | `STORE_COMMIT_CREDIT_MAX_MS = 200 ms` | durable commit I/O of a committed disk-backed `bitty.store.set` is excluded from the hard wall limit, capped per callback; see the constant (bitty #1518) |
+//! | RC-1 | config write I/O credit         | `CONFIG_COMMIT_CREDIT_MAX_MS = 200 ms` | durable write of a committed `config.manage` change (`config.set`, `config.set_enabled`, `profiles.use`) is excluded from the hard wall limit, capped per callback; see the constant (bitty #2972) |
 //! | RC-1 | supervised spawn-wait credit   | `HOST_CALL_CREDIT_MAX_MS = 5000 ms`  | time spent inside a supervised `process.spawn` call is excluded from the hard wall limit, capped per callback at the spawn deadline; every other host call (including `commands.invoke`/`services.*` dispatch) stays charged, and the cheap-call and spawn deadlines are still checked in raw time; see the constant (bitty #2285) |
 //! | RC-2 | per-VM heap (accounted)         | `RC2_MEMORY_PER_PLUGIN_BYTES = 32 MiB` | builder hard quota (`RuntimeBuilder::memory_limit`) refuses over-quota allocation, plus `Lua::total_memory()` polling before/after each slice; exceed => suspend |
 //!
@@ -193,6 +194,29 @@ pub const RC1_WALL_CLOCK_BUDGET_MS: u64 = 50;
 ///   contract cannot preempt it.
 pub const STORE_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
 
+/// Maximum `config.manage` durable-write I/O time credited back to one
+/// callback's RC-1 hard wall-clock limit: `200 ms` (bitty #2972).
+///
+/// Rule:
+///
+/// - Credited: only the host-side durable write of a `config.manage` verb that
+///   committed (`config.set`, `config.set_enabled`, or `profiles.use`): the
+///   backend's re-render, atomic temp-file write, `fsync`, rename, directory
+///   `fsync`, and rolling `.bak`. The span is measured by the host inside the
+///   bridge callback; a refused, stale, or failed write earns no credit, and a
+///   preview/read verb never writes and never earns credit.
+/// - Why: the write latency is filesystem work the plugin neither performs nor
+///   controls. Charging it as plugin time made a committed write suspend the
+///   calling generation (and so release its overlay capture) when the disk was
+///   slower than the per-tick budget — the regression this constant fixes.
+/// - Scope and cap: identical to [`STORE_COMMIT_CREDIT_MAX_MS`] — cumulative
+///   per callback, shared by every callback running on the thread while the
+///   write happens (including a cross-VM provider), capped at this value, so a
+///   slow or malicious backend cannot stretch a callback without bound. I/O
+///   past the cap is charged like any other time.
+/// - The instruction budget ([`RC1_INSTRUCTION_BUDGET`]) is never credited.
+pub const CONFIG_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
+
 /// RC-1 host-call I/O credit cap (`5 s` = the bridge's supervised-call
 /// deadline, [`crate::host::SPAWN_TIMEOUT_MS`]).
 ///
@@ -241,15 +265,15 @@ pub const STORE_COMMIT_CREDIT_MAX_MS: u64 = 4 * RC1_WALL_CLOCK_BUDGET_MS;
 /// same ceiling are suspended fail-closed at completion (bitty #2314). The
 /// ceiling is
 /// `RC1_WALL_CLOCK_BUDGET_MS + STORE_COMMIT_CREDIT_MAX_MS +
-/// HOST_CALL_CREDIT_MAX_MS` (50 + 200 + 5000 ms), and every credited span must
-/// be measured by the host, never chosen by the plugin. The policy is
-/// documented in the isolation RFC (RC-1 row and
-/// `R-RC1-HOST-CALL-CREDIT`, bitty-plugins-docs#169).
+/// CONFIG_COMMIT_CREDIT_MAX_MS + HOST_CALL_CREDIT_MAX_MS`
+/// (50 + 200 + 200 + 5000 ms), and every credited span must be measured by the
+/// host, never chosen by the plugin. The policy is documented in the isolation
+/// RFC (RC-1 row and `R-RC1-HOST-CALL-CREDIT`, bitty-plugins-docs#169).
 pub const HOST_CALL_CREDIT_MAX_MS: u64 = crate::host::SPAWN_TIMEOUT_MS;
 
 /// Maximum raw wall time one callback may consume and still complete under the
-/// default RC-1 budgets: `5250 ms` = 50 ms wall + 200 ms store-commit credit +
-/// 5000 ms supervised spawn-wait credit.
+/// default RC-1 budgets: `5450 ms` = 50 ms wall + 200 ms store-commit credit +
+/// 200 ms config-write credit + 5000 ms supervised spawn-wait credit.
 ///
 /// The ceiling is enforced on every callback at completion (bitty #2314).
 /// App-dispatched commands are resumable: a callback that exceeds the 50 ms
@@ -262,8 +286,10 @@ pub const HOST_CALL_CREDIT_MAX_MS: u64 = crate::host::SPAWN_TIMEOUT_MS;
 /// result past the ceiling. `RC1_WALL_CLOCK_BUDGET_MS` remains the per-tick
 /// budget, and a VM whose wall budget is tuned widens the ceiling by the same
 /// delta (see [`LuaVm::callback_ceiling_ms`]).
-pub const RC1_CALLBACK_CEILING_MS: u64 =
-    RC1_WALL_CLOCK_BUDGET_MS + STORE_COMMIT_CREDIT_MAX_MS + HOST_CALL_CREDIT_MAX_MS;
+pub const RC1_CALLBACK_CEILING_MS: u64 = RC1_WALL_CLOCK_BUDGET_MS
+    + STORE_COMMIT_CREDIT_MAX_MS
+    + CONFIG_COMMIT_CREDIT_MAX_MS
+    + HOST_CALL_CREDIT_MAX_MS;
 
 /// RC-1 warning threshold (candidate): `8 ms` — sets `warning_triggered` but
 /// does not suspend.
@@ -330,6 +356,9 @@ thread_local! {
     /// Total credited bounded host-call time on this thread (see
     /// [`HOST_CALL_CREDIT_MAX_MS`]).
     static HOST_CALL_CREDIT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    /// Total credited `config.manage` durable-write time on this thread (see
+    /// [`CONFIG_COMMIT_CREDIT_MAX_MS`]).
+    static CONFIG_COMMIT_CREDIT: Cell<Duration> = const { Cell::new(Duration::ZERO) };
     /// Commit I/O reported inside the open `bitty.store.set` window, or
     /// `None` when no store write is in progress on this thread.
     static STORE_COMMIT_WINDOW: Cell<Option<Duration>> = const { Cell::new(None) };
@@ -398,6 +427,50 @@ fn host_call_credit_total() -> Duration {
     HOST_CALL_CREDIT.with(Cell::get)
 }
 
+fn config_commit_credit_total() -> Duration {
+    CONFIG_COMMIT_CREDIT.with(Cell::get)
+}
+
+/// One `config.manage` durable-write bridge call measured for the RC-1
+/// config-write credit (see [`CONFIG_COMMIT_CREDIT_MAX_MS`]).
+///
+/// Opened immediately before the bridge dispatches a write verb and closed
+/// where the backend returns. Only a committed write is credited; a refused,
+/// stale, or failed write changed nothing and earns no credit, and the credit
+/// is bounded by the measured span itself so a backend can never report more
+/// time than it took. Nested windows are impossible: the bridge rejects
+/// re-entry, and the credit is a plain thread-local total like the store
+/// commit credit.
+pub(crate) struct ConfigCommitWindow {
+    started: Instant,
+    config_at_start: Duration,
+}
+
+impl ConfigCommitWindow {
+    /// Start measuring one `config.manage` write at the bridge's call origin.
+    pub(crate) fn open() -> Self {
+        Self {
+            started: Instant::now(),
+            config_at_start: config_commit_credit_total(),
+        }
+    }
+
+    /// Close the window; credit the measured span when the write committed.
+    ///
+    /// The credit excludes any `config.manage` write time already credited by
+    /// an enclosing window on this thread, so nested host paths cannot
+    /// double-count one interval.
+    pub(crate) fn close(self, committed: bool) {
+        if !committed {
+            return;
+        }
+        let elapsed = self.started.elapsed();
+        let already = config_commit_credit_total().saturating_sub(self.config_at_start);
+        let credited = elapsed.saturating_sub(already);
+        CONFIG_COMMIT_CREDIT.with(|credit| credit.set(credit.get().saturating_add(credited)));
+    }
+}
+
 /// One bounded host call on this thread, measured for the RC-1 host-call
 /// credit (see [`HOST_CALL_CREDIT_MAX_MS`]).
 ///
@@ -438,40 +511,56 @@ pub(crate) struct BudgetReading {
     /// Bounded host-call time credit applied, capped at the per-callback
     /// maximum and excluding time already covered by `credit`.
     pub(crate) host_call_credit: Duration,
-    /// `raw - credit - host_call_credit`: the Lua execution time charged
-    /// against the hard wall limit.
+    /// `config.manage` durable-write credit applied, capped at the
+    /// per-callback maximum and excluding time already covered above.
+    pub(crate) config_commit_credit: Duration,
+    /// `raw - credit - host_call_credit - config_commit_credit`: the Lua
+    /// execution time charged against the hard wall limit.
     pub(crate) charged: Duration,
 }
 
 impl BudgetReading {
     /// Pure reading from raw elapsed and the accrued credits under their caps.
-    fn new(raw: Duration, accrued: Duration, host_call_accrued: Duration) -> Self {
+    fn new(
+        raw: Duration,
+        accrued: Duration,
+        host_call_accrued: Duration,
+        config_commit_accrued: Duration,
+    ) -> Self {
         let credit = accrued
             .min(Duration::from_millis(STORE_COMMIT_CREDIT_MAX_MS))
             .min(raw);
         let host_call_credit = host_call_accrued
             .min(Duration::from_millis(HOST_CALL_CREDIT_MAX_MS))
             .min(raw.saturating_sub(credit));
+        let config_commit_credit = config_commit_accrued
+            .min(Duration::from_millis(CONFIG_COMMIT_CREDIT_MAX_MS))
+            .min(raw.saturating_sub(credit).saturating_sub(host_call_credit));
         Self {
             raw,
             credit,
             host_call_credit,
-            charged: raw - credit - host_call_credit,
+            config_commit_credit,
+            charged: raw
+                .saturating_sub(credit)
+                .saturating_sub(host_call_credit)
+                .saturating_sub(config_commit_credit),
         }
     }
 }
 
 /// Origin of one RC-1 wall-clock measurement.
 ///
-/// Records the wall instant and the thread's store commit and host-call
-/// credits at the origin; [`BudgetMark::read`] reports raw time, the capped
-/// credits accrued since the origin, and the charged time used by the hard
-/// wall limit.
+/// Records the wall instant and the thread's store commit, host-call, and
+/// config-write credits at the origin; [`BudgetMark::read`] reports raw time,
+/// the capped credits accrued since the origin, and the charged time used by
+/// the hard wall limit.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct BudgetMark {
     start: Instant,
     credit_at_start: Duration,
     host_call_credit_at_start: Duration,
+    config_commit_credit_at_start: Duration,
 }
 
 impl BudgetMark {
@@ -481,6 +570,7 @@ impl BudgetMark {
             start: Instant::now(),
             credit_at_start: store_commit_credit_total(),
             host_call_credit_at_start: host_call_credit_total(),
+            config_commit_credit_at_start: config_commit_credit_total(),
         }
     }
 
@@ -495,6 +585,7 @@ impl BudgetMark {
             self.start.elapsed(),
             store_commit_credit_total().saturating_sub(self.credit_at_start),
             host_call_credit_total().saturating_sub(self.host_call_credit_at_start),
+            config_commit_credit_total().saturating_sub(self.config_commit_credit_at_start),
         )
     }
 }
@@ -637,6 +728,10 @@ pub struct VmBudgetSnapshot {
     /// Bounded host-call time credit (ms) applied to the RC-1 hard wall limit
     /// in the last execute, capped at [`HOST_CALL_CREDIT_MAX_MS`].
     pub host_call_credit_ms: u64,
+    /// `config.manage` durable-write credit (ms) applied to the RC-1 hard wall
+    /// limit in the last execute, capped at
+    /// [`CONFIG_COMMIT_CREDIT_MAX_MS`].
+    pub config_commit_credit_ms: u64,
     /// Memory used (total_allocation).
     pub memory_used: usize,
     /// Whether warning threshold was triggered.
@@ -729,6 +824,9 @@ pub(crate) struct DriveState {
     store_credit: Duration,
     /// Cumulative applied supervised-spawn-wait credit, capped per callback.
     host_credit: Duration,
+    /// Cumulative applied `config.manage` durable-write credit, capped per
+    /// callback.
+    config_credit: Duration,
     warning_triggered: bool,
 }
 
@@ -741,6 +839,7 @@ impl DriveState {
             elapsed: Duration::ZERO,
             store_credit: Duration::ZERO,
             host_credit: Duration::ZERO,
+            config_credit: Duration::ZERO,
             warning_triggered: false,
         }
     }
@@ -754,6 +853,7 @@ struct SegmentReading {
     charged: Duration,
     store_credit: Duration,
     host_credit: Duration,
+    config_credit: Duration,
     total_elapsed: Duration,
 }
 
@@ -796,6 +896,7 @@ pub struct LuaVm {
     wall_elapsed_ms: u64,
     store_commit_credit_ms: u64,
     host_call_credit_ms: u64,
+    config_commit_credit_ms: u64,
     memory_used: usize,
     warning_triggered: bool,
     warning_count: u64,
@@ -940,6 +1041,7 @@ impl LuaVm {
             wall_elapsed_ms: 0,
             store_commit_credit_ms: 0,
             host_call_credit_ms: 0,
+            config_commit_credit_ms: 0,
             memory_used: 0,
             warning_triggered: false,
             warning_count: 0,
@@ -1039,6 +1141,7 @@ impl LuaVm {
     pub fn callback_ceiling_ms(&self) -> u64 {
         self.wall_budget_ms
             .saturating_add(STORE_COMMIT_CREDIT_MAX_MS)
+            .saturating_add(CONFIG_COMMIT_CREDIT_MAX_MS)
             .saturating_add(HOST_CALL_CREDIT_MAX_MS)
     }
 
@@ -1097,6 +1200,13 @@ impl LuaVm {
     #[must_use]
     pub fn host_call_credit_ms(&self) -> u64 {
         self.host_call_credit_ms
+    }
+
+    /// `config.manage` durable-write credit (ms) applied to the RC-1 hard wall
+    /// limit by the last execution (see [`CONFIG_COMMIT_CREDIT_MAX_MS`]).
+    #[must_use]
+    pub fn config_commit_credit_ms(&self) -> u64 {
+        self.config_commit_credit_ms
     }
 
     /// Memory used (total_allocation) after last execution.
@@ -1208,6 +1318,7 @@ impl LuaVm {
         self.wall_elapsed_ms = 0;
         self.store_commit_credit_ms = 0;
         self.host_call_credit_ms = 0;
+        self.config_commit_credit_ms = 0;
     }
 
     /// Replace budgets (for tuning without recreation).
@@ -1293,6 +1404,7 @@ impl LuaVm {
             wall_elapsed_ms: self.wall_elapsed_ms,
             store_commit_credit_ms: self.store_commit_credit_ms,
             host_call_credit_ms: self.host_call_credit_ms,
+            config_commit_credit_ms: self.config_commit_credit_ms,
             memory_used: self.memory_used,
             warning_triggered: self.warning_triggered,
             suspended,
@@ -1388,6 +1500,7 @@ impl LuaVm {
             self.wall_elapsed_ms = elapsed_ms;
             self.store_commit_credit_ms = duration_ms(reading.credit);
             self.host_call_credit_ms = duration_ms(reading.host_call_credit);
+            self.config_commit_credit_ms = duration_ms(reading.config_commit_credit);
             self.memory_used = self.lua.total_memory();
             if elapsed_ms >= self.warning_ms {
                 self.warning_triggered = true;
@@ -1513,6 +1626,7 @@ impl LuaVm {
         self.wall_elapsed_ms = 0;
         self.store_commit_credit_ms = 0;
         self.host_call_credit_ms = 0;
+        self.config_commit_credit_ms = 0;
         self.memory_used = self.lua.total_memory();
     }
 
@@ -1525,15 +1639,20 @@ impl LuaVm {
             Duration::from_millis(STORE_COMMIT_CREDIT_MAX_MS).saturating_sub(state.store_credit);
         let host_remaining =
             Duration::from_millis(HOST_CALL_CREDIT_MAX_MS).saturating_sub(state.host_credit);
+        let config_remaining =
+            Duration::from_millis(CONFIG_COMMIT_CREDIT_MAX_MS).saturating_sub(state.config_credit);
         let store_credit = reading.credit.min(store_remaining);
         let host_credit = reading.host_call_credit.min(host_remaining);
+        let config_credit = reading.config_commit_credit.min(config_remaining);
         SegmentReading {
             charged: reading
                 .raw
                 .saturating_sub(store_credit)
-                .saturating_sub(host_credit),
+                .saturating_sub(host_credit)
+                .saturating_sub(config_credit),
             store_credit,
             host_credit,
+            config_credit,
             total_elapsed: state.elapsed.saturating_add(reading.raw),
         }
     }
@@ -1545,6 +1664,8 @@ impl LuaVm {
             duration_ms(state.store_credit.saturating_add(reading.store_credit));
         self.host_call_credit_ms =
             duration_ms(state.host_credit.saturating_add(reading.host_credit));
+        self.config_commit_credit_ms =
+            duration_ms(state.config_credit.saturating_add(reading.config_credit));
         self.memory_used = self.lua.total_memory();
         if reading.total_elapsed >= Duration::from_millis(self.warning_ms)
             && !state.warning_triggered
@@ -1562,6 +1683,7 @@ impl LuaVm {
         state.elapsed = reading.total_elapsed;
         state.store_credit = state.store_credit.saturating_add(reading.store_credit);
         state.host_credit = state.host_credit.saturating_add(reading.host_credit);
+        state.config_credit = state.config_credit.saturating_add(reading.config_credit);
         self.warning_triggered = state.warning_triggered;
     }
 
@@ -2055,19 +2177,19 @@ mod vm_unit_tests {
         let cap = Duration::from_millis(STORE_COMMIT_CREDIT_MAX_MS);
         let ms = Duration::from_millis;
         // Fully credited commit I/O: nothing charged, raw preserved.
-        let full = BudgetReading::new(ms(60), ms(60), Duration::ZERO);
+        let full = BudgetReading::new(ms(60), ms(60), Duration::ZERO, Duration::ZERO);
         assert_eq!(
             (full.raw, full.credit, full.charged),
             (ms(60), ms(60), ms(0))
         );
         // No credit: everything charged.
-        let none = BudgetReading::new(ms(60), Duration::ZERO, Duration::ZERO);
+        let none = BudgetReading::new(ms(60), Duration::ZERO, Duration::ZERO, Duration::ZERO);
         assert_eq!(none.charged, ms(60));
         // Credit past the cap: the excess is charged.
-        let over = BudgetReading::new(cap + ms(80), cap + ms(80), Duration::ZERO);
+        let over = BudgetReading::new(cap + ms(80), cap + ms(80), Duration::ZERO, Duration::ZERO);
         assert_eq!((over.credit, over.charged), (cap, ms(80)));
         // Credit never exceeds raw time.
-        let bounded = BudgetReading::new(ms(5), ms(9), Duration::ZERO);
+        let bounded = BudgetReading::new(ms(5), ms(9), Duration::ZERO, Duration::ZERO);
         assert_eq!((bounded.credit, bounded.charged), (ms(5), ms(0)));
     }
 
@@ -2075,7 +2197,7 @@ mod vm_unit_tests {
     fn budget_reading_credits_host_call_time_under_its_own_cap() {
         let ms = Duration::from_millis;
         // Two real spawn waits inside one callback: nothing charged.
-        let two_spawns = BudgetReading::new(ms(70), Duration::ZERO, ms(70));
+        let two_spawns = BudgetReading::new(ms(70), Duration::ZERO, ms(70), Duration::ZERO);
         assert_eq!(
             (
                 two_spawns.host_call_credit,
@@ -2086,17 +2208,17 @@ mod vm_unit_tests {
         );
         // A bounded spawn wait longer than the old fixed 200 ms cap is fully
         // credited: the cap now matches the supervised-call deadline.
-        let slow_wait = BudgetReading::new(ms(300), Duration::ZERO, ms(300));
+        let slow_wait = BudgetReading::new(ms(300), Duration::ZERO, ms(300), Duration::ZERO);
         assert_eq!(
             (slow_wait.host_call_credit, slow_wait.charged),
             (ms(300), ms(0))
         );
         // Host time past the cap is charged like any other time.
         let cap = Duration::from_millis(HOST_CALL_CREDIT_MAX_MS);
-        let over = BudgetReading::new(cap + ms(80), Duration::ZERO, cap + ms(80));
+        let over = BudgetReading::new(cap + ms(80), Duration::ZERO, cap + ms(80), Duration::ZERO);
         assert_eq!((over.host_call_credit, over.charged), (cap, ms(80)));
         // Both credits compose without double counting or exceeding raw.
-        let both = BudgetReading::new(ms(100), ms(30), ms(90));
+        let both = BudgetReading::new(ms(100), ms(30), ms(90), Duration::ZERO);
         assert_eq!(
             (both.credit, both.host_call_credit, both.charged),
             (ms(30), ms(70), ms(0))
@@ -2166,6 +2288,57 @@ mod vm_unit_tests {
         let reading = mark.read();
         assert_eq!(reading.credit, Duration::ZERO);
         assert!(reading.charged >= ms(2));
+    }
+
+    #[test]
+    fn config_write_is_credited_only_when_it_committed() {
+        let ms = Duration::from_millis;
+        let before = config_commit_credit_total();
+        // A refused or stale write changed nothing: no credit.
+        let window = ConfigCommitWindow::open();
+        std::thread::sleep(ms(2));
+        window.close(false);
+        assert_eq!(config_commit_credit_total(), before);
+        // A committed write is credited by its measured span.
+        let window = ConfigCommitWindow::open();
+        std::thread::sleep(ms(5));
+        window.close(true);
+        assert!(
+            config_commit_credit_total() >= before + ms(5),
+            "a committed write's host I/O must be credited"
+        );
+        // Credit recorded before a mark never shortens that mark's clock.
+        let mark = BudgetMark::now();
+        std::thread::sleep(ms(2));
+        let reading = mark.read();
+        assert_eq!(reading.config_commit_credit, Duration::ZERO);
+        assert!(reading.charged >= ms(2));
+    }
+
+    #[test]
+    fn budget_reading_credits_config_write_time_under_its_own_cap() {
+        let ms = Duration::from_millis;
+        // A slow durable write inside one callback: nothing charged.
+        let slow = BudgetReading::new(ms(80), Duration::ZERO, Duration::ZERO, ms(80));
+        assert_eq!(
+            (slow.config_commit_credit, slow.charged, slow.raw),
+            (ms(80), ms(0), ms(80))
+        );
+        // Write time past the cap is charged like any other time.
+        let cap = Duration::from_millis(CONFIG_COMMIT_CREDIT_MAX_MS);
+        let over = BudgetReading::new(cap + ms(80), Duration::ZERO, Duration::ZERO, cap + ms(80));
+        assert_eq!((over.config_commit_credit, over.charged), (cap, ms(80)));
+        // Every credit composes without double counting or exceeding raw.
+        let all = BudgetReading::new(ms(200), ms(30), ms(90), ms(50));
+        assert_eq!(
+            (
+                all.credit,
+                all.host_call_credit,
+                all.config_commit_credit,
+                all.charged
+            ),
+            (ms(30), ms(90), ms(50), ms(30))
+        );
     }
 
     #[test]

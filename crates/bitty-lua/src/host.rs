@@ -7073,11 +7073,21 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             .to_error(ctx));
                         }
                     };
-                    let (applied, reload) = state
-                        .bounded_mutation(|expiry| {
-                            state.services.config_set(&key, &value, &digest, expiry)
-                        })
-                        .map_err(|error| error.to_error(ctx))?;
+                    // bitty#2972: the durable user-layer write is host I/O the
+                    // plugin neither performs nor controls (temp file, fsync,
+                    // rename, directory fsync, rolling `.bak`). Credit the
+                    // committed span against the RC-1 hard wall limit so a
+                    // disk slower than the per-tick budget cannot suspend the
+                    // generation that asked for the change — a suspension
+                    // releases that generation's overlay capture and clears
+                    // its UI blocks. A refused or stale write changed nothing
+                    // and earns no credit.
+                    let window = crate::ConfigCommitWindow::open();
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state.services.config_set(&key, &value, &digest, expiry)
+                    });
+                    window.close(matches!(&outcome, Ok((true, _))));
+                    let (applied, reload) = outcome.map_err(|error| error.to_error(ctx))?;
                     stack.replace(
                         ctx,
                         LuaValue::table([
@@ -7260,13 +7270,16 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             .to_error(ctx));
                         }
                     };
-                    let (changed, reload) = state
-                        .bounded_mutation(|expiry| {
-                            state
-                                .services
-                                .config_set_enabled(&id, enabled, &digest, expiry)
-                        })
-                        .map_err(|error| error.to_error(ctx))?;
+                    // bitty#2972: same durable-write credit as `config.set`;
+                    // the managed-ledger replace is host I/O too.
+                    let window = crate::ConfigCommitWindow::open();
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state
+                            .services
+                            .config_set_enabled(&id, enabled, &digest, expiry)
+                    });
+                    window.close(matches!(&outcome, Ok((true, _))));
+                    let (changed, reload) = outcome.map_err(|error| error.to_error(ctx))?;
                     stack.replace(
                         ctx,
                         LuaValue::table([
@@ -7418,11 +7431,15 @@ fn build_bitty_root<'gc>(ctx: Context<'gc>, state: &Rc<BridgeState>) -> Value<'g
                             .to_error(ctx));
                         }
                     };
-                    let (changed, reload, pending_restart) = state
-                        .bounded_mutation(|expiry| {
-                            state.services.profiles_use(&name, &digest, expiry)
-                        })
-                        .map_err(|error| error.to_error(ctx))?;
+                    // bitty#2972: same durable-write credit as `config.set`;
+                    // the selector replace is host I/O too.
+                    let window = crate::ConfigCommitWindow::open();
+                    let outcome = state.bounded_mutation(|expiry| {
+                        state.services.profiles_use(&name, &digest, expiry)
+                    });
+                    window.close(matches!(&outcome, Ok((true, _, _))));
+                    let (changed, reload, pending_restart) =
+                        outcome.map_err(|error| error.to_error(ctx))?;
                     stack.replace(
                         ctx,
                         LuaValue::table([

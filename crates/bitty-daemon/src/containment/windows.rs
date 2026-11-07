@@ -232,8 +232,14 @@ impl ContainedChild {
             .active_processes()
             .map_or(0, |active| usize::try_from(active).unwrap_or(usize::MAX));
         let _ = self.job.terminate(JOB_TERMINATION_EXIT_CODE);
+        // `try_wait` consumes the exit status: a second call after the loop
+        // already reaped the child answers `Ok(None)`, which would turn a
+        // verified sweep into `unverified`. Record the reap where it happens.
+        let mut reaped = false;
         let drained = wait_bounded(limits.kill_wait(), limits, || {
-            let _ = self.child.try_wait();
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                reaped = true;
+            }
             self.job.active_processes().is_ok_and(|active| active == 0)
         });
         if !drained {
@@ -242,7 +248,9 @@ impl ContainedChild {
             // fail-closed.
             let _ = self.job.terminate(JOB_TERMINATION_EXIT_CODE);
         }
-        let reaped = matches!(self.child.try_wait(), Ok(Some(_)));
+        if !reaped {
+            reaped = matches!(self.child.try_wait(), Ok(Some(_)));
+        }
         let empty = self.job.active_processes().is_ok_and(|active| active == 0);
         CleanupOutcome {
             class: if empty && reaped {

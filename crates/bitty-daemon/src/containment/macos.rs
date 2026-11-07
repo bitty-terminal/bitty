@@ -209,12 +209,19 @@ impl ContainedChild {
         }
         // The kill is already on its way to the recorded group; reap the
         // leader inside the bounded window so the group can be observed empty.
+        // `try_wait` consumes the exit status, so record the reap where it
+        // happens instead of asking again after the loop.
+        let mut reaped = false;
         let _ = wait_bounded(limits.kill_wait(), limits, || {
-            let _ = self.child.try_wait();
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                reaped = true;
+            }
             drain_group(self.group.get());
             !group_has_members(self.group.get())
         });
-        let reaped = matches!(self.child.try_wait(), Ok(Some(_)));
+        if !reaped {
+            reaped = matches!(self.child.try_wait(), Ok(Some(_)));
+        }
         let gone = !group_has_members(self.group.get());
         CleanupOutcome {
             class: if gone && reaped && signalled > 0 {

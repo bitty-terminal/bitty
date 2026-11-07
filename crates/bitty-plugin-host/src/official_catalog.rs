@@ -14,7 +14,7 @@ use crate::official::OfficialPlugin;
 pub const SOURCE_REPOSITORY: &str = "https://github.com/bitty-terminal/bitty-plugins";
 
 /// Exact registry commit this catalog was generated from.
-pub const SOURCE_REVISION: &str = "bad9843b06a47cb164b54bdc5e068db1cf31d149";
+pub const SOURCE_REVISION: &str = "dcd6777590afbdce5c929546ab061d4e7996cd91";
 
 /// Official plugin entries, sorted by canonical id.
 pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
@@ -77,8 +77,8 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.dashboard",
         name: "Dashboard",
         repository: "https://github.com/bitty-terminal/dashboard.git",
-        pin: "5a599158d019b278bcd2596173714dd4afb27f78",
-        manifest_hash: "sha256:ff9a2e6ea3538bf9af079d0095342b96ab2000632cbdd4ae723a9e31efdb7408",
+        pin: "96f425fdcb0471b8953337b413b452726194a6b6",
+        manifest_hash: "sha256:ffb3532cea97e4417aa70f51aa3f3d4fe422ef41154d1efb82c9395d15578095",
         compat_bitty: Some(">=0.0.26"),
         compat_plugin_api: Some("^1.0"),
         description: "Read-only configuration and status dashboard over bitty.runtime.inspect(): plugins, extensions, settings, profiles, and diagnostics in one panel.",
@@ -99,8 +99,8 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.git-panel",
         name: "Git Panel",
         repository: "https://github.com/bitty-terminal/git-panel.git",
-        pin: "6aa7965e7b5e4bb4bfa64d49cda8f59e1617986c",
-        manifest_hash: "sha256:2d4ebbe92f3acb5ffa87dee15d81c75f5e1ef889940c504cad6f8a7533d1effe",
+        pin: "9d54372aeab2b0101db6e777eae82be8957885bd",
+        manifest_hash: "sha256:fb18021aba54da25256d01edf2e6fdc6caef9012e9e1f71f1af74ac745f2ace6",
         compat_bitty: Some(">=0.0.24"),
         compat_plugin_api: Some("^1.0"),
         description: "Read-only branch, status, diff, and log panel for the Git repository behind the focused pane.",
@@ -121,8 +121,8 @@ pub static OFFICIAL_PLUGINS: &[OfficialPlugin] = &[
         id: "bitty-terminal.palette",
         name: "Palette",
         repository: "https://github.com/bitty-terminal/palette.git",
-        pin: "b023106bccd83db9e6efae66060b64db96f86cfe",
-        manifest_hash: "sha256:291bfcd222ff0d6cfc4acfb2fc4f27a2e6f2bd993e777262ad5d2f14b7c1b884",
+        pin: "5a5d5c3e8ff34216ea5afbf2aa3addd037421038",
+        manifest_hash: "sha256:53e334de7f98631f68af21495d1dc9c40c7ed27211cdab5062ed0c95ef191547",
         compat_bitty: Some(">=0.0.24"),
         compat_plugin_api: Some("^1.0"),
         description: "Command palette and picker UI via overlay slot, declarative primitives only.",

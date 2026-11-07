@@ -650,8 +650,14 @@ pub struct Runtime {
     /// flag keeps the retry path alive instead of silently staying headless
     /// until restart.
     gpu_reattach_required: bool,
-    /// Corrective full repaints requested because the last abandoned worker
-    /// exited (diagnostics/test evidence).
+    /// Corrective full repaints requested by a recovery path (diagnostics
+    /// evidence): the last abandoned worker exited, or a committed present was
+    /// never confirmed by the compositor (bitty#2989).
+    ///
+    /// The abandoned-worker case is attributed by the paired
+    /// [`Self::forced_repaint_owed`] flag and the committed-frame counter; an
+    /// unconfirmed present also moves the surface telemetry's
+    /// `present_unconfirmed` slot, so the two causes stay distinguishable.
     forced_repaint_requests: u64,
     /// A corrective repaint is owed and the next submitted frame carries it.
     forced_repaint_owed: bool,
@@ -1457,6 +1463,41 @@ pub struct Runtime {
     /// visible or holds nothing to repaint, so an idle hidden window still
     /// arms nothing.
     hidden_repair_at: Option<std::time::Instant>,
+    /// Deadline for the compositor to confirm the last committed frame
+    /// (bitty#2989).
+    ///
+    /// A present can report success and still never reach the screen: the
+    /// commit is dropped, or the compositor never samples the surface again.
+    /// Damage is already consumed at that point, so nothing is owed and no
+    /// retry is armed - the window keeps the older frame while the loop parks
+    /// in `ControlFlow::Wait`. After a commit the runtime arms this bound; the
+    /// embedder clears it when the compositor serves a frame callback
+    /// (`note_present_confirmed`), and a deadline that fires first forces one
+    /// corrective repaint. `None` while no confirmation is outstanding, so a
+    /// healthy idle window arms nothing.
+    present_confirm_at: Option<std::time::Instant>,
+    /// Consecutive unconfirmed presents since the last confirmation, bounded
+    /// by the presenter's repair limit.
+    ///
+    /// A surface that never confirms again (a wedged compositor, a lost
+    /// callback path) must not be repainted every bound forever; the budget
+    /// stops the corrective presents. Reset with the surface incarnation
+    /// (a fresh presenter, a resize) so a new one starts with the full budget.
+    present_confirm_misses: u32,
+    /// Whether [`Runtime::check_present_confirmation`] reopened a closed
+    /// visibility gate speculatively (bitty#2989).
+    ///
+    /// The 300 ms starvation probe infers occlusion from an unanswered
+    /// redraw, which is the same evidence a dropped frame leaves behind, so
+    /// an expiry can be the counter-evidence that the surface is still
+    /// mapped. That reopen is an *experiment*: nothing has yet proven the
+    /// surface visible. While this is `true`, a repair attempt that does not
+    /// commit (a failed acquire, a stuck worker) closes the gate again and
+    /// leaves a genuinely occluded surface its retained damage plus the
+    /// bounded hidden repair - one blind attempt per occlusion epoch. A
+    /// committed frame, a served confirmation, or a real visibility edge
+    /// resolves the speculation and clears this.
+    speculative_present_reopen: bool,
     /// Test-only present-failure seam (issue #2570 B1).
     ///
     /// Forces the real-GPU branch and injects a bounded number of failures so
@@ -2304,6 +2345,9 @@ impl Runtime {
             // every existing present schedule keep their pre-change behavior.
             surface_visible: true,
             hidden_repair_at: None,
+            present_confirm_at: None,
+            present_confirm_misses: 0,
+            speculative_present_reopen: false,
             #[cfg(test)]
             test_present: None,
             pending_activation_gesture: None,
@@ -2627,6 +2671,9 @@ impl Runtime {
             // every existing present schedule keep their pre-change behavior.
             surface_visible: true,
             hidden_repair_at: None,
+            present_confirm_at: None,
+            present_confirm_misses: 0,
+            speculative_present_reopen: false,
             #[cfg(test)]
             test_present: None,
             pending_activation_gesture: None,
@@ -2980,6 +3027,15 @@ impl Runtime {
         self.abandoned_workers_alive = 0;
         self.abandoned_check_at = None;
         self.forced_repaint_owed = false;
+        // bitty#2989: the confirmation belonged to the surface incarnation that
+        // just went away, and so did its repair budget - a fresh incarnation
+        // starts with the full one. The speculation survives on purpose
+        // (review R8): the incarnation change does not prove the surface
+        // visible, so dropping the flag while the gate is open would strand an
+        // unresolved reopen. It is settled by the next commit/confirmation, and
+        // a failed present of the new incarnation closes the gate.
+        self.present_confirm_at = None;
+        self.present_confirm_misses = 0;
     }
 
     /// Current Kitty keyboard flags (7727 bitmask). 0 = legacy.

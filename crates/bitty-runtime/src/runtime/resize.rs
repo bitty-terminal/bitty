@@ -515,8 +515,13 @@ impl Runtime {
             presenter.resize(surface_extent, opacity);
             self.surface = super::headless_mirror(surface_extent, opacity, palette)?;
             self.pending_present = None;
-            // bitty#2989: the confirmation described the pre-resize frame.
+            // bitty#2989: the confirmation described the pre-resize frame. Its
+            // repair budget goes with it, so the new surface incarnation starts
+            // with the full one; an unresolved speculative reopen cannot commit
+            // the frame it was for either.
             self.present_confirm_at = None;
+            self.present_confirm_misses = 0;
+            self.speculative_present_reopen = false;
         } else if let Some(gpu) = self.gpu.as_ref() {
             self.surface
                 .resize(gpu, surface_extent)

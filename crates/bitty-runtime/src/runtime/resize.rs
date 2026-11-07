@@ -517,11 +517,15 @@ impl Runtime {
             self.pending_present = None;
             // bitty#2989: the confirmation described the pre-resize frame. Its
             // repair budget goes with it, so the new surface incarnation starts
-            // with the full one; an unresolved speculative reopen cannot commit
-            // the frame it was for either.
+            // with the full one. The *speculation* is deliberately kept
+            // (review R8): a resize answers nothing about whether the surface
+            // is on screen, so clearing the flag here would leave the gate open
+            // with no mechanism left to close it. It stays until a commit or a
+            // confirmation settles it, and the first present of the resized
+            // surface either settles it that way or fails, which closes the
+            // gate through `restore_hidden_after_blind_repair`.
             self.present_confirm_at = None;
             self.present_confirm_misses = 0;
-            self.speculative_present_reopen = false;
         } else if let Some(gpu) = self.gpu.as_ref() {
             self.surface
                 .resize(gpu, surface_extent)

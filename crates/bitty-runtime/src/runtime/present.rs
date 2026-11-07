@@ -91,7 +91,8 @@ const PRESENT_MIN_WAKE: std::time::Duration = std::time::Duration::from_millis(1
 /// while hidden treats the hide as a possible false positive: it reopens the
 /// gate speculatively and presents once
 /// (see `check_present_confirmation`). A surface that really is hidden fails
-/// that attempt, the gate closes again, and the cost is one blind attempt per
+/// that attempt on either present path (off-thread presenter or synchronous
+/// GPU), the gate closes again, and the cost is one blind attempt per
 /// occlusion epoch rather than a frame loop.
 const PRESENT_CONFIRM_BOUND: std::time::Duration = std::time::Duration::from_millis(750);
 
@@ -102,12 +103,18 @@ const PRESENT_CONFIRM_BOUND: std::time::Duration = std::time::Duration::from_mil
 /// a permanently broken surface into a periodic frame source.
 ///
 /// This budget counts frames *this runtime submits*; it is not the lifetime
-/// bound of a hidden surface. For a genuinely occluded surface the binding
-/// budgets are the acquire-retry backoff (`SURFACE_RETRY_MAX`, 1 s), the
-/// stuck-present recovery (`PRESENT_RECOVERY_LIMIT` replacement workers) and
-/// the GPU reattach cooldown (`PRESENT_REATTACH_RETRY`, 5 s). The blind repair
-/// itself is attempted once per occlusion epoch, because a repair that cannot
-/// commit re-closes the gate instead of re-arming this budget.
+/// bound of a hidden surface. A repair that cannot commit re-closes the gate
+/// instead of re-arming this budget ([`Self::restore_hidden_after_blind_repair`]):
+/// the surface is paused, the frame is retained as damage, and the
+/// [`HIDDEN_REPAIR_INTERVAL_MS`] probe (1 s) owns the next attempt - the #2570
+/// retry is suspended by the same transition, so `SURFACE_RETRY_MAX` does not
+/// bound this path. The retry ladder (`SURFACE_RETRY_MAX` 1 s backoff,
+/// `PRESENT_RECOVERY_LIMIT` replacement workers, `PRESENT_REATTACH_RETRY` 5 s)
+/// only applies where the re-close cannot run: a surface this runtime still
+/// treats as visible (an ordinary acquire failure) and a presenter whose own
+/// recovery failed. A repair that blocks past `PRESENT_STUCK_BOUND` spends one
+/// recovery slot per occlusion epoch, so the 5 s reattach cooldown only shows
+/// up after three such epochs.
 const PRESENT_CONFIRM_REPAIR_LIMIT: u32 = 3;
 
 /// Commit data for the newest frame submitted to the off-thread presenter.
@@ -8149,6 +8156,15 @@ impl Runtime {
                 self.pending_full_redraw = true;
                 // bitty#2989: the failed-present retry owns this frame.
                 self.clear_present_confirmation();
+                // bitty#2989 review R8: the expiry reopen is speculative on
+                // this path too. There is no worker to pause here, but a
+                // present that cannot acquire is still the answer to the
+                // speculation: close the gate so the surface keeps its damage
+                // for the bounded hidden repair instead of paying a full frame
+                // build per retry step for the rest of the occlusion epoch.
+                if self.speculative_present_reopen {
+                    self.restore_hidden_after_blind_repair(now);
+                }
                 return None;
             }
             if let Some(gpu) = self.gpu.as_ref() {
@@ -8181,6 +8197,14 @@ impl Runtime {
                         self.pending_full_redraw = true;
                         // bitty#2989: the failed-present retry owns this frame.
                         self.clear_present_confirmation();
+                        // bitty#2989 review R8: a synchronous present has no
+                        // worker, but a speculatively reopened gate still gets
+                        // the same answer - the repair could not commit, so
+                        // close the gate and hand the surface to the bounded
+                        // hidden repair rather than the retry loop.
+                        if self.speculative_present_reopen {
+                            self.restore_hidden_after_blind_repair(now);
+                        }
                         return None;
                     }
                 }
@@ -12859,9 +12883,14 @@ mod async_present_tests {
     /// Serializes the tests that read or advance the process-global
     /// `present_unconfirmed` counter.
     ///
-    /// The counter is global and these tests run in parallel, so a snapshot
-    /// pair taken by one of them can straddle another's corrective repaint.
-    /// Only these tests touch that counter; everything else stays parallel.
+    /// The counter is global and these tests run in parallel. Every test that
+    /// asserts an exact snapshot delta reads it -
+    /// `an_unconfirmed_present_survives_a_synthetic_occlusion_edge`,
+    /// `a_confirmed_present_arms_no_repair` and
+    /// `a_confirmation_due_with_a_frame_in_flight_is_not_a_miss` - and any
+    /// other test that can reach `check_present_confirmation` advances it, so
+    /// both classes take this guard: a reader's snapshot pair must not straddle
+    /// another test's corrective repaint. Everything else stays parallel.
     static PRESENT_UNCONFIRMED_GUARD: Mutex<()> = Mutex::new(());
 
     fn unconfirmed_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -13489,10 +13518,15 @@ mod async_present_tests {
     fn a_blind_repair_of_a_hidden_surface_is_attempted_once() {
         let _guard = unconfirmed_guard();
         let control = Control::new(false);
+        // The bound is generous on purpose: the healthy commit below ticks on
+        // the real clock, and a loaded runner must not age that frame past the
+        // stuck bound. The blind repair is still triggered deterministically -
+        // see the tick below.
+        let stuck_bound = Duration::from_secs(1);
         let mut runtime = runtime_with(
             &control,
             PresenterConfig {
-                stuck_bound: Duration::from_millis(20),
+                stuck_bound,
                 shutdown_bound: Duration::from_millis(20),
                 ack_capacity: 4,
                 ..PresenterConfig::default()
@@ -13533,10 +13567,15 @@ mod async_present_tests {
         assert!(wait_until(|| control.gate.entered() >= 2, TEST_WAIT));
 
         // The stuck bound fires; the recovery is the answer to the speculation.
+        // The instant is real-clock and pushed past `stuck_bound` on purpose:
+        // `in_flight_age` measures the episode against the presenter's real
+        // `Instant` epoch, so ticking at an instant inherited from the
+        // synthetic `deadline` timeline saturates the age to zero whenever a
+        // loaded runner takes longer than that offset to park the worker in the
+        // gate, and the stuck branch then never fires (review R9).
         assert!(
-            runtime
-                .tick_at(deadline + Duration::from_millis(20))
-                .is_none()
+            runtime.tick_at(Instant::now() + stuck_bound).is_none(),
+            "the stuck recovery repaints nothing by itself"
         );
         assert!(
             !runtime.is_surface_visible(),
@@ -13583,6 +13622,108 @@ mod async_present_tests {
 
         control.gate.release();
         let _ = runtime.shutdown_with_timeout(Duration::from_millis(50));
+    }
+
+    /// bitty#2989 review R8: the same one-blind-attempt rule on the
+    /// presenter-less path.
+    ///
+    /// `check_present_confirmation` reopens a closed gate speculatively whether
+    /// or not a presenter exists, and on the synchronous GPU path the attempt
+    /// itself is the only evidence of failure - there is no worker ack, no
+    /// stuck bound and no dead-worker branch to hang the re-close on. Without
+    /// one, the gate stays open and every #2570 retry step rebuilds and
+    /// re-attempts a full frame for the rest of the occlusion epoch, which is
+    /// exactly the loop the off-thread re-close removes.
+    ///
+    /// No thread and no wall-clock race: the injected present failure is the
+    /// failure, and every instant after the first commit is synthetic.
+    #[test]
+    fn a_blind_repair_without_a_presenter_closes_the_gate_again() {
+        let _guard = unconfirmed_guard();
+        let mut runtime =
+            Runtime::with_deterministic_rasterizer(RuntimeConfig::default()).expect("runtime");
+        assert!(
+            runtime.presenter.is_none(),
+            "this test drives the synchronous present path"
+        );
+        assert!(runtime.is_surface_visible(), "the surface starts visible");
+
+        // One committed frame, so the hide below retains nothing.
+        runtime.handle_pty_bytes(b"stale frame");
+        runtime.enable_test_present(0);
+        runtime.pending_full_redraw = true;
+        tick_until_committed(&mut runtime, TEST_WAIT).expect("the first frame presents");
+
+        // Production arms this from the commit; the headless-route present has
+        // no compositor, so the seam stands in for it.
+        let committed_at = Instant::now();
+        runtime.arm_present_confirmation_for_test(committed_at);
+        let hide_at = committed_at + Duration::from_millis(300);
+        runtime.set_surface_visibility_at(hide_at, false);
+        assert!(
+            !runtime.is_surface_visible(),
+            "the synthetic probe hides it"
+        );
+        let deadline = runtime
+            .present_confirm_deadline()
+            .expect("a hide that retained nothing keeps the bound");
+        assert_eq!(
+            deadline,
+            committed_at + PRESENT_CONFIRM_BOUND,
+            "the bound is the counter-evidence for the hide"
+        );
+        assert!(
+            runtime.hidden_repair_deadline().is_none(),
+            "the commit consumed the damage, so the hide armed no repair"
+        );
+
+        // The expiry reopens the gate speculatively and the repair's acquire
+        // fails - on this path the present call is the failure.
+        runtime.enable_test_present(1);
+        assert!(
+            runtime.tick_at(deadline).is_none(),
+            "the failed repair presents nothing"
+        );
+        assert_eq!(
+            runtime.test_present_attempts(),
+            1,
+            "exactly one blind attempt reached the driver"
+        );
+        assert!(
+            !runtime.is_surface_visible(),
+            "a synchronous repair that cannot commit closes the gate again"
+        );
+        assert!(
+            !runtime.speculative_present_reopen,
+            "the failed attempt settled the speculation"
+        );
+        assert_eq!(
+            runtime.surface_retry_deadline(),
+            None,
+            "the re-close suspends the retry the failure just armed"
+        );
+        assert!(
+            runtime.hidden_repair_deadline().is_some(),
+            "the retained frame goes back to the bounded hidden repair"
+        );
+        assert!(runtime.pending_full_redraw, "the frame stays owed");
+
+        // Several further bounds: an occluded surface costs nothing more.
+        // Without the re-close the gate stays open and each of these ticks
+        // rebuilds and re-submits a frame on the retry deadline.
+        for step in 1..=4u32 {
+            let at = deadline + PRESENT_CONFIRM_BOUND * step;
+            assert!(
+                runtime.tick_at(at).is_none(),
+                "a hidden surface must not present on an unrelated bound"
+            );
+        }
+        assert_eq!(
+            runtime.test_present_attempts(),
+            1,
+            "one blind attempt per occlusion epoch, not one per retry step"
+        );
+        assert!(runtime.shutdown());
     }
 
     /// The healthy half of bitty#2989: a served frame callback disarms the
@@ -13676,6 +13817,7 @@ mod async_present_tests {
     /// stuck-present bound owns a worker that never acks.
     #[test]
     fn a_confirmation_due_with_a_frame_in_flight_is_not_a_miss() {
+        let _guard = unconfirmed_guard();
         let control = Control::new(false);
         let mut runtime = runtime_with(
             &control,

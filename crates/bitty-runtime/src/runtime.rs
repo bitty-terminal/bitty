@@ -3029,10 +3029,13 @@ impl Runtime {
         self.forced_repaint_owed = false;
         // bitty#2989: the confirmation belonged to the surface incarnation that
         // just went away, and so did its repair budget - a fresh incarnation
-        // starts with the full one.
+        // starts with the full one. The speculation survives on purpose
+        // (review R8): the incarnation change does not prove the surface
+        // visible, so dropping the flag while the gate is open would strand an
+        // unresolved reopen. It is settled by the next commit/confirmation, and
+        // a failed present of the new incarnation closes the gate.
         self.present_confirm_at = None;
         self.present_confirm_misses = 0;
-        self.speculative_present_reopen = false;
     }
 
     /// Current Kitty keyboard flags (7727 bitmask). 0 = legacy.

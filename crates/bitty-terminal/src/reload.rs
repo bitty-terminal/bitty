@@ -30,6 +30,18 @@
 //! re-spawned and no layout is rebuilt. A changed field the runtime cannot
 //! adopt live is reported as `restart-required` and stays at its launch value.
 //!
+//! The plugin set is not part of that plan (bitty#2969). It has two persisted
+//! sources, and a running instance applies neither without a restart: the
+//! installed plugin store, read by startup discovery only, and the managed
+//! bundled ledger (`bitty-plugins.lua`), which `bitty plugin enable|disable`
+//! writes for bundled ids and no startup pass reads. The plugin host can
+//! rebuild one generation but `PluginRuntime::reload` is teardown-then-rebuild
+//! (a failed load leaves the plugin disposed, not unchanged) and enabling needs
+//! a whole-store `discover()` pass. A change in either source since launch is
+//! therefore reported as `restart-required` with the affected plugin ids and
+//! exits 4, never a silent no-op; `bitty plugin enable|disable` prints the same
+//! hint.
+//!
 //! A daemon-owned, debounced, per-file watcher is the `bittyd` follow-up and
 //! is not part of this command: `bitty reload` is an explicit, scriptable
 //! request, while the in-process poll watcher keeps working independently.
@@ -41,6 +53,10 @@
 //! - `2` usage error (unknown flag, stray positional, bad `--format`).
 //! - `3` rejected / load error / apply error: the running plan is untouched
 //!   and the diagnostic names the dotted field path.
+//! - `4` the plugin set changed since launch and only a restart can apply it
+//!   (an installed package) or nothing can (a bundled id, whose body ships with
+//!   the build): the reply names the affected plugin ids under
+//!   `plugins_restart_required` and never reads as an applied reload.
 //! - `6` runtime unavailable (no live instance, ambiguous instance, transport
 //!   failure, or an instance that does not serve live reload, e.g. `--safe`).
 //! - `7` permission (the instance did not grant `config.modify`).
@@ -63,6 +79,13 @@ use crate::ctl::{CtlFormat, CtlTargeting};
 pub const EXIT_OK: i32 = 0;
 /// CLI usage error (unknown flag, stray positional, bad `--format`).
 pub const EXIT_USAGE: i32 = 2;
+/// A plugin-set change can only be applied by a restart (bitty#2969).
+///
+/// Distinct from the config `restart-required` class (exit 0): a config field
+/// the runtime cannot adopt live is still part of the accepted reload plan,
+/// while the installed plugin set is a separate resource the reload verb never
+/// applies. Reporting success would recreate the silent no-op of bitty#2969.
+pub const EXIT_RESTART: i32 = 4;
 
 // ---------------------------------------------------------------------------
 // Request model
@@ -117,10 +140,16 @@ pub fn reload_usage() -> String {
          Applies theme/palette, font family and size, keymaps, Leader, appearance\n\
          and statusline options; workspaces, windows, panes, their PTYs and\n\
          scrollback are preserved. A change the runtime cannot adopt live is\n\
-         reported as restart-required, never silently ignored.\n\
+         reported as restart-required, never silently ignored. The plugin set\n\
+         plugin set (bitty plugin enable|disable: installed packages and the bundled\n\
+         ledger) is not part of the config\n\
+         plan: a change since launch is reported as restart-required with the\n\
+         plugin ids and exits 4 (an installed package applies on the next\n\
+         start; a bundled id stays a ledger entry).\n\
          \n\
-         Exit codes: 0 applied/unchanged/dry-run/restart-required; 2 usage;\n\
-         \x20 3 rejected (dotted field path); 6 no live instance; 7 permission.\n\
+         Exit codes: 0 applied/unchanged/dry-run/restart-required (config);\n\
+         \x20 2 usage; 3 rejected (dotted field path); 4 plugin-set restart;\n\
+         \x20 6 no live instance; 7 permission.\n\
          \n\
          examples:\n\
          \x20 bitty reload\n\
@@ -158,14 +187,25 @@ pub fn reload_help_text() -> String {
           \x20 as restart-required and stay at their launch values.\n\
           \n\
           Result: the reply carries the running plan version, the changed dotted\n\
-          \x20 paths, the rejected dotted paths (with the reason), and the\n\
-          \x20 restart-required paths. --format json emits the v1 envelope under\n\
-          \x20 command core.config.reload; table output is human, not a contract.\n\
+          \x20 paths, the rejected dotted paths (with the reason), the\n\
+          \x20 restart-required paths, and the plugin ids whose installed\n\
+          \x20 enabled state changed since launch. --format json emits the v1\n\
+          \x20 envelope under command core.config.reload; table output is human,\n\
+          \x20 not a contract.\n\
           \n\
-          Exit codes: exit 0 applied/unchanged/dry-run/restart-required;\n\
-          \x20 exit 2 usage; exit 3 rejected or load/apply error; exit 6 no\n\
-          \x20 live instance, transport failure, or an instance that does not\n\
-          \x20 serve live reload (--safe); exit 7 permission.\n\
+          Plugin set: `bitty plugin enable|disable` edits the installed plugin\n\
+          \x20 store or the managed bundled ledger (bitty-plugins.lua); the\n\
+          \x20 running instance re-reads neither. A change since launch cannot\n\
+          \x20 be applied live (the plugin host's generation rebuild is\n\
+          \x20 teardown-then-rebuild and re-discovery is a whole-store pass), so\n\
+          \x20 it is reported as restart-required with the affected ids and\n\
+          \x20 exits 4. The running plugin generations are never touched.\n\
+          \n\
+          Exit codes: exit 0 applied/unchanged/dry-run, or restart-required for\n\
+          \x20 config fields; exit 2 usage; exit 3 rejected or load/apply error;\n\
+          \x20 exit 4 the plugin set needs a restart; exit 6 no live instance,\n\
+          \x20 transport failure, or an instance that does not serve live reload\n\
+          \x20 (--safe); exit 7 permission.\n\
           \n\
           Elevation: the instance must grant config.modify. Launch it with\n\
           \x20 BITTY_CTL_ELEVATE=config.modify; without that the request fails\n\
@@ -522,8 +562,10 @@ mod tests {
         assert!(help.contains("keymaps"), "{help}");
         assert!(help.contains("scrollback"), "{help}");
         assert!(help.contains("restart-required"), "{help}");
+        assert!(help.contains("plugin set"), "{help}");
         assert!(help.contains("--dry-run"), "{help}");
         assert!(help.contains("exit 3"), "{help}");
+        assert!(help.contains("exit 4"), "{help}");
         assert!(help.contains("exit 6"), "{help}");
     }
 }

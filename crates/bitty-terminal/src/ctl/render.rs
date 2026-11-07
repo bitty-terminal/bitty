@@ -347,6 +347,7 @@ fn render_reload_outcome(
     };
     let changed = extract_string_array(result_json, "changed").unwrap_or_default();
     let restart = extract_string_array(result_json, "restart_required").unwrap_or_default();
+    let plugins = extract_string_array(result_json, "plugins_restart_required").unwrap_or_default();
     let rejected = extract_string_array(result_json, "rejected").unwrap_or_default();
     let server_message = extract_string_from(result_json, "message").unwrap_or_default();
     let path = extract_string_from(result_json, "path").unwrap_or_default();
@@ -373,7 +374,7 @@ fn render_reload_outcome(
 
     if emit_json {
         println!("{}", format_success(REGISTRY, result_json));
-        return EXIT_OK;
+        return reload_exit(&plugins, dry_run);
     }
     print!(
         "{}",
@@ -381,13 +382,40 @@ fn render_reload_outcome(
             &kind,
             dry_run,
             extract_number(result_json, "plan_version"),
-            &changed,
-            &restart,
+            ReloadTableChanges {
+                changed: &changed,
+                restart: &restart,
+                plugins: &plugins,
+            },
             &path,
             &target.instance,
         )
     );
-    EXIT_OK
+    reload_exit(&plugins, dry_run)
+}
+
+/// Exit code for a reload reply (bitty#2969).
+///
+/// A pending plugin-set change is the one real reload outcome that cannot
+/// apply without a restart, so it is reported with the distinct restart code
+/// even though the config plan itself is valid (or already applied). A
+/// `--dry-run` only reports and keeps the documented dry-run exit 0.
+fn reload_exit(plugins_restart_required: &[String], dry_run: bool) -> i32 {
+    if dry_run || plugins_restart_required.is_empty() {
+        EXIT_OK
+    } else {
+        crate::reload::EXIT_RESTART
+    }
+}
+
+/// The three change lists a human reload table renders.
+struct ReloadTableChanges<'a> {
+    /// Dotted config paths that changed (or would change).
+    changed: &'a [String],
+    /// Dotted config paths that stay pending until restart.
+    restart: &'a [String],
+    /// Plugin ids whose installed enabled state changed since launch.
+    plugins: &'a [String],
 }
 
 /// Human table for a successful reload (not a machine contract).
@@ -395,11 +423,15 @@ fn render_reload_table(
     kind: &str,
     dry_run: bool,
     plan_version: Option<u64>,
-    changed: &[String],
-    restart: &[String],
+    changes: ReloadTableChanges<'_>,
     path: &str,
     instance: &str,
 ) -> String {
+    let ReloadTableChanges {
+        changed,
+        restart,
+        plugins,
+    } = changes;
     let mut out = String::new();
     let headline = if dry_run { "dry run" } else { kind };
     match plan_version {
@@ -427,6 +459,13 @@ fn render_reload_table(
     }
     if !restart.is_empty() {
         out.push_str(&format!("  restart required: {}\n", restart.join(", ")));
+    }
+    if !plugins.is_empty() {
+        out.push_str(&format!(
+            "  restart required (plugin set): {}\n  restart bitty to apply an \
+             installed-package change (a bundled id is ledger-only)\n",
+            plugins.join(", ")
+        ));
     }
     out
 }
@@ -637,6 +676,17 @@ fn render_table(request: &CtlRequest, result_json: &str, target: &ResolvedTarget
                     extract_string_array(result_json, "restart_required").unwrap_or_default();
                 if !restart.is_empty() {
                     out.push_str(&format!("  restart required: {}\n", restart.join(", ")));
+                }
+                // bitty#2969: the plugin set is a separate resource; a
+                // pending enable/disable is named here too, so the registry
+                // verb is never a silent no-op either.
+                let plugins = extract_string_array(result_json, "plugins_restart_required")
+                    .unwrap_or_default();
+                if !plugins.is_empty() {
+                    out.push_str(&format!(
+                        "  restart required (plugin set): {}\n",
+                        plugins.join(", ")
+                    ));
                 }
                 let rejected = extract_string_array(result_json, "rejected").unwrap_or_default();
                 if !rejected.is_empty() {
@@ -1028,4 +1078,48 @@ fn extract_object_body(text: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reload_exit, render_reload_table};
+
+    #[test]
+    fn pending_plugin_set_renders_and_exits_restart() {
+        // bitty#2969: the plugin-set change is named in the human table and
+        // never reads as a successful reload (exit 4, not 0).
+        let table = render_reload_table(
+            "restart-required",
+            false,
+            Some(1),
+            super::ReloadTableChanges {
+                changed: &[],
+                restart: &[],
+                plugins: &[String::from("xuepoo.fixture")],
+            },
+            "(defaults; no file)",
+            "dev",
+        );
+        assert!(
+            table.contains("restart required (plugin set): xuepoo.fixture"),
+            "{table}"
+        );
+        assert!(table.contains("restart bitty to apply"), "{table}");
+        assert!(
+            table.contains("a bundled id is ledger-only"),
+            "the table must not promise a restart applies a bundled id: {table}"
+        );
+        assert_eq!(
+            reload_exit(&[String::from("xuepoo.fixture")], false),
+            4,
+            "a pending plugin set exits the literal restart code"
+        );
+        assert_eq!(
+            reload_exit(&[String::from("xuepoo.fixture")], true),
+            super::EXIT_OK,
+            "a dry run only reports and keeps exit 0"
+        );
+        assert_eq!(reload_exit(&[], false), super::EXIT_OK);
+        assert_eq!(crate::reload::EXIT_RESTART, 4);
+    }
 }

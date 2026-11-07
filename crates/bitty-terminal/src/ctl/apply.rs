@@ -801,7 +801,10 @@ pub fn apply_control(
 /// classify-level report exists; `rejected` lists the dotted paths validation
 /// refused (a non-empty list means the running plan is untouched);
 /// `restart_required` lists the changed fields the runtime cannot adopt live
-/// yet; `plan_version` is the running plan's monotonic version. A module
+/// yet; `plugins_restart_required` lists the plugin ids whose enabled state in
+/// the installed store differs from the launch set (bitty#2969; the plugin set
+/// is not part of the config plan and applies only on restart);
+/// `plan_version` is the running plan's monotonic version. A module
 /// refusal adds the typed `module` object.
 ///
 /// `pub(super)` so `ctl::tests` can pin the encoding without a runtime.
@@ -833,6 +836,15 @@ pub(super) fn reload_config_json(info: &crate::config_reload::ReloadOutcomeInfo)
         restart_required.push_str(&json_escape(field));
         restart_required.push('"');
     }
+    let mut plugins_restart_required = String::new();
+    for (index, id) in info.plugins_restart_required.iter().enumerate() {
+        if index > 0 {
+            plugins_restart_required.push(',');
+        }
+        plugins_restart_required.push('"');
+        plugins_restart_required.push_str(&json_escape(id));
+        plugins_restart_required.push('"');
+    }
     let message = info
         .message
         .as_ref()
@@ -857,7 +869,7 @@ pub(super) fn reload_config_json(info: &crate::config_reload::ReloadOutcomeInfo)
         })
         .unwrap_or_default();
     format!(
-        "{{\"reloaded\":true,\"applied\":{},\"dry_run\":{},\"kind\":\"{}\",\"path\":\"{}\",\"changed\":[{}],\"rejected\":[{}],\"restart_required\":[{}],\"plan_version\":{}{message}{module}}}",
+        "{{\"reloaded\":true,\"applied\":{},\"dry_run\":{},\"kind\":\"{}\",\"path\":\"{}\",\"changed\":[{}],\"rejected\":[{}],\"restart_required\":[{}],\"plugins_restart_required\":[{}],\"plan_version\":{}{message}{module}}}",
         info.applied,
         info.dry_run,
         json_escape(info.kind),
@@ -865,6 +877,7 @@ pub(super) fn reload_config_json(info: &crate::config_reload::ReloadOutcomeInfo)
         changed,
         rejected,
         restart_required,
+        plugins_restart_required,
         info.plan_version,
     )
 }

@@ -3455,6 +3455,7 @@ impl Runtime {
                         distance: edge_distance,
                         point_distance,
                         perpendicular_distance,
+                        same_tier: frame.tier == current_frame.tier,
                     };
                     if contains {
                         containing.push(candidate);
@@ -3480,6 +3481,7 @@ impl Runtime {
                         distance: center_distance,
                         point_distance: 0,
                         perpendicular_distance,
+                        same_tier: frame.tier == current_frame.tier,
                     });
                 }
                 None => {}
@@ -4063,6 +4065,11 @@ struct SpatialCandidate {
     /// Perpendicular center distance; the overlay overlap fallback keeps
     /// ranking by it (a centered overlay has no meaningful focus point).
     perpendicular_distance: i64,
+    /// Whether the candidate shares the focused frame's paint tier
+    /// (issue #2993). Sibling overlays outrank the tiled base they cover in
+    /// the overlap fallback, so directional focus can step from one floating
+    /// panel to another instead of always escaping to the base beneath it.
+    same_tier: bool,
 }
 
 /// How a presented frame relates to the focused frame for one direction.
@@ -4204,15 +4211,24 @@ fn sort_spatial(candidates: &mut [SpatialCandidate]) {
     });
 }
 
-/// Ranking for the centered-overlay fallback, unchanged from issue #2444:
-/// nearest center along the movement axis, then nearest perpendicular
-/// center, then stable focus order, then `ViewId`. An overlay is centered
-/// over the tiled layout by construction, so it has no focus point to
-/// compare against.
+/// Ranking for the centered-overlay fallback (issues #2444, #2993): a
+/// sibling overlay first, then nearest center along the movement axis, then
+/// nearest perpendicular center, then stable focus order, then `ViewId`.
+///
+/// An overlay is centered over the tiled layout by construction, so it has no
+/// focus point to compare against — and the base leaf beneath it is centered
+/// on the very same point. Ranking the base by center distance therefore made
+/// it win every direction against a sibling float, so two stacked floating
+/// panels could not reach each other directionally: the keyboard could only
+/// escape to the tiled pane under them. Sibling overlays (same paint tier)
+/// now outrank the covered base, which keeps the documented "from an overlay
+/// every panel is reachable" contract; a separated pane still wins outright
+/// because the other tiers are consulted first.
 fn sort_spatial_by_center(candidates: &mut [SpatialCandidate]) {
     candidates.sort_by(|a, b| {
-        a.distance
-            .cmp(&b.distance)
+        b.same_tier
+            .cmp(&a.same_tier)
+            .then_with(|| a.distance.cmp(&b.distance))
             .then_with(|| a.perpendicular_distance.cmp(&b.perpendicular_distance))
             .then_with(|| a.order.cmp(&b.order))
             .then_with(|| a.view.cmp(&b.view))
@@ -4883,6 +4899,7 @@ mod tests {
                 distance: 10,
                 point_distance: 0,
                 perpendicular_distance: 0,
+                same_tier: false,
             },
             SpatialCandidate {
                 view: ViewId::new(3),
@@ -4890,6 +4907,7 @@ mod tests {
                 distance: 0,
                 point_distance: 500,
                 perpendicular_distance: 500,
+                same_tier: false,
             },
         ];
         sort_spatial(&mut candidates);
@@ -4903,6 +4921,7 @@ mod tests {
                 distance: 0,
                 point_distance: 10,
                 perpendicular_distance: 0,
+                same_tier: false,
             },
             SpatialCandidate {
                 view: ViewId::new(3),
@@ -4910,6 +4929,7 @@ mod tests {
                 distance: 0,
                 point_distance: 10,
                 perpendicular_distance: 0,
+                same_tier: false,
             },
             SpatialCandidate {
                 view: ViewId::new(5),
@@ -4917,12 +4937,69 @@ mod tests {
                 distance: 0,
                 point_distance: 4,
                 perpendicular_distance: 0,
+                same_tier: false,
             },
         ];
         sort_spatial(&mut candidates);
         assert_eq!(candidates[0].view, ViewId::new(5));
         assert_eq!(candidates[1].view, ViewId::new(3));
         assert_eq!(candidates[2].view, ViewId::new(9));
+    }
+
+    #[test]
+    fn overlay_ranking_prefers_the_sibling_overlay_issue_2993() {
+        // Issue #2993: two floating panels cascade over one tiled base, and
+        // the base's center sits between the two float centers. Ranking the
+        // base by center distance made it win every direction from a float,
+        // so the buried panel was unreachable with `Mod+hjkl`. A same-tier
+        // sibling now outranks the covered base; center distance still
+        // decides between sibling overlays.
+        let mut candidates = [
+            SpatialCandidate {
+                view: ViewId::new(1),
+                order: 0,
+                distance: 4,
+                point_distance: 0,
+                perpendicular_distance: 0,
+                same_tier: false,
+            },
+            SpatialCandidate {
+                view: ViewId::new(3),
+                order: 2,
+                distance: 12,
+                point_distance: 0,
+                perpendicular_distance: 0,
+                same_tier: true,
+            },
+        ];
+        sort_spatial_by_center(&mut candidates);
+        assert_eq!(
+            candidates[0].view,
+            ViewId::new(3),
+            "the sibling float outranks the nearer-centered tiled base"
+        );
+
+        // Two sibling overlays keep the #2444 center-distance order.
+        let mut candidates = [
+            SpatialCandidate {
+                view: ViewId::new(3),
+                order: 0,
+                distance: 12,
+                point_distance: 0,
+                perpendicular_distance: 0,
+                same_tier: true,
+            },
+            SpatialCandidate {
+                view: ViewId::new(2),
+                order: 1,
+                distance: 6,
+                point_distance: 0,
+                perpendicular_distance: 0,
+                same_tier: true,
+            },
+        ];
+        sort_spatial_by_center(&mut candidates);
+        assert_eq!(candidates[0].view, ViewId::new(2));
     }
 
     #[test]
@@ -4936,6 +5013,7 @@ mod tests {
                 distance: 4,
                 point_distance: 0,
                 perpendicular_distance: 40,
+                same_tier: false,
             },
             SpatialCandidate {
                 view: ViewId::new(3),
@@ -4943,6 +5021,7 @@ mod tests {
                 distance: 4,
                 point_distance: 0,
                 perpendicular_distance: 10,
+                same_tier: false,
             },
         ];
         sort_spatial_by_center(&mut candidates);

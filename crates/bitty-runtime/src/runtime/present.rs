@@ -3416,6 +3416,13 @@ impl Runtime {
         self.refresh_chrome_band();
         let frames = self.present_frames();
         self.reflow_present_layout(&frames);
+        // Issue #2993: keep the stored detached-float and pinned Views sized
+        // to the content frame they are painted in. The present pass reads
+        // their `scroll_offset` (and `visible_cells` composes at their
+        // cols/rows), and the page-scroll distance is their row count, so a
+        // stale pre-detach extent both mis-sized a scrolled float and paged
+        // it by the wrong number of rows.
+        self.reflow_overlay_present_layout(&frames);
 
         let mut pending_full = self.pending_full_redraw;
         // CTX-1641 (bitty#2785): a plugin scene revision (ui.mount/update,
@@ -3620,10 +3627,18 @@ impl Runtime {
 
         // For single-window slice we need per-view scrollback viewport and cursor.
         // Build id->View map for scroll/IME lookups.
+        //
+        // Issue #2993: resolve through the shared store lookup (live layout,
+        // detached floats, pinned leaves), not the layout alone. A detached
+        // float lives outside the tree, so the layout-only lookup fell through
+        // to the synthesized fallback below, whose `scroll_offset` is always
+        // zero: the panel scrolled into history in the View store but kept
+        // painting its live grid, so `Mod+u`/`Mod+i` and the wheel looked dead
+        // in every floating panel.
         let view_map: std::collections::HashMap<ViewId, View> = {
             let mut m = std::collections::HashMap::new();
             for frame in &allocations {
-                if let Some(v) = self.layout.find_leaf(frame.view) {
+                if let Some(v) = self.find_view(frame.view) {
                     m.insert(frame.view, v.clone());
                 } else {
                     // Fallback: synthesized view sized to the decorated
@@ -4928,10 +4943,9 @@ impl Runtime {
         if sel.is_empty() && !selection_state.single_cell && !buffer_selected {
             return;
         }
-        // Resolve the owner's scroll state through the shared owner lookup:
-        // detached floats and pinned leaves are not `view_map` layout leaves,
-        // so a map-only check read offset 0 and painted their scrolled range
-        // against the live grid (issue #2523 review).
+        // Resolve the owner's scroll state through the shared store lookup so
+        // a detached float or pinned leaf reports its own offset (issue #2523
+        // review); the map is only a layout-tier convenience.
         let scrolled = self.is_viewport_scrolled(owner);
         let Some(frame) = allocations.iter().find(|frame| frame.view == owner) else {
             return;

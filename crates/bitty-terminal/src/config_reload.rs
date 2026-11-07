@@ -49,7 +49,7 @@
 //! `restart_required` until it gains one.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use bitty_config::{EffectiveConfig, ReloadReport};
@@ -123,6 +123,11 @@ pub(crate) struct ReloadOutcomeInfo {
     /// Changed live-class fields the running runtime has no adopter for yet;
     /// they are recorded and take effect on the next start.
     pub(crate) restart_required: Vec<String>,
+    /// Plugin ids whose enabled state in the installed plugin store differs
+    /// from the set the running instance launched with (bitty#2969). The
+    /// plugin set is not part of the config plan and has no live apply path,
+    /// so these stay at their launch generations until a restart.
+    pub(crate) plugins_restart_required: Vec<String>,
     /// Detail for `rejected` / `load-error` / `apply-error`; `None`
     /// otherwise.
     pub(crate) message: Option<String>,
@@ -682,6 +687,67 @@ impl From<EffectiveConfig> for ResolvedConfig {
     }
 }
 
+/// The enabled installed-plugin set the instance launched with (bitty#2969).
+///
+/// `root` is the resolved plugin store the instance discovered at startup;
+/// `enabled` is the sorted list of store records that were enabled then. The
+/// set is a launch-time baseline only: a later `bitty plugin enable|disable`
+/// rewrites the store index, and a reload reports the difference.
+#[derive(Debug, Clone)]
+struct PluginSetSnapshot {
+    /// Resolved plugin store root at launch (`None` when the environment had
+    /// no data root, so no store plugin could have been discovered).
+    root: Option<PathBuf>,
+    /// Sorted, de-duplicated plugin ids enabled in that store at launch.
+    enabled: Vec<String>,
+}
+
+/// Read the enabled plugin ids from an installed plugin store index.
+///
+/// An absent index is an empty store (no installed packages), so it reports an
+/// empty list. A malformed or unreadable index reports `None`: the caller must
+/// not turn an integrity failure into a fabricated plugin-set change.
+fn enabled_store_plugins(root: Option<&Path>) -> Option<Vec<String>> {
+    let root = root?;
+    match bitty_runtime::plugin_runtime::resolution::load_index(root) {
+        Ok(records) => {
+            let mut enabled: Vec<String> = records
+                .into_iter()
+                .filter(|record| record.enabled)
+                .map(|record| record.plugin_id)
+                .collect();
+            enabled.sort();
+            enabled.dedup();
+            Some(enabled)
+        }
+        Err(error) => {
+            crate::logging::warn(|| {
+                format!("bitty: plugin store index unreadable; plugin set not compared: {error}")
+            });
+            None
+        }
+    }
+}
+
+/// Record the enabled plugin set the running instance launched with.
+///
+/// Called once by `main` after startup plugin discovery, so a later
+/// `bitty reload` can compare the installed store against what the instance
+/// actually launched with (bitty#2969). A missing reload context (`--safe`,
+/// headless paths, tests) or an unreadable index leaves plugin-set tracking
+/// off: the reload never invents a change it cannot prove.
+pub(crate) fn record_launch_plugin_set() {
+    let root = crate::plugin_runtime::store_root();
+    let Some(enabled) = enabled_store_plugins(root.as_deref()) else {
+        return;
+    };
+    CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow_mut().as_mut() {
+            ctx.plugins_launched = Some(PluginSetSnapshot { root, enabled });
+        }
+    });
+}
+
 /// The installed reload context: the engine plus how to re-resolve the config.
 struct ReloadContext {
     engine: ReloadEngine,
@@ -689,6 +755,9 @@ struct ReloadContext {
     /// still run with these values until restart, so pending restart fields
     /// are always computed against it rather than against the last reload.
     launched: EffectiveConfig,
+    /// The enabled plugin set the instance launched with (bitty#2969).
+    /// `None` means plugin-set tracking is not installed for this context.
+    plugins_launched: Option<PluginSetSnapshot>,
     /// Profile identity the running table reflects (bitty#2814): the startup
     /// chain until a reload is adopted, then the identity that reload was
     /// merged from. A persisted selector switch therefore moves it, while an
@@ -736,6 +805,11 @@ pub(crate) fn install(
             })
         });
     install_context(effective, profile, resolve, file_path, theme_dir);
+    // bitty#2969: the context is installed after startup plugin discovery, so
+    // this is the moment the enabled store set the instance runs with is
+    // known. A later `bitty plugin enable|disable` rewrites the store index
+    // and the reload reports the difference as restart-required.
+    record_launch_plugin_set();
 }
 
 /// Install the process-wide context (shared by production and tests).
@@ -758,6 +832,7 @@ fn install_context(
     CONTEXT.with(|slot| {
         *slot.borrow_mut() = Some(ReloadContext {
             launched: effective.clone(),
+            plugins_launched: None,
             engine: ReloadEngine::new(effective),
             profile,
             resolve,
@@ -808,6 +883,20 @@ pub(crate) fn install_with_theme_dir(
     theme_dir: Option<PathBuf>,
 ) {
     install_context(effective, None, resolve, watch, theme_dir);
+}
+
+/// Seed the launch-time plugin set for an installed context (tests only).
+///
+/// Production records it from the environment through
+/// [`record_launch_plugin_set`]; tests pass an explicit store root so no
+/// developer store is ever read.
+#[cfg(test)]
+pub(crate) fn set_launch_plugin_set(root: Option<PathBuf>, enabled: Vec<String>) {
+    CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow_mut().as_mut() {
+            ctx.plugins_launched = Some(PluginSetSnapshot { root, enabled });
+        }
+    });
 }
 
 /// Test-only convenience: a real (non-dry-run) reload against the installed
@@ -1039,6 +1128,29 @@ impl ReloadContext {
         pending_fields(&self.launched, self.engine.current(), runtime_adopts)
     }
 
+    /// Plugin ids whose enabled state in the installed store differs from the
+    /// set the instance launched with (bitty#2969).
+    ///
+    /// Empty when plugin-set tracking is not installed (tests, `--safe`) or
+    /// when the store index cannot be read: an integrity failure must never
+    /// become a fabricated plugin-set change.
+    fn pending_plugin_set(&self) -> Vec<String> {
+        let Some(launched) = self.plugins_launched.as_ref() else {
+            return Vec::new();
+        };
+        let Some(current) = enabled_store_plugins(launched.root.as_deref()) else {
+            return Vec::new();
+        };
+        let launched: std::collections::BTreeSet<&str> =
+            launched.enabled.iter().map(String::as_str).collect();
+        let current: std::collections::BTreeSet<&str> =
+            current.iter().map(String::as_str).collect();
+        launched
+            .symmetric_difference(&current)
+            .map(|id| (*id).to_string())
+            .collect()
+    }
+
     /// Re-resolve, classify, adopt if live, and build the caller-visible info.
     ///
     /// `dry_run` re-resolves and classifies but never commits the plan or
@@ -1062,6 +1174,7 @@ impl ReloadContext {
                     changed: Vec::new(),
                     rejected,
                     restart_required: Vec::new(),
+                    plugins_restart_required: Vec::new(),
                     message: Some(message),
                     module,
                     plan_version: self.plan_version,
@@ -1101,6 +1214,7 @@ impl ReloadContext {
                     changed: Vec::new(),
                     rejected: Vec::new(),
                     restart_required: Vec::new(),
+                    plugins_restart_required: Vec::new(),
                     message: Some(message),
                     module: None,
                     plan_version: self.plan_version,
@@ -1157,14 +1271,28 @@ impl ReloadContext {
                 }
             }
         }
+        // bitty#2969: the installed plugin set is a separate resource from the
+        // config plan and has no live apply path, so a store change the
+        // instance launched without is restart-required, never a silent
+        // no-op. A config `unchanged` attempt that only carries a pending
+        // plugin set reports `restart-required` (and never claims an apply).
+        let plugins_restart_required = self.pending_plugin_set();
+        let (kind, applied) = if !plugins_restart_required.is_empty()
+            && matches!(outcome, ReloadOutcome::Unchanged(_))
+        {
+            ("restart-required", false)
+        } else {
+            (outcome.kind(), applied)
+        };
         ReloadOutcomeInfo {
             path: self.path_label.clone(),
-            kind: outcome.kind(),
+            kind,
             applied,
             dry_run: false,
             changed,
             rejected,
             restart_required,
+            plugins_restart_required,
             message,
             module: None,
             plan_version: self.plan_version,
@@ -1203,9 +1331,16 @@ impl ReloadContext {
         } else {
             Vec::new()
         };
+        // bitty#2969: report a pending plugin-set change without applying
+        // anything, exactly like the real path will.
+        let plugins_restart_required = if rejected.is_empty() {
+            self.pending_plugin_set()
+        } else {
+            Vec::new()
+        };
         let kind = if !rejected.is_empty() {
             "rejected"
-        } else if !restart_required.is_empty() {
+        } else if !restart_required.is_empty() || !plugins_restart_required.is_empty() {
             "restart-required"
         } else if changed.is_empty() {
             "unchanged"
@@ -1220,6 +1355,7 @@ impl ReloadContext {
             changed,
             rejected,
             restart_required,
+            plugins_restart_required,
             message,
             module: None,
             plan_version: self.plan_version,
@@ -2644,5 +2780,152 @@ mod tests {
         assert_eq!(runtime.config().theme.background, [0x0A, 0x0A, 0x12, 0xFF]);
         clear();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Write a plugin-store index with one record for `id`.
+    fn write_plugin_index(root: &Path, id: &str, enabled: bool) {
+        std::fs::create_dir_all(root).expect("store root");
+        let record = bitty_runtime::plugin_runtime::resolution::PluginRecord {
+            source_class: bitty_runtime::plugin_runtime::SourceClass::Registry,
+            plugin_id: id.to_string(),
+            version: String::from("1.0.0"),
+            root: format!("packages/{id}/1.0.0"),
+            manifest_hash: "a".repeat(64),
+            content_digest: "b".repeat(64),
+            enabled,
+            granted: Vec::new(),
+        };
+        bitty_runtime::plugin_runtime::resolution::write_index(root, &[record])
+            .expect("write plugin index");
+    }
+
+    /// Install a reload context whose resolver returns `baseline` unchanged,
+    /// with an explicit launch plugin set (never the developer's store).
+    fn install_plugin_context(baseline: &EffectiveConfig, root: &Path, enabled: Vec<String>) {
+        clear();
+        let resolved = baseline.clone();
+        install_with(
+            baseline.clone(),
+            Box::new(move || Ok(resolved.clone().into())),
+            None,
+        );
+        set_launch_plugin_set(Some(root.to_path_buf()), enabled);
+    }
+
+    #[test]
+    fn reload_reports_a_newly_enabled_plugin_as_restart_required() {
+        // bitty#2969: enabling a store plugin after launch is a plugin-set
+        // change, not a config diff. The reload must name the plugin and
+        // never report `unchanged`.
+        let dir = temp_dir("plugin-enable");
+        let store = dir.join("store");
+        write_plugin_index(&store, "xuepoo.fixture", false);
+        let baseline = bitty_config::fallback_builtin();
+        install_plugin_context(&baseline, &store, Vec::new());
+        let mut runtime = deterministic_runtime(&baseline);
+
+        let unchanged = reload_requested_with(&mut runtime, false).expect("context installed");
+        assert_eq!(unchanged.kind, "unchanged", "{unchanged:?}");
+        assert!(
+            unchanged.plugins_restart_required.is_empty(),
+            "a disabled record is not part of the running set"
+        );
+        assert_eq!(unchanged.plan_version, 1);
+
+        write_plugin_index(&store, "xuepoo.fixture", true);
+        let info = reload_requested_with(&mut runtime, false).expect("context installed");
+        assert_eq!(info.kind, "restart-required", "{info:?}");
+        assert!(!info.applied, "a restart-required attempt never applies");
+        assert_eq!(
+            info.plugins_restart_required,
+            vec![String::from("xuepoo.fixture")]
+        );
+        assert!(info.changed.is_empty(), "no config field changed");
+        assert_eq!(
+            info.plan_version, 1,
+            "a restart-required attempt keeps the plan version"
+        );
+
+        // The dry run reports the same pending set and touches nothing.
+        let preview = reload_requested_with(&mut runtime, true).expect("context installed");
+        assert_eq!(preview.kind, "restart-required", "{preview:?}");
+        assert!(preview.dry_run);
+        assert_eq!(
+            preview.plugins_restart_required,
+            vec![String::from("xuepoo.fixture")]
+        );
+
+        clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reload_reports_a_disabled_plugin_as_restart_required() {
+        // bitty#2969: the symmetric case — disabling a plugin the instance
+        // launched with is pending until restart, and the id is named.
+        let dir = temp_dir("plugin-disable");
+        let store = dir.join("store");
+        write_plugin_index(&store, "xuepoo.fixture", true);
+        let baseline = bitty_config::fallback_builtin();
+        install_plugin_context(&baseline, &store, vec![String::from("xuepoo.fixture")]);
+        let mut runtime = deterministic_runtime(&baseline);
+
+        let unchanged = reload_requested_with(&mut runtime, false).expect("context installed");
+        assert_eq!(unchanged.kind, "unchanged", "{unchanged:?}");
+        assert!(unchanged.plugins_restart_required.is_empty());
+
+        write_plugin_index(&store, "xuepoo.fixture", false);
+        let info = reload_requested_with(&mut runtime, false).expect("context installed");
+        assert_eq!(info.kind, "restart-required", "{info:?}");
+        assert_eq!(
+            info.plugins_restart_required,
+            vec![String::from("xuepoo.fixture")]
+        );
+
+        clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reload_ignores_an_unreadable_plugin_index() {
+        // An integrity failure must never be turned into a fabricated
+        // plugin-set change: the reload stays `unchanged`.
+        let dir = temp_dir("plugin-corrupt");
+        let store = dir.join("store");
+        write_plugin_index(&store, "xuepoo.fixture", true);
+        let baseline = bitty_config::fallback_builtin();
+        install_plugin_context(&baseline, &store, vec![String::from("xuepoo.fixture")]);
+        let mut runtime = deterministic_runtime(&baseline);
+
+        std::fs::write(store.join("current.json"), b"{ not an index").expect("corrupt index");
+        let info = reload_requested_with(&mut runtime, false).expect("context installed");
+        assert_eq!(info.kind, "unchanged", "{info:?}");
+        assert!(info.plugins_restart_required.is_empty());
+
+        clear();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn reload_without_plugin_tracking_never_reports_a_plugin_set() {
+        // Tests, headless paths, and `--safe` install no launch plugin set;
+        // the reload must not read the developer's store to invent one.
+        let dir = temp_dir("plugin-untracked");
+        let store = dir.join("store");
+        write_plugin_index(&store, "xuepoo.fixture", true);
+        let baseline = bitty_config::fallback_builtin();
+        clear();
+        let resolved = baseline.clone();
+        install_with(
+            baseline.clone(),
+            Box::new(move || Ok(resolved.clone().into())),
+            None,
+        );
+        let mut runtime = deterministic_runtime(&baseline);
+        let info = reload_requested_with(&mut runtime, false).expect("context installed");
+        assert_eq!(info.kind, "unchanged", "{info:?}");
+        assert!(info.plugins_restart_required.is_empty());
+        clear();
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

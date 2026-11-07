@@ -1030,6 +1030,12 @@ fn plugin_store_install_and_enable_print_next_steps() {
         !text.contains("enable: bitty plugin enable xuepoo.onboard"),
         "{text}"
     );
+    // bitty#2969: a running instance keeps the old generations; say so.
+    assert!(text.contains("restart bitty to apply"), "{text}");
+    assert!(
+        text.contains("reports the pending plugin set as restart-required"),
+        "{text}"
+    );
     let portable = text.replace('\\', "/");
     assert!(portable.contains("plugins/xuepoo.onboard.lua"), "{text}");
     assert!(!portable.contains(".toml"), "{text}");

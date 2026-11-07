@@ -1109,6 +1109,10 @@ pub fn plugin_help_text() -> String {
      \x20 it explicitly with:\n\
      \x20 bitty plugin enable <id>\n\
      \x20 bitty plugin info <id>     # manifest, grants, and settings\n\
+     \x20 A running instance reads the installed plugin store only at\n\
+     \x20 startup, so enable/disable applies on the next restart. `bitty\n\
+     \x20 reload` reports the pending installed plugin set as restart-required\n\
+     \x20 (exit 4) instead of silently leaving the old generations running.\n\
      \n\
      fetch:\n\
      \x20 Git and archive installs stage under an exclusive temp dir and run\n\
@@ -5679,7 +5683,11 @@ pub fn run_plugin_subcommand(
             if is_managed_operand(&state, id) {
                 match op_enable(&mut state, id) {
                     Ok(result) => {
+                        let changed = result.changed;
                         let code = finish_mutation(&path, state, result, output);
+                        if code == EXIT_OK && changed {
+                            write_restart_hint(output);
+                        }
                         if code == EXIT_OK {
                             let manifest = bundled_manifest(id).ok();
                             if let Some(manifest) = manifest.as_ref() {
@@ -5716,7 +5724,14 @@ pub fn run_plugin_subcommand(
             let id = request.id.as_deref().expect("disable requires an id");
             if is_managed_operand(&state, id) {
                 match op_disable(&mut state, id) {
-                    Ok(result) => finish_mutation(&path, state, result, output),
+                    Ok(result) => {
+                        let changed = result.changed;
+                        let code = finish_mutation(&path, state, result, output);
+                        if code == EXIT_OK && changed {
+                            write_restart_hint(output);
+                        }
+                        code
+                    }
                     Err(failure) => {
                         eprintln!("{}", failure.message);
                         failure.exit
@@ -7641,6 +7656,20 @@ fn write_next_steps(
     );
 }
 
+/// Tell the user a plugin-set change does not reach a running instance.
+///
+/// The installed plugin store is read by startup discovery only, so
+/// `bitty reload` cannot apply an enable/disable (bitty#2969): it reports the
+/// pending set as restart-required. Printing the same hint here closes the
+/// "enable, then nothing happens" trap the CLI's next steps used to leave.
+fn write_restart_hint(output: &mut dyn std::io::Write) {
+    let _ = writeln!(
+        output,
+        "bitty plugin: a running instance keeps its current plugin generations; \
+         restart bitty to apply (a reload reports the pending plugin set as restart-required)"
+    );
+}
+
 /// Toggle one installed store record.
 fn set_store_enabled(
     store_root: &Option<PathBuf>,
@@ -7665,6 +7694,9 @@ fn set_store_enabled(
                     format!("already {state}")
                 }
             );
+            if changed {
+                write_restart_hint(output);
+            }
             if enabled {
                 // Best-effort store manifest for next steps (a missing index
                 // entry or an unreadable body falls back to generic next
@@ -11443,6 +11475,12 @@ mod tests {
         assert!(out.contains("enabled: yes"), "{out}");
         assert!(
             !out.contains("enable: bitty plugin enable bitty-terminal.shell-integration"),
+            "{out}"
+        );
+        // bitty#2969: the enable must say a running instance needs a restart.
+        assert!(out.contains("restart bitty to apply"), "{out}");
+        assert!(
+            out.contains("reports the pending plugin set as restart-required"),
             "{out}"
         );
         let _ = std::fs::remove_dir_all(&dir);

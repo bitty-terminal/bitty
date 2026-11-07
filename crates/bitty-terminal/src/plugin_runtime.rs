@@ -1365,6 +1365,7 @@ mod tests {
     }
 
     /// Unique scratch root for the semantic-cwd probes.
+    #[cfg(target_os = "linux")]
     fn semantic_cwd_root(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "bitty-semantic-cwd-{tag}-{}-{}",

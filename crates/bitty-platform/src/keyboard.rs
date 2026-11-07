@@ -1173,8 +1173,8 @@ fn modify_functional_key_frame(params: &str, final_byte: u8, modifiers: u32) -> 
 ///   type, so a release must stay silent like the legacy path);
 /// - no modifier held (`min_mod` defaults to `1`; level 3, which escape-codes
 ///   unmodified keys, is not implemented);
-/// - ordinary keys that the level keeps on the legacy path (see
-///   [`xterm_level_encodes`]);
+/// - ordinary keys that the level keeps on the legacy path (see the
+///   level table in `xterm_level_encodes`);
 /// - keys outside both the functional table and the ordinary bucket.
 ///
 /// Keys with their own xterm control sequence (cursor keys, `Home`/`End`,

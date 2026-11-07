@@ -921,8 +921,11 @@ core-dump hardening (`RLIMIT_CORE=0` and `PR_SET_DUMPABLE=0` on Linux, before
 any privileged state exists), endpoint (`open_endpoint`), operator capability
 (`0600` file in the `0700` runtime directory), audit sink
 (`$XDG_STATE_HOME/bitty/audit`, `0700`/`0600`), then the single-threaded poll
-loop. The loop blocks `SIGTERM`/`SIGINT` behind a signal fd, so the signal
-drain runs in the same loop as requests.
+loop. The loop blocks `SIGTERM`/`SIGINT`/`SIGHUP` behind a signal fd, so the
+signal drain runs in the same loop as requests. `SIGTERM`/`SIGINT` start the
+drain; `SIGHUP` is drained and dropped, because the daemon must outlive the
+terminal that started it (bitty#2920, see
+[Supervised startup](#supervised-startup-bitty2920)).
 
 | Bound                  | Source                                           | Behavior                                                                                                                |
 | ---------------------- | ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------- |
@@ -1452,6 +1455,51 @@ Linux Tier-1 job executes the real suite and uploads
 `bittyd-conformance-linux-x86_64`. The parity check compares the two signatures
 for every shared, non-known-defect vector and fails on any divergence.
 
+## Supervised startup (bitty#2920)
+
+`bittyd start` stays in the foreground: it does not fork, daemonize, or
+double-fork, and the single-instance `flock` is the only guard against a second
+copy. A supervisor therefore owns the lifetime, and the daemon cooperates with
+it: `SIGTERM`/`SIGINT` drain and exit `0`, while `SIGHUP` is drained and
+dropped, so `bittyd start &` no longer dies when its terminal closes.
+
+The per-user systemd unit ships at `/usr/lib/systemd/user/bittyd.service`
+(`packaging/systemd/bittyd.service`): `Type=simple`,
+`ExecStart=/usr/bin/bittyd start`, `Restart=on-failure`, `RestartSec=2`,
+`KillMode=mixed`. No filesystem or privilege hardening is set, because every
+directive in that family is inherited by the hosted shells and breaks them:
+`NoNewPrivileges` makes `sudo`, `su`, and every setuid helper fail, `PrivateTmp`
+hides `/tmp/.X11-unix` and the tmux/screen sockets the session already owns, and
+`ProtectSystem` mounts `/usr`, `/boot`, and `/etc` read-only so a package upgrade
+launched from a hosted shell fails with `EROFS`. `ProtectHome` is likewise unset:
+the daemon hosts the user's shells in their home directories.
+
+A hosted shell also starts with a clean signal state: the daemon blocks
+`SIGTERM`/`SIGINT`/`SIGHUP` for its own signal fd, and a blocked mask plus any
+`SIG_IGN` a service manager set would otherwise survive `execve` and leave the
+user's shell deaf to a hangup. The PTY spawn path clears the mask and resets
+every resettable disposition to the default in the child, before `exec`.
+
+The unit is per user, not system-wide: the daemon binds a socket inside the
+invoking user's runtime directory, mints an owner-private operator capability,
+and hosts that user's sessions. Every user enables their own copy:
+
+```sh
+systemctl --user enable --now bittyd
+loginctl enable-linger "$USER"   # optional: keep it running without a login session
+```
+
+Without linger the user manager stops at the last logout, which also stops the
+daemon; with linger it starts at boot and survives logout. Packages install the
+file only and never enable it, because enabling is a per-user decision.
+
+The unit is shipped by the nfpm deb/rpm/archlinux packages, the AUR recipes
+(`packaging/PKGBUILD`, `packaging/PKGBUILD.bin`), and the RPM spec
+(`packaging/bitty.spec`), and it travels inside the versioned Linux bundle as
+`share/systemd/user/bittyd.service`. Alpine does not get it: OpenRC has no
+systemd user manager, so `packaging/alpine/APKBUILD` and the nfpm apk omit the
+file.
+
 ## CLI
 
 ```text
@@ -1599,7 +1647,8 @@ violation, not a wiring detail (ADR 0008 / ADR 0019).
   invisible, and post-transfer old/rotated cases), the refusal-burst aggregate
   with suppressed count and histogram, the tamper-exit aggregate flush,
   core-dump hardening (`RLIMIT_CORE` and `/proc/<pid>/mem`),
-  `SIGTERM`/`SIGINT` drain, endpoint tamper → exit 6, clean stop, the
+  `SIGTERM`/`SIGINT` drain, `SIGHUP` survival, endpoint tamper → exit 6, clean
+  stop, the
   status-only invocation, and the bitty#2790 worker path: generation-1 bind,
   keyed replay and spec conflict, live-session orphan exclusion, controller vs
   observer resize, stale generation, spawn-failure rollback, and worker-exit

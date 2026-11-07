@@ -1,0 +1,45 @@
+# Bitty session daemon, as a per-user systemd unit (bitty#2920).
+#
+# The daemon is not a system-wide service: it binds a socket inside the
+# invoking user's runtime directory, mints an owner-private operator
+# capability, and hosts that user's terminal sessions. Enable it per user:
+#
+#   systemctl --user enable --now bittyd
+#   loginctl enable-linger "$USER"   # optional: run without an open session
+#
+# `bittyd start` stays in the foreground, which is what `Type=simple` wants;
+# the daemon drains `SIGHUP` without stopping and drains `SIGTERM` to exit.
+
+[Unit]
+Description=Bitty session daemon
+Documentation=https://github.com/bitty-terminal/bitty
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/bittyd start
+Restart=on-failure
+RestartSec=2
+# `SIGTERM` goes to the daemon only, so its own session drain runs first; if
+# the unit stop timeout expires, `SIGKILL` reaches every process left in the
+# unit's cgroup.
+KillMode=mixed
+# Hardening a session host can actually work under: this unit runs the user's
+# arbitrary programs, so every restriction here must be one a normal login
+# session also lives with. Nothing is set beyond the stop contract above.
+#
+# Deliberately not set, because each one breaks hosted shells rather than
+# containing them:
+#
+# - `NoNewPrivileges=`: the flag is inherited by every hosted shell and cannot
+#   be dropped once set, so `sudo`, `su`, `passwd`, and every setuid or
+#   file-capability helper fail with "the 'no new privileges' flag is set".
+# - `PrivateTmp=`: it gives hosted shells a private `/tmp`, cutting them off
+#   from `/tmp/.X11-unix` (every X11 client) and from the tmux/screen sockets
+#   the user's own session already owns.
+# - `ProtectSystem=`: it mounts `/usr`, `/boot`, and `/etc` read-only for
+#   everything in the unit's cgroup, so a package upgrade or credential change
+#   launched from a hosted shell (`sudo pacman -Syu`, `passwd`, `useradd`)
+#   fails with `EROFS` instead of doing its job.
+
+[Install]
+WantedBy=default.target
